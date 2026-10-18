@@ -7,6 +7,7 @@
 //! Functions taking `&Orchestrator` also need config/settings access.
 
 use cairn_common::ids;
+use cairn_models::types::catalog::VerbKind;
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
@@ -867,6 +868,24 @@ pub fn resolve_recipe_launch(
     )?;
 
     let config_dir = orch.config_dir.clone();
+    // One provider record per backend, asked whether a selection can hold a
+    // session: the same answer the session door gives at launch.
+    let providers = std::cell::RefCell::new(HashMap::new());
+    let serves_session = |selection: &ModelSelection| -> Result<(), String> {
+        let mut providers = providers.borrow_mut();
+        let provider = providers
+            .entry(selection.backend.clone())
+            .or_insert_with(|| orch.catalog_provider(&selection.backend, Some(project_id)));
+        provider
+            .admit(selection.model.as_str(), VerbKind::Session)
+            .map(|_| ())
+            .map_err(|refusal| {
+                refusal
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| refusal.to_string())
+            })
+    };
     let nodes = resolve_launch_nodes(
         &recipe_snapshot.nodes,
         &presets,
@@ -876,6 +895,7 @@ pub fn resolve_recipe_launch(
             config_agents::get_agent(&config_dir, agent_id, Some(&project_path))
                 .map_err(|e| e.to_string())
         },
+        serves_session,
     );
 
     Ok(LaunchPlan {
@@ -888,14 +908,22 @@ pub fn resolve_recipe_launch(
 /// supplied agent loader. Every node carries the global `available` option list
 /// (unioned with the row's own resolved selection) so even an unresolvable row can
 /// render the model dropdown. Loud, per-node errors; never fails the whole plan.
+///
+/// `serves_session` says whether a selection can hold a session. A selection
+/// that cannot is never offered, and a row that resolves to one is reported
+/// as an error naming its tier rather than quietly given another model.
 fn resolve_launch_nodes(
     recipe_nodes: &[RecipeNode],
     presets: &PresetsConfig,
     overrides: &LaunchOverrides,
     plan: &LaunchSelectionPlan,
     load_agent: impl Fn(&str) -> Result<Option<config_agents::FileAgent>, String>,
+    serves_session: impl Fn(&ModelSelection) -> Result<(), String>,
 ) -> Vec<ResolvedLaunchNode> {
-    let global = available_selections(presets);
+    let global: Vec<ModelSelection> = available_selections(presets)
+        .into_iter()
+        .filter(|selection| serves_session(selection).is_ok())
+        .collect();
     let union = |selection: Option<&ModelSelection>| -> Vec<ModelSelection> {
         let mut list = global.clone();
         if let Some(sel) = selection {
@@ -984,6 +1012,24 @@ fn resolve_launch_nodes(
             ),
         };
 
+        // The tier this row asked for, to name in a refusal.
+        let asked_tier = match effective {
+            Some(LaunchSelectionOverride::Tier(tier)) => Some(tier.as_str()),
+            Some(LaunchSelectionOverride::Concrete(_)) => None,
+            Some(LaunchSelectionOverride::Backend(_)) | None => {
+                file_agent.tier.as_ref().map(Model::as_str)
+            }
+        };
+        let resolved = resolved.and_then(|r| match serves_session(&r.selection) {
+            Ok(()) => Ok(r),
+            Err(why) => {
+                let landed = format!("{} on {}", r.selection.model, r.selection.backend);
+                Err(match asked_tier {
+                    Some(tier) => format!("the '{tier}' tier resolves to {landed}: {why}"),
+                    None => format!("{landed}: {why}"),
+                })
+            }
+        });
         let (resolved_row, error, available) = match resolved {
             Ok(r) => {
                 let available = union(Some(&r.selection));
@@ -1623,9 +1669,14 @@ mod tests {
         let presets = default_presets_config(Some(31999));
         let nodes = [agent_node("n1", "builder")];
         let overrides = LaunchOverrides::default();
-        let out = resolve_launch_nodes(&nodes, &presets, &overrides, &plan(), |_id| {
-            Ok(Some(file_agent("builder", Some("md"))))
-        });
+        let out = resolve_launch_nodes(
+            &nodes,
+            &presets,
+            &overrides,
+            &plan(),
+            |_id| Ok(Some(file_agent("builder", Some("md")))),
+            |_| Ok(()),
+        );
         assert_eq!(out.len(), 1);
         let row = &out[0];
         assert!(row.error.is_none());
@@ -1644,9 +1695,14 @@ mod tests {
         let presets = default_presets_config(Some(31999));
         let nodes = [agent_node("n1", "weird")];
         let overrides = LaunchOverrides::default();
-        let out = resolve_launch_nodes(&nodes, &presets, &overrides, &plan(), |_id| {
-            Ok(Some(file_agent("weird", Some("xl"))))
-        });
+        let out = resolve_launch_nodes(
+            &nodes,
+            &presets,
+            &overrides,
+            &plan(),
+            |_id| Ok(Some(file_agent("weird", Some("xl")))),
+            |_| Ok(()),
+        );
         let row = &out[0];
         assert!(row.resolved.is_none());
         assert!(row.error.is_some());
@@ -1667,9 +1723,14 @@ mod tests {
             "n1".to_string(),
             LaunchSelectionOverride::Concrete(pin.clone()),
         );
-        let out = resolve_launch_nodes(&nodes, &presets, &overrides, &plan(), |_id| {
-            Ok(Some(file_agent("builder", Some("md"))))
-        });
+        let out = resolve_launch_nodes(
+            &nodes,
+            &presets,
+            &overrides,
+            &plan(),
+            |_id| Ok(Some(file_agent("builder", Some("md")))),
+            |_| Ok(()),
+        );
         let resolved = out[0].resolved.as_ref().unwrap();
         assert_eq!(resolved.selection.model.as_str(), "custom-xl");
         assert_eq!(resolved.selection.backend, "claude");
@@ -1687,9 +1748,14 @@ mod tests {
         let presets = default_presets_config(Some(31999));
         let nodes = [agent_node("n1", "builder")];
         let overrides = LaunchOverrides::default();
-        let out = resolve_launch_nodes(&nodes, &presets, &overrides, &plan(), |_id| {
-            Ok(Some(file_agent("builder", Some("md"))))
-        });
+        let out = resolve_launch_nodes(
+            &nodes,
+            &presets,
+            &overrides,
+            &plan(),
+            |_id| Ok(Some(file_agent("builder", Some("md")))),
+            |_| Ok(()),
+        );
         let resolved = out[0].resolved.as_ref().unwrap();
         assert_eq!(resolved.selection.model.as_str(), "sonnet");
         let routing = resolved.routing.as_ref().expect("every row records why");
@@ -1720,9 +1786,14 @@ mod tests {
 
         let nodes = [agent_node("n1", "builder"), agent_node("n2", "review")];
         let overrides = LaunchOverrides::default();
-        let out = resolve_launch_nodes(&nodes, &presets, &overrides, &routed, |id| {
-            Ok(Some(file_agent(id, Some("md"))))
-        });
+        let out = resolve_launch_nodes(
+            &nodes,
+            &presets,
+            &overrides,
+            &routed,
+            |id| Ok(Some(file_agent(id, Some("md")))),
+            |_| Ok(()),
+        );
 
         let builder = out[0].resolved.as_ref().unwrap();
         assert_eq!(builder.selection.model.as_str(), "opus");
@@ -1761,9 +1832,14 @@ mod tests {
             "n1".to_string(),
             LaunchSelectionOverride::Tier("sm".to_string()),
         );
-        let out = resolve_launch_nodes(&nodes, &presets, &overrides, &routed, |_id| {
-            Ok(Some(file_agent("builder", Some("md"))))
-        });
+        let out = resolve_launch_nodes(
+            &nodes,
+            &presets,
+            &overrides,
+            &routed,
+            |_id| Ok(Some(file_agent("builder", Some("md")))),
+            |_| Ok(()),
+        );
         let resolved = out[0].resolved.as_ref().unwrap();
         assert_eq!(resolved.selection.model.as_str(), "haiku");
         assert!(
@@ -1777,9 +1853,74 @@ mod tests {
         let presets = default_presets_config(Some(31999));
         let nodes = [agent_node("n1", "ghost")];
         let overrides = LaunchOverrides::default();
-        let out = resolve_launch_nodes(&nodes, &presets, &overrides, &plan(), |_id| Ok(None));
+        let out = resolve_launch_nodes(
+            &nodes,
+            &presets,
+            &overrides,
+            &plan(),
+            |_id| Ok(None),
+            |_| Ok(()),
+        );
         assert!(out[0].error.as_ref().unwrap().contains("not found"));
         assert!(out[0].resolved.is_none());
         assert!(!out[0].available.is_empty());
+    }
+
+    #[test]
+    fn a_selection_that_cannot_hold_a_session_is_never_offered_and_a_row_landing_on_it_says_so() {
+        let mut presets = default_presets_config(Some(31999));
+        presets
+            .backends
+            .entry("codex".to_string())
+            .or_default()
+            .insert(
+                "lg".to_string(),
+                crate::models::Preset {
+                    model: Model::new("gpt-image-2"),
+                    options: Default::default(),
+                },
+            );
+        let image_only = |selection: &ModelSelection| {
+            if selection.model.as_str() == "gpt-image-2" {
+                Err("'gpt-image-2' on codex serves only image".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        assert!(available_selections(&presets)
+            .iter()
+            .any(|s| s.model.as_str() == "gpt-image-2"));
+
+        let nodes = [agent_node("n1", "builder"), agent_node("n2", "review")];
+        let mut overrides = LaunchOverrides::default();
+        overrides.nodes.insert(
+            "n1".to_string(),
+            LaunchSelectionOverride::Tier("codex/lg".to_string()),
+        );
+        let out = resolve_launch_nodes(
+            &nodes,
+            &presets,
+            &overrides,
+            &plan(),
+            |id| Ok(Some(file_agent(id, Some("md")))),
+            image_only,
+        );
+
+        assert!(out[0].resolved.is_none());
+        assert_eq!(
+            out[0].error.as_deref(),
+            Some("the 'codex/lg' tier resolves to gpt-image-2 on codex: 'gpt-image-2' on codex serves only image")
+        );
+        for row in &out {
+            assert!(!row.available.is_empty());
+            assert!(row
+                .available
+                .iter()
+                .all(|s| s.model.as_str() != "gpt-image-2"));
+        }
+        assert_eq!(
+            out[1].resolved.as_ref().unwrap().selection.model.as_str(),
+            "sonnet"
+        );
     }
 }

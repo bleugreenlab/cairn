@@ -150,6 +150,7 @@ impl AgentBackend for OllamaBackend {
         &self,
         request: CompletionRequest,
         orch: &Orchestrator,
+        _admitted: crate::backends::Admitted,
     ) -> Result<CompletionOutcome, CompletionError> {
         let adapter =
             adapter::OllamaAdapter::new(orch, &request.model, request.project_id.as_deref())
@@ -169,7 +170,12 @@ impl AgentBackend for OllamaBackend {
             disallowed: Vec::new(),
         }
     }
-    fn start_session(&self, config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
+    fn start_session(
+        &self,
+        config: SessionConfig,
+        orch: &Orchestrator,
+        _admitted: crate::backends::Admitted,
+    ) -> Result<(), String> {
         let model = config
             .model
             .as_ref()

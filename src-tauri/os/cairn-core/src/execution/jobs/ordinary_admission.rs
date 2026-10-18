@@ -1744,7 +1744,12 @@ mod tests {
                 disallowed: Vec::new(),
             }
         }
-        fn start_session(&self, config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
+        fn start_session(
+            &self,
+            config: SessionConfig,
+            orch: &Orchestrator,
+            _admitted: crate::backends::Admitted,
+        ) -> Result<(), String> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let run_id = config.run_id;
             orch.process_state
@@ -1791,7 +1796,12 @@ mod tests {
                 disallowed: Vec::new(),
             }
         }
-        fn start_session(&self, config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
+        fn start_session(
+            &self,
+            config: SessionConfig,
+            orch: &Orchestrator,
+            _admitted: crate::backends::Admitted,
+        ) -> Result<(), String> {
             orch.process_state
                 .register_process(
                     config.run_id,

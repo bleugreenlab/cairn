@@ -2238,6 +2238,7 @@ pub fn start_agent_session(
         system_prompt_content,
         system_prompt_dynamic_tail,
         backend,
+        spawning_backend,
         permissions,
         max_thinking_tokens,
         reasoning_effort,
@@ -2668,6 +2669,7 @@ pub fn start_agent_session(
             system_prompt_content,
             system_prompt_dynamic_tail,
             backend,
+            spawning_backend.to_string(),
             permissions,
             max_thinking_tokens,
             reasoning_effort,
@@ -2824,7 +2826,7 @@ pub fn start_agent_session(
     event.session_id = Some(&session_id_for_timing);
     event.bytes = Some(session_config.prompt.len());
     event.emit();
-    backend.start_session(session_config, orch)
+    backends::launch::start_session(orch, &spawning_backend, backend.as_ref(), session_config)
 }
 
 #[cfg(test)]
@@ -2873,6 +2875,7 @@ mod tests {
             &self,
             config: crate::backends::SessionConfig,
             _orch: &Orchestrator,
+            _admitted: crate::backends::Admitted,
         ) -> Result<(), String> {
             *self.identity.lock().unwrap() = config.identity;
             Ok(())

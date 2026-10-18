@@ -13,6 +13,7 @@ use crate::backends::{
 use crate::models::{Model, Preset, PresetOptionValue};
 use crate::orchestrator::Orchestrator;
 use crate::storage::NewResponseInvocation;
+use cairn_models::types::catalog::VerbKind;
 
 #[derive(Debug, Clone)]
 pub enum ResponseCaller {
@@ -205,40 +206,29 @@ pub fn model_capabilities(
     // backend adapter, which is the one place that knows what an operator
     // called a provider they defined themselves.
     let inventory = orch.provider_catalog();
-    // What each model serves, as the facet answers it: a response is a
-    // completion, so a model that serves only `image` is no choice for one.
-    let facet = cairn_models::interface::Models::catalog(
-        orch,
-        &cairn_models::interface::ModelScope::workspace(),
-    )
-    .ok();
-    let completes = |backend: &str, model: &str| {
-        facet
-            .as_ref()
-            .and_then(|facet| {
-                facet
-                    .providers
-                    .iter()
-                    .find(|provider| provider.descriptor.key == backend)
-            })
-            .is_none_or(|provider| {
-                provider.serves_for(model).iter().any(|served| {
-                    served.verb.kind() == cairn_models::types::catalog::VerbKind::Complete
-                })
-            })
-    };
     for backend_name in enabled.iter().map(String::as_str) {
         let backend = backend_for_name(Some(backend_name));
+        // What each model serves, as the facet answers it at the launch door:
+        // a response is a completion, so a model that does not serve one (an
+        // image model, an embedder) is never a runnable choice.
+        let provider = orch.catalog_provider(backend_name, project_id);
+        let completes = |model: &str| provider.admit(model, VerbKind::Complete).map(|_| ());
         let availability = backend.response_completion_availability(orch, project_id);
         let mut selections = Vec::new();
         if let Some(backend_presets) = presets.backends.get(backend_name) {
             for tier in &presets.tiers {
                 if let Some(preset) = backend_presets.get(tier) {
-                    let model_availability = backend.response_model_availability(
-                        orch,
-                        project_id,
-                        preset.model.as_str(),
-                    );
+                    // A tier bound to a model that cannot complete stays
+                    // listed, refused with why, rather than silently replaced.
+                    let model_availability = completes(preset.model.as_str())
+                        .map_err(|refusal| refusal.to_string())
+                        .and_then(|()| {
+                            backend.response_model_availability(
+                                orch,
+                                project_id,
+                                preset.model.as_str(),
+                            )
+                        });
                     let legacy_values = crate::config::presets::resolve_preset(tier, &presets)
                         .ok()
                         .filter(|resolved| resolved.backend == backend_name)
@@ -264,7 +254,7 @@ pub fn model_capabilities(
             for model in entry
                 .models
                 .iter()
-                .filter(|model| !model.hidden && completes(backend_name, &model.model))
+                .filter(|model| !model.hidden && provider.serves(&model.model, VerbKind::Complete))
             {
                 let model_availability =
                     backend.response_model_availability(orch, project_id, &model.model);
@@ -296,6 +286,19 @@ pub fn model_capabilities(
                     saved_discovery_selection(backend_name, saved_model, discovery_error)
                 {
                     selections.push(selection);
+                } else if let Err(refusal) = completes(saved_model) {
+                    // Represented so validation can say why it cannot run,
+                    // naming the model and what it serves instead.
+                    selections.push(ResponseModelSelection {
+                        kind: "model".into(),
+                        value: saved_model.into(),
+                        label: format!("Exact · {saved_model}"),
+                        backend: backend_name.into(),
+                        model: saved_model.into(),
+                        legacy_values: Vec::new(),
+                        runnable: false,
+                        unavailable_reason: Some(refusal.to_string()),
+                    });
                 }
             }
         }
@@ -407,6 +410,9 @@ pub enum ResponseError {
     ContractViolation(String),
     #[error("response failed: {0}")]
     Upstream(String),
+    /// The model does not serve completions; the facet's refusal, verbatim.
+    #[error("{0}")]
+    Unserved(String),
 }
 
 impl ResponseCaller {
@@ -629,8 +635,9 @@ async fn complete_definition(
         project_path,
         Arc::new(|backend_name, request, orch| {
             // Run-time eligibility, in order: the workspace has the provider
-            // installed, an account can serve it, and it serves this model.
-            // Catalog membership is an authoring concern and is not checked.
+            // installed, an account can serve it, and (at the launch door) the
+            // model serves completions. Catalog membership is an authoring
+            // concern and is not checked.
             if !orch.provider_enabled(&backend_name) {
                 return Err(ResponseError::BackendUnavailable(format!(
                     "the {backend_name} provider isn't enabled in this workspace; enable it in Settings → Providers"
@@ -643,9 +650,15 @@ async fn complete_definition(
             backend
                 .response_model_availability(orch, request.project_id.as_deref(), &request.model)
                 .map_err(ResponseError::BackendUnavailable)?;
-            backend
-                .complete(request, orch)
-                .map_err(map_completion_error)
+            crate::backends::launch::complete(orch, &backend_name, backend.as_ref(), request)
+                .map_err(|error| match error {
+                    crate::backends::launch::LaunchError::Unserved(refusal) => {
+                        ResponseError::Unserved(refusal.to_string())
+                    }
+                    crate::backends::launch::LaunchError::Completion(error) => {
+                        map_completion_error(error)
+                    }
+                })
         }),
     )
     .await
@@ -1246,6 +1259,138 @@ mod tests {
         assert!(seen.contains(&"codex".to_string()), "{seen:?}");
         assert_eq!(exact("codex"), ["gpt-coverage"]);
         assert_eq!(exact("openrouter"), ["chat/model"]);
+    }
+
+    /// An orchestrator whose Codex is signed in with an API key and whose
+    /// discovery listed its image model, with a definition pinned to it.
+    async fn codex_image_orchestrator() -> Orchestrator {
+        codex_image_orchestrator_discovered(true).await
+    }
+
+    /// As above; `discovered` false leaves the catalog cold, as at startup.
+    async fn codex_image_orchestrator_discovered(discovered: bool) -> Orchestrator {
+        use cairn_models::types::catalog::ProviderModelCatalog;
+        let orch = test_orchestrator().await;
+        assert!(orch.provider_enabled("codex"));
+        orch.add_account(
+            crate::credentials::ApiProvider::OpenAI,
+            "OpenAI key".into(),
+            crate::credentials::ProviderAuth::ApiKey {
+                value: "sk-responses-test".into(),
+            },
+            None,
+        )
+        .unwrap();
+        if !discovered {
+            return orch;
+        }
+        orch.seed_model_catalog_for_test(ProviderModelCatalog {
+            backend: "codex".to_string(),
+            models: vec![cairn_models::image::codex::discovered_model()],
+            options: Vec::new(),
+            refreshed_at: Some(1),
+            error: None,
+        });
+        orch
+    }
+
+    fn image_pinned() -> ResponseDefinition {
+        parse_definition(&format!(
+            "---\nname: Image pinned\ndescription: pinned to an image model\nmodel: {}\nbackend: codex\n---\nSay hi",
+            cairn_models::image::codex::CODEX_IMAGE_MODEL
+        ))
+        .unwrap()
+    }
+
+    fn assert_names_the_image_model(text: &str) {
+        let model = cairn_models::image::codex::CODEX_IMAGE_MODEL;
+        assert!(
+            text.contains(&format!("'{model}' on codex serves only image")),
+            "{text}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tier_bound_to_an_image_model_is_listed_unrunnable_with_why() {
+        for discovered in [true, false] {
+            a_tier_bound_to_an_image_model_is_unrunnable(discovered).await;
+        }
+    }
+
+    async fn a_tier_bound_to_an_image_model_is_unrunnable(discovered: bool) {
+        let orch = codex_image_orchestrator_discovered(discovered).await;
+        let mut backends = orch.get_settings().backends;
+        backends.entry("codex".to_string()).or_default().insert(
+            "lg".to_string(),
+            Preset {
+                model: Model::new(cairn_models::image::codex::CODEX_IMAGE_MODEL),
+                options: Default::default(),
+            },
+        );
+        orch.update_settings(crate::models::UpdateSettings {
+            backends: Some(backends),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let capabilities = model_capabilities(&orch, None, None, None);
+        let codex = capabilities
+            .backends
+            .iter()
+            .find(|backend| backend.backend == "codex")
+            .unwrap();
+        assert!(codex.runnable, "{:?}", codex.unavailable_reason);
+        let lg = codex
+            .selections
+            .iter()
+            .find(|selection| selection.value == "codex/lg")
+            .unwrap();
+        assert!(!lg.runnable);
+        assert_names_the_image_model(lg.unavailable_reason.as_deref().unwrap());
+        assert!(codex
+            .selections
+            .iter()
+            .all(|selection| selection.kind != "model"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saved_pin_to_an_image_model_fails_validation_and_invocation_naming_it() {
+        let orch = codex_image_orchestrator().await;
+        let definition = image_pinned();
+
+        let invalid = validate_runnable_model(&orch, &definition, None, None).unwrap_err();
+        assert_names_the_image_model(&invalid);
+
+        let refused = invoke_definition(
+            &orch,
+            &definition,
+            &json!({}),
+            "image-pinned",
+            ResponseCaller::Internal {
+                label: "test".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        match &refused {
+            ResponseError::Unserved(text) => {
+                assert!(
+                    text.starts_with("No completion-capable model serves"),
+                    "{text}"
+                );
+                assert_names_the_image_model(text);
+            }
+            other => panic!("expected the launch door's refusal, got {other:?}"),
+        }
+        let journal = crate::storage::list_response_invocations(
+            &orch.db.local,
+            "workspace",
+            "image-pinned",
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(journal.len(), 1, "the refusal is journaled");
     }
 
     #[test]

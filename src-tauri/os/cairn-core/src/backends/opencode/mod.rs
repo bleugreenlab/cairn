@@ -434,6 +434,7 @@ impl AgentBackend for OpenCodeBackend {
         &self,
         request: CompletionRequest,
         orch: &Orchestrator,
+        _admitted: crate::backends::Admitted,
     ) -> Result<CompletionOutcome, CompletionError> {
         if request.messages.is_empty() {
             return Err(CompletionError::InvalidRequest(
@@ -518,7 +519,12 @@ impl AgentBackend for OpenCodeBackend {
         }
     }
 
-    fn start_session(&self, config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
+    fn start_session(
+        &self,
+        config: SessionConfig,
+        orch: &Orchestrator,
+        _admitted: crate::backends::Admitted,
+    ) -> Result<(), String> {
         // A model this session cannot actually run on fails here — naming the
         // missing tool calling, or the endpoint family Cairn cannot place —
         // rather than part-way through the first turn as an opaque upstream

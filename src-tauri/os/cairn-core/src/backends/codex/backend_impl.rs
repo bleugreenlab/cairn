@@ -138,11 +138,17 @@ impl AgentBackend for CodexBackend {
             None,
             &HashMap::new(),
         )?;
-        // Codex's own listing is its chat models; the image offer is the
-        // facet's, serving `image` alone, so no picker for a session or a
-        // completion ever lands on it.
-        models.push(cairn_models::image::codex::discovered_model());
+        // Codex's own listing is its chat models; the image offer is declared
+        // beside them.
+        models.extend(self.declared_models());
         Ok(models)
+    }
+
+    /// The image offer is the facet's, serving `image` alone, so neither a
+    /// picker nor a launch door ever takes it for a session or a completion,
+    /// discovered or not.
+    fn declared_models(&self) -> Vec<DiscoveredModel> {
+        vec![cairn_models::image::codex::discovered_model()]
     }
 
     fn option_descriptors(&self) -> Vec<ProviderOptionDescriptor> {
@@ -196,7 +202,12 @@ impl AgentBackend for CodexBackend {
         }
     }
 
-    fn start_session(&self, config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
+    fn start_session(
+        &self,
+        config: SessionConfig,
+        orch: &Orchestrator,
+        _admitted: crate::backends::Admitted,
+    ) -> Result<(), String> {
         // Pooled ephemeral call (CAIRN-2549): run this call as a lightweight
         // `thread/start` on a shared app-server rather than spawning a process
         // for it. Node/task sessions fall through to the process-per-session
@@ -468,6 +479,7 @@ impl AgentBackend for CodexBackend {
         &self,
         request: CompletionRequest,
         orch: &Orchestrator,
+        _admitted: crate::backends::Admitted,
     ) -> Result<CompletionOutcome, CompletionError> {
         use crate::backends::one_shot::{
             instructions, map_one_shot_error, map_open_error, one_shot_timeout,

@@ -1417,7 +1417,12 @@ impl AgentBackend for ClaudeBackend {
         }
     }
 
-    fn start_session(&self, config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
+    fn start_session(
+        &self,
+        config: SessionConfig,
+        orch: &Orchestrator,
+        _admitted: crate::backends::Admitted,
+    ) -> Result<(), String> {
         let start_time = std::time::Instant::now();
 
         let session_id = Some(config.session_start.session_id().to_string());
@@ -1778,6 +1783,7 @@ impl AgentBackend for ClaudeBackend {
         &self,
         request: CompletionRequest,
         orch: &Orchestrator,
+        _admitted: crate::backends::Admitted,
     ) -> Result<CompletionOutcome, CompletionError> {
         use super::one_shot::{
             instructions, map_one_shot_error, map_open_error, one_shot_timeout,

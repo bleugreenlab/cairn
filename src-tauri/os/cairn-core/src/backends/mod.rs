@@ -26,6 +26,8 @@ mod claude_transcript;
 pub mod codex;
 pub mod custom;
 mod http_loop;
+pub(crate) mod launch;
+pub use launch::Admitted;
 pub mod ollama;
 mod one_shot;
 mod openai_compat;
@@ -199,6 +201,15 @@ pub trait AgentBackend: Send + Sync {
     /// that discovery has not reported.
     fn serves(&self, orch: &Orchestrator, project_id: Option<&str>) -> Vec<ServedVerb>;
 
+    /// Models Cairn itself declares this backend serves, whatever discovery
+    /// finds or whether it has run: an offer the facet owns rather than one
+    /// the provider lists (Codex's image tool). The provider's catalog record
+    /// always carries them, so what they serve is known before discovery
+    /// completes and after it fails; discovery includes them too.
+    fn declared_models(&self) -> Vec<DiscoveredModel> {
+        Vec::new()
+    }
+
     /// Whether this backend can execute a response's tool-free, one-shot
     /// completion with the credentials or host configuration currently in
     /// scope. This is the canonical capability check used by both authoring and
@@ -237,13 +248,23 @@ pub trait AgentBackend: Send + Sync {
 
     /// Start a new session. Spawns the process and event reader thread.
     /// Returns immediately — events flow through the Orchestrator's DB/emitter.
-    fn start_session(&self, config: SessionConfig, orch: &Orchestrator) -> Result<(), String>;
+    /// Only [`launch::start_session`] can supply `admitted`, so every session
+    /// passes the verb gate first.
+    fn start_session(
+        &self,
+        config: SessionConfig,
+        orch: &Orchestrator,
+        admitted: Admitted,
+    ) -> Result<(), String>;
 
     /// Execute one tool-free request without creating agent/session state.
+    /// Only [`launch::complete`] can supply the admission, so every
+    /// completion passes the verb gate first.
     fn complete(
         &self,
         _request: CompletionRequest,
         _orch: &Orchestrator,
+        _admitted: crate::backends::Admitted,
     ) -> Result<CompletionOutcome, CompletionError> {
         Err(CompletionError::BackendUnavailable)
     }
@@ -588,7 +609,12 @@ pub(crate) mod tests {
                     disallowed: Vec::new(),
                 }
             }
-            fn start_session(&self, _: SessionConfig, _: &Orchestrator) -> Result<(), String> {
+            fn start_session(
+                &self,
+                _: SessionConfig,
+                _: &Orchestrator,
+                _admitted: crate::backends::Admitted,
+            ) -> Result<(), String> {
                 Ok(())
             }
             fn supports_resume(&self) -> bool {
@@ -627,7 +653,12 @@ pub(crate) mod tests {
                     disallowed: Vec::new(),
                 }
             }
-            fn start_session(&self, _: SessionConfig, _: &Orchestrator) -> Result<(), String> {
+            fn start_session(
+                &self,
+                _: SessionConfig,
+                _: &Orchestrator,
+                _admitted: crate::backends::Admitted,
+            ) -> Result<(), String> {
                 Ok(())
             }
             fn supports_resume(&self) -> bool {

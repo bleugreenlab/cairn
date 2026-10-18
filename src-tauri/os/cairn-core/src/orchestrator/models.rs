@@ -20,8 +20,8 @@ use cairn_db::storage::run_db_blocking;
 use cairn_db::turso::params;
 use cairn_models::accounts::AccountInfo;
 use cairn_models::interface::{
-    Catalog, CatalogProvider, ModelScope, Models, SessionState, SessionView, TierBinding,
-    LOCAL_HOST,
+    Catalog, CatalogProvider, ModelScope, Models, ResolvedServes, SessionState, SessionView,
+    TierBinding, LOCAL_HOST,
 };
 use cairn_models::types::catalog::{self, ServedVerb, CLAUDE_FAMILY_BACKEND};
 use cairn_models::types::pool::ProviderPoolSnapshot;
@@ -86,6 +86,17 @@ impl Orchestrator {
             project_path.as_deref(),
         ))
     }
+}
+
+/// A provider's discovered catalog as the frontend reads it: discovery's
+/// answer plus what each model serves, resolved by the facet
+/// ([`CatalogProvider::resolved_serves`]).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelCatalogView {
+    #[serde(flatten)]
+    pub catalog: cairn_models::types::catalog::ProviderModelCatalog,
+    pub resolved_serves: ResolvedServes,
 }
 
 /// The tiers bound on `provider`, in the workspace's tier order.
@@ -181,6 +192,149 @@ impl Orchestrator {
         }
         crate::backends::backend_for_name(Some(key)).serves(self, project_id)
     }
+
+    /// Provider `key` as the catalog sees it in `project_id`'s scope: the one
+    /// record the launch doors, the pickers, and the frontend's resolved
+    /// serves all ask, so none of them can disagree about what a model
+    /// serves.
+    ///
+    /// It is built whether or not the workspace installed `key` (`installed`
+    /// says which), because a session can launch on a provider the workspace
+    /// has not installed; installation policy is enforced elsewhere.
+    pub(crate) fn catalog_provider(&self, key: &str, project_id: Option<&str>) -> CatalogProvider {
+        let scope = ModelScope {
+            project_id: project_id.map(str::to_string),
+        };
+        // A project the config cannot place still has the workspace's tiers.
+        let presets = self
+            .models_presets(&scope)
+            .unwrap_or_else(|_| load_effective_presets(&self.config_dir, None));
+        self.provider_record(
+            key,
+            project_id,
+            &presets,
+            &self.provider_catalog(),
+            self.provider_enabled(key),
+        )
+    }
+
+    /// Every provider's discovered catalog, each with what its models serve as
+    /// the launch doors resolve it, so a picker filters on the backend's
+    /// answer instead of re-deriving the rule.
+    pub fn model_catalog_view(&self) -> Vec<ProviderModelCatalogView> {
+        let presets = load_effective_presets(&self.config_dir, None);
+        let descriptors = self.provider_catalog();
+        // What discovery stored, and every installed provider whose backend
+        // declares models of its own, discovered yet or not.
+        let mut keys: Vec<String> = self
+            .get_model_catalog()
+            .into_iter()
+            .map(|catalog| catalog.backend)
+            .collect();
+        for key in self.enabled_providers() {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys.sort();
+        keys.into_iter()
+            .filter_map(|key| self.provider_models(&key))
+            .map(|catalog| self.catalog_view(catalog, &presets, &descriptors))
+            .collect()
+    }
+
+    /// Rediscover `backend`'s models and answer them as [`Self::model_catalog_view`] does.
+    pub async fn run_provider_model_catalog_view_refresh(
+        &self,
+        backend: &str,
+    ) -> Result<ProviderModelCatalogView, String> {
+        let refreshed = self.run_provider_model_catalog_refresh(backend).await?;
+        let catalog = self
+            .provider_models(&refreshed.backend)
+            .unwrap_or(refreshed);
+        let presets = load_effective_presets(&self.config_dir, None);
+        Ok(self.catalog_view(catalog, &presets, &self.provider_catalog()))
+    }
+
+    fn catalog_view(
+        &self,
+        catalog: cairn_models::types::catalog::ProviderModelCatalog,
+        presets: &PresetsConfig,
+        descriptors: &[cairn_models::types::catalog::ProviderDescriptor],
+    ) -> ProviderModelCatalogView {
+        let key = catalog.backend.clone();
+        let resolved_serves = self
+            .provider_record(
+                &key,
+                None,
+                presets,
+                descriptors,
+                self.provider_enabled(&key),
+            )
+            .resolved_serves();
+        ProviderModelCatalogView {
+            catalog,
+            resolved_serves,
+        }
+    }
+
+    /// What discovery last found for `key`, with every model its backend
+    /// declares itself ([`crate::backends::AgentBackend::declared_models`])
+    /// added when discovery has not run, failed, or left it out. A declared
+    /// model is never mistaken for an unlisted one.
+    fn provider_models(
+        &self,
+        key: &str,
+    ) -> Option<cairn_models::types::catalog::ProviderModelCatalog> {
+        let mut models = self
+            .model_catalog
+            .read()
+            .ok()
+            .and_then(|catalog| catalog.get(key).cloned());
+        if !catalog::is_supported(key) {
+            return models;
+        }
+        for declared in crate::backends::backend_for_name(Some(key)).declared_models() {
+            let entry =
+                models.get_or_insert_with(|| cairn_models::types::catalog::ProviderModelCatalog {
+                    backend: key.to_string(),
+                    models: Vec::new(),
+                    options: Vec::new(),
+                    refreshed_at: None,
+                    error: None,
+                });
+            if !entry
+                .models
+                .iter()
+                .any(|model| model.id == declared.id || model.model == declared.model)
+            {
+                entry.models.push(declared);
+            }
+        }
+        models
+    }
+
+    fn provider_record(
+        &self,
+        key: &str,
+        project_id: Option<&str>,
+        presets: &PresetsConfig,
+        descriptors: &[cairn_models::types::catalog::ProviderDescriptor],
+        installed: bool,
+    ) -> CatalogProvider {
+        CatalogProvider {
+            descriptor: descriptors
+                .iter()
+                .find(|descriptor| descriptor.key == key)
+                .cloned()
+                .unwrap_or_else(|| catalog::unknown_descriptor(key)),
+            installed,
+            models: self.provider_models(key),
+            tiers: tier_bindings(key, presets),
+            serves: self.provider_serves(key, project_id),
+            unable: self.decision_observations.unable(key),
+        }
+    }
 }
 
 impl Models for Orchestrator {
@@ -188,25 +342,17 @@ impl Models for Orchestrator {
         let presets = self.models_presets(scope)?;
         let descriptors = self.provider_catalog();
         let enabled = self.enabled_providers();
-        let discovered = self
-            .model_catalog
-            .read()
-            .map(|catalog| catalog.clone())
-            .unwrap_or_default();
 
         let mut providers: Vec<CatalogProvider> = enabled
             .iter()
-            .map(|key| CatalogProvider {
-                descriptor: descriptors
-                    .iter()
-                    .find(|descriptor| descriptor.key == key.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| catalog::unknown_descriptor(key)),
-                installed: true,
-                models: discovered.get(key).cloned(),
-                tiers: tier_bindings(key, &presets),
-                serves: self.provider_serves(key, scope.project_id.as_deref()),
-                unable: self.decision_observations.unable(key),
+            .map(|key| {
+                self.provider_record(
+                    key,
+                    scope.project_id.as_deref(),
+                    &presets,
+                    &descriptors,
+                    true,
+                )
             })
             .collect();
         providers.extend(
@@ -531,14 +677,25 @@ pub(crate) mod tests {
         // Not installed: the Add-provider list is every other catalog entry.
         assert_eq!(catalog.providers.len(), page_catalog.len());
 
-        // Models: the page's model catalog, entry for entry.
+        // Models: the page's model catalog (`get_provider_model_catalog`),
+        // entry for entry, a backend's own declared models included.
+        let page_models = orch.model_catalog_view();
         for provider in catalog.installed() {
-            let page = orch
-                .get_model_catalog()
-                .into_iter()
-                .find(|entry| entry.backend == provider.descriptor.key.as_ref());
+            let page = page_models
+                .iter()
+                .find(|entry| entry.catalog.backend == provider.descriptor.key.as_ref())
+                .map(|entry| entry.catalog.clone());
             assert_eq!(provider.models, page);
         }
+        // Codex's discovery failed here, and its image offer is still known.
+        let codex = catalog
+            .installed()
+            .find(|provider| provider.descriptor.key == "codex")
+            .unwrap();
+        assert!(!codex.serves(
+            cairn_models::image::codex::CODEX_IMAGE_MODEL,
+            cairn_models::types::catalog::VerbKind::Session
+        ));
 
         // Tier bindings: the page's matrix, from the same effective presets.
         let presets = orch.models_presets(&scope).unwrap();
@@ -639,5 +796,94 @@ pub(crate) mod tests {
     async fn no_live_process_means_no_sessions() {
         let orch = bare_orchestrator().await;
         assert!(orch.sessions().is_empty());
+    }
+
+    /// The frontend reads what each model serves from this view, and
+    /// `packages/ui/src/models.test.ts` holds its pickers against the same
+    /// golden, so the two languages cannot disagree about a model.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_model_catalog_view_says_what_each_model_serves_as_its_golden() {
+        use cairn_models::types::catalog::{ServedVerb, VerbKind, Wire};
+        let orch = bare_orchestrator().await;
+        let named = |id: &str, serves: Option<Vec<ServedVerb>>| {
+            let mut model = claude_models().remove(0);
+            model.id = id.to_string();
+            model.model = id.to_string();
+            model.display_name = id.to_string();
+            model.serves = serves;
+            model
+        };
+        for (backend, models) in [
+            (
+                "codex",
+                vec![
+                    cairn_models::image::codex::discovered_model(),
+                    named("gpt-5.5", None),
+                ],
+            ),
+            (
+                "opencode-go",
+                vec![
+                    named("glm-unpublished", None),
+                    named(
+                        "kimi-k3",
+                        Some(ServedVerb::conversation(Wire::OpenAiChatCompletions)),
+                    ),
+                ],
+            ),
+        ] {
+            orch.seed_model_catalog_for_test(ProviderModelCatalog {
+                backend: backend.to_string(),
+                models,
+                options: Vec::new(),
+                refreshed_at: Some(1_790_000_000),
+                error: None,
+            });
+        }
+
+        let view = orch.model_catalog_view();
+        let serves = |backend: &str, model: &str| -> Vec<VerbKind> {
+            view.iter()
+                .find(|entry| entry.catalog.backend == backend)
+                .unwrap()
+                .resolved_serves
+                .models[model]
+                .clone()
+        };
+        assert_eq!(
+            serves("codex", cairn_models::image::codex::CODEX_IMAGE_MODEL),
+            [VerbKind::Image]
+        );
+        assert_eq!(
+            serves("codex", "gpt-5.5"),
+            [VerbKind::Complete, VerbKind::Session]
+        );
+        assert!(serves("opencode-go", "glm-unpublished").is_empty());
+        assert_eq!(
+            serves("opencode-go", "kimi-k3"),
+            [VerbKind::Complete, VerbKind::Session]
+        );
+        // Every view agrees with the facet's own answer for its provider.
+        for entry in &view {
+            let provider = orch.catalog_provider(&entry.catalog.backend, None);
+            for (model, verbs) in &entry.resolved_serves.models {
+                for verb in VerbKind::ALL {
+                    assert_eq!(
+                        verbs.contains(&verb),
+                        provider.serves(model, verb),
+                        "{model} {verb}"
+                    );
+                }
+            }
+        }
+
+        let rendered = serde_json::to_string_pretty(&view).unwrap() + "\n";
+        crate::backends::assert_golden_file(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/orchestrator/fixtures/model_catalog_view.json"
+            ),
+            &rendered,
+        );
     }
 }

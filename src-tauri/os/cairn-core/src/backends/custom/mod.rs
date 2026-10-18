@@ -329,6 +329,7 @@ impl AgentBackend for CustomBackend {
         &self,
         request: CompletionRequest,
         orch: &Orchestrator,
+        _admitted: crate::backends::Admitted,
     ) -> Result<CompletionOutcome, CompletionError> {
         let config = self
             .config(orch, request.project_id.as_deref())
@@ -354,7 +355,12 @@ impl AgentBackend for CustomBackend {
         }
     }
 
-    fn start_session(&self, config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
+    fn start_session(
+        &self,
+        config: SessionConfig,
+        orch: &Orchestrator,
+        _admitted: crate::backends::Admitted,
+    ) -> Result<(), String> {
         let provider = self.config(orch, Some(&config.project_id))?;
         provider.require_turns()?;
         crate::backends::http_loop::start_session(

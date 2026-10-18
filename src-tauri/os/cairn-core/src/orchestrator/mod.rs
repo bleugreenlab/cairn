@@ -3230,7 +3230,7 @@ impl Orchestrator {
 }
 
 #[cfg(test)]
-mod launch_coverage_tests;
+pub(crate) mod launch_coverage_tests;
 
 #[cfg(test)]
 mod tests {

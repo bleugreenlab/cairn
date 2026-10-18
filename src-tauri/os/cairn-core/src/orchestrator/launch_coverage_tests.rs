@@ -37,8 +37,8 @@ use super::models::ModelRuntime;
 use super::Orchestrator;
 use crate::agent_process::process::PauseIntent;
 use crate::backends::{
-    backend_for_name, AgentPermissions, CompletionMessage, CompletionRequest, CompletionRole,
-    SessionConfig, SessionStart,
+    backend_for_name, launch, AgentPermissions, CompletionMessage, CompletionRequest,
+    CompletionRole, SessionConfig, SessionStart,
 };
 use crate::credentials::{ActualTargetKind, ApiProvider, ClaudeAuth, CodexAuth, ProviderAuth};
 use crate::identity::UserIdentity;
@@ -572,7 +572,12 @@ fn identity() -> UserIdentity {
     }
 }
 
-fn config(run_id: &str, session_id: &str, model: &str, ephemeral: bool) -> SessionConfig {
+pub(crate) fn config(
+    run_id: &str,
+    session_id: &str,
+    model: &str,
+    ephemeral: bool,
+) -> SessionConfig {
     SessionConfig {
         run_id: run_id.to_string(),
         working_dir: "/tmp".to_string(),
@@ -681,14 +686,17 @@ async fn every_catalog_provider_launches_through_the_facet() {
         let session_id = format!("session-{key}");
         seed_run(&orch, &run_id, &session_id).await;
         let backend = backend_for_name(Some(key));
-        let (launch_orch, launch_config) = (
+        let (launch_orch, launch_config, launch_key) = (
             orch.clone(),
             config(&run_id, &session_id, plan.model, false),
+            key.clone(),
         );
-        tokio::task::spawn_blocking(move || backend.start_session(launch_config, &launch_orch))
-            .await
-            .unwrap()
-            .unwrap_or_else(|error| panic!("{key} did not launch: {error}"));
+        tokio::task::spawn_blocking(move || {
+            launch::start_session(&launch_orch, &launch_key, backend.as_ref(), launch_config)
+        })
+        .await
+        .unwrap()
+        .unwrap_or_else(|error| panic!("{key} did not launch: {error}"));
         for call in &plan.launch {
             recorder.wait_for(call);
         }
@@ -719,9 +727,13 @@ async fn every_catalog_provider_launches_through_the_facet() {
 
         if let Some(call) = plan.one_shot {
             let backend = backend_for_name(Some(key));
-            let (one_shot_orch, model) = (orch.clone(), plan.model.to_string());
+            let (one_shot_orch, model, one_shot_key) =
+                (orch.clone(), plan.model.to_string(), key.clone());
             let outcome = tokio::task::spawn_blocking(move || {
-                backend.complete(
+                launch::complete(
+                    &one_shot_orch,
+                    &one_shot_key,
+                    backend.as_ref(),
                     CompletionRequest {
                         system: None,
                         messages: vec![CompletionMessage {
@@ -734,7 +746,6 @@ async fn every_catalog_provider_launches_through_the_facet() {
                         output_schema: None,
                         timeout: Duration::from_secs(5),
                     },
-                    &one_shot_orch,
                 )
             })
             .await
@@ -783,7 +794,12 @@ async fn every_catalog_provider_launches_through_the_facet() {
         config("run-codex-call", "session-codex-call", "gpt-coverage", true),
     );
     tokio::task::spawn_blocking(move || {
-        backend_for_name(Some("codex")).start_session(call_config, &call_orch)
+        launch::start_session(
+            &call_orch,
+            "codex",
+            backend_for_name(Some("codex")).as_ref(),
+            call_config,
+        )
     })
     .await
     .unwrap()
@@ -845,11 +861,13 @@ async fn complete_on(
     orch: &Orchestrator,
     key: &'static str,
     request: CompletionRequest,
-) -> Result<crate::backends::CompletionOutcome, CompletionError> {
+) -> Result<crate::backends::CompletionOutcome, launch::LaunchError> {
     let orch = orch.clone();
-    tokio::task::spawn_blocking(move || backend_for_name(Some(key)).complete(request, &orch))
-        .await
-        .unwrap()
+    tokio::task::spawn_blocking(move || {
+        launch::complete(&orch, key, backend_for_name(Some(key)).as_ref(), request)
+    })
+    .await
+    .unwrap()
 }
 
 /// Rows a one-shot must never write.
@@ -1361,7 +1379,12 @@ async fn launch_claude(orch: &Orchestrator, run_id: &str, session_id: &str) {
     seed_run(orch, run_id, session_id).await;
     let (launch_orch, launch_config) = (orch.clone(), config(run_id, session_id, "sonnet", false));
     tokio::task::spawn_blocking(move || {
-        backend_for_name(Some("claude")).start_session(launch_config, &launch_orch)
+        launch::start_session(
+            &launch_orch,
+            "claude",
+            backend_for_name(Some("claude")).as_ref(),
+            launch_config,
+        )
     })
     .await
     .unwrap()

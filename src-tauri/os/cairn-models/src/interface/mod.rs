@@ -112,6 +112,73 @@ impl CatalogProvider {
         self.serves_declared(model, declared)
     }
 
+    /// Whether `model` here serves `verb`: the one answer every gate and
+    /// picker asks.
+    pub fn serves(&self, model: &str, verb: VerbKind) -> bool {
+        best(&self.serves_for(model), verb).is_some()
+    }
+
+    /// The verb `model` serves over its best wire, or a refusal naming the
+    /// model and what it does serve.
+    ///
+    /// Unlike [`Catalog::offer_for`], a model discovery never listed is not
+    /// refused for that alone: it serves what the provider serves for any
+    /// model, which is how a Claude alias or a freshly released id launches.
+    pub fn admit(&self, model: &str, verb: VerbKind) -> Result<ServedVerb, NoOffer> {
+        let serves = self.serves_for(model);
+        if let Some(served) = best(&serves, verb) {
+            return Ok(served);
+        }
+        let key = self.descriptor.key.as_ref();
+        let detail = if let Some(why) = self.unable_to(model, verb) {
+            format!("'{model}' on {key} {why}")
+        } else if self.discovered(model).is_none() && best(&self.serves, verb).is_none() {
+            format!(
+                "{key} has not listed '{model}' and serves nothing for a model it has not \
+                 listed; refresh its catalog in Settings → Providers, or pick a listed model"
+            )
+        } else if serves.is_empty() {
+            format!("'{model}' on {key} serves nothing Cairn runs")
+        } else {
+            format!(
+                "'{model}' on {key} serves only {}",
+                kinds(&serves)
+                    .iter()
+                    .map(|kind| kind.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        Err(NoOffer {
+            verb,
+            requested: Some(model.to_string()),
+            detail: Some(detail),
+        })
+    }
+
+    /// [`Self::serves_for`] resolved for every model this provider can name
+    /// (each discovered model, hidden ones included; each model a tier binds;
+    /// each model an [`Unable`] names), for hosts that must not re-derive it.
+    pub fn resolved_serves(&self) -> ResolvedServes {
+        let discovered = self
+            .models
+            .as_ref()
+            .map(|catalog| catalog.models.as_slice())
+            .unwrap_or_default();
+        let named = discovered
+            .iter()
+            .flat_map(|model| [model.model.as_str(), model.id.as_str()])
+            .chain(self.tiers.iter().map(|binding| binding.model.as_str()))
+            .chain(self.unable.iter().map(|unable| unable.model.as_str()));
+        let mut models = BTreeMap::new();
+        for model in named {
+            if !models.contains_key(model) {
+                models.insert(model.to_string(), kinds(&self.serves_for(model)));
+            }
+        }
+        ResolvedServes { models }
+    }
+
     /// Why `model` was observed unable to serve `verb`, when it was.
     pub fn unable_to(&self, model: &str, verb: VerbKind) -> Option<&str> {
         self.unable
@@ -152,6 +219,27 @@ impl CatalogProvider {
                     .any(|id| id == account)
         })
     }
+}
+
+/// What each model a provider can name serves, by verb: [`CatalogProvider::serves_for`]
+/// already resolved, so a host reads the answer instead of re-deriving the
+/// rule.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedServes {
+    pub models: BTreeMap<String, Vec<VerbKind>>,
+}
+
+/// The distinct verbs `serves` serves, in the order it lists them.
+fn kinds(serves: &[ServedVerb]) -> Vec<VerbKind> {
+    let mut kinds = Vec::new();
+    for served in serves {
+        let kind = served.verb.kind();
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    kinds
 }
 
 /// One tier as it resolves on one provider.
@@ -1302,6 +1390,177 @@ mod tests {
                 .to_string()
                 .starts_with("No completion-capable model serves 'opus': 'opus' is offered only by claude, which cannot serve completions. To fix it"),
             "{refusal}"
+        );
+    }
+
+    fn image_only(model: &str) -> DiscoveredModel {
+        let mut image = crate::image::codex::discovered_model();
+        image.id = model.to_string();
+        image.model = model.to_string();
+        image
+    }
+
+    fn unable_to_complete(model: &str, why: &str) -> Unable {
+        Unable {
+            model: model.into(),
+            verb: VerbKind::Complete,
+            why: why.into(),
+        }
+    }
+
+    #[test]
+    fn a_model_serves_its_declaration_or_its_providers_minus_what_it_could_not() {
+        let mut nothing = model("embed-ish", None);
+        nothing.serves = Some(Vec::new());
+        let mut codex = conversing(provider(
+            "codex",
+            Some(vec![
+                image_only("gpt-image-2"),
+                model("gpt-5.5", None),
+                nothing,
+            ]),
+            vec![],
+        ));
+        assert!(codex.serves("gpt-image-2", VerbKind::Image));
+        assert!(!codex.serves("gpt-image-2", VerbKind::Complete));
+        assert!(!codex.serves("gpt-image-2", VerbKind::Session));
+        // No declaration: the provider-wide fallback.
+        assert!(codex.serves("gpt-5.5", VerbKind::Complete));
+        assert!(codex.serves("never-listed", VerbKind::Session));
+        assert!(!codex.serves("embed-ish", VerbKind::Complete));
+
+        codex
+            .unable
+            .push(unable_to_complete("gpt-5.5", "reasons before it answers"));
+        assert!(!codex.serves("gpt-5.5", VerbKind::Complete));
+        assert!(codex.serves("gpt-5.5", VerbKind::Session));
+
+        // OpenCode Go declares nothing provider-wide: a model whose discovery
+        // made no claim serves nothing.
+        let go = provider(
+            "opencode-go",
+            Some(vec![model("unpublished", None)]),
+            vec![],
+        );
+        assert!(!go.serves("unpublished", VerbKind::Session));
+        assert!(!go.serves("unpublished", VerbKind::Complete));
+    }
+
+    #[test]
+    fn admit_names_the_model_and_what_it_does_serve() {
+        let mut nothing = model("embed-ish", None);
+        nothing.serves = Some(Vec::new());
+        let mut codex = conversing(provider(
+            "codex",
+            Some(vec![
+                image_only("gpt-image-2"),
+                model("gpt-5.5", None),
+                nothing,
+            ]),
+            vec![],
+        ));
+        codex
+            .unable
+            .push(unable_to_complete("gpt-5.5", "reasons before it answers"));
+
+        assert_eq!(
+            codex.admit("gpt-5.5", VerbKind::Session).unwrap().verb,
+            Verb::Session
+        );
+        assert_eq!(
+            codex.admit("gpt-image-2", VerbKind::Session).unwrap_err().to_string(),
+            "No session-capable model serves 'gpt-image-2': 'gpt-image-2' on codex serves only image. To fix it, install or configure a provider in Settings → Providers."
+        );
+        assert_eq!(
+            codex
+                .admit("embed-ish", VerbKind::Complete)
+                .unwrap_err()
+                .detail
+                .as_deref(),
+            Some("'embed-ish' on codex serves nothing Cairn runs")
+        );
+        assert_eq!(
+            codex
+                .admit("gpt-5.5", VerbKind::Complete)
+                .unwrap_err()
+                .detail
+                .as_deref(),
+            Some("'gpt-5.5' on codex reasons before it answers")
+        );
+
+        let go = provider("opencode-go", Some(vec![model("listed", None)]), vec![]);
+        let refusal = go.admit("glm-9", VerbKind::Session).unwrap_err();
+        assert_eq!(refusal.requested.as_deref(), Some("glm-9"));
+        assert_eq!(
+            refusal.detail.as_deref(),
+            Some("opencode-go has not listed 'glm-9' and serves nothing for a model it has not listed; refresh its catalog in Settings → Providers, or pick a listed model")
+        );
+        // Listed without a declaration: it serves nothing, said plainly.
+        assert_eq!(
+            go.admit("listed", VerbKind::Session)
+                .unwrap_err()
+                .detail
+                .as_deref(),
+            Some("'listed' on opencode-go serves nothing Cairn runs")
+        );
+    }
+
+    #[test]
+    fn resolved_serves_agrees_with_serves_for_on_every_model_the_provider_names() {
+        let mut hidden = model("preview", None);
+        hidden.hidden = true;
+        let mut codex = conversing(provider(
+            "codex",
+            Some(vec![
+                image_only("gpt-image-2"),
+                model("gpt-5.5", None),
+                hidden,
+            ]),
+            vec![binding("lg", "gpt-5.6-sol"), binding("sm", "gpt-image-2")],
+        ));
+        codex.unable.push(unable_to_complete(
+            "o-reasoner",
+            "reasons before it answers",
+        ));
+        let mut published = model("kimi-k3", None);
+        published.serves = Some(ServedVerb::conversation(Wire::OpenAiChatCompletions));
+        let go = provider(
+            "opencode-go",
+            Some(vec![model("unpublished", None), published]),
+            vec![],
+        );
+
+        for provider in [&codex, &go] {
+            let resolved = provider.resolved_serves();
+            for (model, verbs) in &resolved.models {
+                assert_eq!(verbs, &kinds(&provider.serves_for(model)), "{model}");
+            }
+        }
+        let codex_resolved = codex.resolved_serves().models;
+        assert_eq!(
+            codex_resolved
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "gpt-5.5",
+                "gpt-5.6-sol",
+                "gpt-image-2",
+                "o-reasoner",
+                "preview"
+            ]
+        );
+        assert_eq!(codex_resolved["gpt-image-2"], [VerbKind::Image]);
+        assert_eq!(codex_resolved["o-reasoner"], [VerbKind::Session]);
+        let go_resolved = go.resolved_serves().models;
+        assert_eq!(go_resolved["unpublished"], Vec::<VerbKind>::new());
+        assert_eq!(
+            go_resolved["kimi-k3"],
+            [VerbKind::Complete, VerbKind::Session]
+        );
+        assert_eq!(
+            serde_json::to_value(go.resolved_serves()).unwrap(),
+            serde_json::json!({ "models": { "kimi-k3": ["complete", "session"], "unpublished": [] } })
         );
     }
 

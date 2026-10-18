@@ -207,10 +207,6 @@ fn capability(modalities_known: Option<&Modalities>, serves: &[ServedVerb]) -> S
     out
 }
 
-fn serves_verb(serves: &[ServedVerb], verb: VerbKind) -> bool {
-    serves.iter().any(|served| served.verb.kind() == verb)
-}
-
 fn category(category: ProviderCategory) -> &'static str {
     match category {
         ProviderCategory::Subscription => "subscription",
@@ -433,9 +429,8 @@ fn render_providers(
                     .models
                     .iter()
                     .filter(|model| {
-                        serving.is_none_or(|verb| {
-                            !model.hidden && serves_verb(&provider.serves_for(&model.model), verb)
-                        })
+                        serving
+                            .is_none_or(|verb| !model.hidden && provider.serves(&model.model, verb))
                     })
                     .collect();
                 match serving {
@@ -489,9 +484,7 @@ fn render_models(catalog: &Catalog, only: Option<&str>, serving: Option<VerbKind
         .filter(|model| only.is_none_or(|key| model.offers.iter().any(|o| o.provider == key)))
         .filter_map(|mut model| {
             if let Some(verb) = serving {
-                model
-                    .offers
-                    .retain(|offer| serves_verb(&offer.serves, verb));
+                model.offers.retain(|offer| offer.selected(verb).is_some());
             }
             (!model.offers.is_empty()).then_some(model)
         })

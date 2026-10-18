@@ -281,6 +281,7 @@ impl AgentBackend for ActualBackend {
         &self,
         request: CompletionRequest,
         orch: &Orchestrator,
+        _admitted: crate::backends::Admitted,
     ) -> Result<CompletionOutcome, CompletionError> {
         let adapter =
             adapter::ActualAdapter::new(orch, &request.model, request.project_id.as_deref())
@@ -303,7 +304,12 @@ impl AgentBackend for ActualBackend {
         }
     }
 
-    fn start_session(&self, config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
+    fn start_session(
+        &self,
+        config: SessionConfig,
+        orch: &Orchestrator,
+        _admitted: crate::backends::Admitted,
+    ) -> Result<(), String> {
         let model = config
             .model
             .as_ref()

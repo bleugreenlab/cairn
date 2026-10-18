@@ -5597,6 +5597,7 @@ mod tests {
             &self,
             config: crate::backends::SessionConfig,
             orch: &Orchestrator,
+            _admitted: crate::backends::Admitted,
         ) -> Result<(), String> {
             let session_id = config.session_start.session_id().to_string();
             let launch_index = {

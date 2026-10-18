@@ -1,0 +1,170 @@
+[
+  {
+    "backend": "codex",
+    "models": [
+      {
+        "id": "gpt-image-2",
+        "model": "gpt-image-2",
+        "displayName": "GPT Image (Codex)",
+        "description": "Codex's built-in image generation, drawn under a ChatGPT sign-in on a paid plan",
+        "hidden": false,
+        "isDefault": false,
+        "defaultReasoningEffort": null,
+        "supportedReasoningEfforts": [],
+        "contextWindow": null,
+        "canonicalSlug": null,
+        "servingAccountIds": [],
+        "pricing": null,
+        "supportedParameters": [],
+        "router": false,
+        "modalities": {
+          "input": [
+            "text",
+            "image"
+          ],
+          "output": [
+            "image"
+          ]
+        },
+        "serves": [
+          {
+            "verb": "image",
+            "maxCount": 4,
+            "shape": {
+              "auto": true,
+              "orientation": {
+                "support": "lowered",
+                "kind": "orientationInPrompt"
+              }
+            },
+            "references": {
+              "max": 5,
+              "labels": {
+                "support": "lowered",
+                "kind": "labelsInPrompt"
+              }
+            },
+            "edit": {
+              "base": {
+                "support": "lowered",
+                "kind": "editAsReference"
+              },
+              "mask": {
+                "support": "unsupported"
+              }
+            },
+            "wire": "codex-app-server"
+          }
+        ]
+      },
+      {
+        "id": "gpt-5.5",
+        "model": "gpt-5.5",
+        "displayName": "gpt-5.5",
+        "description": "Fast Claude alias",
+        "hidden": false,
+        "isDefault": false,
+        "defaultReasoningEffort": null,
+        "supportedReasoningEfforts": [],
+        "contextWindow": 200000,
+        "canonicalSlug": null,
+        "servingAccountIds": [],
+        "pricing": null,
+        "supportedParameters": [],
+        "router": false,
+        "modalities": null,
+        "serves": null
+      }
+    ],
+    "options": [],
+    "refreshedAt": 1790000000,
+    "error": null,
+    "resolvedServes": {
+      "models": {
+        "gpt-5.5": [
+          "complete",
+          "session"
+        ],
+        "gpt-5.6-luna": [
+          "complete",
+          "session"
+        ],
+        "gpt-5.6-sol": [
+          "complete",
+          "session"
+        ],
+        "gpt-5.6-terra": [
+          "complete",
+          "session"
+        ],
+        "gpt-image-2": [
+          "image"
+        ]
+      }
+    }
+  },
+  {
+    "backend": "opencode-go",
+    "models": [
+      {
+        "id": "glm-unpublished",
+        "model": "glm-unpublished",
+        "displayName": "glm-unpublished",
+        "description": "Fast Claude alias",
+        "hidden": false,
+        "isDefault": false,
+        "defaultReasoningEffort": null,
+        "supportedReasoningEfforts": [],
+        "contextWindow": 200000,
+        "canonicalSlug": null,
+        "servingAccountIds": [],
+        "pricing": null,
+        "supportedParameters": [],
+        "router": false,
+        "modalities": null,
+        "serves": null
+      },
+      {
+        "id": "kimi-k3",
+        "model": "kimi-k3",
+        "displayName": "kimi-k3",
+        "description": "Fast Claude alias",
+        "hidden": false,
+        "isDefault": false,
+        "defaultReasoningEffort": null,
+        "supportedReasoningEfforts": [],
+        "contextWindow": 200000,
+        "canonicalSlug": null,
+        "servingAccountIds": [],
+        "pricing": null,
+        "supportedParameters": [],
+        "router": false,
+        "modalities": null,
+        "serves": [
+          {
+            "verb": "complete",
+            "wire": "openai-chat"
+          },
+          {
+            "verb": "session",
+            "wire": "openai-chat"
+          }
+        ]
+      }
+    ],
+    "options": [],
+    "refreshedAt": 1790000000,
+    "error": null,
+    "resolvedServes": {
+      "models": {
+        "glm-5.2": [],
+        "glm-unpublished": [],
+        "kimi-k3": [
+          "complete",
+          "session"
+        ],
+        "mimo-v2.5": []
+      }
+    }
+  }
+]

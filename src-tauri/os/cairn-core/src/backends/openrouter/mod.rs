@@ -66,6 +66,7 @@ impl AgentBackend for OpenRouterBackend {
         &self,
         request: CompletionRequest,
         orch: &Orchestrator,
+        _admitted: crate::backends::Admitted,
     ) -> Result<CompletionOutcome, CompletionError> {
         use crate::backends::openai_compat::http::Endpoint;
         use cairn_models::interface::complete::{CompletionCall, CompletionReply, CompletionWire};
@@ -201,7 +202,12 @@ impl AgentBackend for OpenRouterBackend {
         }
     }
 
-    fn start_session(&self, config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
+    fn start_session(
+        &self,
+        config: SessionConfig,
+        orch: &Orchestrator,
+        _admitted: crate::backends::Admitted,
+    ) -> Result<(), String> {
         crate::backends::http_loop::start_session(
             config,
             orch,
