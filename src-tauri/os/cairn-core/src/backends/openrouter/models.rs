@@ -4,6 +4,7 @@ use cairn_models::types::catalog::{
     DiscoveredModel, DiscoveredReasoningEffort, Modalities, Modality, ModelPricing, Price,
     ServedVerb, Wire,
 };
+use cairn_models::types::tokenizers::tokenizer_for;
 use cairn_models::types::usage::{BillingUnit, Charge, Meter};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
@@ -113,6 +114,10 @@ struct OpenRouterModel {
     reasoning: Option<OpenRouterReasoning>,
     #[serde(default)]
     canonical_slug: Option<String>,
+    /// The Hugging Face repository the weights come from (empty or absent for
+    /// closed models). Selects a pinned tokenizer by exact identity.
+    #[serde(default)]
+    hugging_face_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,6 +188,7 @@ fn map_model(model: OpenRouterModel) -> DiscoveredModel {
     });
     let reasoning = model.reasoning;
     let (modalities, serves) = capabilities(model.architecture);
+    let tokenizer = tokenizer_for("openrouter", &model.id, model.hugging_face_id.as_deref());
     DiscoveredModel {
         id: model.id.clone(),
         model: model.id.clone(),
@@ -210,6 +216,7 @@ fn map_model(model: OpenRouterModel) -> DiscoveredModel {
         router: model.id == "openrouter/auto",
         modalities,
         serves,
+        tokenizer,
     }
 }
 
@@ -311,6 +318,32 @@ mod tests {
             .iter()
             .find(|model| model.id == id)
             .unwrap_or_else(|| panic!("{id} is in the fixture"))
+    }
+
+    #[test]
+    fn the_hugging_face_id_selects_a_pinned_tokenizer_exactly() {
+        let models = decode_models(
+            r#"{"data":[
+                {"id":"z-ai/glm-5.3","hugging_face_id":"zai-org/GLM-5.3"},
+                {"id":"minimax/minimax-m3","hugging_face_id":"MiniMaxAI/Minimax-M3"},
+                {"id":"z-ai/glm-5-turbo","hugging_face_id":""},
+                {"id":"anthropic/claude-sonnet-4.5","hugging_face_id":null},
+                {"id":"z-ai/glm-5.3-prime"}
+            ]}"#,
+        )
+        .unwrap();
+        let family = |id: &str| {
+            model(&models, id)
+                .tokenizer
+                .as_ref()
+                .map(|tokenizer| tokenizer.family.to_string())
+        };
+        assert_eq!(family("z-ai/glm-5.3").as_deref(), Some("glm-5"));
+        assert_eq!(family("minimax/minimax-m3").as_deref(), Some("minimax-m3"));
+        // No upstream id, no tokenizer: the slug's resemblance is not evidence.
+        assert_eq!(family("z-ai/glm-5-turbo"), None);
+        assert_eq!(family("anthropic/claude-sonnet-4.5"), None);
+        assert_eq!(family("z-ai/glm-5.3-prime"), None);
     }
 
     #[test]

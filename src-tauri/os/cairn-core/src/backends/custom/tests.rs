@@ -496,6 +496,45 @@ fn discovery_reads_the_openai_model_list_and_its_served_context_length() {
 }
 
 #[test]
+fn discovery_selects_a_pinned_tokenizer_from_the_served_root_or_id() {
+    let body = serde_json::json!({
+        "object": "list",
+        "data": [
+            {"id": "qwen3.8-27b", "object": "model", "root": "unsloth/Qwen3.8-27B-NVFP4"},
+            {"id": "Qwen/Qwen3.8-27B", "object": "model"},
+            {"id": "gemma-4-26b", "object": "model", "root": "/models/gemma-4-26b"},
+            {"id": "Qwen/Qwen3.8-27B", "object": "model", "root": "/models/my-finetune"},
+            {"id": "Qwen/Qwen3.8-27B", "object": "model", "root": "someone/Qwen3.8-27B-merged"}
+        ]
+    })
+    .to_string();
+    let url = serve_once(http_response("200 OK", &body));
+    let (models, error) = discover_blocking(&config("spark", &url, CustomModelPolicy::Discover));
+    assert_eq!(error, None);
+    let digest = |index: usize| {
+        models[index]
+            .tokenizer
+            .as_ref()
+            .map(|tokenizer| tokenizer.sha256)
+    };
+    let pin = |repo: &str| {
+        cairn_models::types::tokenizers::pins()
+            .iter()
+            .find(|pin| pin.repo == repo)
+            .map(|pin| pin.digest_bytes())
+    };
+    // A quantized repack is its own pin, selected by the root vLLM reports.
+    assert_eq!(digest(0), pin("unsloth/Qwen3.8-27B-NVFP4"));
+    assert_eq!(digest(1), pin("Qwen/Qwen3.8-27B"));
+    // A local path identifies nothing Cairn pinned.
+    assert_eq!(digest(2), None);
+    // A reported root is authoritative: a served id that names a pinned
+    // repository does not override a root that names something else.
+    assert_eq!(digest(3), None);
+    assert_eq!(digest(4), None);
+}
+
+#[test]
 fn a_refused_model_listing_reports_the_status_without_echoing_the_body() {
     // An endpoint can echo a rejected credential back in its error body, so
     // only the status crosses into the catalog error a panel will render.

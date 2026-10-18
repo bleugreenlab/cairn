@@ -9,7 +9,8 @@
 use super::Target;
 use crate::credentials::ActualTargetKind;
 use crate::orchestrator::Orchestrator;
-use cairn_models::types::catalog::DiscoveredModel;
+use cairn_models::types::catalog::{DiscoveredModel, ACTUAL_BACKEND_KEY};
+use cairn_models::types::tokenizers::{tokenizer_for, TokenizerRef};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -332,9 +333,17 @@ fn merge_targets(
             router: false,
             modalities: None,
             serves: None,
+            tokenizer: tokenizer_for_registry_id(&id),
             id,
         })
         .collect()
+}
+
+/// The pinned tokenizer for an Actual registry id: its `publisher/model` part
+/// names the Hugging Face repository the weights come from.
+fn tokenizer_for_registry_id(id: &str) -> Option<TokenizerRef> {
+    let repository = id.split_once('@').map_or(id, |(repository, _)| repository);
+    tokenizer_for(ACTUAL_BACKEND_KEY, id, Some(repository))
 }
 
 /// Actual's registry ids pin an exact revision (`publisher/model@<sha>`). The
@@ -377,6 +386,21 @@ mod tests {
         // Absent metadata stays absent rather than being filled from the public
         // registry, which describes the published model and not this device.
         assert_eq!(models[1].1, None);
+    }
+
+    #[test]
+    fn a_registry_id_selects_the_tokenizer_of_its_repository() {
+        let family =
+            |id: &str| tokenizer_for_registry_id(id).map(|tokenizer| tokenizer.family.to_string());
+        assert_eq!(
+            family("google/gemma-4-e2b-it@abc123").as_deref(),
+            Some("gemma-4")
+        );
+        assert_eq!(
+            family("qwen/qwen3.8-27b@def456").as_deref(),
+            Some("qwen3.8")
+        );
+        assert_eq!(family("someone/unpinned-model@0"), None);
     }
 
     #[test]

@@ -14,6 +14,7 @@
 use super::CustomProviderConfig;
 use crate::credentials::{CustomModelPolicy, CustomProtocol};
 use cairn_models::types::catalog::DiscoveredModel;
+use cairn_models::types::tokenizers::tokenizer_for;
 use serde::Deserialize;
 use std::error::Error;
 use std::time::Duration;
@@ -34,6 +35,10 @@ struct ModelEntry {
     /// defaulted to something plausible.
     #[serde(default)]
     max_model_len: Option<i64>,
+    /// vLLM's source for the served model: the Hugging Face repository when it
+    /// was started from one (a local path otherwise, which pins nothing).
+    #[serde(default)]
+    root: Option<String>,
 }
 
 /// The models one custom provider serves, and any error worth surfacing.
@@ -47,7 +52,7 @@ pub(crate) fn discover_blocking(
     match &config.models {
         CustomModelPolicy::Explicit { ids } => (
             ids.iter()
-                .map(|id| model(config, id.clone(), None))
+                .map(|id| model(config, id.clone(), None, None))
                 .collect(),
             None,
         ),
@@ -55,7 +60,7 @@ pub(crate) fn discover_blocking(
             Ok(entries) => (
                 entries
                     .into_iter()
-                    .map(|entry| model(config, entry.id, entry.max_model_len))
+                    .map(|entry| model(config, entry.id, entry.max_model_len, entry.root))
                     .collect(),
                 None,
             ),
@@ -113,7 +118,16 @@ fn model(
     config: &CustomProviderConfig,
     id: String,
     context_window: Option<i64>,
+    root: Option<String>,
 ) -> DiscoveredModel {
+    // A reported root is the server's statement of what it loaded, and is
+    // authoritative: an unknown root (a local path, a fine-tune, an unpinned
+    // repository) selects nothing even when the served id looks like a pinned
+    // repository. Only with no root at all is the id the upstream identity,
+    // since vLLM serves a model under its repository id unless renamed.
+    let backend_key = config.backend_key();
+    let upstream = root.as_deref().unwrap_or(&id);
+    let tokenizer = tokenizer_for(&backend_key, &id, Some(upstream));
     DiscoveredModel {
         id: id.clone(),
         model: id.clone(),
@@ -141,6 +155,7 @@ fn model(
         // What a custom provider serves is fixed by its configured protocol, so
         // the provider declares it once for every model it lists.
         serves: None,
+        tokenizer,
     }
 }
 

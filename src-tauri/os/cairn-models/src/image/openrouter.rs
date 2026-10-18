@@ -141,6 +141,8 @@ pub fn discovered_model(
         router: false,
         modalities,
         serves: Some(serves),
+        // An image offer's output is not budgeted in text tokens.
+        tokenizer: None,
     }
 }
 

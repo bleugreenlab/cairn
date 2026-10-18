@@ -114,4 +114,6 @@ License, Version 2.0.
 
 The legal text is each crate's `LICENSE` file, and [LICENSE](LICENSE) for the
 repository as a whole. Two exceptions are MIT-licensed: `ast-grep-outline`, and
-the portion of `cairn-tokenize` derived from ctok (`LICENSE-ctok`).
+the portion of `cairn-tokenize` derived from ctok (`LICENSE-ctok`). `cairn-toks`
+links the prebuilt toks library, which is Apache-2.0; its `LICENSE` and `NOTICE`
+ship beside the crate as `LICENSE-toks` and `NOTICE-toks`.

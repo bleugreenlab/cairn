@@ -27,6 +27,7 @@ members = [
   "os/cairn-session",
   "os/cairn-symbols",
   "os/cairn-tokenize",
+  "os/cairn-toks",
   "os/cairn-vcs",
   "os/cairn-workflow",
 ]

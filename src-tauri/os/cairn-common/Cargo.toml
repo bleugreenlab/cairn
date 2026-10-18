@@ -47,6 +47,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
 ] }
 
+[features]
+# Test helpers other crates' tests share (`token_meter::assert_meter_contract`).
+test-utils = []
+
 [dev-dependencies]
 tempfile = "3"
 # Integration tests see only the public API plus these, and the cross-language

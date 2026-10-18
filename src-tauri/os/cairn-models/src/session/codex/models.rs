@@ -280,6 +280,7 @@ fn finish_model_discovery(
             router: false,
             modalities: None,
             serves: None,
+            tokenizer: None,
         })
         .collect();
     merge_fallback_models(&mut models);
@@ -363,6 +364,7 @@ fn fallback_model(
         router: false,
         modalities: None,
         serves: None,
+        tokenizer: None,
     }
 }
 

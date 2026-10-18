@@ -1225,6 +1225,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "toml",
  "uuid",
@@ -1237,6 +1238,7 @@ version = "0.12.34"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1304,6 +1306,7 @@ dependencies = [
  "cairn-models",
  "cairn-platform",
  "cairn-tokenize",
+ "cairn-toks",
  "chrono",
  "crossbeam-channel",
  "dirs 5.0.1",
@@ -1344,6 +1347,16 @@ dependencies = [
  "serde_json",
  "unicode-general-category",
  "unicode-normalization",
+]
+
+[[package]]
+name = "cairn-toks"
+version = "0.12.34"
+dependencies = [
+ "cairn-models",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

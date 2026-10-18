@@ -731,6 +731,11 @@ pub struct DiscoveredModel {
     /// refusal, never a guess at a family.
     #[serde(default)]
     pub serves: Option<Vec<ServedVerb>>,
+    /// The exact tokenizer this model uses, when discovery could select one
+    /// of Cairn's pins (`tokenizers::tokenizer_for`). `None` means token
+    /// budgets for it use the backend's estimating meter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer: Option<crate::tokenizers::TokenizerRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -842,6 +847,7 @@ pub fn claude_models() -> Vec<DiscoveredModel> {
         router: false,
         modalities: None,
         serves: None,
+        tokenizer: None,
     })
     .collect()
 }

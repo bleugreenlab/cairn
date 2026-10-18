@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod image;
 pub mod pool;
 pub mod provider_id;
+pub mod tokenizers;
 pub mod usage;
 
 pub use provider_id::ApiProvider;

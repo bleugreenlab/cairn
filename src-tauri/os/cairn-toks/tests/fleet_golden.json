@@ -1,0 +1,252 @@
+{
+ "probes": [
+  {
+   "text": "Hello, world!",
+   "repeat": 1
+  },
+  {
+   "text": "The quick brown fox jumps over the lazy dog. ",
+   "repeat": 3
+  },
+  {
+   "text": "fn main() {\n    let x: Vec<u32> = (0..10).collect();\n    println!(\"{x:?}\");\n}\n",
+   "repeat": 1
+  },
+  {
+   "text": "def count(text):\n\treturn len(text.split())  # tabs and comments\n",
+   "repeat": 1
+  },
+  {
+   "text": "日本語のテキストと漢字、中文句子。",
+   "repeat": 1
+  },
+  {
+   "text": "café vs café, Ångström vs Ångström — NFC",
+   "repeat": 1
+  },
+  {
+   "text": "   leading and   multiple    spaces\t\ttabs\n\n\n  trailing  ",
+   "repeat": 1
+  },
+  {
+   "text": "😀🚀 emoji ✦ αβγ 1234567890 3.14159",
+   "repeat": 1
+  },
+  {
+   "text": "don't won't I'LL WE'VE they're it's",
+   "repeat": 1
+  },
+  {
+   "text": "SELECT id, name FROM users WHERE active = 1;\n",
+   "repeat": 1
+  },
+  {
+   "text": "नमस्ते مرحبا 안녕하세요 Привет",
+   "repeat": 1
+  },
+  {
+   "text": "Token budgets matter most where context windows are smallest: 日本語, code `x += 1;`, and café.\n",
+   "repeat": 1500
+  }
+ ],
+ "pins": {
+  "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d": {
+   "family": "glm-5",
+   "repo": "zai-org/GLM-5.3",
+   "counts": [
+    4,
+    31,
+    27,
+    15,
+    14,
+    19,
+    14,
+    22,
+    14,
+    12,
+    14,
+    36000
+   ]
+  },
+  "9daf23e519d7119b3cda6ba28922449503b6d4a0b3749f8c97d173a111490748": {
+   "family": "kimi-k3",
+   "repo": "moonshotai/Kimi-K3",
+   "counts": [
+    4,
+    31,
+    28,
+    15,
+    14,
+    21,
+    14,
+    20,
+    9,
+    12,
+    15,
+    37500
+   ]
+  },
+  "c1dde261820d8bb00602430e4f28d154b71cb74308abadaa4f10fd8bea532221": {
+   "family": "kimi-k2.5",
+   "repo": "moonshotai/Kimi-K2.5",
+   "counts": [
+    4,
+    31,
+    28,
+    15,
+    14,
+    21,
+    14,
+    20,
+    9,
+    12,
+    15,
+    37500
+   ]
+  },
+  "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b": {
+   "family": "deepseek-v4.1",
+   "repo": "deepseek-ai/DeepSeek-V4.1-Flash",
+   "counts": [
+    4,
+    31,
+    30,
+    15,
+    12,
+    20,
+    14,
+    21,
+    14,
+    12,
+    13,
+    36000
+   ]
+  },
+  "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf": {
+   "family": "deepseek-v4",
+   "repo": "deepseek-ai/DeepSeek-V4-Flash",
+   "counts": [
+    4,
+    31,
+    30,
+    15,
+    12,
+    20,
+    14,
+    21,
+    14,
+    12,
+    13,
+    36000
+   ]
+  },
+  "cd050be35cae877f8f0aa847f45aa87e23835a56ca32b29b28545597852784e5": {
+   "family": "deepseek-v3.2",
+   "repo": "deepseek-ai/DeepSeek-V3.2",
+   "counts": [
+    4,
+    31,
+    30,
+    15,
+    12,
+    20,
+    14,
+    21,
+    14,
+    12,
+    13,
+    36000
+   ]
+  },
+  "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3": {
+   "family": "qwen3.8",
+   "repo": "Qwen/Qwen3.8-27B",
+   "counts": [
+    4,
+    31,
+    34,
+    16,
+    10,
+    16,
+    14,
+    29,
+    14,
+    13,
+    8,
+    37500
+   ]
+  },
+  "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523": {
+   "family": "qwen3.8",
+   "repo": "unsloth/Qwen3.8-27B-NVFP4",
+   "counts": [
+    4,
+    31,
+    34,
+    16,
+    10,
+    16,
+    14,
+    29,
+    14,
+    13,
+    9,
+    37500
+   ]
+  },
+  "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f": {
+   "family": "gemma-4",
+   "repo": "google/gemma-4-12B-it",
+   "counts": [
+    4,
+    31,
+    35,
+    20,
+    9,
+    18,
+    13,
+    27,
+    18,
+    13,
+    5,
+    37500
+   ]
+  },
+  "bb1f1626cf01448f1e3b6036d0a061ffc66c91d9046aada14ea23a5441b5ad6e": {
+   "family": "minimax-m3",
+   "repo": "MiniMaxAI/MiniMax-M3",
+   "counts": [
+    4,
+    31,
+    28,
+    15,
+    9,
+    14,
+    14,
+    19,
+    9,
+    12,
+    11,
+    36000
+   ]
+  },
+  "633518aad78f9f61bae2ae420d621215754a4424c918b052cd8c22a3b59e99d2": {
+   "family": "mimo-v2.5",
+   "repo": "XiaomiMiMo/MiMo-V2.5",
+   "counts": [
+    4,
+    31,
+    29,
+    15,
+    13,
+    16,
+    14,
+    27,
+    14,
+    12,
+    15,
+    37500
+   ]
+  }
+ }
+}

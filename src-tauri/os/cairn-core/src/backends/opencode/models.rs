@@ -23,10 +23,12 @@
 //! The orchestrator retains the last good catalog through one, which is the
 //! behavior that makes this safe to insist on.
 
+use super::OPENCODE_BACKEND_KEY;
 use cairn_models::types::catalog::{
     DiscoveredModel, DiscoveredReasoningEffort, Modalities, Modality, ModelPricing, Price,
     ServedVerb, Wire,
 };
+use cairn_models::types::tokenizers::tokenizer_for;
 use cairn_models::types::usage::{Charge, Meter};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -335,6 +337,9 @@ fn model_from_metadata(id: &str, metadata: &PublishedModel) -> DiscoveredModel {
         router: false,
         modalities,
         serves: Some(serves),
+        // Go reports bare ids and no upstream repository, so only the pins'
+        // exact (provider, model) pairs can select a tokenizer.
+        tokenizer: tokenizer_for(OPENCODE_BACKEND_KEY, id, None),
     }
 }
 
@@ -363,6 +368,9 @@ fn unpublished_model(id: &str) -> DiscoveredModel {
         router: false,
         modalities: None,
         serves: None,
+        // Go reports bare ids and no upstream repository, so only the pins'
+        // exact (provider, model) pairs can select a tokenizer.
+        tokenizer: tokenizer_for(OPENCODE_BACKEND_KEY, id, None),
     }
 }
 

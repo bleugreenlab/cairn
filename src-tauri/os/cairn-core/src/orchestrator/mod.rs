@@ -3421,6 +3421,9 @@ impl Orchestrator {
         if let Ok(mut catalog) = self.model_catalog.write() {
             catalog.insert(backend_name.to_string(), entry.clone());
         }
+        // The meter registry's offer index caches this catalog; this is the
+        // one place a provider's catalog is stored, so it is fed here.
+        crate::token_meters::set_offer_tokenizers(backend_name, &entry.models);
         entry
     }
 
@@ -4113,6 +4116,7 @@ mod tests {
                     router: false,
                     modalities: None,
                     serves: None,
+                    tokenizer: None,
                 }],
                 options: Vec::new(),
                 refreshed_at: Some(20),
@@ -4229,6 +4233,7 @@ mod tests {
                     router: false,
                     modalities: None,
                     serves: None,
+                    tokenizer: None,
                 }],
                 options: Vec::new(),
                 refreshed_at: Some(10),

@@ -1,0 +1,22 @@
+[package]
+name = "cairn-toks"
+version.workspace = true
+edition = "2021"
+license = "BUSL-1.1"
+description = "Exact token counts for open-weight models through toks, Actual Computer's tokenizer, linked from its pinned prebuilt release"
+# build.rs links the prebuilt static library; `links` keeps two crates from ever
+# linking a second copy.
+links = "toks"
+
+# build.rs links toks only on the targets its release ships bundles for (macOS
+# arm64, Linux x86-64 and arm64 on glibc) and sets `cfg(toks_native)` there.
+# Every other target compiles a stub whose loads report `UnsupportedTarget`, so
+# the crate builds everywhere and dependents carry no target cfg of their own.
+[build-dependencies]
+sha2 = "0.10"
+
+[dev-dependencies]
+# The fleet test fetches pins through the same verified store the app uses.
+cairn-models = { path = "../cairn-models" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

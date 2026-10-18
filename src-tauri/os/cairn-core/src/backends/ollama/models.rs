@@ -232,6 +232,9 @@ fn merge_hosts(hosts: Vec<HostModels>) -> Vec<DiscoveredModel> {
                 output: vec![Modality::Text],
             }),
             serves: None,
+            // A GGUF conversion carries its own vocabulary, not guaranteed
+            // identical to the repository's tokenizer.json, so no pin applies.
+            tokenizer: None,
         })
         .collect()
 }

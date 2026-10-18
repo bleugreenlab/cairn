@@ -772,3 +772,22 @@ fn each_familys_one_shot_usage_journals_as_its_golden() {
         &(serde_json::to_string_pretty(&golden).unwrap() + "\n"),
     );
 }
+
+/// Go reports bare ids, so only a pin's exact (provider, model) pair selects a
+/// tokenizer, published or not; an unlisted model keeps none.
+#[test]
+fn shipped_go_models_carry_their_pinned_tokenizers() {
+    let ids: Vec<String> = ["kimi-k3", "glm-5.2", "grok-4.5"]
+        .map(String::from)
+        .to_vec();
+    let catalog = build_catalog(&ids, &std::collections::HashMap::new());
+    let family = |id: &str| {
+        entry(&catalog, id)
+            .tokenizer
+            .as_ref()
+            .map(|tokenizer| tokenizer.family.to_string())
+    };
+    assert_eq!(family("kimi-k3").as_deref(), Some("kimi-k3"));
+    assert_eq!(family("glm-5.2").as_deref(), Some("glm-5"));
+    assert_eq!(family("grok-4.5"), None);
+}

@@ -44,5 +44,6 @@ pub mod openrouter;
 pub mod session;
 pub mod sign_in;
 pub mod subscription;
+pub mod tokenizer_store;
 pub mod turn;
 pub mod usage;
