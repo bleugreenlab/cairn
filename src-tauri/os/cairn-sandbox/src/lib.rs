@@ -468,21 +468,33 @@ pub fn detect_denial(
     #[cfg(not(target_os = "macos"))]
     {
         // No out-of-band violation signal; the signature is the only trigger
-        // (command-scoped). This can false-positive on a genuine non-sandbox
-        // permission error — documented in docs/worktree-fence.md. Keep Linux
-        // behavior unchanged for both Ask and Deny agents.
+        // (command-scoped), so it recognises both C-style and Go-style errno
+        // text. The cost is a false positive on a genuine non-sandbox
+        // permission error, from a C tool or a Go one, which raises an
+        // answerable command-scoped crossing for a fenced spawn
+        // (docs/worktree-fence.md, "Permission decisions").
         let _ = (pid, since, command_scoped_fallback);
         Some(SandboxDenial::Command)
     }
 }
 
-/// Whether output carries a filesystem permission-denial signature.
+/// Whether output carries a permission-denial signature.
+///
+/// C-style errno text is libc's capitalised `strerror` (`Permission denied`).
+/// Go-style errno text is lowercase and arrives in the `*PathError` /
+/// `*SyscallError` shape `op path: errno-text`, which is what podman, docker,
+/// buildah and most Go tooling print, so the Go forms are matched with their
+/// leading `: `. A bare lowercase phrase is deliberately not a signature: an
+/// Ask spawn is scanned even on a clean exit, and `rg 'permission denied'` or
+/// a test log's prose must not raise a crossing.
 fn has_denial_signature(output: &str) -> bool {
-    const SIGS: [&str; 4] = [
+    const SIGS: [&str; 6] = [
         "Operation not permitted",
         "Permission denied",
         "EACCES",
         "EPERM",
+        ": operation not permitted",
+        ": permission denied",
     ];
     SIGS.iter().any(|s| output.contains(s))
 }
@@ -1007,8 +1019,24 @@ mod tests {
         assert!(has_denial_signature("Permission denied"));
         assert!(has_denial_signature("EACCES"));
         assert!(has_denial_signature("EPERM"));
+        // Go's `op path: errno-text`; this is rootless podman under the Linux
+        // fence, verbatim (fedora, exit 125).
+        assert!(has_denial_signature(PODMAN_FENCED_RUNTIME_LOCK));
+        assert!(has_denial_signature("mount /x: operation not permitted"));
         assert!(!has_denial_signature("ordinary test failure"));
+        assert!(!has_denial_signature("denied by policy: 2 tests"));
+        // Lowercase prose without Go's colon form is not a denial; an Ask
+        // spawn is scanned even when it exits 0.
+        assert!(!has_denial_signature(
+            "returns permission denied when the token expires"
+        ));
+        assert!(!has_denial_signature("rg 'permission denied' src"));
+        // The symbolic errno names are uppercase tokens, not prose.
+        assert!(!has_denial_signature("eperm and eacces in a sentence"));
+        assert!(!has_denial_signature(""));
     }
+
+    const PODMAN_FENCED_RUNTIME_LOCK: &str = "Error: acquiring runtime init lock: open /run/user/1000/libpod/tmp/alive.lck: open /run/user/1000/libpod/tmp/alive.lck: permission denied";
 
     #[test]
     fn ask_fallback_detects_denial_even_when_shell_exit_is_masked() {
@@ -1041,6 +1069,16 @@ mod tests {
         );
         assert_eq!(
             detect_denial(Some(13), "open: Permission denied", None, t, true),
+            Some(SandboxDenial::Command)
+        );
+        // A container engine refused by the fence raises the crossing whose
+        // approval reruns it unconfined.
+        assert_eq!(
+            detect_denial(Some(125), PODMAN_FENCED_RUNTIME_LOCK, None, t, true),
+            Some(SandboxDenial::Command)
+        );
+        assert_eq!(
+            detect_denial(Some(125), PODMAN_FENCED_RUNTIME_LOCK, None, t, false),
             Some(SandboxDenial::Command)
         );
     }

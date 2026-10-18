@@ -11941,6 +11941,29 @@ cairn-common = { path = "../cairn-common" }
         assert!(output.contains("stream=turn-checks:1"));
     }
 
+    /// A lane's own output may print a lowercase errno denial, which the
+    /// executor records as command-scoped evidence. The red it carries is the
+    /// test's red: neither the text nor the appended evidence is infrastructure.
+    #[test]
+    fn lowercase_denial_in_lane_output_stays_an_ordinary_red() {
+        let mut output = "--- FAIL: TestRuntimeLock\n    lock_test.go:12: open /run/user/1000/libpod/tmp/alive.lck: permission denied\nFAIL".to_string();
+        append_sandbox_denial_evidence(
+            &mut output,
+            &[cairn_common::executor_protocol::SandboxDenialEvidence {
+                denial: cairn_common::executor_protocol::SandboxDenial::Path(
+                    "/run/user/1000/libpod/tmp/alive.lck".into(),
+                ),
+                operation: None,
+                command: "go test ./...".into(),
+                stream_id: "merge-gate:1".into(),
+            }],
+        );
+        assert_eq!(
+            classify_check_failure("go test ./...", Some(1), false, false, None, &output),
+            None
+        );
+    }
+
     #[test]
     fn tracked_modification_evidence_is_legible_without_overwriting_command_output() {
         let mut output = "cargo check failed with code 101".to_string();
