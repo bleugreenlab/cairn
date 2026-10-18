@@ -35,9 +35,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use cairn_common::query::QueryParam;
 
 use super::common::{connect_and_find_node_job, find_query_value, node_branch};
+use crate::orchestrator::base_advance::{
+    inflight_run_batch_on_branch, mutation_boundary_hold, InflightRunBatch,
+};
 use crate::orchestrator::conflict_session::{
-    assess_session_tip, load_active_session, load_latest_session, ConflictSession, MarkerState,
-    ReplayState, SessionFile, TipAssessment, Unproven,
+    assess_session_tip, load_active_session, load_latest_session, load_reconcile_pass,
+    ConflictSession, MarkerState, ReplayPass, ReplayState, SessionFile, TipAssessment, Unproven,
 };
 use crate::orchestrator::replay_base::{load_base_candidates, resolve_base, BaseSource};
 use crate::orchestrator::Orchestrator;
@@ -174,8 +177,9 @@ pub(super) async fn read_node_rebase(
     let rendered = match request.view {
         RebaseView::Summary => {
             let standing = load_live_standing(orch, &conn, &job.id, &branch, &session).await;
+            let hold = inflight_run_batch_on_branch(&db, &job.id, &branch).await;
             render_summary(
-                orch, project, number, exec_seq, node_id, &session, &standing,
+                orch, project, number, exec_seq, node_id, &session, &standing, &hold,
             )
         }
         RebaseView::Merged => {
@@ -244,7 +248,7 @@ async fn render_closed_session(
         Err(error) => return error,
     };
     let Some(session) = latest.filter(|session| !session.is_open()) else {
-        return render_no_session(orch, conn, job_id, branch).await;
+        return render_no_session(orch, db, conn, job_id, branch).await;
     };
 
     let closed_at = crate::clock::stamp(session.updated_at)
@@ -269,16 +273,18 @@ async fn render_closed_session(
     // deferred or never fired, nothing reopened a session to say so. Reporting
     // an old resolution as "nothing needs doing" is the same false clearance
     // this page gives a branch that never conflicted at all, so it is answered
-    // the same way: from the store.
+    // the same way: from the store, and from what the reconcile record says
+    // happened to that advance.
     let standing = load_base_standing(orch, conn, job_id, branch).await;
     let now = match &standing {
         Ok(standing) if !standing.carries_base => format!(
             "\n⚠️ **Since then, the base has moved again.** `{}` is now at `{}`, which this \
-             branch's ancestry does not contain, and no session opened for it — so that advance \
-             was deferred or never ran. The outcome above is history, not this branch's current \
-             standing.\n{}\n{}\n",
+             branch's ancestry does not contain, and no session opened for it. The outcome above \
+             is history, not this branch's current standing.\n\n## Where the advance \
+             stands\n\n{}\n{}\n{}\n",
             standing.base_branch,
             standing.destination,
+            load_advance_state(db, job_id, branch, standing).await,
             standing.superseded_note(),
             replay_next_action(&standing.base_branch),
         ),
@@ -317,6 +323,8 @@ fn replay_next_action(base_branch: &str) -> String {
 struct BaseStanding {
     base_branch: String,
     destination: String,
+    /// The store the standing was read from, as reconcile intents record it.
+    store_path: String,
     /// True when the branch already has the base's current tip in its ancestry.
     carries_base: bool,
     /// The recorded base this standing had to move past, present exactly when
@@ -370,10 +378,116 @@ async fn load_base_standing(
     Ok(BaseStanding {
         base_branch: resolved.branch,
         destination: resolved.commit,
+        store_path: store.to_string_lossy().into_owned(),
         carries_base,
         superseded: resolved.superseded,
         source: resolved.source,
     })
+}
+
+/// What happened to the advance onto the base's current head, for a branch
+/// that does not carry it and has no open session.
+///
+/// Both reads are made here so the renderer stays pure: the reconcile row for
+/// this branch at that destination says whether a pass deferred it, attempted
+/// it, or never reached it, and the live suspension rows say whether a run
+/// batch on this branch — this node's or a child task's sharing it — holds
+/// the mutation boundary now.
+async fn load_advance_state(
+    db: &crate::storage::LocalDb,
+    job_id: &str,
+    branch: &str,
+    standing: &BaseStanding,
+) -> String {
+    let pass = load_reconcile_pass(db, branch, &standing.store_path, &standing.destination).await;
+    let hold = inflight_run_batch_on_branch(db, job_id, branch).await;
+    advance_state(&standing.destination, &pass, &hold)
+}
+
+/// The advance's state in words, from the reconcile record and the live hold.
+///
+/// "Deferred or never ran" was two incompatible readings offered as one, while
+/// the record knew which: a deferral writes its row, names the batch that held
+/// it, and stays queued for the sweep. So each state the record can be in is
+/// said as itself, and one it cannot vouch for is said to be unknown.
+fn advance_state(
+    destination: &str,
+    pass: &Result<Option<ReplayPass>, String>,
+    hold: &Result<Option<InflightRunBatch>, String>,
+) -> String {
+    let held_now = match hold {
+        Ok(Some(batch)) => format!(
+            " A {} is in flight on this branch now, so an automatic pass that reaches the branch \
+             before it ends will defer at the mutation boundary.",
+            batch.describe()
+        ),
+        Ok(None) => String::new(),
+        Err(error) => {
+            format!(" Whether a run batch on this branch is in flight is unknown: {error}.")
+        }
+    };
+    let pass = match pass {
+        Err(error) => {
+            return format!(
+                "Whether any base-advance pass has reached this branch at `{destination}` is \
+                 **unknown**: its reconcile record could not be read ({error}).{held_now}"
+            )
+        }
+        Ok(None) => {
+            return format!(
+                "**Never ran.** No base-advance pass has reached this branch at `{destination}`: \
+                 none deferred it and none attempted it.{held_now}"
+            )
+        }
+        Ok(Some(pass)) => pass,
+    };
+    let at = crate::clock::stamp(pass.updated_at)
+        .map(|stamp| format!(" at {stamp}"))
+        .unwrap_or_default();
+    let quoted = pass
+        .diagnostic
+        .as_deref()
+        .map(|text| format!("\n\n> {}\n\n", text.trim().replace('\n', "\n> ")))
+        .unwrap_or_else(|| " ".to_string());
+    let intent = pass.intent_status.as_deref();
+    let ref_lock = pass
+        .failure_kind
+        .as_deref()
+        .is_some_and(crate::jj::reconcile_failure_is_ref_lock);
+    match (intent, pass.outcome_kind.as_deref()) {
+        (Some("running"), _) => format!(
+            "**Running.** A base-advance pass onto `{destination}` is running now, under the store \
+             lock.{held_now}"
+        ),
+        (Some("pending"), _) if ref_lock => format!(
+            "**Retrying.** The last pass onto `{destination}`{at} could not take the ref store's \
+             lock. That is the machine's shared Git ref store, not your branch; the reconcile \
+             worker retries it automatically.{quoted}"
+        ),
+        (Some("pending"), Some("deferred")) => format!(
+            "**Deferred.** A base-advance pass onto `{destination}` reached this branch{at} and \
+             stopped at the mutation boundary without attempting the rebase. It recorded:\
+             {quoted}{}",
+            mutation_boundary_hold(hold)
+        ),
+        (_, Some("failed")) => format!(
+            "**Attempted and failed** ({}){at}. The diagnostic says what the pass changed.\
+             {quoted}A transient failure is retried automatically; one that needs you also \
+             arrives as a message.",
+            pass.failure_kind.as_deref().unwrap_or("unknown")
+        ),
+        (Some("pending"), None) => format!(
+            "**Queued.** A pass onto `{destination}` is queued for the durable reconcile worker \
+             and has not reached this branch yet.{held_now}"
+        ),
+        (intent, outcome) => format!(
+            "**Unknown.** The last pass onto `{destination}` recorded `{}`{at}, and its reconcile \
+             work is {}, yet this branch's ancestry does not carry `{destination}`. The record \
+             does not explain that, so this page will not guess.{held_now}",
+            outcome.unwrap_or("nothing"),
+            intent.unwrap_or("missing"),
+        ),
+    }
 }
 
 /// The page's section for a branch whose name the store holds conflicted, or
@@ -609,6 +723,7 @@ fn standing_section(session: &ConflictSession, standing: &Result<LiveStanding, S
 /// the store, so the store is what decides which page this is.
 async fn render_no_session(
     orch: &Orchestrator,
+    db: &crate::storage::LocalDb,
     conn: &cairn_db::turso::Connection,
     job_id: &str,
     branch: &str,
@@ -624,6 +739,11 @@ async fn render_no_session(
         }
     };
     let superseded = standing.superseded_note();
+    let advance = if standing.carries_base {
+        String::new()
+    } else {
+        load_advance_state(db, job_id, branch, &standing).await
+    };
     let BaseStanding {
         base_branch,
         destination,
@@ -644,11 +764,11 @@ async fn render_no_session(
          **and its base has moved out from under it anyway.** `{base_branch}` is now at \
          `{destination}`, which this branch's ancestry does not contain.\n\nThat combination is \
          the quiet failure, not a clean state. A session is the artifact of a rebase that was \
-         ATTEMPTED and hit a conflict; no session means no attempt reached that point — the \
-         advance was deferred while a run batch was in flight, or never fired at all. Nothing \
-         about it is visible from your checkout: local checks stay green, `git diff \
-         {base_branch}...HEAD` stays correct, and only the pull request shows it, as \
-         `Mergeable: CONFLICTING`.\n\nEditing files cannot fix it. Your branch's ANCESTRY is what \
+         ATTEMPTED and hit a conflict; no session means no attempt reached that point.\n\n## \
+         Where the advance stands\n\n{advance}\n\nNothing about it is visible from your \
+         checkout: local checks stay green, `git diff {base_branch}...HEAD` stays correct, and \
+         only the pull request shows it, as `Mergeable: CONFLICTING`.\n\nEditing files cannot \
+         fix it. Your branch's ANCESTRY is what \
          is stale, and slot refs are downstream exports of the runner's store, so nothing you \
          commit moves it.\n{superseded}\n{next}\n",
         next = replay_next_action(&base_branch),
@@ -745,6 +865,7 @@ fn file_table(title: &str, files: &[&SessionFile]) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_summary(
     orch: &Orchestrator,
     project: &str,
@@ -753,6 +874,7 @@ fn render_summary(
     node_id: &str,
     session: &ConflictSession,
     standing: &Result<LiveStanding, String>,
+    hold: &Result<Option<InflightRunBatch>, String>,
 ) -> String {
     let base = format!("cairn://p/{project}/{number}/{exec_seq}/{node_id}/rebase");
     let conflicting: Vec<&SessionFile> = session.conflicting().collect();
@@ -818,7 +940,7 @@ fn render_summary(
         branch = session.bookmark,
         incoming = incoming_line(session),
         markers = marker_line(session),
-        status = status_line(session),
+        status = status_line(session, hold),
         standing = standing_section(session, standing),
         coords = coordinates_block(session),
         resolution_section = resolution_section(assessment.as_ref(), &base),
@@ -1315,7 +1437,10 @@ fn collision_section(
 /// Omitted when nothing has been requested: the Next action block below already
 /// says what to do, and a line saying "no replay requested" would be noise on
 /// every read of the ordinary case.
-fn status_line(session: &ConflictSession) -> String {
+fn status_line(
+    session: &ConflictSession,
+    hold: &Result<Option<InflightRunBatch>, String>,
+) -> String {
     let Some(progress) = session.replay_progress() else {
         return String::new();
     };
@@ -1364,6 +1489,18 @@ fn status_line(session: &ConflictSession) -> String {
                     when(at)
                 )
             }
+        }
+        ReplayState::Deferred { diagnostic, at } => {
+            let recorded = diagnostic
+                .as_deref()
+                .map(|text| format!(" It recorded:\n\n> {}\n\n", text.trim()))
+                .unwrap_or_else(|| " ".to_string());
+            format!(
+                "\n**Status:** replay onto `{destination}`{requested} is DEFERRED. Its last pass{} \
+                 stopped at the mutation boundary and attempted nothing.{recorded}{}\n",
+                when(at),
+                mutation_boundary_hold(hold)
+            )
         }
         ReplayState::Processed { outcome, at } => format!(
             "\n**Status:** replay onto `{destination}`{requested} was processed: {} {}. If this \
@@ -1573,6 +1710,7 @@ mod tests {
         BaseStanding {
             base_branch: "main".into(),
             destination: "deadbeef".into(),
+            store_path: "/store".into(),
             carries_base: false,
             superseded: superseded.map(str::to_string),
             source: BaseSource::PullRequestTarget,
@@ -1697,7 +1835,7 @@ mod tests {
             ),
             updated_at: 130,
         });
-        let line = status_line(&session);
+        let line = status_line(&session, &Ok(None));
         assert!(line.contains("RETRYING"), "{line}");
         assert!(
             line.contains("held by live process 77 (git)"),
@@ -1711,7 +1849,7 @@ mod tests {
             updated_at: 50,
             ..Default::default()
         });
-        let line = status_line(&session);
+        let line = status_line(&session, &Ok(None));
         assert!(line.contains("no pass has processed it"), "{line}");
         assert!(line.contains("Request the replay again"), "{line}");
         assert!(!line.contains("QUEUED"), "{line}");
@@ -1733,7 +1871,7 @@ mod tests {
                 diagnostic: Some(diagnostic.to_string()),
                 updated_at: 130,
             });
-            status_line(&session)
+            status_line(&session, &Ok(None))
         };
         let push = failed(
             "transient_process",
@@ -1766,6 +1904,91 @@ mod tests {
         assert!(
             !unsafe_rollback.contains("nothing needs repair"),
             "{unsafe_rollback}"
+        );
+    }
+
+    fn deferred_pass() -> crate::orchestrator::conflict_session::ReplayPass {
+        crate::orchestrator::conflict_session::ReplayPass {
+            item_status: Some("pending".to_string()),
+            intent_status: Some("pending".to_string()),
+            outcome_kind: Some("deferred".to_string()),
+            failure_kind: None,
+            diagnostic: Some(
+                "deferred at the mutation boundary: run batch `ba0e0085` was in flight on this \
+                 branch, so its rebase was not attempted."
+                    .to_string(),
+            ),
+            updated_at: 130,
+        }
+    }
+
+    fn held() -> Result<Option<InflightRunBatch>, String> {
+        Ok(Some(InflightRunBatch {
+            job_id: "job-builder".to_string(),
+            holder: Some("cairn://p/cairn/5069/1/builder".to_string()),
+            request_id: "ba0e0085".to_string(),
+            label: Some("rust-tests on main".to_string()),
+            parked_at_ms: 130_000,
+        }))
+    }
+
+    /// The 5069 specimen: main moved, no session opened, and the page said
+    /// "deferred or never ran" while the record knew it was deferred by the
+    /// builder's own run batch. Each recorded state is now said as itself.
+    #[test]
+    fn an_advance_owed_by_a_branch_with_no_session_is_stated_from_the_record() {
+        let deferred = advance_state("279ddbcf", &Ok(Some(deferred_pass())), &held());
+        assert!(deferred.contains("**Deferred.**"), "{deferred}");
+        assert!(
+            deferred.contains("run batch `ba0e0085` (\"rust-tests on main\")")
+                && deferred.contains("on cairn://p/cairn/5069/1/builder")
+                && deferred.contains("finishes or is stopped")
+                && deferred.contains("durable sweep"),
+            "names the holding batch and what ends the hold: {deferred}"
+        );
+        assert!(!deferred.contains("never ran"), "{deferred}");
+
+        let released = advance_state("279ddbcf", &Ok(Some(deferred_pass())), &Ok(None));
+        assert!(
+            released.contains("**Deferred.**")
+                && released.contains("nothing holds the boundary any more"),
+            "a hold whose batch has ended says the sweep takes it from here: {released}"
+        );
+
+        let never = advance_state("279ddbcf", &Ok(None), &Ok(None));
+        assert!(never.contains("**Never ran.**"), "{never}");
+        assert!(!never.contains("Deferred"), "{never}");
+
+        let unread = advance_state("279ddbcf", &Err("no such table".to_string()), &held());
+        assert!(
+            unread.contains("**unknown**") && unread.contains("no such table"),
+            "{unread}"
+        );
+        assert!(
+            unread.contains("`ba0e0085`"),
+            "the live hold is still reported: {unread}"
+        );
+
+        let mut contradictory = deferred_pass();
+        contradictory.intent_status = Some("completed".to_string());
+        contradictory.outcome_kind = Some("rebased_clean".to_string());
+        let contradictory = advance_state("279ddbcf", &Ok(Some(contradictory)), &Ok(None));
+        assert!(contradictory.contains("**Unknown.**"), "{contradictory}");
+    }
+
+    /// A replay request whose pass deferred reads DEFERRED with the batch, not
+    /// QUEUED, which read as imminent while the branch could not move.
+    #[test]
+    fn a_deferred_replay_request_names_the_batch_instead_of_reading_queued() {
+        let mut session = recorded_session();
+        session.replay_requested_at = Some(100);
+        session.replay_pass = Some(deferred_pass());
+        let line = status_line(&session, &held());
+        assert!(line.contains("DEFERRED"), "{line}");
+        assert!(!line.contains("QUEUED"), "{line}");
+        assert!(
+            line.contains("run batch `ba0e0085`") && line.contains("finishes or is stopped"),
+            "{line}"
         );
     }
 

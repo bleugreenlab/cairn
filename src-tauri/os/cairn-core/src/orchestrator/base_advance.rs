@@ -1048,44 +1048,196 @@ async fn refresh_stale_durable_intent(
 /// after the executor result has been published. Moving the branch inside that
 /// bracket can leave the resolver publishing against a coordinate that no
 /// longer names the running batch.
-async fn jobs_have_inflight_run_batches(
+///
+/// Returns the batch rather than a yes/no, because the deferral it causes is
+/// only actionable by someone who can name it: the cure is that batch ending,
+/// and an agent told merely "a batch" waits on a lane it should cancel.
+async fn inflight_run_batch(
     db: &LocalDb,
     siblings: &[SiblingJob],
-) -> Result<bool, String> {
+) -> Result<Option<InflightRunBatch>, String> {
     for sibling in siblings {
-        let job_id = sibling.id.clone();
-        let active = db
-            .read(|conn| {
-                let job_id = job_id.clone();
-                Box::pin(async move {
-                    let mut rows = conn
-                        .query(
-                            "SELECT condition_json FROM agent_waits
-                             WHERE job_id = ?1 AND state IN ('pending', 'resolving')",
-                            params![job_id.as_str()],
-                        )
-                        .await?;
-                    while let Some(row) = rows.next().await? {
-                        let condition = serde_json::from_str::<
-                            crate::mcp::handlers::durable_suspend::Condition,
-                        >(&row.text(0)?);
-                        if matches!(
-                            condition,
-                            Ok(crate::mcp::handlers::durable_suspend::Condition::RunBatch { .. })
-                        ) {
-                            return Ok(true);
-                        }
-                    }
-                    Ok(false)
-                })
-            })
-            .await
-            .map_err(|error| format!("inspect in-flight run batches: {error}"))?;
-        if active {
-            return Ok(true);
+        if let Some(batch) = inflight_run_batch_for_job(db, &sibling.id).await? {
+            return Ok(Some(batch));
         }
     }
-    Ok(false)
+    Ok(None)
+}
+
+/// A `run` batch whose durable suspension row is still open: the thing that
+/// holds a branch at the base-advance mutation boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InflightRunBatch {
+    /// The job whose turn the batch parked. Not necessarily the node reading
+    /// about it: child tasks share their parent's branch, so a child's batch
+    /// holds the parent's branch too.
+    pub(crate) job_id: String,
+    /// That job's home URI, when it resolves: the node whose turn to stop.
+    pub(crate) holder: Option<String>,
+    /// The batch's placement request, which is what cancellation addresses.
+    pub(crate) request_id: String,
+    pub(crate) label: Option<String>,
+    /// When the batch parked its turn (Unix milliseconds). The batch itself
+    /// started up to one synchronous window before that.
+    pub(crate) parked_at_ms: i64,
+}
+
+impl InflightRunBatch {
+    /// ``run batch `REQUEST` ("LABEL") on cairn://p/…, parked since 2026-10-18 04:28 PDT``
+    pub(crate) fn describe(&self) -> String {
+        let label = self
+            .label
+            .as_deref()
+            .map(|label| format!(" (\"{label}\")"))
+            .unwrap_or_default();
+        let owner = match self.holder.as_deref() {
+            Some(uri) => format!(" on {uri}"),
+            None => format!(" on job `{}`", self.job_id),
+        };
+        let parked = crate::clock::stamp_millis(self.parked_at_ms)
+            .map(|stamp| format!(", parked since {stamp}"))
+            .unwrap_or_default();
+        format!("run batch `{}`{label}{owner}{parked}", self.request_id)
+    }
+
+    /// Fill in the holder's home URI. Best effort: an unresolved URI falls
+    /// back to the job id, which still identifies it.
+    async fn resolve_holder(mut self, db: &LocalDb) -> Self {
+        self.holder = crate::jobs::queries::home_uri_for_job(db, &self.job_id)
+            .await
+            .ok()
+            .flatten();
+        self
+    }
+}
+
+/// The batch named by one `agent_waits` row, if the row is a run batch.
+fn run_batch_from_wait(
+    job_id: String,
+    condition_json: &str,
+    created_at: i64,
+) -> Option<InflightRunBatch> {
+    match serde_json::from_str(condition_json) {
+        Ok(crate::mcp::handlers::durable_suspend::Condition::RunBatch {
+            request_id,
+            label,
+            ..
+        }) => Some(InflightRunBatch {
+            job_id,
+            holder: None,
+            request_id,
+            label,
+            parked_at_ms: created_at,
+        }),
+        _ => None,
+    }
+}
+
+/// The open run-batch suspension of one job, if it has one.
+async fn inflight_run_batch_for_job(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Option<InflightRunBatch>, String> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT condition_json, created_at FROM agent_waits
+                     WHERE job_id = ?1 AND state IN ('pending', 'resolving')
+                     ORDER BY created_at",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                if let Some(batch) =
+                    run_batch_from_wait(job_id.clone(), &row.text(0)?, row.get::<i64>(1)?)
+                {
+                    return Ok(Some(batch));
+                }
+            }
+            Ok(None)
+        })
+    })
+    .await
+    .map_err(|error| format!("inspect in-flight run batches: {error}"))
+}
+
+/// The open run batch that holds `branch` at the mutation boundary, across
+/// every live job on it — the same owner set the automatic advance and the
+/// durable sweep guard, which reach it as `siblings_for_branch` over the live
+/// jobs cut from the base. A node-only lookup would report "nothing holds it"
+/// to a parent whose child task, sharing the branch, still has a batch open.
+///
+/// `job_id` names the reader: it scopes the lookup to that job's project, and
+/// the reader's own batch is preferred when several are open, since that is
+/// the one it can end itself.
+pub(crate) async fn inflight_run_batch_on_branch(
+    db: &LocalDb,
+    job_id: &str,
+    branch: &str,
+) -> Result<Option<InflightRunBatch>, String> {
+    let (job_id, branch) = (job_id.to_string(), branch.to_string());
+    let sql = format!(
+        "SELECT w.job_id, w.condition_json, w.created_at
+           FROM agent_waits w
+           JOIN jobs j ON j.id = w.job_id
+          WHERE j.project_id = (SELECT project_id FROM jobs WHERE id = ?1)
+            AND j.branch = ?2
+            AND w.state IN ('pending', 'resolving')
+            AND {LIVE_JOB_PREDICATE}
+          ORDER BY (w.job_id = ?1) DESC, w.created_at"
+    );
+    let found = db
+        .read(|conn| {
+            let (job_id, branch, sql) = (job_id.clone(), branch.clone(), sql.clone());
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(&sql, params![job_id.as_str(), branch.as_str()])
+                    .await?;
+                while let Some(row) = rows.next().await? {
+                    if let Some(batch) =
+                        run_batch_from_wait(row.text(0)?, &row.text(1)?, row.get::<i64>(2)?)
+                    {
+                        return Ok(Some(batch));
+                    }
+                }
+                Ok(None)
+            })
+        })
+        .await
+        .map_err(|error| format!("inspect in-flight run batches on `{branch}`: {error}"))?;
+    Ok(match found {
+        Some(batch) => Some(batch.resolve_holder(db).await),
+        None => None,
+    })
+}
+
+/// What a deferral at the mutation boundary is waiting on, read from the live
+/// suspension rows of every job on the branch: the batch that holds it, that
+/// nothing does any more, or that this could not be read. Shared by the rebase
+/// page and the replay request's answer so the two never describe the same
+/// hold differently.
+pub(crate) fn mutation_boundary_hold(batch: &Result<Option<InflightRunBatch>, String>) -> String {
+    let sweep = RECONCILE_SWEEP_INTERVAL.as_secs();
+    match batch {
+        Ok(Some(batch)) => format!(
+            "It is held by {}: a base advance never rewrites a branch under a batch that may \
+             commit to it. The hold ends when that batch finishes or is stopped (stopping the \
+             turn that owns it cancels it); the durable sweep, which revisits deferred work \
+             every {sweep} seconds, then performs the rebase with no further request.",
+            batch.describe()
+        ),
+        Ok(None) => format!(
+            "No run batch is in flight on this branch now, on this node or any other that shares \
+             it, so nothing holds the boundary any more: the durable sweep performs the rebase on \
+             its next pass (every {sweep} seconds) with no further request."
+        ),
+        Err(error) => {
+            format!("Whether a run batch on this branch still holds it is unknown: {error}.")
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1386,6 +1538,9 @@ struct BranchAdvanceOutcome {
     conflicted: usize,
     failed: usize,
     coalesced_destination: Option<String>,
+    /// The intent a coalesced call folded into, so a requester can be told
+    /// which already-running work absorbed it rather than that it was queued.
+    coalesced_intent: Option<String>,
 }
 
 /// Project conflict markers into every live checkout holding this branch, and
@@ -2729,6 +2884,25 @@ async fn finish_reconcile_intent(
     .map_err(|error| format!("complete reconcile intent: {error}"))
 }
 
+/// The id of the intent that owns one destination, for naming it in a summary.
+/// Best effort: a read failure costs the name, never the request.
+async fn reconcile_intent_id(
+    db: &LocalDb,
+    store: &Path,
+    target_branch: &str,
+    destination: &str,
+) -> Option<String> {
+    let store = store.to_string_lossy().into_owned();
+    db.query_text(
+        "SELECT id FROM jj_reconcile_intents
+         WHERE store_path = ?1 AND target_branch = ?2 AND destination_commit = ?3",
+        params![store.as_str(), target_branch, destination],
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
 async fn wait_for_reconcile_slot(
     db: &LocalDb,
     store: &Path,
@@ -2815,11 +2989,14 @@ async fn reconcile_base_advance(
     )
     .await?
     else {
+        let intent = reconcile_intent_id(db, &store, sibling_base_branch, &pinned_dest).await;
         log::debug!(
-            "jj base advance ({label}): coalesced with an existing intent for {pinned_dest}"
+            "jj base advance ({label}): coalesced with existing intent {} for {pinned_dest}",
+            intent.as_deref().unwrap_or("(unread)")
         );
         return Ok(BranchAdvanceOutcome {
             coalesced_destination: Some(pinned_dest),
+            coalesced_intent: intent,
             ..BranchAdvanceOutcome::default()
         });
     };
@@ -3106,6 +3283,10 @@ pub(crate) async fn request_branch_replay(
     // Every destination this request was re-aimed at, so the summary can name a
     // race instead of leaving it to look like a failed resolution.
     let mut retargets: Vec<(String, String)> = Vec::new();
+    // The first already-running intent this request folded into, and the
+    // destination it was running for. Reported, because a request absorbed by
+    // work already under way is not the fresh action "queued" describes.
+    let mut coalesced: Option<(Option<String>, String)> = None;
     loop {
         let attempted_destination = reopen_destination.clone();
         reopen_reconcile_intent(db, &store, &base_branch, &reopen_destination, branch).await?;
@@ -3123,6 +3304,11 @@ pub(crate) async fn request_branch_replay(
         .await?;
         if outcome.eligible > 0 {
             break;
+        }
+        if coalesced.is_none() {
+            if let Some(destination) = outcome.coalesced_destination.clone() {
+                coalesced = Some((outcome.coalesced_intent.clone(), destination));
+            }
         }
         reopen_destination = outcome.coalesced_destination.ok_or_else(|| {
             "Replay reconciliation returned no accepted branch and no coalesced destination."
@@ -3163,19 +3349,86 @@ pub(crate) async fn request_branch_replay(
              failed resolution — your content resolution still stands.\n\n"
         ));
     }
-    summary.push_str(&format!(
-        "Queued a store-side replay of `{branch}` onto `{base_branch}` at `{}`. The durable \
-         reconcile worker performs it under the store lock; nothing runs in your slot. A clean \
-         replay publishes your branch, refreshes your checkout, and closes this session. A replay \
-         that still conflicts leaves your branch untouched and refreshes cairn:~/rebase with fresh \
-         coordinates.",
-        reopen_destination
+    // Read after the pass is queued, so it describes the boundary that pass
+    // will meet. The batch may still end first; the wording allows for that.
+    let hold = inflight_run_batch_on_branch(db, job_id, branch).await;
+    summary.push_str(&replay_queued_summary(
+        branch,
+        &base_branch,
+        &reopen_destination,
+        coalesced.as_ref(),
+        job_id,
+        &hold,
     ));
     for caveat in &caveats {
         summary.push_str("\n\n⚠️ ");
         summary.push_str(caveat);
     }
     Ok(summary)
+}
+
+/// What an accepted replay request did and what it is about to meet.
+///
+/// Pure, so each wording is provable without a store. A request that folded
+/// into already-running work says so and names it; a request whose branch has a
+/// run batch in flight says the pass will be deferred, by what, and what ends
+/// it — otherwise "queued" reads as imminent while the branch cannot move.
+fn replay_queued_summary(
+    branch: &str,
+    base_branch: &str,
+    destination: &str,
+    coalesced: Option<&(Option<String>, String)>,
+    requester_job_id: &str,
+    hold: &Result<Option<InflightRunBatch>, String>,
+) -> String {
+    let mut out = String::new();
+    if let Some((intent, running_for)) = coalesced {
+        let intent = intent
+            .as_deref()
+            .map(|id| format!("reconcile intent `{id}`"))
+            .unwrap_or_else(|| "a reconcile intent (its id could not be read)".to_string());
+        out.push_str(&format!(
+            "Coalesced into {intent}, already running for `{base_branch}` at `{running_for}`. \
+             This request waited for that pass and was then queued as a follow-on pass of \
+             `{branch}` onto `{destination}`; it is not a separate replay.\n\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "Queued a store-side replay of `{branch}` onto `{base_branch}` at `{destination}`. "
+        ));
+    }
+    out.push_str(
+        "The durable reconcile worker performs it under the store lock; nothing runs in your \
+         slot. A clean replay publishes your branch, refreshes your checkout, and closes this \
+         session. A replay that still conflicts leaves your branch untouched and refreshes \
+         cairn:~/rebase with fresh coordinates.",
+    );
+    match hold {
+        Ok(None) => {}
+        Ok(Some(batch)) if batch.job_id == requester_job_id => out.push_str(&format!(
+            "\n\n⚠️ **The branch is deferred, not replayed, while its run batch is in flight.** \
+             A pass that reaches it before the batch ends stops at the mutation boundary without \
+             attempting the rebase. {} Requesting a replay before then only queues another pass \
+             that defers the same way.",
+            mutation_boundary_hold(hold)
+        )),
+        // An explicit replay guards only the requesting job's own batches
+        // (cairn/5098), so another node's batch on the shared branch does not
+        // hold this pass back, though it does hold every automatic one.
+        Ok(Some(batch)) => out.push_str(&format!(
+            "\n\n⚠️ **Another node's {} is in flight on this branch.** Automatic base advances \
+             and the durable sweep defer the branch while it is, but this explicit replay pass \
+             guards only the requesting node's own batches (cairn/5098), so it may rewrite the \
+             branch under that batch. If that batch may commit, stop it or let it finish before \
+             relying on this replay.",
+            batch.describe()
+        )),
+        Err(_) => out.push_str(&format!(
+            "\n\nWhether this pass will be deferred at the mutation boundary is unknown. {}",
+            mutation_boundary_hold(hold)
+        )),
+    }
+    out
 }
 
 struct ReplayProject {
@@ -3504,13 +3757,14 @@ async fn execute_reconcile_claim(
             // row check and bookmark mutation one exclusive bracket.
             let branch_siblings = siblings_for_branch(&siblings, branch);
             let admission_check = guard.phase("in-flight run batch check");
-            let inflight = jobs_have_inflight_run_batches(db, &branch_siblings).await?;
+            let inflight = inflight_run_batch(db, &branch_siblings).await?;
             drop(admission_check);
-            if inflight {
-                log::info!(
-                    "jj base advance ({label}): deferred {branch} at the mutation boundary for an in-flight run batch"
-                );
+            if let Some(batch) = inflight {
                 drop(guard);
+                let held_by = batch.resolve_holder(db).await.describe();
+                log::info!(
+                    "jj base advance ({label}): deferred {branch} at the mutation boundary for an in-flight {held_by}"
+                );
                 // Record the deferral rather than only counting it. A deferred
                 // branch owes a rebase that has not been attempted, which is a
                 // different state from both "rebased" and "never advanced" and
@@ -3518,7 +3772,13 @@ async fn execute_reconcile_claim(
                 // no note was sent, and cairn:~/rebase would otherwise report a
                 // branch that had never met a base advance at all. The row is
                 // what lets the resource say an advance is owed, and it survives
-                // a restart that loses this pass.
+                // a restart that loses this pass. It names the batch, because
+                // the batch ending is the only thing that releases the branch.
+                let diagnostic = format!(
+                    "deferred at the mutation boundary: {held_by} was in flight on this branch, \
+                     so its rebase was not attempted. It stays queued for the durable sweep, \
+                     which performs it once that batch finishes or is stopped."
+                );
                 persist_reconcile_item(
                     db,
                     ReconcileItemUpdate {
@@ -3529,11 +3789,7 @@ async fn execute_reconcile_claim(
                         failure_kind: None,
                         outcome_kind: Some("deferred"),
                         fingerprint: None,
-                        diagnostic: Some(
-                            "deferred at the mutation boundary: this branch had a run batch in \
-                             flight, so its rebase was not attempted. It stays queued for the \
-                             durable sweep.",
-                        ),
+                        diagnostic: Some(&diagnostic),
                     },
                 )
                 .await?;
@@ -4279,6 +4535,7 @@ async fn execute_reconcile_claim(
         conflicted: report.conflicted.len(),
         failed: report.failed.len() + terminal_failed,
         coalesced_destination: None,
+        coalesced_intent: None,
     })
 }
 
@@ -5690,11 +5947,10 @@ mod tests {
                 .is_err(),
             "run-batch admission must wait while bookmark mutation owns the store lock"
         );
-        assert!(
-            !jobs_have_inflight_run_batches(&db, std::slice::from_ref(&sibling))
-                .await
-                .unwrap()
-        );
+        assert!(inflight_run_batch(&db, std::slice::from_ref(&sibling))
+            .await
+            .unwrap()
+            .is_none());
 
         drop(mutation_guard);
         admission.await.unwrap();
@@ -5705,9 +5961,7 @@ mod tests {
                 "test reconcile revalidation",
             )
             .await;
-        assert!(jobs_have_inflight_run_batches(&db, &[sibling])
-            .await
-            .unwrap());
+        assert!(inflight_run_batch(&db, &[sibling]).await.unwrap().is_some());
     }
 
     /// The sweep is the only mechanism that revisits a deferred base advance, so
@@ -6328,10 +6582,175 @@ mod tests {
             clear.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
             vec!["job-clean"]
         );
-        assert!(jobs_have_inflight_run_batches(&db, &blocked).await.unwrap());
+        assert_eq!(
+            inflight_run_batch(&db, &blocked).await.unwrap(),
+            Some(InflightRunBatch {
+                job_id: "job-overlap".into(),
+                holder: None,
+                request_id: "request-local".into(),
+                label: Some("branch-local test".into()),
+                parked_at_ms: 1,
+            }),
+            "the hold names the batch, which is what ends it"
+        );
         assert!(
-            !jobs_have_inflight_run_batches(&db, &clear).await.unwrap(),
+            inflight_run_batch(&db, &clear).await.unwrap().is_none(),
             "a run batch on one branch must not defer its clear sibling"
+        );
+    }
+
+    /// A child task shares its parent's branch, so the automatic guard defers
+    /// the parent's branch on the CHILD's batch. The reported hold has to see
+    /// the same thing: a node-only lookup told an idle parent that nothing held
+    /// the boundary while every sweep kept deferring it.
+    #[tokio::test]
+    async fn the_reported_hold_spans_every_live_job_sharing_the_branch() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        for sql in [
+            "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, created_at, updated_at) VALUES ('job-child','exec-2','node','issue-2','proj-1','running','agent/overlap','integration',1,1)",
+            "INSERT INTO sessions (id,job_id,status,backend_id,created_at,updated_at) VALUES ('session-child','job-child','open','backend',1,1)",
+            "INSERT INTO runs (id,issue_id,project_id,job_id,status,session_id,created_at,updated_at) VALUES ('run-child','issue-2','proj-1','job-child','live','session-child',1,1)",
+            "INSERT INTO turns (id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES ('turn-child','session-child','run-child','job-child',1,'yielded','initial',1,1)",
+            "INSERT INTO agent_waits (id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at) VALUES ('wait-child','job-child','run-child','session-child','turn-child','tool-child','{\"kind\":\"run_batch\",\"request_id\":\"request-child\",\"commits\":true,\"label\":\"child suite\"}','pending',1)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+
+        // The parent is idle; its child's batch is what holds the branch.
+        let hold = inflight_run_batch_on_branch(&db, "job-overlap", "agent/overlap").await;
+        let batch = hold
+            .clone()
+            .unwrap()
+            .expect("the child's batch holds the shared branch");
+        assert_eq!(batch.job_id, "job-child");
+        assert_eq!(batch.request_id, "request-child");
+        assert!(
+            batch.holder.is_some() || batch.describe().contains("job `job-child`"),
+            "names whose turn to stop: {}",
+            batch.describe()
+        );
+        let said = mutation_boundary_hold(&hold);
+        assert!(
+            said.contains("`request-child`") && !said.contains("nothing holds"),
+            "{said}"
+        );
+
+        // The parent's replay pass guards only its own batches (cairn/5098),
+        // and its answer says so rather than promising a deferral.
+        let answer = replay_queued_summary(
+            "agent/overlap",
+            "integration",
+            "dest",
+            None,
+            "job-overlap",
+            &hold,
+        );
+        assert!(
+            answer.contains("Another node's run batch `request-child`")
+                && answer.contains("cairn/5098")
+                && !answer.contains("deferred, not replayed"),
+            "{answer}"
+        );
+
+        assert!(
+            inflight_run_batch_on_branch(&db, "job-clean", "agent/clean")
+                .await
+                .unwrap()
+                .is_none(),
+            "another branch's batch holds nothing here"
+        );
+
+        // With both open, the reader's own batch leads: it is the one the
+        // reader can end itself.
+        for sql in [
+            "INSERT INTO sessions (id,job_id,status,backend_id,created_at,updated_at) VALUES ('session-parent','job-overlap','open','backend',1,1)",
+            "UPDATE runs SET session_id='session-parent' WHERE id='run-job-overlap'",
+            "INSERT INTO turns (id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES ('turn-parent','session-parent','run-job-overlap','job-overlap',1,'yielded','initial',1,1)",
+            "INSERT INTO agent_waits (id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at) VALUES ('wait-parent','job-overlap','run-job-overlap','session-parent','turn-parent','tool-parent','{\"kind\":\"run_batch\",\"request_id\":\"request-parent\",\"commits\":false}','pending',5)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+        let own = inflight_run_batch_on_branch(&db, "job-overlap", "agent/overlap")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(own.request_id, "request-parent");
+        let child_view = inflight_run_batch_on_branch(&db, "job-child", "agent/overlap")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child_view.request_id, "request-child");
+    }
+
+    fn held() -> Result<Option<InflightRunBatch>, String> {
+        Ok(Some(InflightRunBatch {
+            job_id: "job-builder".into(),
+            holder: Some("cairn://p/cairn/5069/1/builder".into()),
+            request_id: "ba0e0085".into(),
+            label: Some("rust-tests on main".into()),
+            parked_at_ms: 1_760_788_078_000,
+        }))
+    }
+
+    /// The 5069 specimen: a replay request that folded into a running intent
+    /// was answered "Queued a store-side replay" while the branch's own run
+    /// batch guaranteed the pass would defer. The answer names the intent it
+    /// joined, the batch that holds the branch, and what releases it.
+    #[test]
+    fn a_coalesced_replay_names_the_intent_and_the_batch_that_defers_it() {
+        let coalesced = (Some("intent-542c".to_string()), "279ddbcf".to_string());
+        let summary = replay_queued_summary(
+            "agent/b",
+            "main",
+            "279ddbcf",
+            Some(&coalesced),
+            "job-builder",
+            &held(),
+        );
+        assert!(
+            summary.contains("Coalesced into reconcile intent `intent-542c`")
+                && summary.contains("`main` at `279ddbcf`"),
+            "{summary}"
+        );
+        assert!(!summary.contains("Queued a store-side replay"), "{summary}");
+        assert!(
+            summary.contains("deferred, not replayed")
+                && summary.contains("run batch `ba0e0085` (\"rust-tests on main\")")
+                && summary.contains("on cairn://p/cairn/5069/1/builder")
+                && summary.contains("parked since"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("finishes or is stopped") && summary.contains("durable sweep"),
+            "says what releases it: {summary}"
+        );
+
+        let fresh = replay_queued_summary(
+            "agent/b",
+            "main",
+            "279ddbcf",
+            None,
+            "job-builder",
+            &Ok(None),
+        );
+        assert!(fresh.starts_with("Queued a store-side replay"), "{fresh}");
+        assert!(
+            !fresh.contains("deferred") && !fresh.contains("unknown"),
+            "nothing holds it, so nothing is said about a hold: {fresh}"
+        );
+
+        let unread = replay_queued_summary(
+            "agent/b",
+            "main",
+            "279ddbcf",
+            None,
+            "job-builder",
+            &Err("database is locked".into()),
+        );
+        assert!(
+            unread.contains("unknown") && unread.contains("database is locked"),
+            "an unreadable hold says unknown rather than nothing: {unread}"
         );
     }
 

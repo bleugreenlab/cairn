@@ -396,6 +396,11 @@ pub(crate) enum ReplayState {
         diagnostic: Option<String>,
         at: i64,
     },
+    /// The last pass reached the branch and stopped at the mutation boundary
+    /// because one of its run batches was in flight, attempting nothing. The
+    /// intent stays pending for the durable sweep. `diagnostic` is what the
+    /// pass recorded, which names the batch that held it then.
+    Deferred { diagnostic: Option<String>, at: i64 },
     /// The last pass finished with this outcome (`conflicted`, `rebased_clean`, …).
     Processed { outcome: String, at: i64 },
     /// Nothing has processed the request and nothing is queued to: its intent
@@ -442,8 +447,16 @@ fn replay_state(pass: &ReplayPass, requested_at: i64) -> ReplayState {
                     at,
                 }
             }
-            // A deferral attempted nothing, so it says no more than the
-            // intent's own lifecycle below.
+            // A deferral attempted nothing, but it is a positive fact about
+            // why nothing moved, and the one that tells the reader what to
+            // end. Reported as such only while the sweep still owes the pass;
+            // otherwise the intent's own lifecycle below decides.
+            Some("deferred") if intent == Some("pending") => {
+                return ReplayState::Deferred {
+                    diagnostic: pass.diagnostic.clone(),
+                    at,
+                }
+            }
             Some("deferred") | None => {}
             Some(outcome) => {
                 return ReplayState::Processed {
@@ -1101,19 +1114,22 @@ async fn load_session(
                 .clone()
                 .unwrap_or_else(|| session.destination_commit.clone());
             session.replay_pass =
-                load_replay_pass(db, &session.bookmark, &session.store_path, &destination).await?;
+                load_reconcile_pass(db, &session.bookmark, &session.store_path, &destination)
+                    .await?;
         }
     }
     Ok(session)
 }
 
-/// The reconcile row that processes a replay request onto `destination`.
+/// What the last reconcile pass onto `destination` recorded for `bookmark`.
 ///
-/// `request_replay` reopens and runs the intent at the request's destination,
-/// so that row — not the one the session was recorded on — carries what the
-/// last pass did. Keyed by store and destination commit rather than base
-/// name, because the request may have re-resolved the base to a new name.
-async fn load_replay_pass(
+/// For a replay request this is the row that processes it: `request_replay`
+/// reopens and runs the intent at the request's destination, so that row — not
+/// the one the session was recorded on — carries what the last pass did. For a
+/// branch with no session it is what the automatic advance did, if anything.
+/// Keyed by store and destination commit rather than base name, because the
+/// base may have been re-resolved to a new name.
+pub(crate) async fn load_reconcile_pass(
     db: &LocalDb,
     bookmark: &str,
     store_path: &str,
@@ -1631,6 +1647,32 @@ mod tests {
             replay_state(&pass("pending", None, None, 50), 100),
             ReplayState::Queued,
             "queued is the positive fact of a pending intent with nothing recorded since"
+        );
+    }
+
+    /// A pass that stopped at the mutation boundary is DEFERRED, carrying the
+    /// diagnostic that names the batch, never folded into QUEUED: queued reads
+    /// as "about to happen" while the branch cannot move until a batch ends.
+    #[test]
+    fn a_pass_deferred_at_the_mutation_boundary_reads_as_deferred() {
+        let mut deferred = pass("pending", Some("deferred"), None, 120);
+        deferred.diagnostic = Some("deferred at the mutation boundary: run batch `r1`".into());
+        assert_eq!(
+            replay_state(&deferred, 100),
+            ReplayState::Deferred {
+                diagnostic: Some("deferred at the mutation boundary: run batch `r1`".into()),
+                at: 120
+            }
+        );
+        assert_eq!(
+            replay_state(&pass("pending", Some("deferred"), None, 50), 100),
+            ReplayState::Queued,
+            "a deferral from before the request says nothing about the request"
+        );
+        assert_eq!(
+            replay_state(&pass("running", Some("deferred"), None, 120), 100),
+            ReplayState::Running,
+            "a pass under way now outranks the deferral it is retrying"
         );
     }
 
