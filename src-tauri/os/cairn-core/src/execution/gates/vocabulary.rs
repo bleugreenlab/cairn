@@ -1252,6 +1252,7 @@ pub(crate) fn check_verdict_evidence(
             check_name: &coordinate.check_name,
             input_hash: &coordinate.input_hash,
             verdict_platforms: &coordinate.verdict_platforms,
+            executor_ids: None,
             implementation_identity: cairn_checkenv::implementation_identity(),
             verdict_environment_hash: &coordinate.verdict_environment_hash,
             result_schema_version: CHECK_RESULT_SCHEMA_VERSION as i64,

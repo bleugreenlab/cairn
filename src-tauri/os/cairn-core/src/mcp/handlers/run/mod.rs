@@ -2353,7 +2353,9 @@ mod slot_publication_tests {
     #[tokio::test]
     #[serial_test::serial(jj)]
     async fn a_batch_built_on_a_held_commit_lands_as_its_own_edit_in_either_order() {
-        let cases: [(&str, (&str, &str), &str, &[&str]); 3] = [
+        // (what the batch did, the file it wrote, that file's content, paths it touched)
+        type Case<'a> = (&'a str, (&'a str, &'a str), &'a str, &'a [&'a str]);
+        let cases: [Case; 3] = [
             (
                 "a new path",
                 ("other.rs", "the next batch\n"),
@@ -3695,6 +3697,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                     logical_resolution
                         .as_ref()
                         .map(|resolution| resolution.rev.as_str()),
+                    payload.executor.as_ref(),
                 )
                 .into_iter()
                 .chain(
@@ -5704,6 +5707,15 @@ async fn settle_run_batch(
 /// `CAIRN_WORKTREE_BRANCH` is the branch a detached cell checkout cannot name
 /// for itself, which branch-keyed tooling (`scripts/resolve-branch.ts`) reads.
 ///
+/// `CAIRN_BATCH_EXECUTOR` is the batch's own placement pin, its machine name or
+/// platform as JSON, so that a `cairn check run` (or an SDK `checkRun`) inside a
+/// batch pinned `executor:{os:"linux"}` asks for a Linux verdict without being
+/// told twice. Only `name` and `os` are inherited: what a check needs from a
+/// machine is its configuration's to declare, never the batch's. A batch the
+/// host spawns itself never carries a pin (the run tool places every pinned
+/// process batch), so [`process::build_agent_spawn_config`] has nothing to
+/// state here.
+///
 /// Transport is deliberately absent. The callback URL and the MCP secret
 /// describe the machine the runner runs on, not the batch, and the CLI resolves
 /// both from the environment it actually executes in. On a colocated executor
@@ -5716,6 +5728,7 @@ pub(crate) fn placed_process_env(
     home_uri: Option<&str>,
     branch_target_rev: Option<&str>,
     managed_workspace_branch: Option<&str>,
+    batch_executor: Option<&cairn_common::executor_protocol::ExecutorSelector>,
 ) -> Vec<(String, String)> {
     let mut env = Vec::new();
     if let Some(run_id) = run_id.filter(|run_id| !run_id.is_empty()) {
@@ -5726,6 +5739,12 @@ pub(crate) fn placed_process_env(
     }
     if let Some(branch) = branch_target_rev.or(managed_workspace_branch) {
         env.push(("CAIRN_WORKTREE_BRANCH".to_string(), branch.to_string()));
+    }
+    if let Some(pin) = batch_executor.and_then(|selector| selector.placement_pin()) {
+        env.push((
+            cairn_common::executor_protocol::BATCH_EXECUTOR_ENV.to_string(),
+            serde_json::to_string(&pin).expect("an executor selector serializes"),
+        ));
     }
     env
 }
@@ -6583,14 +6602,14 @@ mod tests {
     #[test]
     fn placed_process_env_covers_managed_and_explicit_branch_routes() {
         assert_eq!(
-            placed_process_env(None, None, None, Some("agent/cairn-2929-builder-0")),
+            placed_process_env(None, None, None, Some("agent/cairn-2929-builder-0"), None),
             [(
                 "CAIRN_WORKTREE_BRANCH".into(),
                 "agent/cairn-2929-builder-0".into()
             )]
         );
         assert_eq!(
-            placed_process_env(None, None, Some("feature/dev-instance"), None),
+            placed_process_env(None, None, Some("feature/dev-instance"), None, None),
             [(
                 "CAIRN_WORKTREE_BRANCH".into(),
                 "feature/dev-instance".into()
@@ -6614,7 +6633,8 @@ mod tests {
                 Some("run-7"),
                 Some("cairn://p/cairn/thread"),
                 None,
-                Some("agent/cairn-3381-builder-0")
+                Some("agent/cairn-3381-builder-0"),
+                None
             ),
             [
                 ("CAIRN_RUN_ID".into(), "run-7".into()),
@@ -6632,6 +6652,7 @@ mod tests {
                 Some("run-7"),
                 Some("cairn://p/cairn/thread"),
                 Some("main"),
+                None,
                 None
             ),
             [
@@ -6650,8 +6671,46 @@ mod tests {
     /// answer for a batch nobody owns.
     #[test]
     fn an_unowned_batch_states_no_run_at_all() {
-        assert!(placed_process_env(None, None, None, None).is_empty());
-        assert!(placed_process_env(Some(""), None, None, None).is_empty());
+        assert!(placed_process_env(None, None, None, None, None).is_empty());
+        assert!(placed_process_env(Some(""), None, None, None, None).is_empty());
+    }
+
+    /// A batch pinned to a machine or a platform hands that pin to its shells,
+    /// so a check started inside it asks for the same placement. Capability is
+    /// never inherited, and a selector naming neither carries nothing.
+    #[test]
+    fn a_pinned_batch_hands_its_shells_its_name_or_platform_only() {
+        use cairn_common::executor_protocol::ExecutorSelector;
+        let pinned = |selector: ExecutorSelector| {
+            placed_process_env(None, None, None, None, Some(&selector))
+                .into_iter()
+                .find(|(key, _)| key == "CAIRN_BATCH_EXECUTOR")
+                .map(|(_, value)| value)
+        };
+        assert_eq!(
+            pinned(ExecutorSelector {
+                os: Some("linux".into()),
+                required_toolchains: vec!["rust".into()],
+                ..ExecutorSelector::default()
+            })
+            .as_deref(),
+            Some(r#"{"os":"linux"}"#)
+        );
+        assert_eq!(
+            pinned(ExecutorSelector {
+                name: Some("fedora".into()),
+                ..ExecutorSelector::default()
+            })
+            .as_deref(),
+            Some(r#"{"name":"fedora"}"#)
+        );
+        assert_eq!(
+            pinned(ExecutorSelector {
+                required_toolchains: vec!["rust".into()],
+                ..ExecutorSelector::default()
+            }),
+            None
+        );
     }
 
     fn identity_request(project_id: &str, repository_id: &str) -> CellRequest {

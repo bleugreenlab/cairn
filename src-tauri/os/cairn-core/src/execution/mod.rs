@@ -19,6 +19,7 @@ pub mod cache;
 pub mod canonical;
 pub mod check_identity;
 pub mod check_parsers;
+pub mod check_placement;
 pub mod checkpoint_runs;
 pub mod checkpoints;
 pub mod checks;

@@ -753,7 +753,7 @@ fn repl_process_env(
     mcp_secret: Option<String>,
 ) -> Vec<(String, String)> {
     let mut env =
-        crate::mcp::handlers::run::placed_process_env(run_id, home_uri, None, managed_branch);
+        crate::mcp::handlers::run::placed_process_env(run_id, home_uri, None, managed_branch, None);
     env.push(("CAIRN_CALLBACK_URL".into(), callback_url));
     if let Some(secret) = mcp_secret {
         env.push(("CAIRN_MCP_SECRET".into(), secret));

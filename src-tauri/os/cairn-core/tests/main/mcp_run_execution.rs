@@ -1233,6 +1233,53 @@ async fn an_unsatisfiable_executor_selector_still_refuses_instead_of_queueing() 
     );
 }
 
+/// A batch pinned to a machine hands that pin to its shells, so a `cairn check
+/// run` started inside it asks for the same placement without being told twice.
+/// An unpinned batch states no pin at all.
+#[tokio::test]
+async fn a_pinned_batch_shell_sees_its_pin_and_an_unpinned_one_sees_none() {
+    if common::skip_if_fenced("a_pinned_batch_shell_sees_its_pin_and_an_unpinned_one_sees_none") {
+        return;
+    }
+    let (_temp, _db, orch, cwd) = setup("run-batch-pin").await;
+    let pinned = run_text(
+        &handle_run(
+            &orch,
+            &request(
+                &cwd,
+                Some("run-batch-pin"),
+                json!({
+                    "commands": [{ "command": "printf 'pin=[%s]' \"$CAIRN_BATCH_EXECUTOR\"" }],
+                    "executor": { "name": "local" },
+                }),
+            ),
+        )
+        .await,
+    );
+    assert!(
+        pinned.contains(r#"pin=[{"name":"local"}]"#),
+        "a pinned batch's shell inherits its pin: {pinned}"
+    );
+    let unpinned = run_text(
+        &handle_run(
+            &orch,
+            &request(
+                &cwd,
+                Some("run-batch-pin"),
+                json!({
+                    "commands": [{ "command": "printf 'pin=[%s]' \"$CAIRN_BATCH_EXECUTOR\"" }],
+                }),
+            ),
+        )
+        .await,
+    );
+    assert!(
+        unpinned.contains("pin=[]"),
+        "an unpinned batch states no pin: {unpinned}"
+    );
+    kill_all_sessions(&orch);
+}
+
 /// The tracked-writes half of the thread posture, at the `run` door.
 ///
 /// A thread owns no branch, so its job runs ON the base branch: the seal this

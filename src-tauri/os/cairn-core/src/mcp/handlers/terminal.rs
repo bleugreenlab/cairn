@@ -3062,7 +3062,9 @@ fn terminal_process_env(
     callback_url: String,
     mcp_secret: Option<String>,
 ) -> Vec<(String, String)> {
-    let mut env = super::run::placed_process_env(run_id, home_uri, None, managed_branch);
+    // A terminal carries no batch pin: it was placed for its job, not asked to
+    // run anywhere in particular.
+    let mut env = super::run::placed_process_env(run_id, home_uri, None, managed_branch, None);
     // Child tooling can carry the exact tracked-terminal relationship across a
     // launcher handoff. This is provenance only; it grants no terminal control.
     env.push(("CAIRN_TERMINAL_SESSION_ID".into(), session_id.to_string()));

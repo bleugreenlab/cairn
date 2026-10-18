@@ -486,6 +486,7 @@ mod tests {
             output_tail: None,
             failure_kind: None,
             suppressed_after: None,
+            executor: None,
         }
     }
 

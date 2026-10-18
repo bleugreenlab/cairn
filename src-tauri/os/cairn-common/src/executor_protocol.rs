@@ -4532,6 +4532,24 @@ pub struct LearnedResourceEstimate {
 /// accepted: an operator who downgrades their own runner to a pre-5070 build at
 /// this version keeps a settings file whose `machineRoles` that build ignores,
 /// and would offer batch work to a machine enrolled as inference only.
+///
+/// Still 150 (cairn/5066): check lanes take a placement selector from their
+/// request. [`ExecutorSelector::placement_pin`],
+/// [`ExecutorSelector::validate_placement_pin`], [`CheckSelectorSource`],
+/// [`EXECUTOR_PLATFORMS`] and [`BATCH_EXECUTOR_ENV`] are vocabulary the runner
+/// and the `cairn` CLI share; none of them is a field of any `ExecutorMessage`.
+/// A narrowed lane reaches the executor as the same `ExecutorSelector` a
+/// configured check already sent, and the inherited pin reaches a shell as one
+/// more environment entry in the existing item env. An executor of any version
+/// therefore receives nothing it has not always decoded.
+///
+/// The same change prices placement by each machine's own recent
+/// same-signature failures of a command. [`PlacementPrediction::reliability`]
+/// and [`ReliabilityEstimate`] are defaulted fields of the runner's own
+/// decision record, which no executor decodes, and the outcomes they are
+/// learned from are read off the `CellExecutionMeta`, `stop`, and exit status
+/// every executor already reports. An older executor that never reports a
+/// silent stop simply teaches the runner fewer stalls.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 150;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
@@ -5118,6 +5136,66 @@ impl ExecutorSelector {
             parts.join(" with ")
         }
     }
+
+    /// The placement part of this selector — its machine name or platform —
+    /// with every capability requirement removed, or `None` when it names
+    /// neither. This is what a pinned batch hands the shells it starts:
+    /// capability is the configuration's to declare, never the caller's.
+    pub fn placement_pin(&self) -> Option<ExecutorSelector> {
+        (self.name.is_some() || self.os.is_some()).then(|| ExecutorSelector {
+            name: self.name.clone(),
+            os: self.os.clone(),
+            ..ExecutorSelector::default()
+        })
+    }
+
+    /// Validate a selector that may only say WHERE work runs: exactly one of a
+    /// machine name or a platform, and a platform Cairn knows.
+    pub fn validate_placement_pin(&self) -> Result<(), String> {
+        self.validate()?;
+        if !self.required_toolchains.is_empty()
+            || self.requires_macos_nested_sandbox_write
+            || self.containment.is_some()
+        {
+            return Err(
+                "a check placement selector states only name or os: what a check needs from a machine is its configuration's to declare"
+                    .into(),
+            );
+        }
+        match (&self.name, &self.os) {
+            (None, None) => Err("a check placement selector must state name or os".into()),
+            (_, Some(os)) if !EXECUTOR_PLATFORMS.contains(&os.as_str()) => Err(format!(
+                "os {os:?} is not a platform Cairn places work on; use one of {}",
+                EXECUTOR_PLATFORMS.join(", ")
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The platform names a selector's `os` may state, as executors advertise them.
+pub const EXECUTOR_PLATFORMS: [&str; 3] = ["linux", "macos", "windows"];
+
+/// The environment variable through which a batch pinned to a machine or a
+/// platform tells the shells it starts where it was pinned. Its value is a
+/// JSON [`ExecutorSelector`] carrying only `name` or `os`
+/// ([`ExecutorSelector::placement_pin`]).
+pub const BATCH_EXECUTOR_ENV: &str = "CAIRN_BATCH_EXECUTOR";
+
+/// Where a check lane's placement selector came from, which decides what
+/// happens when it contradicts the check's configuration.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CheckSelectorSource {
+    /// The caller asked for it by name (`--os`, `--executor`, the SDK, the
+    /// callback payload). A contradiction is refused: running the lane anywhere
+    /// else would answer a question nobody asked.
+    #[default]
+    Explicit,
+    /// Inherited from the pin of the batch whose shell started the check. A
+    /// contradiction drops the pin and the configuration wins: the batch was
+    /// pinned for its own work, not to overrule a suite's declaration.
+    Inherited,
 }
 
 /// Whether placement policy may choose among machines for a request, stated by
@@ -11772,7 +11850,8 @@ pub struct PlacementPrediction {
     pub base_run_ms: u64,
     pub adjusted_run_ms: u64,
     pub contention: ContentionEstimate,
-    /// Queue wait plus run duration — the two legs that carry honest time.
+    /// Queue wait plus run duration, plus the expected cost of this machine's
+    /// own recent same-signature failures of this command when it has any.
     pub predicted_verdict_ms: u64,
     /// What the runner established about this machine's warmth for this work.
     pub warmth: CacheWarmthEvidence,
@@ -11780,9 +11859,72 @@ pub struct PlacementPrediction {
     /// machines that have not refused it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declined_here: Option<PriorDecline>,
+    /// This machine's recent failures of this command with one signature, and
+    /// what they add to the time to a verdict. A price, never an exclusion: a
+    /// penalized machine still wins when nothing else can answer sooner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reliability: Option<ReliabilityEstimate>,
+}
+
+/// One machine's recent same-signature failures of one command, priced.
+///
+/// Keyed by machine, never aggregated by platform: an aggregate would charge an
+/// unmeasured machine for a sibling's stalls, and every Linux machine for one
+/// host's kernel kills. A platform-wide defect still prices every machine on
+/// that platform, because each accumulates its own history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReliabilityEstimate {
+    pub executor_name: String,
+    /// The failure every counted outcome shares: `silent_stop`, `timed_out`,
+    /// or `signal:<n>`.
+    pub signature: String,
+    /// Recent outcomes with that signature, out of `of` recent outcomes.
+    pub failures: u32,
+    pub of: u32,
+    /// How long those failures ran before they ended.
+    pub mean_failure_ms: u64,
+    /// The expected cost of the failed attempts before a success, added to
+    /// [`PlacementPrediction::predicted_verdict_ms`].
+    pub penalty_ms: u64,
+}
+
+impl ReliabilityEstimate {
+    /// `local +90m — 3 of 4 recent lanes of this command on local ended
+    /// silent_stop (mean 31m)`.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} +{} — {} of {} recent lanes of this command on {} ended {} (mean {})",
+            self.executor_name,
+            compact_duration(self.penalty_ms),
+            self.failures,
+            self.of,
+            self.executor_name,
+            self.signature,
+            compact_duration(self.mean_failure_ms)
+        )
+    }
+}
+
+/// A duration as a person reads it at placement's scale: `45s`, `31m`, `2h5m`.
+fn compact_duration(ms: u64) -> String {
+    let seconds = ms / 1_000;
+    match (seconds / 3_600, (seconds % 3_600) / 60, seconds % 60) {
+        (0, 0, seconds) => format!("{seconds}s"),
+        (0, minutes, _) => format!("{minutes}m"),
+        (hours, 0, _) => format!("{hours}h"),
+        (hours, minutes, _) => format!("{hours}h{minutes}m"),
+    }
 }
 
 impl PlacementPrediction {
+    /// What this machine's failure history adds to its time to a verdict.
+    pub fn reliability_penalty_ms(&self) -> u64 {
+        self.reliability
+            .as_ref()
+            .map_or(0, |reliability| reliability.penalty_ms)
+    }
+
     /// How much of this prediction is this machine's own history rather than a
     /// labeled prior. Lower is better evidence, and it breaks ties between
     /// machines whose predicted totals are equal — never ahead of the totals
@@ -11803,13 +11945,17 @@ impl PlacementPrediction {
     /// The one line every readable surface renders for a candidate.
     pub fn describe(&self) -> String {
         format!(
-            "{}: {}ms predicted ({}; {}; {}; {}){}",
+            "{}: {}ms predicted ({}; {}; {}; {}{}){}",
             self.executor_name,
             self.predicted_verdict_ms,
             self.queue.describe(),
             self.run.describe(),
             self.warmth.describe(),
             self.preparation.describe(),
+            self.reliability
+                .as_ref()
+                .map(|reliability| format!("; priced {}", reliability.describe()))
+                .unwrap_or_default(),
             self.declined_here
                 .map(|decline| format!("; {}", describe_prior_decline(decline)))
                 .unwrap_or_default()

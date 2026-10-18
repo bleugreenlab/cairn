@@ -2030,9 +2030,15 @@ fn render_placement_detail(out: &mut String, decision: &PlacementDecision) {
     }
     for rejection in &decision.rejected {
         out.push_str(&format!(
-            "  - Passed over {}: {}\n",
+            "  - Passed over {}: {}{}\n",
             rejection.executor_name,
-            rejection.reason.describe()
+            rejection.reason.describe(),
+            rejection
+                .prediction
+                .as_ref()
+                .and_then(|prediction| prediction.reliability.as_ref())
+                .map(|reliability| format!(" — Priced: {}", reliability.describe()))
+                .unwrap_or_default()
         ));
         // A machine that was actually ranked shows its own numbers here, so
         // "why not that one" is answered by the same record that answered
@@ -2080,6 +2086,11 @@ fn render_prediction(out: &mut String, label: &str, prediction: &PlacementPredic
         }
     ));
     out.push_str(&format!("    - Cache: {}\n", prediction.warmth.describe()));
+    // A summand like the queue and the run, so it is named wherever the total
+    // is: a winner that was penalized and still won says so too.
+    if let Some(reliability) = &prediction.reliability {
+        out.push_str(&format!("    - Priced: {}\n", reliability.describe()));
+    }
     // History, not a reading: the reason this machine ranked behind ones that
     // never refused this entry, whatever its numbers say.
     if let Some(decline) = prediction.declined_here {

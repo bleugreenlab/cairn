@@ -6,6 +6,7 @@ use rmcp::model::CallToolResult;
 use std::env;
 use std::time::Duration;
 
+use cairn_common::executor_protocol::{CheckSelectorSource, ExecutorSelector, BATCH_EXECUTOR_ENV};
 use cairn_common::protocol::CallbackRequest;
 use cairn_mcp_server::output::assemble_reminders;
 use cairn_mcp_server::schemas::{ChangeInput, ChangeItemInput, ReadFileInput};
@@ -321,11 +322,48 @@ pub(crate) async fn run_cli_watch(issue_uri: String, since: Option<i64>) -> bool
     }
 }
 
+/// Where a check lane was asked to run, and who asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckPlacement {
+    selector: ExecutorSelector,
+    source: CheckSelectorSource,
+}
+
+/// The placement this invocation requests, in precedence order: an explicit
+/// `--os`/`--executor`, then the pin of the batch whose shell this is
+/// (`CAIRN_BATCH_EXECUTOR`), then none. An inherited value that does not parse
+/// as a placement pin is ignored rather than refused: the shell did not write
+/// it, and the check can still run where its configuration says.
+fn check_placement(
+    os: Option<String>,
+    executor: Option<String>,
+    inherited: Option<String>,
+) -> Option<CheckPlacement> {
+    if os.is_some() || executor.is_some() {
+        return Some(CheckPlacement {
+            selector: ExecutorSelector {
+                name: executor,
+                os,
+                ..ExecutorSelector::default()
+            },
+            source: CheckSelectorSource::Explicit,
+        });
+    }
+    let selector = serde_json::from_str::<ExecutorSelector>(inherited?.trim()).ok()?;
+    let selector = selector.placement_pin()?;
+    selector.validate_placement_pin().ok()?;
+    Some(CheckPlacement {
+        selector,
+        source: CheckSelectorSource::Inherited,
+    })
+}
+
 fn check_run_request(
     client: &CairnMcpServer,
     suite: String,
     branch: Option<String>,
     retry: bool,
+    placement: Option<&CheckPlacement>,
 ) -> CallbackRequest {
     let mut payload = serde_json::json!({ "suite": suite });
     if let Some(branch) = branch {
@@ -333,6 +371,12 @@ fn check_run_request(
     }
     if retry {
         payload["retry"] = serde_json::Value::Bool(true);
+    }
+    if let Some(placement) = placement {
+        payload["executor"] =
+            serde_json::to_value(&placement.selector).expect("an executor selector serializes");
+        payload["selectorSource"] =
+            serde_json::to_value(placement.source).expect("a selector source serializes");
     }
     CallbackRequest {
         thread_id: None,
@@ -342,6 +386,22 @@ fn check_run_request(
         payload,
         tool_use_id: None,
     }
+}
+
+/// The machine a verdict came from, as the result line names it: `fedora
+/// (linux)` for a run, `reused from fedora (linux)` for a cached verdict.
+fn check_machine_clause(result: &serde_json::Value, disposition: &str) -> Option<String> {
+    let executor = result.get("executor").filter(|value| !value.is_null())?;
+    let name = executor.get("name").and_then(serde_json::Value::as_str)?;
+    let machine = match executor.get("os").and_then(serde_json::Value::as_str) {
+        Some(os) => format!("{name} ({os})"),
+        None => name.to_string(),
+    };
+    Some(if disposition == "cached" {
+        format!("reused from {machine}")
+    } else {
+        machine
+    })
 }
 
 /// What the runner left out of a check result, as something the caller can act on.
@@ -385,11 +445,23 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
         .get("disposition")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| incomplete_check_result("the disposition"))?;
-    let cache = if disposition == "cached" {
+    let cache_line = if disposition == "cached" {
         "cache hit: suite input tree, verdict environment, schema, and reusable verdict matched"
     } else {
         "cache miss: no reusable verdict matched suite input tree, verdict environment, and schema"
     };
+    // An inherited batch pin the suite's configuration overruled is stated
+    // before anything else, so a lane that landed elsewhere says why.
+    let cache = match result
+        .get("placementNote")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(note) => format!("{note}\n{cache_line}"),
+        None => cache_line.to_string(),
+    };
+    let machine = check_machine_clause(result, disposition)
+        .map(|machine| format!(" · {machine}"))
+        .unwrap_or_default();
 
     // A run that produced no verdict is a fact about Cairn, never a red against
     // the tree, so it renders from its own named cause instead of a ✗ line.
@@ -437,7 +509,7 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
             .unwrap_or("the runner supplied no coverage evidence");
         return Ok((
             format!(
-                "{cache}\n⚠ {suite} is unverified on {short_commit} ({disposition}) — {reason}"
+                "{cache}\n⚠ {suite} is unverified on {short_commit} ({disposition}){machine} — {reason}"
             ),
             false,
         ));
@@ -484,7 +556,7 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
     };
     Ok((
         format!(
-            "{cache}\n{suite} {} on {short_commit} ({disposition}) · {observation}{reuse}",
+            "{cache}\n{suite} {} on {short_commit} ({disposition}){machine} · {observation}{reuse}",
             if passed { "✓" } else { "✗" }
         ),
         passed,
@@ -495,7 +567,10 @@ pub(crate) async fn run_cli_check(
     suites: Vec<String>,
     branch: Option<String>,
     retry: bool,
+    os: Option<String>,
+    executor: Option<String>,
 ) -> bool {
+    let placement = check_placement(os, executor, env::var(BATCH_EXECUTOR_ENV).ok());
     let callback_url = cli_callback_url();
     if !ensure_callback_reachable(&callback_url).await {
         print_unreachable_callback(&callback_url);
@@ -504,7 +579,7 @@ pub(crate) async fn run_cli_check(
     let client = build_cli_client(callback_url);
     let requests = suites
         .into_iter()
-        .map(|suite| check_run_request(&client, suite, branch.clone(), retry));
+        .map(|suite| check_run_request(&client, suite, branch.clone(), retry, placement.as_ref()));
     let outcomes = futures::future::join_all(requests.map(|request| {
         let client = &client;
         async move { client.callback(&request).await }
@@ -525,6 +600,17 @@ pub(crate) async fn run_cli_check(
                 continue;
             }
         };
+        if let Some(error) = start
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .filter(|ok| !ok)
+            .and_then(|_| start.get("error"))
+            .and_then(serde_json::Value::as_str)
+        {
+            eprintln!("cairn check run: {error}");
+            all_passed = false;
+            continue;
+        }
         let Some(handle) = start
             .get("observationHandle")
             .and_then(serde_json::Value::as_str)
@@ -703,7 +789,7 @@ mod tests {
             Some("run-1".into()),
             None,
         );
-        let request = check_run_request(&client, "rust-tests".into(), None, false);
+        let request = check_run_request(&client, "rust-tests".into(), None, false, None);
         assert_eq!(request.tool, "check_run");
         assert_eq!(
             request.payload,
@@ -720,10 +806,68 @@ mod tests {
             Some("run-1".into()),
             None,
         );
-        let request = check_run_request(&client, "rust-tests".into(), None, true);
+        let request = check_run_request(&client, "rust-tests".into(), None, true, None);
         assert_eq!(
             request.payload,
             serde_json::json!({ "suite": "rust-tests", "retry": true })
+        );
+    }
+
+    #[test]
+    fn check_placement_prefers_an_explicit_flag_then_the_batch_pin() {
+        let pinned = Some(r#"{"os":"linux"}"#.to_string());
+        let explicit = check_placement(None, Some("bgsrv".into()), pinned.clone()).unwrap();
+        assert_eq!(explicit.source, CheckSelectorSource::Explicit);
+        assert_eq!(explicit.selector.name.as_deref(), Some("bgsrv"));
+        assert_eq!(explicit.selector.os, None);
+
+        let inherited = check_placement(None, None, pinned).unwrap();
+        assert_eq!(inherited.source, CheckSelectorSource::Inherited);
+        assert_eq!(inherited.selector.os.as_deref(), Some("linux"));
+
+        assert_eq!(check_placement(None, None, None), None);
+        assert_eq!(
+            check_placement(None, None, Some("not json".into())),
+            None,
+            "an unparseable inherited pin is ignored, never refused"
+        );
+        assert_eq!(
+            check_placement(
+                None,
+                None,
+                Some(r#"{"requiredToolchains":["rust"]}"#.into())
+            ),
+            None,
+            "a pin with no name or platform carries nothing to inherit"
+        );
+    }
+
+    #[test]
+    fn check_run_request_carries_the_selector_and_its_source() {
+        let client = fixed_server(
+            "http://localhost".into(),
+            "/repo".into(),
+            Some("run-1".into()),
+            None,
+        );
+        let placement = check_placement(Some("linux".into()), None, None).unwrap();
+        let request =
+            check_run_request(&client, "rust-tests".into(), None, false, Some(&placement));
+        assert_eq!(
+            request.payload,
+            serde_json::json!({
+                "suite": "rust-tests",
+                "executor": { "os": "linux" },
+                "selectorSource": "explicit"
+            })
+        );
+        let inherited = check_placement(None, None, Some(r#"{"name":"fedora"}"#.into())).unwrap();
+        let request =
+            check_run_request(&client, "rust-tests".into(), None, false, Some(&inherited));
+        assert_eq!(request.payload["selectorSource"], "inherited");
+        assert_eq!(
+            request.payload["executor"],
+            serde_json::json!({ "name": "fedora" })
         );
     }
 
@@ -785,6 +929,50 @@ mod tests {
                 "cache hit: suite input tree, verdict environment, schema, and reusable verdict matched\nrust-tests ✓ on 1234567890ab (cached) · rust-tests@1234567890ab · 2026-08-03 11:12 PDT · cairn://p/CAIRN/check-observations/EjRWeJCrze8SNFZ4kKvN7w".to_string(),
                 true,
             )
+        );
+    }
+
+    /// A run names the machine it ran on, a reused verdict names its source's,
+    /// and a batch pin the suite overruled says so first.
+    #[test]
+    fn check_run_response_names_the_machine_and_an_unapplied_pin() {
+        let render = |disposition: &str, note: Option<&str>| {
+            render_check_run_response(
+                &serde_json::json!({
+                    "ok": true,
+                    "result": {
+                        "checkName": "rust-tests",
+                        "commitSha": "abc1234567890",
+                        "disposition": disposition,
+                        "passed": true,
+                        "verified": true,
+                        "reusable": true,
+                        "observationRef": "cairn://p/CAIRN/check-observations/h",
+                        "ranAt": "t",
+                        "executor": { "name": "fedora", "os": "linux" },
+                        "verdictPlatform": "linux",
+                        "placementNote": note,
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap()
+            .0
+        };
+        let fresh = render("fresh", None);
+        assert!(
+            fresh.ends_with("rust-tests ✓ on abc123456789 (fresh) · fedora (linux) · rust-tests@abc123456789 · t · cairn://p/CAIRN/check-observations/h"),
+            "{fresh}"
+        );
+        let cached = render("cached", None);
+        assert!(
+            cached.contains("(cached) · reused from fedora (linux) ·"),
+            "{cached}"
+        );
+        let noted = render("fresh", Some("batch pin os=windows not applied: no"));
+        assert!(
+            noted.starts_with("batch pin os=windows not applied: no\ncache miss"),
+            "{noted}"
         );
     }
 
@@ -1088,6 +1276,7 @@ mod tests {
             "rust-tests".into(),
             Some("main@origin".into()),
             false,
+            None,
         );
         assert_eq!(
             request.payload,

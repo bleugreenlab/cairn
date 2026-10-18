@@ -170,6 +170,9 @@ pub(crate) struct RecordedCheckObservation {
     /// by. Empty for legacy remote executors, whose rows remain addressable by id
     /// for diagnosis but cannot be reused.
     pub environment_fingerprint: String,
+    /// The machine that produced the verdict: this run's, or for a reused
+    /// verdict the source observation's.
+    pub executor_id: Option<String>,
     /// Whether this observation may suppress a later execution of the same
     /// triple. False keeps red, incomplete, or fingerprint-less verdicts out of
     /// the reuse path while still returning them to whoever asked for them.
@@ -280,6 +283,10 @@ pub(crate) struct ReusableCheckLookup<'a> {
     pub check_name: &'a str,
     pub input_hash: &'a str,
     pub verdict_platforms: &'a [String],
+    /// When set, only observations these machines produced may answer. A
+    /// request that named a machine wants that machine's answer, not a
+    /// sibling's on the same platform.
+    pub executor_ids: Option<&'a [String]>,
     pub implementation_identity: &'a str,
     pub verdict_environment_hash: &'a str,
     pub result_schema_version: i64,
@@ -294,11 +301,13 @@ pub(crate) fn get_reusable_check_result(
         check_name,
         input_hash,
         verdict_platforms,
+        executor_ids,
         implementation_identity,
         verdict_environment_hash,
         result_schema_version,
     } = lookup;
     if verdict_platforms.is_empty()
+        || executor_ids.is_some_and(<[String]>::is_empty)
         || implementation_identity.is_empty()
         || verdict_environment_hash.is_empty()
         || result_schema_version <= 0
@@ -312,6 +321,7 @@ pub(crate) fn get_reusable_check_result(
         verdict_platforms.to_vec(),
         implementation_identity.to_string(),
         verdict_environment_hash.to_string(),
+        executor_ids.map(<[String]>::to_vec),
     );
     run_checkpoint_cache_db(async move {
         db.read(|conn| {
@@ -319,6 +329,16 @@ pub(crate) fn get_reusable_check_result(
             Box::pin(async move {
                 let placeholders = (0..keys.3.len()).map(|i| format!("?{}", i + 7))
                     .collect::<Vec<_>>().join(",");
+                let executor_predicate = match &keys.6 {
+                    Some(ids) => format!(
+                        "AND o.executor_id IN ({})",
+                        (0..ids.len())
+                            .map(|i| format!("?{}", i + 7 + keys.3.len()))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                    None => String::new(),
+                };
                 let sql = format!(
                     "SELECT c.project_id,c.tree_hash,c.input_hash,c.check_name,c.exit_code,
                             c.passed,c.output_tail,c.duration_ms,c.ran_at,c.target_results_json,
@@ -333,6 +353,7 @@ pub(crate) fn get_reusable_check_result(
                         AND c.result_schema_version=?4 AND o.runner_build_id=?5
                         AND o.verdict_environment_hash=?6
                         AND o.verdict_platform IN ({placeholders})
+                        {executor_predicate}
                         AND {} AND c.failure_kind IS NULL AND o.reusable=1
                         AND o.complete=1 AND o.failure_kind IS NULL
                         AND o.verdict IN ('passed','failed')
@@ -346,6 +367,7 @@ pub(crate) fn get_reusable_check_result(
                     result_schema_version.into(), keys.4.into(), keys.5.into(),
                 ];
                 values.extend(keys.3.into_iter().map(Into::into));
+                values.extend(keys.6.into_iter().flatten().map(Into::into));
                 let mut rows = conn.query(&sql, values).await?;
                 let Some(row) = rows.next().await? else { return Ok(None); };
                 Ok(Some(ReusableCheckResult {
@@ -399,6 +421,15 @@ pub(crate) fn infra_suppression_scope(job_id: &str, commit_sha: &str) -> String 
     format!("infra:{}:{job_id}:{commit_sha}", job_id.len())
 }
 
+/// The head scope on one platform: this job at this commit, as `os` runs it.
+/// A command that stalls at a commit on one platform (a platform-specific
+/// hang) says nothing about whether it finishes on another, so its counter
+/// must not refuse the others. Namespaced so it can never collide with the
+/// head form above, which stays byte-identical.
+pub(crate) fn infra_platform_head_scope(job_id: &str, commit_sha: &str, os: &str) -> String {
+    format!("infra:platform:{os}:{}:{job_id}:{commit_sha}", job_id.len())
+}
+
 /// One machine's current repair identity. It moves when that machine's measured
 /// facts change or its operator declares it repaired — which is exactly when a
 /// host defect observed on it is worth attempting again.
@@ -417,12 +448,17 @@ pub(crate) fn infra_fleet_scope(digest: &str) -> String {
 ///
 /// A domain earns its place only if we can compute an identity that MOVES when
 /// its repair happens, and only if reaching the bound implies the right
-/// consequence. These three do; a fourth would have to prove the same.
+/// consequence. These four do; a fifth would have to prove the same.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InfraRepairDomain {
     /// A new commit. Cell races, lost links, capacity — conditions local to one
     /// attempt at one head, which must stay narrow and retryable elsewhere.
     Head,
+    /// A new commit, counted per platform. A command that stops making
+    /// progress at a commit does so as one platform runs it, so reaching the
+    /// bound on one platform removes that platform from the request; only
+    /// every platform bounded refuses it.
+    HeadOnPlatform,
     /// Repairing one machine. Reaching the bound here means AVOID that machine,
     /// not refuse the check: somewhere else may still be healthy.
     Environment,
@@ -446,6 +482,10 @@ pub(crate) struct InfraScopes {
     /// `(executor_id, scope)` for every machine currently eligible to run this
     /// check, sorted by executor id so an avoid set is deterministic.
     pub(crate) environments: Vec<(String, String)>,
+    /// `(os, scope)` for every platform whose answer this request counts,
+    /// sorted by platform. Empty when the request counts any platform, and
+    /// then a stall is charged to the head scope.
+    pub(crate) platform_heads: Vec<(String, String)>,
 }
 
 impl InfraScopes {
@@ -456,7 +496,37 @@ impl InfraScopes {
             head: infra_suppression_scope(job_id, commit_sha),
             fleet: None,
             environments: Vec::new(),
+            platform_heads: Vec::new(),
         }
+    }
+
+    /// One head scope per platform this request counts.
+    pub(crate) fn platform_heads_for(
+        job_id: &str,
+        commit_sha: &str,
+        verdict_platforms: &[String],
+    ) -> Vec<(String, String)> {
+        let mut platforms: Vec<String> = verdict_platforms
+            .iter()
+            .map(|platform| platform.to_ascii_lowercase())
+            .collect();
+        platforms.sort();
+        platforms.dedup();
+        platforms
+            .into_iter()
+            .map(|os| {
+                let scope = infra_platform_head_scope(job_id, commit_sha, &os);
+                (os, scope)
+            })
+            .collect()
+    }
+
+    fn platform_head(&self, platform: Option<&str>) -> Option<String> {
+        let platform = platform?;
+        self.platform_heads
+            .iter()
+            .find(|(os, _)| os.eq_ignore_ascii_case(platform))
+            .map(|(_, scope)| scope.clone())
     }
 
     /// Every live scope, head first.
@@ -466,6 +536,7 @@ impl InfraScopes {
             scopes.push(fleet);
         }
         scopes.extend(self.environments.iter().map(|(_, scope)| scope.as_str()));
+        scopes.extend(self.platform_heads.iter().map(|(_, scope)| scope.as_str()));
         scopes
     }
 
@@ -476,8 +547,17 @@ impl InfraScopes {
     /// machine it ran on works for it, and the current capability set can
     /// satisfy its selector. It proves nothing whatsoever about a sibling
     /// machine, so a sibling's counter is never touched.
-    pub(crate) fn verdict_scopes(&self, executor_id: Option<&str>) -> Vec<String> {
+    pub(crate) fn verdict_scopes(
+        &self,
+        executor_id: Option<&str>,
+        platform: Option<&str>,
+    ) -> Vec<String> {
         let mut scopes = vec![self.head.clone()];
+        // A verdict on one platform proves the command finishes there, and
+        // nothing about another platform's stalls.
+        if let Some(scope) = self.platform_head(platform) {
+            scopes.push(scope);
+        }
         if let Some(fleet) = self.fleet.clone() {
             scopes.push(fleet);
         }
@@ -499,9 +579,17 @@ impl InfraScopes {
     /// scope set cannot address, and a fleet failure with no computed capability
     /// identity has nothing durable to bind to. In each case the head domain is
     /// the narrow, always-correct answer.
-    pub(crate) fn scope_for(&self, domain: InfraRepairDomain, executor_id: Option<&str>) -> String {
+    pub(crate) fn scope_for(
+        &self,
+        domain: InfraRepairDomain,
+        executor_id: Option<&str>,
+        platform: Option<&str>,
+    ) -> String {
         match domain {
             InfraRepairDomain::Head => self.head.clone(),
+            InfraRepairDomain::HeadOnPlatform => self
+                .platform_head(platform)
+                .unwrap_or_else(|| self.head.clone()),
             InfraRepairDomain::Fleet => self.fleet.clone().unwrap_or_else(|| self.head.clone()),
             InfraRepairDomain::Environment => executor_id
                 .and_then(|id| {
@@ -631,6 +719,8 @@ pub(crate) struct SuppressedScope {
     pub(crate) scope: String,
     /// The machine this scope bounds, for an environment-domain row.
     pub(crate) executor_id: Option<String>,
+    /// The platform this scope bounds, for a head-on-platform row.
+    pub(crate) platform: Option<String>,
     pub(crate) entry: CheckResultCacheEntry,
 }
 
@@ -683,6 +773,7 @@ fn bounding_domain(
         scopes: vec![SuppressedScope {
             scope: scope.to_string(),
             executor_id: None,
+            platform: None,
             entry: entry.clone(),
         }],
     };
@@ -691,6 +782,29 @@ fn bounding_domain(
     }
     if let Some((scope, entry)) = scopes.fleet.as_deref().and_then(at_bound) {
         return Some(single(InfraRepairDomain::Fleet, scope, entry));
+    }
+    // Per platform, the way environments are per machine: a partly bounded
+    // set narrows the request's platforms, and only a fully bounded one
+    // refuses it.
+    if !scopes.platform_heads.is_empty() {
+        let per_platform: Vec<SuppressedScope> = scopes
+            .platform_heads
+            .iter()
+            .filter_map(|(os, scope)| {
+                at_bound(scope).map(|(_, entry)| SuppressedScope {
+                    scope: scope.clone(),
+                    executor_id: None,
+                    platform: Some(os.clone()),
+                    entry: entry.clone(),
+                })
+            })
+            .collect();
+        if per_platform.len() == scopes.platform_heads.len() {
+            return Some(SuppressedCheck {
+                domain: InfraRepairDomain::HeadOnPlatform,
+                scopes: per_platform,
+            });
+        }
     }
     if scopes.environments.is_empty() {
         return None;
@@ -702,6 +816,7 @@ fn bounding_domain(
             at_bound(scope).map(|(_, entry)| SuppressedScope {
                 scope: scope.clone(),
                 executor_id: Some(executor_id.clone()),
+                platform: None,
                 entry: entry.clone(),
             })
         })
@@ -727,6 +842,24 @@ fn avoided_environments(
             })
         })
         .map(|(executor_id, _)| executor_id.clone())
+        .collect()
+}
+
+/// The platforms whose own head counters are spent for this triple. The
+/// request may still run, just not on them.
+fn avoided_platforms(
+    scopes: &InfraScopes,
+    rows: &[(String, CheckResultCacheEntry)],
+) -> Vec<String> {
+    scopes
+        .platform_heads
+        .iter()
+        .filter(|(_, scope)| {
+            rows.iter().any(|(candidate, entry)| {
+                candidate == scope && entry.infra_failure_streak >= OBSERVED_INFRA_FAILURE_BOUND
+            })
+        })
+        .map(|(os, _)| os.clone())
         .collect()
 }
 
@@ -842,8 +975,12 @@ pub(crate) enum CheckExecutionClaim {
     /// Execute. Either the triple has no infrastructure history at all, or this
     /// caller reserved one of its bounded retries. `avoid` names the eligible
     /// machines whose own environment budgets are spent: the work may run, just
-    /// not there.
-    Clear { avoid: Vec<String> },
+    /// not there. `avoid_platforms` names the platforms whose own head budgets
+    /// are spent, which the request must drop from the platforms it counts.
+    Clear {
+        avoid: Vec<String>,
+        avoid_platforms: Vec<String>,
+    },
     /// Do not execute: the retry budget of a whole repair domain is spent, and
     /// the rows that prove it come back with the decision.
     Suppressed(Box<SuppressedCheck>),
@@ -894,6 +1031,7 @@ pub(crate) fn claim_check_execution(
                     return Ok(CheckExecutionClaim::Suppressed(Box::new(suppressed)));
                 }
                 let avoid = avoided_environments(&scopes, &rows);
+                let avoid_platforms = avoided_platforms(&scopes, &rows);
                 // Charge the retry to every scope that is still live for THIS
                 // attempt. A bounded environment is excluded: the attempt is not
                 // going there, so spending its budget again would charge a
@@ -904,6 +1042,8 @@ pub(crate) fn claim_check_execution(
                     .filter(|scope| {
                         !scopes.environments.iter().any(|(executor_id, candidate)| {
                             candidate == scope && avoid.contains(executor_id)
+                        }) && !scopes.platform_heads.iter().any(|(os, candidate)| {
+                            candidate == scope && avoid_platforms.contains(os)
                         })
                     })
                     .map(str::to_string)
@@ -931,7 +1071,10 @@ pub(crate) fn claim_check_execution(
                     values.extend(chargeable.into_iter().map(Into::into));
                     conn.execute(&update_sql, values).await?;
                 }
-                Ok(CheckExecutionClaim::Clear { avoid })
+                Ok(CheckExecutionClaim::Clear {
+                    avoid,
+                    avoid_platforms,
+                })
             })
         })
         .await
@@ -2165,6 +2308,40 @@ pub(crate) fn get_check_observation_public_handle(
     })
 }
 
+/// The machine an observation was produced on and the platform its verdict
+/// counts from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservationMachine {
+    pub executor_id: Option<String>,
+    pub verdict_platform: Option<String>,
+}
+
+pub(crate) fn get_check_observation_machine(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    observation_id: &str,
+) -> Result<Option<ObservationMachine>, String> {
+    let keys = (project_id.to_string(), observation_id.to_string());
+    run_checkpoint_cache_db(async move {
+        db.read(|conn| {
+            let keys = keys.clone();
+            Box::pin(async move {
+                let mut rows = conn.query(
+                    "SELECT executor_id, verdict_platform FROM check_result_observations WHERE project_id=?1 AND id=?2",
+                    params![keys.0.as_str(), keys.1.as_str()],
+                ).await?;
+                match rows.next().await? {
+                    Some(row) => Ok(Some(ObservationMachine {
+                        executor_id: row.opt_text(0)?,
+                        verdict_platform: row.opt_text(1)?,
+                    })),
+                    None => Ok(None),
+                }
+            })
+        }).await.map_err(|e| format!("Failed to load check observation machine: {e}"))
+    })
+}
+
 #[cfg(test)]
 fn get_exact_reusable_check_result(
     db: Arc<LocalDb>,
@@ -2181,6 +2358,7 @@ fn get_exact_reusable_check_result(
             check_name,
             input_hash,
             verdict_platforms: &["linux".into()],
+            executor_ids: None,
             implementation_identity: cairn_checkenv::implementation_identity(),
             verdict_environment_hash: environment,
             result_schema_version,
@@ -2205,6 +2383,7 @@ fn get_reusable_check_observation_id(
             check_name,
             input_hash,
             verdict_platforms: &["linux".into()],
+            executor_ids: None,
             implementation_identity: cairn_checkenv::implementation_identity(),
             verdict_environment_hash: environment,
             result_schema_version,
@@ -2838,11 +3017,115 @@ mod tests {
         }
     }
 
+    fn platform_scopes(platforms: &[&str]) -> InfraScopes {
+        let platforms: Vec<String> = platforms.iter().map(|os| os.to_string()).collect();
+        InfraScopes {
+            platform_heads: InfraScopes::platform_heads_for("job-test", "commit-test", &platforms),
+            ..InfraScopes::head_only("job-test", "commit-test")
+        }
+    }
+
+    /// The head form existing rows were written under must not move.
+    #[test]
+    fn the_head_scope_is_byte_identical_and_platform_heads_are_namespaced() {
+        assert_eq!(
+            infra_suppression_scope("job-test", "commit-test"),
+            "infra:8:job-test:commit-test"
+        );
+        assert_eq!(
+            infra_platform_head_scope("job-test", "commit-test", "macos"),
+            "infra:platform:macos:8:job-test:commit-test"
+        );
+    }
+
+    /// A stall bounds the platform it happened on: three macOS stalls at a
+    /// commit leave a `[linux, macos]` request free to run on Linux, and only
+    /// stalls on both suppress it.
+    #[tokio::test]
+    async fn stalls_are_bounded_per_platform() {
+        let db = cache_db().await;
+        let scopes = platform_scopes(&["linux", "macos"]);
+        let macos = scopes.scope_for(InfraRepairDomain::HeadOnPlatform, None, Some("macos"));
+        assert_eq!(
+            macos,
+            infra_platform_head_scope("job-test", "commit-test", "macos")
+        );
+        drive_domain_to_bound(&db, "rust", "input-a", &scopes, &macos);
+
+        let claim =
+            claim_check_execution(db.clone(), "project-a", "rust", "input-a", &scopes).unwrap();
+        let CheckExecutionClaim::Clear {
+            avoid_platforms, ..
+        } = claim
+        else {
+            panic!("one bounded platform must not suppress the request: {claim:?}");
+        };
+        assert_eq!(avoid_platforms, vec!["macos".to_string()]);
+        assert!(
+            get_suppressed_check_result(db.clone(), "project-a", "rust", "input-a", &scopes)
+                .unwrap()
+                .is_none()
+        );
+
+        let linux = scopes.scope_for(InfraRepairDomain::HeadOnPlatform, None, Some("linux"));
+        // The claim above reserved one attempt; finish it, then spend the rest.
+        let mut failure = failing_result("project-a", "input-a", "rust", Some("infrastructure"));
+        failure.environment_fingerprint = linux.clone();
+        store_check_result(db.clone(), failure).unwrap();
+        for _ in 1..OBSERVED_INFRA_FAILURE_BOUND {
+            assert!(matches!(
+                claim_check_execution(db.clone(), "project-a", "rust", "input-a", &scopes).unwrap(),
+                CheckExecutionClaim::Clear { .. }
+            ));
+            let mut failure =
+                failing_result("project-a", "input-a", "rust", Some("infrastructure"));
+            failure.environment_fingerprint = linux.clone();
+            store_check_result(db.clone(), failure).unwrap();
+        }
+        let CheckExecutionClaim::Suppressed(suppressed) =
+            claim_check_execution(db.clone(), "project-a", "rust", "input-a", &scopes).unwrap()
+        else {
+            panic!("every platform bounded suppresses the request");
+        };
+        assert_eq!(suppressed.domain, InfraRepairDomain::HeadOnPlatform);
+        let platforms: Vec<_> = suppressed
+            .scopes
+            .iter()
+            .map(|scope| scope.platform.as_deref())
+            .collect();
+        assert_eq!(platforms, vec![Some("linux"), Some("macos")]);
+    }
+
+    /// A stall with no platform scope to land on narrows to the head, and a
+    /// verdict clears only the platform it was produced on.
+    #[test]
+    fn a_platform_head_is_charged_and_cleared_only_by_its_own_platform() {
+        let head_only = InfraScopes::head_only("job-test", "commit-test");
+        assert_eq!(
+            head_only.scope_for(InfraRepairDomain::HeadOnPlatform, None, Some("macos")),
+            head_only.head
+        );
+        let scopes = platform_scopes(&["linux", "macos"]);
+        assert_eq!(
+            scopes.scope_for(InfraRepairDomain::HeadOnPlatform, None, Some("windows")),
+            scopes.head,
+            "a platform the request does not count is not a counter to charge"
+        );
+        assert_eq!(
+            scopes.verdict_scopes(None, Some("linux")),
+            vec![
+                scopes.head.clone(),
+                infra_platform_head_scope("job-test", "commit-test", "linux"),
+            ]
+        );
+    }
+
     fn fleet_scopes(commit: &str, digest: &str) -> InfraScopes {
         InfraScopes {
             head: infra_suppression_scope("job-test", commit),
             fleet: Some(infra_fleet_scope(digest)),
             environments: Vec::new(),
+            platform_heads: Vec::new(),
         }
     }
 
@@ -2854,6 +3137,7 @@ mod tests {
                 .iter()
                 .map(|(id, digest)| ((*id).to_string(), infra_env_scope(digest)))
                 .collect(),
+            platform_heads: Vec::new(),
         }
     }
 
@@ -2885,7 +3169,7 @@ mod tests {
             let claim =
                 claim_check_execution(db.clone(), "project-a", "rust", "ih-rust", &fleet(commit))
                     .unwrap();
-            let CheckExecutionClaim::Clear { avoid } = claim else {
+            let CheckExecutionClaim::Clear { avoid, .. } = claim else {
                 panic!("{commit}: a healthy machine remains, so the check must still run");
             };
             assert_eq!(
@@ -2903,7 +3187,7 @@ mod tests {
             &[("machine-a", "a-repaired"), ("machine-b", "b-healthy")],
         );
         let claim = claim_check_execution(db, "project-a", "rust", "ih-rust", &repaired).unwrap();
-        let CheckExecutionClaim::Clear { avoid } = claim else {
+        let CheckExecutionClaim::Clear { avoid, .. } = claim else {
             panic!("a repaired machine must be usable again");
         };
         assert!(
@@ -2930,7 +3214,7 @@ mod tests {
             &infra_env_scope("a-broken"),
         );
 
-        let cleared = fleet.verdict_scopes(Some("machine-b"));
+        let cleared = fleet.verdict_scopes(Some("machine-b"), None);
         assert_eq!(
             cleared,
             vec![
@@ -2947,7 +3231,7 @@ mod tests {
         record_fresh_check_observation(db.clone(), pass).unwrap();
 
         let claim = claim_check_execution(db, "project-a", "rust", "input-rust", &fleet).unwrap();
-        let CheckExecutionClaim::Clear { avoid } = claim else {
+        let CheckExecutionClaim::Clear { avoid, .. } = claim else {
             panic!("the check still runs; it is one machine that is broken");
         };
         assert_eq!(
@@ -3098,9 +3382,12 @@ mod tests {
     fn an_unaddressable_domain_narrows_to_the_head_scope() {
         let head_only = InfraScopes::head_only("job-test", "commit-test");
         let head = infra_suppression_scope("job-test", "commit-test");
-        assert_eq!(head_only.scope_for(InfraRepairDomain::Fleet, None), head);
         assert_eq!(
-            head_only.scope_for(InfraRepairDomain::Environment, Some("machine-a")),
+            head_only.scope_for(InfraRepairDomain::Fleet, None, None),
+            head
+        );
+        assert_eq!(
+            head_only.scope_for(InfraRepairDomain::Environment, Some("machine-a"), None),
             head
         );
 
@@ -3109,11 +3396,11 @@ mod tests {
             ..head_only.clone()
         };
         assert_eq!(
-            with_machine.scope_for(InfraRepairDomain::Environment, Some("machine-a")),
+            with_machine.scope_for(InfraRepairDomain::Environment, Some("machine-a"), None),
             infra_env_scope("digest-a")
         );
         assert_eq!(
-            with_machine.scope_for(InfraRepairDomain::Environment, Some("machine-b")),
+            with_machine.scope_for(InfraRepairDomain::Environment, Some("machine-b"), None),
             head,
             "a machine this scope set does not address is not a counter to charge"
         );
@@ -5192,6 +5479,7 @@ mod tests {
                 check_name: "rust",
                 input_hash: "input-rust",
                 verdict_platforms: &["macos".into()],
+                executor_ids: None,
                 implementation_identity: cairn_checkenv::implementation_identity(),
                 verdict_environment_hash: "declared-env",
                 result_schema_version: 1,
@@ -5207,6 +5495,7 @@ mod tests {
                 check_name: "rust",
                 input_hash: "input-rust",
                 verdict_platforms: &["macos".into(), "linux".into()],
+                executor_ids: None,
                 implementation_identity: cairn_checkenv::implementation_identity(),
                 verdict_environment_hash: "declared-env",
                 result_schema_version: 1,
@@ -5216,5 +5505,60 @@ mod tests {
         .expect("linux is in the declared trust set");
         assert_eq!(reused.source_observation_id, "obs-trust");
         assert_eq!(reused.environment_fingerprint, "declared-env");
+    }
+
+    /// A request narrowed to one platform, or to one machine, reuses only what
+    /// that platform or machine produced: asking for a Linux verdict must never
+    /// be answered by a cached macOS one, and naming a machine must never be
+    /// answered by its sibling.
+    #[tokio::test]
+    async fn reusable_lookup_honors_a_requested_platform_and_machine() {
+        let db = cache_db().await;
+        let mut source = observation("obs-mac", "commit-mac", "declared-env");
+        source.verdict_platform = Some("macos".into());
+        source.executor_id = Some("executor-mac".into());
+        record_fresh_check_observation(db.clone(), source).unwrap();
+        let lookup = |platforms: &'static [&'static str], ids: Option<Vec<String>>| {
+            let platforms: Vec<String> = platforms.iter().map(|p| p.to_string()).collect();
+            get_reusable_check_result(
+                db.clone(),
+                ReusableCheckLookup {
+                    project_id: "project-a",
+                    check_name: "rust",
+                    input_hash: "input-rust",
+                    verdict_platforms: &platforms,
+                    executor_ids: ids.as_deref(),
+                    implementation_identity: cairn_checkenv::implementation_identity(),
+                    verdict_environment_hash: "declared-env",
+                    result_schema_version: 1,
+                },
+            )
+            .unwrap()
+            .map(|reused| reused.source_observation_id)
+        };
+
+        assert_eq!(
+            lookup(&["linux", "macos"], None).as_deref(),
+            Some("obs-mac")
+        );
+        assert_eq!(
+            lookup(&["linux"], None),
+            None,
+            "a Linux request ignores macOS evidence"
+        );
+        assert_eq!(
+            lookup(&["linux", "macos"], Some(vec!["executor-mac".into()])).as_deref(),
+            Some("obs-mac")
+        );
+        assert_eq!(
+            lookup(&["linux", "macos"], Some(vec!["executor-other".into()])),
+            None,
+            "a named machine is not answered by its sibling"
+        );
+        assert_eq!(
+            lookup(&["linux", "macos"], Some(Vec::new())),
+            None,
+            "a name no machine carries admits nothing"
+        );
     }
 }

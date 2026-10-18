@@ -14,6 +14,7 @@ pub(crate) mod placement;
 pub(crate) mod preparation;
 pub(crate) mod purpose;
 pub(crate) mod queue;
+mod reliability;
 pub(crate) mod repair;
 pub(crate) mod residency;
 mod resource_profiles;
@@ -40,7 +41,7 @@ use cairn_common::executor_protocol::{
     PlacementSelection, PlacementSyncCost, PlacementTieBreak, PreparationForecast, ProcessBatch,
     ProcessBatchExecution, ProcessBatchFile, ProcessBatchItem, ProcessSandboxMode,
     ProcessTelemetry, QueueForecast, QueueUnknownReason, QueuedPlacementEvidence,
-    QueuedPlacementRejection, QueuedPlacementTarget, RemoteAttachAttempt,
+    QueuedPlacementRejection, QueuedPlacementTarget, ReliabilityEstimate, RemoteAttachAttempt,
     RemoteConnectionTransition, RemoteLinkState, RepositoryLocator, ReservationFallback,
     ReservationRationale, ResidencyAcquireRequest, ResidencyFailureKind, ResidencyFence,
     ResidencyHolder, ResidencyOperation, ResidencyResult, ResidencyRuntimeConfig,
@@ -7291,6 +7292,59 @@ impl Fleet {
             .unwrap_or_else(|| executor_id.to_string())
     }
 
+    /// Every executor identity that answers to a public name: attached,
+    /// enrolled but away, or the colocated executor. Empty when nothing this
+    /// runner knows of carries the name.
+    pub(crate) fn executor_ids_named(&self, name: &str) -> Vec<String> {
+        let mut ids: std::collections::BTreeSet<String> = self
+            .lock_connections()
+            .iter()
+            .filter(|(_, entry)| executor_names_match(name, &executor_public_name(entry)))
+            .map(|(executor_id, _)| executor_id.clone())
+            .collect();
+        ids.extend(
+            self.enrolled_remotes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, record)| executor_names_match(name, &record.name))
+                .map(|(executor_id, _)| executor_id.clone()),
+        );
+        if executor_names_match(name, LOCAL_EXECUTOR_NAME) {
+            ids.insert(COLOCATED_EXECUTOR_ID.to_string());
+        }
+        ids.into_iter().collect()
+    }
+
+    /// The platform the machine answering to a public name runs, from its live
+    /// advertisement or, while it is away, its enrollment. `None` when nothing
+    /// this runner knows of carries the name, or when machines of different
+    /// platforms share it.
+    pub(crate) fn executor_os_named(&self, name: &str) -> Option<String> {
+        let mut platforms: std::collections::BTreeSet<String> = self
+            .lock_connections()
+            .values()
+            .filter(|entry| executor_names_match(name, &executor_public_name(entry)))
+            .map(|entry| entry.advertisement.capabilities.os.to_ascii_lowercase())
+            .collect();
+        platforms.extend(
+            self.enrolled_remotes
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|record| executor_names_match(name, &record.name))
+                .map(|record| record.os.to_ascii_lowercase()),
+        );
+        if executor_names_match(name, LOCAL_EXECUTOR_NAME) {
+            platforms.insert(std::env::consts::OS.to_string());
+        }
+        let mut platforms = platforms.into_iter();
+        match (platforms.next(), platforms.next()) {
+            (Some(os), None) => Some(os),
+            _ => None,
+        }
+    }
+
     /// When this runner first observed that an executor was not connected.
     ///
     /// Stamped on disconnect, and stamped here for an executor this process has
@@ -9430,6 +9484,23 @@ impl Fleet {
         } = &outcome
         {
             if batch_profile_identities.is_empty() {
+                if let Some(identity) = profile_identity.as_ref() {
+                    record_command_outcome(
+                        db.clone(),
+                        identity,
+                        &profile_context.os,
+                        &selected.executor_id,
+                        reliability::CommandOutcome::classify(
+                            *exit_code,
+                            *timed_out,
+                            metadata.stop.as_ref(),
+                            crate::execution::check_parsers::declared_empty_selection(output),
+                        ),
+                        metadata.duration_ms,
+                        metadata.finished_at_unix_ms,
+                    )
+                    .await;
+                }
                 resource_profiles::observe_completed(
                     db,
                     profile_identity.as_ref(),
@@ -9447,6 +9518,27 @@ impl Fleet {
             {
                 for (identity, item) in batch_profile_identities.iter().zip(items) {
                     let item_meta = metadata.for_batch_item(&item);
+                    // An item the batch never ran to an end (handed off as
+                    // suspended) says nothing about how the machine ends work.
+                    if !item.suspended {
+                        record_command_outcome(
+                            db.clone(),
+                            identity,
+                            &profile_context.os,
+                            &selected.executor_id,
+                            reliability::CommandOutcome::classify(
+                                item.exit_code,
+                                item.timed_out,
+                                item.stop.as_ref(),
+                                crate::execution::check_parsers::declared_empty_selection(
+                                    &item.body,
+                                ),
+                            ),
+                            Some(item.duration_ms),
+                            item.finished_at_unix_ms,
+                        )
+                        .await;
+                    }
                     let kind = resource_profiles::CompletionKind::classify(
                         item.succeeded && !item.timed_out && !item.suspended,
                         &item.body,
@@ -10104,12 +10196,31 @@ impl Fleet {
             let queue = forecast_queue_wait(entry, &prices, request, run.predicted_ms, now);
             let sync_cost = estimate(request, entry);
             sync_costs.insert(entry.identity.executor_id.clone(), sync_cost);
-            predictions.insert(
-                entry.identity.executor_id.clone(),
-                placement_prediction_with_contention(
-                    entry, warmth, queue, run, contention, sync_cost,
-                ),
+            let mut prediction = placement_prediction_with_contention(
+                entry, warmth, queue, run, contention, sync_cost,
             );
+            if let Some(db) = &oracle.db {
+                let identities: Vec<&CommandResourceIdentity> = match plan {
+                    Some(plan) if !plan.batch_identities.is_empty() => {
+                        plan.batch_identities.iter().collect()
+                    }
+                    _ => request.command_resource_identity.iter().collect(),
+                };
+                if !identities.is_empty() {
+                    price_reliability(
+                        &mut prediction,
+                        reliability::resolve(
+                            db.clone(),
+                            &identities,
+                            &entry.identity.executor_id,
+                            &executor_public_name(entry),
+                            now,
+                        )
+                        .await,
+                    );
+                }
+            }
+            predictions.insert(entry.identity.executor_id.clone(), prediction);
         }
         // Stage three: rank on when each machine is predicted to answer. Budget
         // inspection and consumption share one short critical section, after all
@@ -11890,7 +12001,9 @@ impl<'a> ScoredCandidate<'a> {
                     evidence: hold.evidence.clone(),
                 },
             };
-            prediction.predicted_verdict_ms = prediction.adjusted_run_ms;
+            prediction.predicted_verdict_ms = prediction
+                .adjusted_run_ms
+                .saturating_add(prediction.reliability_penalty_ms());
         }
         prediction.declined_here = declined_here;
         let admission_accepts = !cpu_blind
@@ -12768,6 +12881,51 @@ fn placement_prediction_with_contention(
         warmth,
         // Set by ranking, which is what knows this entry's declines.
         declined_here: None,
+        reliability: None,
+    }
+}
+
+/// Add a machine's own same-signature failure history to its time to a
+/// verdict. The penalty is a summand like the queue and the run, so the
+/// earliest-verdict order and the preference deadline both see it, and it
+/// never removes the machine from ranking.
+fn price_reliability(prediction: &mut PlacementPrediction, estimate: Option<ReliabilityEstimate>) {
+    let Some(estimate) = estimate else {
+        return;
+    };
+    prediction.predicted_verdict_ms = prediction
+        .predicted_verdict_ms
+        .saturating_add(estimate.penalty_ms);
+    prediction.reliability = Some(estimate);
+}
+
+/// Record how one completion ended, when it says anything about the machine.
+/// Best effort: a lost row costs one sample of history, never the work.
+#[allow(clippy::too_many_arguments)]
+async fn record_command_outcome(
+    db: Arc<crate::storage::LocalDb>,
+    identity: &CommandResourceIdentity,
+    os: &str,
+    executor_id: &str,
+    outcome: Option<reliability::CommandOutcome>,
+    duration_ms: Option<u64>,
+    finished_at_unix_ms: u64,
+) {
+    let Some(outcome) = outcome else {
+        return;
+    };
+    if let Err(error) = reliability::record(
+        db,
+        identity,
+        os,
+        executor_id,
+        &outcome,
+        duration_ms,
+        finished_at_unix_ms,
+    )
+    .await
+    {
+        tracing::warn!(%executor_id, %error, "could not record a command outcome");
     }
 }
 
@@ -19380,6 +19538,188 @@ mod tests {
             &ExplorationState::default(),
         );
         assert_eq!(winner.unwrap().entry.identity.executor_id, idle_id);
+    }
+
+    /// A colocated macOS home and an idle Linux remote that would otherwise
+    /// tie, the home carrying `penalty_ms` of its own stall history.
+    fn priced_home_and_remote(
+        penalty_ms: Option<u64>,
+    ) -> (
+        ExecutorConnectionState,
+        ExecutorConnectionState,
+        [PlacementPrediction; 2],
+    ) {
+        let (_, mut home) = fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]);
+        let (_, mut remote) = fleet_entry("fedora", "linux", 0, &[]);
+        home.colocated = true;
+        measured(&mut home, 0.1, 8_000_000_000, 8_000_000_000);
+        measured(&mut remote, 0.1, 8_000_000_000, 8_000_000_000);
+        let warmth = CacheWarmthEvidence::Observed {
+            warmth: ExecutionWarmth::Cold,
+            observed_at_unix_ms: NOW,
+        };
+        let queue = QueueForecast::Forecast {
+            predicted_ms: 0,
+            requests_ahead: 0,
+            running_ahead: 0,
+            fully_measured: true,
+            observed_at_unix_ms: NOW,
+            stalled_head_ms: None,
+        };
+        let mut run = test_prior_duration();
+        run.predicted_ms = 600_000;
+        let idle = ContentionEstimate {
+            co_resident_compile_jobs: 0,
+            co_resident_light_jobs: 0,
+            multiplier_millis: 1_000,
+            source: cairn_common::executor_protocol::ContentionEvidence::Machine,
+            sample_count: 12,
+            fallback: None,
+        };
+        let mut home_prediction = placement_prediction_with_contention(
+            &home,
+            warmth.clone(),
+            queue.clone(),
+            run.clone(),
+            idle.clone(),
+            SyncCost::Known(0),
+        );
+        price_reliability(
+            &mut home_prediction,
+            penalty_ms.map(|penalty_ms| ReliabilityEstimate {
+                executor_name: LOCAL_EXECUTOR_NAME.into(),
+                signature: "silent_stop".into(),
+                failures: 2,
+                of: 4,
+                mean_failure_ms: penalty_ms,
+                penalty_ms,
+            }),
+        );
+        let remote_prediction = placement_prediction_with_contention(
+            &remote,
+            warmth,
+            queue,
+            run,
+            idle,
+            SyncCost::Known(0),
+        );
+        (home, remote, [home_prediction, remote_prediction])
+    }
+
+    fn local_first() -> ActivePlacementPolicy {
+        ActivePlacementPolicy {
+            name: "local-first".into(),
+            profile: profile_with_routes(60, |_| PlacementStance::LocalFirst),
+        }
+    }
+
+    /// Without stall history the local-first stance keeps a comparable lane
+    /// home; a home whose own stalls cost more than the preference window
+    /// ranks behind an idle remote, and the stance no longer rescues it.
+    #[test]
+    fn a_stalling_home_is_priced_behind_an_idle_remote() {
+        let request = spillable_request();
+        let (home, remote, predictions) = priced_home_and_remote(None);
+        let scored = vec![
+            ScoredCandidate::new(
+                &home,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                predictions[0].clone(),
+                None,
+                None,
+                NOW,
+            ),
+            ScoredCandidate::new(
+                &remote,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                predictions[1].clone(),
+                None,
+                None,
+                NOW,
+            ),
+        ];
+        let (winner, _, _, _, _) = rank_candidates(
+            &scored,
+            false,
+            true,
+            &request,
+            &local_first(),
+            &ExplorationState::default(),
+        );
+        assert_eq!(
+            winner.unwrap().entry.identity.executor_id,
+            COLOCATED_EXECUTOR_ID,
+            "an unpenalized home keeps the comparable lane"
+        );
+
+        let (home, remote, predictions) = priced_home_and_remote(Some(30 * 60_000));
+        assert_eq!(predictions[0].predicted_verdict_ms, 600_000 + 30 * 60_000);
+        assert_eq!(predictions[0].reliability_penalty_ms(), 30 * 60_000);
+        let scored = vec![
+            ScoredCandidate::new(
+                &home,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                predictions[0].clone(),
+                None,
+                None,
+                NOW,
+            ),
+            ScoredCandidate::new(
+                &remote,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                predictions[1].clone(),
+                None,
+                None,
+                NOW,
+            ),
+        ];
+        let (winner, _, _, _, _) = rank_candidates(
+            &scored,
+            false,
+            true,
+            &request,
+            &local_first(),
+            &ExplorationState::default(),
+        );
+        assert_eq!(winner.unwrap().entry.identity.executor_id, "fedora");
+    }
+
+    /// Priced, never excluded: a penalized machine that is the only candidate
+    /// still takes the work.
+    #[test]
+    fn a_penalized_machine_still_wins_when_it_is_the_only_candidate() {
+        let request = spillable_request();
+        let (home, _, predictions) = priced_home_and_remote(Some(90 * 60_000));
+        let scored = vec![ScoredCandidate::new(
+            &home,
+            SyncCost::Known(0),
+            None,
+            &ResourceReservation::default(),
+            predictions[0].clone(),
+            None,
+            None,
+            NOW,
+        )];
+        let (winner, _, _, _, _) = rank_candidates(
+            &scored,
+            false,
+            true,
+            &request,
+            &local_first(),
+            &ExplorationState::default(),
+        );
+        assert_eq!(
+            winner.unwrap().entry.identity.executor_id,
+            COLOCATED_EXECUTOR_ID
+        );
     }
 
     #[test]
@@ -26414,6 +26754,7 @@ mod tests {
             public_handle: "111111111111111111111111".into(),
             ran_at: 1,
             environment_fingerprint: "env".to_string(),
+            executor_id: None,
             reusable: true,
         };
         second.published(Some(recorded.clone()));

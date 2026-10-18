@@ -42,6 +42,15 @@ macro_rules! private_purge_poisoned_duration_profiles {
     };
 }
 
+/// cairn/5066: how each recent completion of a command ended, per machine, so
+/// placement can price a machine by its own same-signature failures. Machine-
+/// local observation like the duration profiles, so private like they are.
+macro_rules! private_command_outcome_history {
+    () => {
+        migration!("0265_command_outcome_history")
+    };
+}
+
 /// Machines that could not prepare a project's cells because a setup command
 /// was not found there. Describes this installation's own fleet only.
 macro_rules! private_executor_preparation_refusals {
@@ -1684,6 +1693,7 @@ macro_rules! private_lineage {
             shared_tail_tenet_ruling_imports!(),
             shared_tail_tenet_evidence!(),
             shared_tail_tenet_evidence_measured_by!(),
+            private_command_outcome_history!(),
         ]
     };
 }
@@ -2158,6 +2168,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // observations of how work behaves HERE, rebuildable by running it again.
     (
         "command_contention_profiles",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    // How recent completions of a command ended on each machine (0264). Same
+    // category again: what happened HERE, rebuildable by running the work.
+    (
+        "command_outcome_history",
         TableScope::Private(PrivateReason::RebuildableCache),
     ),
     // The desktop-automation capabilities this runner last probed off each
@@ -3387,6 +3403,7 @@ mod tests {
                 "tenet_ruling_imports",
                 "tenet_evidence",
                 "tenet_evidence_measured_by",
+                "command_outcome_history",
             ]
         );
         assert_eq!(

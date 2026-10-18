@@ -140,6 +140,12 @@ pub struct CheckPlan {
     pub(crate) verdict_environment_names: Vec<String>,
     /// Platforms whose observations the project accepts as this check's verdict.
     pub(crate) verdict_platforms: Vec<String>,
+    /// The machines whose observations may answer this plan, when a request
+    /// named one. `None` admits any machine on a trusted platform; an empty
+    /// list admits none, which is the honest answer for a name nothing this
+    /// runner knows of carries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) verdict_executor_ids: Option<Vec<String>>,
     /// Set when the check's DECLARATION cannot be expanded safely, which makes
     /// the check unrunnable rather than merely un-narrowed.
     ///
@@ -212,6 +218,7 @@ fn unexpandable_plan(name: &str, check: &CheckCommand, placeholder: &str) -> Che
             check,
         ),
         verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
+        verdict_executor_ids: None,
         config_error: Some(error),
     }
 }
@@ -255,6 +262,7 @@ fn plan_one(
                 check,
             ),
             verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
+            verdict_executor_ids: None,
             config_error,
         }
     };
@@ -266,6 +274,7 @@ fn plan_one(
         let error = format!("check {name:?} {error}");
         log::warn!("{error}");
         return CheckPlan {
+            verdict_executor_ids: None,
             config_error: Some(error),
             ..full_plan(CheckScope::Full, true)
         };
@@ -317,6 +326,7 @@ fn plan_one(
                 check,
             ),
             verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
+            verdict_executor_ids: None,
             config_error: None,
         }
     } else if check.command.contains(TARGETS_PLACEHOLDER) {
@@ -347,6 +357,7 @@ fn plan_one(
                     verdict_environment_names:
                         crate::execution::check_identity::verdict_environment_names(check),
                     verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
+                    verdict_executor_ids: None,
                     config_error: None,
                 }
             }
@@ -363,6 +374,7 @@ fn plan_one(
                     verdict_environment_names:
                         crate::execution::check_identity::verdict_environment_names(check),
                     verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
+                    verdict_executor_ids: None,
                     config_error: None,
                 }
             }

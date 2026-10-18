@@ -828,6 +828,10 @@ struct ManualCheckContractSnapshot {
     /// so a manual check on one branch can never run another branch's definition.
     defined_by_commit: String,
     configured_check: CheckCommand,
+    /// Where this run may be placed and whose answer counts, after the
+    /// request's override was applied to `configured_check`. The configured
+    /// check itself stays untouched: it is what the cache key is computed from.
+    placement: crate::execution::check_placement::EffectiveCheckPlacement,
     plan: CheckPlan,
     timeout_ms: u64,
 }
@@ -927,6 +931,7 @@ async fn resolve_manual_check_contract_snapshot(
     run_id: &str,
     check_name: &str,
     branch: Option<&str>,
+    placement_override: Option<&crate::execution::check_placement::CheckPlacementOverride>,
 ) -> Result<ManualCheckContractSnapshot, String> {
     let db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
         .await
@@ -989,6 +994,14 @@ async fn resolve_manual_check_contract_snapshot(
     let check = checks
         .get(check_name)
         .ok_or_else(|| format!("configured check {check_name:?} was not found"))?;
+    // Refused here, before anything is planned: a request this check cannot
+    // answer must not cost a tree read, let alone a lane.
+    let placement = crate::execution::check_placement::resolve_check_placement(
+        check_name,
+        check,
+        placement_override,
+        |name| orch.fleet.executor_os_named(name),
+    )?;
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let tree_hash = crate::jj::logical_tree_hash(&jj, &repository, &commit)?;
     let entries = crate::jj::tree_entries(&jj, &repository, &commit).ok();
@@ -998,7 +1011,7 @@ async fn resolve_manual_check_contract_snapshot(
     };
     let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
     let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
-    let (plan, input_hash) = manual_check_plan(
+    let (mut plan, input_hash) = manual_check_plan(
         &checks,
         &inputs,
         entries.as_deref(),
@@ -1006,6 +1019,13 @@ async fn resolve_manual_check_contract_snapshot(
         check_name,
         &repository,
     )?;
+    // Reuse answers only what this request may count: the narrowed platforms,
+    // and for a named machine, that machine's own observations.
+    plan.verdict_platforms = placement.verdict_platforms.clone();
+    plan.verdict_executor_ids = placement
+        .executor_name
+        .as_deref()
+        .map(|name| orch.fleet.executor_ids_named(name));
     let configured_check = check.clone();
     let timeout_ms =
         resolve_check_timeout_ms(Some(&configured_check), DEFAULT_REVIEW_CHECK_TIMEOUT_MS);
@@ -1033,6 +1053,7 @@ async fn resolve_manual_check_contract_snapshot(
         attribution_target,
         defined_by_commit,
         configured_check,
+        placement,
         plan,
         timeout_ms: timeout_ms.into(),
     })
@@ -1090,10 +1111,14 @@ async fn base_relative_transport(
 
 /// The one item a manual run submits, less the per-attempt command and stream.
 /// Built once, so every attempt carries the transport computed for this run.
+// Each argument is a distinct, already-resolved fact about this one run;
+// bundling them would only rename the parameter list.
+#[allow(clippy::too_many_arguments)]
 fn manual_check_batch_item(
     check_name: &str,
     input_hash: &str,
     check: &CheckCommand,
+    placement: &crate::execution::check_placement::EffectiveCheckPlacement,
     resource_class: CheckResourceClass,
     timeout_ms: u64,
     infra_scopes: InfraScopes,
@@ -1112,8 +1137,8 @@ fn manual_check_batch_item(
         env: transport_env,
         verdict_environment_names: Vec::new(),
         timeout_ms,
-        executor: check.executor.clone(),
-        verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
+        executor: placement.selector.clone(),
+        verdict_platforms: placement.verdict_platforms.clone(),
         resource_class,
         infra_scopes,
         avoid_executor_ids: Vec::new(),
@@ -1130,7 +1155,7 @@ pub async fn manual_check_cache_context(
     branch: Option<&str>,
 ) -> Result<ManualCheckCacheContext, String> {
     Ok(
-        resolve_manual_check_contract_snapshot(orch, run_id, check_name, branch)
+        resolve_manual_check_contract_snapshot(orch, run_id, check_name, branch, None)
             .await?
             .context,
     )
@@ -1184,6 +1209,24 @@ pub struct ManualConfiguredCheckResult {
     /// Set when the run produced NO VERDICT about the tree.
     pub no_verdict: Option<ManualCheckNoVerdict>,
     pub output_tail: String,
+    /// The machine whose run is the recorded verdict: this run's, or for a
+    /// reused verdict the source observation's. A mis-placed lane is visible
+    /// here without reading its log.
+    pub executor: Option<CheckMachine>,
+    /// The platform the recorded verdict counts from.
+    pub verdict_platform: Option<String>,
+    /// Why the batch pin this request inherited was not applied, when it
+    /// contradicted the suite's configuration.
+    pub placement_note: Option<String>,
+}
+
+/// A machine as a check result names it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckMachine {
+    /// The public name `cairn://executors` lists.
+    pub name: String,
+    pub os: String,
 }
 
 /// Why a manual run has no verdict to report.
@@ -1274,6 +1317,9 @@ fn manual_configured_check_result(
         exit_code: outcome.exit_code,
         no_verdict,
         output_tail: outcome.output_tail,
+        executor: None,
+        verdict_platform: None,
+        placement_note: None,
     }
 }
 
@@ -1306,12 +1352,14 @@ pub async fn run_manual_configured_check(
     run_id: &str,
     check_name: &str,
     branch: Option<&str>,
+    placement: Option<crate::execution::check_placement::CheckPlacementOverride>,
 ) -> Result<ManualConfiguredCheckResult, String> {
     run_manual_configured_check_with_progress(
         orch,
         run_id,
         check_name,
         branch,
+        placement,
         false,
         Arc::new(|_, _| {}),
     )
@@ -1325,10 +1373,19 @@ pub async fn run_manual_configured_check_with_progress(
     run_id: &str,
     check_name: &str,
     branch: Option<&str>,
+    placement: Option<crate::execution::check_placement::CheckPlacementOverride>,
     retry: bool,
     progress: ManualCheckProgress,
 ) -> Result<ManualConfiguredCheckResult, String> {
-    let contract = resolve_manual_check_contract_snapshot(orch, run_id, check_name, branch).await?;
+    let contract = resolve_manual_check_contract_snapshot(
+        orch,
+        run_id,
+        check_name,
+        branch,
+        placement.as_ref(),
+    )
+    .await?;
+    let placement = contract.placement;
     let context = contract.context;
     let db = crate::execution::routing::owning_db_for_job(&orch.db, &context.job_id)
         .await
@@ -1399,8 +1456,8 @@ pub async fn run_manual_configured_check_with_progress(
             work_class: crate::fleet::PlacementWorkClass::ReviewChecks,
         },
         &[CheckPlacementQuestion {
-            selector: command_check.executor.clone(),
-            verdict_platforms: crate::execution::check_identity::verdict_platforms(&command_check),
+            selector: placement.selector.clone(),
+            verdict_platforms: placement.verdict_platforms.clone(),
         }],
     )
     .await;
@@ -1408,6 +1465,7 @@ pub async fn run_manual_configured_check_with_progress(
         check_name,
         &context.input_hash,
         &command_check,
+        &placement,
         plan.resource_class,
         timeout_ms,
         infra_scopes[0].clone(),
@@ -1491,14 +1549,34 @@ pub async fn run_manual_configured_check_with_progress(
     let outcome = outcomes.into_iter().next().ok_or_else(|| {
         format!("Cairn lost the result of {check_name}. Run the same command again.")
     })?;
-    Ok(manual_configured_check_result(
+    let mut result = manual_configured_check_result(
         check_name,
         &context.project_key,
         commit_sha,
         context.tree_hash,
         context.input_hash,
         outcome,
-    ))
+    );
+    // A reused verdict's observation id is its source's, so this names the
+    // machine that actually produced the answer.
+    if let Some(crate::execution::cache::ObservationMachine {
+        executor_id,
+        verdict_platform,
+    }) = result.observation_id.as_deref().and_then(|id| {
+        crate::execution::cache::get_check_observation_machine(db.clone(), &project_id, id)
+            .ok()
+            .flatten()
+    }) {
+        result.executor = executor_id.map(|executor_id| CheckMachine {
+            name: orch.fleet.executor_name_for_text(&executor_id),
+            os: verdict_platform
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        });
+        result.verdict_platform = verdict_platform;
+    }
+    result.placement_note = placement.note;
+    Ok(result)
 }
 
 fn format_fixed_batch_summary(summary: &str, commit: &str, paths: &[String]) -> String {
@@ -1669,10 +1747,10 @@ fn split_write_check_batch_outcome(
                     let results = items
                         .into_iter()
                         .map(|item| {
-                            if let Some(stop) = &item.stop {
-                                return Err(stopped_command_failure(stop, &item.body));
-                            }
                             let provenance = metadata.for_batch_item(&item);
+                            if let Some(stop) = &item.stop {
+                                return Err(stopped_command_failure(stop, &item.body, provenance));
+                            }
                             let mut output = item.body;
                             append_sandbox_denial_evidence(&mut output, &item.sandbox_denials);
                             append_tracked_modification_evidence(
@@ -2373,10 +2451,15 @@ pub(crate) async fn plan_infra_scopes(
     let Some(orch) = orch else {
         return placements
             .iter()
-            .map(|_| InfraScopes {
+            .map(|placement| InfraScopes {
                 head: head.clone(),
                 fleet: None,
                 environments: Vec::new(),
+                platform_heads: InfraScopes::platform_heads_for(
+                    inputs.job_id,
+                    inputs.commit_sha,
+                    &placement.verdict_platforms,
+                ),
             })
             .collect();
     };
@@ -2414,6 +2497,11 @@ pub(crate) async fn plan_infra_scopes(
             };
             InfraScopes {
                 head: head.clone(),
+                platform_heads: InfraScopes::platform_heads_for(
+                    inputs.job_id,
+                    inputs.commit_sha,
+                    &placement.verdict_platforms,
+                ),
                 fleet: Some(crate::execution::cache::infra_fleet_scope(
                     &orch.fleet.capability_identity(scope),
                 )),
@@ -2484,9 +2572,23 @@ pub(crate) fn reserve_batch_items(
             // budget for this check is spent is steered away from rather than
             // refused: somewhere else may still be healthy, and a verdict from a
             // healthy machine beats a diagnostic from a broken one.
-            Ok(CheckExecutionClaim::Clear { mut avoid }) => {
+            Ok(CheckExecutionClaim::Clear {
+                mut avoid,
+                avoid_platforms,
+            }) => {
                 avoid.sort();
                 item.avoid_executor_ids = avoid;
+                // A platform whose own stall budget is spent at this head is
+                // dropped from what this request counts. The claim refuses the
+                // item outright when every platform is spent, so what is left
+                // is never empty, which would read as "any platform".
+                if !avoid_platforms.is_empty() {
+                    item.verdict_platforms.retain(|platform| {
+                        !avoid_platforms
+                            .iter()
+                            .any(|avoided| avoided.eq_ignore_ascii_case(platform))
+                    });
+                }
                 admitted.push(item);
             }
             // Fail open. A reservation that could not be read must not become one
@@ -3456,7 +3558,7 @@ fn infra_repair_domain(
             // waited on something that never came. That is a defect in the
             // command at this head, owned by whoever owns the suite, and no
             // machine repair or fleet change touches it.
-            SubstrateFailureShape::CommandStalled => InfraRepairDomain::Head,
+            SubstrateFailureShape::CommandStalled => InfraRepairDomain::HeadOnPlatform,
         };
     }
     // No substrate failure means the command RAN and its own output named the
@@ -3616,6 +3718,12 @@ pub(crate) struct SubstrateFailure {
     /// the whole batch settles, so the check's own timer reads zero however long
     /// it actually waited or ran; this is the time it really spent.
     elapsed_ms: Option<i64>,
+    /// The executor's account of the command this failure ended, when one ran:
+    /// a command the executor stopped still ran somewhere, on some platform.
+    /// Which platform decides which stall counter it is charged to, and the
+    /// machine is what a result names. Boxed: every check result carries this
+    /// failure type, and the metadata is larger than all its other fields.
+    provenance: Option<Box<cairn_common::executor_protocol::CellExecutionMeta>>,
 }
 
 impl SubstrateFailure {
@@ -3626,7 +3734,21 @@ impl SubstrateFailure {
             build_service_implicated: false,
             waited_on: None,
             elapsed_ms: None,
+            provenance: None,
         }
+    }
+
+    /// Attach the executor's account of the command this failure ended.
+    pub(crate) fn ran_as(
+        mut self,
+        provenance: cairn_common::executor_protocol::CellExecutionMeta,
+    ) -> Self {
+        self.provenance = Some(Box::new(provenance));
+        self
+    }
+
+    pub(crate) fn provenance(&self) -> Option<&cairn_common::executor_protocol::CellExecutionMeta> {
+        self.provenance.as_deref()
     }
 
     /// Record how long the request behind this failure was outstanding.
@@ -5994,6 +6116,29 @@ pub(crate) fn suppressed_check_message(suppressed: &SuppressedCheck) -> String {
                 format!("{head}\n\nLast diagnostic:\n{last}")
             }
         }
+        InfraRepairDomain::HeadOnPlatform => {
+            let platforms = suppressed
+                .scopes
+                .iter()
+                .map(|scope| scope.platform.as_deref().unwrap_or("an unnamed platform"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut message = format!(
+                "Stopped after {streak} infrastructure failures on this commit on every platform this check counts ({platforms}); re-runs automatically on the next commit."
+            );
+            for scope in &suppressed.scopes {
+                let last = scope.entry.output_tail.trim();
+                if last.is_empty() {
+                    continue;
+                }
+                let platform = scope.platform.as_deref().unwrap_or("an unnamed platform");
+                message.push_str(&format!(
+                    "\n\nLast diagnostic on {platform}:\n{}",
+                    tail_lines(last, SUPPRESSION_MACHINE_DIAGNOSTIC_CHARS)
+                ));
+            }
+            message
+        }
         InfraRepairDomain::Environment => {
             let machines = suppressed
                 .scopes
@@ -6398,6 +6543,7 @@ pub(crate) fn reusable_verdict_for_plan(
         &plan.name,
         input_hash,
         &plan.verdict_platforms,
+        plan.verdict_executor_ids.as_deref(),
         &effective_verdict_environment_hash(plan, effective_env),
     )
 }
@@ -6424,6 +6570,7 @@ pub(crate) fn reusable_verdict_for_check(
         name,
         input_hash,
         &crate::execution::check_identity::verdict_platforms(check),
+        None,
         &environment_hash,
     )
 }
@@ -6434,6 +6581,7 @@ fn reusable_verdict(
     check_name: &str,
     input_hash: &str,
     verdict_platforms: &[String],
+    executor_ids: Option<&[String]>,
     verdict_environment_hash: &str,
 ) -> Option<ReusedCheckVerdict> {
     let reused = get_reusable_check_result(
@@ -6443,6 +6591,7 @@ fn reusable_verdict(
             check_name,
             input_hash,
             verdict_platforms,
+            executor_ids,
             implementation_identity: cairn_checkenv::implementation_identity(),
             verdict_environment_hash,
             result_schema_version: crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION
@@ -6663,6 +6812,7 @@ where
             public_handle,
             ran_at: entry.ran_at,
             environment_fingerprint: source_environment_fingerprint.clone(),
+            executor_id: entry.executor_id.clone(),
             // Only a reusable observation is ever admitted as a hit.
             reusable: true,
         };
@@ -6845,16 +6995,21 @@ where
                     // the check's output, while the composed failure travels
                     // beside it — its diagnostic to the operator log record
                     // below, its applicability to the advisory gate.
-                    Err(CheckExecutionFailure::Substrate(failure)) => (
-                        None,
-                        failure.agent_message(),
-                        false,
-                        false,
-                        failure.elapsed_ms(),
-                        Some(failure),
-                        None,
-                        None,
-                    ),
+                    // A stopped command still ran somewhere, so its provenance
+                    // survives: it picks the platform the stall is charged to.
+                    Err(CheckExecutionFailure::Substrate(failure)) => {
+                        let provenance = failure.provenance().cloned();
+                        (
+                            None,
+                            failure.agent_message(),
+                            false,
+                            false,
+                            failure.elapsed_ms(),
+                            Some(failure),
+                            provenance,
+                            None,
+                        )
+                    }
                     Err(
                         CheckExecutionFailure::Suppressed(_)
                         | CheckExecutionFailure::NotPlaceable(_),
@@ -6923,6 +7078,9 @@ where
                         .as_ref()
                         .filter(|_| environment_still_current)
                         .map(|meta| meta.executor_id.as_str()),
+                    provenance
+                        .as_ref()
+                        .and_then(|meta| meta.verdict_platform.as_deref()),
                 );
                 let target_results_json =
                     parsed.as_ref().and_then(|p| serde_json::to_string(p).ok());
@@ -7126,6 +7284,9 @@ where
                             reuse,
                             infra_scopes.verdict_scopes(
                                 provenance.as_ref().map(|meta| meta.executor_id.as_str()),
+                                provenance
+                                    .as_ref()
+                                    .and_then(|meta| meta.verdict_platform.as_deref()),
                             ),
                         );
                         let identity = crate::execution::cache::RecordedCheckObservation {
@@ -7133,6 +7294,7 @@ where
                             public_handle: observation.public_handle.clone(),
                             ran_at: observation.ran_at,
                             environment_fingerprint: observation.environment_fingerprint.clone(),
+                            executor_id: observation.executor_id.clone(),
                             reusable: observation.reusable,
                         };
                         let (recorded, not_recorded) = match record_fresh_check_observation(
@@ -7282,6 +7444,7 @@ fn needs_execution(
             check_name: &plan.name,
             input_hash,
             verdict_platforms: &plan.verdict_platforms,
+            executor_ids: plan.verdict_executor_ids.as_deref(),
             implementation_identity: cairn_checkenv::implementation_identity(),
             verdict_environment_hash: &effective_verdict_environment_hash(plan, effective_env),
             result_schema_version: crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION
@@ -7835,27 +7998,31 @@ fn append_tracked_modification_evidence(
 /// reusable verdict. A stall names the request's own last output and how long
 /// it was quiet, so the reader looks at this command rather than at whatever
 /// the machine was doing when it was read; a cancellation is a withdrawal.
+///
+/// The executor's account of the command travels with the failure: the stall
+/// is charged to the counter of the platform it happened on, and the result
+/// names the machine.
 fn stopped_command_failure(
     stop: &cairn_common::executor_protocol::CommandStop,
     output: &str,
+    provenance: cairn_common::executor_protocol::CellExecutionMeta,
 ) -> CheckExecutionFailure {
-    match stop {
-        cairn_common::executor_protocol::CommandStop::Silent { .. } => {
-            CheckExecutionFailure::substrate(
-                SubstrateFailureShape::CommandStalled,
-                format!(
-                    "stopped by its executor: {}. The process tree it left, if any, is listed under Stopped commands on the executor's page.
+    let failure = match stop {
+        cairn_common::executor_protocol::CommandStop::Silent { .. } => SubstrateFailure::new(
+            SubstrateFailureShape::CommandStalled,
+            format!(
+                "stopped by its executor: {}. The process tree it left, if any, is listed under Stopped commands on the executor's page.
 
 {output}",
-                    stop.describe()
-                ),
-            )
-        }
-        cairn_common::executor_protocol::CommandStop::Cancelled => CheckExecutionFailure::substrate(
+                stop.describe()
+            ),
+        ),
+        cairn_common::executor_protocol::CommandStop::Cancelled => SubstrateFailure::new(
             SubstrateFailureShape::Cancelled,
             "cell request was cancelled while its command ran",
         ),
-    }
+    };
+    CheckExecutionFailure::Substrate(failure.ran_as(provenance))
 }
 
 fn check_result_from_cell_outcome(
@@ -7868,6 +8035,7 @@ fn check_result_from_cell_outcome(
         } if metadata.stop.is_some() => Err(stopped_command_failure(
             metadata.stop.as_ref().expect("guarded"),
             &output,
+            metadata.clone(),
         )),
         CellOutcome::Completed {
             exit_code,
@@ -8475,7 +8643,7 @@ mod tests {
             (Shape::OutcomeUnknown, Domain::Head),
             (Shape::Storage, Domain::Head),
             (Shape::Cancelled, Domain::Head),
-            (Shape::CommandStalled, Domain::Head),
+            (Shape::CommandStalled, Domain::HeadOnPlatform),
         ];
         assert_eq!(
             table.len(),
@@ -10221,6 +10389,7 @@ cairn-common = { path = "../cairn-common" }
             resource_class: CheckResourceClass::Shared,
             verdict_environment_names: Vec::new(),
             verdict_platforms: vec![crate::execution::check_identity::gating_platform().to_string()],
+            verdict_executor_ids: None,
             config_error: None,
         };
 
@@ -12267,6 +12436,122 @@ cairn-common = { path = "../cairn-common" }
         ));
     }
 
+    /// A stall is charged to the platform it happened on, end to end: three
+    /// macOS silent stops, decoded from real cell outcomes and recorded by the
+    /// evaluator, leave a `[linux, macos]` request free to run on Linux, and
+    /// the stalled result still names its machine.
+    #[tokio::test]
+    async fn three_macos_stalls_leave_a_linux_request_runnable() {
+        use crate::execution::cache::{claim_check_execution, get_suppressed_check_result};
+        let db = cache_db().await;
+        let stop = cairn_common::executor_protocol::CommandStop::Silent {
+            quiet_ms: 1_800_000,
+            last_output_unix_ms: None,
+            cpu_ms_in_window: Some(3),
+        };
+        let metadata: cairn_common::executor_protocol::CellExecutionMeta =
+            serde_json::from_value(serde_json::json!({
+                "executorId": "mac-1", "slotId": "slot", "cellEpoch": 1,
+                "startedAtUnixMs": 1, "finishedAtUnixMs": 2,
+                "verdictPlatform": "macos",
+                "stop": serde_json::to_value(&stop).unwrap(),
+            }))
+            .unwrap();
+        let failure = check_result_from_cell_outcome(
+            CellOutcome::Completed {
+                request_id: "request".into(),
+                attempt_id: "attempt".into(),
+                exit_code: Some(137),
+                output: "resources::browsers::tests SLOW >60s".into(),
+                timed_out: false,
+                metadata,
+                mutation_delta: None,
+                sandbox_denials: Vec::new(),
+                tracked_modifications: None,
+            },
+            None,
+        )
+        .expect_err("a stopped command is not a verdict");
+        let CheckExecutionFailure::Substrate(substrate) = &failure else {
+            panic!("a stall is a substrate failure: {failure:?}");
+        };
+        assert_eq!(
+            substrate
+                .provenance()
+                .and_then(|meta| meta.verdict_platform.as_deref()),
+            Some("macos"),
+            "the stall keeps the platform it ran on"
+        );
+
+        let lane = plan("rust-tests", "bun run test:rust");
+        let plans = vec![(lane.clone(), "ih-rust".to_string())];
+        let commit = CheckRunCommit {
+            evaluated: "commit-a",
+            defined_by: "commit-a",
+        };
+        let platforms = vec!["linux".to_string(), "macos".to_string()];
+        let scopes = InfraScopes {
+            platform_heads: InfraScopes::platform_heads_for("job-a", "commit-a", &platforms),
+            ..InfraScopes::head_only("job-a", "commit-a")
+        };
+        for _ in 0..crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND {
+            // Submission reserves the attempt; the evaluator records its result.
+            assert!(matches!(
+                claim_check_execution(db.clone(), "project-a", &lane.name, "ih-rust", &scopes)
+                    .unwrap(),
+                crate::execution::cache::CheckExecutionClaim::Clear { .. }
+            ));
+            let coordinates = sealed_coordinates(commit, "tree-a", &plans);
+            let failure = failure.clone();
+            let outcome = run_planned_checks_with_board(
+                db.clone(),
+                "project-a",
+                commit,
+                "tree-a",
+                "job-a",
+                &plans,
+                &coordinates,
+                std::slice::from_ref(&scopes),
+                "turn-checks:job-a",
+                CheckExecMode::Shared,
+                None,
+                None,
+                &[],
+                false,
+                move |_index, _command, _stream_id| {
+                    let failure = failure.clone();
+                    async move { Err::<CheckExecResult, _>(failure) }
+                },
+                |_| {},
+            )
+            .await
+            .remove(0);
+            assert_eq!(
+                outcome
+                    .recorded
+                    .as_ref()
+                    .and_then(|recorded| recorded.executor_id.as_deref()),
+                Some("mac-1"),
+                "a stalled result names its machine"
+            );
+        }
+
+        let claim =
+            claim_check_execution(db.clone(), "project-a", &lane.name, "ih-rust", &scopes).unwrap();
+        let crate::execution::cache::CheckExecutionClaim::Clear {
+            avoid_platforms, ..
+        } = claim
+        else {
+            panic!("macOS stalls must not suppress the Linux half of the request: {claim:?}");
+        };
+        assert_eq!(avoid_platforms, vec!["macos".to_string()]);
+        assert!(
+            get_suppressed_check_result(db, "project-a", &lane.name, "ih-rust", &scopes)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// Every reason a cell can refuse to start, mapped to the condition class an
     /// agent is told — one at a time, from an exhaustive match, so a new reason
     /// upstream cannot reach an agent as a generic "could not start".
@@ -13287,6 +13572,7 @@ cairn-common = { path = "../cairn-common" }
                     verdict_platforms: &[
                         crate::execution::check_identity::gating_platform().to_string()
                     ],
+                    executor_ids: None,
                     implementation_identity: cairn_checkenv::implementation_identity(),
                     verdict_environment_hash: &cairn_checkenv::verdict_environment_hash(
                         Vec::<String>::new(),
@@ -13423,6 +13709,7 @@ cairn-common = { path = "../cairn-common" }
             verdict_environment_names: crate::execution::check_identity::verdict_environment_names(
                 &configured,
             ),
+            verdict_executor_ids: None,
             config_error: None,
             verdict_platforms: vec![crate::execution::check_identity::gating_platform().to_string()],
         }
@@ -14381,6 +14668,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                 public_handle: "111111111111111111111111".into(),
                 ran_at: 1_754_246_320_000,
                 environment_fingerprint: "env-local".to_string(),
+                executor_id: None,
                 reusable: false,
             }),
             not_recorded: None,
@@ -14417,6 +14705,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                 public_handle: public_handle.into(),
                 ran_at,
                 environment_fingerprint: "env".into(),
+                executor_id: None,
                 reusable: true,
             }),
             not_recorded: None,
@@ -14916,6 +15205,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                 check_name: "frontend",
                 input_hash: "ih-frontend",
                 verdict_platforms: &check.verdict_platforms,
+                executor_ids: None,
                 implementation_identity: cairn_checkenv::implementation_identity(),
                 verdict_environment_hash: &effective_verdict_environment_hash(&check, &[]),
                 result_schema_version: crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION
@@ -15109,6 +15399,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         };
         let scopes = InfraScopes {
             head: infra_suppression_scope("job-a", "commit-a"),
+            platform_heads: Vec::new(),
             fleet: Some(infra_fleet_scope("empty-eligible-set")),
             environments: Vec::new(),
         };
@@ -16930,6 +17221,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             verdict_environment_names: Vec::new(),
             infra_scopes: InfraScopes {
                 head: "head".into(),
+                platform_heads: Vec::new(),
                 fleet: None,
                 environments: vec![
                     ("machine-a".into(), "env-a".into()),
@@ -16978,6 +17270,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             verdict_environment_names: Vec::new(),
             infra_scopes: InfraScopes {
                 head: "head".into(),
+                platform_heads: Vec::new(),
                 fleet: None,
                 environments: vec![
                     ("machine-a".into(), "env-a".into()),
@@ -17339,6 +17632,13 @@ mod executor_base_content_tests {
                 check_name,
                 "input",
                 &check,
+                &crate::execution::check_placement::resolve_check_placement(
+                    check_name,
+                    &check,
+                    None,
+                    |_| None,
+                )
+                .unwrap(),
                 CheckResourceClass::Shared,
                 0,
                 InfraScopes::head_only("job", "commit"),

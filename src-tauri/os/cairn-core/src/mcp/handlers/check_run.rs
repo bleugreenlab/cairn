@@ -36,6 +36,35 @@ struct CheckRunPayload {
     observation_handle: Option<String>,
     #[serde(default)]
     retry: bool,
+    /// Narrow where the lane runs: a machine name or a platform, nothing else.
+    #[serde(default)]
+    executor: Option<cairn_common::executor_protocol::ExecutorSelector>,
+    /// Who asked for `executor`. Explicit when omitted.
+    #[serde(default)]
+    selector_source: Option<cairn_common::executor_protocol::CheckSelectorSource>,
+}
+
+impl CheckRunPayload {
+    /// The validated override this request carries, refused before anything
+    /// is queued when it asks for more than a name or a platform.
+    fn placement(
+        &self,
+    ) -> Result<Option<crate::execution::check_placement::CheckPlacementOverride>, String> {
+        match (&self.executor, self.selector_source) {
+            (None, None) => Ok(None),
+            (None, Some(_)) => Err(
+                "selectorSource names where an executor selector came from, and this request carries none"
+                    .into(),
+            ),
+            (Some(selector), source) => {
+                crate::execution::check_placement::CheckPlacementOverride::new(
+                    selector.clone(),
+                    source.unwrap_or_default(),
+                )
+                .map(Some)
+            }
+        }
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -126,6 +155,7 @@ pub(crate) async fn handle_check_run(orch: &Orchestrator, request: &McpCallbackR
             .as_deref()
             .filter(|suite| !suite.trim().is_empty())
             .ok_or_else(|| "configured suite name must not be empty".to_string())?;
+        let placement = payload.placement()?;
         let handle = uuid::Uuid::new_v4().to_string();
         retain_observation(
             &mut *MANUAL_CHECKS
@@ -160,6 +190,7 @@ pub(crate) async fn handle_check_run(orch: &Orchestrator, request: &McpCallbackR
                     &task_run_id,
                     &task_suite,
                     task_branch.as_deref(),
+                    placement,
                     task_retry,
                     progress,
                 )
@@ -217,6 +248,49 @@ mod tests {
             asserted_command.is_err(),
             "raw commands must not cross the trusted producer boundary"
         );
+    }
+
+    #[test]
+    fn payload_carries_a_placement_selector_and_its_source() {
+        let payload: CheckRunPayload = serde_json::from_value(serde_json::json!({
+            "suite": "rust-tests",
+            "executor": { "os": "linux" },
+            "selectorSource": "inherited"
+        }))
+        .unwrap();
+        let placement = payload.placement().unwrap().unwrap();
+        assert_eq!(placement.selector().os.as_deref(), Some("linux"));
+        assert_eq!(
+            placement.source(),
+            cairn_common::executor_protocol::CheckSelectorSource::Inherited
+        );
+
+        let defaulted: CheckRunPayload = serde_json::from_value(serde_json::json!({
+            "suite": "rust-tests",
+            "executor": { "name": "fedora" }
+        }))
+        .unwrap();
+        assert_eq!(
+            defaulted.placement().unwrap().unwrap().source(),
+            cairn_common::executor_protocol::CheckSelectorSource::Explicit
+        );
+
+        let capability: CheckRunPayload = serde_json::from_value(serde_json::json!({
+            "suite": "rust-tests",
+            "executor": { "os": "linux", "requiredToolchains": ["rust"] }
+        }))
+        .unwrap();
+        assert!(
+            capability.placement().is_err(),
+            "capability is the configuration's to declare"
+        );
+
+        let orphan: CheckRunPayload = serde_json::from_value(serde_json::json!({
+            "suite": "rust-tests",
+            "selectorSource": "explicit"
+        }))
+        .unwrap();
+        assert!(orphan.placement().is_err());
     }
 
     #[test]

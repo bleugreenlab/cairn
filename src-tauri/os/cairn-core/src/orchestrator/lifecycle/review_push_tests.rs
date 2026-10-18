@@ -108,6 +108,7 @@ fn waited_on_lanes(
                 output_tail: None,
                 failure_kind: None,
                 suppressed_after: None,
+                executor: None,
             },
         )
         .collect();

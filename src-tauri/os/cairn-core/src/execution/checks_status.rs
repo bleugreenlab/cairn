@@ -166,6 +166,10 @@ pub struct NodeCheckStatus {
     /// is the last real attempt, so without this a suppressed check would read as
     /// an ordinary infrastructure red that is still being retried.
     pub(crate) suppressed_after: Option<i64>,
+    /// The public name of the machine whose run is this lane's verdict (the
+    /// source machine, for a reused one), so a mis-placed lane is visible
+    /// without reading its log.
+    pub(crate) executor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -389,6 +393,9 @@ async fn compute_node_check_statuses(
                         check.policy,
                         check.when,
                         row,
+                        row.executor_id
+                            .as_deref()
+                            .map(|id| orch.fleet.executor_name_for_text(id)),
                     );
                 }
 
@@ -443,6 +450,7 @@ async fn compute_node_check_statuses(
                     output_tail,
                     failure_kind: None,
                     suppressed_after: None,
+                    executor: None,
                 }
             })
             .collect(),
@@ -523,6 +531,7 @@ fn status_from_row(
     policy: CheckPolicy,
     when: CheckWhen,
     row: &CheckResultCacheEntry,
+    executor: Option<String>,
 ) -> NodeCheckStatus {
     let parsed = row
         .target_results_json
@@ -581,6 +590,7 @@ fn status_from_row(
         suppressed_after: (row.infra_failure_streak
             >= crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND)
             .then_some(row.infra_failure_streak),
+        executor,
     }
 }
 
@@ -660,6 +670,9 @@ pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<Strin
             }
         }
         _ => {}
+    }
+    if let Some(machine) = &status.executor {
+        parts.push(format!("on {machine}"));
     }
     if status.cached == Some(true) {
         parts.push("cached".to_string());
@@ -1334,6 +1347,7 @@ mod tests {
                 CheckPolicy::Advisory,
                 CheckWhen::Review,
                 &row,
+                None,
             );
             assert_eq!(status.state, NodeCheckState::Unverified);
             assert!(
@@ -1355,6 +1369,7 @@ mod tests {
             CheckPolicy::Advisory,
             CheckWhen::Review,
             &row,
+            None,
         );
         assert_eq!(status.state, NodeCheckState::Unverified);
 
@@ -1381,6 +1396,7 @@ mod tests {
             CheckPolicy::Advisory,
             CheckWhen::Review,
             &tsc,
+            None,
         );
         assert_eq!(status.state, NodeCheckState::Passed);
     }
@@ -1421,6 +1437,7 @@ mod tests {
             CheckPolicy::Advisory,
             CheckWhen::Review,
             row,
+            None,
         );
         let annotation = format_status_annotation(&status).unwrap_or_default();
         (status.state, annotation)
@@ -1513,6 +1530,7 @@ mod tests {
             CheckPolicy::Advisory,
             CheckWhen::Review,
             &row,
+            None,
         );
         assert_eq!(status.output_tail.as_deref(), Some(LINT_REPORT));
 
@@ -1544,6 +1562,7 @@ mod tests {
             CheckPolicy::Advisory,
             CheckWhen::Review,
             &row,
+            None,
         );
         let excerpt = status.output_tail.unwrap();
         assert!(
@@ -1577,11 +1596,19 @@ mod tests {
             output_tail: None,
             failure_kind: None,
             suppressed_after: None,
+            executor: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
             Some("12 tests, 1 skipped, cached")
         );
+        status.executor = Some("fedora".into());
+        assert_eq!(
+            format_status_annotation(&status).as_deref(),
+            Some("12 tests, 1 skipped, on fedora, cached"),
+            "a lane names the machine its verdict came from"
+        );
+        status.executor = None;
         status.skipped = Some(0);
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -1614,6 +1641,7 @@ mod tests {
                 CheckPolicy::Advisory,
                 CheckWhen::Review,
                 row,
+                None,
             ))
             .unwrap_or_default()
         };
@@ -1659,6 +1687,7 @@ mod tests {
             output_tail: None,
             failure_kind: None,
             suppressed_after: None,
+            executor: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -1697,6 +1726,7 @@ mod tests {
             output_tail: Some("Cannot find module".to_string()),
             failure_kind: None,
             suppressed_after: None,
+            executor: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -1744,6 +1774,7 @@ mod tests {
             output_tail: Some("...".to_string()),
             failure_kind: Some("timed_out".to_string()),
             suppressed_after: None,
+            executor: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -1822,6 +1853,7 @@ mod tests {
             output_tail: Some("sccache: server startup failed".to_string()),
             failure_kind: Some("infrastructure".to_string()),
             suppressed_after: Some(3),
+            executor: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -1872,7 +1904,8 @@ mod tests {
                 "rust",
                 CheckPolicy::Advisory,
                 CheckWhen::Review,
-                &row
+                &row,
+                None
             )
             .suppressed_after,
             None
@@ -1886,7 +1919,8 @@ mod tests {
                 "rust",
                 CheckPolicy::Advisory,
                 CheckWhen::Review,
-                &row
+                &row,
+                None
             )
             .suppressed_after,
             Some(crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND)
@@ -1916,6 +1950,7 @@ mod tests {
             output_tail: Some("Failed to spawn command".to_string()),
             failure_kind: Some("spawn_error".to_string()),
             suppressed_after: None,
+            executor: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),

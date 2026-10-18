@@ -50,6 +50,8 @@ mod cli_parse_tests {
                     suites,
                     branch,
                     retry,
+                    os,
+                    executor,
                 },
         }) = current.command
         else {
@@ -58,6 +60,8 @@ mod cli_parse_tests {
         assert_eq!(suites, ["rust-tests"]);
         assert_eq!(branch, None);
         assert!(!retry);
+        assert_eq!(os, None);
+        assert_eq!(executor, None);
 
         let explicit = Args::try_parse_from([
             "cairn",
@@ -75,6 +79,7 @@ mod cli_parse_tests {
                     suites,
                     branch,
                     retry,
+                    ..
                 },
         }) = explicit.command
         else {
@@ -104,6 +109,54 @@ mod cli_parse_tests {
             panic!("expected check run")
         };
         assert!(retry);
+    }
+
+    #[test]
+    fn check_run_accepts_a_platform_or_a_machine_but_not_both() {
+        let args =
+            Args::try_parse_from(["cairn", "check", "run", "rust-tests", "--os", "linux"]).unwrap();
+        let Some(Command::Check {
+            command: CheckCommand::Run { os, executor, .. },
+        }) = args.command
+        else {
+            panic!("expected check run")
+        };
+        assert_eq!(os.as_deref(), Some("linux"));
+        assert_eq!(executor, None);
+
+        let args = Args::try_parse_from([
+            "cairn",
+            "check",
+            "run",
+            "rust-tests",
+            "--executor",
+            "fedora",
+        ])
+        .unwrap();
+        let Some(Command::Check {
+            command: CheckCommand::Run { os, executor, .. },
+        }) = args.command
+        else {
+            panic!("expected check run")
+        };
+        assert_eq!(os, None);
+        assert_eq!(executor.as_deref(), Some("fedora"));
+
+        assert!(Args::try_parse_from([
+            "cairn",
+            "check",
+            "run",
+            "rust-tests",
+            "--os",
+            "linux",
+            "--executor",
+            "fedora",
+        ])
+        .is_err());
+        assert!(
+            Args::try_parse_from(["cairn", "check", "run", "rust-tests", "--os", "plan9",])
+                .is_err()
+        );
     }
 
     #[test]
@@ -270,6 +323,15 @@ enum CheckCommand {
         /// Force a fresh execution even when an exact reusable verdict exists.
         #[arg(long)]
         retry: bool,
+        /// Run the lane on a machine of this platform. The suite must count this
+        /// platform's verdict (`verdictPlatforms`), or the request is refused.
+        /// Without this flag or `--executor`, a shell inside a batch pinned to a
+        /// machine or platform inherits that pin.
+        #[arg(long, value_parser = ["linux", "macos", "windows"], conflicts_with = "executor")]
+        os: Option<String>,
+        /// Run the lane on this machine, by the public name `cairn://executors` lists.
+        #[arg(long)]
+        executor: Option<String>,
     },
 }
 
@@ -327,9 +389,18 @@ async fn async_main() -> Result<()> {
                     suites,
                     branch,
                     retry,
+                    os,
+                    executor,
                 },
         }) => {
-            let ok = run_cli_check(suites.clone(), branch.clone(), *retry).await;
+            let ok = run_cli_check(
+                suites.clone(),
+                branch.clone(),
+                *retry,
+                os.clone(),
+                executor.clone(),
+            )
+            .await;
             std::process::exit(if ok { 0 } else { 1 });
         }
         Some(Command::Executor { command }) => {

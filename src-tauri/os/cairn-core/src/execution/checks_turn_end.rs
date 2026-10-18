@@ -1451,8 +1451,14 @@ async fn run_turn_end_checks_inner(
     let verdicts: Vec<String> = outcomes
         .iter()
         .map(|o| {
+            let machine = o
+                .recorded
+                .as_ref()
+                .and_then(|recorded| recorded.executor_id.as_deref())
+                .map(|id| format!(", {}", orch.fleet.executor_name_for_text(id)))
+                .unwrap_or_default();
             format!(
-                "{}={} ({}ms)",
+                "{}={} ({}ms{machine})",
                 o.name,
                 if o.passed { "pass" } else { "fail" },
                 o.duration_ms
@@ -2454,6 +2460,7 @@ mod tests {
             output_tail: None,
             failure_kind: None,
             suppressed_after: None,
+            executor: None,
         }
     }
 
@@ -3154,6 +3161,7 @@ mod tests {
                 scope: crate::execution::selection::CheckScope::Full,
                 resource_class: crate::config::project_settings::CheckResourceClass::Shared,
                 verdict_environment_names: Vec::new(),
+                verdict_executor_ids: None,
                 config_error: None,
                 verdict_platforms: Vec::new(),
             },
