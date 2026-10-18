@@ -414,6 +414,10 @@ impl OrchestratorBuilder {
         self
     }
 
+    /// Construct the orchestrator. Must not spawn any task that holds a strong
+    /// `Orchestrator` clone: such a task keeps every channel the orchestrator owns
+    /// (e.g. `browser_command_tx`) open after the caller drops it. Long-lived
+    /// workers start through the host-called `start_*` methods instead.
     pub fn build(self) -> Orchestrator {
         // Install the process-wide rustls CryptoProvider at the single startup
         // chokepoint every sync-capable host passes through before it can open a
@@ -570,11 +574,6 @@ impl OrchestratorBuilder {
                     };
                 }
             });
-        }
-        if tokio::runtime::Handle::try_current().is_ok() {
-            crate::threads::era_worker::spawn(orchestrator.clone(), &orchestrator.era_summary_tx);
-            crate::tenets::evidence::spawn(orchestrator.clone());
-            crate::orchestrator::wakes::conditions::install_evaluator(orchestrator.clone());
         }
         orchestrator
     }
@@ -2175,6 +2174,16 @@ impl Orchestrator {
             .get_or_init(|| Arc::new(SemanticSearch::new(self.embedding_client().clone())))
     }
 
+    /// Start the process-lifetime workers that hold this orchestrator: thread-era
+    /// summary upgrades, tenet evidence evaluation, and the wake-condition
+    /// evaluator. Hosts call this once; `build()` never does, so a dropped test
+    /// orchestrator releases every channel it owns.
+    pub fn start_background_workers(&self) {
+        crate::threads::era_worker::spawn(self.clone(), &self.era_summary_tx);
+        crate::tenets::evidence::spawn(self.clone());
+        crate::orchestrator::wakes::conditions::install_evaluator(self.clone());
+    }
+
     pub fn start_embed_worker(&self) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let client = self.embedding_client().clone();
@@ -3761,6 +3770,27 @@ mod tests {
         assert_eq!(
             substrate_health_status(&[SubstrateHealthReason::NoExecutors]),
             SubstrateHealthStatus::Blocked
+        );
+    }
+
+    /// `build()` must leave nothing running that holds the orchestrator: once the
+    /// caller drops it, every sender it owned is gone and the channel closes.
+    #[tokio::test]
+    async fn build_spawns_nothing_that_outlives_the_orchestrator() {
+        let db = test_db().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let orch = Orchestrator::builder(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .browser_command_tx(Some(tx))
+        .build();
+        drop(orch);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await;
+        assert!(
+            matches!(closed, Ok(None)),
+            "browser command channel stayed open after drop(orch): build() spawned a task holding an Orchestrator clone"
         );
     }
 

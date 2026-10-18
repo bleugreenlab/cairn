@@ -1906,6 +1906,16 @@ mod tests {
         (orch, rx, dir)
     }
 
+    /// Join the stand-in host drain after `drop(orch)`. The drain ends only when
+    /// every BrowserCommandTx clone is gone, so a hang here means something still
+    /// holds the orchestrator (or the sender) after it was dropped.
+    async fn join_host_drain(task: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("browser command channel stayed open after drop(orch): a task still holds an Orchestrator/BrowserCommandTx clone")
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn capture_roundtrip_correlates_reply_and_returns_base64() {
         let (orch, mut rx, _dir) = orch_with_browser_tx().await;
@@ -2071,7 +2081,7 @@ mod tests {
         // End is sent on the guard's drop after the round-trip returns.
         tokio::time::sleep(Duration::from_millis(60)).await;
         drop(orch);
-        let _ = task.await;
+        join_host_drain(task).await;
         let cmds = collected.lock().unwrap().clone();
         assert!(
             matches!(
@@ -2131,7 +2141,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(60)).await;
         drop(orch);
-        let _ = task.await;
+        join_host_drain(task).await;
         let cmds = collected.lock().unwrap().clone();
         assert!(matches!(
             cmds.as_slice(),
@@ -2175,7 +2185,7 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(60)).await;
         drop(orch);
-        let _ = task.await;
+        join_host_drain(task).await;
         let cmds = collected.lock().unwrap().clone();
         assert!(
             cmds.iter()
@@ -2215,7 +2225,7 @@ mod tests {
         assert!(err.contains("still loading"), "{err}");
         assert!(err.contains("http://localhost:5173/app"), "{err}");
         drop(orch);
-        let _ = task.await;
+        join_host_drain(task).await;
     }
 
     /// Part 2: a loading page that finishes within the readiness budget proceeds
@@ -2262,7 +2272,7 @@ mod tests {
         assert!(resp.ok);
         assert_eq!(resp.content.as_deref(), Some("hello"));
         drop(orch);
-        let _ = task.await;
+        join_host_drain(task).await;
     }
 
     /// Part 2: a page that is NOT loading but whose bridge fails reads as a HARD
@@ -2293,7 +2303,7 @@ mod tests {
         assert!(err.contains("did not respond"), "{err}");
         assert!(err.contains("http://x/app"), "{err}");
         drop(orch);
-        let _ = task.await;
+        join_host_drain(task).await;
     }
 
     /// Part 2: the rehydrate race — not loading at entry, but a reload starts
@@ -2350,7 +2360,7 @@ mod tests {
         assert!(resp.ok);
         assert_eq!(resp.content.as_deref(), Some("late"));
         drop(orch);
-        let _ = task.await;
+        join_host_drain(task).await;
     }
 
     /// Part 3: the cold-creation ordering the OpenForRead ack exists to fix. On a
@@ -2419,7 +2429,7 @@ mod tests {
         assert!(resp.ok);
         assert_eq!(resp.content.as_deref(), Some("ready"));
         drop(orch);
-        let _ = task.await;
+        join_host_drain(task).await;
     }
 
     /// Part 3: the screenshot cold path. A cold rehydrate waits for the load before
@@ -2497,7 +2507,7 @@ mod tests {
             "a waited-for cold capture must not be noted partial: {header}"
         );
         drop(orch);
-        let _ = task.await;
+        join_host_drain(task).await;
     }
 
     /// Part 3: a warm, already-loading live page must yield an IMMEDIATE partial
@@ -2570,7 +2580,7 @@ mod tests {
             "an already-loading screenshot must carry the partiality note: {header}"
         );
         drop(orch);
-        let _ = task.await;
+        join_host_drain(task).await;
     }
 
     /// Part 2: the classified messages name the url and the relevant budget so an
