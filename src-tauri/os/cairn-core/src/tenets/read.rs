@@ -153,8 +153,26 @@ pub struct TenetEvidence {
     pub source_uri: String,
     /// `supports` or `contradicts`.
     pub sign: String,
+    /// The probability of the chosen sign. Measured when `measured_by` is set;
+    /// otherwise the judge reported it about itself.
     pub confidence: f64,
+    /// `native` or `logprobs`, as the models facet's `decide` measured it.
+    /// `None` for a row written before evidence was judged through `decide`.
+    pub measured_by: Option<String>,
     pub evaluated_at: i64,
+}
+
+impl TenetEvidence {
+    /// The confidence with how it was measured, as an expanded evidence line
+    /// prints it: `0.82 logprobs`, or `0.82 self-reported` for a row that
+    /// predates measurement.
+    pub fn measurement(&self) -> String {
+        format!(
+            "{:.2} {}",
+            self.confidence,
+            self.measured_by.as_deref().unwrap_or("self-reported")
+        )
+    }
 }
 
 /// A tenet as every surface reads it.
@@ -383,7 +401,7 @@ async fn evidence_by_tenet(
 ) -> Result<HashMap<String, Vec<TenetEvidence>>, String> {
     let rows = db
         .query_all(
-            "SELECT tenet_id, source_uri, sign, confidence, evaluated_at
+            "SELECT tenet_id, source_uri, sign, confidence, measured_by, evaluated_at
              FROM tenet_evidence WHERE project_id = ?1
              ORDER BY evaluated_at DESC, id",
             (project_id.to_string(),),
@@ -394,7 +412,8 @@ async fn evidence_by_tenet(
                         source_uri: row.text(1)?,
                         sign: row.text(2)?,
                         confidence: row.f64(3)?,
-                        evaluated_at: row.i64(4)?,
+                        measured_by: row.opt_text(4)?,
+                        evaluated_at: row.i64(5)?,
                     },
                 ))
             },

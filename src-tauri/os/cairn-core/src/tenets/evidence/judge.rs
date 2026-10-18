@@ -1,108 +1,66 @@
 //! The judgement: does one concluded piece of work support, contradict, or not
 //! bear on each of a few candidate tenets?
+//!
+//! It is asked through the models facet's `decide` verb, never as a Response:
+//! one decision per event, one `choice` question per candidate tenet. A
+//! generating model reporting how sure it is would not be a measurement, and
+//! everything downstream does arithmetic on this number (the confidence floor,
+//! the contradiction weight, the wake threshold). `decide` answers with a
+//! probability measured natively or from logprobs, and refuses outright when
+//! nothing configured can measure one.
 
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
-
-use serde_json::{json, Map, Value};
-
-use crate::responses::{
-    OutputContract, ResponseDefinition, ResponseExample, ResponseOutcome, ResponseVariable,
+use crate::models::decision::{
+    Decision, DecisionAnswer, DecisionNode, DecisionOption, DecisionQuestion, MeasuredBy,
+    QuestionKind, Thresholds,
 };
 use crate::tenets::{TenetOrigin, TenetView};
 
-pub const RESPONSE_ID: &str = "builtin:tenet-evidence";
-pub const CALLER_LABEL: &str = "tenet evidence";
+/// What every question tells the model about the rule it is applying. The
+/// input is the concluded work; the question carries one tenet.
+const PREAMBLE: &str = "The input is one piece of concluded work. Below is a tenet: a standing project decision the operator approved. The chosen option is the tenet, and every rejected option was explicitly ruled out. Does the concluded work support this tenet, contradict it, or neither? Work that adopted a rejected option contradicts the tenet. Work that only shares the tenet's topic or vocabulary is neither. When unsure, answer neither.";
 
-const TEMPLATE: &str = "You check whether one piece of concluded work bears on standing project decisions called tenets. A tenet is a decision the operator approved: the chosen option is the tenet, and the other options were explicitly rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sign {
+    Supports,
+    Contradicts,
+    Neither,
+}
 
-Judge each tenet independently against the concluded work:
-- supports: the work followed the chosen option or relied on it.
-- contradicts: the work did what the tenet rules out. It adopted a rejected alternative, reversed or bypassed the decision, or concluded the decision was wrong.
-- neither: the work does not bear on the tenet, or only shares its topic or vocabulary. When unsure, answer neither.
+impl Sign {
+    pub const ALL: [Sign; 3] = [Sign::Supports, Sign::Contradicts, Sign::Neither];
 
-probability is how sure you are that your verdict is right, from 0 to 1. Return exactly one entry for every tenet number listed.
-
-## Concluded work
-{{event}}
-
-## Tenets
-{{tenets}}";
-
-/// The output schema. Its root is an object: strict providers refuse an array
-/// root.
-pub fn schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["verdicts"],
-        "properties": {
-            "verdicts": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["tenet", "verdict", "probability"],
-                    "properties": {
-                        "tenet": {"type": "integer"},
-                        "verdict": {"type": "string", "enum": ["supports", "contradicts", "neither"]},
-                        "probability": {"type": "number", "minimum": 0, "maximum": 1}
-                    }
-                }
-            }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sign::Supports => "supports",
+            Sign::Contradicts => "contradicts",
+            Sign::Neither => "neither",
         }
-    })
-}
+    }
 
-fn variable(name: &str) -> ResponseVariable {
-    ResponseVariable {
-        name: name.into(),
-        description: None,
-        required: true,
-        default: None,
-        values: vec![],
+    fn description(self) -> &'static str {
+        match self {
+            Sign::Supports => "the work followed the chosen option or relied on it",
+            Sign::Contradicts => "the work did what the tenet rules out: it adopted a rejected option, reversed or bypassed the decision, or concluded the decision was wrong",
+            Sign::Neither => "the work does not bear on the tenet, or only shares its topic or vocabulary",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Sign> {
+        Sign::ALL.into_iter().find(|sign| sign.as_str() == value)
     }
 }
 
-fn example() -> ResponseExample {
-    let mut input = Map::new();
-    input.insert(
-        "event".into(),
-        json!("Issue cairn://p/demo/41 \u{2014} Upload executor build artifacts\nResolution: merged\n\nExecutors now push finished build artifacts straight to the S3 bucket with a presigned URL, bypassing the artifact store, because the store's chunked upload was slow.")
-    );
-    input.insert(
-        "tenets".into(),
-        json!("### Tenet 1\nQuestion: How do executors publish build artifacts?\nChosen: Executor artifacts publish through the content store\nRejected: Direct S3 upload from the executor; Ship artifacts inside the result message\n\n### Tenet 2\nQuestion: Where do build caches live?\nChosen: Build caches stay on the executor's local disk\nRejected: none recorded")
-    );
-    ResponseExample {
-        input,
-        output: json!({"verdicts": [
-            {"tenet": 1, "verdict": "contradicts", "probability": 0.9},
-            {"tenet": 2, "verdict": "neither", "probability": 0.85}
-        ]}),
-    }
+/// The name of the question about tenet `number`, unique within one event's
+/// decision because tenet numbers are unique within a project.
+pub fn question_name(number: i64) -> String {
+    format!("tenet-{number}")
 }
 
-pub fn definition() -> ResponseDefinition {
-    ResponseDefinition {
-        name: "Tenet evidence".into(),
-        description: "Judge whether concluded work supports or contradicts standing tenets".into(),
-        tier: Some("sm".into()),
-        model: None,
-        backend: None,
-        options: HashMap::new(),
-        variables: vec![variable("event"), variable("tenets")],
-        output: OutputContract::Schema(schema()),
-        timeout: Duration::from_secs(60),
-        examples: vec![example()],
-        template: TEMPLATE.into(),
-    }
-}
-
-/// One tenet as the judge reads it, numbered from 1 in candidate order.
-pub fn tenet_block(number: usize, view: &TenetView) -> String {
+/// One tenet as the judge reads it: its question when that differs from its
+/// text, the chosen option, and the rejected ones.
+pub fn tenet_block(view: &TenetView) -> String {
     let text = view.text.as_deref().unwrap_or(&view.row.question);
-    let mut block = format!("### Tenet {number}\n");
+    let mut block = String::new();
     // A migrated ruling has no question distinct from its text.
     let distinct_question =
         view.row.origin != TenetOrigin::MigratedRuling && view.row.question.trim() != text.trim();
@@ -118,31 +76,38 @@ pub fn tenet_block(number: usize, view: &TenetView) -> String {
     block
 }
 
-/// The judge's arguments for one event against its candidates.
-pub fn args(event_text: &str, candidates: &[&TenetView]) -> Value {
-    let tenets = candidates
-        .iter()
-        .enumerate()
-        .map(|(index, view)| tenet_block(index + 1, view))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    json!({"event": event_text, "tenets": tenets})
+/// The question asked about one candidate tenet.
+pub fn question(view: &TenetView) -> DecisionQuestion {
+    DecisionQuestion {
+        name: question_name(view.row.number),
+        instructions: format!(
+            "{PREAMBLE}\n\nTenet #{}\n{}",
+            view.row.number,
+            tenet_block(view)
+        ),
+        kind: QuestionKind::Choice {
+            options: Sign::ALL
+                .into_iter()
+                .map(|sign| DecisionOption {
+                    value: sign.as_str().to_string(),
+                    description: Some(sign.description().to_string()),
+                })
+                .collect(),
+        },
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sign {
-    Supports,
-    Contradicts,
-    Neither,
-}
-
-impl Sign {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Sign::Supports => "supports",
-            Sign::Contradicts => "contradicts",
-            Sign::Neither => "neither",
-        }
+/// The decision asked about one event: one question per candidate, in
+/// candidate order, answered by the workspace's first decision-capable offer.
+/// The event text is the decision's input, so it is sent once rather than
+/// repeated inside every question.
+pub fn decision(candidates: &[&TenetView]) -> DecisionNode {
+    DecisionNode {
+        questions: candidates.iter().map(|view| question(view)).collect(),
+        model: None,
+        // The worker applies `CONFIDENCE_FLOOR` itself, to the chosen
+        // option's probability rather than to `DecisionAnswer::confidence`.
+        thresholds: Thresholds::default(),
     }
 }
 
@@ -151,59 +116,42 @@ impl Sign {
 pub struct Verdict {
     pub candidate: usize,
     pub sign: Sign,
-    pub probability: f64,
+    /// The measured probability of the chosen option. `None` when the answer
+    /// reported no per-option probabilities, so no floor can be shown to hold.
+    pub probability: Option<f64>,
+    pub measured_by: MeasuredBy,
 }
 
-/// The verdicts in a judge's output, one per candidate. An entry naming a
-/// number that is not a candidate is dropped, the first entry for a candidate
-/// wins, and a candidate with no entry reads `neither`.
-pub fn parse(outcome: &ResponseOutcome, candidates: usize) -> Vec<Verdict> {
-    let parsed = outcome
-        .parsed
-        .clone()
-        .or_else(|| serde_json::from_str(&outcome.text).ok())
-        .unwrap_or(Value::Null);
-    let entries = parsed
-        .get("verdicts")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut seen = HashSet::new();
-    let mut verdicts: Vec<Option<Verdict>> = vec![None; candidates];
-    for entry in entries {
-        let Some(number) = entry.get("tenet").and_then(Value::as_u64) else {
-            continue;
-        };
-        let Some(candidate) = (number as usize).checked_sub(1).filter(|i| *i < candidates) else {
-            continue;
-        };
-        if !seen.insert(candidate) {
-            continue;
-        }
-        let sign = match entry.get("verdict").and_then(Value::as_str) {
-            Some("supports") => Sign::Supports,
-            Some("contradicts") => Sign::Contradicts,
-            _ => Sign::Neither,
-        };
-        let probability = entry
-            .get("probability")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0)
-            .clamp(0.0, 1.0);
-        verdicts[candidate] = Some(Verdict {
-            candidate,
-            sign,
-            probability,
-        });
-    }
-    verdicts
-        .into_iter()
+/// The verdicts in a decision, at most one per candidate.
+///
+/// A candidate whose question was refused, went unanswered, or picked a value
+/// that is not a sign gets no verdict: a refusal is never a `neither` with a
+/// probability. The probability is the chosen option's own, not the answer's
+/// `confidence`, which rescales it against an even split.
+pub fn parse(decision: &Decision, candidates: &[&TenetView]) -> Vec<Verdict> {
+    candidates
+        .iter()
         .enumerate()
-        .map(|(candidate, verdict)| {
-            verdict.unwrap_or(Verdict {
+        .filter_map(|(candidate, view)| {
+            let DecisionAnswer::Choice {
+                measured_by,
+                pick,
+                probabilities,
+                ..
+            } = decision.answer(&question_name(view.row.number))?
+            else {
+                return None;
+            };
+            let sign = Sign::parse(pick)?;
+            let probability = probabilities
+                .iter()
+                .find(|option| option.value == *pick)
+                .map(|option| option.probability.clamp(0.0, 1.0));
+            Some(Verdict {
                 candidate,
-                sign: Sign::Neither,
-                probability: 0.0,
+                sign,
+                probability,
+                measured_by: *measured_by,
             })
         })
         .collect()

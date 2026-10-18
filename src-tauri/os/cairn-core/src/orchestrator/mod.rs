@@ -21,6 +21,7 @@ pub mod conflict_session;
 pub mod contended_identifiers;
 pub mod custom_providers;
 mod decide;
+pub(crate) use decide::DecisionFailure;
 pub(crate) mod default_branch_sync;
 pub use decide::DecisionDiagnostic;
 pub mod device_presence;

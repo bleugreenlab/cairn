@@ -367,10 +367,10 @@ fn render_entity(view: &TenetView) -> String {
     }
     for evidence in &view.evidence {
         out.push_str(&format!(
-            "- {} {} ({:.2}, {})\n",
+            "- {} {} ({}, {})\n",
             evidence.sign,
             evidence.source_uri,
-            evidence.confidence,
+            evidence.measurement(),
             crate::tenets::evidence::utc_date(evidence.evaluated_at, "%Y-%m-%d")
         ));
     }

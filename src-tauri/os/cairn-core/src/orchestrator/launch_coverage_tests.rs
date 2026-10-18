@@ -31,6 +31,7 @@ use cairn_models::wire::MessageContent;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use serde_json::{json, Value};
 
+use super::decide::DecisionFailure;
 use super::models::tests::seeded_orchestrator;
 use super::models::ModelRuntime;
 use super::Orchestrator;
@@ -1114,6 +1115,11 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
 
     let refused = orch.decide(None, &decision, "{}".into()).await.unwrap_err();
     assert!(
+        matches!(refused, DecisionFailure::Unanswerable(_)),
+        "no offer is a configuration gap, not a failed call: {refused:?}"
+    );
+    let refused = refused.to_string();
+    assert!(
         refused.starts_with("No decision-capable model is configured"),
         "{refused}"
     );
@@ -1161,6 +1167,11 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
         )
     );
     let failed = orch.decide(None, &decision, "{}".into()).await.unwrap_err();
+    assert!(
+        matches!(failed, DecisionFailure::Failed(_)),
+        "a provider call that fails is a failure, not a missing offer: {failed:?}"
+    );
+    let failed = failed.to_string();
     assert!(failed.contains("recorded, not sent"), "{failed}");
     assert_eq!(
         recorder

@@ -241,6 +241,15 @@ macro_rules! shared_tail_tenet_evidence {
     };
 }
 
+/// cairn/5064: tenet evidence is judged through `decide`, and each evidence
+/// row records how its probability was measured. It alters a ProjectScoped
+/// table, so it lands in both lineages.
+macro_rules! shared_tail_tenet_evidence_measured_by {
+    () => {
+        migration!("0264_tenet_evidence_measured_by")
+    };
+}
+
 /// How each execution bound to a machine. Runner-transient state keyed by a
 /// runner incarnation, like the workflow journal, so it never syncs to a team
 /// replica.
@@ -1406,6 +1415,7 @@ macro_rules! team_lineage {
             shared_tail_tenets!(),
             shared_tail_tenet_ruling_imports!(),
             shared_tail_tenet_evidence!(),
+            shared_tail_tenet_evidence_measured_by!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1673,6 +1683,7 @@ macro_rules! private_lineage {
             shared_tail_tenets!(),
             shared_tail_tenet_ruling_imports!(),
             shared_tail_tenet_evidence!(),
+            shared_tail_tenet_evidence_measured_by!(),
         ]
     };
 }
@@ -3375,6 +3386,7 @@ mod tests {
                 "tenets",
                 "tenet_ruling_imports",
                 "tenet_evidence",
+                "tenet_evidence_measured_by",
             ]
         );
         assert_eq!(
@@ -6651,6 +6663,8 @@ mod tests {
                 "tenets",
                 "tenet_ruling_imports",
                 "tenet_evidence",
+                // cairn/5064: evidence rows record how they were measured.
+                "tenet_evidence_measured_by",
             ]
         );
         assert_eq!(

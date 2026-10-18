@@ -13,7 +13,11 @@ use super::worker::{self, EvidenceDeps, Processed};
 use super::*;
 use crate::embeddings::InputType;
 use crate::issues::crud;
-use crate::responses::{ResponseDefinition, ResponseError, ResponseOutcome};
+use crate::models::decision::{
+    choice_confidence, Decision, DecisionAnswer, DecisionNode, DecisionQuestion, MeasuredBy,
+    OptionProbability, QuestionKind,
+};
+use crate::orchestrator::DecisionFailure;
 use crate::services::testing::CapturingEmitter;
 use crate::services::{Clock, EventEmitter};
 use crate::storage::{LocalDb, RowExt};
@@ -129,8 +133,22 @@ enum EmbedFailure {
     Gateway,
 }
 
+/// One decision the worker asked for.
+#[derive(Debug, Clone)]
+struct JudgeCall {
+    project_id: String,
+    questions: Vec<DecisionQuestion>,
+    input: String,
+}
+
 /// Records every outside call. Texts embed to the vector of the first
 /// registered needle they contain, or to an axis nothing else uses.
+///
+/// The judge answers from `verdicts`, a list of `{tenet, verdict,
+/// probability}` entries where `tenet` is the 1-based position of the
+/// question asked. An entry may add `measuredBy` (default `logprobs`),
+/// `refused: true`, or `noProbabilities: true`. With `judge_failure` set the
+/// judge fails that way instead.
 struct Fake {
     device: String,
     now: AtomicI64,
@@ -139,7 +157,8 @@ struct Fake {
     failures: Mutex<HashMap<usize, EmbedFailure>>,
     embed_calls: Mutex<Vec<(Vec<String>, InputType)>>,
     verdicts: Mutex<Value>,
-    judge_calls: Mutex<Vec<Value>>,
+    judge_failure: Mutex<Option<DecisionFailure>>,
+    judge_calls: Mutex<Vec<JudgeCall>>,
     nudges: Mutex<Vec<String>>,
     emitter: CapturingEmitter,
     /// Seconds the clock moves while the judge is out.
@@ -157,7 +176,8 @@ impl Fake {
             needles: Vec::new(),
             failures: Mutex::new(HashMap::new()),
             embed_calls: Mutex::new(Vec::new()),
-            verdicts: Mutex::new(json!({"verdicts": []})),
+            verdicts: Mutex::new(json!([])),
+            judge_failure: Mutex::new(None),
             judge_calls: Mutex::new(Vec::new()),
             nudges: Mutex::new(Vec::new()),
             emitter: CapturingEmitter::new(),
@@ -179,7 +199,11 @@ impl Fake {
     }
 
     fn set_verdicts(&self, verdicts: Value) {
-        *self.verdicts.lock().unwrap() = json!({ "verdicts": verdicts });
+        *self.verdicts.lock().unwrap() = verdicts;
+    }
+
+    fn fail_judge(&self, failure: DecisionFailure) {
+        *self.judge_failure.lock().unwrap() = Some(failure);
     }
 
     fn fail_call(&self, index: usize, failure: EmbedFailure) {
@@ -190,7 +214,7 @@ impl Fake {
         self.embed_calls.lock().unwrap().len()
     }
 
-    fn judges(&self) -> Vec<Value> {
+    fn judges(&self) -> Vec<JudgeCall> {
         self.judge_calls.lock().unwrap().clone()
     }
 
@@ -233,25 +257,30 @@ impl EvidenceDeps for Fake {
     }
     async fn judge(
         &self,
-        _definition: &ResponseDefinition,
-        args: &Value,
-    ) -> Result<ResponseOutcome, ResponseError> {
-        self.judge_calls.lock().unwrap().push(args.clone());
+        project_id: &str,
+        decision: &DecisionNode,
+        input: &str,
+    ) -> Result<Decision, DecisionFailure> {
+        self.judge_calls.lock().unwrap().push(JudgeCall {
+            project_id: project_id.into(),
+            questions: decision.questions.clone(),
+            input: input.into(),
+        });
         let other = self.during_judge.lock().unwrap().take();
         if let Some(other) = other {
             wake::recheck_contradictions(other.as_ref()).await;
         }
         self.now
             .fetch_add(self.judge_advance.load(Ordering::SeqCst), Ordering::SeqCst);
+        if let Some(failure) = self.judge_failure.lock().unwrap().clone() {
+            return Err(failure);
+        }
         let verdicts = self.verdicts.lock().unwrap().clone();
-        Ok(ResponseOutcome {
-            seq: 1,
-            text: verdicts.to_string(),
-            parsed: Some(verdicts),
-            model: "fake-sm".into(),
-            backend: "fake".into(),
-            latency_ms: 0,
-            cost: None,
+        Ok(Decision {
+            provider: "custom:fake".into(),
+            model: "fake-decider".into(),
+            answers: fake_answers(&decision.questions, &verdicts),
+            input_tokens: None,
         })
     }
     fn nudge(&self, job_id: &str) {
@@ -260,6 +289,55 @@ impl EvidenceDeps for Fake {
     fn emitter(&self) -> &dyn EventEmitter {
         &self.emitter
     }
+}
+
+/// The answers a decision provider would give for `verdicts` (see [`Fake`]).
+/// The probability not on the pick is split evenly over the other options, so
+/// an answer's `confidence` differs from its pick's probability, as a real
+/// three-option choice's does.
+fn fake_answers(questions: &[DecisionQuestion], verdicts: &Value) -> Vec<DecisionAnswer> {
+    let mut answers = Vec::new();
+    for entry in verdicts.as_array().cloned().unwrap_or_default() {
+        let position = entry["tenet"].as_u64().unwrap() as usize;
+        let Some(question) = questions.get(position - 1) else {
+            continue;
+        };
+        let measured_by = match entry["measuredBy"].as_str() {
+            Some("native") => MeasuredBy::Native,
+            _ => MeasuredBy::Logprobs,
+        };
+        if entry["refused"].as_bool() == Some(true) {
+            answers.push(DecisionAnswer::Refusal {
+                name: question.name.clone(),
+                measured_by,
+                reason: Some("policy".into()),
+            });
+            continue;
+        }
+        let pick = entry["verdict"].as_str().unwrap().to_string();
+        let probability = entry["probability"].as_f64().unwrap();
+        let values = question.answer_values();
+        let rest = (1.0 - probability) / (values.len() - 1) as f64;
+        let probabilities = if entry["noProbabilities"].as_bool() == Some(true) {
+            Vec::new()
+        } else {
+            values
+                .iter()
+                .map(|value| OptionProbability {
+                    value: value.to_string(),
+                    probability: if *value == pick { probability } else { rest },
+                })
+                .collect()
+        };
+        answers.push(DecisionAnswer::Choice {
+            name: question.name.clone(),
+            measured_by,
+            pick,
+            confidence: Some(choice_confidence(probability, values.len())),
+            probabilities,
+        });
+    }
+    answers
 }
 
 // ── Hooks ───────────────────────────────────────────────────────────────────
@@ -604,64 +682,283 @@ async fn only_the_five_nearest_tenets_are_judged() {
     let event = add_event(&db, "1", A, "WORK").await;
     worker::process(&fake, &db, &event).await;
     let judged = fake.judges();
-    assert_eq!(judged.len(), 1);
-    let tenets = judged[0]["tenets"].as_str().unwrap();
-    assert!(tenets.contains("### Tenet 5\n"), "{tenets}");
-    assert!(!tenets.contains("### Tenet 6"), "{tenets}");
-    assert!(tenets.contains("Chosen: NEAR1 rule"));
-    assert!(!tenets.contains("NEAR6") && !tenets.contains("NEAR7"));
+    assert_eq!(judged.len(), 1, "one decision per event");
+    let names: Vec<_> = judged[0]
+        .questions
+        .iter()
+        .map(|question| question.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["tenet-1", "tenet-2", "tenet-3", "tenet-4", "tenet-5"]
+    );
+    assert!(judged[0].questions[0]
+        .instructions
+        .contains("Chosen: NEAR1 rule"));
+    assert!(judged[0]
+        .questions
+        .iter()
+        .all(|question| !question.instructions.contains("NEAR6")
+            && !question.instructions.contains("NEAR7")));
 }
 
 #[tokio::test]
-async fn only_confident_supports_and_contradicts_verdicts_are_stored() {
+async fn each_candidate_is_one_choice_question_about_the_event_text() {
+    let db = fixture("evidence-question-shape.db").await;
+    approve(
+        &db,
+        12,
+        "t-design",
+        "Artifacts go through the store",
+        &["Direct S3 upload", "Inline in the result"],
+    )
+    .await;
+    let event = add_event(&db, "1", A, "Uploads go straight to S3 now.").await;
+    let fake = Fake::new(A, 1_000, &db).needle("", &[1.0, 0.0, 0.0, 0.0]);
+    worker::process(&fake, &db, &event).await;
+    let [call] = fake.judges().try_into().unwrap();
+    assert_eq!(call.project_id, "p", "the event's own project scope");
+    assert_eq!(
+        call.input, "Uploads go straight to S3 now.",
+        "the event is the decision's input, sent once"
+    );
+    let [question] = call.questions.try_into().unwrap();
+    assert_eq!(question.name, "tenet-12");
+    let QuestionKind::Choice { options } = &question.kind else {
+        panic!("a choice question: {question:?}");
+    };
+    let values: Vec<_> = options.iter().map(|option| option.value.as_str()).collect();
+    assert_eq!(values, ["supports", "contradicts", "neither"]);
+    let instructions = &question.instructions;
+    assert!(
+        instructions.contains("Question: How should we handle 12?\n"),
+        "{instructions}"
+    );
+    assert!(instructions.contains("Chosen: Artifacts go through the store\n"));
+    assert!(instructions.contains("Rejected: Direct S3 upload; Inline in the result"));
+    assert!(
+        instructions.contains("adopted a rejected option contradicts"),
+        "adopting a rejected alternative is a contradiction: {instructions}"
+    );
+}
+
+/// Every stored evidence row as `(tenet, sign, confidence, measured_by,
+/// model, owner, evaluated_at, source)`.
+#[allow(clippy::type_complexity)]
+async fn stored_evidence(
+    db: &LocalDb,
+) -> Vec<(
+    String,
+    String,
+    f64,
+    Option<String>,
+    String,
+    String,
+    i64,
+    String,
+)> {
+    db.query_all(
+        "SELECT tenet_id, sign, confidence, measured_by, model, owner_device_id, evaluated_at,
+                source_uri
+         FROM tenet_evidence ORDER BY tenet_id",
+        (),
+        |row| {
+            Ok((
+                row.text(0)?,
+                row.text(1)?,
+                row.f64(2)?,
+                row.opt_text(3)?,
+                row.text(4)?,
+                row.text(5)?,
+                row.i64(6)?,
+                row.text(7)?,
+            ))
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn only_measured_supports_and_contradicts_at_the_floor_are_stored() {
     let db = fixture("evidence-confidence.db").await;
-    for (number, word) in [(1, "ALPHA"), (2, "BETA"), (3, "GAMMA")] {
+    for (number, word) in [
+        (1, "ALPHA"),
+        (2, "BETA"),
+        (3, "GAMMA"),
+        (4, "DELTA"),
+        (5, "EPSILON"),
+    ] {
         approve(&db, number, "t-design", &format!("{word} rule"), &["other"]).await;
     }
-    let event = add_event(&db, "5012", A, "ALPHA BETA GAMMA work").await;
+    let event = add_event(&db, "5012", A, "ALPHA BETA GAMMA DELTA EPSILON work").await;
     let fake = Fake::new(A, 1_000, &db).needle("", &[1.0, 0.0, 0.0, 0.0]);
     fake.set_verdicts(json!([
         {"tenet": 1, "verdict": "contradicts", "probability": 0.69},
         {"tenet": 2, "verdict": "supports", "probability": 0.7},
-        {"tenet": 2, "verdict": "contradicts", "probability": 0.99},
         {"tenet": 3, "verdict": "neither", "probability": 0.95},
-        {"tenet": 9, "verdict": "contradicts", "probability": 0.99}
+        // The model declined this one tenet: no row, and the event still
+        // counts as evaluated.
+        {"tenet": 4, "refused": true},
+        // A pick with no reported probabilities cannot be shown to clear the
+        // floor.
+        {"tenet": 5, "verdict": "contradicts", "probability": 0.99, "noProbabilities": true}
     ]));
     assert_eq!(
         worker::process(&fake, &db, &event).await,
         Processed::Done(1)
     );
-    let stored = db
-        .query_all(
-            "SELECT e.tenet_id, e.sign, e.confidence, e.model, e.owner_device_id, e.evaluated_at, e.source_uri
-             FROM tenet_evidence e",
-            (),
-            |row| {
-                Ok((
-                    row.text(0)?,
-                    row.text(1)?,
-                    row.f64(2)?,
-                    row.text(3)?,
-                    row.text(4)?,
-                    row.i64(5)?,
-                    row.text(6)?,
-                ))
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(stored.len(), 1);
+    let stored = stored_evidence(&db).await;
+    assert_eq!(stored.len(), 1, "{stored:?}");
     let row = &stored[0];
-    assert_eq!(row.0, "tenet-2");
-    assert_eq!(row.1, "supports");
-    assert!((row.2 - 0.7).abs() < 1e-9);
-    assert_eq!(
-        (row.3.as_str(), row.4.as_str(), row.5),
-        ("fake-sm", A, 1_000)
+    assert_eq!((row.0.as_str(), row.1.as_str()), ("tenet-2", "supports"));
+    assert!(
+        (row.2 - 0.7).abs() < 1e-9,
+        "the chosen option's probability, not the rescaled confidence: {}",
+        row.2
     );
-    assert_eq!(row.6, "cairn://p/prj/5012");
+    assert_eq!(row.3.as_deref(), Some("logprobs"));
+    assert_eq!(
+        (row.4.as_str(), row.5.as_str(), row.6),
+        ("fake-decider", A, 1_000)
+    );
+    assert_eq!(row.7, "cairn://p/prj/5012");
     assert_eq!(event_row(&db, &event.id).await.0, "done");
     assert_eq!(fake.emitter.events_named("db-change").len(), 1);
+}
+
+#[tokio::test]
+async fn a_logprobs_answer_below_the_floor_stores_nothing() {
+    let db = fixture("evidence-below-floor.db").await;
+    approve(&db, 1, "t-design", "Rule", &["other"]).await;
+    let event = add_event(&db, "1", A, "work").await;
+    let fake = Fake::new(A, 1_000, &db).needle("", &[1.0, 0.0, 0.0, 0.0]);
+    fake.set_verdicts(json!([{
+        "tenet": 1,
+        "verdict": "contradicts",
+        "probability": CONFIDENCE_FLOOR - 0.01,
+        "measuredBy": "logprobs"
+    }]));
+    assert_eq!(
+        worker::process(&fake, &db, &event).await,
+        Processed::Done(0)
+    );
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM tenet_evidence").await, 0);
+    assert_eq!(event_row(&db, &event.id).await.0, "done");
+}
+
+#[tokio::test]
+async fn a_measured_answer_at_the_floor_stores_its_probability_and_method() {
+    let db = fixture("evidence-at-floor.db").await;
+    approve(&db, 1, "t-design", "Rule", &["other"]).await;
+    let event = add_event(&db, "1", A, "work").await;
+    let fake = Fake::new(A, 1_000, &db).needle("", &[1.0, 0.0, 0.0, 0.0]);
+    fake.set_verdicts(json!([{
+        "tenet": 1,
+        "verdict": "contradicts",
+        "probability": CONFIDENCE_FLOOR,
+        "measuredBy": "native"
+    }]));
+    assert_eq!(
+        worker::process(&fake, &db, &event).await,
+        Processed::Done(1)
+    );
+    let [row] = stored_evidence(&db).await.try_into().unwrap();
+    assert_eq!(row.1, "contradicts");
+    assert!((row.2 - CONFIDENCE_FLOOR).abs() < 1e-9);
+    assert_eq!(row.3.as_deref(), Some("native"));
+    assert_eq!(row.4, "fake-decider", "the model decide reports");
+    let view = crate::tenets::get(&db, "p", 1).await.unwrap().unwrap();
+    assert_eq!(view.evidence[0].measured_by.as_deref(), Some("native"));
+    assert_eq!(view.evidence[0].measurement(), "0.70 native");
+}
+
+const REFUSAL: &str =
+    "No decision-capable model is configured. Add a custom provider in Settings → Providers.";
+
+#[tokio::test]
+async fn with_no_decision_capable_offer_the_event_is_skipped_with_the_refusal_until_restart() {
+    let db = fixture("evidence-unanswerable.db").await;
+    approve(&db, 1, "t-design", "LEASE rule", &[]).await;
+    let refused = add_event(&db, "1", A, "ABOVE work").await;
+    let fake = Fake::new(A, 1_000, &db)
+        .needle("LEASE", &[1.0, 0.0, 0.0, 0.0])
+        .needle("ABOVE", &[1.0, 0.0, 0.0, 0.0]);
+    fake.fail_judge(DecisionFailure::Unanswerable(REFUSAL.into()));
+    assert_eq!(
+        worker::process(&fake, &db, &refused).await,
+        Processed::Unanswerable(REFUSAL.into())
+    );
+    let (state, attempts, _, error) = event_row(&db, &refused.id).await;
+    assert_eq!(
+        (state.as_str(), attempts, error.as_deref()),
+        ("skipped", 0, Some(REFUSAL)),
+        "settled with the refusal as its reason, not as a failed attempt"
+    );
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM tenet_evidence").await, 0);
+    assert!(
+        fake.emitter.events_named("db-change").is_empty(),
+        "nothing changed in the evidence table"
+    );
+
+    // The periodic sweep never re-asks: nothing is due.
+    fake.now.store(1_000_000, Ordering::SeqCst);
+    assert!(worker::drain_due(&fake).await.is_empty());
+    assert_eq!(fake.judges().len(), 1);
+
+    // An event skipped for an ordinary reason, after an earlier failed
+    // attempt left a `last_error`, is not mistaken for a refusal.
+    let mut ordinary = add_event(&db, "2", A, "unrelated work").await;
+    fake.fail_call(fake.embeds(), EmbedFailure::Gateway);
+    worker::process(&fake, &db, &ordinary).await;
+    assert!(event_row(&db, &ordinary.id).await.3.is_some());
+    ordinary.attempts = 1;
+    assert_eq!(
+        worker::process(&fake, &db, &ordinary).await,
+        Processed::Skipped("no tenet is near enough")
+    );
+    assert_eq!(
+        event_row(&db, &ordinary.id).await.3,
+        None,
+        "an ordinary skip clears the failure it followed"
+    );
+
+    // Startup re-queues only the refusal; once an offer answers, it is judged.
+    assert_eq!(worker::requeue_unanswerable(&fake).await, 1);
+    assert_eq!(
+        event_row(&db, &refused.id).await,
+        ("pending".into(), 0, 0, None)
+    );
+    assert_eq!(event_row(&db, &ordinary.id).await.0, "skipped");
+    assert_eq!(
+        worker::requeue_unanswerable(&fake.as_device(B)).await,
+        0,
+        "only the owning machine re-queues its events"
+    );
+    *fake.judge_failure.lock().unwrap() = None;
+    fake.set_verdicts(json!([{"tenet": 1, "verdict": "supports", "probability": 0.9}]));
+    assert_eq!(worker::drain_due(&fake).await, [Processed::Done(1)]);
+}
+
+#[tokio::test]
+async fn a_failed_decision_backs_off_like_any_failed_attempt() {
+    let db = fixture("evidence-decision-failed.db").await;
+    approve(&db, 1, "t-design", "Rule", &[]).await;
+    let event = add_event(&db, "1", A, "work").await;
+    let fake = Fake::new(A, 1_000, &db).needle("", &[1.0, 0.0, 0.0, 0.0]);
+    fake.fail_judge(DecisionFailure::Failed("the provider returned 503".into()));
+    assert!(matches!(
+        worker::process(&fake, &db, &event).await,
+        Processed::Failed(error) if error.contains("503")
+    ));
+    let (state, attempts, next, error) = event_row(&db, &event.id).await;
+    assert_eq!((state.as_str(), attempts, next), ("pending", 1, 1_060));
+    assert!(error.unwrap().contains("503"));
+    assert_eq!(
+        worker::requeue_unanswerable(&fake).await,
+        0,
+        "a pending retry is not a refusal"
+    );
 }
 
 #[tokio::test]
@@ -1254,36 +1551,109 @@ async fn a_wake_whose_consumption_was_lost_is_restamped_not_resent() {
 
 // ── The judgement ───────────────────────────────────────────────────────────
 
-#[test]
-fn the_judge_definition_validates_and_its_example_conforms() {
-    let definition = judge::definition();
-    definition.validate().unwrap();
-    assert_eq!(definition.examples.len(), 1);
-    assert_eq!(judge::schema()["type"], "object");
-    let rendered = definition
-        .render(&json!({"event": "E", "tenets": "T"}))
-        .unwrap();
-    assert!(rendered.ends_with("## Concluded work\nE\n\n## Tenets\nT"));
+#[tokio::test]
+async fn the_decision_asks_valid_questions_and_parses_by_name() {
+    let db = fixture("evidence-parse.db").await;
+    approve(&db, 3, "t-design", "Three", &["not three"]).await;
+    approve(&db, 9, "t-design", "Nine", &[]).await;
+    let views = crate::tenets::list(
+        &db,
+        "p",
+        &crate::tenets::TenetFilter {
+            statuses: vec![crate::tenets::TenetStatus::Approved],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let candidates: Vec<_> = views.iter().collect();
+    let decision = judge::decision(&candidates);
+    assert!(decision.problems().is_empty(), "{:?}", decision.problems());
+    assert_eq!(decision.model, None, "the first decision-capable offer");
+    assert!(
+        decision.thresholds.is_empty(),
+        "the worker applies its own floor"
+    );
+    assert!(
+        cairn_models::decide::unmeasurable(&decision.questions, MeasuredBy::Logprobs).is_empty(),
+        "a logprobs offer can ask it"
+    );
+
+    // Answers are matched by name, whatever order they come back in. A pick
+    // that is not a sign, and an answer to a tenet never asked, are ignored.
+    let choice = |name: &str, pick: &str| DecisionAnswer::Choice {
+        name: name.into(),
+        measured_by: MeasuredBy::Native,
+        pick: pick.into(),
+        confidence: Some(0.4),
+        probabilities: vec![
+            OptionProbability {
+                value: pick.into(),
+                probability: 0.6,
+            },
+            OptionProbability {
+                value: "neither".into(),
+                probability: 0.4,
+            },
+        ],
+    };
+    let answered = Decision {
+        provider: "custom:x".into(),
+        model: "m".into(),
+        answers: vec![
+            choice("tenet-9", "contradicts"),
+            choice("tenet-3", "maybe"),
+            choice("tenet-4", "supports"),
+        ],
+        input_tokens: None,
+    };
+    let verdicts = judge::parse(&answered, &candidates);
+    assert_eq!(verdicts.len(), 1, "{verdicts:?}");
+    assert_eq!(views[verdicts[0].candidate].row.number, 9);
+    assert_eq!(verdicts[0].sign, judge::Sign::Contradicts);
+    assert_eq!(
+        verdicts[0].probability,
+        Some(0.6),
+        "the pick's probability, not its confidence"
+    );
+    assert_eq!(verdicts[0].measured_by, MeasuredBy::Native);
 }
 
+/// The judge goes through `decide` and nowhere else: no Response is built,
+/// named, or invoked anywhere in the tenets module.
 #[test]
-fn a_missing_verdict_reads_neither_and_the_first_entry_wins() {
-    let outcome = ResponseOutcome {
-        seq: 1,
-        text: String::new(),
-        parsed: Some(json!({"verdicts": [
-            {"tenet": 2, "verdict": "supports", "probability": 0.8},
-            {"tenet": 2, "verdict": "contradicts", "probability": 0.9},
-            {"tenet": 0, "verdict": "contradicts", "probability": 0.9}
-        ]})),
-        model: "m".into(),
-        backend: "b".into(),
-        latency_ms: 0,
-        cost: None,
-    };
-    let verdicts = judge::parse(&outcome, 2);
-    assert_eq!(verdicts[0].sign, judge::Sign::Neither);
-    assert_eq!(verdicts[1].sign, judge::Sign::Supports);
+fn nothing_in_tenets_reaches_the_responses_layer() {
+    fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tenets");
+    let mut files = Vec::new();
+    sources(&root, &mut files);
+    assert!(files.len() > 5, "found the module's sources: {files:?}");
+    // Split so this file does not match its own needles.
+    let needles = [
+        concat!("crate::", "responses"),
+        concat!("Response", "Definition"),
+        concat!("Response", "Outcome"),
+        concat!("invoke_", "definition"),
+    ];
+    for file in files {
+        let text = std::fs::read_to_string(&file).unwrap();
+        for needle in needles {
+            assert!(
+                !text.contains(needle),
+                "{} mentions {needle}",
+                file.display()
+            );
+        }
+    }
 }
 
 #[test]

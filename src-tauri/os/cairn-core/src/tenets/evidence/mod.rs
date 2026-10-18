@@ -3,8 +3,11 @@
 //! A conclusion (an issue reaching a terminal resolution, a thread era folding
 //! into a generated summary) is snapshotted as one evaluation event in the same
 //! write that concludes it. A background worker embeds the event, takes the
-//! nearest approved tenets of the project, and asks a small model whether the
-//! work supports or contradicts each. Confident verdicts become evidence rows.
+//! nearest approved tenets of the project, and asks the models facet's
+//! `decide` verb whether the work supports or contradicts each. Verdicts whose
+//! measured probability clears the floor become evidence rows. With no
+//! decision-capable model configured, evidence is not gathered at all: there
+//! is no fallback to a model reporting its own certainty.
 //! When the decayed weight of a tenet's contradictions that no wake has counted
 //! yet crosses a threshold, the thread that proposed it is woken to supersede
 //! it or correct course, and that wake consumes exactly the rows it counted.
@@ -44,7 +47,8 @@ pub const KNN_K: usize = 5;
 /// while all pairs had a median of 0.325 and a p99 of 0.534. At 0.55 about
 /// half of conclusions reach the judge.
 pub const KNN_FLOOR: f32 = 0.55;
-/// The judge's probability below which a verdict is not recorded.
+/// The measured probability of the chosen sign below which a verdict is not
+/// recorded.
 pub const CONFIDENCE_FLOOR: f64 = 0.7;
 /// The decayed contradiction weight that wakes the proposing thread.
 pub const WAKE_THRESHOLD: f64 = 1.2;

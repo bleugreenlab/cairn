@@ -269,16 +269,45 @@ pub async fn due_events(
     .await
 }
 
-/// Settle an event that needed no judgement.
-pub async fn mark_skipped(db: &LocalDb, event: &PendingEvent, now: i64) -> DbResult<bool> {
+/// Settle an event without a judgement.
+///
+/// `refusal` is set exactly when nothing configured could answer the
+/// decision, and is kept as `last_error`; a skip that needed no judgement
+/// clears it. So a skipped event carries `last_error` only when it was
+/// refused, which is what [`requeue_unanswerable_events`] selects on.
+pub async fn mark_skipped(
+    db: &LocalDb,
+    event: &PendingEvent,
+    now: i64,
+    refusal: Option<&str>,
+) -> DbResult<bool> {
     let changed = db
         .execute(
-            "UPDATE tenet_evidence_events SET state = 'skipped', evaluated_at = ?1
-             WHERE id = ?2 AND state = 'pending' AND owner_device_id = ?3",
-            params![now, event.id.as_str(), event.owner_device_id.as_str()],
+            "UPDATE tenet_evidence_events SET state = 'skipped', evaluated_at = ?1, last_error = ?2
+             WHERE id = ?3 AND state = 'pending' AND owner_device_id = ?4",
+            params![
+                now,
+                refusal,
+                event.id.as_str(),
+                event.owner_device_id.as_str()
+            ],
         )
         .await?;
     Ok(changed > 0)
+}
+
+/// Return `device`'s events that were skipped because nothing could answer
+/// the decision to the queue, due at once. Reports how many.
+pub async fn requeue_unanswerable_events(db: &LocalDb, device: &str) -> DbResult<usize> {
+    let changed = db
+        .execute(
+            "UPDATE tenet_evidence_events
+             SET state = 'pending', next_attempt_at = 0, evaluated_at = NULL, last_error = NULL
+             WHERE owner_device_id = ?1 AND state = 'skipped' AND last_error IS NOT NULL",
+            params![device],
+        )
+        .await?;
+    Ok(changed as usize)
 }
 
 /// Record one failed attempt: back off, or give up after [`MAX_ATTEMPTS`].

@@ -3546,6 +3546,7 @@ mod tests {
             source_uri: "cairn://p/prj/5012".into(),
             sign: "contradicts".into(),
             confidence: 0.82,
+            measured_by: Some("logprobs".into()),
             evaluated_at: at,
         });
         view

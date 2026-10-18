@@ -113,6 +113,29 @@ pub struct DecisionDiagnostic {
     pub message: String,
 }
 
+/// Why a decision produced no answers, split by what a caller should do
+/// about it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DecisionFailure {
+    /// Nothing in scope can answer these questions: no offer serves `decide`,
+    /// the one selected cannot measure them, or none could be confirmed. Only
+    /// a configuration change fixes it, so retrying is pointless. The text
+    /// names the fixes.
+    Unanswerable(String),
+    /// An offer that can answer was found and something went wrong reaching
+    /// it: the catalog read, the route, a probe that could not tell, or the
+    /// provider call itself.
+    Failed(String),
+}
+
+impl std::fmt::Display for DecisionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unanswerable(text) | Self::Failed(text) => f.write_str(text),
+        }
+    }
+}
+
 /// What a decision node asks the catalog for.
 fn decision_query(decision: &DecisionNode) -> OfferQuery<'_> {
     OfferQuery {
@@ -153,7 +176,7 @@ impl Orchestrator {
         &self,
         project_id: Option<&str>,
         decision: &DecisionNode,
-    ) -> Result<SelectedOffer, String> {
+    ) -> Result<SelectedOffer, DecisionFailure> {
         let scope = ModelScope {
             project_id: project_id.map(str::to_string),
         };
@@ -162,17 +185,23 @@ impl Orchestrator {
         // only guards against an observation expiring mid-walk.
         for _ in 0..32 {
             let offer = self
-                .catalog(&scope)?
+                .catalog(&scope)
+                .map_err(DecisionFailure::Failed)?
                 .offer_for(decision_query(decision))
-                .map_err(|refusal| refusal.to_string())?;
+                .map_err(|refusal| DecisionFailure::Unanswerable(refusal.to_string()))?;
             if let Some(refusal) = unmeasurable_by(&offer, decision) {
-                return Err(refusal);
+                return Err(DecisionFailure::Unanswerable(refusal));
             }
-            if self.confirm_offer(project_id, &offer)? {
+            if self
+                .confirm_offer(project_id, &offer)
+                .map_err(DecisionFailure::Failed)?
+            {
                 return Ok(offer);
             }
         }
-        Err("no decision-capable offer could be confirmed".to_string())
+        Err(DecisionFailure::Unanswerable(
+            "no decision-capable offer could be confirmed".to_string(),
+        ))
     }
 
     /// Whether `offer` can answer decisions: a native offer by its protocol,
@@ -324,7 +353,7 @@ impl Orchestrator {
         project_id: Option<&str>,
         decision: &DecisionNode,
         input: String,
-    ) -> Result<Decision, String> {
+    ) -> Result<Decision, DecisionFailure> {
         let orch = self.clone();
         let project_id = project_id.map(str::to_string);
         let decision = decision.clone();
@@ -332,7 +361,7 @@ impl Orchestrator {
             orch.decide_blocking(project_id.as_deref(), &decision, &input)
         })
         .await
-        .map_err(|error| format!("the decision task failed: {error}"))?
+        .map_err(|error| DecisionFailure::Failed(format!("the decision task failed: {error}")))?
     }
 
     fn decide_blocking(
@@ -340,9 +369,11 @@ impl Orchestrator {
         project_id: Option<&str>,
         decision: &DecisionNode,
         input: &str,
-    ) -> Result<Decision, String> {
+    ) -> Result<Decision, DecisionFailure> {
         let offer = self.decision_offer(project_id, decision)?;
-        let route = self.decision_route(project_id, &offer)?;
+        let route = self
+            .decision_route(project_id, &offer)
+            .map_err(DecisionFailure::Failed)?;
         let result = cairn_models::decide::decide(
             self.models_runtime.complete.as_ref(),
             DecisionCall {
@@ -366,7 +397,7 @@ impl Orchestrator {
             }
             Ok(_) => {}
         }
-        result.map_err(|error| error.to_string())
+        result.map_err(|error| DecisionFailure::Failed(error.to_string()))
     }
 }
 

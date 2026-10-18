@@ -3,19 +3,26 @@
 //! pass and the retry timer.
 //!
 //! Pending rows are the source of truth; the hint only shortens the wait.
+//!
+//! When nothing configured can answer a decision, an event is settled
+//! `skipped` with the refusal as its `last_error`, and the periodic sweep
+//! leaves it there: retrying cannot help until the catalog changes. Only the
+//! startup pass re-queues those events ([`requeue_unanswerable`]), so
+//! configuring a decision-capable offer and restarting re-evaluates them.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::Value;
 
-use super::events::{due_events, mark_attempt_failed, mark_skipped, PendingEvent};
+use super::events::{
+    due_events, mark_attempt_failed, mark_skipped, requeue_unanswerable_events, PendingEvent,
+};
 use super::judge::{self, Sign};
 use super::vectors::{project_tenet_vectors, tenet_embed_text, vector_db};
 use super::{stable_id, CONFIDENCE_FLOOR, EMBED_CHUNK, KNN_FLOOR, KNN_K, SWEEP_INTERVAL};
 use crate::embeddings::{InputType, COHERE_DIMS, COHERE_MODEL};
-use crate::orchestrator::Orchestrator;
-use crate::responses::{ResponseCaller, ResponseDefinition, ResponseError, ResponseOutcome};
+use crate::models::decision::{Decision, DecisionNode, MeasuredBy};
+use crate::orchestrator::{DecisionFailure, Orchestrator};
 use crate::services::EventEmitter;
 use crate::storage::LocalDb;
 use crate::tenets::{TenetFilter, TenetStatus, TenetView};
@@ -38,11 +45,14 @@ pub trait EvidenceDeps: Send + Sync {
         texts: Vec<String>,
         input: InputType,
     ) -> Result<Option<Vec<Vec<f32>>>, String>;
+    /// Answer `decision` about `input` through the models facet's `decide`,
+    /// in `project_id`'s model scope.
     async fn judge(
         &self,
-        definition: &ResponseDefinition,
-        args: &Value,
-    ) -> Result<ResponseOutcome, ResponseError>;
+        project_id: &str,
+        decision: &DecisionNode,
+        input: &str,
+    ) -> Result<Decision, DecisionFailure>;
     /// Wake a job that a message was just queued for.
     fn nudge(&self, job_id: &str);
     fn emitter(&self) -> &dyn EventEmitter;
@@ -80,19 +90,13 @@ impl EvidenceDeps for OrchestratorDeps {
 
     async fn judge(
         &self,
-        definition: &ResponseDefinition,
-        args: &Value,
-    ) -> Result<ResponseOutcome, ResponseError> {
-        crate::responses::invoke_definition(
-            &self.orch,
-            definition,
-            args,
-            judge::RESPONSE_ID,
-            ResponseCaller::Internal {
-                label: judge::CALLER_LABEL.into(),
-            },
-        )
-        .await
+        project_id: &str,
+        decision: &DecisionNode,
+        input: &str,
+    ) -> Result<Decision, DecisionFailure> {
+        self.orch
+            .decide(Some(project_id), decision, input.to_string())
+            .await
     }
 
     fn nudge(&self, job_id: &str) {
@@ -124,6 +128,7 @@ pub fn spawn(orch: Orchestrator) {
             }
         };
         let deps = OrchestratorDeps { orch, device };
+        requeue_unanswerable(&deps).await;
         let mut interval = tokio::time::interval(SWEEP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -142,12 +147,36 @@ pub fn spawn(orch: Orchestrator) {
 pub enum Processed {
     /// Settled without a judgement.
     Skipped(&'static str),
+    /// Settled without a judgement because nothing configured can answer a
+    /// decision; carries the refusal, which names the fixes.
+    Unanswerable(String),
     /// Judged; this many evidence rows were stored.
     Done(usize),
     /// Another writer settled the event first.
     Lost,
     /// One failed attempt was recorded.
     Failed(String),
+}
+
+/// Return every event this machine skipped for want of a decision-capable
+/// offer to the queue, in every database. Called once, at startup: a catalog
+/// change takes effect on restart, and the periodic sweep never re-asks a
+/// refusal it would only get again.
+pub async fn requeue_unanswerable(deps: &dyn EvidenceDeps) -> usize {
+    let device = deps.this_device();
+    let mut requeued = 0;
+    for db in deps.dbs().await {
+        match requeue_unanswerable_events(&db, &device).await {
+            Ok(count) => requeued += count,
+            Err(error) => {
+                log::warn!("tenet evidence could not re-queue unanswerable events: {error}");
+            }
+        }
+    }
+    if requeued > 0 {
+        log::info!("tenet evidence re-queued {requeued} event(s) skipped for want of a decision-capable model");
+    }
+    requeued
 }
 
 /// Evaluate every due event this machine owns, in every database.
@@ -177,11 +206,19 @@ pub async fn process(deps: &dyn EvidenceDeps, db: &LocalDb, event: &PendingEvent
     // a wake fired is newer than that wake's edge and counts toward the next.
     let now = deps.now();
     let settled = match evaluation {
-        Ok(Evaluation::Skip(reason)) => match mark_skipped(db, event, now).await {
+        Ok(Evaluation::Skip(reason)) => match mark_skipped(db, event, now, None).await {
             Ok(true) => Ok(Processed::Skipped(reason)),
             Ok(false) => Ok(Processed::Lost),
             Err(error) => Err(error.to_string()),
         },
+        Ok(Evaluation::Unanswerable(refusal)) => {
+            log::info!("tenet evidence for {} skipped: {refusal}", event.source_uri);
+            match mark_skipped(db, event, now, Some(&refusal)).await {
+                Ok(true) => Ok(Processed::Unanswerable(refusal)),
+                Ok(false) => Ok(Processed::Lost),
+                Err(error) => Err(error.to_string()),
+            }
+        }
         Ok(Evaluation::Judged { verdicts, model }) => store(db, event, &verdicts, &model, now)
             .await
             .map(|stored| match stored {
@@ -213,11 +250,22 @@ pub async fn process(deps: &dyn EvidenceDeps, db: &LocalDb, event: &PendingEvent
 
 enum Evaluation {
     Skip(&'static str),
+    /// No configured offer can answer the decision.
+    Unanswerable(String),
     Judged {
-        /// `(tenet id, sign, probability)` for each verdict worth storing.
-        verdicts: Vec<(String, Sign, f64)>,
+        /// Each verdict worth storing.
+        verdicts: Vec<StoredVerdict>,
         model: String,
     },
+}
+
+#[derive(Clone)]
+struct StoredVerdict {
+    tenet_id: String,
+    sign: Sign,
+    /// The measured probability of the chosen option.
+    probability: f64,
+    measured_by: MeasuredBy,
 }
 
 async fn embed_required(
@@ -320,24 +368,38 @@ async fn evaluate(
         return Ok(Evaluation::Skip("no tenet is near enough"));
     }
 
-    let outcome = deps
-        .judge(&judge::definition(), &judge::args(&event.text, &candidates))
+    let decision = match deps
+        .judge(
+            &event.project_id,
+            &judge::decision(&candidates),
+            &event.text,
+        )
         .await
-        .map_err(|error| error.to_string())?;
-    let verdicts = judge::parse(&outcome, candidates.len())
+    {
+        Ok(decision) => decision,
+        Err(DecisionFailure::Unanswerable(refusal)) => {
+            return Ok(Evaluation::Unanswerable(refusal))
+        }
+        Err(DecisionFailure::Failed(error)) => return Err(error),
+    };
+    let verdicts = judge::parse(&decision, &candidates)
         .into_iter()
-        .filter(|verdict| verdict.sign != Sign::Neither && verdict.probability >= CONFIDENCE_FLOOR)
-        .map(|verdict| {
-            (
-                candidates[verdict.candidate].row.id.clone(),
-                verdict.sign,
-                verdict.probability,
-            )
+        .filter(|verdict| verdict.sign != Sign::Neither)
+        .filter_map(|verdict| {
+            let probability = verdict
+                .probability
+                .filter(|probability| *probability >= CONFIDENCE_FLOOR)?;
+            Some(StoredVerdict {
+                tenet_id: candidates[verdict.candidate].row.id.clone(),
+                sign: verdict.sign,
+                probability,
+                measured_by: verdict.measured_by,
+            })
         })
         .collect();
     Ok(Evaluation::Judged {
         verdicts,
-        model: outcome.model,
+        model: decision.model,
     })
 }
 
@@ -349,7 +411,7 @@ async fn evaluate(
 async fn store(
     db: &LocalDb,
     event: &PendingEvent,
-    verdicts: &[(String, Sign, f64)],
+    verdicts: &[StoredVerdict],
     model: &str,
     now: i64,
 ) -> Result<Option<usize>, String> {
@@ -376,7 +438,8 @@ async fn store(
                 return Ok(None);
             }
             let mut stored = 0;
-            for (tenet_id, sign, probability) in &verdicts {
+            for verdict in &verdicts {
+                let tenet_id = &verdict.tenet_id;
                 // A tenet superseded while the judge ran gets no evidence.
                 let still_approved = crate::storage::query_opt_text_conn(
                     conn,
@@ -396,16 +459,17 @@ async fn store(
                     .execute(
                         "INSERT OR IGNORE INTO tenet_evidence
                              (id, project_id, tenet_id, event_id, source_uri, sign, confidence,
-                              model, owner_device_id, evaluated_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                              measured_by, model, owner_device_id, evaluated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                         cairn_db::turso::params![
                             id,
                             event.project_id.as_str(),
                             tenet_id.as_str(),
                             event.id.as_str(),
                             event.source_uri.as_str(),
-                            sign.as_str(),
-                            *probability,
+                            verdict.sign.as_str(),
+                            verdict.probability,
+                            verdict.measured_by.as_str(),
                             model.as_str(),
                             event.owner_device_id.as_str(),
                             now

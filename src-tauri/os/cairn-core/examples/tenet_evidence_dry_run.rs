@@ -11,8 +11,9 @@
 //!
 //! With `JUDGE_ARGS_OUT=<path>` it also writes one JSON line per event that
 //! clears the floor: the issue URI, the candidate tenet numbers, and the exact
-//! `{event, tenets}` arguments the judge would receive, so the judgement can be
-//! run through the response path separately.
+//! decision the judge would ask (`input`, the event text, and `decision`, one
+//! choice question per candidate), so the judgement can be run through a
+//! decision-capable provider separately.
 //!
 //! A database whose app has not yet booted with tenets holds none: its
 //! standing decisions are still rulings in each thread's store. With
@@ -296,7 +297,8 @@ async fn main() {
                 let line = serde_json::json!({
                     "source": event.source_uri,
                     "candidates": candidates.iter().map(|view| view.row.number).collect::<Vec<_>>(),
-                    "args": judge::args(&event.text, &candidates),
+                    "input": event.text,
+                    "decision": judge::decision(&candidates),
                 });
                 writeln!(file, "{line}").expect("write judge args");
             }
