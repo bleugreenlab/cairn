@@ -464,17 +464,84 @@ pub(crate) fn resolve_backing_checkout(export_cwd: &Path) -> Option<PathBuf> {
 /// HEAD is already detached (the user's own choice, never repaired) or when the
 /// probe fails (best-effort: skip the repair).
 fn snapshot_checkout_head(git: &dyn GitClient, repo: &Path) -> Option<CheckoutHeadBefore> {
-    // `git branch --show-current` is empty exactly when HEAD is detached.
-    let branch = git.current_branch(repo).ok()?;
-    if branch.is_empty() {
-        return None;
-    }
-    let branch_commit = git
-        .rev_parse(repo, vec![format!("refs/heads/{branch}")])
-        .ok()?;
+    // Read from disk first: every export runs this under the store lock, and on
+    // a loaded host each `git` spawn costs about a second. The subprocess probe
+    // stays as the fallback for a layout the reader does not understand.
+    let branch = match read_checkout_head(repo) {
+        CheckoutHead::Detached => return None,
+        CheckoutHead::Attached(branch) => branch,
+        CheckoutHead::Unreadable => {
+            // `git branch --show-current` is empty exactly when HEAD is detached.
+            let branch = git.current_branch(repo).ok()?;
+            if branch.is_empty() {
+                return None;
+            }
+            branch
+        }
+    };
+    let branch_commit = match read_branch_commit(repo, &branch) {
+        Some(commit) => commit,
+        None => git
+            .rev_parse(repo, vec![format!("refs/heads/{branch}")])
+            .ok()?
+            .trim()
+            .to_string(),
+    };
     Some(CheckoutHeadBefore {
         branch,
         branch_commit,
+    })
+}
+
+/// What a checkout's `HEAD` says, read from disk.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckoutHead {
+    /// A symref to `refs/heads/<branch>`.
+    Attached(String),
+    /// An object id.
+    Detached,
+    /// Not an ordinary `.git` directory, or not a form read here (a symref
+    /// outside `refs/heads/`, a reftable repository): ask git instead.
+    Unreadable,
+}
+
+fn read_checkout_head(repo: &Path) -> CheckoutHead {
+    let dot_git = repo.join(".git");
+    if !dot_git.is_dir() || dot_git.join("reftable").exists() {
+        return CheckoutHead::Unreadable;
+    }
+    let Ok(text) = std::fs::read_to_string(dot_git.join("HEAD")) else {
+        return CheckoutHead::Unreadable;
+    };
+    let text = text.trim();
+    match text.strip_prefix("ref:") {
+        Some(target) => match target.trim().strip_prefix("refs/heads/") {
+            Some(branch) if !branch.is_empty() => CheckoutHead::Attached(branch.to_string()),
+            _ => CheckoutHead::Unreadable,
+        },
+        None if is_object_id(text) => CheckoutHead::Detached,
+        None => CheckoutHead::Unreadable,
+    }
+}
+
+fn is_object_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The commit `refs/heads/<branch>` holds, read from the loose ref or, failing
+/// that, `packed-refs`. `None` when neither names it, which the caller treats
+/// as "ask git" rather than "absent".
+fn read_branch_commit(repo: &Path, branch: &str) -> Option<String> {
+    let dot_git = repo.join(".git");
+    let name = format!("refs/heads/{branch}");
+    if let Ok(text) = std::fs::read_to_string(dot_git.join(&name)) {
+        let text = text.trim();
+        return is_object_id(text).then(|| text.to_string());
+    }
+    let packed = std::fs::read_to_string(dot_git.join("packed-refs")).ok()?;
+    packed.lines().find_map(|line| {
+        let (id, reference) = line.split_once(' ')?;
+        (reference == name && is_object_id(id)).then(|| id.to_string())
     })
 }
 
@@ -488,15 +555,19 @@ fn repair_export_detach(
     before: &CheckoutHeadBefore,
     policy: CheckoutRepairPolicy,
 ) {
-    let now = match git.current_branch(repo) {
-        Ok(branch) => branch,
-        Err(e) => {
-            log::warn!(
-                "post-export HEAD check failed for checkout {}: {e}",
-                repo.display()
-            );
-            return;
-        }
+    let now = match read_checkout_head(repo) {
+        CheckoutHead::Attached(branch) => branch,
+        CheckoutHead::Detached => String::new(),
+        CheckoutHead::Unreadable => match git.current_branch(repo) {
+            Ok(branch) => branch,
+            Err(e) => {
+                log::warn!(
+                    "post-export HEAD check failed for checkout {}: {e}",
+                    repo.display()
+                );
+                return;
+            }
+        },
     };
     if !now.is_empty() {
         // Still attached: the export did not detach HEAD.
@@ -504,7 +575,7 @@ fn repair_export_detach(
     }
 
     let after_commit = match git.rev_parse(repo, vec![format!("refs/heads/{}", before.branch)]) {
-        Ok(commit) => commit,
+        Ok(commit) => commit.trim().to_string(),
         Err(e) => {
             log::warn!(
                 "post-export ref read failed for checkout {}: {e}",
@@ -521,5 +592,102 @@ fn repair_export_detach(
 
     if let Err(e) = reattach_checkout_head(git, repo, &before.branch, policy) {
         log::warn!("failed to re-attach checkout HEAD after export detached it: {e}");
+    }
+}
+
+#[cfg(test)]
+mod head_reader_tests {
+    use super::*;
+
+    const A: &str = "1111111111111111111111111111111111111111";
+    const B: &str = "2222222222222222222222222222222222222222";
+
+    fn checkout() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".git/refs/heads/feature")).unwrap();
+        temp
+    }
+
+    #[test]
+    fn head_is_read_attached_detached_or_unreadable() {
+        let temp = checkout();
+        let head = temp.path().join(".git/HEAD");
+        std::fs::write(&head, "ref: refs/heads/main\n").unwrap();
+        assert_eq!(
+            read_checkout_head(temp.path()),
+            CheckoutHead::Attached("main".into())
+        );
+        std::fs::write(&head, format!("{A}\n")).unwrap();
+        assert_eq!(read_checkout_head(temp.path()), CheckoutHead::Detached);
+        std::fs::write(&head, "ref: refs/remotes/origin/main\n").unwrap();
+        assert_eq!(read_checkout_head(temp.path()), CheckoutHead::Unreadable);
+        std::fs::create_dir(temp.path().join(".git/reftable")).unwrap();
+        std::fs::write(&head, "ref: refs/heads/main\n").unwrap();
+        assert_eq!(
+            read_checkout_head(temp.path()),
+            CheckoutHead::Unreadable,
+            "a reftable repository's refs are not files; ask git"
+        );
+    }
+
+    #[test]
+    fn a_branch_commit_is_read_from_the_loose_ref_before_packed_refs() {
+        let temp = checkout();
+        let git = temp.path().join(".git");
+        std::fs::write(
+            git.join("packed-refs"),
+            format!("# pack-refs with: peeled fully-peeled sorted \n{A} refs/heads/main\n{B} refs/heads/feature/x\n^{A}\n"),
+        )
+        .unwrap();
+        assert_eq!(read_branch_commit(temp.path(), "main").as_deref(), Some(A));
+        assert_eq!(
+            read_branch_commit(temp.path(), "feature/x").as_deref(),
+            Some(B)
+        );
+        std::fs::write(git.join("refs/heads/main"), format!("{B}\n")).unwrap();
+        assert_eq!(
+            read_branch_commit(temp.path(), "main").as_deref(),
+            Some(B),
+            "a loose ref is newer than its packed copy"
+        );
+        assert_eq!(read_branch_commit(temp.path(), "absent"), None);
+    }
+
+    /// The disk reader and git agree on a real repository.
+    #[test]
+    fn the_disk_reader_matches_git() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.email=a@b",
+            "-c",
+            "user.name=a",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "one",
+        ]);
+        let head = git(&["rev-parse", "refs/heads/main"]);
+        assert_eq!(
+            read_checkout_head(repo),
+            CheckoutHead::Attached("main".into())
+        );
+        assert_eq!(read_branch_commit(repo, "main"), Some(head.clone()));
+        git(&["pack-refs", "--all"]);
+        assert_eq!(read_branch_commit(repo, "main"), Some(head));
+        git(&["checkout", "-q", "--detach"]);
+        assert_eq!(read_checkout_head(repo), CheckoutHead::Detached);
     }
 }

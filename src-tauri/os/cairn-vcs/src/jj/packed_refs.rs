@@ -30,6 +30,14 @@ use std::time::{Duration, Instant};
 /// that is going to win the race usually does so within the first few attempts.
 const RETRY_DELAY: Duration = Duration::from_millis(250);
 
+/// How long into the wait the lock is first probed for abandonment. A routine
+/// writer holds `packed-refs.lock` for milliseconds, and a slow one holds it
+/// open, which `lsof` sees; a lock five seconds old that nobody holds open is
+/// already proven abandoned, and waiting out the rest of [`LOCK_WAIT`] before
+/// removing it only spends that time inside whatever store lock the caller
+/// holds.
+const STALE_PROBE_AFTER: Duration = Duration::from_secs(5);
+
 /// Where the contended `packed-refs.lock` lives, named the way each caller
 /// already knows its repository.
 #[derive(Clone, Copy)]
@@ -171,6 +179,29 @@ fn heal_stale_lock(
     Ok(true)
 }
 
+thread_local! {
+    /// Contention this thread has waited out since [`take_packed_refs_waited`]
+    /// last read it.
+    static WAITED: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+/// The `packed-refs.lock` contention this thread has spent inside
+/// [`with_packed_refs_patience`] since the last call, resetting it to zero.
+///
+/// Per thread because patience is blocking and runs where its caller runs: a
+/// caller that times a phase reads this on the same thread, after the phase's
+/// work, to attribute the wait to that phase. The async variant is not counted,
+/// because a task can resume on a different thread from the one it began on.
+pub fn take_packed_refs_waited() -> Duration {
+    WAITED.with(|waited| waited.replace(Duration::ZERO))
+}
+
+fn record_waited(contended: Duration) {
+    if !contended.is_zero() {
+        WAITED.with(|waited| waited.set(waited.get() + contended));
+    }
+}
+
 /// What to do after an attempt failed on lock contention.
 enum Recovery {
     /// Ordinary contention, still inside the wait: sleep, then try again.
@@ -185,23 +216,43 @@ struct Patience<'a> {
     scope: PackedRefs<'a>,
     ctx: &'a str,
     started: Instant,
+    /// When the most recent attempt began.
+    attempt_started: Instant,
     attempts: u32,
     healed: bool,
+    /// Whether the early abandonment probe has run.
+    probed: bool,
 }
 
 impl<'a> Patience<'a> {
     fn new(scope: PackedRefs<'a>, ctx: &'a str) -> Self {
+        let started = Instant::now();
         Self {
             scope,
             ctx,
-            started: Instant::now(),
+            started,
+            attempt_started: started,
             attempts: 0,
             healed: false,
+            probed: false,
         }
     }
 
     fn attempting(&mut self) {
         self.attempts += 1;
+        self.attempt_started = Instant::now();
+    }
+
+    /// Time lost to contention: everything before the attempt that succeeded,
+    /// or the whole call when patience gave up.
+    fn contended(&self, succeeded: bool) -> Duration {
+        if succeeded && self.attempts <= 1 {
+            Duration::ZERO
+        } else if succeeded {
+            self.attempt_started.duration_since(self.started)
+        } else {
+            self.started.elapsed()
+        }
     }
 
     fn settled(&self) {
@@ -222,6 +273,24 @@ impl<'a> Patience<'a> {
     fn recover(&mut self, error: String) -> Result<Recovery, String> {
         if !packed_refs_lock_error(&error) {
             return Err(error);
+        }
+        // One early probe, held to the same proof as the final one: older than
+        // the probe bound and held open by no live process. A lock it cannot
+        // prove abandoned is simply waited on, and the final probe at the end
+        // of the wait still decides.
+        if !self.probed && self.started.elapsed() >= STALE_PROBE_AFTER {
+            self.probed = true;
+            match heal_stale_lock(self.scope, self.ctx, STALE_PROBE_AFTER) {
+                Ok(true) => {
+                    self.healed = true;
+                    return Ok(Recovery::RetryNow);
+                }
+                Ok(false) => {}
+                Err(proof_error) => log::debug!(
+                    "{}: early stale-lock probe declined: {proof_error}",
+                    self.ctx
+                ),
+            }
         }
         if self.started.elapsed() < LOCK_WAIT {
             log::warn!(
@@ -276,19 +345,22 @@ pub fn with_packed_refs_patience<T>(
     mut op: impl FnMut() -> Result<T, String>,
 ) -> Result<T, String> {
     let mut patience = Patience::new(scope, ctx);
-    loop {
+    let result = loop {
         patience.attempting();
         match op() {
             Ok(value) => {
                 patience.settled();
-                return Ok(value);
+                break Ok(value);
             }
-            Err(error) => match patience.recover(error)? {
-                Recovery::Wait(delay) => std::thread::sleep(delay),
-                Recovery::RetryNow => {}
+            Err(error) => match patience.recover(error) {
+                Ok(Recovery::Wait(delay)) => std::thread::sleep(delay),
+                Ok(Recovery::RetryNow) => {}
+                Err(error) => break Err(error),
             },
         }
-    }
+    };
+    record_waited(patience.contended(result.is_ok()));
+    result
 }
 
 /// [`with_packed_refs_patience`] for an async caller.
@@ -536,6 +608,91 @@ mod tests {
         })
         .unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        assert!(
+            take_packed_refs_waited() >= RETRY_DELAY * 3,
+            "three lost attempts are attributed to this thread"
+        );
+        assert!(take_packed_refs_waited().is_zero(), "reading resets it");
+    }
+
+    #[test]
+    fn an_uncontended_call_records_no_wait() {
+        let temp = TempDir::new().unwrap();
+        let _ = take_packed_refs_waited();
+        with_packed_refs_patience(PackedRefs::Checkout(temp.path()), "unit test", || Ok(()))
+            .unwrap();
+        assert!(take_packed_refs_waited().is_zero());
+    }
+
+    fn age_lock(lock: &Path, seconds: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(lock)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(seconds))
+            .unwrap();
+    }
+
+    fn contention() -> String {
+        "The lock for the packed-ref file could not be obtained".to_string()
+    }
+
+    /// Five seconds into the wait, a lock that old with no live holder is
+    /// removed then, rather than after the full thirty.
+    #[cfg(unix)]
+    #[test]
+    fn an_abandoned_lock_is_removed_at_the_early_probe() {
+        let (_temp, checkout, lock) = checkout_with_lock();
+        std::fs::write(&lock, "abandoned\n").unwrap();
+        age_lock(&lock, 6);
+        let mut patience = Patience::new(PackedRefs::Checkout(&checkout), "unit test");
+        patience.started = Instant::now() - STALE_PROBE_AFTER;
+        patience.attempting();
+        assert!(matches!(
+            patience.recover(contention()),
+            Ok(Recovery::RetryNow)
+        ));
+        assert!(!lock.exists(), "the proven-abandoned lock is gone");
+    }
+
+    /// The early probe never removes a lock a live process holds open,
+    /// however old it looks; the caller keeps waiting.
+    #[cfg(unix)]
+    #[test]
+    fn the_early_probe_never_removes_a_held_lock() {
+        let (_temp, checkout, lock) = checkout_with_lock();
+        std::fs::write(&lock, "held\n").unwrap();
+        age_lock(&lock, 60);
+        let held = std::fs::File::open(&lock).unwrap();
+        let mut patience = Patience::new(PackedRefs::Checkout(&checkout), "unit test");
+        patience.started = Instant::now() - STALE_PROBE_AFTER;
+        patience.attempting();
+        assert!(matches!(
+            patience.recover(contention()),
+            Ok(Recovery::Wait(_))
+        ));
+        assert!(lock.exists());
+        assert!(
+            !patience.healed,
+            "the final probe at the end of the wait still runs"
+        );
+        drop(held);
+    }
+
+    /// A fresh lock is contention, not abandonment, even with no holder.
+    #[cfg(unix)]
+    #[test]
+    fn the_early_probe_leaves_a_fresh_lock_alone() {
+        let (_temp, checkout, lock) = checkout_with_lock();
+        std::fs::write(&lock, "fresh\n").unwrap();
+        let mut patience = Patience::new(PackedRefs::Checkout(&checkout), "unit test");
+        patience.started = Instant::now() - STALE_PROBE_AFTER;
+        patience.attempting();
+        assert!(matches!(
+            patience.recover(contention()),
+            Ok(Recovery::Wait(_))
+        ));
+        assert!(lock.exists());
     }
 
     /// A rewrite that committed and then could not be put back must stop, and

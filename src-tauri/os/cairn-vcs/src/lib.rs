@@ -646,6 +646,94 @@ pub async fn commit_stamp(
     .map_err(|error| CoordinateResolutionError::Repository(error.to_string()))?
 }
 
+/// What a sibling reconcile checks about one bookmark before it rebases it,
+/// answered by one read of the store at its operation head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookmarkPrecheck {
+    /// What the rebase destination resolves to. `None` when this read could not
+    /// resolve it as a symbol, which the caller treats as "ask the CLI".
+    pub destination: Option<String>,
+    /// The bookmark's single local target. `None` when it is absent or its name
+    /// is conflicted.
+    pub tip: Option<String>,
+    /// The local name holds several competing targets.
+    pub name_conflicted: bool,
+    /// The tip's change has more than one visible commit.
+    pub divergent: bool,
+}
+
+impl BookmarkPrecheck {
+    /// Neither repair applies: the tip read here is the tip the rebase sees.
+    pub fn is_settled(&self) -> bool {
+        !self.name_conflicted && !self.divergent
+    }
+}
+
+/// Read [`BookmarkPrecheck`] for `branch`, and resolve `destination`, from one
+/// repository load and no subprocess.
+///
+/// The reconcile used to ask the same questions with a `jj` invocation each
+/// (destination, conflicted-name probe, tip, change id, visible twins), every
+/// one inside the store lock and each costing about a second on a loaded host.
+/// Read-only; a conflicted or divergent answer sends the caller to the existing
+/// repair commands, which do the writing.
+pub async fn bookmark_precheck(
+    repository_path: &Path,
+    destination: &str,
+    branch: &str,
+) -> Result<BookmarkPrecheck, CoordinateResolutionError> {
+    let repository_path = repository_path.to_path_buf();
+    let destination = destination.trim().to_string();
+    let branch = branch.to_string();
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| CoordinateResolutionError::Repository(error.to_string()))?
+            .block_on(async {
+                let repo = load_repo_at_head(&repository_path).await?;
+                Ok(precheck_at(&repo, &destination, &branch))
+            })
+    })
+    .await
+    .map_err(|error| CoordinateResolutionError::Repository(error.to_string()))?
+}
+
+fn precheck_at(repo: &ReadonlyRepo, destination: &str, branch: &str) -> BookmarkPrecheck {
+    let destination = resolve_symbol_at(repo, destination).ok().map(|id| id.hex());
+    let target = repo.view().get_local_bookmark(RefName::new(branch));
+    if target.has_conflict() {
+        return BookmarkPrecheck {
+            destination,
+            tip: None,
+            name_conflicted: true,
+            divergent: false,
+        };
+    }
+    let Some(tip) = target.as_normal().cloned() else {
+        return BookmarkPrecheck {
+            destination,
+            tip: None,
+            name_conflicted: false,
+            divergent: false,
+        };
+    };
+    // An unreadable commit or index answer is reported as divergent so the
+    // caller runs the CLI probe instead of trusting a guess.
+    let divergent = repo
+        .store()
+        .get_commit(&tip)
+        .ok()
+        .and_then(|commit| repo.resolve_change_id(commit.change_id()).ok())
+        .is_none_or(|targets| targets.is_none_or(|targets| targets.is_divergent()));
+    BookmarkPrecheck {
+        destination,
+        tip: Some(tip.hex()),
+        name_conflicted: false,
+        divergent,
+    }
+}
+
 /// Load a store's workspace through the crate's one settings seam, for the
 /// maintenance pass that rewrites its operation log.
 pub(crate) fn load_workspace(repository_path: &Path) -> Result<Workspace, String> {
@@ -1857,5 +1945,47 @@ mod tests {
             result,
             Err(CoordinateResolutionError::Invalid(String::new()))
         );
+    }
+
+    /// The in-process precheck agrees with the CLI reads it stands in for: a
+    /// settled bookmark reads its tip and resolves the destination, an absent
+    /// one reads no tip, and a conflicted name is flagged so the reconcile runs
+    /// its repair.
+    #[test]
+    fn the_bookmark_precheck_reads_settled_absent_and_conflicted_bookmarks() {
+        let (dir, store, local, _git_side) = conflicted_bookmark_fixture();
+        let main = git_rev(&dir.path().join("project"), "main");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let settled = runtime
+            .block_on(bookmark_precheck(&store, "main", "keep-l"))
+            .unwrap();
+        assert_eq!(
+            settled,
+            BookmarkPrecheck {
+                destination: Some(main),
+                tip: Some(local),
+                name_conflicted: false,
+                divergent: false,
+            }
+        );
+        assert!(settled.is_settled());
+
+        let absent = runtime
+            .block_on(bookmark_precheck(&store, "no-such-destination", "nowhere"))
+            .unwrap();
+        assert_eq!(absent.destination, None, "left to the CLI to resolve");
+        assert_eq!(absent.tip, None);
+        assert!(absent.is_settled());
+
+        let conflicted = runtime
+            .block_on(bookmark_precheck(&store, "main", "agent/x"))
+            .unwrap();
+        assert!(conflicted.name_conflicted);
+        assert_eq!(conflicted.tip, None);
+        assert!(!conflicted.is_settled());
     }
 }

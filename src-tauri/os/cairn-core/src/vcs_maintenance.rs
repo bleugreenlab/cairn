@@ -491,6 +491,7 @@ async fn run_prune(
         let Ok(_guard) = orch
             .acquire_jj_store_lock_with_timeout(
                 &store,
+                crate::orchestrator::StoreLockClass::Background,
                 "ref-store maintenance: truncate the operation log",
                 Some(STORE_LOCK_WAIT),
             )

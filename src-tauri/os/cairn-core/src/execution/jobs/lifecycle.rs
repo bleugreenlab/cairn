@@ -1246,7 +1246,11 @@ where
 {
     let _store_guard = run_db_borrowed(async {
         Ok(orch
-            .acquire_jj_store_lock(store, format!("branch preparation for job {}", job.id))
+            .acquire_jj_store_lock(
+                store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                crate::orchestrator::branch_preparation_operation(&job.id),
+            )
             .await)
     })?;
     crate::jj::ensure_project_store(jj, store, repo_path)?;
@@ -1303,7 +1307,11 @@ pub(crate) fn import_project_store_locked(
 ) -> Result<(), String> {
     let _store_guard = run_db_borrowed(async {
         Ok(orch
-            .acquire_jj_store_lock(store, format!("project store import: {operation}"))
+            .acquire_jj_store_lock(
+                store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                format!("project store import: {operation}"),
+            )
             .await)
     })?;
     crate::jj::ensure_project_store(jj, store, repo_path)
@@ -8671,7 +8679,11 @@ mod tests {
 
         // The sibling reconcile: lock, snapshot, a local-view write of its own.
         let reconcile = orch
-            .acquire_jj_store_lock(&fx.store, "sibling reconcile (test)")
+            .acquire_jj_store_lock(
+                &fx.store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                "sibling reconcile (test)",
+            )
             .await;
         let snapshot = crate::jj::operation_id(&fx.jj, &fx.store).unwrap();
         crate::jj::create_bookmark_at(&fx.jj, &fx.store, SIBLING, &fx.base).unwrap();
@@ -8738,7 +8750,11 @@ mod tests {
         const ARRIVED: &str = "feature/arrived-mid-rollback";
 
         let reconcile = orch
-            .acquire_jj_store_lock(&fx.store, "sibling reconcile (test)")
+            .acquire_jj_store_lock(
+                &fx.store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                "sibling reconcile (test)",
+            )
             .await;
         let snapshot = crate::jj::operation_id(&fx.jj, &fx.store).unwrap();
         // A ref reaches the project's git while the writer holds the lock.

@@ -29,19 +29,31 @@ pub(crate) const STORE_LOCK_TIMEOUT: Duration =
 pub(crate) async fn acquire_store_lock(
     orch: &crate::orchestrator::Orchestrator,
     store: Option<&Path>,
+    class: crate::orchestrator::StoreLockClass,
     operation: &str,
     timeout: Duration,
 ) -> Result<Option<crate::orchestrator::JjStoreGuard>, String> {
     let Some(store) = store else { return Ok(None) };
-    orch.acquire_jj_store_lock_with_timeout(store, operation, Some(timeout))
+    orch.acquire_jj_store_lock_with_timeout(store, class, operation, Some(timeout))
         .await
         .map(Some)
-        .map_err(|()| {
-            let holder = orch
-                .jj_store_lock_holder(store)
-                .unwrap_or_else(|| "another version-control operation".to_string());
-            format!("The project's version-control store is busy behind: {holder}; retry this operation.")
-        })
+        .map_err(|()| store_busy_message(orch.store_lock_status(store).as_ref()))
+}
+
+/// The refusal for a store-lock wait that ran out, naming who holds the lock,
+/// for how long, and how many others are queued.
+fn store_busy_message(status: Option<&crate::orchestrator::StoreLockStatus>) -> String {
+    match status {
+        Some(status) if status.holder.is_some() => format!(
+            "The project's version-control store is busy behind: {} ({} waiting); retry this \
+             operation.",
+            status.describe_holder(),
+            status.waiters.len()
+        ),
+        _ => "The project's version-control store is busy behind: another version-control \
+              operation; retry this operation."
+            .to_string(),
+    }
 }
 
 /// Opaque pre-batch working-copy snapshot, captured before a batch runs so the
@@ -1733,12 +1745,17 @@ mod tests {
         let orch = orch_with_config("store_lock_holder", root.path().to_path_buf()).await;
         let store = root.path().join("store");
         let _holder = orch
-            .acquire_jj_store_lock(&store, "sibling reconcile (external advance on main)")
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                "sibling reconcile (external advance on main)",
+            )
             .await;
 
         let error = acquire_store_lock(
             &orch,
             Some(&store),
+            crate::orchestrator::StoreLockClass::Foreground,
             "test waiter",
             Duration::from_millis(10),
         )

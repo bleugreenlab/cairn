@@ -72,7 +72,11 @@ pub(crate) async fn publish_managed_branch(
 
     {
         let guard = orch
-            .acquire_jj_store_lock(store, format!("stale publication recovery: {branch}"))
+            .acquire_jj_store_lock(
+                store,
+                crate::orchestrator::StoreLockClass::Background,
+                format!("stale publication recovery: {branch}"),
+            )
             .await;
         let _phase = guard.phase(format!("import and converge branch={branch}"));
         crate::jj::converge_managed_branch_after_remote_rewrite(&jj, store, branch)?;
@@ -1658,7 +1662,11 @@ async fn reconcile_jj_downstream(
     // held cells on that exact coordinate before reconciling descendants.
     {
         let guard = orch
-            .acquire_jj_store_lock(&store, format!("jj on-branch advance for {merged_job_id}"))
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Background,
+                format!("jj on-branch advance for {merged_job_id}"),
+            )
             .await;
         let _phase = guard.phase("on-branch coordinate advance");
         refresh_advanced_branch_cells(orch, db, &merged_job.project_id, base_branch, repo_path)
@@ -1839,7 +1847,11 @@ async fn reconcile_store_default_bookmark(
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, repo_path);
     let guard = orch
-        .acquire_jj_store_lock(&store, format!("default bookmark reconcile: {ctx}"))
+        .acquire_jj_store_lock(
+            &store,
+            crate::orchestrator::StoreLockClass::Background,
+            format!("default bookmark reconcile: {ctx}"),
+        )
         .await;
     let _phase = guard.phase("default bookmark reconcile");
     if let Err(error) = crate::jj::ensure_store_initialized(&jj, &store, repo_path) {
@@ -1934,7 +1946,11 @@ pub(crate) async fn reconcile_default_advance(
         let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
         let store = crate::jj::project_store_dir(&orch.config_dir, repo_path_path);
         let store_guard = orch
-            .acquire_jj_store_lock(&store, format!("external import on {default_branch}"))
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Background,
+                format!("external import on {default_branch}"),
+            )
             .await;
         let _phase = store_guard.phase("git ref import");
         // Origin is the authority for the branch just fetched, so its import
@@ -2030,6 +2046,7 @@ async fn reconcile_startup_remote_default_advance(
         let _store_guard = orch
             .acquire_jj_store_lock(
                 &store,
+                crate::orchestrator::StoreLockClass::Background,
                 format!(
                     "startup remote advance snapshot on {}",
                     project.default_branch
@@ -2079,6 +2096,7 @@ async fn reconcile_startup_remote_default_advance(
         let _store_guard = orch
             .acquire_jj_store_lock(
                 &store,
+                crate::orchestrator::StoreLockClass::Background,
                 format!(
                     "startup remote advance snapshot on {}",
                     project.default_branch
@@ -2283,6 +2301,7 @@ async fn execute_durable_reconcile_work(
         let _guard = orch
             .acquire_jj_store_lock(
                 &work.store,
+                crate::orchestrator::StoreLockClass::Background,
                 format!(
                     "durable reconcile destination refresh ({})",
                     work.target_branch
@@ -2765,7 +2784,11 @@ async fn reconcile_base_advance(
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
     let (pinned_dest, existing_bookmarks) = {
         let guard = orch
-            .acquire_jj_store_lock(&store, format!("sibling reconcile preparation ({label})"))
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Background,
+                format!("sibling reconcile preparation ({label})"),
+            )
             .await;
         let _phase = guard.phase(format!(
             "bookmark listing and destination resolution candidate_count={} queried_count={}",
@@ -2991,7 +3014,11 @@ pub(crate) async fn request_branch_replay(
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&project.repo_path));
     let resolved = {
         let guard = orch
-            .acquire_jj_store_lock(&store, format!("replay request for {branch}"))
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Background,
+                format!("replay request for {branch}"),
+            )
             .await;
         let _phase = guard.phase(format!("resolve replay destination branch={branch}"));
         crate::orchestrator::replay_base::resolve_base(&jj, &store, branch, &candidates)
@@ -3290,6 +3317,7 @@ async fn execute_reconcile_claim(
             let guard = orch
                 .acquire_jj_store_lock(
                     &store,
+                    crate::orchestrator::StoreLockClass::Background,
                     format!("sibling reconcile inspect ({label}): {branch}"),
                 )
                 .await;
@@ -3465,15 +3493,20 @@ async fn execute_reconcile_claim(
             resumed
         } else {
             let guard = orch
-                .acquire_jj_store_lock(&store, format!("sibling reconcile ({label}): {branch}"))
+                .acquire_jj_store_lock(
+                    &store,
+                    crate::orchestrator::StoreLockClass::Background,
+                    format!("sibling reconcile ({label}): {branch}"),
+                )
                 .await;
-            let _phase = guard.phase(format!("bookmark transaction branch={branch}"));
-
             // RunBatch suspension admission takes this same store lock while
             // inserting its durable row. Revalidating under the guard makes the
             // row check and bookmark mutation one exclusive bracket.
             let branch_siblings = siblings_for_branch(&siblings, branch);
-            if jobs_have_inflight_run_batches(db, &branch_siblings).await? {
+            let admission_check = guard.phase("in-flight run batch check");
+            let inflight = jobs_have_inflight_run_batches(db, &branch_siblings).await?;
+            drop(admission_check);
+            if inflight {
                 log::info!(
                     "jj base advance ({label}): deferred {branch} at the mutation boundary for an in-flight run batch"
                 );
@@ -3508,9 +3541,36 @@ async fn execute_reconcile_claim(
                 continue;
             }
 
+            // One in-process read answers the destination, the name, the
+            // divergence, and the tip. Each repair below runs its CLI probe only
+            // when this read could not answer or found something to repair; a
+            // failed read falls back to all of them.
+            let precheck = {
+                let _phase = guard.phase("bookmark precheck");
+                match cairn_vcs::bookmark_precheck(&store, rebase_dest, branch).await {
+                    Ok(precheck) => Some(precheck),
+                    Err(error) => {
+                        log::debug!(
+                            "jj base advance ({label}): in-process precheck of {branch} failed, \
+                             probing with jj instead: {error}"
+                        );
+                        None
+                    }
+                }
+            };
+            let settled = precheck.as_ref().filter(|precheck| precheck.is_settled());
+
             // Revalidate that the named destination still identifies the pinned
             // commit before mutating this bookmark.
-            let observed_dest = crate::jj::revset_commit(&jj, &store, rebase_dest);
+            let observed_dest = match precheck
+                .as_ref()
+                .and_then(|precheck| precheck.destination.clone())
+            {
+                Some(destination) => Some(destination),
+                None => guard.blocking_phase("revalidate destination", || {
+                    crate::jj::revset_commit(&jj, &store, rebase_dest)
+                }),
+            };
             if observed_dest.as_deref() != Some(pinned_dest.as_str()) {
                 return Err(format!(
                         "jj base advance ({label}): destination moved while intent was running (pinned {pinned_dest}, observed {observed_dest:?})"
@@ -3521,12 +3581,22 @@ async fn execute_reconcile_claim(
             // retried as `conflicted_bookmark` forever without anything trying
             // to settle it. Settle it here, under the same guard, so healing
             // does not wait for someone to read the branch.
-            let name_refusal = match crate::jj::repair_conflicted_branch_name(
-                &jj,
-                &store,
-                branch,
-                crate::jj::BranchAuthority::Store,
-            ) {
+            let name_repair = if precheck
+                .as_ref()
+                .is_some_and(|precheck| !precheck.name_conflicted)
+            {
+                Ok(None)
+            } else {
+                guard.blocking_phase("name repair", || {
+                    crate::jj::repair_conflicted_branch_name(
+                        &jj,
+                        &store,
+                        branch,
+                        crate::jj::BranchAuthority::Store,
+                    )
+                })
+            };
+            let name_refusal = match name_repair {
                 Ok(Some(settled)) => {
                     log::info!(
                         "jj base advance ({label}): settled `{branch}`'s conflicted name on {settled} before replaying it"
@@ -3548,7 +3618,16 @@ async fn execute_reconcile_claim(
                 }
             };
 
-            match crate::jj::collapse_divergent_bookmark(&jj, &store, branch) {
+            // A repaired name may have moved the tip, so only a read that found
+            // nothing to repair can stand in for the collapse probe.
+            let collapse = if settled.is_some() {
+                Ok(crate::jj::CollapseOutcome::NotDivergent)
+            } else {
+                guard.blocking_phase("divergence collapse", || {
+                    crate::jj::collapse_divergent_bookmark(&jj, &store, branch)
+                })
+            };
+            match collapse {
                 Ok(crate::jj::CollapseOutcome::NotDivergent) => {
                     divergence_resolved = true;
                 }
@@ -3572,7 +3651,13 @@ async fn execute_reconcile_claim(
             }
 
             if ambiguous_item.is_none() {
-                if let Some(commit) = crate::jj::bookmark_commit(&jj, &store, branch) {
+                let tip = match settled {
+                    Some(precheck) => precheck.tip.clone(),
+                    None => guard.blocking_phase("read tip before", || {
+                        crate::jj::bookmark_commit(&jj, &store, branch)
+                    }),
+                };
+                if let Some(commit) = tip {
                     before.insert(branch.clone(), commit);
                 }
             }
@@ -3584,13 +3669,9 @@ async fn execute_reconcile_claim(
                     if session.conflicting().next().is_some()
                         || !session.resolution_basis.is_empty() =>
                 {
-                    Some(plan_resolution_carry(
-                        &jj,
-                        &store,
-                        session,
-                        &pinned_dest,
-                        live_tip,
-                    ))
+                    Some(guard.blocking_phase("plan resolution carry", || {
+                        plan_resolution_carry(&jj, &store, session, &pinned_dest, live_tip)
+                    }))
                 }
                 _ => None,
             };
@@ -3611,16 +3692,19 @@ async fn execute_reconcile_claim(
                             log::info!("jj reconcile ({label}): `{branch}` {note}");
                             carry_notes.insert(branch.clone(), note);
                         }
-                        crate::jj::reconcile_resolved_sibling_without_publication(
-                            &jj,
-                            &store,
-                            &pinned_dest,
-                            branch,
-                            &plan.carry,
-                        )
-                        .map_err(|error| {
-                            format!("jj resolved sibling replay ({label}) failed: {error}")
-                        })?
+                        guard
+                            .blocking_phase("rebase and export", || {
+                                crate::jj::reconcile_resolved_sibling_without_publication(
+                                    &jj,
+                                    &store,
+                                    &pinned_dest,
+                                    branch,
+                                    &plan.carry,
+                                )
+                            })
+                            .map_err(|error| {
+                                format!("jj resolved sibling replay ({label}) failed: {error}")
+                            })?
                     }
                     Err(error) => {
                         let mut refused = crate::jj::ReconcileReport::default();
@@ -3636,11 +3720,21 @@ async fn execute_reconcile_claim(
                 }
             } else {
                 let item = vec![branch.clone()];
-                crate::jj::reconcile_siblings_without_publication(&jj, &store, &pinned_dest, &item)
+                guard
+                    .blocking_phase("rebase and export", || {
+                        crate::jj::reconcile_siblings_without_publication(
+                            &jj,
+                            &store,
+                            &pinned_dest,
+                            &item,
+                        )
+                    })
                     .map_err(|error| format!("jj sibling reconcile ({label}) failed: {error}"))?
             };
             if ambiguous_item.is_none() {
-                if let Some(commit) = crate::jj::bookmark_commit(&jj, &store, branch) {
+                if let Some(commit) = guard.blocking_phase("read tip after", || {
+                    crate::jj::bookmark_commit(&jj, &store, branch)
+                }) {
                     after.insert(branch.clone(), commit);
                 }
             }
@@ -3671,6 +3765,7 @@ async fn execute_reconcile_claim(
                 let guard = orch
                     .acquire_jj_store_lock(
                         &store,
+                        crate::orchestrator::StoreLockClass::Background,
                         format!("migration registry union ({label}): {branch}"),
                     )
                     .await;
@@ -3799,7 +3894,7 @@ async fn execute_reconcile_claim(
                     if !plan.is_empty() {
                         let guard = orch
                             .acquire_jj_store_lock(
-                                &store,
+                                &store, crate::orchestrator::StoreLockClass::Foreground,
                                 format!("contended identifier resolution: {branch}"),
                             )
                             .await;
@@ -5564,14 +5659,22 @@ mod tests {
         // point cannot insert its bracket row underneath that mutation.
         let store = PathBuf::from("/store");
         let mutation_guard = orch
-            .acquire_jj_store_lock(&store, "test reconcile mutation")
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Background,
+                "test reconcile mutation",
+            )
             .await;
         let admission_orch = orch.clone();
         let admission_db = db.clone();
         let admission_store = store.clone();
         let mut admission = tokio::spawn(async move {
             let _guard = admission_orch
-                .acquire_jj_store_lock(&admission_store, "test run batch admission")
+                .acquire_jj_store_lock(
+                    &admission_store,
+                    crate::orchestrator::StoreLockClass::Background,
+                    "test run batch admission",
+                )
                 .await;
             admission_db
                 .execute(
@@ -5596,7 +5699,11 @@ mod tests {
         drop(mutation_guard);
         admission.await.unwrap();
         let _revalidation_guard = orch
-            .acquire_jj_store_lock(&store, "test reconcile revalidation")
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Background,
+                "test reconcile revalidation",
+            )
             .await;
         assert!(jobs_have_inflight_run_batches(&db, &[sibling])
             .await
@@ -8436,6 +8543,7 @@ mod tests {
         let store = crate::jj::project_store_dir(&orch.config_dir, Path::new("/repo"));
         orch.acquire_jj_store_lock_with_timeout(
             &store,
+            crate::orchestrator::StoreLockClass::Background,
             "test run commit barrier publication",
             Some(std::time::Duration::from_millis(100)),
         )

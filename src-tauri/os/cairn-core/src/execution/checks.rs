@@ -1896,85 +1896,230 @@ pub(crate) fn check_ref_is_held(reference: &str) -> bool {
 }
 
 impl TemporaryCheckRef {
-    async fn delete_locked(&mut self) -> Result<(), String> {
-        git_check_ref_write(
-            &self.repository,
-            &["update-ref", "-d", &self.reference, &self.commit],
-            "delete sealed check commit reference",
-        )
-        .await?;
+    /// Hand the ref to the retirement sweeper. It stays held, and so out of
+    /// the ref-store sweep's reach, until it is actually deleted or the
+    /// sweeper gives up on it.
+    fn retire(&mut self) {
+        if !self.armed {
+            return;
+        }
         self.armed = false;
-        release_check_ref(&self.reference);
-        Ok(())
+        retire_check_ref(
+            &self.orch,
+            &self.store_dir,
+            CheckRefRetirement {
+                repository: self.repository.clone(),
+                reference: self.reference.clone(),
+                commit: self.commit.clone(),
+                attempts: 0,
+            },
+        );
     }
 }
 
 impl Drop for TemporaryCheckRef {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        self.armed = false;
-        let orch = self.orch.clone();
-        let repository = self.repository.clone();
-        let store_dir = self.store_dir.clone();
-        let reference = self.reference.clone();
-        let commit = self.commit.clone();
-        let cleanup = async move {
-            // Each attempt is already patient with `packed-refs.lock`, so an
-            // attempt that fails has met something waiting cannot fix. Bounded
-            // rather than endless on purpose: a loop that never gives up also
-            // never reports, and the ref then leaks with nobody accountable for
-            // it. Exhausting the budget is the one outcome worth an error.
-            const CLEANUP_ATTEMPTS: u32 = 5;
-            for attempt in 1..=CLEANUP_ATTEMPTS {
-                let _guard = orch
-                    .acquire_jj_store_lock(
-                        &store_dir,
-                        "remove abandoned sealed check commit reference",
-                    )
-                    .await;
-                match git_check_ref_write(
-                    &repository,
-                    &["update-ref", "-d", &reference, &commit],
-                    "delete abandoned sealed check commit reference",
-                )
-                .await
-                {
-                    Ok(_) => {
-                        release_check_ref(&reference);
-                        return;
-                    }
-                    Err(error) => log::warn!(
-                        "temporary check ref cleanup attempt {attempt}/{CLEANUP_ATTEMPTS} failed: \
-                         reference={reference}, commit={commit}, error={error}"
-                    ),
-                }
-                drop(_guard);
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        self.retire();
+    }
+}
+
+/// One released check ref waiting to be deleted.
+#[derive(Debug, Clone)]
+struct CheckRefRetirement {
+    repository: std::path::PathBuf,
+    reference: String,
+    commit: String,
+    attempts: u32,
+}
+
+/// Released check refs per project store, and whether a sweeper is already
+/// scheduled to delete them.
+#[derive(Default)]
+struct PendingRetirements {
+    refs: Vec<CheckRefRetirement>,
+    sweeping: bool,
+}
+
+static RETIRING_CHECK_REFS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, PendingRetirements>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// How long released refs accumulate before one deletion retires them all.
+/// Every deletion takes `packed-refs.lock`, which jj exports inside the store
+/// lock contend for, so a burst of releases is better paid for once.
+#[cfg(not(test))]
+const CHECK_REF_RETIRE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(test)]
+const CHECK_REF_RETIRE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Rounds a ref is retried before it is left for the ref-store sweep. Each
+/// round is already patient with `packed-refs.lock`, so a ref that fails five
+/// has met something waiting cannot fix.
+const CHECK_REF_RETIRE_ATTEMPTS: u32 = 5;
+
+#[cfg(test)]
+static CHECK_REF_RETIRE_TRANSACTIONS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn retire_check_ref(orch: &Orchestrator, store_dir: &Path, retirement: CheckRefRetirement) {
+    let schedule = {
+        let mut all = RETIRING_CHECK_REFS.lock().unwrap();
+        let pending = all.entry(store_dir.to_path_buf()).or_default();
+        pending.refs.push(retirement);
+        !std::mem::replace(&mut pending.sweeping, true)
+    };
+    if !schedule {
+        return;
+    }
+    let sweep = sweep_retiring_check_refs(orch.clone(), store_dir.to_path_buf());
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(sweep);
+    } else {
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("check ref retirement runtime")
+                .block_on(sweep);
+        });
+    }
+}
+
+/// Delete the store's released check refs in batches until none are left.
+///
+/// Not a store-lock operation in substance — jj never sees `refs/cairn/checks/*`
+/// — but deleting takes `packed-refs.lock`, and taking it under one Background
+/// acquisition keeps the deletion from contending with the jj exports that run
+/// inside the lock, while letting any foreground work go first.
+async fn sweep_retiring_check_refs(orch: Orchestrator, store_dir: std::path::PathBuf) {
+    loop {
+        tokio::time::sleep(CHECK_REF_RETIRE_DEBOUNCE).await;
+        let batch = {
+            let mut all = RETIRING_CHECK_REFS.lock().unwrap();
+            let pending = all.entry(store_dir.clone()).or_default();
+            if pending.refs.is_empty() {
+                all.remove(&store_dir);
+                return;
             }
-            // Released rather than leaked: once no batch holds the ref, the
-            // ref-store maintenance sweep (`vcs_maintenance`) retires it on its
-            // next prune of this store.
-            release_check_ref(&reference);
-            log::warn!(
-                "sealed check ref {reference} was not removed after {CLEANUP_ATTEMPTS} cleanup \
-                 attempts and still pins commit {commit}; it is left for the ref-store \
-                 maintenance sweep, which retires check refs no batch holds"
-            );
+            std::mem::take(&mut pending.refs)
         };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(cleanup);
-        } else {
-            std::thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("temporary check ref cleanup runtime");
-                runtime.block_on(cleanup);
-            });
+        let guard = orch
+            .acquire_jj_store_lock(
+                &store_dir,
+                crate::orchestrator::StoreLockClass::Background,
+                "retire sealed check commit references",
+            )
+            .await;
+        let mut failed = Vec::new();
+        let mut by_repository: HashMap<std::path::PathBuf, Vec<CheckRefRetirement>> =
+            HashMap::new();
+        for retirement in batch {
+            by_repository
+                .entry(retirement.repository.clone())
+                .or_default()
+                .push(retirement);
+        }
+        for (repository, refs) in by_repository {
+            let _phase = guard.phase(format!("delete {} check refs", refs.len()));
+            failed.extend(delete_check_refs(&repository, refs).await);
+        }
+        drop(guard);
+        #[cfg(test)]
+        {
+            *CHECK_REF_RETIRE_TRANSACTIONS
+                .lock()
+                .unwrap()
+                .entry(store_dir.clone())
+                .or_default() += 1;
+        }
+        let mut retry = Vec::new();
+        for (mut retirement, error) in failed {
+            retirement.attempts += 1;
+            if retirement.attempts < CHECK_REF_RETIRE_ATTEMPTS {
+                log::warn!(
+                    "sealed check ref retirement attempt {}/{CHECK_REF_RETIRE_ATTEMPTS} failed: \
+                     reference={}, commit={}, error={error}",
+                    retirement.attempts,
+                    retirement.reference,
+                    retirement.commit
+                );
+                retry.push(retirement);
+            } else {
+                // Released rather than leaked: once no batch holds the ref, the
+                // ref-store maintenance sweep (`vcs_maintenance`) retires it on
+                // its next prune of this store.
+                release_check_ref(&retirement.reference);
+                log::warn!(
+                    "sealed check ref {} was not removed after {CHECK_REF_RETIRE_ATTEMPTS} \
+                     attempts and still pins commit {}; it is left for the ref-store \
+                     maintenance sweep, which retires check refs no batch holds: {error}",
+                    retirement.reference,
+                    retirement.commit
+                );
+            }
+        }
+        if !retry.is_empty() {
+            RETIRING_CHECK_REFS
+                .lock()
+                .unwrap()
+                .entry(store_dir.clone())
+                .or_default()
+                .refs
+                .extend(retry);
         }
     }
+}
+
+/// Delete `refs` from `repository` in one ref transaction, each against the
+/// commit it was published at. One stale entry fails the whole transaction,
+/// so a failed batch falls back to deleting each ref alone. Returns the refs
+/// that could not be deleted, with why.
+async fn delete_check_refs(
+    repository: &Path,
+    refs: Vec<CheckRefRetirement>,
+) -> Vec<(CheckRefRetirement, String)> {
+    let input: String = refs
+        .iter()
+        .map(|retirement| format!("delete {} {}\n", retirement.reference, retirement.commit))
+        .collect();
+    let batched = git_check_ref_write(
+        repository,
+        &["update-ref", "--stdin"],
+        Some(&input),
+        "retire sealed check commit references",
+    )
+    .await;
+    let refs = match batched {
+        Ok(_) => {
+            for retirement in &refs {
+                release_check_ref(&retirement.reference);
+            }
+            return Vec::new();
+        }
+        Err(_) if refs.len() > 1 => refs,
+        Err(error) => return refs.into_iter().map(|r| (r, error.clone())).collect(),
+    };
+    let mut failed = Vec::new();
+    for retirement in refs {
+        match git_check_ref_write(
+            repository,
+            &[
+                "update-ref",
+                "-d",
+                &retirement.reference,
+                &retirement.commit,
+            ],
+            None,
+            "delete sealed check commit reference",
+        )
+        .await
+        {
+            Ok(_) => release_check_ref(&retirement.reference),
+            Err(error) => failed.push((retirement, error)),
+        }
+    }
+    failed
 }
 
 /// Write a ref into the check repository, patiently.
@@ -1997,21 +2142,47 @@ impl Drop for TemporaryCheckRef {
 async fn git_check_ref_write(
     repository: &Path,
     args: &[&str],
+    input: Option<&str>,
     context: &str,
 ) -> Result<String, String> {
     crate::jj::with_packed_refs_patience_async(
         crate::jj::PackedRefs::Checkout(repository),
         context,
-        || git_check_output(repository, args, context),
+        || git_check_run(repository, args, input, context),
     )
     .await
 }
 
 fn git_check_output(repository: &Path, args: &[&str], context: &str) -> Result<String, String> {
-    let output = std::process::Command::new("git")
+    git_check_run(repository, args, None, context)
+}
+
+fn git_check_run(
+    repository: &Path,
+    args: &[&str],
+    input: Option<&str>,
+    context: &str,
+) -> Result<String, String> {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("git")
         .args(args)
         .current_dir(repository)
-        .output()
+        .stdin(if input.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("{context}: {error}"))?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        stdin
+            .write_all(input.as_bytes())
+            .map_err(|error| format!("{context}: write git input: {error}"))?;
+    }
+    let output = child
+        .wait_with_output()
         .map_err(|error| format!("{context}: {error}"))?;
     if !output.status.success() {
         return Err(format!(
@@ -2057,14 +2228,10 @@ async fn publish_check_commit_ref_with_verifier<F>(
 where
     F: FnOnce(&Path, &str) -> Result<String, String>,
 {
-    let _guard = orch
-        .acquire_jj_store_lock_with_timeout(
-            store_dir,
-            "publish sealed check commit",
-            Some(std::time::Duration::from_secs(600)),
-        )
-        .await
-        .map_err(|_| "timed out acquiring the managed store lock for check dispatch".to_string())?;
+    // No store lock: jj never imports `refs/cairn/checks/*`, creating a loose
+    // ref takes no `packed-refs.lock`, and the ref-store sweep and git gc both
+    // already run outside the store lock. The create is an old-value compare,
+    // so it cannot clobber anything.
     git_check_output(
         repository,
         &["cat-file", "-e", &format!("{commit}^{{commit}}")],
@@ -2075,12 +2242,12 @@ where
     git_check_ref_write(
         repository,
         &["update-ref", &reference, commit, &absent],
+        None,
         "publish sealed check commit reference",
     )
     .await?;
     // Arm the cleanup obligation immediately after publication. Every later
-    // error path either deletes under this held store lock or transfers the
-    // obligation to Drop's lock-aware retry task.
+    // path, including Drop, hands the ref to the retirement sweeper.
     hold_check_ref(&reference);
     let mut temporary_ref = TemporaryCheckRef {
         orch: orch.clone(),
@@ -2093,79 +2260,17 @@ where
     let resolved = match verify(repository, &temporary_ref.reference) {
         Ok(resolved) => resolved,
         Err(error) => {
-            return match temporary_ref.delete_locked().await {
-                Ok(()) => Err(error),
-                Err(cleanup_error) => Err(format!(
-                    "{error}; temporary check ref cleanup failed and was scheduled for retry: {cleanup_error}"
-                )),
-            };
+            temporary_ref.retire();
+            return Err(error);
         }
     };
     if resolved != commit {
-        let error =
-            format!("sealed check commit reference resolved to {resolved}, expected {commit}");
-        return match temporary_ref.delete_locked().await {
-            Ok(()) => Err(error),
-            Err(cleanup_error) => Err(format!(
-                "{error}; temporary check ref cleanup failed and was scheduled for retry: {cleanup_error}"
-            )),
-        };
+        temporary_ref.retire();
+        return Err(format!(
+            "sealed check commit reference resolved to {resolved}, expected {commit}"
+        ));
     }
     Ok(temporary_ref)
-}
-
-/// Retiring the temporary check ref failed, but the batch already ran and its
-/// verdicts are in hand.
-///
-/// Those verdicts are facts about the agent's change; a bookkeeping ref that
-/// would not delete is a fact about Cairn. Reporting the second by discarding
-/// the first is how two review lanes that had both finished came to record
-/// nothing at all, and an infrastructure verdict is never cached, so the whole
-/// batch would simply be run again to recompute answers Cairn already had.
-///
-/// The obligation is not dropped: the `TemporaryCheckRef` stays armed, so its
-/// `Drop` retries the deletion under its own store lock and names the ref if it
-/// finally gives up.
-fn report_cleanup_failure_without_discarding_verdicts(error: &str) {
-    log::error!(
-        "sealed check ref cleanup failed after the batch produced verdicts; keeping the verdicts \
-         and leaving removal to the retry task: {error}"
-    );
-}
-
-/// Remove a batch's sealed ref without holding its verdicts back.
-///
-/// The removal takes the managed store lock, which another writer can hold
-/// for minutes; awaited on the result path, that wait delayed every lane's
-/// outcome and inflated its recorded duration by as much. The verdicts never
-/// depended on it, and a failed removal is already left to the retry task.
-fn release_check_commit_ref(
-    orch: &Orchestrator,
-    store_dir: std::path::PathBuf,
-    mut temporary_ref: TemporaryCheckRef,
-) {
-    let orch = orch.clone();
-    tokio::spawn(async move {
-        if let Err(error) = cleanup_check_commit_ref(&orch, &store_dir, &mut temporary_ref).await {
-            report_cleanup_failure_without_discarding_verdicts(&error);
-        }
-    });
-}
-
-async fn cleanup_check_commit_ref(
-    orch: &Orchestrator,
-    store_dir: &Path,
-    temporary_ref: &mut TemporaryCheckRef,
-) -> Result<(), String> {
-    let _guard = orch
-        .acquire_jj_store_lock_with_timeout(
-            store_dir,
-            "remove sealed check commit reference",
-            Some(std::time::Duration::from_secs(600)),
-        )
-        .await
-        .map_err(|_| "timed out acquiring the managed store lock for check cleanup".to_string())?;
-    temporary_ref.delete_locked().await
 }
 
 fn merge_batch_executor(
@@ -3091,7 +3196,7 @@ async fn submit_single_planned_check_batch(
         ));
     }
     let request_id = uuid::Uuid::new_v4().to_string();
-    let temporary_ref = match publish_check_commit_ref(
+    let mut temporary_ref = match publish_check_commit_ref(
         orch,
         Path::new(&batch.repository),
         &batch.store_dir,
@@ -3157,7 +3262,7 @@ async fn submit_single_planned_check_batch(
             split_write_check_batch_outcome(executed.outcome, &executed.account, indexed.len());
         let mut results = indexed.iter().copied().zip(item_outcomes).collect();
         stamp_substrate_elapsed(&mut results, submitted_at.elapsed());
-        release_check_commit_ref(orch, batch.store_dir.clone(), temporary_ref);
+        temporary_ref.retire();
         return Ok(PlannedCheckBatchOutcome {
             results,
             request: Some(request),
@@ -3173,7 +3278,7 @@ async fn submit_single_planned_check_batch(
         .map(|(index, delivery)| (index, check_result_from_delivery(delivery)))
         .collect();
     stamp_substrate_elapsed(&mut results, submitted_at.elapsed());
-    release_check_commit_ref(orch, batch.store_dir.clone(), temporary_ref);
+    temporary_ref.retire();
     Ok(PlannedCheckBatchOutcome {
         results,
         request: Some(request),
@@ -10026,6 +10131,16 @@ fi
         }
     }
 
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while !done() {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+    }
+
     #[tokio::test]
     async fn post_publication_verification_failure_removes_temporary_check_ref() {
         let temp = tempfile::tempdir().unwrap();
@@ -10047,7 +10162,37 @@ fi
         .unwrap_err();
 
         assert!(error.contains("injected post-publication verification failure"));
-        assert!(!check_ref_exists(&repo, &reference));
+        wait_until("the unverified ref is retired", || {
+            !check_ref_exists(&repo, &reference)
+        })
+        .await;
+    }
+
+    /// Publishing a sealed check ref is invisible to jj and takes no
+    /// `packed-refs.lock`, so it does not queue behind whoever holds the store.
+    #[tokio::test]
+    async fn publishing_a_check_ref_does_not_wait_for_the_store_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (repo, commit) = committed_git_repo(&temp);
+        let store = temp.path().join("store");
+        let _held = orch
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                "long publication",
+            )
+            .await;
+        let published = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            publish_check_commit_ref(&orch, &repo, &store, &commit, "unlocked"),
+        )
+        .await
+        .expect("publication must not wait on the store lock")
+        .expect("the sealed check reference publishes");
+        assert!(check_ref_exists(&repo, "refs/cairn/checks/unlocked"));
+        assert!(check_ref_is_held("refs/cairn/checks/unlocked"));
+        std::mem::forget(published);
     }
 
     /// `git update-ref -d` always rewrites `packed-refs`, so retiring a sealed
@@ -10078,18 +10223,94 @@ fi
         });
 
         let started = std::time::Instant::now();
-        cleanup_check_commit_ref(&orch, &store, &mut published)
-            .await
-            .expect("cleanup must retry until the ordinary Git lock is released");
+        published.retire();
+        wait_until("the patient deletion retires the reference", || {
+            !check_ref_exists(&repo, &reference)
+        })
+        .await;
         holder.join().unwrap();
         assert!(
             started.elapsed() >= std::time::Duration::from_secs(1),
             "the fixture must actually have made the deletion wait"
         );
-        assert!(
-            !check_ref_exists(&repo, &reference),
-            "the patient deletion must still retire the reference"
+        assert!(!check_ref_is_held(&reference));
+    }
+
+    /// Releases that arrive together are retired by one ref transaction, and a
+    /// released ref stays held — out of the ref-store sweep's reach — until it
+    /// is actually gone.
+    #[tokio::test]
+    async fn released_check_refs_are_retired_together_and_stay_held_until_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (repo, commit) = committed_git_repo(&temp);
+        let store = temp.path().join("store");
+        let mut published = Vec::new();
+        for id in ["batch-a", "batch-b", "batch-c"] {
+            published.push(
+                publish_check_commit_ref(&orch, &repo, &store, &commit, id)
+                    .await
+                    .unwrap(),
+            );
+        }
+        for reference in &mut published {
+            reference.retire();
+        }
+        for id in ["batch-a", "batch-b", "batch-c"] {
+            assert!(
+                check_ref_is_held(&format!("refs/cairn/checks/{id}")),
+                "a released ref is held until it is deleted"
+            );
+        }
+        wait_until("all three refs are retired", || {
+            ["batch-a", "batch-b", "batch-c"]
+                .iter()
+                .all(|id| !check_ref_exists(&repo, &format!("refs/cairn/checks/{id}")))
+        })
+        .await;
+        assert_eq!(
+            CHECK_REF_RETIRE_TRANSACTIONS
+                .lock()
+                .unwrap()
+                .get(&store)
+                .copied(),
+            Some(1),
+            "three releases inside the debounce cost one deletion"
         );
+        for id in ["batch-a", "batch-b", "batch-c"] {
+            assert!(!check_ref_is_held(&format!("refs/cairn/checks/{id}")));
+        }
+    }
+
+    /// One stale entry fails a batched transaction; the rest are still retired.
+    #[tokio::test]
+    async fn a_stale_entry_does_not_keep_the_rest_of_its_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, commit) = committed_git_repo(&temp);
+        git(&repo, &["update-ref", "refs/cairn/checks/good", &commit]);
+        hold_check_ref("refs/cairn/checks/good");
+        let failed = delete_check_refs(
+            &repo,
+            vec![
+                CheckRefRetirement {
+                    repository: repo.clone(),
+                    reference: "refs/cairn/checks/good".into(),
+                    commit: commit.clone(),
+                    attempts: 0,
+                },
+                CheckRefRetirement {
+                    repository: repo.clone(),
+                    reference: "refs/cairn/checks/moved".into(),
+                    commit: "1".repeat(40),
+                    attempts: 0,
+                },
+            ],
+        )
+        .await;
+        assert!(!check_ref_exists(&repo, "refs/cairn/checks/good"));
+        assert!(!check_ref_is_held("refs/cairn/checks/good"));
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0.reference, "refs/cairn/checks/moved");
     }
 
     /// A batch that cannot retire its check ref releases it rather than
@@ -10111,13 +10332,10 @@ fi
             commit: "0".repeat(40),
             armed: true,
         });
-        tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            while check_ref_is_held(&reference) {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+        wait_until("the exhausted cleanup hands the ref to the sweep", || {
+            !check_ref_is_held(&reference)
         })
-        .await
-        .expect("the exhausted cleanup hands the ref to the sweep");
+        .await;
     }
 
     #[tokio::test]
@@ -10129,7 +10347,11 @@ fi
         let reference = "refs/cairn/checks/cancelled".to_string();
         git(&repo, &["update-ref", &reference, &commit]);
         let held = orch
-            .acquire_jj_store_lock(&store, "hold cancellation cleanup test")
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Background,
+                "hold cancellation cleanup test",
+            )
             .await;
 
         drop(TemporaryCheckRef {
@@ -10140,20 +10362,19 @@ fi
             commit,
             armed: true,
         });
-        tokio::task::yield_now().await;
+        // Past the debounce: the sweeper is now queued on the store lock.
+        tokio::time::sleep(CHECK_REF_RETIRE_DEBOUNCE * 3).await;
         assert!(
             check_ref_exists(&repo, &reference),
-            "cleanup must not bypass the held store lock"
+            "deletion must not bypass the held store lock"
         );
         drop(held);
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while check_ref_exists(&repo, &reference) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancellation cleanup removes the ref after acquiring the store lock");
+        wait_until(
+            "the ref is removed after the store lock is acquired",
+            || !check_ref_exists(&repo, &reference),
+        )
+        .await;
     }
 
     #[test]

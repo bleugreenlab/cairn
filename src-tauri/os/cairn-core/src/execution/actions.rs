@@ -604,7 +604,11 @@ async fn commit_triage_ledger_if_needed(
     };
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
     let _store_guard = orch
-        .acquire_jj_store_lock(&store, "memory triage logical publication")
+        .acquire_jj_store_lock(
+            &store,
+            crate::orchestrator::StoreLockClass::Foreground,
+            "memory triage logical publication",
+        )
         .await;
     let expected = cairn_vcs::resolve_coordinate(&store, &branch)
         .await

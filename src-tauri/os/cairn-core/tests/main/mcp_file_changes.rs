@@ -587,6 +587,131 @@ async fn logical_write_is_immediately_visible_to_ordinary_read_without_checkout_
     assert!(!read.contains("before"), "{read}");
 }
 
+/// A file write is prepared without the store lock and takes it only to seal
+/// (cairn/5069). When the branch moves after the write has read it, the seal's
+/// compare-and-set must send the write back to run under the lock: applying
+/// the patch prepared against the old head would silently drop the line the
+/// move added.
+#[tokio::test]
+async fn a_write_whose_branch_moves_before_its_seal_is_written_again_under_the_lock() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("notes.txt", "alpha\n");
+    let store = jj::project_store_dir(repo.config.path(), repo.project.path());
+    let held = repo.orch.hold_jj_store_lock_for_test(&store).await;
+
+    let orch = repo.orch.clone();
+    let mut request = make_request(
+        repo.cwd(),
+        json!({
+            "changes": [{
+                "target": "file:notes.txt",
+                "mode": "patch",
+                "payload": { "old_string": "alpha", "new_string": "alpha-mine" }
+            }],
+            "commit_msg": "edit alpha"
+        }),
+    );
+    request.run_id = Some("run-change".to_string());
+    let write = tokio::spawn(async move { handle_write(&orch, &request).await });
+
+    // Prepared against `alpha`, and now queued to seal.
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while !repo
+            .orch
+            .jj_store_lock_waiters_for_test(&store)
+            .iter()
+            .any(|operation| operation == "logical write transaction")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the write prepares without the lock and queues only to seal");
+
+    // Another writer lands on the branch while this one waits.
+    repo.write("notes.txt", "alpha\nbeta\n");
+    drop(held);
+
+    let report = parse_report(&write.await.unwrap());
+    assert_successful_change(&report, 1);
+    assert_eq!(
+        repo.read("notes.txt"),
+        "alpha-mine\nbeta\n",
+        "the write is applied to the moved head, keeping the line the move added"
+    );
+}
+
+/// Two deliveries of one write call, where the first seals after the second
+/// read the replay ledger (without the lock) and before it read the head. The
+/// second then finds `old` gone from the moved head. It must still answer with
+/// the first delivery's recorded report rather than an anchor failure: the
+/// replay epoch is re-checked under the store lock before any optimistic
+/// outcome is returned, failures included (I5).
+async fn a_duplicate_delivery_sealed_inside_the_optimistic_window_replays(atomic: bool) {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("notes.txt", "old\n");
+    let tool_use_id = if atomic {
+        "toolu_duplicate_atomic"
+    } else {
+        "toolu_duplicate"
+    };
+    let payload = json!({
+        "changes": [{
+            "target": "file:notes.txt",
+            "mode": "patch",
+            "payload": { "old_string": "old", "new_string": "new" }
+        }],
+        "commit_msg": "old to new",
+        "atomic": atomic
+    });
+    record_write_call(&repo.orch.db.local, tool_use_id, &payload).await;
+
+    let (reached, resume) =
+        cairn_core::internal::mcp::handlers::write::test_pause::after_replay_lookup(tool_use_id);
+    let orch = repo.orch.clone();
+    let mut request = make_request(repo.cwd(), payload.clone());
+    request.run_id = Some("run-change".to_string());
+    request.tool_use_id = Some(tool_use_id.to_string());
+    let second = tokio::spawn(async move { handle_write(&orch, &request).await });
+    tokio::time::timeout(std::time::Duration::from_secs(60), reached.notified())
+        .await
+        .expect("the second delivery parks after its replay lookup");
+
+    let first = repo.change_report_as_tool_use(tool_use_id, payload).await;
+    assert_successful_change(&first, 1);
+    resume.notify_one();
+
+    let second = parse_report(&second.await.unwrap());
+    assert!(
+        second["replayed"]
+            .as_str()
+            .is_some_and(|note| note.contains("delivered more than once")),
+        "answered as a replay: {second:?}"
+    );
+    assert_successful_change(&second, 1);
+    assert_eq!(
+        second["commit"], first["commit"],
+        "the recorded report, not a new one"
+    );
+    assert_eq!(repo.read("notes.txt"), "new\n");
+}
+
+#[tokio::test]
+async fn a_duplicate_atomic_delivery_sealed_inside_the_optimistic_window_replays() {
+    a_duplicate_delivery_sealed_inside_the_optimistic_window_replays(true).await;
+}
+
+#[tokio::test]
+async fn a_duplicate_delivery_sealed_inside_the_optimistic_window_replays_non_atomic() {
+    a_duplicate_delivery_sealed_inside_the_optimistic_window_replays(false).await;
+}
+
 /// cairn/4897: a live builder's own branch was removed out from under it
 /// mid-turn. Every read, write, and command then answered "Could not resolve
 /// branch ref", which reads like a typo to retry. The session must instead be

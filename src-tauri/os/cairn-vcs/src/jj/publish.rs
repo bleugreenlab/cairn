@@ -64,6 +64,22 @@ pub struct PublishedLogicalHead {
     /// rather than logging it is that a discarded export result is what made
     /// this class of failure invisible.
     pub export: Result<(), String>,
+    /// How long each leg took, for the caller's store-lock trace.
+    pub timings: PublicationTimings,
+}
+
+/// The duration of each leg of [`publish_logical_head_exported`], and the part
+/// of each spent waiting out `packed-refs.lock`. The legs run on a blocking
+/// worker the caller's phase timers cannot see into, so they are measured here
+/// and handed back.
+#[derive(Debug, Clone, Copy)]
+pub struct PublicationTimings {
+    pub land_started: std::time::Instant,
+    pub land: std::time::Duration,
+    pub land_packed_refs: std::time::Duration,
+    pub export_started: std::time::Instant,
+    pub export: std::time::Duration,
+    pub export_packed_refs: std::time::Duration,
 }
 
 /// Publish a batch at a branch's logical head and export the advanced bookmark
@@ -104,6 +120,8 @@ pub async fn publish_logical_head_exported(
         // fails on the keep ref has committed no operation, so the bookmark
         // moves at most once. The only residue of a failed attempt is an
         // unreferenced commit object, which git gc reclaims.
+        let _ = super::packed_refs::take_packed_refs_waited();
+        let land_started = std::time::Instant::now();
         let landed =
             with_packed_refs_patience(PackedRefs::JjStore(&store), "publish logical head", || {
                 land_logical_head(
@@ -115,6 +133,9 @@ pub async fn publish_logical_head_exported(
                     mode.clone(),
                 )
             })?;
+        let land = land_started.elapsed();
+        let land_packed_refs = super::packed_refs::take_packed_refs_waited();
+        let export_started = std::time::Instant::now();
         let export = export_bookmark_advance(
             &jj,
             &store,
@@ -122,7 +143,19 @@ pub async fn publish_logical_head_exported(
             &branch,
             &format!("publish `{branch}` at the logical head"),
         );
-        Ok(PublishedLogicalHead { landed, export })
+        let timings = PublicationTimings {
+            land_started,
+            land,
+            land_packed_refs,
+            export_started,
+            export: export_started.elapsed(),
+            export_packed_refs: super::packed_refs::take_packed_refs_waited(),
+        };
+        Ok(PublishedLogicalHead {
+            landed,
+            export,
+            timings,
+        })
     })
     .await
     .map_err(|error| format!("logical-head publication worker failed: {error}"))?

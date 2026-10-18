@@ -1408,6 +1408,16 @@ pub(super) async fn read_node(
         output.push_str(&launch);
         output.push('\n');
     }
+    // Branch preparation queues for the project store before any run exists,
+    // so without this line a new job reads as stalled for as long as it waits.
+    if let Some((status, position, since_ms)) = orch.branch_preparation_wait(&job.id) {
+        output.push_str(&crate::orchestrator::describe_preparation_wait(
+            &status,
+            position,
+            &format_node_timestamp(since_ms / 1_000),
+        ));
+        output.push_str("\n\n");
+    }
 
     // Activity gives the summary something to decide on before an artifact
     // exists: how much has happened (turns/runs/events), when it last moved, and

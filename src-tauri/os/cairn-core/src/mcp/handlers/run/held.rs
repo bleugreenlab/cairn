@@ -28,7 +28,7 @@ use super::{
     climb_landing_rungs, publish_available_delta, straddle_inspection_commands, DeltaPublication,
     LandingRungs, PublishFailure, RoutedLanding, SlotPublicationOutcome,
 };
-use crate::orchestrator::Orchestrator;
+use crate::orchestrator::{JjStoreOperationTrace, Orchestrator};
 use crate::storage::{LocalDb, RowExt};
 use cairn_vcs::PublicationIdentity;
 use std::path::{Path, PathBuf};
@@ -448,6 +448,7 @@ pub(crate) async fn drain_held_publications(
     orch: &Orchestrator,
     project_id: &str,
     branch: &str,
+    trace: Option<&JjStoreOperationTrace>,
 ) -> Vec<Drained> {
     let rows = match held_rows(&orch.db.local, project_id, branch).await {
         Ok(rows) => rows,
@@ -459,7 +460,7 @@ pub(crate) async fn drain_held_publications(
     };
     let mut drained = Vec::new();
     for row in rows {
-        match republish(orch, &row).await {
+        match republish(orch, &row, trace).await {
             Ok(SlotPublicationOutcome::Published { landed, export, .. }) => {
                 record_landed_here(&orch.db.local, &row.attempt_id, &landed.head).await;
                 release_ref(&row).await;
@@ -505,6 +506,7 @@ pub(crate) async fn drain_held_publications(
 async fn republish(
     orch: &Orchestrator,
     row: &HeldRow,
+    trace: Option<&JjStoreOperationTrace>,
 ) -> Result<SlotPublicationOutcome, PublishFailure> {
     // The objects were installed when the delta was held; this re-pins them
     // for the transaction the way a fresh install is pinned.
@@ -527,7 +529,9 @@ async fn republish(
             message: &row.commit_message,
             author: author.as_ref(),
             job_id: row.job_id.as_deref(),
+            trace,
         },
+        None,
     )
     .await
 }
@@ -806,12 +810,16 @@ pub(crate) async fn pr_commit_barrier(
         let drained = match crate::mcp::vcs::acquire_store_lock(
             orch,
             Some(&store),
+            crate::orchestrator::StoreLockClass::Foreground,
             "held publication drain",
             crate::mcp::vcs::STORE_LOCK_TIMEOUT,
         )
         .await
         {
-            Ok(_guard) => drain_held_publications(orch, project_id, branch).await,
+            Ok(guard) => {
+                let trace = guard.as_ref().map(|guard| guard.trace());
+                drain_held_publications(orch, project_id, branch, trace.as_ref()).await
+            }
             Err(error) => vec![Drained::Note(format!(
                 "⚠️ Held commits on this branch could not be published: {error}"
             ))],

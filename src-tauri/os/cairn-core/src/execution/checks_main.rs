@@ -238,7 +238,11 @@ async fn run(
         .map_err(|error| format!("main-attestation fetch failed: {error}"))?;
         let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
         let guard = orch
-            .acquire_jj_store_lock(&store, "main-attestation canonical refresh")
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Background,
+                "main-attestation canonical refresh",
+            )
             .await;
         let _phase = guard.phase("main-attestation canonical refresh");
         // The reconcile below imports with `default_branch` as origin's to

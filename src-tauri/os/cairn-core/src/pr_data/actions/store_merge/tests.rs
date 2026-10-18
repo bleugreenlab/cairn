@@ -397,9 +397,10 @@ async fn verified_landing_publishes_the_exact_prospective_tree() {
         .expect("clean prospective merge");
     let target_before = crate::jj::bookmark_commit(&fx.jj, &fx.store, fx.int).unwrap();
 
-    let result = land_verified_store_merge_child(&fx.orch, &fx.ctx, "squash", &plan)
-        .await
-        .expect("verified landing");
+    let result =
+        land_verified_store_merge_child(&fx.orch, &fx.ctx, "squash", &plan, &test_trace(&fx).await)
+            .await
+            .expect("verified landing");
     let VerifiedLanding::Landed(commit) = result else {
         panic!("unchanged tips must land the verified plan");
     };
@@ -428,7 +429,7 @@ async fn stale_verified_landing_refuses_without_moving_target() {
     plan.source_tip = "0".repeat(64);
 
     assert_eq!(
-        land_verified_store_merge_child(&fx.orch, &fx.ctx, "squash", &plan)
+        land_verified_store_merge_child(&fx.orch, &fx.ctx, "squash", &plan, &test_trace(&fx).await)
             .await
             .expect("stale plan is a retry result"),
         VerifiedLanding::Stale
@@ -441,4 +442,16 @@ async fn stale_verified_landing_refuses_without_moving_target() {
         git_stdout(&fx.origin_path, &["rev-parse", fx.int]),
         origin_before
     );
+}
+
+/// A store-lock trace for calling a function that reports phases into one.
+async fn test_trace(fx: &MergeFixture) -> crate::orchestrator::JjStoreOperationTrace {
+    fx.orch
+        .acquire_jj_store_lock(
+            &fx.store,
+            crate::orchestrator::StoreLockClass::Foreground,
+            "store merge test",
+        )
+        .await
+        .trace()
 }

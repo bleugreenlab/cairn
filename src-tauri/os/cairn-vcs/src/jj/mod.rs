@@ -40,7 +40,9 @@ pub use errors::*;
 pub use export::*;
 pub use maintenance::*;
 pub use merge::*;
-pub use packed_refs::{with_packed_refs_patience, with_packed_refs_patience_async, PackedRefs};
+pub use packed_refs::{
+    take_packed_refs_waited, with_packed_refs_patience, with_packed_refs_patience_async, PackedRefs,
+};
 pub use publish::*;
 pub use reconcile::*;
 pub use seal::*;

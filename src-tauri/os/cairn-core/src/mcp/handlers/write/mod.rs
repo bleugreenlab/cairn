@@ -119,6 +119,7 @@ async fn checkpoint_minted_post_seal(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finish_minted_post_seal(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -446,6 +447,69 @@ fn attach_held_notes(report: String, notes: Vec<String>) -> String {
     }
 }
 
+/// A parking point an integration test can put right after an optimistic
+/// write's unlocked replay-ledger lookup, to make a second delivery of the
+/// same call seal in exactly that window.
+#[cfg(feature = "test-utils")]
+pub mod test_pause {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+    use tokio::sync::Notify;
+
+    type Pause = (Arc<Notify>, Arc<Notify>);
+    static PAUSES: LazyLock<Mutex<HashMap<String, Pause>>> = LazyLock::new(Default::default);
+
+    /// Park the next optimistic delivery of `tool_use_id` after its replay
+    /// lookup. Returns `(reached, resume)`: `reached` is notified when it
+    /// parks, and notifying `resume` lets it continue.
+    pub fn after_replay_lookup(tool_use_id: &str) -> Pause {
+        let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        PAUSES
+            .lock()
+            .unwrap()
+            .insert(tool_use_id.to_string(), pause.clone());
+        pause
+    }
+
+    pub(super) async fn reached(tool_use_id: Option<&str>) {
+        let Some(tool_use_id) = tool_use_id else {
+            return;
+        };
+        let pause = PAUSES.lock().unwrap().remove(tool_use_id);
+        if let Some((reached, resume)) = pause {
+            reached.notify_one();
+            resume.notified().await;
+        }
+    }
+}
+
+/// How a file write serializes against other writers of its store.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteLocking {
+    /// Prepare against the head read without the lock, and take the lock only
+    /// to seal, with that head as the expected one. Used only for batches
+    /// whose preparation has no side effects, so a seal that finds the head
+    /// moved can discard everything and run again locked.
+    Optimistic,
+    /// Hold the lock from head resolution through the seal.
+    Locked,
+}
+
+/// Whether an optimistic attempt's outcome has been checked against the
+/// replay ledger under the store lock (I5).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplayEpoch {
+    /// The attempt was not optimistic, so it held the lock throughout.
+    Locked,
+    /// Optimistic, and it ended before any locked re-check: a preparation
+    /// failure, or nothing applied. Another delivery of the same call may have
+    /// sealed meanwhile, so its report is not yet the answer.
+    Unchecked,
+    /// Optimistic, and its outcome is settled: it replayed a recorded report,
+    /// re-entered locked, or sealed after its locked re-checks passed.
+    Checked,
+}
+
 /// The write itself. A file write is a commit barrier on its branch: the
 /// branch's held deltas are republished into `drained` under the same store
 /// lock, before the head this write builds on is read.
@@ -453,6 +517,72 @@ async fn handle_write_under_barrier(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     drained: &mut Vec<super::run::held::Drained>,
+) -> String {
+    let mut epoch = ReplayEpoch::Locked;
+    // Boxed: the attempt future carries every preparation and sealing state of
+    // the write, and awaiting it inline puts all of that on the caller's
+    // stack, which is how write-driven tests overflowed a worker stack.
+    let report = Box::pin(handle_write_attempt(
+        orch,
+        request,
+        drained,
+        WriteLocking::Optimistic,
+        &mut epoch,
+    ))
+    .await;
+    if epoch != ReplayEpoch::Unchecked {
+        return report;
+    }
+    // The optimistic attempt read the replay ledger without the lock and then
+    // returned before sealing. A second delivery of a call whose first
+    // delivery sealed in between would otherwise report what it found on the
+    // moved head — an anchor that no longer matches — instead of the recorded
+    // success. Re-read the ledger under the lock; if a record appeared, the
+    // locked attempt replays it.
+    let Some(call) = replay::invoking_write_call(orch, request).await else {
+        return report;
+    };
+    let store = crate::mcp::vcs::resolve_store_lock(orch, request).await;
+    let guard = crate::mcp::vcs::acquire_store_lock(
+        orch,
+        store.as_deref(),
+        crate::orchestrator::StoreLockClass::Foreground,
+        "logical write transaction",
+        crate::mcp::vcs::STORE_LOCK_TIMEOUT,
+    )
+    .await;
+    let replayed = match guard {
+        Ok(_) => replay::recorded_report(&orch.db.local, &call)
+            .await
+            .is_some(),
+        // The epoch could not be checked; the locked attempt waits for the
+        // lock itself and reports a busy store if it cannot get it either.
+        Err(_) => true,
+    };
+    drop(guard);
+    if !replayed {
+        return report;
+    }
+    Box::pin(handle_write_attempt(
+        orch,
+        request,
+        drained,
+        WriteLocking::Locked,
+        &mut epoch,
+    ))
+    .await
+}
+
+/// One attempt at the write. An optimistic attempt that meets a moved head,
+/// held work, or a replay record at its seal re-enters here locked: nothing it
+/// did before that point is visible, so the locked attempt produces exactly
+/// the report a fully locked write would have.
+async fn handle_write_attempt(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    drained: &mut Vec<super::run::held::Drained>,
+    locking: WriteLocking,
+    epoch: &mut ReplayEpoch,
 ) -> String {
     // Authoritative validation gate, shared with cairn-cmd's pre-flight check so
     // the contract and error text are identical everywhere. Collects every
@@ -763,6 +893,7 @@ async fn handle_write_under_barrier(
             crate::authorization::prepare::Prepared::Refused(_) => None,
         })
         .collect();
+    let had_authority_request = !authority_requests.is_empty();
     if !authority_requests.is_empty() {
         use crate::mcp::handlers::authority::{self, AuthorityGate};
         let deny =
@@ -888,14 +1019,37 @@ async fn handle_write_under_barrier(
     let write_call = replay::invoking_write_call(orch, request).await;
 
     // The logical coordinate and every anchor evaluation must belong to the
-    // same serialized writer epoch as publication. Acquiring here prevents a
-    // second runner writer from advancing the bookmark between preparation and
-    // the expected-head CAS; no workspace stale/reapply path is involved.
-    let write_store_guard = if has_file_targets {
-        let store = crate::mcp::vcs::resolve_store_lock(orch, request).await;
+    // same writer epoch as publication. A locked write holds the store lock
+    // from here to the seal. An optimistic one reads the head without it and
+    // takes the lock only to seal, re-reading the head, the replay ledger, and
+    // the branch's held work under it first (I3, I5): any of them changed, and
+    // the write runs again locked. Optimistic only where nothing before the
+    // seal has a side effect — every item a file edit, no branch mint (which
+    // needs the lock from the start), no host-path escape or authority prompt
+    // that a second run would raise again.
+    let optimistic = locking == WriteLocking::Optimistic
+        && has_file_targets
+        && mint_index.is_none()
+        && !allow_escape
+        && !had_authority_request
+        && payload
+            .changes
+            .iter()
+            .all(|item| matches!(target_family(&item.target), Ok(TargetFamily::File)));
+    if optimistic {
+        *epoch = ReplayEpoch::Unchecked;
+    }
+    let write_store = if has_file_targets {
+        crate::mcp::vcs::resolve_store_lock(orch, request).await
+    } else {
+        None
+    };
+    let mut write_store_guard = if has_file_targets && !optimistic {
+        let store = write_store.clone();
         match crate::mcp::vcs::acquire_store_lock(
             orch,
             store.as_deref(),
+            crate::orchestrator::StoreLockClass::Foreground,
             "logical write transaction",
             crate::mcp::vcs::STORE_LOCK_TIMEOUT,
         )
@@ -931,7 +1085,7 @@ async fn handle_write_under_barrier(
     } else {
         None
     };
-    let store_trace = write_store_guard.as_ref().map(|guard| guard.trace());
+    let mut store_trace = write_store_guard.as_ref().map(|guard| guard.trace());
 
     // The replay guard. The lookup belongs inside the store-lock epoch that the
     // matching record is written in: that is what serializes two deliveries of
@@ -946,6 +1100,7 @@ async fn handle_write_under_barrier(
                 // The row itself now owns completion. Release the repository-wide
                 // lock before waiting on or resuming remote work for this call.
                 drop(write_store_guard);
+                *epoch = ReplayEpoch::Checked;
                 match replay::await_file_replay_or_takeover(&orch.db.local, call).await {
                     replay::FileReplayClaim::Replayed(report) => {
                         return replay::mark_as_replay(&report);
@@ -1045,6 +1200,11 @@ async fn handle_write_under_barrier(
         }
     }
 
+    #[cfg(feature = "test-utils")]
+    if optimistic {
+        test_pause::reached(request.tool_use_id.as_deref()).await;
+    }
+
     let revert_commit = payload.changes.first().and_then(|change| {
         (change.mode == ChangeMode::Revert).then(|| {
             change
@@ -1126,13 +1286,36 @@ async fn handle_write_under_barrier(
     } else {
         None
     };
+    // Held work lands ahead of this write, and landing it needs the lock.
+    if optimistic {
+        if let Some(resolution) = logical_resolution.as_ref() {
+            let held = super::run::held::held_rows(
+                &orch.db.local,
+                &resolution.project_id,
+                &resolution.rev,
+            )
+            .await;
+            if !held.is_ok_and(|rows| rows.is_empty()) {
+                *epoch = ReplayEpoch::Checked;
+                return Box::pin(handle_write_attempt(
+                    orch,
+                    request,
+                    drained,
+                    WriteLocking::Locked,
+                    epoch,
+                ))
+                .await;
+            }
+        }
+    }
     // A freshly minted branch has nothing held on it yet.
-    if minted_branch.is_none() {
+    if minted_branch.is_none() && !optimistic {
         if let Some(resolution) = logical_resolution.as_mut() {
             *drained = super::run::held::drain_held_publications(
                 orch,
                 &resolution.project_id,
                 &resolution.rev,
+                store_trace.as_ref(),
             )
             .await;
             // The write's expected-head check must see the head the drain
@@ -1707,6 +1890,83 @@ async fn handle_write_under_barrier(
     // report it recorded once the ladder's remaining rungs have settled.
     let mut replay_owner: Option<replay::ReplayOwner> = None;
     let mut ordinary_ledger_claim = replay::LedgerClaim::NotClaimed;
+    if optimistic && first_file_change.is_some() {
+        let guard = match crate::mcp::vcs::acquire_store_lock(
+            orch,
+            write_store.as_deref(),
+            crate::orchestrator::StoreLockClass::Foreground,
+            "logical write transaction",
+            crate::mcp::vcs::STORE_LOCK_TIMEOUT,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                return serde_json::to_string(&empty_change_report(
+                    Vec::new(),
+                    vec![ChangeFailure {
+                        index: 0,
+                        target: payload
+                            .changes
+                            .first()
+                            .map(|change| change.target.clone())
+                            .unwrap_or_default(),
+                        mode: payload
+                            .changes
+                            .first()
+                            .map(|change| mode_name(change.mode))
+                            .unwrap_or("patch")
+                            .to_string(),
+                        kind: "file".to_string(),
+                        error,
+                    }],
+                    None,
+                    payload.atomic.unwrap_or(false),
+                    false,
+                ))
+                .unwrap_or_else(|serialize_error| serialize_error.to_string());
+            }
+        };
+        let resolution = logical_resolution
+            .as_ref()
+            .expect("file writes require a resolved logical head");
+        let replayed = match write_call.as_ref() {
+            Some(call) => replay::recorded_report(&orch.db.local, call)
+                .await
+                .is_some(),
+            None => false,
+        };
+        let head = cairn_vcs::resolve_coordinate(&resolution.repository_path, &resolution.rev)
+            .await
+            .ok();
+        let held =
+            super::run::held::held_rows(&orch.db.local, &resolution.project_id, &resolution.rev)
+                .await;
+        let unchanged = !replayed
+            && head.as_deref() == Some(resolution.commit_id.as_str())
+            && held.is_ok_and(|rows| rows.is_empty());
+        if !unchanged {
+            log::info!(
+                "logical write on `{}`: the head, held work, or replay ledger changed after \
+                 preparation (prepared on {}, now {head:?}); writing again under the store lock",
+                resolution.rev,
+                resolution.commit_id
+            );
+            drop(guard);
+            *epoch = ReplayEpoch::Checked;
+            return Box::pin(handle_write_attempt(
+                orch,
+                request,
+                drained,
+                WriteLocking::Locked,
+                epoch,
+            ))
+            .await;
+        }
+        *epoch = ReplayEpoch::Checked;
+        store_trace = guard.as_ref().map(|guard| guard.trace());
+        write_store_guard = guard;
+    }
     if let Some(first_file_change) = first_file_change {
         let _seal_phase = write_store_guard
             .as_ref()
@@ -3334,6 +3594,11 @@ mod change_preview_tests {
         assert_eq!(routed.project_id, "project-id");
     }
 
+    /// The write's two serialization shapes, pinned in source order. A locked
+    /// write takes the lock before it resolves the head. An optimistic one
+    /// takes it after preparing and, under it, re-reads the head and the
+    /// replay ledger before the seal — the compare-and-set that makes
+    /// preparing outside the lock safe (I3, I5).
     #[test]
     fn logical_write_lock_precedes_head_resolution_and_publication() {
         let source = include_str!("mod.rs");
@@ -3350,8 +3615,23 @@ mod change_preview_tests {
             .find("finalize_file_commit")
             .map(|offset| prepare + offset)
             .unwrap();
-
         assert!(lock < resolve && resolve < prepare && prepare < publish);
+
+        let late_lock = source[lock + 1..]
+            .find("\"logical write transaction\"")
+            .map(|offset| lock + 1 + offset)
+            .expect("an optimistic write takes the lock to seal");
+        let seal = source[late_lock..]
+            .find("finalize_file_commit(")
+            .map(|offset| late_lock + offset)
+            .unwrap();
+        let replay_recheck = source[late_lock..seal]
+            .find("replay::recorded_report")
+            .expect("the replay ledger is re-read under the sealing lock");
+        let head_recheck = source[late_lock..seal]
+            .find("cairn_vcs::resolve_coordinate")
+            .expect("the head is re-read under the sealing lock");
+        assert!(replay_recheck > 0 && head_recheck > 0);
         assert!(!source.contains(&["recover_stale", "file_commit"].concat()));
         assert!(!source.contains(&["update", "_stale"].concat()));
     }

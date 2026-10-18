@@ -138,10 +138,12 @@ pub(super) async fn land_verified_store_merge_child(
     merge_context: &MergeMrContext,
     method: &str,
     verified: &ProspectiveMerge,
+    trace: &crate::orchestrator::JjStoreOperationTrace,
 ) -> Result<VerifiedLanding, String> {
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let store =
         crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
+    let revalidating = trace.phase("revalidate verified tips");
     if crate::jj::bookmark_commit(&jj, &store, &merge_context.source_branch).as_deref()
         != Some(&verified.source_tip)
         || crate::jj::bookmark_commit(&jj, &store, &merge_context.target_branch).as_deref()
@@ -150,18 +152,26 @@ pub(super) async fn land_verified_store_merge_child(
         return Ok(VerifiedLanding::Stale);
     }
     let operation = crate::jj::operation_id(&jj, &store)?;
+    drop(revalidating);
     let mut local = merge_context.clone();
     local.mr.is_local = true;
+    let folding = trace.phase("fold");
     let commit = match store_merge_child_inner(orch, &local, method, false).await {
         Ok(commit) => commit,
         Err(error) => return Err(error),
     };
+    drop(folding);
+    let verifying = trace.phase("verify landed tree");
     let actual_tree = crate::jj::sealed_tree_hash_via_git(&jj, &store, &commit)?;
     if actual_tree != verified.tree_hash {
         crate::jj::restore_operation(&jj, &store, &operation)?;
         return Ok(VerifiedLanding::Stale);
     }
+    drop(verifying);
     if !merge_context.mr.is_local {
+        // Network I/O inside the hold: a failed push rolls the store back to
+        // `operation`, which only stays exact while no other writer runs.
+        let _publishing = trace.phase("push and reflect on origin");
         if let Err(error) = publish_integration_merge(
             &jj,
             &store,

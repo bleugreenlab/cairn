@@ -542,7 +542,11 @@ pub async fn resolve_launch_coordinate(
     let repository = repository_path.clone();
     let imported = {
         let _store_guard = orch
-            .acquire_jj_store_lock(&managed_store, "project store import: dev instance launch")
+            .acquire_jj_store_lock(
+                &managed_store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                "project store import: dev instance launch",
+            )
             .await;
         tokio::task::spawn_blocking(move || {
             crate::jj::ensure_project_store(&jj, &store, &repository)

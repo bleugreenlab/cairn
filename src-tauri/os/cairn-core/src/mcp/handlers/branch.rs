@@ -489,6 +489,7 @@ async fn resolve_coordinate_repairing_conflicts(
     let guard = orch
         .acquire_jj_store_lock(
             repository_path,
+            crate::orchestrator::StoreLockClass::Foreground,
             format!("repair conflicted branch name `{coordinate}`"),
         )
         .await;

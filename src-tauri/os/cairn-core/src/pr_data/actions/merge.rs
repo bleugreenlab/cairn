@@ -914,7 +914,7 @@ async fn merge_pr_for_job_past_barrier(
     let merged_commit = if merge_context.target_branch == resolved_default {
         let _store_guard = orch
             .acquire_jj_store_lock(
-                &merge_store,
+                &merge_store, crate::orchestrator::StoreLockClass::Foreground,
                 format!("merge fold for {}", merge_context.source_branch),
             )
             .await;
@@ -926,7 +926,7 @@ async fn merge_pr_for_job_past_barrier(
             let prospective = {
                 let _store_guard = orch
                     .acquire_jj_store_lock(
-                        &merge_store,
+                        &merge_store, crate::orchestrator::StoreLockClass::Foreground,
                         format!("prospective merge fold for {}", merge_context.source_branch),
                     )
                     .await;
@@ -967,13 +967,20 @@ async fn merge_pr_for_job_past_barrier(
                 }
             }
             let landing = {
-                let _store_guard = orch
+                let store_guard = orch
                     .acquire_jj_store_lock(
-                        &merge_store,
+                        &merge_store, crate::orchestrator::StoreLockClass::Foreground,
                         format!("verified merge landing for {}", merge_context.source_branch),
                     )
                     .await;
-                land_verified_store_merge_child(orch, &merge_context, &method, &prospective).await?
+                land_verified_store_merge_child(
+                    orch,
+                    &merge_context,
+                    &method,
+                    &prospective,
+                    &store_guard.trace(),
+                )
+                .await?
             };
             match landing {
                 VerifiedLanding::Landed(commit) => {

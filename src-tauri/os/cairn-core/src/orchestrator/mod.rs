@@ -39,12 +39,22 @@ pub mod replay_base;
 pub mod session;
 mod settings;
 pub mod skills;
+mod store_lock;
+use store_lock::summarize_bounded;
+#[cfg(test)]
+use store_lock::JJ_STORE_LOCK_SAMPLE_CAPACITY;
+pub(crate) use store_lock::{
+    branch_preparation_operation, describe_preparation_wait, StoreLockStatus,
+};
+pub use store_lock::{
+    JjStoreGuard, JjStoreLockMetrics, JjStoreOperationTrace, JjStorePhaseTimer, StoreLockClass,
+};
 mod team_attention_push;
 pub mod usage_refresh;
 pub mod wakes;
 pub mod workflow_configs;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -579,8 +589,6 @@ impl OrchestratorBuilder {
     }
 }
 
-const JJ_STORE_LOCK_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
-const JJ_STORE_LOCK_SAMPLE_CAPACITY: usize = 256;
 /// Three heartbeat intervals: startup silence becomes evidence only after the
 /// fleet has had ample opportunity to report into this runner session.
 const FLEET_STARTUP_GRACE_SECS: i64 = 90;
@@ -589,113 +597,6 @@ fn fleet_is_warming(executor_count: usize, boot_at: i64, captured_at_unix_ms: u6
     executor_count == 0
         && captured_at_unix_ms / 1_000
             < boot_at.saturating_add(FLEET_STARTUP_GRACE_SECS).max(0) as u64
-}
-
-#[derive(Default)]
-pub struct JjStoreLockMetrics {
-    waiter_count: usize,
-    current_operation: Option<String>,
-    current_task: Option<tokio::task::Id>,
-    waits_ms: VecDeque<u64>,
-    holds_ms: VecDeque<u64>,
-    phase_ms: HashMap<String, VecDeque<u64>>,
-}
-
-/// Correlates phase timings that belong to one top-level store operation, even
-/// when later phases deliberately run after the store guard has been released.
-#[derive(Clone)]
-pub struct JjStoreOperationTrace {
-    operation: Arc<str>,
-    store: Arc<str>,
-    correlation_id: Arc<str>,
-    metrics: Arc<Mutex<HashMap<String, JjStoreLockMetrics>>>,
-}
-
-pub struct JjStorePhaseTimer {
-    trace: JjStoreOperationTrace,
-    phase: Arc<str>,
-    started_at: std::time::Instant,
-}
-
-impl JjStoreOperationTrace {
-    pub(crate) fn phase(&self, phase: impl Into<Arc<str>>) -> JjStorePhaseTimer {
-        JjStorePhaseTimer {
-            trace: self.clone(),
-            phase: phase.into(),
-            started_at: std::time::Instant::now(),
-        }
-    }
-
-    pub(crate) fn deferred(&self, phase: &str) {
-        log::debug!(
-            "jj_store_phase correlation_id={} operation={} store={} phase={}",
-            self.correlation_id,
-            self.operation,
-            self.store,
-            phase
-        );
-    }
-}
-
-impl Drop for JjStorePhaseTimer {
-    fn drop(&mut self) {
-        let elapsed = self.started_at.elapsed();
-        let duration_ms = elapsed.as_millis().try_into().unwrap_or(u64::MAX);
-        let phase_key = format!("{}/{}", self.trace.operation, self.phase);
-        if let Some(metrics) = self
-            .trace
-            .metrics
-            .lock()
-            .unwrap()
-            .get_mut(self.trace.store.as_ref())
-        {
-            record_bounded(metrics.phase_ms.entry(phase_key).or_default(), duration_ms);
-        }
-        if elapsed >= JJ_STORE_LOCK_WARN_AFTER {
-            log::info!(
-                "jj_store_phase correlation_id={} operation={} store={} phase={} duration_ms={}",
-                self.trace.correlation_id,
-                self.trace.operation,
-                self.trace.store,
-                self.phase,
-                duration_ms
-            );
-        } else {
-            log::debug!(
-                "jj_store_phase correlation_id={} operation={} store={} phase={} duration_ms={}",
-                self.trace.correlation_id,
-                self.trace.operation,
-                self.trace.store,
-                self.phase,
-                duration_ms
-            );
-        }
-    }
-}
-
-fn record_bounded(samples: &mut VecDeque<u64>, value: u64) {
-    if samples.len() == JJ_STORE_LOCK_SAMPLE_CAPACITY {
-        samples.pop_front();
-    }
-    samples.push_back(value);
-}
-
-fn summarize_bounded(
-    samples: &VecDeque<u64>,
-) -> cairn_common::executor_protocol::BoundedDurationSummary {
-    let mut sorted: Vec<_> = samples.iter().copied().collect();
-    sorted.sort_unstable();
-    let percentile = |n: usize| {
-        sorted
-            .get((sorted.len().saturating_sub(1) * n) / 100)
-            .copied()
-    };
-    cairn_common::executor_protocol::BoundedDurationSummary {
-        sample_count: sorted.len() as u64,
-        p50_ms: percentile(50),
-        p95_ms: percentile(95),
-        max_ms: sorted.last().copied(),
-    }
 }
 
 /// Everything one executor has to say for itself, as reasons.
@@ -819,86 +720,6 @@ fn substrate_health_status(
         SubstrateHealthStatus::Unknown
     } else {
         SubstrateHealthStatus::Degraded
-    }
-}
-
-struct JjStoreWaiterRegistration {
-    store: String,
-    wait_started: std::time::Instant,
-    metrics: Arc<Mutex<HashMap<String, JjStoreLockMetrics>>>,
-    record_wait: bool,
-}
-
-impl JjStoreWaiterRegistration {
-    fn finish(mut self) -> std::time::Duration {
-        self.record_wait = true;
-        let waited = self.wait_started.elapsed();
-        self.release(waited);
-        std::mem::forget(self);
-        waited
-    }
-
-    fn release(&mut self, waited: std::time::Duration) {
-        if let Some(metrics) = self.metrics.lock().unwrap().get_mut(&self.store) {
-            metrics.waiter_count = metrics.waiter_count.saturating_sub(1);
-            if self.record_wait {
-                record_bounded(
-                    &mut metrics.waits_ms,
-                    waited.as_millis().try_into().unwrap_or(u64::MAX),
-                );
-            }
-        }
-    }
-}
-
-impl Drop for JjStoreWaiterRegistration {
-    fn drop(&mut self) {
-        self.release(self.wait_started.elapsed());
-    }
-}
-
-pub struct JjStoreGuard {
-    _guard: tokio::sync::OwnedMutexGuard<()>,
-    trace: JjStoreOperationTrace,
-    acquired_at: std::time::Instant,
-}
-
-impl JjStoreGuard {
-    pub(crate) fn trace(&self) -> JjStoreOperationTrace {
-        self.trace.clone()
-    }
-
-    pub(crate) fn phase(&self, phase: impl Into<Arc<str>>) -> JjStorePhaseTimer {
-        self.trace.phase(phase)
-    }
-}
-
-impl Drop for JjStoreGuard {
-    fn drop(&mut self) {
-        let held = self.acquired_at.elapsed();
-        if let Some(metrics) = self
-            .trace
-            .metrics
-            .lock()
-            .unwrap()
-            .get_mut(self.trace.store.as_ref())
-        {
-            metrics.current_operation = None;
-            metrics.current_task = None;
-            record_bounded(
-                &mut metrics.holds_ms,
-                held.as_millis().try_into().unwrap_or(u64::MAX),
-            );
-        }
-        if held >= JJ_STORE_LOCK_WARN_AFTER {
-            log::warn!(
-                "jj store lock hold exceeded {:.1}s: correlation_id={}, operation={}, store={}",
-                held.as_secs_f64(),
-                self.trace.correlation_id,
-                self.trace.operation,
-                self.trace.store
-            );
-        }
     }
 }
 
@@ -1400,7 +1221,7 @@ pub struct Orchestrator {
     /// mint divergent conflicted copies of the same change-id; this single-writer
     /// discipline closes that window. Keyed by store path (not execution/job) so
     /// reconciles from different executions on the same project store serialize.
-    jj_store_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
+    jj_store_locks: Arc<Mutex<HashMap<String, Arc<store_lock::PriorityLock>>>>,
     jj_store_lock_metrics: Arc<Mutex<HashMap<String, JjStoreLockMetrics>>>,
 
     /// What this process knows about each project's default branch on origin,
@@ -1709,7 +1530,7 @@ impl Orchestrator {
             .iter()
             .map(|(store, metrics)| StoreLockHealth {
                 store: store.clone(),
-                waiter_count: metrics.waiter_count,
+                waiter_count: metrics.waiter_count(),
                 waits: summarize_bounded(&metrics.waits_ms),
                 holds: summarize_bounded(&metrics.holds_ms),
             })
@@ -1907,107 +1728,6 @@ impl Orchestrator {
             .keys()
             .cloned()
             .collect()
-    }
-
-    /// Get or create a per-store lock serializing base-advance reconcile and
-    /// merge-fold mutations on a shared jj project store. Acquire it once per
-    /// logical operation at exactly one level — `TokioMutex` is not reentrant, so
-    /// the inner reconcile helpers must never re-acquire it while it is held.
-    fn jj_store_lock(&self, store_dir: &Path) -> Arc<TokioMutex<()>> {
-        let key = store_dir.to_string_lossy().into_owned();
-        let mut map = self.jj_store_locks.lock().unwrap();
-        map.entry(key)
-            .or_insert_with(|| Arc::new(TokioMutex::new(())))
-            .clone()
-    }
-
-    /// Acquire a project store lock while recording slow waits and holds.
-    pub(crate) async fn acquire_jj_store_lock(
-        &self,
-        store_dir: &Path,
-        operation: impl Into<String>,
-    ) -> JjStoreGuard {
-        self.acquire_jj_store_lock_with_timeout(store_dir, operation, None)
-            .await
-            .expect("an acquisition without a timeout cannot time out")
-    }
-
-    pub(crate) async fn acquire_jj_store_lock_with_timeout(
-        &self,
-        store_dir: &Path,
-        operation: impl Into<String>,
-        timeout: Option<std::time::Duration>,
-    ) -> Result<JjStoreGuard, ()> {
-        let operation = operation.into();
-        let store = store_dir.to_string_lossy().into_owned();
-        let current_task = tokio::task::try_id();
-        debug_assert!(
-            current_task.is_none()
-                || self
-                    .jj_store_lock_metrics
-                    .lock()
-                    .unwrap()
-                    .get(&store)
-                    .and_then(|metrics| metrics.current_task)
-                    != current_task,
-            "task attempted to re-acquire jj store lock for {store} while already holding it"
-        );
-        let wait_started = std::time::Instant::now();
-        let lock = self.jj_store_lock(store_dir);
-        {
-            let mut all = self.jj_store_lock_metrics.lock().unwrap();
-            all.entry(store.clone()).or_default().waiter_count += 1;
-        }
-        let waiter = JjStoreWaiterRegistration {
-            store: store.clone(),
-            wait_started,
-            metrics: self.jj_store_lock_metrics.clone(),
-            record_wait: false,
-        };
-        let guard = match timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, lock.lock_owned()).await {
-                Ok(guard) => guard,
-                Err(_) => {
-                    let waited = waiter.finish();
-                    log::warn!(
-                        "jj store lock wait timed out after {:.1}s: operation={operation}, store={store}",
-                        waited.as_secs_f64()
-                    );
-                    return Err(());
-                }
-            },
-            None => lock.lock_owned().await,
-        };
-        let waited = waiter.finish();
-        if waited >= JJ_STORE_LOCK_WARN_AFTER {
-            log::warn!(
-                "jj store lock wait exceeded {:.1}s: operation={operation}, store={store}",
-                waited.as_secs_f64()
-            );
-        }
-        let trace = JjStoreOperationTrace {
-            operation: Arc::from(operation.clone()),
-            store: Arc::from(store.clone()),
-            correlation_id: Arc::from(uuid::Uuid::new_v4().to_string()),
-            metrics: self.jj_store_lock_metrics.clone(),
-        };
-        if let Some(metrics) = self.jj_store_lock_metrics.lock().unwrap().get_mut(&store) {
-            metrics.current_operation = Some(operation.clone());
-            metrics.current_task = current_task;
-        }
-        Ok(JjStoreGuard {
-            _guard: guard,
-            trace,
-            acquired_at: std::time::Instant::now(),
-        })
-    }
-
-    pub(crate) fn jj_store_lock_holder(&self, store_dir: &Path) -> Option<String> {
-        self.jj_store_lock_metrics
-            .lock()
-            .unwrap()
-            .get(store_dir.to_string_lossy().as_ref())
-            .and_then(|metrics| metrics.current_operation.clone())
     }
 
     /// Emit a typed attention event to any in-flight `watch` long-poll.
@@ -3816,7 +3536,13 @@ mod tests {
         .build();
         let store = config_dir.join("jj-stores").join("phase-test");
 
-        let guard = orch.acquire_jj_store_lock(&store, "phase operation").await;
+        let guard = orch
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                "phase operation",
+            )
+            .await;
         let trace = guard.trace();
         let correlation = trace.correlation_id.clone();
         let phase = trace.phase("local mutation");
@@ -3826,6 +3552,7 @@ mod tests {
         // its timer alive must not keep the mutex locked.
         orch.acquire_jj_store_lock_with_timeout(
             &store,
+            crate::orchestrator::StoreLockClass::Foreground,
             "phase overlap probe",
             Some(std::time::Duration::from_millis(100)),
         )
@@ -3859,13 +3586,22 @@ mod tests {
         .build();
         let store = config_dir.join("jj-stores").join("abort-test");
         let held = orch
-            .acquire_jj_store_lock(&store, "abort test holder")
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                "abort test holder",
+            )
             .await;
         let waiting_orch = orch.clone();
         let waiting_store = store.clone();
         let waiter = tokio::spawn(async move {
             waiting_orch
-                .acquire_jj_store_lock_with_timeout(&waiting_store, "aborted waiter", None)
+                .acquire_jj_store_lock_with_timeout(
+                    &waiting_store,
+                    crate::orchestrator::StoreLockClass::Foreground,
+                    "aborted waiter",
+                    None,
+                )
                 .await
         });
 
@@ -3901,6 +3637,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_waiting_branch_preparation_reports_its_holder_and_queue_position() {
+        let db = test_db().await;
+        let config_dir = tempfile::tempdir().unwrap().keep();
+        let orch = Orchestrator::builder(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            config_dir.clone(),
+        )
+        .build();
+        let store = config_dir.join("jj-stores").join("preparation-wait");
+        let held = orch
+            .acquire_jj_store_lock(
+                &store,
+                StoreLockClass::Background,
+                "sibling reconcile (test): feature",
+            )
+            .await;
+        assert!(orch.branch_preparation_wait("job-1").is_none());
+
+        let waiting_orch = orch.clone();
+        let waiting_store = store.clone();
+        let preparation = tokio::spawn(async move {
+            drop(
+                waiting_orch
+                    .acquire_jj_store_lock(
+                        &waiting_store,
+                        StoreLockClass::Foreground,
+                        branch_preparation_operation("job-1"),
+                    )
+                    .await,
+            );
+        });
+        let (status, position, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if let Some(wait) = orch.branch_preparation_wait("job-1") {
+                        break wait;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the queued preparation is visible");
+        assert_eq!(position, 0);
+        assert_eq!(
+            status
+                .holder
+                .as_ref()
+                .map(|(operation, _)| operation.as_str()),
+            Some("sibling reconcile (test): feature")
+        );
+
+        drop(held);
+        preparation.await.unwrap();
+        assert!(orch.branch_preparation_wait("job-1").is_none());
+    }
+
+    #[tokio::test]
     async fn store_lock_timeout_returns_without_acquiring_and_releases_waiter() {
         let db = test_db().await;
         let config_dir = tempfile::tempdir().unwrap().keep();
@@ -3912,12 +3706,17 @@ mod tests {
         .build();
         let store = config_dir.join("jj-stores").join("timeout-test");
         let held = orch
-            .acquire_jj_store_lock(&store, "timeout test holder")
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                "timeout test holder",
+            )
             .await;
 
         let result = orch
             .acquire_jj_store_lock_with_timeout(
                 &store,
+                crate::orchestrator::StoreLockClass::Foreground,
                 "timeout test waiter",
                 Some(std::time::Duration::from_millis(10)),
             )
@@ -3927,6 +3726,7 @@ mod tests {
         drop(held);
         orch.acquire_jj_store_lock_with_timeout(
             &store,
+            crate::orchestrator::StoreLockClass::Foreground,
             "timeout test retry",
             Some(std::time::Duration::from_millis(100)),
         )

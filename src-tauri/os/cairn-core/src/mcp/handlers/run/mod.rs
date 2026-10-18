@@ -32,6 +32,7 @@ pub use types::{
 };
 
 use crate::mcp::vcs::{acquire_store_lock, STORE_LOCK_TIMEOUT};
+use crate::orchestrator::JjStoreOperationTrace;
 use crate::storage::RowExt;
 use commit_barrier::{run_commit_barrier, CommitBarrierOutcome};
 use std::path::Path;
@@ -595,13 +596,6 @@ pub(crate) async fn publish_and_seal_slot_delta(
     message: &str,
     author: Option<&PublicationIdentity>,
 ) -> Result<PublishedSlotDelta, String> {
-    let _guard = acquire_store_lock(
-        orch,
-        Some(store_dir),
-        "build-slot delta publication and seal",
-        STORE_LOCK_TIMEOUT,
-    )
-    .await?;
     let repository = request
         .repository
         .colocated_path()
@@ -616,22 +610,49 @@ pub(crate) async fn publish_and_seal_slot_delta(
         store_dir: store_dir.to_path_buf(),
         branch: branch.to_string(),
     };
-    let publication =
-        match publish_visible_slot_delta(orch, &target, request, delta, message, author).await {
-            Ok(publication) => publication,
-            Err(error) => {
-                if let SlotPublicationError::Held {
-                    consume_receipt: true,
-                    ..
-                } = &error
-                {
-                    if let Err(error) = finalize_delta_receipt(orch, &target, delta).await {
-                        log::warn!("held system-fix delta upload was not finalized: {error}");
-                    }
+    // Prepared before the lock: installation, pinning, and the integration
+    // against the head read now need no exclusion (I3, I4).
+    let prepared = prepare_slot_publication(orch, &target, request, delta, message, author)
+        .await
+        .map_err(|error| error.to_string())?;
+    let guard = acquire_store_lock(
+        orch,
+        Some(store_dir),
+        crate::orchestrator::StoreLockClass::Foreground,
+        "build-slot delta publication and seal",
+        STORE_LOCK_TIMEOUT,
+    )
+    .await?;
+    let trace = guard.as_ref().map(|guard| guard.trace());
+    let landed = land_prepared_slot_delta(
+        orch,
+        &target,
+        request,
+        delta,
+        message,
+        author,
+        trace.as_ref(),
+        prepared,
+    )
+    .await;
+    // Receipt finalization talks to the object plane and the patch capture
+    // reads immutable commits; neither needs the store.
+    drop(guard);
+    let mut publication = match landed {
+        Ok(publication) => publication,
+        Err(error) => {
+            if let SlotPublicationError::Held {
+                consume_receipt: true,
+                ..
+            } = &error
+            {
+                if let Err(error) = finalize_delta_receipt(orch, &target, delta).await {
+                    log::warn!("held system-fix delta upload was not finalized: {error}");
                 }
-                return Err(error.to_string());
             }
-        };
+            return Err(error.to_string());
+        }
+    };
     // The upload was validated and installed before either outcome was reached,
     // so it is finalized on both.
     if publication.consume_receipt {
@@ -639,6 +660,7 @@ pub(crate) async fn publish_and_seal_slot_delta(
             log::warn!("system-fix delta upload was not finalized: {error}");
         }
     }
+    publication.outcome.capture_patch(&target.repository);
     let (commit, patch, landed_on_tested_base) = match publication.outcome {
         SlotPublicationOutcome::Published {
             landed,
@@ -833,6 +855,8 @@ enum SlotPublicationOutcome {
         /// Present when the branch moved while the batch ran and its changes
         /// were merged onto the head the branch actually held.
         integration: Option<IntegrationNote>,
+        /// The head the landing transaction was expected to find.
+        published_onto: String,
     },
     /// The branch head's tree already carries this batch's content.
     AlreadyLanded { head: String },
@@ -926,6 +950,8 @@ struct DeltaPublication<'a> {
     author: Option<&'a PublicationIdentity>,
     /// The job whose check status a landing invalidates.
     job_id: Option<&'a str>,
+    /// The enclosing store-lock hold, whose phases this publication reports.
+    trace: Option<&'a JjStoreOperationTrace>,
 }
 
 fn resolve_runner_publication_target(
@@ -997,15 +1023,57 @@ fn make_delta_available(
     })
 }
 
-// Caller holds the canonical per-store lock for the full visibility window.
-async fn publish_visible_slot_delta(
+/// A routed delta made ready to land: installed, pinned, and — when it could
+/// be — integrated against the head the branch held at preparation.
+///
+/// Everything here is computed without the store lock. The objects are pinned
+/// from installation until the landing transaction commits (I4), so nothing
+/// ref-less is ever unprotected, and the plan is only used under the lock if
+/// the bookmark still holds the head it was computed against (I3).
+struct PreparedSlot {
+    available: AvailableDelta,
+    plan: Option<IntegrationPlan>,
+}
+
+fn slot_delta_publication<'a>(
+    target: &'a RunnerPublicationTarget,
+    request: &'a CellRequest,
+    delta: &'a crate::fleet::MutationDelta,
+    message: &'a str,
+    author: Option<&'a PublicationIdentity>,
+    trace: Option<&'a JjStoreOperationTrace>,
+) -> DeltaPublication<'a> {
+    DeltaPublication {
+        repository: &target.repository,
+        store_dir: &target.store_dir,
+        project_id: &target.project_id,
+        branch: &target.branch,
+        base_commit: &delta.base_commit,
+        delta_commit: &delta.delta_commit,
+        message,
+        author,
+        job_id: request
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.job_id.as_deref()),
+        trace,
+    }
+}
+
+/// Install, pin, and integrate a routed delta without holding the store lock.
+///
+/// Only installation can fail the publication here, and it fails exactly as it
+/// would under the lock: nothing is in the store, nothing is held. An
+/// integration that cannot be planned is simply not planned; the locked path
+/// meets the same condition and reports it.
+async fn prepare_slot_publication(
     orch: &Orchestrator,
     target: &RunnerPublicationTarget,
     request: &CellRequest,
     delta: &crate::fleet::MutationDelta,
     message: &str,
     author: Option<&PublicationIdentity>,
-) -> Result<SlotPublication, SlotPublicationError> {
+) -> Result<PreparedSlot, SlotPublicationError> {
     debug_assert_eq!(target.project_id, request.project_id);
     debug_assert_eq!(target.repository_identity, request.repository.identity());
     debug_assert!(target.git_common_dir.is_absolute());
@@ -1016,30 +1084,49 @@ async fn publish_visible_slot_delta(
                 error,
             }
         })?;
-    let job_id = request
-        .owner
-        .as_ref()
-        .and_then(|owner| owner.job_id.as_deref());
-    let publication = DeltaPublication {
-        repository: &target.repository,
-        store_dir: &target.store_dir,
-        project_id: &target.project_id,
-        branch: &target.branch,
-        base_commit: &delta.base_commit,
-        delta_commit: &delta.delta_commit,
-        message,
-        author,
-        job_id,
+    let publication = slot_delta_publication(target, request, delta, message, author, None);
+    let plan = match cairn_vcs::resolve_coordinate(&target.store_dir, &target.branch).await {
+        Ok(head) => plan_integration(orch, &publication, head).await.ok(),
+        Err(_) => None,
     };
-    match publish_available_delta(orch, &publication).await {
+    Ok(PreparedSlot { available, plan })
+}
+
+/// Land a prepared delta. Caller holds the store lock; on a failure that
+/// leaves the delta in the store it is held or stranded here, under the same
+/// hold, as before.
+#[allow(clippy::too_many_arguments)]
+async fn land_prepared_slot_delta(
+    orch: &Orchestrator,
+    target: &RunnerPublicationTarget,
+    request: &CellRequest,
+    delta: &crate::fleet::MutationDelta,
+    message: &str,
+    author: Option<&PublicationIdentity>,
+    trace: Option<&JjStoreOperationTrace>,
+    prepared: PreparedSlot,
+) -> Result<SlotPublication, SlotPublicationError> {
+    // Kept to the end of this function: its pin protects the delta's objects
+    // until the landing transaction has committed or a held ref has taken over.
+    let PreparedSlot { available, plan } = prepared;
+    let publication = slot_delta_publication(target, request, delta, message, author, trace);
+    match publish_available_delta(orch, &publication, plan).await {
         Ok(outcome) => Ok(SlotPublication {
             consume_receipt: available.consume_receipt,
             outcome,
         }),
-        Err(PublishFailure::Conflicted { head, paths }) => Err(SlotPublicationError::Straddled(
-            strand_conflicted_delta(&target.repository, request, delta, &head, &paths),
-        )),
+        Err(PublishFailure::Conflicted { head, paths }) => {
+            let _phase = trace.map(|trace| trace.phase("strand conflicted delta"));
+            Err(SlotPublicationError::Straddled(strand_conflicted_delta(
+                &target.repository,
+                request,
+                delta,
+                &head,
+                &paths,
+            )))
+        }
         Err(PublishFailure::Failed(error)) => {
+            let _phase = trace.map(|trace| trace.phase("hold delta"));
             // Written while `available` still pins the objects, so the ref
             // takes over protecting them before the pin is released.
             let held = held::hold_delta(
@@ -1049,7 +1136,7 @@ async fn publish_visible_slot_delta(
                     store_dir: &target.store_dir,
                     repository: &target.repository,
                     branch: &target.branch,
-                    job_id,
+                    job_id: publication.job_id,
                     attempt_id: &request.attempt_id,
                     base_commit: &delta.base_commit,
                     delta_commit: &delta.delta_commit,
@@ -1065,6 +1152,29 @@ async fn publish_visible_slot_delta(
             })
         }
     }
+}
+
+/// Prepare, land, and capture the patch of a routed delta in one call, for a
+/// caller that holds the store lock across all three. Production callers
+/// prepare before acquiring the lock instead; the straddle tests drive the same
+/// prepare-then-land sequence through this.
+#[cfg(test)]
+async fn publish_visible_slot_delta(
+    orch: &Orchestrator,
+    target: &RunnerPublicationTarget,
+    request: &CellRequest,
+    delta: &crate::fleet::MutationDelta,
+    message: &str,
+    author: Option<&PublicationIdentity>,
+    trace: Option<&JjStoreOperationTrace>,
+) -> Result<SlotPublication, SlotPublicationError> {
+    let prepared = prepare_slot_publication(orch, target, request, delta, message, author).await?;
+    let mut publication = land_prepared_slot_delta(
+        orch, target, request, delta, message, author, trace, prepared,
+    )
+    .await?;
+    publication.outcome.capture_patch(&target.repository);
+    Ok(publication)
 }
 
 /// The merge base for a delta whose parent is a commit its batch's execution
@@ -1115,25 +1225,137 @@ fn git_is_ancestor(repository: &Path, ancestor: &str, descendant: &str) -> bool 
         .is_ok_and(|status| status.success())
 }
 
+/// What landing a delta on one particular head would publish.
+///
+/// A function of that head, the delta, and the message alone — except when the
+/// delta's parent is a carried commit, whose merge base also depends on which
+/// held deltas are waiting, which a head comparison cannot revalidate. Such a
+/// plan is never reused under the lock.
+struct IntegrationPlan {
+    head: String,
+    reusable: bool,
+    landing: PlannedLanding,
+}
+
+enum PlannedLanding {
+    Land {
+        proposed: String,
+        integrated: bool,
+        mode: cairn_vcs::PublicationMode,
+        amend_converted: bool,
+        /// The merged commit, its tree, and the blobs the merge wrote are
+        /// ref-less until the transaction commits.
+        _pin: Option<crate::jj::DeltaObjectPin>,
+    },
+    AlreadyLanded,
+    Conflicted {
+        paths: Vec<String>,
+    },
+}
+
+/// Integrate a delta onto `head`. Needs no exclusion: it writes only
+/// unreferenced objects, which it pins, and reads immutable commits.
+async fn plan_integration(
+    orch: &Orchestrator,
+    publication: &DeltaPublication<'_>,
+    head: String,
+) -> Result<IntegrationPlan, PublishFailure> {
+    let DeltaPublication {
+        repository,
+        base_commit,
+        delta_commit,
+        message,
+        ..
+    } = *publication;
+    // The delta's own parent is the commit its batch opened at: the routed base,
+    // or an unpublished commit the execution home carried forward. In the
+    // second case the batch's work is the diff against that parent, so that is
+    // the merge base once the branch carries it.
+    let parent = git_output(
+        repository,
+        &["rev-parse", &format!("{delta_commit}^1")],
+        "read the delta's parent",
+    )?;
+    let carried = parent != base_commit;
+    let merge_base = if carried {
+        merge_base_for_carried_parent(orch, publication, &parent, &head).await?
+    } else {
+        base_commit.to_string()
+    };
+    let plan = |landing| IntegrationPlan {
+        head: head.clone(),
+        reusable: !carried,
+        landing,
+    };
+    let integration =
+        crate::jj::integrate_delta_onto_head(repository, &merge_base, delta_commit, &head)?;
+    let mut pin = None;
+    let (proposed, integrated) = match integration {
+        crate::jj::Integration::Unmoved if parent == head => (delta_commit.to_string(), false),
+        // The branch never held the carried parent, which is published together
+        // with this delta: the delta's tree re-rooted onto the head.
+        crate::jj::Integration::Unmoved => {
+            let commit = crate::jj::reparent_delta_onto_head(repository, delta_commit, &head)?;
+            pin = Some(crate::jj::pin_validated_delta(
+                repository, &head, &commit, None,
+            )?);
+            (commit, false)
+        }
+        crate::jj::Integration::AlreadyLanded => return Ok(plan(PlannedLanding::AlreadyLanded)),
+        crate::jj::Integration::Commit(commit) => {
+            pin = Some(crate::jj::pin_validated_delta(
+                repository, &head, &commit, None,
+            )?);
+            (commit, true)
+        }
+        crate::jj::Integration::Conflicted { paths } => {
+            return Ok(plan(PlannedLanding::Conflicted { paths }))
+        }
+    };
+    let head_description = if integrated && message == "^" {
+        Some(git_output(
+            repository,
+            &["log", "-1", "--format=%B", &head],
+            "read the logical head description for a converted amend",
+        )?)
+    } else {
+        None
+    };
+    let (mode, amend_converted) = publication_mode(message, head_description.as_deref());
+    Ok(plan(PlannedLanding::Land {
+        proposed,
+        integrated,
+        mode,
+        amend_converted,
+        _pin: pin,
+    }))
+}
+
 /// Land a delta the project store already holds onto its branch.
 ///
 /// Caller holds the canonical per-store lock and keeps the delta's objects
 /// pinned for the duration. Shared by a batch's own publication and by the
 /// republication of a held delta, so both land through one funnel.
+///
+/// `prepared` is an integration planned before the lock. It is used only when
+/// the bookmark, read here under the lock, still holds the head it was planned
+/// against; otherwise the integration is computed again here, which is exactly
+/// the fully locked path, so the outcome is the same either way (I3). The
+/// transaction itself still refuses a bookmark that is no longer that head.
+/// The patch is not captured here: it is a read of two immutable commits, left
+/// to [`SlotPublicationOutcome::capture_patch`] once the lock is released.
 async fn publish_available_delta(
     orch: &Orchestrator,
     publication: &DeltaPublication<'_>,
+    prepared: Option<IntegrationPlan>,
 ) -> Result<SlotPublicationOutcome, PublishFailure> {
     let DeltaPublication {
-        repository,
         store_dir,
-        project_id: _,
         branch,
-        base_commit,
-        delta_commit,
-        message,
         author,
         job_id,
+        trace,
+        ..
     } = *publication;
 
     // A delta declares as its parent the commit the batch was routed against,
@@ -1144,114 +1366,109 @@ async fn publish_available_delta(
     // executor cannot do this: it cannot tell its own head having been refreshed
     // to a new tip from its head being a descendant carrying work the runner has
     // not published back yet.
+    let resolving = trace.map(|trace| trace.phase("resolve head"));
     let head = cairn_vcs::resolve_coordinate(store_dir, branch)
         .await
         .map_err(|error| format!("resolve `{branch}` for delta publication: {error}"))?;
-    // The delta's own parent is the commit its batch opened at: the routed base,
-    // or an unpublished commit the execution home carried forward. In the
-    // second case the batch's work is the diff against that parent, so that is
-    // the merge base once the branch carries it.
-    let parent = git_output(
-        repository,
-        &["rev-parse", &format!("{delta_commit}^1")],
-        "read the delta's parent",
-    )?;
-    let merge_base = if parent == base_commit {
-        base_commit.to_string()
-    } else {
-        merge_base_for_carried_parent(orch, publication, &parent, &head).await?
+    drop(resolving);
+    let plan = match prepared {
+        Some(plan) if plan.reusable && plan.head == head => plan,
+        prepared => {
+            if let Some(stale) = prepared.filter(|plan| plan.head != head) {
+                log::info!(
+                    "delta publication on `{branch}`: the head moved from {} to {head} after \
+                     preparation; integrating again under the store lock",
+                    stale.head
+                );
+            }
+            let _integrating = trace.map(|trace| trace.phase("integrate"));
+            plan_integration(orch, publication, head).await?
+        }
     };
-    let integration =
-        crate::jj::integrate_delta_onto_head(repository, &merge_base, delta_commit, &head)?;
-    // Held for the same window as the caller's delta pin: the merged commit, its
-    // tree, and the blobs the merge wrote are ref-less until the transaction
-    // commits.
-    let mut _integrated_pin = None;
-    let (expected, proposed, integrated) = match integration {
-        crate::jj::Integration::Unmoved if parent == head => {
-            (head.clone(), delta_commit.to_string(), false)
-        }
-        // The branch never held the carried parent, which is published together
-        // with this delta: the delta's tree re-rooted onto the head.
-        crate::jj::Integration::Unmoved => {
-            let commit = crate::jj::reparent_delta_onto_head(repository, delta_commit, &head)?;
-            _integrated_pin = Some(crate::jj::pin_validated_delta(
-                repository, &head, &commit, None,
-            )?);
-            (head.clone(), commit, false)
-        }
-        crate::jj::Integration::AlreadyLanded => {
-            return Ok(SlotPublicationOutcome::AlreadyLanded { head })
-        }
-        crate::jj::Integration::Commit(commit) => {
-            _integrated_pin = Some(crate::jj::pin_validated_delta(
-                repository, &head, &commit, None,
-            )?);
-            (head.clone(), commit, true)
-        }
-        crate::jj::Integration::Conflicted { paths } => {
+    let IntegrationPlan { head, landing, .. } = plan;
+    let (proposed, integrated, mode, amend_converted, _pin) = match landing {
+        PlannedLanding::AlreadyLanded => return Ok(SlotPublicationOutcome::AlreadyLanded { head }),
+        PlannedLanding::Conflicted { paths } => {
             return Err(PublishFailure::Conflicted { head, paths })
         }
+        PlannedLanding::Land {
+            proposed,
+            integrated,
+            mode,
+            amend_converted,
+            _pin,
+        } => (proposed, integrated, mode, amend_converted, _pin),
     };
-
-    let head_description = if integrated && message == "^" {
-        Some(git_output(
-            repository,
-            &["log", "-1", "--format=%B", &expected],
-            "read the logical head description for a converted amend",
-        )?)
-    } else {
-        None
-    };
-    let (mode, amend_converted) = publication_mode(message, head_description.as_deref());
     // Carried for BOTH modes: an amend re-stamps the committer even though it
     // preserves the author, so withholding the identity here leaves the
     // amended commit unpushable.
     let identity = author.cloned();
-    let published_onto = expected.clone();
-    let crate::jj::PublishedLogicalHead { landed, export } =
-        crate::jj::publish_logical_head_exported(
-            &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
-            store_dir,
-            branch,
-            &expected,
-            crate::jj::ProposedPublication::DeltaCommit(proposed),
-            identity,
-            mode,
-        )
-        .await?;
+    let crate::jj::PublishedLogicalHead {
+        landed,
+        export,
+        timings,
+    } = crate::jj::publish_logical_head_exported(
+        &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
+        store_dir,
+        branch,
+        &head,
+        crate::jj::ProposedPublication::DeltaCommit(proposed),
+        identity,
+        mode,
+    )
+    .await?;
+    if let Some(trace) = trace {
+        trace.record_publication(&timings);
+    }
     // Nothing below may fail the publication: the bookmark has moved, and
     // reporting a landed commit as unpublished is the one wrong answer.
     if let Some(job_id) = job_id {
         orch.invalidate_node_check_status(job_id, "logical-head-tree-or-contract-change");
     }
-    // Against the head actually published onto, never the routed base: after an
-    // integration those differ, and diffing from the routed base would attribute
-    // every line the advance carried to this batch.
-    let (patch, patch_unavailable) = match git_output(
-        repository,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--binary",
-            &published_onto,
-            &landed.head,
-        ],
-        "capture logical-head delta patch",
-    ) {
-        Ok(patch) => (patch, None),
-        Err(error) => (String::new(), Some(error)),
-    };
     Ok(SlotPublicationOutcome::Published {
         landed,
         export,
-        patch,
-        patch_unavailable,
+        patch: String::new(),
+        patch_unavailable: None,
         integration: integrated.then_some(IntegrationNote {
-            head: published_onto,
+            head: head.clone(),
             amend_converted,
         }),
+        published_onto: head,
     })
+}
+
+impl SlotPublicationOutcome {
+    /// Read the landed patch. Against the head actually published onto, never
+    /// the routed base: after an integration those differ, and diffing from the
+    /// routed base would attribute every line the advance carried to this
+    /// batch. Needs no lock: both commits are immutable.
+    fn capture_patch(&mut self, repository: &Path) {
+        let Self::Published {
+            landed,
+            patch,
+            patch_unavailable,
+            published_onto,
+            ..
+        } = self
+        else {
+            return;
+        };
+        match git_output(
+            repository,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--binary",
+                published_onto,
+                &landed.head,
+            ],
+            "capture logical-head delta patch",
+        ) {
+            Ok(captured) => *patch = captured,
+            Err(error) => *patch_unavailable = Some(error),
+        }
+    }
 }
 
 /// Where a landed commit's remaining publication rungs reach.
@@ -1744,6 +1961,7 @@ mod slot_publication_tests {
             &fx.delta,
             "the batch",
             None,
+            None,
         )
         .await
         .expect("a straddle over disjoint paths publishes");
@@ -1783,6 +2001,163 @@ mod slot_publication_tests {
         assert_eq!(fx.blob(&landed.head, "mine.rs"), "the batch's work");
     }
 
+    /// A commit parented at `parent` carrying `files`, made in a scratch worktree
+    /// so the colocated checkout is never touched.
+    fn side_commit(fx: &Straddle, parent: &str, files: &[(&str, &str)]) -> String {
+        let worktree = tempfile::tempdir().unwrap();
+        let path = worktree.path().join("side");
+        git(
+            &fx.repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &path.to_string_lossy(),
+                parent,
+            ],
+        );
+        for (name, content) in files {
+            std::fs::write(path.join(name), content).unwrap();
+        }
+        git(&path, &["add", "-A"]);
+        git(&path, &["commit", "-q", "-m", "a sibling lands"]);
+        let commit = git_stdout(&path, &["rev-parse", "HEAD"]);
+        git(
+            &fx.repository,
+            &["worktree", "remove", "--force", &path.to_string_lossy()],
+        );
+        commit
+    }
+
+    /// The compare-and-set behind preparing outside the lock (I3). A batch is
+    /// integrated against the head it finds, then a sibling lands before the
+    /// batch reaches the lock. The prepared plan must be discarded and the
+    /// integration done again under the lock, so the batch lands on the
+    /// sibling exactly as a fully locked publication would have.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_head_that_moves_after_preparation_is_integrated_again_under_the_lock() {
+        let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+            eprintln!("skipping a_head_that_moves_after_preparation: jj not resolvable");
+            return;
+        };
+        let orch = orchestrator().await;
+
+        let prepared =
+            prepare_slot_publication(&orch, &fx.target, &fx.request, &fx.delta, "the batch", None)
+                .await
+                .expect("the delta prepares");
+        assert_eq!(
+            prepared.plan.as_ref().map(|plan| plan.head.as_str()),
+            Some(fx.base.as_str()),
+            "planned against the head the bookmark held at preparation"
+        );
+
+        let sibling = side_commit(&fx, &fx.base, &[("advanced.rs", "after the advance\n")]);
+        let moved = crate::jj::publish_logical_head_exported(
+            &fx.jj,
+            &fx.repository,
+            "feature",
+            &fx.base,
+            crate::jj::ProposedPublication::DeltaCommit(sibling),
+            None,
+            cairn_vcs::PublicationMode::Child {
+                description: "a sibling lands".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .landed
+        .head;
+
+        let mut publication = land_prepared_slot_delta(
+            &orch,
+            &fx.target,
+            &fx.request,
+            &fx.delta,
+            "the batch",
+            None,
+            None,
+            prepared,
+        )
+        .await
+        .expect("the batch still publishes onto the moved head");
+        publication.outcome.capture_patch(&fx.repository);
+        let SlotPublicationOutcome::Published {
+            landed,
+            export,
+            patch,
+            integration,
+            ..
+        } = publication.outcome
+        else {
+            panic!("expected a publication");
+        };
+        export.expect("exported");
+        assert_eq!(
+            integration.expect("reported as integrated").head,
+            moved,
+            "integrated onto the head found under the lock, not the stale plan's"
+        );
+        assert_eq!(
+            git_stdout(&fx.repository, &["rev-parse", &format!("{}^", landed.head)]),
+            moved
+        );
+        assert_eq!(fx.bookmark(), landed.head);
+        assert_eq!(fx.blob(&landed.head, "advanced.rs"), "after the advance");
+        assert_eq!(fx.blob(&landed.head, "mine.rs"), "the batch's work");
+        assert_eq!(published_paths(&patch), ["mine.rs"]);
+    }
+
+    /// With the head unmoved, the prepared plan is the one that lands: the
+    /// sealed delta publishes untouched onto the head it was planned against.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn an_unmoved_head_lands_the_prepared_plan() {
+        let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+            eprintln!("skipping an_unmoved_head_lands_the_prepared_plan: jj not resolvable");
+            return;
+        };
+        let orch = orchestrator().await;
+        let prepared =
+            prepare_slot_publication(&orch, &fx.target, &fx.request, &fx.delta, "the batch", None)
+                .await
+                .unwrap();
+        assert!(matches!(
+            prepared.plan.as_ref().map(|plan| &plan.landing),
+            Some(PlannedLanding::Land {
+                integrated: false,
+                ..
+            })
+        ));
+        let publication = land_prepared_slot_delta(
+            &orch,
+            &fx.target,
+            &fx.request,
+            &fx.delta,
+            "the batch",
+            None,
+            None,
+            prepared,
+        )
+        .await
+        .unwrap();
+        let SlotPublicationOutcome::Published {
+            landed,
+            integration,
+            ..
+        } = publication.outcome
+        else {
+            panic!("expected a publication");
+        };
+        assert!(integration.is_none());
+        assert_eq!(
+            git_stdout(&fx.repository, &["rev-parse", &format!("{}^", landed.head)]),
+            fx.base
+        );
+    }
+
     /// Nothing about the ordinary path changes. With the bookmark still at the
     /// commit the batch was routed against, the sealed delta publishes exactly
     /// as it was sealed and nothing is reported as integrated.
@@ -1801,6 +2176,7 @@ mod slot_publication_tests {
             &fx.request,
             &fx.delta,
             "the batch",
+            None,
             None,
         )
         .await
@@ -1844,7 +2220,7 @@ mod slot_publication_tests {
         let orch = orchestrator().await;
 
         let publication =
-            publish_visible_slot_delta(&orch, &fx.target, &fx.request, &fx.delta, "^", None)
+            publish_visible_slot_delta(&orch, &fx.target, &fx.request, &fx.delta, "^", None, None)
                 .await
                 .expect("a straddled amend still publishes");
         let SlotPublicationOutcome::Published {
@@ -2040,6 +2416,7 @@ mod slot_publication_tests {
             &fx.delta,
             "the batch",
             None,
+            None,
         )
         .await
         .expect_err("divergent edits to one file cannot be merged silently");
@@ -2076,6 +2453,7 @@ mod slot_publication_tests {
             &fx.request,
             &fx.delta,
             "the batch",
+            None,
             None,
         )
         .await
@@ -2259,7 +2637,7 @@ mod slot_publication_tests {
         let held = hold(&orch, &mut fx, "later").await;
         create_bookmark(&fx, "later", &fx.base);
 
-        let drained = held::drain_held_publications(&orch, "project", "later").await;
+        let drained = held::drain_held_publications(&orch, "project", "later", None).await;
 
         assert!(held::any_landed(&drained), "{drained:?}");
         let landed = bookmark_at(&fx, "later");
@@ -2291,7 +2669,7 @@ mod slot_publication_tests {
         );
         assert!(!ref_exists(&fx, &held.reference.unwrap()));
         assert!(
-            held::drain_held_publications(&orch, "project", "later")
+            held::drain_held_publications(&orch, "project", "later", None)
                 .await
                 .is_empty(),
             "a landed delta is not drained twice"
@@ -2318,7 +2696,7 @@ mod slot_publication_tests {
             let held = hold(&orch, &mut fx, "later").await;
             create_bookmark(&fx, "later", &fx.head);
 
-            let drained = held::drain_held_publications(&orch, "project", "later").await;
+            let drained = held::drain_held_publications(&orch, "project", "later", None).await;
 
             let reference = held.reference.unwrap();
             if conflicts {
@@ -2389,11 +2767,13 @@ mod slot_publication_tests {
                         &next_delta,
                         "the next batch",
                         None,
+                        None,
                     )
                 };
 
                 if drain_first {
-                    let drained = held::drain_held_publications(&orch, "project", "later").await;
+                    let drained =
+                        held::drain_held_publications(&orch, "project", "later", None).await;
                     assert!(held::any_landed(&drained), "{name}: {drained:?}");
                     held::settle_drained(&orch, drained).await;
                     let SlotPublicationOutcome::Published { patch, .. } = publish_next()
@@ -2418,7 +2798,8 @@ mod slot_publication_tests {
                         "{name}: {}",
                         held.error
                     );
-                    let drained = held::drain_held_publications(&orch, "project", "later").await;
+                    let drained =
+                        held::drain_held_publications(&orch, "project", "later", None).await;
                     assert_eq!(
                         drained
                             .iter()
@@ -2461,6 +2842,7 @@ mod slot_publication_tests {
             &next_delta,
             "the next batch",
             None,
+            None,
         )
         .await
         .expect("publishes")
@@ -2499,7 +2881,7 @@ mod slot_publication_tests {
         );
 
         // Landed under the lock, and never settled.
-        let drained = held::drain_held_publications(&orch, "project", "later").await;
+        let drained = held::drain_held_publications(&orch, "project", "later", None).await;
         assert!(held::any_landed(&drained), "{drained:?}");
         drop(drained);
         assert_eq!(held_status(&orch, "attempt-3231").await.0, "unpublished");
@@ -2546,7 +2928,7 @@ mod slot_publication_tests {
             &["remote", "add", "origin", &unreachable.to_string_lossy()],
         );
 
-        let drained = held::drain_held_publications(&orch, "project", "later").await;
+        let drained = held::drain_held_publications(&orch, "project", "later", None).await;
         assert!(
             !held::any_landed(&drained),
             "nothing moved the branch: {drained:?}"
@@ -2640,6 +3022,7 @@ mod slot_publication_tests {
             &next_delta,
             "the next batch",
             None,
+            None,
         )
         .await;
         assert!(
@@ -2647,7 +3030,7 @@ mod slot_publication_tests {
             "{next:?}"
         );
 
-        let drained = held::drain_held_publications(&orch, "project", "later").await;
+        let drained = held::drain_held_publications(&orch, "project", "later", None).await;
 
         let [held::Drained::Note(note)] = drained.as_slice() else {
             panic!("expected one note, got {drained:?}");
@@ -5045,6 +5428,7 @@ async fn begin_batch_suspension(
     let _bracket_guard = match acquire_store_lock(
         orch,
         settlement.store_lock.as_deref(),
+        crate::orchestrator::StoreLockClass::Foreground,
         "run batch suspension admission",
         STORE_LOCK_TIMEOUT,
     )
@@ -5349,15 +5733,62 @@ async fn settle_run_batch(
     // Held deltas this barrier republished. Settled once the store lock is
     // released, because their remaining rungs include an origin push.
     let mut drained = Vec::new();
+    // A routed delta is installed, pinned, and integrated against the head it
+    // finds now, before the lock (I3, I4). Under the lock the plan lands only if
+    // the bookmark still holds that head — a held delta the drain below lands
+    // first moves it, and then the integration is simply done again there.
+    let prepared_routed = match (
+        s.commit_msg.as_deref(),
+        routed_delta.as_ref(),
+        publication_request.or(s.routed_request.as_ref()),
+        s.logical_resolution.as_ref(),
+    ) {
+        (Some(message), Some(delta), Some(request), Some(resolution)) => {
+            Some(match s.store_lock.as_deref() {
+                Some(_store) => match resolve_runner_publication_target(resolution, request) {
+                    Ok(target) => match prepare_slot_publication(
+                        orch,
+                        &target,
+                        request,
+                        delta,
+                        message,
+                        author.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(prepared) => Ok((prepared, target, message, delta, request)),
+                        Err(error) => Err((error, Some(target))),
+                    },
+                    Err(error) => Err((
+                        SlotPublicationError::NotInStore {
+                            delta: delta.delta_commit.clone(),
+                            error,
+                        },
+                        None,
+                    )),
+                },
+                None => Err((
+                    SlotPublicationError::NotInStore {
+                        delta: delta.delta_commit.clone(),
+                        error: "build-slot publication has no resolved shared-store lock path"
+                            .to_string(),
+                    },
+                    None,
+                )),
+            })
+        }
+        _ => None,
+    };
     let barrier = match acquire_store_lock(
         orch,
-        s.store_lock.as_deref(),
+        s.store_lock.as_deref(), crate::orchestrator::StoreLockClass::Foreground,
         "run commit barrier publication",
         STORE_LOCK_TIMEOUT,
     )
     .await
     {
         Ok(_store_guard) => {
+            let barrier_trace = _store_guard.as_ref().map(|guard| guard.trace());
             // A commit_msg makes this batch a commit barrier on its branch. A
             // delta an earlier batch sealed but could not publish lands first,
             // ahead of this batch's own changes, and whether or not this batch
@@ -5369,50 +5800,43 @@ async fn settle_run_batch(
                         orch,
                         &resolution.project_id,
                         &resolution.rev,
+                        barrier_trace.as_ref(),
                     )
                     .await;
                 }
             }
-            let routed = match (
-                s.commit_msg.as_deref(),
-                routed_delta.as_ref(),
-                publication_request.or(s.routed_request.as_ref()),
-                s.logical_resolution.as_ref(),
-            ) {
-                (Some(message), Some(delta), Some(request), Some(resolution)) => Some(match s.store_lock.as_deref() {
-                    Some(_store) => match resolve_runner_publication_target(
-                        resolution, request,
-                    ) {
-                        Ok(target) => match publish_visible_slot_delta(
-                            orch,
-                            &target,
-                            request,
-                            delta,
-                            message,
-                            author.as_ref(),
-                        )
-                        .await
-                        {
-                            Ok(publication) => Ok((publication, target)),
-                            Err(error) => Err((error, Some(target))),
-                        },
-                        Err(error) => Err((
-                            SlotPublicationError::NotInStore {
-                                delta: delta.delta_commit.clone(),
-                                error,
-                            },
-                            None,
-                        )),
-                    },
-                    None => Err((
-                        SlotPublicationError::NotInStore {
-                            delta: delta.delta_commit.clone(),
-                            error: "build-slot publication has no resolved shared-store lock path".to_string(),
-                        },
-                        None,
-                    )),
-                }),
-                _ => None,
+            let routed = match prepared_routed {
+                Some(Ok((prepared, target, message, delta, request))) => {
+                    Some(match land_prepared_slot_delta(
+                        orch,
+                        &target,
+                        request,
+                        delta,
+                        message,
+                        author.as_ref(),
+                        barrier_trace.as_ref(),
+                        prepared,
+                    )
+                    .await
+                    {
+                        Ok(publication) => Ok((publication, target)),
+                        Err(error) => Err((error, Some(target))),
+                    })
+                }
+                Some(Err(error)) => Some(Err(error)),
+                None => None,
+            };
+            // A routed publication's store work ends with its landing, or with
+            // the hold or strand that replaced it. Everything its arms do next —
+            // receipt finalization, the patch capture, the origin push — is
+            // network I/O or a read of immutable commits (I6), so the lock is
+            // released here for every routed outcome. Only the ambient barrier
+            // below still needs it.
+            let _store_guard = if routed.is_some() {
+                drop(_store_guard);
+                None
+            } else {
+                _store_guard
             };
             match routed {
                 None if s.logical_resolution.is_some() => CommitBarrierOutcome {
@@ -5445,8 +5869,11 @@ async fn settle_run_batch(
                 Some(Ok((publication, target))) => {
                     let SlotPublication {
                         consume_receipt,
-                        outcome,
+                        mut outcome,
                     } = publication;
+                    // The lock was released above; the patch capture reads
+                    // immutable commits.
+                    outcome.capture_patch(&target.repository);
                     // The upload was validated and installed before either
                     // outcome was reached, so it is finalized on both.
                     let mut notes = String::new();
@@ -5459,9 +5886,6 @@ async fn settle_run_batch(
                             }
                         }
                     }
-                    // Everything below is post-transaction: the origin push is
-                    // network I/O and must not hold the store lock.
-                    drop(_store_guard);
                     let routed = super::run_context::lookup_run_routed(&orch.db, &s.request)
                         .await
                         .ok();
@@ -5479,6 +5903,7 @@ async fn settle_run_batch(
                             patch,
                             patch_unavailable,
                             integration,
+                            ..
                         } => {
                             let resolution = s
                                 .logical_resolution
@@ -6772,5 +7197,38 @@ mod tests {
 
         assert_eq!(command, "Run Rust suite");
         assert_eq!(command_class, CellCommandClass::CargoTest);
+    }
+}
+
+#[cfg(test)]
+mod barrier_lock_scope_tests {
+    /// The commit barrier releases the store lock as soon as a routed
+    /// publication has landed, been held, or been stranded, and before any arm
+    /// finalizes a receipt or pushes: those are network I/O (I6). Pinned in
+    /// source order because the barrier lives inside the run handler, which has
+    /// no harness of its own.
+    #[test]
+    fn the_barrier_releases_the_store_lock_before_any_routed_arm_finalizes() {
+        let source = include_str!("mod.rs");
+        let lock = source
+            .find("\"run commit barrier publication\",")
+            .expect("the barrier acquires the store lock");
+        let landing = lock
+            + source[lock..]
+                .find("land_prepared_slot_delta(")
+                .expect("the barrier lands a prepared delta");
+        let release = landing
+            + source[landing..]
+                .find("let _store_guard = if routed.is_some()")
+                .expect("the barrier releases the lock for routed outcomes");
+        let arms = release
+            + source[release..]
+                .find("match routed {")
+                .expect("the routed arms follow the release");
+        let finalize = landing
+            + source[landing..]
+                .find("finalize_delta_receipt(")
+                .expect("routed arms finalize receipts");
+        assert!(lock < landing && landing < release && release < arms && arms < finalize);
     }
 }
