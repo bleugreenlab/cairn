@@ -1,7 +1,7 @@
 //! The cairn-models facet's dependency boundary, checked against the Cargo graph.
 //!
-//! One implementation, included by `#[path]` from each crate that runs it: the
-//! five public facet members, the two `os/` crates most likely to grow a
+//! One implementation, included by `#[path]` from each crate that runs it: every
+//! public facet member (`PUBLIC_ROOTS`), the two `os/` crates most likely to grow a
 //! forbidden edge (`cairn-core`, `cairn-session`), the private
 //! `cairn-models-subscriptions`, and the external host in `examples/llm-host`. A
 //! manifest-only change to any of them therefore runs the check under the

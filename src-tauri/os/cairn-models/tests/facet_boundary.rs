@@ -36,6 +36,7 @@ fn metadata(
 const PUBLIC_EDGES: &[(&str, &str, Option<&str>)] = &[
     ("cairn-models", "cairn-llm-wire", None),
     ("cairn-models", "cairn-image-wire", None),
+    ("cairn-models", "cairn-speech-wire", None),
     ("cairn-models", "cairn-models-types", None),
     ("cairn-models", "cairn-credentials", None),
     ("cairn-credentials", "cairn-models-types", None),
@@ -47,6 +48,7 @@ fn members_under(root: &str) -> Vec<(&'static str, String)> {
         "cairn-models",
         "cairn-llm-wire",
         "cairn-image-wire",
+        "cairn-speech-wire",
         "cairn-models-types",
         "cairn-credentials",
         "cairn-domain",
