@@ -1254,7 +1254,13 @@ mod tests {
                     requested: Some("a"),
                     ..query
                 },
-                |offer| if offer.model == "a" { Err("too small") } else { Ok(()) },
+                |offer| {
+                    if offer.model == "a" {
+                        Err("too small")
+                    } else {
+                        Ok(())
+                    }
+                },
             )
             .unwrap_err();
         assert_eq!(

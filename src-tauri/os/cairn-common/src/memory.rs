@@ -6,7 +6,26 @@ pub struct SystemMemory {
     pub available: u64,
 }
 
+/// What a [`SystemMemory`] reading measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryScope {
+    /// The whole machine's physical memory.
+    Host,
+    /// The memory limit on this process's cgroup, reported in place of the
+    /// host's because it is what bounds this process. It does not bound what a
+    /// device driver allocates for other processes, so it is not a unified
+    /// GPU's pool.
+    CgroupLimit,
+}
+
 pub fn system_memory() -> Option<SystemMemory> {
+    system_memory_scoped().map(|(memory, _)| memory)
+}
+
+/// [`system_memory`] together with what it measured. The one implementation
+/// of the host-or-cgroup choice, so a reader asking whether this reading is
+/// the host's cannot come to answer it differently from the reading itself.
+pub fn system_memory_scoped() -> Option<(SystemMemory, MemoryScope)> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -18,10 +37,13 @@ pub fn system_memory() -> Option<SystemMemory> {
         if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
             return None;
         }
-        return Some(SystemMemory {
-            total: status.ullTotalPhys,
-            available: status.ullAvailPhys.min(status.ullTotalPhys),
-        });
+        return Some((
+            SystemMemory {
+                total: status.ullTotalPhys,
+                available: status.ullAvailPhys.min(status.ullTotalPhys),
+            },
+            MemoryScope::Host,
+        ));
     }
     #[cfg(target_os = "macos")]
     {
@@ -61,11 +83,14 @@ pub fn system_memory() -> Option<SystemMemory> {
         if result != 0 {
             return None;
         }
-        return Some(SystemMemory {
-            total,
-            available: (stats.free_count as u64 + stats.inactive_count as u64)
-                .saturating_mul(page_size as u64),
-        });
+        return Some((
+            SystemMemory {
+                total,
+                available: (stats.free_count as u64 + stats.inactive_count as u64)
+                    .saturating_mul(page_size as u64),
+            },
+            MemoryScope::Host,
+        ));
     }
     #[cfg(target_os = "linux")]
     {
@@ -76,10 +101,13 @@ pub fn system_memory() -> Option<SystemMemory> {
             if max.trim() != "max" {
                 let total = max.trim().parse::<u64>().ok()?;
                 let current = current.trim().parse::<u64>().ok()?;
-                return Some(SystemMemory {
-                    total,
-                    available: total.saturating_sub(current),
-                });
+                return Some((
+                    SystemMemory {
+                        total,
+                        available: total.saturating_sub(current),
+                    },
+                    MemoryScope::CgroupLimit,
+                ));
             }
         }
         let content = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -92,10 +120,13 @@ pub fn system_memory() -> Option<SystemMemory> {
                 available = value.split_whitespace().next()?.parse::<u64>().ok();
             }
         }
-        return Some(SystemMemory {
-            total: total?.saturating_mul(1024),
-            available: available?.saturating_mul(1024),
-        });
+        return Some((
+            SystemMemory {
+                total: total?.saturating_mul(1024),
+                available: available?.saturating_mul(1024),
+            },
+            MemoryScope::Host,
+        ));
     }
     #[allow(unreachable_code)]
     None

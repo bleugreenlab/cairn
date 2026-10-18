@@ -4314,6 +4314,13 @@ pub struct LearnedResourceEstimate {
 /// throttled disk I/O. That is how the executor schedules its own children,
 /// not anything it posts or admits: an older colocated executor lowers less,
 /// which is exactly what every runner has had until now.
+///
+/// cairn/5068 adds [`HostHealth::gpus`] without a bump. It is optional and
+/// defaulted on decode, and no struct it lands in refuses unknown fields. An
+/// older executor leaves it absent, which a runner reads as a `NotSampled` gap
+/// and renders as unmeasured, never as "no GPUs"; an older runner ignores it.
+/// No admission, placement, or load-context input reads it, so mixed versions
+/// cannot disagree about capacity.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 148;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
@@ -9056,6 +9063,104 @@ pub struct HostHealth {
     /// than a zero, from an executor too old to report it.
     #[serde(default)]
     pub io_pressure: Measurement<IoPressure>,
+    /// Every GPU this machine can measure, read on its own cadence so a wedged
+    /// driver can only age this reading, never stall the beat. Defaulted, and
+    /// so a `NotSampled` gap rather than "no GPUs", from an executor too old to
+    /// report it. `Measured` with an empty list is a positive claim: the reader
+    /// works and found no devices.
+    #[serde(default)]
+    pub gpus: Measurement<Vec<GpuDevice>>,
+}
+
+/// One GPU as its vendor's driver reports it.
+///
+/// Per-field readings are untimestamped: the enclosing [`Measurement`] carries
+/// the single instant of the attempt, and a field the driver refused is a named
+/// gap beside the fields it answered, so a partially readable device is never
+/// dropped and never reads as zero.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuDevice {
+    /// The reader's device ordinal.
+    pub index: u32,
+    pub vendor: GpuVendor,
+    /// The driver's marketing name: "NVIDIA GeForce RTX 4090", "NVIDIA GB10",
+    /// "Apple M4 Pro".
+    pub model: String,
+    /// NVML's UUID, the stable name a deployment uses for a device across
+    /// reboots and re-enumeration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    /// GPU core count, where the driver publishes one (Apple's
+    /// `gpu-core-count`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cores: Option<u32>,
+    pub memory: MeasurementReading<GpuMemory>,
+    /// Thousandths of the driver's sample window the GPU was busy: NVML's
+    /// `gpu` utilisation percent or Apple's `Device Utilization %`, times ten.
+    pub utilization_millis: MeasurementReading<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum GpuVendor {
+    Nvidia,
+    Apple,
+}
+
+/// Where a GPU's memory lives, which decides what "GPU memory headroom" means.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum GpuMemory {
+    /// Dedicated memory the system-memory reading never sees (a 4090's VRAM).
+    Discrete { used_bytes: u64, total_bytes: u64 },
+    /// The GPU's memory is system memory. This carries only the share
+    /// attributed to the GPU inside that pool. The pool's size and headroom
+    /// are [`MachineTelemetry::memory`], the same reading the memory brake acts
+    /// on, deliberately not repeated here so the two can never disagree, but
+    /// only where `pool` says that reading measures the host: an executor
+    /// under a cgroup limit reports the limit as its memory, and a limit
+    /// bounds the executor's own processes, not the GPU's allocations.
+    Unified {
+        gpu_allocated_bytes: MeasurementReading<u64>,
+        source: UnifiedAllocationSource,
+        pool: MeasurementReading<UnifiedPool>,
+    },
+}
+
+/// Whether the machine's memory reading is a unified GPU's pool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum UnifiedPool {
+    /// The memory reading measures the whole host, the pool this GPU
+    /// allocates from.
+    HostMemory,
+    /// The memory reading is this executor's cgroup limit. The GPU's physical
+    /// pool is unmeasured here, and the limit must not be read as it.
+    CgroupLimited { limit_bytes: u64 },
+}
+
+/// What a unified GPU's allocated share counts, since the two drivers that
+/// report one do not count the same thing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum UnifiedAllocationSource {
+    /// The sum of `usedGpuMemory` over NVML's running compute processes. GB10's
+    /// NVML reports no device memory at all, by design, so per-process use is
+    /// the only GPU-side figure it has.
+    NvmlComputeProcesses,
+    /// The Apple GPU driver's `In use system memory` performance statistic,
+    /// across every process. Its `Alloc system memory` is the driver's pool
+    /// reservation rather than use, and is deliberately not this.
+    AppleDriverInUse,
 }
 
 /// The host's storage stall, as Linux's pressure-stall information and block
@@ -14650,6 +14755,45 @@ mod tests {
                     }),
                 },
             ),
+            gpus: Measurement::measured(
+                6,
+                vec![
+                    GpuDevice {
+                        index: 0,
+                        vendor: GpuVendor::Nvidia,
+                        model: "NVIDIA GeForce RTX 4090".into(),
+                        uuid: Some("GPU-ab12".into()),
+                        cores: None,
+                        memory: MeasurementReading::Measured {
+                            value: GpuMemory::Discrete {
+                                used_bytes: 1,
+                                total_bytes: 2,
+                            },
+                        },
+                        utilization_millis: MeasurementReading::Measured { value: 870 },
+                    },
+                    GpuDevice {
+                        index: 0,
+                        vendor: GpuVendor::Apple,
+                        model: "Apple M4 Pro".into(),
+                        uuid: None,
+                        cores: Some(16),
+                        memory: MeasurementReading::Measured {
+                            value: GpuMemory::Unified {
+                                gpu_allocated_bytes: MeasurementReading::Measured { value: 3 },
+                                source: UnifiedAllocationSource::AppleDriverInUse,
+                                pool: MeasurementReading::Measured {
+                                    value: UnifiedPool::CgroupLimited { limit_bytes: 4 },
+                                },
+                            },
+                        },
+                        utilization_millis: MeasurementReading::Unavailable {
+                            reason: MeasurementGap::SamplingFailed,
+                            detail: Some("no Device Utilization %".into()),
+                        },
+                    },
+                ],
+            ),
         };
         let machine = MachineTelemetry {
             cpu: Measurement::measured(
@@ -16417,6 +16561,74 @@ mod tests {
         host_value.as_object_mut().unwrap().remove("cpuAdmission");
         let host: HostHealth = serde_json::from_value(host_value).unwrap();
         assert_eq!(host.cpu_admission, CpuAdmissionHealth::default());
+    }
+
+    #[test]
+    fn host_health_without_gpus_decodes_as_not_sampled_rather_than_no_gpus() {
+        let mut host_value = serde_json::to_value(HostHealth::default()).unwrap();
+        assert!(host_value.as_object_mut().unwrap().remove("gpus").is_some());
+        let host: HostHealth = serde_json::from_value(host_value).unwrap();
+        assert_eq!(host.gpus.gap(), Some(MeasurementGap::NotSampled));
+        assert_eq!(host.gpus.measured_at_unix_ms, 0);
+    }
+
+    #[test]
+    fn gpu_devices_round_trip_discrete_and_unified_with_per_field_gaps() {
+        let gpus = Measurement::measured(
+            1_791_000_000_000,
+            vec![
+                GpuDevice {
+                    index: 0,
+                    vendor: GpuVendor::Nvidia,
+                    model: "NVIDIA GeForce RTX 4090".into(),
+                    uuid: Some("GPU-ab12".into()),
+                    cores: None,
+                    memory: MeasurementReading::Measured {
+                        value: GpuMemory::Discrete {
+                            used_bytes: 19_541_000_000,
+                            total_bytes: 25_757_220_864,
+                        },
+                    },
+                    utilization_millis: MeasurementReading::Measured { value: 870 },
+                },
+                GpuDevice {
+                    index: 0,
+                    vendor: GpuVendor::Nvidia,
+                    model: "NVIDIA GB10".into(),
+                    uuid: Some("GPU-cd34".into()),
+                    cores: None,
+                    memory: MeasurementReading::Measured {
+                        value: GpuMemory::Unified {
+                            gpu_allocated_bytes: MeasurementReading::Unavailable {
+                                reason: MeasurementGap::SamplingFailed,
+                                detail: Some("process 7 memory unavailable".into()),
+                            },
+                            source: UnifiedAllocationSource::NvmlComputeProcesses,
+                            pool: MeasurementReading::Measured {
+                                value: UnifiedPool::HostMemory,
+                            },
+                        },
+                    },
+                    utilization_millis: MeasurementReading::Measured { value: 350 },
+                },
+            ],
+        );
+        let host = HostHealth {
+            gpus: gpus.clone(),
+            ..HostHealth::default()
+        };
+        let value = serde_json::to_value(&host).unwrap();
+        let unified = &value["gpus"]["reading"]["value"][1]["memory"]["value"];
+        assert_eq!(unified["kind"], "unified");
+        assert_eq!(unified["source"], "nvmlComputeProcesses");
+        assert_eq!(unified["gpuAllocatedBytes"]["reason"], "samplingFailed");
+        assert_eq!(unified["pool"]["value"]["kind"], "hostMemory");
+        assert_eq!(
+            value["gpus"]["reading"]["value"][0]["memory"]["value"]["totalBytes"],
+            25_757_220_864u64
+        );
+        let decoded: HostHealth = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.gpus, gpus);
     }
 
     fn sample_outcome() -> CellOutcome {

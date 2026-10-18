@@ -193,7 +193,7 @@ pub fn boot_id() -> Option<String> {
     let mut size = buffer.len();
     let read = unsafe {
         libc::sysctlbyname(
-            b"kern.bootsessionuuid\0".as_ptr().cast(),
+            c"kern.bootsessionuuid".as_ptr().cast(),
             buffer.as_mut_ptr().cast(),
             &mut size,
             std::ptr::null_mut(),

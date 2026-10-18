@@ -93,6 +93,9 @@ use cairn_common::executor_protocol::{
     ExecutorSubstrateEvidence, ExecutorSubstrateState, GenerationHoldReason, RetirementOrigin,
     RetirementOutcome, RetirementPhase, WorkloadSurvivor,
 };
+use cairn_common::executor_protocol::{
+    GpuDevice, GpuMemory, MachineMemory, UnifiedAllocationSource, UnifiedPool,
+};
 
 use crate::fleet::management::{EnrollmentCleanup, EnrollmentOperation};
 
@@ -832,6 +835,12 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         "- Kernel I/O timeouts: not measured; the kernel log is their only source, and whether it is readable varies by host\n",
     );
     out.push('\n');
+
+    out.push_str(&render_gpus(
+        &health.host.gpus,
+        &machine.memory,
+        executor.captured_at_unix_ms,
+    ));
 
     out.push_str(&render_storage(executor));
     // Two verdicts, never one. The physical half is how much room is left; the
@@ -2774,6 +2783,145 @@ fn render_io_pressure(pressure: &cairn_common::executor_protocol::IoPressure) ->
         });
     }
     line
+}
+
+/// The `## GPU` section: one line per device, or the named reason there are
+/// none.
+///
+/// A unified device's pool is quoted from the machine's own `Memory` reading
+/// and from nowhere else, because it is the same memory: printing a second
+/// figure for it is how a reader would come to add the two together.
+fn render_gpus(
+    gpus: &Measurement<Vec<GpuDevice>>,
+    memory: &Measurement<MachineMemory>,
+    captured_at_unix_ms: u64,
+) -> String {
+    let mut out = String::from("## GPU\n");
+    let devices = match &gpus.reading {
+        MeasurementReading::Unavailable { reason, detail } => {
+            out.push_str(&format!("- UNMEASURED: {}", reason.describe()));
+            if let Some(detail) = detail {
+                out.push_str(&format!(" ({detail})"));
+            }
+            out.push_str("\n\n");
+            return out;
+        }
+        MeasurementReading::Measured { value } => value,
+    };
+    let reading_age_ms = gpus.age_ms(captured_at_unix_ms);
+    let duration = |ms: u64| age(ms).trim_end_matches(" ago").to_string();
+    if reading_age_ms > MACHINE_READING_STALE_AFTER_MS {
+        out.push_str(&format!(
+            "- STALE: last reading {} ago, past the {} sampler bound; these are history, and \
+             anything that acts on GPU headroom must treat them as unmeasured\n",
+            duration(reading_age_ms),
+            duration(MACHINE_READING_STALE_AFTER_MS),
+        ));
+    }
+    let measured = format!("(measured {})", age(reading_age_ms));
+    if devices.is_empty() {
+        out.push_str(&format!(
+            "- No GPU devices: the reader works and found none {measured}\n\n"
+        ));
+        return out;
+    }
+    for device in devices {
+        let identity = match (&device.uuid, device.cores) {
+            (Some(uuid), Some(cores)) => format!(" ({uuid}, {cores} cores)"),
+            (Some(uuid), None) => format!(" ({uuid})"),
+            (None, Some(cores)) => format!(" ({cores} cores)"),
+            (None, None) => String::new(),
+        };
+        out.push_str(&format!(
+            "- GPU {} {}{identity}: {}; {} {measured}\n",
+            device.index,
+            device.model,
+            render_gpu_memory(&device.memory, memory),
+            gpu_field("utilisation", &device.utilization_millis, |millis| {
+                format!("utilisation {:.0}%", f64::from(*millis) / 10.0)
+            }),
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+fn render_gpu_memory(
+    reading: &MeasurementReading<GpuMemory>,
+    system_memory: &Measurement<MachineMemory>,
+) -> String {
+    gpu_field("memory", reading, |memory| match memory {
+        GpuMemory::Discrete {
+            used_bytes,
+            total_bytes,
+        } => format!(
+            "discrete memory {} used of {}, not part of system memory",
+            bytes(*used_bytes),
+            bytes(*total_bytes)
+        ),
+        GpuMemory::Unified {
+            gpu_allocated_bytes,
+            source,
+            pool,
+        } => {
+            // The Memory reading is quoted as the pool only where the executor
+            // says it measures the host. Under a cgroup limit it is the limit,
+            // which bounds the executor's processes but not the GPU's
+            // allocations, and quoting it would put 100 GiB of GPU memory
+            // inside a 32 GiB "pool".
+            let pool = match pool {
+                MeasurementReading::Measured {
+                    value: UnifiedPool::HostMemory,
+                } => match system_memory.value() {
+                    Some(pool) => format!(
+                        "{} available of {}, the Memory reading above, not a second number",
+                        bytes(pool.available_bytes),
+                        bytes(pool.total_bytes)
+                    ),
+                    None => "the Memory reading above is unavailable, so the pool's size is too"
+                        .to_string(),
+                },
+                MeasurementReading::Measured {
+                    value: UnifiedPool::CgroupLimited { limit_bytes },
+                } => format!(
+                    "pool UNMEASURED: the Memory reading above is this executor's cgroup limit of {}, which bounds its own processes but not the GPU's allocations",
+                    bytes(*limit_bytes)
+                ),
+                MeasurementReading::Unavailable { reason, detail } => match detail {
+                    Some(detail) => format!("pool unavailable: {} ({detail})", reason.describe()),
+                    None => format!("pool unavailable: {}", reason.describe()),
+                },
+            };
+            let allocated = match source {
+                UnifiedAllocationSource::NvmlComputeProcesses => {
+                    gpu_field("GPU-allocated", gpu_allocated_bytes, |allocated| {
+                        format!("GPU-allocated {} by compute processes", bytes(*allocated))
+                    })
+                }
+                UnifiedAllocationSource::AppleDriverInUse => {
+                    gpu_field("GPU driver in use", gpu_allocated_bytes, |allocated| {
+                        format!("GPU driver in use {}", bytes(*allocated))
+                    })
+                }
+            };
+            format!("unified memory, one pool with system memory: {pool}; {allocated}")
+        }
+    })
+}
+
+/// One per-device field: its value, or `<label> unavailable: <reason>`.
+fn gpu_field<T>(
+    label: &str,
+    reading: &MeasurementReading<T>,
+    render: impl Fn(&T) -> String,
+) -> String {
+    match reading {
+        MeasurementReading::Measured { value } => render(value),
+        MeasurementReading::Unavailable { reason, detail } => match detail {
+            Some(detail) => format!("{label} unavailable: {} ({detail})", reason.describe()),
+            None => format!("{label} unavailable: {}", reason.describe()),
+        },
+    }
 }
 
 fn refresh_duration(ms: u64) -> String {
@@ -5584,6 +5732,276 @@ mod tests {
         );
         assert!(
             rendered.contains("- Kernel I/O timeouts: not measured;"),
+            "{rendered}"
+        );
+    }
+
+    fn gpu(
+        model: &str,
+        uuid: Option<&str>,
+        cores: Option<u32>,
+        memory: GpuMemory,
+        utilization_millis: MeasurementReading<u32>,
+    ) -> GpuDevice {
+        use cairn_common::executor_protocol::GpuVendor;
+        GpuDevice {
+            index: 0,
+            vendor: if model.starts_with("Apple") {
+                GpuVendor::Apple
+            } else {
+                GpuVendor::Nvidia
+            },
+            model: model.into(),
+            uuid: uuid.map(Into::into),
+            cores,
+            memory: MeasurementReading::Measured { value: memory },
+            utilization_millis,
+        }
+    }
+
+    fn host_pool() -> MeasurementReading<UnifiedPool> {
+        MeasurementReading::Measured {
+            value: UnifiedPool::HostMemory,
+        }
+    }
+
+    fn gb10_with_pool(pool: MeasurementReading<UnifiedPool>) -> GpuDevice {
+        gpu(
+            "NVIDIA GB10",
+            Some("GPU-cd34"),
+            None,
+            GpuMemory::Unified {
+                gpu_allocated_bytes: MeasurementReading::Measured {
+                    value: 107_632_132_096,
+                },
+                source: UnifiedAllocationSource::NvmlComputeProcesses,
+                pool,
+            },
+            MeasurementReading::Measured { value: 350 },
+        )
+    }
+
+    fn gb10() -> GpuDevice {
+        gb10_with_pool(host_pool())
+    }
+
+    /// bginf-sp1's `/proc/meminfo` while models were resident: MemTotal
+    /// 127,600,812 kB, MemAvailable 7,971,312 kB (cairn/5068, 10-17).
+    fn spark_memory() -> Measurement<MachineMemory> {
+        Measurement::measured(
+            CAPTURED_AT - 2_000,
+            MachineMemory {
+                total_bytes: 127_600_812 * 1024,
+                available_bytes: 7_971_312 * 1024,
+            },
+        )
+    }
+
+    /// Each GPU renders as one line under its own heading after placement
+    /// telemetry, discrete memory as its own number and unified memory as the
+    /// machine's Memory reading, quoted rather than repeated.
+    #[test]
+    fn gpus_render_discrete_and_unified_memory_per_device() {
+        let mut executor = inspection("bbs", false);
+        measured(&mut executor);
+        executor.health.host.gpus = Measurement::measured(
+            CAPTURED_AT - 2_000,
+            vec![gpu(
+                "NVIDIA GeForce RTX 4090",
+                Some("GPU-ab12"),
+                None,
+                GpuMemory::Discrete {
+                    used_bytes: 19_541_000_192,
+                    total_bytes: 25_757_220_864,
+                },
+                MeasurementReading::Measured { value: 870 },
+            )],
+        );
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "## GPU\n- GPU 0 NVIDIA GeForce RTX 4090 (GPU-ab12): discrete memory 18.2 GiB used of 24.0 GiB, not part of system memory; utilisation 87% (measured 2s ago)\n"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.find("## Placement telemetry") < rendered.find("## GPU"),
+            "{rendered}"
+        );
+
+        let laptop_memory = executor.health.machine.memory.clone();
+        executor.health.machine.memory = spark_memory();
+        executor.health.host.gpus = Measurement::measured(CAPTURED_AT - 2_000, vec![gb10()]);
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("- Memory: 7.6 GiB available of 121.7 GiB (measured 2s ago)\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "- GPU 0 NVIDIA GB10 (GPU-cd34): unified memory, one pool with system memory: 7.6 GiB available of 121.7 GiB, the Memory reading above, not a second number; GPU-allocated 100.2 GiB by compute processes; utilisation 35% (measured 2s ago)\n"
+            ),
+            "{rendered}"
+        );
+        executor.health.machine.memory = laptop_memory;
+
+        executor.health.host.gpus = Measurement::measured(
+            CAPTURED_AT - 2_000,
+            vec![gpu(
+                "Apple M4 Pro",
+                None,
+                Some(16),
+                GpuMemory::Unified {
+                    gpu_allocated_bytes: MeasurementReading::Measured { value: 172_130_304 },
+                    source: UnifiedAllocationSource::AppleDriverInUse,
+                    pool: host_pool(),
+                },
+                MeasurementReading::Unavailable {
+                    reason: MeasurementGap::SamplingFailed,
+                    detail: Some("PerformanceStatistics has no \"Device Utilization %\"".into()),
+                },
+            )],
+        );
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "- GPU 0 Apple M4 Pro (16 cores): unified memory, one pool with system memory: 8.0 GiB available of 64.0 GiB, the Memory reading above, not a second number; GPU driver in use 164.2 MiB; utilisation unavailable: sampling failed (PerformanceStatistics has no \"Device Utilization %\") (measured 2s ago)\n"
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// A unified pool is never sized from anywhere but the Memory reading,
+    /// so when that reading is a gap the pool is one too.
+    #[test]
+    fn a_unified_pool_without_a_memory_reading_says_so() {
+        let mut executor = inspection("spark", false);
+        executor.health.machine.memory =
+            Measurement::unavailable(CAPTURED_AT - 2_000, MeasurementGap::SamplingFailed);
+        executor.health.host.gpus = Measurement::measured(CAPTURED_AT - 2_000, vec![gb10()]);
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "unified memory, one pool with system memory: the Memory reading above is unavailable, so the pool's size is too; GPU-allocated 100.2 GiB"
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// A cgroup limit is never presented as a unified GPU's pool. The
+    /// executor's Memory reading stays exactly what the brake acts on, and the
+    /// GPU line says the physical pool is unmeasured rather than placing
+    /// 100 GiB of GPU allocations inside a 32 GiB limit.
+    #[test]
+    fn a_cgroup_limited_executor_does_not_present_its_limit_as_the_gpu_pool() {
+        let mut executor = inspection("spark", false);
+        let limit_bytes = 32 * 1024 * 1024 * 1024;
+        executor.health.machine.memory = Measurement::measured(
+            CAPTURED_AT - 2_000,
+            MachineMemory {
+                total_bytes: limit_bytes,
+                available_bytes: 4 * 1024 * 1024 * 1024,
+            },
+        );
+        executor.health.host.gpus = Measurement::measured(
+            CAPTURED_AT - 2_000,
+            vec![gb10_with_pool(MeasurementReading::Measured {
+                value: UnifiedPool::CgroupLimited { limit_bytes },
+            })],
+        );
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("- Memory: 4.0 GiB available of 32.0 GiB (measured 2s ago)\n"),
+            "the brake's reading is unchanged: {rendered}"
+        );
+        let line = rendered
+            .lines()
+            .find(|line| line.starts_with("- GPU 0 NVIDIA GB10"))
+            .expect("the GB10 line");
+        assert_eq!(
+            line,
+            "- GPU 0 NVIDIA GB10 (GPU-cd34): unified memory, one pool with system memory: pool UNMEASURED: the Memory reading above is this executor's cgroup limit of 32.0 GiB, which bounds its own processes but not the GPU's allocations; GPU-allocated 100.2 GiB by compute processes; utilisation 35% (measured 2s ago)"
+        );
+        assert!(!line.contains("available of"), "{line}");
+
+        executor.health.host.gpus = Measurement::measured(
+            CAPTURED_AT - 2_000,
+            vec![gb10_with_pool(MeasurementReading::Unavailable {
+                reason: MeasurementGap::SamplingFailed,
+                detail: Some("the system memory probe returned no reading".into()),
+            })],
+        );
+        assert!(
+            render_executor(&executor).contains(
+                "one pool with system memory: pool unavailable: sampling failed (the system memory probe returned no reading); GPU-allocated"
+            ),
+            "{}",
+            render_executor(&executor)
+        );
+    }
+
+    /// No reading is never "no GPUs": a host without a reader, and an
+    /// executor too old to report, name why; a reader that found nothing says
+    /// exactly that.
+    #[test]
+    fn gpu_gaps_render_unmeasured_and_an_empty_list_renders_as_none_found() {
+        let mut executor = inspection("bgsrv-ub", false);
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("## GPU\n- UNMEASURED: not sampled yet\n"),
+            "an older executor: {rendered}"
+        );
+
+        executor.health.host.gpus = Measurement::unavailable_with(
+            CAPTURED_AT - 1_000,
+            MeasurementGap::UnsupportedPlatform,
+            "NVML not loadable: libnvidia-ml.so.1: cannot open shared object file",
+        );
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "## GPU\n- UNMEASURED: this platform has no reading (NVML not loadable: libnvidia-ml.so.1: cannot open shared object file)\n"
+            ),
+            "{rendered}"
+        );
+
+        executor.health.host.gpus = Measurement::measured(CAPTURED_AT - 2_000, Vec::new());
+        assert!(
+            render_executor(&executor).contains(
+                "## GPU\n- No GPU devices: the reader works and found none (measured 2s ago)\n"
+            ),
+            "{}",
+            render_executor(&executor)
+        );
+    }
+
+    /// Past the sampler's bound the device lines are history, and the section
+    /// says so before them.
+    #[test]
+    fn a_gpu_reading_past_the_sampler_bound_renders_stale() {
+        let mut executor = inspection("spark", false);
+        let bound_s = MACHINE_READING_STALE_AFTER_MS / 1_000;
+        executor.health.host.gpus = Measurement::measured(
+            CAPTURED_AT - MACHINE_READING_STALE_AFTER_MS - 1_000,
+            vec![gb10()],
+        );
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(&format!(
+                "## GPU\n- STALE: last reading {}s ago, past the {bound_s}s sampler bound; these are history, and anything that acts on GPU headroom must treat them as unmeasured\n- GPU 0 NVIDIA GB10",
+                bound_s + 1
+            )),
+            "{rendered}"
+        );
+
+        executor.health.host.gpus = Measurement::measured(
+            CAPTURED_AT - MACHINE_READING_STALE_AFTER_MS + 1_000,
+            vec![gb10()],
+        );
+        let rendered = render_executor(&executor);
+        assert!(!rendered.contains("STALE"), "{rendered}");
+        assert!(
+            rendered.contains("## GPU\n- GPU 0 NVIDIA GB10"),
             "{rendered}"
         );
     }
