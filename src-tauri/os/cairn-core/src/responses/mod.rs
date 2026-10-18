@@ -205,6 +205,28 @@ pub fn model_capabilities(
     // backend adapter, which is the one place that knows what an operator
     // called a provider they defined themselves.
     let inventory = orch.provider_catalog();
+    // What each model serves, as the facet answers it: a response is a
+    // completion, so a model that serves only `image` is no choice for one.
+    let facet = cairn_models::interface::Models::catalog(
+        orch,
+        &cairn_models::interface::ModelScope::workspace(),
+    )
+    .ok();
+    let completes = |backend: &str, model: &str| {
+        facet
+            .as_ref()
+            .and_then(|facet| {
+                facet
+                    .providers
+                    .iter()
+                    .find(|provider| provider.descriptor.key == backend)
+            })
+            .is_none_or(|provider| {
+                provider.serves_for(model).iter().any(|served| {
+                    served.verb.kind() == cairn_models::types::catalog::VerbKind::Complete
+                })
+            })
+    };
     for backend_name in enabled.iter().map(String::as_str) {
         let backend = backend_for_name(Some(backend_name));
         let availability = backend.response_completion_availability(orch, project_id);
@@ -239,7 +261,11 @@ pub fn model_capabilities(
             .iter()
             .find(|entry| entry.backend == backend_name && entry.error.is_none())
         {
-            for model in entry.models.iter().filter(|model| !model.hidden) {
+            for model in entry
+                .models
+                .iter()
+                .filter(|model| !model.hidden && completes(backend_name, &model.model))
+            {
                 let model_availability =
                     backend.response_model_availability(orch, project_id, &model.model);
                 selections.push(ResponseModelSelection {
@@ -1161,6 +1187,65 @@ mod tests {
             .filter(|backend| !backend.runnable)
             .flat_map(|backend| backend.selections.iter())
             .all(|selection| !selection.runnable));
+    }
+
+    /// A response is a completion: a model that serves only `image` (Codex's
+    /// image offer, an OpenRouter image model) is never one of its choices.
+    #[tokio::test]
+    async fn capabilities_offer_no_image_only_model() {
+        use cairn_models::types::catalog::{DiscoveredModel, ProviderModelCatalog};
+        let orch = test_orchestrator().await;
+        let chat = |id: &str| {
+            let mut model: DiscoveredModel = cairn_models::image::codex::discovered_model();
+            model.id = id.into();
+            model.model = id.into();
+            model.display_name = id.into();
+            model.modalities = None;
+            model.serves = None;
+            model
+        };
+        let mut openrouter_image = cairn_models::image::codex::discovered_model();
+        openrouter_image.id = "bfl/flux".into();
+        openrouter_image.model = "bfl/flux".into();
+        openrouter_image.serves.as_mut().unwrap()[0].wire =
+            cairn_models::types::catalog::Wire::OpenRouterImages;
+        for (backend, models) in [
+            (
+                "codex",
+                vec![
+                    chat("gpt-coverage"),
+                    cairn_models::image::codex::discovered_model(),
+                ],
+            ),
+            ("openrouter", vec![chat("chat/model"), openrouter_image]),
+        ] {
+            orch.seed_model_catalog_for_test(ProviderModelCatalog {
+                backend: backend.to_string(),
+                models,
+                options: Vec::new(),
+                refreshed_at: Some(1),
+                error: None,
+            });
+        }
+        let capabilities = model_capabilities(&orch, None, None, None);
+        let exact = |backend: &str| -> Vec<String> {
+            capabilities
+                .backends
+                .iter()
+                .filter(|capability| capability.backend == backend)
+                .flat_map(|capability| capability.selections.iter())
+                .filter(|selection| selection.kind == "model")
+                .map(|selection| selection.model.clone())
+                .collect()
+        };
+        let seen: Vec<_> = capabilities
+            .backends
+            .iter()
+            .map(|b| b.backend.clone())
+            .collect();
+        assert!(seen.contains(&"codex".to_string()), "{seen:?}");
+        assert_eq!(exact("codex"), ["gpt-coverage"]);
+        assert_eq!(exact("openrouter"), ["chat/model"]);
     }
 
     #[test]

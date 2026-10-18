@@ -8,6 +8,7 @@ use cairn_models_types::catalog::Modality;
 use cairn_models_types::usage::{BillingUnit, Charge, Measure, Meter, MeteredUsage};
 
 use crate::image_wire::{openai, openrouter};
+use crate::wire::TurnUsage;
 
 fn measure(
     charge: Charge,
@@ -92,6 +93,28 @@ pub fn openai(usage: Option<&openai::wire::ImagesUsage>, images: usize) -> Meter
         }
     }
     // The Images API reports no cost.
+    MeteredUsage {
+        measures,
+        cost_usd: None,
+    }
+}
+
+/// A Codex image call: the images returned, and every worker turn's tokens
+/// summed meter by meter. Those are the worker model's text tokens, not the
+/// image model's, which Codex does not report; a subscription has no price.
+pub fn codex(turns: &[TurnUsage], images: usize) -> MeteredUsage {
+    let mut measures = vec![images_returned(images)];
+    for turn in turns {
+        for measure in crate::usage::metered(turn).measures {
+            match measures
+                .iter_mut()
+                .find(|summed| summed.meter == measure.meter)
+            {
+                Some(summed) => summed.quantity += measure.quantity,
+                None => measures.push(measure),
+            }
+        }
+    }
     MeteredUsage {
         measures,
         cost_usd: None,

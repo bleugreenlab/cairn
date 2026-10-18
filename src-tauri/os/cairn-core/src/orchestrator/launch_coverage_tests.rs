@@ -341,9 +341,9 @@ impl SessionProvider for RecordingCodex {
                 self.0.open_notifications.lock().unwrap().push(tx);
                 (client.clone(), Some(rx))
             }
-            CodexServer::Shared(client) => {
+            CodexServer::Shared(router) => {
                 self.0.record("codex:shared");
-                (client.clone(), None)
+                (router.client(), None)
             }
         };
         if spec.mcp.is_none() {

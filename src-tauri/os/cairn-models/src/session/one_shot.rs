@@ -11,7 +11,8 @@
 //! tries a tool anyway is a failure, not something to answer: a
 //! [`SessionEvent::ToolCall`] or a [`SessionEvent::ServerRequest`] (declined
 //! first) ends the wait. Claude's own tools are refused by the CLI through the
-//! caller's disallow list.
+//! caller's disallow list. The one exception is asked for by name
+//! ([`OneShotAllow`]): a Codex image worker's own image tool.
 
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ use serde_json::Value;
 
 use crate::interface::session::{LaunchedSession, ProcessHandle, SessionControl, SessionEvents};
 use crate::session::events::{EventReader, ReadEnd, SessionEvent, TurnStatus, STDERR_SETTLE};
+use crate::wire::codex_app_server::{ImageGenerationItem, IMAGE_GENERATION_ITEM};
 use crate::wire::TurnUsage;
 
 /// How long a finished Claude process is given to exit before it is killed.
@@ -39,6 +41,33 @@ pub struct OneShotReply {
     pub usage: Option<TurnUsage>,
     /// The provider's own cost figure, when it reports one.
     pub cost_usd: Option<f64>,
+}
+
+/// How a wait that let something through ended: the reply or why there is
+/// none, and every image Codex's image tool returned on the way, however the
+/// wait ended. An image that came before a timeout, a closed server, or a
+/// forbidden tool is still here, so its saved copy can always be removed.
+#[derive(Debug)]
+pub struct OneShotTurn {
+    pub reply: Result<OneShotReply, OneShotError>,
+    pub images: Vec<ImageGenerationItem>,
+}
+
+/// What a tool-free one-shot lets through besides messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OneShotAllow {
+    /// Nothing: any tool ends the wait.
+    #[default]
+    Nothing,
+    /// Codex's image tool, on a thread opened with it
+    /// ([`crate::interface::session::CodexNativeTools::ImageGeneration`]): its
+    /// `imageGeneration` call goes on, and each image it returns is collected
+    /// into [`OneShotTurn::images`]. Any other tool still ends the wait.
+    ///
+    /// Once an image has come, the turn's end answers with it whatever the
+    /// turn's status, because the image item says how the image went; the
+    /// reply's text is then the worker's last message, or the turn's error.
+    ImageGeneration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +135,27 @@ pub fn await_one_shot(
     launched: LaunchedSession,
     timeout: Duration,
 ) -> Result<OneShotReply, OneShotError> {
+    await_one_shot_with(launched, timeout, OneShotAllow::Nothing).reply
+}
+
+/// [`await_one_shot`], letting through what `allow` names.
+pub fn await_one_shot_with(
+    launched: LaunchedSession,
+    timeout: Duration,
+    allow: OneShotAllow,
+) -> OneShotTurn {
+    let mut images = Vec::new();
+    let reply = fold(launched, timeout, allow, &mut images);
+    OneShotTurn { reply, images }
+}
+
+fn fold(
+    launched: LaunchedSession,
+    timeout: Duration,
+    allow: OneShotAllow,
+    images: &mut Vec<ImageGenerationItem>,
+) -> Result<OneShotReply, OneShotError> {
+    let images_allowed = allow == OneShotAllow::ImageGeneration;
     let deadline = Instant::now() + timeout;
     let LaunchedSession {
         control,
@@ -158,8 +208,23 @@ pub fn await_one_shot(
             // disallow list and `--tools ""`), and the one tool that survives
             // is `StructuredOutput`, the very way a schema-constrained answer
             // arrives; its value rides the terminal result.
+            SessionEvent::ToolCall { name, .. }
+                if !claude && images_allowed && name == IMAGE_GENERATION_ITEM =>
+            {
+                return ControlFlow::Continue(());
+            }
+            SessionEvent::ImageGenerated { image } if images_allowed => {
+                images.push(image);
+                return ControlFlow::Continue(());
+            }
             SessionEvent::ToolCall { name, .. } if !claude => (
                 Err(OneShotError::Failed(format!("{TOOL_ATTEMPT} ({name})"))),
+                true,
+            ),
+            SessionEvent::ImageGenerated { .. } => (
+                Err(OneShotError::Failed(format!(
+                    "{TOOL_ATTEMPT} ({IMAGE_GENERATION_ITEM})"
+                ))),
                 true,
             ),
             SessionEvent::TurnComplete {
@@ -171,6 +236,12 @@ pub fn await_one_shot(
                 error,
             } => {
                 let result = match (status, text) {
+                    (_, text) if !images.is_empty() => Ok(OneShotReply {
+                        text: text.or(error).unwrap_or_default(),
+                        structured,
+                        usage,
+                        cost_usd,
+                    }),
                     (TurnStatus::Completed, Some(text)) => Ok(OneShotReply {
                         text,
                         structured,
@@ -667,6 +738,114 @@ mod tests {
             await_one_shot(launched, LONG),
             Err(OneShotError::Protocol(_))
         ));
+    }
+
+    fn image_item(method: &str, status: &str, result: &str) -> Value {
+        notify(
+            method,
+            json!({"item": {"id": "exec-1", "type": "imageGeneration", "status": status,
+                "revisedPrompt": "a fox", "result": result, "failure": null,
+                "savedPath": "/home/generated_images/thread-1/exec-1.png"}}),
+        )
+    }
+
+    #[test]
+    fn an_image_worker_s_image_is_collected_beside_its_answer() {
+        let (launched, tx, seen, _) = codex();
+        for message in [
+            image_item("item/started", "in_progress", ""),
+            image_item("item/completed", "completed", "iVBORw0KGgo="),
+            agent_message("DONE"),
+            usage(12_000, 11_000, 40),
+            turn_completed("completed"),
+        ] {
+            tx.send(message).unwrap();
+        }
+        let turn = await_one_shot_with(launched, LONG, OneShotAllow::ImageGeneration);
+        let reply = turn.reply.unwrap();
+        assert_eq!(reply.text, "DONE");
+        assert_eq!(turn.images.len(), 1);
+        assert_eq!(turn.images[0].result, "iVBORw0KGgo=");
+        assert_eq!(
+            turn.images[0].saved_path.as_deref(),
+            Some("/home/generated_images/thread-1/exec-1.png")
+        );
+        assert_eq!(reply.usage.unwrap().prompt_tokens, Some(12_000));
+        assert!(!seen.interrupted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn an_image_worker_still_fails_on_any_other_tool() {
+        let (launched, tx, seen, _) = codex();
+        tx.send(notify(
+            "item/started",
+            json!({"item": {"id": "c", "type": "commandExecution"}}),
+        ))
+        .unwrap();
+        assert!(matches!(
+            await_one_shot_with(launched, LONG, OneShotAllow::ImageGeneration).reply,
+            Err(OneShotError::Failed(text)) if text.contains("commandExecution")
+        ));
+        assert!(seen.interrupted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn the_image_tool_fails_a_wait_that_does_not_allow_it() {
+        let (launched, tx, _, _) = codex();
+        tx.send(image_item("item/started", "in_progress", ""))
+            .unwrap();
+        assert!(matches!(
+            await_one_shot(launched, LONG),
+            Err(OneShotError::Failed(text)) if text.contains("imageGeneration")
+        ));
+    }
+
+    /// The item says how the image went; a turn that then fails does not
+    /// hide it.
+    #[test]
+    fn an_image_survives_a_failed_turn() {
+        let (launched, tx, _, _) = codex();
+        tx.send(image_item("item/completed", "failed", "")).unwrap();
+        tx.send(turn_completed("failed")).unwrap();
+        let turn = await_one_shot_with(launched, LONG, OneShotAllow::ImageGeneration);
+        assert_eq!(turn.images[0].status, "failed");
+        assert_eq!(turn.reply.unwrap().text, "the Codex turn ended failed");
+    }
+
+    /// However the wait ends after an image came, the image is handed back,
+    /// so its saved copy can be removed.
+    #[test]
+    fn an_image_is_handed_back_when_the_wait_fails_after_it() {
+        let completed = || image_item("item/completed", "completed", "iVBORw0KGgo=");
+        // Then a forbidden tool.
+        let (launched, tx, _, _) = codex();
+        tx.send(completed()).unwrap();
+        tx.send(notify(
+            "item/started",
+            json!({"item": {"id": "c", "type": "commandExecution"}}),
+        ))
+        .unwrap();
+        let turn = await_one_shot_with(launched, LONG, OneShotAllow::ImageGeneration);
+        assert!(matches!(turn.reply, Err(OneShotError::Failed(_))));
+        assert_eq!(turn.images.len(), 1);
+        // Then nothing until the deadline.
+        let (launched, tx, _, _) = codex();
+        tx.send(completed()).unwrap();
+        let turn = await_one_shot_with(
+            launched,
+            Duration::from_millis(200),
+            OneShotAllow::ImageGeneration,
+        );
+        assert_eq!(turn.reply, Err(OneShotError::Timeout));
+        assert_eq!(turn.images.len(), 1);
+        drop(tx);
+        // Then the server closes.
+        let (launched, tx, _, _) = codex();
+        tx.send(completed()).unwrap();
+        drop(tx);
+        let turn = await_one_shot_with(launched, LONG, OneShotAllow::ImageGeneration);
+        assert!(matches!(turn.reply, Err(OneShotError::Failed(_))));
+        assert_eq!(turn.images.len(), 1);
     }
 
     #[test]

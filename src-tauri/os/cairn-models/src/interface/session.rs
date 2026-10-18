@@ -28,6 +28,7 @@ use cairn_platform::services::process::{ChildProcess, SpawnConfig};
 use serde_json::Value;
 
 use crate::codex::app_server::AppServerClient;
+use crate::codex::thread_router::ThreadRouter;
 use crate::session::mcp::McpServers;
 use crate::wire::MessageContent;
 
@@ -238,6 +239,9 @@ pub struct CodexSpec {
     pub developer_instructions: Option<String>,
     pub service_tier: Option<String>,
     pub native_goal: NativeGoal,
+    /// A Codex-native tool the thread is given back. Only a tool-free thread
+    /// (`SessionSpec::mcp` is `None`) takes one.
+    pub native_tools: CodexNativeTools,
     /// The first turn's text when a resumed thread is gone and a fresh one is
     /// rebuilt from Cairn's transcript. Asked only on that fallback; `None`
     /// keeps the original message.
@@ -250,6 +254,7 @@ impl fmt::Debug for CodexSpec {
             .field("server", &self.server)
             .field("service_tier", &self.service_tier)
             .field("native_goal", &self.native_goal)
+            .field("native_tools", &self.native_tools)
             .finish_non_exhaustive()
     }
 }
@@ -259,15 +264,17 @@ impl fmt::Debug for CodexSpec {
 pub enum CodexServer {
     /// This session's own app-server. Stopping the session stops it.
     Dedicated(Arc<AppServerClient>),
-    /// A pooled app-server many threads share. The session holds no process,
-    /// its notifications arrive through the pool, and the pooled thread is
-    /// not given the per-thread MCP attachment check.
+    /// An app-server many threads share. The session holds no process, its
+    /// notifications arrive through the server's router (the caller registers
+    /// the opened thread on it before the first turn and puts the receiver in
+    /// [`SessionEvents::CodexAppServer`]), and the shared thread is not given
+    /// the per-thread MCP attachment check.
     ///
     /// A shared thread sees the MCP servers its server process was started
     /// with ([`ServerLaunch::mcp`]), not the ones in its [`SessionSpec`], so a
     /// host that pools servers keys its pool by server set. Cairn's pool is
     /// always the `cairn` server alone.
-    Shared(Arc<AppServerClient>),
+    Shared(Arc<ThreadRouter>),
 }
 
 impl fmt::Debug for CodexServer {
@@ -277,6 +284,17 @@ impl fmt::Debug for CodexServer {
             Self::Shared(_) => "Shared",
         })
     }
+}
+
+/// The Codex-native tools a thread is given. Cairn's Codex home turns them all
+/// off; a tool-free thread may take one back for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodexNativeTools {
+    #[default]
+    None,
+    /// Codex's built-in image generation (`image_gen.imagegen`), for an image
+    /// worker: see `cairn_models::image::codex`.
+    ImageGeneration,
 }
 
 /// What the thread's native goal should be once it is open.

@@ -14,8 +14,8 @@ use crate::orchestrator::session::{
 use crate::orchestrator::Orchestrator;
 use cairn_models::codex::tokens::{find_codex_oauth_account_id, CodexAuthState};
 use cairn_models::interface::session::{
-    Cli, CodexModels, CodexServer, CodexSpec, NativeGoal, ProviderSpec, Secret, SecretEnv,
-    ServerLaunch, SessionError, SessionEvents, SessionHost, SessionSpec, SessionStart,
+    Cli, CodexModels, CodexNativeTools, CodexServer, CodexSpec, NativeGoal, ProviderSpec, Secret,
+    SecretEnv, ServerLaunch, SessionError, SessionEvents, SessionHost, SessionSpec, SessionStart,
 };
 use cairn_models::session::codex::models::discover_codex_models;
 use std::collections::{BTreeMap, HashMap};
@@ -132,12 +132,17 @@ impl AgentBackend for CodexBackend {
             .lock()
             .map_err(|_| "Codex start lock poisoned".to_string())?;
         let codex_path = crate::env::find_binary("codex")?;
-        discover_codex_models(
+        let mut models = discover_codex_models(
             &codex_path,
             &super::cairn_codex_home(),
             None,
             &HashMap::new(),
-        )
+        )?;
+        // Codex's own listing is its chat models; the image offer is the
+        // facet's, serving `image` alone, so no picker for a session or a
+        // completion ever lands on it.
+        models.push(cairn_models::image::codex::discovered_model());
+        Ok(models)
     }
 
     fn option_descriptors(&self) -> Vec<ProviderOptionDescriptor> {
@@ -339,6 +344,7 @@ impl AgentBackend for CodexBackend {
                 developer_instructions: developer_instructions_from_segments(&prompt_segments),
                 service_tier: config.service_tier.clone(),
                 native_goal: native_goal(&config),
+                native_tools: CodexNativeTools::None,
                 resume_fallback: Some(resume_fallback),
             }),
         };
@@ -505,11 +511,12 @@ impl AgentBackend for CodexBackend {
             secrets: SecretEnv::new(),
             account_id: selection.account_id.clone(),
             provider: ProviderSpec::Codex(CodexSpec {
-                server: CodexServer::Shared(server.client()),
+                server: CodexServer::Shared(server.router()),
                 base_instructions: instructions(&request),
                 developer_instructions: None,
                 service_tier: extras.service_tier,
                 native_goal: NativeGoal::Leave,
+                native_tools: CodexNativeTools::None,
                 resume_fallback: None,
             }),
         };
@@ -820,11 +827,12 @@ fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), S
         secrets: SecretEnv::new(),
         account_id,
         provider: ProviderSpec::Codex(CodexSpec {
-            server: CodexServer::Shared(server.client()),
+            server: CodexServer::Shared(server.router()),
             base_instructions: base_instructions_from_segments(&prompt_segments),
             developer_instructions: developer_instructions_from_segments(&prompt_segments),
             service_tier: config.service_tier.clone(),
             native_goal: NativeGoal::Leave,
+            native_tools: CodexNativeTools::None,
             resume_fallback: None,
         }),
     };

@@ -79,29 +79,6 @@ fn openrouter_shaped() -> ImageCapabilities {
     }
 }
 
-/// Codex's image generation as cairn/4905 measured it: the provider sizes
-/// the image, orientation and labels ride in the prompt, an edit is sent as
-/// a reference, and there is no mask.
-fn codex() -> ImageCapabilities {
-    ImageCapabilities {
-        max_count: 4,
-        shape: ShapeSupport {
-            auto: true,
-            pixels: None,
-            aspect: Vec::new(),
-            orientation: Support::Lowered(Lowering::OrientationInPrompt),
-        },
-        references: Some(ReferenceSupport {
-            max: 5,
-            labels: Support::Lowered(Lowering::LabelsInPrompt),
-        }),
-        edit: Some(EditSupport {
-            base: Support::Lowered(Lowering::EditAsReference),
-            mask: Support::Unsupported,
-        }),
-    }
-}
-
 fn refused_feature(result: Result<Vec<Lowering>, ImageError>) -> ImageFeature {
     match result {
         Err(ImageError::Unsupported { feature, .. }) => feature,
@@ -309,7 +286,12 @@ fn each_lowering_is_recorded_and_composed_only_when_applied() {
         [Lowering::OrientationAsPixels { .. }]
     ));
 
-    let lowerings = admit(&codex(), Wire::CodexAppServer, &portrait).unwrap();
+    let lowerings = admit(
+        &ImageCapabilities::codex_image_gen(),
+        Wire::CodexAppServer,
+        &portrait,
+    )
+    .unwrap();
     assert_eq!(lowerings, vec![Lowering::OrientationInPrompt]);
     assert_eq!(
         compose_prompt("card art", &portrait, &lowerings),
@@ -348,7 +330,12 @@ fn codex_as_measured_admits_portrait_card_art_with_labels_and_refuses_masks_and_
         reference(Some("the art style")),
         reference(Some("the tower")),
     ];
-    let lowerings = admit(&codex(), Wire::CodexAppServer, &card).unwrap();
+    let lowerings = admit(
+        &ImageCapabilities::codex_image_gen(),
+        Wire::CodexAppServer,
+        &card,
+    )
+    .unwrap();
     assert_eq!(
         lowerings,
         vec![Lowering::LabelsInPrompt, Lowering::OrientationInPrompt]
@@ -364,13 +351,21 @@ fn codex_as_measured_admits_portrait_card_art_with_labels_and_refuses_masks_and_
         mask: Some(mask()),
     });
     assert_eq!(
-        refused_feature(admit(&codex(), Wire::CodexAppServer, &masked)),
+        refused_feature(admit(
+            &ImageCapabilities::codex_image_gen(),
+            Wire::CodexAppServer,
+            &masked
+        )),
         ImageFeature::Mask
     );
     let mut sized = ImageRequest::new("card art");
     sized.shape = ImageShape::Pixels(Pixels::new(1024, 1536));
     assert_eq!(
-        refused_feature(admit(&codex(), Wire::CodexAppServer, &sized)),
+        refused_feature(admit(
+            &ImageCapabilities::codex_image_gen(),
+            Wire::CodexAppServer,
+            &sized
+        )),
         ImageFeature::Pixels
     );
 }
@@ -396,10 +391,13 @@ impl Scripted {
 
 impl ImageTransport for Scripted {
     fn post(&self, post: ImagePost<'_>) -> Result<ImageReply, ImageWireError> {
-        self.sent
-            .lock()
-            .unwrap()
-            .push((post.endpoint.base_url.clone(), post.body));
+        let target = match post.route {
+            ImageRoute::OpenRouter(endpoint) | ImageRoute::OpenAi(endpoint) => {
+                endpoint.base_url.clone()
+            }
+            ImageRoute::Codex(route) => route.provider_name.clone(),
+        };
+        self.sent.lock().unwrap().push((target, post.body));
         self.reply.clone()
     }
 }
@@ -1233,4 +1231,280 @@ fn a_declaration_the_wire_cannot_carry_is_refused_before_anything_is_sent() {
         refused(&openrouter, native_mask, masked),
         ImageFeature::Mask
     );
+}
+
+mod codex_route {
+    //! The Codex route: what each worker is given, and how its outcomes map.
+
+    use super::*;
+    use crate::image::codex::{turn_text, DEFAULT_WORKER_EFFORT, WORKER_INSTRUCTIONS};
+    use crate::wire::codex_app_server::{ImageGenerationFailure, ImageGenerationItem};
+    use crate::wire::TurnUsage;
+
+    fn route() -> ImageRoute {
+        ImageRoute::Codex(CodexImageRoute::chatgpt(Some("gpt-5.6-luna".into())))
+    }
+
+    fn turn(input: i32, cached: i32, output: i32) -> TurnUsage {
+        TurnUsage::from_anthropic(Some(input), Some(output), Some(cached), None, None)
+    }
+
+    fn item(
+        status: &str,
+        result: &str,
+        failure: Option<ImageGenerationFailure>,
+    ) -> ImageGenerationItem {
+        ImageGenerationItem {
+            id: "exec-1".into(),
+            status: status.into(),
+            revised_prompt: Some("A tarot card of a tower".into()),
+            result: result.into(),
+            saved_path: None,
+            failure,
+        }
+    }
+
+    fn draw(image: Option<ImageGenerationItem>, text: &str) -> CodexDrawOutcome {
+        CodexDrawOutcome {
+            image,
+            text: text.into(),
+            usage: vec![turn(2_000, 10_000, 40)],
+        }
+    }
+
+    fn replying(draws: Vec<CodexDrawOutcome>) -> Scripted {
+        Scripted::replying(Ok(ImageReply::Codex(CodexImageReply { draws })))
+    }
+
+    fn codex_call<'a>(
+        route: &'a ImageRoute,
+        capabilities: &'a ImageCapabilities,
+        request: &'a ImageRequest,
+    ) -> ImageCall<'a> {
+        ImageCall {
+            model: "gpt-image-2",
+            ..call(route, capabilities, request)
+        }
+    }
+
+    #[test]
+    fn the_worker_instructions_name_the_tool_the_prompt_and_both_answers() {
+        for phrase in [
+            "image_gen.imagegen tool exactly once",
+            "inside <prompt> verbatim",
+            "num_last_images_to_include",
+            "reply with the single word DONE",
+            "FAILED: followed by the tool error text verbatim",
+        ] {
+            assert!(WORKER_INSTRUCTIONS.contains(phrase), "{phrase}");
+        }
+        assert_eq!(turn_text("a fox"), "<prompt>a fox</prompt>");
+        assert_eq!(DEFAULT_WORKER_EFFORT, "low");
+    }
+
+    #[test]
+    fn a_codex_call_sends_its_inputs_and_prompt_and_reads_the_image() {
+        let route = route();
+        let capabilities = ImageCapabilities::codex_image_gen();
+        let mut request = ImageRequest::new("Tarot card: The Tower");
+        request.shape = ImageShape::Orientation(Orientation::Portrait);
+        request.edit = Some(Edit {
+            base: png(),
+            mask: None,
+        });
+        request.references = vec![reference(Some("the art style")), reference(None)];
+        let transport = replying(vec![CodexDrawOutcome {
+            usage: vec![turn(2_000, 10_000, 40), turn(1_500, 9_000, 30)],
+            ..draw(Some(item("completed", PNG_2X3, None)), "DONE")
+        }]);
+        let result = image(&transport, codex_call(&route, &capabilities, &request)).unwrap();
+
+        assert_eq!(transport.sent.lock().unwrap()[0].0, "Codex (ChatGPT)");
+        let ImageBody::Codex(sent) = transport.body() else {
+            panic!("a Codex body");
+        };
+        assert_eq!(sent.instructions, WORKER_INSTRUCTIONS);
+        assert_eq!(sent.images.len(), 3, "the edit base, then both references");
+        assert_eq!(sent.images[0], png());
+        assert_eq!(sent.text, turn_text(&result.provenance.prompt_sent));
+        assert_eq!(sent.count, 1);
+        assert_eq!(sent.effort, "low");
+        assert_eq!(
+            result.provenance.prompt_sent,
+            format!(
+                "Tarot card: The Tower\n\n{EDIT_SENTENCE}\nImage 2: the art style\nCompose the image in portrait orientation."
+            )
+        );
+        assert_eq!(
+            result.provenance.lowerings,
+            vec![
+                Lowering::EditAsReference,
+                Lowering::LabelsInPrompt,
+                Lowering::OrientationInPrompt
+            ]
+        );
+        assert_eq!(result.provenance.provider, "codex");
+        assert_eq!(result.provenance.model, "gpt-image-2");
+        assert_eq!(result.provenance.wire, Wire::CodexAppServer);
+
+        let drawn = &result.images[0];
+        assert_eq!(drawn.media_type, "image/png");
+        assert_eq!(drawn.size, Some(Pixels::new(2, 3)));
+        assert_eq!(
+            drawn.revised_prompt.as_deref(),
+            Some("A tarot card of a tower")
+        );
+
+        // The image counted, and both worker turns' text tokens summed.
+        assert_eq!(
+            measure(
+                &result.usage,
+                meter(Charge::Output, Some(Modality::Image), BillingUnit::Images)
+            ),
+            Some(1)
+        );
+        assert_eq!(result.usage.prompt_tokens(), Some(22_500));
+        assert_eq!(
+            result
+                .usage
+                .quantity(Charge::CacheRead, BillingUnit::Tokens),
+            Some(19_000)
+        );
+        assert_eq!(
+            result.usage.quantity(Charge::Output, BillingUnit::Tokens),
+            Some(70)
+        );
+        assert_eq!(result.usage.cost_usd, None);
+    }
+
+    #[test]
+    fn each_codex_outcome_maps_onto_what_a_caller_can_act_on() {
+        let route = route();
+        let capabilities = ImageCapabilities::codex_image_gen();
+        let mut request = ImageRequest::new("a lighthouse");
+        request.count = 2;
+        let outcome = |draws: Vec<CodexDrawOutcome>| {
+            image(
+                &replying(draws),
+                codex_call(&route, &capabilities, &request),
+            )
+        };
+        let done = || draw(Some(item("completed", PNG_2X3, None)), "DONE");
+
+        assert_eq!(outcome(vec![done(), done()]).unwrap().images.len(), 2);
+
+        let quota = draw(
+            Some(item(
+                "failed",
+                "",
+                Some(ImageGenerationFailure::UsageLimitExceeded {
+                    limit_id: "image_gen".into(),
+                    resets_at: Some(1_786_150_800),
+                }),
+            )),
+            "FAILED: usage limit",
+        );
+        assert_eq!(
+            outcome(vec![done(), quota]).unwrap_err(),
+            ImageError::Quota {
+                message: "Codex (ChatGPT): the image_gen limit is used up; it resets at 2026-08-08T01:00:00+00:00".into()
+            }
+        );
+
+        let blocked = draw(
+            Some(item("failed", "", None)),
+            r#"FAILED: image generation failed: http 400 {"code":"moderation_blocked","moderation_stage":"input"}"#,
+        );
+        assert_eq!(
+            outcome(vec![blocked, done()]).unwrap_err(),
+            ImageError::Refused {
+                message: r#"Codex (ChatGPT): image generation failed: http 400 {"code":"moderation_blocked","moderation_stage":"input"}"#.into()
+            }
+        );
+
+        let failed = draw(Some(item("failed", "", None)), "FAILED: http 500 upstream");
+        assert_eq!(
+            outcome(vec![done(), failed]).unwrap_err(),
+            ImageError::Upstream(
+                "Codex (ChatGPT): the image tool failed: http 500 upstream".into()
+            )
+        );
+        let silent = draw(Some(item("failed", "", None)), "DONE");
+        assert!(matches!(
+            outcome(vec![silent, done()]).unwrap_err(),
+            ImageError::Upstream(text) if text.contains("gave no reason; it answered: DONE")
+        ));
+
+        let missed = draw(None, "I cannot draw.");
+        assert_eq!(
+            outcome(vec![missed, done()]).unwrap_err(),
+            ImageError::Upstream("the Codex worker did not call its image tool (it answered: I cannot draw.); Codex offers it only to a ChatGPT sign-in on a paid plan".into())
+        );
+
+        let empty = draw(Some(item("completed", "", None)), "DONE");
+        assert!(matches!(
+            outcome(vec![empty, done()]).unwrap_err(),
+            ImageError::InvalidResponse(_)
+        ));
+
+        let timed_out = Scripted::replying(Err(ImageWireError::Timeout));
+        assert_eq!(
+            image(&timed_out, codex_call(&route, &capabilities, &request)).unwrap_err(),
+            ImageError::Timeout
+        );
+        let closed = Scripted::replying(Err(ImageWireError::Transport(
+            "the Codex app-server closed during an image turn".into(),
+        )));
+        assert_eq!(
+            image(&closed, codex_call(&route, &capabilities, &request)).unwrap_err(),
+            ImageError::Upstream("the Codex app-server closed during an image turn".into())
+        );
+    }
+
+    #[test]
+    fn the_codex_wire_takes_only_a_worker_effort_in_its_extras() {
+        let route = route();
+        let capabilities = ImageCapabilities::codex_image_gen();
+        let with = |fields: Value| {
+            let mut request = ImageRequest::new("a lighthouse");
+            request.extras = vec![WireExtras {
+                wire: Wire::CodexAppServer,
+                fields: fields.as_object().unwrap().clone(),
+            }];
+            let transport = replying(vec![draw(Some(item("completed", PNG_2X3, None)), "DONE")]);
+            let result = image(&transport, codex_call(&route, &capabilities, &request));
+            let sent = transport.sent.lock().unwrap().len();
+            (result, sent, transport)
+        };
+
+        let (result, _, transport) = with(json!({"reasoning_effort": "high"}));
+        result.unwrap();
+        let ImageBody::Codex(sent) = transport.body() else {
+            panic!("a Codex body");
+        };
+        assert_eq!(sent.effort, "high");
+
+        for refused in [json!({"quality": "high"}), json!({"reasoning_effort": 3})] {
+            let (result, sent, _) = with(refused);
+            assert!(
+                matches!(result, Err(ImageError::InvalidRequest(_))),
+                "{result:?}"
+            );
+            assert_eq!(sent, 0, "nothing is sent");
+        }
+    }
+
+    #[test]
+    fn the_http_transport_refuses_a_codex_route_without_sending() {
+        let error = crate::image::http::HttpImages
+            .post(ImagePost {
+                route: &route(),
+                body: ImageBody::OpenRouter(json!({})),
+                timeout: Duration::from_secs(1),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(error, ImageWireError::InvalidRequest(text) if text.contains("CodexImages"))
+        );
+    }
 }

@@ -3,12 +3,13 @@
 //! Everything here is a fact about what the server sends or accepts: the typed
 //! reading of each method-keyed notification, the rule for when a provider turn
 //! has ended, token usage normalized from Codex's counters, readers for the
-//! items a turn produces, the goal payloads, and the `UserInput` a turn starts
-//! with. Spawning the server and correlating requests is transport
+//! items a turn produces (the image tool's typed), the goal payloads, and the
+//! `UserInput` a turn starts with. Spawning the server and correlating requests is transport
 //! (`cairn_models::codex::app_server`); persisting what a turn did belongs to the
 //! session runtime.
 
 pub mod goal;
+mod image;
 mod input;
 mod items;
 mod notification;
@@ -17,6 +18,7 @@ mod usage;
 #[cfg(test)]
 mod tests;
 
+pub use image::{ImageGenerationFailure, ImageGenerationItem, IMAGE_GENERATION_ITEM};
 pub use input::build_codex_input;
 pub use items::{
     extract_app_server_delta, extract_command_execution, extract_mcp_result,

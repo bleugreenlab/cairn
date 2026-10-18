@@ -3,10 +3,9 @@
 //! Ordinary Codex node/task sessions keep one app-server process each. Ephemeral
 //! CALLS instead share a long-lived app-server: each call is a lightweight
 //! `thread/start` on it, so a deep-research workflow fanning ~40 calls uses ONE
-//! process (N threads) instead of N processes. `AppServerClient` is already a
-//! multiplexing JSON-RPC transport with one shared notification channel; the
-//! piece it lacks — and what this module adds — is a demultiplexer that routes
-//! each `params.threadId` notification to the owning call's reader, plus the
+//! process (N threads) instead of N processes. Each server's messages are
+//! routed to the owning call's reader by the facet's [`ThreadRouter`]; what
+//! this module adds is the pool's keys and lifecycle, and the
 //! `threadId -> run_id` map the host uses to attribute each pooled call's MCP
 //! tool results and `cairn:~/` targets to the right run.
 //!
@@ -21,12 +20,12 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::thread;
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::Receiver;
 use serde_json::Value;
 
 use cairn_models::codex::app_server::AppServerClient;
+use cairn_models::codex::thread_router::{Scoped, ThreadRouter};
 use cairn_models::wire::codex_app_server::Notification;
 /// Application actions for a pool's shared identity and disconnected runs.
 pub trait PoolHost: Send + Sync {
@@ -57,40 +56,31 @@ pub struct CallBinding {
 
 /// One long-lived app-server hosting N ephemeral call threads.
 pub struct PooledAppServer {
-    client: Arc<AppServerClient>,
+    /// Routes each `params.threadId` message to the owning call's reader, and
+    /// hands pool-scoped ones (the token refresh) to the pool's [`PoolHost`].
+    router: Arc<ThreadRouter>,
     /// `threadId -> run_id`. Read by the host (`binding_for_thread`) to map a
     /// pooled tool call's `_meta.threadId` back to its authenticated run.
     thread_runs: Arc<Mutex<HashMap<String, CallBinding>>>,
-    /// `threadId -> per-call notification sender`. The dispatcher routes each
-    /// notification carrying that threadId to the owning call's reader.
-    senders: Arc<Mutex<HashMap<String, Sender<Value>>>>,
-    /// Host for the pool's single identity, used by the dispatcher to
-    /// answer pool-scoped `account/chatgptAuthTokens/refresh` requests (which
-    /// carry no threadId and so cannot be routed to a per-call reader).
-    host: Arc<dyn PoolHost>,
 }
 
 impl PooledAppServer {
-    /// The shared transport (per-call readers send approval responses through it).
-    pub fn client(&self) -> Arc<AppServerClient> {
-        self.client.clone()
+    /// The server's router: a thread opened on it is `CodexServer::Shared`
+    /// with this, and its reader answers through the router's client.
+    pub fn router(&self) -> Arc<ThreadRouter> {
+        self.router.clone()
     }
 
     /// Register a call thread before `turn/start`, so its first tool call routes
     /// to the authenticated run, and return its notification receiver.
     pub fn register_call(&self, thread_id: &str, run_id: &str) -> Receiver<Value> {
-        let (tx, rx) = unbounded();
         self.thread_runs.lock().unwrap().insert(
             thread_id.to_string(),
             CallBinding {
                 run_id: run_id.to_string(),
             },
         );
-        self.senders
-            .lock()
-            .unwrap()
-            .insert(thread_id.to_string(), tx);
-        rx
+        self.router.route(thread_id)
     }
 
     /// Register a one-shot completion's thread before `turn/start` and return
@@ -101,97 +91,53 @@ impl PooledAppServer {
     /// and fails closed, and a pool death reaches it only by closing this
     /// channel, never as a run [`PoolHost::disconnected`] must fail.
     pub fn register_completion(&self, thread_id: &str) -> Receiver<Value> {
-        let (tx, rx) = unbounded();
-        self.senders
-            .lock()
-            .unwrap()
-            .insert(thread_id.to_string(), tx);
-        rx
+        self.router.route(thread_id)
     }
 
     /// Drop a call thread's routing entries. Idempotent: the reader calls it on
     /// exit and a crash-teardown may have already removed it.
+    ///
+    /// The run binding goes only with a live route. When the server dies the
+    /// router closes every route first, and each reader then unwinds through
+    /// here; its binding must survive that, so the death callback can still
+    /// find and fail its run.
     fn deregister_call(&self, thread_id: &str) {
-        self.thread_runs.lock().unwrap().remove(thread_id);
-        self.senders.lock().unwrap().remove(thread_id);
-    }
-
-    /// Close EVERY per-call channel by dropping its sender. Used on app-server
-    /// death: each per-call reader is blocked on `notifications.iter()`, so
-    /// dropping the senders disconnects the receivers, unblocks the readers, and
-    /// lets them run their cleanup/deregister path — otherwise a pool crash would
-    /// leak one blocked OS thread (plus its captured orchestrator/client state)
-    /// per in-flight call.
-    fn close_all_calls(&self) {
-        if let Ok(mut senders) = self.senders.lock() {
-            senders.clear();
+        if self.router.deregister(thread_id) {
+            self.thread_runs.lock().unwrap().remove(thread_id);
         }
     }
 
-    fn thread_of(msg: &Value) -> Option<String> {
-        msg.pointer("/params/threadId")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
+    /// A pool-scoped message (one with no threadId): the token refresh is
+    /// answered from the pool's shared login, exactly as a dedicated session's
+    /// reader would; anything else is left to the router.
+    fn scoped(host: &dyn PoolHost, client: &AppServerClient, message: &Value) -> Scoped {
+        match Notification::parse(message) {
+            Notification::AuthTokensRefreshRequest { id } => {
+                host.refresh_tokens(client, id);
+                Scoped::Answered
+            }
+            _ => Scoped::Passed,
+        }
     }
 
-    /// Route one notification to the owning call's reader by `threadId` (demux
-    /// #1). A message for a thread that has already finalized is dropped; if it
-    /// expected a response, decline it so the app-server never hangs on us.
+    #[cfg(test)]
     fn deliver(&self, msg: Value) {
-        let method = msg.get("method").and_then(|v| v.as_str());
-        let expects_response = msg.get("id").is_some()
-            && msg.get("result").is_none()
-            && msg.get("error").is_none()
-            && method.is_some();
-        let decline = |id: &Value, reason: &str| {
-            let _ = self.client.respond_error(id, -32601, reason);
-        };
-        match Self::thread_of(&msg) {
-            Some(thread_id) => {
-                let sender = self.senders.lock().unwrap().get(&thread_id).cloned();
-                match sender {
-                    Some(tx) => {
-                        let _ = tx.send(msg);
-                    }
-                    None => {
-                        if expects_response {
-                            if let Some(id) = msg.get("id") {
-                                decline(id, "pooled call thread no longer active");
-                            }
-                        }
-                        log::debug!(
-                            "codex pool: dropping notification for unknown thread {}",
-                            thread_id
-                        );
-                    }
-                }
-            }
-            None => {
-                // A pool-scoped notification without a threadId
-                // (account/rateLimits/updated, account/login/completed). Nothing
-                // per-call to do; a stray expects_response is declined so the
-                // server never blocks on us.
-                if expects_response {
-                    if let Some(id) = msg.get("id") {
-                        decline(id, "unsupported pool-scoped request");
-                    }
-                }
-            }
-        }
+        self.router.deliver(msg);
     }
 
     #[cfg(test)]
     fn close_all_calls_for_test(&self) {
-        self.close_all_calls();
+        self.router.close();
     }
 
     #[cfg(test)]
     fn for_test(client: Arc<AppServerClient>) -> Arc<Self> {
+        let host: Arc<dyn PoolHost> = Arc::new(TestPoolHost);
         Arc::new(Self {
-            client,
+            router: ThreadRouter::new(client, move |client, message| {
+                Self::scoped(host.as_ref(), client, message)
+            }),
             thread_runs: Arc::new(Mutex::new(HashMap::new())),
-            senders: Arc::new(Mutex::new(HashMap::new())),
-            host: Arc::new(TestPoolHost),
         })
     }
 }
@@ -256,8 +202,7 @@ impl CodexAppServerPool {
     /// Get-or-spawn the app-server for `key`. `build` performs the full spawn +
     /// `initialize`/`initialized` + `account/login/start` handshake and returns
     /// the ready client and its identity host; it runs at most once per key
-    /// under the per-key init lock. Starts the notification dispatcher on first
-    /// build.
+    /// under the per-key init lock. Starts the server's router on first build.
     pub fn ensure(
         self: &Arc<Self>,
         key: &PoolKey,
@@ -280,13 +225,17 @@ impl CodexAppServerPool {
             return Ok(existing);
         }
         let (client, host) = build()?;
-        let server = Arc::new(PooledAppServer {
+        let thread_runs = Arc::new(Mutex::new(HashMap::new()));
+        let closed = self.on_server_closed(key.clone(), thread_runs.clone(), host.clone());
+        let router = ThreadRouter::start(
             client,
-            thread_runs: Arc::new(Mutex::new(HashMap::new())),
-            senders: Arc::new(Mutex::new(HashMap::new())),
-            host,
+            move |client, message| PooledAppServer::scoped(host.as_ref(), client, message),
+            closed,
+        );
+        let server = Arc::new(PooledAppServer {
+            router,
+            thread_runs,
         });
-        self.spawn_dispatcher(key.clone(), server.clone());
         self.pools
             .lock()
             .unwrap()
@@ -298,33 +247,22 @@ impl CodexAppServerPool {
         self.pools.lock().unwrap().remove(key);
     }
 
-    /// The single dispatcher thread for a pooled app-server. It owns the shared
-    /// notification receiver and routes every message by `threadId` to the
-    /// owning call's reader (demux #1). Pool-scoped auth-refresh requests (no
-    /// threadId) are answered here from the shared login. On channel close (the
-    /// app-server died) it fails every in-flight call and drops the pool.
-    fn spawn_dispatcher(self: &Arc<Self>, key: PoolKey, server: Arc<PooledAppServer>) {
-        let notifications = server.client.notifications();
+    /// What the pool does when a server's channel closes (the app-server
+    /// died). The router has already closed every per-call channel, so each
+    /// blocked reader exits (no leaked threads) while its run binding stays
+    /// (see `PooledAppServer::deregister_call`). Every in-flight call is then
+    /// failed through the normal error path so parked workflow awaits resolve
+    /// (never hang), and the pool entry is dropped so the next call spawns a
+    /// fresh app-server.
+    fn on_server_closed(
+        self: &Arc<Self>,
+        key: PoolKey,
+        thread_runs: Arc<Mutex<HashMap<String, CallBinding>>>,
+        host: Arc<dyn PoolHost>,
+    ) -> impl FnOnce() + Send + 'static {
         let pool = self.clone();
-        thread::spawn(move || {
-            for msg in notifications.iter() {
-                // Pool-scoped auth-token refresh carries no threadId, so it can't
-                // be routed to a per-call reader — answer it here from the shared
-                // login, exactly as a dedicated session's reader would.
-                if let Notification::AuthTokensRefreshRequest { id } = Notification::parse(&msg) {
-                    server.host.refresh_tokens(server.client.as_ref(), id);
-                    continue;
-                }
-
-                server.deliver(msg);
-            }
-
-            // Channel closed => the app-server process died. Fail EVERY in-flight
-            // call through the normal error path so parked workflow awaits
-            // resolve (never hang), then drop the pool so the next call spawns a
-            // fresh app-server.
-            let runs: Vec<String> = server
-                .thread_runs
+        move || {
+            let runs: Vec<String> = thread_runs
                 .lock()
                 .map(|m| m.values().map(|b| b.run_id.clone()).collect())
                 .unwrap_or_default();
@@ -333,12 +271,9 @@ impl CodexAppServerPool {
                 key,
                 runs.len()
             );
-            // Close every per-call channel FIRST so each blocked reader exits and
-            // deregisters (no leaked threads), then finalize the runs.
-            server.close_all_calls();
-            server.host.disconnected(&runs);
+            host.disconnected(&runs);
             pool.remove_pool(&key);
-        });
+        }
     }
 }
 
@@ -490,7 +425,30 @@ mod tests {
             matches!(rx.recv(), Err(crossbeam_channel::RecvError)),
             "dropping the guard deregisters the thread"
         );
-        assert!(server.senders.lock().unwrap().is_empty());
+        assert!(!server.router.is_routed("thread-d"));
+    }
+
+    // A server death closes every route before the pool fails its runs. A
+    // reader that unwinds through its guard in between must not erase its run
+    // binding, or that run would never be failed; a call that ends on a live
+    // route still clears its binding.
+    #[test]
+    fn a_route_closed_by_the_server_s_death_keeps_its_run_binding() {
+        let pool = CodexAppServerPool::default();
+        let server = PooledAppServer::for_test(scripted_client());
+        pool.insert_test_server("identity-a".to_string(), server.clone());
+        let _done = server.register_call("thread-done", "run-done");
+        let _live = server.register_call("thread-live", "run-live");
+
+        drop(PooledCall::new(server.clone(), "thread-done".to_string()));
+        assert!(pool.binding_for_thread("thread-done").is_none());
+
+        server.close_all_calls_for_test();
+        drop(PooledCall::new(server.clone(), "thread-live".to_string()));
+        assert_eq!(
+            pool.binding_for_thread("thread-live").map(|b| b.run_id),
+            Some("run-live".to_string())
+        );
     }
 
     // A notification for a thread that already finalized is dropped, not routed

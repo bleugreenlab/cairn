@@ -3,7 +3,7 @@
 use cairn_domain::Model;
 use serde_json::Value;
 
-use crate::interface::session::ApprovalMode;
+use crate::interface::session::{ApprovalMode, CodexNativeTools};
 
 /// Codex's `approvalPolicy` for an approval mode. Cairn's verb handlers make
 /// the user-facing fence decision; this only stops Codex asking on its own.
@@ -38,6 +38,7 @@ pub fn build_thread_start_params(
     developer_instructions: Option<&str>,
     tool_free: bool,
     process_mcp_servers: &[String],
+    native_tools: CodexNativeTools,
 ) -> Value {
     let mut params = serde_json::json!({
         "model": model.unwrap_or(Model::GPT_5_6_LUNA),
@@ -74,6 +75,16 @@ pub fn build_thread_start_params(
             "tools.experimental_request_user_input.enabled".to_string(),
             serde_json::json!(false),
         );
+        // The home Cairn renders turns Codex's image tool off for every
+        // thread; an image worker turns it back on for itself alone
+        // (measured on codex-cli 0.162.1: a thread with this line is offered
+        // `image_gen.imagegen`, a plain one on the same server is not).
+        if native_tools == CodexNativeTools::ImageGeneration {
+            config.insert(
+                "features.image_generation".to_string(),
+                serde_json::json!(true),
+            );
+        }
         params["config"] = Value::Object(config);
     }
     if let Some(model) = model {
@@ -362,6 +373,7 @@ mod tests {
             Some("agent content"),
             false,
             &["cairn".to_string()],
+            CodexNativeTools::None,
         );
 
         assert_eq!(params["baseInstructions"], "BASE");
@@ -387,6 +399,7 @@ mod tests {
             None,
             true,
             &["cairn".to_string()],
+            CodexNativeTools::None,
         );
         assert_eq!(params["ephemeral"], true);
         assert_eq!(params["environments"], serde_json::json!([]));
@@ -413,10 +426,47 @@ mod tests {
             None,
             true,
             &["tm".to_string(), "deck".to_string()],
+            CodexNativeTools::None,
         );
         assert_eq!(several["config"]["mcp_servers.tm.enabled"], false);
         assert_eq!(several["config"]["mcp_servers.deck.enabled"], false);
         assert!(several["config"].get("mcp_servers.cairn.enabled").is_none());
+    }
+
+    /// An image worker is the tool-free thread plus exactly one line: its own
+    /// image tool switched back on.
+    #[test]
+    fn an_image_worker_thread_adds_only_its_image_tool() {
+        let plain = build_thread_start_params(
+            "/tmp/scratch",
+            "on-request",
+            "workspace-write",
+            None,
+            Some("low"),
+            None,
+            "WORKER",
+            None,
+            true,
+            &[],
+            CodexNativeTools::None,
+        );
+        let worker = build_thread_start_params(
+            "/tmp/scratch",
+            "on-request",
+            "workspace-write",
+            None,
+            Some("low"),
+            None,
+            "WORKER",
+            None,
+            true,
+            &[],
+            CodexNativeTools::ImageGeneration,
+        );
+        let mut expected = plain.clone();
+        expected["config"]["features.image_generation"] = serde_json::json!(true);
+        assert_eq!(worker, expected);
+        assert!(plain["config"].get("features.image_generation").is_none());
     }
 
     /// Why a prompt edit does not need a fresh thread on Codex (CAIRN-4618).
@@ -456,6 +506,7 @@ mod tests {
             Some("EDITED AGENT PROMPT"),
             false,
             &[],
+            CodexNativeTools::None,
         );
         assert_eq!(resumed["baseInstructions"], started["baseInstructions"]);
         assert_eq!(
@@ -496,6 +547,7 @@ mod tests {
             developer,
             false,
             &[],
+            CodexNativeTools::None,
         );
 
         assert_eq!(params["baseInstructions"], "BASE");

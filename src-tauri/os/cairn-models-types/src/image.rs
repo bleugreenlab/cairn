@@ -401,6 +401,33 @@ impl ImageCapabilities {
         }
     }
 
+    /// Codex's built-in image generation (`image_gen.imagegen`) under a
+    /// ChatGPT sign-in, as measured live on codex-cli 0.153.3 (cairn/4905's
+    /// probe): the tool takes a prompt and the conversation's last images
+    /// only, so the size is always the provider's (`auto`), the orientation
+    /// and reference labels ride in the prompt, an edit is sent as reference
+    /// 1, there is no mask, and at most five images go in. Each image is its
+    /// own worker thread, so four are drawn in parallel.
+    pub fn codex_image_gen() -> Self {
+        Self {
+            max_count: 4,
+            shape: ShapeSupport {
+                auto: true,
+                pixels: None,
+                aspect: Vec::new(),
+                orientation: Support::Lowered(Lowering::OrientationInPrompt),
+            },
+            references: Some(ReferenceSupport {
+                max: 5,
+                labels: Support::Lowered(Lowering::LabelsInPrompt),
+            }),
+            edit: Some(EditSupport {
+                base: Support::Lowered(Lowering::EditAsReference),
+                mask: Support::Unsupported,
+            }),
+        }
+    }
+
     fn gpt_image_orientation() -> Lowering {
         Lowering::OrientationAsPixels {
             portrait: GPT_IMAGE_PORTRAIT,
@@ -500,6 +527,7 @@ mod tests {
         for capabilities in [
             ImageCapabilities::openai_images_minimal(),
             ImageCapabilities::openai_gpt_image(),
+            ImageCapabilities::codex_image_gen(),
         ] {
             let json = serde_json::to_value(&capabilities).unwrap();
             assert_eq!(
@@ -550,6 +578,10 @@ mod tests {
         assert_eq!(
             ImageCapabilities::openai_images_minimal().summary(),
             "≤1 · size 1024x1024|1024x1536|1536x1024 · no edit"
+        );
+        assert_eq!(
+            ImageCapabilities::codex_image_gen().summary(),
+            "≤4 · refs ≤5 · no mask"
         );
     }
 

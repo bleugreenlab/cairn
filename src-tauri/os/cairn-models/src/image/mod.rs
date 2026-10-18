@@ -1,5 +1,5 @@
-//! The facet's image implementation: one [`image`] over either route, through
-//! an [`ImageTransport`] so the POST passes one seam.
+//! The facet's image implementation: one [`image`] over every route, through
+//! an [`ImageTransport`] so the call passes one seam.
 //!
 //! A call runs in order: [`admit`] the request against the offer's declared
 //! capabilities, [`compose_prompt`] for the lowerings that admits, build the
@@ -7,6 +7,7 @@
 //! Nothing is stored: the result carries the bytes and the usage.
 
 mod admit;
+pub mod codex;
 pub mod http;
 pub mod openai;
 pub mod openrouter;
@@ -24,8 +25,8 @@ use crate::image_wire::{
     data_url, decode_base64, openai as openai_wire, openrouter as openrouter_wire, sniff,
 };
 use crate::interface::image::{
-    GeneratedImage, ImageBody, ImageCall, ImageError, ImagePost, ImageReply, ImageResult,
-    ImageRoute, ImageShape, ImageTransport, Provenance,
+    CodexImageTurn, GeneratedImage, ImageBody, ImageCall, ImageError, ImageInput, ImagePost,
+    ImageReply, ImageResult, ImageRoute, ImageShape, ImageTransport, Provenance,
 };
 
 /// Draw what `call.request` asks for on `call.route`.
@@ -38,18 +39,24 @@ pub fn image(
     let lowerings = admit(call.capabilities, wire, request)?;
     let prompt_sent = compose_prompt(&request.prompt, request, &lowerings);
     let extras = request.extras_for(wire);
-    let endpoint = call.route.endpoint();
-    let provider = endpoint.provider_name.as_str();
+    let provider = call.route.provider_name();
     let shaped = Shaped::from(request.shape, &lowerings);
+    // Every input image, in the order each wire numbers them: an edit's base
+    // is image 1 wherever it goes.
+    let inputs = || -> Vec<&ImageInput> {
+        request
+            .edit
+            .iter()
+            .map(|edit| &edit.base)
+            .chain(request.references.iter().map(|reference| &reference.image))
+            .collect()
+    };
 
     let body = match call.route {
         ImageRoute::OpenRouter(_) => {
             // Admission over this wire refused a mask.
-            let input_references = request
-                .edit
-                .iter()
-                .map(|edit| &edit.base)
-                .chain(request.references.iter().map(|reference| &reference.image))
+            let input_references = inputs()
+                .into_iter()
                 .map(|image| data_url(&image.media_type, &image.bytes))
                 .collect();
             let generation = openrouter_wire::Generation {
@@ -74,11 +81,8 @@ pub fn image(
                 n: request.count,
                 size: shaped.pixels.map(|pixels| pixels.to_string()),
             };
-            let images: Vec<openai_wire::ImagePart> = request
-                .edit
-                .iter()
-                .map(|edit| &edit.base)
-                .chain(request.references.iter().map(|reference| &reference.image))
+            let images: Vec<openai_wire::ImagePart> = inputs()
+                .into_iter()
                 .map(|image| openai_wire::ImagePart {
                     bytes: image.bytes.clone(),
                     media_type: image.media_type.clone(),
@@ -104,11 +108,20 @@ pub fn image(
                 )
             }
         }
+        // Admission over this wire refused a size, an aspect ratio and a
+        // mask; the shape, the labels and an edit ride in the prompt.
+        ImageRoute::Codex(_) => ImageBody::Codex(CodexImageTurn {
+            instructions: codex::WORKER_INSTRUCTIONS.to_string(),
+            images: inputs().into_iter().cloned().collect(),
+            text: codex::turn_text(&prompt_sent),
+            count: request.count,
+            effort: codex::worker_effort(&extras)?,
+        }),
     };
 
     let reply = transport
         .post(ImagePost {
-            endpoint,
+            route: call.route,
             body,
             timeout: call.timeout,
         })
@@ -142,6 +155,7 @@ pub fn image(
             let usage = usage::openai(reply.usage.as_ref(), images.len());
             (images, usage)
         }
+        ImageReply::Codex(reply) => codex::read_reply(provider, &reply)?,
     };
     if images.is_empty() {
         return Err(ImageError::InvalidResponse(format!(
@@ -151,7 +165,7 @@ pub fn image(
     Ok(ImageResult {
         images,
         provenance: Provenance {
-            provider: endpoint.backend_key.clone(),
+            provider: call.route.backend_key().to_string(),
             model: call.model.to_string(),
             wire,
             prompt_sent,

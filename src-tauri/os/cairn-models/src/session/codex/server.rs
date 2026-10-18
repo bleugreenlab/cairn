@@ -18,9 +18,9 @@ use super::thread::{
 };
 use crate::codex::app_server::AppServerClient;
 use crate::interface::session::{
-    CodexServer, CodexSessionProvider, LaunchedSession, NativeGoal, ProviderSpec, ServerLaunch,
-    SessionError, SessionEvents, SessionFacts, SessionHost, SessionProvider, SessionSpec,
-    SessionStart,
+    CodexNativeTools, CodexServer, CodexSessionProvider, LaunchedSession, NativeGoal, ProviderSpec,
+    ServerLaunch, SessionError, SessionEvents, SessionFacts, SessionHost, SessionProvider,
+    SessionSpec, SessionStart,
 };
 
 /// Opens Codex threads.
@@ -113,9 +113,15 @@ impl SessionProvider for CodexAppServer {
                 "a tool-free Codex thread can only be a new one".to_string(),
             ));
         }
+        if codex.native_tools != CodexNativeTools::None && !tool_free {
+            return Err(SessionError::Setup(
+                "a Codex-native tool is given back only to a tool-free thread".to_string(),
+            ));
+        }
+        let native_tools = codex.native_tools;
         let (client, dedicated) = match &codex.server {
             CodexServer::Dedicated(client) => (client.clone(), true),
-            CodexServer::Shared(client) => (client.clone(), false),
+            CodexServer::Shared(router) => (router.client(), false),
         };
         let approval_policy = codex_approval_policy(approval);
         let sandbox_mode = codex_sandbox_mode(approval);
@@ -138,6 +144,7 @@ impl SessionProvider for CodexAppServer {
                 developer,
                 tool_free,
                 &process_mcp_servers,
+                native_tools,
             )
         };
         let mut fallback = codex.resume_fallback.take();
@@ -561,6 +568,12 @@ mod tests {
         (client, requests)
     }
 
+    /// `client` as a shared server, routed by a router its test feeds.
+    fn shared(client: Arc<AppServerClient>) -> CodexServer {
+        use crate::codex::thread_router::{Scoped, ThreadRouter};
+        CodexServer::Shared(ThreadRouter::new(client, |_, _| Scoped::Passed))
+    }
+
     fn spec(start: SessionStart, server: CodexServer, goal: NativeGoal) -> SessionSpec {
         SessionSpec {
             start,
@@ -579,6 +592,7 @@ mod tests {
                 developer_instructions: Some("AGENT".to_string()),
                 service_tier: Some("priority".to_string()),
                 native_goal: goal,
+                native_tools: CodexNativeTools::None,
                 resume_fallback: Some(Box::new(|| Some("TRANSCRIPT + latest".to_string()))),
             }),
         }
@@ -690,7 +704,7 @@ mod tests {
                     SessionStart::New {
                         session_id: "session-1".to_string(),
                     },
-                    CodexServer::Shared(client),
+                    shared(client),
                     NativeGoal::Leave,
                 ),
             )
@@ -843,7 +857,7 @@ mod tests {
         ] {
             let (client, requests) =
                 scripted_client(|request| panic!("no request expected, got {}", request["method"]));
-            let mut tool_free = spec(start, CodexServer::Shared(client), NativeGoal::Leave);
+            let mut tool_free = spec(start, shared(client), NativeGoal::Leave);
             tool_free.mcp = None;
             let error = CodexAppServer
                 .open(&host(empty_result), tool_free)
@@ -852,6 +866,31 @@ mod tests {
             assert!(matches!(error, SessionError::Setup(_)), "{error:?}");
             assert!(requests.lock().unwrap().is_empty());
         }
+    }
+
+    /// A native tool is given back only on a thread without tools: on one
+    /// with them it would ride beside the host's servers.
+    #[test]
+    fn a_native_tool_on_a_thread_with_tools_is_refused() {
+        let (client, requests) =
+            scripted_client(|request| panic!("no request expected, got {}", request["method"]));
+        let mut with_tools = spec(
+            SessionStart::New {
+                session_id: "session-1".to_string(),
+            },
+            shared(client),
+            NativeGoal::Leave,
+        );
+        let ProviderSpec::Codex(codex) = &mut with_tools.provider else {
+            unreachable!()
+        };
+        codex.native_tools = CodexNativeTools::ImageGeneration;
+        let error = CodexAppServer
+            .open(&host(empty_result), with_tools)
+            .err()
+            .unwrap();
+        assert!(matches!(error, SessionError::Setup(_)), "{error:?}");
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     #[test]

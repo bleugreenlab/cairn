@@ -19,6 +19,50 @@ impl Drop for DiscoveryHome {
 
 struct DiscoveryChild(std::process::Child);
 
+/// How many trailing stderr lines a failed discovery reports.
+const STDERR_TAIL_LINES: usize = 20;
+
+/// The discovery app-server's stderr, read on its own thread from the start
+/// and kept as its last lines. Codex can log more than a pipe holds (16 KB on
+/// macOS) before it answers; unread, it would block writing its log, stop
+/// reading its stdin, and stall discovery on its first request.
+struct StderrTail(
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    Option<std::thread::JoinHandle<()>>,
+);
+
+impl StderrTail {
+    fn drain(stderr: Option<std::process::ChildStderr>) -> Self {
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::with_capacity(STDERR_TAIL_LINES),
+        ));
+        let kept = lines.clone();
+        let reader = stderr.map(|stderr| {
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let Ok(mut kept) = kept.lock() else { return };
+                    if kept.len() == STDERR_TAIL_LINES {
+                        kept.pop_front();
+                    }
+                    kept.push_back(line);
+                }
+            })
+        });
+        Self(lines, reader)
+    }
+
+    /// Everything kept, once the process has exited and its stderr closed.
+    fn finish(mut self) -> String {
+        if let Some(reader) = self.1.take() {
+            let _ = reader.join();
+        }
+        self.0
+            .lock()
+            .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default()
+    }
+}
+
 impl Drop for DiscoveryChild {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -111,6 +155,7 @@ pub fn discover_codex_models(
         .take()
         .ok_or_else(|| "Failed to capture Codex app-server stdout".to_string())?;
     let mut reader = BufReader::new(stdout);
+    let mut stderr = Some(StderrTail::drain(child.0.stderr.take()));
 
     send_message(
         &mut stdin,
@@ -153,7 +198,11 @@ pub fn discover_codex_models(
         // what writes models_cache.json. A home without auth.json would then
         // have no catalog for sessions to harden.
         let Some(response) = read_response(&mut reader, 3)? else {
-            return Err(exited_before(&mut child, "account/login/start"));
+            return Err(exited_before(
+                &mut child,
+                &mut stderr,
+                "account/login/start",
+            ));
         };
         if let Some(error) = response.get("error") {
             return Err(format!("Codex rejected the discovery login: {error}"));
@@ -170,7 +219,7 @@ pub fn discover_codex_models(
     )?;
 
     let Some(response) = read_response(&mut reader, 2)? else {
-        return Err(exited_before(&mut child, "model/list"));
+        return Err(exited_before(&mut child, &mut stderr, "model/list"));
     };
     let result: CodexModelListResult = serde_json::from_value(
         response
@@ -213,19 +262,14 @@ fn read_response(reader: &mut impl BufRead, id: i64) -> Result<Option<Value>, St
     }
 }
 
-fn exited_before(child: &mut DiscoveryChild, awaiting: &str) -> String {
-    let stderr = child
-        .0
-        .stderr
-        .take()
-        .and_then(|mut stderr| {
-            let mut buf = String::new();
-            std::io::Read::read_to_string(&mut stderr, &mut buf).ok()?;
-            Some(buf)
-        })
-        .unwrap_or_default();
+fn exited_before(
+    child: &mut DiscoveryChild,
+    stderr: &mut Option<StderrTail>,
+    awaiting: &str,
+) -> String {
     let _ = child.0.kill();
     let _ = child.0.wait();
+    let stderr = stderr.take().map(StderrTail::finish).unwrap_or_default();
     if stderr.trim().is_empty() {
         format!("Codex app-server exited before answering {awaiting}")
     } else {
@@ -500,6 +544,11 @@ mod tests {
         std::fs::write(
             &script,
             r#"#!/bin/sh
+if [ "$FAKE_STDERR" = flood ]; then
+  i=0; while [ $i -lt 1024 ]; do
+    printf '%s\n' 'WARN codex: a log line long enough to fill a pipe quickly...........' >&2
+    i=$((i + 1)); done
+fi
 while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
@@ -519,6 +568,31 @@ done
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         script.to_string_lossy().into_owned()
+    }
+
+    /// A Codex that logs more than a pipe holds before it reads its first
+    /// request still answers: discovery drains its stderr from the start.
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_that_floods_its_stderr_still_answers_discovery() {
+        let bin = tempfile::tempdir().unwrap();
+        let codex = scripted_app_server(bin.path());
+        let home = tempfile::tempdir().unwrap();
+        let env = HashMap::from([("FAKE_STDERR".to_string(), "flood".to_string())]);
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let login = json!({"type": "scriptedLogin"});
+            let _ = done.send(refresh_codex_model_cache(
+                &codex,
+                home.path(),
+                Some(login),
+                &env,
+            ));
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("discovery deadlocked on a full stderr pipe")
+            .unwrap();
     }
 
     #[cfg(unix)]

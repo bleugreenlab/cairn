@@ -578,3 +578,88 @@ fn an_image_serializes_as_a_native_codex_image_without_base64_text() {
     let encoded = data_url.split_once(',').unwrap().1;
     assert!(!serialized[0]["text"].as_str().unwrap().contains(encoded));
 }
+
+/// Items recorded from codex-cli 0.153.3 (cairn/4905's probe), with the
+/// megabytes of base64 cut to a stand-in.
+mod image_generation {
+    use super::*;
+
+    #[test]
+    fn a_completed_image_item_reads_its_image_prompt_and_path() {
+        let item = json!({
+            "type": "imageGeneration",
+            "id": "exec-431922e8-9f5a-4a8d-917f-a218953354da",
+            "status": "completed",
+            "revisedPrompt": "A small watercolor of a red fox sitting in snow, tall portrait composition (2:3).",
+            "result": "iVBORw0KGgo=",
+            "transparentBackground": false,
+            "failure": null,
+            "savedPath": "/scratch/codex-imgworker-087ljppn/generated_images/01a137e1-04f3-71f1-9a9d-f69164bb8bdb/exec-431922e8-9f5a-4a8d-917f-a218953354da.png"
+        });
+        let image = ImageGenerationItem::parse(&item).unwrap();
+        assert!(image.is_completed());
+        assert_eq!(image.id, "exec-431922e8-9f5a-4a8d-917f-a218953354da");
+        assert_eq!(image.result, "iVBORw0KGgo=");
+        assert!(image
+            .revised_prompt
+            .unwrap()
+            .starts_with("A small watercolor"));
+        assert!(image
+            .saved_path
+            .unwrap()
+            .ends_with("exec-431922e8-9f5a-4a8d-917f-a218953354da.png"));
+        assert_eq!(image.failure, None);
+    }
+
+    #[test]
+    fn a_moderation_block_is_a_failed_item_with_no_failure_and_no_image() {
+        let item = json!({
+            "type": "imageGeneration",
+            "id": "exec-3a563379-5f77-4bfd-8042-05bab2231dab",
+            "status": "failed",
+            "revisedPrompt": "A photorealistic photo of Taylor Swift and Joe Biden shaking hands at a press event.",
+            "result": "",
+            "transparentBackground": null,
+            "failure": null
+        });
+        let image = ImageGenerationItem::parse(&item).unwrap();
+        assert!(!image.is_completed());
+        assert!(image.result.is_empty());
+        assert_eq!(image.saved_path, None);
+        assert_eq!(image.failure, None);
+    }
+
+    /// The quota shape is Codex's own (`ext/items/src/image_generation.rs`):
+    /// tagged by `type`.
+    #[test]
+    fn a_quota_hit_carries_its_limit_and_reset() {
+        let item = json!({
+            "type": "imageGeneration",
+            "id": "ig_123",
+            "status": "failed",
+            "revisedPrompt": null,
+            "result": "",
+            "failure": {"type": "usageLimitExceeded", "limitId": "image_gen", "resetsAt": 1786150800}
+        });
+        assert_eq!(
+            ImageGenerationItem::parse(&item).unwrap().failure,
+            Some(ImageGenerationFailure::UsageLimitExceeded {
+                limit_id: "image_gen".to_string(),
+                resets_at: Some(1_786_150_800),
+            })
+        );
+        let mut unknown = item.clone();
+        unknown["failure"] = json!({"type": "somethingNew", "detail": 1});
+        assert_eq!(
+            ImageGenerationItem::parse(&unknown).unwrap().failure,
+            Some(ImageGenerationFailure::Other)
+        );
+    }
+
+    #[test]
+    fn another_item_kind_is_not_an_image() {
+        let message = json!({"type": "agentMessage", "id": "m", "text": "DONE"});
+        assert_eq!(ImageGenerationItem::parse(&message), None);
+        assert_eq!(IMAGE_GENERATION_ITEM, "imageGeneration");
+    }
+}

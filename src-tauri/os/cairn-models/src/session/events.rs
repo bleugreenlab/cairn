@@ -67,6 +67,13 @@ pub enum SessionEvent {
         content: String,
         is_error: bool,
     },
+    /// Codex's image tool finished: the result of the `imageGeneration`
+    /// [`Self::ToolCall`] with the same id. It carries the image itself
+    /// (base64) and where Codex saved it; a reader recording the call as a
+    /// tool result takes the revised prompt as its content, never the image.
+    ImageGenerated {
+        image: crate::wire::codex_app_server::ImageGenerationItem,
+    },
     /// The app-server asks the host something (an approval, a token refresh).
     /// The host must answer it, or the turn waits.
     ServerRequest {
@@ -291,7 +298,8 @@ pub mod claude {
 pub mod codex {
     use super::*;
     use crate::wire::codex_app_server::{
-        CodexTurnUsageAccumulator, Notification, ProviderTurnStatus,
+        CodexTurnUsageAccumulator, ImageGenerationItem, Notification, ProviderTurnStatus,
+        IMAGE_GENERATION_ITEM,
     };
 
     /// The items that are conversation, not tools. Every other item kind is
@@ -311,6 +319,19 @@ pub mod codex {
         match (kind, field("server"), field("tool")) {
             ("mcpToolCall", Some(server), Some(tool)) => format!("mcp__{server}__{tool}"),
             _ => kind.to_string(),
+        }
+    }
+
+    fn tool_result(item: &Value) -> SessionEvent {
+        SessionEvent::ToolResult {
+            tool_use_id: item
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            content: tool_output(item),
+            is_error: item.get("status").and_then(Value::as_str) == Some("failed")
+                || item.get("error").is_some_and(|error| !error.is_null()),
         }
     }
 
@@ -393,16 +414,11 @@ pub mod codex {
                             None => Vec::new(),
                         },
                         _ if MESSAGE_ITEMS.contains(&kind) => Vec::new(),
-                        _ => vec![SessionEvent::ToolResult {
-                            tool_use_id: item
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            content: tool_output(item),
-                            is_error: item.get("status").and_then(Value::as_str) == Some("failed")
-                                || item.get("error").is_some_and(|error| !error.is_null()),
-                        }],
+                        IMAGE_GENERATION_ITEM => match ImageGenerationItem::parse(item) {
+                            Some(image) => vec![SessionEvent::ImageGenerated { image }],
+                            None => vec![tool_result(item)],
+                        },
+                        _ => vec![tool_result(item)],
                     }
                 }
                 Notification::TokenUsageUpdated {

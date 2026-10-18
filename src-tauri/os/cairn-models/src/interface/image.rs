@@ -5,8 +5,10 @@
 //! `image` is its own verb rather than a kind of completion because neither
 //! side fits [`super::complete::Complete`]: an edit is a multipart body, and a
 //! reply carries megabytes of binary. It has its own transport seam instead,
-//! [`ImageTransport`], with one real implementation
-//! ([`crate::image::http::HttpImages`]), and shares the rest of the facet: the
+//! [`ImageTransport`], with two real implementations
+//! ([`crate::image::http::HttpImages`] for the HTTP wires, and
+//! [`crate::image::codex::CodexImages`], which runs Codex image workers and
+//! hands every other body to its HTTP transport), and shares the rest of the facet: the
 //! same [`super::Catalog`] chooses its offer ([`super::Catalog::image_offer`])
 //! and the same metered usage describes what it cost.
 //!
@@ -31,6 +33,8 @@ use crate::image_wire::openai::wire::ImagesResponse as OpenAiImagesResponse;
 use crate::image_wire::openai::EditsForm;
 use crate::image_wire::openrouter::wire::ImagesResponse as OpenRouterImagesResponse;
 use crate::image_wire::{ImageWireError, ImagesEndpoint};
+use crate::wire::codex_app_server::ImageGenerationItem;
+use crate::wire::TurnUsage;
 
 pub use cairn_models_types::image::ImageCapabilities;
 
@@ -40,7 +44,8 @@ pub const IMAGE_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// The fixes every no-offer refusal of an image names.
 pub const IMAGE_FIXES: &str = "Add an OpenRouter API key in Settings → Providers (its image \
-models serve this verb), or add a custom provider with protocol OpenAI Images pointing at an \
+models serve this verb), sign in to Codex with a ChatGPT account on a paid plan (Codex draws \
+with its own image tool), or add a custom provider with protocol OpenAI Images pointing at an \
 OpenAI-compatible /v1/images server: OpenAI at https://api.openai.com/v1, or a local server.";
 
 /// An image sent with a request.
@@ -244,7 +249,7 @@ impl From<NoOffer> for ImageError {
 }
 
 /// The provider codes a moderation or content-policy refusal arrives with.
-const REFUSAL_CODES: &[&str] = &[
+pub(crate) const REFUSAL_CODES: &[&str] = &[
     "moderation_blocked",
     "content_policy_violation",
     "content_filter",
@@ -295,6 +300,9 @@ pub enum ImageRoute {
     OpenRouter(ImagesEndpoint),
     /// The OpenAI Images API, on OpenAI or any compatible server.
     OpenAi(ImagesEndpoint),
+    /// Codex's own image tool, called by a worker thread on a Codex
+    /// app-server signed in to ChatGPT.
+    Codex(CodexImageRoute),
 }
 
 impl ImageRoute {
@@ -304,12 +312,47 @@ impl ImageRoute {
         match self {
             Self::OpenRouter(_) => Wire::OpenRouterImages,
             Self::OpenAi(_) => Wire::OpenAiImages,
+            Self::Codex(_) => Wire::CodexAppServer,
         }
     }
 
-    pub fn endpoint(&self) -> &ImagesEndpoint {
+    /// What to call the provider in an error a user will read.
+    pub fn provider_name(&self) -> &str {
         match self {
-            Self::OpenRouter(endpoint) | Self::OpenAi(endpoint) => endpoint,
+            Self::OpenRouter(endpoint) | Self::OpenAi(endpoint) => &endpoint.provider_name,
+            Self::Codex(route) => &route.provider_name,
+        }
+    }
+
+    /// The backend key provenance and usage are attributed to.
+    pub fn backend_key(&self) -> &str {
+        match self {
+            Self::OpenRouter(endpoint) | Self::OpenAi(endpoint) => &endpoint.backend_key,
+            Self::Codex(route) => &route.backend_key,
+        }
+    }
+}
+
+/// Where a Codex image call goes. The app-server itself is the transport's
+/// ([`crate::image::codex::CodexImages`]); the route names the provider and
+/// the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexImageRoute {
+    pub provider_name: String,
+    pub backend_key: String,
+    /// The text model that calls the image tool, from the host's Codex
+    /// model list; `None` leaves it to Codex's default. It is not what draws:
+    /// the image tool's own model does.
+    pub worker_model: Option<String>,
+}
+
+impl CodexImageRoute {
+    /// Codex under a ChatGPT sign-in, attributed to the `codex` backend.
+    pub fn chatgpt(worker_model: Option<String>) -> Self {
+        Self {
+            provider_name: "Codex (ChatGPT)".to_string(),
+            backend_key: "codex".to_string(),
+            worker_model,
         }
     }
 }
@@ -320,12 +363,30 @@ pub enum ImageBody {
     OpenRouter(Value),
     OpenAiGenerations(Value),
     OpenAiEdits(EditsForm),
+    Codex(CodexImageTurn),
+}
+
+/// What each Codex image worker is given: pure data, built by
+/// [`crate::image::image`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexImageTurn {
+    /// The worker thread's base instructions.
+    pub instructions: String,
+    /// The images the turn attaches, in order: an edit's base first, then
+    /// the references.
+    pub images: Vec<ImageInput>,
+    /// The turn's text: the composed prompt, wrapped for the worker.
+    pub text: String,
+    /// How many images, each drawn by a worker thread of its own.
+    pub count: u32,
+    /// The worker's reasoning effort.
+    pub effort: String,
 }
 
 /// One POST: where, what, and how long it may take.
 #[derive(Debug)]
 pub struct ImagePost<'a> {
-    pub endpoint: &'a ImagesEndpoint,
+    pub route: &'a ImageRoute,
     pub body: ImageBody,
     pub timeout: Duration,
 }
@@ -335,6 +396,26 @@ pub struct ImagePost<'a> {
 pub enum ImageReply {
     OpenRouter(OpenRouterImagesResponse),
     OpenAi(OpenAiImagesResponse),
+    Codex(CodexImageReply),
+}
+
+/// What the Codex workers produced: one outcome per requested image.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexImageReply {
+    pub draws: Vec<CodexDrawOutcome>,
+}
+
+/// How one worker's image went.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexDrawOutcome {
+    /// The image tool's item, when the worker called it.
+    pub image: Option<ImageGenerationItem>,
+    /// The worker's final text (`DONE`, or `FAILED: ` and the tool's error),
+    /// or what ended its turn when that failed.
+    pub text: String,
+    /// Each worker turn's usage, a retried draw's included: the worker
+    /// model's text tokens, not the image model's.
+    pub usage: Vec<TurnUsage>,
 }
 
 /// How image calls reach providers. The seam sits at the POST, like

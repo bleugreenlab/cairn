@@ -3226,6 +3226,15 @@ impl Orchestrator {
         });
     }
 
+    /// Seed one backend's discovered catalog, for a test outside this module.
+    #[cfg(test)]
+    pub(crate) fn seed_model_catalog_for_test(&self, catalog: ProviderModelCatalog) {
+        self.model_catalog
+            .write()
+            .unwrap()
+            .insert(catalog.backend.clone(), catalog);
+    }
+
     pub fn get_model_catalog(&self) -> Vec<ProviderModelCatalog> {
         let Ok(catalog) = self.model_catalog.read() else {
             return Vec::new();

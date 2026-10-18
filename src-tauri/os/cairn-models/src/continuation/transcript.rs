@@ -179,23 +179,12 @@ impl TranscriptBuilder {
                 tool_use_id,
                 content,
                 is_error,
-            } => {
-                let call = self
-                    .turns
-                    .iter_mut()
-                    .rev()
-                    .flat_map(|turn| turn.entries.iter_mut().rev())
-                    .find_map(|entry| match entry {
-                        Entry::Tool(call) if call.id == *tool_use_id => Some(call),
-                        _ => None,
-                    });
-                if let Some(call) = call {
-                    call.outcome = Some(ToolOutcome {
-                        content: content.clone(),
-                        is_error: *is_error,
-                    });
-                }
-            }
+            } => self.record_outcome(tool_use_id, content.clone(), *is_error),
+            SessionEvent::ImageGenerated { image } => self.record_outcome(
+                &image.id,
+                image.revised_prompt.clone().unwrap_or_default(),
+                !image.is_completed(),
+            ),
             SessionEvent::Error {
                 message,
                 will_retry: false,
@@ -219,6 +208,22 @@ impl TranscriptBuilder {
             | SessionEvent::CredentialRejected
             | SessionEvent::CredentialAcknowledged { .. }
             | SessionEvent::ThinkingDelta { .. } => {}
+        }
+    }
+
+    /// Close the tool call `tool_use_id` with its outcome.
+    fn record_outcome(&mut self, tool_use_id: &str, content: String, is_error: bool) {
+        let call = self
+            .turns
+            .iter_mut()
+            .rev()
+            .flat_map(|turn| turn.entries.iter_mut().rev())
+            .find_map(|entry| match entry {
+                Entry::Tool(call) if call.id == tool_use_id => Some(call),
+                _ => None,
+            });
+        if let Some(call) = call {
+            call.outcome = Some(ToolOutcome { content, is_error });
         }
     }
 
