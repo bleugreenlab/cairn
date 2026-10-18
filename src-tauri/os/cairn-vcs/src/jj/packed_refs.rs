@@ -16,24 +16,15 @@
 //! remove it exactly once and try again.
 //!
 //! The proof matters more than the removal. Deleting a live writer's lock is
-//! how a ref store gets corrupted, so the healer re-reads the lock file's
-//! `(dev, ino)` immediately before unlinking it and refuses to delete a
-//! replacement that a live writer minted in the window between the proof and
-//! the removal.
-//!
-//! This module exists so that sequence is never copied. It was first written
-//! for the import path alone, and its identity revalidation already needed one
-//! review correction; a second copy would drift on exactly that step, and the
-//! step is the one that decides whether healing is safe.
+//! how a ref store gets corrupted, so the proof and the identity-revalidated
+//! removal live in one place, [`cairn_common::lock_proof`], shared with every
+//! other caller that removes an abandoned Git lock. This module is the patience
+//! policy around that proof, and the one place every ref transaction routes
+//! through; it keeps no copy of the proof itself.
 
+use cairn_common::lock_proof::{self, LOCK_WAIT};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, Instant};
-
-/// How long a ref transaction waits out contention before it treats the lock as
-/// abandoned. Longer than any legitimate `packed-refs` rewrite, and far shorter
-/// than the 600s managed-store lease several callers hold while they write.
-const LOCK_WAIT: Duration = Duration::from_secs(30);
 
 /// Gap between attempts. gix's own internal wait is about a second, so a caller
 /// that is going to win the race usually does so within the first few attempts.
@@ -99,109 +90,18 @@ pub(crate) fn git_common_dir(checkout: &Path) -> Option<PathBuf> {
         .then(|| checkout.to_path_buf())
 }
 
-/// Does this text say the operation lost the race for `packed-refs.lock`?
-///
-/// Narrow on purpose. It covers gix's phrasings, which jj's Git backend
-/// surfaces, and git's own `Unable to create '<path>/packed-refs.lock'` — all of
-/// which name either the lock file or the packed-ref file. Anything broader
-/// would retry genuine failures for thirty seconds before reporting them.
-///
-/// Public to the crate because contention does not always arrive as an error:
-/// `jj git export` reports a refused ref on stderr and still exits 0, so its
-/// caller has to recognize the same phrasing in a "successful" run and hand it
-/// back as the failure it is.
-pub(crate) fn packed_refs_lock_error(error: &str) -> bool {
-    error.contains("packed-refs.lock")
-        || error.contains("packed-ref file could not be obtained")
-        || error.contains("lock for the packed-ref")
-}
+/// Whether an error lost the race for `packed-refs.lock`. Public to the crate
+/// because contention does not always arrive as an error: `jj git export`
+/// reports a refused ref on stderr and still exits 0, so its caller has to
+/// recognize the same phrasing in a "successful" run and hand it back as the
+/// failure it is.
+pub(crate) use cairn_common::lock_proof::packed_refs_lock_error;
 
 /// The leading words of the line a give-up appends to diagnose the lock as it
 /// stood when patience ran out. Stable on purpose: the reconcile classifier
 /// keys its `ref_lock_contention` and `ref_lock_stale` kinds on them.
 pub(crate) const CONTENTION_DIAGNOSIS: &str = "packed-refs lock: contention";
 pub(crate) const STALE_DIAGNOSIS: &str = "packed-refs lock: stale";
-
-/// A live process `lsof` reports holding the lock open.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LockHolder {
-    pid: String,
-    command: String,
-}
-
-/// Who holds `lock` open right now, according to `lsof`: `None` when nobody
-/// does. An error means the question could not be answered, which is never
-/// read as "nobody".
-#[cfg(unix)]
-fn lock_holder(lock: &Path) -> Result<Option<LockHolder>, String> {
-    let output = cairn_platform::env::command("lsof")
-        .args(["-F", "pc", "--"])
-        .arg(lock)
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|error| format!("ask lsof who holds {}: {error}", lock.display()))?;
-    match output.status.code() {
-        Some(0) => Ok(Some(parse_lsof_holder(&String::from_utf8_lossy(
-            &output.stdout,
-        )))),
-        Some(1) => Ok(None),
-        code => Err(format!(
-            "ask lsof who holds {}: unexpected exit {code:?}",
-            lock.display()
-        )),
-    }
-}
-
-#[cfg(not(unix))]
-fn lock_holder(_lock: &Path) -> Result<Option<LockHolder>, String> {
-    Err("no lsof on this platform to prove the lock unheld".to_string())
-}
-
-/// The first process in `lsof -F pc` output: a `p<pid>` line, then `c<command>`.
-fn parse_lsof_holder(output: &str) -> LockHolder {
-    let field = |tag: char| {
-        output
-            .lines()
-            .find_map(|line| line.strip_prefix(tag))
-            .map(str::to_string)
-            .unwrap_or_else(|| "?".to_string())
-    };
-    LockHolder {
-        pid: field('p'),
-        command: field('c'),
-    }
-}
-
-fn lock_age(metadata: &std::fs::Metadata, lock: &Path) -> Result<Duration, String> {
-    metadata
-        .modified()
-        .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
-        .map_err(|error| format!("inspect {}: {error}", lock.display()))
-}
-
-/// Prove a lock is abandoned: older than `stale_after` and held by no live
-/// process. Returns the lock's `(dev, ino)` identity, which is what makes the
-/// proof usable — it names the exact file that was proven, not merely the path.
-#[cfg(unix)]
-fn stale_unheld_lock(lock: &Path, stale_after: Duration) -> Result<Option<(u64, u64)>, String> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = lock
-        .metadata()
-        .map_err(|error| format!("inspect {}: {error}", lock.display()))?;
-    if lock_age(&metadata, lock)? < stale_after {
-        return Ok(None);
-    }
-    match lock_holder(lock)? {
-        Some(_) => Ok(None),
-        None => Ok(Some((metadata.dev(), metadata.ino()))),
-    }
-}
-
-#[cfg(not(unix))]
-fn stale_unheld_lock(_lock: &Path, _stale_after: Duration) -> Result<Option<(u64, u64)>, String> {
-    Ok(None)
-}
 
 /// One line saying what the lock looked like when patience gave up, so a
 /// reader can tell a busy ref store from an abandoned lock without gathering
@@ -221,13 +121,13 @@ fn give_up_diagnosis(scope: PackedRefs<'_>, refusal: Option<&str>) -> String {
     let Ok(metadata) = lock.metadata() else {
         return burst("no lock");
     };
-    let old = lock_age(&metadata, &lock).is_ok_and(|age| age >= LOCK_WAIT);
+    let old = lock_proof::lock_age(&metadata, &lock).is_ok_and(|age| age >= LOCK_WAIT);
     let stale = |reason: &str| {
         format!(
             "{STALE_DIAGNOSIS} — older than {waited}s with no live holder, not removed: {reason}"
         )
     };
-    match lock_holder(&lock) {
+    match lock_proof::lock_holder(&lock) {
         Ok(Some(holder)) => format!(
             "{CONTENTION_DIAGNOSIS} — held by live process {} ({}) after {waited}s",
             holder.pid, holder.command
@@ -243,15 +143,6 @@ fn give_up_diagnosis(scope: PackedRefs<'_>, refusal: Option<&str>) -> String {
     }
 }
 
-#[cfg(unix)]
-fn lock_identity_matches(lock: &Path, identity: (u64, u64)) -> Result<bool, String> {
-    use std::os::unix::fs::MetadataExt;
-    let current = lock
-        .metadata()
-        .map_err(|error| format!("revalidate {} before removal: {error}", lock.display()))?;
-    Ok((current.dev(), current.ino()) == identity)
-}
-
 /// Remove a lock that has been proven abandoned, and say so in the log with the
 /// detail an operator would otherwise gather by hand: which lock, how long it
 /// was waited out, and that `lsof` found no holder.
@@ -263,24 +154,15 @@ fn heal_stale_lock(
     let Some(lock) = scope.lock_path() else {
         return Ok(false);
     };
-    let Some(identity) = stale_unheld_lock(&lock, stale_after)? else {
+    let Some(identity) = lock_proof::prove_abandoned(&lock, stale_after)? else {
         return Ok(false);
     };
-    #[cfg(unix)]
-    {
-        // Between the lsof proof and this unlink, a live writer may have taken
-        // the lock for itself. Removing THAT lock is the corruption this whole
-        // ceremony exists to avoid, so the file still standing at the path must
-        // be the same file that was proven abandoned.
-        if !lock_identity_matches(&lock, identity)? {
-            return Err(format!(
-                "refused to remove {} because the lock was replaced after stale-lock proof",
-                lock.display()
-            ));
-        }
+    if !lock_proof::remove_proven(&lock, identity)? {
+        return Err(format!(
+            "refused to remove {} because the lock was replaced after stale-lock proof",
+            lock.display()
+        ));
     }
-    std::fs::remove_file(&lock)
-        .map_err(|error| format!("remove proven-stale {}: {error}", lock.display()))?;
     log::warn!(
         "{ctx}: removed proven-stale packed-refs lock {} after waiting {:.1}s; lsof found no live holder",
         lock.display(),
@@ -575,47 +457,15 @@ mod tests {
         assert!(!packed_refs_lock_error("Revision main does not exist"));
     }
 
+    /// Healing declines a lock it could not prove abandoned, and removes the
+    /// same lock once its holder goes away. The proof itself is pinned in
+    /// `cairn_common::lock_proof`; this pins that the healer defers to it.
     #[cfg(unix)]
     #[test]
-    fn an_old_unheld_lock_is_proven_stale() {
-        let temp = TempDir::new().unwrap();
-        let lock = temp.path().join("packed-refs.lock");
-        std::fs::write(&lock, "orphaned\n").unwrap();
-        assert!(stale_unheld_lock(&lock, Duration::ZERO).unwrap().is_some());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_lock_younger_than_the_wait_is_not_stale() {
-        let temp = TempDir::new().unwrap();
-        let lock = temp.path().join("packed-refs.lock");
-        std::fs::write(&lock, "fresh\n").unwrap();
-        assert!(stale_unheld_lock(&lock, LOCK_WAIT).unwrap().is_none());
-    }
-
-    /// The refusal that makes healing safe at all: a lock old enough to look
-    /// abandoned but still held open by a live process must never be removed.
-    /// Deleting a live writer's lock is how a ref store gets corrupted.
-    ///
-    /// The holder is the only variable — the same lock, at the same age, is
-    /// removable once the descriptor closes — so a regression that read `lsof`'s
-    /// exit 0 as "nobody home" fails here and nowhere else.
-    #[cfg(unix)]
-    #[test]
-    fn an_old_lock_a_live_process_holds_open_is_never_removed() {
-        let temp = TempDir::new().unwrap();
-        let checkout = temp.path().join("repo");
-        std::fs::create_dir_all(checkout.join(".git")).unwrap();
-        let lock = checkout.join(".git").join("packed-refs.lock");
+    fn healing_declines_a_lock_a_live_process_holds_open() {
+        let (_temp, checkout, lock) = checkout_with_lock();
         std::fs::write(&lock, "held by a live writer\n").unwrap();
-
-        // An open descriptor is what distinguishes a live writer from an
-        // abandoned lock, and it is what `lsof` reports.
         let held = std::fs::File::open(&lock).unwrap();
-        assert!(
-            stale_unheld_lock(&lock, Duration::ZERO).unwrap().is_none(),
-            "a lock a live process holds open must never be proven stale, however old it looks"
-        );
         assert!(
             !heal_stale_lock(PackedRefs::Checkout(&checkout), "unit test", Duration::ZERO).unwrap(),
             "healing must decline a lock it could not prove abandoned"
@@ -625,25 +475,11 @@ mod tests {
             "the held lock must survive the healing attempt"
         );
 
-        // Nothing changes but the holder going away.
         drop(held);
-        assert!(stale_unheld_lock(&lock, Duration::ZERO).unwrap().is_some());
         assert!(
             heal_stale_lock(PackedRefs::Checkout(&checkout), "unit test", Duration::ZERO).unwrap()
         );
         assert!(!lock.exists(), "a proven-abandoned lock is removed");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn replacement_after_stale_proof_is_not_the_proven_lock() {
-        let temp = TempDir::new().unwrap();
-        let lock = temp.path().join("packed-refs.lock");
-        std::fs::write(&lock, "old\n").unwrap();
-        let identity = stale_unheld_lock(&lock, Duration::ZERO).unwrap().unwrap();
-        std::fs::remove_file(&lock).unwrap();
-        std::fs::write(&lock, "new live writer\n").unwrap();
-        assert!(!lock_identity_matches(&lock, identity).unwrap());
     }
 
     /// A checkout's lock lives in `.git`; a linked worktree shares the common
@@ -730,18 +566,6 @@ mod tests {
             "Revision x does not exist",
             "an unrelated error is quoted verbatim"
         );
-    }
-
-    #[test]
-    fn lsof_field_output_names_the_first_holder() {
-        assert_eq!(
-            parse_lsof_holder("p4242\ncgit\nf3\np99\ncjj\n"),
-            LockHolder {
-                pid: "4242".to_string(),
-                command: "git".to_string()
-            }
-        );
-        assert_eq!(parse_lsof_holder("").pid, "?");
     }
 
     fn checkout_with_lock() -> (TempDir, PathBuf, PathBuf) {

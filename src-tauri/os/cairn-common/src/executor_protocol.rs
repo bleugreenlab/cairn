@@ -4321,7 +4321,28 @@ pub struct LearnedResourceEstimate {
 /// and renders as unmeasured, never as "no GPUs"; an older runner ignores it.
 /// No admission, placement, or load-context input reads it, so mixed versions
 /// cannot disagree about capacity.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 148;
+///
+/// Version 149 (cairn/5057) changes what a claim does with a slot it finds
+/// locked, and adds the report that makes the new outcome visible. A claim now
+/// scans only the slot's private Git directory for locks, where a 148 executor
+/// also scanned the repository's shared common directory, and quarantined the
+/// slot (moving its tree into forensic retention) whenever a repository writer
+/// held `packed-refs.lock` or the user's checkout held its `index.lock`. A lock
+/// proven abandoned in the private directory is removed and the claim goes on;
+/// a live or unprovable one declines the slot, which stays `Idle` in the pool
+/// rather than leaving it. So equivalent machines on 148 and 149 retire
+/// different slots under the same load and report different warm inventory and
+/// usable capacity, the disagreement v144 and v146 were minted for, and the bump
+/// is what carries the change to attached executors through their pull-update.
+/// The wire addition is defaulted: [`ExecutorSubstrateReport::busy_declined_cells`]
+/// names each slot declined [`BUSY_DECLINE_REPORT_THRESHOLD`] or more claims in a
+/// row, with the lock, its age, and its holder, so a slot pinned by a lock this
+/// machine cannot prove abandoned is visible rather than merely absent from
+/// claims. A 148 executor never declines and so reports none, which is the truth
+/// about it, and a 148 runner ignores the field. The same change makes
+/// re-quarantining a persisted slot authority idempotent per condition, which
+/// sends nothing new.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 149;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -10014,6 +10035,10 @@ pub struct ExecutorSubstrateReport {
     /// last. Bounded, and cleared by nothing but a restart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evicted_cells: Vec<EvictedCellReport>,
+    /// Idle slots claims keep declining because someone appears to be writing
+    /// them, listed once a streak reaches [`BUSY_DECLINE_REPORT_THRESHOLD`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub busy_declined_cells: Vec<BusyDeclinedCellReport>,
     /// Commands this executor stopped, most recent last. Bounded, and cleared
     /// by nothing but a restart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -10114,6 +10139,45 @@ pub struct EvictedCellReport {
     pub retirement_failed: bool,
 }
 
+/// How many claims in a row must decline one slot before the executor reports
+/// it. A writer that holds a slot's lock for milliseconds never reaches three
+/// consecutive claims; a lock nothing will release reaches it quickly under
+/// ordinary claim traffic.
+pub const BUSY_DECLINE_REPORT_THRESHOLD: u32 = 3;
+
+/// An idle slot that consecutive claims have declined because something
+/// appears to be writing it.
+///
+/// A declined slot is not quarantined: it stays in the pool, `Idle`, with its
+/// tree intact, because a writer finishes and damage does not. That is right
+/// for a writer and wrong for a lock nothing will ever release, which a
+/// machine that cannot prove a lock abandoned (no `lsof`, or no way to ask on
+/// this platform) leaves in place on every claim. Reported so that state is
+/// visible rather than inferred from a pool whose claims keep landing
+/// elsewhere.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BusyDeclinedCellReport {
+    pub project_id: String,
+    #[serde(rename = "slotId")]
+    pub cell_id: String,
+    pub consecutive_declines: u32,
+    pub first_declined_at_unix_ms: u64,
+    pub last_declined_at_unix_ms: u64,
+    /// The lock the latest decline found, when a lock caused it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_path: Option<String>,
+    /// That lock's age when the latest decline observed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_age_ms: Option<u64>,
+    /// The live process `lsof` named holding it, as `<pid> <command>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+    /// The latest decline's diagnostic, verbatim, so the report and the
+    /// executor's log line cannot tell different stories.
+    pub diagnostic: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutorHealthSnapshot {
@@ -10166,6 +10230,8 @@ pub struct ExecutorHealthSnapshot {
     pub command_processes: CommandProcessHealth,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evicted_cells: Vec<EvictedCellReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub busy_declined_cells: Vec<BusyDeclinedCellReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stopped_commands: Vec<StoppedCommandReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -15256,6 +15322,7 @@ mod tests {
                 resident_processes: ResidentProcessHealth::default(),
                 command_processes: CommandProcessHealth::default(),
                 evicted_cells: Vec::new(),
+                busy_declined_cells: Vec::new(),
                 build_skew: Some(BuildSkew {
                     runner_build_id: "runner".into(),
                     executor_build_id: "executor".into(),

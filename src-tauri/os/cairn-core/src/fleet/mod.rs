@@ -13182,6 +13182,7 @@ fn executor_health_snapshot(
         resident_processes: entry.health.resident_processes.clone(),
         command_processes: entry.health.command_processes.clone(),
         evicted_cells: entry.health.evicted_cells.clone(),
+        busy_declined_cells: entry.health.busy_declined_cells.clone(),
         stopped_commands: entry.health.stopped_commands.clone(),
         build_skew: expected_build_ids
             .get(&entry.identity.executor_id)

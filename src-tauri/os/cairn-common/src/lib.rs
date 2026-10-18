@@ -19,6 +19,7 @@ pub mod imports;
 pub mod install_staging;
 pub mod kernel_lock;
 pub mod link_transport;
+pub mod lock_proof;
 pub mod logging;
 pub mod maintenance;
 pub mod memory;

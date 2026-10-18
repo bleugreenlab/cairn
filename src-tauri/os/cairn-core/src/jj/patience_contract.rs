@@ -128,8 +128,9 @@ fn no_site_keeps_a_private_copy_of_the_healing_ceremony() {
         ] {
             assert!(
                 !source.contains(copied),
-                "{name} contains `{copied}`, which belongs to the stale-lock ceremony in \
-                 jj/packed_refs.rs. The dev/ino revalidation in that ceremony decides \
+                "{name} contains `{copied}`, which belongs to the stale-lock ceremony: \
+                 cairn_common::lock_proof proves a lock abandoned, and jj/packed_refs.rs \
+                 heals through it. The dev/ino revalidation in that proof decides \
                  whether removing a lock is safe; a second copy will drift on it."
             );
         }

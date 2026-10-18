@@ -300,6 +300,7 @@ mod tests {
                 resident_processes: Default::default(),
                 command_processes: Default::default(),
                 evicted_cells: Vec::new(),
+                busy_declined_cells: Vec::new(),
                 build_skew: None,
                 stopped_commands: Vec::new(),
             },

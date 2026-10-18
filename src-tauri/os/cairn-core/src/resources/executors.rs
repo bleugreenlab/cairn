@@ -1044,6 +1044,39 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             ));
         }
     }
+    // Only when there are any. A declined slot is still in the pool and still
+    // Idle, so nothing else on this page distinguishes it from a warm one that
+    // claims simply have not needed; this is the one place that says claims
+    // keep refusing it, and why.
+    if !health.busy_declined_cells.is_empty() {
+        out.push_str("\n## Slots declined at claim\n");
+        for declined in &health.busy_declined_cells {
+            let cause = match &declined.lock_path {
+                Some(lock) => format!(
+                    "Git lock {lock}{}, {}",
+                    declined
+                        .lock_age_ms
+                        .map(|ms| format!(", {} old", duration_ms(ms)))
+                        .unwrap_or_default(),
+                    declined
+                        .holder
+                        .as_deref()
+                        .map(|holder| format!("held by {holder}"))
+                        .unwrap_or_else(|| "no holder could be proven".to_string()),
+                ),
+                None => declined.diagnostic.clone(),
+            };
+            out.push_str(&format!(
+                "- {} ({}): declined {} claims in a row, the first {}; {cause}. Still in the pool, not quarantined; a lock no process holds on a machine that cannot prove it abandoned is the likely cause, and removing it by hand clears this.\n",
+                declined.cell_id,
+                declined.project_id,
+                declined.consecutive_declines,
+                age(executor
+                    .captured_at_unix_ms
+                    .saturating_sub(declined.first_declined_at_unix_ms)),
+            ));
+        }
+    }
     out.push_str(&render_stopped_commands(
         &health.stopped_commands,
         &capabilities.os,
@@ -4139,6 +4172,7 @@ mod tests {
                 resident_processes: Default::default(),
                 command_processes: Default::default(),
                 evicted_cells: Vec::new(),
+                busy_declined_cells: Vec::new(),
                 build_skew: None,
                 stopped_commands: Vec::new(),
             },
@@ -6078,6 +6112,91 @@ mod tests {
             rendered.contains("STILL ON DISK: retirement failed"),
             "{rendered}"
         );
+    }
+
+    /// A slot claims keep declining is still in the pool, so the page says so
+    /// plainly, with the lock, its age, and its holder, or the diagnostic when
+    /// no lock was named.
+    #[test]
+    fn a_slot_declined_at_claim_names_its_lock_and_stays_in_the_pool() {
+        let mut executor = inspection("bglab-mac", false);
+        assert!(
+            !render_executor(&executor).contains("## Slots declined at claim"),
+            "a machine that declined nothing says nothing"
+        );
+
+        executor.health.busy_declined_cells =
+            vec![cairn_common::executor_protocol::BusyDeclinedCellReport {
+                project_id: "cairn".into(),
+                cell_id: "slot-42".into(),
+                consecutive_declines: 5,
+                first_declined_at_unix_ms: CAPTURED_AT - 240_000,
+                last_declined_at_unix_ms: CAPTURED_AT - 10_000,
+                lock_path: Some("/r/.git/worktrees/slot-42/index.lock".into()),
+                lock_age_ms: Some(252_000),
+                holder: Some("812 git".into()),
+                diagnostic: "claim found live Git lock /r/.git/worktrees/slot-42/index.lock (held by 812 git)".into(),
+            }];
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("## Slots declined at claim"),
+            "{rendered}"
+        );
+        let line = rendered
+            .lines()
+            .find(|line| line.starts_with("- slot-42 (cairn)"))
+            .unwrap_or_else(|| panic!("{rendered}"));
+        assert!(
+            line.contains("declined 5 claims in a row, the first 4m ago;"),
+            "{line}"
+        );
+        assert!(
+            line.contains("Git lock /r/.git/worktrees/slot-42/index.lock"),
+            "{line}"
+        );
+        assert!(
+            line.contains("index.lock, 4.2m old, held by 812 git"),
+            "{line}"
+        );
+        assert!(line.contains("held by 812 git"), "{line}");
+        assert!(
+            line.contains("Still in the pool, not quarantined"),
+            "{line}"
+        );
+
+        let declined = &mut executor.health.busy_declined_cells[0];
+        declined.holder = None;
+        assert!(render_executor(&executor).contains("no holder could be proven"));
+
+        // A decline from a git step's contention may name no lock at all; the
+        // diagnostic is then the whole account.
+        let declined = &mut executor.health.busy_declined_cells[0];
+        declined.lock_path = None;
+        declined.lock_age_ms = None;
+        declined.diagnostic =
+            "switch idle pool slot: The lock for the packed-ref file could not be obtained".into();
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("the first 4m ago; switch idle pool slot: The lock for the packed-ref file could not be obtained."),
+            "{rendered}"
+        );
+    }
+
+    /// An older executor's report carries no declined slots, and reads as none.
+    #[test]
+    fn a_report_without_declined_slots_decodes_to_none() {
+        let mut report = serde_json::to_value(
+            cairn_common::executor_protocol::ExecutorSubstrateReport::default(),
+        )
+        .unwrap();
+        assert!(
+            report.get("busyDeclinedCells").is_none(),
+            "an empty list is not sent"
+        );
+        report.as_object_mut().unwrap().remove("busyDeclinedCells");
+        let decoded: cairn_common::executor_protocol::ExecutorSubstrateReport =
+            serde_json::from_value(report).unwrap();
+        assert!(decoded.busy_declined_cells.is_empty());
     }
 
     /// A stop names the command, the evidence that justified it, and anything
