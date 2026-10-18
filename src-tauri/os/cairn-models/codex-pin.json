@@ -1,14 +1,14 @@
 {
   "integration": 1,
-  "version": "0.153.3",
-  "tag": "rust-v0.153.3",
-  "reason": "Verified against Cairn's app-server integration: thread goals, turn/interrupt, turn/completed error status, MCP at 2025-06-18 (docs/backends.md, docs/mcp-server.md).",
+  "version": "0.163.0",
+  "tag": "rust-v0.163.0",
+  "reason": "Upstream stable bump from 0.153.3 with integration 1 unchanged; app-server contract verified by the codex-contract lanes.",
   "packages": {
-    "aarch64-apple-darwin": { "sha256": "1101ce8b7f9aaf598120bf14ff260c5f591eaa2c611cf8738070529e60ae8105", "size": 111544763 },
-    "x86_64-apple-darwin": { "sha256": "a387e1b26f68ee9c0c6cce3645ed82c2958876db74c76b49a94f81a5e4d17522", "size": 121086850 },
-    "aarch64-unknown-linux-musl": { "sha256": "53d4604d339cdc87f1c396aca80c2addc8e092987b1b15c5f34dcda1fa54748a", "size": 117230996 },
-    "x86_64-unknown-linux-musl": { "sha256": "47bb1fb36fb1dbd5fe1af3eb0db422ffb4c3c38d9c1762c7618a9bed46c44a63", "size": 126189723 },
-    "aarch64-pc-windows-msvc": { "sha256": "fd082d32e8cb99afa44b34b6b2714589abde072a0acd31278c25604eff336c1a", "size": 126183173 },
-    "x86_64-pc-windows-msvc": { "sha256": "7db4c2a12dadbf39db73dd13f058fb14e03c83133e51825b7ad7c708e40cea31", "size": 136063174 }
+    "aarch64-apple-darwin": { "sha256": "b0344fc2e41f15e0071147e5869008047b8ff4bf2c4a8897975d3bae3f103b34", "size": 133412281 },
+    "x86_64-apple-darwin": { "sha256": "0c182d6194da7003943678dc87866b54b3dee719edaf8d092f304affbc6b57d1", "size": 144982749 },
+    "aarch64-unknown-linux-musl": { "sha256": "9d8ecf2d19d3e184877983902d6c85de48b3888dcb72c382a8a0c975845927fb", "size": 149800043 },
+    "x86_64-unknown-linux-musl": { "sha256": "582646c6bf0561eb0de540f7fc85b9121b0091a826bc6e96830b7f1722122182", "size": 159424486 },
+    "aarch64-pc-windows-msvc": { "sha256": "6bbada389cd1ce26783e837fd9ba4711fb4542f432044f7955139e27e27acfde", "size": 150223371 },
+    "x86_64-pc-windows-msvc": { "sha256": "901028b285614a9974f431f9d9f6534b3e5ed8d62eba4ba64f4762c00f040522", "size": 162230206 }
   }
 }
