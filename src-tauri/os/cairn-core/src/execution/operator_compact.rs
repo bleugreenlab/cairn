@@ -535,7 +535,9 @@ fn tear_down(
 
     // After the kill, so a batch dispatched in the final moments is caught too.
     for job in &live.jobs {
-        report.batches_cancelled += orch.fleet.cancel_job_requests(job);
+        report.batches_cancelled += orch
+            .fleet
+            .cancel_job_requests(job, crate::fleet::CancelCause::OperatorCompact);
     }
 
     // Anything that went live between the first sweep and the kill — a goal

@@ -1727,6 +1727,7 @@ fn fixers_superseded_by_a_later_fixer(
 
 fn split_write_check_batch_outcome(
     outcome: CellOutcome,
+    account: &crate::fleet::CellAccount,
     expected: usize,
 ) -> (
     Vec<Result<CheckExecResult, CheckExecutionFailure>>,
@@ -1749,7 +1750,9 @@ fn split_write_check_batch_outcome(
                         .map(|item| {
                             let provenance = metadata.for_batch_item(&item);
                             if let Some(stop) = &item.stop {
-                                return Err(stopped_command_failure(stop, &item.body, provenance));
+                                return Err(stopped_command_failure(
+                                    stop, &item.body, provenance, account,
+                                ));
                             }
                             let mut output = item.body;
                             append_sandbox_denial_evidence(&mut output, &item.sandbox_denials);
@@ -1793,7 +1796,7 @@ fn split_write_check_batch_outcome(
         // The composed failure travels whole: flattening it to text here would
         // discard the operator half before it ever reaches the log.
         other => {
-            let failure = check_result_from_cell_outcome(other, None)
+            let failure = check_result_from_cell_outcome(other, account, None)
                 .err()
                 .unwrap_or_else(|| {
                     CheckExecutionFailure::substrate(
@@ -2130,6 +2133,25 @@ fn report_cleanup_failure_without_discarding_verdicts(error: &str) {
     );
 }
 
+/// Remove a batch's sealed ref without holding its verdicts back.
+///
+/// The removal takes the managed store lock, which another writer can hold
+/// for minutes; awaited on the result path, that wait delayed every lane's
+/// outcome and inflated its recorded duration by as much. The verdicts never
+/// depended on it, and a failed removal is already left to the retry task.
+fn release_check_commit_ref(
+    orch: &Orchestrator,
+    store_dir: std::path::PathBuf,
+    mut temporary_ref: TemporaryCheckRef,
+) {
+    let orch = orch.clone();
+    tokio::spawn(async move {
+        if let Err(error) = cleanup_check_commit_ref(&orch, &store_dir, &mut temporary_ref).await {
+            report_cleanup_failure_without_discarding_verdicts(&error);
+        }
+    });
+}
+
 async fn cleanup_check_commit_ref(
     orch: &Orchestrator,
     store_dir: &Path,
@@ -2401,6 +2423,10 @@ pub(crate) async fn execute_job_verdict(
             // diagnostic instead of pointing at an operator-only log.
             CheckExecutionFailure::Suppressed(suppressed) => suppressed_check_message(&suppressed),
             CheckExecutionFailure::NotPlaceable(reason) => reason,
+            CheckExecutionFailure::Cancelled(cause) => format!(
+                "Cairn cancelled this check before it produced a verdict: {}.",
+                cause.sentence()
+            ),
         })?;
     Ok(JobVerdictResult {
         coordinate,
@@ -3065,7 +3091,7 @@ async fn submit_single_planned_check_batch(
         ));
     }
     let request_id = uuid::Uuid::new_v4().to_string();
-    let mut temporary_ref = match publish_check_commit_ref(
+    let temporary_ref = match publish_check_commit_ref(
         orch,
         Path::new(&batch.repository),
         &batch.store_dir,
@@ -3117,7 +3143,7 @@ async fn submit_single_planned_check_batch(
         // The queued row says what it is queued BEHIND. "Waiting for build
         // slot" told an operator watching their own fleet only that Cairn was
         // waiting on Cairn, which is the one thing they could already see.
-        let outcome = orch
+        let executed = orch
             .fleet
             .submit_write_check_batch(
                 orch,
@@ -3127,14 +3153,11 @@ async fn submit_single_planned_check_batch(
                 batch.status_board.clone(),
             )
             .await;
-        let (item_outcomes, delta) = split_write_check_batch_outcome(outcome, indexed.len());
+        let (item_outcomes, delta) =
+            split_write_check_batch_outcome(executed.outcome, &executed.account, indexed.len());
         let mut results = indexed.iter().copied().zip(item_outcomes).collect();
         stamp_substrate_elapsed(&mut results, submitted_at.elapsed());
-        if let Err(error) =
-            cleanup_check_commit_ref(orch, &batch.store_dir, &mut temporary_ref).await
-        {
-            report_cleanup_failure_without_discarding_verdicts(&error);
-        }
+        release_check_commit_ref(orch, batch.store_dir.clone(), temporary_ref);
         return Ok(PlannedCheckBatchOutcome {
             results,
             request: Some(request),
@@ -3142,23 +3165,15 @@ async fn submit_single_planned_check_batch(
             store_dir: Some(batch.store_dir),
         });
     };
-    if let Err(error) = cleanup_check_commit_ref(orch, &batch.store_dir, &mut temporary_ref).await {
-        report_cleanup_failure_without_discarding_verdicts(&error);
-    }
+    // Measured and answered before the sealed ref is released, so a lane's
+    // outcome is reported at its own time.
     let mut results = indexed
         .into_iter()
         .zip(submitted)
-        .map(|(index, submitted)| {
-            let result = match submitted {
-                Ok(submitted) => {
-                    check_result_from_cell_outcome(submitted.outcome, Some(submitted.publication))
-                }
-                Err(outcome) => check_result_from_cell_outcome(outcome, None),
-            };
-            (index, result)
-        })
+        .map(|(index, delivery)| (index, check_result_from_delivery(delivery)))
         .collect();
     stamp_substrate_elapsed(&mut results, submitted_at.elapsed());
+    release_check_commit_ref(orch, batch.store_dir.clone(), temporary_ref);
     Ok(PlannedCheckBatchOutcome {
         results,
         request: Some(request),
@@ -3281,8 +3296,12 @@ pub(crate) enum SubstrateFailureShape {
     /// Execution capacity never became available before the deadline. The one
     /// condition time alone relieves, and so the only one worth retrying.
     Capacity,
-    /// Contact with the machine that would have run the check was lost.
+    /// Contact with the machine that claimed the check was lost. Only said
+    /// when a machine claimed it: before a claim there was no contact to lose.
     MachineUnreachable,
+    /// The fleet had no reachable machine to hand the check to. What an
+    /// executor-unavailable refusal means before any machine claimed the work.
+    NoReachableMachine,
     /// The machine is being taken out of service and accepts no new work.
     Draining,
     /// Nothing in the fleet matches what this check requires.
@@ -3303,8 +3322,10 @@ pub(crate) enum SubstrateFailureShape {
     OutcomeUnknown,
     /// Cairn's own storage for the check failed.
     Storage,
-    /// Cairn cancelled the check before it produced a verdict.
-    Cancelled,
+    /// Cairn's runner lost track of the check's result between the execution
+    /// and the requester. Never a machine or a link: every path that ends a
+    /// wait is meant to answer it, so reaching this is a bug in Cairn.
+    RunnerFault,
     /// The check ran, then its process tree stopped making progress — no
     /// output and no meaningful CPU for the cadence's silence bound — and its
     /// executor stopped it. Distinct from `Result` because the outcome is
@@ -3321,9 +3342,8 @@ impl SubstrateFailureShape {
             Self::Capacity => {
                 "Cairn could not obtain the capacity to run this check before its deadline."
             }
-            Self::MachineUnreachable => {
-                "Cairn lost contact with the machine that would have run this check."
-            }
+            Self::MachineUnreachable => "Cairn lost contact with the machine running this check.",
+            Self::NoReachableMachine => "Cairn had no reachable machine to hand this check to.",
             Self::Draining => {
                 "The machine that runs checks is being taken out of service, so this check did not start."
             }
@@ -3341,7 +3361,9 @@ impl SubstrateFailureShape {
                 "Cairn lost track of this check on the machine it was handed to, so whether it ran is unknown."
             }
             Self::Storage => "Cairn's own storage for this check failed.",
-            Self::Cancelled => "Cairn cancelled this check before it produced a verdict.",
+            Self::RunnerFault => {
+                "Cairn's runner lost track of this check's result, which is a bug in Cairn rather than a machine failure."
+            }
             Self::CommandStalled => {
                 "This check stopped making progress, so Cairn stopped it before it produced a verdict."
             }
@@ -3463,6 +3485,22 @@ fn tail_lines(text: &str, budget: usize) -> String {
     }
 }
 
+/// What an executor's refusal to start a cell says about the check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoStart {
+    /// A substrate condition, in the shape an agent is told.
+    Substrate(SubstrateFailureShape),
+    /// Cairn itself ended the check, so nothing failed.
+    Cancelled(crate::fleet::CancelCause),
+}
+
+#[cfg(test)]
+impl NoStart {
+    fn is_transient(self) -> bool {
+        matches!(self, Self::Substrate(shape) if shape.is_transient())
+    }
+}
+
 /// The condition class behind an executor's refusal to start a cell.
 ///
 /// Exhaustive over [`CellUnavailableReason`] on purpose: a new reason cannot be
@@ -3472,48 +3510,49 @@ fn tail_lines(text: &str, budget: usize) -> String {
 /// question about the same input — whether the fleet should keep waiting — and
 /// the two are deliberately separate: what the fleet does next and what the
 /// agent is told are not the same decision.
-fn no_start_shape(
-    reason: &cairn_common::executor_protocol::CellUnavailableReason,
-) -> SubstrateFailureShape {
+fn no_start(reason: &cairn_common::executor_protocol::CellUnavailableReason) -> NoStart {
     use cairn_common::executor_protocol::{AdmissionRejectionReason, CellUnavailableReason};
+    use NoStart::Substrate;
+    use SubstrateFailureShape as Shape;
     match reason {
         CellUnavailableReason::Deadline {
             host_pressure,
             substrate,
-        } => deadline_shape(host_pressure.as_ref(), substrate.as_ref()),
-        CellUnavailableReason::AdmissionRejected { reason } => match reason {
-            AdmissionRejectionReason::QueueFull => SubstrateFailureShape::Capacity,
-            AdmissionRejectionReason::Draining => SubstrateFailureShape::Draining,
-            AdmissionRejectionReason::StorageCleanupFailed => SubstrateFailureShape::Storage,
+        } => Substrate(deadline_shape(host_pressure.as_ref(), substrate.as_ref())),
+        CellUnavailableReason::AdmissionRejected { reason } => Substrate(match reason {
+            AdmissionRejectionReason::QueueFull => Shape::Capacity,
+            AdmissionRejectionReason::Draining => Shape::Draining,
+            AdmissionRejectionReason::StorageCleanupFailed => Shape::Storage,
             // A reservation larger than the machine's whole budget is not a
             // wait: no amount of idling makes the host bigger.
-            AdmissionRejectionReason::RequestTooLarge => SubstrateFailureShape::NoMachine,
-        },
-        CellUnavailableReason::ExecutorUnavailable => SubstrateFailureShape::MachineUnreachable,
-        CellUnavailableReason::NoMatchingExecutor => SubstrateFailureShape::NoMachine,
+            AdmissionRejectionReason::RequestTooLarge => Shape::NoMachine,
+        }),
+        CellUnavailableReason::ExecutorUnavailable => Substrate(Shape::MachineUnreachable),
+        CellUnavailableReason::NoMatchingExecutor => Substrate(Shape::NoMachine),
         // The pinned machine can never hold the work's measured memory: the
         // pin, not the fleet, is what left no machine to run it on.
-        CellUnavailableReason::HomeCannotHold { .. } => SubstrateFailureShape::NoMachine,
+        CellUnavailableReason::HomeCannotHold { .. } => Substrate(Shape::NoMachine),
         // The runner withdrew the work because the runner itself was stopping.
-        // That is Cairn ending the check, not a machine lost or missing; naming
-        // either was how a runner restart came to be charged to the substrate.
-        CellUnavailableReason::RunnerStopping { .. } => SubstrateFailureShape::Cancelled,
+        // That is Cairn ending the check, not a machine lost or missing, and
+        // not a substrate failure either: charged to the substrate, a runner
+        // restart advanced every lane's infrastructure streak.
+        CellUnavailableReason::RunnerStopping { .. } => {
+            NoStart::Cancelled(crate::fleet::CancelCause::RunnerStopping)
+        }
         // What the machine said last cannot settle whether the check ran: the
         // runner reads its account between polls, an item can start and end
         // between two reads, and a completion record covers refusals too.
-        CellUnavailableReason::ClaimedAttemptSilent { .. } => SubstrateFailureShape::OutcomeUnknown,
+        CellUnavailableReason::ClaimedAttemptSilent { .. } => Substrate(Shape::OutcomeUnknown),
         CellUnavailableReason::Provisioning
         | CellUnavailableReason::Checkout
         | CellUnavailableReason::Preparation
-        | CellUnavailableReason::PreparationCommandNotFound { .. } => {
-            SubstrateFailureShape::Preparation
-        }
-        CellUnavailableReason::SlotUnhealthy => SubstrateFailureShape::EnvironmentRetired,
+        | CellUnavailableReason::PreparationCommandNotFound { .. } => Substrate(Shape::Preparation),
+        CellUnavailableReason::SlotUnhealthy => Substrate(Shape::EnvironmentRetired),
         // The environment was ready and the command still could not be launched,
         // which is Cairn's own machinery failing rather than the machine's state.
         CellUnavailableReason::Spawn
         | CellUnavailableReason::RunnerContext
-        | CellUnavailableReason::ObjectInfrastructure(_) => SubstrateFailureShape::Dispatch,
+        | CellUnavailableReason::ObjectInfrastructure(_) => Substrate(Shape::Dispatch),
     }
 }
 
@@ -3548,12 +3587,13 @@ fn infra_repair_domain(
             SubstrateFailureShape::Dispatch
             | SubstrateFailureShape::Capacity
             | SubstrateFailureShape::MachineUnreachable
+            | SubstrateFailureShape::NoReachableMachine
             | SubstrateFailureShape::Preparation
             | SubstrateFailureShape::EnvironmentRetired
             | SubstrateFailureShape::Result
             | SubstrateFailureShape::OutcomeUnknown
             | SubstrateFailureShape::Storage
-            | SubstrateFailureShape::Cancelled => InfraRepairDomain::Head,
+            | SubstrateFailureShape::RunnerFault => InfraRepairDomain::Head,
             // A stalled command is the suite's own: some test or step in it
             // waited on something that never came. That is a defect in the
             // command at this head, owned by whoever owns the suite, and no
@@ -3718,6 +3758,8 @@ pub(crate) struct SubstrateFailure {
     /// the whole batch settles, so the check's own timer reads zero however long
     /// it actually waited or ran; this is the time it really spent.
     elapsed_ms: Option<i64>,
+    /// The machine that had claimed the check when it failed, when one had.
+    placement: Option<Box<crate::fleet::CellPlacement>>,
     /// The executor's account of the command this failure ended, when one ran:
     /// a command the executor stopped still ran somewhere, on some platform.
     /// Which platform decides which stall counter it is charged to, and the
@@ -3735,6 +3777,30 @@ impl SubstrateFailure {
             waited_on: None,
             elapsed_ms: None,
             provenance: None,
+            placement: None,
+        }
+    }
+
+    /// Record the machine that had claimed the check.
+    pub(crate) fn on_machine(mut self, placement: crate::fleet::CellPlacement) -> Self {
+        self.placement = Some(Box::new(placement));
+        self
+    }
+
+    pub(crate) fn placement(&self) -> Option<&crate::fleet::CellPlacement> {
+        self.placement.as_deref()
+    }
+
+    /// The sentence that opens the agent's message: the shape's own, naming
+    /// the machine when the failure is a lost link to one.
+    fn lead(&self) -> std::borrow::Cow<'static, str> {
+        match (&self.placement, self.shape) {
+            (Some(placement), SubstrateFailureShape::MachineUnreachable) => format!(
+                "Cairn lost contact with {}, the machine running this check.",
+                placement.name
+            )
+            .into(),
+            _ => self.shape.lead().into(),
         }
     }
 
@@ -3787,10 +3853,10 @@ impl SubstrateFailure {
         let explanation = match &self.waited_on {
             Some(waited_on) => format!(
                 "{} {}. {SUBSTRATE_FAILURE_CONSEQUENCE}",
-                self.shape.lead(),
+                self.lead(),
                 bounded_attribution(waited_on, CAPACITY_ATTRIBUTION_CHARS)
             ),
-            None => format!("{} {SUBSTRATE_FAILURE_CONSEQUENCE}", self.shape.lead()),
+            None => format!("{} {SUBSTRATE_FAILURE_CONSEQUENCE}", self.lead()),
         };
         let prefix = format!("{explanation}\nFailing step:\n");
         let budget = SUBSTRATE_AGENT_MESSAGE_CHARS.saturating_sub(prefix.chars().count());
@@ -3826,6 +3892,11 @@ pub(crate) enum CheckExecutionFailure {
     /// failure preceded it. The sentence names what was asked for and what the
     /// fleet has instead.
     NotPlaceable(String),
+    /// Cairn cancelled the check before it produced a verdict, for a stated
+    /// cause. Not an execution result: nothing about the tree, the machine, or
+    /// the substrate was learned, so like a suppression it is never stored or
+    /// counted, and it moves no infrastructure streak.
+    Cancelled(crate::fleet::CancelCause),
 }
 
 impl CheckExecutionFailure {
@@ -3972,6 +4043,11 @@ pub enum CheckFailureKind {
     /// Nothing ran: this is the absence of a verdict until such a machine
     /// attaches, not a failure of anything.
     NotPlaceable,
+    /// Cairn cancelled the check before it produced a verdict: its job was
+    /// stopped, a newer request replaced it, the runner was stopping. Neither
+    /// a verdict about the code nor a fact about the substrate, so it is never
+    /// stored and renders as unverified.
+    Cancelled,
 }
 
 impl CheckFailureKind {
@@ -3994,6 +4070,14 @@ impl CheckFailureKind {
         )
     }
 
+    /// Whether a failure of this kind says something about the evaluated
+    /// change — whether it is a red. Distinct from [`Self::is_infrastructure`],
+    /// which asks whether the substrate is failing: a cancellation is neither,
+    /// so it must stay out of both the streak and the red.
+    pub(crate) fn is_verdict_about_the_code(self) -> bool {
+        !self.is_infrastructure() && self != CheckFailureKind::Cancelled
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             CheckFailureKind::TimedOut => "timed_out",
@@ -4006,6 +4090,7 @@ impl CheckFailureKind {
             CheckFailureKind::Capacity => "capacity",
             CheckFailureKind::RunnerError => "runner_error",
             CheckFailureKind::NotPlaceable => "not_placeable",
+            CheckFailureKind::Cancelled => "cancelled",
         }
     }
 
@@ -4024,6 +4109,7 @@ impl CheckFailureKind {
             "capacity" => Some(CheckFailureKind::Capacity),
             "runner_error" => Some(CheckFailureKind::RunnerError),
             "not_placeable" => Some(CheckFailureKind::NotPlaceable),
+            "cancelled" => Some(CheckFailureKind::Cancelled),
             _ => None,
         }
     }
@@ -4050,6 +4136,7 @@ impl CheckFailureKind {
             CheckFailureKind::NotPlaceable => {
                 "not placeable — no machine in the fleet can run it".to_string()
             }
+            CheckFailureKind::Cancelled => "cancelled".to_string(),
         }
     }
 }
@@ -6082,9 +6169,9 @@ impl CheckOutcome {
     pub(crate) fn is_genuine_failure(&self) -> bool {
         !self.passed
             && self.suppressed_after.is_none()
-            && !self
+            && self
                 .failure_kind
-                .is_some_and(CheckFailureKind::is_infrastructure)
+                .is_none_or(CheckFailureKind::is_verdict_about_the_code)
     }
 }
 
@@ -6958,6 +7045,13 @@ where
                         board.transition(index, "unverified", summary_annotation(&outcome));
                         return (index, outcome);
                     }
+                    // Cairn ended the check itself. Nothing was evaluated, and
+                    // nothing failed, so nothing is recorded or counted.
+                    Err(CheckExecutionFailure::Cancelled(cause)) => {
+                        let outcome = record_cancelled_check(job_id, &plan.name, cause);
+                        board.transition(index, "unverified", summary_annotation(&outcome));
+                        return (index, outcome);
+                    }
                     other => other,
                 };
 
@@ -7012,7 +7106,8 @@ where
                     }
                     Err(
                         CheckExecutionFailure::Suppressed(_)
-                        | CheckExecutionFailure::NotPlaceable(_),
+                        | CheckExecutionFailure::NotPlaceable(_)
+                        | CheckExecutionFailure::Cancelled(_),
                     ) => {
                         unreachable!("a refused submission returns above")
                     }
@@ -7221,7 +7316,19 @@ where
                         (recorded, false, None)
                     }
                     role => {
-                        let legacy_write = CheckResultCacheWrite {
+                        // A failure with no executor provenance may still have
+                        // had a machine: the one that claimed it. Its rows name
+                        // that machine, so a lost link is attributable.
+                        let placed_on = provenance
+                            .is_none()
+                            .then(|| {
+                                substrate_failure
+                                    .as_ref()
+                                    .and_then(SubstrateFailure::placement)
+                                    .cloned()
+                            })
+                            .flatten();
+                        let mut legacy_write = CheckResultCacheWrite {
                             project_id: project_id.to_string(),
                             defined_by_commit_sha: Some(commit.defined_by.to_string()),
                             tree_hash: tree_hash.to_string(),
@@ -7267,9 +7374,14 @@ where
                                 .as_ref()
                                 .and_then(|meta| meta.verdict_environment_hash.clone()),
                         };
+                        if let Some(placement) = &placed_on {
+                            legacy_write.executor_id = Some(placement.executor_id.clone());
+                            legacy_write.executor_connection_generation =
+                                Some(placement.generation as i64);
+                        }
                         let reuse =
                             check_reuse_decision(&plan.command, failure_kind, parsed.as_ref());
-                        let observation = fresh_observation_write(
+                        let mut observation = fresh_observation_write(
                             project_id,
                             &sealed_coordinates[index],
                             plan,
@@ -7289,6 +7401,11 @@ where
                                     .and_then(|meta| meta.verdict_platform.as_deref()),
                             ),
                         );
+                        if let Some(placement) = placed_on {
+                            observation.executor_id = Some(placement.executor_id);
+                            observation.executor_connection_generation =
+                                Some(placement.generation as i64);
+                        }
                         let identity = crate::execution::cache::RecordedCheckObservation {
                             id: observation.id.clone(),
                             public_handle: observation.public_handle.clone(),
@@ -7609,6 +7726,48 @@ pub(crate) fn record_unplaceable_check(
     }
 }
 
+/// Account for a check Cairn cancelled before it produced a verdict.
+///
+/// Nothing is written. No observation, because nothing was evaluated; no cache
+/// row, because a cancellation says nothing about the tree or the machine, so it
+/// must not advance an infrastructure streak, claim an escalation, or replace
+/// the last real verdict on the board. The next wave for this tree runs it.
+fn record_cancelled_check(
+    job_id: &str,
+    check_name: &str,
+    cause: crate::fleet::CancelCause,
+) -> CheckOutcome {
+    log::info!(
+        "check {check_name} for job {job_id}: cancelled: {}",
+        cause.sentence()
+    );
+    CheckOutcome {
+        name: check_name.to_string(),
+        passed: false,
+        exit_code: None,
+        failure_kind: Some(CheckFailureKind::Cancelled),
+        parsed: None,
+        output_tail: format!(
+            "Cairn cancelled this check before it produced a verdict: {}. No verdict was recorded; it runs again the next time checks run for this tree.",
+            cause.sentence()
+        ),
+        cached: false,
+        duration_ms: 0,
+        suppressed_after: None,
+        recorded: None,
+        not_recorded: Some(format!("cancelled: {}", cause.sentence())),
+    }
+}
+
+/// Whether this outcome holds no verdict at all — the check never ran, or Cairn
+/// ended it — so a summary must not mark it red.
+fn holds_no_verdict(outcome: &CheckOutcome) -> bool {
+    matches!(
+        outcome.failure_kind,
+        Some(CheckFailureKind::NotPlaceable | CheckFailureKind::Cancelled)
+    )
+}
+
 /// Render the inline pass/fail summary appended to the originating tool result.
 /// The first line is the compact per-check status
 /// (`\u{2713} frontend \u{b7} \u{2717} typecheck (exit 1)`); each failing check
@@ -7619,8 +7778,8 @@ pub(crate) fn format_check_summary(results: &[CheckOutcome]) -> String {
     let header = results
         .iter()
         .map(|o| {
-            let mark = if o.failure_kind == Some(CheckFailureKind::NotPlaceable) {
-                // Nothing ran, so there is no red to mark.
+            let mark = if holds_no_verdict(o) {
+                // No verdict, so there is no red to mark.
                 '\u{26a0}'
             } else if !o.passed {
                 '\u{2717}'
@@ -7639,10 +7798,7 @@ pub(crate) fn format_check_summary(results: &[CheckOutcome]) -> String {
         .join(" \u{b7} ");
 
     let mut out = header;
-    for o in results
-        .iter()
-        .filter(|o| !o.passed && o.failure_kind != Some(CheckFailureKind::NotPlaceable))
-    {
+    for o in results.iter().filter(|o| !o.passed && !holds_no_verdict(o)) {
         if let Some(detail) = format_check_detail(o) {
             out.push_str("\n\n");
             out.push_str(&detail);
@@ -7706,7 +7862,13 @@ fn summary_annotation(o: &CheckOutcome) -> Option<String> {
     } else if let Some(kind) = o.failure_kind {
         // A classified death renders as itself, never a zero-failure assertion
         // count the agent would chase into tests that never failed.
-        if kind == CheckFailureKind::RunnerError {
+        if kind == CheckFailureKind::Cancelled {
+            parts.push(
+                o.not_recorded
+                    .clone()
+                    .unwrap_or_else(|| kind.describe(o.duration_ms)),
+            );
+        } else if kind == CheckFailureKind::RunnerError {
             let passed = o.parsed.as_ref().map(|parsed| parsed.passed).unwrap_or(0);
             if passed == 0 {
                 parts.push("test runner failed before reporting tests".to_string());
@@ -7865,17 +8027,11 @@ async fn submit_review_check(
                 .implicating_build_service(),
         ));
     }
-    let submitted = match orch
-        .fleet
-        .submit_pure_verdict(orch, result_identity, request)
-        .await
-    {
-        Ok(submitted) => submitted,
-        Err(outcome) => {
-            return Err(check_result_from_cell_outcome(outcome, None).unwrap_err());
-        }
-    };
-    check_result_from_cell_outcome(submitted.outcome, Some(submitted.publication))
+    check_result_from_delivery(
+        orch.fleet
+            .submit_pure_verdict(orch, result_identity, request)
+            .await,
+    )
 }
 
 /// Append the shared build-cache service's advisory to a verdict — but only for
@@ -8006,6 +8162,7 @@ fn stopped_command_failure(
     stop: &cairn_common::executor_protocol::CommandStop,
     output: &str,
     provenance: cairn_common::executor_protocol::CellExecutionMeta,
+    account: &crate::fleet::CellAccount,
 ) -> CheckExecutionFailure {
     let failure = match stop {
         cairn_common::executor_protocol::CommandStop::Silent { .. } => SubstrateFailure::new(
@@ -8017,16 +8174,69 @@ fn stopped_command_failure(
                 stop.describe()
             ),
         ),
-        cairn_common::executor_protocol::CommandStop::Cancelled => SubstrateFailure::new(
-            SubstrateFailureShape::Cancelled,
-            "cell request was cancelled while its command ran",
-        ),
+        // Cairn ended the command itself: a cancellation, not a substrate
+        // failure, so nothing is charged to the platform it ran on.
+        cairn_common::executor_protocol::CommandStop::Cancelled => {
+            return CheckExecutionFailure::Cancelled(cancel_cause(account));
+        }
     };
     CheckExecutionFailure::Substrate(failure.ran_as(provenance))
 }
 
+/// The cause Cairn recorded for a cancellation the executor reported. The
+/// executor's outcome carries none, and one that went unrecorded is still a
+/// cancellation rather than a failure.
+fn cancel_cause(account: &crate::fleet::CellAccount) -> crate::fleet::CancelCause {
+    account
+        .cancel_cause
+        .unwrap_or(crate::fleet::CancelCause::Unrecorded)
+}
+
+/// What a coalesced wait delivered, as a check result.
+fn check_result_from_delivery(
+    delivery: crate::fleet::CoalescedDelivery,
+) -> Result<CheckExecResult, CheckExecutionFailure> {
+    use crate::fleet::CoalescedWaitError;
+    match delivery {
+        Ok(submitted) => check_result_from_cell_outcome(
+            submitted.outcome,
+            &submitted.account,
+            Some(submitted.publication),
+        ),
+        Err(CoalescedWaitError::Refused(outcome)) => {
+            check_result_from_cell_outcome(*outcome, &crate::fleet::CellAccount::default(), None)
+        }
+        Err(CoalescedWaitError::Cancelled(cause)) => Err(CheckExecutionFailure::Cancelled(cause)),
+        Err(CoalescedWaitError::LeaderVanished) => Err(CheckExecutionFailure::substrate(
+            SubstrateFailureShape::RunnerFault,
+            "the shared execution's leader ended without publishing a terminal outcome",
+        )),
+        Err(CoalescedWaitError::Orphaned) => Err(CheckExecutionFailure::substrate(
+            SubstrateFailureShape::RunnerFault,
+            "the coalesced result channel closed with nothing sent",
+        )),
+    }
+}
+
 fn check_result_from_cell_outcome(
     outcome: CellOutcome,
+    account: &crate::fleet::CellAccount,
+    publication: Option<crate::fleet::PublicationCoordination>,
+) -> Result<CheckExecResult, CheckExecutionFailure> {
+    match (
+        outcome_result(outcome, account, publication),
+        &account.placement,
+    ) {
+        (Err(CheckExecutionFailure::Substrate(failure)), Some(placement)) => Err(
+            CheckExecutionFailure::Substrate(failure.on_machine(placement.clone())),
+        ),
+        (result, _) => result,
+    }
+}
+
+fn outcome_result(
+    outcome: CellOutcome,
+    account: &crate::fleet::CellAccount,
     publication: Option<crate::fleet::PublicationCoordination>,
 ) -> Result<CheckExecResult, CheckExecutionFailure> {
     match outcome {
@@ -8036,6 +8246,7 @@ fn check_result_from_cell_outcome(
             metadata.stop.as_ref().expect("guarded"),
             &output,
             metadata.clone(),
+            account,
         )),
         CellOutcome::Completed {
             exit_code,
@@ -8119,23 +8330,32 @@ fn check_result_from_cell_outcome(
                 format!("build-slot deadline ({}) — {diagnostic}", facts.join(", ")),
             ))
         }
-        // The diagnostic already names the machine, the silence, and what the
-        // machine said last; a `Debug` rendering of the reason would only
-        // repeat it less readably.
-        CellOutcome::Unavailable {
-            reason:
-                reason @ cairn_common::executor_protocol::CellUnavailableReason::ClaimedAttemptSilent {
-                    ..
-                },
-            diagnostic,
-        } => Err(CheckExecutionFailure::substrate(
-            no_start_shape(&reason),
-            diagnostic,
-        )),
-        CellOutcome::Unavailable { reason, diagnostic } => Err(CheckExecutionFailure::substrate(
-            no_start_shape(&reason),
-            format!("{reason:?}: {diagnostic}"),
-        )),
+        CellOutcome::Unavailable { reason, diagnostic } => match no_start(&reason) {
+            NoStart::Cancelled(cause) => Err(CheckExecutionFailure::Cancelled(cause)),
+            NoStart::Substrate(shape) => {
+                // "Lost contact" needs a machine that had the work. Before any
+                // claim there was no contact to lose: the fleet had nowhere
+                // to send it.
+                let shape = match (shape, &account.placement) {
+                    (SubstrateFailureShape::MachineUnreachable, None) => {
+                        SubstrateFailureShape::NoReachableMachine
+                    }
+                    (shape, _) => shape,
+                };
+                // A silent claim's diagnostic already names the machine, the
+                // silence, and what the machine said last; a `Debug` rendering
+                // of the reason would only repeat it less readably.
+                let diagnostic = if matches!(
+                    reason,
+                    cairn_common::executor_protocol::CellUnavailableReason::ClaimedAttemptSilent { .. }
+                ) {
+                    diagnostic
+                } else {
+                    format!("{reason:?}: {diagnostic}")
+                };
+                Err(CheckExecutionFailure::substrate(shape, diagnostic))
+            }
+        },
         CellOutcome::StorageFailure {
             stage,
             kind,
@@ -8145,18 +8365,24 @@ fn check_result_from_cell_outcome(
             SubstrateFailureShape::Storage,
             format!("storage failure ({stage:?}/{kind:?}): {diagnostic}"),
         )),
-        CellOutcome::Cancelled { .. } => Err(CheckExecutionFailure::substrate(
-            SubstrateFailureShape::Cancelled,
-            "cell request was cancelled",
-        )),
+        CellOutcome::Cancelled { .. } => {
+            Err(CheckExecutionFailure::Cancelled(cancel_cause(account)))
+        }
     }
 }
 
 #[derive(Debug)]
 pub(crate) enum ReviewTreeGateResult {
     Green,
-    CheckFailed { name: String, detail: String },
+    CheckFailed {
+        name: String,
+        detail: String,
+    },
     InfrastructureFailure(String),
+    /// Cairn cancelled a gating check before it produced a verdict, naming
+    /// which check and why. Neither a red nor a substrate failure: the tree
+    /// was not judged, so the caller asks again rather than refusing it.
+    Cancelled(String),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8589,8 +8815,21 @@ pub(crate) async fn verify_review_tree(
 }
 
 fn review_tree_gate_result(outcomes: Vec<CheckOutcome>) -> ReviewTreeGateResult {
+    // A cancelled lane says nothing about the tree, so it must neither pass the
+    // gate nor hide a real red behind it: it answers only when nothing else did.
+    let mut cancelled = None;
     for outcome in outcomes {
         if outcome.passed {
+            continue;
+        }
+        if outcome.failure_kind == Some(CheckFailureKind::Cancelled) {
+            cancelled.get_or_insert_with(|| {
+                format!(
+                    "check '{}' {}",
+                    outcome.name,
+                    outcome.not_recorded.as_deref().unwrap_or("cancelled")
+                )
+            });
             continue;
         }
         if outcome
@@ -8607,7 +8846,10 @@ fn review_tree_gate_result(outcomes: Vec<CheckOutcome>) -> ReviewTreeGateResult 
             detail: outcome.output_tail,
         };
     }
-    ReviewTreeGateResult::Green
+    match cancelled {
+        Some(detail) => ReviewTreeGateResult::Cancelled(detail),
+        None => ReviewTreeGateResult::Green,
+    }
 }
 
 fn unix_time_ms_for_checks() -> u64 {
@@ -8637,17 +8879,18 @@ mod tests {
             (Shape::Dispatch, Domain::Head),
             (Shape::Capacity, Domain::Head),
             (Shape::MachineUnreachable, Domain::Head),
+            (Shape::NoReachableMachine, Domain::Head),
             (Shape::Preparation, Domain::Head),
             (Shape::EnvironmentRetired, Domain::Head),
             (Shape::Result, Domain::Head),
             (Shape::OutcomeUnknown, Domain::Head),
             (Shape::Storage, Domain::Head),
-            (Shape::Cancelled, Domain::Head),
+            (Shape::RunnerFault, Domain::Head),
             (Shape::CommandStalled, Domain::HeadOnPlatform),
         ];
         assert_eq!(
             table.len(),
-            12,
+            13,
             "a new substrate shape must be classified in this table, not defaulted"
         );
         for (shape, expected) in table {
@@ -12246,10 +12489,9 @@ cairn-common = { path = "../cairn-common" }
             attempt_id: "attempt".to_string(),
             diagnostic: "publication failed".to_string(),
         });
-        failures.push(CellOutcome::Cancelled {
-            request_id: "request".to_string(),
-            attempt_id: "attempt".to_string(),
-        });
+        // A cancellation is not here: it is not a substrate failure, and the
+        // gate reports it as one (see
+        // `merge_gate_reports_a_cancelled_lane_as_a_cancellation`).
         failures.push(CellOutcome::StorageFailure {
             request_id: "request".to_string(),
             attempt_id: "attempt".to_string(),
@@ -12300,8 +12542,12 @@ cairn-common = { path = "../cairn-common" }
         });
 
         for (index, outcome) in failures.into_iter().enumerate() {
-            let failure = check_result_from_cell_outcome(outcome, None)
-                .expect_err("substrate outcome must not become a command verdict");
+            let failure = check_result_from_cell_outcome(
+                outcome,
+                &crate::fleet::CellAccount::default(),
+                None,
+            )
+            .expect_err("substrate outcome must not become a command verdict");
             let db = cache_db().await;
             let results = run_planned_checks(
                 db,
@@ -12380,6 +12626,7 @@ cairn-common = { path = "../cairn-common" }
                 sandbox_denials: Vec::new(),
                 tracked_modifications: None,
             },
+            &crate::fleet::CellAccount::default(),
             None,
         )
         .expect_err("a stopped command is not a verdict");
@@ -12403,6 +12650,7 @@ cairn-common = { path = "../cairn-common" }
                 sandbox_denials: Vec::new(),
                 tracked_modifications: None,
             },
+            &crate::fleet::CellAccount::default(),
             1,
         );
         stalled(
@@ -12469,6 +12717,7 @@ cairn-common = { path = "../cairn-common" }
                 sandbox_denials: Vec::new(),
                 tracked_modifications: None,
             },
+            &crate::fleet::CellAccount::default(),
             None,
         )
         .expect_err("a stopped command is not a verdict");
@@ -12663,14 +12912,6 @@ cairn-common = { path = "../cairn-common" }
                 CellUnavailableReason::NoMatchingExecutor,
                 SubstrateFailureShape::NoMachine,
             ),
-            // The runner's own shutdown is neither of the two above, which are
-            // what it used to be reported as.
-            (
-                CellUnavailableReason::RunnerStopping {
-                    stopped_at_unix_ms: 1,
-                },
-                SubstrateFailureShape::Cancelled,
-            ),
             (
                 CellUnavailableReason::Provisioning,
                 SubstrateFailureShape::Preparation,
@@ -12706,8 +12947,21 @@ cairn-common = { path = "../cairn-common" }
             ),
         ];
         for (reason, expected) in cases {
-            assert_eq!(no_start_shape(&reason), expected, "{reason:?}");
+            assert_eq!(
+                no_start(&reason),
+                NoStart::Substrate(expected),
+                "{reason:?}"
+            );
         }
+        // The runner's own shutdown is neither a lost machine nor a missing
+        // one, which is what it used to be reported as, and not a substrate
+        // failure at all: it is Cairn ending the check.
+        assert_eq!(
+            no_start(&CellUnavailableReason::RunnerStopping {
+                stopped_at_unix_ms: 1,
+            }),
+            NoStart::Cancelled(crate::fleet::CancelCause::RunnerStopping)
+        );
     }
 
     fn deadline(
@@ -12772,16 +13026,16 @@ cairn-common = { path = "../cairn-common" }
             ),
         ];
         assert_eq!(
-            no_start_shape(&deadline(
+            no_start(&deadline(
                 Some(ExecutorSubstrateState::PermanentRefusal),
                 None,
             )),
-            SubstrateFailureShape::Dispatch,
+            NoStart::Substrate(SubstrateFailureShape::Dispatch),
             "an explicit refusal must not claim Cairn lost contact with the machine"
         );
         for reason in specimens {
             assert_eq!(
-                no_start_shape(&reason).is_transient(),
+                no_start(&reason).is_transient(),
                 classify_unavailable(&reason, LinkRestoration::NotRestoring).is_capacity(),
                 "check composition and fleet placement must read {reason:?} the same way"
             );
@@ -12802,7 +13056,7 @@ cairn-common = { path = "../cairn-common" }
             SubstrateFailureShape::Preparation,
             SubstrateFailureShape::Result,
             SubstrateFailureShape::Storage,
-            SubstrateFailureShape::Cancelled,
+            SubstrateFailureShape::RunnerFault,
             SubstrateFailureShape::CommandStalled,
         ] {
             assert!(!shape.is_transient(), "{shape:?} is not relieved by time");
@@ -12855,9 +13109,8 @@ cairn-common = { path = "../cairn-common" }
         );
         outcome.results.insert(
             1,
-            Err(CheckExecutionFailure::substrate(
-                SubstrateFailureShape::Cancelled,
-                "request was cancelled",
+            Err(CheckExecutionFailure::Cancelled(
+                crate::fleet::CancelCause::JobStopped,
             )),
         );
         assert_eq!(capacity_retry_decision(&outcome), CapacityRetry::Surface);
@@ -13042,7 +13295,7 @@ cairn-common = { path = "../cairn-common" }
             SubstrateFailureShape::Preparation,
             SubstrateFailureShape::Storage,
             SubstrateFailureShape::Result,
-            SubstrateFailureShape::Cancelled,
+            SubstrateFailureShape::RunnerFault,
             SubstrateFailureShape::CommandStalled,
             SubstrateFailureShape::Dispatch,
             SubstrateFailureShape::EnvironmentRetired,
@@ -13136,10 +13389,6 @@ cairn-common = { path = "../cairn-common" }
                 attempt_id: "attempt".to_string(),
                 diagnostic: "executor lost the slot before publication".to_string(),
             },
-            CellOutcome::Cancelled {
-                request_id: "request".to_string(),
-                attempt_id: "attempt".to_string(),
-            },
             CellOutcome::Unavailable {
                 reason: NoMatchingExecutor,
                 diagnostic: "no executor advertises toolchain matlab".to_string(),
@@ -13169,8 +13418,12 @@ cairn-common = { path = "../cairn-common" }
 
         let mut leads = BTreeSet::new();
         for outcome in outcomes {
-            let failure = check_result_from_cell_outcome(outcome, None)
-                .expect_err("substrate outcome must not become a command verdict");
+            let failure = check_result_from_cell_outcome(
+                outcome,
+                &crate::fleet::CellAccount::default(),
+                None,
+            )
+            .expect_err("substrate outcome must not become a command verdict");
             let CheckExecutionFailure::Substrate(failure) = failure else {
                 panic!("a substrate outcome must compose a substrate failure");
             };
@@ -13193,11 +13446,12 @@ cairn-common = { path = "../cairn-common" }
                     .to_string(),
             );
         }
-        // Ten outcome classes, ten distinct openings: composition informs, it
+        // Nine outcome classes, nine distinct openings: composition informs, it
         // does not flatten every infrastructure failure into one sentence. The
         // count is the assertion — a new class that reuses an existing lead is
-        // exactly the collapse this guards against.
-        assert_eq!(leads.len(), 10, "each outcome class needs its own lead");
+        // exactly the collapse this guards against. (A cancellation is not a
+        // substrate outcome and has no lead here.)
+        assert_eq!(leads.len(), 9, "each outcome class needs its own lead");
     }
 
     /// The inline diagnostic of a substrate failure, with the authored
@@ -13219,10 +13473,11 @@ cairn-common = { path = "../cairn-common" }
     /// against whichever one a specimen happens to use. The match below makes
     /// the list exhaustive by construction: a new shape stops compiling here
     /// until it is added.
-    const ALL_SUBSTRATE_SHAPES: [SubstrateFailureShape; 12] = [
+    const ALL_SUBSTRATE_SHAPES: [SubstrateFailureShape; 13] = [
         SubstrateFailureShape::Dispatch,
         SubstrateFailureShape::Capacity,
         SubstrateFailureShape::MachineUnreachable,
+        SubstrateFailureShape::NoReachableMachine,
         SubstrateFailureShape::Draining,
         SubstrateFailureShape::NoMachine,
         SubstrateFailureShape::Preparation,
@@ -13230,7 +13485,7 @@ cairn-common = { path = "../cairn-common" }
         SubstrateFailureShape::Result,
         SubstrateFailureShape::OutcomeUnknown,
         SubstrateFailureShape::Storage,
-        SubstrateFailureShape::Cancelled,
+        SubstrateFailureShape::RunnerFault,
         SubstrateFailureShape::CommandStalled,
     ];
 
@@ -13248,6 +13503,7 @@ cairn-common = { path = "../cairn-common" }
                 SubstrateFailureShape::Dispatch
                 | SubstrateFailureShape::Capacity
                 | SubstrateFailureShape::MachineUnreachable
+                | SubstrateFailureShape::NoReachableMachine
                 | SubstrateFailureShape::Draining
                 | SubstrateFailureShape::NoMachine
                 | SubstrateFailureShape::Preparation
@@ -13255,7 +13511,7 @@ cairn-common = { path = "../cairn-common" }
                 | SubstrateFailureShape::Result
                 | SubstrateFailureShape::OutcomeUnknown
                 | SubstrateFailureShape::Storage
-                | SubstrateFailureShape::Cancelled
+                | SubstrateFailureShape::RunnerFault
                 | SubstrateFailureShape::CommandStalled => {}
             }
 
@@ -13463,6 +13719,7 @@ cairn-common = { path = "../cairn-common" }
                 diagnostic: scratch_path.to_string(),
                 slot_retired: true,
             },
+            &crate::fleet::CellAccount::default(),
             None,
         )
         .expect_err("a storage failure is never a verdict");
@@ -13608,6 +13865,219 @@ cairn-common = { path = "../cairn-common" }
             ReviewTreeGateResult::InfrastructureFailure(ref detail)
                 if detail.contains("rust-full") && detail.contains("timed out")
         ));
+    }
+
+    fn cancelled_outcome(name: &str) -> CheckOutcome {
+        record_cancelled_check("job", name, crate::fleet::CancelCause::JobStopped)
+    }
+
+    /// A cancelled gating lane judged nothing: the merge is told to retry,
+    /// never that the tree is red or that the infrastructure failed.
+    #[test]
+    fn merge_gate_reports_a_cancelled_lane_as_a_cancellation() {
+        let result = review_tree_gate_result(vec![cancelled_outcome("rust-tests")]);
+        let ReviewTreeGateResult::Cancelled(detail) = result else {
+            panic!("a cancelled lane must gate as a cancellation, got {result:?}");
+        };
+        assert_eq!(detail, "check 'rust-tests' cancelled: job stopped");
+    }
+
+    /// A cancellation must not hide a real red that came after it.
+    #[test]
+    fn merge_gate_still_reports_a_red_behind_a_cancelled_lane() {
+        let mut red = outcome("lint", false, Some(1));
+        red.output_tail = "error: unused".to_string();
+        let result = review_tree_gate_result(vec![cancelled_outcome("rust-tests"), red]);
+        assert!(matches!(
+            result,
+            ReviewTreeGateResult::CheckFailed { ref name, .. } if name == "lint"
+        ));
+    }
+
+    #[test]
+    fn a_cancellation_is_neither_infrastructure_nor_a_verdict() {
+        let kind = CheckFailureKind::Cancelled;
+        assert!(!kind.is_infrastructure());
+        assert!(!kind.is_verdict_about_the_code());
+        assert_eq!(CheckFailureKind::from_stored(kind.as_str()), Some(kind));
+        assert!(CheckFailureKind::Killed.is_verdict_about_the_code());
+        assert!(!CheckFailureKind::Infrastructure.is_verdict_about_the_code());
+        let cancelled = cancelled_outcome("rust-tests");
+        assert!(!cancelled.is_genuine_failure());
+        let summary = format_check_summary(&[cancelled]);
+        assert_eq!(summary, "\u{26a0} rust-tests (cancelled: job stopped)");
+    }
+
+    /// Every way the executor or the fleet reports a cancellation becomes the
+    /// one typed cancellation, carrying the cause the runner recorded.
+    #[test]
+    fn every_cancellation_shape_maps_to_a_cancellation_with_its_cause() {
+        use crate::fleet::{CancelCause, CellAccount, CoalescedWaitError};
+        let stopped = CellAccount {
+            cancel_cause: Some(CancelCause::JobStopped),
+            ..CellAccount::default()
+        };
+        let cancelled = || CellOutcome::Cancelled {
+            request_id: "r".into(),
+            attempt_id: "a".into(),
+        };
+        assert_eq!(
+            check_result_from_cell_outcome(cancelled(), &stopped, None).unwrap_err(),
+            CheckExecutionFailure::Cancelled(CancelCause::JobStopped)
+        );
+        assert_eq!(
+            check_result_from_cell_outcome(cancelled(), &CellAccount::default(), None).unwrap_err(),
+            CheckExecutionFailure::Cancelled(CancelCause::Unrecorded)
+        );
+        assert_eq!(
+            stopped_command_failure(
+                &cairn_common::executor_protocol::CommandStop::Cancelled,
+                "",
+                serde_json::from_value(serde_json::json!({
+                    "executorId": "e-1", "slotId": "slot", "cellEpoch": 1,
+                    "startedAtUnixMs": 1, "finishedAtUnixMs": 2,
+                }))
+                .unwrap(),
+                &stopped
+            ),
+            CheckExecutionFailure::Cancelled(CancelCause::JobStopped)
+        );
+        assert_eq!(
+            check_result_from_cell_outcome(
+                CellOutcome::Unavailable {
+                    reason:
+                        cairn_common::executor_protocol::CellUnavailableReason::RunnerStopping {
+                            stopped_at_unix_ms: 1,
+                        },
+                    diagnostic: "stopping".into(),
+                },
+                &CellAccount::default(),
+                None,
+            )
+            .unwrap_err(),
+            CheckExecutionFailure::Cancelled(CancelCause::RunnerStopping)
+        );
+        assert_eq!(
+            check_result_from_delivery(Err(CoalescedWaitError::Cancelled(CancelCause::Superseded)))
+                .unwrap_err(),
+            CheckExecutionFailure::Cancelled(CancelCause::Superseded)
+        );
+    }
+
+    fn executor_unavailable_outcome() -> CellOutcome {
+        CellOutcome::Unavailable {
+            reason: cairn_common::executor_protocol::CellUnavailableReason::ExecutorUnavailable,
+            diagnostic: "executor e-1 (generation 4): connection closed before returning a result"
+                .into(),
+        }
+    }
+
+    /// A lost link is laid at the machine that held the work, by name, and
+    /// only when one did. Before any claim the honest sentence is that the
+    /// fleet had nowhere to send it.
+    #[test]
+    fn lost_contact_is_said_only_of_a_machine_that_held_the_check() {
+        let placed = crate::fleet::CellAccount {
+            placement: Some(crate::fleet::CellPlacement {
+                executor_id: "e-1".into(),
+                generation: 4,
+                name: "bglab-ub".into(),
+            }),
+            ..crate::fleet::CellAccount::default()
+        };
+        let CheckExecutionFailure::Substrate(failure) =
+            check_result_from_cell_outcome(executor_unavailable_outcome(), &placed, None)
+                .unwrap_err()
+        else {
+            panic!("a lost link is a substrate failure");
+        };
+        assert_eq!(failure.shape(), SubstrateFailureShape::MachineUnreachable);
+        assert_eq!(failure.placement().unwrap().executor_id, "e-1");
+        assert!(failure
+            .agent_message()
+            .starts_with("Cairn lost contact with bglab-ub, the machine running this check."));
+
+        let CheckExecutionFailure::Substrate(unplaced) = check_result_from_cell_outcome(
+            executor_unavailable_outcome(),
+            &crate::fleet::CellAccount::default(),
+            None,
+        )
+        .unwrap_err() else {
+            panic!("an unplaced refusal is a substrate failure");
+        };
+        assert_eq!(unplaced.shape(), SubstrateFailureShape::NoReachableMachine);
+        assert!(unplaced.placement().is_none());
+        assert!(!unplaced.agent_message().contains("lost contact"));
+    }
+
+    /// The rows a lost link writes name the machine that claimed the check,
+    /// which is what makes the failure attributable after the fact.
+    #[tokio::test]
+    async fn a_lost_link_records_the_machine_that_held_the_check() {
+        let db = cache_db().await;
+        let plans = vec![(plan("cargo-test", "cargo test"), "ih-link".to_string())];
+        let placed = crate::fleet::CellAccount {
+            placement: Some(crate::fleet::CellPlacement {
+                executor_id: "e-1".into(),
+                generation: 4,
+                name: "bglab-ub".into(),
+            }),
+            ..crate::fleet::CellAccount::default()
+        };
+        let result = std::sync::Mutex::new(Some(check_result_from_cell_outcome(
+            executor_unavailable_outcome(),
+            &placed,
+            None,
+        )));
+        let outcomes = run_planned_checks(
+            db.clone(),
+            "project-a",
+            "tree-link",
+            "job-a",
+            &plans,
+            "write-checks:run-a",
+            CheckExecMode::Shared,
+            None,
+            |_index, _command, _stream_id| {
+                let result = result.lock().unwrap().take().unwrap();
+                async move { result }
+            },
+            |_| {},
+        )
+        .await;
+        assert!(outcomes[0]
+            .output_tail
+            .contains("lost contact with bglab-ub"));
+        let recorded = db
+            .query_opt_text(
+                "SELECT executor_id || ':' || executor_connection_generation \
+                 FROM check_result_observations LIMIT 1",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recorded.as_deref(), Some("e-1:4"));
+    }
+
+    /// A result the runner lost is a bug in Cairn, and says so; it never
+    /// claims a machine was lost.
+    #[test]
+    fn a_lost_coalesced_result_is_a_runner_fault_not_a_lost_machine() {
+        use crate::fleet::CoalescedWaitError;
+        for error in [
+            CoalescedWaitError::LeaderVanished,
+            CoalescedWaitError::Orphaned,
+        ] {
+            let CheckExecutionFailure::Substrate(failure) =
+                check_result_from_delivery(Err(error.clone())).unwrap_err()
+            else {
+                panic!("{error:?} must be a substrate failure");
+            };
+            assert_eq!(failure.shape(), SubstrateFailureShape::RunnerFault);
+            let message = failure.agent_message();
+            assert!(message.contains("bug in Cairn"), "{message}");
+            assert!(!message.contains("lost contact"), "{message}");
+        }
     }
 
     #[test]
@@ -14562,13 +15032,14 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
     }
 
     /// The cairn/4966 specimen: a write check queued behind a busy machine when
-    /// the runner restarted. It is recorded as Cairn ending the check because
-    /// the runner stopped, not as a lost machine or a missing one, and with the
-    /// time the request was really outstanding rather than the zero a batched
-    /// check's own timer reads once the batch has already settled.
+    /// the runner restarted. It is Cairn ending the check because the runner
+    /// stopped — not a lost machine, not a missing one, and not a substrate
+    /// failure — so it is reported as a cancellation with its cause and
+    /// nothing is recorded: no observation, no cache row, no streak.
     #[tokio::test]
-    async fn a_runner_stop_is_recorded_as_such_with_the_time_it_was_outstanding() {
+    async fn a_runner_stop_is_a_cancellation_that_records_nothing() {
         let db = cache_db().await;
+        let observed_db = db.clone();
         let plans = vec![(plan("cargo-test", "cargo test"), "ih-stop".to_string())];
         let mut results = HashMap::from([(
             0,
@@ -14579,7 +15050,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                     },
                     diagnostic: "this runner began shutting down while this request was waiting to be placed"
                         .into(),
-                },
+                }, &crate::fleet::CellAccount::default(),
                 None,
             ),
         )]);
@@ -14607,17 +15078,42 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         .await;
 
         let outcome = outcomes.into_iter().next().unwrap();
-        assert_eq!(outcome.duration_ms, 190_000);
+        assert_eq!(outcome.failure_kind, Some(CheckFailureKind::Cancelled));
+        assert_eq!(
+            outcome.not_recorded.as_deref(),
+            Some("cancelled: Cairn's runner is stopping")
+        );
         assert!(
-            outcome
-                .output_tail
-                .contains(SubstrateFailureShape::Cancelled.lead()),
+            outcome.output_tail.contains("Cairn cancelled this check"),
             "{}",
             outcome.output_tail
         );
-        assert!(outcome.output_tail.contains("began shutting down"));
         assert!(!outcome.output_tail.contains("lost contact"));
         assert!(!outcome.output_tail.contains("No machine available"));
+        assert!(!outcome.is_genuine_failure());
+        assert_eq!(cancelled_rows(&observed_db).await, (0, 0));
+    }
+
+    /// Rows a cancellation must never write: observations, and cache rows.
+    async fn cancelled_rows(db: &Arc<LocalDb>) -> (i64, i64) {
+        let observations = db
+            .query_opt_text(
+                "SELECT CAST(count(*) AS TEXT) FROM check_result_observations",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let cache_rows = db
+            .query_opt_text("SELECT CAST(count(*) AS TEXT) FROM check_result_cache", ())
+            .await
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        (observations, cache_rows)
     }
 
     /// A check Cairn declined to run says so, and an ordinary red stays an
@@ -16833,7 +17329,9 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             reason: cairn_common::executor_protocol::CellUnavailableReason::Spawn,
             diagnostic: "sandbox denial cannot be adjudicated without runner context".to_string(),
         };
-        let failure = check_result_from_cell_outcome(outcome, None).unwrap_err();
+        let failure =
+            check_result_from_cell_outcome(outcome, &crate::fleet::CellAccount::default(), None)
+                .unwrap_err();
         assert_eq!(
             failure,
             CheckExecutionFailure::substrate(
@@ -17429,9 +17927,12 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                 },
                 diagnostic: "bgsrv-ub gave no account of request r attempt a for 10m00s".into(),
             };
-            let CheckExecutionFailure::Substrate(failure) =
-                check_result_from_cell_outcome(outcome, None).unwrap_err()
-            else {
+            let CheckExecutionFailure::Substrate(failure) = check_result_from_cell_outcome(
+                outcome,
+                &crate::fleet::CellAccount::default(),
+                None,
+            )
+            .unwrap_err() else {
                 panic!("silence is a substrate failure");
             };
             assert_eq!(
@@ -17473,6 +17974,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                 cairn_common::executor_protocol::ExecutorSubstrateState::CapacityBusy,
                 now,
             ),
+            &crate::fleet::CellAccount::default(),
             None,
         )
         .unwrap_err();
@@ -17490,6 +17992,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                     cairn_common::executor_protocol::EXECUTOR_PROGRESS_FRESHNESS_MS + 1,
                 ),
             ),
+            &crate::fleet::CellAccount::default(),
             None,
         )
         .unwrap_err();

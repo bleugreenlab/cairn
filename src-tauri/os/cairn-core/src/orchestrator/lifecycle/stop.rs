@@ -1087,7 +1087,9 @@ fn stop_session_with_pause_intent(
         // suspended on — would otherwise keep running with nobody to read its
         // result.
         if let Some(job_id) = job_id_for_run(orch, run_id) {
-            let cancelled = orch.fleet.cancel_job_requests(&job_id);
+            let cancelled = orch
+                .fleet
+                .cancel_job_requests(&job_id, crate::fleet::CancelCause::JobStopped);
             if cancelled > 0 {
                 log::info!("stop cancelled {cancelled} in-flight batch(es) for job {job_id}");
             }

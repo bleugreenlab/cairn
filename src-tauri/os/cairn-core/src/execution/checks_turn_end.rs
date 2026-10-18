@@ -1378,12 +1378,17 @@ async fn run_turn_end_checks_inner(
                     reason.describe(),
                     submit.len()
                 );
-                if orch.fleet.cancel_job_requests(job_id) > 0 {
-                    let _ = orch
-                        .services
-                        .emitter
-                        .emit("substrate-health-change", serde_json::json!({}));
-                }
+                // Returning drops the batch future, and that is the whole
+                // cancellation: each lane's subscriber guard releases this
+                // wave's interest, and a shared execution keeps running for
+                // whoever else in this job still waits on it — a manual check,
+                // a write-cadence check, a merge gate. A job-wide cancel here
+                // detached those consumers too, and they read it as the
+                // machine vanishing.
+                let _ = orch
+                    .services
+                    .emitter
+                    .emit("substrate-health-change", serde_json::json!({}));
                 return Ok(TurnEndDisposition::Cancelled(format!(
                     "cancelled while the check wave was submitted because {}",
                     reason.describe()

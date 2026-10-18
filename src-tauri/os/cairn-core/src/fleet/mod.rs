@@ -447,13 +447,16 @@ impl Drop for CoalescedLeaderCompletionGuard {
         if let Some(id) = &self.runner_context_id {
             self.pool.runner_contexts.lock().unwrap().remove(id);
         }
-        let outcome = CellOutcome::Unavailable {
-            reason: CellUnavailableReason::ExecutorUnavailable,
-            diagnostic: "coalesced cell leader ended without publishing a terminal outcome".into(),
-        };
+        log::error!(
+            "coalesced leader {:?} ended without publishing a terminal outcome",
+            self.leader
+        );
         for result_identity in &self.result_identities {
-            self.pool
-                .complete_coalesced_for_leader(result_identity, &self.leader, outcome.clone());
+            self.pool.complete_coalesced_for_leader(
+                result_identity,
+                &self.leader,
+                LeaderSettlement::Vanished,
+            );
         }
     }
 }
@@ -512,7 +515,7 @@ struct PendingDrainResult {
 use crate::execution::cache::CheckResultIdentity;
 
 struct CoalescedSubscriber {
-    waiter: oneshot::Sender<CoalescedCellOutcome>,
+    waiter: oneshot::Sender<CoalescedDelivery>,
     priority: CellPriority,
     requesting_job_id: Option<String>,
 }
@@ -561,6 +564,157 @@ pub(crate) enum PublicationRole {
 pub(crate) struct CoalescedCellOutcome {
     pub outcome: CellOutcome,
     pub publication: PublicationCoordination,
+    /// What the runner knows about how the shared execution ended beyond its
+    /// outcome.
+    pub account: CellAccount,
+}
+
+/// What a coalesced wait delivers: the shared execution's outcome, or why
+/// there is none to judge.
+pub(crate) type CoalescedDelivery = Result<CoalescedCellOutcome, CoalescedWaitError>;
+
+/// Why a coalesced wait has no execution outcome for its requester.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CoalescedWaitError {
+    /// Answered without waiting on an execution: a deadline that elapsed
+    /// before the work started, or a submission refused before dispatch.
+    Refused(Box<CellOutcome>),
+    /// Cairn withdrew this requester, or the work it waited on, and says why.
+    Cancelled(CancelCause),
+    /// The leader's task ended without publishing an outcome.
+    LeaderVanished,
+    /// The result channel closed with nothing sent. Every path that removes a
+    /// waiter answers it first, so only a bug reaches this.
+    Orphaned,
+}
+
+impl CoalescedWaitError {
+    fn refused(outcome: CellOutcome) -> Self {
+        Self::Refused(Box::new(outcome))
+    }
+}
+
+/// What a coalesced leader hands the subscribers waiting on it.
+///
+/// Unboxed despite the size difference: one is built per leader settlement
+/// and cloned once per subscriber, so boxing would only add an allocation.
+#[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
+enum LeaderSettlement {
+    /// The execution's terminal outcome, with the runner's account of it.
+    Settled {
+        outcome: CellOutcome,
+        account: CellAccount,
+    },
+    /// The leader's task ended without publishing one.
+    Vanished,
+}
+
+impl From<CellOutcome> for LeaderSettlement {
+    fn from(outcome: CellOutcome) -> Self {
+        Self::Settled {
+            outcome,
+            account: CellAccount::default(),
+        }
+    }
+}
+
+/// Why Cairn itself ended a request before it produced an answer.
+///
+/// A cancellation is not a failure of anything — not of a machine, the
+/// substrate, or the check — so it travels to the requester as a cause rather
+/// than being synthesized into an outcome a reader takes for a lost machine.
+/// Distinct from [`WithdrawalCause`], which is the runner abandoning one queue
+/// entry for reasons of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelCause {
+    /// An operator, or a merge's resolution cascade, stopped the job.
+    JobStopped,
+    /// The job's issue resolved and its session closed.
+    SessionClosed,
+    /// The operator compacted the job.
+    OperatorCompact,
+    /// The operator cancelled this one request.
+    OperatorRetracted,
+    /// A newer request for the same answer replaced this one.
+    Superseded,
+    /// This runner began shutting down.
+    RunnerStopping,
+    /// A cancellation came back with no cause on record.
+    Unrecorded,
+}
+
+impl CancelCause {
+    /// The cause as the clause a requester reads after "cancelled: ".
+    pub(crate) fn sentence(self) -> &'static str {
+        match self {
+            Self::JobStopped => "job stopped",
+            Self::SessionClosed => "its issue resolved and closed the job's session",
+            Self::OperatorCompact => "the operator compacted the job",
+            Self::OperatorRetracted => "the operator cancelled this request",
+            Self::Superseded => "a newer request for the same answer replaced it",
+            Self::RunnerStopping => "Cairn's runner is stopping",
+            Self::Unrecorded => "cause not recorded",
+        }
+    }
+}
+
+/// What the runner knows about how a request ended that the executor's
+/// outcome does not say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CellAccount {
+    /// Why Cairn cancelled the request, when it did and recorded why.
+    pub cancel_cause: Option<CancelCause>,
+    /// The machine that claimed the request, once one did. Without it a lost
+    /// result cannot honestly be blamed on a lost machine: no machine had it.
+    pub placement: Option<CellPlacement>,
+}
+
+/// The machine a request was placed on: the one that claimed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CellPlacement {
+    pub executor_id: String,
+    /// The link generation the claim was made on.
+    pub generation: u64,
+    /// The machine as an operator names it.
+    pub name: String,
+}
+
+/// How many cancellation causes the runner holds while their outcomes are in
+/// flight. Bounded because an outcome that never comes back must not hold its
+/// entry forever; a cause evicted early reads as `Unrecorded`, which is still
+/// a cancellation and still moves nothing.
+const RECENT_CANCEL_CAUSES: usize = 256;
+
+/// Why Cairn sent `Cancel` for requests whose terminal outcome has not yet
+/// come back. The executor's `Cancelled` carries no cause, so the runner keeps
+/// it here and joins it to the outcome when the outcome arrives.
+#[derive(Default)]
+struct CancelCauses {
+    order: VecDeque<RequestIdentity>,
+    causes: HashMap<RequestIdentity, CancelCause>,
+}
+
+impl CancelCauses {
+    /// The first cause recorded for a request is the one that stopped it.
+    fn record(&mut self, identity: RequestIdentity, cause: CancelCause) {
+        if self.causes.contains_key(&identity) {
+            return;
+        }
+        if self.order.len() >= RECENT_CANCEL_CAUSES {
+            if let Some(evicted) = self.order.pop_front() {
+                self.causes.remove(&evicted);
+            }
+        }
+        self.causes.insert(identity.clone(), cause);
+        self.order.push_back(identity);
+    }
+
+    fn take(&mut self, identity: &RequestIdentity) -> Option<CancelCause> {
+        let cause = self.causes.remove(identity)?;
+        self.order.retain(|recorded| recorded != identity);
+        Some(cause)
+    }
 }
 
 pub(crate) struct PureVerdictBatchItem {
@@ -875,6 +1029,9 @@ pub struct Fleet {
     /// waiting on its predecessor's death learns of it rather than polling.
     purpose_quiesced: Arc<tokio::sync::Notify>,
     cancelled_leaders: Arc<Mutex<HashSet<RequestIdentity>>>,
+    /// Why each request Cairn sent `Cancel` for was cancelled, until its
+    /// outcome returns and takes the cause with it.
+    cancel_causes: Arc<Mutex<CancelCauses>>,
     coalesced_leaders: Arc<Mutex<HashSet<RequestIdentity>>>,
     preparing_leaders: Arc<Mutex<HashMap<RequestIdentity, LeaderPreparation>>>,
     in_flight: Arc<Mutex<InFlightRegistry>>,
@@ -2444,7 +2601,7 @@ impl CoalescedSubscriberDropGuard {
 impl Drop for CoalescedSubscriberDropGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.pool.detach_coalesced_subscriber(&self.identity);
+            self.pool.detach_coalesced_subscriber(&self.identity, None);
         }
     }
 }
@@ -4000,7 +4157,8 @@ impl Fleet {
             generation,
             ExecutorDisconnectOrigin::RunnerInitiated,
         );
-        let abandoned_in_flight = self.abandon_in_flight_for_leaders(&abandoned_leaders);
+        let abandoned_in_flight =
+            self.abandon_in_flight_for_leaders(executor_id, generation, &abandoned_leaders);
         log::warn!(
             "abandoned stalled executor link executor_id={executor_id} generation={generation} \
              cause={cause} disconnected={disconnected} \
@@ -4022,12 +4180,29 @@ impl Fleet {
     /// (`await_coalesced` stops evaluating one once `ExecutionRunning` is
     /// observed), so leaving its resolution to a chain of collaborating drop
     /// guards is what turns a link reset into an indefinite hold.
-    fn abandon_in_flight_for_leaders(&self, leaders: &[RequestIdentity]) -> usize {
-        let outcome = CellOutcome::Unavailable {
-            reason: CellUnavailableReason::ExecutorUnavailable,
-            diagnostic: "the build environment was reset while this attempt was in flight; \
-                         it is being restored and a retry runs normally"
-                .into(),
+    fn abandon_in_flight_for_leaders(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        leaders: &[RequestIdentity],
+    ) -> usize {
+        let settlement = LeaderSettlement::Settled {
+            outcome: CellOutcome::Unavailable {
+                reason: CellUnavailableReason::ExecutorUnavailable,
+                diagnostic: format!(
+                    "executor {executor_id} (generation {generation}): the build environment \
+                     was reset while this attempt was in flight; it is being restored and a \
+                     retry runs normally"
+                ),
+            },
+            account: CellAccount {
+                cancel_cause: None,
+                placement: Some(CellPlacement {
+                    executor_id: executor_id.to_string(),
+                    generation,
+                    name: self.executor_name_for_text(executor_id),
+                }),
+            },
         };
         let mut resolved = 0;
         for leader in leaders {
@@ -4043,7 +4218,8 @@ impl Fleet {
             for result_identity in led {
                 // Leader-fenced, so whichever of this and the leader's own
                 // publication runs second is a no-op rather than a double send.
-                if self.complete_coalesced_for_leader(&result_identity, leader, outcome.clone()) {
+                if self.complete_coalesced_for_leader(&result_identity, leader, settlement.clone())
+                {
                     resolved += 1;
                 }
             }
@@ -5925,7 +6101,9 @@ impl Fleet {
             .find(|(id, _)| id == request_id)
             .cloned();
         if let Some(identity) = subscriber {
-            return match self.detach_coalesced_subscriber(&identity) {
+            return match self
+                .detach_coalesced_subscriber(&identity, Some(CancelCause::OperatorRetracted))
+            {
                 Detachment::Retired { leader } => {
                     // Retiring, not retired: the key stays owed until this
                     // leader's terminal outcome lands, so a fresh answer to the
@@ -5950,6 +6128,10 @@ impl Fleet {
             .lock()
             .unwrap()
             .retire(&identity, unix_time_ms());
+        self.cancel_causes
+            .lock()
+            .unwrap()
+            .record(identity.clone(), CancelCause::OperatorRetracted);
         // Delivery is what this can honestly claim. An executor built from this
         // tree binds the request identity when it CLAIMS an offer, on its
         // message loop and before anything is spawned, so a Cancel naming it is
@@ -5983,8 +6165,9 @@ impl Fleet {
         &self,
         result_identity: &CheckResultIdentity,
         expected_leader: &RequestIdentity,
-        outcome: CellOutcome,
+        settlement: impl Into<LeaderSettlement>,
     ) -> bool {
+        let settlement = settlement.into();
         let execution = {
             let mut registry = self.in_flight.lock().unwrap();
             if registry
@@ -6017,10 +6200,15 @@ impl Fleet {
                 .remove(&execution.leader);
         }
         for (identity, subscriber) in execution.subscribers {
-            let _ = subscriber.waiter.send(CoalescedCellOutcome {
-                outcome: restamp_outcome(&outcome, &identity),
-                publication: execution.publication.clone(),
-            });
+            let delivery = match &settlement {
+                LeaderSettlement::Settled { outcome, account } => Ok(CoalescedCellOutcome {
+                    outcome: restamp_outcome(outcome, &identity),
+                    publication: execution.publication.clone(),
+                    account: account.clone(),
+                }),
+                LeaderSettlement::Vanished => Err(CoalescedWaitError::LeaderVanished),
+            };
+            let _ = subscriber.waiter.send(delivery);
         }
         true
     }
@@ -6115,6 +6303,10 @@ impl Fleet {
             .lock()
             .unwrap()
             .insert(request.clone());
+        self.cancel_causes
+            .lock()
+            .unwrap()
+            .record(request.clone(), CancelCause::Superseded);
         let owner = self.queue.binding_of(request);
         if let Some((executor_id, generation)) = owner {
             let _ = self.send_to(
@@ -6128,8 +6320,21 @@ impl Fleet {
         }
     }
 
-    fn detach_coalesced_subscriber(&self, identity: &RequestIdentity) -> Detachment {
+    /// Release one subscriber's interest in a coalesced execution.
+    ///
+    /// `on_behalf` is the cause when someone other than the subscriber's own
+    /// wait is ending it — a job stop, a session closing, an operator. That
+    /// subscriber's waiter is still listening, so it is told why before its
+    /// entry goes; a removed sender with nothing sent would read as the result
+    /// channel failing. `None` is the waiter detaching itself, with nobody left
+    /// to tell.
+    fn detach_coalesced_subscriber(
+        &self,
+        identity: &RequestIdentity,
+        on_behalf: Option<CancelCause>,
+    ) -> Detachment {
         let remaining;
+        let removed;
         let leader_to_cancel = {
             let mut registry = self.in_flight.lock().unwrap();
             let Some(result_identity) = registry.subscriber_keys.remove(identity) else {
@@ -6138,7 +6343,7 @@ impl Fleet {
             let Some(execution) = registry.by_key.get_mut(&result_identity) else {
                 return Detachment::Unknown;
             };
-            execution.subscribers.remove(identity);
+            removed = execution.subscribers.remove(identity);
             remaining = execution.subscribers.len();
             if execution.subscribers.is_empty() {
                 let leader = execution.leader.clone();
@@ -6162,9 +6367,23 @@ impl Fleet {
                 None
             }
         };
+        if let (Some(cause), Some(subscriber)) = (on_behalf, removed) {
+            let _ = subscriber
+                .waiter
+                .send(Err(CoalescedWaitError::Cancelled(cause)));
+        }
         let Some(leader) = leader_to_cancel else {
             return Detachment::Released { remaining };
         };
+        // The execution stays coalescible until its terminal outcome, so a
+        // follower can still join it after this. Recorded against the leader,
+        // the cause reaches that follower with the cancelled outcome.
+        if let Some(cause) = on_behalf {
+            self.cancel_causes
+                .lock()
+                .unwrap()
+                .record(leader.clone(), cause);
+        }
         let owner = self
             .queue
             .binding_of(&leader)
@@ -6182,7 +6401,13 @@ impl Fleet {
         Detachment::Retired { leader }
     }
 
-    pub(crate) fn cancel_job_requests(&self, job_id: &str) -> usize {
+    /// Cancel everything one job is waiting on, for `cause`.
+    ///
+    /// Job-wide on purpose: every consumer in the job is ended, so only a
+    /// caller ending the whole job may call it. A caller abandoning its own
+    /// requests drops the futures awaiting them instead, and leaves the job's
+    /// other consumers their answers.
+    pub(crate) fn cancel_job_requests(&self, job_id: &str, cause: CancelCause) -> usize {
         let subscribers: Vec<_> = self
             .in_flight
             .lock()
@@ -6195,7 +6420,7 @@ impl Fleet {
             .collect();
         let subscriber_count = subscribers.len();
         for identity in subscribers {
-            self.detach_coalesced_subscriber(&identity);
+            self.detach_coalesced_subscriber(&identity, Some(cause));
         }
 
         let coalesced_leaders = self.coalesced_leaders.lock().unwrap().clone();
@@ -6212,6 +6437,10 @@ impl Fleet {
             + pending
                 .into_iter()
                 .filter(|(request_id, attempt_id, executor_id, generation)| {
+                    self.cancel_causes
+                        .lock()
+                        .unwrap()
+                        .record((request_id.clone(), attempt_id.clone()), cause);
                     self.send_to(
                         executor_id,
                         *generation,
@@ -7979,14 +8208,17 @@ impl Fleet {
         orch: &Orchestrator,
         result_identity: CheckResultIdentity,
         mut request: CellRequest,
-    ) -> Result<CoalescedCellOutcome, CellOutcome> {
+    ) -> CoalescedDelivery {
         if request.mutation_policy != MutationPolicy::PureVerdict {
-            return Err(CellOutcome::Unavailable {
+            return Err(CoalescedWaitError::refused(CellOutcome::Unavailable {
                 reason: CellUnavailableReason::ExecutorUnavailable,
                 diagnostic: "coalesced submission requires pure-verdict mutation policy".into(),
-            });
+            }));
         }
-        let prepared = self.prepare_execution(orch, &mut request).await?;
+        let prepared = self
+            .prepare_execution(orch, &mut request)
+            .await
+            .map_err(CoalescedWaitError::refused)?;
         let public_identity = (request.request_id.clone(), request.attempt_id.clone());
         let wait_horizon_unix_ms = request.wait_horizon_unix_ms;
         let (tx, rx) = oneshot::channel();
@@ -7994,9 +8226,9 @@ impl Fleet {
         {
             let mut registry = self.in_flight.lock().unwrap();
             if registry.subscriber_keys.contains_key(&public_identity) {
-                return Err(executor_unavailable(
+                return Err(CoalescedWaitError::refused(executor_unavailable(
                     "duplicate coalesced subscriber identity".into(),
-                ));
+                )));
             }
             if let Some(execution) = registry.by_key.get_mut(&result_identity) {
                 execution.subscribers.insert(
@@ -8079,10 +8311,19 @@ impl Fleet {
                     return;
                 }
                 let leader = (request.request_id.clone(), request.attempt_id.clone());
-                let outcome = pool.execute_prepared(request, None, prepared).await;
+                let executed = pool
+                    .execute_prepared_accounted(request, None, prepared)
+                    .await;
                 pool.cancelled_leaders.lock().unwrap().remove(&leader);
                 pool.coalesced_leaders.lock().unwrap().remove(&leader);
-                pool.complete_coalesced_for_leader(&result_identity, &leader, outcome);
+                pool.complete_coalesced_for_leader(
+                    &result_identity,
+                    &leader,
+                    LeaderSettlement::Settled {
+                        outcome: executed.outcome,
+                        account: executed.account,
+                    },
+                );
                 completion_guard.disarm();
             });
         }
@@ -8095,8 +8336,8 @@ impl Fleet {
         &self,
         identity: RequestIdentity,
         wait_horizon_unix_ms: u64,
-        mut rx: oneshot::Receiver<CoalescedCellOutcome>,
-    ) -> Result<CoalescedCellOutcome, CellOutcome> {
+        mut rx: oneshot::Receiver<CoalescedDelivery>,
+    ) -> CoalescedDelivery {
         let mut guard = CoalescedSubscriberDropGuard {
             pool: self.clone(),
             identity: identity.clone(),
@@ -8114,9 +8355,9 @@ impl Fleet {
             let remaining = wait_horizon_unix_ms.saturating_sub(now);
             if !execution_started && remaining == 0 {
                 let substrate = self.leader_deadline_evidence(&identity);
-                self.detach_coalesced_subscriber(&identity);
+                self.detach_coalesced_subscriber(&identity, None);
                 guard.disarm();
-                return Err(CellOutcome::Unavailable {
+                return Err(CoalescedWaitError::refused(CellOutcome::Unavailable {
                     diagnostic: format!(
                         "cell subscriber deadline elapsed with {:?}; last progress at {}",
                         substrate.state, substrate.last_progress_unix_ms
@@ -8125,7 +8366,7 @@ impl Fleet {
                         host_pressure: None,
                         substrate: Some(substrate),
                     },
-                });
+                }));
             }
             let wait = if execution_started {
                 Duration::from_millis(250)
@@ -8133,15 +8374,17 @@ impl Fleet {
                 Duration::from_millis(remaining.clamp(1, 250))
             };
             match tokio::time::timeout(wait, &mut rx).await {
-                Ok(Ok(outcome)) => {
+                Ok(Ok(delivery)) => {
                     guard.disarm();
-                    return Ok(outcome);
+                    return delivery;
                 }
                 Ok(Err(_)) => {
                     guard.disarm();
-                    return Err(executor_unavailable(
-                        "coalesced cell result channel closed".into(),
-                    ));
+                    log::error!(
+                        "coalesced result channel for {identity:?} closed with nothing sent; \
+                         every path that removes a waiter answers it first, so this is a bug"
+                    );
+                    return Err(CoalescedWaitError::Orphaned);
                 }
                 Err(_) => {}
             }
@@ -8259,13 +8502,13 @@ impl Fleet {
         items: Vec<PureVerdictBatchItem>,
         run_context: Option<crate::mcp::handlers::RunContext>,
         purpose: Option<purpose::PurposeKey>,
-    ) -> Vec<Result<CoalescedCellOutcome, CellOutcome>> {
+    ) -> Vec<CoalescedDelivery> {
         if request.mutation_policy != MutationPolicy::PureVerdict {
             let mut outcomes = Vec::with_capacity(items.len());
             for _ in items {
-                outcomes.push(Err(executor_unavailable(
+                outcomes.push(Err(CoalescedWaitError::refused(executor_unavailable(
                     "coalesced batch submission requires pure-verdict mutation policy".into(),
-                )));
+                ))));
             }
             return outcomes;
         }
@@ -8302,10 +8545,7 @@ impl Fleet {
                     );
                     let mut refused = Vec::with_capacity(items.len());
                     for _ in &items {
-                        refused.push(Err(CellOutcome::Cancelled {
-                            request_id: leader.0.clone(),
-                            attempt_id: leader.1.clone(),
-                        }));
+                        refused.push(Err(CoalescedWaitError::Cancelled(CancelCause::Superseded)));
                     }
                     return refused;
                 }
@@ -8320,10 +8560,7 @@ impl Fleet {
                     );
                     let mut refused = Vec::with_capacity(items.len());
                     for _ in &items {
-                        refused.push(Err(CellOutcome::Cancelled {
-                            request_id: leader.0.clone(),
-                            attempt_id: leader.1.clone(),
-                        }));
+                        refused.push(Err(CoalescedWaitError::Cancelled(CancelCause::Superseded)));
                     }
                     return refused;
                 }
@@ -8345,7 +8582,9 @@ impl Fleet {
                     self.purpose_quiesced.notify_waiters();
                     let mut refused = Vec::with_capacity(items.len());
                     for _ in &items {
-                        refused.push(Err(executor_unavailable(diagnostic.clone())));
+                        refused.push(Err(CoalescedWaitError::refused(executor_unavailable(
+                            diagnostic.clone(),
+                        ))));
                     }
                     return refused;
                 }
@@ -8453,16 +8692,23 @@ impl Fleet {
             tokio::spawn(async move {
                 let mut completion_guard = completion_guard;
                 let mut request = request;
-                let outcome = match pool.prepare_execution(&orch, &mut request).await {
+                let (outcome, account) = match pool.prepare_execution(&orch, &mut request).await {
                     Ok(prepared) => {
                         if let Some(preparing) =
                             pool.preparing_leaders.lock().unwrap().get_mut(&leader)
                         {
                             preparing.last_progress_unix_ms = unix_time_ms();
                         }
-                        pool.execute_prepared(request, Some(batch), prepared).await
+                        let executed = pool
+                            .execute_prepared_accounted(request, Some(batch), prepared)
+                            .await;
+                        (executed.outcome, executed.account)
                     }
-                    Err(outcome) => outcome,
+                    Err(outcome) => (outcome, CellAccount::default()),
+                };
+                let settled = |outcome: CellOutcome| LeaderSettlement::Settled {
+                    outcome,
+                    account: account.clone(),
                 };
                 pool.preparing_leaders.lock().unwrap().remove(&leader);
                 if let Some(id) = runner_context_id {
@@ -8498,7 +8744,7 @@ impl Fleet {
                                 pool.complete_coalesced_for_leader(
                                     key,
                                     &leader,
-                                    CellOutcome::Completed {
+                                    settled(CellOutcome::Completed {
                                         request_id: leader.0.clone(),
                                         attempt_id: leader.1.clone(),
                                         exit_code: result.exit_code,
@@ -8508,7 +8754,7 @@ impl Fleet {
                                         mutation_delta: None,
                                         sandbox_denials: result.sandbox_denials,
                                         tracked_modifications: result.tracked_modifications,
-                                    },
+                                    }),
                                 );
                             }
                         }
@@ -8523,7 +8769,11 @@ impl Fleet {
                                 ),
                             };
                             for key in &keys {
-                                pool.complete_coalesced_for_leader(key, &leader, failure.clone());
+                                pool.complete_coalesced_for_leader(
+                                    key,
+                                    &leader,
+                                    settled(failure.clone()),
+                                );
                             }
                         }
                         Err(error) => {
@@ -8533,7 +8783,11 @@ impl Fleet {
                                 diagnostic: format!("decode typed check batch outcomes: {error}"),
                             };
                             for key in &keys {
-                                pool.complete_coalesced_for_leader(key, &leader, failure.clone());
+                                pool.complete_coalesced_for_leader(
+                                    key,
+                                    &leader,
+                                    settled(failure.clone()),
+                                );
                             }
                         }
                     },
@@ -8549,12 +8803,20 @@ impl Fleet {
                                     .into(),
                         };
                         for key in &keys {
-                            pool.complete_coalesced_for_leader(key, &leader, failure.clone());
+                            pool.complete_coalesced_for_leader(
+                                key,
+                                &leader,
+                                settled(failure.clone()),
+                            );
                         }
                     }
                     _ => {
                         for key in &keys {
-                            pool.complete_coalesced_for_leader(key, &leader, outcome.clone());
+                            pool.complete_coalesced_for_leader(
+                                key,
+                                &leader,
+                                settled(outcome.clone()),
+                            );
                         }
                     }
                 }
@@ -8680,11 +8942,12 @@ impl Fleet {
         items: Vec<ProcessBatchItem>,
         run_context: Option<crate::mcp::handlers::RunContext>,
         check_status_board: Option<crate::execution::checks::CheckStatusBoard>,
-    ) -> CellOutcome {
+    ) -> ExecutedRequest {
         if request.mutation_policy != MutationPolicy::AllowDelta {
             return executor_unavailable(
                 "write-check batch submission requires allow-delta mutation policy".into(),
-            );
+            )
+            .into();
         }
         let runner_context_id = uuid::Uuid::new_v4().to_string();
         let output = output_guard::RelayedOutput::shared();
@@ -8710,10 +8973,17 @@ impl Fleet {
             Self::check_batch_containment(&request),
             Self::WRITE_CHECK_SILENCE_BOUND_MS,
         );
-        let outcome = self.submit_execution(orch, request, Some(batch)).await;
+        let mut request = request;
+        let executed = match self.prepare_execution(orch, &mut request).await {
+            Ok(prepared) => {
+                self.execute_prepared_accounted(request, Some(batch), prepared)
+                    .await
+            }
+            Err(outcome) => outcome.into(),
+        };
         output_guard::flush_batch_output(orch, &output, flushed_context.as_ref());
         self.settle_runner_context(&runner_context_id);
-        outcome
+        executed
     }
 
     /// Publish process output without entering the serialized core task lane.
@@ -9119,8 +9389,26 @@ impl Fleet {
     }
 
     /// [`Self::execute_prepared`], also reporting a grant it delivered that
-    /// produced no result. Every path that returns before the grant converts
-    /// its outcome with `into()`, which states that nothing was granted.
+    /// produced no result, and why Cairn cancelled the request when it did.
+    ///
+    /// The cause is joined here, at the one exit every queued request passes,
+    /// because the executor's `Cancelled` carries none: the runner recorded it
+    /// when it sent `Cancel`, and taking it here also clears the record.
+    async fn execute_prepared_accounted(
+        &self,
+        request: CellRequest,
+        batch: Option<ProcessBatch>,
+        prepared: PreparedExecution,
+    ) -> ExecutedRequest {
+        let key = (request.request_id.clone(), request.attempt_id.clone());
+        let mut executed = self.execute_entry(request, batch, prepared).await;
+        executed.account.cancel_cause = self.cancel_causes.lock().unwrap().take(&key);
+        executed
+    }
+
+    /// Queue, place, grant, and await one request. Every path that returns
+    /// before the grant converts its outcome with `into()`, which states that
+    /// nothing was granted.
     ///
     /// The runner beginning to shut down is raced at each wait, and the order
     /// differs on either side of the grant. Before it, the stop is checked
@@ -9129,7 +9417,7 @@ impl Fleet {
     /// it, the result is checked first, so an answer the runner has already
     /// accepted is never replaced, and a stop that does win keeps the account
     /// of the grant, because the batch may already have run.
-    async fn execute_prepared_accounted(
+    async fn execute_entry(
         &self,
         request: CellRequest,
         batch: Option<ProcessBatch>,
@@ -9303,6 +9591,13 @@ impl Fleet {
                 }
             }
         };
+        // Only a claim puts the work on a machine, so only from here on can a
+        // lost result be laid at a machine's door.
+        let mut placement = CellPlacement {
+            executor_id: selected.executor_id.clone(),
+            generation: selected.generation,
+            name: self.executor_name_for_text(&selected.executor_id),
+        };
         // The claim is the binding, so it is the moment every grant is issued:
         // the runner context and the purpose registry's record that this item
         // has actually been dispatched. An offer conferred neither, which is
@@ -9390,20 +9685,38 @@ impl Fleet {
                 );
             }
             guard.disarm();
-            return executor_unavailable(
-                "executor connection closed while granting a claimed request".into(),
-            )
+            let mut executed: ExecutedRequest = executor_unavailable(format!(
+                "executor {} (generation {}): connection closed while granting a claimed request",
+                selected.executor_id, selected.generation
+            ))
             .into();
+            executed.account.placement = Some(placement);
+            return executed;
         }
         let waited = tokio::select! {
             biased;
             waited = self.await_claimed_result(&key, granted_at_unix_ms, rx) => Ok(waited),
             stopped_at = self.runner_stop.stopped() => Err(stopped_at),
         };
+        // A claim can be carried across a reconnect onto a new generation, so
+        // the link that answers for the work is the binding it held when it
+        // was answered, or the one it holds now if the runner is ending it.
+        if let Some((executor_id, generation)) = self
+            .queue
+            .take_settled_binding(&key)
+            .or_else(|| self.queue.binding_of(&key))
+        {
+            if executor_id == placement.executor_id {
+                placement.generation = generation;
+            }
+        }
         let (outcome, ended_by_runner) = match waited {
             Ok(ClaimedWait::Answered(outcome)) => (*outcome, false),
             Ok(ClaimedWait::ChannelClosed) => (
-                executor_unavailable("executor result channel closed".into()),
+                executor_unavailable(format!(
+                    "executor {} (generation {}): result channel closed",
+                    placement.executor_id, placement.generation
+                )),
                 false,
             ),
             Err(stopped_at) => {
@@ -9473,6 +9786,10 @@ impl Fleet {
                 outcome,
                 grant_without_result,
                 above_ceiling: claimed_above_ceiling,
+                account: CellAccount {
+                    cancel_cause: None,
+                    placement: Some(placement),
+                },
             };
         }
         if let CellOutcome::Completed {
@@ -9559,6 +9876,10 @@ impl Fleet {
             outcome,
             grant_without_result,
             above_ceiling: claimed_above_ceiling,
+            account: CellAccount {
+                cancel_cause: None,
+                placement: Some(placement),
+            },
         }
     }
 
@@ -10565,7 +10886,7 @@ impl Fleet {
                 Some((executor_id, generation)),
                 queue::TerminalState::Completed,
                 executor_unavailable(format!(
-                    "the executor reattached at generation {generation} without request {} attempt {}, \
+                    "executor {executor_id}: reattached at generation {generation} without request {} attempt {}, \
                      which it claimed {}s earlier and was running at generation {}: it is no longer \
                      running or queued on that machine, so no result is coming",
                     key.0,
@@ -14727,6 +15048,8 @@ pub(crate) struct ExecutedRequest {
     /// Set when a machine claimed this work above its memory ceiling, because
     /// no usable machine could hold it.
     pub(crate) above_ceiling: Option<AboveMemoryCeiling>,
+    /// What the runner knows about how the request ended beyond its outcome.
+    pub(crate) account: CellAccount,
 }
 
 /// An outcome reached before any grant was delivered.
@@ -14736,6 +15059,7 @@ impl From<CellOutcome> for ExecutedRequest {
             outcome,
             grant_without_result: None,
             above_ceiling: None,
+            account: CellAccount::default(),
         }
     }
 }
@@ -16801,7 +17125,7 @@ mod tests {
         CheckResultIdentity,
         RequestIdentity,
         oneshot::Receiver<CellOutcome>,
-        Vec<(RequestIdentity, oneshot::Receiver<CoalescedCellOutcome>)>,
+        Vec<(RequestIdentity, oneshot::Receiver<CoalescedDelivery>)>,
     );
 
     /// Wire a colocated connection whose leader is executing, with `followers`
@@ -17095,7 +17419,8 @@ mod tests {
             .unwrap();
         let resolved = match outcome {
             Ok(coalesced) => coalesced.outcome,
-            Err(outcome) => outcome,
+            Err(CoalescedWaitError::Refused(outcome)) => *outcome,
+            Err(error) => panic!("a link reset must resolve with an outcome, got {error:?}"),
         };
         assert!(
             matches!(
@@ -17784,14 +18109,12 @@ mod tests {
             armed: true,
         });
 
-        let outcome = rx.await.unwrap();
-        assert!(matches!(
-            outcome.outcome,
-            CellOutcome::Unavailable {
-                reason: CellUnavailableReason::ExecutorUnavailable,
-                ref diagnostic,
-            } if diagnostic.contains("leader ended without publishing")
-        ));
+        // A vanished leader is Cairn's own fault, and the subscriber is told
+        // exactly that rather than handed a machine-loss outcome.
+        assert_eq!(
+            rx.await.unwrap().err(),
+            Some(CoalescedWaitError::LeaderVanished)
+        );
         assert!(!pool.in_flight.lock().unwrap().by_key.contains_key(&key));
         assert!(!pool.coalesced_leaders.lock().unwrap().contains(&leader));
         assert!(!pool.cancelled_leaders.lock().unwrap().contains(&leader));
@@ -17838,7 +18161,7 @@ mod tests {
             armed: true,
         };
 
-        pool.detach_coalesced_subscriber(&subscriber_a);
+        pool.detach_coalesced_subscriber(&subscriber_a, None);
 
         let leader_b = ("leader-b".to_string(), "attempt-b".to_string());
         let subscriber_b = ("subscriber-b".to_string(), "attempt-b".to_string());
@@ -17890,7 +18213,7 @@ mod tests {
         };
         assert!(pool.complete_coalesced_for_leader(&key, &leader_b, completed.clone()));
         assert_eq!(
-            rx_b.await.unwrap().outcome,
+            rx_b.await.unwrap().unwrap().outcome,
             restamp_outcome(&completed, &subscriber_b)
         );
     }
@@ -26275,14 +26598,14 @@ mod tests {
             },
         );
         assert_eq!(
-            first_rx.await.unwrap().outcome,
+            first_rx.await.unwrap().unwrap().outcome,
             CellOutcome::Cancelled {
                 request_id: first.0,
                 attempt_id: first.1,
             }
         );
         assert_eq!(
-            second_rx.await.unwrap().outcome,
+            second_rx.await.unwrap().unwrap().outcome,
             CellOutcome::Cancelled {
                 request_id: second.0,
                 attempt_id: second.1,
@@ -26358,7 +26681,10 @@ mod tests {
             Some("job-a"),
         );
 
-        assert_eq!(pool.cancel_job_requests("job-a"), 1);
+        assert_eq!(
+            pool.cancel_job_requests("job-a", CancelCause::JobStopped),
+            1
+        );
         assert!(executor_rx.try_recv().is_err());
         let registry = pool.in_flight.lock().unwrap();
         assert_eq!(registry.by_key[&key].subscribers.len(), 1);
@@ -26406,12 +26732,338 @@ mod tests {
             },
         );
         drop(registry);
-        pool.detach_coalesced_subscriber(&first);
+        pool.detach_coalesced_subscriber(&first, None);
         let registry = pool.in_flight.lock().unwrap();
         assert_eq!(registry.by_key[&result_identity()].subscribers.len(), 1);
         assert!(registry.by_key[&result_identity()]
             .subscribers
             .contains_key(&second));
+    }
+
+    /// Register one coalesced execution led by `leader`, with each of
+    /// `subscribers` waiting on it for its own job.
+    fn register_coalesced(
+        pool: &Fleet,
+        leader: &RequestIdentity,
+        subscribers: Vec<(RequestIdentity, oneshot::Sender<CoalescedDelivery>, &str)>,
+    ) -> CheckResultIdentity {
+        let key = result_identity();
+        let mut registry = pool.in_flight.lock().unwrap();
+        let mut waiting = HashMap::new();
+        for (identity, waiter, job) in subscribers {
+            registry
+                .subscriber_keys
+                .insert(identity.clone(), key.clone());
+            waiting.insert(
+                identity,
+                CoalescedSubscriber {
+                    waiter,
+                    priority: CellPriority::ReviewCheck,
+                    requesting_job_id: Some(job.into()),
+                },
+            );
+        }
+        registry.by_key.insert(
+            key.clone(),
+            InFlightExecution {
+                leader: leader.clone(),
+                subscribers: waiting,
+                publication: PublicationCoordination::new(),
+            },
+        );
+        drop(registry);
+        pool.coalesced_leaders
+            .lock()
+            .unwrap()
+            .insert(leader.clone());
+        key
+    }
+
+    /// A turn-end wave abandons its lanes by dropping the future awaiting
+    /// them. Another consumer in the same job waiting on the same answer — a
+    /// manual check, a merge gate — must still receive it.
+    #[tokio::test]
+    async fn dropping_one_consumers_wait_leaves_a_same_job_sibling_its_result() {
+        let pool = Fleet::default();
+        let wave = ("wave".to_string(), "attempt-1".to_string());
+        let manual = ("manual".to_string(), "attempt-2".to_string());
+        let (wave_tx, wave_rx) = oneshot::channel();
+        let (manual_tx, manual_rx) = oneshot::channel();
+        let key = register_coalesced(
+            &pool,
+            &wave,
+            vec![
+                (wave.clone(), wave_tx, "job"),
+                (manual.clone(), manual_tx, "job"),
+            ],
+        );
+
+        let wave_wait = pool.await_coalesced(wave.clone(), unix_time_ms() + 30_000, wave_rx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), wave_wait)
+                .await
+                .is_err(),
+            "nothing has published yet"
+        );
+
+        {
+            let registry = pool.in_flight.lock().unwrap();
+            let execution = &registry.by_key[&key];
+            assert_eq!(execution.subscribers.len(), 1);
+            assert!(execution.subscribers.contains_key(&manual));
+        }
+        assert!(!pool.cancelled_leaders.lock().unwrap().contains(&wave));
+
+        let mut request = provenance_request();
+        request.request_id.clone_from(&wave.0);
+        request.attempt_id.clone_from(&wave.1);
+        pool.complete_coalesced_for_leader(
+            &key,
+            &wave,
+            completed_for(&request, COLOCATED_EXECUTOR_ID, 1),
+        );
+        let delivered = manual_rx
+            .await
+            .expect("the sibling's waiter is answered")
+            .expect("the sibling receives the execution's outcome");
+        assert!(matches!(
+            delivered.outcome,
+            CellOutcome::Completed { ref request_id, .. } if request_id == &manual.0
+        ));
+    }
+
+    /// A job stop ends a lane that is still waiting. Its waiter is told the
+    /// stop, never handed a closed channel it would read as a lost machine.
+    #[tokio::test]
+    async fn a_job_stop_tells_its_waiting_subscriber_why() {
+        let pool = Fleet::default();
+        let lane = ("lane".to_string(), "attempt-1".to_string());
+        let (tx, rx) = oneshot::channel();
+        register_coalesced(&pool, &lane, vec![(lane.clone(), tx, "job")]);
+        let waiting = tokio::spawn({
+            let pool = pool.clone();
+            let lane = lane.clone();
+            async move {
+                pool.await_coalesced(lane, unix_time_ms() + 30_000, rx)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+
+        assert_eq!(pool.cancel_job_requests("job", CancelCause::JobStopped), 1);
+        let delivered = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiter is answered at once")
+            .unwrap();
+        assert_eq!(
+            delivered.err(),
+            Some(CoalescedWaitError::Cancelled(CancelCause::JobStopped))
+        );
+    }
+
+    /// Another job's stop releases only that job's interest: a follower in a
+    /// different job keeps waiting and receives the leader's result.
+    #[tokio::test]
+    async fn a_job_stop_leaves_another_jobs_follower_its_result() {
+        let pool = Fleet::default();
+        let leader = ("leader".to_string(), "attempt-a".to_string());
+        let follower = ("follower".to_string(), "attempt-b".to_string());
+        let (leader_tx, leader_rx) = oneshot::channel();
+        let (follower_tx, follower_rx) = oneshot::channel();
+        let key = register_coalesced(
+            &pool,
+            &leader,
+            vec![
+                (leader.clone(), leader_tx, "job-a"),
+                (follower.clone(), follower_tx, "job-b"),
+            ],
+        );
+
+        pool.cancel_job_requests("job-a", CancelCause::JobStopped);
+        assert_eq!(
+            leader_rx.await.unwrap().err(),
+            Some(CoalescedWaitError::Cancelled(CancelCause::JobStopped))
+        );
+        assert!(!pool.cancelled_leaders.lock().unwrap().contains(&leader));
+
+        let mut request = provenance_request();
+        request.request_id.clone_from(&leader.0);
+        request.attempt_id.clone_from(&leader.1);
+        pool.complete_coalesced_for_leader(
+            &key,
+            &leader,
+            completed_for(&request, COLOCATED_EXECUTOR_ID, 1),
+        );
+        let delivered = follower_rx
+            .await
+            .unwrap()
+            .expect("the follower gets the result");
+        assert!(matches!(
+            delivered.outcome,
+            CellOutcome::Completed { ref request_id, .. } if request_id == &follower.0
+        ));
+    }
+
+    /// A job stop that reaches a request outside any coalesced execution sends
+    /// the machine `Cancel` and keeps why, for the outcome that comes back.
+    #[test]
+    fn a_job_stop_records_its_cause_for_a_dispatched_request() {
+        let pool = Fleet::default();
+        let (executor_tx, _executor_rx) = mpsc::unbounded_channel();
+        let generation = pool.attach_executor(executor_tx);
+        let request = ("request".to_string(), "attempt".to_string());
+        let _pending = claim_entry(
+            &pool,
+            &request,
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            Some("job"),
+        );
+
+        assert_eq!(
+            pool.cancel_job_requests("job", CancelCause::SessionClosed),
+            1
+        );
+        assert_eq!(
+            pool.cancel_causes.lock().unwrap().take(&request),
+            Some(CancelCause::SessionClosed)
+        );
+    }
+
+    /// Work answered because its machine's link ended says which machine and
+    /// which generation, so a reader can tell a real link loss from anything else.
+    #[tokio::test]
+    async fn a_link_loss_answer_names_the_machine_and_generation() {
+        let pool = Fleet::default();
+        let (executor_tx, _executor_rx) = mpsc::unbounded_channel();
+        let generation = pool.attach_executor(executor_tx);
+        let request = ("request".to_string(), "attempt".to_string());
+        let pending = claim_entry(&pool, &request, COLOCATED_EXECUTOR_ID, generation, None);
+
+        pool.queue.fail_claims_for(
+            COLOCATED_EXECUTOR_ID,
+            "executor connection closed before returning a result",
+            unix_time_ms(),
+        );
+        let CellOutcome::Unavailable { diagnostic, .. } = pending.await.unwrap() else {
+            panic!("a lost link answers unavailable");
+        };
+        assert!(
+            diagnostic.starts_with(&format!(
+                "executor {COLOCATED_EXECUTOR_ID} (generation {generation}): "
+            )),
+            "{diagnostic}"
+        );
+    }
+
+    /// Cancelling the last consumer of a shared execution stops it, but the
+    /// execution stays joinable until its terminal outcome. A follower that
+    /// joins in that window learns the real cause, not "cause not recorded".
+    #[tokio::test]
+    async fn a_follower_joining_a_cancelled_execution_learns_why() {
+        let pool = Fleet::default();
+        let leader = ("leader".to_string(), "attempt-a".to_string());
+        let (leader_tx, _leader_rx) = oneshot::channel();
+        let key = register_coalesced(&pool, &leader, vec![(leader.clone(), leader_tx, "job")]);
+        pool.cancel_job_requests("job", CancelCause::JobStopped);
+
+        let follower = ("follower".to_string(), "attempt-b".to_string());
+        let (follower_tx, follower_rx) = oneshot::channel();
+        {
+            let mut registry = pool.in_flight.lock().unwrap();
+            registry
+                .by_key
+                .get_mut(&key)
+                .expect("the cancelled execution remains joinable")
+                .subscribers
+                .insert(
+                    follower.clone(),
+                    CoalescedSubscriber {
+                        waiter: follower_tx,
+                        priority: CellPriority::ReviewCheck,
+                        requesting_job_id: Some("other-job".into()),
+                    },
+                );
+            registry
+                .subscriber_keys
+                .insert(follower.clone(), key.clone());
+        }
+
+        // What the leader's task does when its cancelled outcome comes back.
+        let account = CellAccount {
+            cancel_cause: pool.cancel_causes.lock().unwrap().take(&leader),
+            placement: None,
+        };
+        pool.complete_coalesced_for_leader(
+            &key,
+            &leader,
+            LeaderSettlement::Settled {
+                outcome: CellOutcome::Cancelled {
+                    request_id: leader.0.clone(),
+                    attempt_id: leader.1.clone(),
+                },
+                account,
+            },
+        );
+        let delivered = follower_rx
+            .await
+            .unwrap()
+            .expect("the follower gets the outcome");
+        assert!(matches!(delivered.outcome, CellOutcome::Cancelled { .. }));
+        assert_eq!(
+            delivered.account.cancel_cause,
+            Some(CancelCause::JobStopped)
+        );
+    }
+
+    /// A claim carried across a reconnect is answered for by its new
+    /// generation, and that is the generation its caller collects.
+    #[tokio::test]
+    async fn the_settling_binding_is_the_rebound_generation() {
+        let pool = Fleet::default();
+        let (executor_tx, _executor_rx) = mpsc::unbounded_channel();
+        let claimed_on = pool.attach_executor(executor_tx);
+        let request = ("request".to_string(), "attempt".to_string());
+        let pending = claim_entry(&pool, &request, COLOCATED_EXECUTOR_ID, claimed_on, None);
+        let rebound_to = claimed_on + 1;
+        let carried = pool.queue.rebind(COLOCATED_EXECUTOR_ID, rebound_to);
+        assert!(
+            carried.contains_key(&request),
+            "the claim is carried across"
+        );
+
+        pool.queue.fail_claims_for(
+            COLOCATED_EXECUTOR_ID,
+            "executor connection closed before returning a result",
+            unix_time_ms(),
+        );
+        let CellOutcome::Unavailable { diagnostic, .. } = pending.await.unwrap() else {
+            panic!("a lost link answers unavailable");
+        };
+        assert!(
+            diagnostic.contains(&format!("(generation {rebound_to})")),
+            "{diagnostic}"
+        );
+        assert_eq!(
+            pool.queue.take_settled_binding(&request),
+            Some((COLOCATED_EXECUTOR_ID.to_string(), rebound_to))
+        );
+    }
+
+    #[test]
+    fn the_first_cancel_cause_stands_and_the_ledger_stays_bounded() {
+        let mut causes = CancelCauses::default();
+        let first = ("first".to_string(), "attempt".to_string());
+        causes.record(first.clone(), CancelCause::Superseded);
+        causes.record(first.clone(), CancelCause::JobStopped);
+        assert_eq!(causes.take(&first), Some(CancelCause::Superseded));
+        assert_eq!(causes.take(&first), None);
+
+        for index in 0..=RECENT_CANCEL_CAUSES {
+            causes.record((index.to_string(), "a".into()), CancelCause::JobStopped);
+        }
+        assert_eq!(causes.causes.len(), RECENT_CANCEL_CAUSES);
+        assert_eq!(causes.take(&("0".to_string(), "a".to_string())), None);
     }
 
     #[test]
@@ -26458,7 +27110,7 @@ mod tests {
             Some("job"),
         );
 
-        pool.detach_coalesced_subscriber(&leader);
+        pool.detach_coalesced_subscriber(&leader, None);
         assert!(matches!(
             executor_rx.try_recv(),
             Ok(ExecutorMessage::Cancel { ref request_id, ref attempt_id })
@@ -26490,7 +27142,7 @@ mod tests {
         pool: &Fleet,
         generation: u64,
         identity: RequestIdentity,
-        waiter: oneshot::Sender<CoalescedCellOutcome>,
+        waiter: oneshot::Sender<CoalescedDelivery>,
         state: ExecutorSubstrateState,
     ) -> CheckResultIdentity {
         let key = result_identity();
@@ -26672,7 +27324,8 @@ mod tests {
             .await
         {
             Ok(_) => panic!("stalled subscriber unexpectedly completed"),
-            Err(outcome) => outcome,
+            Err(CoalescedWaitError::Refused(outcome)) => *outcome,
+            Err(error) => panic!("a stalled subscriber is refused at its deadline, got {error:?}"),
         };
         assert!(matches!(
             outcome,

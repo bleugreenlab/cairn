@@ -336,7 +336,12 @@ async fn deliver(
 ) -> Result<(), String> {
     let carrier = carried_by_job.unwrap_or("an external default-branch advance");
     let (report, fingerprint_part) = main_health_report(carrier, commit, &result);
-    if matches!(result, ReviewTreeGateResult::Green) {
+    // A cancelled attestation judged nothing — most often a newer tip replaced
+    // it — so it is no news about main's health and wakes nobody.
+    if matches!(
+        result,
+        ReviewTreeGateResult::Green | ReviewTreeGateResult::Cancelled(_)
+    ) {
         log::info!("{report}");
         return Ok(());
     }
@@ -494,6 +499,10 @@ fn main_health_report(
         ReviewTreeGateResult::InfrastructureFailure(detail) => (
             format!("{prefix}: check infrastructure failed: {detail}"),
             format!("infrastructure:{detail}"),
+        ),
+        ReviewTreeGateResult::Cancelled(detail) => (
+            format!("{prefix}: cancelled before a verdict ({detail})"),
+            format!("cancelled:{detail}"),
         ),
     }
 }

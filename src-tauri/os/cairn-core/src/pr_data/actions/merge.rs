@@ -960,6 +960,11 @@ async fn merge_pr_for_job_past_barrier(
                         "Combined-tree verification infrastructure failure: {error}. Retry the merge."
                     ));
                 }
+                crate::execution::checks::ReviewTreeGateResult::Cancelled(detail) => {
+                    return Err(format!(
+                        "Combined-tree verification was cancelled ({detail}); retry the merge."
+                    ));
+                }
             }
             let landing = {
                 let _store_guard = orch

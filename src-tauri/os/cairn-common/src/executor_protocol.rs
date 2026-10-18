@@ -4550,6 +4550,18 @@ pub struct LearnedResourceEstimate {
 /// learned from are read off the `CellExecutionMeta`, `stop`, and exit status
 /// every executor already reports. An older executor that never reports a
 /// silent stop simply teaches the runner fewer stalls.
+///
+/// cairn/5075 changes how the runner accounts for a cancellation and a lost
+/// link, without a bump. The runner now records why it sent each `Cancel` and
+/// joins that cause to the `Cancelled` (or cancelled-stop) outcome when it comes
+/// back, delivers a cause to a coalesced subscriber it detaches on that
+/// subscriber's behalf, and names the machine and generation in the
+/// `ExecutorUnavailable` diagnostics it composes itself when a link ends. Every
+/// one of those is runner state or runner-composed text: `Cancel`, `Cancelled`,
+/// and `CellUnavailableReason` are unchanged, an executor of any version is sent
+/// and answers exactly what it was before, and nothing it posts is read
+/// differently. A runner talking to an older executor gets the same outcomes
+/// it always did and accounts for them the new way.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 150;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.

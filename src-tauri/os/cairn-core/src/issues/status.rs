@@ -534,7 +534,9 @@ async fn settle_work_left_on_closed_sessions(
         // The run-scoped branch of `stop_job` cancels the executor's in-flight
         // batches itself; the branch for a job with no live run to attach to does
         // not, so cancel explicitly here as well. Both are idempotent.
-        let cancelled = orch.fleet.cancel_job_requests(&job_id);
+        let cancelled = orch
+            .fleet
+            .cancel_job_requests(&job_id, crate::fleet::CancelCause::SessionClosed);
         if cancelled > 0 {
             log::info!(
                 "Cancelled {cancelled} in-flight batch(es) for job {job_id} after its session closed"

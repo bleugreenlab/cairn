@@ -40,7 +40,7 @@
 //! the only place that holds both, and it holds them in that order because the
 //! sweep must happen in the same critical section that removes the connection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use cairn_common::executor_protocol::{
@@ -470,6 +470,41 @@ struct QueueState {
     /// duplicate-submission refusal the pending map used to give.
     by_identity: HashMap<RequestIdentity, EntryId>,
     next_sequence: u64,
+    /// The binding each answered entry held when it was answered. A claim can
+    /// be carried across a reconnect onto a new generation, so the generation
+    /// that answers for the work is known only here, at settlement, and is
+    /// kept for the awaiting caller to collect.
+    settled: SettledBindings,
+}
+
+/// How many answered entries' bindings the queue keeps for collection. Bounded
+/// because a caller that stopped awaiting never collects its own.
+const SETTLED_BINDINGS: usize = 256;
+
+#[derive(Default)]
+struct SettledBindings {
+    order: VecDeque<RequestIdentity>,
+    bindings: HashMap<RequestIdentity, (String, u64)>,
+}
+
+impl SettledBindings {
+    fn record(&mut self, identity: RequestIdentity, binding: (String, u64)) {
+        if self.bindings.insert(identity.clone(), binding).is_some() {
+            return;
+        }
+        if self.order.len() >= SETTLED_BINDINGS {
+            if let Some(evicted) = self.order.pop_front() {
+                self.bindings.remove(&evicted);
+            }
+        }
+        self.order.push_back(identity);
+    }
+
+    fn take(&mut self, identity: &RequestIdentity) -> Option<(String, u64)> {
+        let binding = self.bindings.remove(identity)?;
+        self.order.retain(|recorded| recorded != identity);
+        Some(binding)
+    }
 }
 
 impl Default for ExecutionQueue {
@@ -910,6 +945,9 @@ impl ExecutionQueue {
             None,
             now_unix_ms,
         ));
+        if let Some(bound) = bound {
+            state.settled.record(identity.clone(), bound);
+        }
         drop(state);
         entry.answer(outcome);
         self.journal(rows);
@@ -1086,13 +1124,18 @@ impl ExecutionQueue {
             }
         }
         for identity in answered {
+            state
+                .settled
+                .record(identity.clone(), (executor_id.to_string(), generation));
             if let Some(id) = state.by_identity.remove(&identity) {
                 if let Some(mut entry) = state.entries.remove(&id) {
                     entry.answer(match cause {
                         GenerationEndCause::RunnerStopping { stopped_at_unix_ms } => {
                             super::runner_stopping(stopped_at_unix_ms, diagnostic.to_string())
                         }
-                        _ => super::executor_unavailable(diagnostic.to_string()),
+                        _ => super::executor_unavailable(format!(
+                            "executor {executor_id} (generation {generation}): {diagnostic}"
+                        )),
                     });
                 }
             }
@@ -1155,13 +1198,22 @@ impl ExecutionQueue {
     }
 
     /// Answer everything bound to this machine, because none of it is coming.
+    ///
+    /// Each answer names the machine and the generation the work was bound to,
+    /// so a reader of a lost result can tell which link ended.
     pub(crate) fn fail_claims_for(&self, executor_id: &str, diagnostic: &str, now_unix_ms: u64) {
         for identity in self.identities_bound_to(executor_id) {
+            let named = match self.binding_of(&identity) {
+                Some((_, generation)) => {
+                    format!("executor {executor_id} (generation {generation}): {diagnostic}")
+                }
+                None => format!("executor {executor_id}: {diagnostic}"),
+            };
             self.settle(
                 &identity,
                 None,
                 TerminalState::Completed,
-                super::executor_unavailable(diagnostic.to_string()),
+                super::executor_unavailable(named),
                 now_unix_ms,
             );
         }
@@ -1261,6 +1313,12 @@ fn decline_reason_key(reason: DeclineReason) -> String {
 }
 
 impl ExecutionQueue {
+    /// The binding an answered entry held when it was answered, collected once
+    /// by the caller that awaited it.
+    pub(crate) fn take_settled_binding(&self, identity: &RequestIdentity) -> Option<(String, u64)> {
+        self.entries.lock().unwrap().settled.take(identity)
+    }
+
     /// Which machine and generation an identity is bound to, if any.
     pub(crate) fn binding_of(&self, identity: &RequestIdentity) -> Option<(String, u64)> {
         self.with_entry_by_identity(identity, |entry| {
