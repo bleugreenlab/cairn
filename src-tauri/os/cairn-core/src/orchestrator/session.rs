@@ -2918,6 +2918,7 @@ mod tests {
         let host = cairn_models::session::local::LocalSessionHost::new(
             std::sync::Arc::new(crate::services::RealProcessSpawner),
             residence.path().join("codex"),
+            std::sync::Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
         );
         let place = |run_id: &str, content: &str| {
             let file = system_prompt_placement(residence.path(), run_id, content.to_string());

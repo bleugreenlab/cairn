@@ -8,7 +8,7 @@ use cairn_platform::services::process::{ChildProcess, ProcessSpawner, SpawnConfi
 
 use crate::interface::session::{Cli, CodexModels, SessionError, SessionHost};
 use crate::interface::LOCAL_HOST;
-use crate::session::codex::{home, models, version};
+use crate::session::codex::{home, models, ManagedCodex};
 
 /// How a host finds the Claude CLI. Cairn caches the answer; the default
 /// searches the `PATH` each time.
@@ -20,17 +20,24 @@ pub type ClaudeResolver = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
 pub struct LocalSessionHost {
     process: Arc<dyn ProcessSpawner>,
     codex_home: PathBuf,
+    codex: Arc<ManagedCodex>,
     claude: ClaudeResolver,
 }
 
 impl LocalSessionHost {
     /// Spawn through `process`, and keep Codex's home at `codex_home` (which
     /// must be the host's own, never the user's `~/.codex`; see
-    /// [`home`]). The Claude CLI is found on the `PATH`.
-    pub fn new(process: Arc<dyn ProcessSpawner>, codex_home: impl Into<PathBuf>) -> Self {
+    /// [`home`]). Codex is the one `codex` installs and resolves; the Claude
+    /// CLI is found on the `PATH`.
+    pub fn new(
+        process: Arc<dyn ProcessSpawner>,
+        codex_home: impl Into<PathBuf>,
+        codex: Arc<ManagedCodex>,
+    ) -> Self {
         Self {
             process,
             codex_home: codex_home.into(),
+            codex,
             claude: Arc::new(|| cairn_platform::env::find_binary("claude")),
         }
     }
@@ -44,6 +51,11 @@ impl LocalSessionHost {
     pub fn codex_home(&self) -> &Path {
         &self.codex_home
     }
+
+    /// The managed Codex this host launches.
+    pub fn managed_codex(&self) -> &Arc<ManagedCodex> {
+        &self.codex
+    }
 }
 
 impl SessionHost for LocalSessionHost {
@@ -54,12 +66,11 @@ impl SessionHost for LocalSessionHost {
     fn resolve_cli(&self, cli: Cli) -> Result<String, SessionError> {
         match cli {
             Cli::Claude => (self.claude)().map_err(SessionError::CliNotFound),
-            Cli::Codex => {
-                let path =
-                    cairn_platform::env::find_binary("codex").map_err(SessionError::CliNotFound)?;
-                version::check_codex_version(&path).map_err(SessionError::CliIncompatible)?;
-                Ok(path)
-            }
+            Cli::Codex => self
+                .codex
+                .ensure()
+                .map(|resolved| resolved.path.to_string_lossy().into_owned())
+                .map_err(|error| SessionError::CliInstallFailed(error.to_string())),
         }
     }
 
@@ -69,8 +80,7 @@ impl SessionHost for LocalSessionHost {
 
     fn prepare_codex_home(&self, models: CodexModels<'_>) -> Result<String, SessionError> {
         if let CodexModels::Refresh { login } = models {
-            let codex_path =
-                cairn_platform::env::find_binary("codex").map_err(SessionError::CliNotFound)?;
+            let codex_path = self.resolve_cli(Cli::Codex)?;
             models::refresh_codex_model_cache(
                 &codex_path,
                 &self.codex_home,

@@ -211,6 +211,18 @@ pub fn withdrawn_notice(cause: Option<WithdrawalCause>) -> String {
     )
 }
 
+/// What the agent is told when its permission is withdrawn after its provider
+/// turn ended: the content of the successor turn the withdrawal continues
+/// into. It says what the open-turn case's failed call says. [`withdrawn_notice`]
+/// is for a late answerer, and its "no turn was started" would be false here.
+pub(crate) fn withdrawn_continuation_notice(cause: WithdrawalCause) -> String {
+    format!(
+        "The permission you were waiting on was withdrawn before it was answered: {}. No \
+         decision was recorded and nothing was granted; retry the call if you still need it.",
+        cause.sentence()
+    )
+}
+
 /// Whether a permission wait can learn that its handoff closed.
 ///
 /// Only the executor-relayed fence wait is watched: every other caller holds
@@ -901,7 +913,7 @@ pub(crate) async fn withdraw_permission_request(
                     request_id,
                     job_id,
                     successor_turn_id,
-                    &withdrawn_notice(Some(cause)),
+                    &withdrawn_continuation_notice(cause),
                 )
                 .await;
                 log::info!(

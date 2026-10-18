@@ -38,7 +38,9 @@ fn carries(wire: Wire) -> Carries {
         | Wire::AnthropicMessages
         | Wire::OpenAiResponses
         | Wire::OpenAiDecisions
-        | Wire::ClaudeStreamJson => Carries {
+        | Wire::ClaudeStreamJson
+        | Wire::ElevenLabsStreamInput
+        | Wire::OpenAiSpeech => Carries {
             aspect: false,
             pixels: false,
             native_edit: false,

@@ -165,7 +165,6 @@ fn only_the_facet_starts_an_app_server_for_a_session() {
 /// a mechanics flow that is not a session.
 const CLI_RESOLUTION: &[&str] = &[
     "find_binary(\"claude\")",
-    "find_binary(\"codex\")",
     "get_claude_path",
     "claude_path()",
 ];
@@ -177,7 +176,7 @@ fn only_the_session_host_resolves_a_cli_to_launch() {
         &[
             (
                 "cairn-models/src/session/local.rs",
-                "LocalSessionHost::resolve_cli, the launch seam",
+                "LocalSessionHost's default Claude resolver, the launch seam",
             ),
             (
                 "cairn-core/src/orchestrator/models.rs",
@@ -192,26 +191,14 @@ fn only_the_session_host_resolves_a_cli_to_launch() {
                 "availability and catalog checks, not launches",
             ),
             (
-                "cairn-core/src/backends/codex/backend_impl.rs",
-                "the availability check, not a launch",
-            ),
-            (
                 "cairn-core/src/orchestrator/identity.rs",
-                "ModelHost::claude_path and codex_path, for subscription mechanics",
+                "ModelHost::claude_path, for subscription mechanics",
             ),
             (
                 "cairn-transport/src/routes/invoke/sync_commands/config_family.rs",
-                "an installed-CLI check for Settings",
+                "an installed-Claude-CLI check for onboarding",
             ),
             ("src/commands/setup.rs", "an installed-CLI check for setup"),
-            (
-                "cairn-models-subscriptions/src/usage/codex.rs",
-                "subscription usage probe",
-            ),
-            (
-                "cairn-models-subscriptions/src/signin/codex.rs",
-                "sign-in flow",
-            ),
             (
                 "cairn-models-subscriptions/src/signin/claude.rs",
                 "sign-in flow",
@@ -230,6 +217,27 @@ fn only_the_session_host_resolves_a_cli_to_launch() {
         found.is_empty(),
         "a CLI resolved outside the session host; launch through the \
          orchestrator's `models_runtime()` providers instead:\n  {}",
+        found.join("\n  ")
+    );
+}
+
+/// Searching the user's PATH for Codex. Every Codex Cairn runs (sessions,
+/// pooled calls, sign-in, usage, catalog discovery) is the managed copy
+/// `cairn_models::session::codex::ManagedCodex` installed, so no file may look
+/// for another one. No allowlist.
+const CODEX_PATH_SEARCH: &[&str] = &[
+    "find_binary(\"codex\")",
+    "find_binary_on_agent_path(\"codex\")",
+];
+
+#[test]
+fn codex_resolves_only_through_the_managed_copy() {
+    let found = hits(CODEX_PATH_SEARCH, &[]);
+    assert!(
+        found.is_empty(),
+        "a Codex CLI searched for on the PATH; resolve it through the session \
+         host (`models_runtime().host.resolve_cli(Cli::Codex)`) or the \
+         `ManagedCodex` itself instead:\n  {}",
         found.join("\n  ")
     );
 }

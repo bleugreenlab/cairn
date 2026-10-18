@@ -1,0 +1,9 @@
+{
+  "model": "gpt-4o-mini-tts",
+  "input": "Counterspell. Not today.",
+  "voice": {"id": "voice_1234"},
+  "response_format": "mp3",
+  "speed": 1.25,
+  "instructions": "Dry, unhurried, faintly amused.",
+  "stream_format": "sse"
+}

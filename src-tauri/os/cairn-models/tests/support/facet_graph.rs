@@ -22,12 +22,18 @@ pub const PUBLIC_ROOTS: &[&str] = &[
     "cairn-models",
     "cairn-llm-wire",
     "cairn-image-wire",
+    "cairn-speech-wire",
     "cairn-models-types",
     "cairn-credentials",
 ];
 
 /// Public members that must reach no workspace crate at all.
-pub const LEAF_ROOTS: &[&str] = &["cairn-llm-wire", "cairn-image-wire", "cairn-models-types"];
+pub const LEAF_ROOTS: &[&str] = &[
+    "cairn-llm-wire",
+    "cairn-image-wire",
+    "cairn-speech-wire",
+    "cairn-models-types",
+];
 
 /// The runtime, the work layer, heavy configuration, and the private crate.
 pub const PUBLIC_FORBIDDEN: &[&str] = &[

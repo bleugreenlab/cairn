@@ -140,6 +140,19 @@ impl ThreadRouter {
         self.routes.lock().unwrap().closed
     }
 
+    /// Close the router if no thread is routed, and say whether this call
+    /// closed it. Decided under the lock [`Self::route`] takes, so a thread
+    /// registering at the same moment either keeps the router open or gets an
+    /// already-closed channel; the caller shuts the server down on `true`.
+    pub fn close_if_idle(&self) -> bool {
+        let mut routes = self.routes.lock().unwrap();
+        if routes.closed || !routes.senders.is_empty() {
+            return false;
+        }
+        routes.closed = true;
+        true
+    }
+
     /// Close every route, as the server's death does: each reader's channel
     /// disconnects, so a reader blocked on it unwinds instead of leaking.
     pub fn close(&self) {

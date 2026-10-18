@@ -74,10 +74,11 @@ pub fn agent_shell_path() -> String {
 /// `CAIRN_INSTANCE` leaves the directly-inherited `CARGO_TARGET_DIR` in place.
 pub const DEV_INSTANCE_ROUTING_ENV: [&str; 2] = ["CAIRN_INSTANCE", "CARGO_TARGET_DIR"];
 
-/// Maintain the full set of agent tool shims in `<cairn_home>/bin` — `cairn`
+/// Maintain the bundled agent tool shims in `<cairn_home>/bin` — `cairn`
 /// (→ `cairn-cmd`), `jj`, `bun`, and `uv` — so every agent-spawned shell
 /// resolves all four on PATH regardless of the host service's own (possibly
-/// empty) PATH. Called at startup by whichever host owns the orchestrator (the
+/// empty) PATH. The fifth, `codex`, is not bundled: `ManagedCodex` installs it
+/// and maintains its shim through [`ensure_tool_shim`]. Called at startup by whichever host owns the orchestrator (the
 /// runner and `cairn-server`); the desktop thin host does not maintain them.
 ///
 /// `cairn`, `bun`, and `uv` are plain forwarders; `jj` additionally intercepts
@@ -92,10 +93,10 @@ pub fn ensure_agent_tool_shims(
     uv_binary: &str,
 ) {
     let bin_dir = cairn_bin_dir();
-    ensure_forwarder_shim_in(&bin_dir, "cairn", cli_binary);
+    ensure_tool_shim(&bin_dir, "cairn", cli_binary);
     ensure_jj_shim_in(&bin_dir, jj_binary);
-    ensure_forwarder_shim_in(&bin_dir, "bun", bun_binary);
-    ensure_forwarder_shim_in(&bin_dir, "uv", uv_binary);
+    ensure_tool_shim(&bin_dir, "bun", bun_binary);
+    ensure_tool_shim(&bin_dir, "uv", uv_binary);
 }
 
 /// The uv package cache injected into every agent-spawned process (inline `run`
@@ -202,14 +203,16 @@ pub const CAIRN_SHIM_MARKER: &str = "cairn-managed-shim";
 
 /// Install a plain forwarder shim `<bin_dir>/<name>` → the absolute `target_bin`
 /// (Unix symlink; Windows `<name>.cmd`). For tools that need no interception,
-/// only PATH resolution (`cairn`, `bun`).
+/// only PATH resolution (`cairn`, `bun`, `uv`, and the managed `codex`, which
+/// `cairn_models::session::codex::ManagedCodex` repoints at each release it
+/// activates).
 ///
 /// Best-effort and idempotent, mirroring `cli_install`'s semantics: an
 /// already-correct shim is left alone, a stale one (old build path) is replaced,
 /// and a real file that is not our shim is never clobbered. Failures are logged,
 /// never fatal. The shim points at the sibling binary so it tracks app updates
 /// (prod) and rebuilds (dev) automatically.
-fn ensure_forwarder_shim_in(bin_dir: &Path, name: &str, target_bin: &str) {
+pub fn ensure_tool_shim(bin_dir: &Path, name: &str, target_bin: &str) {
     let target = PathBuf::from(target_bin);
     if !target.exists() {
         log::debug!("{name} shim skipped: {target_bin} does not exist");
@@ -602,7 +605,7 @@ pub fn gh() -> Command {
 #[cfg(not(windows))]
 mod tests {
     use super::{
-        cairn_jj_shim_target, ensure_forwarder_shim_in, ensure_jj_shim_in, executable_candidates,
+        cairn_jj_shim_target, ensure_jj_shim_in, ensure_tool_shim, executable_candidates,
         is_legacy_cairn_forwarder, jj_shim_script_unix, jj_shim_script_windows,
         real_jj_behind_shim, resolve_sidecar_from, uv_cache_dir_with_test_override,
         write_shim_file_if_ours, CAIRN_SHIM_MARKER,
@@ -662,12 +665,12 @@ mod tests {
         std::fs::write(&target, b"#!/bin/sh\n").unwrap();
         let target_str = target.to_string_lossy().to_string();
 
-        ensure_forwarder_shim_in(&bin, "cairn", &target_str);
+        ensure_tool_shim(&bin, "cairn", &target_str);
         let link = bin.join("cairn");
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
 
         // Second call is a no-op and leaves the correct symlink in place.
-        ensure_forwarder_shim_in(&bin, "cairn", &target_str);
+        ensure_tool_shim(&bin, "cairn", &target_str);
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
     }
 
@@ -683,7 +686,7 @@ mod tests {
 
         let target = dir.path().join("cairn-cmd");
         std::fs::write(&target, b"y").unwrap();
-        ensure_forwarder_shim_in(&bin, "cairn", &target.to_string_lossy());
+        ensure_tool_shim(&bin, "cairn", &target.to_string_lossy());
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
     }
 
@@ -697,7 +700,7 @@ mod tests {
 
         let target = dir.path().join("cairn-cmd");
         std::fs::write(&target, b"y").unwrap();
-        ensure_forwarder_shim_in(&bin, "cairn", &target.to_string_lossy());
+        ensure_tool_shim(&bin, "cairn", &target.to_string_lossy());
         // Untouched: still a real file (not a symlink) with its original bytes.
         assert!(std::fs::read_link(&link).is_err());
         assert_eq!(std::fs::read(&link).unwrap(), b"user's own cairn");
@@ -707,7 +710,7 @@ mod tests {
     fn agent_cli_shim_skips_missing_target() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
-        ensure_forwarder_shim_in(&bin, "cairn", "/nonexistent/cairn-cmd");
+        ensure_tool_shim(&bin, "cairn", "/nonexistent/cairn-cmd");
         assert!(!bin.join("cairn").exists());
     }
 
@@ -730,10 +733,10 @@ mod tests {
         let target_str = target.to_string_lossy().to_string();
 
         // Created as a symlink to the bundled bun, idempotently.
-        ensure_forwarder_shim_in(&bin, "bun", &target_str);
+        ensure_tool_shim(&bin, "bun", &target_str);
         let link = bin.join("bun");
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
-        ensure_forwarder_shim_in(&bin, "bun", &target_str);
+        ensure_tool_shim(&bin, "bun", &target_str);
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
 
         // A stale symlink (old build path) is replaced.
@@ -741,13 +744,13 @@ mod tests {
         let stale = dir.path().join("old-bun");
         std::fs::write(&stale, b"x").unwrap();
         std::os::unix::fs::symlink(&stale, &link).unwrap();
-        ensure_forwarder_shim_in(&bin, "bun", &target_str);
+        ensure_tool_shim(&bin, "bun", &target_str);
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
 
         // A real user file is never clobbered.
         std::fs::remove_file(&link).unwrap();
         std::fs::write(&link, b"user's own bun").unwrap();
-        ensure_forwarder_shim_in(&bin, "bun", &target_str);
+        ensure_tool_shim(&bin, "bun", &target_str);
         assert!(std::fs::read_link(&link).is_err());
         assert_eq!(std::fs::read(&link).unwrap(), b"user's own bun");
     }
@@ -756,7 +759,7 @@ mod tests {
     fn bun_forwarder_shim_skips_missing_target() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
-        ensure_forwarder_shim_in(&bin, "bun", "/nonexistent/bun");
+        ensure_tool_shim(&bin, "bun", "/nonexistent/bun");
         assert!(!bin.join("bun").exists());
     }
 
@@ -790,10 +793,10 @@ mod tests {
         let target_str = target.to_string_lossy().to_string();
 
         // Created as a symlink to the bundled uv, idempotently.
-        ensure_forwarder_shim_in(&bin, "uv", &target_str);
+        ensure_tool_shim(&bin, "uv", &target_str);
         let link = bin.join("uv");
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
-        ensure_forwarder_shim_in(&bin, "uv", &target_str);
+        ensure_tool_shim(&bin, "uv", &target_str);
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
 
         // A stale symlink (old build path) is replaced.
@@ -801,13 +804,13 @@ mod tests {
         let stale = dir.path().join("old-uv");
         std::fs::write(&stale, b"x").unwrap();
         std::os::unix::fs::symlink(&stale, &link).unwrap();
-        ensure_forwarder_shim_in(&bin, "uv", &target_str);
+        ensure_tool_shim(&bin, "uv", &target_str);
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
 
         // A real user file is never clobbered.
         std::fs::remove_file(&link).unwrap();
         std::fs::write(&link, b"user's own uv").unwrap();
-        ensure_forwarder_shim_in(&bin, "uv", &target_str);
+        ensure_tool_shim(&bin, "uv", &target_str);
         assert!(std::fs::read_link(&link).is_err());
         assert_eq!(std::fs::read(&link).unwrap(), b"user's own uv");
     }
@@ -816,7 +819,7 @@ mod tests {
     fn uv_forwarder_shim_skips_missing_target() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
-        ensure_forwarder_shim_in(&bin, "uv", "/nonexistent/uv");
+        ensure_tool_shim(&bin, "uv", "/nonexistent/uv");
         assert!(!bin.join("uv").exists());
     }
 

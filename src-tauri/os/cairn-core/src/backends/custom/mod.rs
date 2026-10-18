@@ -102,22 +102,16 @@ impl CustomProviderConfig {
         else {
             return Err(format!("account {account_id} is not a custom endpoint"));
         };
-        let mut request_headers =
-            vec![("content-type".to_string(), "application/json".to_string())];
-        if let Some(key) = api_key {
-            request_headers.push(("authorization".to_string(), format!("Bearer {key}")));
-        }
-        request_headers.extend(
-            headers
-                .iter()
-                .map(|header| (header.name.clone(), header.value.clone())),
-        );
+        let operator: Vec<(String, String)> = headers
+            .iter()
+            .map(|header| (header.name.clone(), header.value.clone()))
+            .collect();
         Ok(Self {
             account_id: account.id.clone(),
             display_name: account.label.clone(),
             base_url: base_url.clone(),
             protocol: *protocol,
-            headers: request_headers,
+            headers: request_headers(*protocol, api_key.as_deref(), &operator),
             models: models.clone(),
             sampling: sampling.clone(),
             max_output_tokens: *max_output_tokens,
@@ -143,8 +137,9 @@ impl CustomProviderConfig {
         format!("{}/decisions", self.base_url)
     }
 
-    /// Refuse what a Decisions or Images provider cannot do: each serves its
-    /// one verb, and has no agent turn or text completion to offer.
+    /// Refuse what a provider that is not a chat server cannot do: a Decisions
+    /// provider answers decisions, an Images provider draws, and a speech
+    /// provider speaks; none has an agent turn or a text completion to offer.
     pub(crate) fn require_turns(&self) -> Result<(), String> {
         match self.protocol {
             CustomProtocol::OpenAiChatCompletions => Ok(()),
@@ -156,13 +151,21 @@ impl CustomProviderConfig {
                 "{} speaks the OpenAI Images protocol, which draws images only; it cannot run an agent or a response. Choose a chat provider for this.",
                 self.display_name
             )),
+            CustomProtocol::OpenAiSpeech | CustomProtocol::ElevenLabs => Err(format!(
+                "{} speaks speech only (the {} protocol); it cannot run an agent or a response. Choose a chat provider for this.",
+                self.display_name,
+                self.protocol.as_str()
+            )),
         }
     }
 
-    /// What this provider serves, fixed by its protocol. A chat server is
-    /// offered for decisions as a logprobs route; whether it actually returns
-    /// logprobs is learned from its first reply, and one that does not is
-    /// recorded unable, never guessed at.
+    /// What this provider serves for any model it lists, fixed by its
+    /// protocol. A chat server is offered for decisions as a logprobs route;
+    /// whether it actually returns logprobs is learned from its first reply,
+    /// and one that does not is recorded unable, never guessed at. A speech
+    /// provider declares nothing provider-wide, because what a speech model
+    /// can do depends on the model: each discovered or declared model declares
+    /// its own ([`models`]).
     pub(crate) fn serves(&self) -> Vec<ServedVerb> {
         let wire = self.wire();
         let decide = ServedVerb {
@@ -184,6 +187,7 @@ impl CustomProviderConfig {
                 ),
                 wire,
             }],
+            CustomProtocol::OpenAiSpeech | CustomProtocol::ElevenLabs => Vec::new(),
         }
     }
 
@@ -194,6 +198,8 @@ impl CustomProviderConfig {
             CustomProtocol::OpenAiChatCompletions => Wire::OpenAiChatCompletions,
             CustomProtocol::Decisions => Wire::OpenAiDecisions,
             CustomProtocol::OpenAiImages => Wire::OpenAiImages,
+            CustomProtocol::OpenAiSpeech => Wire::OpenAiSpeech,
+            CustomProtocol::ElevenLabs => Wire::ElevenLabsStreamInput,
         }
     }
 
@@ -219,8 +225,36 @@ impl CustomProviderConfig {
                 "{} speaks the OpenAI Images protocol, which cannot answer a decision",
                 self.display_name
             )),
+            CustomProtocol::OpenAiSpeech | CustomProtocol::ElevenLabs => Err(format!(
+                "{} speaks speech only; it cannot answer a decision",
+                self.display_name
+            )),
         }
     }
+}
+
+/// Every header a request to a `protocol` provider carries: the content type,
+/// the key in the header that protocol authenticates with (ElevenLabs'
+/// `xi-api-key`, a bearer token everywhere else), then the operator's own.
+fn request_headers(
+    protocol: CustomProtocol,
+    api_key: Option<&str>,
+    operator: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
+    if let Some(key) = api_key {
+        headers.push(match protocol {
+            CustomProtocol::ElevenLabs => ("xi-api-key".to_string(), key.to_string()),
+            CustomProtocol::OpenAiChatCompletions
+            | CustomProtocol::Decisions
+            | CustomProtocol::OpenAiImages
+            | CustomProtocol::OpenAiSpeech => {
+                ("authorization".to_string(), format!("Bearer {key}"))
+            }
+        });
+    }
+    headers.extend(operator.iter().cloned());
+    headers
 }
 
 /// The backend for one custom provider.

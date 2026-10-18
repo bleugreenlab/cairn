@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::image::ImageCapabilities;
 use crate::provider_id::ApiProvider;
+use crate::speech::SpeechCapabilities;
 use crate::usage::{BillingUnit, Charge, Meter};
 
 /// How a provider is paid for and reached, which is what a user is actually
@@ -492,8 +493,8 @@ impl fmt::Display for Modalities {
 }
 
 /// A protocol that carries a verb. This is a name, not the implementation: LLM
-/// families are implemented in cairn-llm-wire, and image wires in its sibling
-/// cairn-image-wire.
+/// families are implemented in cairn-llm-wire, and media wires in its sibling
+/// crates, cairn-image-wire and cairn-speech-wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Wire {
     /// OpenAI-compatible `chat/completions`.
@@ -523,6 +524,12 @@ pub enum Wire {
     /// image server answers it.
     #[serde(rename = "openai-images")]
     OpenAiImages,
+    /// ElevenLabs' text-to-speech WebSocket, which takes text as it arrives.
+    #[serde(rename = "elevenlabs-stream-input")]
+    ElevenLabsStreamInput,
+    /// OpenAI-compatible `audio/speech`: whole text in, audio streamed out.
+    #[serde(rename = "openai-speech")]
+    OpenAiSpeech,
 }
 
 impl Wire {
@@ -536,6 +543,8 @@ impl Wire {
             Self::CodexAppServer => "codex-app-server",
             Self::OpenRouterImages => "openrouter-images",
             Self::OpenAiImages => "openai-images",
+            Self::ElevenLabsStreamInput => "elevenlabs-stream-input",
+            Self::OpenAiSpeech => "openai-speech",
         }
     }
 }
@@ -548,9 +557,9 @@ impl fmt::Display for Wire {
 
 /// A facet verb an offer serves. Each variant carries that verb's capability
 /// type, which is where a verb with real capability differences (image sizes,
-/// speech voices) says what it can do. The conversational verbs and `decide`
-/// carry none; `image` carries what the offer can draw, flattened beside the
-/// tag (`{"verb": "image", "maxCount": 4, ...}`).
+/// speech formats) says what it can do. The conversational verbs and `decide`
+/// carry none; `image` and `speak` carry what the offer can do, flattened
+/// beside the tag (`{"verb": "image", "maxCount": 4, ...}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "lowercase")]
 pub enum Verb {
@@ -558,6 +567,8 @@ pub enum Verb {
     Session,
     Decide,
     Image(ImageCapabilities),
+    /// Text in as a stream, audio out as a stream.
+    Speak(SpeechCapabilities),
 }
 
 impl Verb {
@@ -567,6 +578,7 @@ impl Verb {
             Self::Session => VerbKind::Session,
             Self::Decide => VerbKind::Decide,
             Self::Image(_) => VerbKind::Image,
+            Self::Speak(_) => VerbKind::Speak,
         }
     }
 
@@ -588,10 +600,17 @@ pub enum VerbKind {
     Session,
     Decide,
     Image,
+    Speak,
 }
 
 impl VerbKind {
-    pub const ALL: [VerbKind; 4] = [Self::Complete, Self::Session, Self::Decide, Self::Image];
+    pub const ALL: [VerbKind; 5] = [
+        Self::Complete,
+        Self::Session,
+        Self::Decide,
+        Self::Image,
+        Self::Speak,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -599,6 +618,7 @@ impl VerbKind {
             Self::Session => "session",
             Self::Decide => "decide",
             Self::Image => "image",
+            Self::Speak => "speak",
         }
     }
 
@@ -855,9 +875,10 @@ pub fn claude_models() -> Vec<DiscoveredModel> {
 /// The context window `model` is read with on `provider`.
 ///
 /// Claude's windows are a fact of its subscription plans, answered from
-/// [`claude_context_window`]. Every other provider reports its windows through
-/// discovery, so the answer comes from `discovered`, that provider's discovered
-/// models; a model the catalog does not carry has no known window. The
+/// [`claude_context_window`]; a Claude session with no known model has no
+/// known window, since the plans differ by model. Every other provider reports
+/// its windows through discovery, so the answer comes from `discovered`, that
+/// provider's discovered models; a model the catalog does not carry has no known window. The
 /// provider only needs to be *supported*, not enabled: this also reads windows
 /// for sessions that already ran, and disabling a provider must not make its
 /// transcripts unreadable.
@@ -867,10 +888,7 @@ pub fn context_window(
     discovered: &[DiscoveredModel],
 ) -> Option<i64> {
     if provider.eq_ignore_ascii_case(CLAUDE_FAMILY_BACKEND) {
-        return Some(claude_context_window(
-            model.unwrap_or("unknown"),
-            ClaudeContextOptIn::default(),
-        ));
+        return model.map(|model| claude_context_window(model, ClaudeContextOptIn::default()));
     }
     if !is_supported(&provider.to_ascii_lowercase()) {
         return None;
@@ -932,6 +950,8 @@ mod tests {
             Wire::CodexAppServer,
             Wire::OpenRouterImages,
             Wire::OpenAiImages,
+            Wire::ElevenLabsStreamInput,
+            Wire::OpenAiSpeech,
         ] {
             assert_eq!(serde_json::to_value(wire).unwrap(), wire.as_str());
         }
@@ -959,6 +979,33 @@ mod tests {
             Some(&ImageCapabilities::openai_images_minimal())
         );
         assert_eq!(Verb::Decide.image(), None);
+    }
+
+    #[test]
+    fn a_speech_verb_flattens_its_capabilities_beside_its_wire() {
+        use crate::speech::{AudioFormat, InputStreaming, StyleControl};
+        let served = ServedVerb {
+            verb: Verb::Speak(SpeechCapabilities {
+                input: InputStreaming::Native,
+                formats: vec![AudioFormat::pcm(16_000)],
+                speed: None,
+                style: StyleControl::None,
+            }),
+            wire: Wire::ElevenLabsStreamInput,
+        };
+        let json = serde_json::to_value(&served).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "verb": "speak",
+                "input": "native",
+                "formats": [{"encoding": "pcm-s16le", "sampleRate": 16000}],
+                "style": "none",
+                "wire": "elevenlabs-stream-input"
+            })
+        );
+        assert_eq!(serde_json::from_value::<ServedVerb>(json).unwrap(), served);
+        assert_eq!(served.verb.kind(), VerbKind::Speak);
     }
 
     #[test]
@@ -1133,7 +1180,8 @@ mod tests {
             1_000_000
         );
         assert_eq!(claude_context_window("haiku", sub), 200_000);
-        assert_eq!(claude_context_window("unknown", sub), 200_000);
+        // A named Claude model outside the 1M families reads the plan default.
+        assert_eq!(claude_context_window("claude-haiku-4-5", sub), 200_000);
     }
 
     #[test]
@@ -1166,7 +1214,7 @@ mod tests {
     #[test]
     fn context_window_reads_claude_from_its_plans_and_others_from_discovery() {
         assert_eq!(context_window("Claude", Some("opus"), &[]), Some(1_000_000));
-        assert_eq!(context_window("claude", None, &[]), Some(200_000));
+        assert_eq!(context_window("claude", None, &[]), None);
         let found = [discovered("qwen3:32b", Some(40_960))];
         assert_eq!(
             context_window("ollama", Some("qwen3:32b"), &found),

@@ -9,7 +9,9 @@
 //!
 //! The launch side is [`complete`] (an HTTP completion over one of the three
 //! protocol families), [`session`] (a CLI session opened on a host and
-//! driven through its control), [`decide`], and [`image`].
+//! driven through its control), [`decide`] (typed questions answered with
+//! measured probabilities), [`image`], and [`speak`] (a text stream in, an
+//! audio stream out).
 //!
 //! Every answer reuses the facet's existing vocabulary: accounts are
 //! [`AccountInfo`], usage is [`ProviderPoolSnapshot`], providers are
@@ -21,6 +23,7 @@ pub mod complete;
 pub mod decide;
 pub mod image;
 pub mod session;
+pub mod speak;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -357,7 +360,7 @@ impl SelectedOffer {
     pub fn measured_by(&self) -> Option<MeasuredBy> {
         match self.served.verb {
             Verb::Decide => decide::measured_by(self.served.wire),
-            Verb::Complete | Verb::Session | Verb::Image(_) => None,
+            Verb::Complete | Verb::Session | Verb::Image(_) | Verb::Speak(_) => None,
         }
     }
 }
@@ -403,6 +406,7 @@ fn capable(verb: VerbKind) -> &'static str {
         VerbKind::Session => "session-capable",
         VerbKind::Decide => "decision-capable",
         VerbKind::Image => "image-capable",
+        VerbKind::Speak => "speech-capable",
     }
 }
 
@@ -413,6 +417,7 @@ fn cannot(verb: VerbKind) -> &'static str {
         VerbKind::Session => "cannot run sessions",
         VerbKind::Decide => "cannot answer decisions",
         VerbKind::Image => "cannot generate images",
+        VerbKind::Speak => "cannot speak",
     }
 }
 
@@ -422,16 +427,22 @@ pub fn fixes(verb: VerbKind) -> &'static str {
         VerbKind::Complete | VerbKind::Session => CONVERSATION_FIXES,
         VerbKind::Decide => decide::DECISION_FIXES,
         VerbKind::Image => image::IMAGE_FIXES,
+        VerbKind::Speak => speak::SPEECH_FIXES,
     }
 }
 
 /// How offers serving the same verb rank, lower first. A decision measured
-/// natively comes before one read from logprobs; every other verb ranks
+/// natively comes before one read from logprobs, and speech that streams its
+/// input natively before speech cut into segments; every other verb ranks
 /// flat, which leaves the workspace's provider order to decide.
 fn preference(served: &ServedVerb) -> u8 {
-    match served.verb {
+    match &served.verb {
         Verb::Decide if decide::measured_by(served.wire) == Some(MeasuredBy::Native) => 0,
         Verb::Decide => 1,
+        Verb::Speak(capabilities) => match capabilities.input {
+            speak::InputStreaming::Native => 0,
+            speak::InputStreaming::Segmented => 1,
+        },
         Verb::Complete | Verb::Session | Verb::Image(_) => 0,
     }
 }
@@ -1672,5 +1683,135 @@ mod tests {
         assert!(text.contains("cairn://models/usage"));
         assert!(text.contains("cairn://models/accounts"));
         assert!(text.contains("cairn://p/cairn/llm"));
+    }
+
+    /// A custom provider whose models each serve `speak` over `wire`, with
+    /// the capabilities the facet declares for them.
+    fn speaking(account: &str, wire: Wire, models: &[&str]) -> CatalogProvider {
+        let mut provider = custom(account, models, vec![]);
+        for model in &mut provider.models.as_mut().expect("discovered").models {
+            model.serves = Some(vec![ServedVerb {
+                verb: Verb::Speak(speak::capabilities(wire, &model.model).expect("speaks")),
+                wire,
+            }]);
+        }
+        provider
+    }
+
+    fn speech_catalog() -> Catalog {
+        Catalog {
+            providers: vec![
+                provider("claude", Some(claude_models()), vec![]),
+                speaking("acc_kokoro", Wire::OpenAiSpeech, &["kokoro"]),
+                speaking(
+                    "acc_openai",
+                    Wire::OpenAiSpeech,
+                    &["tts-1", "gpt-4o-mini-tts"],
+                ),
+                speaking(
+                    "acc_eleven",
+                    Wire::ElevenLabsStreamInput,
+                    &["eleven_flash_v2_5"],
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn speech_with_nothing_to_serve_it_names_the_speech_fixes() {
+        let refusal = subscription_only()
+            .offer_for(OfferQuery::new(VerbKind::Speak))
+            .unwrap_err();
+        let text = refusal.to_string();
+        assert!(
+            text.starts_with("No speech-capable model is configured. To fix it"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ElevenLabs") && text.contains("Kokoro-FastAPI"),
+            "{text}"
+        );
+        let refusal = subscription_only()
+            .offer_for(OfferQuery {
+                requested: Some("opus"),
+                ..OfferQuery::new(VerbKind::Speak)
+            })
+            .unwrap_err();
+        assert_eq!(
+            refusal.detail.as_deref(),
+            Some("'opus' is offered only by claude, which cannot speak")
+        );
+    }
+
+    #[test]
+    fn speech_that_streams_input_natively_ranks_first() {
+        let offers: Vec<(String, String)> = speech_catalog()
+            .offers_serving(VerbKind::Speak)
+            .into_iter()
+            .map(|offer| (offer.provider, offer.model))
+            .collect();
+        assert_eq!(
+            offers,
+            vec![
+                ("custom:acc_eleven".into(), "eleven_flash_v2_5".into()),
+                ("custom:acc_kokoro".into(), "kokoro".into()),
+                ("custom:acc_openai".into(), "tts-1".into()),
+                ("custom:acc_openai".into(), "gpt-4o-mini-tts".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn speech_selection_walks_to_the_first_offer_that_admits_the_request() {
+        let catalog = speech_catalog();
+        let plain = speak::SpeechRequest::new("alloy");
+        let (offer, format) = catalog
+            .speech_offer(OfferQuery::new(VerbKind::Speak), &plain)
+            .unwrap();
+        assert_eq!(offer.model, "eleven_flash_v2_5");
+        assert_eq!(format.to_string(), "mp3_44100_128");
+
+        let mut steered = speak::SpeechRequest::new("alloy");
+        steered.instructions = Some("wry".into());
+        let (offer, _) = catalog
+            .speech_offer(OfferQuery::new(VerbKind::Speak), &steered)
+            .unwrap();
+        assert_eq!(
+            (offer.provider.as_str(), offer.model.as_str()),
+            ("custom:acc_openai", "gpt-4o-mini-tts")
+        );
+
+        // A pinned model that cannot take the request names one that would.
+        let refusal = catalog
+            .speech_offer(
+                OfferQuery {
+                    requested: Some("tts-1"),
+                    ..OfferQuery::new(VerbKind::Speak)
+                },
+                &steered,
+            )
+            .unwrap_err();
+        let text = refusal.to_string();
+        assert!(
+            text.starts_with("No speech-capable model serves 'tts-1': tts-1 on custom:acc_openai: this offer takes no delivery instructions"),
+            "{text}"
+        );
+        assert!(
+            text.contains("; offers that would: custom:acc_openai/gpt-4o-mini-tts. To fix it"),
+            "{text}"
+        );
+
+        // Nothing admits it: every candidate's reason, three at most.
+        let mut impossible = speak::SpeechRequest::new("alloy");
+        impossible.speed = Some(9.0);
+        let text = catalog
+            .speech_offer(OfferQuery::new(VerbKind::Speak), &impossible)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.starts_with("No speech-capable model is available: eleven_flash_v2_5 on custom:acc_eleven: speed 9 is outside"),
+            "{text}"
+        );
+        assert!(text.contains("; and 1 more."), "{text}");
     }
 }

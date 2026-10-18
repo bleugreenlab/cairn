@@ -915,9 +915,10 @@ impl cairn_models::subscription::ModelHost for Orchestrator {
     }
 
     fn codex_path(&self) -> Result<String, String> {
-        let path = crate::env::find_binary("codex")?;
-        cairn_models::session::codex::version::check_codex_version(&path)?;
-        Ok(path)
+        self.models_runtime()
+            .host
+            .resolve_cli(cairn_models::interface::session::Cli::Codex)
+            .map_err(String::from)
     }
 
     fn credentials_published(&self) {

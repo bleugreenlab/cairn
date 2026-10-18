@@ -1,0 +1,1 @@
+{"error":{"message":"Invalid value: 'wav2'. Supported values are: 'mp3', 'opus', 'aac', 'flac', 'wav', and 'pcm'.","type":"invalid_request_error","param":"response_format","code":"invalid_value"}}

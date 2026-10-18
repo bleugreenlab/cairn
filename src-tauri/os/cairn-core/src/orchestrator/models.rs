@@ -14,7 +14,8 @@ use cairn_models::complete::HttpComplete;
 use cairn_models::interface::complete::Complete;
 use cairn_models::interface::session::{CodexSessionProvider, SessionHost, SessionProvider};
 use cairn_models::session::claude::ClaudeCli;
-use cairn_models::session::codex::CodexAppServer;
+use cairn_models::session::codex::managed::{UpdateOutcome, UPDATE_INTERVAL};
+use cairn_models::session::codex::{CodexAppServer, ManagedCodex};
 
 use cairn_db::storage::run_db_blocking;
 use cairn_db::turso::params;
@@ -46,6 +47,9 @@ pub struct ModelRuntime {
     pub codex: Arc<dyn CodexSessionProvider>,
     /// Where session processes run.
     pub host: Arc<dyn SessionHost>,
+    /// The Codex CLI the local host launches, installed and kept on the
+    /// published pin by Cairn.
+    pub codex_cli: Arc<ManagedCodex>,
 }
 
 impl ModelRuntime {
@@ -55,6 +59,7 @@ impl ModelRuntime {
         process: Arc<dyn crate::services::ProcessSpawner>,
         process_state: Arc<crate::agent_process::process::AgentProcessState>,
     ) -> Self {
+        let codex_cli = Arc::new(ManagedCodex::for_host());
         Self {
             complete: Arc::new(HttpComplete),
             claude: Arc::new(ClaudeCli),
@@ -63,11 +68,65 @@ impl ModelRuntime {
                 cairn_models::session::local::LocalSessionHost::new(
                     process,
                     crate::backends::codex::cairn_codex_home(),
+                    codex_cli.clone(),
                 )
                 .with_claude_resolver(Arc::new(move || {
                     crate::orchestrator::session::get_claude_path(&process_state)
                 })),
             ),
+            codex_cli,
+        }
+    }
+}
+
+impl Orchestrator {
+    /// Keep the managed Codex on the published pin: once now, then every
+    /// [`UPDATE_INTERVAL`]. A swap refreshes the model catalog from the new
+    /// release and retires pooled app-servers on the old one; running
+    /// sessions finish on the release they started with.
+    pub fn spawn_managed_codex_follow(&self) {
+        let orch = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(UPDATE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                orch.follow_managed_codex(false).await;
+            }
+        });
+    }
+
+    /// Retry an install that failed or never ran, unless one is already in
+    /// progress. Onboarding's "Check again" lands here.
+    pub fn kick_managed_codex_install(&self) {
+        let orch = self.clone();
+        tokio::spawn(async move { orch.follow_managed_codex(true).await });
+    }
+
+    async fn follow_managed_codex(&self, only_if_idle: bool) {
+        let codex = self.models_runtime().codex_cli.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            if only_if_idle {
+                codex.update_if_idle()
+            } else {
+                Some(codex.update())
+            }
+        })
+        .await;
+        match outcome {
+            Ok(Some(Ok(UpdateOutcome::Installed { resolved, previous }))) => {
+                log::info!(
+                    "managed codex: now on {} (was {})",
+                    resolved.version,
+                    previous.as_deref().unwrap_or("not installed")
+                );
+                self.codex_pool.retire_versions_except(&resolved.version);
+                self.spawn_model_catalog_refresh();
+            }
+            Ok(Some(Ok(UpdateOutcome::Current(_)))) | Ok(None) => {}
+            // `ManagedCodex` logs and records the refusal; status reports it.
+            Ok(Some(Err(_))) => {}
+            Err(error) => log::warn!("managed codex: the update task failed: {error}"),
         }
     }
 }

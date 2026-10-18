@@ -541,9 +541,13 @@ mod tests {
     fn scripted_app_server(dir: &Path) -> String {
         use std::os::unix::fs::PermissionsExt;
         let script = dir.join("codex");
-        std::fs::write(
-            &script,
-            r#"#!/bin/sh
+        std::fs::write(&script, format!("#!/bin/sh\n{SCRIPTED_APP_SERVER}")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    const SCRIPTED_APP_SERVER: &str = r#"if [ "$1" = --version ]; then echo 'codex-cli 0.153.3'; exit 0; fi
 if [ "$FAKE_STDERR" = flood ]; then
   i=0; while [ $i -lt 1024 ]; do
     printf '%s\n' 'WARN codex: a log line long enough to fill a pipe quickly...........' >&2
@@ -563,12 +567,7 @@ while IFS= read -r line; do
     *'"method":"model/list"'*) printf '%s\n' '{"id":2,"result":{"data":[]}}' ;;
   esac
 done
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        script.to_string_lossy().into_owned()
-    }
+"#;
 
     /// A Codex that logs more than a pipe holds before it reads its first
     /// request still answers: discovery drains its stderr from the start.
@@ -595,18 +594,33 @@ done
             .unwrap();
     }
 
+    /// Driven through the session host, so the CLI that refreshes the
+    /// catalog is the one the managed resolver installed.
     #[cfg(unix)]
     #[test]
     fn fresh_home_gets_a_session_catalog_from_a_login_message() {
-        let bin = tempfile::tempdir().unwrap();
-        let codex = scripted_app_server(bin.path());
+        use crate::interface::session::{CodexModels, Secret, SessionHost};
+        use crate::session::codex::managed::tests::installed_script;
+        use crate::session::local::LocalSessionHost;
+        use std::sync::Arc;
+
+        let tools = tempfile::tempdir().unwrap();
+        let codex = installed_script(tools.path(), "0.153.3", SCRIPTED_APP_SERVER);
         // A fresh Codex home: no auth.json and no previously published cache,
         // so only the login message can make Codex write the catalog.
         let home = tempfile::tempdir().unwrap();
+        let host = LocalSessionHost::new(
+            Arc::new(cairn_platform::services::process::RealProcessSpawner),
+            home.path(),
+            Arc::new(codex),
+        );
         // The stand-in never reads the params, so they are not subscription-
         // shaped: real ones come only from `Subscriptions::codex_session_login`.
-        let login = json!({"type": "scriptedLogin"});
-        refresh_codex_model_cache(&codex, home.path(), Some(login), &HashMap::new()).unwrap();
+        let login = Secret::new(json!({"type": "scriptedLogin"}));
+        host.prepare_codex_home(CodexModels::Refresh {
+            login: Some(&login),
+        })
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(home.path().join("models_cache.json")).unwrap(),
             r#"{"models":[{"slug":"gpt-6-astra"}]}"#

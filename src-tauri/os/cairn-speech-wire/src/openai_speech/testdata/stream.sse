@@ -1,0 +1,9 @@
+data: {"type":"speech.audio.delta","audio":"AAEC"}
+
+data: {"type":"speech.audio.delta","audio":"AwQF"}
+
+event: ping
+data: {"type":"speech.audio.keepalive"}
+
+data: {"type":"speech.audio.done","usage":{"input_tokens":14,"output_tokens":101,"total_tokens":115}}
+

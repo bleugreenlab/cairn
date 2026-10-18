@@ -17,8 +17,14 @@
 //! - When the shared app-server dies the dispatcher fails EVERY in-flight call
 //!   through the normal error path (fail-closed, so parked workflow awaits
 //!   resolve) and drops the pool entry so the next call respawns a fresh one.
+//! - A key names the Codex release its server runs ([`versioned_key`]). When
+//!   the managed Codex swaps releases,
+//!   [`CodexAppServerPool::retire_versions_except`] takes older servers out of
+//!   lookup; each is shut down once its last call deregisters, so in-flight
+//!   calls finish on the release they started on.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Receiver;
@@ -41,8 +47,24 @@ pub trait PoolHost: Send + Sync {
 /// fan-out calls under one identity share ONE app-server. Auth, however, is
 /// process-global (`account/login/start` runs once per app-server), so distinct
 /// identities need distinct pools. Model/reasoning/sandbox are per-thread params
-/// and likewise excluded.
+/// and likewise excluded. The Codex release is included (see [`versioned_key`]).
 pub type PoolKey = String;
+
+const VERSION_SEPARATOR: &str = "@codex-";
+
+/// The key for `identity`'s server on Codex `version`. `None` (nothing was
+/// installed yet when the key was made) is a key every retirement retires.
+pub fn versioned_key(identity: &str, version: Option<&str>) -> PoolKey {
+    match version {
+        Some(version) => format!("{identity}{VERSION_SEPARATOR}{version}"),
+        None => identity.to_string(),
+    }
+}
+
+fn key_version(key: &str) -> Option<&str> {
+    key.rsplit_once(VERSION_SEPARATOR)
+        .map(|(_, version)| version)
+}
 
 /// The authenticated run bound to a pooled call's thread.
 ///
@@ -62,9 +84,22 @@ pub struct PooledAppServer {
     /// `threadId -> run_id`. Read by the host (`binding_for_thread`) to map a
     /// pooled tool call's `_meta.threadId` back to its authenticated run.
     thread_runs: Arc<Mutex<HashMap<String, CallBinding>>>,
+    /// Out of lookup: shut down when its last call deregisters.
+    retiring: AtomicBool,
 }
 
 impl PooledAppServer {
+    fn new(
+        router: Arc<ThreadRouter>,
+        thread_runs: Arc<Mutex<HashMap<String, CallBinding>>>,
+    ) -> Self {
+        Self {
+            router,
+            thread_runs,
+            retiring: AtomicBool::new(false),
+        }
+    }
+
     /// The server's router: a thread opened on it is `CodexServer::Shared`
     /// with this, and its reader answers through the router's client.
     pub fn router(&self) -> Arc<ThreadRouter> {
@@ -105,6 +140,21 @@ impl PooledAppServer {
         if self.router.deregister(thread_id) {
             self.thread_runs.lock().unwrap().remove(thread_id);
         }
+        self.close_if_drained();
+    }
+
+    /// Shut the process down if it is retiring and no call is left on it.
+    /// The router decides "no call left" under the same lock a registration
+    /// takes, so a call that races the retirement gets a closed channel and
+    /// fails as it would on a server death, never a channel nobody serves.
+    fn close_if_drained(&self) {
+        if self.retiring.load(Ordering::SeqCst) && self.router.close_if_idle() {
+            self.router.client().shutdown();
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.router.is_closed()
     }
 
     /// A pool-scoped message (one with no threadId): the token refresh is
@@ -133,12 +183,12 @@ impl PooledAppServer {
     #[cfg(test)]
     fn for_test(client: Arc<AppServerClient>) -> Arc<Self> {
         let host: Arc<dyn PoolHost> = Arc::new(TestPoolHost);
-        Arc::new(Self {
-            router: ThreadRouter::new(client, move |client, message| {
+        Arc::new(Self::new(
+            ThreadRouter::new(client, move |client, message| {
                 Self::scoped(host.as_ref(), client, message)
             }),
-            thread_runs: Arc::new(Mutex::new(HashMap::new())),
-        })
+            Arc::new(Mutex::new(HashMap::new())),
+        ))
     }
 }
 
@@ -174,6 +224,8 @@ pub struct CodexAppServerPool {
     /// Per-key init lock so two simultaneous first-callers don't double-spawn or
     /// double-login the same app-server.
     init_locks: Mutex<HashMap<PoolKey, Arc<Mutex<()>>>>,
+    /// Out of lookup, still serving the calls that started on them.
+    retiring: Mutex<Vec<Arc<PooledAppServer>>>,
 }
 
 impl CodexAppServerPool {
@@ -191,12 +243,40 @@ impl CodexAppServerPool {
     /// linear scan across the (few) live pools is correct and cheap.
     pub fn binding_for_thread(&self, thread_id: &str) -> Option<CallBinding> {
         let pools = self.pools.lock().ok()?;
-        for server in pools.values() {
+        let retiring = self.retiring.lock().ok()?;
+        for server in pools.values().chain(retiring.iter()) {
             if let Some(binding) = server.thread_runs.lock().ok()?.get(thread_id) {
                 return Some(binding.clone());
             }
         }
         None
+    }
+
+    /// Take every server not on Codex `current` out of lookup, so the next
+    /// call starts one on `current`. Each retired server is shut down now if
+    /// it is idle, else when its last call deregisters.
+    pub fn retire_versions_except(&self, current: &str) {
+        let retired: Vec<Arc<PooledAppServer>> = {
+            let mut pools = self.pools.lock().unwrap();
+            let stale: Vec<PoolKey> = pools
+                .keys()
+                .filter(|key| key_version(key) != Some(current))
+                .cloned()
+                .collect();
+            stale.iter().filter_map(|key| pools.remove(key)).collect()
+        };
+        for server in retired {
+            log::info!("codex pool: retiring a server not on Codex {current}");
+            server.retiring.store(true, Ordering::SeqCst);
+            server.close_if_drained();
+            if !server.is_closed() {
+                self.retiring.lock().unwrap().push(server);
+            }
+        }
+        self.retiring
+            .lock()
+            .unwrap()
+            .retain(|server| !server.is_closed());
     }
 
     /// Get-or-spawn the app-server for `key`. `build` performs the full spawn +
@@ -232,10 +312,7 @@ impl CodexAppServerPool {
             move |client, message| PooledAppServer::scoped(host.as_ref(), client, message),
             closed,
         );
-        let server = Arc::new(PooledAppServer {
-            router,
-            thread_runs,
-        });
+        let server = Arc::new(PooledAppServer::new(router, thread_runs));
         self.pools
             .lock()
             .unwrap()
@@ -243,14 +320,24 @@ impl CodexAppServerPool {
         Ok(server)
     }
 
-    fn remove_pool(&self, key: &PoolKey) {
-        self.pools.lock().unwrap().remove(key);
+    /// Forget the server whose run map is `thread_runs`, whether it is still
+    /// in lookup under `key` or retiring. Matched by identity, so a retired
+    /// server's death never removes a newer server that took its key.
+    fn remove_pool(&self, key: &PoolKey, thread_runs: &Arc<Mutex<HashMap<String, CallBinding>>>) {
+        let ours = |server: &Arc<PooledAppServer>| Arc::ptr_eq(&server.thread_runs, thread_runs);
+        let mut pools = self.pools.lock().unwrap();
+        if pools.get(key).is_some_and(ours) {
+            pools.remove(key);
+        }
+        drop(pools);
+        self.retiring.lock().unwrap().retain(|server| !ours(server));
     }
 
     /// What the pool does when a server's channel closes (the app-server
-    /// died). The router has already closed every per-call channel, so each
-    /// blocked reader exits (no leaked threads) while its run binding stays
-    /// (see `PooledAppServer::deregister_call`). Every in-flight call is then
+    /// died, or a retired server was shut down). The router has already
+    /// closed every per-call channel, so each blocked reader exits (no leaked
+    /// threads) while its run binding stays (see
+    /// `PooledAppServer::deregister_call`). Every in-flight call is then
     /// failed through the normal error path so parked workflow awaits resolve
     /// (never hang), and the pool entry is dropped so the next call spawns a
     /// fresh app-server.
@@ -272,7 +359,7 @@ impl CodexAppServerPool {
                 runs.len()
             );
             host.disconnected(&runs);
-            pool.remove_pool(&key);
+            pool.remove_pool(&key, &thread_runs);
         }
     }
 }
@@ -449,6 +536,57 @@ mod tests {
             pool.binding_for_thread("thread-live").map(|b| b.run_id),
             Some("run-live".to_string())
         );
+    }
+
+    #[test]
+    fn a_key_names_the_codex_release_its_server_runs() {
+        assert_eq!(
+            versioned_key("codex-oauth:acct", Some("0.153.3")),
+            "codex-oauth:acct@codex-0.153.3"
+        );
+        assert_eq!(
+            key_version("codex-oauth:acct@codex-0.153.3"),
+            Some("0.153.3")
+        );
+        assert_eq!(versioned_key("codex-oauth:acct", None), "codex-oauth:acct");
+        assert_eq!(key_version("codex-oauth:acct"), None);
+    }
+
+    // After a swap, a drained old server is shut down at once, a busy one
+    // keeps serving (and attributing) its calls until the last deregisters,
+    // and the server on the current release is left alone.
+    #[test]
+    fn retiring_closes_old_servers_once_drained_and_keeps_the_current_one() {
+        let pool = CodexAppServerPool::default();
+        let idle_old = PooledAppServer::for_test(scripted_client());
+        let busy_old = PooledAppServer::for_test(scripted_client());
+        let current = PooledAppServer::for_test(scripted_client());
+        pool.insert_test_server(versioned_key("a", Some("1.0.0")), idle_old.clone());
+        pool.insert_test_server(versioned_key("b", None), busy_old.clone());
+        pool.insert_test_server(versioned_key("a", Some("2.0.0")), current.clone());
+        let _rx = busy_old.register_call("thread-old", "run-old");
+
+        pool.retire_versions_except("2.0.0");
+
+        assert!(idle_old.is_closed());
+        assert!(!busy_old.is_closed());
+        assert!(!current.is_closed());
+        let keys: Vec<PoolKey> = pool.pools.lock().unwrap().keys().cloned().collect();
+        assert_eq!(keys, vec![versioned_key("a", Some("2.0.0"))]);
+        assert_eq!(
+            pool.binding_for_thread("thread-old").map(|b| b.run_id),
+            Some("run-old".to_string()),
+            "a retiring server still attributes its calls"
+        );
+
+        drop(PooledCall::new(busy_old.clone(), "thread-old".to_string()));
+        assert!(busy_old.is_closed());
+        let late = busy_old.register_completion("thread-late");
+        assert!(
+            matches!(late.recv(), Err(crossbeam_channel::RecvError)),
+            "a call that reaches a closed server fails closed"
+        );
+        assert!(!current.is_closed());
     }
 
     // A notification for a thread that already finalized is dropped, not routed

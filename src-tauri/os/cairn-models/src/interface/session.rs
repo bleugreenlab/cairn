@@ -367,8 +367,10 @@ pub enum Cli {
 pub enum SessionError {
     /// The CLI is not installed on the host.
     CliNotFound(String),
-    /// The CLI is installed but cannot be used (an unsupported version).
-    CliIncompatible(String),
+    /// Cairn could not install the CLI it manages (see
+    /// `cairn_models::session::codex::managed::CodexInstallError`); the text
+    /// says what failed and how to retry.
+    CliInstallFailed(String),
     /// Preparing the launch failed (placing a file, an invalid spec).
     Setup(String),
     /// The process did not start.
@@ -384,7 +386,7 @@ impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CliNotFound(text)
-            | Self::CliIncompatible(text)
+            | Self::CliInstallFailed(text)
             | Self::Setup(text)
             | Self::Spawn(text)
             | Self::Protocol(text)

@@ -12,7 +12,7 @@ use cairn_models::interface::{
 };
 use cairn_models::types::catalog::{
     custom_account_id, DiscoveredModel, Modalities, Modality, ModelPricing, ProviderCategory,
-    ServedVerb, VerbKind, Wire,
+    ServedVerb, Verb, VerbKind, Wire,
 };
 use cairn_models::types::pool::{
     ProviderPoolAccountState, ProviderPoolConstraintReach, ProviderPoolSegmentState,
@@ -158,33 +158,47 @@ fn modalities(modalities: &Modalities) -> Option<String> {
 }
 
 /// The verbs grouped by the wire each rides, `complete, session
-/// (openai-chat)`, or `None` for serving nothing. An image verb says what it
-/// can draw beside its wire: `image (openrouter-images: ≤4 · refs ≤16 · no
-/// mask)`.
+/// (openai-chat)`, or `None` for serving nothing. A verb with capabilities
+/// says them inside its own group: `speak (openai-speech: segmented ·
+/// pcm_24000|mp3|opus · speed 25–400%)`, or `image (openrouter-images: ≤4 ·
+/// refs ≤16 · no mask)`.
 fn served(serves: &[ServedVerb]) -> Option<String> {
-    let mut groups: Vec<(Wire, Vec<&str>, Option<String>)> = Vec::new();
+    enum Group<'a> {
+        /// Capability-free verbs sharing a wire.
+        Verbs(Wire, Vec<&'static str>),
+        /// One verb that says what it can do.
+        Capable(&'a ServedVerb),
+    }
+    let mut groups: Vec<Group> = Vec::new();
     for served in serves {
+        if matches!(served.verb, Verb::Speak(_) | Verb::Image(_)) {
+            groups.push(Group::Capable(served));
+            continue;
+        }
         let verb = served.verb.kind().as_str();
-        let detail = served
-            .verb
-            .image()
-            .map(|capabilities| capabilities.summary());
-        match groups.iter_mut().find(|(wire, _, _)| *wire == served.wire) {
-            Some((_, verbs, summary)) => {
-                verbs.push(verb);
-                if summary.is_none() {
-                    *summary = detail;
-                }
-            }
-            None => groups.push((served.wire, vec![verb], detail)),
+        let shared = groups.iter_mut().find_map(|group| match group {
+            Group::Verbs(wire, verbs) if *wire == served.wire => Some(verbs),
+            _ => None,
+        });
+        match shared {
+            Some(verbs) => verbs.push(verb),
+            None => groups.push(Group::Verbs(served.wire, vec![verb])),
         }
     }
     (!groups.is_empty()).then(|| {
         groups
             .iter()
-            .map(|(wire, verbs, summary)| match summary {
-                Some(summary) => format!("{} ({wire}: {summary})", verbs.join(", ")),
-                None => format!("{} ({wire})", verbs.join(", ")),
+            .map(|group| match group {
+                Group::Verbs(wire, verbs) => format!("{} ({wire})", verbs.join(", ")),
+                Group::Capable(served) => match &served.verb {
+                    Verb::Speak(capabilities) => {
+                        format!("speak ({}: {capabilities})", served.wire)
+                    }
+                    Verb::Image(capabilities) => {
+                        format!("image ({}: {})", served.wire, capabilities.summary())
+                    }
+                    other => format!("{} ({})", other.kind(), served.wire),
+                },
             })
             .collect::<Vec<_>>()
             .join("; ")
@@ -1228,10 +1242,62 @@ mod tests {
         let bad = read(&orch, "cairn://models/catalog?serves=speech").await;
         assert!(
             bad.starts_with(
-                "Unknown serves='speech' for cairn://models/catalog; expected one of complete, session, decide, image."
+                "Unknown serves='speech' for cairn://models/catalog; expected one of complete, session, decide, image, speak."
             ),
             "{bad}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_catalog_says_what_a_speech_offer_can_do() {
+        use crate::credentials::{CustomModelPolicy, CustomProtocol, CustomSampling, ProviderAuth};
+        let orch = seeded_orchestrator().await;
+        let account = orch
+            .add_custom_provider(
+                "Kokoro".into(),
+                ProviderAuth::custom_endpoint(
+                    "http://127.0.0.1:1",
+                    CustomProtocol::OpenAiSpeech,
+                    None,
+                    &[],
+                    CustomModelPolicy::Explicit {
+                        ids: vec!["kokoro".into(), "gpt-4o-mini-tts".into()],
+                    },
+                    CustomSampling::default(),
+                    32_768,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+        let key = cairn_models::types::catalog::custom_key(&account.id);
+        orch.run_provider_model_catalog_refresh(&key).await.unwrap();
+
+        let catalog = read(&orch, "cairn://models/catalog").await;
+        assert!(
+            catalog.contains(
+                "Serves: nothing by default; each model serves what its discovery declares"
+            ),
+            "a speech provider declares nothing provider-wide: {catalog}"
+        );
+        let speaking = read(&orch, "cairn://models/catalog?serves=speak").await;
+        assert!(
+            speaking.contains(
+                "serves speak (openai-speech: segmented · pcm_24000|mp3|opus · speed 25–400%)"
+            ),
+            "{speaking}"
+        );
+        assert!(
+            speaking.contains("speed 25–400% · instructions)"),
+            "gpt-4o-mini-tts takes instructions: {speaking}"
+        );
+        assert!(!speaking.contains("`opus` — 1M context"), "{speaking}");
+        let models = read(&orch, "cairn://models/catalog?view=models&serves=speak").await;
+        assert!(
+            models.contains("`kokoro`") || models.contains("kokoro"),
+            "{models}"
+        );
+        assert!(!models.contains("qwen3.8-27b"), "{models}");
     }
 
     #[test]

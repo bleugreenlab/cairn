@@ -46,8 +46,9 @@ pub trait ModelHost: Send + Sync {
     fn process_spawner(&self) -> &dyn ProcessSpawner;
     /// The Claude CLI this host runs sessions with.
     fn claude_path(&self) -> Result<String, String>;
-    /// The Codex CLI this host signs in and probes usage with, checked to be
-    /// new enough (see `cairn_models::session::codex::version`).
+    /// The Codex CLI this host signs in and probes usage with: the managed
+    /// copy sessions launch (see `cairn_models::session::codex::managed`). An
+    /// `Err` is the install refusal's own text.
     fn codex_path(&self) -> Result<String, String>;
     /// A credential was published to the store; surfaces that show accounts
     /// should re-read.

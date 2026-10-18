@@ -347,24 +347,48 @@ pub enum CustomProtocol {
     /// server. It draws images and nothing else.
     #[serde(rename = "openai-images")]
     OpenAiImages,
+    /// OpenAI-compatible speech (`POST {base}/audio/speech`): OpenAI itself,
+    /// or a local TTS server such as Kokoro-FastAPI. It speaks and does
+    /// nothing else. Its speech models are discovered from `{base}/models`,
+    /// and an explicit list adds ids discovery does not recognise.
+    #[serde(rename = "openai-speech")]
+    OpenAiSpeech,
+    /// ElevenLabs' text-to-speech WebSocket, reached from its REST root
+    /// (`https://api.elevenlabs.io/v1` or a regional host). It speaks and does
+    /// nothing else. Its speech models are discovered from `{base}/models`.
+    #[serde(rename = "elevenlabs")]
+    ElevenLabs,
 }
 
 impl CustomProtocol {
+    /// Every protocol, in the order a refusal lists them.
+    pub const ALL: [CustomProtocol; 5] = [
+        Self::OpenAiChatCompletions,
+        Self::Decisions,
+        Self::OpenAiImages,
+        Self::OpenAiSpeech,
+        Self::ElevenLabs,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             CustomProtocol::OpenAiChatCompletions => "openai-chat",
             CustomProtocol::Decisions => "openai-decisions",
             CustomProtocol::OpenAiImages => "openai-images",
+            CustomProtocol::OpenAiSpeech => "openai-speech",
+            CustomProtocol::ElevenLabs => "elevenlabs",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "openai-chat" => Some(Self::OpenAiChatCompletions),
-            "openai-decisions" => Some(Self::Decisions),
-            "openai-images" => Some(Self::OpenAiImages),
-            _ => None,
-        }
+        Self::ALL
+            .into_iter()
+            .find(|protocol| protocol.as_str() == value)
+    }
+
+    /// Whether this protocol only speaks.
+    pub fn is_speech(self) -> bool {
+        matches!(self, Self::OpenAiSpeech | Self::ElevenLabs)
     }
 }
 

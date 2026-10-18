@@ -13,7 +13,8 @@
 
 use super::CustomProviderConfig;
 use crate::credentials::{CustomModelPolicy, CustomProtocol};
-use cairn_models::types::catalog::DiscoveredModel;
+use cairn_models::interface::speak;
+use cairn_models::types::catalog::{DiscoveredModel, ServedVerb, Verb};
 use cairn_models::types::tokenizers::tokenizer_for;
 use serde::Deserialize;
 use std::error::Error;
@@ -49,6 +50,9 @@ struct ModelEntry {
 pub(crate) fn discover_blocking(
     config: &CustomProviderConfig,
 ) -> (Vec<DiscoveredModel>, Option<String>) {
+    if config.protocol.is_speech() {
+        return discover_speech(config);
+    }
     match &config.models {
         CustomModelPolicy::Explicit { ids } => (
             ids.iter()
@@ -69,18 +73,108 @@ pub(crate) fn discover_blocking(
     }
 }
 
+/// An ElevenLabs `GET /v1/models` entry.
+#[derive(Debug, Deserialize)]
+struct ElevenLabsModel {
+    model_id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    can_do_text_to_speech: Option<bool>,
+}
+
+/// A speech provider's models: the speech models its listing shows, plus any
+/// the operator declared (an explicit list adds to discovery here rather than
+/// replacing it, for servers whose ids Cairn does not recognise). Declared
+/// models survive a failed listing: they are the operator's word.
+fn discover_speech(config: &CustomProviderConfig) -> (Vec<DiscoveredModel>, Option<String>) {
+    let declared: &[String] = match &config.models {
+        CustomModelPolicy::Explicit { ids } => ids,
+        CustomModelPolicy::Discover => &[],
+    };
+    let (mut models, error) = match fetch_speech(config) {
+        Ok(found) => (found, None),
+        Err(error) if declared.is_empty() => (Vec::new(), Some(error)),
+        Err(error) => (
+            Vec::new(),
+            Some(format!("{error}; the declared models are still offered")),
+        ),
+    };
+    for id in declared {
+        if !models.iter().any(|found| &found.model == id) {
+            models.push(model(config, id.clone(), None, None));
+        }
+    }
+    (models, error)
+}
+
+/// The speech models a speech provider lists. ElevenLabs marks them itself
+/// (`can_do_text_to_speech`); an OpenAI-compatible listing mixes chat and
+/// speech ids, so it is filtered to the ones the facet recognises
+/// (`speak::recognises`).
+fn fetch_speech(config: &CustomProviderConfig) -> Result<Vec<DiscoveredModel>, String> {
+    let body = listing(config)?;
+    let found: Vec<DiscoveredModel> = match config.protocol {
+        CustomProtocol::ElevenLabs => serde_json::from_str::<Vec<ElevenLabsModel>>(&body)
+            .map_err(|error| format!("model listing was not an ElevenLabs model list: {error}"))?
+            .into_iter()
+            .filter(|entry| entry.can_do_text_to_speech == Some(true))
+            .map(|entry| {
+                let mut found = model(config, entry.model_id, None, None);
+                if let Some(name) = entry.name {
+                    found.display_name = name;
+                }
+                found.description = entry.description;
+                found
+            })
+            .collect(),
+        _ => serde_json::from_str::<ModelsResponse>(&body)
+            .map_err(|error| format!("model listing was not an OpenAI model list: {error}"))?
+            .data
+            .into_iter()
+            .filter(|entry| speak::recognises(config.wire(), &entry.id))
+            .map(|entry| model(config, entry.id, None, None))
+            .collect(),
+    };
+    if found.is_empty() {
+        return Err(
+            "the endpoint listed no speech model Cairn recognises; list its model ids".to_string(),
+        );
+    }
+    Ok(found)
+}
+
 fn fetch(config: &CustomProviderConfig) -> Result<Vec<ModelEntry>, String> {
+    // Unreachable through configuration, which requires a Decisions or OpenAI
+    // Images provider to list its models; refused rather than probed
+    // regardless.
     match config.protocol {
-        CustomProtocol::OpenAiChatCompletions => {}
-        // Unreachable through configuration, which requires a Decisions
-        // provider to list its models; refused rather than probed regardless.
         CustomProtocol::Decisions => {
             return Err("a Decisions provider lists its models explicitly".to_string())
         }
         CustomProtocol::OpenAiImages => {
             return Err("an OpenAI Images provider lists its models explicitly".to_string())
         }
+        CustomProtocol::OpenAiChatCompletions
+        | CustomProtocol::OpenAiSpeech
+        | CustomProtocol::ElevenLabs => {}
     }
+    let body = listing(config)?;
+    let parsed: ModelsResponse = serde_json::from_str(&body)
+        .map_err(|error| format!("model listing was not an OpenAI model list: {error}"))?;
+    if parsed.data.is_empty() {
+        return Err(
+            "the endpoint listed no models; list them explicitly if it does not enumerate"
+                .to_string(),
+        );
+    }
+    Ok(parsed.data)
+}
+
+/// The body of `GET {base}/models`, with the provider's own headers.
+fn listing(config: &CustomProviderConfig) -> Result<String, String> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(DISCOVERY_TIMEOUT)
         .timeout(DISCOVERY_TIMEOUT)
@@ -103,15 +197,7 @@ fn fetch(config: &CustomProviderConfig) -> Result<Vec<ModelEntry>, String> {
         // unauthorized, not found, or the server being unwell.
         return Err(format!("model listing returned HTTP {}", status.as_u16()));
     }
-    let parsed: ModelsResponse = serde_json::from_str(&body)
-        .map_err(|error| format!("model listing was not an OpenAI model list: {error}"))?;
-    if parsed.data.is_empty() {
-        return Err(
-            "the endpoint listed no models; list them explicitly if it does not enumerate"
-                .to_string(),
-        );
-    }
-    Ok(parsed.data)
+    Ok(body)
 }
 
 fn model(
@@ -120,6 +206,15 @@ fn model(
     context_window: Option<i64>,
     root: Option<String>,
 ) -> DiscoveredModel {
+    // A chat or Decisions provider's protocol fixes what every model serves,
+    // so the provider declares it once. A speech model's capabilities depend
+    // on the model, so each declares its own.
+    let serves = speak::capabilities(config.wire(), &id).map(|capabilities| {
+        vec![ServedVerb {
+            verb: Verb::Speak(capabilities),
+            wire: config.wire(),
+        }]
+    });
     // A reported root is the server's statement of what it loaded, and is
     // authoritative: an unknown root (a local path, a fine-tune, an unpinned
     // repository) selects nothing even when the served id looks like a pinned
@@ -152,9 +247,7 @@ fn model(
         supported_parameters: vec![],
         router: false,
         modalities: None,
-        // What a custom provider serves is fixed by its configured protocol, so
-        // the provider declares it once for every model it lists.
-        serves: None,
+        serves,
         tokenizer,
     }
 }

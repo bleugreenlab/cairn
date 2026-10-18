@@ -341,6 +341,9 @@ pub struct RunHandle {
     /// The effective model this process was started with. Used by warm reuse to
     /// detect when the job's requested model has diverged from the live process.
     pub model: Option<String>,
+    /// The model the provider reported running this session on (Claude's
+    /// `system:init`), whatever was or was not selected.
+    reported_model: Option<String>,
     /// Concrete provider account whose credentials were frozen into this child
     /// at launch. Warm reuse compares this with the durable session pin.
     pub account_id: Option<String>,
@@ -436,6 +439,7 @@ impl RunHandle {
             backend: None,
             goal_pause: Arc::new(Mutex::new(GoalPauseClaim::default())),
             model: None,
+            reported_model: None,
             account_id: None,
             credential_feed: None,
             terminal_tool_called: Arc::new(AtomicBool::new(false)),
@@ -1336,6 +1340,30 @@ impl AgentProcessState {
         false
     }
 
+    /// Record the model the provider reported for a process. Returns true if
+    /// the run exists.
+    pub fn set_reported_model(&self, run_id: &str, model: &str) -> bool {
+        if let Ok(mut processes) = self.processes.lock() {
+            if let Some(process) = processes.get_mut(run_id) {
+                process.reported_model = Some(model.to_string());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The model a live session runs on: the selected model when one was set,
+    /// otherwise the model the provider reported. The persisted context-token
+    /// read applies the same rule from the events table.
+    pub fn effective_model(&self, run_id: &str) -> Option<String> {
+        let processes = self.processes.lock().ok()?;
+        let process = processes.get(run_id)?;
+        process
+            .model
+            .clone()
+            .or_else(|| process.reported_model.clone())
+    }
+
     /// Get the backend name for a process by run_id (None for Claude/default or
     /// when the run is unknown).
     pub fn get_backend(&self, run_id: &str) -> Option<String> {
@@ -1942,6 +1970,25 @@ mod tests {
         // Overwriting replaces the value.
         assert!(state.set_model("run-1", "sonnet"));
         assert_eq!(state.get_model("run-1"), Some("sonnet".to_string()));
+    }
+
+    #[test]
+    fn effective_model_prefers_the_selected_model_over_the_reported_one() {
+        let state = state_with_run("run-1");
+        assert_eq!(state.effective_model("run-1"), None);
+        assert!(!state.set_reported_model("ghost", "claude-opus-5-5"));
+        assert_eq!(state.effective_model("ghost"), None);
+
+        assert!(state.set_reported_model("run-1", "claude-opus-5-5"));
+        assert_eq!(
+            state.effective_model("run-1").as_deref(),
+            Some("claude-opus-5-5")
+        );
+        // The reported model never stands in for the selected one.
+        assert_eq!(state.get_model("run-1"), None);
+
+        assert!(state.set_model("run-1", "sonnet"));
+        assert_eq!(state.effective_model("run-1").as_deref(), Some("sonnet"));
     }
 
     #[test]

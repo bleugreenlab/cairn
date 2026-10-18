@@ -500,6 +500,7 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
         claude: Arc::new(RecordingClaude(recorder.clone())),
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
+        codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
     };
     for (provider, label, auth) in [
         (
@@ -899,6 +900,7 @@ async fn claude_and_codex_serve_responses_through_the_facet() {
         claude: Arc::new(RecordingClaude(recorder.clone())),
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
+        codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
     };
     let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
     orch.subscriptions = Arc::new(homes.clone());
@@ -1108,6 +1110,7 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
         claude: Arc::new(RecordingClaude(recorder.clone())),
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
+        codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
     };
     let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
     orch.subscriptions = Arc::new(homes.clone());

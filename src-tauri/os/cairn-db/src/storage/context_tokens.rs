@@ -21,7 +21,13 @@ pub async fn get_latest_context_token_event(
                 e.output_tokens,
                 e.thinking_tokens,
                 e.created_at,
-                e.data
+                e.data,
+                (SELECT i.data FROM events i
+                  WHERE i.session_id = e.session_id
+                    AND i.event_type = 'system:init'
+                    AND i.parent_tool_use_id IS NULL
+                  ORDER BY i.created_at DESC, i.sequence DESC
+                  LIMIT 1) AS init_data
          FROM events e
          LEFT JOIN runs r ON r.id = e.run_id
          LEFT JOIN sessions s ON s.id = e.session_id
@@ -42,11 +48,18 @@ pub async fn get_latest_context_token_event(
         |row| {
             let db_model = row.opt_text(3)?;
             let data = row.text(10)?;
+            let init_data = row.opt_text(11)?;
+            // The effective-model rule (the live path applies it through
+            // `AgentProcessState::effective_model`): selected, else the model
+            // the provider reported at init, else the one this event names.
+            let model = db_model
+                .or_else(|| init_data.as_deref().and_then(extract_model_from_event_data))
+                .or_else(|| extract_model_from_event_data(&data));
             Ok(ContextTokenEventSnapshot {
                 run_id: row.text(0)?,
                 session_id: row.text(1)?,
                 backend: row.text(2)?.to_ascii_lowercase(),
-                model: db_model.or_else(|| extract_model_from_event_data(&data)),
+                model,
                 input_tokens: row.opt_i64(4)?,
                 cache_read_tokens: row.opt_i64(5)?,
                 cache_create_tokens: row.opt_i64(6)?,
@@ -121,6 +134,23 @@ mod tests {
                 .is_none()
         );
 
+        // The model the CLI reported at init beats the one the token event
+        // names; a subagent's init, though newer, is not the session's.
+        db.execute_script(r#"
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                parent_tool_use_id, created_at)
+              VALUES
+                ('init', 'ctx-run', 'ctx-session', 0, 9, 'system:init', '{"raw":{"model":"init-model"}}', NULL, 9),
+                ('child-init', 'ctx-run', 'ctx-session', 6, 14, 'system:init', '{"raw":{"model":"child-model"}}', 'tool', 14);
+        "#).await.unwrap();
+        let event = get_latest_context_token_event(db.clone(), "ctx-session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.model.as_deref(), Some("init-model"));
+        assert_eq!(event.captured_at, 10);
+
+        // The selected model wins over everything the provider reported.
         db.execute_script("UPDATE jobs SET model = 'job-pinned-model' WHERE id = 'ctx-job'")
             .await
             .unwrap();

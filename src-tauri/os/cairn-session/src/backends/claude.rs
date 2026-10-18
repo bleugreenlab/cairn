@@ -16,7 +16,7 @@ use cairn_common::ids;
 use cairn_db::storage::LocalDb;
 use cairn_domain::ContextTokenState;
 use cairn_models::session::events::SessionEvent;
-use cairn_models::types::catalog::{claude_context_window, ClaudeContextOptIn};
+use cairn_models::types::catalog::{context_window, CLAUDE_FAMILY_BACKEND};
 use cairn_models::types::usage::{ProviderUsageScope, ProviderUsageSnapshot, ProviderUsageWindow};
 use cairn_models::wire::claude_stream::{
     extract_tool_start, message_start_usage, parse_thinking_tokens_estimate,
@@ -741,17 +741,14 @@ pub(crate) fn build_claude_context_snapshot(
     model: Option<String>,
     usage: &Usage,
 ) -> ContextTokenState {
-    let context_window = claude_context_window(
-        model.as_deref().unwrap_or("unknown"),
-        ClaudeContextOptIn::default(),
-    );
+    let context_window = context_window(CLAUDE_FAMILY_BACKEND, model.as_deref(), &[]);
     ContextTokenState {
         run_id: run_id.to_string(),
         session_id: session_id.map(str::to_string),
         backend: "claude".to_string(),
         model,
         used_tokens: claude_context_used_tokens(usage),
-        context_window: Some(context_window),
+        context_window,
         auto_compact_limit: None,
         reasoning_tokens: usage
             .output_tokens_details
@@ -773,7 +770,7 @@ pub(crate) fn emit_claude_context_snapshot(
     session_id: Option<&str>,
     usage: &Usage,
 ) {
-    let model = host.process_state.get_model(run_id);
+    let model = host.process_state.effective_model(run_id);
     host.host.context_snapshot(build_claude_context_snapshot(
         run_id, session_id, model, usage,
     ));
@@ -1429,6 +1426,13 @@ impl ClaudeRuntime {
                             // so routing and the provider card converge without
                             // an operator refresh.
                             host.host.initialized();
+                            if let Some(model) = data
+                                .get("model")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|model| !model.is_empty())
+                            {
+                                host.process_state.set_reported_model(run_id, model);
+                            }
                         }
                     }
 
@@ -2444,6 +2448,23 @@ mod tests {
         assert_eq!(state.context_window, Some(200_000));
         assert_eq!(state.last_output_tokens, Some(4_147));
     }
+
+    #[test]
+    fn build_claude_context_snapshot_without_a_model_has_no_window() {
+        let usage = Usage {
+            input_tokens: 4,
+            cache_creation_input_tokens: Some(19_000),
+            cache_read_input_tokens: Some(150_000),
+            output_tokens: 996,
+            output_tokens_details: None,
+        };
+
+        let state = build_claude_context_snapshot("run-1", Some("session"), None, &usage);
+
+        assert_eq!(state.model, None);
+        assert_eq!(state.context_window, None);
+        assert_eq!(state.used_tokens, 170_000);
+    }
 }
 
 #[cfg(test)]
@@ -2562,6 +2583,7 @@ mod depletion_order_tests {
     #[derive(Default)]
     struct RecordingHost {
         calls: Mutex<Vec<String>>,
+        snapshots: Mutex<Vec<ContextTokenState>>,
     }
 
     impl RecordingHost {
@@ -2623,7 +2645,9 @@ mod depletion_order_tests {
             }
             true
         }
-        fn context_snapshot(&self, _snapshot: ContextTokenState) {}
+        fn context_snapshot(&self, snapshot: ContextTokenState) {
+            self.snapshots.lock().unwrap().push(snapshot);
+        }
         fn complete(&self, _outcome: ClaudeTurnOutcome, context: ClaudeTurnContext) {
             let _ = context;
             self.record("complete".to_string());
@@ -2672,6 +2696,69 @@ mod depletion_order_tests {
         .expect("reader thread");
         let calls = host.calls.lock().unwrap().clone();
         calls
+    }
+
+    // A job that selected no model still runs on one: the CLI names it in its
+    // init. The live gauge reads the window from that reported model rather
+    // than inventing a default for a model it never saw.
+    #[tokio::test]
+    async fn the_live_gauge_reads_the_window_of_the_model_the_cli_reported() {
+        let db = Arc::new(cairn_db::storage::migrated_test_db("claude-reported-model.db").await);
+        let host = Arc::new(RecordingHost::default());
+        let process_state = Arc::new(AgentProcessState::default());
+        process_state.processes.lock().unwrap().register(
+            "run-reported".to_string(),
+            crate::agent_process::process::RunHandle::test_handle(None, None),
+        );
+        let runtime = ClaudeRuntime {
+            process_state,
+            emitter: Arc::new(cairn_platform::services::emitter::CapturingEmitter::default()),
+            boot_id: "boot".to_string(),
+            host: host.clone(),
+        };
+        let init = serde_json::json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": "s1",
+            "model": "claude-opus-5-5",
+            "tools": crate::agent_process::toolkits::CORE_VERBS,
+        });
+        let delta = serde_json::json!({
+            "type": "stream_event",
+            "session_id": "s1",
+            "event": {
+                "type": "message_delta",
+                "delta": {},
+                "usage": {
+                    "input_tokens": 4,
+                    "cache_read_input_tokens": 100_000,
+                    "cache_creation_input_tokens": 16_000,
+                    "output_tokens": 996
+                }
+            }
+        });
+        let stdout = format!("{init}\n{delta}\n");
+        std::thread::spawn(move || {
+            ClaudeRuntime::reader_thread(
+                &runtime,
+                "run-reported",
+                None,
+                false,
+                Box::new(std::io::Cursor::new(stdout.into_bytes())),
+                None,
+                db,
+            );
+        })
+        .join()
+        .expect("reader thread");
+
+        let snapshots = host.snapshots.lock().unwrap().clone();
+        let [snapshot] = snapshots.as_slice() else {
+            panic!("expected one live snapshot, got {snapshots:?}");
+        };
+        assert_eq!(snapshot.used_tokens, 117_000);
+        assert_eq!(snapshot.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(snapshot.context_window, Some(1_000_000));
     }
 
     // The credits shape: a structured synthetic error, then a generic error

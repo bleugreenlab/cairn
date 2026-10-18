@@ -3118,6 +3118,8 @@ impl Orchestrator {
             }
         } else if backend_name == "claude" {
             crate::backends::claude::discover_catalog_blocking(self)
+        } else if backend_name == "codex" {
+            crate::backends::codex::discover_catalog_blocking(self)
         } else if backend_name == "ollama" {
             crate::backends::ollama::models::discover_catalog_blocking(self)
         } else if backend_name == crate::backends::openrouter::OPENROUTER_BACKEND_KEY {
@@ -4021,6 +4023,99 @@ mod tests {
         assert_eq!(state.reasoning_tokens, Some(12));
         assert_eq!(state.last_output_tokens, Some(38));
         assert_eq!(state.captured_at, 10);
+    }
+
+    /// The `(used, window)` reading `session_occupancy` hands the continuation's
+    /// capacity trigger: no window, no reading.
+    fn occupancy_of(state: &ContextTokenState) -> Option<(i64, i64)> {
+        Some((state.used_tokens, state.context_window?))
+    }
+
+    async fn insert_model_less_claude_session(db: &DbState, prefix: &str, init_data: Option<&str>) {
+        let init = init_data
+            .map(|data| {
+                format!(
+                    "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                        parent_tool_use_id, created_at)
+                     VALUES ('{prefix}-init', '{prefix}-run', '{prefix}-session', 1, 5, 'system:init',
+                        '{data}', NULL, 5);"
+                )
+            })
+            .unwrap_or_default();
+        db.local
+            .execute_script(&format!(
+                "
+                INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('{prefix}-project', 'default', 'Model-less', '{prefix}', '/tmp/{prefix}', 1, 1);
+                INSERT INTO jobs(id, project_id, status, model, created_at, updated_at)
+                 VALUES ('{prefix}-job', '{prefix}-project', 'running', NULL, 1, 1);
+                INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+                 VALUES ('{prefix}-session', '{prefix}-job', 'CLAUDE', 'open', 1, 1, 1);
+                INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+                 VALUES ('{prefix}-run', '{prefix}-project', '{prefix}-job', 'exited', '{prefix}-session', 1, 1);
+                {init}
+                INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                    parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
+                    cache_create_tokens, output_tokens, thinking_tokens)
+                 VALUES ('{prefix}-assistant', '{prefix}-run', '{prefix}-session', 2, 10, 'assistant', '{{}}',
+                    NULL, 10, 4, 150000, 19000, 996, NULL);
+                "
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn claude_context_token_state_falls_back_to_the_init_reported_model() {
+        use cairn_models::continuation::window_pressure_reached;
+        let db = test_db().await;
+        insert_model_less_claude_session(
+            &db,
+            "CLINIT",
+            Some(r#"{"raw":{"model":"claude-opus-5-5"}}"#),
+        )
+        .await;
+        let orch = OrchestratorBuilder::new(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+
+        let state = orch
+            .get_context_token_state("CLINIT-session")
+            .await
+            .unwrap();
+        assert_eq!(state.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(state.context_window, Some(1_000_000));
+        assert_eq!(state.used_tokens, 170_000);
+        // 170k of a 1M window is nowhere near the compaction threshold.
+        assert!(!window_pressure_reached(occupancy_of(&state), 0.8));
+    }
+
+    #[tokio::test]
+    async fn claude_context_token_state_without_any_model_has_no_window() {
+        use cairn_models::continuation::window_pressure_reached;
+        let db = test_db().await;
+        insert_model_less_claude_session(&db, "CLNONE", None).await;
+        let orch = OrchestratorBuilder::new(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+
+        let state = orch
+            .get_context_token_state("CLNONE-session")
+            .await
+            .unwrap();
+        assert_eq!(state.model, None);
+        assert_eq!(state.used_tokens, 170_000);
+        // No model means no known window: the gauge shows a bare count and the
+        // capacity trigger has no reading, so it never rebuilds the thread.
+        assert_eq!(state.context_window, None);
+        assert_eq!(occupancy_of(&state), None);
+        assert!(!window_pressure_reached(occupancy_of(&state), 0.8));
     }
 
     #[tokio::test]

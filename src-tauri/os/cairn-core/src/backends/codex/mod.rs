@@ -5,6 +5,7 @@
 //! and translates app-server notifications into Cairn transcript events.
 
 mod backend_impl;
+pub(crate) use backend_impl::discover_catalog_blocking;
 mod events;
 mod permissions;
 pub mod pool;

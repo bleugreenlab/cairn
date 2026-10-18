@@ -25,6 +25,7 @@ members = [
   "os/cairn-platform",
   "os/cairn-sandbox",
   "os/cairn-session",
+  "os/cairn-speech-wire",
   "os/cairn-symbols",
   "os/cairn-tokenize",
   "os/cairn-toks",

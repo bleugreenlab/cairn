@@ -373,8 +373,11 @@ pub struct Measure {
 
 /// What one call consumed, in the units it was counted in.
 ///
-/// Only what the provider actually reported is measured. A meter that is absent
-/// was not reported, which is not the same as having consumed nothing on it.
+/// Only what is known exactly is measured: what the provider reported, or what
+/// the facet counted exactly on the wire (the characters it sent a speech
+/// provider, the PCM samples it received back). A meter that is absent was
+/// neither reported nor counted, which is not the same as having consumed
+/// nothing on it.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeteredUsage {

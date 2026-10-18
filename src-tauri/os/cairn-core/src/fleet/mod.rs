@@ -30844,7 +30844,7 @@ mod handoff_tests {
             .execute_script(format!(
                 "DELETE FROM permission_requests;
                  INSERT INTO sessions(id, job_id, status, created_at, updated_at)
-                  VALUES ('session-1','job-1','active',1,1);
+                  VALUES ('session-1','job-1','open',1,1);
                  UPDATE runs SET session_id = 'session-1' WHERE id = '{RUN}';
                  INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
                   VALUES ('{TURN}','session-1','{RUN}','job-1',1,'running','initial',1,1);
@@ -31183,20 +31183,191 @@ mod handoff_tests {
         assert_eq!(turn_state(&orch).await, "yielded");
     }
 
-    /// With no live process the provider turn has ended. Continuing it is the
-    /// single successor owner's job (cairn/4936); until that lands, withdrawal
-    /// mints nothing and leaves the turn as it found it.
+    /// Stdin of a warm process, recording every prompt it is sent.
+    struct RecordingStdin(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for RecordingStdin {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The provider turn ends while the fence wait is inline (the warm process
+    /// goes idle), so nothing holds the yielded turn when the batch settles.
+    /// Withdrawal continues it through the single successor owner: exactly one
+    /// `permission_response` successor, started on the warm process, which is
+    /// told the permission was withdrawn. A late answerer's notice ("no turn
+    /// was started") would be false in the turn it is delivered in. Withdrawing
+    /// the same request again, or answering it late, continues nothing further.
     #[tokio::test(start_paused = true)]
-    async fn withdrawal_after_the_provider_turn_ended_mints_nothing_here() {
+    async fn withdrawal_after_the_provider_turn_ended_continues_into_one_successor() {
         let orch = fence_orchestrator(false).await;
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        orch.process_state
+            .register_process(
+                RUN.into(),
+                RunHandle::new(
+                    Arc::new(std::sync::Mutex::new(None)),
+                    Arc::new(std::sync::Mutex::new(Some(
+                        cairn_models::session::claude::ClaudeControl::boxed(Box::new(
+                            RecordingStdin(delivered.clone()),
+                        )),
+                    ))),
+                    Some("session-1".into()),
+                    Some("job-1".into()),
+                ),
+            )
+            .unwrap();
+        orch.process_state.begin_turn(RUN, TURN);
         let turns_before = turn_count(&orch).await;
-        let result = close_mid_wait(&orch, |fleet| {
-            fleet.settle_runner_contexts_for_request("request-1", "attempt-1");
-        })
-        .await;
-        assert_withdrawn_reply(&result);
-        assert_eq!(turn_count(&orch).await, turns_before);
+
+        let task = raise(&orch).await;
         assert_eq!(turn_state(&orch).await, "yielded");
+        orch.process_state.transition_to_warm(RUN);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        orch.fleet
+            .settle_runner_contexts_for_request("request-1", "attempt-1");
+        assert_withdrawn_reply(&task.await.unwrap());
+        assert_withdrawn_with(&orch, "batch_settled").await;
+
+        let successors = orch
+            .db
+            .local
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT id, state, start_reason, run_id, end_reason FROM turns \
+                             WHERE predecessor_id = ?1",
+                            (TURN,),
+                        )
+                        .await?;
+                    let mut successors = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        successors.push((
+                            row.text(0)?,
+                            row.text(1)?,
+                            row.opt_text(2)?,
+                            row.opt_text(3)?,
+                            row.opt_text(4)?,
+                        ));
+                    }
+                    Ok(successors)
+                })
+            })
+            .await
+            .unwrap();
+        let [(successor, state, start_reason, run_id, end_reason)] = successors.as_slice() else {
+            panic!("exactly one successor of the withdrawn turn: {successors:?}");
+        };
+        assert_eq!(start_reason.as_deref(), Some("permission_response"));
+        assert_eq!(
+            (state.as_str(), run_id.as_deref(), end_reason.as_deref()),
+            ("running", Some(RUN), None),
+            "the successor is started on the warm run, not settled as refused"
+        );
+        assert_eq!(
+            turn_count(&orch).await,
+            turns_before + 1,
+            "nothing else is minted"
+        );
+        assert_eq!(
+            orch.process_state.get_current_turn_id(RUN).as_deref(),
+            Some(successor.as_str()),
+            "the warm process serves the successor"
+        );
+        let resume_error = orch
+            .db
+            .local
+            .query_one("SELECT resume_error FROM permission_requests", (), |row| {
+                row.opt_text(0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(resume_error, None, "the continuation was not refused");
+
+        let prompt = String::from_utf8_lossy(&delivered.lock().unwrap()).into_owned();
+        assert!(
+            prompt.contains("The permission you were waiting on was withdrawn before it was answered: the batch finished while this was still waiting"),
+            "the agent is told why its permission was withdrawn: {prompt}"
+        );
+        assert!(
+            !prompt.contains("no turn was started"),
+            "the agent is not sent the late answerer's notice: {prompt}"
+        );
+        let waits = orch
+            .db
+            .local
+            .query_one(
+                "SELECT COUNT(*) FROM agent_waits \
+                 WHERE predecessor_turn_id = ?1 AND state IN ('pending', 'resolving')",
+                (TURN,),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            waits, 0,
+            "no durable wait is left holding the withdrawn turn"
+        );
+
+        // The continuation happens once. Withdrawing the same request again,
+        // or answering it late, continues nothing further.
+        let (request_id, _, _) = permission(&orch).await;
+        let turns_after = turn_count(&orch).await;
+        let delivered_after = delivered.lock().unwrap().len();
+        let again = crate::mcp::handlers::permission::withdraw_permission_request(
+            &orch,
+            RUN,
+            &request_id,
+            TOOL_USE,
+            Some(TURN),
+            crate::mcp::handlers::permission::WithdrawalCause::BatchSettled,
+            crate::mcp::handlers::permission::HandBackPolicy::Resume,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            again,
+            crate::mcp::handlers::permission::Withdrawal::NotPending
+        );
+        let late = resolve_permission_request(
+            &orch,
+            &request_id,
+            PermissionAnswer::from_surface(PermissionDecision::Deny, AnswerSurface::ResourcePatch)
+                .with_actor("cairn://p/prj/1/1/agent"),
+        )
+        .await
+        .expect("a late answer is told, not refused");
+        assert!(late.withdrawn.is_some() && !late.duplicate, "{late:?}");
+
+        assert_eq!(turn_count(&orch).await, turns_after, "no second successor");
+        assert_eq!(
+            orch.process_state.get_current_turn_id(RUN).as_deref(),
+            Some(successor.as_str()),
+            "the warm process still serves the one successor"
+        );
+        let successor_state = orch
+            .db
+            .local
+            .query_one(
+                "SELECT state FROM turns WHERE id = ?1",
+                (successor.clone(),),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(successor_state, "running");
+        assert_eq!(
+            delivered.lock().unwrap().len(),
+            delivered_after,
+            "nothing further is prompted"
+        );
     }
 
     /// An older executor gives up on every callback at a flat 30 s, while the

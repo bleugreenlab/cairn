@@ -562,6 +562,260 @@ fn an_endpoint_that_lists_nothing_says_so_rather_than_looking_healthy() {
         .contains("list them explicitly"));
 }
 
+fn speech_config(protocol: CustomProtocol, ids: &[&str]) -> CustomProviderConfig {
+    CustomProviderConfig {
+        protocol,
+        ..config(
+            "voice",
+            "http://127.0.0.1:1/v1",
+            CustomModelPolicy::Explicit {
+                ids: ids.iter().map(|id| id.to_string()).collect(),
+            },
+        )
+    }
+}
+
+#[test]
+fn a_speech_provider_speaks_per_model_and_serves_nothing_else() {
+    use cairn_models::interface::speak::{InputStreaming, StyleControl};
+    use cairn_models::types::catalog::{Verb, Wire};
+
+    let openai = speech_config(CustomProtocol::OpenAiSpeech, &["kokoro", "gpt-4o-mini-tts"]);
+    assert_eq!(openai.wire(), Wire::OpenAiSpeech);
+    assert!(openai.serves().is_empty(), "nothing provider-wide");
+    // The endpoint is down, so the declared models stand on their own.
+    let (models, error) = discover_blocking(&openai);
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|e| e.ends_with("the declared models are still offered")),
+        "{error:?}"
+    );
+    let speaks = |index: usize| {
+        let served = models[index].serves.as_ref().expect("declared per model");
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].wire, Wire::OpenAiSpeech);
+        match &served[0].verb {
+            Verb::Speak(capabilities) => capabilities.clone(),
+            other => panic!("expected speak, got {other:?}"),
+        }
+    };
+    assert_eq!(speaks(0).input, InputStreaming::Segmented);
+    assert_eq!(speaks(0).style, StyleControl::None);
+    assert_eq!(speaks(1).style, StyleControl::Instructions);
+
+    let eleven = speech_config(CustomProtocol::ElevenLabs, &["eleven_flash_v2_5"]);
+    assert_eq!(eleven.wire(), Wire::ElevenLabsStreamInput);
+    let (models, _) = discover_blocking(&eleven);
+    assert!(matches!(
+        &models[0].serves.as_ref().unwrap()[0].verb,
+        Verb::Speak(capabilities) if capabilities.input == InputStreaming::Native
+    ));
+
+    for config in [&openai, &eleven] {
+        let refusal = config.require_turns().unwrap_err();
+        assert!(refusal.contains("speaks speech only"), "{refusal}");
+        let refusal = config.decision_route().unwrap_err();
+        assert!(refusal.contains("cannot answer a decision"), "{refusal}");
+    }
+    // A chat provider's models still declare nothing of their own.
+    let (chat, _) = discover_blocking(&config(
+        "chat",
+        "http://127.0.0.1:1/v1",
+        CustomModelPolicy::Explicit {
+            ids: vec!["qwen3".into()],
+        },
+    ));
+    assert_eq!(chat[0].serves, None);
+}
+
+/// Kokoro-FastAPI's and OpenAI's listings mixed: chat, transcription,
+/// embedding and speech ids.
+const OPENAI_MIXED_MODELS: &str = r#"{"object":"list","data":[
+  {"id":"gpt-4o","object":"model"},
+  {"id":"tts-1","object":"model"},
+  {"id":"whisper-1","object":"model"},
+  {"id":"gpt-4o-mini-tts","object":"model"},
+  {"id":"text-embedding-3-small","object":"model"},
+  {"id":"kokoro","object":"model"}
+]}"#;
+
+/// ElevenLabs' `GET /v1/models` shape: speech models and a voice-conversion
+/// one.
+const ELEVENLABS_MIXED_MODELS: &str = r#"[
+  {"model_id":"eleven_flash_v2_5","name":"Eleven Flash v2.5","description":"Ultra low latency","can_do_text_to_speech":true,"can_do_voice_conversion":false},
+  {"model_id":"eleven_multilingual_sts_v2","name":"Eleven Multilingual STS","can_do_text_to_speech":false,"can_do_voice_conversion":true},
+  {"model_id":"eleven_multilingual_v2","name":"Eleven Multilingual v2","can_do_text_to_speech":true}
+]"#;
+
+fn discovering(protocol: CustomProtocol, base: &str, declared: &[&str]) -> CustomProviderConfig {
+    CustomProviderConfig {
+        base_url: base.to_string(),
+        models: if declared.is_empty() {
+            CustomModelPolicy::Discover
+        } else {
+            CustomModelPolicy::Explicit {
+                ids: declared.iter().map(|id| id.to_string()).collect(),
+            }
+        },
+        ..speech_config(protocol, &[])
+    }
+}
+
+fn ids(models: &[cairn_models::types::catalog::DiscoveredModel]) -> Vec<&str> {
+    models.iter().map(|model| model.model.as_str()).collect()
+}
+
+#[test]
+fn an_openai_speech_provider_discovers_only_its_speech_models() {
+    let base = serve_once(http_response("200 OK", OPENAI_MIXED_MODELS));
+    let (models, error) = discover_blocking(&discovering(CustomProtocol::OpenAiSpeech, &base, &[]));
+    assert_eq!(error, None);
+    assert_eq!(ids(&models), vec!["tts-1", "gpt-4o-mini-tts", "kokoro"]);
+    assert!(models.iter().all(|model| model.serves.is_some()));
+}
+
+#[test]
+fn an_elevenlabs_provider_discovers_only_models_that_speak() {
+    let base = serve_once(http_response("200 OK", ELEVENLABS_MIXED_MODELS));
+    let (models, error) = discover_blocking(&discovering(CustomProtocol::ElevenLabs, &base, &[]));
+    assert_eq!(error, None);
+    assert_eq!(
+        ids(&models),
+        vec!["eleven_flash_v2_5", "eleven_multilingual_v2"]
+    );
+    assert_eq!(models[0].display_name, "Eleven Flash v2.5");
+    assert_eq!(models[0].description.as_deref(), Some("Ultra low latency"));
+}
+
+#[test]
+fn declared_speech_models_add_to_discovery_without_duplicates() {
+    let base = serve_once(http_response("200 OK", OPENAI_MIXED_MODELS));
+    let (models, error) = discover_blocking(&discovering(
+        CustomProtocol::OpenAiSpeech,
+        &base,
+        &["kokoro", "my-custom-voice-model"],
+    ));
+    assert_eq!(error, None);
+    assert_eq!(
+        ids(&models),
+        vec![
+            "tts-1",
+            "gpt-4o-mini-tts",
+            "kokoro",
+            "my-custom-voice-model"
+        ]
+    );
+    // An unrecognised declared id is still a speech model on this wire.
+    assert!(models[3].serves.is_some());
+}
+
+#[test]
+fn a_failed_speech_listing_keeps_the_declared_models() {
+    let base = serve_once(http_response("503 Service Unavailable", "{}"));
+    let (models, error) = discover_blocking(&discovering(
+        CustomProtocol::OpenAiSpeech,
+        &base,
+        &["kokoro"],
+    ));
+    assert_eq!(ids(&models), vec!["kokoro"]);
+    assert_eq!(
+        error.as_deref(),
+        Some("model listing returned HTTP 503; the declared models are still offered")
+    );
+    // With nothing declared, the failure is the whole answer.
+    let base = serve_once(http_response("200 OK", r#"{"data":[{"id":"gpt-4o"}]}"#));
+    let (models, error) = discover_blocking(&discovering(CustomProtocol::OpenAiSpeech, &base, &[]));
+    assert!(models.is_empty());
+    assert!(error.unwrap().contains("no speech model Cairn recognises"));
+}
+
+/// A live discovery pass against a running OpenAI-compatible TTS server (for
+/// example Kokoro-FastAPI): `SPEECH_DISCOVERY_URL=http://host:8880/v1 cargo
+/// test -p cairn-core --lib live_speech_discovery -- --ignored --nocapture`.
+#[test]
+#[ignore = "needs a running TTS server at SPEECH_DISCOVERY_URL"]
+fn live_speech_discovery() {
+    let base = std::env::var("SPEECH_DISCOVERY_URL").expect("SPEECH_DISCOVERY_URL");
+    let (models, error) = discover_blocking(&discovering(CustomProtocol::OpenAiSpeech, &base, &[]));
+    for model in &models {
+        let served = model.serves.as_ref().expect("declared per model");
+        println!(
+            "discovered {} serves {}",
+            model.model,
+            serde_json::to_string(served).unwrap()
+        );
+    }
+    assert_eq!(error, None);
+    assert!(!models.is_empty());
+}
+
+#[test]
+fn a_speech_provider_may_discover_or_declare() {
+    for protocol in [CustomProtocol::OpenAiSpeech, CustomProtocol::ElevenLabs] {
+        for models in [
+            CustomModelPolicy::Discover,
+            CustomModelPolicy::Explicit {
+                ids: vec!["kokoro".into()],
+            },
+        ] {
+            ProviderAuth::custom_endpoint(
+                "http://localhost:8880",
+                protocol,
+                None,
+                &[],
+                models,
+                CustomSampling::default(),
+                32_768,
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn elevenlabs_authenticates_with_its_own_header() {
+    let operator = vec![("x-team".to_string(), "t".to_string())];
+    assert_eq!(
+        super::request_headers(CustomProtocol::ElevenLabs, Some("xi-key"), &operator),
+        vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("xi-api-key".to_string(), "xi-key".to_string()),
+            ("x-team".to_string(), "t".to_string()),
+        ]
+    );
+    for protocol in [
+        CustomProtocol::OpenAiChatCompletions,
+        CustomProtocol::Decisions,
+        CustomProtocol::OpenAiSpeech,
+    ] {
+        assert_eq!(
+            super::request_headers(protocol, Some("sk"), &[])[1],
+            ("authorization".to_string(), "Bearer sk".to_string())
+        );
+    }
+    assert_eq!(
+        super::request_headers(CustomProtocol::OpenAiSpeech, None, &[]).len(),
+        1
+    );
+}
+
+#[test]
+fn every_custom_protocol_round_trips_its_name() {
+    for protocol in CustomProtocol::ALL {
+        assert_eq!(CustomProtocol::parse(protocol.as_str()), Some(protocol));
+        let json = serde_json::to_value(protocol).unwrap();
+        assert_eq!(json, protocol.as_str());
+        assert_eq!(
+            serde_json::from_value::<CustomProtocol>(json).unwrap(),
+            protocol
+        );
+    }
+    assert_eq!(CustomProtocol::parse("openai-video"), None);
+    assert!(CustomProtocol::OpenAiSpeech.is_speech() && CustomProtocol::ElevenLabs.is_speech());
+    assert!(!CustomProtocol::Decisions.is_speech());
+}
+
 #[test]
 fn two_custom_providers_can_serve_the_same_model_id() {
     // The same id on two endpoints is two different models. They stay apart

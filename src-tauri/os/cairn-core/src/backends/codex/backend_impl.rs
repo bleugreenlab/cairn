@@ -17,6 +17,7 @@ use cairn_models::interface::session::{
     Cli, CodexModels, CodexNativeTools, CodexServer, CodexSpec, NativeGoal, ProviderSpec, Secret,
     SecretEnv, ServerLaunch, SessionError, SessionEvents, SessionHost, SessionSpec, SessionStart,
 };
+use cairn_models::session::codex::managed::{CodexInstallError, ManagedCodexStatus};
 use cairn_models::session::codex::models::discover_codex_models;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -32,8 +33,9 @@ use cairn_models::types::catalog::{
     DiscoveredModel, OptionChoice, OptionKind, ProviderOptionDescriptor, ProviderOptionKey,
 };
 
-/// The Codex CLI on the session host, reporting a missing or unusable one on
-/// the run's transcript.
+/// The Codex CLI on the session host, reporting a missing one on the run's
+/// transcript. A managed install's refusal is written as-is: it already says
+/// what failed and how to retry.
 fn resolve_codex_cli(
     orch: &Orchestrator,
     host: &dyn SessionHost,
@@ -48,13 +50,50 @@ fn resolve_codex_cli(
                 session_id,
                 &format!("Codex CLI not found: {}", reason),
             ),
-            SessionError::CliIncompatible(reason) => {
+            SessionError::CliInstallFailed(reason) => {
                 insert_error_event(orch, run_id, session_id, reason)
             }
             _ => {}
         }
         error.to_string()
     })
+}
+
+/// The Codex catalog, asked of the installed managed Codex. Never installs:
+/// a catalog refresh must not wait on a download, and the follow loop
+/// refreshes the catalog once an install lands.
+pub(crate) fn discover_catalog_blocking(
+    orch: &Orchestrator,
+) -> (Vec<DiscoveredModel>, Option<String>) {
+    let codex = &orch.models_runtime().codex_cli;
+    let discovered =
+        (|| {
+            let Some(installed) = codex.installed() else {
+                return Err(match codex.status() {
+                ManagedCodexStatus::Failed(refusal) => refusal,
+                _ => "Cairn is still installing Codex; its models appear once the install finishes."
+                    .to_string(),
+            });
+            };
+            let _guard = CODEX_START_LOCK
+                .lock()
+                .map_err(|_| "Codex start lock poisoned".to_string())?;
+            discover_codex_models(
+                &installed.path.to_string_lossy(),
+                &super::cairn_codex_home(),
+                None,
+                &HashMap::new(),
+            )
+        })();
+    match discovered {
+        Ok(mut models) => {
+            // Codex's own listing is its chat models; the image offer is declared
+            // beside them.
+            models.extend(CodexBackend.declared_models());
+            (models, None)
+        }
+        Err(error) => (Vec::new(), Some(error)),
+    }
 }
 
 /// A Codex OAuth credential's live state, and the Cairn account it belongs
@@ -114,8 +153,17 @@ impl AgentBackend for CodexBackend {
         "Codex"
     }
 
+    /// Cairn installs Codex itself, so it is available wherever OpenAI
+    /// publishes a package for the host.
     fn is_available(&self) -> Result<(), String> {
-        crate::env::find_binary("codex").map(|_| ())
+        match cairn_models::session::codex::pin::host_target() {
+            Some(_) => Ok(()),
+            None => Err(CodexInstallError::UnsupportedPlatform {
+                os: std::env::consts::OS,
+                arch: std::env::consts::ARCH,
+            }
+            .to_string()),
+        }
     }
 
     fn serves(
@@ -128,20 +176,9 @@ impl AgentBackend for CodexBackend {
     }
 
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
-        let _guard = CODEX_START_LOCK
-            .lock()
-            .map_err(|_| "Codex start lock poisoned".to_string())?;
-        let codex_path = crate::env::find_binary("codex")?;
-        let mut models = discover_codex_models(
-            &codex_path,
-            &super::cairn_codex_home(),
-            None,
-            &HashMap::new(),
-        )?;
-        // Codex's own listing is its chat models; the image offer is declared
-        // beside them.
-        models.extend(self.declared_models());
-        Ok(models)
+        // Discovery runs the managed Codex, which the orchestrator owns, so it
+        // routes Codex through `discover_catalog_blocking` instead.
+        Err("Codex discovery requires the managed Codex CLI".to_string())
     }
 
     /// The image offer is the facet's, serving `image` alone, so neither a
@@ -714,7 +751,16 @@ fn acquire_pooled_server(
 ) -> Result<(Arc<super::pool::PooledAppServer>, Option<String>), String> {
     let runtime = orch.models_runtime().clone();
     let (oauth_state, account_id) = codex_oauth_state(orch, codex_auth)?;
-    let pool_key = pool_key_for_auth(codex_auth, oauth_state.as_ref());
+    // The release is part of the key, so after the managed Codex swaps, the
+    // next call starts a server on the new release.
+    let pool_key = super::pool::versioned_key(
+        &pool_key_for_auth(codex_auth, oauth_state.as_ref()),
+        runtime
+            .codex_cli
+            .installed()
+            .map(|installed| installed.version)
+            .as_deref(),
+    );
     orch.collect_warm_if_needed();
 
     // Get-or-spawn the shared app-server (spawn + initialize + login run ONCE per
