@@ -24,6 +24,7 @@ use cairn_core::internal::storage::{
     DbError, DbResult, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS,
 };
 use cairn_db::turso::params;
+use cairn_exec::blocking::offload;
 use cairn_exec::{AdmissionLimits, ExecutorRuntime, Fleet as ExecutorPool};
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
@@ -462,19 +463,25 @@ fn attach_executor(
     );
     let handle = executor_pool.clone();
 
+    // Each frame's synchronous pool work runs on the blocking pool, awaited in
+    // arrival order, as the executor's link-control worker runs it. The pool's
+    // blocking guard therefore sees here what it sees in production, and the
+    // runner's half of each exchange stays on this task.
     tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
             match message {
                 // Answer the offer the way a real machine does: from admission,
-                // immediately, on the loop. Every integration test therefore
-                // exercises the whole offer -> claim -> grant path rather than a
-                // dispatch that skips it.
+                // before the next frame is read. Every integration test
+                // therefore exercises the whole offer -> claim -> grant path
+                // rather than a dispatch that skips it.
                 ExecutorMessage::Offer { entry_id, summary } => {
-                    let answer = answer_offer(&executor_pool, entry_id, &summary);
+                    let pool = executor_pool.clone();
+                    let answer = offload(move || answer_offer(&pool, entry_id, &summary)).await;
                     core_pool.handle_executor_message(executor_id, attached_generation, answer);
                 }
                 ExecutorMessage::Lost { entry_id } => {
-                    forget_lost_claim(&executor_pool, &entry_id);
+                    let pool = executor_pool.clone();
+                    offload(move || forget_lost_claim(&pool, &entry_id)).await;
                 }
                 ExecutorMessage::Granted {
                     entry_id,
@@ -482,8 +489,13 @@ fn attach_executor(
                     request,
                     batch,
                 } => {
-                    executor_pool.configure(config);
-                    executor_pool.consume_claim(&entry_id, &request.resource_reservation);
+                    let pool = executor_pool.clone();
+                    let reservation = request.resource_reservation.clone();
+                    offload(move || {
+                        pool.configure(config);
+                        pool.consume_claim(&entry_id, &reservation);
+                    })
+                    .await;
                     let executor_pool = executor_pool.clone();
                     let core_pool = core_pool.clone();
                     let projects_served = projects_served.clone();
@@ -546,10 +558,12 @@ fn attach_executor(
                     });
                 }
                 ExecutorMessage::Cancel { request_id, .. } => {
-                    executor_pool.cancel_request(&request_id);
+                    let pool = executor_pool.clone();
+                    offload(move || pool.cancel_request(&request_id)).await;
                 }
                 ExecutorMessage::CancelJob { job_id } => {
-                    executor_pool.cancel_job_requests(&job_id);
+                    let pool = executor_pool.clone();
+                    offload(move || pool.cancel_job_requests(&job_id)).await;
                 }
                 ExecutorMessage::ResidencyRequest {
                     correlation_id,
@@ -558,7 +572,8 @@ fn attach_executor(
                     granted_entry_id,
                 } => {
                     if let ResidencyRuntimeConfig::Install(config) = config {
-                        executor_pool.configure(config);
+                        let pool = executor_pool.clone();
+                        offload(move || pool.configure(config)).await;
                     }
                     let executor_pool = executor_pool.clone();
                     let core_pool = core_pool.clone();
@@ -577,13 +592,16 @@ fn attach_executor(
                     });
                 }
                 ExecutorMessage::SnapshotRequest { correlation_id } => {
+                    let pool = executor_pool.clone();
+                    let (snapshot, health) =
+                        offload(move || (pool.snapshot(), pool.substrate_report())).await;
                     core_pool.handle_executor_message(
                         executor_id,
                         attached_generation,
                         ExecutorMessage::SnapshotResponse {
                             correlation_id,
-                            snapshot: executor_pool.snapshot(),
-                            health: executor_pool.substrate_report(),
+                            snapshot,
+                            health,
                         },
                     );
                 }

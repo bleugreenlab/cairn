@@ -130,6 +130,16 @@ fn orchestrator_without_executor(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrat
     Orchestrator::builder(db_state, services, temp.path().join("config")).build()
 }
 
+/// Run `work` against the test machine's pool on the blocking pool, where the
+/// executor's own handlers make its synchronous pool calls.
+async fn on_machine<R: Send + 'static>(
+    machine: &cairn_exec::Fleet,
+    work: impl FnOnce(&cairn_exec::Fleet) -> R + Send + 'static,
+) -> R {
+    let machine = machine.clone();
+    cairn_exec::blocking::offload(move || work(&machine)).await
+}
+
 fn git_output(repo: &Path, args: &[&str]) -> std::process::Output {
     Command::new("git")
         .args(args)
@@ -876,36 +886,40 @@ async fn a_batch_declined_while_its_project_provisions_runs_when_the_hold_clears
     let cwd = worktree.display().to_string();
 
     // Another request is provisioning a cell for this project.
-    machine
-        .try_claim(
-            "provisioning-elsewhere",
-            &OfferSummary {
-                request_id: "provisioning-elsewhere".into(),
-                attempt_id: "attempt".into(),
-                project_id: project_id.clone(),
-                repository: RepositoryLocator::ScratchOnly {
-                    owner_id: project_id.clone(),
-                },
-                base_commit: String::new(),
-                reservation: Default::default(),
-                admission_kind: CellAdmissionKind::Command,
-                interactive: true,
-                priority: CellPriority::AgentInteractive,
-                waiting_since_unix_ms: 0,
-                wait_horizon_unix_ms: u64::MAX,
-                predicted_cost_ms: None,
-                execution_residency: None,
-            },
-        )
-        .expect("an idle machine takes the project's provisioning ticket");
-    assert!(
-        machine
-            .snapshot()
-            .provisioning_holds
-            .iter()
-            .any(|hold| hold.project_id == project_id),
-        "the project is held, so the batch below is declined"
-    );
+    let elsewhere = OfferSummary {
+        request_id: "provisioning-elsewhere".into(),
+        attempt_id: "attempt".into(),
+        project_id: project_id.clone(),
+        repository: RepositoryLocator::ScratchOnly {
+            owner_id: project_id.clone(),
+        },
+        base_commit: String::new(),
+        reservation: Default::default(),
+        admission_kind: CellAdmissionKind::Command,
+        interactive: true,
+        priority: CellPriority::AgentInteractive,
+        waiting_since_unix_ms: 0,
+        wait_horizon_unix_ms: u64::MAX,
+        predicted_cost_ms: None,
+        execution_residency: None,
+    };
+    on_machine(&machine, move |machine| {
+        machine.try_claim("provisioning-elsewhere", &elsewhere)
+    })
+    .await
+    .expect("an idle machine takes the project's provisioning ticket");
+    let held = {
+        let project_id = project_id.clone();
+        on_machine(&machine, move |machine| {
+            machine
+                .snapshot()
+                .provisioning_holds
+                .iter()
+                .any(|hold| hold.project_id == project_id)
+        })
+        .await
+    };
+    assert!(held, "the project is held, so the batch below is declined");
 
     let batch = {
         let orch = orch.clone();
@@ -923,7 +937,10 @@ async fn a_batch_declined_while_its_project_provisions_runs_when_the_hold_clears
 
     // The hold clears. Giving the ticket back publishes the machine's state,
     // which is what makes the runner offer the acquisition again.
-    assert!(machine.release_claim("provisioning-elsewhere").is_some());
+    assert!(on_machine(&machine, |machine| machine
+        .release_claim("provisioning-elsewhere"))
+    .await
+    .is_some());
     let result = tokio::time::timeout(Duration::from_secs(60), batch)
         .await
         .expect("the batch runs once the hold clears")
@@ -992,34 +1009,37 @@ async fn a_batch_in_an_existing_environment_runs_while_another_request_provision
     assert!(first.contains("environment-ready"), "{first}");
 
     // Another request is provisioning a cell for this project.
-    machine
-        .try_claim(
-            "provisioning-elsewhere",
-            &OfferSummary {
-                request_id: "provisioning-elsewhere".into(),
-                attempt_id: "attempt".into(),
-                project_id: project_id.clone(),
-                repository: RepositoryLocator::ScratchOnly {
-                    owner_id: project_id.clone(),
-                },
-                base_commit: String::new(),
-                reservation: Default::default(),
-                admission_kind: CellAdmissionKind::Command,
-                interactive: true,
-                priority: CellPriority::AgentInteractive,
-                waiting_since_unix_ms: 0,
-                wait_horizon_unix_ms: u64::MAX,
-                predicted_cost_ms: None,
-                execution_residency: None,
-            },
-        )
-        .expect("an idle project's ticket is taken");
+    let elsewhere = OfferSummary {
+        request_id: "provisioning-elsewhere".into(),
+        attempt_id: "attempt".into(),
+        project_id: project_id.clone(),
+        repository: RepositoryLocator::ScratchOnly {
+            owner_id: project_id.clone(),
+        },
+        base_commit: String::new(),
+        reservation: Default::default(),
+        admission_kind: CellAdmissionKind::Command,
+        interactive: true,
+        priority: CellPriority::AgentInteractive,
+        waiting_since_unix_ms: 0,
+        wait_horizon_unix_ms: u64::MAX,
+        predicted_cost_ms: None,
+        execution_residency: None,
+    };
+    on_machine(&machine, move |machine| {
+        machine.try_claim("provisioning-elsewhere", &elsewhere)
+    })
+    .await
+    .expect("an idle project's ticket is taken");
     let held_by_elsewhere = || {
-        machine.snapshot().provisioning_holds.iter().any(|hold| {
-            hold.project_id == project_id && hold.owner_request_id == "provisioning-elsewhere"
+        let project_id = project_id.clone();
+        on_machine(&machine, move |machine| {
+            machine.snapshot().provisioning_holds.iter().any(|hold| {
+                hold.project_id == project_id && hold.owner_request_id == "provisioning-elsewhere"
+            })
         })
     };
-    assert!(held_by_elsewhere());
+    assert!(held_by_elsewhere().await);
 
     let during = tokio::time::timeout(
         Duration::from_secs(60),
@@ -1038,11 +1058,14 @@ async fn a_batch_in_an_existing_environment_runs_while_another_request_provision
     assert!(during.contains("during-the-hold"), "{during}");
     assert!(!during.contains(DURABLE_SUSPEND), "{during}");
     assert!(
-        held_by_elsewhere(),
+        held_by_elsewhere().await,
         "the batch ran while the other request still held the project, and took nothing from it"
     );
 
-    assert!(machine.release_claim("provisioning-elsewhere").is_some());
+    assert!(on_machine(&machine, |machine| machine
+        .release_claim("provisioning-elsewhere"))
+    .await
+    .is_some());
     kill_all_sessions(&orch);
 }
 

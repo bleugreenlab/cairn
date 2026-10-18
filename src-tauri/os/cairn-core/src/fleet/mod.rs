@@ -22725,7 +22725,7 @@ mod tests {
             }
         };
         let (_machine_home, machine) = claiming_machine();
-        machine_claims(&machine, &offered, &summary);
+        machine_claims(&machine, &offered, &summary).await;
         orch.fleet.handle_executor_message(
             "remote",
             generation,
@@ -22750,7 +22750,7 @@ mod tests {
                 assert!(
                     matches!(&frame, ExecutorMessage::Lost { entry_id } if *entry_id == offered)
                 );
-                machine_hears(&machine, frame);
+                machine_hears(&machine, frame).await;
             }
             other => panic!("an abandoned claim is withdrawn with Lost, got {other:?}"),
         }
@@ -22758,7 +22758,7 @@ mod tests {
             remote.try_recv().is_err(),
             "a machine whose claim the runner could not dispatch never receives a grant"
         );
-        assert_machine_released(&machine, &summary);
+        assert_machine_released(&machine, &summary).await;
         assert!(
             !orch.object_plane.authorizes(
                 &ObjectTransferCoordinate {
@@ -22787,22 +22787,29 @@ mod tests {
         (home, machine)
     }
 
-    /// Answer an offer the way the executor's link handler does.
-    fn machine_claims(
+    /// Answer an offer the way the executor's link handler does: on the
+    /// blocking pool, where the handler runs.
+    async fn machine_claims(
         machine: &cairn_exec::Fleet,
         entry_id: &str,
         summary: &cairn_common::executor_protocol::OfferSummary,
     ) {
-        machine
-            .try_claim(entry_id, summary)
-            .expect("an idle machine claims the offer");
-        assert!(machine.bind_request_identity(&summary.request_id));
+        let (machine, entry_id, summary) = (machine.clone(), entry_id.to_owned(), summary.clone());
+        cairn_exec::blocking::offload(move || {
+            machine
+                .try_claim(&entry_id, &summary)
+                .expect("an idle machine claims the offer");
+            assert!(machine.bind_request_identity(&summary.request_id));
+        })
+        .await;
     }
 
     /// Apply a runner frame that withdraws or cancels work, the way the
-    /// executor's link handler does.
-    fn machine_hears(machine: &cairn_exec::Fleet, frame: ExecutorMessage) {
-        match frame {
+    /// executor's link handler does: on the blocking pool, where the handler
+    /// runs.
+    async fn machine_hears(machine: &cairn_exec::Fleet, frame: ExecutorMessage) {
+        let machine = machine.clone();
+        cairn_exec::blocking::offload(move || match frame {
             ExecutorMessage::Lost { entry_id } => {
                 if let Some(request_id) = machine.release_claim(&entry_id) {
                     machine.release_request_identity(&request_id);
@@ -22812,7 +22819,8 @@ mod tests {
                 machine.cancel_request(&request_id);
             }
             other => panic!("not a withdrawal: {other:?}"),
-        }
+        })
+        .await;
     }
 
     /// A claim is carried across every link gap of the machine holding it, and
@@ -23624,21 +23632,27 @@ mod tests {
 
     /// Everything the claim took is back: its identity binds again, and the
     /// next offer for the same project claims on the same link. A leaked ticket
-    /// fails the second half as provisioning for the withdrawn request.
-    fn assert_machine_released(
+    /// fails the second half as provisioning for the withdrawn request. Both
+    /// halves run on the blocking pool, as the machine's link handler would
+    /// run them.
+    async fn assert_machine_released(
         machine: &cairn_exec::Fleet,
         summary: &cairn_common::executor_protocol::OfferSummary,
     ) {
-        assert!(
-            machine.bind_request_identity(&summary.request_id),
-            "the withdrawn claim's request identity is released"
-        );
-        machine.release_request_identity(&summary.request_id);
-        let mut next = summary.clone();
-        next.request_id = format!("{}-next", summary.request_id);
-        machine
-            .try_claim("next-entry", &next)
-            .expect("the next offer for the same project claims without reconnecting");
+        let (machine, summary) = (machine.clone(), summary.clone());
+        cairn_exec::blocking::offload(move || {
+            assert!(
+                machine.bind_request_identity(&summary.request_id),
+                "the withdrawn claim's request identity is released"
+            );
+            machine.release_request_identity(&summary.request_id);
+            let mut next = summary.clone();
+            next.request_id = format!("{}-next", summary.request_id);
+            machine
+                .try_claim("next-entry", &next)
+                .expect("the next offer for the same project claims without reconnecting");
+        })
+        .await;
     }
 
     /// An entry that leaves the queue while its offer is out may already have
@@ -23675,7 +23689,7 @@ mod tests {
             }
         };
         let (_machine_home, machine) = claiming_machine();
-        machine_claims(&machine, &offered, &summary);
+        machine_claims(&machine, &offered, &summary).await;
 
         // The claim has not reached the runner when the entry goes.
         assert!(orch
@@ -23704,7 +23718,7 @@ mod tests {
                     assert!(
                         matches!(&frame, ExecutorMessage::Lost { entry_id } if *entry_id == offered)
                     );
-                    machine_hears(&machine, frame);
+                    machine_hears(&machine, frame).await;
                     break;
                 }
                 other => {
@@ -23712,7 +23726,7 @@ mod tests {
                 }
             }
         }
-        assert_machine_released(&machine, &summary);
+        assert_machine_released(&machine, &summary).await;
     }
 
     /// The offer is the machine's whole basis for admission, so it must name
@@ -23761,7 +23775,7 @@ mod tests {
             "the offer carries placement's clamp, not the submitted declaration"
         );
         let (_machine_home, machine) = claiming_machine();
-        machine_claims(&machine, &offered, &summary);
+        machine_claims(&machine, &offered, &summary).await;
         orch.fleet.handle_executor_message(
             "remote",
             generation,
@@ -23785,7 +23799,16 @@ mod tests {
             summary.reservation, granted.resource_reservation,
             "the machine admits exactly the reservation it will run and release"
         );
-        assert!(machine.consume_claim(&offered, &granted.resource_reservation));
+        // The grant is consumed on the blocking pool, where the machine's link
+        // handler consumes it.
+        let consumed = {
+            let machine = machine.clone();
+            cairn_exec::blocking::offload(move || {
+                machine.consume_claim(&offered, &granted.resource_reservation)
+            })
+            .await
+        };
+        assert!(consumed);
         submitting.abort();
     }
 
@@ -26193,7 +26216,7 @@ mod tests {
                         reoffered, entry,
                         "the same entry comes back to the same machine"
                     );
-                    machine_claims(&machine, &reoffered, &summary);
+                    machine_claims(&machine, &reoffered, &summary).await;
                     // The second claim fails before its grant.
                     std::fs::remove_dir_all(&route_parent).ok();
                     std::fs::write(&route_parent, "not a directory").unwrap();
@@ -26228,12 +26251,12 @@ mod tests {
                     "no grant reached the second claim, so it is not cancelled: {frame:?}"
                 );
                 if matches!(&frame, ExecutorMessage::Lost { entry_id } if *entry_id == entry) {
-                    machine_hears(&machine, frame);
+                    machine_hears(&machine, frame).await;
                     withdrawn = true;
                 }
             }
             assert!(withdrawn, "the second claim is withdrawn with Lost");
-            assert_machine_released(&machine, &summary);
+            assert_machine_released(&machine, &summary).await;
         })
         .await;
     }
@@ -27791,7 +27814,7 @@ mod tests {
                             other => panic!("fresh acquisition must offer before granting: {other:?}"),
                         };
                         assert!(!orch.object_plane.authorizes(&coordinate, "base"));
-                        machine_claims(&machine, &entry, &summary);
+                        machine_claims(&machine, &entry, &summary).await;
                         // Break persistence only after all placement preparation and
                         // route resolution succeeded, before the real Claim arrives.
                         std::fs::write(&route_parent, "not a directory").unwrap();
@@ -27809,12 +27832,12 @@ mod tests {
                     assert!(!matches!(frame, ExecutorMessage::ResidencyRequest { .. }), "failed persistence must not grant: {frame:?}");
                     assert!(!matches!(frame, ExecutorMessage::Cancel { .. }), "an ungranted claim is withdrawn, not cancelled: {frame:?}");
                     if matches!(&frame, ExecutorMessage::Lost { entry_id } if *entry_id == entry) {
-                        machine_hears(&machine, frame);
+                        machine_hears(&machine, frame).await;
                         withdrawn = true;
                     }
                 }
                 assert!(withdrawn, "the machine is told its claim is withdrawn with Lost");
-                assert_machine_released(&machine, &summary);
+                assert_machine_released(&machine, &summary).await;
             }).await;
     }
 

@@ -699,8 +699,9 @@ pub(crate) mod tests {
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
     use cairn_common::executor_protocol::{
-        ExecutorMessage, ResidencyRuntimeConfig, LOCAL_EXECUTOR_NAME,
+        DeclineReason, ExecutorMessage, OfferSummary, ResidencyRuntimeConfig, LOCAL_EXECUTOR_NAME,
     };
+    use cairn_exec::blocking::offload;
     use cairn_exec::{ExecutorRuntime, Fleet as ExecutorPool};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
@@ -710,7 +711,10 @@ pub(crate) mod tests {
     ///
     /// Both callbacks are wired exactly as production wires them, so a one-shot
     /// run through this orchestrator meets the real executor's process
-    /// supervision and the real runner's event admission. What it does not
+    /// supervision and the real runner's event admission. The pump handles each
+    /// frame's synchronous pool work on the blocking pool, awaited in arrival
+    /// order, as the executor's link-control worker does, so the executor's
+    /// blocking guard sees what it sees in production. What it does not
     /// reproduce is the skew between an executor's two streams: in process,
     /// every callback is synchronous and in order.
     pub(crate) async fn attached_orchestrator() -> (Orchestrator, tempfile::TempDir) {
@@ -771,30 +775,22 @@ pub(crate) mod tests {
             while let Some(message) = receiver.recv().await {
                 match message {
                     ExecutorMessage::Offer { entry_id, summary } => {
-                        let result = if pool.bind_request_identity(&summary.request_id) {
-                            pool.try_claim(&entry_id, &summary)
-                        } else {
-                            Err(cairn_exec::AdmissionRefusal::new(
-                                cairn_common::executor_protocol::DeclineReason::Constraint,
-                                Some("request identity is already bound".into()),
-                            ))
-                        };
-                        let answer = match result {
-                            Ok(()) => ExecutorMessage::Claim { entry_id },
-                            Err(refusal) => {
-                                pool.release_request_identity(&summary.request_id);
-                                refusal.into_decline(entry_id)
-                            }
-                        };
+                        let pool = pool.clone();
+                        let answer = offload(move || answer_offer(&pool, entry_id, &summary)).await;
                         fleet.handle_executor_message(EXECUTOR_ID, attached, answer);
                     }
                     ExecutorMessage::Lost { entry_id } => {
-                        if let Some(id) = pool.release_claim(&entry_id) {
-                            pool.release_request_identity(&id);
-                        }
+                        let pool = pool.clone();
+                        offload(move || {
+                            if let Some(id) = pool.release_claim(&entry_id) {
+                                pool.release_request_identity(&id);
+                            }
+                        })
+                        .await;
                     }
                     ExecutorMessage::Cancel { request_id, .. } => {
-                        pool.cancel_request(&request_id);
+                        let pool = pool.clone();
+                        offload(move || pool.cancel_request(&request_id)).await;
                     }
                     ExecutorMessage::ResidencyRequest {
                         correlation_id,
@@ -803,7 +799,8 @@ pub(crate) mod tests {
                         granted_entry_id,
                     } => {
                         if let ResidencyRuntimeConfig::Install(config) = config {
-                            pool.configure(config);
+                            let pool = pool.clone();
+                            offload(move || pool.configure(config)).await;
                         }
                         let (pool, fleet) = (pool.clone(), fleet.clone());
                         tokio::spawn(async move {
@@ -824,6 +821,31 @@ pub(crate) mod tests {
             }
         });
         attached
+    }
+
+    /// Answer an offer in the executor link handler's order: claim, then bind
+    /// the request identity. A refused claim has bound nothing, and a claim
+    /// whose identity is already live here gives its capacity back without
+    /// touching the binding, which belongs to whatever already holds it.
+    fn answer_offer(
+        pool: &ExecutorPool,
+        entry_id: String,
+        summary: &OfferSummary,
+    ) -> ExecutorMessage {
+        match pool.try_claim(&entry_id, summary) {
+            Ok(()) if pool.bind_request_identity(&summary.request_id) => {
+                ExecutorMessage::Claim { entry_id }
+            }
+            Ok(()) => {
+                pool.release_claim(&entry_id);
+                cairn_exec::AdmissionRefusal::new(
+                    DeclineReason::Constraint,
+                    Some("this machine already holds that request identity".into()),
+                )
+                .into_decline(entry_id)
+            }
+            Err(refusal) => refusal.into_decline(entry_id),
+        }
     }
 
     /// A one-shot returns what its command printed and the status it exited
