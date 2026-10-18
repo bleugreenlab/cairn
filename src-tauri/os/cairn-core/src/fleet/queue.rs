@@ -50,7 +50,7 @@ use cairn_common::executor_protocol::{
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-use super::decline_condition::PostedCondition;
+use super::decline_condition::{AdmissionView, PostedCondition};
 use super::RequestIdentity;
 
 /// The first wait before a machine that declined an entry may be offered it
@@ -169,6 +169,10 @@ pub(crate) struct QueueEntry {
     pub(crate) admission_kind: CellAdmissionKind,
     /// Whether someone is blocked on this, which admission weighs differently.
     pub(crate) interactive: bool,
+    /// The residency the work runs inside, which every offer names and the
+    /// machine checks against its own cells to decide whether the work
+    /// provisions. `None` for an acquisition, which is what provisions one.
+    pub(crate) execution_residency: Option<ResidencyFence>,
     pub(crate) requesting_job_id: Option<String>,
     /// The requester's own instant past which this result is not wanted. Taken
     /// from the request and never refreshed, so a re-presentation cannot extend
@@ -225,14 +229,12 @@ impl QueueEntry {
     /// reservation (the submitted default, or an unclamped whole-machine
     /// declaration) while the work consumes another.
     ///
-    /// `execution_residency` is the fence of the batch the grant will carry,
-    /// when that batch runs inside an existing residency. The machine checks it
-    /// against its own cells to decide whether the work provisions anything.
+    /// `execution_residency` is the entry's own: the fence of the batch the
+    /// grant will carry, when that batch runs inside an existing residency.
     pub(crate) fn summary(
         &self,
         attempt: &CellRequest,
         predicted_cost_ms: Option<u64>,
-        execution_residency: Option<&ResidencyFence>,
     ) -> OfferSummary {
         debug_assert_eq!(
             (&attempt.request_id, &attempt.attempt_id),
@@ -252,7 +254,17 @@ impl QueueEntry {
             waiting_since_unix_ms: attempt.waiting_since_unix_ms,
             wait_horizon_unix_ms: attempt.wait_horizon_unix_ms,
             predicted_cost_ms,
-            execution_residency: execution_residency.cloned(),
+            execution_residency: self.execution_residency.clone(),
+        }
+    }
+
+    /// How the executor will judge this entry, from the same fields its offer
+    /// carries.
+    pub(crate) fn admission_view(&self) -> AdmissionView {
+        AdmissionView {
+            interactive: self.interactive,
+            entry_id: Some(self.id.clone()),
+            execution_residency: self.execution_residency.clone(),
         }
     }
 
@@ -481,6 +493,7 @@ pub(crate) struct NewEntry {
     pub(crate) request: CellRequest,
     pub(crate) admission_kind: CellAdmissionKind,
     pub(crate) interactive: bool,
+    pub(crate) execution_residency: Option<ResidencyFence>,
 }
 
 impl ExecutionQueue {
@@ -518,6 +531,7 @@ impl ExecutionQueue {
             request: new.request,
             admission_kind: new.admission_kind,
             interactive: new.interactive,
+            execution_residency: new.execution_residency,
             state: EntryState::Queued,
             declined: HashMap::new(),
             chain: Vec::new(),
@@ -818,27 +832,29 @@ impl ExecutionQueue {
     /// Supersede this machine's declines whose reason its new posted state no
     /// longer bears out.
     ///
-    /// `still_posted` answers, for one entry's request and the decline the
-    /// machine gave it, whether the machine's current posted condition for
-    /// that reason is the one recorded with the decline. A decline it answers
+    /// `still_posted` answers, for one entry's request, how the machine will
+    /// judge it, and the decline the machine gave it, whether the machine's
+    /// current posted condition for that reason is the one recorded with the
+    /// decline. A decline it answers
     /// `false` for is superseded; the rest stand. The decline's facts stay on
     /// the entry as that machine's last answer either way. Returns whether
     /// anything was superseded, which is worth a placement wake.
     pub(crate) fn supersede_declines_for(
         &self,
         executor_id: &str,
-        still_posted: impl Fn(&CellRequest, &EntryDecline) -> bool,
+        still_posted: impl Fn(&CellRequest, &AdmissionView, &EntryDecline) -> bool,
     ) -> bool {
         let mut state = self.entries.lock().unwrap();
         let mut superseded = false;
         for entry in state.entries.values_mut() {
+            let view = entry.admission_view();
             let request = &entry.request;
             if let Some(decline) = entry
                 .declined
                 .get_mut(executor_id)
                 .filter(|decline| !decline.superseded)
             {
-                if !still_posted(request, decline) {
+                if !still_posted(request, &view, decline) {
                     decline.superseded = true;
                     superseded = true;
                 }
@@ -1540,6 +1556,7 @@ impl super::Fleet {
                     request,
                     admission_kind: super::CellAdmissionKind::Command,
                     interactive: false,
+                    execution_residency: None,
                 },
                 now,
             )
@@ -1747,6 +1764,7 @@ pub(super) mod tests {
                     request: request(request_id, mobility),
                     admission_kind: CellAdmissionKind::Command,
                     interactive: false,
+                    execution_residency: None,
                 },
                 1,
             )
@@ -1954,6 +1972,7 @@ pub(super) mod tests {
                     request: request("r", PlacementMobility::SpillEligible),
                     admission_kind: CellAdmissionKind::Command,
                     interactive: false,
+                    execution_residency: None,
                 },
                 1,
             )
@@ -1973,6 +1992,7 @@ pub(super) mod tests {
                     request: request("r", PlacementMobility::SpillEligible),
                     admission_kind: CellAdmissionKind::Command,
                     interactive: false,
+                    execution_residency: None,
                 },
                 3,
             )
@@ -2253,7 +2273,7 @@ pub(super) mod tests {
     /// what a decline's reason depends on, and still the rule for a reason
     /// nothing posted explains.
     fn supersede_all(queue: &ExecutionQueue, executor_id: &str) -> bool {
-        queue.supersede_declines_for(executor_id, |_, _| false)
+        queue.supersede_declines_for(executor_id, |_, _, _| false)
     }
 
     fn cpu_pressured() -> PostedCondition {
@@ -2285,7 +2305,7 @@ pub(super) mod tests {
             .applied());
 
         let posted = std::cell::RefCell::new(cpu_pressured());
-        let still_posted = |_: &CellRequest, decline: &EntryDecline| {
+        let still_posted = |_: &CellRequest, _: &AdmissionView, decline: &EntryDecline| {
             decline.condition.as_ref() == Some(&*posted.borrow())
         };
         for _ in 0..1_000 {

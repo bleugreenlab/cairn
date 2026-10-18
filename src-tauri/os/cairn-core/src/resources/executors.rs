@@ -2066,6 +2066,14 @@ fn render_prediction(out: &mut String, label: &str, prediction: &PlacementPredic
         }
     ));
     out.push_str(&format!("    - Cache: {}\n", prediction.warmth.describe()));
+    // History, not a reading: the reason this machine ranked behind ones that
+    // never refused this entry, whatever its numbers say.
+    if let Some(decline) = prediction.declined_here {
+        out.push_str(&format!(
+            "    - Declined here: {}\n",
+            cairn_common::executor_protocol::describe_prior_decline(decline)
+        ));
+    }
     // Preparation is evidence, never a summand. No transfer history exists to
     // turn missing object bytes into milliseconds, and inventing a rate would be
     // exactly the kind of proxy this ranking replaced.
@@ -6538,6 +6546,28 @@ mod tests {
         assert!(
             rendered.contains("Passed over local: volume is unavailable: sampling failed"),
             "the idle machine's own reason is readable off the record: {rendered}"
+        );
+
+        executor.recent_placements[0]
+            .rejected
+            .push(PlacementRejection {
+                prediction: None,
+                executor_name: "bglab-mac".into(),
+                executor_id: "bglab-mac".into(),
+                reason: PlacementRejectionReason::Held {
+                    evidence: cairn_common::executor_protocol::AdmissionHoldEvidence::Disk {
+                        free_bytes: 1024 * 1024 * 1024 * 14 / 10,
+                        floor_bytes: 2 * 1024 * 1024 * 1024,
+                        sweep_in_flight: false,
+                    },
+                },
+            });
+        let rendered = render_placement(&executor, "check-cadence-7");
+        assert!(
+            rendered.contains(
+                "Passed over bglab-mac: held: disk free 1.4 GiB (floor 2.0 GiB), no sweep in flight"
+            ),
+            "a machine demoted by its posted condition names it with its figures: {rendered}"
         );
 
         let PlacementOutcome::Selected(selection) = &mut executor.recent_placements[0].outcome

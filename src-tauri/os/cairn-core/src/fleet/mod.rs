@@ -51,8 +51,10 @@ use cairn_common::executor_protocol::{
     RESIDENCY_ACQUIRE_ATTEMPT_ID,
 };
 use cairn_common::executor_protocol::{
-    executor_names_match, normalize_executor_name, ClaimedAttemptAccount,
+    executor_names_match, normalize_executor_name, AdmissionHoldEvidence, ClaimedAttemptAccount,
+    PriorDecline,
 };
+use decline_condition::{AdmissionView, PostedHold};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -4255,20 +4257,24 @@ impl Fleet {
                 // What the machine has posted that explains this reason, so the
                 // decline stands until that changes rather than until the
                 // machine posts anything at all.
-                let condition = self
-                    .posted_state(executor_id)
-                    .and_then(|(snapshot, health)| {
-                        self.queue
-                            .with_entry(&entry_id, |entry| {
-                                decline_condition::posted_condition(
-                                    reason,
-                                    &entry.request,
-                                    &snapshot,
-                                    &health,
-                                )
-                            })
-                            .flatten()
-                    });
+                let condition =
+                    self.posted_state(executor_id)
+                        .and_then(|(snapshot, health, colocated)| {
+                            self.queue
+                                .with_entry(&entry_id, |entry| {
+                                    decline_condition::posted_condition(
+                                        reason,
+                                        &entry.admission_view(),
+                                        &entry.request,
+                                        decline_condition::PostedState {
+                                            snapshot: &snapshot,
+                                            health: &health,
+                                            colocated,
+                                        },
+                                    )
+                                })
+                                .flatten()
+                        });
                 // A parked request is re-asked whenever the condition behind
                 // its decline changes, so the same answer can come back for as
                 // long as a hold lasts. The first answer of a kind is the news;
@@ -4414,7 +4420,7 @@ impl Fleet {
                 // snapshot) still makes those decliners offerable within one
                 // beat, so a request parked on a horizon it may never reach is
                 // not parked forever.
-                if let Some((snapshot, health)) = self.posted_state(executor_id) {
+                if let Some((snapshot, health, _)) = self.posted_state(executor_id) {
                     self.supersede_declines(executor_id, &snapshot, &health);
                 }
                 updated
@@ -4459,14 +4465,19 @@ impl Fleet {
         self.set_executor_snapshot(executor_id, generation, snapshot, health)
     }
 
-    /// This connection's latest posted snapshot and health, shared.
+    /// This connection's latest posted snapshot and health, shared, and
+    /// whether it is the colocated machine.
     fn posted_state(
         &self,
         executor_id: &str,
-    ) -> Option<(Arc<FleetSnapshot>, Arc<ExecutorSubstrateReport>)> {
-        self.lock_connections()
-            .get(executor_id)
-            .map(|entry| (entry.snapshot.clone(), entry.health.clone()))
+    ) -> Option<(Arc<FleetSnapshot>, Arc<ExecutorSubstrateReport>, bool)> {
+        self.lock_connections().get(executor_id).map(|entry| {
+            (
+                entry.snapshot.clone(),
+                entry.health.clone(),
+                entry.colocated,
+            )
+        })
     }
 
     /// Supersede this machine's declines whose reason the posted state no
@@ -4481,21 +4492,30 @@ impl Fleet {
         snapshot: &FleetSnapshot,
         health: &ExecutorSubstrateReport,
     ) {
-        let superseded = self
-            .queue
-            .supersede_declines_for(executor_id, |request, decline| {
-                decline.condition.as_ref().is_some_and(|recorded| {
-                    recorded.still_holds(
-                        decline_condition::posted_condition(
-                            decline.reason,
-                            request,
-                            snapshot,
-                            health,
+        let colocated = self
+            .lock_connections()
+            .get(executor_id)
+            .is_some_and(|entry| entry.colocated);
+        let machine = decline_condition::PostedState {
+            snapshot,
+            health,
+            colocated,
+        };
+        let superseded =
+            self.queue
+                .supersede_declines_for(executor_id, |request, view, decline| {
+                    decline.condition.as_ref().is_some_and(|recorded| {
+                        recorded.still_holds(
+                            decline_condition::posted_condition(
+                                decline.reason,
+                                view,
+                                request,
+                                machine,
+                            )
+                            .as_ref(),
                         )
-                        .as_ref(),
-                    )
-                })
-            });
+                    })
+                });
         if superseded {
             self.connection_ready.notify_waiters();
         }
@@ -6331,6 +6351,9 @@ impl Fleet {
                     request: placement.clone(),
                     admission_kind: CellAdmissionKind::Residency,
                     interactive: original.holder.is_interactive(),
+                    // An acquisition is what provisions the environment, so
+                    // it never names one to run inside.
+                    execution_residency: None,
                 },
                 unix_time_ms(),
             ) else {
@@ -6431,7 +6454,7 @@ impl Fleet {
             // An acquisition is what provisions the environment, so it never
             // names one to run inside.
             match self
-                .offer_once(&entry_id, &attempt_request, None, &selected, &mut decision)
+                .offer_once(&entry_id, &attempt_request, &selected, &mut decision)
                 .await
             {
                 OfferAnswer::Requeued => continue,
@@ -9021,6 +9044,9 @@ impl Fleet {
                 request: request.clone(),
                 admission_kind: CellAdmissionKind::Command,
                 interactive: request.priority == CellPriority::AgentInteractive,
+                execution_residency: batch
+                    .as_ref()
+                    .and_then(|batch| batch.execution_residency.clone()),
             },
             unix_time_ms(),
         ) else {
@@ -9114,9 +9140,6 @@ impl Fleet {
                 answer = self.offer_once(
                     &entry_id,
                     &attempt_request,
-                    attempt_batch
-                        .as_ref()
-                        .and_then(|batch| batch.execution_residency.as_ref()),
                     &selected,
                     &mut decision,
                 ) => answer,
@@ -9533,7 +9556,6 @@ impl Fleet {
         &self,
         entry_id: &str,
         attempt_request: &CellRequest,
-        execution_residency: Option<&ResidencyFence>,
         selected: &SelectedExecutor,
         decision: &mut PlacementDecision,
     ) -> OfferAnswer {
@@ -9564,7 +9586,6 @@ impl Fleet {
                     .learned_estimate
                     .as_ref()
                     .and_then(|estimate| estimate.upper_duration_ms),
-                execution_residency,
             )
         });
         let reached = summary.is_some_and(|summary| {
@@ -9683,7 +9704,8 @@ impl Fleet {
                 &unattached,
                 request,
                 unix_time_ms(),
-                &HashMap::new()
+                &HashMap::new(),
+                &AdmissionView::of_request(request),
             )
             .map(|survey| describe_preparation_rejections(&survey.rejected))
             .unwrap_or_default()
@@ -9837,11 +9859,21 @@ impl Fleet {
             // report wakes this wait as surely as a new connection does. That is
             // the whole of the retry rule: posted state, not a clock.
             let notified = self.connection_ready.notified();
-            let declined = entry_id
-                .and_then(|id| self.queue.with_entry(id, |entry| entry.declined.clone()))
-                .unwrap_or_default();
+            let (declined, view) = entry_id
+                .and_then(|id| {
+                    self.queue
+                        .with_entry(id, |entry| (entry.declined.clone(), entry.admission_view()))
+                })
+                .unwrap_or_else(|| (HashMap::new(), AdmissionView::of_request(request)));
             let selection = self
-                .select_executor_once_with(request, plan, policy, &declined, repository_sync_cost)
+                .select_executor_once_with(
+                    request,
+                    plan,
+                    policy,
+                    &declined,
+                    &view,
+                    repository_sync_cost,
+                )
                 .await;
             let rejected = match selection {
                 Ok(Selection::Placed(placement)) => return Ok(*placement),
@@ -9858,9 +9890,7 @@ impl Fleet {
             };
             let parked_on: Vec<PlacementRejection> = rejected
                 .iter()
-                .filter(|rejection| {
-                    matches!(rejection.reason, PlacementRejectionReason::Declined { .. })
-                })
+                .filter(|rejection| waits_on_machine(&rejection.reason))
                 .cloned()
                 .collect();
             let now = unix_time_ms();
@@ -9910,6 +9940,7 @@ impl Fleet {
         plan: Option<&ReservationPlan>,
         policy: &ActivePlacementPolicy,
         declined: &HashMap<String, queue::EntryDecline>,
+        view: &AdmissionView,
         estimate: impl Fn(&CellRequest, &ExecutorConnectionState) -> SyncCost,
     ) -> Result<Selection, RefusedPlacement> {
         // Placement can inspect the local repository to estimate transfer cost
@@ -9923,10 +9954,11 @@ impl Fleet {
         // which of those have already said "not yet" to this entry. Keep the
         // actual survey's refusal while the shadow is ranked independently: an
         // unavailable home is the most important case for the counterfactual.
-        let actual_survey = survey_candidates(&connections, &unattached, request, now, declined);
+        let actual_survey =
+            survey_candidates(&connections, &unattached, request, now, declined, view);
         let shadow_request = hermetic_shadow_request(request);
         let shadow_survey = shadow_request.as_ref().and_then(|shadow| {
-            survey_candidates(&connections, &unattached, shadow, now, declined).ok()
+            survey_candidates(&connections, &unattached, shadow, now, declined, view).ok()
         });
         // Stage two: what it would cost on each of them. Resource profiles are
         // executor-context keyed, so this is a per-candidate question -- and it
@@ -10001,7 +10033,7 @@ impl Fleet {
                 None => resource_profiles::contention_prior(&load),
             };
             let prices = QueuePrices::resolve(&oracle, entry, &context, now).await;
-            let queue = forecast_queue_wait(entry, &prices, request, now);
+            let queue = forecast_queue_wait(entry, &prices, request, run.predicted_ms, now);
             let sync_cost = estimate(request, entry);
             sync_costs.insert(entry.identity.executor_id.clone(), sync_cost);
             predictions.insert(
@@ -10073,7 +10105,7 @@ impl Fleet {
         let parked_on_decliner = survey
             .rejected
             .iter()
-            .any(|rejection| matches!(rejection.reason, PlacementRejectionReason::Declined { .. }))
+            .any(|rejection| waits_on_machine(&rejection.reason))
             .then(|| survey.rejected.clone());
         let draft = match rank_survey(
             request,
@@ -10738,7 +10770,6 @@ fn prior_predictions(
         );
         let warmth = candidate_warmth(entry, request, now_unix_ms);
         let prices = QueuePrices::from_priors(entry, &context);
-        let queue = forecast_queue_wait(entry, &prices, request, now_unix_ms);
         let run = resource_profiles::unmeasured_duration(
             request.command_class,
             &context,
@@ -10746,6 +10777,7 @@ fn prior_predictions(
             warmth.for_lookup(),
             DurationFallback::NoProfileStore,
         );
+        let queue = forecast_queue_wait(entry, &prices, request, run.predicted_ms, now_unix_ms);
         let sync_cost = estimate(request, entry);
         sync_costs.insert(entry.identity.executor_id.clone(), sync_cost);
         predictions.insert(
@@ -10810,7 +10842,14 @@ fn choose_executor_with_policy(
     estimate: impl Fn(&CellRequest, &ExecutorConnectionState) -> SyncCost,
     now_unix_ms: u64,
 ) -> Result<PlacementDraft, String> {
-    let survey = survey_candidates(connections, &[], request, now_unix_ms, &HashMap::new())?;
+    let survey = survey_candidates(
+        connections,
+        &[],
+        request,
+        now_unix_ms,
+        &HashMap::new(),
+        &AdmissionView::of_request(request),
+    )?;
     let (predictions, sync_costs) =
         prior_predictions(&survey.usable, request, &estimate, now_unix_ms);
     let cache_distances = candidate_cache_distances(&survey.usable, request, now_unix_ms);
@@ -10849,6 +10888,11 @@ fn placement_settled_by_caller(request: &CellRequest) -> bool {
 struct CandidateSurvey<'a> {
     usable: Vec<&'a ExecutorConnectionState>,
     rejected: Vec<PlacementRejection>,
+    /// How the executor will judge this entry, which ranking reads each
+    /// machine's posted hold against.
+    view: AdmissionView,
+    /// Each machine that has declined this entry, superseded or not.
+    declined_here: HashMap<String, PriorDecline>,
 }
 
 /// The facts about a piece of work that decide which machines could
@@ -11119,12 +11163,17 @@ fn candidate_rejection(
 /// not offered again until it posts new state, and it is something to wait
 /// for rather than a reason to refuse. A structural reason always wins over a
 /// decline, so a machine that is wrong for the work says so.
+///
+/// `view` is how the executor will judge this entry. The survey carries it to
+/// ranking, which reads each usable machine's posted hold once the demand the
+/// offer will name has been resolved for that machine (see [`rank_survey`]).
 fn survey_candidates<'a>(
     connections: &'a HashMap<String, ExecutorConnectionState>,
     unattached: &[EnrolledRemote],
     request: &CellRequest,
     now_unix_ms: u64,
     declined: &HashMap<String, queue::EntryDecline>,
+    view: &AdmissionView,
 ) -> Result<CandidateSurvey<'a>, String> {
     let scope = PlacementScope::of(request);
     let targeted = scope.targeted();
@@ -11153,11 +11202,23 @@ fn survey_candidates<'a>(
             None => usable.push(entry),
         }
     }
+    let declined_here = declined
+        .iter()
+        .map(|(executor_id, decline)| {
+            (
+                executor_id.clone(),
+                PriorDecline {
+                    reason: decline.reason,
+                    declined_at_unix_ms: decline.at_unix_ms,
+                },
+            )
+        })
+        .collect();
     // A capable machine that has said "not yet" is something to wait for, so
     // neither immediate refusal below applies while one stands.
     let awaiting_decliner = rejected
         .iter()
-        .any(|rejection| matches!(rejection.reason, PlacementRejectionReason::Declined { .. }));
+        .any(|rejection| waits_on_machine(&rejection.reason));
 
     // A caller that named a machine or a platform is owed an immediate answer
     // naming what exists. An untargeted request with nothing usable is instead
@@ -11204,7 +11265,22 @@ fn survey_candidates<'a>(
             ));
         }
     }
-    Ok(CandidateSurvey { usable, rejected })
+    Ok(CandidateSurvey {
+        usable,
+        rejected,
+        view: view.clone(),
+        declined_here,
+    })
+}
+
+/// Whether a rejection is a capable machine's "not yet": its own decline, or
+/// a posted condition its admission would decline on. Either is something to
+/// wait for rather than a reason to refuse.
+fn waits_on_machine(reason: &PlacementRejectionReason) -> bool {
+    matches!(
+        reason,
+        PlacementRejectionReason::Declined { .. } | PlacementRejectionReason::Held { .. }
+    )
 }
 
 /// Logged placement rejections, keyed by request and machine.
@@ -11247,6 +11323,9 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
         PlacementRejectionReason::Drained => "drained",
         PlacementRejectionReason::AvoidedInfrastructure => "avoidedInfrastructure",
         PlacementRejectionReason::Declined { reason, .. } => return format!("declined:{reason:?}"),
+        PlacementRejectionReason::Held { evidence } => {
+            return format!("held:{}", evidence.as_str())
+        }
         PlacementRejectionReason::PreparationToolchainMissing { .. } => {
             "preparationToolchainMissing"
         }
@@ -11263,10 +11342,14 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
 /// is re-placed on every posted state, and each placement records every
 /// standing decline again, so logging those rows at WARN would repeat the
 /// same sentence every few seconds for as long as a hold lasts. The
-/// placement record and the queue journal keep them either way.
+/// placement record and the queue journal keep them either way. A `Held` row
+/// is the same answer read from posted state before it was asked, restated on
+/// every pass for as long as the condition lasts.
 fn placement_rejection_log_level(rejection: &PlacementRejection) -> log::Level {
     match rejection.reason {
-        PlacementRejectionReason::Declined { .. } => log::Level::Debug,
+        PlacementRejectionReason::Declined { .. } | PlacementRejectionReason::Held { .. } => {
+            log::Level::Debug
+        }
         // A standing fact about the machine and the project, restated on every
         // placement for as long as it holds; the refusal itself was logged
         // at WARN when it was recorded, and the placement record keeps it.
@@ -11292,7 +11375,7 @@ fn declined_rejection(decline: &queue::EntryDecline) -> PlacementRejectionReason
 fn describe_declines(rejected: &[PlacementRejection]) -> String {
     let rows: Vec<String> = rejected
         .iter()
-        .filter(|rejection| matches!(rejection.reason, PlacementRejectionReason::Declined { .. }))
+        .filter(|rejection| waits_on_machine(&rejection.reason))
         .map(|rejection| {
             format!(
                 "{} {}",
@@ -11351,7 +11434,55 @@ fn rank_survey(
     let CandidateSurvey {
         usable,
         mut rejected,
+        view,
+        declined_here,
     } = survey;
+    // Each machine's posted state is read against the demand the offer to it
+    // will name: the reservation resolved for that machine, which an ordinary
+    // submission's declared zero growth is not. A hold nothing running will
+    // clear (a latched cleanup, a disk under its floor with no sweep in
+    // flight) keeps work that is free to go elsewhere off the machine, and is
+    // waited for like a decline; work that cannot leave it is still offered
+    // and gets the executor's own decline. A hold that relieves itself leaves
+    // the machine ranked behind every machine that is not held.
+    let free_to_move =
+        request.placement_mobility.may_spill() && !placement_settled_by_caller(request);
+    let mut holds = HashMap::new();
+    let usable: Vec<_> = usable
+        .into_iter()
+        .filter(|entry| {
+            let executor_id = &entry.identity.executor_id;
+            let resolved = reservations.get(executor_id).map(|resolved| CellRequest {
+                resource_reservation: resolved.reservation.clone(),
+                ..request.clone()
+            });
+            let Some(hold) = decline_condition::posted_hold(
+                &view,
+                resolved.as_ref().unwrap_or(request),
+                decline_condition::PostedState {
+                    snapshot: &entry.snapshot,
+                    health: &entry.health,
+                    colocated: entry.colocated,
+                },
+                now_unix_ms,
+            ) else {
+                return true;
+            };
+            if free_to_move && !hold.relieves_itself {
+                rejected.push(PlacementRejection {
+                    prediction: None,
+                    executor_name: executor_public_name(entry),
+                    executor_id: executor_id.clone(),
+                    reason: PlacementRejectionReason::Held {
+                        evidence: hold.evidence,
+                    },
+                });
+                return false;
+            }
+            holds.insert(executor_id.clone(), hold);
+            true
+        })
+        .collect();
     if usable.is_empty() {
         return Ok(PlacementDraft {
             selected: None,
@@ -11390,6 +11521,8 @@ fn rank_survey(
                         // predicted, and it says so rather than scoring zero.
                         unpredicted_candidate(entry, request, sync_cost)
                     }),
+                holds.get(&entry.identity.executor_id),
+                declined_here.get(&entry.identity.executor_id).copied(),
                 now_unix_ms,
             );
             candidate.cache_distance = cache_distances.get(&entry.identity.executor_id).copied();
@@ -11407,9 +11540,21 @@ fn rank_survey(
             exploration,
         );
     let Some(winner) = winner else {
+        rejected.extend(ranked.into_iter().map(|candidate| candidate.rejection()));
+        // A machine held on a condition it posted is something to wait for,
+        // like a decline, so the blind rest are not a reason to refuse.
+        if rejected
+            .iter()
+            .any(|rejection| matches!(rejection.reason, PlacementRejectionReason::Held { .. }))
+        {
+            return Ok(PlacementDraft {
+                selected: None,
+                rejected,
+                policy: policy_evidence(request, policy, false),
+            });
+        }
         // Every usable machine was measured-blind and none of them was a
         // machine policy is allowed to spill onto. Say so with the evidence.
-        rejected.extend(ranked.into_iter().map(|candidate| candidate.rejection()));
         return Err(no_measurable_executor_diagnostic(request, &rejected));
     };
 
@@ -11522,8 +11667,15 @@ struct ScoredCandidate<'a> {
     /// will ever reserve. A fact about the machine's size rather than its
     /// readings, so it holds whether or not the machine is blind.
     over_ceiling: Option<PlacementRejectionReason>,
+    /// What this machine has posted that its admission would decline this
+    /// request on now. A current fact, so it outranks everything below it.
+    held: Option<AdmissionHoldEvidence>,
     /// Whether executor admission can retain and fit this request right now.
     admission_accepts: bool,
+    /// This machine already declined this entry. History rather than current
+    /// state, so it ranks below admission; it covers the refusals posted
+    /// state cannot explain.
+    declined_here: Option<PriorDecline>,
     /// The machine's volume is at or below its pressure line. A price: a tight
     /// machine ranks below an otherwise-equal one that is not, and stays
     /// selectable — it is chosen whenever it is the only candidate.
@@ -11538,12 +11690,15 @@ struct ScoredCandidate<'a> {
 }
 
 impl<'a> ScoredCandidate<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         entry: &'a ExecutorConnectionState,
         sync_cost: SyncCost,
         reservation: Option<&'a resource_profiles::ResolvedResourceProfile>,
         declared_reservation: &ResourceReservation,
         mut prediction: PlacementPrediction,
+        hold: Option<&PostedHold>,
+        declined_here: Option<PriorDecline>,
         now_unix_ms: u64,
     ) -> Self {
         let machine = &entry.health.machine;
@@ -11606,8 +11761,6 @@ impl<'a> ScoredCandidate<'a> {
             .is_some_and(|measured_at| {
                 now_unix_ms.saturating_sub(measured_at) <= CPU_ADMISSION_BLIND_AFTER_MS
             });
-        let cpu_pressured =
-            cpu_admission_fresh && cpu_admission.state == CpuAdmissionState::Pressured;
         // A machine that measured its own cores and stopped is not a machine
         // with headroom, and ranking it as one is how work keeps arriving at a
         // host nobody can see into. Derived from the reading's age rather than
@@ -11628,14 +11781,20 @@ impl<'a> ScoredCandidate<'a> {
                     .then(|| ((utilization - policy.clear_utilization) / span).clamp(0.0, 1.0))
             })
             .flatten();
-        if cpu_pressured {
+        // A held machine's queue has no forecastable relief: nothing Cairn
+        // owns completes on a schedule that ends sustained pressure or another
+        // request's provisioning. Its wait is unknown rather than the zero its
+        // free units would say, and the hold is named.
+        if let Some(hold) = hold {
             prediction.queue = QueueForecast::Unknown {
-                reason: QueueUnknownReason::MeasuredCpuPressure,
+                reason: QueueUnknownReason::Held {
+                    evidence: hold.evidence.clone(),
+                },
             };
             prediction.predicted_verdict_ms = prediction.adjusted_run_ms;
         }
-        let admission_accepts = !cpu_pressured
-            && !cpu_blind
+        prediction.declined_here = declined_here;
+        let admission_accepts = !cpu_blind
             && queue_depth < entry.health.applied_policy.maximum_queue_depth
             && admission.memory_capacity_bytes.is_none_or(|capacity| {
                 active.memory_bytes.saturating_add(demand.memory_bytes) <= capacity
@@ -11659,7 +11818,9 @@ impl<'a> ScoredCandidate<'a> {
             blindness,
             misfit,
             over_ceiling,
+            held: hold.map(|hold| hold.evidence.clone()),
             admission_accepts,
+            declined_here,
             disk_tight: entry.health.disk.status == DiskHealthStatus::Tight,
             cpu_headroom_risk,
             prediction,
@@ -11677,6 +11838,7 @@ impl<'a> ScoredCandidate<'a> {
                 .clone()
                 .or_else(|| self.over_ceiling.clone())
                 .or_else(|| self.misfit.clone())
+                .or_else(|| self.held_rejection())
                 .unwrap_or(PlacementRejectionReason::NotColocated),
         }
     }
@@ -11689,6 +11851,7 @@ impl<'a> ScoredCandidate<'a> {
             .clone()
             .or_else(|| self.over_ceiling.clone())
             .or_else(|| self.misfit.clone())
+            .or_else(|| self.held_rejection())
             .unwrap_or_else(|| PlacementRejectionReason::OutrankedBy {
                 executor_name: winner_name.to_string(),
             });
@@ -11700,6 +11863,12 @@ impl<'a> ScoredCandidate<'a> {
             executor_id: self.entry.identity.executor_id.clone(),
             reason,
         }
+    }
+
+    fn held_rejection(&self) -> Option<PlacementRejectionReason> {
+        self.held
+            .clone()
+            .map(|evidence| PlacementRejectionReason::Held { evidence })
     }
 }
 
@@ -11729,6 +11898,14 @@ impl<'a> ScoredCandidate<'a> {
 /// absent placement evidence is exactly as disqualifying there as it is for an
 /// unconstrained request. A gap is never read as no load.
 ///
+/// Below fit come two answers about this request on this machine. A machine
+/// whose posted condition its own admission would decline the request on
+/// (`held`) ranks behind every machine that is not, ahead of whether admission
+/// has room, because it is current evidence of a decline. A machine that has
+/// already declined this entry (`declined_here`) ranks behind every machine
+/// that has not, after admission, because it is history: it covers the
+/// refusals posted state cannot explain.
+///
 /// Among the machines that survive those gates, a known queue forecast always
 /// precedes an unknown one: there is no numeric total to compare when one summand
 /// is absent. Within that comparable set, the order is predicted time to a
@@ -11756,7 +11933,9 @@ fn rank_candidates<'a, 'b>(
             .cmp(&b.blindness.is_some())
             .then_with(|| a.over_ceiling.is_some().cmp(&b.over_ceiling.is_some()))
             .then_with(|| a.misfit.is_some().cmp(&b.misfit.is_some()))
+            .then_with(|| a.held.is_some().cmp(&b.held.is_some()))
             .then_with(|| b.admission_accepts.cmp(&a.admission_accepts))
+            .then_with(|| a.declined_here.is_some().cmp(&b.declined_here.is_some()))
             // A tight volume is reclaiming toward its pressure line, and new
             // growth there costs a warm cache. Ranked, never refused: a tight
             // machine still wins when nothing else can take the work.
@@ -12309,10 +12488,16 @@ impl QueuePrices {
     }
 }
 
+/// How long this request would wait on this machine before it starts.
+///
+/// `run_ms` is this request's own predicted run. A queue whose oldest entry
+/// ahead has already waited longer than that has measurably not moved, and is
+/// priced at least at that wait whatever its free units say.
 fn forecast_queue_wait(
     entry: &ExecutorConnectionState,
     prices: &QueuePrices,
     request: &CellRequest,
+    run_ms: u64,
     now_unix_ms: u64,
 ) -> QueueForecast {
     let observed_at = entry
@@ -12350,6 +12535,7 @@ fn forecast_queue_wait(
 
     let mut demand_ahead = request.resource_reservation.concurrency_units;
     let mut requests_ahead = 0_usize;
+    let mut oldest_ahead_ms = 0_u64;
     for queued in &entry.snapshot.queued_requests {
         let theirs = (
             aged_priority(queued.priority, queued.queued_at_unix_ms, now_unix_ms),
@@ -12359,6 +12545,7 @@ fn forecast_queue_wait(
             continue;
         }
         requests_ahead += 1;
+        oldest_ahead_ms = oldest_ahead_ms.max(now_unix_ms.saturating_sub(queued.queued_at_unix_ms));
         let Some(estimate) = prices.get(
             queued.command_resource_identity.as_ref(),
             queued.command_class,
@@ -12374,14 +12561,17 @@ fn forecast_queue_wait(
         demand_ahead = demand_ahead.saturating_add(queued.resource_reservation.concurrency_units);
     }
 
-    let reserve = if request.priority == CellPriority::AgentInteractive {
-        0
-    } else {
-        entry.health.admission.interactive_reserve
-    };
-    let free = capacity
-        .saturating_sub(entry.health.admission.active_reservation.concurrency_units)
-        .saturating_sub(reserve);
+    // Whatever the units say, entries ahead that have waited longer than this
+    // request would take to run are a queue that is not moving, and that wait
+    // is the measurement that prices it. Free units cannot read it as zero:
+    // a machine holding work back for a reason it has not posted looks exactly
+    // like one with room.
+    let stalled_head_ms =
+        (requests_ahead > 0 && oldest_ahead_ms > run_ms).then_some(oldest_ahead_ms);
+    // The advertised capacity is already net of the interactive reserve (the
+    // executor removes it when it sizes its budget, and admits against that
+    // budget with nothing subtracted), so the reserve is not taken again here.
+    let free = capacity.saturating_sub(entry.health.admission.active_reservation.concurrency_units);
     let running_ahead = entry.snapshot.executing_requests.len();
 
     // If measured capacity can admit this request and everything ranked ahead,
@@ -12389,11 +12579,12 @@ fn forecast_queue_wait(
     // zero even when those durations only have priors.
     if demand_ahead <= free {
         return QueueForecast::Forecast {
-            predicted_ms: 0,
+            predicted_ms: stalled_head_ms.unwrap_or(0),
             requests_ahead,
             running_ahead,
-            fully_measured: true,
+            fully_measured: stalled_head_ms.is_none(),
             observed_at_unix_ms: observed_at,
+            stalled_head_ms,
         };
     }
 
@@ -12429,11 +12620,12 @@ fn forecast_queue_wait(
     }
 
     QueueForecast::Forecast {
-        predicted_ms,
+        predicted_ms: stalled_head_ms.map_or(predicted_ms, |waited| waited.max(predicted_ms)),
         requests_ahead,
         running_ahead,
-        fully_measured,
+        fully_measured: fully_measured && stalled_head_ms.is_none(),
         observed_at_unix_ms: observed_at,
+        stalled_head_ms,
     }
 }
 
@@ -12475,6 +12667,8 @@ fn placement_prediction_with_contention(
         adjusted_run_ms,
         contention,
         warmth,
+        // Set by ranking, which is what knows this entry's declines.
+        declined_here: None,
     }
 }
 
@@ -15668,6 +15862,7 @@ mod tests {
             request: request.clone(),
             admission_kind: CellAdmissionKind::Residency,
             interactive: true,
+            execution_residency: None,
         };
         let (entry_id, _rx) = pool.queue.enqueue(new_entry(), unix_time_ms()).unwrap();
         assert!(pool.queue.enqueue(new_entry(), unix_time_ms()).is_err());
@@ -15704,6 +15899,7 @@ mod tests {
                     request,
                     admission_kind: CellAdmissionKind::Residency,
                     interactive: true,
+                    execution_residency: None,
                 },
                 unix_time_ms(),
             )
@@ -16096,6 +16292,7 @@ mod tests {
                     request,
                     admission_kind: CellAdmissionKind::Command,
                     interactive: false,
+                    execution_residency: None,
                 },
                 unix_time_ms(),
             )
@@ -17967,6 +18164,8 @@ mod tests {
                 CandidateSurvey {
                     usable: vec![&first, &second],
                     rejected: vec![],
+                    view: AdmissionView::default(),
+                    declined_here: HashMap::new(),
                 },
                 SurveyRankingContext {
                     reservations: &HashMap::new(),
@@ -18264,6 +18463,7 @@ mod tests {
                 None,
                 &ActivePlacementPolicy::default_profile(),
                 &HashMap::new(),
+                &AdmissionView::default(),
                 |_, entry| SyncCost::Known(if entry.colocated { 1_000_000_000 } else { 0 }),
             )
             .await
@@ -18314,6 +18514,7 @@ mod tests {
                 None,
                 &ActivePlacementPolicy::default_profile(),
                 &HashMap::new(),
+                &AdmissionView::default(),
                 |_, _| SyncCost::Known(0),
             )
             .await
@@ -18488,6 +18689,7 @@ mod tests {
                 Some(&plan),
                 &ActivePlacementPolicy::default_profile(),
                 &HashMap::new(),
+                &AdmissionView::default(),
                 |_, _| SyncCost::Known(0),
             )
             .await
@@ -18549,6 +18751,7 @@ mod tests {
                 Some(&plan),
                 &ActivePlacementPolicy::default_profile(),
                 &HashMap::new(),
+                &AdmissionView::default(),
                 |_, _| SyncCost::Known(0),
             )
             .await
@@ -18585,6 +18788,7 @@ mod tests {
                 Some(&plan),
                 &ActivePlacementPolicy::default_profile(),
                 &HashMap::new(),
+                &AdmissionView::default(),
                 |_, _| SyncCost::Known(0),
             )
             .await
@@ -18625,6 +18829,7 @@ mod tests {
                 Some(&plan),
                 &ActivePlacementPolicy::default_profile(),
                 &HashMap::new(),
+                &AdmissionView::default(),
                 |_, _| SyncCost::Known(0),
             )
             .await
@@ -18793,13 +18998,14 @@ mod tests {
         };
 
         assert_eq!(
-            forecast_queue_wait(&entry, &prices, &request, NOW),
+            forecast_queue_wait(&entry, &prices, &request, 10_000, NOW),
             QueueForecast::Forecast {
                 predicted_ms: 0,
                 requests_ahead: 0,
                 running_ahead: 1,
                 fully_measured: true,
                 observed_at_unix_ms: NOW,
+                stalled_head_ms: None,
             }
         );
     }
@@ -18837,7 +19043,7 @@ mod tests {
         };
 
         let QueueForecast::Forecast { predicted_ms, .. } =
-            forecast_queue_wait(&entry, &prices, &request, NOW)
+            forecast_queue_wait(&entry, &prices, &request, 10_000, NOW)
         else {
             panic!("capacity facts should produce a forecast");
         };
@@ -18907,6 +19113,7 @@ mod tests {
                 running_ahead: 0,
                 fully_measured: true,
                 observed_at_unix_ms: NOW,
+                stalled_head_ms: None,
             },
             longer_run,
             SyncCost::Known(0),
@@ -18918,6 +19125,8 @@ mod tests {
                 None,
                 &ResourceReservation::default(),
                 unknown_prediction,
+                None,
+                None,
                 NOW,
             ),
             ScoredCandidate::new(
@@ -18926,6 +19135,8 @@ mod tests {
                 None,
                 &ResourceReservation::default(),
                 known_prediction,
+                None,
+                None,
                 NOW,
             ),
         ];
@@ -18966,6 +19177,7 @@ mod tests {
             running_ahead: 0,
             fully_measured: true,
             observed_at_unix_ms: NOW,
+            stalled_head_ms: None,
         };
         let mut fast_run = test_prior_duration();
         fast_run.predicted_ms = 5_000;
@@ -19014,6 +19226,8 @@ mod tests {
                 None,
                 &ResourceReservation::default(),
                 predictions[0].clone(),
+                None,
+                None,
                 NOW,
             ),
             ScoredCandidate::new(
@@ -19022,6 +19236,8 @@ mod tests {
                 None,
                 &ResourceReservation::default(),
                 predictions[1].clone(),
+                None,
+                None,
                 NOW,
             ),
         ];
@@ -19062,6 +19278,7 @@ mod tests {
                 running_ahead: 0,
                 fully_measured: true,
                 observed_at_unix_ms: NOW,
+                stalled_head_ms: None,
             },
             learned,
             SyncCost::Known(0),
@@ -19078,6 +19295,7 @@ mod tests {
                 running_ahead: 0,
                 fully_measured: true,
                 observed_at_unix_ms: NOW,
+                stalled_head_ms: None,
             },
             unmeasured,
             SyncCost::Known(0),
@@ -19089,6 +19307,8 @@ mod tests {
                 None,
                 &ResourceReservation::default(),
                 favorite_prediction,
+                None,
+                None,
                 NOW,
             ),
             ScoredCandidate::new(
@@ -19097,6 +19317,8 @@ mod tests {
                 None,
                 &ResourceReservation::default(),
                 fresh_prediction,
+                None,
+                None,
                 NOW,
             ),
         ];
@@ -19160,6 +19382,7 @@ mod tests {
             running_ahead: 0,
             fully_measured: true,
             observed_at_unix_ms: NOW,
+            stalled_head_ms: None,
         };
         let mut learned = test_prior_duration();
         learned.source = cairn_common::executor_protocol::DurationEvidence::Learned;
@@ -19182,6 +19405,8 @@ mod tests {
                 None,
                 &ResourceReservation::default(),
                 predictions[0].clone(),
+                None,
+                None,
                 NOW,
             ),
             ScoredCandidate::new(
@@ -19190,6 +19415,8 @@ mod tests {
                 None,
                 &ResourceReservation::default(),
                 predictions[1].clone(),
+                None,
+                None,
                 NOW,
             ),
         ];
@@ -19229,6 +19456,8 @@ mod tests {
                 None,
                 &ResourceReservation::default(),
                 predictions[0].clone(),
+                None,
+                None,
                 NOW,
             ),
             ScoredCandidate::new(
@@ -19237,6 +19466,8 @@ mod tests {
                 None,
                 &ResourceReservation::default(),
                 faster,
+                None,
+                None,
                 NOW,
             ),
         ];
@@ -19260,6 +19491,8 @@ mod tests {
                 None,
                 &ResourceReservation::default(),
                 faster_unmeasured,
+                None,
+                None,
                 NOW,
             ),
             ScoredCandidate::new(
@@ -19268,6 +19501,8 @@ mod tests {
                 None,
                 &ResourceReservation::default(),
                 slower_unmeasured,
+                None,
+                None,
                 NOW,
             ),
         ];
@@ -19342,6 +19577,7 @@ mod tests {
                 running_ahead: 0,
                 fully_measured: true,
                 observed_at_unix_ms: NOW,
+                stalled_head_ms: None,
             },
             learned,
             SyncCost::Known(0),
@@ -19358,6 +19594,7 @@ mod tests {
                 running_ahead: 0,
                 fully_measured: true,
                 observed_at_unix_ms: NOW,
+                stalled_head_ms: None,
             },
             unmeasured,
             SyncCost::Known(0),
@@ -19369,6 +19606,8 @@ mod tests {
                 None,
                 &ResourceReservation::default(),
                 favorite_prediction,
+                None,
+                None,
                 NOW,
             ),
             ScoredCandidate::new(
@@ -19377,6 +19616,8 @@ mod tests {
                 None,
                 &ResourceReservation::default(),
                 fresh_prediction,
+                None,
+                None,
                 NOW,
             ),
         ];
@@ -19611,6 +19852,468 @@ mod tests {
             chosen(&place(&connections, &spillable_request()).unwrap()).executor_id,
             "bglab-ub",
             "a fresh sample must keep an executor rejected after pressure has remained active beyond one sampling interval"
+        );
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// Survey and rank as production does for one queue entry: its declines
+    /// and the admission view its offer will carry.
+    fn place_entry(
+        connections: &HashMap<String, ExecutorConnectionState>,
+        request: &CellRequest,
+        declined: &HashMap<String, queue::EntryDecline>,
+        view: &AdmissionView,
+    ) -> Result<PlacementDraft, String> {
+        place_entry_resolved(connections, request, declined, view, &HashMap::new())
+    }
+
+    /// [`place_entry`] with the demand resolved for each machine, as
+    /// production resolves it between the survey and ranking.
+    fn place_entry_resolved(
+        connections: &HashMap<String, ExecutorConnectionState>,
+        request: &CellRequest,
+        declined: &HashMap<String, queue::EntryDecline>,
+        view: &AdmissionView,
+        reservations: &HashMap<String, resource_profiles::ResolvedResourceProfile>,
+    ) -> Result<PlacementDraft, String> {
+        let survey = survey_candidates(connections, &[], request, NOW, declined, view)?;
+        let (predictions, sync_costs) =
+            prior_predictions(&survey.usable, request, |_, _| SyncCost::Known(0), NOW);
+        rank_survey(
+            request,
+            survey,
+            SurveyRankingContext {
+                reservations,
+                predictions: &predictions,
+                sync_costs: &sync_costs,
+                cache_distances: &HashMap::new(),
+                policy: &ActivePlacementPolicy::default_profile(),
+                now_unix_ms: NOW,
+                exploration: &ExplorationState::default(),
+            },
+        )
+    }
+
+    fn idle(id: &str) -> (String, ExecutorConnectionState) {
+        let (id, mut entry) = fleet_entry(id, "linux", 0, &[]);
+        measured(&mut entry, 0.05, 48 * GIB, 900 * GIB);
+        Arc::make_mut(&mut entry.health)
+            .admission
+            .concurrency_capacity = Some(8);
+        (id, entry)
+    }
+
+    fn queued_ahead(request_id: &str, queued_at_unix_ms: u64) -> QueuedCellRequest {
+        QueuedCellRequest {
+            admission_kind: CellAdmissionKind::Command,
+            executor_id: String::new(),
+            request_id: request_id.into(),
+            attempt_id: "a".into(),
+            project_id: "p".into(),
+            command: "true".into(),
+            command_class: CellCommandClass::Other,
+            owner: None,
+            priority: CellPriority::ReviewCheck,
+            effective_priority: None,
+            requesting_job_id: None,
+            affinity_key: None,
+            command_resource_identity: None,
+            queued_at_unix_ms,
+            resource_reservation: ResourceReservation {
+                concurrency_units: 1,
+                ..ResourceReservation::default()
+            },
+            learned_estimate: None,
+            subscriber_count: 1,
+            substrate_hold: None,
+            placement: None,
+        }
+    }
+
+    /// 09-03: bglab-mac's volume sat at 1.4 GiB against a 2 GiB watermark with
+    /// no sweep running, posted that, declined every offer for it, and still
+    /// outranked local on free units. Posted state that the machine's own
+    /// admission declines on now keeps work that can go elsewhere off it.
+    #[test]
+    fn a_machine_under_its_disk_floor_is_not_offered_work_that_can_go_elsewhere() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        measured(&mut local, 0.60, 16 * GIB, 400 * GIB);
+        let (mac_id, mut mac) = idle("bglab-mac");
+        measured(&mut mac, 0.05, 48 * GIB, GIB * 14 / 10);
+        let health = Arc::make_mut(&mut mac.health);
+        health.disk.watermark_bytes = 2 * GIB;
+        health.admission.concurrency_capacity = Some(12);
+        health.admission.active_reservation.concurrency_units = 3;
+        let connections = HashMap::from([(local_id, local), (mac_id, mac)]);
+        let request = spillable_request();
+
+        let draft = place_entry(
+            &connections,
+            &request,
+            &HashMap::new(),
+            &AdmissionView::of_request(&request),
+        )
+        .unwrap();
+        assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
+        assert_eq!(
+            rejection_for(&draft, "bglab-mac"),
+            &PlacementRejectionReason::Held {
+                evidence: AdmissionHoldEvidence::Disk {
+                    free_bytes: GIB * 14 / 10,
+                    floor_bytes: 2 * GIB,
+                    sweep_in_flight: false,
+                }
+            }
+        );
+        assert!(rejection_for(&draft, "bglab-mac")
+            .describe()
+            .starts_with("held: disk free 1.4 GiB (floor 2.0 GiB)"));
+
+        let mut pinned = request.clone();
+        pinned.pinned_executor_id = Some("bglab-mac".into());
+        let draft = place_entry(
+            &connections,
+            &pinned,
+            &HashMap::new(),
+            &AdmissionView::of_request(&pinned),
+        )
+        .unwrap();
+        assert_eq!(
+            chosen(&draft).executor_id,
+            "bglab-mac",
+            "work that cannot leave the machine is still offered, and gets the executor's own decline"
+        );
+    }
+
+    /// 10-17: fedora and bgsrv-ub rotated provisioning holders on the project
+    /// all afternoon, bgsrv-mac sat on a latched cleanup, and each outranked an
+    /// idle local in turn. However the holder changes between surveys, local
+    /// wins every one, and each row names what demoted it.
+    #[test]
+    fn rotating_provisioning_holders_and_a_latched_cleanup_never_outrank_an_idle_machine() {
+        for pass in 0..10 {
+            let (local_id, local) = idle(COLOCATED_EXECUTOR_ID);
+            let mut connections = HashMap::from([(local_id, local)]);
+            for name in ["fedora", "bgsrv-ub"] {
+                let (id, mut entry) = idle(name);
+                Arc::make_mut(&mut entry.snapshot).provisioning_holds =
+                    vec![cairn_common::executor_protocol::ProvisioningHold {
+                        project_id: "p".into(),
+                        owner_request_id: format!("holder-{name}-{pass}"),
+                        entry_id: Some(format!("residency-acquire:job:{pass}")),
+                        since_unix_ms: NOW - 61_000,
+                    }];
+                connections.insert(id, entry);
+            }
+            let (mac_id, mut mac) = idle("bgsrv-mac");
+            let health = Arc::make_mut(&mut mac.health);
+            health.disk.cleanup_blocked = true;
+            health.disk.cleanup_last_error = Some("Directory not empty".into());
+            connections.insert(mac_id, mac);
+
+            let mut request = spillable_request();
+            request.request_id = format!("acquire-{pass}");
+            let view = AdmissionView {
+                interactive: true,
+                entry_id: Some(format!("entry-{pass}")),
+                execution_residency: None,
+            };
+            let draft = place_entry(&connections, &request, &HashMap::new(), &view).unwrap();
+            assert_eq!(
+                chosen(&draft).executor_id,
+                COLOCATED_EXECUTOR_ID,
+                "pass {pass}"
+            );
+            for name in ["fedora", "bgsrv-ub"] {
+                assert!(
+                    matches!(
+                        rejection_for(&draft, name),
+                        PlacementRejectionReason::Held {
+                            evidence: AdmissionHoldEvidence::ProjectProvisioning { .. }
+                        }
+                    ),
+                    "{name}: {:?}",
+                    rejection_for(&draft, name)
+                );
+            }
+            assert_eq!(
+                rejection_for(&draft, "bgsrv-mac"),
+                &PlacementRejectionReason::Held {
+                    evidence: AdmissionHoldEvidence::CleanupLatched {
+                        error: Some("Directory not empty".into())
+                    }
+                }
+            );
+        }
+    }
+
+    /// A hold this entry's own acquisition took is not a hold on it.
+    #[test]
+    fn an_entrys_own_provisioning_hold_does_not_demote_the_machine() {
+        let (id, mut entry) = idle("fedora");
+        Arc::make_mut(&mut entry.snapshot).provisioning_holds =
+            vec![cairn_common::executor_protocol::ProvisioningHold {
+                project_id: "p".into(),
+                owner_request_id: "someone".into(),
+                entry_id: Some("mine".into()),
+                since_unix_ms: NOW - 1_000,
+            }];
+        let connections = HashMap::from([(id, entry)]);
+        let request = spillable_request();
+        let view = AdmissionView {
+            entry_id: Some("mine".into()),
+            ..AdmissionView::of_request(&request)
+        };
+        let draft = place_entry(&connections, &request, &HashMap::new(), &view).unwrap();
+        assert_eq!(chosen(&draft).executor_id, "fedora");
+        assert!(chosen(&draft)
+            .prediction
+            .as_ref()
+            .is_some_and(|prediction| prediction.queue.predicted_ms().is_some()));
+    }
+
+    /// A queue whose oldest entry ahead has waited an hour has not moved, and
+    /// free units do not make that wait zero.
+    #[test]
+    fn a_stalled_queue_head_is_priced_at_its_wait() {
+        let (id, mut stalled) = idle("bglab-ub");
+        Arc::make_mut(&mut stalled.health)
+            .admission
+            .concurrency_capacity = Some(8);
+        Arc::make_mut(&mut stalled.snapshot).queued_requests = vec![
+            queued_ahead("head", NOW - 61 * 60_000),
+            queued_ahead("next", NOW - 60_000),
+        ];
+        let request = spillable_request();
+        let context =
+            ReservationPlan::context_for("device", "executor", &stalled.advertisement.capabilities);
+        let prices = QueuePrices::from_priors(&stalled, &context);
+        let forecast = forecast_queue_wait(&stalled, &prices, &request, 10_000, NOW);
+        let QueueForecast::Forecast {
+            predicted_ms,
+            requests_ahead,
+            fully_measured,
+            stalled_head_ms,
+            ..
+        } = &forecast
+        else {
+            panic!("a priced queue: {forecast:?}");
+        };
+        assert_eq!(*requests_ahead, 2);
+        assert!(*predicted_ms >= 61 * 60_000, "{forecast:?}");
+        assert_eq!(*stalled_head_ms, Some(61 * 60_000));
+        assert!(!fully_measured);
+        assert!(
+            forecast.describe().ends_with("head waiting 61m"),
+            "{}",
+            forecast.describe()
+        );
+
+        let (peer_id, mut peer) = idle("bgsrv-ub");
+        Arc::make_mut(&mut peer.health)
+            .admission
+            .concurrency_capacity = Some(8);
+        let connections = HashMap::from([(id, stalled), (peer_id, peer)]);
+        let draft = place_entry(
+            &connections,
+            &request,
+            &HashMap::new(),
+            &AdmissionView::of_request(&request),
+        )
+        .unwrap();
+        assert_eq!(chosen(&draft).executor_id, "bgsrv-ub");
+    }
+
+    /// A head younger than the run it would wait on is an ordinary queue, and
+    /// free units still read it as no wait.
+    #[test]
+    fn a_moving_queue_head_keeps_the_arithmetic_forecast() {
+        let (_, mut entry) = idle("bglab-ub");
+        Arc::make_mut(&mut entry.health)
+            .admission
+            .concurrency_capacity = Some(8);
+        Arc::make_mut(&mut entry.snapshot).queued_requests =
+            vec![queued_ahead("head", NOW - 5_000)];
+        let context =
+            ReservationPlan::context_for("device", "executor", &entry.advertisement.capabilities);
+        let prices = QueuePrices::from_priors(&entry, &context);
+        assert_eq!(
+            forecast_queue_wait(&entry, &prices, &spillable_request(), 10_000, NOW),
+            QueueForecast::Forecast {
+                predicted_ms: 0,
+                requests_ahead: 1,
+                running_ahead: 0,
+                fully_measured: true,
+                observed_at_unix_ms: NOW,
+                stalled_head_ms: None,
+            }
+        );
+    }
+
+    /// Advertised capacity is already net of the interactive reserve, so a
+    /// request that fits it exactly does not wait.
+    #[test]
+    fn the_interactive_reserve_is_not_subtracted_from_advertised_capacity_again() {
+        let (_, mut entry) = idle("local-ish");
+        let admission = &mut Arc::make_mut(&mut entry.health).admission;
+        admission.concurrency_capacity = Some(14);
+        admission.interactive_reserve = 2;
+        let mut request = spillable_request();
+        request.resource_reservation.concurrency_units = 14;
+        let context =
+            ReservationPlan::context_for("device", "executor", &entry.advertisement.capabilities);
+        let prices = QueuePrices::from_priors(&entry, &context);
+        assert_eq!(
+            forecast_queue_wait(&entry, &prices, &request, 10_000, NOW).predicted_ms(),
+            Some(0)
+        );
+    }
+
+    /// A machine that declined this entry ranks behind one that has not, even
+    /// after its decline is superseded and nothing it posts explains it.
+    #[test]
+    fn a_machine_that_declined_this_entry_ranks_behind_one_that_has_not() {
+        let (a_id, a) = idle("a-machine");
+        let (b_id, b) = idle("b-machine");
+        let connections = HashMap::from([(a_id, a), (b_id, b)]);
+        let request = spillable_request();
+        let view = AdmissionView::of_request(&request);
+        assert_eq!(
+            chosen(&place_entry(&connections, &request, &HashMap::new(), &view).unwrap())
+                .executor_id,
+            "a-machine",
+            "otherwise equal, the stable order prefers a-machine"
+        );
+
+        let declined = HashMap::from([(
+            "a-machine".to_string(),
+            queue::EntryDecline {
+                generation: 1,
+                reason: DeclineReason::Unknown,
+                detail: None,
+                disk: None,
+                at_unix_ms: NOW - 12_000,
+                condition: None,
+                backoff_ms: 0,
+                retry_after_unix_ms: 0,
+                superseded: true,
+            },
+        )]);
+        let draft = place_entry(&connections, &request, &declined, &view).unwrap();
+        assert_eq!(chosen(&draft).executor_id, "b-machine");
+        let row = draft
+            .rejected
+            .iter()
+            .find(|row| row.executor_id == "a-machine")
+            .unwrap();
+        assert!(matches!(
+            row.reason,
+            PlacementRejectionReason::OutrankedBy { .. }
+        ));
+        let prediction = row.prediction.as_ref().unwrap();
+        assert_eq!(
+            prediction.declined_here,
+            Some(PriorDecline {
+                reason: DeclineReason::Unknown,
+                declined_at_unix_ms: NOW - 12_000,
+            })
+        );
+        assert!(prediction
+            .describe()
+            .contains("(Unknown); ranked after machines that have not"));
+    }
+
+    /// With every capable machine held on its disk, a request free to move
+    /// waits out its horizon rather than taking the immediate no-machine
+    /// refusal: a latch retries and an operator can free disk.
+    #[test]
+    fn a_fleet_held_on_disk_is_waited_for_not_refused() {
+        let (id, mut entry) = idle("bglab-mac");
+        let health = Arc::make_mut(&mut entry.health);
+        health.disk.watermark_bytes = 1000 * GIB;
+        let connections = HashMap::from([(id, entry)]);
+        let mut request = targeted_request("linux");
+        request.placement_mobility = PlacementMobility::SpillEligible;
+        let draft = place_entry(
+            &connections,
+            &request,
+            &HashMap::new(),
+            &AdmissionView::of_request(&request),
+        )
+        .expect("a held machine is waited for, not refused");
+        assert!(draft.selected.is_none());
+        assert!(matches!(
+            draft.rejected[0].reason,
+            PlacementRejectionReason::Held {
+                evidence: AdmissionHoldEvidence::Disk { .. }
+            }
+        ));
+        assert!(describe_declines(&draft.rejected).contains("held: disk free"));
+    }
+
+    /// An ordinary submission declares no disk growth; the reservation
+    /// resolved for each machine does, and it is what the offer names. A
+    /// machine with 8 GiB free, a 2 GiB watermark, and 4 GiB of growth already
+    /// admitted looks fine against the declared zero and against the resolved
+    /// 4 GiB without the admitted growth (both a 6 GiB floor), but its admission
+    /// charges all three and declines below 10 GiB. Its posted state already
+    /// says so, and is read against the demand the offer will carry.
+    #[test]
+    fn a_posted_hold_is_read_against_the_reservation_resolved_for_that_machine() {
+        let (fast_id, mut fast) = idle("a-fast");
+        measured(&mut fast, 0.05, 48 * GIB, 8 * GIB);
+        let health = Arc::make_mut(&mut fast.health);
+        health.disk.watermark_bytes = 2 * GIB;
+        health.admission.active_reservation.disk_growth_bytes = 4 * GIB;
+        let (peer_id, peer) = idle("b-peer");
+        let connections = HashMap::from([(fast_id, fast), (peer_id, peer)]);
+        let request = spillable_request();
+        assert_eq!(request.resource_reservation.disk_growth_bytes, 0);
+        let view = AdmissionView::of_request(&request);
+
+        assert_eq!(
+            chosen(&place_entry(&connections, &request, &HashMap::new(), &view).unwrap())
+                .executor_id,
+            "a-fast",
+            "against the declared zero nothing holds a-fast, which wins the stable order"
+        );
+
+        let demand = resource_profiles::ResolvedResourceProfile {
+            duration: test_prior_duration(),
+            item_durations: Vec::new(),
+            reservation: ResourceReservation {
+                memory_bytes: GIB,
+                disk_growth_bytes: 4 * GIB,
+                concurrency_units: 1,
+                source: ResourceReservationSource::Learned,
+            },
+            learned_estimate: None,
+            rationale: unresolved_rationale(&ResourceReservation::default()),
+            memory_fit: resource_profiles::MemoryFit::Unknown,
+        };
+        let reservations = HashMap::from([
+            ("a-fast".to_string(), demand.clone()),
+            ("b-peer".to_string(), demand),
+        ]);
+        let draft = place_entry_resolved(
+            &connections,
+            &request,
+            &HashMap::new(),
+            &view,
+            &reservations,
+        )
+        .unwrap();
+        assert_eq!(chosen(&draft).executor_id, "b-peer");
+        assert_eq!(
+            rejection_for(&draft, "a-fast"),
+            &PlacementRejectionReason::Held {
+                evidence: AdmissionHoldEvidence::Disk {
+                    free_bytes: 8 * GIB,
+                    floor_bytes: 10 * GIB,
+                    sweep_in_flight: false,
+                }
+            }
         );
     }
 
@@ -20374,9 +21077,11 @@ mod tests {
         );
     }
 
-    /// The machine's own admission floor counts toward fit: a volume with room
-    /// for the declared growth but not for the growth plus the watermark would
-    /// only decline the work, so it ranks as a misfit and says why.
+    /// The machine's own admission floor counts: a volume with room for the
+    /// resolved growth but not for the growth plus the watermark would only
+    /// decline the work. With no sweep in flight nothing will free the bytes, so
+    /// work that can go elsewhere is kept off it, and the row names the floor
+    /// and the sweep state rather than only a shortfall.
     #[test]
     fn the_volume_misfit_includes_the_machines_watermark() {
         const GIB: u64 = 1024 * 1024 * 1024;
@@ -20414,9 +21119,12 @@ mod tests {
         assert_eq!(chosen(&draft).executor_id, "bglab-ub");
         assert_eq!(
             rejection_for(&draft, COLOCATED_EXECUTOR_ID),
-            &PlacementRejectionReason::InsufficientVolume {
-                required_bytes: 4 * GIB,
-                free_bytes: 3 * GIB,
+            &PlacementRejectionReason::Held {
+                evidence: AdmissionHoldEvidence::Disk {
+                    free_bytes: 3 * GIB,
+                    floor_bytes: 4 * GIB,
+                    sweep_in_flight: false,
+                }
             }
         );
     }
@@ -24567,6 +25275,7 @@ mod tests {
                     None,
                     &ActivePlacementPolicy::default_profile(),
                     &HashMap::new(),
+                    &AdmissionView::default(),
                     |_, _| {
                         estimation_started_tx.send(()).unwrap();
                         release_estimation_rx.recv().unwrap();
@@ -24621,6 +25330,7 @@ mod tests {
                     None,
                     &ActivePlacementPolicy::default_profile(),
                     &HashMap::new(),
+                    &AdmissionView::default(),
                     |_, _| {
                         estimation_started_tx.send(()).unwrap();
                         release_estimation_rx.recv().unwrap();
@@ -24651,6 +25361,7 @@ mod tests {
                 None,
                 &ActivePlacementPolicy::default_profile(),
                 &HashMap::new(),
+                &AdmissionView::default(),
                 |_, _| SyncCost::Unknown,
             ))
             .unwrap()
@@ -26166,6 +26877,84 @@ mod tests {
             }).await;
     }
 
+    /// A machine that posts another acquisition's provisioning hold on the
+    /// project would decline this one, and has said so before being asked.
+    /// The first offer goes to the idle machine: no decline round trip, and a
+    /// binding of exactly offered then claimed there. Without the hold, "first"
+    /// would win on the stable order.
+    #[tokio::test]
+    async fn residency_queue_first_offer_skips_a_machine_posting_the_projects_provisioning() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (_, mut held) = residency_queue_attach(&orch.fleet, "first");
+            let (generation, mut idle) = residency_queue_attach(&orch.fleet, "second");
+            Arc::make_mut(
+                &mut orch
+                    .fleet
+                    .lock_connections()
+                    .get_mut("first")
+                    .unwrap()
+                    .snapshot,
+            )
+            .provisioning_holds = vec![cairn_common::executor_protocol::ProvisioningHold {
+                project_id: "p".into(),
+                owner_request_id: "another-acquisition".into(),
+                entry_id: Some("another-entry".into()),
+                since_unix_ms: unix_time_ms() - 30_000,
+            }];
+            let mut request = residency_queue_request("held");
+            request.executor = None;
+            let (result, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: request.clone()
+                    }
+                ),
+                async {
+                    let entry = residency_queue_offer(&mut idle).await;
+                    while let Ok(frame) = held.try_recv() {
+                        assert!(
+                            !matches!(frame, ExecutorMessage::Offer { .. }),
+                            "the held machine is never offered: {frame:?}"
+                        );
+                    }
+                    orch.fleet.handle_executor_message(
+                        "second",
+                        generation,
+                        ExecutorMessage::Claim {
+                            entry_id: entry.clone(),
+                        },
+                    );
+                    let (correlation, granted) =
+                        residency_queue_grant(&mut idle, Some(&entry)).await;
+                    let chain = orch
+                        .fleet
+                        .queue
+                        .with_entry(&entry, |entry| entry.chain.clone())
+                        .unwrap();
+                    assert!(
+                        matches!(
+                            chain.as_slice(),
+                            [
+                                BindingEvent::Offered { executor_id, .. },
+                                BindingEvent::Claimed { executor_id: claimant, .. }
+                            ] if executor_id == "second" && claimant == "second"
+                        ),
+                        "{chain:?}"
+                    );
+                    residency_queue_reply(&orch.fleet, "second", generation, correlation, &granted);
+                }
+            );
+            assert!(
+                matches!(result, ResidencyResult::State { .. }),
+                "{result:?}"
+            );
+        })
+        .await;
+    }
+
     /// A grant belongs to one claim. The machine that received it can go away,
     /// come back, and claim the requeued entry afresh; if that second claim is
     /// abandoned before its own grant, the machine holds only a ticket and must
@@ -27173,6 +27962,7 @@ mod tests {
                     request: request.clone(),
                     admission_kind: CellAdmissionKind::Command,
                     interactive: false,
+                    execution_residency: None,
                 },
                 unix_time_ms(),
             )

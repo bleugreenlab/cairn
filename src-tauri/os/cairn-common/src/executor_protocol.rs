@@ -4350,6 +4350,31 @@ pub struct LearnedResourceEstimate {
 /// why this is a version and not a silent addition. The storage sweep also stops
 /// latching admission over a fault confined to one tree; that changes what an
 /// executor refuses, not any message shape.
+///
+/// cairn/4740 changes how the runner ranks machines before it offers, without a
+/// bump. It reads each machine's posted admission condition with the reader
+/// that judges decline supersession, in the executor's check order, and
+/// excludes or ranks on it; it ranks a machine that declined an entry behind
+/// those that have not; it prices a queue whose head has waited longer than
+/// the request's run at that wait; and it stops subtracting the interactive
+/// reserve from a capacity the executor already advertises net of it. Every
+/// input is a field executors already post (the cleanup latch, sweep state,
+/// watermark, reserved growth, provisioning holds, the CPU verdict, memory,
+/// cells, queued requests), and nothing is added to what either peer sends.
+/// The records it adds, [`AdmissionHoldEvidence`], [`PriorDecline`],
+/// [`QueueUnknownReason::Held`] (which replaces `MeasuredCpuPressure`),
+/// [`PlacementRejectionReason::Held`], [`PlacementPrediction::declined_here`]
+/// and a forecast's `stalled_head_ms`, are produced by the runner and rendered
+/// only by runner surfaces: no executor decodes a placement record.
+/// [`admission_provisions`] and [`ResidencyFence::is_active_among`] move here
+/// from the executor so both peers answer one predicate; the executor's
+/// admission is unchanged by the move. The capacity question the
+/// executor-semantic-capacity ruling asks is unchanged: an executor of any
+/// version answers an offer from its own admission exactly as before. What a
+/// runner gets wrong talking to an older executor: nothing. A condition an
+/// older executor does not post reads as no hold, which is the ranking every
+/// runner had until now, and the executor still declines anything its
+/// admission refuses.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 150;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
@@ -11287,6 +11312,13 @@ pub enum QueueForecast {
         /// from learned history.
         fully_measured: bool,
         observed_at_unix_ms: u64,
+        /// How long the oldest request ranked ahead has waited, when that is
+        /// longer than this request's own predicted run. A queue whose head
+        /// has measurably not moved is priced by that measurement, so
+        /// `predicted_ms` is then at least this wait and never the zero that
+        /// free units alone would say.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stalled_head_ms: Option<u64>,
     },
     Unknown {
         reason: QueueUnknownReason,
@@ -11310,26 +11342,43 @@ impl QueueForecast {
                 requests_ahead,
                 running_ahead,
                 fully_measured,
+                stalled_head_ms,
                 ..
             } => format!(
-                "{predicted_ms}ms behind {requests_ahead} queued and {running_ahead} running{}",
+                "{predicted_ms}ms behind {requests_ahead} queued and {running_ahead} running{}{}",
                 if *fully_measured {
                     ""
                 } else {
                     ", partly from class priors"
-                }
+                },
+                stalled_head_ms
+                    .map(|waited| format!(", head waiting {}", describe_wait(waited)))
+                    .unwrap_or_default()
             ),
             Self::Unknown { reason } => format!("queue wait unknown: {}", reason.describe()),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// A span of milliseconds, coarse enough to read at a glance.
+fn describe_wait(ms: u64) -> String {
+    let seconds = ms / 1_000;
+    match seconds {
+        0..120 => format!("{seconds}s"),
+        120..7_200 => format!("{}m", seconds / 60),
+        _ => format!("{}h", seconds / 3_600),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum QueueUnknownReason {
-    /// Sustained measured host CPU pressure has no Cairn-owned completion event
-    /// from which a relief time can be predicted.
-    MeasuredCpuPressure,
+    /// The machine's posted admission condition would decline this request
+    /// now (sustained CPU pressure, memory under the floor, a project
+    /// provisioning hold, a disk below its floor). No Cairn-owned completion
+    /// event predicts when that ends, so there is no wait to sum; the machine
+    /// ranks behind every machine whose queue can be priced.
+    Held { evidence: AdmissionHoldEvidence },
     /// The machine's advertised facts aged past the liveness bound.
     FactsStale,
     /// The executor advertises no concurrency capacity, so what sits ahead of a
@@ -11338,23 +11387,155 @@ pub enum QueueUnknownReason {
 }
 
 impl QueueUnknownReason {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
-            Self::MeasuredCpuPressure => "measuredCpuPressure",
+            Self::Held { .. } => "held",
             Self::FactsStale => "factsStale",
             Self::NoAdmissionCapacity => "noAdmissionCapacity",
         }
     }
 
-    pub fn describe(self) -> &'static str {
+    pub fn describe(&self) -> String {
         match self {
-            Self::MeasuredCpuPressure => {
-                "sustained measured CPU pressure has no forecastable relief event"
-            }
-            Self::FactsStale => "the machine's queue facts are past the liveness bound",
-            Self::NoAdmissionCapacity => "the machine advertises no concurrency capacity",
+            Self::Held { evidence } => evidence.describe(),
+            Self::FactsStale => "the machine's queue facts are past the liveness bound".into(),
+            Self::NoAdmissionCapacity => "the machine advertises no concurrency capacity".into(),
         }
     }
+}
+
+/// What a machine has posted that its own admission would decline a request
+/// on, read before the request is offered to it.
+///
+/// The runner reads it with the same reader that decides when a decline is
+/// superseded (`fleet::decline_condition` in cairn-core), in the executor's
+/// own check order, so ranking and supersession cannot disagree about what a
+/// machine's posted state means. Carried by [`QueueUnknownReason::Held`] for a
+/// hold that relieves itself and by [`PlacementRejectionReason::Held`] for one
+/// that does not; produced and rendered by the runner only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum AdmissionHoldEvidence {
+    /// The storage sweep failed and admission is latched until it succeeds.
+    CleanupLatched {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Another request holds this project's provisioning on the machine, and
+    /// this work would provision.
+    ProjectProvisioning {
+        project_id: String,
+        holder_request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        holder_entry_id: Option<String>,
+        since_unix_ms: u64,
+    },
+    /// Sustained CPU pressure, or posted free memory under the floor this
+    /// request would have to leave. `available_memory_bytes` is `None` when the
+    /// machine posted no memory reading.
+    Pressure {
+        cpu_pressured: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        available_memory_bytes: Option<u64>,
+        memory_floor_bytes: u64,
+    },
+    /// Free space under the floor admission would charge this request.
+    /// `sweep_in_flight` is whether reclamation is running now, which is the
+    /// only posted sign that waiting can help.
+    Disk {
+        free_bytes: u64,
+        floor_bytes: u64,
+        sweep_in_flight: bool,
+    },
+}
+
+impl AdmissionHoldEvidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CleanupLatched { .. } => "cleanupLatched",
+            Self::ProjectProvisioning { .. } => "projectProvisioning",
+            Self::Pressure { .. } => "pressure",
+            Self::Disk { .. } => "disk",
+        }
+    }
+
+    /// The condition and its figures, as one line, aged against the wall clock.
+    pub fn describe(&self) -> String {
+        self.describe_at(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or(0),
+        )
+    }
+
+    pub fn describe_at(&self, now_unix_ms: u64) -> String {
+        match self {
+            Self::CleanupLatched { error } => match error {
+                Some(error) => format!("held: cleanup latched ({error})"),
+                None => "held: cleanup latched".into(),
+            },
+            Self::ProjectProvisioning {
+                project_id,
+                holder_request_id,
+                holder_entry_id,
+                since_unix_ms,
+            } => format!(
+                "held: project {project_id} provisioning for {} for {}",
+                holder_entry_id.as_deref().unwrap_or(holder_request_id),
+                describe_wait(now_unix_ms.saturating_sub(*since_unix_ms))
+            ),
+            Self::Pressure {
+                cpu_pressured,
+                available_memory_bytes,
+                memory_floor_bytes,
+            } => {
+                let memory = available_memory_bytes
+                    .filter(|available| available < memory_floor_bytes)
+                    .map(|available| {
+                        format!(
+                            "memory {} available (floor {})",
+                            describe_gib(available),
+                            describe_gib(*memory_floor_bytes)
+                        )
+                    });
+                let parts: Vec<String> = cpu_pressured
+                    .then(|| "sustained CPU pressure".to_string())
+                    .into_iter()
+                    .chain(memory)
+                    .collect();
+                format!("held: {}", parts.join(", "))
+            }
+            Self::Disk {
+                free_bytes,
+                floor_bytes,
+                sweep_in_flight,
+            } => format!(
+                "held: disk free {} (floor {}), {}",
+                describe_gib(*free_bytes),
+                describe_gib(*floor_bytes),
+                if *sweep_in_flight {
+                    "sweep in flight"
+                } else {
+                    "no sweep in flight"
+                }
+            ),
+        }
+    }
+}
+
+/// This machine already declined the entry being placed. History, not current
+/// state: it ranks the machine behind every machine that has not, for the life
+/// of the entry, which covers the refusals posted state cannot explain.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PriorDecline {
+    pub reason: DeclineReason,
+    pub declined_at_unix_ms: u64,
 }
 
 /// What this machine would have to fetch or build before the command could
@@ -11430,6 +11611,10 @@ pub struct PlacementPrediction {
     pub predicted_verdict_ms: u64,
     /// What the runner established about this machine's warmth for this work.
     pub warmth: CacheWarmthEvidence,
+    /// This machine's earlier refusal of the same entry, which ranks it behind
+    /// machines that have not refused it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declined_here: Option<PriorDecline>,
 }
 
 impl PlacementPrediction {
@@ -11453,15 +11638,27 @@ impl PlacementPrediction {
     /// The one line every readable surface renders for a candidate.
     pub fn describe(&self) -> String {
         format!(
-            "{}: {}ms predicted ({}; {}; {}; {})",
+            "{}: {}ms predicted ({}; {}; {}; {}){}",
             self.executor_name,
             self.predicted_verdict_ms,
             self.queue.describe(),
             self.run.describe(),
             self.warmth.describe(),
-            self.preparation.describe()
+            self.preparation.describe(),
+            self.declined_here
+                .map(|decline| format!("; {}", describe_prior_decline(decline)))
+                .unwrap_or_default()
         )
     }
+}
+
+/// An earlier refusal of this entry, as the clause a ranked row carries.
+pub fn describe_prior_decline(decline: PriorDecline) -> String {
+    format!(
+        "declined this entry {} ({:?}); ranked after machines that have not",
+        describe_age(decline.declined_at_unix_ms),
+        decline.reason
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -11613,6 +11810,12 @@ pub enum PlacementRejectionReason {
         detail: Option<String>,
         declined_at_unix_ms: u64,
     },
+    /// The machine has posted a condition its own admission would decline this
+    /// request on, and nothing running will clear it (a latched cleanup, or a
+    /// disk under its floor with no sweep in flight). It is not offered work
+    /// that is free to go elsewhere; like a decline, it is something to wait
+    /// for rather than a reason to refuse.
+    Held { evidence: AdmissionHoldEvidence },
     /// The project's setup commands, which every cell for the project runs
     /// before its first command, invoke a toolchain this machine does not
     /// advertise. A fact about the machine and the project, not the batch: a
@@ -11732,6 +11935,7 @@ impl PlacementRejectionReason {
                 detail,
                 declined_at_unix_ms,
             } => describe_decline(*reason, detail.as_deref(), *declined_at_unix_ms),
+            Self::Held { evidence } => evidence.describe(),
             Self::PreparationToolchainMissing {
                 project_id,
                 missing,
@@ -12054,6 +12258,72 @@ pub struct ResidencyFence {
     #[serde(default)]
     pub incarnation_id: String,
     pub cell_epoch: u64,
+}
+
+impl ResidencyFence {
+    /// Whether this fence names a residency active among `cells` for
+    /// `project_id`: the same holder and incarnation, in its active phase, on
+    /// the cell epoch the fence carries.
+    ///
+    /// The executor asks this of its own cells and the runner of the cells the
+    /// machine posted, so both read an offer's fence the same way.
+    pub fn is_active_among<'a>(
+        &self,
+        project_id: &str,
+        cells: impl IntoIterator<Item = &'a PersistentCellState>,
+    ) -> bool {
+        cells.into_iter().any(|cell| {
+            cell.project_id == project_id
+                && cell.cell_epoch == self.cell_epoch
+                && cell.residency.as_ref().is_some_and(|residency| {
+                    residency.holder == self.holder
+                        && residency.incarnation_id == self.incarnation_id
+                        && residency.phase == ResidencyPhase::Active
+                })
+        })
+    }
+}
+
+/// Whether admitting work provisions a cell, and so must take, or wait on, its
+/// project's provisioning hold.
+///
+/// The hold guards materialization: managed object preparation, cell
+/// provisioning, and the checkout a slot gets before its lease. Only work
+/// whose admission skips all of it is exempt:
+///
+/// - work against an existing checkout, which the executor never provisions;
+/// - work bound to a residency active on the machine (`resident_here`) that
+///   does not prepare managed objects, which runs in the cell its residency
+///   already holds.
+///
+/// Everything else provisions. That includes a detached batch that will reuse
+/// a warm cell, because preparing that slot is materialization, and a resident
+/// batch on a machine that receives managed objects (see
+/// [`resident_work_provisions`]).
+///
+/// The one answer for the executor's admission and for the runner reading a
+/// machine's posted state before it offers: two copies would be free to
+/// disagree about exactly which work the hold delays.
+pub fn admission_provisions(repository: &RepositoryLocator, resident_here: bool) -> bool {
+    if matches!(repository, RepositoryLocator::ExistingCheckout { .. }) {
+        return false;
+    }
+    if resident_here {
+        return resident_work_provisions(repository);
+    }
+    true
+}
+
+/// Whether work inside a live residency still provisions.
+///
+/// The executor prepares managed objects for every `ManagedObjects` request,
+/// resident or not: the batch needs the prepared repository and its cache pin
+/// to publish its delta. That preparation initializes the shared object
+/// database, rewrites the cache manifest, and can fetch and evict packs, and
+/// the hold is what serializes it per project. Keep this in step with the
+/// preparation match in the executor's `run_admission`.
+pub fn resident_work_provisions(repository: &RepositoryLocator) -> bool {
+    matches!(repository, RepositoryLocator::ManagedObjects { .. })
 }
 
 /// A bounded, read-only request against an already-live resident materialization.
