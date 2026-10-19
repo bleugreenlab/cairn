@@ -65,6 +65,7 @@ pub(super) async fn read_project_check_observation(
                 &query,
                 &observation,
                 Some(&citation),
+                ran_on(orch, &observation).as_deref(),
             )
         }
         Ok(None) => "Check observation not found".to_string(),
@@ -224,6 +225,7 @@ pub(super) async fn read_project_check_results(
             &query,
             &observation,
             None,
+            ran_on(orch, &observation).as_deref(),
         ),
         Ok(None) => render_miss(
             project,
@@ -244,6 +246,39 @@ fn millis_stamp(millis: i64) -> String {
     crate::clock::stamp_millis_with_seconds(millis).unwrap_or_else(|| millis.to_string())
 }
 
+/// The machine that ran an observation, as `name (os/arch)`, with the platform
+/// this runner knows the machine by rather than the one the row records, so a
+/// row labelled with the wrong platform reads as wrong beside it.
+fn ran_on(orch: &Orchestrator, observation: &CheckResultObservationProjection) -> Option<String> {
+    let executor_id = observation.executor_id.as_deref()?;
+    let platform = orch.fleet.executor_platform(executor_id).map_or_else(
+        || "platform not known to this runner".to_string(),
+        |platform| platform.to_string(),
+    );
+    Some(format!(
+        "{} ({platform})",
+        orch.fleet.executor_name_for_text(executor_id)
+    ))
+}
+
+fn verdict_platform_line(
+    observation: &CheckResultObservationProjection,
+    ran_on: Option<&str>,
+) -> String {
+    let label = match (
+        observation.verdict_platform.as_deref(),
+        observation.verdict_arch.as_deref(),
+    ) {
+        (Some(os), Some(arch)) => format!("{os}/{arch}"),
+        (Some(os), None) => os.to_string(),
+        (None, _) => "unrecorded".to_string(),
+    };
+    match ran_on {
+        Some(machine) => format!("- Verdict platform: {label} · ran on {machine}"),
+        None => format!("- Verdict platform: {label}"),
+    }
+}
+
 fn render_observation(
     project: &str,
     revision: &str,
@@ -251,6 +286,7 @@ fn render_observation(
     query: &CheckResultsQuery,
     observation: &CheckResultObservationProjection,
     permalink: Option<&str>,
+    ran_on: Option<&str>,
 ) -> String {
     let short_commit = commit.get(..12).unwrap_or(commit);
     let handle = format!("{}@{short_commit}", observation.check_name);
@@ -307,6 +343,7 @@ fn render_observation(
             "- Verdict: {} (exit {})",
             observation.verdict, observation.exit_code
         ),
+        verdict_platform_line(observation, ran_on),
         format!("- Complete: {}", observation.complete),
         format!("- Reusable: {}", observation.reusable),
         format!(
@@ -615,6 +652,8 @@ mod tests {
             executor_finished_at_unix_ms: Some(100),
             runner_build_id: Some("runner-1".into()),
             toolchain_fingerprint: Some("tools-1".into()),
+            verdict_platform: Some("linux".into()),
+            verdict_arch: Some("x86_64".into()),
             output_tail: "failed".into(),
             tests: vec![
                 crate::execution::cache::CheckTestResultRow {
@@ -652,7 +691,15 @@ mod tests {
             param("limit", "2"),
         ])
         .unwrap();
-        let body = render_observation("cairn", "main", "target-commit", &query, &observation, None);
+        let body = render_observation(
+            "cairn",
+            "main",
+            "target-commit",
+            &query,
+            &observation,
+            None,
+            None,
+        );
         for expected in [
             "cached observation",
             "Citation: [rust-tests@target-commi](cairn://p/cairn/check-results/target-commit?suite=rust-tests&environment=env-1)",
@@ -676,6 +723,41 @@ mod tests {
         assert!(!body.contains("obs-1"), "internal UUID/key leaked: {body}");
     }
 
+    /// The verdict platform is shown with the machine that ran the lane and
+    /// the platform that machine is known by, so the two can be compared.
+    #[test]
+    fn observation_names_its_verdict_platform_beside_the_machine_that_ran_it() {
+        let mut observation = cached_observation();
+        let query =
+            parse_query(&[param("suite", "rust-tests"), param("environment", "env-1")]).unwrap();
+        let body = render_observation(
+            "cairn",
+            "main",
+            "target-commit",
+            &query,
+            &observation,
+            None,
+            Some("fedora (linux/x86_64)"),
+        );
+        assert!(
+            body.contains("- Verdict platform: linux/x86_64 · ran on fedora (linux/x86_64)"),
+            "{body}"
+        );
+
+        observation.verdict_platform = None;
+        observation.verdict_arch = None;
+        let body = render_observation(
+            "cairn",
+            "main",
+            "target-commit",
+            &query,
+            &observation,
+            None,
+            None,
+        );
+        assert!(body.contains("- Verdict platform: unrecorded\n"), "{body}");
+    }
+
     /// A legacy row has no truthful defining commit. It says so, rather than
     /// letting the reader infer the evaluated commit defined the check.
     #[test]
@@ -685,7 +767,15 @@ mod tests {
         observation.source_defined_by_commit_sha = None;
         let query =
             parse_query(&[param("suite", "rust-tests"), param("environment", "env-1")]).unwrap();
-        let body = render_observation("cairn", "main", "target-commit", &query, &observation, None);
+        let body = render_observation(
+            "cairn",
+            "main",
+            "target-commit",
+            &query,
+            &observation,
+            None,
+            None,
+        );
         assert!(body.contains("Defined by commit: unrecorded (legacy row)"));
         assert!(body.contains("Source defined by commit: unrecorded (legacy row)"));
     }
@@ -700,7 +790,15 @@ mod tests {
             "stderr:\n```\nExecutor protocol check could not evaluate\n".into();
         let query =
             parse_query(&[param("suite", "rust-tests"), param("environment", "env-1")]).unwrap();
-        let body = render_observation("cairn", "main", "target-commit", &query, &observation, None);
+        let body = render_observation(
+            "cairn",
+            "main",
+            "target-commit",
+            &query,
+            &observation,
+            None,
+            None,
+        );
         assert!(body.contains("## Output (tail)"), "{body}");
         assert!(body.contains("Executor protocol check could not evaluate"));
         assert!(
@@ -709,7 +807,15 @@ mod tests {
         );
 
         observation.output_tail = "  \n".into();
-        let body = render_observation("cairn", "main", "target-commit", &query, &observation, None);
+        let body = render_observation(
+            "cairn",
+            "main",
+            "target-commit",
+            &query,
+            &observation,
+            None,
+            None,
+        );
         assert!(!body.contains("## Output"));
     }
 }

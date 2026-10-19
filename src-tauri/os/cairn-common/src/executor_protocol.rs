@@ -4605,6 +4605,16 @@ pub struct LearnedResourceEstimate {
 /// gets wrong talking to an older executor: nothing; the older executor admits
 /// and widens the batch by the charge it is sent, as it always has.
 ///
+/// cairn/5175 changes how the runner labels a check result whose executor's
+/// account was lost, without a bump. The runner's record of a claim now keeps
+/// the os and arch the claiming machine advertised in `ExecutorCapabilities`,
+/// and a result row with no `CellExecutionMeta` takes its platform from that
+/// claim instead of from the runner's own process. The advertisement is the
+/// one every executor already sends; the claim record is runner state that
+/// never crosses the link. What a runner gets wrong talking to an older
+/// executor: nothing; the older executor advertises the same capabilities and
+/// reports the same metadata, and the runner only reads them correctly.
+///
 /// Version 151 (cairn/5154) moves the `cairn` CLI on a remote machine under the
 /// same rule as the executor binary: the build the runner selected, identified
 /// by content. Until now the CLI was installed only by the enrolment ceremony,

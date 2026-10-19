@@ -678,6 +678,42 @@ pub(crate) struct CellPlacement {
     pub generation: u64,
     /// The machine as an operator names it.
     pub name: String,
+    /// What the machine advertised itself as when it claimed the request.
+    /// When its own account of the run is lost, this is the only honest
+    /// answer to which platform the run belongs to. `None` only for a
+    /// placement reconstructed after the machine was forgotten.
+    pub platform: Option<ExecutorPlatform>,
+}
+
+/// The operating system and architecture a machine advertises, in the
+/// lowercase vocabulary verdict platforms are recorded in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecutorPlatform {
+    pub os: String,
+    pub arch: String,
+}
+
+impl ExecutorPlatform {
+    pub(crate) fn advertised(capabilities: &ExecutorCapabilities) -> Self {
+        Self {
+            os: capabilities.os.to_ascii_lowercase(),
+            arch: capabilities.arch.to_ascii_lowercase(),
+        }
+    }
+
+    /// The platform of the process this runner is.
+    pub(crate) fn this_process() -> Self {
+        Self {
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for ExecutorPlatform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.os, self.arch)
+    }
 }
 
 /// How many cancellation causes the runner holds while their outcomes are in
@@ -4201,6 +4237,7 @@ impl Fleet {
                     executor_id: executor_id.to_string(),
                     generation,
                     name: self.executor_name_for_text(executor_id),
+                    platform: self.executor_platform(executor_id),
                 }),
             },
         };
@@ -7564,6 +7601,28 @@ impl Fleet {
         ids.into_iter().collect()
     }
 
+    /// The platform one machine advertises: its live connection's, or, while
+    /// it is away, what its enrollment last recorded. `None` for an executor
+    /// this runner does not know.
+    pub(crate) fn executor_platform(&self, executor_id: &str) -> Option<ExecutorPlatform> {
+        if let Some(entry) = self.lock_connections().get(executor_id) {
+            return Some(ExecutorPlatform::advertised(
+                &entry.advertisement.capabilities,
+            ));
+        }
+        if executor_id == COLOCATED_EXECUTOR_ID {
+            return Some(ExecutorPlatform::this_process());
+        }
+        self.enrolled_remotes
+            .lock()
+            .unwrap()
+            .get(executor_id)
+            .map(|record| ExecutorPlatform {
+                os: record.os.to_ascii_lowercase(),
+                arch: record.arch.to_ascii_lowercase(),
+            })
+    }
+
     /// The platform the machine answering to a public name runs, from its live
     /// advertisement or, while it is away, its enrollment. `None` when nothing
     /// this runner knows of carries the name, or when machines of different
@@ -9616,6 +9675,7 @@ impl Fleet {
             executor_id: selected.executor_id.clone(),
             generation: selected.generation,
             name: self.executor_name_for_text(&selected.executor_id),
+            platform: Some(ExecutorPlatform::advertised(&selected.capabilities)),
         };
         // The claim is the binding, so it is the moment every grant is issued:
         // the runner context and the purpose registry's record that this item

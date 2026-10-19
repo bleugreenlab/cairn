@@ -1790,6 +1790,8 @@ pub(crate) struct CheckResultObservationProjection {
     pub executor_finished_at_unix_ms: Option<i64>,
     pub runner_build_id: Option<String>,
     pub toolchain_fingerprint: Option<String>,
+    pub verdict_platform: Option<String>,
+    pub verdict_arch: Option<String>,
     pub output_tail: String,
     pub tests: Vec<CheckTestResultRow>,
     pub test_total: usize,
@@ -2156,7 +2158,8 @@ pub(crate) fn get_check_result_observation(
                             o.executor_device_id,o.executor_connection_generation,o.executor_slot_id,
                             o.executor_lease_epoch,o.executor_started_at_unix_ms,
                             o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
-                            o.output_tail,a.defined_by_commit_sha,o.defined_by_commit_sha
+                            o.output_tail,a.defined_by_commit_sha,o.defined_by_commit_sha,
+                            o.verdict_platform,o.verdict_arch
                        FROM check_result_commit_aliases a
                        JOIN check_result_observations o ON o.id=a.source_observation_id
                       WHERE a.project_id=?1 AND a.commit_sha=?2 AND a.check_name=?3
@@ -2185,7 +2188,9 @@ pub(crate) fn get_check_result_observation(
                     executor_cell_id: row.opt_text(27)?, executor_lease_epoch: row.opt_i64(28)?,
                     executor_started_at_unix_ms: row.opt_i64(29)?,
                     executor_finished_at_unix_ms: row.opt_i64(30)?, runner_build_id: row.opt_text(31)?,
-                    toolchain_fingerprint: row.opt_text(32)?, output_tail: row.text(33)?, tests: Vec::new(),
+                    toolchain_fingerprint: row.opt_text(32)?,
+                    verdict_platform: row.opt_text(36)?, verdict_arch: row.opt_text(37)?,
+                    output_tail: row.text(33)?, tests: Vec::new(),
                     test_total: 0, test_offset: offset,
                 };
                 let mut totals = conn.query(
@@ -2237,7 +2242,7 @@ pub(crate) fn get_check_result_observation_by_handle(
                             o.executor_device_id,o.executor_connection_generation,o.executor_slot_id,
                             o.executor_lease_epoch,o.executor_started_at_unix_ms,
                             o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
-                            o.output_tail,o.defined_by_commit_sha
+                            o.output_tail,o.defined_by_commit_sha,o.verdict_platform,o.verdict_arch
                        FROM check_result_observations o
                       WHERE o.project_id=?1 AND o.public_handle=?2",
                     params![keys.0.as_str(), keys.1.as_str()],
@@ -2262,6 +2267,7 @@ pub(crate) fn get_check_result_observation_by_handle(
                     executor_cell_id: row.opt_text(23)?, executor_lease_epoch: row.opt_i64(24)?,
                     executor_started_at_unix_ms: row.opt_i64(25)?, executor_finished_at_unix_ms: row.opt_i64(26)?,
                     runner_build_id: row.opt_text(27)?, toolchain_fingerprint: row.opt_text(28)?,
+                    verdict_platform: row.opt_text(31)?, verdict_arch: row.opt_text(32)?,
                     output_tail: row.text(29)?, tests: Vec::new(), test_total: 0, test_offset: 0,
                 };
                 let mut tests = conn.query(

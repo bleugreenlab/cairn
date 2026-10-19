@@ -268,8 +268,7 @@ async fn archive_issue_executions(orch: &Orchestrator, db: &LocalDb, issue_id: &
                     job.default_branch,
                 );
                 if !resolved.contains_key(&key) {
-                    let range =
-                        resolve_archive_range(orch, &key.0, &key.1, &key.2, &key.3).await;
+                    let range = resolve_archive_range(orch, &key.0, &key.1, &key.2, &key.3).await;
                     resolved.insert(key.clone(), range);
                 }
                 resolved[&key].clone()

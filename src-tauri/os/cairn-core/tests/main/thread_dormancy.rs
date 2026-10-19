@@ -124,7 +124,9 @@ async fn the_composer_enqueue_is_refused_on_a_closed_thread() {
         is_dormancy_refusal(&refused),
         "the composer sees the same refusal the continue path does: {refused}"
     );
-    assert!(operator_messages(&orch.db.local, "job-thread").await.is_empty());
+    assert!(operator_messages(&orch.db.local, "job-thread")
+        .await
+        .is_empty());
 }
 
 /// Closing does not cancel a turn in flight, and a follow-up to that turn is not
@@ -144,8 +146,14 @@ async fn a_follow_up_to_a_turn_still_running_on_a_closed_thread_is_kept() {
         .await
         .unwrap();
 
-    continue_job_or_enqueue(&orch, "job-thread", Some("one more thing"), None, Some("req-1"))
-        .expect("a follow-up to the running turn is queued, not refused");
+    continue_job_or_enqueue(
+        &orch,
+        "job-thread",
+        Some("one more thing"),
+        None,
+        Some("req-1"),
+    )
+    .expect("a follow-up to the running turn is queued, not refused");
     assert_eq!(
         operator_messages(&orch.db.local, "job-thread").await,
         vec!["one more thing".to_string()]

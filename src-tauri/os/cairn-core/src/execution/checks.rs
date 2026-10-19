@@ -6538,6 +6538,104 @@ fn check_reuse_decision(
     }
 }
 
+/// The machine a check's verdict came from. Every machine-derived field a
+/// result row records (executor, platform, architecture, toolchain, verdict
+/// environment) is read from this and nothing else, so a row can only be
+/// labelled with the platform of the machine that ran it. The coordinator's own
+/// platform and environment describe a row only when the coordinator *is* that
+/// machine; for a lane placed elsewhere they are the requester's, which is
+/// exactly the label that must never be recorded.
+#[derive(Clone, Copy)]
+enum ObservedOn<'a> {
+    /// The executor's own account of the run.
+    Executor(&'a cairn_common::executor_protocol::CellExecutionMeta),
+    /// A machine claimed the lane and its account of the run was lost; what it
+    /// advertised when it claimed is all that is known about where it ran.
+    Claim(&'a crate::fleet::CellPlacement),
+    /// The coordinator's own process produced the result, with no executor
+    /// between them.
+    Coordinator,
+    /// The lane failed before any machine claimed it, so it ran nowhere.
+    Unplaced,
+}
+
+impl<'a> ObservedOn<'a> {
+    fn resolve(
+        provenance: Option<&'a cairn_common::executor_protocol::CellExecutionMeta>,
+        claim: Option<&'a crate::fleet::CellPlacement>,
+        substrate_failed: bool,
+    ) -> Self {
+        match (provenance, claim) {
+            (Some(meta), _) => Self::Executor(meta),
+            (None, Some(placement)) => Self::Claim(placement),
+            (None, None) if substrate_failed => Self::Unplaced,
+            (None, None) => Self::Coordinator,
+        }
+    }
+
+    fn attestation(self) -> Option<&'a cairn_common::executor_protocol::CellExecutionMeta> {
+        match self {
+            Self::Executor(meta) => Some(meta),
+            _ => None,
+        }
+    }
+
+    /// Whether the machine that ran this is the process recording it.
+    fn is_coordinator(self) -> bool {
+        match self {
+            Self::Executor(meta) => meta.executor_id == crate::fleet::COLOCATED_EXECUTOR_ID,
+            Self::Claim(placement) => placement.executor_id == crate::fleet::COLOCATED_EXECUTOR_ID,
+            Self::Coordinator => true,
+            Self::Unplaced => false,
+        }
+    }
+
+    fn executor_id(self) -> Option<String> {
+        match self {
+            Self::Executor(meta) => Some(meta.executor_id.clone()),
+            Self::Claim(placement) => Some(placement.executor_id.clone()),
+            Self::Coordinator | Self::Unplaced => None,
+        }
+    }
+
+    fn connection_generation(self) -> Option<i64> {
+        match self {
+            Self::Executor(meta) => Some(meta.executor_connection_generation as i64),
+            Self::Claim(placement) => Some(placement.generation as i64),
+            Self::Coordinator | Self::Unplaced => None,
+        }
+    }
+
+    /// The verdict platform and architecture: what the executor attested, else
+    /// what the claiming machine advertised, else this process's own when this
+    /// process is the machine.
+    fn verdict_platform(self) -> (Option<String>, Option<String>) {
+        let (os, arch) = match self {
+            Self::Executor(meta) => (meta.verdict_platform.clone(), meta.verdict_arch.clone()),
+            Self::Claim(placement) => placement.platform.clone().map_or((None, None), |platform| {
+                (Some(platform.os), Some(platform.arch))
+            }),
+            Self::Coordinator | Self::Unplaced => (None, None),
+        };
+        let here = self
+            .is_coordinator()
+            .then(crate::fleet::ExecutorPlatform::this_process);
+        (
+            os.or_else(|| here.as_ref().map(|platform| platform.os.clone())),
+            arch.or_else(|| here.map(|platform| platform.arch)),
+        )
+    }
+
+    fn toolchain_fingerprint(self) -> Option<String> {
+        self.attestation()
+            .and_then(|meta| meta.toolchain_fingerprint.clone())
+            .or_else(|| {
+                self.is_coordinator()
+                    .then(|| check_toolchain_identity().to_string())
+            })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fresh_observation_write(
     project_id: &str,
@@ -6549,11 +6647,13 @@ fn fresh_observation_write(
     failure_kind: Option<CheckFailureKind>,
     duration_ms: i64,
     output_tail: &str,
-    provenance: Option<&cairn_common::executor_protocol::CellExecutionMeta>,
+    observed_on: ObservedOn<'_>,
     parsed: Option<&ParsedCheckResult>,
     reuse: CheckReuseDecision,
     infra_reset_scopes: Vec<String>,
 ) -> FreshCheckObservationWrite {
+    let provenance = observed_on.attestation();
+    let coordinator_ran = observed_on.is_coordinator();
     let tests = parsed
         .map(|result| {
             result
@@ -6594,12 +6694,13 @@ fn fresh_observation_write(
         .filter(|meta| !meta.environment_fingerprint.is_empty())
         .map(|meta| meta.environment_fingerprint.clone())
         .unwrap_or_else(|| {
-            if remote_environment_unknown {
-                String::new()
-            } else {
+            if coordinator_ran {
                 plan_environment_fingerprint(plan)
+            } else {
+                String::new()
             }
         });
+    let (verdict_platform, verdict_arch) = observed_on.verdict_platform();
     FreshCheckObservationWrite {
         sealed_coordinate: sealed_coordinate.clone(),
         id: uuid::Uuid::new_v4().to_string(),
@@ -6611,16 +6712,12 @@ fn fresh_observation_write(
         check_name: plan.name.clone(),
         input_hash: sealed_coordinate.input_hash().to_string(),
         environment_fingerprint,
-        verdict_platform: provenance
-            .and_then(|meta| meta.verdict_platform.clone())
-            .or_else(|| (!remote_environment_unknown).then(|| std::env::consts::OS.to_string())),
-        verdict_arch: provenance
-            .and_then(|meta| meta.verdict_arch.clone())
-            .or_else(|| (!remote_environment_unknown).then(|| std::env::consts::ARCH.to_string())),
+        verdict_platform,
+        verdict_arch,
         verdict_environment_hash: provenance
             .and_then(|meta| meta.verdict_environment_hash.clone())
             .or_else(|| {
-                (!remote_environment_unknown).then(|| {
+                coordinator_ran.then(|| {
                     cairn_checkenv::verdict_environment_hash(
                         plan.verdict_environment_names.clone(),
                         |name| std::env::var(name).ok(),
@@ -6653,20 +6750,15 @@ fn fresh_observation_write(
             .strip_prefix("manual-check:")
             .and_then(|value| value.split_once(':').map(|(run_id, _)| run_id.to_string())),
         cadence: observation_cadence(tool_use_id).to_string(),
-        executor_id: provenance.map(|meta| meta.executor_id.clone()),
+        executor_id: observed_on.executor_id(),
         executor_device_id: provenance.map(|meta| meta.executor_device_id.clone()),
-        executor_connection_generation: provenance
-            .map(|meta| meta.executor_connection_generation as i64),
+        executor_connection_generation: observed_on.connection_generation(),
         executor_cell_id: provenance.map(|meta| meta.cell_id.clone()),
         executor_lease_epoch: provenance.map(|meta| meta.cell_epoch as i64),
         executor_started_at_unix_ms: provenance.map(|meta| meta.started_at_unix_ms as i64),
         executor_finished_at_unix_ms: provenance.map(|meta| meta.finished_at_unix_ms as i64),
         runner_build_id: Some(cairn_checkenv::implementation_identity().to_string()),
-        toolchain_fingerprint: provenance
-            .and_then(|meta| meta.toolchain_fingerprint.clone())
-            .or_else(|| {
-                (!remote_environment_unknown).then(|| check_toolchain_identity().to_string())
-            }),
+        toolchain_fingerprint: observed_on.toolchain_fingerprint(),
         output_tail: output_tail.to_string(),
         target_results_json: parsed.and_then(|result| serde_json::to_string(result).ok()),
         tests,
@@ -7515,16 +7607,15 @@ where
                         // A failure with no executor provenance may still have
                         // had a machine: the one that claimed it. Its rows name
                         // that machine, so a lost link is attributable.
-                        let placed_on = provenance
-                            .is_none()
-                            .then(|| {
-                                substrate_failure
-                                    .as_ref()
-                                    .and_then(SubstrateFailure::placement)
-                                    .cloned()
-                            })
-                            .flatten();
-                        let mut legacy_write = CheckResultCacheWrite {
+                        let observed_on = ObservedOn::resolve(
+                            provenance.as_ref(),
+                            substrate_failure
+                                .as_ref()
+                                .and_then(SubstrateFailure::placement),
+                            substrate_failure.is_some(),
+                        );
+                        let (verdict_platform, verdict_arch) = observed_on.verdict_platform();
+                        let legacy_write = CheckResultCacheWrite {
                             project_id: project_id.to_string(),
                             defined_by_commit_sha: Some(commit.defined_by.to_string()),
                             tree_hash: tree_hash.to_string(),
@@ -7538,13 +7629,11 @@ where
                             job_id: Some(job_id.to_string()),
                             cached: Some(false),
                             failure_kind: failure_kind.map(|kind| kind.as_str().to_string()),
-                            executor_id: provenance.as_ref().map(|meta| meta.executor_id.clone()),
+                            executor_id: observed_on.executor_id(),
                             executor_device_id: provenance
                                 .as_ref()
                                 .map(|meta| meta.executor_device_id.clone()),
-                            executor_connection_generation: provenance
-                                .as_ref()
-                                .map(|meta| meta.executor_connection_generation as i64),
+                            executor_connection_generation: observed_on.connection_generation(),
                             executor_cell_id: provenance.as_ref().map(|meta| meta.cell_id.clone()),
                             executor_lease_epoch: provenance
                                 .as_ref()
@@ -7555,29 +7644,17 @@ where
                             executor_finished_at_unix_ms: provenance
                                 .as_ref()
                                 .map(|meta| meta.finished_at_unix_ms as i64),
-                            toolchain_fingerprint: provenance
-                                .as_ref()
-                                .and_then(|meta| meta.toolchain_fingerprint.clone())
-                                .or_else(|| Some(check_toolchain_identity().to_string())),
+                            toolchain_fingerprint: observed_on.toolchain_fingerprint(),
                             environment_fingerprint: infra_scope.clone(),
-                            verdict_platform: provenance
-                                .as_ref()
-                                .and_then(|meta| meta.verdict_platform.clone()),
-                            verdict_arch: provenance
-                                .as_ref()
-                                .and_then(|meta| meta.verdict_arch.clone()),
+                            verdict_platform,
+                            verdict_arch,
                             verdict_environment_hash: provenance
                                 .as_ref()
                                 .and_then(|meta| meta.verdict_environment_hash.clone()),
                         };
-                        if let Some(placement) = &placed_on {
-                            legacy_write.executor_id = Some(placement.executor_id.clone());
-                            legacy_write.executor_connection_generation =
-                                Some(placement.generation as i64);
-                        }
                         let reuse =
                             check_reuse_decision(&plan.command, failure_kind, parsed.as_ref());
-                        let mut observation = fresh_observation_write(
+                        let observation = fresh_observation_write(
                             project_id,
                             &sealed_coordinates[index],
                             plan,
@@ -7587,7 +7664,7 @@ where
                             failure_kind,
                             duration_ms,
                             &output_tail,
-                            provenance.as_ref(),
+                            observed_on,
                             parsed.as_ref(),
                             reuse,
                             infra_scopes.verdict_scopes(
@@ -7597,11 +7674,6 @@ where
                                     .and_then(|meta| meta.verdict_platform.as_deref()),
                             ),
                         );
-                        if let Some(placement) = placed_on {
-                            observation.executor_id = Some(placement.executor_id);
-                            observation.executor_connection_generation =
-                                Some(placement.generation as i64);
-                        }
                         let identity = crate::execution::cache::RecordedCheckObservation {
                             id: observation.id.clone(),
                             public_handle: observation.public_handle.clone(),
@@ -9258,7 +9330,7 @@ mod tests {
             None,
             12,
             "ok",
-            None,
+            ObservedOn::Coordinator,
             None,
             CheckReuseDecision {
                 reusable: true,
@@ -14141,6 +14213,7 @@ cairn-common = { path = "../cairn-common" }
                 executor_id: "e-1".into(),
                 generation: 4,
                 name: "bglab-ub".into(),
+                platform: None,
             }),
             ..crate::fleet::CellAccount::default()
         };
@@ -14170,16 +14243,23 @@ cairn-common = { path = "../cairn-common" }
     }
 
     /// The rows a lost link writes name the machine that claimed the check,
-    /// which is what makes the failure attributable after the fact.
+    /// which is what makes the failure attributable after the fact. They carry
+    /// that machine's advertised platform, never the coordinator's: a Linux
+    /// lane requested from a Mac and lost is a Linux row (cairn/5175).
     #[tokio::test]
     async fn a_lost_link_records_the_machine_that_held_the_check() {
         let db = cache_db().await;
         let plans = vec![(plan("cargo-test", "cargo test"), "ih-link".to_string())];
+        // A platform no coordinator runs, so the coordinator's cannot pass for it.
         let placed = crate::fleet::CellAccount {
             placement: Some(crate::fleet::CellPlacement {
                 executor_id: "e-1".into(),
                 generation: 4,
                 name: "bglab-ub".into(),
+                platform: Some(crate::fleet::ExecutorPlatform {
+                    os: "plan9".into(),
+                    arch: "mips64".into(),
+                }),
             }),
             ..crate::fleet::CellAccount::default()
         };
@@ -14216,6 +14296,70 @@ cairn-common = { path = "../cairn-common" }
             .await
             .unwrap();
         assert_eq!(recorded.as_deref(), Some("e-1:4"));
+        let machine = db
+            .query_opt_text(
+                "SELECT verdict_platform || '/' || verdict_arch || ' env=' \
+                        || environment_fingerprint || ' hash=' \
+                        || COALESCE(verdict_environment_hash, '-') || ' tools=' \
+                        || COALESCE(toolchain_fingerprint, '-') \
+                 FROM check_result_observations LIMIT 1",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            machine.as_deref(),
+            Some("plan9/mips64 env= hash=- tools=-"),
+            "the claim's platform labels the row, and nothing of the coordinator's \
+             environment or toolchain is recorded for a machine it is not"
+        );
+        let legacy = db
+            .query_opt_text(
+                "SELECT verdict_platform || '/' || verdict_arch FROM check_result_cache LIMIT 1",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy.as_deref(), Some("plan9/mips64"));
+    }
+
+    /// A lane that failed before any machine claimed it ran nowhere, so its
+    /// row names no platform rather than the requester's.
+    #[tokio::test]
+    async fn an_unclaimed_substrate_failure_records_no_platform() {
+        let db = cache_db().await;
+        let plans = vec![(plan("cargo-test", "cargo test"), "ih-unclaimed".to_string())];
+        let result = std::sync::Mutex::new(Some(check_result_from_cell_outcome(
+            executor_unavailable_outcome(),
+            &crate::fleet::CellAccount::default(),
+            None,
+        )));
+        run_planned_checks(
+            db.clone(),
+            "project-a",
+            "tree-unclaimed",
+            "job-a",
+            &plans,
+            "write-checks:run-a",
+            CheckExecMode::Shared,
+            None,
+            |_index, _command, _stream_id| {
+                let result = result.lock().unwrap().take().unwrap();
+                async move { result }
+            },
+            |_| {},
+        )
+        .await;
+        let recorded = db
+            .query_opt_text(
+                "SELECT COALESCE(executor_id, '-') || ' ' || COALESCE(verdict_platform, '-') \
+                        || '/' || COALESCE(verdict_arch, '-') \
+                 FROM check_result_observations LIMIT 1",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recorded.as_deref(), Some("- -/-"));
     }
 
     /// A result the runner lost is a bug in Cairn, and says so; it never
@@ -14538,13 +14682,18 @@ cairn-common = { path = "../cairn-common" }
     }
 
     /// A check run reported by a REMOTE executor — what an enrolled machine
-    /// returns when a spill-eligible suite lands on it.
+    /// returns when a spill-eligible suite lands on it. An executor that
+    /// reports its environment reports its platform with it, as `cairn-exec`
+    /// computes both in one place; an empty fingerprint models a legacy
+    /// executor that reports neither.
     fn exec_on_executor(
         exit_code: Option<i32>,
         output: impl Into<String>,
         executor_id: &str,
         environment_fingerprint: impl Into<String>,
     ) -> Result<CheckExecResult, String> {
+        let environment_fingerprint = environment_fingerprint.into();
+        let reports = !environment_fingerprint.is_empty();
         Ok(CheckExecResult {
             exit_code,
             output: output.into(),
@@ -14567,10 +14716,15 @@ cairn-common = { path = "../cairn-common" }
                 allocation: None,
                 disk_delta_bytes: None,
                 measurement_quality: None,
-                environment_fingerprint: environment_fingerprint.into(),
-                verdict_platform: None,
-                verdict_arch: None,
-                verdict_environment_hash: None,
+                environment_fingerprint,
+                verdict_platform: reports
+                    .then(|| crate::execution::check_identity::gating_platform().to_string()),
+                verdict_arch: reports.then(|| std::env::consts::ARCH.to_string()),
+                verdict_environment_hash: reports.then(|| {
+                    cairn_checkenv::verdict_environment_hash(Vec::<String>::new(), |name| {
+                        std::env::var(name).ok()
+                    })
+                }),
                 sandbox: None,
                 toolchain_fingerprint: None,
                 containment: None,

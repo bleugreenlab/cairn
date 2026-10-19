@@ -117,7 +117,8 @@ pub(super) fn try_assistant_write(
     updates: &mut Vec<EventUpdate>,
     summary: &mut ArchiveSummary,
 ) -> Result<(), String> {
-    let (Some(commit), Some(store)) = (committed_write_for_event(&event.data, write_commits), store)
+    let (Some(commit), Some(store)) =
+        (committed_write_for_event(&event.data, write_commits), store)
     else {
         return push_zstd(event, tool_name, updates, summary);
     };

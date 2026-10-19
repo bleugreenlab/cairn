@@ -388,6 +388,7 @@ const COPY_ORDER: &[TableCopySpec] = &[
     spec("search_outbox", "source_id = ?1 OR source_id IN (SELECT id FROM issues WHERE project_id = ?1) OR source_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR source_id IN (SELECT id FROM runs WHERE project_id = ?1) OR source_id IN (SELECT id FROM events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?1))"),
     delete_only("check_result_observations", "project_id = ?1"),
     delete_only("check_test_results", "observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
+    delete_only("check_observation_relabels", "project_id = ?1 OR observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_result_commit_aliases", "project_id = ?1 OR source_observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_result_cache", "project_id = ?1 OR source_observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("codemap_cache", "project_id = ?1"),
