@@ -1362,7 +1362,7 @@ async fn a_thread_cannot_commit_from_a_run_and_an_ordinary_issue_still_can() {
         .await,
     );
     assert!(
-        refusal.contains("thread-owned job") && refusal.contains("child issue"),
+        refusal.contains("thread-owned job") && refusal.contains("cairn:~/branches"),
         "the thread must be told the posture and where the work belongs: {refusal}"
     );
     assert!(

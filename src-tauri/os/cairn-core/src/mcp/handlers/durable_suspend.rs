@@ -1686,7 +1686,7 @@ mod tests {
     use crate::db::DbState;
     use crate::internal::services::testing::CapturingEmitter;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::SearchIndex;
     use async_trait::async_trait;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1725,9 +1725,7 @@ mod tests {
     /// suspension told clients.
     async fn durable_env_capturing() -> (Orchestrator, Record, Arc<CapturingEmitter>) {
         let root = tempfile::tempdir().unwrap().keep();
-        let local = LocalDb::open(root.join("test.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        let local = LocalDb::open_migrated_for_test(root.join("test.db"))
             .await
             .unwrap();
         for sql in [

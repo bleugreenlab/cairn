@@ -1,0 +1,6 @@
+# A scrubbed copy of bginf's nodes.yaml: the same node names, pools and outlet
+# layout, with documentation-range addresses and neutral entity names.
+sp1: { ip: 192.0.2.40, pool: sparks, outlet: switch.sp1_outlet, power_sensor: sensor.sp1_power, brick_idle_w: 15 }
+sp2: { ip: 192.0.2.41, pool: sparks, outlet: switch.sp2_outlet, power_sensor: sensor.sp2_power, brick_idle_w: 15 }
+# No outlet of its own: always powered as far as ctl is concerned.
+halo: { ip: 192.0.2.43, pool: halo }

@@ -32,6 +32,8 @@ use crate::orchestrator::Orchestrator;
 
 use super::permission::{await_permission_decision, resolve_fence_policy, Handoff, PermissionWait};
 
+mod command_refusal;
+
 /// Typed result of resolving the fence attached to a request. Ambient means no
 /// authenticated identity was supplied; unavailable means one was supplied but
 /// its context or policy could not be recovered.
@@ -147,6 +149,10 @@ pub struct Crossing {
     pub descriptor: String,
     /// Human-readable summary for the UI and the deny message.
     summary: String,
+    /// The agent's command exactly as written, for a command-scoped crossing.
+    /// Kept beside the descriptor because normalizing collapses the newlines
+    /// that separate a script's commands.
+    command: Option<String>,
 }
 
 impl Crossing {
@@ -160,6 +166,7 @@ impl Crossing {
             verb: "read",
             summary: format!("read a sensitive denied path: {descriptor}"),
             descriptor,
+            command: None,
         }
     }
 
@@ -170,6 +177,7 @@ impl Crossing {
             verb: "write",
             summary: format!("write an external host path: {descriptor}"),
             descriptor,
+            command: None,
         }
     }
 
@@ -183,6 +191,7 @@ impl Crossing {
             verb: "run",
             descriptor: resolved.display().to_string(),
             summary: format!("command references an external host path: {token}"),
+            command: None,
         }
     }
 
@@ -201,6 +210,7 @@ impl Crossing {
             verb: "run",
             descriptor: normalize_command_for_descriptor(command),
             summary,
+            command: Some(command.to_string()),
         }
     }
 
@@ -234,6 +244,14 @@ impl Crossing {
         self.kind
             .is_path_scoped()
             .then(|| Path::new(self.descriptor.as_str()))
+    }
+
+    /// The instructive refusal for a command whose blocked step has an
+    /// ordinary route inside the sandbox, or `None`.
+    fn command_refusal(&self) -> Option<String> {
+        self.command
+            .as_deref()
+            .and_then(command_refusal::denied_command_refusal)
     }
 }
 
@@ -300,13 +318,25 @@ pub(crate) async fn raise_fence_with_handoff(
         }
     }
 
+    // A blocked command whose blocked step has an ordinary route inside the
+    // sandbox (a git index or ref write, see `command_refusal`) is answered
+    // with that route instead of a prompt, so no operator is asked a question
+    // whose only answers are harmful or futile. Unlike the protected-path
+    // refusal above it leaves an `allow` fence alone: an agent trusted to
+    // escape is spending nobody's attention, and its command does what it
+    // says once unsandboxed.
     match fence {
         Fence::Allow => FenceDecision::Allow,
-        Fence::Deny => FenceDecision::Deny(format!(
-            "Denied by agent fence policy (fence: deny): {}",
-            crossing.summary
-        )),
+        Fence::Deny => FenceDecision::Deny(crossing.command_refusal().unwrap_or_else(|| {
+            format!(
+                "Denied by agent fence policy (fence: deny): {}",
+                crossing.summary
+            )
+        })),
         Fence::Ask => {
+            if let Some(refusal) = crossing.command_refusal() {
+                return FenceDecision::Deny(refusal);
+            }
             // A session grant for this descriptor short-circuits to allow.
             if let Ok(allowed) = orch.session_allowed_crossings.lock() {
                 if allowed.contains(&crossing.descriptor) {
@@ -450,6 +480,63 @@ mod tests {
             c.descriptor,
             normalize_command_for_descriptor("sudo rm -rf /")
         );
+    }
+
+    async fn permission_rows(orch: &Orchestrator) -> i64 {
+        use crate::storage::RowExt;
+        orch.db
+            .local
+            .query_one("SELECT COUNT(*) FROM permission_requests", (), |row| {
+                row.i64(0)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// The command refusal lives in `raise_fence`, the one function that turns
+    /// a crossing into a decision. The in-runner adjudication site in
+    /// `run/process.rs` and the executor-relayed one in `fleet/mod.rs` both
+    /// reach it, and a third cannot adjudicate without it, so this is where the
+    /// "no operator card" property is pinned for all of them (the relayed path
+    /// is also exercised end to end in `fleet::handoff_tests`).
+    #[tokio::test]
+    async fn a_blocked_git_index_write_is_refused_with_its_route_and_raises_no_permission() {
+        let orch = super::super::permission::tests::test_orchestrator().await;
+        let request = McpCallbackRequest {
+            thread_id: None,
+            cwd: "/wt".to_string(),
+            run_id: Some("run-1".to_string()),
+            tool: "run".to_string(),
+            tool_use_id: Some("tool-1".to_string()),
+            payload: serde_json::json!({}),
+        };
+        let crossing = || {
+            Crossing::shell_command(
+                "command blocked by the executor sandbox".to_string(),
+                "cd src && git mv old.rs new.rs && cargo check",
+            )
+        };
+
+        for fence in [Fence::Ask, Fence::Deny] {
+            match raise_fence(&orch, "run-1", fence, &request, crossing()).await {
+                FenceDecision::Deny(refusal) => {
+                    assert!(refusal.contains("runs `git mv`"), "{refusal}");
+                    assert!(refusal.contains("plain `mv`"), "{refusal}");
+                }
+                other => panic!("{fence:?}: expected the instructive refusal, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            permission_rows(&orch).await,
+            0,
+            "the refusal must not spend a permission on anyone's desk"
+        );
+
+        // An agent trusted to escape is left alone.
+        assert!(matches!(
+            raise_fence(&orch, "run-1", Fence::Allow, &request, crossing()).await,
+            FenceDecision::Allow
+        ));
     }
 
     #[test]

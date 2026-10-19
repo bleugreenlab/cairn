@@ -1433,16 +1433,12 @@ mod tests {
     use crate::db::DbState;
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use std::sync::Arc;
 
     async fn orch_with_db() -> (Orchestrator, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let local = LocalDb::open(dir.path().join("browser-render.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        let local = LocalDb::open_migrated_for_test(dir.path().join("browser-render.db"))
             .await
             .unwrap();
         local
@@ -1886,9 +1882,7 @@ mod tests {
         tempfile::TempDir,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let local = LocalDb::open(dir.path().join("capture.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        let local = LocalDb::open_migrated_for_test(dir.path().join("capture.db"))
             .await
             .unwrap();
         let search =

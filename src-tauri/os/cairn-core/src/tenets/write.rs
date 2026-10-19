@@ -11,7 +11,7 @@ use cairn_db::turso::{params, Connection};
 use super::read::row_conn;
 use super::{
     emit_changed, successor_refusal, AnswerSource, TenetOrigin, TenetRow, TenetStatus, Verdict,
-    MAX_OPTIONS, MAX_PROPOSAL_CHARS, OVER_LENGTH_REFUSAL,
+    MAX_PROPOSAL_CHARS, OVER_LENGTH_REFUSAL,
 };
 use crate::execution::gates::sweep::notify_gate_evidence_changed;
 use crate::services::EventEmitter;
@@ -20,9 +20,8 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 /// What a thread proposes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proposal {
-    pub question: String,
-    /// Option 1 is the thread's recommendation.
-    pub options: Vec<String>,
+    /// How the project does things, as the thread proposes it.
+    pub statement: String,
     /// An approved tenet this one replaces once it is itself approved.
     pub supersedes: Option<i64>,
     pub origin: TenetOrigin,
@@ -82,11 +81,9 @@ pub struct NewTenet {
     pub project_id: String,
     pub proposing_thread_id: String,
     pub slug: Option<String>,
-    pub question: String,
-    pub options: Vec<String>,
+    pub statement: String,
     pub status: TenetStatus,
-    pub verdict: Option<&'static str>,
-    pub selected_option: Option<usize>,
+    pub verdict: Option<Verdict>,
     pub comment: Option<String>,
     pub answered_by: Option<PrincipalRef>,
     pub answer_source: Option<AnswerSource>,
@@ -128,23 +125,20 @@ pub async fn insert_conn(conn: &Connection, tenet: &NewTenet) -> DbResult<(Strin
     let id = cairn_common::ids::mint_child(&tenet.project_id);
     conn.execute(
         "INSERT INTO tenets (
-            id, project_id, number, proposing_thread_id, slug, question, options_json,
-            status, verdict, selected_option, comment, answered_by_json, answer_source,
-            answered_at, supersedes, origin, legacy_json, proposer_principal_json,
-            created_at, updated_at
+            id, project_id, number, proposing_thread_id, slug, statement, status, verdict,
+            comment, answered_by_json, answer_source, answered_at, supersedes, origin,
+            legacy_json, proposer_principal_json, created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                   ?17, ?18, ?19, ?19)",
+                   ?17, ?17)",
         params![
             id.as_str(),
             tenet.project_id.as_str(),
             number,
             tenet.proposing_thread_id.as_str(),
             tenet.slug.as_deref(),
-            tenet.question.as_str(),
-            encode(&tenet.options)?,
+            tenet.statement.as_str(),
             tenet.status.as_str(),
-            tenet.verdict,
-            tenet.selected_option.map(|index| index as i64),
+            tenet.verdict.map(Verdict::as_str),
             tenet.comment.as_deref(),
             tenet.answered_by.as_ref().map(encode).transpose()?,
             tenet.answer_source.map(AnswerSource::as_str),
@@ -166,41 +160,23 @@ fn encode<T: serde::Serialize>(value: &T) -> DbResult<String> {
     serde_json::to_string(value).map_err(|error| DbError::Row(error.to_string()))
 }
 
-/// The proposal's question and options, trimmed, or the refusal naming what
-/// is wrong with it.
-pub(super) fn validate(proposal: &Proposal) -> Result<(String, Vec<String>), String> {
-    let question = proposal.question.trim().to_string();
-    if question.is_empty() {
-        return Err("a proposal needs a non-empty question".into());
+/// The proposal's statement, trimmed, or the refusal naming what is wrong
+/// with it.
+pub(super) fn validate(proposal: &Proposal) -> Result<String, String> {
+    let statement = proposal.statement.trim().to_string();
+    if statement.is_empty() {
+        return Err("a proposal needs a non-empty statement".into());
     }
-    let options: Vec<String> = proposal
-        .options
-        .iter()
-        .map(|option| option.trim().to_string())
-        .collect();
-    if options.is_empty() || options.len() > MAX_OPTIONS {
-        return Err(format!(
-            "a proposal has 1 to {MAX_OPTIONS} options, option 1 being your recommendation; this one has {}",
-            options.len()
-        ));
-    }
-    if let Some(blank) = options.iter().position(String::is_empty) {
-        return Err(format!("option {} is empty", blank + 1));
-    }
-    let chars = question.chars().count()
-        + options
-            .iter()
-            .map(|option| option.chars().count())
-            .sum::<usize>();
+    let chars = statement.chars().count();
     if chars > MAX_PROPOSAL_CHARS {
         return Err(format!(
-            "{OVER_LENGTH_REFUSAL} (this proposal is {chars} characters; the question and options together may be at most {MAX_PROPOSAL_CHARS})"
+            "{OVER_LENGTH_REFUSAL} (this statement is {chars} characters; it may be at most {MAX_PROPOSAL_CHARS})"
         ));
     }
     if proposal.origin == TenetOrigin::MigratedRuling {
         return Err("migrated rulings are imported, never proposed".into());
     }
-    Ok((question, options))
+    Ok(statement)
 }
 
 fn not_found(number: i64) -> String {
@@ -233,16 +209,14 @@ pub async fn propose(
     proposer: &Proposer,
     proposal: Proposal,
 ) -> Result<TenetRow, String> {
-    let (question, options) = validate(&proposal)?;
+    let statement = validate(&proposal)?;
     let new = NewTenet {
         project_id: proposer.project_id.clone(),
         proposing_thread_id: proposer.thread_id.clone(),
         slug: None,
-        question,
-        options,
+        statement,
         status: TenetStatus::Proposed,
         verdict: None,
-        selected_option: None,
         comment: None,
         answered_by: None,
         answer_source: None,
@@ -347,7 +321,7 @@ pub struct Answered {
 
 /// Record the operator's verdict on proposal `number`.
 ///
-/// An option or `your_call` approves; `none` declines. Approving a tenet that
+/// `yes` or `your_call` approves; `no` declines. Approving a tenet that
 /// names `supersedes: m` marks #m superseded in the same transaction. The
 /// verdict is delivered in that transaction too (`super::verdict`): one
 /// message to the proposing thread and, on approval, a comment on every issue
@@ -394,26 +368,13 @@ pub async fn answer(
                         )))
                     }
                 }
-                let (status, selected) = match verdict {
-                    Verdict::Option(k) if k >= 1 && k <= row.options.len() => {
-                        (TenetStatus::Approved, Some(k - 1))
-                    }
-                    Verdict::Option(k) => {
-                        return Ok(Err(format!(
-                            "option {k} is out of range: tenet #{number} has {} option{}",
-                            row.options.len(),
-                            if row.options.len() == 1 { "" } else { "s" }
-                        )))
-                    }
-                    Verdict::YourCall => (TenetStatus::Approved, Some(0)),
-                    Verdict::None => (TenetStatus::Declined, None),
-                };
+                let status = verdict.status();
                 let superseded = match (status, row.supersedes) {
                     (TenetStatus::Approved, Some(target)) => {
                         let target_row = row_conn(conn, &project_id, target).await?;
                         if let Some(refusal) = supersede_refusal(target_row.as_ref(), target) {
                             return Ok(Err(format!(
-                                "tenet #{number} supersedes #{target}, but approving it now would supersede nothing: {refusal}. Answer `none`, or ask the thread to withdraw it and propose again"
+                                "tenet #{number} supersedes #{target}, but approving it now would supersede nothing: {refusal}. Answer no, or ask the thread to withdraw it and propose again"
                             )));
                         }
                         conn.execute(
@@ -428,14 +389,12 @@ pub async fn answer(
                 };
                 conn.execute(
                     "UPDATE tenets
-                     SET status = ?1, verdict = ?2, selected_option = ?3, comment = ?4,
-                         answered_by_json = ?5, answer_source = ?6, answered_at = ?7,
-                         updated_at = ?7
-                     WHERE id = ?8 AND status = 'proposed'",
+                     SET status = ?1, verdict = ?2, comment = ?3, answered_by_json = ?4,
+                         answer_source = ?5, answered_at = ?6, updated_at = ?6
+                     WHERE id = ?7 AND status = 'proposed'",
                     params![
                         status.as_str(),
-                        verdict.kind(),
-                        selected.map(|index| index as i64),
+                        verdict.as_str(),
                         comment.as_deref(),
                         answered_by.as_str(),
                         source.as_str(),

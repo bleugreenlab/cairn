@@ -2,15 +2,10 @@
 use super::specs::*;
 use super::types::*;
 
-const TENET_QUESTION: KeySpec = KeySpec::new(
-    "question",
+const TENET_STATEMENT: KeySpec = KeySpec::new(
+    "statement",
     KeyType::Str,
-    "what the operator decides, written for them: what it does, what it won't",
-);
-const TENET_OPTIONS: KeySpec = KeySpec::new(
-    "options",
-    KeyType::Array,
-    "1-5 strings; option 1 is your recommendation; question plus options at most 1500 characters",
+    "how the project does things, written for the operator to answer yes or no; alternatives you ruled out belong in its own words; at most 1500 characters",
 );
 const TENET_SUPERSEDES: KeySpec = KeySpec::new(
     "supersedes",
@@ -24,8 +19,8 @@ const TENET_WITHDRAW: KeySpec = KeySpec::new(
 );
 const TENET_VERDICT: KeySpec = KeySpec::new(
     "verdict",
-    KeyType::Any,
-    "option number (1-based), \"none\", or \"your_call\"; operator only, given in the Tenets tab, refused to agents",
+    KeyType::Str,
+    "\"yes\", \"no\", or \"your_call\" (approves, recording that the thread was trusted); operator only, given in the desktop app, refused to agents",
 );
 const TENET_COMMENT: KeySpec = KeySpec::new(
     "comment",
@@ -37,7 +32,7 @@ pub(crate) const PROJECT_TENETS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectTenets,
     uri_template: "cairn://p/{project}/tenets",
     name: "Project tenets",
-    description: "The questions a project's threads put to the operator and the verdicts given, newest first; a thread proposes, only the operator answers, and a tenet never changes once proposed",
+    description: "The statements of how a project does things that its threads put to the operator, and the yes/no verdicts given, newest first; a thread proposes, only the operator answers, and a tenet never changes once proposed",
     read_projections: &[
         ProjectionSpec {
             key: "status",
@@ -45,7 +40,7 @@ pub(crate) const PROJECT_TENETS_CONTRACT: ResourceContract = ResourceContract {
         },
         ProjectionSpec { key: "thread", values: "a thread name: only the tenets that thread proposed" },
         ProjectionSpec { key: "slug", values: "a migrated ruling's slug" },
-        ProjectionSpec { key: "search", values: "case-insensitive question/option substring" },
+        ProjectionSpec { key: "search", values: "case-insensitive statement substring" },
         ProjectionSpec { key: "limit", values: "N (default 50, max 200)" },
         ProjectionSpec { key: "format", values: "json for the full projection" },
     ],
@@ -53,10 +48,10 @@ pub(crate) const PROJECT_TENETS_CONTRACT: ResourceContract = ResourceContract {
     cross_actions: NO_CROSS_ACTIONS,
     mutations: &[MutationSpec {
         mode: ChangeMode::Append,
-        required: &[TENET_QUESTION, TENET_OPTIONS],
+        required: &[TENET_STATEMENT],
         optional: &[TENET_SUPERSEDES],
         label: "propose a tenet (threads only)",
-        example: "write({changes:[{target:\"cairn:@/tenets\",mode:\"append\",payload:{question:\"Should X be done via Y?\",options:[\"Do X via Y (recommended)\",\"Do X via Z\"]}}]})",
+        example: "write({changes:[{target:\"cairn:@/tenets\",mode:\"append\",payload:{statement:\"X is done via Y, not Z: ...\"}}]})",
     }],
 };
 
@@ -64,7 +59,7 @@ pub(crate) const PROJECT_TENET_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectTenet,
     uri_template: "cairn://p/{project}/tenets/{number}",
     name: "Tenet",
-    description: "One tenet by number (a migrated ruling's slug is an alias): its question, options, verdict and who gave it, what it supersedes or was superseded by, and what it gates. Immutable: withdraw and propose again, or propose a successor with supersedes",
+    description: "One tenet by number (a migrated ruling's slug is an alias): its statement, the verdict and who gave it, what it supersedes or was superseded by, and what it gates. Immutable: withdraw and propose again, or propose a successor with supersedes",
     read_projections: &[ProjectionSpec { key: "format", values: "json for the full projection" }],
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
@@ -80,8 +75,8 @@ pub(crate) const PROJECT_TENET_CONTRACT: ResourceContract = ResourceContract {
             mode: ChangeMode::Patch,
             required: &[TENET_VERDICT],
             optional: &[TENET_COMMENT],
-            label: "answer a proposal (operator only, in the Tenets tab)",
-            example: "write({changes:[{target:\"cairn://p/PROJECT/tenets/3\",mode:\"patch\",payload:{verdict:2,comment:\"...\"}}]})",
+            label: "answer a proposal (operator only, in the desktop app)",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/tenets/3\",mode:\"patch\",payload:{verdict:\"yes\",comment:\"...\"}}]})",
         },
     ],
 };

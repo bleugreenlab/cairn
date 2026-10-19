@@ -62,24 +62,15 @@ async fn fixture(name: &str) -> Arc<LocalDb> {
 }
 
 /// Insert an approved tenet proposed by `thread`, returning its id.
-async fn approve(db: &LocalDb, number: i64, thread: &str, text: &str, rejected: &[&str]) -> String {
+async fn approve(db: &LocalDb, number: i64, thread: &str, statement: &str) -> String {
     let id = format!("tenet-{number}");
-    let mut options = vec![text.to_string()];
-    options.extend(rejected.iter().map(|option| option.to_string()));
     db.execute(
-        "INSERT INTO tenets (id, project_id, number, proposing_thread_id, question, options_json,
-             status, verdict, selected_option, answer_source, answered_at, origin,
+        "INSERT INTO tenets (id, project_id, number, proposing_thread_id, statement,
+             status, verdict, answer_source, answered_at, origin,
              proposer_principal_json, created_at, updated_at)
-         VALUES (?1, 'p', ?2, ?3, ?4, ?5, 'approved', 'option', 0, 'device', ?6, 'standing',
+         VALUES (?1, 'p', ?2, ?3, ?4, 'approved', 'yes', 'device', ?5, 'standing',
              '{\"kind\":\"agent\",\"node\":\"cairn://p/prj/design\",\"run_id\":null}', 1, 1)",
-        cairn_db::turso::params![
-            id.as_str(),
-            number,
-            thread,
-            format!("How should we handle {number}?"),
-            serde_json::to_string(&options).unwrap(),
-            100 + number
-        ],
+        cairn_db::turso::params![id.as_str(), number, thread, statement, 100 + number],
     )
     .await
     .unwrap();
@@ -584,7 +575,7 @@ async fn an_event_with_no_approved_tenets_is_skipped_without_a_network_call() {
 #[tokio::test]
 async fn unavailable_embeddings_back_off_then_fail_after_five_attempts() {
     let db = fixture("evidence-embed-unavailable.db").await;
-    approve(&db, 1, "t-design", "Uploads go through the store", &[]).await;
+    approve(&db, 1, "t-design", "Uploads go through the store").await;
     let mut event = add_event(&db, "1", A, "work").await;
     let fake = Fake::new(A, 1_000, &db);
     fake.fail_call(0, EmbedFailure::NoToken);
@@ -614,7 +605,7 @@ async fn unavailable_embeddings_back_off_then_fail_after_five_attempts() {
 async fn tenet_vectors_saved_before_a_failure_persist() {
     let db = fixture("evidence-embed-chunks.db").await;
     for number in 1..=(EMBED_CHUNK as i64 + 1) {
-        approve(&db, number, "t-design", &format!("Rule {number}"), &[]).await;
+        approve(&db, number, "t-design", &format!("Rule {number}")).await;
     }
     let event = add_event(&db, "1", A, "work").await;
     let fake = Fake::new(A, 1_000, &db);
@@ -646,7 +637,7 @@ fn at_similarity(similarity: f32) -> [f32; 4] {
 #[tokio::test]
 async fn no_tenet_above_the_similarity_floor_skips_the_judge() {
     let db = fixture("evidence-knn-floor.db").await;
-    approve(&db, 1, "t-design", "LEASE rule", &[]).await;
+    approve(&db, 1, "t-design", "LEASE rule").await;
     let below = add_event(&db, "1", A, "BELOW work").await;
     let above = add_event(&db, "2", A, "ABOVE work").await;
     let fake = Fake::new(A, 1_000, &db)
@@ -672,7 +663,7 @@ async fn only_the_five_nearest_tenets_are_judged() {
     let db = fixture("evidence-top-k.db").await;
     let mut fake = Fake::new(A, 1_000, &db).needle("WORK", &[1.0, 0.0, 0.0, 0.0]);
     for number in 1..=7 {
-        approve(&db, number, "t-design", &format!("NEAR{number} rule"), &[]).await;
+        approve(&db, number, "t-design", &format!("NEAR{number} rule")).await;
         let x = 1.0 - number as f32 * 0.05;
         fake = fake.needle(
             &format!("NEAR{number} "),
@@ -694,7 +685,7 @@ async fn only_the_five_nearest_tenets_are_judged() {
     );
     assert!(judged[0].questions[0]
         .instructions
-        .contains("Chosen: NEAR1 rule"));
+        .contains("Statement: NEAR1 rule"));
     assert!(judged[0]
         .questions
         .iter()
@@ -709,8 +700,7 @@ async fn each_candidate_is_one_choice_question_about_the_event_text() {
         &db,
         12,
         "t-design",
-        "Artifacts go through the store",
-        &["Direct S3 upload", "Inline in the result"],
+        "Artifacts go through the store, not direct S3 upload",
     )
     .await;
     let event = add_event(&db, "1", A, "Uploads go straight to S3 now.").await;
@@ -731,14 +721,12 @@ async fn each_candidate_is_one_choice_question_about_the_event_text() {
     assert_eq!(values, ["supports", "contradicts", "neither"]);
     let instructions = &question.instructions;
     assert!(
-        instructions.contains("Question: How should we handle 12?\n"),
+        instructions.contains("Statement: Artifacts go through the store, not direct S3 upload"),
         "{instructions}"
     );
-    assert!(instructions.contains("Chosen: Artifacts go through the store\n"));
-    assert!(instructions.contains("Rejected: Direct S3 upload; Inline in the result"));
     assert!(
-        instructions.contains("adopted a rejected option contradicts"),
-        "adopting a rejected alternative is a contradiction: {instructions}"
+        instructions.contains("did what the statement rules out contradicts"),
+        "doing what the statement rules out is a contradiction: {instructions}"
     );
 }
 
@@ -789,7 +777,7 @@ async fn only_measured_supports_and_contradicts_at_the_floor_are_stored() {
         (4, "DELTA"),
         (5, "EPSILON"),
     ] {
-        approve(&db, number, "t-design", &format!("{word} rule"), &["other"]).await;
+        approve(&db, number, "t-design", &format!("{word} rule")).await;
     }
     let event = add_event(&db, "5012", A, "ALPHA BETA GAMMA DELTA EPSILON work").await;
     let fake = Fake::new(A, 1_000, &db).needle("", &[1.0, 0.0, 0.0, 0.0]);
@@ -830,7 +818,7 @@ async fn only_measured_supports_and_contradicts_at_the_floor_are_stored() {
 #[tokio::test]
 async fn a_logprobs_answer_below_the_floor_stores_nothing() {
     let db = fixture("evidence-below-floor.db").await;
-    approve(&db, 1, "t-design", "Rule", &["other"]).await;
+    approve(&db, 1, "t-design", "Rule").await;
     let event = add_event(&db, "1", A, "work").await;
     let fake = Fake::new(A, 1_000, &db).needle("", &[1.0, 0.0, 0.0, 0.0]);
     fake.set_verdicts(json!([{
@@ -850,7 +838,7 @@ async fn a_logprobs_answer_below_the_floor_stores_nothing() {
 #[tokio::test]
 async fn a_measured_answer_at_the_floor_stores_its_probability_and_method() {
     let db = fixture("evidence-at-floor.db").await;
-    approve(&db, 1, "t-design", "Rule", &["other"]).await;
+    approve(&db, 1, "t-design", "Rule").await;
     let event = add_event(&db, "1", A, "work").await;
     let fake = Fake::new(A, 1_000, &db).needle("", &[1.0, 0.0, 0.0, 0.0]);
     fake.set_verdicts(json!([{
@@ -879,7 +867,7 @@ const REFUSAL: &str =
 #[tokio::test]
 async fn with_no_decision_capable_offer_the_event_is_skipped_with_the_refusal_until_restart() {
     let db = fixture("evidence-unanswerable.db").await;
-    approve(&db, 1, "t-design", "LEASE rule", &[]).await;
+    approve(&db, 1, "t-design", "LEASE rule").await;
     let refused = add_event(&db, "1", A, "ABOVE work").await;
     let fake = Fake::new(A, 1_000, &db)
         .needle("LEASE", &[1.0, 0.0, 0.0, 0.0])
@@ -943,7 +931,7 @@ async fn with_no_decision_capable_offer_the_event_is_skipped_with_the_refusal_un
 #[tokio::test]
 async fn a_failed_decision_backs_off_like_any_failed_attempt() {
     let db = fixture("evidence-decision-failed.db").await;
-    approve(&db, 1, "t-design", "Rule", &[]).await;
+    approve(&db, 1, "t-design", "Rule").await;
     let event = add_event(&db, "1", A, "work").await;
     let fake = Fake::new(A, 1_000, &db).needle("", &[1.0, 0.0, 0.0, 0.0]);
     fake.fail_judge(DecisionFailure::Failed("the provider returned 503".into()));
@@ -964,7 +952,7 @@ async fn a_failed_decision_backs_off_like_any_failed_attempt() {
 #[tokio::test]
 async fn only_the_owning_machine_evaluates_an_event() {
     let db = fixture("evidence-two-runners-events.db").await;
-    approve(&db, 1, "t-design", "Rule", &[]).await;
+    approve(&db, 1, "t-design", "Rule").await;
     let event = add_event(&db, "1", A, "work").await;
     let base = Fake::new(A, 1_000, &db).needle("", &[1.0, 0.0, 0.0, 0.0]);
 
@@ -986,7 +974,7 @@ async fn only_the_owning_machine_evaluates_an_event() {
 #[tokio::test]
 async fn replayed_rows_with_derived_ids_upsert_instead_of_colliding() {
     let db = fixture("evidence-replay.db").await;
-    let tenet = approve(&db, 1, "t-design", "Rule", &[]).await;
+    let tenet = approve(&db, 1, "t-design", "Rule").await;
     let event = add_event(&db, "1", A, "work").await;
     // The same logical event, written again by another machine.
     add_event(&db, "1", B, "work").await;
@@ -1021,7 +1009,7 @@ async fn replayed_rows_with_derived_ids_upsert_instead_of_colliding() {
 #[tokio::test]
 async fn the_read_projection_carries_evidence_newest_first() {
     let db = fixture("evidence-projection.db").await;
-    let tenet = approve(&db, 1, "t-design", "Rule", &[]).await;
+    let tenet = approve(&db, 1, "t-design", "Rule").await;
     contradiction(&db, &tenet, "cairn://p/prj/1", 0.8, 100, A).await;
     contradiction(&db, &tenet, "cairn://p/prj/2", 0.9, 300, A).await;
     let view = crate::tenets::get(&db, "p", 1).await.unwrap().unwrap();
@@ -1180,14 +1168,7 @@ const T0: i64 = 1_760_000_000;
 #[tokio::test]
 async fn the_wake_fires_once_from_the_owner_of_the_newest_contradiction_after_it_settles() {
     let db = fixture("evidence-two-runners-wake.db").await;
-    let tenet = approve(
-        &db,
-        12,
-        "t-design",
-        "Artifacts go through the store",
-        &["Direct S3"],
-    )
-    .await;
+    let tenet = approve(&db, 12, "t-design", "Artifacts go through the store").await;
     contradiction(&db, &tenet, "cairn://p/prj/5012", 0.86, T0, A).await;
     contradiction(&db, &tenet, "cairn://p/prj/5013", 0.78, T0 + 10, B).await;
 
@@ -1214,7 +1195,7 @@ async fn the_wake_fires_once_from_the_owner_of_the_newest_contradiction_after_it
     assert_eq!(
         sent[0],
         "Tenet #12 is contradicted by concluded work (weight 1.64, threshold 1.2).\n\n\
-         #12 \u{2014} Artifacts go through the store\n  rejected: Direct S3\n\
+         #12 \u{2014} Artifacts go through the store\n\
          Contradicting evidence since approval:\n\
          - contradicts cairn://p/prj/5012 (0.86, 2025-10-09)\n\
          - contradicts cairn://p/prj/5013 (0.78, 2025-10-09)\n\
@@ -1257,7 +1238,7 @@ async fn the_wake_fires_once_from_the_owner_of_the_newest_contradiction_after_it
 #[tokio::test]
 async fn a_second_wake_needs_contradictions_the_first_did_not_count() {
     let db = fixture("evidence-second-wake.db").await;
-    let tenet = approve(&db, 1, "t-design", "Rule", &[]).await;
+    let tenet = approve(&db, 1, "t-design", "Rule").await;
     contradiction(&db, &tenet, "cairn://p/prj/1", 0.9, T0, A).await;
     contradiction(&db, &tenet, "cairn://p/prj/2", 0.9, T0, A).await;
     let fake = Fake::new(A, T0 + DAY, &db);
@@ -1297,7 +1278,7 @@ async fn a_second_wake_needs_contradictions_the_first_did_not_count() {
 #[tokio::test]
 async fn old_contradictions_decay_below_the_threshold() {
     let db = fixture("evidence-decay.db").await;
-    let tenet = approve(&db, 1, "t-design", "Rule", &[]).await;
+    let tenet = approve(&db, 1, "t-design", "Rule").await;
     contradiction(&db, &tenet, "cairn://p/prj/1", 1.0, T0, A).await;
     contradiction(&db, &tenet, "cairn://p/prj/2", 1.0, T0, A).await;
     let fake = Fake::new(A, T0 + 90 * DAY, &db);
@@ -1310,7 +1291,7 @@ async fn old_contradictions_decay_below_the_threshold() {
 #[tokio::test]
 async fn a_superseded_tenet_never_wakes() {
     let db = fixture("evidence-superseded.db").await;
-    let tenet = approve(&db, 1, "t-design", "Rule", &[]).await;
+    let tenet = approve(&db, 1, "t-design", "Rule").await;
     contradiction(&db, &tenet, "cairn://p/prj/1", 0.9, T0, A).await;
     contradiction(&db, &tenet, "cairn://p/prj/2", 0.9, T0, A).await;
     db.execute("UPDATE tenets SET status = 'superseded'", ())
@@ -1324,7 +1305,7 @@ async fn a_superseded_tenet_never_wakes() {
 #[tokio::test]
 async fn an_unreachable_thread_keeps_the_wake_owed_until_it_can_be_reached() {
     let db = fixture("evidence-unreachable.db").await;
-    let tenet = approve(&db, 1, "t-design", "Rule", &[]).await;
+    let tenet = approve(&db, 1, "t-design", "Rule").await;
     contradiction(&db, &tenet, "cairn://p/prj/1", 0.9, T0, A).await;
     contradiction(&db, &tenet, "cairn://p/prj/2", 0.9, T0, A).await;
     let fake = Fake::new(A, T0 + DAY, &db);
@@ -1374,7 +1355,7 @@ async fn an_unreachable_thread_keeps_the_wake_owed_until_it_can_be_reached() {
 #[tokio::test]
 async fn a_contradiction_that_lands_after_a_wake_counts_toward_the_next() {
     let db = fixture("evidence-late-contradiction.db").await;
-    let tenet = approve(&db, 1, "t-design", "Rule", &[]).await;
+    let tenet = approve(&db, 1, "t-design", "Rule").await;
     contradiction(&db, &tenet, "cairn://p/prj/1", 0.9, T0, B).await;
     contradiction(&db, &tenet, "cairn://p/prj/2", 0.9, T0, B).await;
     let event = add_event(&db, "late", A, "late work").await;
@@ -1441,8 +1422,8 @@ async fn a_contradiction_replicated_in_after_a_wake_counts_toward_the_next_howev
     // Two replicas of one team project, each with its own database view.
     let replica_a = fixture("evidence-delayed-replica-a.db").await;
     let replica_b = fixture("evidence-delayed-replica-b.db").await;
-    let tenet = approve(&replica_a, 1, "t-design", "Rule", &[]).await;
-    approve(&replica_b, 1, "t-design", "Rule", &[]).await;
+    let tenet = approve(&replica_a, 1, "t-design", "Rule").await;
+    approve(&replica_b, 1, "t-design", "Rule").await;
 
     // A records contradictions at T0+100 and T0+110. B, offline, records one
     // at T0+105 that has not reached A.
@@ -1520,7 +1501,7 @@ async fn a_contradiction_replicated_in_after_a_wake_counts_toward_the_next_howev
 #[tokio::test]
 async fn a_wake_whose_consumption_was_lost_is_restamped_not_resent() {
     let db = fixture("evidence-lost-consumption.db").await;
-    let tenet = approve(&db, 1, "t-design", "Rule", &[]).await;
+    let tenet = approve(&db, 1, "t-design", "Rule").await;
     contradiction(&db, &tenet, "cairn://p/prj/1", 0.9, T0, A).await;
     contradiction(&db, &tenet, "cairn://p/prj/2", 0.9, T0, A).await;
     let fake = Fake::new(A, T0 + DAY, &db);
@@ -1554,8 +1535,8 @@ async fn a_wake_whose_consumption_was_lost_is_restamped_not_resent() {
 #[tokio::test]
 async fn the_decision_asks_valid_questions_and_parses_by_name() {
     let db = fixture("evidence-parse.db").await;
-    approve(&db, 3, "t-design", "Three", &["not three"]).await;
-    approve(&db, 9, "t-design", "Nine", &[]).await;
+    approve(&db, 3, "t-design", "Three").await;
+    approve(&db, 9, "t-design", "Nine").await;
     let views = crate::tenets::list(
         &db,
         "p",

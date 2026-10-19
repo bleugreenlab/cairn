@@ -295,13 +295,11 @@ fn run_anon_db_future<T>(future: impl Future<Output = Result<T, String>>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
 
     async fn test_db() -> Arc<DbState> {
         let temp = tempfile::tempdir().unwrap();
-        let local = LocalDb::open(temp.keep().join("anon.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        let local = LocalDb::open_migrated_for_test(temp.keep().join("anon.db"))
             .await
             .unwrap();
         let search_dir = tempfile::tempdir().unwrap();

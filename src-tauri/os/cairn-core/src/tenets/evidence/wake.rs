@@ -321,15 +321,11 @@ fn message(
     now: i64,
 ) -> String {
     let number = tenet.number;
-    let text = tenet.text().unwrap_or(&tenet.question);
+    let text = &tenet.statement;
     let mut out = format!(
         "Tenet #{number} is contradicted by concluded work (weight {:.2}, threshold {WAKE_THRESHOLD}).\n\n#{number} \u{2014} {text}\n",
         weight(contradictions, now)
     );
-    let rejected = tenet.rejected();
-    if !rejected.is_empty() {
-        out.push_str(&format!("  rejected: {}\n", rejected.join("; ")));
-    }
     match last_alerted {
         None => out.push_str("Contradicting evidence since approval:\n"),
         Some(at) => out.push_str(&format!(

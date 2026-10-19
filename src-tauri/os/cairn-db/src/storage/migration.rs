@@ -377,6 +377,24 @@ impl Migration {
     }
 }
 
+/// A digest of everything that determines what `migrations` build: each entry's
+/// version, name, SQL, and foreign-key mode, in order. Two chains share a
+/// fingerprint only when replaying them is the same experiment, which is what
+/// lets a migrated test template be reused across processes.
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) fn chain_fingerprint(migrations: &[Migration]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for migration in migrations {
+        for part in [migration.version, migration.name, migration.sql] {
+            hasher.update((part.len() as u64).to_le_bytes());
+            hasher.update(part.as_bytes());
+        }
+        hasher.update([u8::from(migration.fk_off)]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 #[derive(Debug, Clone)]
 pub struct MigrationRunner {
     migrations: Vec<Migration>,

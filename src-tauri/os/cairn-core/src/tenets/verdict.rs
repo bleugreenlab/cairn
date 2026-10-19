@@ -4,10 +4,10 @@
 //! so neither can be lost or doubled:
 //!
 //! - the proposing thread gets one system direct message, keyed
-//!   `tenet-verdict:<id>`: the verdict, the chosen text, the rejected
-//!   alternatives, the comment, and what it gated. A decline steers the
+//!   `tenet-verdict:<id>`: the verdict, the statement, the comment, and what
+//!   it gated. A decline steers the
 //!   thread awake; an approval rides along quietly with its next turn.
-//! - every issue an approved tenet releases gets a comment naming the choice,
+//! - every issue an approved tenet releases gets a comment naming the decision,
 //!   so the planner that starts on release reads what the operator decided
 //!   from the issue it works. The comment's id is derived from the tenet and
 //!   the issue, so it is written once per pair however many paths reach it:
@@ -19,7 +19,7 @@
 use cairn_db::turso::{params, Connection};
 
 use super::read::answerer_label;
-use super::{tenet_uri, TenetRow, TenetStatus, TENET_GATE_FACT};
+use super::{tenet_uri, TenetRow, TenetStatus, Verdict, TENET_GATE_FACT};
 use crate::messages::queued::DeliveryUrgency;
 use crate::storage::{DbResult, RowExt};
 
@@ -175,21 +175,12 @@ async fn gated_conn(conn: &Connection, uri: &str) -> DbResult<Vec<Gated>> {
     Ok(gated)
 }
 
-fn list(items: &[&str]) -> String {
-    if items.is_empty() {
-        "none".to_string()
-    } else {
-        items.join("; ")
-    }
-}
-
 /// The approval comment a gated issue gets.
 fn approval_comment(tenet: &TenetRow, label: &str) -> String {
     format!(
-        "Tenet #{} approved by the operator ({label}): {}. Rejected: {}. Comment: {}.",
+        "Tenet #{} approved by the operator ({label}): {}\nComment: {}.",
         tenet.number,
-        tenet.text().unwrap_or("?"),
-        list(&tenet.rejected()),
+        tenet.statement,
         tenet.comment.as_deref().unwrap_or("none"),
     )
 }
@@ -203,21 +194,15 @@ fn verdict_message(
 ) -> String {
     let number = tenet.number;
     let approved = tenet.status != TenetStatus::Declined;
-    let verdict = match (tenet.verdict.as_deref(), tenet.selected_option) {
-        (Some("your_call"), _) => {
-            "approved it as your call, adopting your recommendation, option 1".to_string()
-        }
-        (_, Some(index)) => format!("approved option {}", index + 1),
-        _ => "declined it: none of the options".to_string(),
+    let verdict = match tenet.verdict {
+        Some(Verdict::YourCall) => "approved it as your call, trusting your judgment",
+        Some(Verdict::Yes) => "approved it: yes",
+        _ => "declined it: no",
     };
     let mut lines = vec![
         format!("The operator ({label}) answered tenet #{number} ({uri}): {verdict}."),
-        format!("Question: {}", tenet.question),
+        format!("Statement: {}", tenet.statement),
     ];
-    if let Some(text) = tenet.text() {
-        lines.push(format!("Chosen: {text}"));
-    }
-    lines.push(format!("Rejected: {}", list(&tenet.rejected())));
     lines.push(format!(
         "Comment: {}",
         tenet.comment.as_deref().unwrap_or("none")
@@ -240,7 +225,7 @@ fn verdict_message(
         lines.push(if approved {
             format!(
                 "It gated {}: each starts once its other gates are met, and its issue carries \
-                 this choice as a comment.",
+                 this decision as a comment.",
                 gates.join(", ")
             )
         } else {

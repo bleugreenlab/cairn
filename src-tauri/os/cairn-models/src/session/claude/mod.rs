@@ -327,8 +327,56 @@ mod tests {
             .collect()
     }
 
-    /// A tool-free one-shot: an empty strict MCP config, only the tools the
-    /// caller allows, the caller's disallow list, and nothing saved to resume.
+    /// An agent launch, with Cairn's server attached, is offered no built-in
+    /// tool (`--tools ""`), and with no MCP denials passes no disallow list.
+    #[test]
+    fn an_agent_launch_offers_no_built_in_tools() {
+        use crate::interface::session::{
+            ApprovalMode, ClaudeSpec, PlacedFile, SecretEnv, SessionSpec,
+        };
+        use crate::session::mcp::{McpServer, McpServers};
+        let spec = SessionSpec {
+            start: SessionStart::New {
+                session_id: "agent".to_string(),
+            },
+            model: None,
+            effort: None,
+            approval: ApprovalMode::Allow,
+            output_schema: None,
+            cwd: "/tmp/worktree".to_string(),
+            env: std::collections::BTreeMap::new(),
+            mcp: Some(McpServers::new(vec![McpServer::cairn_http("http://o/mcp")]).unwrap()),
+            secrets: SecretEnv::new(),
+            account_id: None,
+            provider: ProviderSpec::Claude(ClaudeSpec {
+                system_prompt: PlacedFile {
+                    dir: "/tmp/worktree".to_string(),
+                    name: "system.md".to_string(),
+                    contents: "work".to_string(),
+                },
+                hook_settings: None,
+                allowed_tools: vec!["mcp__cairn__read".to_string()],
+                disallowed_tools: vec![],
+                mode: ClaudeMode::Interactive,
+            }),
+        };
+        let config = ClaudeCli::spawn_config("/bin/claude", &spec, None, None).unwrap();
+        let value = |flag: &str| {
+            config
+                .args
+                .iter()
+                .position(|arg| arg == flag)
+                .map(|index| config.args[index + 1].clone())
+        };
+        assert_eq!(value("--tools").as_deref(), Some(""));
+        assert_eq!(value("--disallowedTools"), None);
+        assert!(!config
+            .args
+            .contains(&"--no-session-persistence".to_string()));
+    }
+
+    /// A tool-free one-shot: an empty strict MCP config, no built-in tools,
+    /// no disallow list to pass, and nothing saved to resume.
     #[test]
     fn a_tool_free_one_shot_gets_no_servers_and_is_not_persisted() {
         use crate::interface::session::{
@@ -355,7 +403,7 @@ mod tests {
                 },
                 hook_settings: None,
                 allowed_tools: vec![],
-                disallowed_tools: vec!["Bash".to_string(), "Read".to_string()],
+                disallowed_tools: vec![],
                 mode: ClaudeMode::OneShot {
                     prompt: "hello".to_string(),
                 },
@@ -375,7 +423,7 @@ mod tests {
         );
         assert!(config.args.contains(&"--strict-mcp-config".to_string()));
         assert_eq!(value("--allowedTools").as_deref(), Some(""));
-        assert_eq!(value("--disallowedTools").as_deref(), Some("Bash,Read"));
+        assert_eq!(value("--disallowedTools"), None);
         assert_eq!(value("--tools").as_deref(), Some(""));
         assert!(config
             .args

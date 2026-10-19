@@ -66,7 +66,35 @@ pub fn hash_tree(root: &Path) -> Result<ContentHash, String> {
     if !root.exists() {
         return Ok(ContentHash::Missing);
     }
-    Ok(ContentHash::Present(hash_tree_present(root)?))
+    Ok(ContentHash::Present(hash_tree_present(root, false)?))
+}
+
+/// The tree hash as it was computed before OS metadata was excluded.
+///
+/// Lock baselines recorded by earlier builds hashed whatever `.DS_Store` sat in
+/// a skill or workflow directory at the time. Comparing such a baseline against
+/// [`hash_tree`] would read that file's absence from the new hash as a user
+/// edit, so ownership checks fall back to this before declaring a fork.
+pub fn hash_tree_including_os_metadata(root: &Path) -> Result<ContentHash, String> {
+    if !root.exists() {
+        return Ok(ContentHash::Missing);
+    }
+    Ok(ContentHash::Present(hash_tree_present(root, true)?))
+}
+
+/// Whether a package-relative path is metadata a file browser or archiver
+/// drops into any directory it touches (`.DS_Store`, `__MACOSX/`).
+///
+/// Such files are never content: opening a pack skill in Finder must not fork
+/// it, and exporting a skill must not ship them. `.meta.json` is deliberately
+/// NOT metadata in this sense — it records the provenance of an agent's edit.
+pub fn is_os_metadata_path(relative_path: &Path) -> bool {
+    relative_path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some(".DS_Store" | "__MACOSX")
+        )
+    })
 }
 
 pub fn hash_item_path(kind: PackItemKind, root: &Path, path: &Path) -> Result<ContentHash, String> {
@@ -222,16 +250,16 @@ pub fn available_pack(resource_dir: &Path, id: &str) -> Option<PackManifest> {
 /// single global `.bundle-sync` marker: an unchanged hash short-circuits that
 /// pack's sync entirely.
 pub fn content_hash(root: &Path) -> Result<String, String> {
-    if !root.exists() {
-        return hash_tree_present(root);
-    }
-    hash_tree_present(root)
+    hash_tree_present(root, false)
 }
 
-fn hash_tree_present(root: &Path) -> Result<String, String> {
+fn hash_tree_present(root: &Path, include_os_metadata: bool) -> Result<String, String> {
     let mut entries = Vec::new();
     if root.exists() {
         for file in guarded_tree_files(root)? {
+            if !include_os_metadata && is_os_metadata_path(&file.relative_path) {
+                continue;
+            }
             let relative_path = file
                 .relative_path
                 .components()
@@ -380,6 +408,35 @@ mod tests {
         assert_ne!(
             hash_tree(left.path()).unwrap(),
             hash_tree(right.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn os_metadata_never_changes_a_tree_hash_but_provenance_does() {
+        let temp = TempDir::new().unwrap();
+        let skill = temp.path().join("skill");
+        write(&skill.join("SKILL.md"), "---\nname: S\n---\n");
+        let clean = hash_tree(&skill).unwrap();
+
+        write(&skill.join(".DS_Store"), "finder");
+        write(&skill.join("refs/.DS_Store"), "finder");
+        write(&skill.join("__MACOSX/._SKILL.md"), "resource fork");
+        assert_eq!(
+            hash_tree(&skill).unwrap(),
+            clean,
+            "opening a skill in Finder must not fork it"
+        );
+        assert_ne!(
+            hash_tree_including_os_metadata(&skill).unwrap(),
+            clean,
+            "the legacy hash still sees metadata, which is what lets old baselines match"
+        );
+
+        write(&skill.join(".meta.json"), "{\"source\":\"agent\"}");
+        assert_ne!(
+            hash_tree(&skill).unwrap(),
+            clean,
+            ".meta.json records an agent edit and must stay in the hash"
         );
     }
 

@@ -135,9 +135,30 @@ struct ProjectIssuesQuery {
     labels: Option<Vec<String>>,
 }
 
-const PROJECT_ISSUES_SUPPORTED_PARAMS: &[&str] =
-    &["status", "limit", "offset", "sort", "label", "labels"];
-const PROJECT_ISSUES_SUPPORTED_PARAMS_TEXT: &str = "status, limit, offset, sort, label, labels";
+/// Query keys this reader once accepted or advertised, each with the refusal
+/// that points the caller at what replaced it.
+const PROJECT_ISSUES_RETIRED_PARAMS: &[(&str, &str)] = &[
+    (
+        "ready",
+        "Unsupported query parameter 'ready' for project issues: it filtered on issue dependencies, which are retired into `after:` gates on executions. An issue whose execution is waiting shows it as held, with each gate named, in this list and in the issue overview.",
+    ),
+    (
+        "kind",
+        "Unsupported query parameter 'kind' for project issues: threads are no longer issues, so this collection lists only issues. Threads are listed at cairn://p/PROJECT/threads.",
+    ),
+];
+
+/// The accepted query keys are exactly the filters the resource contract
+/// advertises, so the affordance block and this reader's refusal cannot name
+/// different sets.
+fn project_issues_supported_params() -> impl Iterator<Item = &'static str> {
+    cairn_common::contract::contract_for(cairn_common::contract::ResourceKind::ProjectIssues)
+        .map(|contract| contract.read_projections)
+        .unwrap_or_default()
+        .iter()
+        .map(|projection| projection.key)
+}
+
 const PROJECT_ISSUES_ALLOWED_STATUSES: &[&str] = &[
     "backlog", "active", "waiting", "merged", "closed", "failed", "complete",
 ];
@@ -158,16 +179,22 @@ impl Default for ProjectIssuesQuery {
 
 impl ProjectIssuesQuery {
     fn parse(params: &[QueryParam]) -> Result<Self, String> {
-        if params.iter().any(|param| param.key == "ready") {
-            return Err("Unsupported query parameter 'ready' for project issues: it filtered on issue dependencies, which are retired into `after:` gates on executions. An issue whose execution is waiting shows it as held, with each gate named, in this list and in the issue overview.".to_string());
+        if let Some((_, refusal)) = PROJECT_ISSUES_RETIRED_PARAMS
+            .iter()
+            .find(|(key, _)| params.iter().any(|param| param.key == *key))
+        {
+            return Err((*refusal).to_string());
         }
         if let Some(unsupported) = params
             .iter()
-            .find(|param| !PROJECT_ISSUES_SUPPORTED_PARAMS.contains(&param.key.as_str()))
+            .find(|param| !project_issues_supported_params().any(|key| key == param.key))
         {
             return Err(format!(
                 "Unsupported query parameter '{}' for project issues. Supported parameters: {}",
-                unsupported.key, PROJECT_ISSUES_SUPPORTED_PARAMS_TEXT
+                unsupported.key,
+                project_issues_supported_params()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
 
@@ -671,8 +698,10 @@ fn human_bytes(bytes: i64) -> String {
         format!("{bytes:.0} B")
     } else if bytes < KIB * KIB {
         format!("{:.0} KB", bytes / KIB)
-    } else {
+    } else if bytes < KIB * KIB * KIB {
         format!("{:.1} MB", bytes / (KIB * KIB))
+    } else {
+        format!("{:.1} GB", bytes / (KIB * KIB * KIB))
     }
 }
 
@@ -997,6 +1026,11 @@ pub(super) fn render_ref_store(
         }
     }
 
+    let awaiting_confirmation = overview.policy == PrunePolicy::Default
+        && overview.last_ok_prune_at.is_none()
+        && !over_threshold.is_empty();
+    out.push_str(&render_object_store(overview, awaiting_confirmation, now));
+
     let confirm = format!(
         "`write({{changes:[{{target:\"cairn://p/{project_key}\",mode:\"patch\",\
          payload:{{refStorePrune:true}}}}]}})`"
@@ -1015,10 +1049,7 @@ pub(super) fn render_ref_store(
         }
         return out;
     }
-    if overview.policy == PrunePolicy::Default
-        && overview.last_ok_prune_at.is_none()
-        && !over_threshold.is_empty()
-    {
+    if awaiting_confirmation {
         out.push_str(&format!(
             "**The first prune of this store is waiting for confirmation**: {}. A first prune \
              of a store this size rewrites a large, long-lived ref store and object database in \
@@ -1062,6 +1093,13 @@ pub(super) fn render_ref_store(
                     out.push_str(&format!(
                         "{attempt} and succeeded in {took}. It removed {removed}{truncated}.\n\n"
                     ));
+                }
+                Some(("partial", failure)) if failure.starts_with("reclaim-failed:") => {
+                    out.push_str(&format!(
+                        "{attempt} and only partly succeeded, in {took}. It removed {removed}, but \
+                         its reclaim of unreferenced objects failed; the object store above says \
+                         why. The next prune retries the reclaim.\n\n"
+                    ))
                 }
                 Some(("partial", refusal)) => out.push_str(&format!(
                     "{attempt} and only partly succeeded, in {took}. It removed {removed}, but it \
@@ -1136,7 +1174,179 @@ pub(super) fn render_ref_store(
     out
 }
 
+/// The object-store paragraph of the ref-store section: how many packs and
+/// loose objects the store holds, when it was last compacted and reclaimed,
+/// and, when something is wrong, what.
+fn render_object_store(
+    overview: &crate::vcs_maintenance::RefStoreOverview,
+    awaiting_confirmation: bool,
+    now: i64,
+) -> String {
+    use crate::vcs_maintenance::{
+        PrunePolicy, LOOSE_OBJECT_LIMIT, PACK_LIMIT, RECLAIM_INTERVAL, RETENTION,
+    };
+    let ago = |at: i64| crate::clock::format_elapsed((now - at).max(0));
+    let Some(census) = overview.objects else {
+        return if overview.latest.is_some() {
+            "Object store: not measured on this machine yet; the next hourly pass measures it.\n\n"
+                .to_string()
+        } else {
+            String::new()
+        };
+    };
+    let kept = if census.kept_packs > 0 {
+        format!(
+            " ({} held by in-flight publications)",
+            thousands(census.kept_packs)
+        )
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "Object store: {} packs{kept} in {}, about {} loose objects, {}.",
+        thousands(census.packs),
+        human_bytes(census.pack_bytes as i64),
+        thousands(census.loose_objects),
+        if census.multi_pack_index {
+            "with a multi-pack index"
+        } else {
+            "without a multi-pack index"
+        }
+    );
+    let opted_out = overview.policy == PrunePolicy::OptedOut;
+
+    let compaction_problem = match &overview.last_compaction {
+        Some(step) if step.outcome == "ok" => {
+            let packs = match (step.before, step.after) {
+                (Some(before), Some(after)) => format!(
+                    "{} packs to {}, ",
+                    thousands(before.packs),
+                    thousands(after.packs)
+                ),
+                _ => String::new(),
+            };
+            out.push_str(&format!(
+                " Last compacted {} ago ({packs}in {}).",
+                ago(step.started_at),
+                duration_words(step.duration_ms)
+            ));
+            None
+        }
+        Some(step) => {
+            let what = match step.outcome.split_once(':') {
+                Some(("skipped", reason)) => format!("was skipped because {}", skip_reason(reason)),
+                Some(("failed", error)) => format!("failed: {error}"),
+                _ => format!("recorded `{}`", step.outcome),
+            };
+            out.push_str(&format!(
+                " The last compaction, {} ago, {what}.",
+                ago(step.started_at)
+            ));
+            Some(what)
+        }
+        None if !opted_out => {
+            out.push_str(&format!(
+                " Not compacted on this machine yet; it compacts whenever the store passes {} \
+                 packs or {} loose objects.",
+                PACK_LIMIT,
+                thousands(LOOSE_OBJECT_LIMIT)
+            ));
+            None
+        }
+        None => None,
+    };
+
+    if !opted_out {
+        let days = RETENTION.as_secs() / 86_400;
+        match &overview.last_reclaim {
+            Some(step) => {
+                let bytes = match (step.before, step.after) {
+                    (Some(before), Some(after)) => format!(
+                        "{} to {}, ",
+                        human_bytes(before.pack_bytes as i64),
+                        human_bytes(after.pack_bytes as i64)
+                    ),
+                    _ => String::new(),
+                };
+                let due = step.started_at + RECLAIM_INTERVAL.as_secs() as i64;
+                let next = if due > now {
+                    format!(
+                        "the next reclaim is due in {}",
+                        crate::clock::format_elapsed(due - now)
+                    )
+                } else {
+                    "a reclaim is due at the next prune".to_string()
+                };
+                out.push_str(&format!(
+                    " Unreferenced objects older than {days} days were last reclaimed {} ago \
+                     ({bytes}in {}); {next}.",
+                    ago(step.started_at),
+                    duration_words(step.duration_ms)
+                ));
+            }
+            None if awaiting_confirmation => out.push_str(
+                " Unreferenced objects have never been reclaimed on this machine. The reclaim \
+                 runs inside the prune, so it waits on the same confirmation.",
+            ),
+            None => out.push_str(
+                " Unreferenced objects have never been reclaimed on this machine; the next prune \
+                 reclaims those older than the retention window.",
+            ),
+        }
+        if let Some(prune) = &overview.last_prune {
+            if let Some(reason) = prune.reclaim_skipped.as_deref() {
+                out.push_str(&format!(
+                    " The reclaim due at the last prune was skipped because {}; the next prune \
+                     retries it.",
+                    skip_reason(reason)
+                ));
+            }
+            if let Some(error) = prune.reclaim_failed.as_deref() {
+                out.push_str(&format!(
+                    " **The reclaim at the last prune failed:** {error}. The next prune retries \
+                     it."
+                ));
+            }
+        }
+    }
+    out.push_str("\n\n");
+
+    let unkept = census.packs.saturating_sub(census.kept_packs);
+    if opted_out {
+        out.push_str(
+            "Because this store is opted out, its objects are neither compacted nor reclaimed.\n\n",
+        );
+    } else if unkept > PACK_LIMIT {
+        let why = match compaction_problem {
+            Some(what) => format!("the last compaction {what}"),
+            None => "a compaction runs at the next hourly pass".to_string(),
+        };
+        out.push_str(&format!(
+            "**The object store is over git's {PACK_LIMIT}-pack limit** with {} packs not held \
+             by a publication, and {why}. Until it is compacted, every git and jj process pays \
+             to open each pack.\n\n",
+            thousands(unkept)
+        ));
+    }
+    out
+}
+
+/// A step's duration in words, to the second below a minute.
+fn duration_words(ms: i64) -> String {
+    if ms < 60_000 {
+        format!("{}s", ms.max(0) / 1000)
+    } else {
+        crate::clock::format_elapsed(ms / 1000)
+    }
+}
+
 fn skip_reason(reason: &str) -> String {
+    if let Some(held) = reason.strip_prefix("operator-git-busy:") {
+        return match held.split_once(' ') {
+            Some((lock, age)) => format!("the operator's git held `{lock}` {age}"),
+            None => format!("the operator's git held `{held}`"),
+        };
+    }
     match reason {
         "reconcile-in-flight" => "a base-advance reconcile was in flight for this store".into(),
         "operator-git-busy" => {
@@ -1233,18 +1443,18 @@ async fn render_held_executions(
 // Projects collection + project settings readers
 // ============================================================================
 
-/// The default-branch attestation wave converging right now, if one is.
+/// The main-cadence pass running right now, if one is.
 ///
-/// A wave records nothing until its whole applicable review suite returns — nine
-/// cache hits and two fresh suites is minutes, not seconds — so for that whole
-/// window the store holds no observation and no commit alias for the freshly
-/// advanced head. Read alone, that is the same emptiness a convergence that never
-/// ran would leave behind, and CAIRN-3823 was filed on exactly that reading. The
-/// line below is the difference: while it is present, the absence of rows for the
-/// current head is a wave still working, not a gap.
+/// A pass records nothing until its whole-suite lanes return — most of an hour
+/// for the Rust suite — so for that whole window the store holds no cadence
+/// observation for the freshly advanced head. Read alone, that is the same
+/// emptiness a cadence that never ran would leave behind, and CAIRN-3823 was
+/// filed on exactly that reading. The line below is the difference: while it is
+/// present, the absence of rows for the current head is a pass still working,
+/// not a gap.
 ///
-/// Silent when nothing is converging, because then the aliases already say
-/// everything there is to say.
+/// Silent when nothing is running, because then the rows and the cadence's
+/// thread messages already say everything there is to say.
 fn render_main_attestation(orch: &Orchestrator, project_id: &str) -> String {
     let Some((branch, armed_at_unix_ms)) =
         crate::execution::checks_main::in_flight(orch, project_id)
@@ -1253,9 +1463,9 @@ fn render_main_attestation(orch: &Orchestrator, project_id: &str) -> String {
     };
     let elapsed_seconds = (chrono::Utc::now().timestamp_millis() - armed_at_unix_ms).max(0) / 1000;
     format!(
-        "## Main attestation\n\nConverging `{branch}` — armed {} ago. Verdicts for the current \
-         default head are recorded when this finishes, so rows missing for it now are pending, \
-         not absent.\n\n",
+        "## Main cadence\n\nA whole-suite pass over `{branch}` was armed {} ago. Its rows for \
+         the current default head are recorded when it finishes, so rows missing for it now are \
+         pending, not absent.\n\n",
         crate::clock::format_elapsed(elapsed_seconds)
     )
 }
@@ -1699,7 +1909,7 @@ mod project_issues_query_tests {
         crud::{create_label_conn, DEFAULT_WORKSPACE_ID},
     };
     use crate::models::CreateLabel;
-    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::LocalDb;
     use tempfile::tempdir;
 
     fn param(key: &str, value: &str) -> QueryParam {
@@ -1762,13 +1972,55 @@ mod project_issues_query_tests {
         assert!(error.contains("after:"), "{error}");
     }
 
+    #[test]
+    fn the_retired_kind_filter_points_to_the_threads_collection() {
+        let error = ProjectIssuesQuery::parse(&[param("kind", "thread")]).unwrap_err();
+        assert!(error.contains("'kind'"), "{error}");
+        assert!(error.contains("cairn://p/PROJECT/threads"), "{error}");
+    }
+
+    /// Every filter the affordance block advertises must be accepted by this
+    /// reader and change the query it builds. A key added to the contract
+    /// without a parser arm would be accepted and silently ignored; one listed
+    /// without a sample here fails the key-set comparison first.
+    #[test]
+    fn every_advertised_filter_is_accepted_and_takes_effect() {
+        let samples: &[(&str, &str)] = &[
+            ("status", "active"),
+            ("limit", "5"),
+            ("offset", "1"),
+            ("sort", "created_asc"),
+            ("label", "bug"),
+            ("labels", "bug,ui"),
+        ];
+        let advertised = cairn_common::contract::contract_for(
+            cairn_common::contract::ResourceKind::ProjectIssues,
+        )
+        .expect("project issues contract")
+        .read_projections
+        .iter()
+        .map(|projection| projection.key)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            advertised,
+            samples.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            "each advertised filter needs a sample value here"
+        );
+
+        for (key, value) in samples {
+            let query = ProjectIssuesQuery::parse(&[param(key, value)])
+                .unwrap_or_else(|error| panic!("advertised filter `{key}` refused: {error}"));
+            assert_ne!(
+                query,
+                ProjectIssuesQuery::default(),
+                "advertised filter `{key}={value}` is accepted but has no effect"
+            );
+        }
+    }
+
     async fn test_db() -> LocalDb {
         let temp = tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("project-labels.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("project-labels.db"))
             .await
             .unwrap();
         db
@@ -2001,8 +2253,10 @@ mod ref_store_render_tests {
     use super::*;
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
-    use crate::vcs_maintenance::{PrunePolicy, PruneSample, RefStoreOverview, RefStoreSample};
+    use crate::storage::SearchIndex;
+    use crate::vcs_maintenance::{
+        ObjectStepSample, PrunePolicy, PruneSample, RefStoreOverview, RefStoreSample,
+    };
     use cairn_db::turso::params;
     use std::sync::Arc;
 
@@ -2098,6 +2352,8 @@ mod ref_store_render_tests {
                 removed_cairn_refs: Some(2_950),
                 ops_abandoned: Some(146_083),
                 truncated: true,
+                reclaim_skipped: None,
+                reclaim_failed: None,
             }),
             last_ok_prune_at: Some(NOW - 3 * HOUR),
             last_truncation_at: Some(NOW - 3 * HOUR),
@@ -2152,6 +2408,8 @@ mod ref_store_render_tests {
                 removed_cairn_refs: Some(3),
                 ops_abandoned: Some(0),
                 truncated: false,
+                reclaim_skipped: None,
+                reclaim_failed: None,
             }),
             last_ok_prune_at: Some(NOW - HOUR),
             last_truncation_at: None,
@@ -2175,16 +2433,183 @@ mod ref_store_render_tests {
         );
     }
 
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    fn objects(packs: u64, kept_packs: u64, gib: f64) -> crate::jj::ObjectStoreCensus {
+        crate::jj::ObjectStoreCensus {
+            packs,
+            kept_packs,
+            pack_bytes: (gib * GIB) as u64,
+            loose_objects: 1_200,
+            multi_pack_index: true,
+            ..Default::default()
+        }
+    }
+
+    fn step(
+        started_at: i64,
+        outcome: &str,
+        duration_ms: i64,
+        before: crate::jj::ObjectStoreCensus,
+        after: crate::jj::ObjectStoreCensus,
+    ) -> ObjectStepSample {
+        ObjectStepSample {
+            started_at,
+            outcome: outcome.into(),
+            duration_ms,
+            before: Some(before),
+            after: Some(after),
+        }
+    }
+
+    fn healthy_objects() -> RefStoreOverview {
+        RefStoreOverview {
+            latest: Some(sample(NOW - 60, 5_965, 1_783)),
+            objects: Some(objects(23, 2, 3.6)),
+            last_compaction: Some(step(
+                NOW - 2 * HOUR,
+                "ok",
+                14_000,
+                objects(61, 2, 3.7),
+                objects(23, 2, 3.6),
+            )),
+            last_reclaim: Some(step(
+                NOW - 4 * 24 * HOUR,
+                "ok",
+                26 * 60 * 1000,
+                objects(40, 0, 5.1),
+                objects(3, 0, 3.7),
+            )),
+            last_ok_prune_at: Some(NOW - 3 * HOUR),
+            last_truncation_at: Some(NOW - 3 * HOUR),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_healthy_object_store_is_said_in_words() {
+        let text = render_ref_store(&healthy_objects(), "CAIRN", NOW);
+        assert!(
+            text.contains(
+                "Object store: 23 packs (2 held by in-flight publications) in 3.6 GB, about 1,200 \
+                 loose objects, with a multi-pack index."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Last compacted 2h ago (61 packs to 23, in 14s)."));
+        assert!(text.contains(
+            "Unreferenced objects older than 30 days were last reclaimed 4d ago (5.1 GB to 3.7 \
+             GB, in 26m); the next reclaim is due in 26d."
+        ));
+        assert!(!text.contains("pack limit"));
+        assert!(!text.contains("never been reclaimed"));
+    }
+
+    #[test]
+    fn the_object_paragraph_survives_the_awaiting_confirmation_and_opted_out_states() {
+        let awaiting = RefStoreOverview {
+            latest: Some(sample(NOW - 600, 147_863, 143_681)),
+            objects: Some(objects(23, 0, 3.6)),
+            ..Default::default()
+        };
+        let text = render_ref_store(&awaiting, "CAIRN", NOW);
+        assert!(text.contains("waiting for confirmation"), "{text}");
+        assert!(text.contains("Object store: 23 packs in 3.6 GB"), "{text}");
+        assert!(text.contains(
+            "Unreferenced objects have never been reclaimed on this machine. The reclaim runs \
+             inside the prune, so it waits on the same confirmation."
+        ));
+        assert!(text.contains("Not compacted on this machine yet"));
+
+        let opted_out = RefStoreOverview {
+            policy: PrunePolicy::OptedOut,
+            ..awaiting
+        };
+        let text = render_ref_store(&opted_out, "CAIRN", NOW);
+        assert!(text.contains("opted out of pruning"), "{text}");
+        assert!(text.contains("Object store: 23 packs in 3.6 GB"));
+        assert!(text.contains(
+            "Because this store is opted out, its objects are neither compacted nor reclaimed."
+        ));
+        assert!(!text.contains("never been reclaimed"));
+    }
+
+    #[test]
+    fn an_object_store_over_the_pack_limit_says_why_compaction_did_not_help() {
+        let overview = RefStoreOverview {
+            objects: Some(objects(4_802, 0, 4.2)),
+            last_compaction: Some(ObjectStepSample {
+                started_at: NOW - HOUR,
+                outcome: "failed:git repack --geometric: fatal: out of memory".into(),
+                duration_ms: 3_000,
+                ..Default::default()
+            }),
+            ..healthy_objects()
+        };
+        let text = render_ref_store(&overview, "CAIRN", NOW);
+        assert!(
+            text.contains("The last compaction, 1h ago, failed: git repack --geometric"),
+            "{text}"
+        );
+        assert!(text.contains(
+            "**The object store is over git's 50-pack limit** with 4,802 packs not held by a \
+             publication, and the last compaction failed: git repack --geometric: fatal: out of \
+             memory."
+        ));
+
+        let skipped = RefStoreOverview {
+            last_compaction: Some(ObjectStepSample {
+                started_at: NOW - HOUR,
+                outcome: "skipped:operator-git-busy:gc.pid (3m old)".into(),
+                ..Default::default()
+            }),
+            ..overview
+        };
+        let text = render_ref_store(&skipped, "CAIRN", NOW);
+        assert!(
+            text.contains(
+                "the last compaction was skipped because the operator's git held `gc.pid` (3m \
+                 old)"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_failed_reclaim_is_a_partial_prune_and_says_why() {
+        let overview = RefStoreOverview {
+            last_prune: Some(PruneSample {
+                started_at: NOW - HOUR,
+                outcome: "partial:reclaim-failed:git repack --cruft: No space left on device"
+                    .into(),
+                duration_ms: 90_000,
+                reclaim_failed: Some("git repack --cruft: No space left on device".into()),
+                ..Default::default()
+            }),
+            last_ok_prune_at: Some(NOW - HOUR),
+            ..healthy_objects()
+        };
+        let text = render_ref_store(&overview, "CAIRN", NOW);
+        assert!(
+            text.contains(
+                "**The reclaim at the last prune failed:** git repack --cruft: No space left on \
+                 device. The next prune retries it."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("its reclaim of unreferenced objects failed"));
+        assert!(
+            !text.contains("could not truncate the operation log"),
+            "a reclaim failure is not a truncation refusal"
+        );
+    }
+
     /// The section reaches the project page from what the maintenance pass
     /// recorded, not from a hand-built overview.
     #[tokio::test]
     async fn the_project_page_renders_recorded_samples() {
         let temp = tempfile::tempdir().unwrap();
-        let local = LocalDb::open(temp.path().join("ref-store-page.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        let local = LocalDb::open_migrated_for_test(temp.path().join("ref-store-page.db"))
             .await
             .unwrap();
         let search = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());

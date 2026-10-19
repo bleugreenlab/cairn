@@ -281,16 +281,12 @@ fn run_outbox_db_future<T>(future: impl Future<Output = Result<T, String>>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+
     use tempfile::{tempdir, TempDir};
 
     async fn test_db() -> (TempDir, LocalDb) {
         let temp = tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("outbox-test.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("outbox-test.db"))
             .await
             .unwrap();
         (temp, db)

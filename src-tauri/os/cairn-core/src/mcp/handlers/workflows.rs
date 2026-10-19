@@ -157,7 +157,7 @@ mod tests {
     use crate::db::DbState;
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use serde_json::{json, Value};
     use std::sync::Arc;
 
@@ -168,14 +168,12 @@ mod tests {
     /// arrives in, and the minimum a transcript claim needs to resolve.
     async fn seeded_caller() -> (Orchestrator, Arc<LocalDb>) {
         let local = Arc::new(
-            LocalDb::open(tempfile::tempdir().unwrap().keep().join("workflows.db"))
-                .await
-                .unwrap(),
-        );
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+            LocalDb::open_migrated_for_test(
+                tempfile::tempdir().unwrap().keep().join("workflows.db"),
+            )
             .await
-            .unwrap();
+            .unwrap(),
+        );
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",

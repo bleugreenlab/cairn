@@ -87,19 +87,13 @@ mod artifact_present_tests {
     };
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{
-        DbError, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS,
-    };
+    use crate::storage::{DbError, LocalDb, RowExt, SearchIndex};
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     async fn test_db() -> LocalDb {
         let temp = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("recompute.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("recompute.db"))
             .await
             .unwrap();
         db
@@ -875,16 +869,12 @@ mod port_gate_tests {
         NodePosition, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot,
         RecipeTrigger, TriggerContext, TriggerType,
     };
-    use crate::storage::{DbError, LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
+    use crate::storage::{DbError, LocalDb, RowExt};
     use std::collections::HashMap;
 
     async fn test_db() -> LocalDb {
         let temp = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("port_gate.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("port_gate.db"))
             .await
             .unwrap();
         std::mem::forget(temp);
@@ -1253,9 +1243,7 @@ mod warm_provider_run_tests {
     };
     use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{
-        DbError, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS,
-    };
+    use crate::storage::{DbError, LocalDb, RowExt, SearchIndex};
     use cairn_db::turso::params;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1330,9 +1318,7 @@ mod warm_provider_run_tests {
     }
 
     async fn test_db(dir: &std::path::Path) -> LocalDb {
-        let db = LocalDb::open(dir.join("warm_run.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(dir.join("warm_run.db"))
             .await
             .unwrap();
         db
@@ -1730,9 +1716,7 @@ mod resolution_edge_tests {
     use crate::db::DbState;
     use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{
-        DbError, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS,
-    };
+    use crate::storage::{DbError, LocalDb, RowExt, SearchIndex};
     use cairn_db::turso::params;
     use std::path::Path;
     use std::sync::Arc;
@@ -1740,9 +1724,7 @@ mod resolution_edge_tests {
     const CHILD_URI: &str = "cairn://p/res/2";
 
     async fn test_db(dir: &Path) -> Arc<LocalDb> {
-        let db = LocalDb::open(dir.join("resolution-edge.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(dir.join("resolution-edge.db"))
             .await
             .unwrap();
         Arc::new(db)

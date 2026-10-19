@@ -4201,11 +4201,7 @@ pub(crate) mod tests {
     pub(crate) async fn test_orchestrator() -> Orchestrator {
         let root = tempfile::tempdir().unwrap().keep();
         let db_path = root.join("test.db");
-        let local = LocalDb::open(db_path).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
-            .await
-            .unwrap();
+        let local = LocalDb::open_migrated_for_test(db_path).await.unwrap();
         let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
         let db = Arc::new(DbState::new(Arc::new(local), search));
         Orchestrator::builder(db, Arc::new(TestServicesBuilder::new().build()), root).build()

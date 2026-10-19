@@ -586,13 +586,11 @@ mod tests {
     use super::*;
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::SearchIndex;
 
     async fn test_orchestrator() -> Orchestrator {
         let root = tempfile::tempdir().unwrap().keep();
-        let local = LocalDb::open(root.join("test.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        let local = LocalDb::open_migrated_for_test(root.join("test.db"))
             .await
             .unwrap();
         for sql in [

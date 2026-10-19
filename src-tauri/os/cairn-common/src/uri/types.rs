@@ -763,6 +763,23 @@ pub enum CairnResource {
         project: String,
         id: i64,
     },
+    /// The ingress endpoints this install minted for a project: named
+    /// publishers into the install's relay channel whose events become
+    /// `ingress` fact log rows.
+    ProjectEventEndpoints {
+        project: String,
+    },
+    ProjectEventEndpoint {
+        project: String,
+        name: String,
+    },
+    /// One event an endpoint delivered: the canonical local record an
+    /// `ingress` fact log row points at.
+    ProjectEventDelivery {
+        project: String,
+        name: String,
+        id: i64,
+    },
     /// The workspace view of the fact log: every row, including those that
     /// belong to no project.
     WorkspaceEvents,
@@ -905,6 +922,15 @@ pub enum CairnResource {
     ModelsSession {
         id: String,
     },
+    /// The cairn-inference facet's index: the bginf link's status and one line
+    /// per `cairn://inference/*` collection.
+    Inference,
+    /// How each model is run.
+    InferenceRecipes,
+    /// Recipes placed on named machines.
+    InferenceDeployments,
+    /// Pools, their pin and default, and Cairn's resolution beside bginf's.
+    InferencePools,
     /// Global bug report sink.
     Bug,
     /// Self-describing help page: URI grammar + read catalog + mutation matrix.
@@ -1028,6 +1054,10 @@ impl CairnResource {
             Self::ModelsUsage => ResourceKind::ModelsUsage,
             Self::ModelsSessions => ResourceKind::ModelsSessions,
             Self::ModelsSession { .. } => ResourceKind::ModelsSession,
+            Self::Inference => ResourceKind::Inference,
+            Self::InferenceRecipes => ResourceKind::InferenceRecipes,
+            Self::InferenceDeployments => ResourceKind::InferenceDeployments,
+            Self::InferencePools => ResourceKind::InferencePools,
             Self::Bug => ResourceKind::Bug,
             Self::Help => ResourceKind::Help,
             Self::WebSearch => ResourceKind::WebSearch,
@@ -1064,6 +1094,9 @@ impl CairnResource {
             Self::ProjectRouteHistoryEntry { .. } => ResourceKind::ProjectRouteHistoryEntry,
             Self::ProjectEvents { .. } => ResourceKind::ProjectEvents,
             Self::ProjectEvent { .. } => ResourceKind::ProjectEvent,
+            Self::ProjectEventEndpoints { .. } => ResourceKind::ProjectEventEndpoints,
+            Self::ProjectEventEndpoint { .. } => ResourceKind::ProjectEventEndpoint,
+            Self::ProjectEventDelivery { .. } => ResourceKind::ProjectEventDelivery,
             Self::WorkspaceEvents => ResourceKind::WorkspaceEvents,
             Self::WorkspaceEvent { .. } => ResourceKind::WorkspaceEvent,
             Self::Responses => ResourceKind::Responses,

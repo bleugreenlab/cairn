@@ -13,16 +13,12 @@ use turso::params;
 use crate::models::Event;
 use crate::storage::event_fixture::read_stub;
 use crate::storage::events::testutil::{commit_all, git, init_repo, write_file};
-use crate::storage::{build_execution_pack, LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+use crate::storage::{build_execution_pack, LocalDb};
 
 pub async fn migrated_db() -> LocalDb {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.keep().join("cairn-archival-reconstruct.db");
-    let db = LocalDb::open(path).await.unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
-        .await
-        .unwrap();
+    let db = LocalDb::open_migrated_for_test(path).await.unwrap();
     db
 }
 
@@ -217,7 +213,7 @@ pub fn build_fixture() -> Fixture {
     write_file(&clone, "c.txt", b"new file\n");
     let tip = commit_all(&clone, "work");
 
-    let (pack, idx) = build_execution_pack(&clone, &tip, &anchor, "main")
+    let (pack, idx) = build_execution_pack(&clone, &[tip.as_str()], &[anchor.as_str(), "main"])
         .unwrap()
         .unwrap();
 

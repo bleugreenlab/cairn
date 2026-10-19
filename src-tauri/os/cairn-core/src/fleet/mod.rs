@@ -5620,6 +5620,25 @@ impl Fleet {
                     .saturating_add(occupancy.reservation.concurrency_units);
             }
         }
+        // Work waiting for room waits in the runner's queue, not on a machine,
+        // so the executors' reports hold only what they claimed. An identity a
+        // machine already reports is left to that report.
+        let reported: HashSet<(&str, &str)> =
+            aggregate
+                .queued_requests
+                .iter()
+                .map(|queued| (queued.request_id.as_str(), queued.attempt_id.as_str()))
+                .chain(aggregate.executing_requests.iter().map(|executing| {
+                    (executing.request_id.as_str(), executing.attempt_id.as_str())
+                }))
+                .collect();
+        let waiting: Vec<_> = self
+            .queue
+            .waiting_rows()
+            .into_iter()
+            .filter(|row| !reported.contains(&(row.request_id.as_str(), row.attempt_id.as_str())))
+            .collect();
+        aggregate.queued_requests.extend(waiting);
         aggregate.recent_completions.extend(
             self.recent_cached_completions
                 .lock()
@@ -13576,6 +13595,8 @@ struct ReservationPlan {
     /// overrule.
     resolves: bool,
     stated: ResourceReservation,
+    /// How many items run at once: a parallel batch's item count, otherwise 1.
+    parallel_width: u32,
 }
 
 impl ReservationPlan {
@@ -13612,6 +13633,9 @@ impl ReservationPlan {
             resolves: declared_concurrency.is_some()
                 || request.resource_reservation == ResourceReservation::default(),
             stated: request.resource_reservation.clone(),
+            parallel_width: batch.filter(|batch| !batch.sequential).map_or(1, |batch| {
+                u32::try_from(batch.items.len()).unwrap_or(u32::MAX).max(1)
+            }),
         }
     }
 
@@ -13696,6 +13720,22 @@ impl ReservationPlan {
             )
             .await
         };
+        // The executor runs a parallel batch as many items at a time as it was
+        // charged units for, so a parallel batch is charged one item's units for
+        // every item running beside the others. Charging its heaviest item alone,
+        // which is right for a sequential batch, runs a parallel one item by item.
+        // The machine's admission budget caps it, past which the items run in
+        // waves rather than the batch never fitting at all.
+        if self.parallel_width > 1 {
+            resolved.reservation.concurrency_units = clamp_declared_concurrency(
+                resolved
+                    .reservation
+                    .concurrency_units
+                    .max(1)
+                    .saturating_mul(self.parallel_width),
+                capabilities,
+            );
+        }
         // Whole-machine demand is declared as saturation because the submitter
         // cannot know which executor would be chosen. Clamp it to this executor's
         // capacity: a reservation larger than the host's budget can never fit, so
@@ -15424,7 +15464,7 @@ mod tests {
     #[tokio::test]
     async fn a_successor_does_not_run_until_what_it_displaced_is_confirmed_dead() {
         let fleet = Fleet::default();
-        let key = purpose::PurposeKey::main_attestation("project");
+        let key = purpose::PurposeKey::main_cadence("project", "rust-tests", "linux");
         let older: RequestIdentity = ("tip-x".into(), "tip-x-attempt".into());
         let newer: RequestIdentity = ("tip-x1".into(), "tip-x1-attempt".into());
 
@@ -15479,7 +15519,7 @@ mod tests {
     #[tokio::test]
     async fn an_item_displaced_while_waiting_to_dispatch_settles_instead_of_deadlocking() {
         let fleet = Fleet::default();
-        let key = purpose::PurposeKey::main_attestation("project");
+        let key = purpose::PurposeKey::main_cadence("project", "rust-tests", "linux");
         let a: RequestIdentity = ("tip-a".into(), "a".into());
         let b: RequestIdentity = ("tip-b".into(), "b".into());
         let c: RequestIdentity = ("tip-c".into(), "c".into());
@@ -15543,7 +15583,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_debt_that_never_clears_refuses_rather_than_dispatching_beside_it() {
         let fleet = Fleet::default();
-        let key = purpose::PurposeKey::main_attestation("project");
+        let key = purpose::PurposeKey::main_cadence("project", "rust-tests", "linux");
         let newer: RequestIdentity = ("tip-x1".into(), "attempt".into());
         fleet
             .purposes
@@ -15573,7 +15613,7 @@ mod tests {
     #[tokio::test]
     async fn an_uncontested_question_dispatches_without_waiting() {
         let fleet = Fleet::default();
-        let key = purpose::PurposeKey::main_attestation("project");
+        let key = purpose::PurposeKey::main_cadence("project", "rust-tests", "linux");
         fleet
             .purposes
             .lock()
@@ -15601,7 +15641,7 @@ mod tests {
     #[test]
     fn arming_a_newer_answer_retires_the_older_before_it_can_dispatch() {
         let fleet = Fleet::default();
-        let key = purpose::PurposeKey::main_attestation("project");
+        let key = purpose::PurposeKey::main_cadence("project", "rust-tests", "linux");
         let older: RequestIdentity = ("tip-x".into(), "tip-x-attempt".into());
         let newer: RequestIdentity = ("tip-x1".into(), "tip-x1-attempt".into());
 
@@ -15640,7 +15680,7 @@ mod tests {
     #[test]
     fn an_answer_older_than_the_live_one_never_becomes_the_live_one() {
         let fleet = Fleet::default();
-        let key = purpose::PurposeKey::main_attestation("project");
+        let key = purpose::PurposeKey::main_cadence("project", "rust-tests", "linux");
         let newer: RequestIdentity = ("newer".into(), "newer-attempt".into());
         let older: RequestIdentity = ("older".into(), "older-attempt".into());
 
@@ -15667,7 +15707,7 @@ mod tests {
 
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use cairn_codec::testutil::{commit_all, init_repo, write_file};
     use cairn_common::executor_protocol::{
         CellAdmissionKind, CellOccupancy, GitObjectFormat, MachineMemory, Measurement,
@@ -16030,11 +16070,7 @@ mod tests {
     }
 
     async fn test_orchestrator(config_dir: &Path) -> Orchestrator {
-        let local = LocalDb::open(config_dir.join("build-slots.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        let local = LocalDb::open_migrated_for_test(config_dir.join("build-slots.db"))
             .await
             .unwrap();
         let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
@@ -16779,6 +16815,61 @@ mod tests {
             .expect("no probe measures the pseudoterminal seam yet");
         assert!(reason.contains("PtyResidentFilesystem"), "{reason}");
         assert!(reason.contains("no probe attempts"), "{reason}");
+    }
+
+    /// A parallel batch runs as many items at once as it was charged for, so it
+    /// is charged for every item it runs together. Charging only its heaviest
+    /// item, as a sequential batch rightly is, ran an agent's parallel items one
+    /// after another.
+    #[tokio::test]
+    async fn a_parallel_batch_is_charged_for_every_item_it_runs_at_once() {
+        let db = Arc::new(crate::storage::migrated_test_db("parallel-batch-width.db").await);
+        let request = provenance_request();
+        let batch = |sequential: bool, items: usize| ProcessBatch {
+            files: Vec::new(),
+            runtime_packages: Vec::new(),
+            sequential,
+            stop_on_error: false,
+            sandbox_mode: ProcessSandboxMode::Unconfined,
+            timeout_bases: Vec::new(),
+            items: (0..items).map(|_| cache_batch_item(Vec::new())).collect(),
+            runner_context_id: None,
+            execution_residency: None,
+            containment: None,
+        };
+        let units = |batch: ProcessBatch, capabilities: ExecutorCapabilities| {
+            let (db, request) = (db.clone(), request.clone());
+            async move {
+                ReservationPlan::new(db, &request, Some(&batch))
+                    .resolve_for(
+                        &request,
+                        "device",
+                        "executor",
+                        &capabilities,
+                        resource_profiles::DurationContext {
+                            class: request.command_class,
+                            warmth: ExecutionWarmth::Cold,
+                            now_unix_ms: NOW,
+                        },
+                    )
+                    .await
+                    .reservation
+                    .concurrency_units
+            }
+        };
+
+        assert_eq!(units(batch(false, 3), capabilities_with_cores(16)).await, 3);
+        assert_eq!(
+            units(batch(true, 3), capabilities_with_cores(16)).await,
+            1,
+            "a sequential batch runs one item at a time"
+        );
+        let small = capabilities_with_cores(2);
+        assert_eq!(
+            units(batch(false, 40), small.clone()).await,
+            small.admission_concurrency_budget(),
+            "a batch wider than the machine runs in waves rather than never fitting"
+        );
     }
 
     /// A reservation has two independent halves, and the record must carry both.
@@ -22140,6 +22231,51 @@ mod tests {
         let enrolled = fleet.unattached_enrolled_remotes();
         assert_eq!(enrolled.len(), 1);
         assert!(!enrolled[0].link.is_connected());
+    }
+
+    /// The first-dial wait accepts any generation that attaches while it
+    /// runs, not only one present when it began. The specimen's machine died
+    /// at generation 1 and came back as generation 2; that is a dial.
+    #[tokio::test]
+    async fn a_later_generation_attaching_during_the_first_dial_wait_ends_it() {
+        let fleet = std::sync::Arc::new(Fleet::default());
+        fleet.declare_enrolled_remote("sp1", "sp1", "linux", "aarch64");
+        let (_, first) = fleet_entry("sp1", "linux", 0, &[]);
+        let generation = fleet
+            .attach_advertised_executor(first.advertisement, first.sender, false, None, None)
+            .expect("generation 1 attaches");
+        assert!(fleet.disconnect_advertised_executor("sp1", generation));
+        assert!(
+            !fleet.wait_for_enrolled_remote("sp1", Duration::ZERO).await,
+            "generation 1 is gone"
+        );
+
+        let waiting = tokio::spawn({
+            let fleet = fleet.clone();
+            async move {
+                fleet
+                    .wait_for_enrolled_remote("sp1", Duration::from_secs(2))
+                    .await
+            }
+        });
+        // Long enough for the waiter to have checked, found nothing, and
+        // registered for the next attach, so the dial below is one it hears
+        // rather than one it finds already present.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished(), "no generation is attached yet");
+        let (_, second) = fleet_entry("sp1", "linux", 0, &[]);
+        let later = fleet
+            .attach_advertised_executor(second.advertisement, second.sender, false, None, None)
+            .expect("generation 2 attaches");
+
+        assert!(later > generation);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), waiting)
+                .await
+                .expect("the wait returns")
+                .unwrap(),
+            "the later generation is the dial the wait was for"
+        );
     }
 
     /// The defect this whole seam exists for: a drain must be settable on a
@@ -30080,6 +30216,7 @@ mod tests {
                     } else {
                         "could not run: No such file or directory".into()
                     },
+                    build_sha256: None,
                 }],
             });
         advertising(entry, if bun_detected { &["bun"] } else { &[] });
@@ -31005,6 +31142,61 @@ mod handoff_tests {
         assert_eq!(permission_rows(&orch).await, 1);
         assert_eq!(permission(&orch).await.1, "pending");
         assert!(orch.park_slots.armed(RUN), "the budget path parks the turn");
+    }
+
+    /// A relayed command-scoped denial for a git index write is answered with
+    /// its in-sandbox route at once, and no permission is raised for anyone to
+    /// answer. The control beside it shows the same harness does raise one for
+    /// a command the refusal does not recognize.
+    #[tokio::test]
+    async fn a_relayed_git_index_write_is_refused_without_raising_a_permission() {
+        let orch = fence_orchestrator(true).await;
+        let result = orch
+            .fleet
+            .handle_runner_callback(
+                &orch,
+                RunnerCallback::SandboxDenied {
+                    runner_context_id: "ctx".into(),
+                    // Native-shell items are relayed as `program` (empty) plus
+                    // the raw command, hence the leading space.
+                    command: " git mv src-tauri/a src-tauri/b && git status --short".into(),
+                    cwd: "/tmp/worktree".into(),
+                    denial: SandboxDenial::Command,
+                },
+            )
+            .await;
+        match result {
+            RunnerCallbackResult::Rejected { diagnostic } => {
+                assert!(diagnostic.contains("plain `mv`"), "{diagnostic}");
+            }
+            other => panic!("expected the instructive refusal, got {other:?}"),
+        }
+        assert_eq!(permission_rows(&orch).await, 0);
+        assert!(!orch.park_slots.armed(RUN));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_relayed_unrecognized_command_denial_still_raises_a_permission() {
+        let orch = fence_orchestrator(true).await;
+        let task = {
+            let orch = orch.clone();
+            tokio::spawn(async move {
+                orch.fleet
+                    .handle_runner_callback(
+                        &orch,
+                        RunnerCallback::SandboxDenied {
+                            runner_context_id: "ctx".into(),
+                            command: " sh -c 'git mv a b'".into(),
+                            cwd: "/tmp/worktree".into(),
+                            denial: SandboxDenial::Command,
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(RELAYED_FENCE_WAIT_BUDGET + Duration::from_millis(10)).await;
+        assert_eq!(task.await.unwrap(), RunnerCallbackResult::Suspended);
+        assert_eq!(permission_rows(&orch).await, 1);
     }
 
     /// Acceptance 3: the batch settles before the budget, so the fence wait is

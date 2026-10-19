@@ -9,7 +9,7 @@ use crate::models::{RunStatus, TurnEndReason};
 use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
 use crate::services::testing::TestServicesBuilder;
 use crate::services::EventEmitter;
-use crate::storage::{DbError, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
+use crate::storage::{DbError, LocalDb, RowExt, SearchIndex};
 use cairn_session::agent_process::completion::TurnFailureDisposition;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
@@ -310,11 +310,7 @@ impl EventEmitter for SharedCaptureEmitter {
 
 async fn test_db() -> LocalDb {
     let temp = tempfile::tempdir().unwrap();
-    let db = LocalDb::open(temp.keep().join("warm-completion.db"))
-        .await
-        .unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
+    let db = LocalDb::open_migrated_for_test(temp.keep().join("warm-completion.db"))
         .await
         .unwrap();
     db

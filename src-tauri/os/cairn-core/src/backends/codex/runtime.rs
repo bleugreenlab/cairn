@@ -3,7 +3,7 @@ use super::permissions::{
     handle_codex_mcp_server_elicitation_request,
 };
 use super::CodexBackend;
-use crate::agent_process::completion::SessionTurnCompletion;
+use crate::agent_process::completion::{SessionTurnCompletion, SessionTurnOutcome};
 use crate::agent_process::stream::TranscriptEvent;
 use crate::models::ContextTokenState;
 use crate::orchestrator::lifecycle::{apply_codex_turn_completion, CodexTurnContext};
@@ -11,8 +11,9 @@ use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 use cairn_models::codex::app_server::AppServerClient;
-use cairn_models::codex::token_requests::token_request_reply;
+use cairn_models::codex::token_requests::{standing_refusal_notice, token_request_reply};
 use cairn_models::codex::tokens::CodexAuthState;
+use cairn_session::agent_process::completion::TurnFailureDisposition;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -396,6 +397,18 @@ struct CodexReaderHost {
     oauth_state: Option<Arc<Mutex<CodexAuthState>>>,
     cleanup: Mutex<Option<super::pool::PooledCall>>,
 }
+impl CodexReaderHost {
+    /// Cairn's notice for a token request it refused this session, while the
+    /// refusal stands. A dedicated session answers its own token requests; a
+    /// pooled call's are answered by its pool.
+    fn standing_token_refusal(&self) -> Option<String> {
+        if self.oauth_state.is_some() {
+            return standing_refusal_notice(self.oauth_state.as_ref());
+        }
+        let cleanup = self.cleanup.lock().ok()?;
+        cleanup.as_ref()?.standing_token_refusal()
+    }
+}
 impl CodexHost for CodexReaderHost {
     fn transcripts(&self) -> &dyn cairn_session::transcripts::TranscriptHost {
         &self.session
@@ -691,6 +704,17 @@ impl CodexHost for CodexReaderHost {
         )
     }
     fn complete(&self, completion: SessionTurnCompletion, context: CodexTurnContext) {
+        // Codex reports a turn that ran out of tokens in its own words (a
+        // routing or auth error) and drops the reason Cairn gave it, so the
+        // run is told that reason beside Codex's. A failure another path
+        // already took over (a capacity retry) is not this turn's to explain.
+        if matches!(completion.outcome, SessionTurnOutcome::Failed { .. })
+            && context.failure_disposition != TurnFailureDisposition::AlreadyHandled
+        {
+            if let Some(notice) = self.standing_token_refusal() {
+                self.error(&notice);
+            }
+        }
         apply_codex_turn_completion(
             &self.session.orch,
             &self.session.run_db,
@@ -1091,6 +1115,157 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(repeat_count, Some(1));
+    }
+
+    /// An orchestrator whose Codex refresh authority can no longer renew
+    /// anything, and a session on Cairn account `acct-cairn` holding `at-1`.
+    fn refusing_orchestrator(db: Arc<LocalDb>) -> (Orchestrator, Arc<Mutex<CodexAuthState>>) {
+        let root = tempfile::tempdir().unwrap().keep();
+        let state = Arc::new(DbState::new(
+            db,
+            Arc::new(SearchIndex::open_or_create(root.join("search.db")).unwrap()),
+        ));
+        let orch =
+            OrchestratorBuilder::new(state, Arc::new(TestServicesBuilder::new().build()), root)
+                .subscriptions(Arc::new(
+                    cairn_models::subscription::testing::RenewingCodex::refusing(),
+                ))
+                .build();
+        let login = json!({"tokens": {
+            "id_token": "id-1",
+            "access_token": "at-1",
+            "account_id": "chatgpt-1",
+        }});
+        let auth = CodexAuthState::new_for_account(
+            &orch,
+            &login.to_string(),
+            Some("acct-cairn".to_string()),
+        )
+        .unwrap();
+        (orch, Arc::new(Mutex::new(auth)))
+    }
+
+    /// Codex drops the message a refused token request carries and fails the
+    /// turn in its own words; the run must still hear Cairn's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_failing_after_a_refused_token_request_reports_the_refusal() {
+        let db = Arc::new(crate::storage::migrated_test_db("codex-refused-token-request").await);
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO jobs(id,project_id,status,node_name,created_at,updated_at) VALUES('j','p','running','builder',1,1);
+             INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at) VALUES('s','j','codex','native-thread','open',1,1,1);
+             INSERT INTO runs(id,project_id,job_id,status,session_id,created_at,updated_at) VALUES('r','p','j','live','s',1,1);
+             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('t','s','r','j',1,'running','initial',1,1);
+             UPDATE jobs SET current_turn_id='t',current_session_id='s' WHERE id='j';",
+        )
+        .await
+        .unwrap();
+        let (orch, auth) = refusing_orchestrator(db.clone());
+        let mut handle = RunHandle::new(
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Some(
+                cairn_models::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
+            ))),
+            Some("s".into()),
+            Some("j".into()),
+        );
+        handle.begin_turn("t");
+        orch.process_state
+            .processes
+            .lock()
+            .unwrap()
+            .register("r".into(), handle);
+        orch.process_state.set_current_turn_id("r", Some("t"));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let client = Arc::new(AppServerClient::for_test_scripted(vec![], sent.clone()));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(json!({"id": 41, "method": "account/chatgptAuthTokens/refresh", "params": {"reason": "unauthorized"}})).unwrap();
+        tx.send(json!({"method": "error", "params": {
+            "turnId": "p1",
+            "error": {"message": "workspace routing discovery unauthorized (401)"},
+            "willRetry": false,
+        }}))
+        .unwrap();
+        drop(tx);
+
+        CodexBackend::reader_thread_app_server(
+            &orch,
+            &orch.services.emitter,
+            "r",
+            Some("s".into()),
+            rx,
+            client,
+            Arc::new(Mutex::new(Some("p1".into()))),
+            Some(auth),
+            "codex".into(),
+            db.clone(),
+            None,
+        );
+
+        // What Codex was sent is the refusal, unchanged.
+        let reply = sent.lock().unwrap()[0].clone();
+        assert_eq!(reply["id"], 41);
+        assert_eq!(
+            reply["error"]["code"],
+            cairn_models::codex::token_requests::TOKEN_REQUEST_REFUSED
+        );
+        let refusal = reply["error"]["message"].as_str().unwrap().to_string();
+        assert!(refusal.contains("acct-cairn"), "{refusal}");
+
+        let errors = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT json_extract(data,'$.content') FROM events WHERE event_type='system:error' ORDER BY sequence",
+                            (),
+                        )
+                        .await?;
+                    let mut errors = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        errors.push(row.text(0)?);
+                    }
+                    Ok(errors)
+                })
+            })
+            .await
+            .unwrap();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("workspace routing discovery unauthorized")),
+            "Codex's own error is kept: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|error| error.contains(&refusal)),
+            "the run hears Cairn's refusal: {errors:?}"
+        );
+        assert!(
+            errors.iter().all(|error| !error.contains("at-1")),
+            "{errors:?}"
+        );
+    }
+
+    /// A pooled call's token requests are answered by its pool, which keeps
+    /// what it refused for the calls it serves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pool_remembers_the_token_request_it_refused() {
+        let db = Arc::new(crate::storage::migrated_test_db("codex-pool-refused-token").await);
+        let (orch, auth) = refusing_orchestrator(db);
+        let host = super::super::pool::pool_host(&orch, Some(auth));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let client = AppServerClient::for_test_scripted(vec![], sent.clone());
+        assert_eq!(host.standing_token_refusal(), None);
+
+        host.refresh_tokens(&client, &json!(7));
+
+        let refusal = sent.lock().unwrap()[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let notice = host.standing_token_refusal().expect("the refusal stands");
+        assert!(notice.contains(&refusal), "{notice}");
     }
 
     #[tokio::test]

@@ -1,0 +1,14 @@
+# Scrubbed: bginf's ids, nodes, head, ports and paths; neutral shell and addresses.
+id: dsv4f-tp2
+model: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+served_model: deepseek-v4-flash-vision-exp
+engine: vllm, tensor parallel 2
+nodes: [sp1, sp2]
+head: sp1
+start: "./start.sh --port 8888"
+stop:  "./stop.sh"
+health: http://192.0.2.40:8888/v1/models
+api_base: http://192.0.2.40:8888/v1
+catalog_id: deepseek/deepseek-v4-flash-vision-exp
+aliases: [big, vision, dsv4-flash]
+notes: "1M ctx"

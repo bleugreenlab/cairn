@@ -79,6 +79,9 @@ pub fn export_git_preserving_checkout(
 /// An empty `expect` is exactly today's behavior, which is what keeps the eight
 /// existing export sites unchanged instead of fabricating expectations they do
 /// not have.
+///
+/// Every named commit is also checked for jj conflict scaffolding at its tree
+/// root BEFORE anything is exported; see [`export_git_guarded`].
 pub fn export_git_verified(
     jj: &JjEnv,
     export_cwd: &Path,
@@ -86,8 +89,101 @@ pub fn export_git_verified(
     ctx: &str,
     expect: &[(&str, &str)],
 ) -> Result<(), String> {
+    export_git_guarded(jj, export_cwd, ignore_working_copy, ctx, expect).map_err(String::from)
+}
+
+/// Why a verified export did not establish its postcondition.
+///
+/// The scaffolding refusal is typed because it is a finding about the TREE, not
+/// a failure to act: a caller that moved the bookmark itself (the base-advance
+/// replay) has to record it as a conflict for the agent, where every other
+/// export failure is infrastructure that is rolled back and retried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportError {
+    /// The commit `branch` was about to be exported to carries jj conflict
+    /// scaffolding at its tree root. Nothing was exported, so no git ref moved.
+    ConflictScaffolding {
+        branch: String,
+        commit: String,
+        entries: Vec<String>,
+    },
+    /// Anything else: the export could not run, or could not be proven.
+    Failed(String),
+}
+
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConflictScaffolding {
+                branch,
+                commit,
+                entries,
+            } => write!(
+                f,
+                "{CONFLICT_SCAFFOLDING_EXPORT_REFUSAL} (`{branch}`): {}",
+                cairn_common::conflict_scaffolding::conflict_scaffolding_refusal(
+                    "export", commit, entries
+                )
+            ),
+            Self::Failed(error) => f.write_str(error),
+        }
+    }
+}
+
+impl From<ExportError> for String {
+    fn from(error: ExportError) -> Self {
+        error.to_string()
+    }
+}
+
+impl From<String> for ExportError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// [`export_git_verified`] with the scaffolding refusal kept typed.
+///
+/// The tree check runs BEFORE `jj git export`, against each commit a named ref
+/// would move to, because the export is the step that publishes: every agent
+/// cell is a checkout of `refs/heads/<branch>`, and a tree whose root carries
+/// `JJ-CONFLICT-README` or `.jjconflict-*` sidecars cannot be materialized on
+/// any machine. jj's conflict flag is not trusted as the answer here — the
+/// incident this exists for was a commit jj reported conflict-free whose
+/// exported tree carried a copy of the whole repository under
+/// `.jjconflict-base-0/`.
+///
+/// A ref that already names the commit is not checked: this export does not
+/// move it, and refusing there would turn every rollback onto a tip that was
+/// already published into an unrestorable state.
+///
+/// Fails closed: a tree that cannot be listed, or no backing checkout to list
+/// it in, is "could not check", which on a publication path is not "checked and
+/// fine".
+pub(crate) fn export_git_guarded(
+    jj: &JjEnv,
+    export_cwd: &Path,
+    ignore_working_copy: bool,
+    ctx: &str,
+    expect: &[(&str, &str)],
+) -> Result<(), ExportError> {
     let checkout = resolve_backing_checkout(export_cwd);
     let git = RealGitClient;
+    if !expect.is_empty() {
+        let Some(repo) = checkout.as_deref() else {
+            // A caller that named an expectation asked to be PROVEN right. Without a
+            // resolvable backing checkout there is no `refs/heads/*` to compare
+            // against and no tree to inspect, so neither check can run — and
+            // "could not check" must not be reported as "checked and fine". Fail
+            // closed before exporting anything.
+            return Err(ExportError::Failed(format!(
+                "{EXPORT_FREEZE_MSG} ({ctx}): cannot verify the exported ref(s) — no backing git \
+                 checkout resolved for {}",
+                export_cwd.display()
+            )));
+        };
+        refuse_scaffolded_ref_moves(&git, repo, ctx, expect)?;
+    }
     let before = checkout
         .as_deref()
         .and_then(|repo| snapshot_checkout_head(&git, repo));
@@ -99,20 +195,8 @@ pub fn export_git_verified(
     }
     let export_stderr = exported?;
 
-    if expect.is_empty() {
+    let Some(repo) = checkout.as_deref().filter(|_| !expect.is_empty()) else {
         return Ok(());
-    }
-    let Some(repo) = checkout.as_deref() else {
-        // A caller that named an expectation asked to be PROVEN right. Without a
-        // resolvable backing checkout there is no `refs/heads/*` to compare
-        // against, so verification cannot run — and "could not check" must not be
-        // reported as "checked and fine". Fail closed: publishing something we
-        // cannot prove we exported is the failure this exists to prevent.
-        return Err(format!(
-            "{EXPORT_FREEZE_MSG} ({ctx}): cannot verify the exported ref(s) — no backing git \
-             checkout resolved for {}",
-            export_cwd.display()
-        ));
     };
     verify_exported_refs(
         jj,
@@ -124,6 +208,87 @@ pub fn export_git_verified(
         expect,
         &export_stderr,
     )
+    .map_err(ExportError::Failed)
+}
+
+/// Stable marker phrase carried by every [`ExportError::ConflictScaffolding`]
+/// once it is rendered to text, so a refusal that crossed a `String` boundary
+/// (a flatten's squash export) is still recognizable as a finding about the
+/// tree rather than jj failing to run.
+pub const CONFLICT_SCAFFOLDING_EXPORT_REFUSAL: &str =
+    "export refused: the commit carries jj conflict scaffolding";
+
+/// Whether an export error is the conflict-scaffolding refusal.
+pub fn is_conflict_scaffolding_export_refusal(error: &str) -> bool {
+    error.contains(CONFLICT_SCAFFOLDING_EXPORT_REFUSAL)
+}
+
+/// The jj conflict scaffolding at the root of `commit`'s tree in `repository`,
+/// in listing order. Empty means none.
+///
+/// The scaffolding always sits at the tree ROOT, so this is one non-recursive
+/// `git ls-tree`. An unreadable tree is an `Err`, never an empty list.
+pub(crate) fn root_conflict_scaffolding(
+    repository: &Path,
+    commit: &str,
+) -> Result<Vec<String>, String> {
+    let output = cairn_platform::env::git()
+        .args(["ls-tree", "--name-only", commit])
+        .current_dir(repository)
+        .output()
+        .map_err(|error| {
+            format!("inspect tree root of {commit} for conflict scaffolding: {error}")
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "inspect tree root of {commit} for conflict scaffolding: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(
+        cairn_common::conflict_scaffolding::conflict_scaffolding_in_root_listing(
+            &String::from_utf8_lossy(&output.stdout),
+        ),
+    )
+}
+
+/// Refuse an export that would move any named ref onto a commit whose tree root
+/// carries conflict scaffolding. Runs before the export; see
+/// [`export_git_guarded`] for why a ref already at its commit is skipped.
+fn refuse_scaffolded_ref_moves(
+    git: &dyn GitClient,
+    repo: &Path,
+    ctx: &str,
+    expect: &[(&str, &str)],
+) -> Result<(), ExportError> {
+    for (branch, commit) in expect {
+        let current =
+            read_branch_commit(repo, branch).or_else(|| git_ref_commit(git, repo, branch));
+        if current.as_deref() == Some(*commit) {
+            continue;
+        }
+        let entries = root_conflict_scaffolding(repo, commit).map_err(|error| {
+            ExportError::Failed(format!(
+                "{ctx}: refusing to export `{branch}` to {commit}: its tree could not be checked \
+                 for jj conflict scaffolding, and an unchecked tree is not a clean one: {error}"
+            ))
+        })?;
+        if entries.is_empty() {
+            continue;
+        }
+        log::error!(
+            "{ctx}: refusing to export `{branch}` to {commit}: its tree root carries jj conflict \
+             scaffolding ({}). refs/heads/{branch} stays at {}.",
+            entries.join(", "),
+            current.as_deref().unwrap_or("<absent>")
+        );
+        return Err(ExportError::ConflictScaffolding {
+            branch: (*branch).to_string(),
+            commit: (*commit).to_string(),
+            entries,
+        });
+    }
+    Ok(())
 }
 
 /// Run the export itself, returning jj's stderr on success. jj reports a refused
@@ -306,6 +471,19 @@ pub(crate) fn export_bookmark_advance(
     branch: &str,
     ctx: &str,
 ) -> Result<(), String> {
+    export_bookmark_advance_guarded(jj, cwd, ignore_working_copy, branch, ctx).map_err(String::from)
+}
+
+/// [`export_bookmark_advance`] with the conflict-scaffolding refusal kept
+/// typed, for the caller that must record it as a conflict rather than a
+/// failure.
+pub(crate) fn export_bookmark_advance_guarded(
+    jj: &JjEnv,
+    cwd: &Path,
+    ignore_working_copy: bool,
+    branch: &str,
+    ctx: &str,
+) -> Result<(), ExportError> {
     let commit = bookmark_commit_checked(jj, cwd, branch)
         .and_then(|commit| {
             commit.ok_or_else(|| {
@@ -318,7 +496,7 @@ pub(crate) fn export_bookmark_advance(
                  bookmark this operation just advanced does not resolve to a single commit: {error}"
             )
         })?;
-    export_git_verified(
+    export_git_guarded(
         jj,
         cwd,
         ignore_working_copy,

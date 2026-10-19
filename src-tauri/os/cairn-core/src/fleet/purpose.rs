@@ -52,12 +52,15 @@ use super::RequestIdentity;
 pub(crate) struct PurposeKey(String);
 
 impl PurposeKey {
-    /// The standing question "is this project's default branch healthy".
+    /// The standing question "what is this check's whole-suite verdict on this
+    /// project's default branch, on this platform" (one main-cadence lane).
     ///
-    /// Deliberately free of the tip being attested: arming an attestation for a
-    /// newer tip replaces the older one rather than joining it.
-    pub(crate) fn main_attestation(project_id: &str) -> Self {
-        Self(format!("main-attestation:{project_id}"))
+    /// Deliberately free of the tip being attested: a newer tip is a newer
+    /// answer to the same question. The cadence itself never arms a successor
+    /// while a lane's run is live, so in practice this retires only a run an
+    /// earlier process left behind.
+    pub(crate) fn main_cadence(project_id: &str, check: &str, platform: &str) -> Self {
+        Self(format!("main-cadence:{project_id}:{check}:{platform}"))
     }
 }
 
@@ -336,7 +339,7 @@ mod tests {
     #[test]
     fn a_newer_tip_replaces_the_attestation_rather_than_joining_it() {
         let mut registry = PurposeRegistry::default();
-        let key = PurposeKey::main_attestation("project");
+        let key = PurposeKey::main_cadence("project", "rust-tests", "linux");
 
         assert_eq!(
             registry.admit(key.clone(), request("tip-x"), 10),
@@ -361,7 +364,7 @@ mod tests {
     fn replacement_reports_the_phase_the_displaced_item_had_reached() {
         for phase in [ItemPhase::Preparing, ItemPhase::Dispatched] {
             let mut registry = PurposeRegistry::default();
-            let key = PurposeKey::main_attestation("project");
+            let key = PurposeKey::main_cadence("project", "rust-tests", "linux");
             registry.admit(key.clone(), request("old"), 10);
             assert!(registry.advance(&request("old"), phase));
 
@@ -382,7 +385,7 @@ mod tests {
     #[test]
     fn an_item_older_than_the_live_one_is_refused_rather_than_dispatched() {
         let mut registry = PurposeRegistry::default();
-        let key = PurposeKey::main_attestation("project");
+        let key = PurposeKey::main_cadence("project", "rust-tests", "linux");
         registry.admit(key.clone(), request("newer"), 50);
 
         assert_eq!(
@@ -399,7 +402,7 @@ mod tests {
     #[test]
     fn a_tie_leaves_the_incumbent_in_place() {
         let mut registry = PurposeRegistry::default();
-        let key = PurposeKey::main_attestation("project");
+        let key = PurposeKey::main_cadence("project", "rust-tests", "linux");
         registry.admit(key.clone(), request("first"), 10);
 
         assert_eq!(
@@ -416,7 +419,7 @@ mod tests {
     #[test]
     fn readmitting_the_live_item_is_not_a_replacement() {
         let mut registry = PurposeRegistry::default();
-        let key = PurposeKey::main_attestation("project");
+        let key = PurposeKey::main_cadence("project", "rust-tests", "linux");
         registry.admit(key.clone(), request("item"), 10);
 
         assert_eq!(
@@ -433,7 +436,7 @@ mod tests {
     #[test]
     fn a_displaced_item_finishing_late_clears_only_its_own_debt() {
         let mut registry = PurposeRegistry::default();
-        let key = PurposeKey::main_attestation("project");
+        let key = PurposeKey::main_cadence("project", "rust-tests", "linux");
         registry.admit(key.clone(), request("old"), 10);
         registry.admit(key.clone(), request("new"), 20);
 
@@ -451,7 +454,7 @@ mod tests {
     #[test]
     fn a_displaced_item_is_owed_a_death_before_its_successor_may_run() {
         let mut registry = PurposeRegistry::default();
-        let key = PurposeKey::main_attestation("project");
+        let key = PurposeKey::main_cadence("project", "rust-tests", "linux");
 
         registry.admit(key.clone(), request("tip-x"), 10);
         assert_eq!(registry.pending_retirements(&key), 0);
@@ -478,7 +481,7 @@ mod tests {
     #[test]
     fn every_displaced_item_is_owed_its_own_death() {
         let mut registry = PurposeRegistry::default();
-        let key = PurposeKey::main_attestation("project");
+        let key = PurposeKey::main_cadence("project", "rust-tests", "linux");
 
         registry.admit(key.clone(), request("tip-x"), 10);
         registry.admit(key.clone(), request("tip-x1"), 20);
@@ -497,7 +500,7 @@ mod tests {
     #[test]
     fn cancelling_the_live_item_leaves_the_question_owing_a_death() {
         let mut registry = PurposeRegistry::default();
-        let key = PurposeKey::main_attestation("project");
+        let key = PurposeKey::main_cadence("project", "rust-tests", "linux");
         registry.admit(key.clone(), request("item"), 10);
 
         assert!(registry.retire(&request("item"), 15));
@@ -519,7 +522,7 @@ mod tests {
     #[test]
     fn a_finished_answer_does_not_free_a_question_that_still_owes_a_death() {
         let mut registry = PurposeRegistry::default();
-        let key = PurposeKey::main_attestation("project");
+        let key = PurposeKey::main_cadence("project", "rust-tests", "linux");
         registry.admit(key.clone(), request("old"), 10);
         registry.admit(key.clone(), request("new"), 20);
 
@@ -536,9 +539,17 @@ mod tests {
     #[test]
     fn questions_about_different_projects_are_different_questions() {
         let mut registry = PurposeRegistry::default();
-        registry.admit(PurposeKey::main_attestation("one"), request("a"), 10);
+        registry.admit(
+            PurposeKey::main_cadence("one", "rust-tests", "linux"),
+            request("a"),
+            10,
+        );
         assert_eq!(
-            registry.admit(PurposeKey::main_attestation("two"), request("b"), 10),
+            registry.admit(
+                PurposeKey::main_cadence("two", "rust-tests", "linux"),
+                request("b"),
+                10
+            ),
             Admission::Admitted
         );
         assert_eq!(registry.len(), 2);
@@ -549,11 +560,11 @@ mod tests {
     /// exact behavior this module was written to end.
     #[test]
     fn a_purpose_key_names_the_question_and_not_the_answer() {
-        let key = PurposeKey::main_attestation("project");
-        assert_eq!(key.to_string(), "main-attestation:project");
+        let key = PurposeKey::main_cadence("project", "rust-tests", "linux");
+        assert_eq!(key.to_string(), "main-cadence:project:rust-tests:linux");
         assert_eq!(
             key,
-            PurposeKey::main_attestation("project"),
+            PurposeKey::main_cadence("project", "rust-tests", "linux"),
             "the same question asked twice is one key"
         );
     }

@@ -171,16 +171,14 @@ pub async fn list_disabled_configs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::LocalDb;
 
     async fn db() -> LocalDb {
-        let db = LocalDb::open(tempfile::tempdir().unwrap().keep().join("disables.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
+        let db = LocalDb::open_migrated_for_test(
+            tempfile::tempdir().unwrap().keep().join("disables.db"),
+        )
+        .await
+        .unwrap();
         db
     }
 

@@ -1284,8 +1284,13 @@ pub(crate) mod tests {
     fn a_digest_mismatch_is_refused_and_installs_nothing() {
         let fixture = Fixture::new();
         let good = package("9.1.0", "9.1.0");
-        let pin = pin_for("9.1.0", &good);
         let tampered = package("9.1.0", "6.6.6");
+        // The two archives compress to lengths that differ by build (the
+        // workspace can unify a different flate2 backend in), so the pinned
+        // size covers both: the download completes and only the checksum can
+        // refuse it.
+        let size = good.len().max(tampered.len()) as u64;
+        let pin = pin_with_digest("9.1.0", &sha256(&good), size);
         fixture.served.serve(&pin, tampered.clone());
         let managed = fixture.managed(&pin);
 
@@ -1311,6 +1316,33 @@ pub(crate) mod tests {
             managed.status(),
             ManagedCodexStatus::Failed(error.to_string())
         );
+    }
+
+    /// The pinned size bounds the download: an archive past it is refused as a
+    /// failed download, even one whose checksum would have matched, and
+    /// nothing is installed.
+    #[test]
+    fn an_archive_larger_than_its_pinned_size_is_refused_and_installs_nothing() {
+        let fixture = Fixture::new();
+        let archive = package("9.1.0", "9.1.0");
+        let cap = archive.len() as u64 - 1;
+        let pin = pin_with_digest("9.1.0", &sha256(&archive), cap);
+        fixture.served.serve(&pin, archive);
+        let managed = fixture.managed(&pin);
+
+        let error = managed.ensure().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Cairn could not install its pinned Codex CLI 9.1.0: the download of codex-package-{target}.tar.gz failed (it is larger than the pinned {cap} bytes). Cairn does not fall back to a `codex` found on your PATH. It retries the next time a Codex session starts, at its next six-hourly update check, and at every restart. {route}",
+                target = target(),
+                route = manual_route_text(&fixture, &pin),
+            )
+        );
+        assert!(matches!(error, CodexInstallError::Download { .. }));
+        assert!(!fixture.release("9.1.0").exists());
+        assert!(fixture.leftovers().is_empty(), "{:?}", fixture.leftovers());
+        assert!(managed.installed().is_none());
     }
 
     #[cfg(unix)]

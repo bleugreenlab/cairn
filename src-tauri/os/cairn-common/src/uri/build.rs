@@ -871,6 +871,18 @@ pub fn build_project_events_uri(project: &str) -> String {
 pub fn build_project_event_uri(project: &str, id: i64) -> String {
     format!("{}/{id}", build_project_events_uri(project))
 }
+pub fn build_project_event_endpoints_uri(project: &str) -> String {
+    format!("{}/endpoints", build_project_events_uri(project))
+}
+pub fn build_project_event_endpoint_uri(project: &str, name: &str) -> String {
+    format!("{}/{name}", build_project_event_endpoints_uri(project))
+}
+pub fn build_project_event_delivery_uri(project: &str, name: &str, id: i64) -> String {
+    format!(
+        "{}/deliveries/{id}",
+        build_project_event_endpoint_uri(project, name)
+    )
+}
 /// The workspace view of the fact log: every row, including project-less ones.
 /// It lives in the routes family because the log is the route system's fact
 /// stream; `events` is therefore a reserved route id.
@@ -1381,6 +1393,10 @@ impl CairnResource {
             Self::ModelsUsage => "cairn://models/usage".to_string(),
             Self::ModelsSessions => "cairn://models/sessions".to_string(),
             Self::ModelsSession { id } => format!("cairn://models/sessions/{id}"),
+            Self::Inference => "cairn://inference".to_string(),
+            Self::InferenceRecipes => "cairn://inference/recipes".to_string(),
+            Self::InferenceDeployments => "cairn://inference/deployments".to_string(),
+            Self::InferencePools => "cairn://inference/pools".to_string(),
             Self::Executor { name } => format!("cairn://executors/{name}"),
             Self::ExecutorAction { name, action } => {
                 format!("cairn://executors/{name}/{action}")
@@ -1471,6 +1487,13 @@ impl CairnResource {
             } => build_project_route_history_entry_uri(project, route_id, *seq),
             Self::ProjectEvents { project } => build_project_events_uri(project),
             Self::ProjectEvent { project, id } => build_project_event_uri(project, *id),
+            Self::ProjectEventEndpoints { project } => build_project_event_endpoints_uri(project),
+            Self::ProjectEventEndpoint { project, name } => {
+                build_project_event_endpoint_uri(project, name)
+            }
+            Self::ProjectEventDelivery { project, name, id } => {
+                build_project_event_delivery_uri(project, name, *id)
+            }
             Self::WorkspaceEvents => build_workspace_events_uri(),
             Self::WorkspaceEvent { id } => build_workspace_event_uri(*id),
             Self::Responses => build_responses_uri(),

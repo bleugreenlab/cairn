@@ -30,6 +30,7 @@ pub mod docs;
 pub mod executor_registry; // Synced visibility; live placement remains in fleet.
 pub(crate) mod generation_cache;
 pub mod identity;
+pub mod inference;
 pub mod lifecycle;
 pub mod models;
 pub mod object_plane;
@@ -554,7 +555,7 @@ impl OrchestratorBuilder {
             session_reseed_fallback_attempted: Arc::new(Mutex::new(HashSet::new())),
             turn_end_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             recent_turn_end_check_requests: self.recent_turn_end_check_requests,
-            main_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            main_cadence: Arc::new(Mutex::new(Default::default())),
             write_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             node_check_status_cache: Arc::new(
                 crate::execution::checks_status::NodeCheckStatusCache::default(),
@@ -1010,10 +1011,9 @@ pub struct Orchestrator {
     /// settlement so the equally short-lived Work history can join a completed
     /// executor row back to its exact check lane without guessing by command.
     recent_turn_end_check_requests: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
-    /// The newest default-branch verdict wave for each project. Replacing an
-    /// entry signals the stale wave before the new head enters its settle window.
-    pub(crate) main_checks_in_flight:
-        Arc<Mutex<HashMap<String, crate::execution::checks_main::MainCheckRun>>>,
+    /// The main cadence's per-project slot: one pass in flight, at most one
+    /// queued successor.
+    pub(crate) main_cadence: Arc<Mutex<crate::execution::checks_main::CadenceSlots>>,
     /// Job ids with a synchronous when:write batch in flight. Runtime-only.
     write_checks_in_flight: Arc<Mutex<HashMap<String, usize>>>,
     /// Exact settled node-check projection, generation-fenced and single-flight.
@@ -1896,13 +1896,15 @@ impl Orchestrator {
     }
 
     /// Start the process-lifetime workers that hold this orchestrator: thread-era
-    /// summary upgrades, tenet evidence evaluation, and the wake-condition
-    /// evaluator. Hosts call this once; `build()` never does, so a dropped test
-    /// orchestrator releases every channel it owns.
+    /// summary upgrades, tenet evidence evaluation, the wake-condition
+    /// evaluator, and the read-only bginf mirror. Hosts call this once;
+    /// `build()` never does, so a dropped test orchestrator releases every
+    /// channel it owns.
     pub fn start_background_workers(&self) {
         crate::threads::era_worker::spawn(self.clone(), &self.era_summary_tx);
         crate::tenets::evidence::spawn(self.clone());
         crate::orchestrator::wakes::conditions::install_evaluator(self.clone());
+        crate::orchestrator::inference::spawn_bginf_poller(self.clone());
     }
 
     pub fn start_embed_worker(&self) {
@@ -2119,19 +2121,22 @@ impl Orchestrator {
         });
     }
 
-    /// Spawn the one-time archival backfill on a background task.
+    /// Run one archival sweep pass: archive the leftover `full` events of every
+    /// execution whose issue was resolved more than the grace period ago.
     ///
-    /// Call once at startup, on a tokio runtime. Compresses the events of
-    /// already-torn-down executions (history the teardown writer can never reach)
-    /// into their durable archival form, gated by `archival_backfill_state` so it
-    /// runs once, never on every startup; the work is detached so it never blocks
-    /// startup or the UI. This frees pages to the freelist but does NOT shrink the
-    /// database file: file-size reclamation is a separate one-time, offline step
-    /// run via the `vacuum_reclaim` cargo example (see the `archival::backfill`
-    /// module docs, docs/database.md, and CAIRN-1556).
+    /// This frees pages to the freelist but does NOT shrink the database file:
+    /// file-size reclamation is a separate offline step run via the
+    /// `vacuum_reclaim` cargo example (see the `archival::sweep` module docs and
+    /// docs/database.md).
     pub async fn run_archival_maintenance(&self) {
-        if let Err(e) = crate::archival::run_archival_maintenance(&self.db.local).await {
-            log::warn!("archival maintenance failed: {e}");
+        match crate::archival::run_archival_sweep(&self.db.local).await {
+            Ok(summary) => log::info!(
+                "archival sweep: {} executions archived, {} failed ({})",
+                summary.executions,
+                summary.failed,
+                summary.archive,
+            ),
+            Err(e) => log::warn!("archival sweep failed: {e}"),
         }
     }
 
@@ -2177,11 +2182,18 @@ impl Orchestrator {
         });
     }
 
+    /// Spawn the archival sweep on its own task: one pass now, then one every
+    /// [`crate::archival::sweep::SWEEP_INTERVAL`]. Detached because the first
+    /// pass on an install with a backlog is a long catch-up that no other
+    /// startup work should wait behind.
     pub fn spawn_archival_maintenance(&self) {
-        let db = self.db.local.clone();
+        let orch = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::archival::run_archival_maintenance(&db).await {
-                log::warn!("archival maintenance failed: {e}");
+            let mut interval = tokio::time::interval(crate::archival::sweep::SWEEP_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                orch.run_archival_maintenance().await;
             }
         });
     }
@@ -2402,7 +2414,11 @@ impl Orchestrator {
         crate::projects::crud::reconcile_project_repositories(&self.db.local).await;
         crate::projects::crud::reconcile_default_branches(&self.db.local).await;
         crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(self).await;
-        crate::execution::checks_main::spawn_all_current(self).await;
+        crate::execution::checks_main::spawn_all_current(
+            self,
+            crate::execution::checks_main::Trigger::Startup,
+        )
+        .await;
         crate::orchestrator::base_advance::sweep_reconcile_intents(self).await;
     }
 
@@ -2419,7 +2435,12 @@ impl Orchestrator {
 
             crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(&orch)
                 .await;
-            crate::execution::checks_main::spawn_all_current(&orch).await;
+            crate::execution::checks_main::spawn_all_current(
+                &orch,
+                crate::execution::checks_main::Trigger::Startup,
+            )
+            .await;
+            crate::execution::checks_main::spawn_heartbeat(&orch);
             orch.spawn_reconcile_intent_sweep();
             crate::orchestrator::default_branch_sync::spawn_default_branch_poll(&orch);
         });
@@ -3260,7 +3281,7 @@ mod tests {
     use crate::account::jwt::encrypt_jwt_for_storage;
     use crate::services::testing::{CapturingEmitter, TestServicesBuilder};
     use crate::services::EventEmitter;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use cairn_models::types::catalog::DiscoveredModel;
 
     #[test]
@@ -3272,13 +3293,10 @@ mod tests {
     }
 
     async fn test_db() -> Arc<DbState> {
-        let local = LocalDb::open(tempfile::tempdir().unwrap().keep().join("orch.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
-            .await
-            .unwrap();
+        let local =
+            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("orch.db"))
+                .await
+                .unwrap();
         let search =
             Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
         Arc::new(DbState::new(Arc::new(local), search))

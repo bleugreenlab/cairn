@@ -814,7 +814,7 @@ async fn foreclosure_message(
              `after {rendered}` is foreclosed \u{2014} {reason}.\n\n\
              It stays held (not released, not cancelled). The verdict is the operator's, so do \
              not release the work around it. Either:\n\
-             - ask again: propose a new tenet with write({{changes:[{{target:\"{tenets_uri}\",mode:\"append\",payload:{{question:\"...\",options:[\"...\"]}}}}]}}), then hold this execution on it (NEW is the new tenet's number): write({{changes:[{{target:\"{execution_uri}\",mode:\"patch\",payload:{{after:{gates}}}}}]}})\n\
+             - ask again: propose a new tenet with write({{changes:[{{target:\"{tenets_uri}\",mode:\"append\",payload:{{statement:\"...\"}}}}]}}), then hold this execution on it (NEW is the new tenet's number): write({{changes:[{{target:\"{execution_uri}\",mode:\"patch\",payload:{{after:{gates}}}}}]}})\n\
              - or drop the work: close {issue_uri}."
         ));
     }

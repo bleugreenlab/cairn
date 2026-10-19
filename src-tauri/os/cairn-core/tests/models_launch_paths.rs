@@ -263,6 +263,31 @@ fn only_subscription_support_presents_a_codex_subscription() {
     );
 }
 
+/// No Codex Cairn launches holds a refresh token. A Codex given an `auth.json`
+/// manages that credential itself and spends its refresh token whenever it
+/// decides to, and the replacement it mints lands in a home Cairn does not
+/// publish from, leaving the stored token already spent and the account
+/// unrenewable. So every launch (sessions, pooled servers, usage probes,
+/// catalog discovery) signs in through `account/login/start` with the access
+/// token alone, and only the sign-in flow, which reads the credential its own
+/// scratch `codex login` wrote, names the file.
+#[test]
+fn no_codex_launch_is_handed_an_auth_file() {
+    let found = outside_the_facet(
+        &["\"auth.json\""],
+        &[(
+            "cairn-models-subscriptions/src/signin/codex.rs",
+            "sign-in reads what its scratch `codex login` wrote",
+        )],
+    );
+    assert!(
+        found.is_empty(),
+        "a Codex auth file named outside sign-in; sign the app-server in with \
+         `Subscriptions::codex_session_login` instead:\n  {}",
+        found.join("\n  ")
+    );
+}
+
 /// A managed Claude account's refresh token is spent by Cairn's refresh
 /// authority alone; the CLIs it launches never hold one. A second caller of the
 /// token endpoint would be a second spender, and single-use refresh tokens make

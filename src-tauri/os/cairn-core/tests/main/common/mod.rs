@@ -20,9 +20,7 @@ use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::TestServicesBuilder;
-use cairn_core::internal::storage::{
-    DbError, DbResult, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS,
-};
+use cairn_core::internal::storage::{DbError, DbResult, LocalDb, RowExt, SearchIndex};
 use cairn_db::turso::params;
 use cairn_exec::blocking::offload;
 use cairn_exec::{AdmissionLimits, ExecutorRuntime, Fleet as ExecutorPool};
@@ -32,11 +30,7 @@ use tokio::sync::mpsc;
 
 pub async fn migrated_db() -> (TempDir, LocalDb) {
     let temp = tempdir().unwrap();
-    let db = LocalDb::open(temp.path().join("cairn.turso.db"))
-        .await
-        .unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
+    let db = LocalDb::open_migrated_for_test(temp.path().join("cairn.turso.db"))
         .await
         .unwrap();
     (temp, db)
@@ -49,20 +43,7 @@ pub async fn migrated_db() -> (TempDir, LocalDb) {
 /// several foreign targets, so neither `CAIRN_JJ_BIN` nor a prefix scan is a
 /// trustworthy first answer.
 fn jj_candidate() -> Option<PathBuf> {
-    let triple = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => "aarch64-apple-darwin",
-        ("macos", "x86_64") => "x86_64-apple-darwin",
-        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
-        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
-        ("windows", "aarch64") => "aarch64-pc-windows-msvc",
-        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
-        _ => return None,
-    };
-    let suffix = if cfg!(windows) { ".exe" } else { "" };
-    let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../binaries")
-        .join(format!("jj-{triple}{suffix}"));
-    if bundled.is_file() {
+    if let Some(bundled) = cairn_vcs::jj::testing::provisioned_jj() {
         return Some(bundled);
     }
 

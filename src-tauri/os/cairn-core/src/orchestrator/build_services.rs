@@ -2851,7 +2851,7 @@ mod tests {
     use super::*;
     use crate::db::DbState;
     use crate::services::testing::{MockChildProcess, MockProcessSpawner, TestServicesBuilder};
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use std::sync::Arc;
 
     const BUILD_SERVICE_CLIENT_ENV: &str = "CAIRN_BUILD_SERVICE_CLIENT";
@@ -4509,11 +4509,7 @@ Max cache size                       50 GiB
     }
 
     async fn test_orchestrator(config_dir: &Path) -> Orchestrator {
-        let local = LocalDb::open(config_dir.join("build-services.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        let local = LocalDb::open_migrated_for_test(config_dir.join("build-services.db"))
             .await
             .unwrap();
         let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());

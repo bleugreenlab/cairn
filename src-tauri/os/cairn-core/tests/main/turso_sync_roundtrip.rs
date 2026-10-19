@@ -27,9 +27,7 @@ use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::TestServicesBuilder;
 use cairn_core::internal::services::RealClock;
-use cairn_core::internal::storage::{
-    LocalDb, MigrationRunner, SearchIndex, TEAM_MIGRATIONS, TURSO_MIGRATIONS,
-};
+use cairn_core::internal::storage::{LocalDb, MigrationRunner, SearchIndex, TEAM_MIGRATIONS};
 use cairn_core::issues::crud as issue_crud;
 use cairn_core::models::CreateProject;
 use cairn_core::projects::crud;
@@ -216,9 +214,7 @@ async fn team_schema_trigger_row_syncs_without_refiring_on_receiver() {
 }
 
 async fn private_db_state(dir: &Path, name: &str) -> Arc<DbState> {
-    let db = LocalDb::open(dir.join(name)).await.unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
+    let db = LocalDb::open_migrated_for_test(dir.join(name))
         .await
         .unwrap();
     let search = SearchIndex::open_or_create(dir.join(format!("{name}.search"))).unwrap();

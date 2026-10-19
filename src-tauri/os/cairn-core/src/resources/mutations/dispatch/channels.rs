@@ -106,17 +106,14 @@ mod tests {
     use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
     use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use std::sync::Arc;
 
     async fn orchestrator() -> Orchestrator {
-        let local = LocalDb::open(tempfile::tempdir().unwrap().keep().join("t.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
-            .await
-            .unwrap();
+        let local =
+            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("t.db"))
+                .await
+                .unwrap();
         local
             .execute_script(
                 "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1);

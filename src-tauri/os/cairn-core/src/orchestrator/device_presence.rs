@@ -145,7 +145,7 @@ pub async fn list_device_presence(team_db: &LocalDb) -> Vec<DevicePresence> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MigrationRunner, TEAM_MIGRATIONS, TURSO_MIGRATIONS};
+    use crate::storage::{MigrationRunner, TEAM_MIGRATIONS};
 
     async fn team_db() -> LocalDb {
         let dir = tempfile::tempdir().unwrap().keep();
@@ -159,9 +159,7 @@ mod tests {
 
     async fn private_db() -> LocalDb {
         let dir = tempfile::tempdir().unwrap().keep();
-        let db = LocalDb::open(dir.join("private.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(dir.join("private.db"))
             .await
             .unwrap();
         db

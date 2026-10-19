@@ -164,7 +164,6 @@ mod tests {
         arm_watchdog, claim_watchdog_recovery, finish_watchdog_recovery, get_watchdog_lease,
         heartbeat_watchdog, NewWatchdogLease, WatchdogIdentity, WatchdogLeaseState, WatchdogPhase,
     };
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
 
     struct CountingRecovery {
         calls: AtomicUsize,
@@ -202,14 +201,10 @@ mod tests {
     async fn fixture(boot_id: &str) -> (Arc<LocalDb>, WatchdogIdentity) {
         let dir = tempfile::tempdir().unwrap().keep();
         let db = Arc::new(
-            LocalDb::open(dir.join("watchdog-reconciler.db"))
+            LocalDb::open_migrated_for_test(dir.join("watchdog-reconciler.db"))
                 .await
                 .unwrap(),
         );
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
         db.execute_batch(
             "PRAGMA foreign_keys = OFF;
              INSERT INTO sessions (id, chat_id, backend, status, sequence, created_at, updated_at)

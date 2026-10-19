@@ -59,7 +59,7 @@ pub(crate) async fn delete_issue(orch: &Orchestrator, issue_id: &str) -> Result<
 
     crate::execution::teardown::cleanup_issue_jobs(
         orch,
-        crate::execution::teardown::TeardownScope::Issue(issue_id.to_string()),
+        crate::execution::teardown::TeardownScope::DeletedIssue(issue_id.to_string()),
         // Deleting the issue is an explicit discard — remove branches as before.
         crate::execution::teardown::TeardownReason::Discarded,
     )

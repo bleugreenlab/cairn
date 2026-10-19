@@ -445,14 +445,23 @@ pub fn recover_provider_watchdog(
                     crate::execution::jobs::JobRunnable::Unknown,
                 ) {
                     Err(error) => {
+                        let reason = "post_tool_goal_reactivation_failed";
                         record_lifecycle(
                             db.clone(),
                             identity,
                             WatchdogLifecycleKind::TerminalizationFailed,
-                            Some("post_tool_goal_reactivation_failed"),
+                            Some(reason),
                             Some(serde_json::json!({ "error": error })),
                             now,
                         );
+                        // The interrupt already ended the exact turn; only the
+                        // goal's status is unknown. A failed read of it is
+                        // uncertainty, not proof the provider thread is dead, so
+                        // it must not spend recovery budget or kill the session.
+                        finish_recovery(db, identity, claimed_at, false, reason, None, now)?;
+                        return Ok(ProviderWatchdogRecovery::PreservedUncertain {
+                            reason: reason.to_string(),
+                        });
                     }
                     Ok(outcome) => {
                         let reason = match &outcome {

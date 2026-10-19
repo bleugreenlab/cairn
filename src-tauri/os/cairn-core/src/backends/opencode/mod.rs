@@ -512,7 +512,6 @@ impl AgentBackend for OpenCodeBackend {
         use crate::agent_process::toolkits;
         let mut allowed = toolkits::resolve_tools(agent_tools);
         toolkits::ensure_core_verbs(&mut allowed);
-        allowed.retain(|tool| tool != "apply_patch");
         ResolvedTools {
             allowed,
             disallowed: Vec::new(),

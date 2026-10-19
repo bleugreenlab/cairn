@@ -816,9 +816,11 @@ pub(crate) mod tests {
         // Should contain Cairn versions
         assert!(rt.allowed.contains(&"mcp__cairn__read".into()));
         assert!(rt.allowed.contains(&"mcp__cairn__run".into()));
-        // Native versions in disallowed
-        assert!(rt.disallowed.contains(&"Read".into()));
-        assert!(rt.disallowed.contains(&"Bash".into()));
+        // Native names are aliased away, and `--tools ""` keeps the built-ins
+        // off, so nothing needs disallowing by name.
+        assert!(!rt.allowed.contains(&"Read".into()));
+        assert!(!rt.allowed.contains(&"Bash".into()));
+        assert!(rt.disallowed.is_empty(), "{:?}", rt.disallowed);
     }
 
     #[test]
@@ -839,7 +841,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn claude_resolve_tools_drops_and_disallows_all_native() {
+    fn claude_resolve_tools_drops_every_native_name() {
         let backend = claude::ClaudeBackend;
         let native = [
             "Task",
@@ -852,6 +854,7 @@ pub(crate) mod tests {
             "LSP",
             "Skill",
             "NotebookEdit",
+            "FutureBuiltin",
         ];
         let input: Vec<String> = std::iter::once("Read".to_string())
             .chain(native.iter().map(|t| t.to_string()))
@@ -862,46 +865,54 @@ pub(crate) mod tests {
                 !rt.allowed.contains(&tool.to_string()),
                 "{tool} must be dropped from allowed"
             );
-            assert!(
-                rt.disallowed.contains(&tool.to_string()),
-                "{tool} must be in Claude's disallowed list"
-            );
         }
+        assert!(rt.disallowed.is_empty(), "{:?}", rt.disallowed);
         // Only the aliased read verb survives (the dead `return` tool is no
         // longer auto-added — CAIRN-2505).
         assert!(rt.allowed.contains(&"mcp__cairn__read".into()));
         assert!(!rt.allowed.contains(&"mcp__cairn__return".into()));
     }
 
-    /// Every name on the roster, driven from the roster itself.
-    ///
-    /// Each entry is there because Claude Code declares that built-in to the
-    /// model unless `--disallowedTools` names it, so the guarantee has to hold
-    /// for the whole list rather than for whichever names a test once copied.
-    /// The roster is fed in as agent config too: a stale config listing
-    /// `TodoWrite` or `EnterPlanMode` must still be stripped from `allowed`
-    /// (native `TodoWrite` would silently store nothing) rather than honoured.
+    /// No bare name reaches `allowed`, whether a planning or todo tool a stale
+    /// config still lists (native `TodoWrite` would silently store nothing), a
+    /// known host-harness built-in, or one no list has ever named. The
+    /// disallow list is exactly the agent's own MCP denials, sorted and
+    /// deduped, since `--tools ""` already keeps every built-in off.
     #[test]
-    fn claude_resolve_tools_blocks_every_always_disallowed_tool() {
+    fn claude_resolve_tools_never_allows_a_bare_name_and_disallows_only_the_agents_list() {
         let backend = claude::ClaudeBackend;
-        let agent_tools: Vec<String> = std::iter::once("Read".to_string())
-            .chain(
-                crate::models::ALWAYS_DISALLOWED_TOOLS
-                    .iter()
-                    .map(|t| t.to_string()),
-            )
-            .collect();
-        let rt = backend.resolve_tools(&agent_tools, &[]);
-        for tool in crate::models::ALWAYS_DISALLOWED_TOOLS {
-            assert!(
-                rt.disallowed.contains(&tool.to_string()),
-                "{tool} must be in Claude's disallowed list"
-            );
-            assert!(
-                !rt.allowed.contains(&tool.to_string()),
-                "{tool} must never be allowed, even when agent config lists it"
-            );
-        }
+        let agent_tools: Vec<String> = [
+            "Read",
+            "TodoWrite",
+            "EnterPlanMode",
+            "Monitor",
+            "SendMessage",
+            "FutureBuiltin",
+            "mcp__cairn__create_pr",
+        ]
+        .map(String::from)
+        .to_vec();
+        let agent_disallowed: Vec<String> = [
+            "mcp__cairn__update_issue",
+            "mcp__axon__look",
+            "mcp__cairn__update_issue",
+        ]
+        .map(String::from)
+        .to_vec();
+        let rt = backend.resolve_tools(&agent_tools, &agent_disallowed);
+        assert!(
+            rt.allowed.iter().all(|tool| tool.starts_with("mcp__")),
+            "{:?}",
+            rt.allowed
+        );
+        assert!(rt.allowed.contains(&"mcp__cairn__create_pr".into()));
+        assert_eq!(
+            rt.disallowed,
+            vec![
+                "mcp__axon__look".to_string(),
+                "mcp__cairn__update_issue".to_string()
+            ]
+        );
     }
 
     #[test]

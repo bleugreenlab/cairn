@@ -13,6 +13,8 @@ mod route_firings;
 mod row;
 mod runtime_admission;
 mod search_index;
+#[cfg(any(test, feature = "test-utils"))]
+mod test_template;
 
 pub mod authority;
 pub mod content_store;
@@ -108,12 +110,7 @@ pub use events::{
 pub async fn migrated_test_db(name: &str) -> LocalDb {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.keep().join(name);
-    let db = LocalDb::open(path).await.unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
-        .await
-        .unwrap();
-    db
+    LocalDb::open_migrated_for_test(path).await.unwrap()
 }
 
 pub mod outbox;

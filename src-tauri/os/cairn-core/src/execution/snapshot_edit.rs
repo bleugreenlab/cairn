@@ -335,3 +335,151 @@ async fn load_agent_job_sessions(
     .await
     .map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::models::{
+        ExecutionSnapshot, Fence, Model, ModelSelection, RecipeSnapshot, RecipeTrigger,
+        TriggerContext, TriggerType,
+    };
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    async fn orchestrator() -> Orchestrator {
+        let local = LocalDb::open(tempfile::tempdir().unwrap().keep().join("t.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        OrchestratorBuilder::new(
+            Arc::new(DbState::new(Arc::new(local), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build()
+    }
+
+    fn builder(model: &str) -> AgentSnapshot {
+        AgentSnapshot {
+            edited_at: None,
+            id: "builder".to_string(),
+            name: "builder".to_string(),
+            description: String::new(),
+            prompt: "prompt".to_string(),
+            tools: vec![],
+            tier: None,
+            backend_preference: None,
+            selection: Some(ModelSelection {
+                backend: "claude".to_string(),
+                model: Model::new(model),
+            }),
+            provider_account: None,
+            disallowed_tools: None,
+            skills: None,
+            fence: Some(Fence::Ask),
+            sandbox: None,
+            on_escape: None,
+            model: None,
+            resolved_backend: None,
+            extras: None,
+            seed_budget_tokens: None,
+            seed_eras: None,
+        }
+    }
+
+    fn snapshot_json(agent: AgentSnapshot) -> String {
+        let recipe = RecipeSnapshot {
+            id: "r".to_string(),
+            name: "R".to_string(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            nodes: vec![],
+            edges: vec![],
+        };
+        ExecutionSnapshot::new(
+            recipe,
+            HashMap::from([("builder".to_string(), agent)]),
+            HashMap::new(),
+            TriggerContext {
+                issue_id: Some("issue-1".to_string()),
+                project_id: "proj-1".to_string(),
+                trigger_type: TriggerType::Manual,
+                event_payload: None,
+                initiated_via: None,
+            },
+        )
+        .to_json()
+        .unwrap()
+    }
+
+    /// A job that has not opened a session yet carries a NULL
+    /// `current_session_id`. A model-carrying edit must treat that as "no session
+    /// to rotate": write the job's model and succeed. Reading the column as
+    /// required TEXT failed the edit after the snapshot had already been written.
+    #[tokio::test]
+    async fn a_model_edit_lands_on_a_job_that_has_no_session_yet() {
+        let orch = orchestrator().await;
+        let db = &orch.db.local;
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('proj-1','default','Cairn','cairn','/tmp/repo',1,1);
+             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+               VALUES ('issue-1','proj-1',1,'T','active',1,1);
+             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('exec-1','r','issue-1','proj-1','running',1,1);
+             INSERT INTO jobs (id, execution_id, issue_id, project_id, node_name, agent_config_id,
+                               status, model, current_session_id, created_at, updated_at, uri_segment)
+               VALUES ('job-1','exec-1','issue-1','proj-1','Builder','builder',
+                       'pending','claude-old',NULL,1,1,'builder');",
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE executions SET snapshot = ?1 WHERE id = 'exec-1'",
+            params![snapshot_json(builder("claude-old"))],
+        )
+        .await
+        .unwrap();
+
+        update_execution_agent(&orch, "exec-1", "builder", builder(Model::SONNET))
+            .await
+            .expect("a model edit to a session-less job succeeds");
+
+        let stored = db
+            .query_opt_text("SELECT snapshot FROM executions WHERE id = 'exec-1'", ())
+            .await
+            .unwrap()
+            .unwrap();
+        let stored = crate::config::snapshot_migrate::load(&stored).unwrap();
+        let edited = &stored.agents["builder"];
+        assert_eq!(
+            edited.selection.as_ref().map(|s| s.model.to_string()),
+            Some(Model::new(Model::SONNET).to_string()),
+            "the snapshot carries the edited model"
+        );
+        assert!(edited.edited_at.is_some(), "the edit is stamped");
+        assert_eq!(
+            db.query_opt_text("SELECT model FROM jobs WHERE id = 'job-1'", ())
+                .await
+                .unwrap(),
+            Some(Model::new(Model::SONNET).to_string()),
+            "the job's model follows the edit"
+        );
+        assert_eq!(
+            db.query_opt_text("SELECT current_session_id FROM jobs WHERE id = 'job-1'", ())
+                .await
+                .unwrap(),
+            None,
+            "no session is invented for a job that had none"
+        );
+    }
+}

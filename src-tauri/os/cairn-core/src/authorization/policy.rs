@@ -37,6 +37,8 @@ const CAPABILITY_BEARING_SETTINGS: &[&str] = &[
     "routeCallsViaOpenRouter",
     // Commands this workspace will execute on the host.
     "buildServices",
+    // Where the bginf token is sent: changing the URL redirects a credential.
+    "inference",
     // Outward-facing message delivery and the identity commits are attributed
     // to: both let a local change speak as the operator to the outside world.
     "channels",

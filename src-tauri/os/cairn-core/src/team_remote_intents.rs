@@ -559,6 +559,9 @@ mod tests {
     use super::*;
     use crate::storage::{MigrationRunner, TEAM_MIGRATIONS};
 
+    /// One issue with three running executions owned by different devices. An
+    /// issue has at most one canonical execution, so the two beside
+    /// `exec-owned` are declared `parallel` alternatives.
     async fn team_db() -> (tempfile::TempDir, LocalDb) {
         let temp = tempfile::tempdir().unwrap();
         let db = LocalDb::open(temp.path().join("team.turso.db"))
@@ -576,10 +579,10 @@ mod tests {
                VALUES('issue','project',1,'Issue','active',1,1);
              INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq,runner_device_id)
                VALUES('exec-owned','recipe','issue','project','running',1,1,'device-a');
-             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq,runner_device_id)
-               VALUES('exec-peer','recipe','issue','project','running',1,2,'device-b');
-             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq,runner_device_id)
-               VALUES('exec-null','recipe','issue','project','running',1,3,NULL);"
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq,runner_device_id,lifecycle)
+               VALUES('exec-peer','recipe','issue','project','running',1,2,'device-b','parallel');
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq,runner_device_id,lifecycle)
+               VALUES('exec-null','recipe','issue','project','running',1,3,NULL,'parallel');"
         ).await.unwrap();
         (temp, db)
     }

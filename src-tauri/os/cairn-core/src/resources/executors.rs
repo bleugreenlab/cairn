@@ -813,6 +813,10 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             (None, None) => "not reported".to_string(),
         }
     ));
+    out.push_str(&format!(
+        "- CLI build: {}\n",
+        render_cli_build(capabilities)
+    ));
     out.push('\n');
 
     out.push_str("## Placement telemetry\n");
@@ -3317,6 +3321,43 @@ fn describe_disposition(disposition: &cairn_common::executor_protocol::EdgeDispo
 /// absence intelligible: a per-user toolchain install belongs to one account, so
 /// the account a probe ran as is frequently the whole explanation for what it
 /// could and could not see.
+/// The `cairn` CLI this machine's cells resolve, by content, beside the
+/// executor's own build.
+///
+/// By digest because the version string cannot tell two builds apart: a CLI a
+/// month stale reported the same `cairn-cmd 0.12.34` as the runner's selection
+/// (cairn/5154). Not advertised means it is not the runner's selected build,
+/// and the detail says which build was found and, after a failed refresh, why
+/// it was not replaced.
+fn render_cli_build(capabilities: &ExecutorCapabilities) -> String {
+    let Some(probe) = capabilities
+        .toolchain_detection
+        .as_ref()
+        .and_then(|detection| {
+            detection.probes.iter().find(|probe| {
+                probe.toolchain == cairn_common::toolchain_requirements::CAIRN_CLI_TOOLCHAIN
+            })
+        })
+    else {
+        return "not reported by this executor".to_string();
+    };
+    let at = probe.resolved_path.as_deref().unwrap_or("not on PATH");
+    match (&probe.build_sha256, probe.detected) {
+        (Some(sha256), true) => format!("{sha256} at {at} ({})", probe.detail),
+        (Some(sha256), false) => format!(
+            "{sha256} at {at} — NOT the runner's selected CLI, so `cairn-cli` is not advertised: {}",
+            probe.detail
+        ),
+        (None, _) if probe.resolved_path.is_none() => {
+            format!("none — `cairn-cli` is not advertised: {}", probe.detail)
+        }
+        (None, _) => format!(
+            "not reported by this executor, which predates CLI build identity; {at}: {}",
+            probe.detail
+        ),
+    }
+}
+
 fn render_toolchain_probes(capabilities: &ExecutorCapabilities) -> String {
     let Some(detection) = &capabilities.toolchain_detection else {
         return "- Toolchain probes: not reported by this executor\n".to_string();
@@ -4375,6 +4416,7 @@ mod tests {
                 detected: false,
                 resolved_path: None,
                 detail: "could not run: program not found".into(),
+                build_sha256: None,
             }],
         }
     }
@@ -4389,8 +4431,62 @@ mod tests {
                 detected: true,
                 resolved_path: Some("C:\\Users\\mitch\\.cargo\\bin\\cargo.exe".into()),
                 detail: "cargo 1.97.1 (c980f4866 2026-06-30)".into(),
+                build_sha256: None,
             }],
         }
+    }
+
+    fn cli_probe(detected: bool, detail: &str) -> ToolchainDetection {
+        ToolchainDetection {
+            account: "dev".into(),
+            home: "/home/dev".into(),
+            probes: vec![ToolchainProbe {
+                toolchain: "cairn-cli".into(),
+                command: "cairn --version".into(),
+                detected,
+                resolved_path: Some("/home/dev/.cairn-exec/bin/cairn".into()),
+                detail: detail.into(),
+                build_sha256: Some("7704f2fdbef1b931".into()),
+            }],
+        }
+    }
+
+    /// The CLI build sits beside the executor's, so a machine whose cells
+    /// resolve a stale `cairn` is visible as one, digest and reason included.
+    #[test]
+    fn the_cli_build_is_rendered_beside_the_executor_build() {
+        let current = render_executor(&with_toolchains(
+            "fedora",
+            vec!["cairn-cli".into()],
+            Some(cli_probe(true, "cairn-cmd 0.12.34")),
+        ));
+        assert!(
+            current.contains(
+                "- Build: build-abc\n- CLI build: 7704f2fdbef1b931 at /home/dev/.cairn-exec/bin/cairn (cairn-cmd 0.12.34)\n"
+            ),
+            "{current}"
+        );
+
+        let stale = render_executor(&with_toolchains(
+            "fedora",
+            Vec::new(),
+            Some(cli_probe(
+                false,
+                "reports `cairn-cmd 0.12.34` as build 7704f2fdbef1b931, but the runner selected CLI build 58a011d42952966c",
+            )),
+        ));
+        assert!(
+            stale.contains(
+                "- CLI build: 7704f2fdbef1b931 at /home/dev/.cairn-exec/bin/cairn — NOT the runner's selected CLI, so `cairn-cli` is not advertised: reports `cairn-cmd 0.12.34` as build 7704f2fdbef1b931, but the runner selected CLI build 58a011d42952966c\n"
+            ),
+            "{stale}"
+        );
+
+        let unreported = render_executor(&with_toolchains("fedora", Vec::new(), None));
+        assert!(
+            unreported.contains("- CLI build: not reported by this executor\n"),
+            "{unreported}"
+        );
     }
 
     fn with_toolchains(
@@ -4495,6 +4591,7 @@ mod tests {
                 detected: false,
                 resolved_path: Some("C:\\Users\\other\\.cargo\\bin\\cargo.exe".into()),
                 detail: "exited 1: error: rustup could not choose a version of cargo to run".into(),
+                build_sha256: None,
             }],
         };
         let rendered = render_executor(&with_toolchains("bglab-win", Vec::new(), Some(detection)));

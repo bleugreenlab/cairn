@@ -1,9 +1,8 @@
 //! The read projection: a stored tenet plus what it means.
 //!
-//! Derived fields are computed here rather than stored: the adopted text and
-//! the rejected alternatives from `options` and `selected_option`, the
-//! successor from the other rows' `supersedes`, the gated executions from
-//! `execution_gates`, and the labels a surface prints beside a verdict.
+//! Derived fields are computed here rather than stored: the successor from the
+//! other rows' `supersedes`, the gated executions from `execution_gates`, and
+//! the labels a surface prints beside a verdict.
 
 use std::collections::HashMap;
 
@@ -12,13 +11,15 @@ use cairn_common::identity::PrincipalRef;
 use serde::Serialize;
 
 use super::policy::{release_label, TenetRelease};
-use super::{tenet_uri, AnswerSource, TenetOrigin, TenetRow, TenetStatus, TABLE, TENET_GATE_FACT};
+use super::{
+    tenet_uri, AnswerSource, TenetOrigin, TenetRow, TenetStatus, Verdict, TABLE, TENET_GATE_FACT,
+};
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
-const COLUMNS: &str = "t.id, t.project_id, t.number, t.proposing_thread_id, t.slug, t.question,
-    t.options_json, t.status, t.verdict, t.selected_option, t.comment, t.answered_by_json,
-    t.answer_source, t.answered_at, t.supersedes, t.origin, t.legacy_json,
-    t.contradiction_alerted_at, t.proposer_principal_json, t.created_at, t.updated_at";
+const COLUMNS: &str = "t.id, t.project_id, t.number, t.proposing_thread_id, t.slug, t.statement,
+    t.status, t.verdict, t.comment, t.answered_by_json, t.answer_source, t.answered_at,
+    t.supersedes, t.origin, t.legacy_json, t.contradiction_alerted_at,
+    t.proposer_principal_json, t.created_at, t.updated_at";
 
 /// A `SELECT` of every stored column from `tenets t` under `filter`.
 pub(super) fn select_sql(filter: &str) -> String {
@@ -39,23 +40,27 @@ fn json_column<T: serde::de::DeserializeOwned>(
 
 /// Decode one row selected with [`select_sql`].
 pub(super) fn decode(row: &cairn_db::turso::Row) -> DbResult<TenetRow> {
-    let status = row.text(7)?;
-    let origin = row.text(15)?;
-    let answer_source = row.opt_text(12)?;
+    let status = row.text(6)?;
+    let origin = row.text(13)?;
+    let answer_source = row.opt_text(10)?;
     Ok(TenetRow {
         id: row.text(0)?,
         project_id: row.text(1)?,
         number: row.i64(2)?,
         proposing_thread_id: row.text(3)?,
         slug: row.opt_text(4)?,
-        question: row.text(5)?,
-        options: json_column(Some(row.text(6)?), "options_json")?.unwrap_or_default(),
+        statement: row.text(5)?,
         status: TenetStatus::parse(&status)
             .ok_or_else(|| DbError::Row(format!("tenets.status: unknown {status}")))?,
-        verdict: row.opt_text(8)?,
-        selected_option: row.opt_i64(9)?.map(|index| index as usize),
-        comment: row.opt_text(10)?,
-        answered_by: json_column(row.opt_text(11)?, "answered_by_json")?,
+        verdict: match row.opt_text(7)? {
+            Some(verdict) => Some(
+                Verdict::parse(&verdict)
+                    .ok_or_else(|| DbError::Row(format!("tenets.verdict: unknown {verdict}")))?,
+            ),
+            None => None,
+        },
+        comment: row.opt_text(8)?,
+        answered_by: json_column(row.opt_text(9)?, "answered_by_json")?,
         answer_source: match answer_source {
             Some(source) => {
                 Some(AnswerSource::parse(&source).ok_or_else(|| {
@@ -64,16 +69,16 @@ pub(super) fn decode(row: &cairn_db::turso::Row) -> DbResult<TenetRow> {
             }
             None => None,
         },
-        answered_at: row.opt_i64(13)?,
-        supersedes: row.opt_i64(14)?,
+        answered_at: row.opt_i64(11)?,
+        supersedes: row.opt_i64(12)?,
         origin: TenetOrigin::parse(&origin)
             .ok_or_else(|| DbError::Row(format!("tenets.origin: unknown {origin}")))?,
-        legacy: json_column(row.opt_text(16)?, "legacy_json")?,
-        contradiction_alerted_at: row.opt_i64(17)?,
-        proposer: json_column(Some(row.text(18)?), "proposer_principal_json")?
+        legacy: json_column(row.opt_text(14)?, "legacy_json")?,
+        contradiction_alerted_at: row.opt_i64(15)?,
+        proposer: json_column(Some(row.text(16)?), "proposer_principal_json")?
             .ok_or_else(|| DbError::Row("tenets.proposer_principal_json: missing".into()))?,
-        created_at: row.i64(19)?,
-        updated_at: row.i64(20)?,
+        created_at: row.i64(17)?,
+        updated_at: row.i64(18)?,
     })
 }
 
@@ -188,10 +193,6 @@ pub struct TenetView {
     pub proposing_thread: String,
     /// The bare name of the proposing thread, when its row resolves.
     pub proposing_thread_name: Option<String>,
-    /// The adopted option, once the tenet is approved.
-    pub text: Option<String>,
-    /// The options the verdict did not adopt.
-    pub rejected: Vec<String>,
     /// The approved tenet that replaced this one.
     pub superseded_by: Option<i64>,
     /// Who answered, as it is always printed beside the verdict.
@@ -268,7 +269,7 @@ pub struct TenetFilter {
     pub statuses: Vec<TenetStatus>,
     pub thread_id: Option<String>,
     pub slug: Option<String>,
-    /// Case-insensitive substring of the question or any option.
+    /// Case-insensitive substring of the statement.
     pub search: Option<String>,
     /// Oldest first, the order an inbox is worked in. Newest first otherwise.
     pub oldest_first: bool,
@@ -377,8 +378,6 @@ async fn project_views(
                     None => row.proposing_thread_id.clone(),
                 },
                 proposing_thread_name: name,
-                text: row.text().map(str::to_string),
-                rejected: row.rejected().into_iter().map(str::to_string).collect(),
                 superseded_by: superseded_by.get(&row.number).copied(),
                 answerer_label: answerer_label(row.answer_source, row.answered_by.as_ref()),
                 policy_label: policy_label.clone(),
@@ -533,13 +532,9 @@ pub async fn list(
                 .slug
                 .as_deref()
                 .is_none_or(|slug| row.slug.as_deref() == Some(slug))
-            && search.as_deref().is_none_or(|needle| {
-                row.question.to_lowercase().contains(needle)
-                    || row
-                        .options
-                        .iter()
-                        .any(|option| option.to_lowercase().contains(needle))
-            })
+            && search
+                .as_deref()
+                .is_none_or(|needle| row.statement.to_lowercase().contains(needle))
     });
     if filter.oldest_first {
         rows.sort_by_key(|row| row.number);

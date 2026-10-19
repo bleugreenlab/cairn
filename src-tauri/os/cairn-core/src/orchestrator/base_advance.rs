@@ -1875,7 +1875,7 @@ async fn reconcile_jj_downstream(
             merged_job.project_id.clone(),
             repo_path.to_string(),
             base_branch.to_string(),
-            Some(merged_job.id.clone()),
+            crate::execution::checks_main::Trigger::Merge,
         );
         // The code map projects the base tree, so this merge is exactly what
         // makes the stored one describe a tree that is no longer the base.
@@ -2070,7 +2070,7 @@ pub(crate) async fn reconcile_default_advance(
         project_id.to_string(),
         repo_path.clone(),
         default_branch.to_string(),
-        None,
+        crate::execution::checks_main::Trigger::Merge,
     );
     // Same reasoning as the Cairn-merge path: an advance the webhook observed
     // moves the base the code map projects, whether or not Cairn drove it.
@@ -2623,6 +2623,7 @@ async fn retry_pending_materializations(orch: &Orchestrator, db: &LocalDb) {
                     classification: crate::jj::IncomingClassification::Conflicting,
                 })
                 .collect(),
+            scaffolding: None,
         };
         let (state, marker_diagnostic, dispositions) =
             materialize_markers_for_branch(orch, db, &session.project_id, &bookmark, &diagnostic)
@@ -4927,6 +4928,30 @@ fn marker_guidance(state: MarkerState, condition: crate::jj::ConflictCondition) 
     }
 }
 
+/// The guidance for a replay refused at export because the rebased tree carried
+/// jj conflict scaffolding, though jj recorded no conflict.
+///
+/// It must not read as "nothing to resolve": the branch did NOT take the new
+/// base, and a replay requested without new work meets the same tree. It names
+/// the refused commit and the entries so the agent (or an operator reading over
+/// its shoulder) can see exactly what was refused.
+fn scaffolding_guidance(refusal: &crate::jj::ScaffoldingRefusal, ours: Option<&str>) -> String {
+    let tip = ours.map(|ours| format!(" {ours}")).unwrap_or_default();
+    format!(
+        "\nThis rebase was REFUSED AT EXPORT, not by jj. jj reported the rebased commit {} as \
+         conflict-free, but its tree root carries jj conflict scaffolding ({}), and a tree like \
+         that cannot be materialized on any machine. It was never exported: your branch and its \
+         git ref stay on your last clean tip{tip}, and a `/rebase` session is open for this \
+         conflict at `cairn:~/rebase`. The files changed on both sides are where jj merged the \
+         two versions silently; read both versions of each through that session, commit any \
+         merged result your work needs with ordinary edits, then request the replay there. Never \
+         rebase or force-push by hand. If a replay meets the same refusal, the branch needs an \
+         operator to repair it in the store.",
+        refusal.commit,
+        refusal.entries.join(", ")
+    )
+}
+
 fn append_conflict_diagnostic(
     note: &str,
     diagnostic: Option<&crate::jj::ConflictDiagnostic>,
@@ -4951,15 +4976,17 @@ fn append_conflict_diagnostic(
         _ => String::new(),
     };
 
-    let guidance = match diagnostic.condition {
-        crate::jj::ConflictCondition::ContentConflict => {
+    let guidance = match (&diagnostic.scaffolding, diagnostic.condition) {
+        (Some(refusal), _) => scaffolding_guidance(refusal, diagnostic.ours.as_deref()),
+        (None, crate::jj::ConflictCondition::ContentConflict) => {
             "\nThis is a CONTENT CONFLICT: the two sides genuinely disagree. Read both versions of \
              each conflicting file, write the merged result with ordinary edits, and commit it on \
              your branch. Pull the clean-on-retry files across too if your resolution depends on \
              them — they are part of the same coordinated change and your branch will not compile \
              without them. Never rebase or force-push by hand."
+                .to_string()
         }
-        crate::jj::ConflictCondition::BaseDrift => {
+        (None, crate::jj::ConflictCondition::BaseDrift) => {
             "\nThis is BASE DRIFT, not a content conflict: every conflicting file is already \
              byte-identical between your branch and the new base, so there is nothing to merge and \
              editing will not clear it. What is stale is your branch's ANCESTRY, and you cannot \
@@ -4967,14 +4994,20 @@ fn append_conflict_diagnostic(
              downstream exports of the runner's private jj store, so no local ref move survives. \
              Ask the store to replay your branch instead: \
              write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"replay\"}}]})."
+                .to_string()
         }
+    };
+    let conflicting_label = if diagnostic.scaffolding.is_some() {
+        "Changed on both sides, merged by jj without a recorded conflict"
+    } else {
+        "Conflicting files, yours to merge"
     };
 
     format!(
         "{note}{}{}{coordinates}{guidance}{}\nThe complete session — both sides of the merge as \
          browsable patches, the whole incoming file set, and the sanctioned replay action — is at \
          `cairn:~/rebase`.",
-        render_incoming_group("Conflicting files, yours to merge", &conflicting),
+        render_incoming_group(conflicting_label, &conflicting),
         render_incoming_group("Also arriving with this change, cleanly on retry", &clean),
         marker_guidance(marker_state, diagnostic.condition),
     )
@@ -6813,6 +6846,7 @@ mod tests {
                     classification: crate::jj::IncomingClassification::CleanOnRetry,
                 },
             ],
+            scaffolding: None,
         };
         let incoming = IncomingIdentity {
             base_branch: "main".to_string(),
@@ -6905,6 +6939,7 @@ mod tests {
                 conflicted_tip: None,
                 condition: crate::jj::ConflictCondition::ContentConflict,
                 incoming: Vec::new(),
+                scaffolding: None,
             };
             fingerprints.push(diagnostic.fingerprint());
             record_conflict_session(
@@ -6961,6 +6996,7 @@ mod tests {
                 status: "M".to_string(),
                 classification: crate::jj::IncomingClassification::Conflicting,
             }],
+            scaffolding: None,
         }
     }
 
@@ -8091,6 +8127,52 @@ mod tests {
             .unwrap()
     }
 
+    /// A replay refused at export for conflict scaffolding tells the agent what
+    /// was refused and where the session is, and never that there is nothing to
+    /// resolve.
+    #[test]
+    fn a_scaffolding_refusal_names_the_commit_the_entries_and_the_open_session() {
+        let note = build_jj_conflict_note("main", Some(42), None);
+        let refused = "r".repeat(40);
+        let message = append_conflict_diagnostic(
+            &note,
+            Some(&crate::jj::ConflictDiagnostic {
+                base: Some("b".repeat(40)),
+                ours: Some("o".repeat(40)),
+                theirs: Some("t".repeat(40)),
+                conflicted_tip: Some(refused.clone()),
+                condition: crate::jj::ConflictCondition::ContentConflict,
+                incoming: vec![crate::jj::IncomingFile {
+                    path: "shared.rs".to_string(),
+                    status: "M".to_string(),
+                    classification: crate::jj::IncomingClassification::Conflicting,
+                }],
+                scaffolding: Some(crate::jj::ScaffoldingRefusal {
+                    commit: refused.clone(),
+                    entries: vec![
+                        ".jjconflict-base-0".to_string(),
+                        "JJ-CONFLICT-README".to_string(),
+                    ],
+                }),
+            }),
+            MarkerState::NotMaterialized,
+        );
+        assert!(message.contains(&refused), "{message}");
+        assert!(
+            message.contains(".jjconflict-base-0, JJ-CONFLICT-README"),
+            "{message}"
+        );
+        assert!(message.contains("a `/rebase` session is open"), "{message}");
+        assert!(message.contains("shared.rs"), "{message}");
+        assert!(message.contains(&"o".repeat(40)), "{message}");
+        assert!(!message.contains("nothing to resolve"), "{message}");
+        assert!(!message.contains("nothing to merge"), "{message}");
+        assert!(
+            !message.contains("the two sides genuinely disagree"),
+            "jj recorded no disagreement; the guidance must not claim one: {message}"
+        );
+    }
+
     /// The two conditions must give OPPOSITE advice, and the base-drift branch
     /// must not send an agent to edit files that already agree — the exact round
     /// CAIRN-3327 and CAIRN-3328 each burned.
@@ -8112,6 +8194,7 @@ mod tests {
                 conflicted_tip: None,
                 condition: crate::jj::ConflictCondition::BaseDrift,
                 incoming: incoming.clone(),
+                scaffolding: None,
             }),
             MarkerState::NotMaterialized,
         );
@@ -8138,6 +8221,7 @@ mod tests {
                 conflicted_tip: None,
                 condition: crate::jj::ConflictCondition::ContentConflict,
                 incoming,
+                scaffolding: None,
             }),
             MarkerState::NotMaterialized,
         );
@@ -8187,6 +8271,7 @@ mod tests {
                 status: "M".to_string(),
                 classification: crate::jj::IncomingClassification::Conflicting,
             }],
+            scaffolding: None,
         };
 
         let confirmed =
@@ -8613,6 +8698,7 @@ mod tests {
                         classification: crate::jj::IncomingClassification::CleanOnRetry,
                     },
                 ],
+                scaffolding: None,
             },
         );
 

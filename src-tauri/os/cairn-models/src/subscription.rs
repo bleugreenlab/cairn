@@ -380,6 +380,7 @@ pub mod testing {
 
     use crate::accounts::ProviderAuth;
     use crate::claude::tokens::{stored_claude_oauth, ClaudeOAuth};
+    use crate::codex::tokens::CodexRefreshFailureKind;
 
     /// Places managed Claude homes anywhere under `root`, and answers
     /// "signed in" from a marker file [`TempHomes::sign_in`] writes.
@@ -609,19 +610,27 @@ pub mod testing {
     /// next credential for the ChatGPT account the request names: the n-th
     /// renewal answers access token `at-<n+1>`, as for a session that started
     /// on `at-1`. One built [`RenewingCodex::refusing`] answers every renewal
-    /// as unrecoverable instead. Every other subscription question gets
-    /// [`Unsubscribed`]'s answer.
+    /// as unrecoverable instead, and one built [`RenewingCodex::refusing_as`]
+    /// as the failure kind it names. A session login presents the session's
+    /// current tokens, and only them, so a test sees which tokens a launch
+    /// signs in on; the real login's shape is built only by the private crate.
+    /// Every other subscription question gets [`Unsubscribed`]'s answer.
     #[derive(Debug, Clone, Default)]
     pub struct RenewingCodex {
         asked: Arc<Mutex<Vec<CodexRefreshRequest>>>,
-        refuse: bool,
+        refuse: Option<CodexRefreshFailureKind>,
     }
 
     impl RenewingCodex {
         /// An authority that can no longer renew the account.
         pub fn refusing() -> Self {
+            Self::refusing_as(CodexRefreshFailureKind::Unrecoverable)
+        }
+
+        /// An authority whose every renewal fails as `kind`.
+        pub fn refusing_as(kind: CodexRefreshFailureKind) -> Self {
             Self {
-                refuse: true,
+                refuse: Some(kind),
                 ..Self::default()
             }
         }
@@ -711,10 +720,15 @@ pub mod testing {
 
         fn codex_session_login(
             &self,
-            host: &dyn ModelHost,
+            _host: &dyn ModelHost,
             auth: &CodexAuthState,
         ) -> Result<Secret<Value>, String> {
-            Unsubscribed.codex_session_login(host, auth)
+            let (id_token, access_token) = auth.id_access_pair();
+            Ok(Secret::new(serde_json::json!({
+                "idToken": id_token,
+                "accessToken": access_token,
+                "chatgptAccountId": auth.chatgpt_account_id(),
+            })))
         }
 
         fn refresh_codex(
@@ -735,9 +749,10 @@ pub mod testing {
                 label: "Renewing Codex".to_string(),
                 email: None,
             };
-            if self.refuse {
-                return Err(CodexRefreshFailure::unrecoverable(
+            if let Some(kind) = self.refuse {
+                return Err(CodexRefreshFailure::new(
                     Some(&account),
+                    kind,
                     "the scripted authority renews nothing",
                 ));
             }

@@ -1841,7 +1841,7 @@ pub fn continue_job_or_enqueue(
     message: Option<&str>,
     identity_override: Option<crate::identity::UserIdentity>,
     request_id: Option<&str>,
-) -> Result<Run, String> {
+) -> Result<Option<Run>, String> {
     continue_job_or_enqueue_inner(orch, job_id, message, identity_override, request_id, || {})
 }
 
@@ -1875,7 +1875,7 @@ fn continue_job_or_enqueue_inner(
     identity_override: Option<crate::identity::UserIdentity>,
     request_id: Option<&str>,
     before_resume: impl FnOnce(),
-) -> Result<Run, String> {
+) -> Result<Option<Run>, String> {
     // Only a message-bearing send can be queued; a bare continue has nothing to
     // enqueue, so it falls straight through to the resume (and its guard).
     if let Some(text) = message.filter(|m| !m.trim().is_empty()) {
@@ -1898,11 +1898,17 @@ fn continue_job_or_enqueue_inner(
         );
         before_resume();
 
+        // The durable row is the acknowledgement, so nothing after it may report
+        // failure: the message is already accepted and the nudge below delivers
+        // it. The job's latest run rides along for callers keyed on runs, and a
+        // session that has never taken a turn — a freshly minted thread session —
+        // has none.
         let latest = crate::runs::queries::list_runs_for_job(owning_db, job_id)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .next()
-            .ok_or_else(|| "queued continuation has no run row".to_string())?;
+            .map(|runs| runs.into_iter().next())
+            .unwrap_or_else(|error| {
+                log::warn!("queued continuation for job {job_id}: listing runs failed: {error}");
+                None
+            });
         let orch = orch.clone();
         let job_id = job_id.to_string();
         std::thread::spawn(move || {
@@ -1927,6 +1933,7 @@ fn continue_job_or_enqueue_inner(
             ..Default::default()
         }),
     )
+    .map(Some)
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -1936,7 +1943,7 @@ pub fn continue_job_or_enqueue_with_before_resume_for_test(
     message: Option<&str>,
     request_id: &str,
     before_resume: impl FnOnce(),
-) -> Result<Run, String> {
+) -> Result<Option<Run>, String> {
     continue_job_or_enqueue_inner(orch, job_id, message, None, Some(request_id), before_resume)
 }
 
@@ -2119,8 +2126,8 @@ fn continue_job_impl_with_intent(
     let resume_id = ids::mint_child(job_id);
     // A closed thread takes no new turns, and this is the boundary that decides
     // what a turn is. Everything else dormancy gates — a prompt, a wake, a queued
-    // push — exists to reach this function, and the desktop composer reaches it
-    // WITHOUT them: it holds the session job id and resumes it directly, so a gate
+    // push — exists to reach this function, and the desktop's resume controls
+    // reach it WITHOUT them: they hold the session job id and resume it directly, so a gate
     // anywhere upstream would leave the app's own send path ungated and make the
     // read-only composer the enforcement rather than the courtesy it should be.
     // Taken before the launch lock so a refused resume touches nothing.

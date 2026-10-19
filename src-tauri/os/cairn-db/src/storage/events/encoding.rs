@@ -1,6 +1,7 @@
 //! The single encode/decode contract over the archival `events` columns.
 //!
-//! The teardown writer (`crate::archival::rewrite`) and the read-path reader
+//! The archival writer (`crate::archival::rewrite`, run at issue teardown and by
+//! the recurring sweep) and the read-path reader
 //! ([`super::reconstruct`]) speak exactly one private contract over six event
 //! columns. Holding it in one enum keeps the two sides from drifting: the writer
 //! encodes a shape to columns and the reader decodes columns back to a shape, so

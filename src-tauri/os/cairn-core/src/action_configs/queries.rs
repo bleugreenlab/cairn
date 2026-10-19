@@ -431,16 +431,13 @@ pub async fn delete_action_config(db: &LocalDb, id: &str) -> Result<(), String> 
 mod tests {
     use super::*;
     use crate::models::CreateActionConfig;
-    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, MigrationRunner};
 
     async fn db() -> LocalDb {
-        let db = LocalDb::open(tempfile::tempdir().unwrap().keep().join("actions.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
+        let db =
+            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("actions.db"))
+                .await
+                .unwrap();
         db
     }
 

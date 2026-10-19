@@ -432,7 +432,7 @@ async fn list_calls(db: &LocalDb, node_job_id: &str) -> Result<Vec<WorkflowCall>
 mod tests {
     use super::super::append_entry;
     use super::*;
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+
     use tempfile::tempdir;
 
     fn call(phase: &str, status: &str, started: i64) -> WorkflowCall {
@@ -516,11 +516,7 @@ mod tests {
 
     async fn test_db() -> LocalDb {
         let temp = tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("workflow-monitor.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("workflow-monitor.db"))
             .await
             .unwrap();
         db

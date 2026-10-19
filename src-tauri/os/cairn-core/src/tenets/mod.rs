@@ -1,10 +1,11 @@
 //! Tenets: the human checkpoint for threads.
 //!
-//! A thread proposes a question with one to five options, option 1 being its
-//! own recommendation, and the operator answers with an option, `none`, or
-//! `your_call` (which adopts option 1). The answered tenet's text is
-//! `options[selected_option]` and its rejected alternatives are the other
-//! options; neither is stored twice.
+//! A thread proposes a statement of how the project does things, and the
+//! operator answers `yes`, `no`, or `your_call`. `your_call` approves exactly
+//! as `yes` does; it is kept apart because it records that the operator simply
+//! trusted the thread, which calibrates how far a thread is trusted. A thread
+//! that wants the alternatives it rejected on record writes them into the
+//! statement.
 //!
 //! A tenet is immutable once proposed. The only transitions are the proposing
 //! thread withdrawing an unanswered proposal, the operator answering one, and a
@@ -56,11 +57,9 @@ pub const TABLE: &str = "tenets";
 /// projection's `gates` field finds executions through it.
 pub const TENET_GATE_FACT: &str = "tenet_verdict";
 
-pub const MAX_OPTIONS: usize = 5;
-
-/// The ceiling on a proposal's question plus all of its options, in
-/// characters. A proposal is read by the operator in one glance; the reasoning
-/// behind it belongs in the issue it gates.
+/// The ceiling on a proposal's statement, in characters. A proposal is read
+/// by the operator in one glance; the reasoning behind it belongs in the issue
+/// it gates.
 pub const MAX_PROPOSAL_CHARS: usize = 1500;
 
 pub const OVER_LENGTH_REFUSAL: &str =
@@ -71,7 +70,18 @@ pub const IMMUTABLE_REFUSAL: &str = "tenets are immutable; withdraw and propose 
 
 /// Why an agent cannot record a verdict, and where the operator records one.
 pub const AGENT_VERDICT_REFUSAL: &str =
-    "verdicts belong to the operator: a tenet is answered in the Tenets tab of the desktop app, never by an agent";
+    "verdicts belong to the operator: a tenet is answered in the desktop app, from the Tenets tab or the proposal's card in the chat, never by an agent";
+
+/// The refusal for a proposal in the retired question-with-options shape,
+/// with `prefix` naming where the proposal sits in the payload (`payload.`,
+/// `payload.execution.proposal.`).
+pub fn retired_proposal_shape_refusal(prefix: &str) -> String {
+    format!(
+        "a tenet is one statement the operator answers yes or no: send {prefix}statement, \
+         \"this is how we do things\", in place of `question` and `options`, which are retired. \
+         Alternatives you ruled out belong in the statement's own words."
+    )
+}
 
 /// The refusal for changing a tenet that already has a verdict: the change is
 /// a new tenet that supersedes it.
@@ -205,50 +215,49 @@ impl AnswerSource {
 }
 
 /// The operator's answer to a proposal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Verdict {
-    /// Option `k`, 1-based as the operator reads it.
-    Option(usize),
-    /// None of the options: the tenet is declined.
-    None,
-    /// The operator defers to the thread, which adopts its recommendation,
-    /// option 1.
+    /// This is how we do things: the tenet is approved.
+    Yes,
+    /// It is not: the tenet is declined.
+    No,
+    /// Approved on the thread's judgment rather than the operator's own.
     YourCall,
 }
 
 impl Verdict {
-    /// The stored `verdict` column.
-    pub fn kind(self) -> &'static str {
+    pub const ALL: [Verdict; 3] = [Verdict::Yes, Verdict::No, Verdict::YourCall];
+
+    /// The stored `verdict` column, and how every payload spells it.
+    pub fn as_str(self) -> &'static str {
         match self {
-            Verdict::Option(_) => "option",
-            Verdict::None => "none",
+            Verdict::Yes => "yes",
+            Verdict::No => "no",
             Verdict::YourCall => "your_call",
         }
     }
 
-    /// A verdict as a payload spells it: an option number (`2` or `"2"`),
-    /// `"none"`, or `"your_call"`.
-    pub fn from_value(value: &serde_json::Value) -> Result<Self, String> {
-        const SHAPE: &str =
-            "verdict must be an option number (1-based), \"none\", or \"your_call\"";
-        match value {
-            serde_json::Value::Number(number) => number
-                .as_u64()
-                .filter(|k| *k >= 1)
-                .map(|k| Verdict::Option(k as usize))
-                .ok_or_else(|| SHAPE.to_string()),
-            serde_json::Value::String(text) => match text.trim() {
-                "none" => Ok(Verdict::None),
-                "your_call" => Ok(Verdict::YourCall),
-                digits => digits
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|k| *k >= 1)
-                    .map(Verdict::Option)
-                    .ok_or_else(|| SHAPE.to_string()),
-            },
-            _ => Err(SHAPE.to_string()),
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|verdict| verdict.as_str() == value)
+    }
+
+    /// The status this verdict gives a proposal.
+    pub fn status(self) -> TenetStatus {
+        match self {
+            Verdict::Yes | Verdict::YourCall => TenetStatus::Approved,
+            Verdict::No => TenetStatus::Declined,
         }
+    }
+
+    /// A verdict as a payload spells it: `"yes"`, `"no"`, or `"your_call"`.
+    pub fn from_value(value: &serde_json::Value) -> Result<Self, String> {
+        value
+            .as_str()
+            .and_then(|text| Self::parse(text.trim()))
+            .ok_or_else(|| "verdict must be \"yes\", \"no\", or \"your_call\"".to_string())
     }
 }
 
@@ -261,12 +270,10 @@ pub struct TenetRow {
     pub number: i64,
     pub proposing_thread_id: String,
     pub slug: Option<String>,
-    pub question: String,
-    pub options: Vec<String>,
+    /// What the tenet says: how the project does things.
+    pub statement: String,
     pub status: TenetStatus,
-    pub verdict: Option<String>,
-    /// 0-based.
-    pub selected_option: Option<usize>,
+    pub verdict: Option<Verdict>,
     pub comment: Option<String>,
     pub answered_by: Option<PrincipalRef>,
     pub answer_source: Option<AnswerSource>,
@@ -278,29 +285,6 @@ pub struct TenetRow {
     pub proposer: PrincipalRef,
     pub created_at: i64,
     pub updated_at: i64,
-}
-
-impl TenetRow {
-    /// The adopted text: the selected option, when one was selected.
-    pub fn text(&self) -> Option<&str> {
-        self.selected_option
-            .and_then(|index| self.options.get(index))
-            .map(String::as_str)
-    }
-
-    /// Every option the verdict did not adopt. For a declined tenet that is
-    /// all of them; for an unanswered one, none yet.
-    pub fn rejected(&self) -> Vec<&str> {
-        if !self.status.has_verdict() {
-            return Vec::new();
-        }
-        self.options
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| Some(*index) != self.selected_option)
-            .map(|(_, option)| option.as_str())
-            .collect()
-    }
 }
 
 /// Record the operator's verdict ([`answer`]) and rouse the proposing thread

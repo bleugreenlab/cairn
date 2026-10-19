@@ -12,16 +12,38 @@
 //! orchestrator decides when it runs, under which locks, and what it records;
 //! everything here takes paths and returns counts.
 //!
-//! The pass mirrors `jj util gc` from the pinned jj 0.42 with one deliberate
-//! difference. jj finishes with a bare `git gc --prune=<keep_newer>`, and a bare
-//! `git gc` also expires reflogs and prunes worktree records. The backing
-//! repository is the operator's own working checkout, so the collection here
-//! runs `git gc` with reflog expiry, worktree pruning, and ref packing all
-//! disabled: it never runs `reflog expire`, never passes `--aggressive` or
-//! `--prune=now`, and leaves `refs/stash` and every `refs/heads/*` exactly as it
-//! found them. Commits older than the window that nothing references any more
-//! (rewritten or abandoned history) stop resolving by design; anything a ref or
-//! reflog reaches survives regardless of age.
+//! The pass mirrors `jj util gc` from the pinned jj 0.42 except for its last
+//! step. jj finishes with a bare `git gc --prune=<keep_newer>`, which also
+//! expires reflogs and prunes worktree records in what is here the operator's
+//! own working checkout, and which repacks the whole object database into one
+//! pack (28 minutes on the Cairn project). The object database is maintained by
+//! two `git repack` steps instead:
+//!
+//! - [`compact_object_store`] rolls small packs up geometrically and writes a
+//!   multi-pack index. It never deletes an object, so it runs on its own cadence
+//!   whenever git's own thresholds trip.
+//! - [`reclaim_unreachable_objects`] is the only step that drops objects: a cruft
+//!   repack, which drops packed unreferenced objects older than the window, then
+//!   `git prune`, which drops loose ones. Geometric compaction packs every loose
+//!   object, referenced or not, and `git prune` only ever looks at loose
+//!   objects, so without the cruft repack packed garbage would never be
+//!   reclaimed at all.
+//!
+//! An unreferenced object's age is its loose file's mtime, or, once packed, the
+//! mtime of the pack holding it; a cruft pack then records that age per object
+//! and carries it forward. Compaction writes fresh packs, so it restamps every
+//! unreferenced object it rolls up. Retention is therefore at least the window
+//! from an object's last repack outside a cruft pack, not from when it was
+//! written: garbage that compaction packed survives the next reclaim (into a
+//! cruft pack, which compaction leaves alone) and is dropped by the one after.
+//!
+//! Neither runs `reflog expire` or prunes worktrees, and both walk from every
+//! ref, reflog, and index, so `refs/stash`, every `refs/heads/*`, and their
+//! reflogs keep everything they reach regardless of age. Commits older than the
+//! window that nothing references any more (rewritten or abandoned history)
+//! stop resolving by design. The reclaim must run after
+//! [`collect_store_garbage`] has recreated the keep refs, so that every hidden
+//! commit inside the window is reachable when it walks.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -164,6 +186,230 @@ fn count_loose_refs(dir: &Path, prefix: &str, census: &mut RefStoreCensus) -> Re
         }
     }
     Ok(())
+}
+
+/// The shape of a repository's object database, taken without any lock and
+/// without spawning git.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObjectStoreCensus {
+    /// `.pack` files under `objects/pack`, kept and cruft packs included.
+    pub packs: u64,
+    /// Packs with a `.keep` beside them. Cairn's own are the delta pins a
+    /// publication holds until its tree is committed into jj; no repack rewrites
+    /// or deletes a kept pack.
+    pub kept_packs: u64,
+    /// Packs with a `.mtimes` beside them: cruft packs, which hold unreferenced
+    /// objects with each object's own modification time.
+    pub cruft_packs: u64,
+    /// Bytes of the `.pack` files themselves; their indexes are not counted.
+    pub pack_bytes: u64,
+    /// Loose objects, estimated the way `git gc --auto` estimates them: the
+    /// entries of `objects/17` times 256. Listing every loose object directory
+    /// of a store holding 668k of them is what this census avoids.
+    pub loose_objects: u64,
+    /// Whether `objects/pack/multi-pack-index` exists.
+    pub multi_pack_index: bool,
+}
+
+/// Measure a repository's object database from one listing of `objects/pack`
+/// and one of `objects/17`.
+pub fn census_object_store(git_dir: &Path) -> Result<ObjectStoreCensus, String> {
+    let objects = git_dir.join("objects");
+    let pack_dir = objects.join("pack");
+    let mut census = ObjectStoreCensus::default();
+    let mut names = HashSet::new();
+    let mut packs = Vec::new();
+    match std::fs::read_dir(&pack_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry =
+                    entry.map_err(|error| format!("list {}: {error}", pack_dir.display()))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(stem) = name.strip_suffix(".pack") {
+                    // A pack another repack unlinked between the listing and the
+                    // stat is simply gone; it is not an error in the census.
+                    let bytes = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+                    packs.push((stem.to_string(), bytes));
+                }
+                names.insert(name);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("list {}: {error}", pack_dir.display())),
+    }
+    for (stem, bytes) in packs {
+        census.packs += 1;
+        census.pack_bytes += bytes;
+        if names.contains(&format!("{stem}.keep")) {
+            census.kept_packs += 1;
+        }
+        if names.contains(&format!("{stem}.mtimes")) {
+            census.cruft_packs += 1;
+        }
+    }
+    census.multi_pack_index = names.contains("multi-pack-index");
+
+    let sample = objects.join("17");
+    match std::fs::read_dir(&sample) {
+        Ok(entries) => {
+            let loose = entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.len() == 38 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .count() as u64;
+            census.loose_objects = loose * 256;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("list {}: {error}", sample.display())),
+    }
+    Ok(census)
+}
+
+/// What one repack of the object database did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObjectStoreCompaction {
+    pub before: ObjectStoreCensus,
+    pub after: ObjectStoreCensus,
+    pub duration: Duration,
+}
+
+/// Roll the repository's small packs up into a geometric progression and write
+/// a multi-pack index: `git repack --geometric=2 -d -n --write-midx`.
+///
+/// The large base pack is left alone: a pack is rewritten only when it is less
+/// than half the size of the packs below it combined, so the work is
+/// proportional to what was written since the last pass, not to the store.
+///
+/// It never drops an object, which is what lets it run beside every other
+/// reader and writer without a lock or a confirmation. Packs it replaces are
+/// deleted only after the new pack and index are in place; git and gix (jj)
+/// both re-scan the pack directory when an object they look up is missing, and
+/// a deleted pack a reader already has mapped stays readable on Unix until it
+/// is unmapped. Kept packs are neither rolled up nor deleted (git's default
+/// without `--pack-kept-objects`), so a publication's in-flight delta pin is
+/// safe; its pack is rolled up on a later pass, once the pin is released.
+///
+/// `-n` skips `update-server-info`, which would otherwise rewrite `info/refs`
+/// naming every ref in the store; bitmaps are off because nothing here serves
+/// fetches.
+///
+/// One consequence callers must know: `--geometric` packs every loose object,
+/// whether anything references it or not. Unreferenced objects therefore move
+/// into packs before they age out of the retention window, after which
+/// `git prune` never finds them; only [`reclaim_unreachable_objects`] drops
+/// them.
+pub fn compact_object_store(git_dir: &Path) -> Result<ObjectStoreCompaction, String> {
+    require_git(
+        git_dir,
+        (2, 34),
+        "geometric compaction with a multi-pack index",
+    )?;
+    run_repack(
+        git_dir,
+        &["--geometric=2".to_string()],
+        "git repack --geometric",
+    )
+}
+
+/// Repack the whole object database, dropping unreferenced objects older than
+/// `keep_newer`: `git repack --cruft --cruft-expiration=<keep_newer> -d -n
+/// --write-midx`, then `git prune --expire=<keep_newer>`, the two steps
+/// `git gc --cruft` runs.
+///
+/// Every object reachable from any ref, any reflog, or any worktree's index goes
+/// into the new main pack, so the operator's branches, stash, and reflogs keep
+/// everything they reach regardless of age. Unreferenced objects younger than
+/// the cutoff go into a cruft pack that records each one's age (see the module
+/// doc for what restamps it); older packed ones are dropped. The repack leaves
+/// expired unreferenced *loose* objects where they are, so `git prune`, which
+/// walks the same refs, reflogs, and index, deletes those. Neither expires a
+/// reflog or prunes a worktree, so neither needs configuration to leave them
+/// alone. Kept packs are left in place.
+///
+/// This rewrites the base pack, so it takes as long as a full `git gc`. It is
+/// the only step that removes objects, and the caller gates and schedules it
+/// accordingly.
+pub fn reclaim_unreachable_objects(
+    git_dir: &Path,
+    keep_newer: SystemTime,
+) -> Result<ObjectStoreCompaction, String> {
+    require_git(git_dir, (2, 37), "a cruft reclaim of unreferenced objects")?;
+    let keep_newer = keep_newer
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut step = run_repack(
+        git_dir,
+        &[
+            "--cruft".to_string(),
+            format!("--cruft-expiration=@{keep_newer} +0000"),
+        ],
+        "git repack --cruft",
+    )?;
+    let started = Instant::now();
+    git_capture(
+        git_dir,
+        &["prune", &format!("--expire=@{keep_newer} +0000")],
+        "git prune",
+    )?;
+    step.duration += started.elapsed();
+    step.after = census_object_store(git_dir)?;
+    Ok(step)
+}
+
+fn run_repack(
+    git_dir: &Path,
+    mode: &[String],
+    context: &str,
+) -> Result<ObjectStoreCompaction, String> {
+    let before = census_object_store(git_dir)?;
+    let started = Instant::now();
+    let output = cairn_platform::env::git()
+        .args(["--git-dir=.", "-c", "repack.writeBitmaps=false", "repack"])
+        .args(mode)
+        .args(["-d", "-n", "--write-midx", "--quiet"])
+        .current_dir(git_dir)
+        .output()
+        .map_err(|error| format!("start {context}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{context}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let duration = started.elapsed();
+    Ok(ObjectStoreCompaction {
+        before,
+        after: census_object_store(git_dir)?,
+        duration,
+    })
+}
+
+/// Refuse, naming the version found, when the git these steps spawn is older
+/// than the one that introduced the options they pass.
+fn require_git(git_dir: &Path, minimum: (u32, u32), what: &str) -> Result<(), String> {
+    let reported = git_capture(git_dir, &["version"], "read the git version")?;
+    match parse_git_version(&reported) {
+        Some(found) if found >= minimum => Ok(()),
+        Some((major, minor)) => Err(format!(
+            "{what} needs git {}.{} or later, and the git on this machine's PATH is {major}.{minor}",
+            minimum.0, minimum.1
+        )),
+        None => Err(format!(
+            "{what}: could not read a version from `git version` (`{}`)",
+            reported.trim()
+        )),
+    }
+}
+
+/// `(major, minor)` from `git version 2.39.5 (Apple Git-154)` and its kin.
+fn parse_git_version(reported: &str) -> Option<(u32, u32)> {
+    let version = reported.trim().strip_prefix("git version ")?;
+    let mut parts = version.split(|c: char| !c.is_ascii_digit());
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
 /// How many operations the store's operation log holds, by counting its files.
@@ -432,16 +678,17 @@ pub struct StoreGarbageCollection {
     pub keep_refs_locked: u64,
     pub op_store_gc: Duration,
     pub ref_phase: Duration,
-    pub git_gc: Duration,
 }
 
-/// Garbage-collect the store and its backing repository, keeping every
-/// operation and object newer than `keep_newer`.
+/// Garbage-collect the store, keeping every operation newer than `keep_newer`.
 ///
-/// The same three phases as jj 0.42's `jj util gc`: unreachable operations and
-/// views, then the keep refs (recreated for the index heads only), then Git
-/// objects. Each phase protects what was written recently by mtime, which is
-/// what lets it run beside other writers without the store lock.
+/// The first two of jj 0.42's `jj util gc` phases: unreachable operations and
+/// views, then the keep refs (recreated for the index heads only) and the
+/// commit metadata table. Each protects what was written recently by mtime,
+/// which is what lets it run beside other writers without the store lock. The
+/// third phase, Git objects, is [`reclaim_unreachable_objects`], which the
+/// caller runs after this so every hidden commit inside the window has its
+/// keep ref when the repack walks.
 ///
 /// Keep refs get their own, much shorter, grace (`keep_refs_newer`). jj spares a
 /// young loose keep ref because the commit it protects may belong to an
@@ -505,10 +752,6 @@ async fn collect_store_garbage_inner(
         .gc(&extras_head, keep_newer)
         .map_err(|error| format!("collect the commit metadata table: {error}"))?;
     report.ref_phase = started.elapsed();
-
-    let started = Instant::now();
-    run_git_gc(&git_dir, keep_newer)?;
-    report.git_gc = started.elapsed();
     Ok(report)
 }
 
@@ -669,52 +912,6 @@ fn update_refs(git_dir: &Path, transaction: &str) -> Result<(), String> {
         ))
     }
 }
-
-/// `git gc --auto` that honours the operator's reflogs and worktrees.
-///
-/// Reflog expiry and worktree pruning are what a bare `git gc` adds on top of
-/// object collection, and both reach into state the operator owns. Ref packing
-/// is off too: the keep-ref transactions already shrank `packed-refs`, and
-/// leaving the remaining refs loose keeps every later rewrite of it small.
-///
-/// `--auto` because a full gc repacks the whole object store every time; on
-/// the first pass over this project that took 28 minutes. With `--auto` git
-/// consolidates only when its own loose-object and pack-count thresholds trip,
-/// and respects an operator who turned automatic gc off with `gc.auto=0`.
-fn run_git_gc(git_dir: &Path, keep_newer: SystemTime) -> Result<(), String> {
-    let keep_newer = keep_newer
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let output = cairn_platform::env::git()
-        .arg("--git-dir=.")
-        .args(GIT_GC_CONFIG.iter().flat_map(|setting| ["-c", setting]))
-        .args([
-            "gc",
-            "--auto",
-            "--quiet",
-            &format!("--prune=@{keep_newer} +0000"),
-        ])
-        .current_dir(git_dir)
-        .output()
-        .map_err(|error| format!("start git gc: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "git gc: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-const GIT_GC_CONFIG: [&str; 5] = [
-    "gc.reflogExpire=never",
-    "gc.reflogExpireUnreachable=never",
-    "gc.worktreePruneExpire=never",
-    "gc.packRefs=false",
-    "gc.autoDetach=false",
-];
 
 fn git_capture(git_dir: &Path, args: &[&str], context: &str) -> Result<String, String> {
     let output = cairn_platform::env::git()
@@ -1051,6 +1248,7 @@ mod tests {
             );
             let future = SystemTime::now() + Duration::from_secs(60);
             collect_store_garbage(&fx.store, future, future).unwrap();
+            reclaim_unreachable_objects(&fx.git_dir(), future).unwrap();
         }
         assert_eq!(
             bookmark_commit(&fx.jj, &fx.store, branch).as_deref(),
@@ -1091,6 +1289,9 @@ mod tests {
             gc.keep_refs_removed > 0,
             "pre-cut rewrites lost their keep refs: {gc:?}"
         );
+        // Every hidden head kept its keep ref, so a reclaim that drops every
+        // unreferenced object, whatever its age, loses nothing jj can name.
+        reclaim_unreachable_objects(&fx.git_dir(), future).unwrap();
 
         let keep = list_refs(&fx.git_dir(), "refs/jj/keep/").unwrap();
         assert_eq!(
@@ -1136,17 +1337,316 @@ mod tests {
             .expect("the store's working copy names an operation that still exists");
     }
 
-    /// The backing repository is the operator's own checkout. The collection
-    /// must leave reflogs, the stash, and every branch exactly as it found
-    /// them, and still prune what nothing reaches.
+    fn object_exists(repo: &Path, object: &str) -> bool {
+        cairn_platform::env::git()
+            .args(["cat-file", "-e", object])
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    fn loose_object_path(git_dir: &Path, object: &str) -> PathBuf {
+        git_dir
+            .join("objects")
+            .join(&object[..2])
+            .join(&object[2..])
+    }
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    /// Write a blob nothing references, its loose file dated `age` ago.
+    fn aged_dangling_blob(repo: &Path, git_dir: &Path, content: &str, age: Duration) -> String {
+        std::fs::write(repo.join("aged.txt"), content).unwrap();
+        let blob = git_stdout(repo, &["hash-object", "-w", "aged.txt"]);
+        std::fs::remove_file(repo.join("aged.txt")).unwrap();
+        // git writes loose objects read-only; setting an explicit time needs
+        // only ownership, not a writable handle.
+        std::fs::File::open(loose_object_path(git_dir, &blob))
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+        blob
+    }
+
+    fn cruft_packs(git_dir: &Path) -> Vec<String> {
+        let mut stems: Vec<String> = std::fs::read_dir(git_dir.join("objects/pack"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.strip_suffix(".mtimes").map(str::to_string)
+            })
+            .collect();
+        stems.sort();
+        stems
+    }
+
+    /// What an unreferenced object's age is, and so when the reclaim drops it:
+    /// an expired loose object goes at once, a young one moves into a cruft
+    /// pack, and one compaction already packed was restamped with the new
+    /// pack's date, so it outlives the next reclaim. A cruft pack is never
+    /// rolled up by compaction, so the age it records carries to the reclaim
+    /// after.
     #[test]
     #[serial_test::serial(jj)]
-    fn git_gc_honours_reflogs_the_stash_and_branches() {
+    fn the_reclaim_ages_unreferenced_objects_by_their_loose_file_or_last_pack() {
         let Some(fx) = Fixture::new() else {
-            eprintln!("skipping ref-store gc reflog test: jj not resolvable");
+            eprintln!("skipping object reclaim age test: jj not resolvable");
             return;
         };
         let repo = fx.proj.path();
+        let git_dir = fx.git_dir();
+        let window = SystemTime::now() - 30 * DAY;
+
+        let expired_loose = aged_dangling_blob(repo, &git_dir, "expired\n", 60 * DAY);
+        let young_loose = aged_dangling_blob(repo, &git_dir, "young\n", DAY);
+        reclaim_unreachable_objects(&git_dir, window).unwrap();
+        assert!(
+            !object_exists(repo, &expired_loose),
+            "an expired loose object is dropped, not left loose"
+        );
+        assert!(object_exists(repo, &young_loose));
+        assert!(!loose_object_path(&git_dir, &young_loose).exists());
+        let cruft = cruft_packs(&git_dir);
+        assert_eq!(cruft.len(), 1, "the young object is in a cruft pack");
+
+        let restamped = aged_dangling_blob(repo, &git_dir, "restamped\n", 60 * DAY);
+        for round in 0..4 {
+            std::fs::write(repo.join(format!("round-{round}.rs")), format!("{round}\n")).unwrap();
+            git(repo, &["add", "-A"]);
+            git(repo, &["commit", "-q", "-m", &format!("round {round}")]);
+            git(repo, &["repack", "-q", "-d"]);
+        }
+        compact_object_store(&git_dir).unwrap();
+        assert!(!loose_object_path(&git_dir, &restamped).exists());
+        assert_eq!(
+            cruft_packs(&git_dir),
+            cruft,
+            "compaction leaves the cruft pack and the ages it records alone"
+        );
+
+        reclaim_unreachable_objects(&git_dir, window).unwrap();
+        assert!(
+            object_exists(repo, &restamped),
+            "compaction restamped the object with its new pack's date, so this reclaim keeps it"
+        );
+        assert!(object_exists(repo, &young_loose));
+    }
+
+    /// Every loose object file, counted exactly rather than estimated.
+    fn loose_object_files(git_dir: &Path) -> usize {
+        std::fs::read_dir(git_dir.join("objects"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.len() == 2 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .map(|entry| std::fs::read_dir(entry.path()).unwrap().count())
+            .sum()
+    }
+
+    /// `(stem, objects, kept)` for every pack, the object count read from the
+    /// last fanout entry of its version-2 index.
+    fn packs(git_dir: &Path) -> Vec<(String, u64, bool)> {
+        let dir = git_dir.join("objects/pack");
+        let mut packs: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let stem = name.strip_suffix(".pack")?.to_string();
+                let index = std::fs::read(dir.join(format!("{stem}.idx"))).unwrap();
+                let last_fanout = 8 + 255 * 4;
+                let objects =
+                    u32::from_be_bytes(index[last_fanout..last_fanout + 4].try_into().unwrap());
+                let kept = dir.join(format!("{stem}.keep")).exists();
+                Some((stem, u64::from(objects), kept))
+            })
+            .collect();
+        packs.sort_by_key(|(_, objects, _)| *objects);
+        packs
+    }
+
+    fn all_objects(repo: &Path) -> Vec<String> {
+        git_stdout(
+            repo,
+            &[
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname)",
+            ],
+        )
+        .lines()
+        .map(str::to_string)
+        .collect()
+    }
+
+    #[test]
+    fn git_versions_parse_with_and_without_a_vendor_suffix() {
+        assert_eq!(
+            super::parse_git_version("git version 2.52.0\n"),
+            Some((2, 52))
+        );
+        assert_eq!(
+            super::parse_git_version("git version 2.39.5 (Apple Git-154)"),
+            Some((2, 39))
+        );
+        assert_eq!(
+            super::parse_git_version("git version 2.45.1.windows.1"),
+            Some((2, 45))
+        );
+        assert_eq!(super::parse_git_version("not git"), None);
+        assert!((2, 33) < (2, 34) && (3, 0) > (2, 37));
+    }
+
+    #[test]
+    fn the_object_census_counts_packs_and_estimates_loose_objects_without_git() {
+        let temp = TempDir::new().unwrap();
+        let git_dir = temp.path();
+        let pack = git_dir.join("objects/pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        for stem in ["pack-a", "pack-b", "cairn-delta-pin-c", "pack-cruft"] {
+            std::fs::write(pack.join(format!("{stem}.pack")), [0u8; 100]).unwrap();
+            std::fs::write(pack.join(format!("{stem}.idx")), [0u8; 10]).unwrap();
+        }
+        std::fs::write(pack.join("cairn-delta-pin-c.keep"), "").unwrap();
+        std::fs::write(pack.join("pack-cruft.mtimes"), "").unwrap();
+        std::fs::write(pack.join("tmp_pack_xyz"), "").unwrap();
+        let sample = git_dir.join("objects/17");
+        std::fs::create_dir_all(&sample).unwrap();
+        std::fs::write(sample.join("a".repeat(38)), "").unwrap();
+        std::fs::write(sample.join("b".repeat(38)), "").unwrap();
+        std::fs::write(sample.join("tmp_obj_xyz"), "").unwrap();
+
+        let census = census_object_store(git_dir).unwrap();
+        assert_eq!(
+            census,
+            ObjectStoreCensus {
+                packs: 4,
+                kept_packs: 1,
+                cruft_packs: 1,
+                pack_bytes: 400,
+                loose_objects: 512,
+                multi_pack_index: false,
+            }
+        );
+        std::fs::write(pack.join("multi-pack-index"), "").unwrap();
+        assert!(census_object_store(git_dir).unwrap().multi_pack_index);
+        assert_eq!(
+            census_object_store(&temp.path().join("missing")).unwrap(),
+            ObjectStoreCensus::default(),
+            "a repository with no objects yet is empty, not an error"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn compaction_rolls_small_packs_into_a_geometric_progression_with_a_multi_pack_index() {
+        let Some(fx) = Fixture::new() else {
+            eprintln!("skipping object-store compaction test: jj not resolvable");
+            return;
+        };
+        let repo = fx.proj.path();
+        let git_dir = fx.git_dir();
+        for round in 0..10 {
+            std::fs::write(repo.join(format!("round-{round}.rs")), format!("{round}\n")).unwrap();
+            git(repo, &["add", "-A"]);
+            git(repo, &["commit", "-q", "-m", &format!("round {round}")]);
+            git(repo, &["repack", "-q", "-d"]);
+        }
+        // A publication's delta pin, held while its tree is committed into jj.
+        let (pinned, _, _) = packs(&git_dir).pop().unwrap();
+        let keep = git_dir.join(format!("objects/pack/{pinned}.keep"));
+        std::fs::write(&keep, "Cairn validated delta publication\n").unwrap();
+        // Loose objects: one commit after the last repack, and a blob nothing
+        // references.
+        std::fs::write(repo.join("loose.rs"), "loose\n").unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-q", "-m", "loose"]);
+        std::fs::write(repo.join("dangling.txt"), "dangling\n").unwrap();
+        let dangling = git_stdout(repo, &["hash-object", "-w", "dangling.txt"]);
+        std::fs::remove_file(repo.join("dangling.txt")).unwrap();
+        let objects = all_objects(repo);
+        assert!(loose_object_files(&git_dir) > 0);
+
+        let compaction = compact_object_store(&git_dir).unwrap();
+
+        assert_eq!(
+            compaction.before.packs, 10,
+            "one pack per round: {compaction:?}"
+        );
+        assert_eq!(compaction.before.kept_packs, 1);
+        assert!(!compaction.before.multi_pack_index);
+        let after = packs(&git_dir);
+        let unkept: Vec<u64> = after
+            .iter()
+            .filter(|(_, _, kept)| !kept)
+            .map(|(_, objects, _)| *objects)
+            .collect();
+        assert!(
+            (unkept.len() as u64) < compaction.before.packs - 1,
+            "small packs were rolled up: {after:?}"
+        );
+        assert!(
+            unkept.windows(2).all(|pair| pair[1] >= 2 * pair[0]),
+            "the unkept packs form a factor-2 progression: {after:?}"
+        );
+        assert_eq!(compaction.after.packs, after.len() as u64);
+        assert!(compaction.after.multi_pack_index);
+        assert!(git_dir.join("objects/pack/multi-pack-index").exists());
+        assert!(
+            after.iter().any(|(stem, _, kept)| *stem == pinned && *kept),
+            "the kept pack and its .keep are untouched"
+        );
+        assert!(keep.exists());
+        assert_eq!(
+            loose_object_files(&git_dir),
+            0,
+            "every loose object was packed"
+        );
+        assert_eq!(compaction.after.loose_objects, 0);
+        assert!(
+            object_exists(repo, &dangling),
+            "compaction never drops an object, referenced or not"
+        );
+        let mut check = cairn_platform::env::git()
+            .args(["cat-file", "--batch-check"])
+            .current_dir(repo)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(
+            &mut check.stdin.take().unwrap(),
+            format!("{}\n", objects.join("\n")).as_bytes(),
+        )
+        .unwrap();
+        let checked = String::from_utf8(check.wait_with_output().unwrap().stdout).unwrap();
+        assert_eq!(checked.lines().count(), objects.len());
+        assert!(
+            !checked.contains("missing"),
+            "every object that existed before still resolves:\n{checked}"
+        );
+        // jj reads the store through gix, which must read the new layout.
+        fx.jj(&["log", "-r", "all()", "--no-graph"]);
+    }
+
+    /// The backing repository is the operator's own checkout. The reclaim must
+    /// leave reflogs, the stash, and every branch exactly as it found them,
+    /// keep unreferenced objects inside the window, and drop the older ones,
+    /// including those compaction has already moved into a pack.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn reclaim_honours_reflogs_the_stash_and_branches() {
+        let Some(fx) = Fixture::new() else {
+            eprintln!("skipping object reclaim reflog test: jj not resolvable");
+            return;
+        };
+        let repo = fx.proj.path();
+        let git_dir = fx.git_dir();
         // A commit only the reflog still reaches.
         std::fs::write(repo.join("reflogged.rs"), "reflogged\n").unwrap();
         git(repo, &["add", "-A"]);
@@ -1161,37 +1661,44 @@ mod tests {
         std::fs::write(repo.join("dangling.txt"), "dangling\n").unwrap();
         let dangling = git_stdout(repo, &["hash-object", "-w", "dangling.txt"]);
         std::fs::remove_file(repo.join("dangling.txt")).unwrap();
-        // Two packs over a limit of one, so `gc --auto` decides to collect.
-        git(repo, &["config", "gc.autoPackLimit", "1"]);
-        git(repo, &["repack", "-q", "-d"]);
-        std::fs::write(repo.join("second.rs"), "second\n").unwrap();
-        git(repo, &["add", "-A"]);
-        git(repo, &["commit", "-q", "-m", "second pack"]);
-        git(repo, &["repack", "-q", "-d"]);
 
         let tips = fx.branch_tips();
         let head_reflog = git_stdout(repo, &["reflog", "show", "HEAD"]);
         let main_reflog = git_stdout(repo, &["reflog", "show", "main"]);
+
+        // The catch the reclaim exists for: compaction packs the dangling
+        // object, so `git prune` would never see it again.
+        compact_object_store(&git_dir).unwrap();
+        assert!(object_exists(repo, &dangling));
+        assert!(!loose_object_path(&git_dir, &dangling).exists());
+
         let future = SystemTime::now() + Duration::from_secs(60);
         collect_store_garbage(&fx.store, future, future).unwrap();
 
-        let exists = |object: &str| {
-            cairn_platform::env::git()
-                .args(["cat-file", "-e", object])
-                .current_dir(repo)
-                .status()
-                .unwrap()
-                .success()
-        };
+        // Inside the window, the unreferenced object survives in a cruft pack.
+        let past = SystemTime::now() - DAY;
+        let kept = reclaim_unreachable_objects(&git_dir, past).unwrap();
+        assert!(object_exists(repo, &dangling), "younger than the cutoff");
+        assert!(!loose_object_path(&git_dir, &dangling).exists());
+        assert!(kept.after.cruft_packs >= 1, "{kept:?}");
+        assert!(kept.after.multi_pack_index);
+
+        // Past the window, it is dropped; everything a ref or reflog reaches
+        // is not.
+        let reclaimed = reclaim_unreachable_objects(&git_dir, future).unwrap();
         assert!(
-            !exists(&dangling),
-            "git gc ran and pruned what nothing reaches"
+            !object_exists(repo, &dangling),
+            "the reclaim dropped what nothing reaches: {reclaimed:?}"
         );
-        assert!(exists(&reflogged), "a reflogged commit survives");
+        assert!(
+            object_exists(repo, &reflogged),
+            "a reflogged commit survives"
+        );
         assert_eq!(git_stdout(repo, &["rev-parse", "refs/stash"]), stash);
         assert_eq!(fx.branch_tips(), tips, "no branch moved");
         assert_eq!(git_stdout(repo, &["reflog", "show", "HEAD"]), head_reflog);
         assert_eq!(git_stdout(repo, &["reflog", "show", "main"]), main_reflog);
+        fx.jj(&["log", "-r", "all()", "--no-graph"]);
     }
 
     #[test]

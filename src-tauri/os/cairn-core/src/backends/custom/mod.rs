@@ -385,9 +385,6 @@ impl AgentBackend for CustomBackend {
         use crate::agent_process::toolkits;
         let mut allowed = toolkits::resolve_tools(agent_tools);
         toolkits::ensure_core_verbs(&mut allowed);
-        // `apply_patch` is a Codex-native affordance, not a Cairn verb, and an
-        // OpenAI-compatible server has no way to service it.
-        allowed.retain(|tool| tool != "apply_patch");
         ResolvedTools {
             allowed,
             disallowed: Vec::new(),

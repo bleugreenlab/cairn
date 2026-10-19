@@ -17,9 +17,7 @@ use crate::common::sync_server::{skip_if_team_schema_unavailable, SyncServer};
 use cairn_core::account::TeamTokenMinter;
 use cairn_core::internal::db::{DbState, SyncRuntime, TeamConfig};
 use cairn_core::internal::services::testing::CapturingEmitter;
-use cairn_core::internal::storage::{
-    LocalDb, MigrationRunner, SearchIndex, SyncCadence, TURSO_MIGRATIONS,
-};
+use cairn_core::internal::storage::{LocalDb, SearchIndex, SyncCadence};
 use tempfile::tempdir;
 
 fn test_cadence() -> SyncCadence {
@@ -33,9 +31,7 @@ fn test_cadence() -> SyncCadence {
 }
 
 async fn private_db_state(dir: &Path, name: &str) -> Arc<DbState> {
-    let db = LocalDb::open(dir.join(name)).await.unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
+    let db = LocalDb::open_migrated_for_test(dir.join(name))
         .await
         .unwrap();
     let search = SearchIndex::open_or_create(dir.join(format!("{name}.search"))).unwrap();

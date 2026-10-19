@@ -7,7 +7,7 @@
 //!   decompression stable forever).
 //! - [`objects`] — the in-memory, layered git [`objects::ObjectStore`] that
 //!   resolves objects from an execution range pack layered over the repo ODB.
-//! - [`packfile`] — range-pack construction at worktree teardown.
+//! - [`packfile`] — range-pack construction at issue teardown.
 //! - [`diff`] — committed range/commit diff rendering, entirely in-process (no
 //!   `.git`, no shelling out).
 //!

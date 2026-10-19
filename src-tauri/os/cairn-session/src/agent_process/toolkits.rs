@@ -2,71 +2,56 @@
 //!
 //! Agent configs list tools using friendly, Claude-Code-style names (`Read`,
 //! `Write`, `Edit`, `Bash`, …). Cairn exposes exactly three working verbs —
-//! `read`, `write`, `run` — so the only surviving job here is a small
-//! friendly→canonical alias map. Native provider tools are fully off: every
-//! native name is hard-disallowed at the backend layer (see
-//! [`cairn_domain::ALL_NATIVE_TOOLS`]) and dropped from the allow-list here.
-//! There is no longer any "pick a side when both native and Cairn exist"
-//! logic — Cairn always wins because native never runs.
+//! `read`, `write`, `run` — so the friendly verbs alias to them and every
+//! other bare name is dropped. Every tool Cairn offers is an MCP tool, so a
+//! bare name can only be a provider built-in, and built-ins never run (every
+//! Claude launch passes `--tools ""`). The rule needs no roster of built-ins,
+//! so one nobody has named yet is dropped all the same.
 //!
-//! Both `ClaudeBackend` and `CodexBackend` call [`resolve_tools`] from their
-//! `resolve_tools()` implementations.
+//! Every backend calls [`resolve_tools`] from its `resolve_tools()`.
 
-use std::collections::BTreeSet;
-use std::sync::{Mutex, OnceLock};
+/// The log target of a Claude session whose declared tools broke the
+/// `--tools ""` contract.
+pub const TOOL_SURFACE_LOG_TARGET: &str = "cairn::claude_tool_surface";
+
+/// The CLI-internal tool through which a `--json-schema` answer arrives. It is
+/// declared only under `--json-schema`, and `--tools ""` rightly leaves it.
+const STRUCTURED_OUTPUT: &str = "StructuredOutput";
 
 /// Does this declared tool name sit outside Cairn's surface?
 ///
 /// Every tool Cairn offers is an MCP tool: the three verbs (`mcp__cairn__*`),
 /// the corpus tools, and any external server reached through the `cairn://mcp`
-/// gateway. Nothing legitimate is a bare name, so a bare name in a live
-/// session's declared surface is a host-harness built-in that escaped
-/// `--disallowedTools`. That invariant is the durable check; the roster in
-/// [`cairn_domain::ALWAYS_DISALLOWED_TOOLS`] is only the list of escapees
-/// already known by name.
+/// gateway. Every launch passes `--tools ""`, so the CLI declares no built-in,
+/// and a bare name in a session's declared surface means that contract broke.
 fn is_native_leak(tool: &str) -> bool {
-    !tool.starts_with("mcp__")
+    !tool.starts_with("mcp__") && tool != STRUCTURED_OUTPUT
 }
 
-/// Built-ins seen leaking into a live session's declared tool surface.
+/// Check the tool surface a Claude session declared in its `init` event,
+/// returning every name outside Cairn's surface and logging an error when
+/// there is any.
 ///
-/// The CLI declares each of its built-ins unless the name appears in
-/// `--disallowedTools`, and that flag is fixed when the process spawns — so a
-/// leak is only observable after the fact, from the session's `init` event.
-/// Quarantining the name here disallows it for every later session in this
-/// process, which contains the leak without waiting for a release. It is a
-/// stopgap, not a second source of truth: the warning names the escapee so it
-/// can be folded into `ALWAYS_DISALLOWED_TOOLS`, which is what closes the hole
-/// for the first session after every restart.
-static QUARANTINED_TOOLS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
-
-fn quarantine() -> &'static Mutex<BTreeSet<String>> {
-    QUARANTINED_TOOLS.get_or_init(Mutex::default)
-}
-
-/// Record the tool surface a session actually declared, returning the leaked
-/// names not already quarantined.
-///
-/// Returning only the newly-seen names keeps the caller's warning to once per
-/// escapee per process rather than once per session.
-pub fn record_declared_surface(declared: &[String]) -> Vec<String> {
-    let leaks = declared.iter().filter(|t| is_native_leak(t));
-    let mut quarantined = quarantine().lock().unwrap_or_else(|e| e.into_inner());
-    leaks
-        .filter(|t| quarantined.insert((*t).clone()))
-        .cloned()
-        .collect()
-}
-
-/// Names observed leaking earlier in this process, unioned into the disallow
-/// list of every session spawned afterwards.
-pub fn quarantined_tools() -> Vec<String> {
-    quarantine()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+/// This is a tripwire, not a fence: `--tools ""` is what keeps built-ins off,
+/// and nothing here feeds a later launch. It holds no memory, so every
+/// violating session is reported. The `init` event itself is persisted as the
+/// run's `system:init` event row, which keeps the evidence queryable.
+pub fn report_declared_surface(run_id: &str, declared: &[String]) -> Vec<String> {
+    let violations: Vec<String> = declared
         .iter()
+        .filter(|tool| is_native_leak(tool))
         .cloned()
-        .collect()
+        .collect();
+    if !violations.is_empty() {
+        log::error!(
+            target: TOOL_SURFACE_LOG_TARGET,
+            "Run {run_id}: the Claude CLI declared {} tool(s) outside Cairn's MCP surface: {}. \
+             Every launch passes `--tools \"\"`, so the CLI broke that contract.",
+            violations.len(),
+            violations.join(", "),
+        );
+    }
+    violations
 }
 
 /// Map a friendly native tool name to its canonical Cairn verb.
@@ -94,19 +79,20 @@ const DEAD_CAIRN_TOOLS: &[&str] = &[
 
 /// Should this tool name be dropped from the allow-list entirely?
 ///
-/// True for any native provider tool (all native tools are hard-disabled) and
-/// for dead Cairn names. Aliased names (`Read`/`Write`/`Edit`/`Bash`) are
+/// True for any bare (non-MCP) name, which can only be a provider built-in,
+/// and for dead Cairn names. Aliased names (`Read`/`Write`/`Edit`/`Bash`) are
 /// resolved before this is consulted, so they never reach here.
 fn is_dropped(tool: &str) -> bool {
-    cairn_domain::ALL_NATIVE_TOOLS.contains(&tool) || DEAD_CAIRN_TOOLS.contains(&tool)
+    !tool.starts_with("mcp__") || DEAD_CAIRN_TOOLS.contains(&tool)
 }
 
 /// Resolve an agent's configured tool names to the Cairn allow-list.
 ///
 /// - Friendly verbs (`Read`/`Write`/`Edit`/`Bash`) map to their canonical
 ///   Cairn verb (`mcp__cairn__read`/`write`/`run`).
-/// - Native provider tools and dead Cairn names are dropped.
-/// - All other names (canonical Cairn verbs, Cairn corpus tools like
+/// - Every other bare name (a provider built-in, named anywhere or not) and
+///   dead Cairn names are dropped.
+/// - All other MCP names (canonical Cairn verbs, Cairn corpus tools like
 ///   `create_pr` and the memory tools) pass through unchanged.
 ///
 /// The result is deduplicated, preserving first-seen order.
@@ -162,41 +148,50 @@ mod tests {
         assert!(!is_native_leak("mcp__cairn__read"));
         assert!(!is_native_leak("mcp__cairn__create_pr"));
         assert!(!is_native_leak("mcp__axon__look"));
+        // The schema answer channel is the CLI's own, not a built-in.
+        assert!(!is_native_leak("StructuredOutput"));
         // A bare name can only have come from the host harness.
         assert!(is_native_leak("ListAgents"));
         assert!(is_native_leak("SendMessage"));
     }
 
+    /// The `tools` of an `init` event the real CLI emitted.
+    fn recorded_init_tools(init: &str) -> Vec<String> {
+        let init: serde_json::Value = serde_json::from_str(init).unwrap();
+        init["tools"]
+            .as_array()
+            .expect("an init event lists its tools")
+            .iter()
+            .map(|tool| tool.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Claude Code, launched with Cairn's own arguments and Cairn's MCP
+    /// server, declared only Cairn's verbs, so the tripwire stays quiet.
     #[test]
-    fn declared_surface_reports_each_leak_once_and_quarantines_it() {
-        // Names unique to this test: the quarantine is process-global, so a
-        // real tool name here would bleed into sibling tests.
-        let declared = vec![
-            "mcp__cairn__read".to_string(),
-            "LeakOnceProbeA".to_string(),
-            "LeakOnceProbeB".to_string(),
-        ];
-
-        let first = record_declared_surface(&declared);
-        assert_eq!(
-            first,
-            vec!["LeakOnceProbeA".to_string(), "LeakOnceProbeB".to_string()],
-            "every bare name is reported the first time it is seen"
-        );
-
-        // A second session declaring the same surface warns about nothing new.
+    fn the_recorded_agent_launch_declares_only_cairn_tools() {
+        let tools = recorded_init_tools(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cairn-models/tests/fixtures/claude_init_tools_none-2.1.302.json"
+        )));
+        assert!(!tools.is_empty());
         assert!(
-            record_declared_surface(&declared).is_empty(),
-            "an already-quarantined leak must not warn again"
+            tools.iter().all(|tool| tool.starts_with("mcp__cairn__")),
+            "{tools:?}"
         );
+        assert!(report_declared_surface("fixture", &tools).is_empty());
+    }
 
-        let quarantined = quarantined_tools();
-        assert!(quarantined.contains(&"LeakOnceProbeA".to_string()));
-        assert!(quarantined.contains(&"LeakOnceProbeB".to_string()));
-        assert!(
-            !quarantined.contains(&"mcp__cairn__read".to_string()),
-            "Cairn's own tools must never be quarantined"
-        );
+    /// A schema-constrained call declares StructuredOutput, which is how its
+    /// answer arrives, and that is not a violation.
+    #[test]
+    fn the_recorded_schema_call_declares_only_structured_output() {
+        let tools = recorded_init_tools(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cairn-models/tests/fixtures/claude_init_json_schema-2.1.302.json"
+        )));
+        assert_eq!(tools, vec!["StructuredOutput".to_string()]);
+        assert!(report_declared_surface("fixture", &tools).is_empty());
     }
 
     #[test]
@@ -248,6 +243,9 @@ mod tests {
             "LSP".to_string(),
             "Skill".to_string(),
             "NotebookEdit".to_string(),
+            "apply_patch".to_string(),
+            // Never enumerated anywhere: dropped because it is bare.
+            "FutureBuiltin".to_string(),
         ]);
         assert!(
             allowed.is_empty(),
@@ -291,6 +289,7 @@ mod tests {
             "Bash".to_string(),
             "Glob".to_string(),
             "WebFetch".to_string(),
+            "FutureBuiltin".to_string(),
             "mcp__cairn__read".to_string(), // duplicate of aliased Read
             "mcp__cairn__create_pr".to_string(),
         ]);

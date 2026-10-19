@@ -2052,14 +2052,12 @@ fn artifact_from_row(row: &cairn_db::turso::Row) -> Result<Artifact, DbError> {
 mod tests {
     use super::*;
     use crate::services::{testing::MockGitClient, GitOutput, RealGitClient};
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+
     use std::process::Command as StdCommand;
 
     async fn test_db() -> LocalDb {
         let temp = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("actions.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("actions.db"))
             .await
             .unwrap();
         // Leak the tempdir so the file outlives the test body.
@@ -2746,11 +2744,11 @@ mod tests {
             .to_json()
             .unwrap();
             let temp = tempfile::tempdir().unwrap();
-            let local = Arc::new(LocalDb::open(temp.path().join("pr.db")).await.unwrap());
-            MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-                .run(&local)
-                .await
-                .unwrap();
+            let local = Arc::new(
+                LocalDb::open_migrated_for_test(temp.path().join("pr.db"))
+                    .await
+                    .unwrap(),
+            );
             local.write(|conn| {
                 let snapshot = snapshot.clone();
                 Box::pin(async move {
@@ -2858,11 +2856,11 @@ mod tests {
         // Database: project + triage issue #7 + the WS-90 shape: ten
         // workspace memories with NO promotions, split between five discards and
         // five project re-scopes across two target projects.
-        let db_local = Arc::new(LocalDb::open(temp.path().join("triage.db")).await.unwrap());
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db_local)
-            .await
-            .unwrap();
+        let db_local = Arc::new(
+            LocalDb::open_migrated_for_test(temp.path().join("triage.db"))
+                .await
+                .unwrap(),
+        );
         let repo_path = project_repo.to_string_lossy().to_string();
         db_local
             .write(|conn| {

@@ -496,7 +496,25 @@ fn has_denial_signature(output: &str) -> bool {
         ": operation not permitted",
         ": permission denied",
     ];
-    SIGS.iter().any(|s| output.contains(s))
+    output
+        .lines()
+        .filter(|line| !is_selinux_creation_context_warning(line))
+        .any(|line| SIGS.iter().any(|s| line.contains(s)))
+}
+
+/// Whether a line is the warning SELinux-aware GNU tools print when they cannot
+/// set the security context for the files they are about to create.
+///
+/// On an SELinux host, GNU `sed -i` (and coreutils' `install`, `cp`, `mkdir`)
+/// first writes the desired context to `/proc/self/attr/fscreate`. The fence
+/// does not grant procfs writes, so that write fails, the tool prints
+/// `warning: failed to set default file creation context to …: Permission
+/// denied`, and then carries on creating the file with the context it inherits
+/// from its directory. The edit lands and the exit status is 0. Read as a
+/// denial, it turned every in-worktree `sed -i` on such a host into an
+/// unanswerable command-scoped prompt for an edit that had already happened.
+fn is_selinux_creation_context_warning(line: &str) -> bool {
+    line.contains("failed to set default file creation context")
 }
 
 /// The static writable carve-outs shared by the OS sandbox **and** the `write`
@@ -1034,6 +1052,32 @@ mod tests {
         // The symbolic errno names are uppercase tokens, not prose.
         assert!(!has_denial_signature("eperm and eacces in a sentence"));
         assert!(!has_denial_signature(""));
+    }
+
+    /// GNU sed 4.9's in-place edit on an SELinux-enforcing host under the Linux
+    /// fence, verbatim (fedora). The file was edited and sed exited 0.
+    const SELINUX_SED_IN_PLACE_WARNING: &str = "sed: warning: failed to set default file creation context to unconfined_u:object_r:user_home_t:s0: Permission denied";
+
+    #[test]
+    fn an_selinux_creation_context_warning_is_not_a_denial() {
+        let t = SystemTime::now();
+        assert!(!has_denial_signature(SELINUX_SED_IN_PLACE_WARNING));
+        assert_eq!(
+            detect_denial(Some(0), SELINUX_SED_IN_PLACE_WARNING, None, t, true),
+            None,
+            "a successful in-place edit must not raise a crossing"
+        );
+        // The warning only excuses its own line: a real denial elsewhere in
+        // the same output still counts.
+        let alongside =
+            format!("{SELINUX_SED_IN_PLACE_WARNING}\nbash: /etc/hosts: Permission denied\n");
+        assert!(has_denial_signature(&alongside));
+        // GNU sed misreading BSD's `-i ''`: the real failure is a missing
+        // file, which is the agent's to fix, not the fence's.
+        let bsd_syntax = format!(
+            "sed: can't read s/a/b/: No such file or directory\n{SELINUX_SED_IN_PLACE_WARNING}"
+        );
+        assert_eq!(detect_denial(Some(2), &bsd_syntax, None, t, true), None);
     }
 
     const PODMAN_FENCED_RUNTIME_LOCK: &str = "Error: acquiring runtime init lock: open /run/user/1000/libpod/tmp/alive.lck: open /run/user/1000/libpod/tmp/alive.lck: permission denied";

@@ -7,23 +7,32 @@
 //! `refs/jj/keep` ref and snapshots every git ref into each operation's view,
 //! and nothing ever pruned either. This pass does.
 //!
-//! Every hour it takes a lock-free census of each store's refs and records it.
-//! Once a day it prunes each store:
+//! Every hour it takes a lock-free census of each store's refs and of its Git
+//! object database (packs, kept packs, loose objects, the multi-pack index)
+//! and records it. Once a day it prunes each store:
 //!
 //! 1. Cairn's own refs whose lifecycle ended: `refs/cairn/checks/*` that no
 //!    check batch holds, `refs/cairn/stranded/*` whose issue was resolved more
 //!    than the retention window ago, and `refs/cairn/rescued/*` older than it.
 //! 2. At most weekly, under the store lock, the operation log older than the
 //!    window.
-//! 3. Outside the store lock, unreachable operations, keep refs for anything
-//!    that is not an index head, and (when git's own thresholds trip) Git
-//!    objects older than the window. `cairn_vcs::jj::collect_store_garbage`
-//!    documents how that `git gc` honours the operator's reflogs, stash, and
-//!    branches.
+//! 3. Outside the store lock, unreachable operations and keep refs for anything
+//!    that is not an index head; then, at most once per window and outside
+//!    every Cairn lock, a cruft repack that reclaims unreferenced Git objects
+//!    older than the window. `cairn_vcs::jj::reclaim_unreachable_objects`
+//!    documents how it honours the operator's reflogs, stash, and branches.
 //!
 //! It never prunes while a reconcile intent for the store is pending or
 //! running, or while the operator's git holds `index.lock` or
 //! `packed-refs.lock`; a skipped prune is recorded and retried next hour.
+//!
+//! Separately from the prune, every hour, the object database is compacted
+//! whenever git's own auto-gc thresholds trip ([`compaction_due`]): small packs
+//! are rolled up geometrically under a multi-pack index. Compaction removes
+//! nothing, so it takes no lock and waits for no confirmation; only an
+//! opted-out store is left alone. It does wait out the operator's own git
+//! ([`object_store_busy`]). Staying under those thresholds is also what keeps
+//! the operator's own `git gc --auto` from deciding to repack the whole store.
 //!
 //! Pruning is the default. The one gate is the first prune of a store that is
 //! already above a size threshold: that rewrites a large, long-lived ref store
@@ -40,7 +49,8 @@ use cairn_db::turso::params;
 use serde_json::json;
 
 use crate::jj::{
-    OperationLogTruncation, PackedRefs, RefStoreCensus, RefTarget, StoreGarbageCollection,
+    ObjectStoreCensus, ObjectStoreCompaction, OperationLogTruncation, PackedRefs, RefStoreCensus,
+    RefTarget, StoreGarbageCollection,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
@@ -76,6 +86,31 @@ pub(crate) const PRUNE_OVERDUE: Duration = Duration::from_secs(2 * DAY);
 /// daily schedule says.
 pub(crate) const KEEP_REF_THRESHOLD: u64 = 50_000;
 pub(crate) const PACKED_BYTES_THRESHOLD: u64 = 4 * 1024 * 1024;
+
+/// Packs (kept packs aside) above which compaction runs: `gc.autoPackLimit`'s
+/// default. Past it the operator's own `git gc --auto` repacks everything into
+/// one pack, rewriting the base pack (28 minutes on the Cairn project), and
+/// every object lookup pays to open each pack; git does not count kept packs,
+/// and neither does this.
+pub(crate) const PACK_LIMIT: u64 = 50;
+/// Loose objects, estimated the way git estimates them, above which compaction
+/// runs: `gc.auto`'s default, past which `git gc --auto` runs.
+pub(crate) const LOOSE_OBJECT_LIMIT: u64 = 6_700;
+/// The cruft reclaim rewrites the base pack, so it runs at most once per
+/// retention window. An object is dropped by the first reclaim after it is a
+/// window older than its last repack (see `cairn_vcs::jj` maintenance for why
+/// compaction restamps it). Garbage written just after one reclaim is moved
+/// into a cruft pack by the next and dropped by the one after, so it lives
+/// between one and about two windows.
+pub(crate) const RECLAIM_INTERVAL: Duration = RETENTION;
+/// An `index.lock` or `packed-refs.lock` older than this is a leftover of an
+/// interrupted writer, not the operator's git at work. Such leftovers do
+/// accumulate in a busy store, and treating each as busy would skip object
+/// maintenance for good.
+const STALE_LOCK: Duration = Duration::from_secs(600);
+/// git's own rule: a `gc.pid` older than twelve hours belongs to a gc that
+/// died. A live gc repacking a large store legitimately runs for half an hour.
+const STALE_GC_PID: Duration = Duration::from_secs(12 * 60 * 60);
 
 const STORE_LOCK_WAIT: Duration = Duration::from_secs(600);
 
@@ -115,8 +150,8 @@ impl Orchestrator {
 async fn run_pass(orch: &Orchestrator) {
     for project in project_stores(orch).await {
         let started = unix_now();
-        let census = match census_store(&project.store).await {
-            Ok(Some((_, census))) => census,
+        let (census, objects) = match census_store(&project.store).await {
+            Ok(Some((_, census, objects))) => (census, objects),
             Ok(None) => continue,
             Err(error) => {
                 log::warn!(
@@ -127,13 +162,14 @@ async fn run_pass(orch: &Orchestrator) {
             }
         };
         let db = &orch.db.local;
-        record_measurement(db, &project, &census, started).await;
+        record_measurement(db, &project, &census, &objects, started).await;
         let last_ok = last_successful_prune(db, &project.store, false).await;
-        match prune_gate(
+        let gate = prune_gate(
             prune_policy(db, &project.store).await,
             last_ok.is_some(),
             &census,
-        ) {
+        );
+        match gate {
             PruneGate::OptedOut => {}
             PruneGate::AwaitingConfirmation => record_awaiting_confirmation(db, &project).await,
             PruneGate::Open => {
@@ -142,6 +178,133 @@ async fn run_pass(orch: &Orchestrator) {
                 }
             }
         }
+        if compaction_allowed(gate) {
+            compact_if_due(db, &project).await;
+        }
+    }
+}
+
+/// Compaction removes nothing, so it needs no confirmation; only a store the
+/// operator opted out is left untouched.
+pub(crate) fn compaction_allowed(gate: PruneGate) -> bool {
+    gate != PruneGate::OptedOut
+}
+
+/// Whether git's own auto-gc thresholds have tripped.
+pub(crate) fn compaction_due(census: &ObjectStoreCensus) -> bool {
+    census.packs.saturating_sub(census.kept_packs) > PACK_LIMIT
+        || census.loose_objects > LOOSE_OBJECT_LIMIT
+}
+
+/// Whether a prune should also reclaim unreferenced objects.
+pub(crate) fn reclaim_is_due(last_reclaim: Option<i64>, now: i64) -> bool {
+    last_reclaim.is_none_or(|last| now - last >= RECLAIM_INTERVAL.as_secs() as i64)
+}
+
+/// Compact the store's object database if a fresh census says it is due. The
+/// census is taken again here because a prune that just reclaimed has left the
+/// store compacted.
+async fn compact_if_due(db: &LocalDb, project: &ProjectStore) {
+    let store = project.store.clone();
+    let census = blocking(move || {
+        let git_dir = crate::jj::store_git_dir(&store)
+            .ok_or_else(|| "the store has no git repository behind it".to_string())?;
+        let census = crate::jj::census_object_store(&git_dir)?;
+        Ok((git_dir, census))
+    })
+    .await;
+    match census {
+        Ok((git_dir, census)) if compaction_due(&census) => {
+            compact(db, project, &git_dir, census).await
+        }
+        Ok(_) => {}
+        Err(error) => log::warn!(
+            "object-store census of {} failed: {error}",
+            project.store.display()
+        ),
+    }
+}
+
+/// Run one geometric compaction of the store's object database and record it.
+/// It holds no Cairn lock: it never drops an object, so every reader and
+/// writer may run beside it.
+pub(crate) async fn compact(
+    db: &LocalDb,
+    project: &ProjectStore,
+    git_dir: &Path,
+    before: ObjectStoreCensus,
+) {
+    let started = unix_now();
+    let result = match object_store_busy(git_dir, SystemTime::now()) {
+        Some(lock) => Err(format!("skipped:operator-git-busy:{lock}")),
+        None => blocking({
+            let git_dir = git_dir.to_path_buf();
+            move || crate::jj::compact_object_store(&git_dir)
+        })
+        .await
+        .map_err(failed),
+    };
+    log_object_step(&project.store, "compaction", &result);
+    record_compaction(db, project, started, &result, &before).await;
+}
+
+/// What the operator's own git holds that an object repack must not race,
+/// named with its age so a leftover lock is visible as one: a `gc.pid` younger
+/// than [`STALE_GC_PID`] (the operator's own gc is repacking), or an
+/// `index.lock` or `packed-refs.lock` younger than [`STALE_LOCK`]. An older
+/// lock is logged as a leftover and not waited for.
+pub(crate) fn object_store_busy(git_dir: &Path, now: SystemTime) -> Option<String> {
+    let age = |lock: &str| {
+        let meta = git_dir.join(lock).metadata().ok()?;
+        // A lock whose age cannot be read counts as just taken.
+        Some(
+            meta.modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .unwrap_or_default(),
+        )
+    };
+    let held = |lock: &str, age: Duration| {
+        format!(
+            "{lock} ({} old)",
+            crate::clock::format_elapsed(age.as_secs() as i64)
+        )
+    };
+    for (lock, stale) in [
+        ("gc.pid", STALE_GC_PID),
+        ("index.lock", STALE_LOCK),
+        ("packed-refs.lock", STALE_LOCK),
+    ] {
+        match age(lock) {
+            Some(age) if age < stale => return Some(held(lock, age)),
+            Some(age) => log::warn!(
+                "{} holds a leftover {}; object maintenance does not wait for it",
+                git_dir.display(),
+                held(lock, age)
+            ),
+            None => {}
+        }
+    }
+    None
+}
+
+/// One line per compaction or reclaim: what it changed and how long it took, or
+/// why it did not run.
+fn log_object_step(store: &Path, mode: &str, result: &Result<ObjectStoreCompaction, String>) {
+    match result {
+        Ok(step) => log::info!(
+            "object-store {mode} of {}: {} packs to {}, {} to {} pack bytes, about {} to {} loose \
+             objects, in {:.1}s",
+            store.display(),
+            step.before.packs,
+            step.after.packs,
+            step.before.pack_bytes,
+            step.after.pack_bytes,
+            step.before.loose_objects,
+            step.after.loose_objects,
+            step.duration.as_secs_f64(),
+        ),
+        Err(outcome) => log::warn!("object-store {mode} of {}: {outcome}", store.display()),
     }
 }
 
@@ -247,16 +410,19 @@ async fn project_stores(orch: &Orchestrator) -> Vec<ProjectStore> {
     stores
 }
 
-/// The store's git directory and a census of its refs, or `None` when the
-/// store has no git backend this pass can resolve.
-async fn census_store(store: &Path) -> Result<Option<(PathBuf, RefStoreCensus)>, String> {
+/// The store's git directory and a census of its refs and objects, or `None`
+/// when the store has no git backend this pass can resolve.
+async fn census_store(
+    store: &Path,
+) -> Result<Option<(PathBuf, RefStoreCensus, ObjectStoreCensus)>, String> {
     let store = store.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let Some(git_dir) = crate::jj::store_git_dir(&store) else {
             return Ok(None);
         };
         let census = crate::jj::census_ref_store(&git_dir)?;
-        Ok(Some((git_dir, census)))
+        let objects = crate::jj::census_object_store(&git_dir)?;
+        Ok(Some((git_dir, census, objects)))
     })
     .await
     .map_err(|error| format!("census task failed: {error}"))?
@@ -289,10 +455,37 @@ fn keep_refs(census: &RefStoreCensus) -> u64 {
         .unwrap_or(0)
 }
 
+fn objects_json(census: &ObjectStoreCensus) -> serde_json::Value {
+    json!({
+        "packs": census.packs,
+        "kept_packs": census.kept_packs,
+        "cruft_packs": census.cruft_packs,
+        "pack_bytes": census.pack_bytes,
+        "loose_objects": census.loose_objects,
+        "multi_pack_index": census.multi_pack_index,
+    })
+}
+
+fn objects_from_json(value: &serde_json::Value) -> Option<ObjectStoreCensus> {
+    let count = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+    Some(ObjectStoreCensus {
+        packs: count("packs")?,
+        kept_packs: count("kept_packs").unwrap_or(0),
+        cruft_packs: count("cruft_packs").unwrap_or(0),
+        pack_bytes: count("pack_bytes").unwrap_or(0),
+        loose_objects: count("loose_objects").unwrap_or(0),
+        multi_pack_index: value
+            .get("multi_pack_index")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
 async fn record_measurement(
     db: &LocalDb,
     project: &ProjectStore,
     census: &RefStoreCensus,
+    objects: &ObjectStoreCensus,
     started: i64,
 ) {
     let finished = unix_now();
@@ -300,8 +493,10 @@ async fn record_measurement(
         .execute(
             "INSERT INTO ref_store_samples
                (id, project_id, store_path, kind, started_at, finished_at, outcome,
-                packed_bytes, packed_entries, loose_refs, ref_locks, namespaces_json, duration_ms)
-             VALUES (?1, ?2, ?3, 'measure', ?4, ?5, 'ok', ?6, ?7, ?8, ?9, ?10, ?11)",
+                packed_bytes, packed_entries, loose_refs, ref_locks, namespaces_json, duration_ms,
+                packs, kept_packs, pack_bytes, loose_objects, multi_pack_index)
+             VALUES (?1, ?2, ?3, 'measure', ?4, ?5, 'ok', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16)",
             params![
                 uuid::Uuid::new_v4().to_string(),
                 project.project_id.as_str(),
@@ -313,7 +508,12 @@ async fn record_measurement(
                 census.loose_refs as i64,
                 census.ref_locks as i64,
                 namespaces_json(census),
-                (finished - started) * 1000
+                (finished - started) * 1000,
+                objects.packs as i64,
+                objects.kept_packs as i64,
+                objects.pack_bytes as i64,
+                objects.loose_objects as i64,
+                i64::from(objects.multi_pack_index)
             ],
         )
         .await;
@@ -372,12 +572,15 @@ pub(crate) async fn set_prune_confirmed(
 }
 
 /// When the store's refs were last swept and collected (`truncations_only`
-/// false), which a partial prune did; or when its operation log was last
-/// truncated (`true`), which only a fully successful one did.
+/// false), which a partial prune did too; or when its operation log was last
+/// truncated (`true`). A partial prune whose truncation was refused records no
+/// `ops_reparented`, so it never counts as a truncation; one that truncated and
+/// then failed only its reclaim does.
 async fn last_successful_prune(db: &LocalDb, store: &Path, truncations_only: bool) -> Option<i64> {
     let sql = if truncations_only {
         "SELECT MAX(started_at) FROM ref_store_samples
-         WHERE store_path = ?1 AND kind = 'prune' AND outcome = 'ok' AND ops_reparented IS NOT NULL"
+         WHERE store_path = ?1 AND kind = 'prune' AND ops_reparented IS NOT NULL
+           AND (outcome = 'ok' OR outcome LIKE 'partial:%')"
     } else {
         "SELECT MAX(started_at) FROM ref_store_samples
          WHERE store_path = ?1 AND kind = 'prune'
@@ -388,6 +591,22 @@ async fn last_successful_prune(db: &LocalDb, store: &Path, truncations_only: boo
         .ok()
         .flatten()
         .flatten()
+}
+
+/// When a prune last reclaimed unreferenced objects: the latest prune that ran
+/// the reclaim (`reclaimed_bytes` set) and did not fail.
+pub(crate) async fn last_successful_reclaim(db: &LocalDb, store: &Path) -> Option<i64> {
+    db.query_opt(
+        "SELECT MAX(started_at) FROM ref_store_samples
+         WHERE store_path = ?1 AND kind = 'prune' AND reclaimed_bytes IS NOT NULL
+           AND (outcome = 'ok' OR outcome LIKE 'partial:%')",
+        params![store_key(store)],
+        |row| row.opt_i64(0),
+    )
+    .await
+    .ok()
+    .flatten()
+    .flatten()
 }
 
 /// Whether the census or the schedule calls for a prune now.
@@ -408,6 +627,11 @@ struct PruneReport {
     truncation: Option<OperationLogTruncation>,
     truncation_refusal: Option<String>,
     gc: Option<StoreGarbageCollection>,
+    reclaim: Option<ObjectStoreCompaction>,
+    /// Why a reclaim that was due did not run; the next prune retries it.
+    reclaim_skipped: Option<String>,
+    /// git's error from a reclaim that ran and failed; the next prune retries it.
+    reclaim_failed: Option<String>,
 }
 
 /// Cairn-owned refs the sweep retired, and the ones it deliberately kept.
@@ -433,11 +657,16 @@ pub(crate) async fn prune(orch: &Orchestrator, project: &ProjectStore) {
     let started = unix_now();
     let mut report = PruneReport::default();
     // A truncation refused by a live foreign workspace leaves the refs swept
-    // but the history unbounded, so it is recorded as partial, never as ok.
+    // but the history unbounded, and a failed reclaim leaves the objects
+    // unreclaimed, so either is recorded as partial, never as ok. Partial
+    // still counts as swept, so a reclaim that keeps failing (a full repack
+    // needs about the store's size in free disk) is retried at the next daily
+    // prune rather than re-running the whole prune every hour.
     let outcome = match run_prune(orch, project, &mut report).await {
-        Ok(()) => match &report.truncation_refusal {
-            Some(refusal) => format!("partial:{refusal}"),
-            None => "ok".to_string(),
+        Ok(()) => match (&report.truncation_refusal, &report.reclaim_failed) {
+            (Some(refusal), _) => format!("partial:{refusal}"),
+            (None, Some(error)) => format!("partial:reclaim-failed:{error}"),
+            (None, None) => "ok".to_string(),
         },
         Err(outcome) => outcome,
     };
@@ -530,6 +759,46 @@ async fn run_prune(
     .map_err(failed)?;
     report.gc = Some(gc);
 
+    // After the keep refs were recreated, so every hidden commit inside the
+    // window is reachable when the repack walks; outside every Cairn lock,
+    // because it rewrites the base pack and takes as long as a full gc. A
+    // reclaim the operator's git is racing, or one that fails, waits for the
+    // next prune rather than failing a prune whose ref work already landed.
+    if reclaim_is_due(
+        last_successful_reclaim(&orch.db.local, &store).await,
+        unix_now(),
+    ) {
+        match object_store_busy(&git_dir, SystemTime::now()) {
+            Some(lock) => {
+                let reason = format!("operator-git-busy:{lock}");
+                log_object_step(&store, "reclaim", &Err(format!("skipped:{reason}")));
+                report.reclaim_skipped = Some(reason);
+            }
+            None => {
+                let reclaim = blocking({
+                    let git_dir = git_dir.clone();
+                    move || {
+                        crate::jj::reclaim_unreachable_objects(
+                            &git_dir,
+                            SystemTime::now() - RETENTION,
+                        )
+                    }
+                })
+                .await;
+                match reclaim {
+                    Ok(step) => {
+                        log_object_step(&store, "reclaim", &Ok(step));
+                        report.reclaim = Some(step);
+                    }
+                    Err(error) => {
+                        log_object_step(&store, "reclaim", &Err(failed(error.clone())));
+                        report.reclaim_failed = Some(error);
+                    }
+                }
+            }
+        }
+    }
+
     let (census, bytes) = blocking(move || {
         Ok((
             crate::jj::census_ref_store(&git_dir)?,
@@ -575,7 +844,8 @@ async fn reconcile_in_flight(orch: &Orchestrator, store: &Path) -> bool {
     false
 }
 
-/// The operator's own git is mid-operation on the checkout.
+/// The operator's own git is mid-operation on the checkout. The ref sweep
+/// itself contends for `packed-refs.lock`, so here any lock counts.
 fn operator_git_busy(git_dir: &Path) -> bool {
     git_dir.join("index.lock").exists() || git_dir.join("packed-refs.lock").exists()
 }
@@ -759,18 +1029,29 @@ async fn record_prune(
             "operations_after": gc.operations_after,
             "op_store_gc_ms": gc.op_store_gc.as_millis() as u64,
             "ref_phase_ms": gc.ref_phase.as_millis() as u64,
-            "git_gc_ms": gc.git_gc.as_millis() as u64,
         })),
+        "objects": match (&report.reclaim, &report.reclaim_skipped, &report.reclaim_failed) {
+            (Some(reclaim), _, _) => json!({
+                "before": objects_json(&reclaim.before),
+                "after": objects_json(&reclaim.after),
+                "duration_ms": reclaim.duration.as_millis() as u64,
+            }),
+            (None, Some(reason), _) => json!({ "skipped": reason }),
+            (None, None, Some(error)) => json!({ "failed": error }),
+            (None, None, None) => serde_json::Value::Null,
+        },
     });
+    let objects = report.reclaim.as_ref().map(|reclaim| reclaim.after);
     let result = db
         .execute(
             "INSERT INTO ref_store_samples
                (id, project_id, store_path, kind, started_at, finished_at, outcome,
                 packed_bytes, packed_entries, loose_refs, ref_locks, namespaces_json,
                 jj_store_bytes, removed_keep_refs, removed_cairn_refs, ops_abandoned,
-                ops_reparented, detail_json, duration_ms)
+                ops_reparented, detail_json, duration_ms, packs, kept_packs, pack_bytes,
+                loose_objects, multi_pack_index, reclaimed_bytes)
              VALUES (?1, ?2, ?3, 'prune', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18)",
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 uuid::Uuid::new_v4().to_string(),
                 project.project_id.as_str(),
@@ -798,12 +1079,95 @@ async fn record_prune(
                     .as_ref()
                     .map(|truncation| truncation.reparented as i64),
                 detail.to_string(),
-                (finished - started) * 1000
+                (finished - started) * 1000,
+                objects.map(|objects| objects.packs as i64),
+                objects.map(|objects| objects.kept_packs as i64),
+                objects.map(|objects| objects.pack_bytes as i64),
+                objects.map(|objects| objects.loose_objects as i64),
+                objects.map(|objects| i64::from(objects.multi_pack_index)),
+                report.reclaim.as_ref().map(|reclaim| reclaim
+                    .before
+                    .pack_bytes
+                    .saturating_sub(reclaim.after.pack_bytes)
+                    as i64)
             ],
         )
         .await;
     if let Err(error) = result {
         log::warn!("failed to record a ref-store prune: {error}");
+    }
+}
+
+/// Record one compaction: the census after it (before it, when it did not
+/// run) in the object columns, and both in `detail_json`.
+async fn record_compaction(
+    db: &LocalDb,
+    project: &ProjectStore,
+    started: i64,
+    result: &Result<ObjectStoreCompaction, String>,
+    before: &ObjectStoreCensus,
+) {
+    let finished = unix_now();
+    let (outcome, census, detail, duration_ms) = match result {
+        Ok(step) => (
+            "ok".to_string(),
+            step.after,
+            json!({
+                "mode": "geometric",
+                "before": objects_json(&step.before),
+                "after": objects_json(&step.after),
+            }),
+            step.duration.as_millis() as i64,
+        ),
+        Err(outcome) => (
+            outcome.clone(),
+            *before,
+            json!({ "mode": "geometric", "before": objects_json(before) }),
+            (finished - started) * 1000,
+        ),
+    };
+    let key = store_key(&project.store);
+    let result = db
+        .execute(
+            "INSERT INTO ref_store_samples
+               (id, project_id, store_path, kind, started_at, finished_at, outcome,
+                detail_json, duration_ms, packs, kept_packs, pack_bytes, loose_objects,
+                multi_pack_index)
+             VALUES (?1, ?2, ?3, 'compact', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                project.project_id.as_str(),
+                key.as_str(),
+                started,
+                finished,
+                outcome,
+                detail.to_string(),
+                duration_ms,
+                census.packs as i64,
+                census.kept_packs as i64,
+                census.pack_bytes as i64,
+                census.loose_objects as i64,
+                i64::from(census.multi_pack_index)
+            ],
+        )
+        .await;
+    if let Err(error) = result {
+        log::warn!("failed to record an object-store compaction: {error}");
+    }
+    // A busy store compacts several times a day. Older rows go after the
+    // retention window, as measurements do, but the latest always stays so the
+    // page can say when a quiet store was last compacted.
+    if let Err(error) = db
+        .execute(
+            "DELETE FROM ref_store_samples
+             WHERE kind = 'compact' AND store_path = ?1 AND started_at < ?2
+               AND started_at < (SELECT MAX(started_at) FROM ref_store_samples
+                                 WHERE kind = 'compact' AND store_path = ?1)",
+            params![key.as_str(), finished - RETENTION.as_secs() as i64],
+        )
+        .await
+    {
+        log::warn!("failed to trim old object-store compactions: {error}");
     }
 }
 
@@ -819,6 +1183,22 @@ pub(crate) struct RefStoreOverview {
     pub(crate) last_ok_prune_at: Option<i64>,
     /// The last prune that also truncated the operation log.
     pub(crate) last_truncation_at: Option<i64>,
+    /// The latest census of the object database, from whichever row last took
+    /// one. Its row records no cruft packs, so that count reads zero.
+    pub(crate) objects: Option<ObjectStoreCensus>,
+    pub(crate) last_compaction: Option<ObjectStepSample>,
+    /// The last prune that reclaimed unreferenced objects.
+    pub(crate) last_reclaim: Option<ObjectStepSample>,
+}
+
+/// One compaction or reclaim as recorded.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ObjectStepSample {
+    pub(crate) started_at: i64,
+    pub(crate) outcome: String,
+    pub(crate) duration_ms: i64,
+    pub(crate) before: Option<ObjectStoreCensus>,
+    pub(crate) after: Option<ObjectStoreCensus>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -855,6 +1235,10 @@ pub(crate) struct PruneSample {
     pub(crate) removed_cairn_refs: Option<i64>,
     pub(crate) ops_abandoned: Option<i64>,
     pub(crate) truncated: bool,
+    /// Why the reclaim this prune was due to run did not.
+    pub(crate) reclaim_skipped: Option<String>,
+    /// git's error from this prune's reclaim.
+    pub(crate) reclaim_failed: Option<String>,
 }
 
 const SAMPLE_COLUMNS: &str =
@@ -916,12 +1300,22 @@ pub(crate) async fn ref_store_overview(
     let last_prune = db
         .query_opt(
             "SELECT started_at, outcome, duration_ms, removed_keep_refs, removed_cairn_refs,
-                    ops_abandoned, ops_reparented
+                    ops_abandoned, ops_reparented, detail_json
              FROM ref_store_samples
              WHERE project_id = ?1 AND kind = 'prune'
              ORDER BY started_at DESC, rowid DESC LIMIT 1",
             params![project_id],
             |row| {
+                let detail = detail(row.opt_text(7)?);
+                let objects = |key: &str| {
+                    detail
+                        .as_ref()?
+                        .pointer(&format!("/objects/{key}"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                };
+                let reclaim_skipped = objects("skipped");
+                let reclaim_failed = objects("failed");
                 Ok(PruneSample {
                     started_at: row.i64(0)?,
                     outcome: row.text(1)?,
@@ -930,12 +1324,54 @@ pub(crate) async fn ref_store_overview(
                     removed_cairn_refs: row.opt_i64(4)?,
                     ops_abandoned: row.opt_i64(5)?,
                     truncated: row.opt_i64(6)?.is_some(),
+                    reclaim_skipped,
+                    reclaim_failed,
                 })
             },
         )
         .await
         .ok()
         .flatten();
+    let objects = db
+        .query_opt(
+            "SELECT packs, kept_packs, pack_bytes, loose_objects, multi_pack_index
+             FROM ref_store_samples
+             WHERE project_id = ?1 AND packs IS NOT NULL
+             ORDER BY finished_at DESC, rowid DESC LIMIT 1",
+            params![project_id],
+            |row| {
+                Ok(ObjectStoreCensus {
+                    packs: row.i64(0)? as u64,
+                    kept_packs: row.opt_i64(1)?.unwrap_or(0) as u64,
+                    cruft_packs: 0,
+                    pack_bytes: row.opt_i64(2)?.unwrap_or(0) as u64,
+                    loose_objects: row.opt_i64(3)?.unwrap_or(0) as u64,
+                    multi_pack_index: row.opt_i64(4)?.unwrap_or(0) != 0,
+                })
+            },
+        )
+        .await
+        .ok()
+        .flatten();
+    let last_compaction = object_step(
+        db,
+        "SELECT started_at, outcome, duration_ms, detail_json FROM ref_store_samples
+         WHERE project_id = ?1 AND kind = 'compact'
+         ORDER BY started_at DESC, rowid DESC LIMIT 1",
+        project_id,
+        "",
+    )
+    .await;
+    let last_reclaim = object_step(
+        db,
+        "SELECT started_at, outcome, duration_ms, detail_json FROM ref_store_samples
+         WHERE project_id = ?1 AND kind = 'prune' AND reclaimed_bytes IS NOT NULL
+           AND (outcome = 'ok' OR outcome LIKE 'partial:%')
+         ORDER BY started_at DESC, rowid DESC LIMIT 1",
+        project_id,
+        "/objects",
+    )
+    .await;
     RefStoreOverview {
         policy: prune_policy(db, &store).await,
         latest: sample_at_or_before(db, project_id, now).await,
@@ -944,7 +1380,43 @@ pub(crate) async fn ref_store_overview(
         last_prune,
         last_ok_prune_at: last_successful_prune(db, &store, false).await,
         last_truncation_at: last_successful_prune(db, &store, true).await,
+        objects,
+        last_compaction,
+        last_reclaim,
     }
+}
+
+fn detail(text: Option<String>) -> Option<serde_json::Value> {
+    serde_json::from_str(&text?).ok()
+}
+
+/// One compaction or reclaim row, its before and after census read from
+/// `detail_json` at `pointer`.
+async fn object_step(
+    db: &LocalDb,
+    sql: &str,
+    project_id: &str,
+    pointer: &'static str,
+) -> Option<ObjectStepSample> {
+    db.query_opt(sql, params![project_id], move |row| {
+        let detail = detail(row.opt_text(3)?);
+        let census = |key: &str| {
+            detail
+                .as_ref()?
+                .pointer(&format!("{pointer}/{key}"))
+                .and_then(objects_from_json)
+        };
+        Ok(ObjectStepSample {
+            started_at: row.i64(0)?,
+            outcome: row.text(1)?,
+            duration_ms: row.i64(2)?,
+            before: census("before"),
+            after: census("after"),
+        })
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn unix_of(time: SystemTime) -> i64 {

@@ -681,6 +681,7 @@ mod tests {
             verdict_environment: Vec::new(),
             verdict_platforms: None,
             fixes: false,
+            main_cadence: None,
         }
     }
 

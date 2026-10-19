@@ -204,6 +204,168 @@ async fn post_tool_hang_interrupts_only_the_lease_and_rearms_the_goal() {
     );
 }
 
+/// The interrupt is acknowledged, so the only unknown left is the goal's
+/// status. A `thread/goal/get` that cannot answer is uncertainty about that
+/// status, not evidence the provider thread is dead: recovery must preserve the
+/// live process and session and spend no automatic recovery budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_goal_read_after_acknowledged_interrupt_preserves_the_session() {
+    let db = migrated_test_db("post-tool-goal-read-failure").await;
+    db.execute_script(
+        "PRAGMA foreign_keys = OFF;
+         INSERT INTO jobs (id, project_id, status, current_session_id, current_turn_id, created_at, updated_at)
+           VALUES ('job', 'project', 'running', 'session', 'turn', 1, 1);
+         INSERT INTO sessions (id, job_id, backend, backend_id, status, sequence, created_at, updated_at)
+           VALUES ('session', 'job', 'codex', 'native-thread', 'open', 1, 1, 1);
+         INSERT INTO runs (id, job_id, session_id, status, created_at, updated_at)
+           VALUES ('run', 'job', 'session', 'live', 1, 1);
+         INSERT INTO turns (id, job_id, session_id, run_id, sequence, state, start_reason, created_at, updated_at)
+           VALUES ('turn', 'job', 'session', 'run', 1, 'running', 'initial', 1, 1);
+         PRAGMA foreign_keys = ON;",
+    )
+    .await
+    .unwrap();
+    let identity = WatchdogIdentity {
+        run_id: "run".into(),
+        session_id: "session".into(),
+        provider_turn_id: "provider-turn".into(),
+        generation: "generation".into(),
+    };
+    arm_watchdog(
+        &db,
+        NewWatchdogLease {
+            identity: identity.clone(),
+            runner_boot_id: "boot".into(),
+            phase: WatchdogPhase::PostToolContinuation,
+            phase_deadline_at: 150,
+            now: 100,
+        },
+        "post-tool-silence".into(),
+    )
+    .await
+    .unwrap();
+    let orch = test_orchestrator(db);
+
+    // The provider acknowledges the interrupt by ending the exact turn, then
+    // answers the goal read with a JSON-RPC error.
+    let provider_turn = Arc::new(Mutex::new(Some("provider-turn".to_string())));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let observed_turn = provider_turn.clone();
+    let client = Arc::new(
+        cairn_models::codex::app_server::AppServerClient::for_test_responding(
+            move |request| match request["method"].as_str() {
+                Some("turn/interrupt") => {
+                    *observed_turn.lock().unwrap() = None;
+                    Ok(serde_json::json!({ "result": {} }))
+                }
+                method => Ok(serde_json::json!({ "error": {
+                    "code": -32601,
+                    "message": format!("fixture has no reply for {}", method.unwrap_or("?")),
+                } })),
+            },
+            requests.clone(),
+        ),
+    );
+    let control = cairn_models::session::codex::CodexControl::new(
+        client,
+        "native-thread".to_string(),
+        "/tmp/project".to_string(),
+        None,
+        None,
+        None,
+        provider_turn.clone(),
+    );
+    let mut handle = RunHandle::new(
+        Arc::new(Mutex::new(None)),
+        Arc::new(Mutex::new(Some(Box::new(control)))),
+        Some("session".into()),
+        Some("job".into()),
+    );
+    handle.backend = Some("codex".into());
+    orch.process_state
+        .processes
+        .lock()
+        .unwrap()
+        .register("run".into(), handle);
+    orch.process_state.set_current_turn_id("run", Some("turn"));
+
+    let recovery = recover_provider_watchdog(&orch, &identity, 300);
+    let lifecycle = list_watchdog_lifecycle(&orch.db.local, &identity)
+        .await
+        .unwrap();
+    assert_eq!(
+        recovery,
+        Ok(ProviderWatchdogRecovery::PreservedUncertain {
+            reason: "post_tool_goal_reactivation_failed".into(),
+        }),
+        "requests: {:?}; lifecycle: {:?}",
+        requests.lock().unwrap(),
+        lifecycle
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request["method"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>(),
+        vec!["turn/interrupt", "thread/goal/get"]
+    );
+    assert_eq!(*provider_turn.lock().unwrap(), None);
+
+    let reasons = lifecycle
+        .iter()
+        .map(|event| (event.kind, event.reason.as_deref()))
+        .collect::<Vec<_>>();
+    assert!(
+        reasons.contains(&(
+            WatchdogLifecycleKind::TerminalizationSucceeded,
+            Some("post_tool_interrupt_acknowledged")
+        )),
+        "{lifecycle:?}"
+    );
+    let failure = lifecycle
+        .iter()
+        .find(|event| event.reason.as_deref() == Some("post_tool_goal_reactivation_failed"))
+        .expect("goal read failure is recorded");
+    assert_eq!(failure.kind, WatchdogLifecycleKind::TerminalizationFailed);
+    assert!(
+        failure
+            .details_json
+            .as_deref()
+            .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+            .and_then(|details| details["error"].as_str().map(str::to_owned))
+            .is_some_and(|error| error.contains("thread/goal/get")),
+        "the provider error stays on the record: {failure:?}"
+    );
+
+    // The automatic recovery budget is the job's count of reserved successors.
+    let reservations = orch
+        .db
+        .local
+        .query_opt(
+            "SELECT COUNT(*) FROM codex_watchdog_lifecycle lifecycle
+             JOIN runs ON runs.id = lifecycle.run_id
+             WHERE runs.job_id = 'job' AND lifecycle.kind = 'successor_reserved'",
+            (),
+            |row| Ok(row.get::<i64>(0)?),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reservations, Some(0), "{lifecycle:?}");
+    assert!(orch.process_state.has_process("run") == Some(true));
+    assert_eq!(session_status(&orch).await, "open");
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt("SELECT status FROM runs WHERE id = 'run'", (), |row| row
+                .text(0))
+            .await
+            .unwrap(),
+        Some("live".into())
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn repeated_process_interrupt_timeouts_preserve_one_native_session() {

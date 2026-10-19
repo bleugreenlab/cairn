@@ -234,6 +234,22 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
         out.push('\n');
     }
 
+    // --- Inference link ---
+    out.push_str("## Inference\n\n");
+    match crate::config::settings::load_inference(&orch.config_dir).bginf {
+        None => out.push_str("- bginf: not linked\n\n"),
+        Some(link) => {
+            out.push_str(&format!("- bginf url: {}\n", link.url));
+            if link.machines.is_empty() {
+                out.push_str("- bginf machines: every node keeps its name\n");
+            }
+            for (node, machine) in &link.machines {
+                out.push_str(&format!("- bginf node {node} is machine {machine}\n"));
+            }
+            out.push_str("- token: the first `bginf` account; see cairn://inference\n\n");
+        }
+    }
+
     // --- GitHub (read-only; connect/disconnect handshake stays UI-only) ---
     out.push_str("## GitHub (read-only)\n\n");
     match crate::github::credentials::get_github_credentials(&orch.db.local).await {

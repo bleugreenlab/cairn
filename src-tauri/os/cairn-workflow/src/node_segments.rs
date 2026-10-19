@@ -240,12 +240,10 @@ mod tests {
     /// and `action_runs.uri_segment` for the execution (CAIRN-1222).
     #[tokio::test]
     async fn top_level_segment_dedupes_across_jobs_and_action_runs() {
-        use crate::storage::{DbError, LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+        use crate::storage::{DbError, LocalDb};
 
         let temp = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("seg.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("seg.db"))
             .await
             .unwrap();
 
@@ -320,14 +318,10 @@ mod tests {
     /// their namespace stays the parent job.
     #[tokio::test]
     async fn a_thread_task_segment_is_unique_across_every_session_of_the_thread() {
-        use crate::storage::{DbError, LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+        use crate::storage::{DbError, LocalDb};
 
         let temp = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("thread-seg.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("thread-seg.db"))
             .await
             .unwrap();
 

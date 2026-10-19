@@ -140,6 +140,18 @@ async fn record_operator_message(
     delivered_at: Option<i64>,
     request_id: Option<String>,
 ) -> Result<QueuedMessage, String> {
+    // A closed thread takes no new work. Every operator message enters the core
+    // here, and it is persisted BEFORE any turn is admitted — the turn starts
+    // behind a background nudge — so the turn-admission gate alone would accept
+    // the text and then decline the nudge with nothing but a log line. Refuse
+    // before writing. A follow-up to a turn still running on a just-closed
+    // session is kept: closing does not cancel that turn, and the text is
+    // claimed by the thread's next turn once it is reopened.
+    if crate::threads::is_dormant_thread_session(db, job_id).await
+        && !crate::messages::delivery::head_turn_active(db, job_id).await?
+    {
+        return Err(crate::threads::dormant_thread_refusal());
+    }
     let timing_started = std::time::Instant::now();
     let id = request_id.unwrap_or_else(|| ids::mint_child(job_id));
     let job_id = job_id.to_string();

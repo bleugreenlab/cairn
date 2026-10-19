@@ -186,13 +186,11 @@ pub async fn local_has_clone(private_db: &LocalDb, project_key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MigrationRunner, TEAM_MIGRATIONS, TURSO_MIGRATIONS};
+    use crate::storage::{MigrationRunner, TEAM_MIGRATIONS};
 
     async fn db() -> LocalDb {
         let dir = tempfile::tempdir().unwrap().keep();
-        let db = LocalDb::open(dir.join("t.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(dir.join("t.db"))
             .await
             .unwrap();
         db

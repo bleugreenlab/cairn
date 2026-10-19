@@ -554,7 +554,11 @@ pub fn finalize_stream(
                     if final_event.content.is_none() && !active.content.is_empty() {
                         final_event.content = Some(active.content.clone());
                     }
-                    if final_event.thinking.is_none() && !active.thinking.is_empty() {
+                    // `Some("")` is the private-reasoning disposition, not prose:
+                    // treat it as absent so the streamed prose still backfills.
+                    if final_event.thinking.as_deref().unwrap_or("").is_empty()
+                        && !active.thinking.is_empty()
+                    {
                         final_event.thinking = Some(active.thinking.clone());
                     }
                     if final_event.session_id.is_none() {
@@ -1167,15 +1171,11 @@ fn run_stream_db_future<T>(future: impl Future<Output = Result<T, String>>) -> R
 #[cfg(any(test, feature = "test-utils"))]
 pub mod testing {
     use super::*;
-    use cairn_db::storage::{MigrationRunner, TEAM_MIGRATIONS, TURSO_MIGRATIONS};
+    use cairn_db::storage::{MigrationRunner, TEAM_MIGRATIONS};
     use tempfile::{tempdir, TempDir};
     pub async fn test_db() -> (TempDir, Arc<LocalDb>) {
         let temp = tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("stream-store-test.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("stream-store-test.db"))
             .await
             .unwrap();
         (temp, Arc::new(db))

@@ -1503,8 +1503,8 @@ mod tests {
               VALUES ('thread-delete', 0, 1);
             INSERT INTO thread_branches(id, thread_id, number, stage, git_ref, job_id, created_at, moved_at)
               VALUES ('branch-delete', 'thread-delete', 1, 'accumulating', 'agent/delete', 'job-delete', 1, 1);
-            INSERT INTO tenets(id, project_id, number, proposing_thread_id, question, options_json, status, origin, proposer_principal_json, created_at, updated_at)
-              VALUES ('tenet-delete', 'project-delete', 1, 'thread-delete', 'q', '["a"]', 'proposed', 'standing', '{"kind":"agent","node":"cairn://p/delete/thread-delete","run_id":null}', 1, 1);
+            INSERT INTO tenets(id, project_id, number, proposing_thread_id, statement, status, origin, proposer_principal_json, created_at, updated_at)
+              VALUES ('tenet-delete', 'project-delete', 1, 'thread-delete', 'q', 'proposed', 'standing', '{"kind":"agent","node":"cairn://p/delete/thread-delete","run_id":null}', 1, 1);
             INSERT INTO tenet_ruling_imports(thread_id, project_id, imported_at)
               VALUES ('thread-delete', 'project-delete', 1);
             INSERT INTO tenet_evidence_events(id, project_id, source_uri, source_kind, dedupe_key, owner_device_id, text, created_at)

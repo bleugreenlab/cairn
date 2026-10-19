@@ -744,7 +744,7 @@ mod tests {
         use crate::db::DbState;
         use crate::orchestrator::OrchestratorBuilder;
         use crate::services::testing::TestServicesBuilder;
-        use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+        use crate::storage::{LocalDb, SearchIndex};
         use std::sync::Arc;
 
         let worktree = tempfile::tempdir().unwrap();
@@ -755,13 +755,10 @@ mod tests {
         std::fs::write(worktree.path().join("big.rs"), &big).unwrap();
         std::fs::write(worktree.path().join("small.rs"), "hello\nworld").unwrap();
 
-        let local = LocalDb::open(tempfile::tempdir().unwrap().keep().join("t.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
-            .await
-            .unwrap();
+        let local =
+            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("t.db"))
+                .await
+                .unwrap();
         let search =
             Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
         let db = Arc::new(DbState::new(Arc::new(local), search));
@@ -912,16 +909,13 @@ mod tests {
         use crate::db::DbState;
         use crate::orchestrator::OrchestratorBuilder;
         use crate::services::testing::TestServicesBuilder;
-        use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+        use crate::storage::{LocalDb, SearchIndex};
         use std::sync::Arc;
 
-        let local = LocalDb::open(tempfile::tempdir().unwrap().keep().join("t.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
-            .await
-            .unwrap();
+        let local =
+            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("t.db"))
+                .await
+                .unwrap();
         let search =
             Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
         let db = Arc::new(DbState::new(Arc::new(local), search));

@@ -139,7 +139,7 @@ fn thread_principal(thread_name: &str) -> PrincipalRef {
 }
 
 /// Propose a tenet the way a thread does, through the tenets module.
-async fn propose_tenet(db: &LocalDb, thread_id: &str, question: &str, options: &[&str]) {
+async fn propose_tenet(db: &LocalDb, thread_id: &str, statement: &str) {
     cairn_core::tenets::propose(
         db,
         &NoopEmitter,
@@ -150,8 +150,7 @@ async fn propose_tenet(db: &LocalDb, thread_id: &str, question: &str, options: &
             principal: thread_principal("library"),
         },
         Proposal {
-            question: question.into(),
-            options: options.iter().map(|option| option.to_string()).collect(),
+            statement: statement.into(),
             supersedes: None,
             origin: TenetOrigin::Standing,
         },
@@ -173,17 +172,19 @@ async fn insert_answered(db: &LocalDb, tenet: NewTenet) {
     .expect("the tenet is stored");
 }
 
-fn answered(thread_id: &str, status: TenetStatus, options: &[&str]) -> NewTenet {
-    let selected = matches!(status, TenetStatus::Approved | TenetStatus::Superseded);
+fn answered(thread_id: &str, status: TenetStatus, statement: &str) -> NewTenet {
+    let approved = matches!(status, TenetStatus::Approved | TenetStatus::Superseded);
     NewTenet {
         project_id: "p-1".into(),
         proposing_thread_id: thread_id.into(),
         slug: None,
-        question: format!("Decide: {}?", options[0]),
-        options: options.iter().map(|option| option.to_string()).collect(),
+        statement: statement.into(),
         status,
-        verdict: Some(if selected { "option" } else { "none" }),
-        selected_option: selected.then_some(0),
+        verdict: Some(if approved {
+            cairn_core::tenets::Verdict::Yes
+        } else {
+            cairn_core::tenets::Verdict::No
+        }),
         comment: None,
         answered_by: Some(PrincipalRef::Machine {
             device_id: "d-1".into(),
@@ -389,25 +390,16 @@ async fn the_json_projection_is_prose_only_and_still_reparses() {
         answered(
             "t-json",
             TenetStatus::Approved,
-            &[
-                "packs resolve by name, not by content hash",
-                "packs resolve by hash",
-            ],
+            "packs resolve by name, not by content hash",
         ),
     )
     .await;
     insert_answered(
         &db,
-        answered("t-json", TenetStatus::Declined, &["vendor every pack"]),
+        answered("t-json", TenetStatus::Declined, "vendor every pack"),
     )
     .await;
-    propose_tenet(
-        &db,
-        "t-json",
-        "Should packs carry a version?",
-        &["yes, semver", "no"],
-    )
-    .await;
+    propose_tenet(&db, "t-json", "Packs carry a semver version.").await;
 
     let json_read =
         common::read_resource(&orch, format!("{}?format=json", arc_uri("library"))).await;
@@ -434,14 +426,12 @@ async fn the_json_projection_is_prose_only_and_still_reparses() {
     let rendered = common::read_resource(&orch, arc_uri("library")).await;
     for needle in [
         "### Awaiting verdict",
-        "- **#3** (proposed 1970-01-01) — Should packs carry a version?",
-        "  1. yes, semver (recommended)",
+        "- **#3** (proposed 1970-01-01) — Packs carry a semver version.",
         "### Tenets",
         "- **#1** (approved by anonymous device",
         "2023-11-14) — packs resolve by name, not by content hash",
-        "  rejected: packs resolve by hash",
         "### Tenet index",
-        "- #2 · declined · Decide: vendor every pack?",
+        "- #2 · declined · vendor every pack",
         "Full text: cairn://p/thr/tenets/<n> · all of this thread's: cairn://p/thr/tenets?thread=library",
         "cairn:@/tenets",
         "_cairn_open_questions",
@@ -509,7 +499,7 @@ async fn a_migrated_rulings_multi_paragraph_rationale_renders_byte_exact() {
     let mut migrated = answered(
         "t-fidelity",
         TenetStatus::Approved,
-        &["A retry wrapper is a no-op unless the failure it retries is representable"],
+        "A retry wrapper is a no-op unless the failure it retries is representable",
     );
     migrated.slug = Some("retry-needs-a-representable-failure".into());
     migrated.origin = TenetOrigin::MigratedRuling;

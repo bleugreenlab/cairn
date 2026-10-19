@@ -2,7 +2,7 @@
 
 use crate::common;
 
-use cairn_core::internal::storage::{DbResult, LocalDb};
+use cairn_core::internal::storage::LocalDb;
 use cairn_core::merge_requests::queries;
 use cairn_db::turso::params;
 
@@ -150,22 +150,6 @@ async fn create_action_run(
     id
 }
 
-async fn insert_webhook_event(db: &LocalDb, pr_number: i64, processed_at: i64) -> DbResult<String> {
-    let id = uuid::Uuid::new_v4().to_string();
-    db.execute(
-        "
-        INSERT INTO webhook_events (
-            id, event_type, action, repo_full_name, pr_number,
-            payload_summary, processed_at
-        )
-        VALUES (?1, 'pull_request', 'opened', 'owner/repo', ?2, 'opened PR', ?3)
-        ",
-        params![id.as_str(), pr_number, processed_at],
-    )
-    .await
-    .map(|_| id)
-}
-
 #[tokio::test]
 async fn summaries_for_action_runs_preserve_action_run_id() {
     let (_temp, db) = common::migrated_db().await;
@@ -225,36 +209,4 @@ async fn get_by_action_run_id_accepts_action_run_or_job_id() {
     assert_eq!(via_action.id, merge_request);
     assert_eq!(via_job.id, via_action.id);
     assert_eq!(via_action.pr_number, Some(33));
-}
-
-#[tokio::test]
-async fn webhook_events_can_load_by_number_or_job() {
-    let (_temp, db) = common::migrated_db().await;
-    let project = common::create_project(&db, "prw").await;
-    let execution = create_execution(&db, &project).await;
-    let job = create_job(&db, &project, None, Some(&execution), Some("feature")).await;
-    create_merge_request(
-        &db,
-        &job,
-        &project,
-        None,
-        "Webhook PR",
-        "open",
-        Some(51),
-        Some("https://github.com/test/test/pull/51"),
-    )
-    .await;
-    let older = insert_webhook_event(&db, 51, 10).await.unwrap();
-    let newer = insert_webhook_event(&db, 51, 20).await.unwrap();
-
-    let by_number = queries::get_webhook_events(&db, 51).await.unwrap();
-    assert_eq!(by_number.len(), 2);
-    assert_eq!(by_number[0].id, newer);
-    assert_eq!(by_number[1].id, older);
-
-    let by_job = queries::get_webhook_events_for_job(&db, &job)
-        .await
-        .unwrap();
-    assert_eq!(by_job.len(), 2);
-    assert_eq!(by_job[0].processed_at, 20);
 }

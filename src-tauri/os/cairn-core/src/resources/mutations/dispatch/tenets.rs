@@ -60,21 +60,16 @@ fn proposal(
     item: &ChangeItem,
     payload: &serde_json::Value,
 ) -> ResourceMutationResult<Proposal> {
-    let question = payload
-        .get("question")
+    let statement = payload
+        .get("statement")
         .and_then(|value| value.as_str())
-        .ok_or_else(|| build_failure(index, item, "payload.question must be a string"))?;
-    let options = payload
-        .get("options")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| build_failure(index, item, "payload.options must be an array of strings"))?
-        .iter()
-        .map(|option| {
-            option.as_str().map(str::to_string).ok_or_else(|| {
-                build_failure(index, item, "payload.options must be an array of strings")
-            })
-        })
-        .collect::<ResourceMutationResult<Vec<_>>>()?;
+        .ok_or_else(|| {
+            build_failure(
+                index,
+                item,
+                "payload.statement must be a string: how the project does things, for the operator to answer yes or no",
+            )
+        })?;
     let supersedes = match payload.get("supersedes") {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => Some(value.as_i64().filter(|number| *number > 0).ok_or_else(|| {
@@ -82,8 +77,7 @@ fn proposal(
         })?),
     };
     Ok(Proposal {
-        question: question.to_string(),
-        options,
+        statement: statement.to_string(),
         supersedes,
         origin: TenetOrigin::Standing,
     })
@@ -95,6 +89,18 @@ fn verdict_refusal(project: &str, key: &str) -> String {
         crate::tenets::AGENT_VERDICT_REFUSAL,
         build_project_tenets_uri(project)
     )
+}
+
+/// The refusal for a proposal in the retired `{question, options}` shape.
+/// Runs before the contract gate so the caller hears that a tenet is now a
+/// statement, not only that `question` and `options` are unknown keys.
+pub(super) fn retired_shape_refusal(resource: &CairnResource, item: &ChangeItem) -> Option<String> {
+    if !matches!(resource, CairnResource::ProjectTenets { .. }) || item.mode != ChangeMode::Append {
+        return None;
+    }
+    let payload = item.payload.as_ref()?.as_object()?;
+    (payload.contains_key("question") || payload.contains_key("options"))
+        .then(|| crate::tenets::retired_proposal_shape_refusal("payload."))
 }
 
 /// Why a write to tenet `key` is an edit rather than a withdrawal or an
@@ -153,7 +159,7 @@ pub(super) async fn dispatch(
             let payload = append_payload(index, item)?;
             let proposal = proposal(index, item, payload)?;
             if dry_run {
-                format!("Would propose tenet: {}", proposal.question.trim())
+                format!("Would propose tenet: {}", proposal.statement.trim())
             } else {
                 let (proposer, db, _) = proposer(orch, request, project, index, item).await?;
                 let tenet = crate::tenets::propose(
@@ -166,7 +172,7 @@ pub(super) async fn dispatch(
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
                 format!(
-                    "Proposed tenet {}: it awaits the operator's verdict in the Tenets tab. A pending proposal blocks only what it gates.",
+                    "Proposed tenet {}: it awaits the operator's verdict. A pending proposal blocks only what it gates.",
                     crate::tenets::tenet_uri(project, tenet.number)
                 )
             }

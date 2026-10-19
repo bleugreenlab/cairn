@@ -197,16 +197,12 @@ mod tests {
     use super::*;
     use crate::labels::crud::{create_label_conn, list_labels_conn, DEFAULT_WORKSPACE_ID};
     use crate::models::CreateLabel;
-    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::LocalDb;
     use tempfile::tempdir;
 
     async fn test_db() -> LocalDb {
         let temp = tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("labels-attach.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("labels-attach.db"))
             .await
             .unwrap();
         db

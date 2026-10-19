@@ -12,10 +12,9 @@ use crate::embeddings::{COHERE_DIMS, COHERE_MODEL};
 use crate::storage::{DbResult, LocalDb};
 use crate::tenets::TenetView;
 
-/// What a tenet embeds as: the adopted text, then the question it answered.
+/// What a tenet embeds as: its statement.
 pub fn tenet_embed_text(view: &TenetView) -> String {
-    let text = view.text.as_deref().unwrap_or(&view.row.question);
-    format!("{text}\n\n{}", view.row.question)
+    view.row.statement.clone()
 }
 
 /// The URI prefix every tenet of a project shares.

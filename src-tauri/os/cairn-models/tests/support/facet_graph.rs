@@ -25,6 +25,8 @@ pub const PUBLIC_ROOTS: &[&str] = &[
     "cairn-speech-wire",
     "cairn-models-types",
     "cairn-credentials",
+    // Not a leaf: it reaches cairn-models-types for `VerbKind`.
+    "cairn-inference",
 ];
 
 /// Public members that must reach no workspace crate at all.

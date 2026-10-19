@@ -587,6 +587,21 @@ pub struct ConflictDiagnostic {
     pub condition: ConflictCondition,
     /// The incoming change's COMPLETE file set, each classified.
     pub incoming: Vec<IncomingFile>,
+    /// Set when jj recorded NO conflict but the rebased tip's tree root carried
+    /// jj conflict scaffolding, so the verified export refused it. Then
+    /// `conflicted_tip` is that refused commit and the conflicting paths are the
+    /// files both sides changed, since jj named none.
+    pub scaffolding: Option<ScaffoldingRefusal>,
+}
+
+/// A rebased tip refused at export because its tree root carried jj conflict
+/// scaffolding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScaffoldingRefusal {
+    /// The commit the bookmark would have been exported to.
+    pub commit: String,
+    /// The scaffolding entries at its tree root, e.g. `JJ-CONFLICT-README`.
+    pub entries: Vec<String>,
 }
 
 impl ConflictDiagnostic {
@@ -944,6 +959,39 @@ fn roll_back_rebase(
     }
 }
 
+/// Undo a rebase whose result is being reported as a conflict, and PROVE it
+/// undone.
+///
+/// The bookmark is back where it started after the restore, so the export
+/// asserts the pre-rebase commit rather than publishing anything new. It is
+/// what proves the git ref was never dragged onto the refused tip. Anything
+/// short of that proof is [`rollback_incomplete`].
+fn roll_back_conflicting_rebase(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    dest: &str,
+    pre_op: &str,
+) -> Result<(), String> {
+    restore_operation(jj, store, pre_op)
+        .and_then(|()| {
+            export_bookmark_advance(
+                jj,
+                store,
+                true,
+                branch,
+                "jj git export (conflicting rebase rolled back)",
+            )
+        })
+        .map_err(|error| {
+            rollback_incomplete(&format!(
+                "jj rebase of `{branch}` onto `{dest}` was refused as a conflict, and the store \
+                 could not be proven rolled back to its pre-rebase operation {pre_op}: {error}. \
+                 The branch may be sitting on the refused commit; do NOT export or publish it."
+            ))
+        })
+}
+
 /// Rebase a branch while honoring an explicitly identified committed resolution.
 ///
 /// `resolution` is supplied only by the explicit durable conflict-session
@@ -1057,27 +1105,7 @@ pub(crate) fn rebase_branch_onto_with_resolution(
         let paths = branch_conflicted_paths(jj, store, branch);
         let diagnostic =
             capture_conflict_diagnostic(jj, store, branch, dest, pre_tip.as_deref(), paths.clone());
-        // The bookmark is back where it started after the restore, so the
-        // export asserts the pre-rebase commit rather than publishing anything
-        // new. It is what proves the git ref was never dragged onto the conflict.
-        restore_operation(jj, store, &pre_op)
-            .and_then(|()| {
-                export_bookmark_advance(
-                    jj,
-                    store,
-                    true,
-                    branch,
-                    "jj git export (conflicting rebase rolled back)",
-                )
-            })
-            .map_err(|error| {
-                rollback_incomplete(&format!(
-                    "jj rebase of `{branch}` onto `{dest}` recorded a conflict, and the store \
-                     could not be proven rolled back to its pre-rebase operation {pre_op}: \
-                     {error}. The branch may be sitting on a conflict-flagged commit; do NOT \
-                     export or publish it."
-                ))
-            })?;
+        roll_back_conflicting_rebase(jj, store, branch, dest, &pre_op)?;
         log::info!(
             "jj rebase: `{branch}` onto `{dest}` recorded a {} and was rolled back to {} — nothing \
              conflict-flagged was exported. Conflicting file(s): {}. Incoming change also carries \
@@ -1095,17 +1123,65 @@ pub(crate) fn rebase_branch_onto_with_resolution(
     }
 
     reached_step("rebase: before export");
-    if let Err(error) = export_bookmark_advance(jj, store, true, branch, "jj git export (rebase)") {
-        return Err(roll_back_rebase(
-            jj,
-            store,
-            branch,
-            &pre_op,
-            format!(
-                "jj rebase of `{branch}` onto `{dest}` moved the bookmark, and exporting it to \
-                 git failed: {error}"
-            ),
-        ));
+    match export_bookmark_advance_guarded(jj, store, true, branch, "jj git export (rebase)") {
+        Ok(()) => {}
+        Err(ExportError::ConflictScaffolding {
+            commit, entries, ..
+        }) => {
+            // jj called this tip clean, and its tree says otherwise. The tree
+            // wins: the export refused before moving the git ref, and the
+            // rebase is undone exactly as a recorded conflict is. jj names no
+            // conflicting path, so the files both sides changed stand in — they
+            // are where a side was chosen silently — captured now, while the
+            // rebased tip still exists to diff against.
+            let overlapping = pre_tip
+                .as_deref()
+                .map(|pre| rebase_side_selection(jj, store, dest, pre, &commit).overlapping)
+                .unwrap_or_default();
+            let mut diagnostic = capture_conflict_diagnostic(
+                jj,
+                store,
+                branch,
+                dest,
+                pre_tip.as_deref(),
+                overlapping.clone(),
+            );
+            // Never base drift: with no conflicting path named, the drift probe
+            // would find "no difference" vacuously and tell the agent there is
+            // nothing to merge, while the next replay meets the same tree.
+            diagnostic.condition = ConflictCondition::ContentConflict;
+            diagnostic.scaffolding = Some(ScaffoldingRefusal {
+                commit: commit.clone(),
+                entries: entries.clone(),
+            });
+            roll_back_conflicting_rebase(jj, store, branch, dest, &pre_op)?;
+            log::error!(
+                "jj rebase: `{branch}` onto `{dest}` produced {commit}, which jj reported \
+                 conflict-free but whose tree root carries jj conflict scaffolding ({}). The \
+                 export was refused and the rebase rolled back to {}; recorded as a conflict. \
+                 File(s) both sides changed: {}",
+                entries.join(", "),
+                pre_tip.as_deref().unwrap_or("<unresolved>"),
+                if overlapping.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    overlapping.join(", ")
+                }
+            );
+            return Ok(RebaseOutcome::Conflicted { diagnostic });
+        }
+        Err(ExportError::Failed(error)) => {
+            return Err(roll_back_rebase(
+                jj,
+                store,
+                branch,
+                &pre_op,
+                format!(
+                    "jj rebase of `{branch}` onto `{dest}` moved the bookmark, and exporting it \
+                     to git failed: {error}"
+                ),
+            ));
+        }
     }
 
     // A clean TIP is not a clean branch. Enumerate the whole rebased range: a
@@ -1319,6 +1395,7 @@ pub(crate) fn capture_conflict_diagnostic(
         conflicted_tip,
         condition,
         incoming,
+        scaffolding: None,
     }
 }
 
@@ -1466,6 +1543,7 @@ pub(crate) fn fast_forward_bookmark(
     branch: &str,
     dest: &str,
 ) -> Result<(), String> {
+    let before = bookmark_commit(jj, store, branch);
     jj.run(
         store,
         &[
@@ -1480,11 +1558,51 @@ pub(crate) fn fast_forward_bookmark(
     )?;
     // `dest` is the exact commit this was asked to land on, so assert that rather
     // than whatever the bookmark reports afterwards.
-    export_git_verified(
+    let Err(error) = export_git_verified(
         jj,
         store,
         true,
         "jj git export (bookmark fast-forward)",
         &[(branch, dest)],
-    )
+    ) else {
+        return Ok(());
+    };
+    // A refused export (a frozen ref, or a tree carrying conflict scaffolding)
+    // leaves git where it was, so the store goes back too: a bookmark ahead of
+    // its git ref is the drift every later import turns into a conflicted name.
+    let Some(before) = before else {
+        return Err(error);
+    };
+    let restored = jj
+        .run(
+            store,
+            &[
+                "bookmark",
+                "set",
+                branch,
+                "-r",
+                &before,
+                "--allow-backwards",
+                "--ignore-working-copy",
+            ],
+            "jj bookmark fast-forward rollback",
+        )
+        .and_then(|_| {
+            export_git_verified(
+                jj,
+                store,
+                true,
+                "jj git export (fast-forward rolled back)",
+                &[(branch, before.as_str())],
+            )
+        });
+    Err(match restored {
+        Ok(()) => format!("{error}\nThe fast-forward was rolled back to {before}."),
+        Err(rollback) => format!(
+            "{error}\n{}",
+            rollback_incomplete(&format!(
+                "rolling the fast-forward of `{branch}` back to {before} also failed: {rollback}"
+            ))
+        ),
+    })
 }

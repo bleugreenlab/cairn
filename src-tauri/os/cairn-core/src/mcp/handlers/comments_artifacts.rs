@@ -2190,21 +2190,17 @@ mod capture_tests {
     use crate::db::DbState;
     use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, RowExt, SearchIndex};
     use cairn_db::turso::params;
     use serde_json::json;
     use std::sync::Arc;
 
     async fn orch_with_db() -> (Orchestrator, Arc<LocalDb>) {
         let local = Arc::new(
-            LocalDb::open(tempfile::tempdir().unwrap().keep().join("capture.db"))
+            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("capture.db"))
                 .await
                 .unwrap(),
         );
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
-            .await
-            .unwrap();
         let search =
             Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
         let db = Arc::new(DbState::new(local.clone(), search));

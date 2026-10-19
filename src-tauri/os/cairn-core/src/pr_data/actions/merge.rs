@@ -943,11 +943,8 @@ async fn merge_pr_for_job_past_barrier(
                 &prospective.tree_hash,
                 &prospective.tree_entries,
                 &prospective.changed_files,
-                None,
                 job_id,
                 crate::fleet::CellPriority::ReviewCheck,
-                crate::execution::checks::ReviewTreeCheckScope::Gates,
-                None,
             )
             .await
             {
@@ -1087,15 +1084,11 @@ async fn merge_pr_for_job_past_barrier(
 mod tests {
     use super::super::context::MrContext;
     use super::*;
-    use crate::storage::{MigrationRunner, RowExt, TURSO_MIGRATIONS};
+    use crate::storage::RowExt;
 
     async fn merge_journal_test_db() -> LocalDb {
         let dir = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(dir.keep().join("merge-journal.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(dir.keep().join("merge-journal.db"))
             .await
             .unwrap();
         db.execute(

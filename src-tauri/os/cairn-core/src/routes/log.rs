@@ -13,7 +13,8 @@
 //! transcript or of a file. The one exception is a source with no local
 //! record at all (a relayed GitHub comment): its row stores the content once,
 //! bounded only by the external record's own limit, because clipping it would
-//! hand routes less than the producer saw.
+//! hand routes less than the producer saw. An `ingress` row stores no body:
+//! its canonical local record is the `ingress_events` row it points at.
 
 use std::collections::BTreeMap;
 
@@ -142,6 +143,12 @@ pub async fn mint(orch: &Orchestrator, mint: Mint<'_>) -> Result<Option<i64>, St
         None => (None, None),
     };
     let dedupe = spec.dedupe;
+    // An outsider's content never reaches the summary: for an untrusted source
+    // the producer's summary is ignored and composed from label fields.
+    let summary = match spec.untrusted {
+        Some(labels) => super::predicate::label_summary(labels, &mint.fact.fields),
+        None => mint.fact.summary,
+    };
     let fields_json = serde_json::to_string(&stored_fields(spec, mint.fact.fields))
         .map_err(|error| error.to_string())?;
     let new = NewFact {
@@ -151,9 +158,7 @@ pub async fn mint(orch: &Orchestrator, mint: Mint<'_>) -> Result<Option<i64>, St
         record_ref: mint.record_ref,
         record_id: mint.record_id,
         fields_json,
-        summary: mint
-            .fact
-            .summary
+        summary: summary
             .as_deref()
             .map(str::trim)
             .filter(|summary| !summary.is_empty())
@@ -313,6 +318,17 @@ pub async fn hydrate(orch: &Orchestrator, row: &FactRow) -> Result<Hydrated, Str
             &field("url"),
             &field("text"),
         );
+        fact.fields.insert("body".into(), Value::String(body));
+    }
+    if row.source == "ingress" {
+        let id: i64 = row
+            .record_id
+            .as_deref()
+            .and_then(|id| id.parse().ok())
+            .ok_or_else(|| format!("ingress row {} has no ingress_events id", row.id))?;
+        let body = crate::ingress::event_body(&orch.db.local, id)
+            .await?
+            .ok_or_else(|| format!("ingress event {id} no longer exists"))?;
         fact.fields.insert("body".into(), Value::String(body));
     }
     Ok(Hydrated {

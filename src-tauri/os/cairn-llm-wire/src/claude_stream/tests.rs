@@ -396,6 +396,73 @@ fn an_assistant_message_without_blocks_has_no_tools() {
     assert_eq!(assistant.thinking, None);
 }
 
+// Reasoning arrives in one of two dispositions, distinguished ONLY by whether
+// the block's text is empty: visible intent prose, or private reasoning whose
+// text is withheld and whose volume is reported by `thinking_tokens`. Both are
+// ordinary `thinking` blocks on the wire.
+
+fn thinking_of(blocks: Vec<ContentBlock>) -> Option<String> {
+    extract_assistant_content(&MessageContentInner::Blocks(blocks)).thinking
+}
+
+fn reasoning(text: &str) -> ContentBlock {
+    ContentBlock::Thinking {
+        thinking: text.to_string(),
+    }
+}
+
+#[test]
+fn a_private_reasoning_block_yields_no_prose() {
+    // Not `Some("")`: that is not `None`, so it would defeat the downstream
+    // `is_none()` backfill guards and persist an empty-prose orphan row.
+    assert_eq!(thinking_of(vec![reasoning("")]), None);
+}
+
+#[test]
+fn a_private_block_before_a_visible_one_leaves_no_separator() {
+    assert_eq!(
+        thinking_of(vec![reasoning(""), reasoning("Reading both files first.")]).as_deref(),
+        Some("Reading both files first."),
+        "the private block must not contribute a leading newline"
+    );
+}
+
+#[test]
+fn a_visible_reasoning_block_keeps_its_prose_beside_tool_calls() {
+    let assistant = extract_assistant_content(&MessageContentInner::Blocks(vec![
+        reasoning(""),
+        reasoning("Checking the config."),
+        ContentBlock::ToolUse {
+            id: "t1".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "a.rs"}),
+        },
+    ]));
+    assert_eq!(assistant.thinking.as_deref(), Some("Checking the config."));
+    assert_eq!(assistant.tool_uses.map(|uses| uses.len()), Some(1));
+}
+
+#[test]
+fn a_signature_delta_is_discarded_rather_than_modeled() {
+    // The standing guarantee that the opaque private-reasoning payload never
+    // enters Cairn: there is no variant to carry it, so it parses as Unknown.
+    let delta: DeltaContent = serde_json::from_value(serde_json::json!({
+        "type": "signature_delta",
+        "signature": "<redacted>",
+    }))
+    .expect("a signature delta must parse, not error");
+    assert!(matches!(delta, DeltaContent::Unknown));
+
+    // Nor does a consolidated thinking block retain its signature.
+    let block: ContentBlock = serde_json::from_value(serde_json::json!({
+        "type": "thinking",
+        "thinking": "",
+        "signature": "<redacted>",
+    }))
+    .expect("a private thinking block must parse");
+    assert!(!serde_json::to_string(&block).unwrap().contains("redacted"));
+}
+
 #[test]
 fn parse_thinking_tokens_estimate_reads_absolute_estimate() {
     let data = serde_json::json!({

@@ -1,10 +1,10 @@
 //! Range packfile construction for session archival.
 //!
-//! At worktree teardown, [`build_execution_pack`] captures the git objects that
-//! exist only on the execution's branch — those reachable from the worktree tip
-//! but not from the durable pack anchor or the default branch — into a single
+//! At issue teardown, [`build_execution_pack`] captures the git objects that
+//! exist only on the execution's branch — those reachable from the branch tip
+//! but not from its fork point or the integration target — into a single
 //! packfile plus index. These are exactly the objects at risk of garbage
-//! collection once the worktree is removed; everything else stays resolvable
+//! collection once the branch is deleted; everything else stays resolvable
 //! from the project repository's object database.
 
 use std::io::Write;
@@ -53,43 +53,35 @@ pub fn build_reachable_range_pack(
         .ok_or_else(|| format!("reachable range {base}..{tip} unexpectedly contained no objects"))
 }
 
-/// Build the execution range pack for the range `pack_anchor..tip`.
+/// Build the execution range pack: every object reachable from any of `tips`
+/// but from none of `exclude`.
 ///
-/// `git_dir` is the git repository the range is computed and packed in, and
-/// `tip` is the worktree tip the range is built against — both resolved by the
-/// caller so this never assumes the worktree itself is a git repository. Under
-/// jj a production workspace is `.jj`-only (no `.git`), so the caller routes
-/// `git_dir` to the project repo, where `jj git export` has landed the
-/// execution's objects, and resolves `tip` from jj's `@-`; under plain git both
-/// are the worktree.
+/// `git_dir` is the git repository the range is computed and packed in — the
+/// project repository, where the execution's branches' objects live. An
+/// execution can span several branches (one per node), so the pack is the union
+/// of their ranges; `exclude` names the already-durable commits (each branch's
+/// fork point and its integration target's head), so an integration branch
+/// merged into a branch mid-flight never over-packs durable objects.
 ///
 /// Returns `Ok(Some((pack, idx)))` with the packfile bytes and its index bytes.
-/// Returns `Ok(None)` when the range is empty — everything reachable from the tip
-/// is already durable (a fast-forward or true merge into the default branch, or
-/// tip == anchor) — so reconstruction resolves entirely from the project repo's
-/// object database.
-///
-/// `pack_anchor` is the durable anchor the range is built against; both it and
-/// `default_branch_ref` are excluded so a default branch merged into the branch
-/// mid-flight never over-packs already-durable objects. Shelling out to git here
-/// is intentional: this runs at teardown where the objects still exist.
+/// Returns `Ok(None)` when the range is empty — everything reachable from the
+/// tips is already durable (a fast-forward or true merge, or a branch with no
+/// commits of its own) — so reconstruction resolves entirely from the project
+/// repo's object database. Shelling out to git here is intentional: this runs at
+/// teardown where the objects still exist.
 pub fn build_execution_pack(
     git_dir: &Path,
-    tip: &str,
-    pack_anchor: &str,
-    default_branch_ref: &str,
+    tips: &[&str],
+    exclude: &[&str],
 ) -> Result<Option<ExecutionPack>, String> {
-    let rev_list = run_git(
-        git_dir,
-        &[
-            "rev-list",
-            "--objects",
-            tip,
-            "--not",
-            pack_anchor,
-            default_branch_ref,
-        ],
-    )?;
+    if tips.is_empty() {
+        return Ok(None);
+    }
+    let mut args = vec!["rev-list", "--objects"];
+    args.extend_from_slice(tips);
+    args.push("--not");
+    args.extend_from_slice(exclude);
+    let rev_list = run_git(git_dir, &args)?;
 
     build_pack_from_rev_list(git_dir, &rev_list)
 }
@@ -269,7 +261,7 @@ mod tests {
         write_file(repo, "c.txt", b"C");
         let tip = commit_all(repo, "work 2");
 
-        let (pack, idx) = build_execution_pack(repo, &tip, &anchor, "main")
+        let (pack, idx) = build_execution_pack(repo, &[tip.as_str()], &[anchor.as_str(), "main"])
             .unwrap()
             .unwrap();
         assert!(!pack.is_empty());
@@ -295,7 +287,7 @@ mod tests {
         write_file(repo, "ch.txt", b"CH");
         let tip = commit_all(repo, "child 1");
 
-        let (_pack, idx) = build_execution_pack(repo, &tip, &anchor, "main")
+        let (_pack, idx) = build_execution_pack(repo, &[tip.as_str()], &[anchor.as_str(), "main"])
             .unwrap()
             .unwrap();
         let oids = pack_index_oids(&idx);
@@ -313,9 +305,11 @@ mod tests {
         write_file(repo, "a.txt", b"A");
         let anchor = commit_all(repo, "base");
         // tip == anchor == main: nothing is at risk.
-        assert!(build_execution_pack(repo, &anchor, &anchor, "main")
-            .unwrap()
-            .is_none());
+        assert!(
+            build_execution_pack(repo, &[anchor.as_str()], &[anchor.as_str(), "main"])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -332,8 +326,10 @@ mod tests {
         // Fast-forward the default branch to the work tip: everything reachable
         // from tip is now durable on main, so the range is empty.
         git(repo, &["branch", "-f", "main", &tip]);
-        assert!(build_execution_pack(repo, &tip, &anchor, "main")
-            .unwrap()
-            .is_none());
+        assert!(
+            build_execution_pack(repo, &[tip.as_str()], &[anchor.as_str(), "main"])
+                .unwrap()
+                .is_none()
+        );
     }
 }

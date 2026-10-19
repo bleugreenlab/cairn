@@ -114,8 +114,7 @@ fn claude_launch_env(
 mod tests {
     use super::{
         arm_claude_watchdog_lease, disarm_claude_watchdog_lease, record_claude_watchdog_lifecycle,
-        should_confirm_backend_id_after_init, update_claude_watchdog_lease, ClaudeBackend,
-        NO_CLAUDE_CREDENTIAL,
+        should_confirm_backend_id_after_init, update_claude_watchdog_lease, NO_CLAUDE_CREDENTIAL,
     };
     use std::sync::Arc;
 
@@ -183,7 +182,7 @@ mod tests {
         assert!(!NO_CLAUDE_CREDENTIAL.contains("CLI"));
         assert!(!NO_CLAUDE_CREDENTIAL.contains("available for this session"));
     }
-    use crate::backends::{AgentBackend, SessionStart};
+    use crate::backends::SessionStart;
 
     #[test]
     fn claude_confirms_backend_id_for_new_sessions() {
@@ -208,31 +207,6 @@ mod tests {
             session_id: "session-fork".to_string(),
             source_backend_id: "backend-source".to_string(),
         }));
-    }
-
-    #[test]
-    fn claude_disallows_host_harness_builtin_tools() {
-        let host_harness_tools = ["SendMessage", "ReportFindings"];
-        let resolved = ClaudeBackend.resolve_tools(
-            &host_harness_tools
-                .iter()
-                .map(|tool| tool.to_string())
-                .collect::<Vec<_>>(),
-            &[],
-        );
-
-        for tool in host_harness_tools {
-            assert!(
-                resolved.disallowed.contains(&tool.to_string()),
-                "{tool} must be passed through --disallowedTools: {:?}",
-                resolved.disallowed
-            );
-            assert!(
-                !resolved.allowed.contains(&tool.to_string()),
-                "{tool} must not remain on the Claude allow-list: {:?}",
-                resolved.allowed
-            );
-        }
     }
 }
 
@@ -1376,7 +1350,8 @@ impl AgentBackend for ClaudeBackend {
         use crate::agent_process::toolkits;
 
         // Resolve agent tool names to the Cairn allow-list (friendly verbs
-        // aliased to Cairn verbs; native + dead names dropped).
+        // aliased to Cairn verbs; every other bare name and dead names
+        // dropped).
         let mut allowed = toolkits::resolve_tools(agent_tools);
 
         // Temporary permissions floor: the three core verbs are always allowed
@@ -1389,25 +1364,9 @@ impl AgentBackend for ClaudeBackend {
         // native structured output server-side (CAIRN-2505). No MCP handler ever
         // dispatched a `return` tool, so it was dead weight on the allow-list.
 
-        // Defensively strip always-disallowed tools from allowed (in case an
-        // agent config lists planning/todo tools).
-        allowed.retain(|t| !crate::models::ALWAYS_DISALLOWED_TOOLS.contains(&t.as_str()));
-
-        // Native is fully off: the disallow list is the union of all native
-        // tools, the always-disallowed planning/todo tools, and the agent's own
-        // disallowed list. This is the single source for `--disallowedTools`.
-        let mut disallowed: Vec<String> = crate::models::ALL_NATIVE_TOOLS
-            .iter()
-            .chain(crate::models::ALWAYS_DISALLOWED_TOOLS.iter())
-            .map(|t| t.to_string())
-            .collect();
-        disallowed.extend(agent_disallowed.iter().cloned());
-
-        // Built-ins caught escaping an earlier session in this process. A CLI
-        // update can add a built-in that predates no list; quarantining what was
-        // actually observed keeps it off every later session.
-        disallowed.extend(toolkits::quarantined_tools());
-
+        // Built-ins are off for every launch (`--tools ""`), so the disallow
+        // list is only the MCP tools this agent is denied.
+        let mut disallowed = agent_disallowed.to_vec();
         disallowed.sort();
         disallowed.dedup();
 
@@ -1837,7 +1796,7 @@ impl AgentBackend for ClaudeBackend {
                 },
                 hook_settings: None,
                 allowed_tools: Vec::new(),
-                disallowed_tools: self.resolve_tools(&[], &[]).disallowed,
+                disallowed_tools: Vec::new(),
                 mode: ClaudeMode::OneShot {
                     prompt: request.single_prompt(),
                 },
@@ -2045,7 +2004,7 @@ mod launch_contract_tests {
                     "mcp__cairn__read".to_string(),
                     "mcp__cairn__write".to_string(),
                 ],
-                disallowed_tools: vec!["Bash".to_string(), "Read".to_string()],
+                disallowed_tools: vec!["mcp__cairn__update_issue".to_string()],
                 mode,
             }),
         }
@@ -2125,11 +2084,13 @@ mod launch_contract_tests {
                 "--allowedTools",
                 "mcp__cairn__read,mcp__cairn__write",
                 "--disallowedTools",
-                "Bash,Read",
+                "mcp__cairn__update_issue",
                 "--session-id",
                 "session-1",
                 "--print",
                 "--verbose",
+                "--tools",
+                "",
                 "--include-partial-messages",
             ])
         );
@@ -2146,7 +2107,7 @@ mod launch_contract_tests {
             SecretEnv::new().with("ANTHROPIC_API_KEY", "brokered-key"),
         ));
         assert_eq!(env, expected_env(("ANTHROPIC_API_KEY", "brokered-key")));
-        let tail = &args[args.len() - 5..];
+        let tail = &args[args.len() - 7..];
         assert_eq!(
             tail,
             strings(&[
@@ -2154,6 +2115,8 @@ mod launch_contract_tests {
                 "backend-1",
                 "--print",
                 "--verbose",
+                "--tools",
+                "",
                 "--include-partial-messages"
             ])
         );
@@ -2177,11 +2140,13 @@ mod launch_contract_tests {
             .iter()
             .any(|arg| arg == "-starts-with-dash" || arg == "--"));
         assert_eq!(
-            &args[args.len() - 4..],
+            &args[args.len() - 6..],
             strings(&[
                 "session-1",
                 "--print",
                 "--verbose",
+                "--tools",
+                "",
                 "--include-partial-messages",
             ])
         );
@@ -2486,7 +2451,7 @@ mod flush_pending_tests {
     use crate::db::DbState;
     use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, RowExt, SearchIndex};
     use crate::transcripts::stream_store::open_stream;
     use cairn_db::turso::params;
     use cairn_models::wire::claude_stream::parse_event;
@@ -2494,11 +2459,7 @@ mod flush_pending_tests {
 
     async fn test_db() -> LocalDb {
         let temp = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("flush-pending-test.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("flush-pending-test.db"))
             .await
             .unwrap();
         db
@@ -2776,6 +2737,244 @@ mod flush_pending_tests {
         );
     }
 
+    const STATED_INTENT: &str = "Reading both files first.";
+    const TURN_REASONING_TOKENS: u32 = 412;
+
+    /// One tool-using turn as the CLI streams reasoning. A PRIVATE block (empty
+    /// text, signature only) always leads; `visible` adds the stated-intent block
+    /// a Fable-class model emits after it. Each block is closed by its own
+    /// consolidated `assistant` message, and the turn's reasoning count -- private
+    /// and visible together -- arrives last, on `message_delta`. Signatures are
+    /// placeholders; a real one must never be committed.
+    fn reasoning_turn_fixture(visible: Option<&str>) -> String {
+        use serde_json::{json, Value};
+        let sid = "session-1";
+        let stream =
+            |event: Value| json!({"type": "stream_event", "session_id": sid, "event": event});
+        let assistant = |uuid: &str, content: Value| {
+            json!({"type": "assistant", "uuid": uuid, "session_id": sid,
+                   "message": {"role": "assistant", "content": content}})
+        };
+        let estimate = |tokens: u32| json!({"type": "system", "subtype": "thinking_tokens", "session_id": sid, "estimated_tokens": tokens});
+        let signature = |index: usize| {
+            stream(json!({"type": "content_block_delta", "index": index,
+                          "delta": {"type": "signature_delta", "signature": "<redacted>"}}))
+        };
+        // The reader fails closed on an init that lacks any core verb, so the
+        // fixture declares exactly the set the startup gate requires.
+        let mut lines = vec![
+            json!({"type": "system", "subtype": "init", "session_id": sid, "cwd": "/tmp",
+                   "model": "claude-fable-5",
+                   "tools": cairn_session::agent_process::toolkits::CORE_VERBS,
+                   "mcp_servers": [{"name": "cairn", "status": "connected"}]}),
+            stream(json!({"type": "message_start",
+                          "message": {"id": "msg_01", "role": "assistant", "model": "claude-fable-5"}})),
+            stream(json!({"type": "content_block_start", "index": 0,
+                          "content_block": {"type": "thinking", "thinking": ""}})),
+            estimate(120),
+            signature(0),
+            stream(json!({"type": "content_block_stop", "index": 0})),
+            assistant(
+                "evt-private",
+                json!([{"type": "thinking", "thinking": "", "signature": "<redacted>"}]),
+            ),
+        ];
+        let mut tool_index = 1;
+        if let Some(prose) = visible {
+            let (head, tail) = prose.split_at(prose.len() / 2);
+            lines.extend([
+                stream(json!({"type": "content_block_start", "index": 1,
+                              "content_block": {"type": "thinking", "thinking": ""}})),
+                stream(json!({"type": "content_block_delta", "index": 1,
+                              "delta": {"type": "thinking_delta", "thinking": head}})),
+                estimate(380),
+                stream(json!({"type": "content_block_delta", "index": 1,
+                              "delta": {"type": "thinking_delta", "thinking": tail}})),
+                signature(1),
+                stream(json!({"type": "content_block_stop", "index": 1})),
+                assistant(
+                    "evt-visible",
+                    json!([{"type": "thinking", "thinking": prose, "signature": "<redacted>"}]),
+                ),
+            ]);
+            tool_index = 2;
+        }
+        lines.extend([
+            stream(json!({"type": "content_block_start", "index": tool_index,
+                          "content_block": {"type": "tool_use", "id": "toolu_01", "name": "mcp__cairn__read", "input": {}}})),
+            stream(json!({"type": "content_block_delta", "index": tool_index,
+                          "delta": {"type": "input_json_delta", "partial_json": "{\"paths\":[\"file:notes.txt\"]}"}})),
+            stream(json!({"type": "content_block_stop", "index": tool_index})),
+            assistant("evt-tool", json!([{"type": "tool_use", "id": "toolu_01", "name": "mcp__cairn__read",
+                                          "input": {"paths": ["file:notes.txt"]}}])),
+            stream(json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+                          "usage": {"input_tokens": 11, "output_tokens": 470,
+                                    "output_tokens_details": {"thinking_tokens": TURN_REASONING_TOKENS}}})),
+            stream(json!({"type": "message_stop"})),
+            json!({"type": "user", "uuid": "evt-tool-result", "session_id": sid,
+                   "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_01", "content": "three lines"}]}}),
+            json!({"type": "result", "subtype": "success", "session_id": sid, "is_error": false,
+                   "duration_ms": 1200, "num_turns": 1, "total_cost_usd": 0.01,
+                   "usage": {"input_tokens": 11, "output_tokens": 470}}),
+        ]);
+        lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Drive the real reader over `fixture` for a run serving one live turn.
+    async fn replay_reasoning_turn(orch: &Orchestrator, run_id: &str, fixture: String) {
+        insert_run(orch, run_id).await;
+        insert_turn(orch, run_id, "turn-1").await;
+        orch.process_state
+            .register_process(
+                run_id.to_string(),
+                RunHandle::test_handle(Some("session-1"), None),
+            )
+            .unwrap();
+        orch.process_state.transition_to_active(run_id);
+        orch.process_state.begin_turn(run_id, "turn-1");
+        let orch_thread = orch.clone();
+        let run_db = orch.db.local.clone();
+        let emitter = orch.services.emitter.clone();
+        let run_id_thread = run_id.to_string();
+        std::thread::spawn(move || {
+            ClaudeBackend::reader_thread(
+                &orch_thread,
+                &emitter,
+                &run_id_thread,
+                Some("session-1".to_string()),
+                false,
+                Box::new(std::io::Cursor::new(fixture.into_bytes())),
+                None,
+                run_db,
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// The persisted event types, and for each assistant row its prose (or
+    /// `<none>`) and its reasoning count (or -1), all in sequence order.
+    async fn persisted_reasoning(
+        orch: &Orchestrator,
+        run_id: &str,
+    ) -> (Vec<String>, Vec<String>, Vec<i64>) {
+        let db = &orch.db.local;
+        let types = db
+            .query_all(
+                format!(
+                    "SELECT event_type FROM events WHERE run_id = '{run_id}' ORDER BY sequence"
+                ),
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        let prose = db
+            .query_all(
+                format!(
+                    "SELECT COALESCE(json_extract(data, '$.thinking'), '<none>') FROM events \
+                     WHERE run_id = '{run_id}' AND event_type = 'assistant' ORDER BY sequence"
+                ),
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        let counts = db
+            .query_all(
+                format!(
+                    "SELECT COALESCE(thinking_tokens, -1) FROM events \
+                     WHERE run_id = '{run_id}' AND event_type = 'assistant' ORDER BY sequence"
+                ),
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        (types, prose, counts)
+    }
+
+    /// The text of every `system:error` the reader persisted, so a failed
+    /// event-type assertion names why the turn was refused.
+    async fn persisted_errors(orch: &Orchestrator, run_id: &str) -> Vec<String> {
+        orch.db
+            .local
+            .query_all(
+                format!(
+                    "SELECT data FROM events \
+                     WHERE run_id = '{run_id}' AND event_type = 'system:error' ORDER BY sequence"
+                ),
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn reasoning_fixtures_parse_into_the_branches_under_test() {
+        for fixture in [
+            reasoning_turn_fixture(Some(STATED_INTENT)),
+            reasoning_turn_fixture(None),
+        ] {
+            let kinds: Vec<&'static str> = fixture
+                .lines()
+                .map(|line| parse_event(line).expect("fixture line parses").0.kind())
+                .collect();
+            assert!(!kinds.contains(&"unknown"), "{kinds:?}");
+        }
+    }
+
+    /// A Fable-class turn states its intent AND reasons privately. The persisted
+    /// assistant event must carry both facts in their own fields: the stated
+    /// prose exactly, and the turn's whole reasoning count -- with the private
+    /// block contributing neither a separator nor a row of its own.
+    #[tokio::test]
+    async fn a_private_then_visible_reasoning_turn_persists_prose_and_count() {
+        let orch = build_orch(test_db().await);
+        replay_reasoning_turn(
+            &orch,
+            "run-fable",
+            reasoning_turn_fixture(Some(STATED_INTENT)),
+        )
+        .await;
+        let (types, prose, counts) = persisted_reasoning(&orch, "run-fable").await;
+        assert_eq!(
+            types,
+            ["system:init", "assistant", "tool_result", "result:success"],
+            "one assistant event for the turn: no orphan row for either reasoning block; \
+             errors: {:?}",
+            persisted_errors(&orch, "run-fable").await
+        );
+        assert_eq!(
+            prose,
+            [STATED_INTENT],
+            "the stated intent, with no leading separator"
+        );
+        assert_eq!(counts, [TURN_REASONING_TOKENS as i64]);
+    }
+
+    /// An Opus-class turn reasons privately only: the count survives, no prose
+    /// is invented, and the private block leaves no empty row behind.
+    #[tokio::test]
+    async fn a_private_only_reasoning_turn_persists_the_count_and_no_prose() {
+        let orch = build_orch(test_db().await);
+        replay_reasoning_turn(&orch, "run-opus", reasoning_turn_fixture(None)).await;
+        let (types, prose, counts) = persisted_reasoning(&orch, "run-opus").await;
+        assert_eq!(
+            types,
+            ["system:init", "assistant", "tool_result", "result:success"],
+            "errors: {:?}",
+            persisted_errors(&orch, "run-opus").await
+        );
+        assert_eq!(prose, ["<none>"]);
+        assert_eq!(counts, [TURN_REASONING_TOKENS as i64]);
+    }
+
     #[tokio::test]
     async fn flush_commits_pending_assistant_paired_with_stream() {
         let orch = build_orch(test_db().await);
@@ -2912,6 +3111,36 @@ mod flush_pending_tests {
         let incoming = write_tool_assistant("toolu_write");
         merge_pending_assistant(&mut parked, &incoming);
         assert_eq!(parked.content.as_deref(), Some("I'll dig"));
+    }
+
+    // A parked message carrying only PRIVATE reasoning has an empty prose slot.
+    // `Some("")` is not `None`, so an `is_none()` guard here would treat that
+    // nothing as prose and swallow the visible intent arriving behind it.
+    #[test]
+    fn merge_adopts_incoming_prose_over_an_empty_parked_thinking() {
+        let mut parked = read_tool_assistant("toolu_read");
+        parked.thinking = Some(String::new());
+        let mut incoming = write_tool_assistant("toolu_write");
+        incoming.thinking = Some("Checking the second file too.".to_string());
+        merge_pending_assistant(&mut parked, &incoming);
+        assert_eq!(
+            parked.thinking.as_deref(),
+            Some("Checking the second file too."),
+            "an empty parked thinking value is absence, not prose to protect"
+        );
+    }
+
+    #[test]
+    fn merge_retains_parked_prose_against_a_later_message_without_any() {
+        let mut parked = read_tool_assistant("toolu_read");
+        parked.thinking = Some("Reading both files first.".to_string());
+        let mut incoming = write_tool_assistant("toolu_write");
+        incoming.thinking = None;
+        merge_pending_assistant(&mut parked, &incoming);
+        assert_eq!(
+            parked.thinking.as_deref(),
+            Some("Reading both files first.")
+        );
     }
 
     #[test]

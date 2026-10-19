@@ -1004,8 +1004,10 @@ pub fn merge_pending_assistant(parked: &mut TranscriptEvent, incoming: &Transcri
         (Some(p), Some(c)) if c.contains(p.as_str()) => parked.content = Some(c.clone()),
         _ => {}
     }
-    // thinking: keep parked unless empty.
-    if parked.thinking.is_none() {
+    // thinking: keep parked unless empty. `Some("")` counts as empty -- a parked
+    // message carrying only private reasoning has no prose to protect, and
+    // treating it as present would swallow the visible prose arriving behind it.
+    if parked.thinking.as_deref().unwrap_or("").is_empty() {
         parked.thinking = incoming.thinking.clone();
     }
     // Recompute legacy single-tool fields to match from_claude_event semantics.
@@ -1485,8 +1487,9 @@ impl ClaudeRuntime {
                     }
 
                     // The `init` event reports the tools the CLI actually
-                    // declared to the model, which is the only direct evidence
-                    // of what `--disallowedTools` failed to suppress.
+                    // declared to the model. Under `--tools ""` that is only
+                    // MCP tools; anything else means the CLI broke the
+                    // contract, and the tripwire logs it.
                     if let ClaudeEvent::System { subtype, data, .. } = &event {
                         if subtype == "init" {
                             let declared: Vec<String> = data
@@ -1499,18 +1502,9 @@ impl ClaudeRuntime {
                                         .collect()
                                 })
                                 .unwrap_or_default();
-                            let leaked =
-                                crate::agent_process::toolkits::record_declared_surface(&declared);
-                            if !leaked.is_empty() {
-                                log::warn!(
-                                    "Claude CLI declared {} tool(s) outside Cairn's MCP surface: {}. \
-                                     Quarantined for later sessions in this process; add them to \
-                                     ALWAYS_DISALLOWED_TOOLS (cairn-db models/toolkit.rs) to keep \
-                                     them off the first session after a restart.",
-                                    leaked.len(),
-                                    leaked.join(", "),
-                                );
-                            }
+                            crate::agent_process::toolkits::report_declared_surface(
+                                run_id, &declared,
+                            );
                         }
                     }
 
@@ -1998,8 +1992,12 @@ impl ClaudeRuntime {
                         transcript_event.content.is_some() || transcript_event.tool_uses.is_some();
                     let has_thinking = transcript_event.thinking.is_some();
 
-                    // Partial Assistant event (thinking complete, no content yet)
-                    if streaming_state.is_some() && is_assistant && has_thinking && !has_content {
+                    // Partial Assistant event: reasoning complete, no content yet. The
+                    // reasoning may be visible prose or PRIVATE (withheld, so the
+                    // message carries no prose at all); both mark the same boundary,
+                    // so this keys on the absence of content rather than the presence
+                    // of prose.
+                    if streaming_state.is_some() && is_assistant && !has_content {
                         if let Some(ref mut state) = streaming_state {
                             state.capture_thinking_done();
                             state.record_thinking_started(last_thinking_tokens);
@@ -2015,6 +2013,13 @@ impl ClaudeRuntime {
                                 state.tool_write.as_ref(),
                             );
                         }
+                        continue;
+                    }
+
+                    // An assistant message carrying only private reasoning has nothing
+                    // to persist: its volume rides the turn's `thinking_tokens`, and a
+                    // row here would be an empty orphan in the transcript.
+                    if is_assistant && !has_content && !has_thinking {
                         continue;
                     }
 

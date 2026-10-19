@@ -7,7 +7,7 @@ use crate::db::DbState;
 use crate::models::CreateThread;
 use crate::orchestrator::OrchestratorBuilder;
 use crate::services::testing::{CapturingEmitter, TestServicesBuilder};
-use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
+use crate::storage::{LocalDb, RowExt, SearchIndex};
 use std::sync::Arc;
 
 async fn seeded_orch() -> Orchestrator {
@@ -125,11 +125,7 @@ async fn agent_thread_mutations_emit_scoped_db_changes_and_dry_runs_stay_silent(
 }
 
 async fn seeded_orch_with_emitter() -> (Orchestrator, Arc<CapturingEmitter>) {
-    let local = LocalDb::open(tempfile::tempdir().unwrap().keep().join("t.db"))
-        .await
-        .unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&local)
+    let local = LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("t.db"))
         .await
         .unwrap();
     local

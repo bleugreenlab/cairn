@@ -206,10 +206,9 @@ pub struct SessionSpec {
     /// include `cairn` at all.
     ///
     /// `None` is a tool-free session: no server and nothing in their place,
-    /// and nothing saved to resume. Claude gets an empty strict MCP config, no
-    /// built-in tools (`--tools ""`), and `--no-session-persistence`, with
-    /// [`ClaudeSpec::disallowed_tools`] still passed as a second fence; a
-    /// Codex thread is started ephemeral, read-only, with no environment, and
+    /// and nothing saved to resume. Claude gets an empty strict MCP config and
+    /// `--no-session-persistence`, and, like every Claude launch, no built-in
+    /// tools (`--tools ""`); a Codex thread is started ephemeral, read-only, with no environment, and
     /// with every server its app-server process was started with disabled for
     /// that thread. Only a new session can be tool-free.
     pub mcp: Option<McpServers>,

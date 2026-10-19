@@ -492,6 +492,12 @@ pub(crate) fn failing_interrupt_stdin_for_test(
     ))
 }
 
+/// A real app-server process whose provider goal stays `active`, as it does
+/// across a `turn/interrupt` that Cairn did not pair with a pause.
+///
+/// Any request the script has no arm for is answered with a JSON-RPC error
+/// naming the method. Staying silent would instead block the caller for the
+/// client's full request timeout before the test sees anything.
 #[cfg(all(test, unix))]
 pub(crate) fn process_active_stdin_for_test(
     thread_id: &str,
@@ -509,17 +515,22 @@ pub(crate) fn process_active_stdin_for_test(
     let notification = terminal_notification.unwrap_or("");
     let script = format!(
         r#"#!/bin/sh
+goal='{{"threadId":"{thread_id}","objective":"finish work","status":"active","tokenBudget":null,"tokensUsed":0,"timeUsedSeconds":0,"createdAt":1,"updatedAt":2}}'
 while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -E 's/.*\"id\":([0-9]+).*/\1/')
+  id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
   case "$line" in
     *'"method":"turn/interrupt"'*)
-      printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{}}}}\n' "$id"
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"
       if [ -n '{notification}' ]; then
-        printf '{{\"jsonrpc\":\"2.0\",\"method\":\"turn/{notification}\",\"params\":{{\"turn\":{{\"id\":\"{provider_turn_id}\",\"status\":\"{notification}\"}},\"reason\":\"interrupted\"}}}}\n'
+        printf '{{"jsonrpc":"2.0","method":"turn/{notification}","params":{{"turn":{{"id":"{provider_turn_id}","status":"{notification}"}},"reason":"interrupted"}}}}\n'
       fi
       ;;
-    *'"method":"thread/goal/set"'*)
-      printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"goal\":{{\"threadId\":\"{thread_id}\",\"objective\":\"finish work\",\"status\":\"active\",\"tokenBudget\":null,\"tokensUsed\":0,\"timeUsedSeconds\":0,\"createdAt\":1,\"updatedAt\":2}}}}}}\n' "$id"
+    *'"method":"thread/goal/get"'*|*'"method":"thread/goal/set"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"goal":%s}}}}\n' "$id" "$goal"
+      ;;
+    *'"id":'[0-9]*)
+      method=$(printf '%s' "$line" | sed -E 's/.*"method":"([^"]*)".*/\1/')
+      printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32601,"message":"codex process fixture has no reply for %s"}}}}\n' "$id" "$method"
       ;;
   esac
 done

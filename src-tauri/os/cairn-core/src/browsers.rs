@@ -891,16 +891,12 @@ pub async fn dispatch_browser_bridge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::LocalDb;
     use tempfile::tempdir;
 
     async fn test_db() -> LocalDb {
         let temp = tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("browsers-crud.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("browsers-crud.db"))
             .await
             .unwrap();
         db

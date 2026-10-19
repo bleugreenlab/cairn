@@ -80,21 +80,6 @@ pub struct NewGitHubInstallation<'a> {
     pub updated_at: i32,
 }
 
-// ============================================================================
-// Webhook Event models
-// ============================================================================
-
-#[derive(Debug)]
-pub struct DbWebhookEvent {
-    pub id: String,
-    pub event_type: String,
-    pub action: String,
-    pub repo_full_name: String,
-    pub pr_number: Option<i32>,
-    pub payload_summary: String,
-    pub processed_at: i32,
-}
-
 #[derive(Debug)]
 pub struct NewWebhookEvent<'a> {
     pub id: &'a str,

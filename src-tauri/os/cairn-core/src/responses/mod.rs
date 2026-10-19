@@ -1158,15 +1158,13 @@ mod tests {
     use crate::backends::CompletionOutcome;
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use serde_json::json;
     use std::sync::Mutex;
 
     async fn test_orchestrator() -> Orchestrator {
         let temp = tempfile::tempdir().unwrap().keep();
-        let local = LocalDb::open(temp.join("responses.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        let local = LocalDb::open_migrated_for_test(temp.join("responses.db"))
             .await
             .unwrap();
         let search = Arc::new(SearchIndex::open_or_create(temp.join("search")).unwrap());
@@ -1272,15 +1270,23 @@ mod tests {
         use cairn_models::types::catalog::ProviderModelCatalog;
         let orch = test_orchestrator().await;
         assert!(orch.provider_enabled("codex"));
-        orch.add_account(
+        // Saved through the store rather than `add_account`, which also starts
+        // a detached rediscovery of every provider. That refresh would race the
+        // catalog seeded below (a failed Codex discovery marks the entry
+        // errored, hiding its models) and fetch real provider listings.
+        let mut store = orch.get_credential_store().unwrap_or_else(|| {
+            crate::identity::local::credential_store_from_git_config(&orch.config_dir)
+        });
+        store.add_account(
             crate::credentials::ApiProvider::OpenAI,
             "OpenAI key".into(),
             crate::credentials::ProviderAuth::ApiKey {
                 value: "sk-responses-test".into(),
             },
             None,
-        )
-        .unwrap();
+            0,
+        );
+        orch.save_credential_store(store).unwrap();
         if !discovered {
             return orch;
         }

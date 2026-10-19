@@ -697,7 +697,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use cairn_common::executor_protocol::{
         DeclineReason, ExecutorMessage, OfferSummary, ResidencyRuntimeConfig, LOCAL_EXECUTOR_NAME,
     };
@@ -728,11 +728,7 @@ pub(crate) mod tests {
     pub(crate) async fn attached_orchestrator_with_link() -> (Orchestrator, tempfile::TempDir, u64)
     {
         let config = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(config.path().join("cairn.turso.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(config.path().join("cairn.turso.db"))
             .await
             .unwrap();
         let index = SearchIndex::open_or_create(config.path().join("search-index.db")).unwrap();

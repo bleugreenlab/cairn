@@ -127,16 +127,12 @@ pub async fn list_entries(db: &LocalDb, job_id: &str) -> Result<Vec<ProgressEntr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+
     use tempfile::tempdir;
 
     async fn test_db() -> LocalDb {
         let temp = tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("workflow-progress.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("workflow-progress.db"))
             .await
             .unwrap();
         db

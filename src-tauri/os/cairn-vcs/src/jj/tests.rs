@@ -4245,9 +4245,11 @@ fn operation_id_and_restore_operation_roll_back_a_fold() {
     );
 }
 /// Component A, the pinned failure mode: WITHOUT the target flatten, folding a
-/// child into the conflicted hub leaves the integration branch's ancestry
-/// carrying a conflicted commit, so the push is REFUSED — exactly the live
-/// wedge (`Won't push commit ... since it has conflicts`).
+/// child into the conflicted hub would carry a conflicted commit into the
+/// integration branch. That fold now stops at its export — the folded commit's
+/// tree carries jj conflict scaffolding, so the integration git ref never moves
+/// onto it — well before the push that used to be the first refusal (`Won't
+/// push commit ... since it has conflicts`).
 #[test]
 #[serial_test::serial(jj)]
 fn child_merge_push_refused_without_target_flatten() {
@@ -4262,10 +4264,21 @@ fn child_merge_push_refused_without_target_flatten() {
     // Unguarded on purpose: this is the pre-flatten wedge itself, which
     // `rebase_branch_onto` now rolls back rather than lands.
     rebase_recording_conflict(&hub.jj, &hub.store, child, hub.int);
-    merge_into_bookmark(&hub.jj, &hub.store, hub.int, child).unwrap();
+    let checkout = resolve_backing_checkout(&hub.store).expect("backing checkout");
+    let int_ref = format!("refs/heads/{}", hub.int);
+    let int_ref_before = git_stdout(&checkout, &["rev-parse", &int_ref]);
 
-    // The integration branch's ancestry now includes the hub's conflicted
-    // intermediate, so jj refuses to push it.
+    let err = merge_into_bookmark(&hub.jj, &hub.store, hub.int, child)
+        .expect_err("a fold onto conflicted ancestry never reaches git");
+    assert!(is_conflict_scaffolding_export_refusal(&err), "{err}");
+    assert!(err.contains("JJ-CONFLICT-README"), "{err}");
+    assert_eq!(
+        git_stdout(&checkout, &["rev-parse", &int_ref]),
+        int_ref_before,
+        "the integration git ref did not move onto the scaffolded fold"
+    );
+
+    // Nothing reached git, so there is nothing a push could publish either.
     let err = push_store_bookmark(&hub.jj, &hub.store, hub.int).unwrap_err();
     assert!(
         err.to_lowercase().contains("conflict"),
@@ -8225,6 +8238,244 @@ fn a_clean_rebase_names_the_files_both_sides_changed() {
             .any(|(status, path)| !status.is_empty() && path == "shared.rs"),
         "the name-status record covers what the rebase actually changed: {selection:?}"
     );
+}
+
+/// A base-advance replay is judged by the TREE it would publish, not only by
+/// jj's conflict flag.
+///
+/// The incident shape: jj reports the rebased tip as conflict-free, yet the
+/// commit's tree root carries `JJ-CONFLICT-README` and `.jjconflict-*`
+/// sidecars. Exported, that ref can never be materialized on any machine, and
+/// the branch was being reported as cleanly rebased. Here the advanced base
+/// carries the scaffolding as ordinary files, which gives exactly that pair of
+/// facts — a commit jj calls clean whose root listing is scaffolding — without
+/// depending on whatever jj state produces it in the wild.
+#[test]
+#[serial_test::serial(jj)]
+fn a_replay_whose_rebased_tree_carries_conflict_scaffolding_is_rolled_back_as_a_conflict() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping a_replay_whose_rebased_tree_carries_conflict_scaffolding_is_rolled_back_as_a_conflict: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+
+    git(proj.path(), &["init", "-q", "-b", "main"]);
+    git(proj.path(), &["config", "user.email", "p@e.com"]);
+    git(proj.path(), &["config", "user.name", "p"]);
+    let body: String = (0..40).map(|n| format!("line {n}\n")).collect();
+    std::fs::write(proj.path().join("shared.rs"), &body).unwrap();
+    git(proj.path(), &["add", "-A"]);
+    git(proj.path(), &["commit", "-q", "-m", "base"]);
+
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let branch = "agent/cairn-5171-builder-0";
+    let ws = wts.path().join("agent");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    std::fs::write(
+        ws.join("shared.rs"),
+        body.replacen("line 0\n", "line 0 BRANCH\n", 1),
+    )
+    .unwrap();
+    std::fs::write(ws.join("own.rs"), "AGENT GENUINE WORK\n").unwrap();
+    seal(&jj, &ws, "branch work", None).unwrap();
+    let pre_tip = bookmark_commit(&jj, &store, branch).unwrap();
+    let branch_ref = format!("refs/heads/{branch}");
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", &branch_ref]),
+        pre_tip
+    );
+
+    // The base advances in the store only: one edit at the far end of the file
+    // the branch also touched, and the scaffolding at the tree root.
+    jj.run(
+        &store,
+        &["new", "main", "-m", "base advance"],
+        "new on main",
+    )
+    .unwrap();
+    std::fs::write(
+        store.join("shared.rs"),
+        body.replacen("line 39\n", "line 39 MAIN\n", 1),
+    )
+    .unwrap();
+    std::fs::write(store.join("JJ-CONFLICT-README"), "conflict\n").unwrap();
+    std::fs::create_dir_all(store.join(".jjconflict-base-0")).unwrap();
+    std::fs::write(store.join(".jjconflict-base-0").join("shared.rs"), "base\n").unwrap();
+    jj.run(
+        &store,
+        &["bookmark", "set", "main", "-r", "@"],
+        "advance main",
+    )
+    .unwrap();
+
+    let report =
+        reconcile_siblings_without_publication(&jj, &store, "main", &[branch.to_string()]).unwrap();
+
+    assert!(
+        !report.rebased_clean.contains(&branch.to_string()),
+        "a replay whose tree carries conflict scaffolding is never reported clean: {report:?}"
+    );
+    assert_eq!(
+        report.conflicted,
+        vec![branch.to_string()],
+        "it is a conflict, so the attention layer opens a session: {report:?}"
+    );
+    assert!(
+        report.failed.is_empty(),
+        "not a retried failure: {report:?}"
+    );
+    assert_eq!(
+        bookmark_commit(&jj, &store, branch).unwrap(),
+        pre_tip,
+        "the store bookmark is back on its last clean tip"
+    );
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", &branch_ref]),
+        pre_tip,
+        "the git ref never moved onto the scaffolded tree"
+    );
+    let diagnostic = report
+        .conflict_diagnostics
+        .get(branch)
+        .expect("the conflict carries a diagnostic");
+    assert_eq!(
+        diagnostic.conflicting_paths(),
+        vec!["shared.rs".to_string()],
+        "the file both sides changed is named, captured before the rollback: {diagnostic:?}"
+    );
+    assert_eq!(diagnostic.ours.as_deref(), Some(pre_tip.as_str()));
+    assert_eq!(
+        diagnostic.condition,
+        ConflictCondition::ContentConflict,
+        "never base drift: the next replay would meet the same tree"
+    );
+    let scaffolding = diagnostic
+        .scaffolding
+        .as_ref()
+        .expect("the diagnostic says the TREE was refused, not a jj conflict");
+    assert_eq!(
+        scaffolding.entries,
+        vec![
+            ".jjconflict-base-0".to_string(),
+            "JJ-CONFLICT-README".to_string()
+        ]
+    );
+    assert_eq!(
+        diagnostic.conflicted_tip.as_ref(),
+        Some(&scaffolding.commit)
+    );
+    assert_ne!(scaffolding.commit, pre_tip);
+}
+
+/// The verified export is a tree-level postcondition: it refuses to move a ref
+/// onto a commit whose tree root carries jj conflict scaffolding, before `jj git
+/// export` runs, and names the commit and the entries. A clean commit still
+/// exports, and a ref already sitting on its commit is not re-judged (a rollback
+/// onto a published tip must stay restorable).
+#[test]
+#[serial_test::serial(jj)]
+fn the_verified_export_refuses_a_bookmark_on_a_tree_carrying_conflict_scaffolding() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping the_verified_export_refuses_a_bookmark_on_a_tree_carrying_conflict_scaffolding: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let branch = "agent/cairn-5171-export-0";
+    let branch_ref = format!("refs/heads/{branch}");
+
+    // A clean commit exports, so the guard is not refusing everything.
+    jj.run(&store, &["new", "main", "-m", "clean"], "new clean")
+        .unwrap();
+    std::fs::write(store.join("clean.rs"), "clean\n").unwrap();
+    jj.run(
+        &store,
+        &["bookmark", "create", branch, "-r", "@"],
+        "bookmark clean",
+    )
+    .unwrap();
+    let clean = bookmark_commit(&jj, &store, branch).unwrap();
+    export_bookmark_advance(&jj, &store, true, branch, "clean export")
+        .expect("a clean tree exports");
+    assert_eq!(git_stdout(proj.path(), &["rev-parse", &branch_ref]), clean);
+
+    // The bookmark advances onto a commit whose root carries scaffolding.
+    jj.run(&store, &["new", "-m", "poisoned"], "new poisoned")
+        .unwrap();
+    std::fs::write(store.join("JJ-CONFLICT-README"), "conflict\n").unwrap();
+    std::fs::create_dir_all(store.join(".jjconflict-side-0")).unwrap();
+    std::fs::write(store.join(".jjconflict-side-0").join("clean.rs"), "side\n").unwrap();
+    jj.run(
+        &store,
+        &["bookmark", "set", branch, "-r", "@"],
+        "bookmark poisoned",
+    )
+    .unwrap();
+    let poisoned = bookmark_commit(&jj, &store, branch).unwrap();
+    assert_ne!(poisoned, clean);
+
+    let refusal = export_bookmark_advance_guarded(&jj, &store, true, branch, "poisoned export")
+        .expect_err("a tree carrying conflict scaffolding must never be exported");
+    assert_eq!(
+        refusal,
+        ExportError::ConflictScaffolding {
+            branch: branch.to_string(),
+            commit: poisoned.clone(),
+            entries: vec![
+                ".jjconflict-side-0".to_string(),
+                "JJ-CONFLICT-README".to_string()
+            ],
+        }
+    );
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", &branch_ref]),
+        clean,
+        "the git ref did not move"
+    );
+
+    // The String form every other caller sees names the commit and the entries
+    // and is recognizable as the tree finding it is.
+    let error = export_git_verified(
+        &jj,
+        &store,
+        true,
+        "poisoned export",
+        &[(branch, poisoned.as_str())],
+    )
+    .expect_err("the String form refuses too");
+    assert!(is_conflict_scaffolding_export_refusal(&error), "{error}");
+    assert!(error.contains(&poisoned), "{error}");
+    assert!(error.contains("JJ-CONFLICT-README"), "{error}");
+    assert!(error.contains(".jjconflict-side-0"), "{error}");
+    assert_eq!(git_stdout(proj.path(), &["rev-parse", &branch_ref]), clean);
+
+    // Putting the bookmark back proves the store and git agree again.
+    jj.run(
+        &store,
+        &[
+            "bookmark",
+            "set",
+            branch,
+            "-r",
+            &clean,
+            "--allow-backwards",
+            "--ignore-working-copy",
+        ],
+        "restore",
+    )
+    .unwrap();
+    export_bookmark_advance(&jj, &store, true, branch, "restored export")
+        .expect("the restored clean tip re-exports");
+    assert_eq!(git_stdout(proj.path(), &["rev-parse", &branch_ref]), clean);
 }
 
 /// The publish boundary refuses a delta whose tree root carries jj conflict

@@ -978,6 +978,137 @@ mod tests {
         assert!(lock.migration_complete());
     }
 
+    /// Legacy-lock migration against a workspace history carrying the commit
+    /// subjects found on a real pre-v2 machine. Two things prove ownership:
+    /// bytes identical to what this build ships (no history needed), and a
+    /// last commit from the June bundle-branch sync, which committed nothing
+    /// but shipped files. Subjects that carry the user's own content -- a
+    /// pre-sync snapshot of pending edits, or a merge that combined both
+    /// sides -- never do, so those files stay the user's.
+    #[test]
+    fn migration_owns_shipped_bytes_and_bundle_branch_commits_but_not_user_content() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("home");
+        let resources = temp.path().join("resources");
+        write_manifest(&resources, "core", true, &[]);
+        let core = source_pack(&resources, "core");
+        for id in ["branch", "identical", "merged", "snapshot"] {
+            write(&core.join(format!("agents/{id}.md")), "shipped v1\n");
+        }
+        write(&core.join("skills/finder/SKILL.md"), "shipped skill v1\n");
+        seed_legacy_workspace(&repo, &resources, &["core"]);
+
+        let git = RealGitClient;
+        let commit = |path: &str, body: &str, subject: &str| {
+            write(&repo.join(path), body);
+            git.add_all(&repo).unwrap();
+            git.commit(&repo, subject).unwrap();
+        };
+        // An older shipped vintage, committed by the bundle-branch sync.
+        commit(
+            "agents/branch.md",
+            "shipped v0\n",
+            "Update bundled defaults to 0.8.7",
+        );
+        // A snapshot that happens to hold exactly the shipped bytes.
+        commit("agents/identical.md", "scratch\n", "User scratch");
+        commit(
+            "agents/identical.md",
+            "shipped v1\n",
+            "Snapshot workspace config",
+        );
+        commit(
+            "agents/merged.md",
+            "mine + theirs\n",
+            "Merge branch 'bundle'",
+        );
+        commit(
+            "agents/snapshot.md",
+            "my pending edit\n",
+            "Snapshot workspace config",
+        );
+        // Finder metadata, never committed (the legacy allowlist ignores it).
+        write(&repo.join("skills/finder/.DS_Store"), "finder");
+
+        // The app moves on: v2 ships for every item.
+        for id in ["branch", "identical", "merged", "snapshot"] {
+            write(&core.join(format!("agents/{id}.md")), "shipped v2\n");
+        }
+        write(&core.join("skills/finder/SKILL.md"), "shipped skill v2\n");
+        // ... except `identical`, whose shipped bytes are still what the user has.
+        write(&core.join("agents/identical.md"), "shipped v1\n");
+
+        sync_workspace_packs(&git, &RealFileSystem, &resources, &repo, "2.0.0").unwrap();
+
+        let lock = pack_lock::read_lock(&repo, "core").unwrap();
+        let forked = |kind, id: &str| lock.item(kind, id).unwrap().forked;
+        let body = |path: &str| std::fs::read_to_string(repo.join(path)).unwrap();
+
+        assert!(!forked(PackItemKind::Agent, "branch"));
+        assert_eq!(
+            body("agents/branch.md"),
+            "shipped v2\n",
+            "owned items update"
+        );
+        assert!(!forked(PackItemKind::Agent, "identical"));
+        assert_eq!(body("agents/identical.md"), "shipped v1\n");
+        assert!(forked(PackItemKind::Agent, "merged"));
+        assert_eq!(body("agents/merged.md"), "mine + theirs\n");
+        assert!(forked(PackItemKind::Agent, "snapshot"));
+        assert_eq!(body("agents/snapshot.md"), "my pending edit\n");
+        assert!(
+            !forked(PackItemKind::Skill, "finder"),
+            "a .DS_Store beside shipped files is not an edit"
+        );
+        assert_eq!(body("skills/finder/SKILL.md"), "shipped skill v2\n");
+    }
+
+    /// Baselines recorded before OS metadata left the tree hash included any
+    /// `.DS_Store` present at the time. Such an item must keep updating, and its
+    /// baseline is re-recorded in today's terms.
+    #[test]
+    fn a_baseline_that_hashed_finder_metadata_still_counts_as_owned() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("home");
+        let resources = temp.path().join("resources");
+        write_complete_resources(&resources);
+        sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
+
+        write(&repo.join("skills/example/.DS_Store"), "finder");
+        let mut lock = pack_lock::read_lock(&repo, "core").unwrap();
+        let pack::ContentHash::Present(legacy) =
+            pack::hash_tree_including_os_metadata(&repo.join("skills/example")).unwrap()
+        else {
+            panic!("skill exists")
+        };
+        lock.item_mut(PackItemKind::Skill, "example")
+            .unwrap()
+            .content_hash = Some(legacy.clone());
+        pack_lock::write_lock(&RealFileSystem, &repo, &lock).unwrap();
+
+        // Unchanged source: no fork, and the baseline is rewritten.
+        sync_one_pack(&RealGitClient, &RealFileSystem, &resources, &repo, "core").unwrap();
+        let item = pack_lock::read_lock(&repo, "core")
+            .unwrap()
+            .item(PackItemKind::Skill, "example")
+            .unwrap()
+            .clone();
+        assert!(!item.forked);
+        assert_ne!(item.content_hash.as_deref(), Some(legacy.as_str()));
+
+        // A changed source still reaches it.
+        write(
+            &source_pack(&resources, "core").join("skills/example/SKILL.md"),
+            "---\nname: Example\ndescription: Example skill v2\n---\n",
+        );
+        sync_one_pack(&RealGitClient, &RealFileSystem, &resources, &repo, "core").unwrap();
+        assert!(
+            std::fs::read_to_string(repo.join("skills/example/SKILL.md"))
+                .unwrap()
+                .contains("v2")
+        );
+    }
+
     /// A fresh workspace seeds the packed `fan-out` workflow package, the loader
     /// then lists it, and a later sync of a CHANGED pack preserves the user's
     /// edit to their copy (directory packages are copy-when-missing, never

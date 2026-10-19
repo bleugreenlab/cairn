@@ -345,15 +345,11 @@ async fn streamed_reasoning_then_tool_call_persists_both_events() {
     use crate::db::DbState;
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::SearchIndex;
     use cairn_db::turso::params;
 
     let db_dir = tempfile::tempdir().unwrap();
-    let db = LocalDb::open(db_dir.path().join("or-transcript-test.db"))
-        .await
-        .unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
+    let db = LocalDb::open_migrated_for_test(db_dir.path().join("or-transcript-test.db"))
         .await
         .unwrap();
 
@@ -860,7 +856,7 @@ async fn each_familys_usage_persists_as_its_golden() {
     use crate::db::DbState;
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::SearchIndex;
     use cairn_db::turso::params;
     use cairn_models::wire::stream::{StreamSink, StreamSummary};
 
@@ -896,11 +892,7 @@ async fn each_familys_usage_persists_as_its_golden() {
     ];
 
     let db_dir = tempfile::tempdir().unwrap();
-    let db = LocalDb::open(db_dir.path().join("usage-golden.db"))
-        .await
-        .unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
+    let db = LocalDb::open_migrated_for_test(db_dir.path().join("usage-golden.db"))
         .await
         .unwrap();
     let root = tempfile::tempdir().unwrap().keep();

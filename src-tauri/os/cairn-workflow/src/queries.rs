@@ -814,7 +814,6 @@ fn db_action_run_from_row(row: &cairn_db::turso::Row) -> Result<DbActionRun, DbE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
 
     /// Queries that append joined columns after the EXECUTION_COLUMNS block read
     /// them at offsets derived from this count. When the block grows and the
@@ -841,11 +840,7 @@ mod tests {
     }
 
     async fn migrated_db() -> LocalDb {
-        let db = LocalDb::open(tempfile::tempdir().unwrap().keep().join("t.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("t.db"))
             .await
             .unwrap();
         db

@@ -223,7 +223,7 @@ pub(super) async fn apply_agent_patch(
 
     let path = config_agents::save_agent(&orch.config_dir, &agent, project_path.as_deref())?;
     crate::config::commit_config_paths(
-        std::slice::from_ref(&path),
+        &config_agents::agent_stage_paths(&path),
         &format!("cairn: update agent {agent_id}"),
     );
     Ok(format!("Updated agent '{agent_id}'"))
@@ -244,7 +244,7 @@ pub(super) async fn apply_agent_delete(
     };
     config_agents::delete_agent(&orch.config_dir, agent_id, project_path.as_deref())?;
     crate::config::commit_config_paths(
-        std::slice::from_ref(&agent.file_path),
+        &config_agents::agent_stage_paths(&agent.file_path),
         &format!("cairn: delete agent {agent_id}"),
     );
     Ok(format!("Deleted agent '{agent_id}'"))

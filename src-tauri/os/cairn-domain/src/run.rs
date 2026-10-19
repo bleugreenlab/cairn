@@ -168,8 +168,9 @@ pub struct Event {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cost_usd: Option<f64>,
     /// Archival storage mode (CAIRN-1538): `full` (or absent) for a live inline
-    /// event, `gitcoord`/`zstd` for one rewritten at worktree teardown. These
-    /// coordinate fields drive `archival::reconstruct_events` and are skipped
+    /// event, `gitcoord`/`zstd` for one rewritten by archival once its issue
+    /// resolved. These coordinate fields drive `storage::reconstruct_events` and
+    /// are skipped
     /// from serialization — consumers only ever see reconstructed `data`.
     #[serde(skip, default)]
     pub storage_mode: Option<String>,

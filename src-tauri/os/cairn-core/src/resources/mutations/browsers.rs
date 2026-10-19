@@ -745,7 +745,7 @@ mod tests {
     use crate::db::DbState;
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use std::sync::Arc;
     use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -758,11 +758,7 @@ mod tests {
         tempfile::TempDir,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let local = LocalDb::open(dir.path().join("browser-mut.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        let local = LocalDb::open_migrated_for_test(dir.path().join("browser-mut.db"))
             .await
             .unwrap();
         local

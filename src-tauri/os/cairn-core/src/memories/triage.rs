@@ -562,7 +562,7 @@ mod tests {
     use crate::models::{Memory, MemoryScope, MemoryStatus};
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, RowExt, SearchIndex};
     use cairn_db::turso::params;
     use tempfile::TempDir;
 
@@ -593,14 +593,10 @@ mod tests {
         .unwrap();
 
         let local = Arc::new(
-            LocalDb::open(temp.path().join("triage-test.db"))
+            LocalDb::open_migrated_for_test(temp.path().join("triage-test.db"))
                 .await
                 .unwrap(),
         );
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
-            .await
-            .unwrap();
         local
             .write(|conn| {
                 let workspace_path = workspace_dir.to_string_lossy().to_string();
@@ -2230,14 +2226,10 @@ mod tests {
 
     async fn migrated_team_db(temp: &TempDir) -> Arc<LocalDb> {
         let db = Arc::new(
-            LocalDb::open(temp.path().join("triage-team-test.db"))
+            LocalDb::open_migrated_for_test(temp.path().join("triage-team-test.db"))
                 .await
                 .unwrap(),
         );
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
         db
     }
 

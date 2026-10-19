@@ -17,15 +17,9 @@ mod tests {
 
     // ---- reparent_delegated_jobs disambiguation -------------------------------
 
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
-
     async fn migrated_db() -> LocalDb {
         let temp = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(temp.keep().join("dag-reparent-test.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.keep().join("dag-reparent-test.db"))
             .await
             .unwrap();
         db.write(|conn| {

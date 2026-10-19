@@ -26,13 +26,13 @@ pub struct ClaudeArgsConfig {
     /// StructuredOutput tool (`--json-schema`). `Some` only for schema-
     /// constrained ephemeral calls; the structured result rides the terminal
     /// `result` event's `structured_output` (CAIRN-2505). `None` leaves output
-    /// unconstrained (every non-call session).
+    /// unconstrained (every non-call session). StructuredOutput is the CLI's
+    /// own mechanism rather than a built-in, so `--tools ""` leaves it in
+    /// place (`tests/claude_cli_contract.rs` pins this).
     pub json_schema: Option<serde_json::Value>,
-    /// A tool-free one-shot: no built-in tools at all (`--tools ""`, which
-    /// also keeps their definitions out of the prompt, about 15k tokens; the
-    /// `--json-schema` StructuredOutput tool survives it) and nothing saved to
-    /// resume (`--no-session-persistence`, print mode only). Verified against
-    /// Claude Code 2.1.285.
+    /// A tool-free one-shot: nothing saved to resume
+    /// (`--no-session-persistence`, print mode only). Built-in tools are off
+    /// for every launch, tool-free or not.
     pub tool_free: bool,
 }
 
@@ -108,13 +108,17 @@ pub fn build_claude_args(config: &ClaudeArgsConfig) -> Vec<String> {
         args.push("--dangerously-skip-permissions".to_string());
     }
 
-    // Add allowed tools
+    // Which tools run without a permission prompt. This governs permission
+    // only; which tools exist at all is `--tools` below.
     args.push("--allowedTools".to_string());
     args.push(config.allowed_tools.join(","));
 
-    // Add disallowed tools
-    args.push("--disallowedTools".to_string());
-    args.push(config.disallowed_tools.join(","));
+    // Built-ins are already off, so a disallow list only ever names MCP tools
+    // an agent is denied.
+    if !config.disallowed_tools.is_empty() {
+        args.push("--disallowedTools".to_string());
+        args.push(config.disallowed_tools.join(","));
+    }
 
     // Constrain output to a JSON Schema via the CLI's built-in StructuredOutput
     // tool. The schema-valid object comes back on the terminal `result` event as
@@ -151,9 +155,13 @@ pub fn build_claude_args(config: &ClaudeArgsConfig) -> Vec<String> {
     args.push("--verbose".to_string());
     if config.tool_free {
         args.push("--no-session-persistence".to_string());
-        args.push("--tools".to_string());
-        args.push(String::new());
     }
+    // `--tools` is an allowlist of built-ins, and it is empty: no built-in is
+    // declared to the model, including ones a later CLI adds, and their
+    // definitions stay out of the prompt. Every tool Cairn offers is an MCP
+    // tool, which this does not touch.
+    args.push("--tools".to_string());
+    args.push(String::new());
 
     // Enable partial message streaming for real-time token display
     args.push("--include-partial-messages".to_string());
@@ -188,17 +196,82 @@ mod tests {
         }
     }
 
+    /// No launch relies on naming built-ins to switch them off: every one
+    /// carries `--tools ""`, the CLI's allowlist of built-ins, so a built-in a
+    /// CLI update adds is off before anyone has heard of it. A tool-free
+    /// launch differs only in not being saved to resume.
     #[test]
-    fn only_a_tool_free_session_drops_built_in_tools_and_persistence() {
-        let with_tools = build_claude_args(&base_config());
-        assert!(!with_tools.contains(&"--no-session-persistence".to_string()));
-        assert!(!with_tools.contains(&"--tools".to_string()));
-        let tool_free = build_claude_args(&ClaudeArgsConfig {
-            tool_free: true,
+    fn every_claude_launch_offers_an_explicit_builtin_allowlist() {
+        let starts = [
+            SessionStart::New {
+                session_id: "cairn-uuid".to_string(),
+            },
+            SessionStart::Resume {
+                session_id: "cairn-uuid".to_string(),
+                backend_id: "claude-thread".to_string(),
+            },
+            SessionStart::Fork {
+                session_id: "cairn-fork".to_string(),
+                source_backend_id: "claude-thread".to_string(),
+            },
+        ];
+        let schemas = [None, Some(serde_json::json!({"type": "object"}))];
+        for start in &starts {
+            for interactive in [true, false] {
+                for with_mcp in [true, false] {
+                    for schema in &schemas {
+                        let config = ClaudeArgsConfig {
+                            mcp_config: if with_mcp {
+                                r#"{"mcpServers":{"cairn":{"type":"http","url":"http://o/mcp"}}}"#
+                                    .to_string()
+                            } else {
+                                r#"{"mcpServers":{}}"#.to_string()
+                            },
+                            session_start: start.clone(),
+                            bidirectional: interactive,
+                            json_schema: schema.clone(),
+                            tool_free: !with_mcp,
+                            ..base_config()
+                        };
+                        let args = build_claude_args(&config);
+                        let case = format!(
+                            "{start:?}, interactive={interactive}, mcp={with_mcp}, schema={}",
+                            schema.is_some()
+                        );
+                        assert_eq!(
+                            args.iter().filter(|arg| *arg == "--tools").count(),
+                            1,
+                            "{case}: {args:?}"
+                        );
+                        assert_eq!(flag_value(&args, "--tools"), Some(""), "{case}");
+                        assert_eq!(
+                            args.contains(&"--no-session-persistence".to_string()),
+                            !with_mcp,
+                            "{case}: only a tool-free launch goes unsaved"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// With built-ins off by `--tools`, the disallow list only ever names an
+    /// agent's own MCP denials, and is left off entirely when there are none.
+    #[test]
+    fn disallowed_tools_are_passed_only_when_some_are_named() {
+        let none = build_claude_args(&base_config());
+        assert!(!none.contains(&"--disallowedTools".to_string()), "{none:?}");
+        let named = build_claude_args(&ClaudeArgsConfig {
+            disallowed_tools: vec![
+                "mcp__cairn__update_issue".to_string(),
+                "mcp__deck__draw".to_string(),
+            ],
             ..base_config()
         });
-        assert!(tool_free.contains(&"--no-session-persistence".to_string()));
-        assert_eq!(flag_value(&tool_free, "--tools"), Some(""));
+        assert_eq!(
+            flag_value(&named, "--disallowedTools"),
+            Some("mcp__cairn__update_issue,mcp__deck__draw")
+        );
     }
 
     fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {

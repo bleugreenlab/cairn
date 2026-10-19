@@ -1860,6 +1860,28 @@ async fn render_resource_body(
         CairnResource::Grant { id } => {
             crate::resources::grants::read_grant(&orch.db.local, &id).await
         }
+        // The cairn-inference facet: the stored inventory and the bginf link's
+        // last read, compared live on the pools page.
+        CairnResource::Inference
+        | CairnResource::InferenceRecipes
+        | CairnResource::InferenceDeployments
+        | CairnResource::InferencePools => {
+            match crate::orchestrator::inference::load_view(orch).await {
+                Err(error) => format!("cairn://inference is unavailable: {error}"),
+                Ok(view) => match resource {
+                    CairnResource::Inference => {
+                        crate::resources::inference::render_index(&view, &params)
+                    }
+                    CairnResource::InferenceRecipes => {
+                        crate::resources::inference::render_recipes(&view, &params)
+                    }
+                    CairnResource::InferenceDeployments => {
+                        crate::resources::inference::render_deployments(&view, &params)
+                    }
+                    _ => crate::resources::inference::render_pools(&view, &params),
+                },
+            }
+        }
         // The cairn-models facet. Each page renders the facet interface's answer,
         // which the orchestrator composes from what Settings → Providers reads.
         CairnResource::Models => match reject_query_params("cairn://models", &params) {
@@ -2903,6 +2925,15 @@ async fn render_resource_body(
         CairnResource::ProjectEvent { project, id } => {
             super::events::member(orch, Some(&project), id, &params).await
         }
+        CairnResource::ProjectEventEndpoints { project } => {
+            super::event_endpoints::list(orch, &project, &params).await
+        }
+        CairnResource::ProjectEventEndpoint { project, name } => {
+            super::event_endpoints::member(orch, &project, &name, &params).await
+        }
+        CairnResource::ProjectEventDelivery { project, name, id } => {
+            super::event_endpoints::delivery(orch, &project, &name, id, &params).await
+        }
         CairnResource::WorkspaceEvents => super::events::list(orch, None, &params).await,
         CairnResource::WorkspaceEvent { id } => {
             super::events::member(orch, None, id, &params).await
@@ -3915,19 +3946,22 @@ line2', X'0001020AFF', 2.5),
     /// normalization happens before the block is built. Before that, every thread
     /// sub-resource got the generic thread block, which advertised only
     /// patch/append/delete and said nothing about what the descendant accepts.
+    ///
+    /// It also pins the arc's machine channel: `?format=json` is the prose
+    /// alone, and a legacy arc ruling reads back exactly through the tenet the
+    /// boot import made of it.
     #[tokio::test]
     async fn thread_descendants_read_with_their_node_familys_affordances() {
         use crate::db::DbState;
         use crate::orchestrator::OrchestratorBuilder;
         use crate::services::testing::TestServicesBuilder;
-        use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+        use crate::storage::{LocalDb, SearchIndex};
 
         let dir = tempfile::tempdir().unwrap();
-        let local = LocalDb::open(dir.path().join("thread-read.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        // The arc read opens the thread's own store; without this it would be
+        // created under the real CAIRN_HOME.
+        crate::threads::db_store::use_test_path("t-ux", dir.path().join("t-ux.db"));
+        let local = LocalDb::open_migrated_for_test(dir.path().join("thread-read.db"))
             .await
             .unwrap();
         local
@@ -3967,6 +4001,15 @@ line2', X'0001020AFF', 2.5),
             tempfile::tempdir().unwrap().keep(),
         )
         .build();
+        // What boot does: the arc's embedded rulings become migrated tenets.
+        let imported = crate::tenets::import_thread_rulings(
+            &orch.db,
+            &*orch.services.emitter,
+            orch.services.clock.now(),
+        )
+        .await;
+        assert!(imported.errors.is_empty(), "{:?}", imported.errors);
+        assert_eq!(imported.inserted(), 1);
         let request = McpCallbackRequest {
             thread_id: None,
             cwd: String::new(),
@@ -4003,12 +4046,37 @@ line2', X'0001020AFF', 2.5),
         );
         assert!(!block.contains("_cairn_rulings"), "{block}");
 
+        // The JSON projection is the stored prose only, byte for byte: rulings
+        // are tenets and open questions are thread-database rows, so neither is
+        // inlined, and non-ASCII text is not escaped.
         let raw =
             produce_cairn_resource(&orch, &request, "cairn://p/thr/thread-ux/arc?format=json")
                 .await;
-        assert_eq!(raw.content, stored_arc);
+        assert_eq!(
+            raw.content,
+            "{\n  \"current_intent\": \"The canonical arc — café\"\n}"
+        );
         assert!(raw.affordance.is_none());
         assert!(!raw.content.contains("## actions"));
+
+        // The ruling the arc carried reads back exactly from its tenet: the
+        // escaped quote and newline, and the nested provenance object.
+        let stored: serde_json::Value = serde_json::from_str(stored_arc).unwrap();
+        let ruling = &stored["rulings"][0];
+        let tenet = produce_cairn_resource(
+            &orch,
+            &request,
+            "cairn://p/thr/tenets/quoted-ruling?format=json",
+        )
+        .await;
+        assert!(tenet.content.contains("résumé"), "{}", tenet.content);
+        let tenet: serde_json::Value = serde_json::from_str(&tenet.content)
+            .unwrap_or_else(|error| panic!("{error}: {}", tenet.content));
+        assert_eq!(tenet["slug"], ruling["slug"]);
+        assert_eq!(tenet["question"], "Say \"yes\"\nthen proceed");
+        assert_eq!(tenet["text"], ruling["text"]);
+        assert_eq!(tenet["legacy"]["rationale"], ruling["rationale"]);
+        assert_eq!(tenet["legacy"]["provenance"], ruling["provenance"]);
 
         // A branch-shaped segment is refused with its reason rather than read as
         // an artifact of that name.
@@ -4027,14 +4095,10 @@ line2', X'0001020AFF', 2.5),
         use crate::db::DbState;
         use crate::orchestrator::OrchestratorBuilder;
         use crate::services::testing::TestServicesBuilder;
-        use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+        use crate::storage::{LocalDb, SearchIndex};
 
         let dir = tempfile::tempdir().unwrap();
-        let local = LocalDb::open(dir.path().join("browser-read.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        let local = LocalDb::open_migrated_for_test(dir.path().join("browser-read.db"))
             .await
             .unwrap();
         local

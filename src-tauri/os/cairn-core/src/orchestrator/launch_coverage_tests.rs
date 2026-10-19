@@ -286,7 +286,10 @@ impl SessionProvider for RecordingClaude {
                 claude.allowed_tools.is_empty(),
                 "a tool-free session allows nothing"
             );
-            assert!(claude.disallowed_tools.contains(&"Bash".to_string()));
+            assert!(
+                claude.disallowed_tools.is_empty(),
+                "a tool-free session has no MCP tool to deny"
+            );
             assert!(claude.hook_settings.is_none());
             self.0.record("claude:tool_free");
             if spec.secrets.names().any(|name| name == "CLAUDE_CONFIG_DIR") {

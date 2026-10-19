@@ -64,6 +64,22 @@ pub const EXECUTOR_RUNNER_DEVICE_ID_ENV: &str = "CAIRN_EXECUTOR_RUNNER_DEVICE_ID
 pub const EXECUTOR_SUPERVISION_NONCE_ENV: &str = "CAIRN_EXECUTOR_SUPERVISION_NONCE";
 pub const EXECUTOR_DISTRIBUTION_INFO_ARG: &str = "--distribution-info";
 
+/// Where a runner serves the [`ExecutorDistributionManifest`] for the build it
+/// would install, on its executor listener. `ProtocolIncompatible` sends a
+/// mismatched executor here to self-update.
+pub const EXECUTOR_ARTIFACT_MANIFEST_PATH: &str = "/api/executor/artifact/manifest";
+
+/// Where a runner serves the [`SidecarArtifact`] describing the `cairn` CLI it
+/// selected for a target (`?target=`), on its executor listener. A resident
+/// executor reads it after every Ready and replaces the CLI in its own home when
+/// the bytes it holds have a different sha256. The artifact's `url` is relative
+/// to the runner, which serves the bytes itself.
+pub const EXECUTOR_CLI_SELECTION_PATH: &str = "/api/executor/artifact/cli";
+
+/// The workspace crate the `cairn` CLI is published as, in a manifest's
+/// `sidecars`.
+pub const CLI_SIDECAR_CRATE: &str = "cairn-cmd";
+
 /// Receives and accepts one executor Ready message before starting work that is
 /// explicitly outside the readiness boundary.
 pub async fn accept_ready_then<T, R, E, Receive, Accept, PostReady>(
@@ -4562,7 +4578,52 @@ pub struct LearnedResourceEstimate {
 /// and answers exactly what it was before, and nothing it posts is read
 /// differently. A runner talking to an older executor gets the same outcomes
 /// it always did and accounts for them the new way.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 150;
+///
+/// cairn/5136 changes two things the executor does, without a bump. It reads a
+/// command leader's identity from the child's own kernel record, which an
+/// exited child keeps until the executor waits on it, so a command that
+/// finishes before the read completes instead of failing its launch with
+/// "disappeared before identity capture"; and adoption reads a command
+/// ownership envelope with no attempts in it as proven empty rather than as
+/// incomplete identity. Both live in the executor's own cell state: the
+/// identity it records has the shape every recorded identity has had, an
+/// adopted cell is advertised as any adopted cell is, and no message changes.
+/// What a runner gets wrong talking to an older executor: nothing it would
+/// decode differently. That executor still fails some very fast commands and
+/// quarantines some empty envelopes, as it always has, until it runs a build
+/// carrying this, which for a remote machine is the next published version.
+///
+/// cairn/4831 changes two runner-side readings, without a bump. The runner's
+/// aggregate `FleetSnapshot` now carries the runner queue's unclaimed entries as
+/// `queued_requests` rows; that aggregate is built by the runner for its own
+/// surfaces and is never sent to an executor. And a parallel process batch's
+/// offer now charges `concurrency_units` once per item running together (capped
+/// at the machine's admission budget) instead of once for its heaviest item.
+/// That is a new value in an existing field whose meaning is unchanged: the
+/// executor charges it against admission and runs that many parallel items at
+/// once, exactly as every executor at this version already does. What a runner
+/// gets wrong talking to an older executor: nothing; the older executor admits
+/// and widens the batch by the charge it is sent, as it always has.
+///
+/// Version 151 (cairn/5154) moves the `cairn` CLI on a remote machine under the
+/// same rule as the executor binary: the build the runner selected, identified
+/// by content. Until now the CLI was installed only by the enrolment ceremony,
+/// over ssh, behind a probe that compared `cairn-cmd <version>` strings, and the
+/// workspace version read `0.12.34` for a month of builds, so every machine kept
+/// the CLI it was first given and refused the `--os`/`--executor` flags agents
+/// are taught. Now the runner serves its selected CLI at
+/// [`EXECUTOR_CLI_SELECTION_PATH`], and a resident executor reads it after
+/// every Ready and replaces `<home>/bin/cairn` when the sha256 differs, so the
+/// fleet converges on the next attach after a rebuild. Its `cairn-cli` probe
+/// records the resolved CLI's digest in [`ToolchainProbe::build_sha256`] and
+/// stops advertising `cairn-cli` when that digest is not the runner's
+/// selection. No frame changes shape. The probe field is defaulted, so an
+/// earlier runner decodes it and ignores the digest, and the selection is a new
+/// HTTP route an earlier executor never asks for. The number moves as a rollout
+/// trigger, as 137 did: the runner replaces an installed executor only on a
+/// protocol mismatch, so without one no attached machine would run the build
+/// that refreshes its CLI.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 151;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -5285,6 +5346,12 @@ pub struct ToolchainProbe {
     /// The verdict in the machine's own words: the version line that proved the
     /// toolchain works, or the failure the OS or the tool reported.
     pub detail: String,
+    /// The sha256 of the executable that resolved, for a probe held to one
+    /// build rather than to any version that runs. Only `cairn-cli` is: its
+    /// version string stayed the same across a month of builds, so the digest is
+    /// the only identity that tells two of them apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_sha256: Option<String>,
 }
 
 /// The evidence behind an executor's advertised toolchain set.

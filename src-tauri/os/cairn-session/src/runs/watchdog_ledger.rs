@@ -752,13 +752,10 @@ pub async fn list_watchdog_lifecycle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_db::storage::{MigrationRunner, TURSO_MIGRATIONS};
 
     async fn migrated_db() -> LocalDb {
         let dir = tempfile::tempdir().unwrap().keep();
-        let db = LocalDb::open(dir.join("watchdog.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(dir.join("watchdog.db"))
             .await
             .unwrap();
         db

@@ -89,6 +89,9 @@ pub struct GitHubCredentials {
     pub relay_last_unmapped_event_id: Option<String>,
     pub relay_last_unmapped_repository: Option<String>,
     pub relay_last_unmapped_at: Option<String>,
+    /// Events the relay consumer recorded and skipped since its last
+    /// successful delivery. Non-zero means the feed is `skipping`.
+    pub relay_undeliverable_since_healthy: i64,
 }
 
 /// Get GitHub credentials from DB.
@@ -107,7 +110,7 @@ pub async fn get_github_credentials(db: &LocalDb) -> Result<GitHubCredentials, S
                             relay_pending_public_key, relay_pending_private_key_encrypted,
                             relay_key_rotated_at, relay_unmapped_mention_count,
                             relay_last_unmapped_event_id, relay_last_unmapped_repository,
-                            relay_last_unmapped_at
+                            relay_last_unmapped_at, relay_undeliverable_since_healthy
                      FROM github_app
                      WHERE id = 'default'",
                     (),
@@ -145,6 +148,7 @@ pub async fn get_github_credentials(db: &LocalDb) -> Result<GitHubCredentials, S
                 relay_last_unmapped_event_id: row.opt_text(23)?,
                 relay_last_unmapped_repository: row.opt_text(24)?,
                 relay_last_unmapped_at: row.opt_text(25)?,
+                relay_undeliverable_since_healthy: row.opt_i64(26)?.unwrap_or(0),
             })
         })
     })
@@ -255,11 +259,11 @@ where
                     relay_pending_public_key, relay_pending_private_key_encrypted,
                     relay_key_rotated_at, relay_unmapped_mention_count,
                     relay_last_unmapped_event_id, relay_last_unmapped_repository,
-                    relay_last_unmapped_at
+                    relay_last_unmapped_at, relay_undeliverable_since_healthy
                  )
                  VALUES ('default', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12,
                          ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                         ?26, ?27)
+                         ?26, ?27, ?28)
                  ON CONFLICT(id) DO UPDATE SET
                     app_id = excluded.app_id,
                     app_name = excluded.app_name,
@@ -287,7 +291,8 @@ where
                     relay_unmapped_mention_count = excluded.relay_unmapped_mention_count,
                     relay_last_unmapped_event_id = excluded.relay_last_unmapped_event_id,
                     relay_last_unmapped_repository = excluded.relay_last_unmapped_repository,
-                    relay_last_unmapped_at = excluded.relay_last_unmapped_at",
+                    relay_last_unmapped_at = excluded.relay_last_unmapped_at,
+                    relay_undeliverable_since_healthy = excluded.relay_undeliverable_since_healthy",
                 params![
                     creds.app_id,
                     creds.app_name,
@@ -316,6 +321,7 @@ where
                     creds.relay_last_unmapped_event_id,
                     creds.relay_last_unmapped_repository,
                     creds.relay_last_unmapped_at,
+                    creds.relay_undeliverable_since_healthy,
                 ],
             )
             .await?;

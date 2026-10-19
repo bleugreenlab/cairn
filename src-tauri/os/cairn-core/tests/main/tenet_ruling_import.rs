@@ -170,11 +170,9 @@ struct Imported {
     number: i64,
     thread: String,
     slug: String,
-    question: String,
-    options: Vec<String>,
+    statement: String,
     status: String,
     verdict: Option<String>,
-    selected: Option<i64>,
     answer_source: Option<String>,
     answered_at: Option<i64>,
     answered_by: Option<String>,
@@ -187,8 +185,8 @@ struct Imported {
 
 async fn imported(db: &LocalDb) -> Vec<Imported> {
     db.query_all(
-        "SELECT number, proposing_thread_id, slug, question, options_json, status, verdict,
-                selected_option, answer_source, answered_at, answered_by_json, origin,
+        "SELECT number, proposing_thread_id, slug, statement, status, verdict,
+                answer_source, answered_at, answered_by_json, origin,
                 legacy_json, proposer_principal_json, created_at, updated_at
          FROM tenets WHERE project_id = 'p-imp' ORDER BY number",
         (),
@@ -197,19 +195,17 @@ async fn imported(db: &LocalDb) -> Vec<Imported> {
                 number: row.i64(0)?,
                 thread: row.text(1)?,
                 slug: row.text(2)?,
-                question: row.text(3)?,
-                options: serde_json::from_str(&row.text(4)?).unwrap(),
-                status: row.text(5)?,
-                verdict: row.opt_text(6)?,
-                selected: row.opt_i64(7)?,
-                answer_source: row.opt_text(8)?,
-                answered_at: row.opt_i64(9)?,
-                answered_by: row.opt_text(10)?,
-                origin: row.text(11)?,
-                legacy: serde_json::from_str(&row.text(12)?).unwrap(),
-                proposer: serde_json::from_str(&row.text(13)?).unwrap(),
-                created_at: row.i64(14)?,
-                updated_at: row.i64(15)?,
+                statement: row.text(3)?,
+                status: row.text(4)?,
+                verdict: row.opt_text(5)?,
+                answer_source: row.opt_text(6)?,
+                answered_at: row.opt_i64(7)?,
+                answered_by: row.opt_text(8)?,
+                origin: row.text(9)?,
+                legacy: serde_json::from_str(&row.text(10)?).unwrap(),
+                proposer: serde_json::from_str(&row.text(11)?).unwrap(),
+                created_at: row.i64(12)?,
+                updated_at: row.i64(13)?,
             })
         },
     )
@@ -260,11 +256,9 @@ async fn rulings_from_both_sources_become_numbered_migrated_tenets_exactly_once(
     );
 
     let accepted = &rows[0];
-    assert_eq!(accepted.question, "Leases decide placement");
-    assert_eq!(accepted.options, ["Leases decide placement"]);
+    assert_eq!(accepted.statement, "Leases decide placement");
     assert_eq!(accepted.status, "approved");
-    assert_eq!(accepted.verdict.as_deref(), Some("option"));
-    assert_eq!(accepted.selected, Some(0));
+    assert_eq!(accepted.verdict.as_deref(), Some("yes"));
     assert_eq!(accepted.answer_source.as_deref(), Some("migrated"));
     assert_eq!(accepted.answered_by, None);
     assert_eq!(accepted.answered_at, Some(11));
@@ -289,13 +283,11 @@ async fn rulings_from_both_sources_become_numbered_migrated_tenets_exactly_once(
 
     let rejected = &rows[2];
     assert_eq!(rejected.status, TenetStatus::Declined.as_str());
-    assert_eq!(rejected.verdict.as_deref(), Some("none"));
-    assert_eq!(rejected.selected, None);
+    assert_eq!(rejected.verdict.as_deref(), Some("no"));
 
     let superseded = &rows[5];
     assert_eq!(superseded.status, TenetStatus::Superseded.as_str());
-    assert_eq!(superseded.verdict.as_deref(), Some("option"));
-    assert_eq!(superseded.selected, Some(0));
+    assert_eq!(superseded.verdict.as_deref(), Some("yes"));
     assert_eq!(
         superseded.answer_source.as_deref(),
         Some(AnswerSource::Migrated.as_str())

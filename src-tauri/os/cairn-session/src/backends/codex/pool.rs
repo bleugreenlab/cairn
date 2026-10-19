@@ -37,6 +37,9 @@ use cairn_models::wire::codex_app_server::Notification;
 pub trait PoolHost: Send + Sync {
     fn refresh_tokens(&self, client: &AppServerClient, request_id: &Value);
     fn disconnected(&self, run_ids: &[String]);
+    /// What a call whose turn fails is told about a token request this pool
+    /// refused on its shared login, while that refusal stands.
+    fn standing_token_refusal(&self) -> Option<String>;
 }
 
 /// Auth-identity fingerprint keying the pool.
@@ -86,17 +89,21 @@ pub struct PooledAppServer {
     thread_runs: Arc<Mutex<HashMap<String, CallBinding>>>,
     /// Out of lookup: shut down when its last call deregisters.
     retiring: AtomicBool,
+    /// The pool's shared identity, which answers the server's token requests.
+    host: Arc<dyn PoolHost>,
 }
 
 impl PooledAppServer {
     fn new(
         router: Arc<ThreadRouter>,
         thread_runs: Arc<Mutex<HashMap<String, CallBinding>>>,
+        host: Arc<dyn PoolHost>,
     ) -> Self {
         Self {
             router,
             thread_runs,
             retiring: AtomicBool::new(false),
+            host,
         }
     }
 
@@ -183,11 +190,13 @@ impl PooledAppServer {
     #[cfg(test)]
     fn for_test(client: Arc<AppServerClient>) -> Arc<Self> {
         let host: Arc<dyn PoolHost> = Arc::new(TestPoolHost);
+        let scoped_host = host.clone();
         Arc::new(Self::new(
             ThreadRouter::new(client, move |client, message| {
-                Self::scoped(host.as_ref(), client, message)
+                Self::scoped(scoped_host.as_ref(), client, message)
             }),
             Arc::new(Mutex::new(HashMap::new())),
+            host,
         ))
     }
 }
@@ -208,6 +217,12 @@ impl PooledCall {
     /// Remove this call's `threadId -> run_id` and per-call sender entries.
     pub fn deregister(&self) {
         self.server.deregister_call(&self.thread_id);
+    }
+
+    /// The pool's standing token-request refusal ([`PoolHost::standing_token_refusal`]):
+    /// a call's own reader never sees the token request, which the pool answers.
+    pub fn standing_token_refusal(&self) -> Option<String> {
+        self.server.host.standing_token_refusal()
     }
 }
 
@@ -307,12 +322,13 @@ impl CodexAppServerPool {
         let (client, host) = build()?;
         let thread_runs = Arc::new(Mutex::new(HashMap::new()));
         let closed = self.on_server_closed(key.clone(), thread_runs.clone(), host.clone());
+        let scoped_host = host.clone();
         let router = ThreadRouter::start(
             client,
-            move |client, message| PooledAppServer::scoped(host.as_ref(), client, message),
+            move |client, message| PooledAppServer::scoped(scoped_host.as_ref(), client, message),
             closed,
         );
-        let server = Arc::new(PooledAppServer::new(router, thread_runs));
+        let server = Arc::new(PooledAppServer::new(router, thread_runs, host));
         self.pools
             .lock()
             .unwrap()
@@ -372,6 +388,9 @@ impl PoolHost for TestPoolHost {
         panic!("unexpected refresh");
     }
     fn disconnected(&self, _runs: &[String]) {}
+    fn standing_token_refusal(&self) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]

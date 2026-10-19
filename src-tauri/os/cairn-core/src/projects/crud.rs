@@ -1114,7 +1114,7 @@ fn db_project_from_row(row: &cairn_db::turso::Row) -> Result<DbProject, DbError>
 mod tests {
     use super::*;
     use crate::services::Clock;
-    use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex};
     use tempfile::tempdir;
 
     struct FixedClock;
@@ -1129,9 +1129,7 @@ mod tests {
 
     async fn migrated_db() -> LocalDb {
         let temp = tempdir().unwrap();
-        let db = LocalDb::open(temp.keep().join("cairn.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.keep().join("cairn.db"))
             .await
             .unwrap();
         db

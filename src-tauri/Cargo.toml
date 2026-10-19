@@ -17,6 +17,7 @@ members = [
   "os/cairn-db",
   "os/cairn-domain",
   "os/cairn-image-wire",
+  "os/cairn-inference",
   "os/cairn-llm-wire",
   "os/cairn-mcp-server",
   "os/cairn-models",

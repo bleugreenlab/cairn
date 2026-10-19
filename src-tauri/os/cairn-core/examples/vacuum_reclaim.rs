@@ -1,7 +1,7 @@
 //! Offline archival reclamation (CAIRN-1556): shrink a Cairn Turso database by
 //! returning freelist pages to the OS via `VACUUM INTO`.
 //!
-//! The archival backfill (CAIRN-1555) compresses historical event data and frees
+//! The archival sweep (`archival::sweep`) compresses historical event data and frees
 //! pages onto the freelist, but the database *file* never shrinks on its own:
 //! freed pages are reused for new writes, so the file plateaus at its
 //! high-water mark. This is a one-time, offline cleanup of that high-water mark.

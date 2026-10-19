@@ -15,6 +15,7 @@
 
 mod events;
 mod globals;
+mod inference;
 mod issues;
 mod jobs;
 mod models;
@@ -68,6 +69,10 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     models::MODELS_USAGE_CONTRACT,
     models::MODELS_SESSIONS_CONTRACT,
     models::MODELS_SESSION_CONTRACT,
+    inference::INFERENCE_CONTRACT,
+    inference::INFERENCE_RECIPES_CONTRACT,
+    inference::INFERENCE_DEPLOYMENTS_CONTRACT,
+    inference::INFERENCE_POOLS_CONTRACT,
     globals::EXECUTOR_ACTION_CONTRACT,
     globals::MCP_CONTRACT,
     globals::HELP_CONTRACT,
@@ -185,6 +190,9 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     routes::PROJECT_ROUTE_HISTORY_ENTRY_CONTRACT,
     events::PROJECT_EVENTS_CONTRACT,
     events::PROJECT_EVENT_CONTRACT,
+    events::PROJECT_EVENT_ENDPOINTS_CONTRACT,
+    events::PROJECT_EVENT_ENDPOINT_CONTRACT,
+    events::PROJECT_EVENT_DELIVERY_CONTRACT,
     events::WORKSPACE_EVENTS_CONTRACT,
     events::WORKSPACE_EVENT_CONTRACT,
     responses::RESPONSES_CONTRACT,

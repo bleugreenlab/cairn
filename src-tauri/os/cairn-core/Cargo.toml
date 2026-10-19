@@ -15,6 +15,7 @@ cairn-workflow = { path = "../cairn-workflow" }
 cairn-session = { path = "../cairn-session" }
 cairn-config = { path = "../cairn-config" }
 cairn-models = { path = "../cairn-models" }
+cairn-inference = { path = "../cairn-inference" }
 cairn-channels = { path = "../cairn-channels" }
 cairn-platform = { path = "../cairn-platform" }
 cairn-packs = { path = "../cairn-packs" }

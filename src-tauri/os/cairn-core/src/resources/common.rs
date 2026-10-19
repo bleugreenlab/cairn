@@ -710,11 +710,11 @@ pub(super) fn artifact_affordance_spec_with_schema(
             mode: ChangeMode::Append.as_str().to_string(),
             uri_template: "cairn:@/tenets".to_string(),
             uri: None,
-            required: vec![schema_key("question"), schema_key("options")],
+            required: vec![schema_key("statement")],
             optional: vec![schema_key("supersedes")],
             example: crate::resources::sql_policy::TENET_APPEND_EXAMPLE.to_string(),
             guidance: Some(
-                "; a decision is a tenet the operator answers; option 1 is your recommendation"
+                "; a decision is a tenet: one statement of how the project does things, which the operator answers yes or no"
                     .to_string(),
             ),
         });
@@ -1682,6 +1682,25 @@ mod tests {
         let catalog = affordance_for_kind(ResourceKind::ModelsCatalog);
         assert!(catalog.contains("installed"), "{catalog}");
         assert!(catalog.contains("view"), "{catalog}");
+    }
+
+    /// Every `cairn://inference` page is read-only, and the index offers its
+    /// YAML export as a projection.
+    #[test]
+    fn affordance_for_inference_kinds_is_read_only() {
+        for kind in [
+            ResourceKind::Inference,
+            ResourceKind::InferenceRecipes,
+            ResourceKind::InferenceDeployments,
+            ResourceKind::InferencePools,
+        ] {
+            let output = affordance_for_kind(kind);
+            assert!(!output.contains("### actions"), "{kind:?}:\n{output}");
+            assert!(output.contains("cairn://inference"), "{kind:?}:\n{output}");
+        }
+        let index = affordance_for_kind(ResourceKind::Inference);
+        assert!(index.contains("format"), "{index}");
+        assert!(index.contains("cairn://inference/pools"), "{index}");
     }
 
     /// The accounts list starts a sign-in and re-measures a provider; one

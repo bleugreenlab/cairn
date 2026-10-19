@@ -52,4 +52,7 @@ pub struct EventDeliveryStatus {
     pub failing_event_id: Option<String>,
     pub failing_event_at: Option<String>,
     pub last_successful_delivery_at: Option<String>,
+    /// Events recorded and skipped since the last successful delivery; with
+    /// `health_state` `skipping`, the feed is moving but dropping events.
+    pub undeliverable_since_healthy: i64,
 }

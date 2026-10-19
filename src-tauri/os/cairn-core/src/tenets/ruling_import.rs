@@ -28,7 +28,7 @@ use cairn_common::identity::PrincipalRef;
 use cairn_db::turso::params;
 use serde_json::{json, Value};
 
-use super::{emit_changed, insert_conn, AnswerSource, NewTenet, TenetOrigin, TenetStatus};
+use super::{emit_changed, insert_conn, AnswerSource, NewTenet, TenetOrigin, TenetStatus, Verdict};
 use crate::db::DbState;
 use crate::services::EventEmitter;
 use crate::storage::{LocalDb, RowExt};
@@ -409,20 +409,18 @@ fn new_tenet(
     slug: String,
     now: i64,
 ) -> NewTenet {
-    let (status, verdict, selected_option) = match candidate.status.as_str() {
-        "rejected" => (TenetStatus::Declined, Some("none"), None),
-        "superseded" => (TenetStatus::Superseded, Some("option"), Some(0)),
-        _ => (TenetStatus::Approved, Some("option"), Some(0)),
+    let (status, verdict) = match candidate.status.as_str() {
+        "rejected" => (TenetStatus::Declined, Verdict::No),
+        "superseded" => (TenetStatus::Superseded, Verdict::Yes),
+        _ => (TenetStatus::Approved, Verdict::Yes),
     };
     NewTenet {
         project_id: project_id.to_string(),
         proposing_thread_id: candidate.thread_id.clone(),
         slug: Some(slug),
-        question: candidate.text.clone(),
-        options: vec![candidate.text.clone()],
+        statement: candidate.text.clone(),
         status,
-        verdict,
-        selected_option,
+        verdict: Some(verdict),
         comment: None,
         answered_by: None,
         answer_source: Some(AnswerSource::Migrated),
@@ -681,21 +679,16 @@ mod tests {
     #[test]
     fn statuses_map_onto_verdicts() {
         let mut row = candidate("s", "Text");
-        for (status, expected, verdict, selected) in [
-            ("accepted", TenetStatus::Approved, Some("option"), Some(0)),
-            ("rejected", TenetStatus::Declined, Some("none"), None),
-            (
-                "superseded",
-                TenetStatus::Superseded,
-                Some("option"),
-                Some(0),
-            ),
+        for (status, expected, verdict) in [
+            ("accepted", TenetStatus::Approved, Verdict::Yes),
+            ("rejected", TenetStatus::Declined, Verdict::No),
+            ("superseded", TenetStatus::Superseded, Verdict::Yes),
         ] {
             row.status = status.into();
             let tenet = new_tenet("p", "proj", &row, "s".into(), 9);
             assert_eq!(tenet.status, expected);
-            assert_eq!(tenet.verdict, verdict);
-            assert_eq!(tenet.selected_option, selected);
+            assert_eq!(tenet.verdict, Some(verdict));
+            assert_eq!(tenet.statement, "Text");
             assert_eq!(tenet.answered_at, Some(1));
         }
     }

@@ -1,4 +1,12 @@
-//! GitHub relay catch-up and conversion into declarative route facts.
+//! Relay catch-up: the install's relay channel carries the GitHub App's
+//! webhooks and every ingress endpoint's events on one shared cursor.
+//!
+//! Each event is handled on its own. A GitHub event becomes a route fact (or
+//! a default-branch sync); an endpoint event goes to [`crate::ingress`]. An
+//! event that cannot be handled is recorded and skipped, and the cursor moves
+//! past it, so one poison event never parks the feed for the events behind
+//! it. The one exception is a key mismatch, which means every later event is
+//! unreadable too: that pauses the channel until it is repaired.
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -11,6 +19,9 @@ use crate::{
     projects::remote::find_project_by_remote_full_name,
     routes::RouteFact,
 };
+
+/// The api's relay, which every install's channel lives on.
+pub const DEFAULT_RELAY_URL: &str = "https://api.cairn.computer/relay";
 
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(10 * 60);
@@ -63,7 +74,7 @@ fn event_cursor(event: &RelayEvent) -> String {
     encode_cursor(&event.received_at, event.id)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct RelayEvent {
     pub id: i64,
     pub event_type: String,
@@ -71,6 +82,15 @@ pub struct RelayEvent {
     pub received_at: String,
     #[serde(default)]
     pub encrypted: bool,
+    /// Set only on an ingress endpoint's event; a GitHub webhook has none.
+    #[serde(default)]
+    pub endpoint_id: Option<String>,
+    #[serde(default)]
+    pub delivery_id: Option<String>,
+    #[serde(default)]
+    pub verification: Option<String>,
+    #[serde(default)]
+    pub sender: Option<Value>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -118,7 +138,31 @@ fn record_key_mismatch(creds: &mut credentials::GitHubCredentials, event: &Relay
     creds.relay_failing_event_at = Some(event.received_at.clone());
 }
 
+/// Record an event the consumer skipped. The feed keeps moving, so this is not
+/// a failure state like `key_mismatch`: it is `skipping`, with the skipped
+/// event and the reason, until the next successful delivery clears it. The
+/// consecutive-failure count belongs to key mismatches and is left alone.
+fn record_skip(
+    creds: &mut credentials::GitHubCredentials,
+    event_id: i64,
+    received_at: &str,
+    reason: &str,
+    now: &str,
+) {
+    creds.relay_health_state = Some("skipping".into());
+    creds.relay_health_reason = Some(reason.into());
+    creds
+        .relay_first_failure_at
+        .get_or_insert_with(|| now.to_owned());
+    creds.relay_last_failure_at = Some(now.to_owned());
+    creds.relay_failing_event_id = Some(event_id.to_string());
+    creds.relay_failing_event_at = Some(received_at.to_owned());
+    creds.relay_undeliverable_since_healthy =
+        creds.relay_undeliverable_since_healthy.saturating_add(1);
+}
+
 fn record_successful_delivery(creds: &mut credentials::GitHubCredentials, now: &str) {
+    creds.relay_undeliverable_since_healthy = 0;
     creds.relay_health_state = Some("healthy".into());
     creds.relay_health_reason = None;
     creds.relay_first_failure_at = None;
@@ -407,6 +451,157 @@ pub async fn process_event(
     Ok(ProcessEventOutcome::Routed)
 }
 
+/// What became of one relay event.
+#[derive(Debug, PartialEq, Eq)]
+enum EventOutcome {
+    /// Opened and handled: evidence the channel delivers.
+    Delivered,
+    /// Passed over without being opened: a dead-epoch event, or the skip
+    /// marker the relay sends in place of an oversized payload.
+    PassedOver,
+    /// Could not be handled. Recorded, and the cursor still advances.
+    Skipped {
+        reason: &'static str,
+        detail: String,
+    },
+}
+
+/// What every event on one sync shares.
+struct PageContext<'a> {
+    private_key: &'a str,
+    relay_key_rotated_at: Option<&'a str>,
+    app_slug: &'a str,
+}
+
+/// Handle one event. `Err` only for a key mismatch outside a dead epoch,
+/// which is recorded first and pauses the channel.
+async fn handle_event(
+    orch: &Orchestrator,
+    event: &RelayEvent,
+    ctx: &PageContext<'_>,
+) -> Result<EventOutcome, String> {
+    // `Ok(None)` is a plaintext event: a skip marker in place of a payload.
+    let opened: Result<Option<Value>, String> = if event.encrypted {
+        match decrypt_event_payload(&event.payload, ctx.private_key) {
+            Ok(payload) => Ok(Some(payload)),
+            Err(RelayPayloadError::KeyMismatch) => {
+                if is_dead_epoch_event(event, ctx.relay_key_rotated_at) {
+                    log::warn!(
+                        "skipping dead-epoch relay event {} (pre-rotation)",
+                        event.id
+                    );
+                    return Ok(EventOutcome::PassedOver);
+                }
+                let now = chrono::Utc::now().to_rfc3339();
+                credentials::update_github_credentials(&orch.db.local, |creds| {
+                    record_key_mismatch(creds, event, &now);
+                })
+                .await?;
+                return Err(format!(
+                    "relay key mismatch at event {}; cursor remains paused",
+                    event.id
+                ));
+            }
+            Err(RelayPayloadError::Malformed(error)) => Err(error),
+        }
+    } else {
+        Ok(None)
+    };
+
+    if let Some(endpoint_id) = &event.endpoint_id {
+        let body = match &opened {
+            Ok(Some(payload)) => Ok(payload.clone()),
+            Ok(None) => Err(format!(
+                "the relay delivered no sealed body ({})",
+                event.payload
+            )),
+            Err(error) => Err(format!("the sealed body could not be opened: {error}")),
+        };
+        let consumed = crate::ingress::consume::consume(
+            orch,
+            crate::ingress::consume::EndpointEvent {
+                relay_event_id: event.id,
+                endpoint_id: endpoint_id.clone(),
+                delivery_id: event.delivery_id.clone(),
+                event_type: event.event_type.clone(),
+                verification: event.verification.clone(),
+                sender: event.sender.clone(),
+                received_at: event.received_at.clone(),
+                body,
+            },
+        )
+        .await;
+        return Ok(match consumed {
+            crate::ingress::consume::Consumed::Delivered { .. } => EventOutcome::Delivered,
+            crate::ingress::consume::Consumed::Undeliverable { reason, detail } => {
+                log::warn!(
+                    "Skipping relay event {} for ingress endpoint {endpoint_id}: {reason}: {detail}",
+                    event.id
+                );
+                EventOutcome::Skipped { reason, detail }
+            }
+        });
+    }
+
+    let (payload, decrypted) = match opened {
+        Ok(Some(payload)) => (payload, true),
+        Ok(None) => (event.payload.clone(), false),
+        Err(error) => {
+            log::warn!(
+                "Skipping malformed GitHub relay event {}: {error}",
+                event.id
+            );
+            return Ok(EventOutcome::Skipped {
+                reason: "relay_event_malformed",
+                detail: error,
+            });
+        }
+    };
+    match process_event(orch, event.id, &event.event_type, &payload, ctx.app_slug).await {
+        Ok(_) if decrypted => Ok(EventOutcome::Delivered),
+        Ok(_) => Ok(EventOutcome::PassedOver),
+        Err(error) => {
+            log::warn!(
+                "Skipping GitHub relay event {} ({}): {error}",
+                event.id,
+                event.event_type
+            );
+            Ok(EventOutcome::Skipped {
+                reason: "relay_event_processing_failed",
+                detail: error,
+            })
+        }
+    }
+}
+
+/// Handle a page of events in order, persisting the cursor and the health
+/// evidence after each. Returns the cursor after the last event handled.
+async fn apply_page(
+    orch: &Orchestrator,
+    events: Vec<RelayEvent>,
+    ctx: &PageContext<'_>,
+) -> Result<Option<String>, String> {
+    let mut cursor = None;
+    for event in events {
+        let event_cursor = event_cursor(&event);
+        let outcome = handle_event(orch, &event, ctx).await?;
+        let now = chrono::Utc::now().to_rfc3339();
+        credentials::update_github_credentials(&orch.db.local, |creds| {
+            creds.last_event_sync = Some(event_cursor.clone());
+            match &outcome {
+                EventOutcome::Delivered => record_successful_delivery(creds, &now),
+                EventOutcome::PassedOver => {}
+                EventOutcome::Skipped { reason, .. } => {
+                    record_skip(creds, event.id, &event.received_at, reason, &now)
+                }
+            }
+        })
+        .await?;
+        cursor = Some(event_cursor);
+    }
+    Ok(cursor)
+}
+
 async fn sync_once(orch: &Orchestrator, relay_url: &str) -> Result<(), String> {
     let _relay_operation = credentials::relay_operation_lock().lock().await;
     let creds = credentials::get_github_credentials(&orch.db.local).await?;
@@ -446,63 +641,13 @@ async fn sync_once(orch: &Orchestrator, relay_url: &str) -> Result<(), String> {
             .await
             .map_err(|error| format!("invalid relay response: {error}"))?;
 
-        for mut event in response.events {
-            let event_cursor = event_cursor(&event);
-            let mut decrypted = false;
-            if event.encrypted {
-                match decrypt_event_payload(&event.payload, &private_key) {
-                    Ok(payload) => {
-                        event.payload = payload;
-                        decrypted = true;
-                    }
-                    Err(RelayPayloadError::KeyMismatch) => {
-                        if is_dead_epoch_event(&event, relay_key_rotated_at.as_deref()) {
-                            log::warn!(
-                                "skipping dead-epoch relay event {} (pre-rotation)",
-                                event.id
-                            );
-                            credentials::update_github_credentials(&orch.db.local, |creds| {
-                                creds.last_event_sync = Some(event_cursor.clone());
-                            })
-                            .await?;
-                            cursor = Some(event_cursor);
-                            continue;
-                        }
-                        let now = chrono::Utc::now().to_rfc3339();
-                        credentials::update_github_credentials(&orch.db.local, |creds| {
-                            record_key_mismatch(creds, &event, &now);
-                        })
-                        .await?;
-                        return Err(format!(
-                            "relay key mismatch at event {}; cursor remains paused",
-                            event.id
-                        ));
-                    }
-                    Err(RelayPayloadError::Malformed(error)) => {
-                        log::warn!(
-                            "Skipping malformed GitHub relay event {}: {error}",
-                            event.id
-                        );
-                        credentials::update_github_credentials(&orch.db.local, |creds| {
-                            creds.last_event_sync = Some(event_cursor.clone());
-                        })
-                        .await?;
-                        cursor = Some(event_cursor);
-                        continue;
-                    }
-                }
-            }
-            let _outcome =
-                process_event(orch, event.id, &event.event_type, &event.payload, &app_slug).await?;
-            let now = chrono::Utc::now().to_rfc3339();
-            credentials::update_github_credentials(&orch.db.local, |creds| {
-                creds.last_event_sync = Some(event_cursor.clone());
-                if decrypted {
-                    record_successful_delivery(creds, &now);
-                }
-            })
-            .await?;
-            cursor = Some(event_cursor);
+        let ctx = PageContext {
+            private_key: &private_key,
+            relay_key_rotated_at: relay_key_rotated_at.as_deref(),
+            app_slug: &app_slug,
+        };
+        if let Some(last) = apply_page(orch, response.events, &ctx).await? {
+            cursor = Some(last);
         }
 
         if !response.has_more {
@@ -832,6 +977,7 @@ mod tests {
             payload: json!("ciphertext"),
             received_at: "2026-08-12T21:30:00Z".into(),
             encrypted: true,
+            ..Default::default()
         }
     }
 
@@ -920,6 +1066,220 @@ mod tests {
         assert!(creds.relay_last_failure_at.is_none());
         assert!(creds.relay_failing_event_id.is_none());
         assert!(creds.relay_failing_event_at.is_none());
+    }
+
+    /// The install's relay key, a bugs endpoint mirrored for project `p`, and a
+    /// way to seal events to the key the way the api does.
+    struct SealedFeed {
+        public_key: String,
+        private_key: String,
+    }
+
+    impl SealedFeed {
+        async fn new(db: &crate::storage::LocalDb) -> Self {
+            crate::ingress::upsert_endpoint(
+                db,
+                &crate::ingress::EndpointRecord {
+                    id: "src_bugs".into(),
+                    channel_id: "ch-1".into(),
+                    project_id: Some("p".into()),
+                    name: "bugs".into(),
+                    provider: "first-party".into(),
+                    topic: Some("cairn.bugs".into()),
+                    status: "active".into(),
+                    granted_at: Some("2026-10-18T00:00:00Z".into()),
+                    created_at: 1,
+                    revoked_at: None,
+                },
+            )
+            .await
+            .unwrap();
+            let (public_key, private_key) = crypto::generate_keypair();
+            Self {
+                public_key,
+                private_key,
+            }
+        }
+
+        fn ctx(&self) -> PageContext<'_> {
+            PageContext {
+                private_key: &self.private_key,
+                relay_key_rotated_at: None,
+                app_slug: "cairn-app",
+            }
+        }
+
+        /// A mention whose repository name can never be resolved, so
+        /// `process_event` fails on every attempt.
+        fn poison_github_event(&self, id: i64) -> RelayEvent {
+            let mut payload = comment("alice", "User", "@cairn-app please look");
+            payload["repository"]["full_name"] = json!("not-a-repository-name");
+            RelayEvent {
+                id,
+                event_type: "issue_comment".into(),
+                payload: json!(crypto::seal_payload_for_test(
+                    &payload.to_string(),
+                    &self.public_key
+                )),
+                received_at: format!("2026-10-18T20:00:{id:02}.000Z"),
+                encrypted: true,
+                ..Default::default()
+            }
+        }
+
+        fn bug_event(&self, id: i64, endpoint_id: &str, report: i64) -> RelayEvent {
+            RelayEvent {
+                id,
+                event_type: "bug.reported".into(),
+                payload: json!(crypto::seal_payload_for_test(
+                    &json!({"id": report, "title": "Wakes stopped"}).to_string(),
+                    &self.public_key
+                )),
+                received_at: format!("2026-10-18T20:00:{id:02}.000Z"),
+                encrypted: true,
+                endpoint_id: Some(endpoint_id.into()),
+                delivery_id: Some(format!("bug-report:{report}")),
+                verification: Some("first-party".into()),
+                sender: None,
+            }
+        }
+    }
+
+    async fn count(db: &crate::storage::LocalDb, sql: &str) -> i64 {
+        db.query_opt_i64(sql, ()).await.unwrap().unwrap_or(0)
+    }
+
+    /// A GitHub event that fails at `process_event` on every attempt is
+    /// recorded and passed, and a bug event queued behind it on the shared
+    /// cursor is still delivered and minted.
+    #[tokio::test]
+    async fn a_persistently_failing_github_event_does_not_park_the_bug_event_behind_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = crate::routes::fixture::orchestrator(temp.path(), &[]).await;
+        let feed = SealedFeed::new(&db).await;
+        let poison = feed.poison_github_event(1);
+        let poison_cursor = event_cursor(&poison);
+
+        // Delivered alone first, the way a page boundary could leave it.
+        let cursor = apply_page(&orch, vec![poison], &feed.ctx()).await.unwrap();
+        assert_eq!(cursor.as_deref(), Some(poison_cursor.as_str()));
+        let creds = credentials::get_github_credentials(&db).await.unwrap();
+        assert_eq!(
+            creds.last_event_sync.as_deref(),
+            Some(poison_cursor.as_str())
+        );
+        assert_eq!(creds.relay_health_state.as_deref(), Some("skipping"));
+        assert_eq!(
+            creds.relay_health_reason.as_deref(),
+            Some("relay_event_processing_failed")
+        );
+        assert_eq!(creds.relay_failing_event_id.as_deref(), Some("1"));
+        assert_eq!(
+            creds.relay_failing_event_at.as_deref(),
+            Some("2026-10-18T20:00:01.000Z")
+        );
+        assert_eq!(creds.relay_undeliverable_since_healthy, 1);
+        assert!(creds.relay_first_failure_at.is_some());
+        // Skipping is not a key failure: the channel's failure streak is untouched.
+        assert_eq!(creds.relay_consecutive_failures, None);
+
+        // The same poison again, then a bug report, on one page.
+        let bug = feed.bug_event(3, "src_bugs", 7);
+        let bug_cursor = event_cursor(&bug);
+        let cursor = apply_page(&orch, vec![feed.poison_github_event(2), bug], &feed.ctx())
+            .await
+            .unwrap();
+        assert_eq!(cursor.as_deref(), Some(bug_cursor.as_str()));
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM ingress_events WHERE status = 'ok' AND delivery_id = 'bug-report:7'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM fact_log WHERE source = 'ingress'"
+            )
+            .await,
+            1
+        );
+        let creds = credentials::get_github_credentials(&db).await.unwrap();
+        assert_eq!(creds.last_event_sync.as_deref(), Some(bug_cursor.as_str()));
+        assert_eq!(creds.relay_health_state.as_deref(), Some("healthy"));
+        assert_eq!(creds.relay_undeliverable_since_healthy, 0);
+        assert!(creds.relay_failing_event_id.is_none());
+        assert!(creds.relay_last_successful_delivery_at.is_some());
+    }
+
+    /// An endpoint event this install cannot deliver is recorded undeliverable,
+    /// counted, and passed.
+    #[tokio::test]
+    async fn an_undeliverable_ingress_event_is_recorded_and_the_cursor_advances() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = crate::routes::fixture::orchestrator(temp.path(), &[]).await;
+        let feed = SealedFeed::new(&db).await;
+        let stray = feed.bug_event(4, "src_unknown", 8);
+        let stray_cursor = event_cursor(&stray);
+
+        let cursor = apply_page(&orch, vec![stray], &feed.ctx()).await.unwrap();
+
+        assert_eq!(cursor.as_deref(), Some(stray_cursor.as_str()));
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM ingress_events WHERE status = 'undeliverable' AND endpoint_id = 'src_unknown'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM fact_log WHERE source = 'ingress'"
+            )
+            .await,
+            0
+        );
+        let creds = credentials::get_github_credentials(&db).await.unwrap();
+        assert_eq!(
+            creds.last_event_sync.as_deref(),
+            Some(stray_cursor.as_str())
+        );
+        assert_eq!(creds.relay_health_state.as_deref(), Some("skipping"));
+        assert_eq!(
+            creds.relay_health_reason.as_deref(),
+            Some("ingress_unknown_endpoint")
+        );
+        assert_eq!(creds.relay_undeliverable_since_healthy, 1);
+    }
+
+    /// A key mismatch still pauses the whole channel: every later event is
+    /// unreadable too, so the cursor must not move past it.
+    #[tokio::test]
+    async fn a_key_mismatch_still_pauses_the_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = crate::routes::fixture::orchestrator(temp.path(), &[]).await;
+        let feed = SealedFeed::new(&db).await;
+        let (other_public, _) = crypto::generate_keypair();
+        let mut foreign = feed.bug_event(5, "src_bugs", 9);
+        foreign.payload = json!(crypto::seal_payload_for_test("{}", &other_public));
+
+        let error = apply_page(
+            &orch,
+            vec![foreign, feed.bug_event(6, "src_bugs", 10)],
+            &feed.ctx(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("key mismatch"), "{error}");
+        let creds = credentials::get_github_credentials(&db).await.unwrap();
+        assert_eq!(creds.last_event_sync, None);
+        assert_eq!(creds.relay_health_state.as_deref(), Some("suspect"));
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM ingress_events").await, 0);
     }
 
     #[test]

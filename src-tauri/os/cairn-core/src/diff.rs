@@ -438,16 +438,11 @@ mod tests {
 
     mod db {
         use super::super::*;
-        use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
 
         async fn migrated_db() -> LocalDb {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.keep().join("cairn-node-diff.db");
-            let db = LocalDb::open(path).await.unwrap();
-            MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-                .run(&db)
-                .await
-                .unwrap();
+            let db = LocalDb::open_migrated_for_test(path).await.unwrap();
             db
         }
 

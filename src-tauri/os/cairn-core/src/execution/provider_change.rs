@@ -33,8 +33,11 @@ pub async fn apply_for_job(
     to_backend: &str,
     model: Option<&str>,
 ) -> Result<bool, String> {
+    // `current_session_id` is NULL for a job that has not opened a session yet,
+    // which is an ordinary state for a model edit to meet: `query_opt_text`
+    // reads the NULL as no session, where `query_text` would refuse the row.
     let open_session = match db
-        .query_text(
+        .query_opt_text(
             "SELECT current_session_id FROM jobs WHERE id = ?1",
             (job_id.to_string(),),
         )

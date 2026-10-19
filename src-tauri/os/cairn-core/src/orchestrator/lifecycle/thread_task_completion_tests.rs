@@ -11,7 +11,7 @@ use crate::models::{
     RecipeTrigger, TriggerContext, TriggerType, TurnEndReason,
 };
 use crate::orchestrator::Orchestrator;
-use crate::storage::{LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
+use crate::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
 
 const THREAD: &str = "t-roadmap";
@@ -65,11 +65,7 @@ impl Task {
 
 async fn test_db() -> LocalDb {
     let temp = tempfile::tempdir().unwrap();
-    let db = LocalDb::open(temp.keep().join("thread-tasks.db"))
-        .await
-        .unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
+    let db = LocalDb::open_migrated_for_test(temp.keep().join("thread-tasks.db"))
         .await
         .unwrap();
     db.execute_script(

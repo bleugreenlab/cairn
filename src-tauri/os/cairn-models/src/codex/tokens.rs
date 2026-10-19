@@ -42,6 +42,9 @@ pub struct CodexOAuthTokens {
 pub struct CodexAuthState {
     account_id: Option<String>,
     tokens: CodexOAuthTokens,
+    /// What Cairn told this session's app-server when it last refused a token
+    /// request, until a renewal succeeds.
+    refusal: Option<String>,
 }
 
 /// Register a Codex token set for scrubbing.
@@ -76,7 +79,11 @@ impl CodexAuthState {
     ) -> Result<Self, String> {
         let tokens = parse_codex_oauth_tokens(raw_json)?;
         register_codex_tokens(host, account_id.as_deref(), &tokens);
-        Ok(Self { account_id, tokens })
+        Ok(Self {
+            account_id,
+            tokens,
+            refusal: None,
+        })
     }
 
     pub fn tokens(&self) -> CodexOAuthTokens {
@@ -94,11 +101,36 @@ impl CodexAuthState {
         self.tokens.chatgpt_account_id.clone()
     }
 
+    /// When the access token this session holds stops being accepted, as the
+    /// Unix time its `exp` claim names. `None` for a token with no readable
+    /// expiry, which can only be presented as it is.
+    pub fn access_token_expires_at(&self) -> Option<i64> {
+        jwt_payload(&self.tokens.access_token)?.get("exp")?.as_i64()
+    }
+
     /// The Cairn account this session's credential came from, for attributing
     /// what the app-server reports (usage, rate-limit blocks) to the right
     /// subscription.
     pub fn cairn_account_id(&self) -> Option<String> {
         self.account_id.clone()
+    }
+
+    /// The operator message Cairn refused this session's last token request
+    /// with, while that refusal stands.
+    ///
+    /// The app-server asks for tokens only once the ones it holds stop
+    /// working, and drops the refusal's message, reporting its own error
+    /// instead. Until a renewal succeeds the session has no working tokens,
+    /// so a turn that fails meanwhile is explained by this, not by whatever
+    /// Codex said.
+    pub fn token_refusal(&self) -> Option<String> {
+        self.refusal.clone()
+    }
+
+    /// Record the outcome of a token request: the refusal's message, or `None`
+    /// once a renewal answered it.
+    pub(crate) fn set_token_refusal(&mut self, refusal: Option<String>) {
+        self.refusal = refusal;
     }
 
     /// What a renewal of this session's credential has to be asked for: the
@@ -219,6 +251,17 @@ pub enum CodexRefreshFailureKind {
     /// The durable credential can no longer be renewed at all — revoked, or
     /// spent by a refresher that died before it could publish the replacement.
     Unrecoverable,
+}
+
+impl CodexRefreshFailureKind {
+    /// The kind as a log line names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Transient => "transient",
+            Self::Unrecoverable => "unrecoverable",
+        }
+    }
 }
 
 /// The account is boxed because this rides in the `Err` of every refresh entry

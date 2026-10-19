@@ -1,8 +1,8 @@
 //! Storage-level event-content codec and reconstruction.
 //!
 //! Events are recorded `full` on the hot path and rewritten to git coordinates
-//! (with a zstd backstop) at worktree teardown by the archival WRITER
-//! (`crate::archival`). This module is the READ/codec half every event consumer
+//! (with a zstd backstop) at issue teardown, and by the recurring sweep, by the
+//! archival WRITER (`crate::archival`). This module is the READ/codec half every event consumer
 //! shares to restore them. The gix + zstd substrate — tagged compression
 //! ([`cairn_codec::codec`]), the in-memory layered git
 //! ([`cairn_codec::objects::ObjectStore`]), range packfile construction

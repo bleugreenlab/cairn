@@ -8,16 +8,12 @@ use super::handle_session_crash;
 use crate::db::DbState;
 use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
 use crate::services::testing::TestServicesBuilder;
-use crate::storage::{DbError, LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+use crate::storage::{DbError, LocalDb, SearchIndex};
 use std::sync::Arc;
 
 async fn test_db() -> LocalDb {
     let temp = tempfile::tempdir().unwrap();
-    let db = LocalDb::open(temp.keep().join("reseed-fallback.db"))
-        .await
-        .unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
+    let db = LocalDb::open_migrated_for_test(temp.keep().join("reseed-fallback.db"))
         .await
         .unwrap();
     db

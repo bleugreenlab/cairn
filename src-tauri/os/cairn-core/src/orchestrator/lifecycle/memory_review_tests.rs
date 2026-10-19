@@ -3,15 +3,13 @@ use crate::agent_process::process::RunHandle;
 use crate::db::DbState;
 use crate::orchestrator::OrchestratorBuilder;
 use crate::services::testing::TestServicesBuilder;
-use crate::storage::{DbError, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
+use crate::storage::{DbError, LocalDb, RowExt, SearchIndex};
 use std::sync::{Arc, Mutex};
 
 async fn test_db() -> LocalDb {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.keep();
-    let db = LocalDb::open(root.join("memory-review.db")).await.unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
+    let db = LocalDb::open_migrated_for_test(root.join("memory-review.db"))
         .await
         .unwrap();
     db

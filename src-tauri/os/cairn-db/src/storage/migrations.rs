@@ -51,6 +51,25 @@ macro_rules! private_command_outcome_history {
     };
 }
 
+/// cairn/5099: the cairn-inference facet's recipes, deployments and pools, and
+/// the bginf link's last read. The orch's own inventory, mirrored from this
+/// installation's bginf, so private.
+macro_rules! private_inference_records {
+    () => {
+        migration!("0268_inference_records")
+    };
+}
+
+/// cairn/4910: the canonical local record of ingress endpoint events, which
+/// the fact log's `ingress` rows point at; this install's mirror of the
+/// endpoints it minted; the relay skip counter. Replaces the writer-less
+/// `webhook_events`. Private: endpoints belong to this install's relay channel.
+macro_rules! private_ingress_events {
+    () => {
+        migration!("0270_ingress_events")
+    };
+}
+
 /// Machines that could not prepare a project's cells because a setup command
 /// was not found there. Describes this installation's own fleet only.
 macro_rules! private_executor_preparation_refusals {
@@ -82,6 +101,18 @@ macro_rules! private_thread_compaction_unconfirmed_start_trigger {
 macro_rules! private_ref_store_maintenance {
     () => {
         migration!("0253_ref_store_maintenance")
+    };
+}
+
+/// cairn/5085: the shape of each store's Git object database beside its refs,
+/// and the `compact` rows of its geometric compaction. Rebuilds the
+/// private-only `ref_store_samples` to widen its `kind` CHECK.
+macro_rules! private_object_store_maintenance {
+    () => {
+        migration!(
+            "0269_object_store_maintenance",
+            rebuild_fk_off: &[RebuildCheck::Conserved("ref_store_samples")]
+        )
     };
 }
 
@@ -271,6 +302,20 @@ macro_rules! shared_tail_tenet_evidence {
 macro_rules! shared_tail_tenet_evidence_measured_by {
     () => {
         migration!("0264_tenet_evidence_measured_by")
+    };
+}
+
+/// cairn/5113: a tenet is a yes/no statement. The verdict CHECK changes, so
+/// `tenets` is rebuilt; `tenet_evidence` references it, hence foreign keys off.
+macro_rules! shared_tail_tenet_statements {
+    () => {
+        migration!(
+            "0271_tenet_statements",
+            rebuild_fk_off: &[
+                RebuildCheck::Conserved("tenets"),
+                RebuildCheck::Conserved("tenet_evidence"),
+            ]
+        )
     };
 }
 
@@ -1442,6 +1487,7 @@ macro_rules! team_lineage {
             shared_tail_tenet_evidence_measured_by!(),
             shared_tail_pr_publish_attempts!(),
             shared_tail_sibling_job_lookup_indexes!(),
+            shared_tail_tenet_statements!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1713,6 +1759,10 @@ macro_rules! private_lineage {
             private_command_outcome_history!(),
             shared_tail_pr_publish_attempts!(),
             shared_tail_sibling_job_lookup_indexes!(),
+            private_inference_records!(),
+            private_object_store_maintenance!(),
+            private_ingress_events!(),
+            shared_tail_tenet_statements!(),
         ]
     };
 }
@@ -2196,6 +2246,24 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "command_outcome_history",
         TableScope::Private(PrivateReason::RebuildableCache),
     ),
+    // The inference records (0267). Every row today mirrors this install's
+    // bginf and is rebuilt by the next import; the link row is its last read.
+    (
+        "inference_recipes",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    (
+        "inference_deployments",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    (
+        "inference_pools",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    (
+        "inference_bginf_link",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
     // The desktop-automation capabilities this runner last probed off each
     // enrolled executor (0158). A cached answer about machines THIS runner can
     // reach, refreshed by probing again; a teammate's replica would describe a
@@ -2249,8 +2317,15 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "github_installations",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
+    // Ingress endpoint events and this install's endpoint mirror (0267). The
+    // endpoints belong to this install's relay channel, and the events were
+    // sealed to its key, like the GitHub App credentials beside them.
     (
-        "webhook_events",
+        "ingress_events",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "ingress_endpoints",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
     // ── Private: structural roots & the router ───────────────────────────────
@@ -3147,6 +3222,48 @@ mod tests {
         }
     }
 
+    /// Holds an applied lineage to its authored pin, naming what moved.
+    ///
+    /// Adding a migration is by far the common way a pin breaks, so membership
+    /// drift is reported as the edit it calls for before the full ordered
+    /// comparison, which is then left to catch a genuine reorder.
+    #[track_caller]
+    fn assert_lineage_pin(lineage: &str, applied: &[String], pinned: &[&str]) {
+        let names = applied_names(applied);
+        let unpinned: Vec<&str> = applied
+            .iter()
+            .zip(&names)
+            .filter(|(_, name)| !pinned.contains(name))
+            .map(|(stem, _)| stem.as_str())
+            .collect();
+        assert!(
+            unpinned.is_empty(),
+            "you added migration {} to the {lineage} lineage; update this list: \
+             add its name at the position it occupies in the lineage",
+            unpinned.join(", ")
+        );
+        let unregistered: Vec<&str> = pinned
+            .iter()
+            .filter(|name| !names.contains(name))
+            .copied()
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "the {lineage} lineage no longer applies {}; remove it from this list",
+            unregistered.join(", ")
+        );
+        assert_eq!(
+            names, pinned,
+            "the {lineage} lineage applies its migrations in a different order than this list pins"
+        );
+    }
+
+    /// The full private lineage applied to a fresh database.
+    ///
+    /// Checks only that the runner applied every registered migration once, in
+    /// registry order. Which migrations those are, and in what order, is
+    /// `private_migrations_apply_in_order`'s pin, so adding a migration fails
+    /// that one test rather than every test that merely needs the real schema.
     async fn migrated_db() -> DbResult<LocalDb> {
         let temp = tempdir()?;
         let path = temp.keep().join("cairn-real-turso-schema.db");
@@ -3154,9 +3271,44 @@ mod tests {
         let applied = MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
             .run(&db)
             .await?;
+        let registered: Vec<String> = TURSO_MIGRATIONS
+            .iter()
+            .map(|migration| format!("{}_{}", migration.version(), migration.name()))
+            .collect();
+        assert_eq!(applied, registered);
         assert_eq!(
-            applied_names(&applied),
-            vec![
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name='human_base_merge_policy'"
+            )
+            .await?,
+            1
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='merge_attempt_events'"
+            )
+            .await?,
+            1
+        );
+        Ok(db)
+    }
+
+    #[tokio::test]
+    async fn private_migrations_apply_in_order() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("private.turso.db"))
+            .await
+            .unwrap();
+        let applied = MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        assert_lineage_pin(
+            "private",
+            &applied,
+            &[
                 "initial_schema",
                 "search_outbox",
                 "seed_default_workspace",
@@ -3380,9 +3532,6 @@ mod tests {
                 "kind_scoped_device_enrollment",
                 "human_base_merge_policy",
                 "merge_attempt_journal",
-                // These three are registered in the private lineage but were
-                // never added here. The first two predate CAIRN-4618 and had
-                // already left this assertion failing.
                 "thread_branches",
                 "write_replay_ownership",
                 "retire_needs_fresh_session",
@@ -3430,6 +3579,11 @@ mod tests {
                 "command_outcome_history",
                 "pr_publish_attempts",
                 "index_sibling_job_lookup",
+                "inference_records",
+                "object_store_maintenance",
+                "ingress_events",
+            ],
+                "tenet_statements",
             ]
         );
         assert_eq!(
@@ -3448,7 +3602,6 @@ mod tests {
             .await?,
             1
         );
-        Ok(db)
     }
 
     #[tokio::test]
@@ -4832,6 +4985,95 @@ mod tests {
             .unwrap(),
             Some(1),
             "a firing with no surviving ledger row stays unrecorded rather than wrong"
+        );
+    }
+
+    #[tokio::test]
+    async fn tenet_statements_carry_the_adopted_option_and_keep_evidence() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("tenet-statements.turso.db"))
+            .await
+            .unwrap();
+        let head = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < "0268")
+            .cloned()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(head).run(&db).await.unwrap();
+
+        // A pending three-option proposal whose question is the full proposal
+        // and whose option 1 is only a label, a withdrawn one, an approval of
+        // option 2, a decline, and an imported ruling, plus an evidence row on
+        // the approval.
+        db.execute_batch(
+            r#"INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('ws1', 'w', 0, 0);
+             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('p1', 'ws1', 'p', 'p', '/tmp/p', 0, 0);
+             INSERT INTO threads (id, project_id, name, created_at, updated_at)
+                 VALUES ('t1', 'p1', 'design', 0, 0);
+             INSERT INTO tenets (id, project_id, number, proposing_thread_id, question, options_json,
+                 status, verdict, selected_option, answer_source, answered_at, origin,
+                 proposer_principal_json, created_at, updated_at) VALUES
+               ('n1', 'p1', 1, 't1', 'Brand feeling. Proposed: the well-kept workshop, because no competitor sells relief. Source: cairn://p/p/chat/3.',
+                '["Workshop (recommended)","Open","Loud"]',
+                'proposed', NULL, NULL, NULL, NULL, 'standing', '{}', 1, 1),
+               ('n5', 'p1', 5, 't1', 'Drop the cockpit register, because it reads as adrenaline.',
+                '["Drop it (recommended)","Keep it"]',
+                'withdrawn', NULL, NULL, NULL, NULL, 'standing', '{}', 8, 8),
+               ('n2', 'p1', 2, 't1', 'Where?', '["Row","Config"]',
+                'approved', 'option', 1, 'device', 5, 'standing', '{}', 2, 5),
+               ('n3', 'p1', 3, 't1', 'Budget kills?', '["Kill on budget"]',
+                'declined', 'none', NULL, 'device', 6, 'standing', '{}', 3, 6),
+               ('n4', 'p1', 4, 't1', 'No budget kills', '["No budget kills"]',
+                'superseded', 'your_call', 0, 'migrated', 7, 'migrated-ruling', '{}', 4, 7);
+             INSERT INTO tenet_evidence_events (id, project_id, source_uri, source_kind, dedupe_key,
+                 owner_device_id, text, created_at)
+                 VALUES ('e1', 'p1', 'cairn://p/p/1', 'issue_resolution', 'k1', 'd', 'x', 1);
+             INSERT INTO tenet_evidence (id, project_id, tenet_id, event_id, source_uri, sign,
+                 confidence, model, owner_device_id, evaluated_at)
+                 VALUES ('ev1', 'p1', 'n2', 'e1', 'cairn://p/p/1', 'supports', 0.9, 'm', 'd', 1);"#,
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT group_concat(id || '=' || statement || '|' || COALESCE(verdict, ''), ';')
+                 FROM (SELECT * FROM tenets ORDER BY number)"
+            )
+            .await
+            .unwrap(),
+            "n1=Brand feeling. Proposed: the well-kept workshop, because no competitor sells relief. Source: cairn://p/p/chat/3.|;\
+             n2=Config|yes;n3=Kill on budget|no;n4=No budget kills|your_call;\
+             n5=Drop the cockpit register, because it reads as adrenaline.|",
+            "an unanswered row keeps its question; an answered one its adopted option; verdicts read yes/no"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM pragma_table_info('tenets')
+                 WHERE name IN ('question', 'options_json', 'selected_option')"
+            )
+            .await
+            .unwrap(),
+            0,
+            "question, options, and selected_option retire"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM tenet_evidence WHERE tenet_id = 'n2'"
+            )
+            .await
+            .unwrap(),
+            1,
+            "the rebuild keeps the evidence that references a tenet"
         );
     }
 
@@ -6572,9 +6814,10 @@ mod tests {
             .run(&db)
             .await
             .unwrap();
-        assert_eq!(
-            applied_names(&applied),
-            vec![
+        assert_lineage_pin(
+            "team",
+            &applied,
+            &[
                 "team_initial_schema",
                 "labels_read_completeness",
                 // CAIRN-2629: team-only device_presence table (head migration).
@@ -6710,6 +6953,9 @@ mod tests {
                 "tenet_evidence_measured_by",
                 "pr_publish_attempts",
                 "index_sibling_job_lookup",
+            ],
+                // cairn/5113: tenets become yes/no statements.
+                "tenet_statements",
             ]
         );
         assert_eq!(
@@ -6847,11 +7093,7 @@ mod tests {
     #[tokio::test]
     async fn team_schema_matches_private() {
         let priv_temp = tempdir().unwrap();
-        let priv_db = LocalDb::open(priv_temp.path().join("private.turso.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&priv_db)
+        let priv_db = LocalDb::open_migrated_for_test(priv_temp.path().join("private.turso.db"))
             .await
             .unwrap();
         let (_team_temp, team_db) = migrated_team_db().await;

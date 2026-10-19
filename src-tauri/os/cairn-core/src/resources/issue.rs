@@ -1437,7 +1437,7 @@ mod execution_snapshot_read_tests {
         AgentSnapshot, Model, ModelSelection, RecipeSnapshot, RecipeTrigger, SkillSnapshot,
         TriggerContext, TriggerType,
     };
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+
     use cairn_db::turso::params;
     use std::collections::HashMap;
 
@@ -1453,11 +1453,7 @@ mod execution_snapshot_read_tests {
     }
 
     async fn test_db() -> LocalDb {
-        let db = LocalDb::open(tempfile::tempdir().unwrap().keep().join("t.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("t.db"))
             .await
             .unwrap();
         db

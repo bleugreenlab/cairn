@@ -9,7 +9,7 @@ use cairn_common::query::QueryParam;
 use cairn_common::uri::{build_project_tenets_uri, build_thread_uri};
 
 use crate::storage::LocalDb;
-use crate::tenets::{TenetFilter, TenetStatus, TenetView};
+use crate::tenets::{TenetFilter, TenetStatus, TenetView, Verdict};
 
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
@@ -37,17 +37,15 @@ async fn project_id(db: &LocalDb, project_key: &str) -> Result<String, String> {
 /// The verdict line, with its answerer and time always beside it.
 pub(crate) fn verdict_line(view: &TenetView) -> Option<String> {
     let row = &view.row;
-    let decided = match (row.status, row.verdict.as_deref(), row.selected_option) {
-        (TenetStatus::Proposed, ..) => return Some("Awaiting the operator's verdict".into()),
-        (TenetStatus::Withdrawn, ..) => {
+    let decided = match (row.status, row.verdict) {
+        (TenetStatus::Proposed, _) => return Some("Awaiting the operator's verdict".into()),
+        (TenetStatus::Withdrawn, _) => {
             return Some("Withdrawn by its thread before a verdict".into())
         }
-        (_, Some("your_call"), _) => {
-            "Approved: your call (the thread's recommendation, option 1)".to_string()
-        }
-        (_, Some("none"), _) => "Declined: none of the options".to_string(),
-        (_, _, Some(index)) => format!("Approved: option {}", index + 1),
-        _ => "Answered".to_string(),
+        (_, Some(Verdict::Yes)) => "Approved: yes",
+        (_, Some(Verdict::YourCall)) => "Approved: your call (the thread's judgment, trusted)",
+        (_, Some(Verdict::No)) => "Declined: no",
+        (_, None) => "Answered",
     };
     let by = view.answerer_label.as_deref().unwrap_or("unattributed");
     let at = row
@@ -73,43 +71,15 @@ fn thread_link(view: &TenetView) -> String {
     }
 }
 
-fn options_block(view: &TenetView) -> String {
-    let mut out = String::new();
-    for (index, option) in view.row.options.iter().enumerate() {
-        let mut marks = Vec::new();
-        if index == 0 {
-            marks.push("recommended");
-        }
-        if view.row.selected_option == Some(index) {
-            marks.push("chosen");
-        }
-        let marks = if marks.is_empty() {
-            String::new()
-        } else {
-            format!(" _({})_", marks.join(", "))
-        };
-        out.push_str(&format!("{}. {option}{marks}\n", index + 1));
-    }
-    out
-}
-
 fn summary(view: &TenetView) -> String {
     let row = &view.row;
     let mut out = format!(
-        "## [#{}]({}) · {} — {}\n\n",
+        "## [#{}]({}) · {}\n\n{}\n\n",
         row.number,
         view.uri,
         row.status.as_str(),
-        row.question
+        row.statement
     );
-    match view.text.as_deref() {
-        Some(text) => out.push_str(&format!("- Tenet: {text}\n")),
-        None => {
-            for (index, option) in row.options.iter().enumerate() {
-                out.push_str(&format!("- Option {}: {option}\n", index + 1));
-            }
-        }
-    }
     if let Some(line) = verdict_line(view) {
         out.push_str(&format!("- {line}\n"));
     }
@@ -264,21 +234,14 @@ fn supersedes_line(status: TenetStatus, previous: &str) -> String {
 fn render_entity(view: &TenetView) -> String {
     let row = &view.row;
     let mut out = format!(
-        "# Tenet #{} · {}\n\n{}\n\n## Options\n\n{}\n",
+        "# Tenet #{} · {}\n\n{}\n\n",
         row.number,
         row.status.as_str(),
-        row.question,
-        options_block(view)
+        row.statement,
     );
     out.push_str("## Verdict\n\n");
     if let Some(line) = verdict_line(view) {
         out.push_str(&format!("- {line}\n"));
-    }
-    if let Some(text) = &view.text {
-        out.push_str(&format!("- Tenet: {text}\n"));
-    }
-    if !view.rejected.is_empty() {
-        out.push_str(&format!("- Rejected: {}\n", view.rejected.join(" · ")));
     }
     if let Some(comment) = &row.comment {
         out.push_str(&format!("- Comment: {comment}\n"));

@@ -56,6 +56,19 @@ use crate::orchestrator::Orchestrator;
 /// holding a year of them.
 const RETAINED_TERMINAL_OPERATIONS: usize = 8;
 
+/// How old an unfinished enrollment operation may be before it is treated as
+/// abandoned: nothing is still running it, so it will never move again.
+///
+/// The runner bounds every enrollment by one wall-clock budget, and a queued
+/// one by that budget again while it waits for the machine's previous
+/// enrollment, so a live operation always reaches a terminal phase well inside
+/// this window. One that has not was stranded by something that did not
+/// settle it (a task that died), and leaving it in flight would refuse its
+/// machine's removal with `still enrolling` forever. The runner asserts that
+/// its budget stays inside this window.
+pub const ENROLLMENT_OPERATION_ABANDONED_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(3 * 60 * 60);
+
 /// What a lifecycle mutation did, in the words the caller reports.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,6 +144,9 @@ pub trait RemoteExecutorLifecycle: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EnrollmentPhase {
+    /// Waiting for another enrollment of the same machine to finish. Every
+    /// operation starts here, and leaves the moment it holds the machine.
+    Queued,
     /// Waiting for this runner's own executor listener to serve. A runner-side
     /// precondition: nothing has touched the machine yet.
     AwaitingRunnerListener,
@@ -153,6 +169,7 @@ impl EnrollmentPhase {
     /// The phase in the words a surface renders.
     pub fn label(self) -> &'static str {
         match self {
+            Self::Queued => "waiting for another enrollment of this machine to finish",
             Self::AwaitingRunnerListener => "waiting for this runner's executor listener",
             Self::Validating => "validating the request",
             Self::ProbingHost => "probing the host and its platform",
@@ -208,6 +225,12 @@ pub struct EnrollmentOperation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
     pub cleanup: EnrollmentCleanup,
+    /// When this process started the operation, on the monotonic clock the
+    /// runner's enrollment budget runs on. Abandonment is judged on it rather
+    /// than on the wall clock: a laptop asleep for hours mid-enrollment has
+    /// not spent any of the budget, and the add is still alive when it wakes.
+    #[serde(skip, default = "std::time::Instant::now")]
+    started: std::time::Instant,
 }
 
 impl EnrollmentOperation {
@@ -253,6 +276,12 @@ impl EnrollmentProgress {
     pub fn id(&self) -> &str {
         &self.id
     }
+
+    /// The phase this operation is in now, or `None` once it has been evicted
+    /// or forgotten.
+    pub fn current_phase(&self) -> Option<EnrollmentPhase> {
+        self.operations.phase_of(&self.id)
+    }
 }
 
 /// The bounded record of enrollment attempts this runner has made.
@@ -266,10 +295,9 @@ impl EnrollmentOperations {
     ///
     /// The id carries a process-unique counter, not just the clock: two
     /// enrollments of the same name can start inside one millisecond — the
-    /// manager's mutation gate serializes their *work*, not their arrival — and
-    /// two records sharing an id would send both progress handles to the first
-    /// one, stranding the second at `validating` forever. A stranded operation
-    /// is never terminal, so it is also never evicted.
+    /// manager's per-machine gate serializes their *work*, not their arrival —
+    /// and two records sharing an id would send both progress handles to the
+    /// first one, stranding the second at `queued` forever.
     pub fn start(&self, name: &str, host: &str, executor_id: &str) -> EnrollmentOperation {
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let now = unix_time_ms();
@@ -280,18 +308,32 @@ impl EnrollmentOperations {
             host: host.to_string(),
             executor_id: executor_id.to_string(),
             uri: format!("cairn://executors/{name}"),
-            phase: EnrollmentPhase::Validating,
+            phase: EnrollmentPhase::Queued,
             started_at_unix_ms: now,
             updated_at_unix_ms: now,
             diagnostic: None,
             cleanup: EnrollmentCleanup::NotApplicable,
+            started: std::time::Instant::now(),
         };
+        log::info!(
+            "enrollment {} ({name}): started, {}",
+            operation.id,
+            operation.phase.label()
+        );
         let mut entries = self.entries.lock().unwrap();
+        Self::reap_abandoned(&mut entries, std::time::Instant::now());
         entries.push_back(operation.clone());
         Self::evict(&mut entries);
         operation
     }
 
+    /// Every phase change goes through here, so this is the one place each
+    /// transition is logged: the orchestrator log alone then places where an
+    /// operation stopped.
+    ///
+    /// A terminal operation is final. Nothing moves it again, so a verdict
+    /// once recorded (ready, failed, or abandoned) is the one every surface
+    /// keeps showing.
     fn record(
         &self,
         id: &str,
@@ -301,6 +343,31 @@ impl EnrollmentOperations {
     ) {
         let mut entries = self.entries.lock().unwrap();
         if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+            if entry.phase.is_terminal() {
+                log::warn!(
+                    "enrollment {id} ({}): already {}; not moving it to {}",
+                    entry.name,
+                    entry.phase.label(),
+                    phase.label()
+                );
+                return;
+            }
+            if entry.phase != phase || diagnostic.is_some() {
+                match &diagnostic {
+                    Some(diagnostic) => log::info!(
+                        "enrollment {id} ({}): {} -> {}: {diagnostic}",
+                        entry.name,
+                        entry.phase.label(),
+                        phase.label()
+                    ),
+                    None => log::info!(
+                        "enrollment {id} ({}): {} -> {}",
+                        entry.name,
+                        entry.phase.label(),
+                        phase.label()
+                    ),
+                }
+            }
             entry.phase = phase;
             entry.updated_at_unix_ms = unix_time_ms();
             if let Some(diagnostic) = diagnostic {
@@ -311,6 +378,62 @@ impl EnrollmentOperations {
             }
         }
         Self::evict(&mut entries);
+    }
+
+    fn phase_of(&self, id: &str) -> Option<EnrollmentPhase> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.phase)
+    }
+
+    /// Settle every unfinished operation older than
+    /// [`ENROLLMENT_OPERATION_ABANDONED_AFTER`] as failed: nothing is still
+    /// running it. Its cleanup is `NotApplicable` because nothing is known
+    /// about what it reached, which is also what lets removal dismiss it.
+    fn reap_abandoned(entries: &mut VecDeque<EnrollmentOperation>, now: std::time::Instant) {
+        let now_unix_ms = unix_time_ms();
+        for entry in entries.iter_mut() {
+            if entry.phase.is_terminal()
+                || now.saturating_duration_since(entry.started)
+                    <= ENROLLMENT_OPERATION_ABANDONED_AFTER
+            {
+                continue;
+            }
+            let diagnostic = format!(
+                "abandoned: it did not finish within {} minutes and nothing is still running it",
+                ENROLLMENT_OPERATION_ABANDONED_AFTER.as_secs() / 60
+            );
+            log::warn!(
+                "enrollment {} ({}): {} -> {}: {diagnostic}",
+                entry.id,
+                entry.name,
+                entry.phase.label(),
+                EnrollmentPhase::Failed.label()
+            );
+            entry.phase = EnrollmentPhase::Failed;
+            entry.updated_at_unix_ms = now_unix_ms;
+            entry.diagnostic = Some(diagnostic);
+            entry.cleanup = EnrollmentCleanup::NotApplicable;
+        }
+        Self::evict(entries);
+    }
+
+    /// The record, with abandoned operations settled first so no reader is
+    /// shown one as still in flight.
+    fn current(&self) -> std::sync::MutexGuard<'_, VecDeque<EnrollmentOperation>> {
+        let mut entries = self.entries.lock().unwrap();
+        Self::reap_abandoned(&mut entries, std::time::Instant::now());
+        entries
+    }
+
+    /// Reap as a reader would at `now`, for tests that stand in the future
+    /// rather than move an operation into the past.
+    #[cfg(test)]
+    fn reap_at(&self, now: std::time::Instant) {
+        Self::reap_abandoned(&mut self.entries.lock().unwrap(), now);
     }
 
     /// Drop the oldest finished operations once there are more than the runner
@@ -339,14 +462,12 @@ impl EnrollmentOperations {
 
     /// Every recorded operation, oldest first.
     pub fn all(&self) -> Vec<EnrollmentOperation> {
-        self.entries.lock().unwrap().iter().cloned().collect()
+        self.current().iter().cloned().collect()
     }
 
     /// Operations that have not finished yet.
     pub fn in_flight(&self) -> Vec<EnrollmentOperation> {
-        self.entries
-            .lock()
-            .unwrap()
+        self.current()
             .iter()
             .filter(|entry| !entry.phase.is_terminal())
             .cloned()
@@ -355,9 +476,7 @@ impl EnrollmentOperations {
 
     /// The most recent operation for a public name, in flight or finished.
     pub fn latest_for(&self, name: &str) -> Option<EnrollmentOperation> {
-        self.entries
-            .lock()
-            .unwrap()
+        self.current()
             .iter()
             .rfind(|entry| executor_names_match(&entry.name, name))
             .cloned()
@@ -860,6 +979,13 @@ pub async fn enroll(
     tokio::spawn(async move {
         let outcome = lifecycle.add(declaration, progress.clone()).await;
         match outcome {
+            // The lifecycle settled the operation itself, with a cleanup
+            // verdict this mapping cannot reconstruct from the message: an
+            // enrollment that ran out of budget after it was persisted stays
+            // enrolled, which is not a completed rollback.
+            _ if progress
+                .current_phase()
+                .is_some_and(EnrollmentPhase::is_terminal) => {}
             Ok(_) => progress.phase(EnrollmentPhase::Ready),
             Err(error) => {
                 // "Retry Remove" is the manager's own words for a rollback it
@@ -937,8 +1063,14 @@ pub async fn remove(
                 operation.name
             ));
         }
+        // A completed rollback left nothing behind. So did an abandoned
+        // operation, as far as this registry can tell: its machine is neither
+        // configured nor attached, which is what a removal would have undone.
         if operation.phase != EnrollmentPhase::Failed
-            || operation.cleanup != EnrollmentCleanup::Complete
+            || !matches!(
+                operation.cleanup,
+                EnrollmentCleanup::Complete | EnrollmentCleanup::NotApplicable
+            )
         {
             return Err(format!(
                 "{} has no configured machine to remove, and its enrollment record is not a failed attempt with completed rollback",
@@ -956,9 +1088,12 @@ pub async fn remove(
             display_name: operation.name,
             os: None,
             arch: None,
-            attach_state:
+            attach_state: if operation.cleanup == EnrollmentCleanup::Complete {
                 "removed failed enrollment; no remote cleanup was needed because rollback completed"
-                    .into(),
+            } else {
+                "removed abandoned enrollment; its machine was never configured or attached here"
+            }
+            .into(),
             unverified_remote_cleanup: None,
         });
     }
@@ -1346,15 +1481,11 @@ mod tests {
     use super::*;
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use cairn_common::executor_protocol::ExecutorMessage;
 
     async fn test_orchestrator(config_dir: &std::path::Path) -> Orchestrator {
-        let local = LocalDb::open(config_dir.join("management.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        let local = LocalDb::open_migrated_for_test(config_dir.join("management.db"))
             .await
             .unwrap();
         let search =
@@ -1687,7 +1818,7 @@ mod tests {
         let recorded = operations.all();
         let first = recorded.iter().find(|e| e.id == first.id).expect("kept");
         let second = recorded.iter().find(|e| e.id == second.id).expect("kept");
-        assert_eq!(first.phase, EnrollmentPhase::Validating);
+        assert_eq!(first.phase, EnrollmentPhase::Queued);
         assert_eq!(
             second.phase,
             EnrollmentPhase::ProbingHost,
@@ -1748,15 +1879,136 @@ mod tests {
         assert!(resolve_executor_reference(&orch, "Build host").is_err());
     }
 
+    /// A queued operation says so, and in different words than one that is
+    /// actually validating: the specimen's second machine read `validating the
+    /// request` for twenty-five minutes while it waited on the first.
+    #[test]
+    fn an_operation_starts_queued_and_reads_differently_from_validating() {
+        let operations = std::sync::Arc::new(EnrollmentOperations::default());
+        let started = operations.start("sp2", "sp2.local", "sp2-id");
+        assert_eq!(started.phase, EnrollmentPhase::Queued);
+        assert_ne!(
+            EnrollmentPhase::Queued.label(),
+            EnrollmentPhase::Validating.label()
+        );
+        assert!(EnrollmentPhase::Queued
+            .label()
+            .contains("another enrollment"));
+        assert_eq!(
+            operations.progress(&started.id).current_phase(),
+            Some(EnrollmentPhase::Queued)
+        );
+    }
+
+    /// Reap as a reader would once the abandonment window has passed.
+    fn after_the_window(operations: &EnrollmentOperations) {
+        operations.reap_at(
+            std::time::Instant::now()
+                + ENROLLMENT_OPERATION_ABANDONED_AFTER
+                + std::time::Duration::from_secs(1),
+        );
+    }
+
+    /// An operation nothing is running any more is settled as failed the next
+    /// time anyone reads the record, rather than shown in flight forever.
+    #[test]
+    fn an_operation_older_than_the_abandonment_window_is_reaped() {
+        let operations = std::sync::Arc::new(EnrollmentOperations::default());
+        let stranded = operations.start("sp1", "sp1.local", "sp1-id");
+        operations
+            .progress(&stranded.id)
+            .phase(EnrollmentPhase::AwaitingFirstDial);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let live = operations.start("sp2", "sp2.local", "sp2-id");
+        assert_eq!(
+            operations.in_flight().len(),
+            2,
+            "inside the window both are live"
+        );
+
+        // Just past the stranded operation's window, and 25ms short of the
+        // younger one's.
+        let stranded_started = operations.entries.lock().unwrap()[0].started;
+        operations.reap_at(
+            stranded_started
+                + ENROLLMENT_OPERATION_ABANDONED_AFTER
+                + std::time::Duration::from_millis(25),
+        );
+        assert_eq!(
+            operations
+                .in_flight()
+                .iter()
+                .map(|op| op.id.as_str())
+                .collect::<Vec<_>>(),
+            [live.id.as_str()],
+            "only the young operation is still in flight"
+        );
+        let reaped = operations.latest_for("sp1").unwrap();
+        assert_eq!(reaped.phase, EnrollmentPhase::Failed);
+        assert_eq!(reaped.cleanup, EnrollmentCleanup::NotApplicable);
+        assert!(
+            reaped.diagnostic.as_deref().unwrap().contains("abandoned"),
+            "{reaped:?}"
+        );
+    }
+
+    /// A terminal verdict is final: a late progress report cannot move a
+    /// finished or reaped operation back into flight.
+    #[test]
+    fn a_terminal_operation_is_never_moved_again() {
+        let operations = std::sync::Arc::new(EnrollmentOperations::default());
+        let finished = operations.start("sp1", "sp1.local", "sp1-id");
+        let progress = operations.progress(&finished.id);
+        progress.failed("refused", EnrollmentCleanup::Complete);
+
+        progress.phase(EnrollmentPhase::AwaitingFirstDial);
+        progress.phase(EnrollmentPhase::Ready);
+
+        let recorded = operations.latest_for("sp1").unwrap();
+        assert_eq!(recorded.phase, EnrollmentPhase::Failed);
+        assert_eq!(recorded.diagnostic.as_deref(), Some("refused"));
+    }
+
+    /// The refusal `still enrolling; wait for it to finish` ends with the
+    /// abandonment window: an abandoned operation for a machine that was never
+    /// configured or attached is dismissed like a rolled-back one.
+    #[tokio::test]
+    async fn an_abandoned_enrollment_of_an_unconfigured_machine_is_removable() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let operations = orch.fleet.management().operations.clone();
+        let operation = operations.start("sp2", "sp2.local", "sp2-id");
+        orch.fleet
+            .declare_enrolled_remote("sp2-id", "sp2", "linux", "x86_64");
+
+        let refusal = remove(&orch, "sp2", false)
+            .await
+            .expect_err("a live enrollment is not dismissed");
+        assert!(refusal.contains("still enrolling"), "{refusal}");
+        assert!(!operations.all()[0].phase.is_terminal());
+        assert_eq!(operations.all()[0].id, operation.id);
+
+        after_the_window(&operations);
+        let result = remove(&orch, "sp2", false)
+            .await
+            .expect("an abandoned enrollment is dismissed");
+        assert!(result.attach_state.contains("abandoned"), "{result:?}");
+        assert!(operations.all().is_empty());
+        assert!(orch.fleet.unattached_enrolled_remotes().is_empty());
+    }
+
     #[test]
     fn every_phase_reads_as_a_place_the_work_actually_is() {
         for phase in [
+            EnrollmentPhase::Queued,
+            EnrollmentPhase::AwaitingRunnerListener,
             EnrollmentPhase::Validating,
             EnrollmentPhase::ProbingHost,
             EnrollmentPhase::ResolvingArtifact,
             EnrollmentPhase::InstallingBinary,
             EnrollmentPhase::PersistingConfiguration,
             EnrollmentPhase::GrantingEnrollment,
+            EnrollmentPhase::VerifyingReach,
             EnrollmentPhase::RegisteringService,
             EnrollmentPhase::AwaitingFirstDial,
             EnrollmentPhase::CleaningUp,

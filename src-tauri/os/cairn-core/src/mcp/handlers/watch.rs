@@ -580,14 +580,11 @@ mod tests {
         assert!(!event_is_actionable(&event, Some(101)));
     }
 
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
     use tempfile::tempdir;
 
     async fn test_db() -> LocalDb {
         let temp = tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("watch.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("watch.db"))
             .await
             .unwrap();
         db

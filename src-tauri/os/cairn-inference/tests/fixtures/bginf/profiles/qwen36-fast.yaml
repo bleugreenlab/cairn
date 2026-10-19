@@ -1,0 +1,13 @@
+# Scrubbed: bginf's ids, nodes, head, ports and paths; neutral shell and addresses.
+id: qwen36-fast
+model: nvidia/Qwen3.6-35B-A3B-NVFP4
+served_model: qwen3.6-35b
+engine: vllm, 128k ctx
+nodes: [sp1]
+head: sp1
+start: "./start.sh --port 8001"
+stop:  "./stop.sh"
+health: http://192.0.2.40:8001/v1/models
+api_base: http://192.0.2.40:8001/v1
+catalog_id: qwen/qwen3.6-35b-a3b
+aliases: [fast]

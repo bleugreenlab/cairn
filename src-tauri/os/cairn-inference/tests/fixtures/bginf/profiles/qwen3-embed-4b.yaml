@@ -1,0 +1,15 @@
+# Scrubbed: bginf's ids, nodes, head, ports and paths; neutral shell and addresses.
+id: qwen3-embed-4b
+model: Qwen/Qwen3-Embedding-4B-GGUF (Q8_0)
+served_model: qwen3-embedding-4b
+engine: llama.cpp server on Vulkan, --embedding --pooling last
+nodes: [halo]
+head: halo
+start: >-
+  ./start.sh
+  --port 8090
+stop: "./stop.sh"
+health: http://192.0.2.43:8090/health
+api_base: http://192.0.2.43:8090/v1
+catalog_id: qwen/qwen3-embedding-4b
+aliases: [embed]

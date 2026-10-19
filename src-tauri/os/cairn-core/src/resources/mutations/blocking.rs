@@ -1017,8 +1017,6 @@ mod blocking_group_tests {
     /// that node's worktree and lists in its tasks collection.
     #[tokio::test]
     async fn resolve_task_routing_addresses_target_node_not_caller() {
-        use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
-
         async fn exec(db: &LocalDb, sql: &'static str) {
             db.write(|conn| {
                 Box::pin(async move {
@@ -1031,11 +1029,7 @@ mod blocking_group_tests {
         }
 
         let temp = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("blocking-routing.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("blocking-routing.db"))
             .await
             .unwrap();
 

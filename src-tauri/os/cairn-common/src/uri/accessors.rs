@@ -89,6 +89,9 @@ impl CairnResource {
             | ProjectRouteHistoryEntry { project, .. }
             | ProjectEvents { project, .. }
             | ProjectEvent { project, .. }
+            | ProjectEventEndpoints { project, .. }
+            | ProjectEventEndpoint { project, .. }
+            | ProjectEventDelivery { project, .. }
             | ProjectResponses { project, .. }
             | ProjectResponse { project, .. }
             | ProjectResponseHistory { project, .. }
@@ -323,6 +326,9 @@ impl CairnResource {
             | Self::ProjectRouteHistoryEntry { .. }
             | Self::ProjectEvents { .. }
             | Self::ProjectEvent { .. }
+            | Self::ProjectEventEndpoints { .. }
+            | Self::ProjectEventEndpoint { .. }
+            | Self::ProjectEventDelivery { .. }
             | Self::WorkspaceEvents
             | Self::WorkspaceEvent { .. }
             | Self::Responses
@@ -359,6 +365,10 @@ impl CairnResource {
             | Self::ModelsUsage
             | Self::ModelsSessions
             | Self::ModelsSession { .. }
+            | Self::Inference
+            | Self::InferenceRecipes
+            | Self::InferenceDeployments
+            | Self::InferencePools
             | Self::Bug
             | Self::Help
             | Self::WebSearch
@@ -478,6 +488,9 @@ impl CairnResource {
             | Self::ProjectRouteHistoryEntry { project, .. }
             | Self::ProjectEvents { project }
             | Self::ProjectEvent { project, .. }
+            | Self::ProjectEventEndpoints { project }
+            | Self::ProjectEventEndpoint { project, .. }
+            | Self::ProjectEventDelivery { project, .. }
             | Self::ProjectResponses { project }
             | Self::ProjectResponse { project, .. }
             | Self::ProjectResponseHistory { project, .. }
@@ -533,6 +546,10 @@ impl CairnResource {
             | Self::ModelsUsage
             | Self::ModelsSessions
             | Self::ModelsSession { .. }
+            | Self::Inference
+            | Self::InferenceRecipes
+            | Self::InferenceDeployments
+            | Self::InferencePools
             | Self::Bug
             | Self::Help
             | Self::WebSearch
@@ -642,6 +659,9 @@ impl CairnResource {
             | Self::ProjectRouteHistoryEntry { .. }
             | Self::ProjectEvents { .. }
             | Self::ProjectEvent { .. }
+            | Self::ProjectEventEndpoints { .. }
+            | Self::ProjectEventEndpoint { .. }
+            | Self::ProjectEventDelivery { .. }
             | Self::WorkspaceEvents
             | Self::WorkspaceEvent { .. }
             | Self::Responses
@@ -683,6 +703,10 @@ impl CairnResource {
             | Self::ModelsUsage
             | Self::ModelsSessions
             | Self::ModelsSession { .. }
+            | Self::Inference
+            | Self::InferenceRecipes
+            | Self::InferenceDeployments
+            | Self::InferencePools
             | Self::Bug
             | Self::Help
             | Self::WebSearch

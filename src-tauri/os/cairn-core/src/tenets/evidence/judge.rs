@@ -13,11 +13,11 @@ use crate::models::decision::{
     Decision, DecisionAnswer, DecisionNode, DecisionOption, DecisionQuestion, MeasuredBy,
     QuestionKind, Thresholds,
 };
-use crate::tenets::{TenetOrigin, TenetView};
+use crate::tenets::TenetView;
 
 /// What every question tells the model about the rule it is applying. The
 /// input is the concluded work; the question carries one tenet.
-const PREAMBLE: &str = "The input is one piece of concluded work. Below is a tenet: a standing project decision the operator approved. The chosen option is the tenet, and every rejected option was explicitly ruled out. Does the concluded work support this tenet, contradict it, or neither? Work that adopted a rejected option contradicts the tenet. Work that only shares the tenet's topic or vocabulary is neither. When unsure, answer neither.";
+const PREAMBLE: &str = "The input is one piece of concluded work. Below is a tenet: a statement of how the project does things, which the operator approved. Anything the statement rules out was explicitly ruled out. Does the concluded work support this tenet, contradict it, or neither? Work that did what the statement rules out contradicts the tenet. Work that only shares the tenet's topic or vocabulary is neither. When unsure, answer neither.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sign {
@@ -39,8 +39,8 @@ impl Sign {
 
     fn description(self) -> &'static str {
         match self {
-            Sign::Supports => "the work followed the chosen option or relied on it",
-            Sign::Contradicts => "the work did what the tenet rules out: it adopted a rejected option, reversed or bypassed the decision, or concluded the decision was wrong",
+            Sign::Supports => "the work followed the statement or relied on it",
+            Sign::Contradicts => "the work did what the tenet rules out: it took a path the statement rejects, reversed or bypassed the decision, or concluded the decision was wrong",
             Sign::Neither => "the work does not bear on the tenet, or only shares its topic or vocabulary",
         }
     }
@@ -56,24 +56,9 @@ pub fn question_name(number: i64) -> String {
     format!("tenet-{number}")
 }
 
-/// One tenet as the judge reads it: its question when that differs from its
-/// text, the chosen option, and the rejected ones.
+/// One tenet as the judge reads it: its statement.
 pub fn tenet_block(view: &TenetView) -> String {
-    let text = view.text.as_deref().unwrap_or(&view.row.question);
-    let mut block = String::new();
-    // A migrated ruling has no question distinct from its text.
-    let distinct_question =
-        view.row.origin != TenetOrigin::MigratedRuling && view.row.question.trim() != text.trim();
-    if distinct_question {
-        block.push_str(&format!("Question: {}\n", view.row.question));
-    }
-    block.push_str(&format!("Chosen: {text}\n"));
-    if view.rejected.is_empty() {
-        block.push_str("Rejected: none recorded");
-    } else {
-        block.push_str(&format!("Rejected: {}", view.rejected.join("; ")));
-    }
-    block
+    format!("Statement: {}", view.row.statement)
 }
 
 /// The question asked about one candidate tenet.

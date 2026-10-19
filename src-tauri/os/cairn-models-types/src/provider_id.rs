@@ -34,6 +34,12 @@ pub enum ApiProvider {
     /// GitHub APIs
     #[serde(rename = "github", alias = "git_hub")]
     GitHub,
+    /// The token for bginf's control service, which Cairn mirrors read-only
+    /// into its inference records. Like GitHub, it serves no model backend.
+    /// This variant retires with bginf, when Cairn's own inference control
+    /// replaces it; it is not a lasting provider.
+    #[serde(rename = "bginf")]
+    Bginf,
     /// An HTTP inference service the operator runs and names themselves.
     ///
     /// Unlike every other variant, this one does not identify a vendor. It
@@ -57,6 +63,7 @@ impl ApiProvider {
             ApiProvider::Ollama => "ollama",
             ApiProvider::Actual => "actual",
             ApiProvider::GitHub => "github",
+            ApiProvider::Bginf => "bginf",
             ApiProvider::Custom => "custom",
         }
     }
@@ -72,6 +79,7 @@ impl ApiProvider {
             ApiProvider::Ollama,
             ApiProvider::Actual,
             ApiProvider::GitHub,
+            ApiProvider::Bginf,
             ApiProvider::Custom,
         ]
     }
@@ -88,6 +96,7 @@ impl std::fmt::Display for ApiProvider {
             ApiProvider::Ollama => write!(f, "Ollama"),
             ApiProvider::Actual => write!(f, "Actual"),
             ApiProvider::GitHub => write!(f, "GitHub"),
+            ApiProvider::Bginf => write!(f, "bginf"),
             ApiProvider::Custom => write!(f, "Custom"),
         }
     }

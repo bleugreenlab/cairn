@@ -41,6 +41,7 @@ const PUBLIC_EDGES: &[(&str, &str, Option<&str>)] = &[
     ("cairn-models", "cairn-credentials", None),
     ("cairn-credentials", "cairn-models-types", None),
     ("cairn-credentials", "cairn-domain", None),
+    ("cairn-inference", "cairn-models-types", None),
 ];
 
 fn members_under(root: &str) -> Vec<(&'static str, String)> {
@@ -52,6 +53,7 @@ fn members_under(root: &str) -> Vec<(&'static str, String)> {
         "cairn-models-types",
         "cairn-credentials",
         "cairn-domain",
+        "cairn-inference",
         "cairn-core",
     ]
     .into_iter()

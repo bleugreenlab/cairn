@@ -33,7 +33,8 @@ pub struct MaterializationSettings {
 // (pure serde data, no upward dependency on config). Re-exported here so every
 // `project_settings::CheckCommand`-style path keeps resolving.
 pub use crate::models::{
-    CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector, CheckWhen, PopulateConfig,
+    CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector, CheckWhen, MainCadence,
+    PopulateConfig,
 };
 
 /// Project settings as stored in YAML file.

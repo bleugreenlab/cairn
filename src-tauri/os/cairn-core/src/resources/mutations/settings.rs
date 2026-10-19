@@ -51,8 +51,13 @@ pub(crate) const PREF_KEYS: &[&str] = &[
 ];
 
 /// Section objects that route to dedicated stores.
-pub(crate) const SECTION_KEYS: &[&str] =
-    &["gitIdentities", "accounts", "keybinds", "buildServices"];
+pub(crate) const SECTION_KEYS: &[&str] = &[
+    "gitIdentities",
+    "accounts",
+    "keybinds",
+    "buildServices",
+    "inference",
+];
 
 /// True when `item` is a `cairn://settings` patch.
 pub(crate) fn is_workspace_settings_mutation(item: &ChangeItem) -> bool {
@@ -217,7 +222,7 @@ fn string_array(value: &Value, key: &str) -> Result<Vec<String>, String> {
 fn parse_provider(value: &str) -> Result<ApiProvider, String> {
     serde_json::from_value(Value::String(value.to_string())).map_err(|_| {
         format!(
-            "unknown provider '{value}'; expected anthropic|openai|google|openrouter|opencode|ollama|github"
+            "unknown provider '{value}'; expected anthropic|openai|google|openrouter|opencode|ollama|github|bginf"
         )
     })
 }
@@ -238,6 +243,16 @@ fn parse_auth(auth_type: &str, auth_value: Option<String>) -> Result<ProviderAut
             "unknown authType '{other}'; expected api_key|oauth_token|base_url|claude_profile (OAuth browser add stays UI-only)"
         )),
     }
+}
+
+fn parse_inference(section: &Value) -> Result<cairn_config::inference::InferenceSettings, String> {
+    let inference: cairn_config::inference::InferenceSettings = match section {
+        Value::Null => Default::default(),
+        other => serde_json::from_value(other.clone())
+            .map_err(|error| format!("invalid inference settings: {error}"))?,
+    };
+    inference.validate()?;
+    Ok(inference)
 }
 
 pub(super) async fn apply_settings_patch(
@@ -424,6 +439,18 @@ pub(super) async fn apply_settings_patch(
         summary.push(format!("build services ({count} op(s))"));
     }
 
+    // --- Inference link (replaces the section) ---
+    if let Some(section) = obj.get("inference") {
+        let inference = parse_inference(section)?;
+        if !dry_run {
+            settings::set_inference(&orch.config_dir, &inference)?;
+        }
+        summary.push(match &inference.bginf {
+            Some(link) => format!("inference (bginf link {})", link.url),
+            None => "inference (bginf link removed)".to_string(),
+        });
+    }
+
     if summary.is_empty() {
         return Err("payload contained no recognized settings sections".to_string());
     }
@@ -530,6 +557,46 @@ mod tests {
         }
         assert!(parse_auth("base_url", Some("https://ollama.example.test/".to_string())).is_ok());
         assert!(parse_auth("base_url", None).is_err());
+    }
+
+    #[test]
+    fn the_inference_section_parses_validates_and_clears() {
+        let parsed = parse_inference(&serde_json::json!({
+            "bginf": {"url": "http://ctl.example:4100", "machines": {"halo": "fedora"}}
+        }))
+        .unwrap();
+        let link = parsed.bginf.unwrap();
+        assert_eq!(link.url, "http://ctl.example:4100");
+        assert_eq!(
+            link.machines.get("halo").map(String::as_str),
+            Some("fedora")
+        );
+        assert_eq!(parse_inference(&Value::Null).unwrap().bginf, None);
+        assert_eq!(
+            parse_inference(&serde_json::json!({"bginf": null}))
+                .unwrap()
+                .bginf,
+            None
+        );
+        assert!(parse_inference(&serde_json::json!({"bginf": {"url": "ctl"}})).is_err());
+        assert!(
+            parse_inference(&serde_json::json!({"bginf": {"url": "http://x", "token": "t"}}))
+                .is_err()
+        );
+        assert_eq!(parse_provider("bginf").unwrap(), ApiProvider::Bginf);
+    }
+
+    #[test]
+    fn the_inference_section_is_capability_bearing() {
+        let request = crate::authorization::normalize::workspace_settings_write(
+            crate::authorization::WORKSPACE_ID,
+            "inference",
+        )
+        .unwrap();
+        assert!(!matches!(
+            crate::authorization::policy::classify(&request.scope, false),
+            cairn_common::authorization::AuthorityPolicy::Direct
+        ));
     }
 
     #[test]

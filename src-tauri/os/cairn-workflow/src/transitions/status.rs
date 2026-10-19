@@ -207,18 +207,15 @@ fn valid_job_transition(from: &JobStatus, to: &JobStatus) -> bool {
 mod tests {
     use super::*;
     use crate::models::JobStatus;
-    use crate::storage::{LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, RowExt};
     use cairn_db::turso::params;
     use cairn_platform::services::emitter::CapturingEmitter;
 
     async fn migrated_db() -> LocalDb {
-        let db = LocalDb::open(tempfile::tempdir().unwrap().keep().join("resolve.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
+        let db =
+            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("resolve.db"))
+                .await
+                .unwrap();
         db
     }
 

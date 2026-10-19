@@ -695,7 +695,7 @@ mod tests {
     use crate::db::DbState;
     use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, RowExt, SearchIndex};
     use cairn_db::turso::params;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -711,14 +711,10 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
 
         let local = Arc::new(
-            LocalDb::open(temp.path().join("review-test.db"))
+            LocalDb::open_migrated_for_test(temp.path().join("review-test.db"))
                 .await
                 .unwrap(),
         );
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
-            .await
-            .unwrap();
         local
             .write(|conn| {
                 Box::pin(async move {
@@ -897,14 +893,10 @@ mod tests {
 
     async fn migrated_team_db(temp: &TempDir) -> Arc<LocalDb> {
         let db = Arc::new(
-            LocalDb::open(temp.path().join("team-memory-test.db"))
+            LocalDb::open_migrated_for_test(temp.path().join("team-memory-test.db"))
                 .await
                 .unwrap(),
         );
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
         db
     }
 

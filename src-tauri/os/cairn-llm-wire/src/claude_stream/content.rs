@@ -156,7 +156,15 @@ pub fn extract_assistant_content(content: &MessageContentInner) -> AssistantCont
                             input: input.clone(),
                         });
                     }
-                    ContentBlock::Thinking { thinking } => {
+                    // A `thinking` block whose text is empty is the PRIVATE
+                    // reasoning disposition: the model reasoned, but the prose is
+                    // withheld and only its signature travels. That volume is
+                    // reported by the turn's `thinking_tokens`, never by this
+                    // field. Keeping it would yield `Some("")` for a private-only
+                    // message -- which is not `None`, and so defeats the
+                    // `is_none()` guards downstream that let real prose land --
+                    // and a leading newline when it precedes a visible block.
+                    ContentBlock::Thinking { thinking } if !thinking.trim().is_empty() => {
                         thinking_blocks.push(thinking.clone());
                     }
                     _ => {}

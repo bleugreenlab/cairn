@@ -651,9 +651,13 @@ pub(crate) struct RebaseRollback {
 
 /// Whether a flatten refusal came from one of its guards — a positive finding
 /// that this tree must not be folded — rather than from jj failing to run. The
-/// prefixes are the ones [`flatten_branch_recovery`] writes for its guards.
+/// prefixes are the ones [`flatten_branch_recovery`] writes for its guards; the
+/// squash's verified export refusing a tree that carries conflict scaffolding is
+/// the same kind of finding, reached through the export guard.
 fn flatten_refusal_is_guard(error: &str) -> bool {
-    error.starts_with("flatten guard:") || error.starts_with("flatten footprint guard:")
+    error.starts_with("flatten guard:")
+        || error.starts_with("flatten footprint guard:")
+        || is_conflict_scaffolding_export_refusal(error)
 }
 
 /// Undo this pass's rebase of a branch whose conflicted history could not be

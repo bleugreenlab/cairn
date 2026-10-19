@@ -339,7 +339,7 @@ mod tests {
     use crate::db::DbState;
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use cairn_models::subscription::testing::TempHomes;
     use cairn_models::types::usage::{ProviderUsageScope, ProviderUsageWindow};
     use std::path::Path;
@@ -350,9 +350,7 @@ mod tests {
     async fn orchestrator_at(root: &Path, homes: &TempHomes) -> Orchestrator {
         let config_dir = root.join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
-        let db = LocalDb::open(root.join("orch.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(root.join("orch.db"))
             .await
             .unwrap();
         // The search index is not what a restart has to keep, and the first

@@ -280,8 +280,7 @@ async fn main() {
         println!("{title}");
         for (score, view) in scored.iter().take(KNN_K) {
             let mark = if *score >= KNN_FLOOR { "*" } else { " " };
-            let text = view.text.as_deref().unwrap_or(&view.row.question);
-            let text: String = text.chars().take(90).collect();
+            let text: String = view.row.statement.chars().take(90).collect();
             println!("  {mark} {score:.3}  #{} {text}", view.row.number);
         }
         let candidates: Vec<&TenetView> = scored

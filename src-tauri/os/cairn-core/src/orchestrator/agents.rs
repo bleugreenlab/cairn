@@ -199,8 +199,9 @@ impl ConfigResource for AgentResource {
             } else {
                 existing.file_path.clone()
             },
-            seed_budget_tokens: None,
-            seed_eras: None,
+            // No editor exposes these; an update keeps what the file authored.
+            seed_budget_tokens: existing.seed_budget_tokens,
+            seed_eras: existing.seed_eras,
         }
     }
 
@@ -258,6 +259,10 @@ impl ConfigResource for AgentResource {
 
     fn primary_path(file: &Self::File) -> PathBuf {
         file.file_path.clone()
+    }
+
+    fn stage_paths(primary_path: &Path) -> Vec<PathBuf> {
+        config_agents::agent_stage_paths(primary_path)
     }
 }
 
@@ -346,17 +351,14 @@ mod tests {
     use crate::db::DbState;
     use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use std::sync::Arc;
 
     async fn build_orch(config_dir: std::path::PathBuf) -> Orchestrator {
-        let local = LocalDb::open(tempfile::tempdir().unwrap().keep().join("orch.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
-            .await
-            .unwrap();
+        let local =
+            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("orch.db"))
+                .await
+                .unwrap();
         let search =
             Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
         let db = Arc::new(DbState::new(Arc::new(local), search));
@@ -431,6 +433,143 @@ mod tests {
 
         let invalid = orch.list_invalid_configs(None, None, None).unwrap();
         assert!(invalid.is_empty(), "UI-created agent must not be invalid");
+    }
+
+    /// The editor's exact save payload for a pin-only change: every field the
+    /// form round-trips (trimmed prompt, explicit default fence, unchanged
+    /// tools) plus the one key the user touched.
+    fn editor_pin_update(
+        agent: &crate::models::AgentConfig,
+        backend: Option<&str>,
+        icon: Option<&str>,
+    ) -> crate::models::UpdateAgentConfig {
+        crate::models::UpdateAgentConfig {
+            name: Some(agent.name.clone()),
+            description: Some(agent.description.trim().to_string()),
+            prompt: Some(agent.prompt.trim().to_string()),
+            tools: Some(agent.tools.clone()),
+            tier: Some(agent.tier.clone()),
+            disallowed_tools: None,
+            skills: None,
+            workspace_id: Some(Some("default".to_string())),
+            project_id: Some(None),
+            fence: Some(Some(agent.fence.unwrap_or_default())),
+            backend_preference: Some(backend.map(str::to_string)),
+            icon: Some(icon.map(str::to_string)),
+        }
+    }
+
+    /// Acceptance for cairn/4993: pinning `backend: claude` / `icon: hammer`
+    /// on the shipped Build agent through the editor leaves `agents/build.md`
+    /// byte-identical and pack-owned with the pin in effect, and the next pack
+    /// update advances the prompt while the pin holds. A real body edit still
+    /// forks, and resetting that fork keeps the pin.
+    #[tokio::test]
+    async fn a_pinned_backend_keeps_a_shipped_agent_pack_owned_and_updating() {
+        use crate::config::pack::{self, lock as pack_lock, PackItemKind};
+        use crate::services::{RealFileSystem, RealGitClient};
+        use crate::workspace::bundle::sync_workspace_packs;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let resources = temp.path().join("resources");
+        let core = resources.join("packs/core");
+        let ship = |prompt: &str| {
+            std::fs::create_dir_all(core.join("agents")).unwrap();
+            std::fs::write(
+                core.join("cairn-pack.yaml"),
+                "id: core\nname: Core\nversion: 1.0.0\ndefault: true\n",
+            )
+            .unwrap();
+            std::fs::write(
+                core.join("agents/build.md"),
+                format!(
+                    "---\nname: Build\nbundles: [coding]\ndescription: Implements features and fixes\ntools: mcp__cairn__read, mcp__cairn__write, mcp__cairn__run\ntier: lg\n---\n\n{prompt}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let sync = || {
+            sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &home, "1.0.0")
+                .unwrap()
+        };
+        let forked = || {
+            pack_lock::read_lock(&home, "core")
+                .unwrap()
+                .item(PackItemKind::Agent, "build")
+                .unwrap()
+                .forked
+        };
+        let file = || std::fs::read_to_string(home.join("agents/build.md")).unwrap();
+
+        ship("# Implementation Mode\n\nPrompt v1.");
+        sync();
+        let shipped_v1 = file();
+        let orch = build_orch(home.clone()).await;
+
+        let build = orch.get_agent_config("build", None).unwrap().unwrap();
+        orch.update_agent_config(
+            "build",
+            editor_pin_update(&build, Some("claude"), Some("hammer")),
+            None,
+            Some("default"),
+        )
+        .unwrap();
+
+        assert_eq!(file(), shipped_v1, "a pin must not touch the agent file");
+        let pinned = orch.get_agent_config("build", None).unwrap().unwrap();
+        assert_eq!(pinned.backend_preference.as_deref(), Some("claude"));
+        assert_eq!(pinned.icon.as_deref(), Some("hammer"));
+        sync();
+        assert!(!forked(), "the pinned agent stays pack-owned");
+
+        ship("# Implementation Mode\n\nPrompt v2.");
+        sync();
+        let updated = orch.get_agent_config("build", None).unwrap().unwrap();
+        assert!(
+            updated.prompt.contains("Prompt v2."),
+            "the pack update lands"
+        );
+        assert_eq!(updated.backend_preference.as_deref(), Some("claude"));
+        assert!(!forked());
+
+        // A body edit is a real fork; the pin stays in its own layer.
+        let mut edit = editor_pin_update(&updated, Some("claude"), Some("hammer"));
+        edit.prompt = Some("My own prompt.".to_string());
+        orch.update_agent_config("build", edit, None, Some("default"))
+            .unwrap();
+        assert!(!file().contains("claude"), "pins never land in the file");
+        sync();
+        assert!(forked());
+
+        // Resetting the fork restores the shipped body and keeps the pin.
+        let mut lock = pack_lock::read_lock(&home, "core").unwrap();
+        let pack::ContentHash::Present(current) =
+            pack::hash_file(&home.join("agents/build.md")).unwrap()
+        else {
+            panic!("agent exists")
+        };
+        lock.reset_item_baseline(PackItemKind::Agent, "build", current);
+        pack_lock::write_lock(&RealFileSystem, &home, &lock).unwrap();
+        sync();
+        let reset = orch.get_agent_config("build", None).unwrap().unwrap();
+        assert!(reset.prompt.contains("Prompt v2."));
+        assert_eq!(reset.backend_preference.as_deref(), Some("claude"));
+        assert_eq!(reset.icon.as_deref(), Some("hammer"));
+
+        // Choosing the file's own value again un-pins.
+        orch.update_agent_config(
+            "build",
+            editor_pin_update(&reset, None, None),
+            None,
+            Some("default"),
+        )
+        .unwrap();
+        let unpinned = orch.get_agent_config("build", None).unwrap().unwrap();
+        assert_eq!(unpinned.backend_preference, None);
+        assert!(cairn_config::agent_pins::load_pins(&home)
+            .get("build")
+            .is_none());
     }
 
     /// An inherited workspace agent disabled for one project drops out of that

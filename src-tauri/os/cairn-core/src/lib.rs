@@ -66,6 +66,7 @@ pub mod diff;
 pub mod docs;
 pub mod github;
 pub mod identity;
+pub mod ingress;
 // `models` and `db_records` descend into cairn-db (with the storage engine);
 // re-exported here at their original crate paths so `crate::models` and
 // `crate::db_records` consumers compile unchanged. `storage` keeps a thin core
@@ -106,6 +107,7 @@ mod orchestrator;
 mod resources;
 mod resume_timing;
 mod services;
+mod stack;
 mod storage;
 mod team_remote_intents;
 mod vcs_maintenance;

@@ -760,13 +760,10 @@ pub async fn revoke(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
 
     async fn db() -> LocalDb {
         let dir = tempfile::tempdir().unwrap().keep();
-        let db = LocalDb::open(dir.join("private.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(dir.join("private.db"))
             .await
             .unwrap();
         db

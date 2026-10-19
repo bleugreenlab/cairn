@@ -328,6 +328,25 @@ pub struct CheckCommand {
     /// has already run against the tree the fix replaced. See docs/checks.md.
     #[serde(default, skip_serializing_if = "is_not_check_fixer")]
     pub fixes: bool,
+
+    /// Run this check's whole suite on the default branch after every merge,
+    /// on each named platform, and post each result to a project thread. Absent
+    /// means the check never runs on main by itself. Not part of the check's
+    /// result identity: where a verdict is announced does not change it. See
+    /// docs/checks.md, "Main cadence".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_cadence: Option<MainCadence>,
+}
+
+/// A check's `mainCadence:` declaration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MainCadence {
+    /// Lowercase OS names, each one the check counts a verdict from
+    /// (`verdictPlatforms`). One lane runs per platform.
+    pub platforms: Vec<String>,
+    /// Name of the project thread every cadence row is posted to.
+    pub notify: String,
 }
 
 /// Read a check's `executor:` key, tolerating the retired scalar form.

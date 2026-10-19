@@ -1042,6 +1042,7 @@ dependencies = [
  "cairn-config",
  "cairn-core",
  "cairn-db",
+ "cairn-inference",
  "cairn-models",
  "cairn-packs",
  "cairn-platform",
@@ -1176,6 +1177,17 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "cairn-inference"
+version = "0.12.34"
+dependencies = [
+ "cairn-models-types",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]

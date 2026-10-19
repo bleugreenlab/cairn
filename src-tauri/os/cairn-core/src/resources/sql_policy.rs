@@ -8,7 +8,8 @@ pub(crate) const RULINGS_ARE_TENETS: &str =
     "rulings are project tenets now: propose with an append to cairn:@/tenets";
 
 /// The append that replaces a ruling insert.
-pub(crate) const TENET_APPEND_EXAMPLE: &str = "write({changes:[{target:\"cairn:@/tenets\",mode:\"append\",payload:{question:\"...\",options:[\"recommended\",\"alternative\"]}}]})";
+pub(crate) const TENET_APPEND_EXAMPLE: &str =
+    "write({changes:[{target:\"cairn:@/tenets\",mode:\"append\",payload:{statement:\"...\"}}]})";
 
 /// Refuse SQL that names the retired `_cairn_rulings` table, in any
 /// identifier form. A string literal that merely mentions it is not refused.

@@ -115,6 +115,10 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
             id: (*id).to_string(),
         }),
         ["models", "usage"] => Some(CairnResource::ModelsUsage),
+        ["inference"] => Some(CairnResource::Inference),
+        ["inference", "recipes"] => Some(CairnResource::InferenceRecipes),
+        ["inference", "deployments"] => Some(CairnResource::InferenceDeployments),
+        ["inference", "pools"] => Some(CairnResource::InferencePools),
         ["models", "sessions"] => Some(CairnResource::ModelsSessions),
         ["models", "sessions", id] => Some(CairnResource::ModelsSession {
             id: (*id).to_string(),
@@ -287,6 +291,25 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         [PROJECT_SCOPE, project, "events"] => Some(CairnResource::ProjectEvents {
             project: canonical_project(project),
         }),
+        // `endpoints` is reserved beside the numeric row ids.
+        [PROJECT_SCOPE, project, "events", "endpoints"] => {
+            Some(CairnResource::ProjectEventEndpoints {
+                project: canonical_project(project),
+            })
+        }
+        [PROJECT_SCOPE, project, "events", "endpoints", name] => {
+            Some(CairnResource::ProjectEventEndpoint {
+                project: canonical_project(project),
+                name: (*name).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, "events", "endpoints", name, "deliveries", id] => {
+            Some(CairnResource::ProjectEventDelivery {
+                project: canonical_project(project),
+                name: (*name).to_string(),
+                id: id.parse::<i64>().ok().filter(|id| *id > 0)?,
+            })
+        }
         [PROJECT_SCOPE, project, "events", id] => Some(CairnResource::ProjectEvent {
             project: canonical_project(project),
             id: id.parse::<i64>().ok().filter(|id| *id > 0)?,

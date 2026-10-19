@@ -502,15 +502,14 @@ impl ProjectionSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
 
     async fn projection_db() -> Arc<LocalDb> {
         let dir = tempfile::tempdir().unwrap().keep();
-        let db = Arc::new(LocalDb::open(dir.join("projection.db")).await.unwrap());
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
+        let db = Arc::new(
+            LocalDb::open_migrated_for_test(dir.join("projection.db"))
+                .await
+                .unwrap(),
+        );
         db
     }
 

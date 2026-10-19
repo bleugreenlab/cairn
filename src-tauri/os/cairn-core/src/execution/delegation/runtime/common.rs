@@ -703,15 +703,10 @@ pub(super) async fn dispatch_ready_agent_jobs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
 
     async fn migrated_db() -> LocalDb {
         let temp = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(temp.keep().join("anchor-test.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.keep().join("anchor-test.db"))
             .await
             .unwrap();
         db

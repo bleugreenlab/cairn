@@ -7,11 +7,7 @@ use tempfile::tempdir;
 
 async fn fixture_db() -> LocalDb {
     let temp = tempdir().unwrap();
-    let db = LocalDb::open(temp.path().join("analytics-test.db"))
-        .await
-        .unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
+    let db = LocalDb::open_migrated_for_test(temp.path().join("analytics-test.db"))
         .await
         .unwrap();
     // A claude job (sonnet/Builder) and a codex job (gpt-5/Planner-0), each
@@ -748,11 +744,7 @@ const FEB_2025: i64 = 1_738_368_000;
 
 async fn cost_db() -> LocalDb {
     let temp = tempdir().unwrap();
-    let db = LocalDb::open(temp.path().join("eff-cost-test.db"))
-        .await
-        .unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
+    let db = LocalDb::open_migrated_for_test(temp.path().join("eff-cost-test.db"))
         .await
         .unwrap();
     db.execute(
@@ -1435,11 +1427,7 @@ const DAY2: i64 = 180_000;
 /// no billable tokens at all (the tok-side guard).
 async fn oracle_db() -> LocalDb {
     let temp = tempdir().unwrap();
-    let db = LocalDb::open(temp.path().join("rollup-oracle.db"))
-        .await
-        .unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
+    let db = LocalDb::open_migrated_for_test(temp.path().join("rollup-oracle.db"))
         .await
         .unwrap();
     db.execute_script(

@@ -7,15 +7,11 @@ use crate::orchestrator::OrchestratorBuilder;
 use crate::projects::crud as project_crud;
 use crate::services::testing::TestServicesBuilder;
 use crate::services::RealClock;
-use crate::storage::{LocalDb, MigrationRunner, PostScope, SearchIndex, TURSO_MIGRATIONS};
+use crate::storage::{LocalDb, PostScope, SearchIndex};
 use std::sync::Arc;
 
 async fn seeded_orch() -> Orchestrator {
-    let local = LocalDb::open(tempfile::tempdir().unwrap().keep().join("t.db"))
-        .await
-        .unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&local)
+    let local = LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("t.db"))
         .await
         .unwrap();
     let search =
@@ -2412,14 +2408,10 @@ async fn patch_execution_reevaluate_routes_a_team_executions_condition() {
     let issue_id = format!("{team_id}~00000000-0000-4000-8000-200000000002");
     let execution_id = format!("{team_id}~00000000-0000-4000-8000-200000000003");
     let team_db = Arc::new(
-        LocalDb::open(tempfile::tempdir().unwrap().keep().join("team.db"))
+        LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("team.db"))
             .await
             .unwrap(),
     );
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&team_db)
-        .await
-        .unwrap();
     let snapshot_json = serde_json::json!({
         "recipe": {"id":"r","name":"R","description":null,"trigger":"manual","nodes":[
             {"id":"check-risk","nodeType":"condition","name":"Check risk","position":{"x":0.0,"y":0.0},
@@ -2664,6 +2656,8 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::ModelsAccounts => "cairn://models/accounts",
         K::ModelsAccount => "cairn://models/accounts/acc_1",
         K::ProjectAttachment => "cairn://p/cairn/4647/attachments/1",
+        K::ProjectEventEndpoints => "cairn://p/cairn/events/endpoints",
+        K::ProjectEventEndpoint => "cairn://p/cairn/events/endpoints/bugs",
         // Pre-existing gaps, filled here because they sit between this test and
         // the arm above: the parity check panics on the first unsampled kind and
         // never reaches any later one, so the whole tail of the table —
@@ -3582,13 +3576,39 @@ async fn a_thread_proposes_and_withdraws_tenets_but_never_answers_or_edits_them(
     let project_id = project_id_of(&orch, &issue_id).await;
     let (_, _, run) = seed_thread_session_run(&orch, &project_id, "design").await;
 
+    // The retired question-with-options shape is refused, naming `statement`.
+    let retired = apply_as_run(
+        &orch,
+        &tenet_item(
+            "cairn://p/cairn/tenets",
+            ChangeMode::Append,
+            serde_json::json!({"question": "How do we ship X?", "options": ["via Y", "via Z"]}),
+        ),
+        &run,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        retired.error,
+        crate::tenets::retired_proposal_shape_refusal("payload.")
+    );
+    assert!(
+        retired.error.contains("payload.statement"),
+        "{}",
+        retired.error
+    );
+
     let propose = tenet_item(
         "cairn://p/cairn/tenets",
         ChangeMode::Append,
-        serde_json::json!({"question": "How do we ship X?", "options": ["via Y", "via Z"]}),
+        serde_json::json!({"statement": "X ships via Y, not Z."}),
     );
     let proposed = apply_as_run(&orch, &propose, &run).await.unwrap();
     assert!(proposed.contains("cairn://p/cairn/tenets/1"), "{proposed}");
+    assert!(
+        proposed.contains("awaits the operator's verdict") && !proposed.contains("Tenets tab"),
+        "{proposed}"
+    );
     let tenet = crate::tenets::get(&orch.db.local, &project_id, 1)
         .await
         .unwrap()
@@ -3607,7 +3627,7 @@ async fn a_thread_proposes_and_withdraws_tenets_but_never_answers_or_edits_them(
     let verdict = tenet_item(
         "cairn://p/cairn/tenets/1",
         ChangeMode::Patch,
-        serde_json::json!({"verdict": 1}),
+        serde_json::json!({"verdict": "yes"}),
     );
     for refusal in [
         apply_as_run(&orch, &verdict, &run).await.unwrap_err(),
@@ -3624,12 +3644,12 @@ async fn a_thread_proposes_and_withdraws_tenets_but_never_answers_or_edits_them(
         tenet_item(
             "cairn://p/cairn/tenets/1",
             ChangeMode::Patch,
-            serde_json::json!({"question": "Something else?"}),
+            serde_json::json!({"statement": "Something else."}),
         ),
         tenet_item(
             "cairn://p/cairn/tenets/1",
             ChangeMode::Replace,
-            serde_json::json!({"options": ["a"]}),
+            serde_json::json!({"statement": "a"}),
         ),
     ] {
         let refusal = apply_as_run(&orch, &edit, &run).await.unwrap_err();
@@ -3639,7 +3659,7 @@ async fn a_thread_proposes_and_withdraws_tenets_but_never_answers_or_edits_them(
     let both = tenet_item(
         "cairn://p/cairn/tenets/1",
         ChangeMode::Patch,
-        serde_json::json!({"withdraw": true, "verdict": 1}),
+        serde_json::json!({"withdraw": true, "verdict": "yes"}),
     );
     assert!(apply_as_run(&orch, &both, &run).await.is_err());
 
@@ -3699,7 +3719,7 @@ async fn editing_an_answered_tenet_points_at_a_successor() {
         &tenet_item(
             "cairn://p/cairn/tenets",
             ChangeMode::Append,
-            serde_json::json!({"question": "Q?", "options": ["a"]}),
+            serde_json::json!({"statement": "S."}),
         ),
         &run,
     )
@@ -3726,7 +3746,7 @@ async fn editing_an_answered_tenet_points_at_a_successor() {
         &tenet_item(
             "cairn://p/cairn/tenets/1",
             ChangeMode::Patch,
-            serde_json::json!({"options": ["b"]}),
+            serde_json::json!({"statement": "b"}),
         ),
         &run,
     )
@@ -3736,7 +3756,7 @@ async fn editing_an_answered_tenet_points_at_a_successor() {
     let read = crate::resources::tenets::read_entity(&orch.db.local, "cairn", "1", &[]).await;
     assert!(
         read.contains(
-            "Approved: your call (the thread's recommendation, option 1) — anonymous device dev,"
+            "Approved: your call (the thread's judgment, trusted) — anonymous device dev,"
         ),
         "the answerer sits beside the verdict: {read}"
     );

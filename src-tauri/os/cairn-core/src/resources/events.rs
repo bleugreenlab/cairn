@@ -22,6 +22,9 @@ use crate::storage::{FactFilter, FactRow, FactScope, FactWake, RouteFiringRecord
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 200;
+/// How many rows a `match=` listing examines, newest first, before it stops.
+const MATCH_SCAN_ROWS: i64 = 10_000;
+const MATCH_SCAN_PAGE: i64 = 500;
 
 #[derive(Debug, PartialEq, Eq)]
 struct ListQuery {
@@ -31,6 +34,64 @@ struct ListQuery {
     to_id: Option<i64>,
     limit: i64,
     offset: i64,
+    /// `match=`, as the trigger clause a thread would declare.
+    matcher: Option<crate::routes::TriggerClause>,
+}
+
+/// `match=field:value[,field:value...]` over `source`, as a trigger clause.
+/// A value keeps everything after its first `:`, so `deliveryId:bug-report:7`
+/// tests `deliveryId`. The clause is validated by the registry the way a
+/// standing trigger is, and may name only stored fields: listing never
+/// restores content from records.
+fn parse_match(source: &str, value: &str) -> Result<crate::routes::TriggerClause, String> {
+    let registry = FactRegistry::default();
+    let mut clause = crate::routes::TriggerClause::new();
+    clause.insert("fact".into(), Value::String(source.into()));
+    for test in value.split(',') {
+        let (field, expected) = test.split_once(':').ok_or_else(|| {
+            format!(
+                "Query parameter 'match' needs field:value pairs separated by commas, got '{test}'"
+            )
+        })?;
+        let field = field.trim();
+        if field.is_empty() || field == "fact" {
+            return Err(format!(
+                "Query parameter 'match' cannot test '{field}'; name the source with `source=`"
+            ));
+        }
+        let base = field.strip_suffix("Prefix").unwrap_or(field);
+        if registry
+            .source(source)
+            .is_some_and(|spec| spec.is_hydrated(base))
+        {
+            return Err(format!(
+                "Query parameter 'match' tests stored fields only; '{base}' on {source} is restored from the record, so a listing cannot filter by it"
+            ));
+        }
+        if clause
+            .insert(field.to_string(), Value::String(expected.to_string()))
+            .is_some()
+        {
+            return Err(format!("Query parameter 'match' names '{field}' twice"));
+        }
+    }
+    registry
+        .validate_clause(source, &clause)
+        .map_err(|error| format!("Query parameter 'match': {error}"))?;
+    Ok(clause)
+}
+
+/// Whether a row passes `clause`, by the matcher standing triggers use.
+fn row_matches(clause: &crate::routes::TriggerClause, row: &FactRow) -> bool {
+    let fields = serde_json::from_str(&row.fields_json).unwrap_or_default();
+    crate::routes::matches(
+        std::slice::from_ref(clause),
+        &crate::routes::Fact {
+            source: &row.source,
+            fields: &fields,
+            presence: crate::routes::log::presence_from_str(&row.presence),
+        },
+    )
 }
 
 fn row_id_param(key: &str, value: &str) -> Result<i64, String> {
@@ -49,7 +110,9 @@ fn parse_list_query(params: &[QueryParam]) -> Result<ListQuery, String> {
         to_id: None,
         limit: DEFAULT_LIMIT,
         offset: 0,
+        matcher: None,
     };
+    let mut match_value: Option<&str> = None;
     let mut seen: Vec<&str> = Vec::new();
     for param in params {
         let key = param.key.as_str();
@@ -75,6 +138,7 @@ fn parse_list_query(params: &[QueryParam]) -> Result<ListQuery, String> {
                 })?;
                 query.since_ms = Some(seconds.saturating_mul(1000));
             }
+            "match" => match_value = Some(param.value.as_str()),
             "from" => query.from_id = Some(row_id_param(key, &param.value)?),
             "to" => query.to_id = Some(row_id_param(key, &param.value)?),
             "limit" => {
@@ -100,10 +164,16 @@ fn parse_list_query(params: &[QueryParam]) -> Result<ListQuery, String> {
             }
             other => {
                 return Err(format!(
-                    "Unsupported query parameter '{other}' for events (accepted: source, since, from, to, limit, offset)"
+                    "Unsupported query parameter '{other}' for events (accepted: source, match, since, from, to, limit, offset)"
                 ))
             }
         }
+    }
+    if let Some(value) = match_value {
+        let source = query.source.as_deref().ok_or(
+            "Query parameter 'match' needs `source=`: it tests that source's fields, the way a standing trigger does",
+        )?;
+        query.matcher = Some(parse_match(source, value)?);
     }
     if let (Some(from), Some(to)) = (query.from_id, query.to_id) {
         if from > to {
@@ -348,22 +418,65 @@ pub(crate) async fn list(
         },
         None => FactScope::Workspace,
     };
-    let rows = match crate::storage::list_facts(
-        &orch.db.local,
-        FactFilter {
-            scope,
-            source: query.source.clone(),
-            since_ms: query.since_ms,
-            from_id: query.from_id,
-            to_id: query.to_id,
-            limit: query.limit,
-            offset: query.offset,
+    let filter = |limit, offset| FactFilter {
+        scope: scope.clone(),
+        source: query.source.clone(),
+        since_ms: query.since_ms,
+        from_id: query.from_id,
+        to_id: query.to_id,
+        limit,
+        offset,
+    };
+    let mut scan_note = None;
+    let rows = match &query.matcher {
+        None => match crate::storage::list_facts(&orch.db.local, filter(query.limit, query.offset))
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => return error.to_string(),
         },
-    )
-    .await
-    {
-        Ok(rows) => rows,
-        Err(error) => return error.to_string(),
+        // The clause is evaluated in Rust by the trigger matcher, so the scan
+        // pages through the source's rows; `offset` and `limit` count matches.
+        Some(clause) => {
+            let mut matched = Vec::new();
+            let mut skipped = 0;
+            let mut scanned = 0;
+            'scan: while scanned < MATCH_SCAN_ROWS {
+                let page = match crate::storage::list_facts(
+                    &orch.db.local,
+                    filter(MATCH_SCAN_PAGE, scanned),
+                )
+                .await
+                {
+                    Ok(page) => page,
+                    Err(error) => return error.to_string(),
+                };
+                let exhausted = (page.len() as i64) < MATCH_SCAN_PAGE;
+                scanned += page.len() as i64;
+                for row in page {
+                    if !row_matches(clause, &row) {
+                        continue;
+                    }
+                    if skipped < query.offset {
+                        skipped += 1;
+                    } else {
+                        matched.push(row);
+                        if matched.len() as i64 == query.limit {
+                            break 'scan;
+                        }
+                    }
+                }
+                if exhausted {
+                    break;
+                }
+            }
+            if scanned >= MATCH_SCAN_ROWS && (matched.len() as i64) < query.limit {
+                scan_note = Some(format!(
+                    "\nOnly the newest {MATCH_SCAN_ROWS} rows were examined; narrow with `since`, `from`, or `to` to look further back.\n"
+                ));
+            }
+            matched
+        }
     };
     let keys = project_keys(orch).await;
     let batches = coalesced_wakes(orch, &rows).await;
@@ -398,6 +511,9 @@ pub(crate) async fn list(
             query.offset + query.limit
         ));
     }
+    if let Some(note) = scan_note {
+        out.push_str(&note);
+    }
     out
 }
 
@@ -410,6 +526,7 @@ fn record_id_label(source: &str) -> &'static str {
         "file_changed" => "file_changes.id",
         "post_created" => "posts.id",
         "post_commented" => "post_comments.id",
+        "ingress" => "ingress_events.id",
         _ => "record id",
     }
 }
@@ -617,7 +734,8 @@ mod tests {
                 from_id: Some(3),
                 to_id: Some(9),
                 limit: 5,
-                offset: 2
+                offset: 2,
+                matcher: None,
             }
         );
         assert!(parse_list_query(&params(&[("from", "9"), ("to", "3")]))
@@ -636,5 +754,108 @@ mod tests {
             "{unknown}"
         );
         assert!(parse_list_query(&params(&[("limit", "201")])).is_err());
+    }
+
+    #[test]
+    fn match_is_a_trigger_clause_over_stored_fields_of_the_named_source() {
+        let clause = parse_list_query(&params(&[
+            ("source", "ingress"),
+            ("match", "endpoint:bugs,deliveryId:bug-report:7"),
+        ]))
+        .unwrap()
+        .matcher
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&clause).unwrap(),
+            serde_json::json!({"fact": "ingress", "endpoint": "bugs", "deliveryId": "bug-report:7"})
+        );
+        let refused = |pairs: &[(&str, &str)]| parse_list_query(&params(pairs)).unwrap_err();
+        assert!(refused(&[("match", "endpoint:bugs")]).contains("needs `source=`"));
+        assert!(
+            refused(&[("source", "ingress"), ("match", "body:x")]).contains("stored fields only")
+        );
+        assert!(refused(&[("source", "ingress"), ("match", "mystery:x")]).contains("unknown field"));
+        assert!(refused(&[("source", "ingress"), ("match", "endpoint")]).contains("field:value"));
+        assert!(refused(&[("source", "ingress"), ("match", "fact:attention")]).contains("source="));
+    }
+
+    /// A listing filtered by `match=` and a thread whose standing trigger is
+    /// the same clause select exactly the same rows.
+    #[tokio::test]
+    async fn match_and_a_standing_trigger_agree_on_which_rows_they_select() {
+        use crate::ingress::consume::{consume, EndpointEvent};
+        use crate::routes::fixture::{orchestrator, standing_triggers};
+
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = orchestrator(temp.path(), &[]).await;
+        for name in ["bugs", "ci"] {
+            crate::ingress::upsert_endpoint(
+                &db,
+                &crate::ingress::EndpointRecord {
+                    id: format!("src_{name}"),
+                    channel_id: "ch-1".into(),
+                    project_id: Some("p".into()),
+                    name: name.into(),
+                    provider: "first-party".into(),
+                    topic: Some("cairn.bugs".into()),
+                    status: "active".into(),
+                    granted_at: None,
+                    created_at: 1,
+                    revoked_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let trigger = r#"[{"fact":"ingress","endpoint":"bugs","type":"bug.reported"}]"#;
+        standing_triggers(&db, "watcher", trigger).await;
+        let fixtures = [
+            ("bugs", "bug.reported"),
+            ("bugs", "bug.closed"),
+            ("ci", "bug.reported"),
+            ("bugs", "bug.reported"),
+        ];
+        for (n, (endpoint, event_type)) in fixtures.iter().enumerate() {
+            consume(
+                &orch,
+                EndpointEvent {
+                    relay_event_id: n as i64 + 1,
+                    endpoint_id: format!("src_{endpoint}"),
+                    delivery_id: None,
+                    event_type: (*event_type).into(),
+                    verification: Some("first-party".into()),
+                    sender: None,
+                    received_at: "2026-10-18T20:00:00.000Z".into(),
+                    body: Ok(serde_json::json!({})),
+                },
+            )
+            .await;
+        }
+        crate::routes::drain_fact_log(&orch).await;
+
+        let woken: Vec<i64> = db
+            .query_all(
+                "SELECT id FROM fact_log WHERE source = 'ingress' AND wakes_json LIKE '%watcher%' ORDER BY id DESC",
+                (),
+                |row| crate::storage::RowExt::i64(row, 0),
+            )
+            .await
+            .unwrap();
+        let listed = list(
+            &orch,
+            Some("cairn"),
+            &params(&[
+                ("source", "ingress"),
+                ("match", "endpoint:bugs,type:bug.reported"),
+            ]),
+        )
+        .await;
+        let listed_ids: Vec<i64> = listed
+            .lines()
+            .filter_map(|line| line.strip_prefix("[#"))
+            .filter_map(|rest| rest.split(']').next()?.parse().ok())
+            .collect();
+        assert_eq!(woken.len(), 2, "{listed}");
+        assert_eq!(listed_ids, woken, "{listed}");
     }
 }

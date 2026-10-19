@@ -974,6 +974,19 @@ async fn prune_pass(orch: &Orchestrator, policy: &EventLogPolicy) -> Result<(), 
             tokio::task::yield_now().await;
         }
     }
+    // The records `ingress` rows point at keep the rows' own retention.
+    let ingress_cutoff = now.saturating_sub(
+        policy
+            .retention_ms
+            .get("ingress")
+            .copied()
+            .unwrap_or(policy.default_retention_ms),
+    );
+    while crate::ingress::prune_events(&orch.db.local, ingress_cutoff, PRUNE_BATCH).await?
+        == PRUNE_BATCH as u64
+    {
+        tokio::task::yield_now().await;
+    }
     Ok(())
 }
 

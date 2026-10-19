@@ -45,7 +45,7 @@ use std::sync::Mutex;
 
 use cairn_common::executor_protocol::{
     BindingEvent, CellAdmissionKind, CellOutcome, CellRequest, DeclineReason, DiskDecline,
-    DiskReliefOutlook, OfferSummary, ResidencyFence,
+    DiskReliefOutlook, OfferSummary, QueuedCellRequest, ResidencyFence,
 };
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -178,6 +178,12 @@ pub(crate) struct QueueEntry {
     /// from the request and never refreshed, so a re-presentation cannot extend
     /// what the caller said it would wait.
     pub(crate) horizon_unix_ms: u64,
+    /// When the request began waiting: the `waiting_since` it states, so a
+    /// re-presented request keeps the wait it already did, or its arrival here
+    /// when it states none. Clamped to the arrival, so a clock skewed into the
+    /// future cannot report a wait that has not happened. The same rule the
+    /// executor's own queue applies, so a row reads the same wherever it waits.
+    queued_at_unix_ms: u64,
     pub(crate) state: EntryState,
     /// The latest answer each machine that declined gave, keyed by executor id.
     ///
@@ -562,6 +568,10 @@ impl ExecutionQueue {
         let mut entry = QueueEntry {
             id: id.clone(),
             horizon_unix_ms: new.request.wait_horizon_unix_ms,
+            queued_at_unix_ms: match new.request.waiting_since_unix_ms {
+                0 => now_unix_ms,
+                stated => stated.min(now_unix_ms),
+            },
             requesting_job_id: new.request.requesting_job_id.clone(),
             request: new.request,
             admission_kind: new.admission_kind,
@@ -1400,6 +1410,45 @@ impl ExecutionQueue {
             .collect()
     }
 
+    /// Every entry no machine has claimed, as a row of the fleet's waiting room.
+    ///
+    /// Work waits for room here, not on a machine: an executor holds only what
+    /// it claimed, and reports claimed work as executing. So this queue is the
+    /// only place a request waiting for capacity can be seen, by the operator's
+    /// panel and by anything else that asks what a job still has in flight.
+    pub(crate) fn waiting_rows(&self) -> Vec<QueuedCellRequest> {
+        let state = self.entries.lock().unwrap();
+        state
+            .entries
+            .values()
+            .filter(|entry| !matches!(entry.state, EntryState::Claimed { .. }))
+            .map(|entry| {
+                let request = &entry.request;
+                QueuedCellRequest {
+                    admission_kind: entry.admission_kind,
+                    executor_id: entry.state.executor_id().unwrap_or_default().to_string(),
+                    request_id: request.request_id.clone(),
+                    attempt_id: request.attempt_id.clone(),
+                    project_id: request.project_id.clone(),
+                    command: request.command.clone(),
+                    command_class: request.command_class,
+                    owner: request.owner.clone(),
+                    priority: request.priority,
+                    effective_priority: None,
+                    requesting_job_id: entry.requesting_job_id.clone(),
+                    affinity_key: request.affinity_key.clone(),
+                    command_resource_identity: request.command_resource_identity.clone(),
+                    queued_at_unix_ms: entry.queued_at_unix_ms,
+                    resource_reservation: request.resource_reservation.clone(),
+                    learned_estimate: request.learned_estimate.clone(),
+                    subscriber_count: 1,
+                    substrate_hold: None,
+                    placement: None,
+                }
+            })
+            .collect()
+    }
+
     /// The live attempt of a request id, and where it is bound.
     ///
     /// A request id addresses at most one live attempt, which is what lets a
@@ -1827,6 +1876,57 @@ pub(super) mod tests {
                 1,
             )
             .expect("a fresh identity enqueues")
+    }
+
+    /// The waiting room is this queue, so its rows come from here: an entry is
+    /// waiting until a machine claims it, and it reports the wait its requester
+    /// says it already did rather than the age of this enqueue.
+    #[test]
+    fn unclaimed_entries_are_the_waiting_rows_and_keep_the_wait_they_state() {
+        let queue = ExecutionQueue::default();
+        let stated = |request_id: &str, waiting_since_unix_ms: u64| NewEntry {
+            request: CellRequest {
+                waiting_since_unix_ms,
+                ..request(request_id, PlacementMobility::SpillEligible)
+            },
+            admission_kind: CellAdmissionKind::Command,
+            interactive: false,
+            execution_residency: None,
+        };
+        let _re_presented = queue.enqueue(stated("re-presented", 40), 100).unwrap();
+        let _skewed = queue.enqueue(stated("skewed", 500), 100).unwrap();
+        let (_fresh, _fresh_waiter) = enqueue(&queue, "fresh", PlacementMobility::SpillEligible);
+        let (offered, _offered_waiter) =
+            enqueue(&queue, "offered", PlacementMobility::SpillEligible);
+        assert!(queue.offer(&offered, "machine", "machine", 7, 2));
+        let (claimed, _claimed_waiter) =
+            enqueue(&queue, "claimed", PlacementMobility::SpillEligible);
+        assert!(queue.offer(&claimed, "machine", "machine", 7, 2));
+        assert_eq!(
+            queue.claim(&claimed, "machine", 7, 3),
+            ClaimVerdict::Granted
+        );
+
+        let rows: HashMap<String, (u64, String)> = queue
+            .waiting_rows()
+            .into_iter()
+            .map(|row| (row.request_id, (row.queued_at_unix_ms, row.executor_id)))
+            .collect();
+
+        assert_eq!(rows["re-presented"], (40, String::new()));
+        assert_eq!(
+            rows["skewed"].0, 100,
+            "a wait cannot begin after its arrival"
+        );
+        assert_eq!(rows["fresh"].0, 1, "no stated wait begins at the arrival");
+        assert_eq!(
+            rows["offered"].1, "machine",
+            "an offer nobody has answered is still waiting, at the machine asked"
+        );
+        assert!(
+            !rows.contains_key("claimed"),
+            "claimed work is the executor's to report, as executing"
+        );
     }
 
     /// The cairn/4380 class, closed. An offer confers nothing and starts

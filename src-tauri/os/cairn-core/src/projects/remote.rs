@@ -204,7 +204,7 @@ mod tests {
     use crate::models::CreateProject;
     use crate::services::testing::MockGitClient;
     use crate::services::Clock;
-    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::LocalDb;
     use mockall::predicate::{eq, function};
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -242,9 +242,7 @@ mod tests {
 
     async fn migrated_db() -> LocalDb {
         let temp = tempdir().unwrap();
-        let db = LocalDb::open(temp.keep().join("cairn.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.keep().join("cairn.db"))
             .await
             .unwrap();
         db

@@ -685,7 +685,7 @@ mod snapshot_edit_guard_tests {
     };
     use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::SearchIndex;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -701,13 +701,10 @@ mod snapshot_edit_guard_tests {
     }
 
     async fn seeded_orch() -> Orchestrator {
-        let local = LocalDb::open(tempfile::tempdir().unwrap().keep().join("t.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
-            .await
-            .unwrap();
+        let local =
+            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("t.db"))
+                .await
+                .unwrap();
         let search =
             Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
         let db = Arc::new(DbState::new(Arc::new(local), search));
@@ -805,10 +802,12 @@ mod snapshot_edit_guard_tests {
         .unwrap();
     }
 
-    /// Project CAIRN / issue 1 with two executions. exec-1 (seq 1) holds the
-    /// edited snapshot and two running, started agent jobs (builder, planner)
-    /// with their runs. exec-2 (seq 2) is an unrelated execution whose run lets
-    /// us exercise the cross-execution (allowed) path.
+    /// Project CAIRN / issue 1 with two executions. exec-1 (seq 1) is the
+    /// issue's canonical attempt and holds the edited snapshot and two running,
+    /// started agent jobs (builder, planner) with their runs. exec-2 (seq 2) is
+    /// an unrelated execution whose run lets us exercise the cross-execution
+    /// (allowed) path; it is declared `parallel` because an issue has at most one
+    /// canonical execution, and a running sibling is a declared alternative.
     async fn seed(orch: &Orchestrator) {
         let db = &orch.db.local;
         exec(
@@ -831,8 +830,8 @@ mod snapshot_edit_guard_tests {
         .await;
         exec(
             db,
-            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
-             VALUES ('exec-2','r','issue-1','proj-1','running',1,2)",
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle)
+             VALUES ('exec-2','r','issue-1','proj-1','running',1,2,'parallel')",
         )
         .await;
         exec(

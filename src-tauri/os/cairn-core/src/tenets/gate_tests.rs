@@ -131,8 +131,7 @@ async fn env(name: &str) -> Env {
 
 fn proposal() -> TenetClaim {
     TenetClaim::Proposal {
-        question: "Plan the memory triage now?".into(),
-        options: vec!["Plan it now".into(), "Wait a release".into()],
+        statement: "Plan the memory triage now, not after the release.".into(),
     }
 }
 
@@ -300,8 +299,7 @@ async fn standing_tenet_of(env: &Env, project: &str, thread: &str, node: &str, r
             },
         },
         Proposal {
-            question: "Which plan?".into(),
-            options: vec!["The whole plan".into()],
+            statement: "The whole plan.".into(),
             supersedes: None,
             origin: TenetOrigin::Standing,
         },
@@ -319,7 +317,7 @@ async fn a_thread_filing_a_gated_recipe_with_a_proposal_is_held_on_it() {
         .unwrap();
     assert!(summary.contains("HELD"), "{summary}");
     assert!(summary.contains(TENET_1), "names the tenet: {summary}");
-    assert!(summary.contains("Tenets tab"), "{summary}");
+    assert!(summary.contains("for the operator's verdict"), "{summary}");
     assert!(
         !summary.contains("release:true"),
         "a thread is not offered the early release it would be refused: {summary}"
@@ -385,13 +383,26 @@ async fn a_gated_filing_naming_no_tenet_or_both_is_refused_before_anything_is_wr
         &env,
         THREAD_RUN,
         "cairn://p/prj/1/executions",
-        json!({"recipe": RECIPE, "proposal": {"question": "Q?", "options": ["a"]}, "tenet": 1}),
+        json!({"recipe": RECIPE, "proposal": {"statement": "S."}, "tenet": 1}),
     )
     .await
     .unwrap_err();
     assert!(
         both.contains("exactly one of payload.proposal or payload.tenet"),
         "{both}"
+    );
+
+    let retired = write(
+        &env,
+        THREAD_RUN,
+        "cairn://p/prj/1/executions",
+        json!({"recipe": RECIPE, "proposal": {"question": "Q?", "options": ["a"]}}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        retired.contains("payload.proposal.statement") && retired.contains("retired"),
+        "{retired}"
     );
 
     // The issue-create door refuses before the issue exists.
@@ -463,7 +474,7 @@ async fn both_doors_gate_a_thread_filing() {
         &env,
         THREAD_RUN,
         "cairn://p/prj/1/executions",
-        json!({"recipe": RECIPE, "proposal": {"question": "Plan it?", "options": ["yes", "no"]}}),
+        json!({"recipe": RECIPE, "proposal": {"statement": "Plan it."}}),
     )
     .await
     .unwrap();
@@ -580,7 +591,7 @@ async fn no_spelling_of_a_gated_recipe_files_it_past_the_gate() {
         &env,
         THREAD_RUN,
         "cairn://p/prj/1/executions",
-        json!({"recipe": "Memory-TRIAGE", "proposal": {"question": "Plan it?", "options": ["yes"]}}),
+        json!({"recipe": "Memory-TRIAGE", "proposal": {"statement": "Plan it."}}),
     )
     .await
     .unwrap();
@@ -604,7 +615,7 @@ async fn no_spelling_of_a_gated_recipe_files_it_past_the_gate() {
 async fn naming_an_approved_tenet_releases_at_creation() {
     let env = env("tenet-gate-approved.db").await;
     let number = standing_tenet(&env).await;
-    answer(&env, number, Verdict::Option(1), Some("go")).await;
+    answer(&env, number, Verdict::Yes, Some("go")).await;
     let summary = file(
         &env,
         1,
@@ -622,8 +633,7 @@ async fn naming_an_approved_tenet_releases_at_creation() {
     assert_eq!(
         comments,
         vec![
-            "Tenet #1 approved by the operator (signed in as alice): The whole plan. \
-             Rejected: none. Comment: go."
+            "Tenet #1 approved by the operator (signed in as alice): The whole plan.\nComment: go."
                 .to_string()
         ]
     );
@@ -658,7 +668,7 @@ async fn a_regate_onto_another_projects_same_numbered_tenet_is_refused() {
         "q",
         foreign,
         Answer {
-            verdict: Verdict::Option(1),
+            verdict: Verdict::Yes,
             comment: None,
             principal: human(),
         },
@@ -738,7 +748,7 @@ async fn a_filing_holds_only_on_its_own_threads_live_tenet() {
         .unwrap_err();
     assert!(missing.contains("no tenet #7"), "{missing}");
     let number = standing_tenet(&env).await;
-    answer(&env, number, Verdict::None, Some("no")).await;
+    answer(&env, number, Verdict::No, Some("no")).await;
     let declined = file(
         &env,
         1,
@@ -772,12 +782,12 @@ async fn a_failed_launch_withdraws_the_tenet_its_filing_proposed() {
 }
 
 #[tokio::test]
-async fn an_option_verdict_releases_and_comments_on_the_gated_issue() {
-    let env = env("tenet-gate-option.db").await;
+async fn a_yes_releases_and_comments_on_the_gated_issue() {
+    let env = env("tenet-gate-yes.db").await;
     file(&env, 1, Some(THREAD_RUN), Some(proposal()))
         .await
         .unwrap();
-    let answered = answer(&env, 1, Verdict::Option(2), Some("after the release")).await;
+    let answered = answer(&env, 1, Verdict::Yes, Some("after the release")).await;
     assert_eq!(answered.wake, None, "an approval is delivered quietly");
 
     let report = sweep_at(&env.orch, NOW).await.unwrap();
@@ -789,8 +799,8 @@ async fn an_option_verdict_releases_and_comments_on_the_gated_issue() {
     assert_eq!(
         comments,
         vec![
-            "Tenet #1 approved by the operator (signed in as alice): Wait a release. \
-             Rejected: Plan it now. Comment: after the release."
+            "Tenet #1 approved by the operator (signed in as alice): Plan the memory triage \
+             now, not after the release.\nComment: after the release."
                 .to_string()
         ]
     );
@@ -798,9 +808,11 @@ async fn an_option_verdict_releases_and_comments_on_the_gated_issue() {
     let messages = thread_messages(&env).await;
     assert_eq!(messages.len(), 1, "{messages:?}");
     let message = &messages[0];
-    assert!(message.contains("approved option 2"), "{message}");
-    assert!(message.contains("Chosen: Wait a release"), "{message}");
-    assert!(message.contains("Rejected: Plan it now"), "{message}");
+    assert!(message.contains("approved it: yes"), "{message}");
+    assert!(
+        message.contains("Statement: Plan the memory triage now, not after the release."),
+        "{message}"
+    );
     assert!(message.contains("Comment: after the release"), "{message}");
     assert!(
         message.contains("cairn://p/prj/1/executions/1"),
@@ -817,31 +829,31 @@ async fn an_option_verdict_releases_and_comments_on_the_gated_issue() {
 }
 
 #[tokio::test]
-async fn your_call_releases_and_adopts_option_1() {
+async fn your_call_releases_like_yes() {
     let env = env("tenet-gate-your-call.db").await;
     file(&env, 1, Some(THREAD_RUN), Some(proposal()))
         .await
         .unwrap();
     let answered = answer(&env, 1, Verdict::YourCall, None).await;
-    assert_eq!(answered.tenet.text(), Some("Plan it now"));
+    assert_eq!(answered.tenet.status, TenetStatus::Approved);
 
     sweep_at(&env.orch, NOW).await.unwrap();
     assert_eq!(execution(&env, 1).await.1, "running");
     let comment = &texts(&env, "SELECT content FROM comments WHERE issue_id = 'i1'").await[0];
     assert!(
-        comment.contains(": Plan it now. Rejected: Wait a release."),
+        comment.contains(": Plan the memory triage now, not after the release.\n"),
         "{comment}"
     );
     assert!(thread_messages(&env).await[0].contains("your call"));
 }
 
 #[tokio::test]
-async fn none_forecloses_and_wakes_the_proposer_not_the_coordinator() {
-    let env = env("tenet-gate-none.db").await;
+async fn no_forecloses_and_wakes_the_proposer_not_the_coordinator() {
+    let env = env("tenet-gate-no.db").await;
     file(&env, 1, Some(THREAD_RUN), Some(proposal()))
         .await
         .unwrap();
-    let answered = answer(&env, 1, Verdict::None, Some("not this quarter")).await;
+    let answered = answer(&env, 1, Verdict::No, Some("not this quarter")).await;
     assert_eq!(
         answered.wake.as_deref(),
         Some("j-thread"),

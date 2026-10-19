@@ -90,6 +90,26 @@ pub fn decrypt_payload(encrypted_b64: &str, secret_key_b64: &str) -> Result<Stri
     String::from_utf8(decrypted).map_err(|e| format!("Invalid UTF-8: {e}"))
 }
 
+/// Seal `plaintext` to a relay public key in the v1 format the api writes, so
+/// tests can feed the relay consumer real ciphertext.
+#[cfg(test)]
+pub(crate) fn seal_payload_for_test(plaintext: &str, public_key_b64: &str) -> String {
+    let recipient = PublicKey::from(
+        <[u8; 32]>::try_from(BASE64.decode(public_key_b64).unwrap().as_slice()).unwrap(),
+    );
+    let ephemeral = SecretKey::generate(&mut OsRng);
+    let mut hasher = Sha256::new();
+    hasher.update(ephemeral.public_key().as_bytes());
+    hasher.update(recipient.as_bytes());
+    let nonce: [u8; 24] = hasher.finalize()[..24].try_into().unwrap();
+    let sealed = SalsaBox::new(&recipient, &ephemeral)
+        .encrypt((&nonce).into(), plaintext.as_bytes())
+        .unwrap();
+    let mut out = ephemeral.public_key().as_bytes().to_vec();
+    out.extend_from_slice(&sealed);
+    BASE64.encode(out)
+}
+
 /// Version byte prefixing the ChaCha20-Poly1305 ciphertext format.
 const VERSION: u8 = 0x01;
 

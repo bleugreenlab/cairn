@@ -1542,7 +1542,7 @@ fn content_of(data: &serde_json::Value) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::LocalDb;
     use cairn_common::query::QueryParam;
 
     fn param(key: &str, value: &str) -> QueryParam {
@@ -1721,11 +1721,7 @@ mod tests {
     async fn load_job_events_reconstructs_archived_and_live_for_structured_output() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.keep().join("structured-transcript-archival.db");
-        let db = LocalDb::open(path).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
+        let db = LocalDb::open_migrated_for_test(path).await.unwrap();
 
         let tool_input = serde_json::json!({
             "commands": [{ "command": "echo archived" }]
@@ -1805,11 +1801,7 @@ mod tests {
     async fn load_turn_events_reconstructs_archived_zstd() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.keep().join("transcript-archival.db");
-        let db = LocalDb::open(path).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
+        let db = LocalDb::open_migrated_for_test(path).await.unwrap();
 
         let original = "{\"eventType\":\"user\",\"content\":\"archived turn content\"}";
         let blob = crate::storage::compress(original.as_bytes()).unwrap();
@@ -1931,13 +1923,11 @@ mod tests {
 
     #[tokio::test]
     async fn get_single_event_resolves_tool_result_name() {
-        let db = LocalDb::open(tempfile::tempdir().unwrap().keep().join("transcript.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
+        let db = LocalDb::open_migrated_for_test(
+            tempfile::tempdir().unwrap().keep().join("transcript.db"),
+        )
+        .await
+        .unwrap();
         let conn = db.connect().await.unwrap();
         conn.execute(
             "INSERT INTO runs (id, created_at, updated_at) VALUES ('run-1', 1, 1)",

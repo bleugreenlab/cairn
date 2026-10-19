@@ -26,6 +26,7 @@ use crate::resources::mutations::{
     blocking_append_kind, dispatch_resource_change, project_write_crossing_path,
     run_blocking_group, validate_blocking_group, PromotedMemoryRef,
 };
+use crate::stack::off_frame;
 use cairn_common::authorization::AuthorityRequest;
 
 /// A single-failure change report for an item refused before anything applied.
@@ -519,16 +520,14 @@ async fn handle_write_under_barrier(
     drained: &mut Vec<super::run::held::Drained>,
 ) -> String {
     let mut epoch = ReplayEpoch::Locked;
-    // Boxed: the attempt future carries every preparation and sealing state of
-    // the write, and awaiting it inline puts all of that on the caller's
-    // stack, which is how write-driven tests overflowed a worker stack.
-    let report = Box::pin(handle_write_attempt(
-        orch,
-        request,
-        drained,
-        WriteLocking::Optimistic,
-        &mut epoch,
-    ))
+    // Off this frame: the attempt carries every preparation and sealing state
+    // of the write (see `crate::stack`).
+    let report = {
+        let (drained, epoch) = (&mut *drained, &mut epoch);
+        off_frame(move || {
+            handle_write_attempt(orch, request, drained, WriteLocking::Optimistic, epoch)
+        })
+    }
     .await;
     if epoch != ReplayEpoch::Unchecked {
         return report;
@@ -563,14 +562,9 @@ async fn handle_write_under_barrier(
     if !replayed {
         return report;
     }
-    Box::pin(handle_write_attempt(
-        orch,
-        request,
-        drained,
-        WriteLocking::Locked,
-        &mut epoch,
-    ))
-    .await
+    let epoch = &mut epoch;
+    off_frame(move || handle_write_attempt(orch, request, drained, WriteLocking::Locked, epoch))
+        .await
 }
 
 /// One attempt at the write. An optimistic attempt that meets a moved head,
@@ -713,11 +707,11 @@ async fn handle_write_attempt(
             .iter()
             .any(|item| item.mode == ChangeMode::Rename)
     {
-        return preview_change(orch, request, &payload).await;
+        return off_frame(|| preview_change(orch, request, &payload)).await;
     }
 
     if payload.preview.unwrap_or(false) {
-        return preview_change(orch, request, &payload).await;
+        return off_frame(|| preview_change(orch, request, &payload)).await;
     }
 
     log::info!(
@@ -1153,17 +1147,19 @@ async fn handle_write_attempt(
                             let job_id = job_id.ok_or_else(|| {
                                 "the sealed branch no longer has its publication job".to_string()
                             })?;
-                            finish_minted_post_seal(
-                                orch,
-                                request,
-                                &payload,
-                                index,
-                                &resolution,
-                                &job_id,
-                                call,
-                                &owner,
-                                prior,
-                            )
+                            off_frame(|| {
+                                finish_minted_post_seal(
+                                    orch,
+                                    request,
+                                    &payload,
+                                    index,
+                                    &resolution,
+                                    &job_id,
+                                    call,
+                                    &owner,
+                                    prior,
+                                )
+                            })
                             .await
                         });
                         match replay::with_owned_report_heartbeat(
@@ -1757,7 +1753,7 @@ async fn handle_write_attempt(
                 index += 1;
                 continue;
             }
-            match dispatch_resource_change(orch, request, index, item, false).await {
+            match off_frame(|| dispatch_resource_change(orch, request, index, item, false)).await {
                 Ok(change) => {
                     if let Some(promoted) = change.promoted_memory.clone() {
                         promoted_memories.push((
@@ -2296,17 +2292,19 @@ async fn handle_write_attempt(
                 ledger_recorded: false,
                 cloud_published: false,
             });
-            return finish_minted_post_seal(
-                orch,
-                request,
-                &payload,
-                index,
-                &minted.resolution,
-                &minted.job_id,
-                call,
-                owner,
-                report,
-            )
+            return off_frame(|| {
+                finish_minted_post_seal(
+                    orch,
+                    request,
+                    &payload,
+                    index,
+                    &minted.resolution,
+                    &minted.job_id,
+                    call,
+                    owner,
+                    report,
+                )
+            })
             .await
             .unwrap_or_else(|error| {
                 format!("The minted branch sealed, but post-seal recovery remains pending: {error}")
@@ -2431,13 +2429,15 @@ async fn handle_write_attempt(
                 crate::execution::checks::cancel_stale_review_on_branch_advance(orch, &ctx.job_id)
                     .await;
             }
-            crate::execution::checks::run_write_checks_after_seal(
-                orch,
-                run_context.as_ref(),
-                &request.cwd,
-                &tool_use_id,
-                logical_resolution.as_ref(),
-            )
+            off_frame(|| {
+                crate::execution::checks::run_write_checks_after_seal(
+                    orch,
+                    run_context.as_ref(),
+                    &request.cwd,
+                    &tool_use_id,
+                    logical_resolution.as_ref(),
+                )
+            })
             .await
         } else {
             None

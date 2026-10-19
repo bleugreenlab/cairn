@@ -6,8 +6,7 @@
 //! `tenet_gated_recipes`: planbuild, coordinator, and PlanCoord by default)
 //! wait for the operator. Such a filing carries exactly one of:
 //!
-//! - `proposal: {question, options}`, proposed to the operator on the spot,
-//!   with option 1 the thread's recommendation; or
+//! - `proposal: {statement}`, proposed to the operator on the spot; or
 //! - `tenet: <n>`, one of the same thread's proposed or approved tenets, which
 //!   is how one approval releases every filing of a whole plan.
 //!
@@ -33,11 +32,8 @@ use crate::storage::LocalDb;
 /// What a filing says about its tenet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TenetClaim {
-    /// Propose this question now and hold on its verdict.
-    Proposal {
-        question: String,
-        options: Vec<String>,
-    },
+    /// Propose this statement now and hold on its verdict.
+    Proposal { statement: String },
     /// Hold on this existing tenet of the filing thread.
     Existing(i64),
 }
@@ -99,30 +95,25 @@ impl TenetFiling {
 fn parse_proposal(value: &Value, key_prefix: &str) -> Result<TenetClaim, String> {
     let shape = || {
         format!(
-            "{key_prefix}.proposal must be {{question: string, options: [string, ...]}}, \
-             option 1 being your recommendation"
+            "{key_prefix}.proposal must be {{statement: string}}: how the project does things, \
+             for the operator to answer yes or no"
         )
     };
     let object = value.as_object().ok_or_else(shape)?;
-    if object
-        .keys()
-        .any(|key| key != "question" && key != "options")
-    {
+    if object.contains_key("question") || object.contains_key("options") {
+        return Err(super::retired_proposal_shape_refusal(&format!(
+            "{key_prefix}.proposal."
+        )));
+    }
+    if object.keys().any(|key| key != "statement") {
         return Err(shape());
     }
-    let question = object
-        .get("question")
+    let statement = object
+        .get("statement")
         .and_then(Value::as_str)
         .ok_or_else(shape)?
         .to_string();
-    let options = object
-        .get("options")
-        .and_then(Value::as_array)
-        .ok_or_else(shape)?
-        .iter()
-        .map(|option| option.as_str().map(str::to_string).ok_or_else(shape))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(TenetClaim::Proposal { question, options })
+    Ok(TenetClaim::Proposal { statement })
 }
 
 /// The refusal for a caller that names a tenet while acting for no thread.
@@ -131,8 +122,8 @@ pub const NON_THREAD_FILING_REFUSAL: &str = "`proposal` and `tenet` belong to a 
 fn missing_tenet_refusal(recipe: &str, key_prefix: &str) -> String {
     format!(
         "a thread files `{recipe}` only behind a tenet the operator answers. Send exactly one of \
-         {key_prefix}.proposal: {{question, options}} (option 1 your recommendation), proposed to \
-         the operator now, or {key_prefix}.tenet: <n>, one of your thread's proposed or approved \
+         {key_prefix}.proposal: {{statement}}, a statement of how the project does things \
+         proposed to the operator now for a yes or no, or {key_prefix}.tenet: <n>, one of your thread's proposed or approved \
          tenets (one approval can release every filing of a plan). The execution is filed HELD \
          until the operator answers. `build` is for repair only, not a way around this."
     )
@@ -238,10 +229,9 @@ pub(crate) async fn plan(
         (None, _) => return Ok(None),
     };
     let claim = match claim {
-        TenetClaim::Proposal { question, options } => {
+        TenetClaim::Proposal { statement } => {
             let proposal = Proposal {
-                question,
-                options,
+                statement,
                 supersedes: None,
                 origin: TenetOrigin::FilingGate,
             };
@@ -357,7 +347,7 @@ pub(crate) async fn guard_gate_change(
     let Some(replacement) = replacement else {
         return Err(format!(
             "this execution waits on the operator's verdict on {waits_on}; a thread does not \
-             release its own tenet-gated filing early. The operator answers it in the Tenets tab."
+             release its own tenet-gated filing early. Only the operator answers it."
         ));
     };
     let policy = super::load_policy(db, project_id).await?;
@@ -499,7 +489,7 @@ impl FilingGate {
             "awaiting the operator"
         };
         format!(
-            " It waits on tenet {} ({how}) in the operator's Tenets tab; you hear the verdict \
+            " It waits on tenet {} ({how}) for the operator's verdict; you hear the verdict \
              when it is given.",
             self.uri
         )

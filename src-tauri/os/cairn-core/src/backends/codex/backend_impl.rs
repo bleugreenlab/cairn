@@ -12,6 +12,7 @@ use crate::orchestrator::session::{
     select_routed_serving_identity, SelectionMode,
 };
 use crate::orchestrator::Orchestrator;
+use cairn_models::codex::token_requests::renew_for_launch;
 use cairn_models::codex::tokens::{find_codex_oauth_account_id, CodexAuthState};
 use cairn_models::interface::session::{
     Cli, CodexModels, CodexNativeTools, CodexServer, CodexSpec, NativeGoal, ProviderSpec, Secret,
@@ -100,6 +101,13 @@ pub(crate) fn discover_catalog_blocking(
 /// to. `None` for an API key.
 type CodexOAuth = (Option<Arc<Mutex<CodexAuthState>>>, Option<String>);
 
+/// The live state a Codex launch signs in on, with tokens worth presenting.
+///
+/// The dedicated and the pooled host both build their login from this before
+/// anything is spawned, so a subscription whose access token has expired, or
+/// is about to, is renewed here first ([`renew_for_launch`]), and one that can
+/// no longer be renewed refuses the launch with the operator's instruction
+/// instead of starting Codex on dead tokens.
 fn codex_oauth_state(orch: &Orchestrator, auth: &CodexAuth) -> Result<CodexOAuth, String> {
     let CodexAuth::OAuthToken(json) = auth else {
         return Ok((None, None));
@@ -109,7 +117,10 @@ fn codex_oauth_state(orch: &Orchestrator, auth: &CodexAuth) -> Result<CodexOAuth
         .and_then(|store| find_codex_oauth_account_id(&store, json));
     let state = CodexAuthState::new_for_account(orch, json, account_id.clone())
         .map_err(|e| format!("Invalid Codex OAuth tokens: {}", e))?;
-    Ok((Some(Arc::new(Mutex::new(state))), account_id))
+    let state = Arc::new(Mutex::new(state));
+    renew_for_launch(orch, orch.subscriptions(), &state)
+        .map_err(|failure| failure.operator_message())?;
+    Ok((Some(state), account_id))
 }
 
 /// The `account/login/start` params an app-server is signed in with. A
@@ -223,8 +234,6 @@ impl AgentBackend for CodexBackend {
         // Temporary permissions floor: the three core verbs are always allowed
         // for every agent (CAIRN-1172).
         toolkits::ensure_core_verbs(&mut allowed);
-
-        allowed.retain(|tool| tool != "apply_patch");
 
         // The retired `mcp__cairn__return` tool is no longer injected: returning
         // is `write cairn:~/return` (CAIRN-2505). No MCP handler dispatched it.
@@ -998,6 +1007,113 @@ mod tests {
     use cairn_models::codex::app_server::AppServerClient;
     use cairn_models::interface::session::SessionControl;
     use cairn_models::session::codex::CodexControl;
+    use cairn_models::subscription::testing::RenewingCodex;
+    use cairn_platform::services::process::RecordingProcessSpawner;
+
+    use crate::db::DbState;
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::SearchIndex;
+
+    /// An orchestrator renewing Codex tokens through `subscriptions`, whose
+    /// every process spawn is recorded.
+    async fn launching_orchestrator(
+        name: &str,
+        subscriptions: RenewingCodex,
+    ) -> (Orchestrator, RecordingProcessSpawner) {
+        let db = Arc::new(crate::storage::migrated_test_db(name).await);
+        let root = tempfile::tempdir().unwrap().keep();
+        let state = Arc::new(DbState::new(
+            db,
+            Arc::new(SearchIndex::open_or_create(root.join("search.db")).unwrap()),
+        ));
+        let spawner = RecordingProcessSpawner::new();
+        let orch = OrchestratorBuilder::new(
+            state,
+            Arc::new(
+                TestServicesBuilder::new()
+                    .with_process(spawner.clone())
+                    .build(),
+            ),
+            root,
+        )
+        .subscriptions(Arc::new(subscriptions))
+        .build();
+        (orch, spawner)
+    }
+
+    /// A stored subscription credential whose access token expired a minute
+    /// ago.
+    fn expired_subscription() -> CodexAuth {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let exp = chrono::Utc::now().timestamp() - 60;
+        let access_token = format!(
+            "e30.{}.at-1",
+            URL_SAFE_NO_PAD.encode(serde_json::json!({ "exp": exp }).to_string())
+        );
+        CodexAuth::OAuthToken(
+            serde_json::json!({"tokens": {
+                "id_token": "id-1",
+                "access_token": access_token,
+                "refresh_token": "rt-1",
+                "account_id": "chatgpt-1",
+            }})
+            .to_string(),
+        )
+    }
+
+    /// A launch on an expired stored access token renews it before the
+    /// app-server is signed in, and signs it in on the renewed token, never on
+    /// the refresh token.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_launch_on_an_expired_access_token_signs_in_on_the_renewed_one() {
+        let authority = RenewingCodex::default();
+        let (orch, _) = launching_orchestrator("codex-launch-renews", authority.clone()).await;
+        let auth = expired_subscription();
+
+        let (state, _) = codex_oauth_state(&orch, &auth).expect("the launch goes ahead");
+        let login = codex_login(&orch, &auth, state.as_ref())
+            .unwrap()
+            .expect("a subscription is signed in");
+
+        assert_eq!(authority.asked().len(), 1, "renewed once, before login");
+        assert_eq!(authority.asked()[0].spending.as_deref(), Some("rt-1"));
+        let login = login.expose();
+        assert_eq!(login["accessToken"], "at-2");
+        assert!(
+            !login.to_string().contains("rt-1"),
+            "a login never carries the refresh token: {login}"
+        );
+    }
+
+    /// An account that can no longer be renewed refuses the launch with the
+    /// instruction that fixes it, and Codex is never started.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unrecoverable_renewal_refuses_the_launch_before_codex_starts() {
+        let (orch, spawner) =
+            launching_orchestrator("codex-launch-refused", RenewingCodex::refusing()).await;
+        let auth = expired_subscription();
+
+        let Err(refusal) = acquire_pooled_server(&orch, &auth) else {
+            panic!("a launch on dead tokens must be refused");
+        };
+
+        assert!(
+            refusal.contains("Reconnect that account from Settings → Providers"),
+            "{refusal}"
+        );
+        assert!(
+            !refusal.contains("Failed to start Codex app-server pool"),
+            "refused before the pool tried to start a server: {refusal}"
+        );
+        assert_eq!(spawner.spawn_count(), 0, "Codex was never spawned");
+        assert!(
+            codex_oauth_state(&orch, &auth).is_err(),
+            "the dedicated host refuses through the same seam"
+        );
+        assert_eq!(spawner.spawn_count(), 0);
+    }
 
     #[test]
     fn codex_send_set_model_is_unsupported() {

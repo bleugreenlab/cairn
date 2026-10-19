@@ -953,7 +953,7 @@ mod tests {
         write_file(&clone, "a.txt", b"A-modified");
         let tip = commit_all(&clone, "modify a");
 
-        let (pack, idx) = build_execution_pack(&clone, &tip, &anchor, "main")
+        let (pack, idx) = build_execution_pack(&clone, &[tip.as_str()], &[anchor.as_str(), "main"])
             .unwrap()
             .unwrap();
 
@@ -1016,9 +1016,11 @@ mod tests {
         write_file(repo, "a.txt", b"A");
         let anchor = commit_all(repo, "base");
         // tip == anchor: the range is empty.
-        assert!(build_execution_pack(repo, &anchor, &anchor, "main")
-            .unwrap()
-            .is_none());
+        assert!(
+            build_execution_pack(repo, &[anchor.as_str()], &[anchor.as_str(), "main"])
+                .unwrap()
+                .is_none()
+        );
 
         let store = ObjectStore::new(repo, None).unwrap();
         let bytes = store.resolve_path_at_commit(&anchor, "a.txt").unwrap();

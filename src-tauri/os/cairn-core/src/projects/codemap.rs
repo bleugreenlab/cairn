@@ -594,7 +594,7 @@ pub(crate) async fn note_base_advance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+
     use tempfile::tempdir;
 
     fn tree() -> TreeProjection {
@@ -662,9 +662,7 @@ mod tests {
 
     async fn test_db() -> LocalDb {
         let temp = tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("codemap.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("codemap.db"))
             .await
             .unwrap();
         db.execute(

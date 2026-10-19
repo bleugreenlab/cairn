@@ -49,19 +49,18 @@ fn design() -> Proposer {
     proposer(DESIGN, "design")
 }
 
-fn proposal(question: &str, options: &[&str]) -> Proposal {
+fn proposal(statement: &str) -> Proposal {
     Proposal {
-        question: question.into(),
-        options: options.iter().map(|option| option.to_string()).collect(),
+        statement: statement.into(),
         supersedes: None,
         origin: TenetOrigin::Standing,
     }
 }
 
-fn successor(question: &str, supersedes: i64) -> Proposal {
+fn successor(statement: &str, supersedes: i64) -> Proposal {
     Proposal {
         supersedes: Some(supersedes),
-        ..proposal(question, &["new way", "old way"])
+        ..proposal(statement)
     }
 }
 
@@ -113,16 +112,10 @@ async fn concurrent_proposals_take_distinct_gapless_numbers() {
         let who = &who;
         let emitter = &emitter;
         async move {
-            propose(
-                db,
-                emitter,
-                10,
-                who,
-                proposal(&format!("question {i}"), &["yes"]),
-            )
-            .await
-            .unwrap()
-            .number
+            propose(db, emitter, 10, who, proposal(&format!("question {i}")))
+                .await
+                .unwrap()
+                .number
         }
     }))
     .await;
@@ -141,7 +134,7 @@ async fn concurrent_proposals_take_distinct_gapless_numbers() {
 }
 
 #[tokio::test]
-async fn a_proposal_is_refused_with_too_many_or_too_few_options_or_too_much_text() {
+async fn a_proposal_is_refused_when_its_statement_is_blank_or_too_long() {
     let db = fixture("tenets-validation.db").await;
     let who = design();
     let emitter = CapturingEmitter::new();
@@ -152,19 +145,9 @@ async fn a_proposal_is_refused_with_too_many_or_too_few_options_or_too_much_text
         async move { propose(db, emitter, 10, who, p).await.unwrap_err() }
     };
 
-    let none = refuse(proposal("q", &[])).await;
-    assert!(none.contains("1 to 5 options"), "{none}");
-    let six = refuse(proposal("q", &["a", "b", "c", "d", "e", "f"])).await;
-    assert!(
-        six.contains("1 to 5 options") && six.contains("has 6"),
-        "{six}"
-    );
-    let blank = refuse(proposal("q", &["a", "  "])).await;
-    assert!(blank.contains("option 2 is empty"), "{blank}");
-    let question = refuse(proposal("   ", &["a"])).await;
-    assert!(question.contains("non-empty question"), "{question}");
-    let long = "x".repeat(1200);
-    let over = refuse(proposal("q", &[&long, &long])).await;
+    let blank = refuse(proposal("   ")).await;
+    assert!(blank.contains("non-empty statement"), "{blank}");
+    let over = refuse(proposal(&"x".repeat(MAX_PROPOSAL_CHARS + 1))).await;
     assert!(over.starts_with(OVER_LENGTH_REFUSAL), "{over}");
 
     assert!(
@@ -175,23 +158,19 @@ async fn a_proposal_is_refused_with_too_many_or_too_few_options_or_too_much_text
 }
 
 #[tokio::test]
-async fn choosing_an_option_approves_it_and_records_the_signed_in_person() {
-    let db = fixture("tenets-option.db").await;
-    let tenet = propose_ok(
-        &db,
-        &design(),
-        proposal("How?", &["via Y", "via Z", "not at all"]),
-    )
-    .await;
+async fn yes_approves_the_statement_and_records_the_signed_in_person() {
+    let db = fixture("tenets-yes.db").await;
+    let tenet = propose_ok(&db, &design(), proposal("  X is done via Y, not Z.  ")).await;
     assert_eq!(tenet.status, TenetStatus::Proposed);
+    assert_eq!(tenet.statement, "X is done via Y, not Z.");
     assert_eq!(pending_count(&db, PROJECT).await.unwrap(), 1);
 
     let answered = answer_with(
         &db,
         tenet.number,
         Answer {
-            comment: Some("  Z is cheaper  ".into()),
-            ..by(Verdict::Option(2), human())
+            comment: Some("  Y is cheaper  ".into()),
+            ..by(Verdict::Yes, human())
         },
     )
     .await
@@ -199,15 +178,13 @@ async fn choosing_an_option_approves_it_and_records_the_signed_in_person() {
     assert_eq!(answered.superseded, None);
     let row = &answered.tenet;
     assert_eq!(row.status, TenetStatus::Approved);
-    assert_eq!(row.verdict.as_deref(), Some("option"));
-    assert_eq!(row.selected_option, Some(1));
+    assert_eq!(row.verdict, Some(Verdict::Yes));
     assert_eq!(row.answer_source, Some(AnswerSource::Principal));
     assert_eq!(row.answered_by, Some(human()));
-    assert_eq!(row.comment.as_deref(), Some("Z is cheaper"));
+    assert_eq!(row.comment.as_deref(), Some("Y is cheaper"));
 
     let view = view(&db, tenet.number).await;
-    assert_eq!(view.text.as_deref(), Some("via Z"));
-    assert_eq!(view.rejected, vec!["via Y", "not at all"]);
+    assert_eq!(view.row.statement, "X is done via Y, not Z.");
     assert_eq!(view.answerer_label.as_deref(), Some("signed in as alice"));
     assert_eq!(view.proposing_thread, "prj/design");
     assert_eq!(view.uri, "cairn://p/prj/tenets/1");
@@ -216,22 +193,27 @@ async fn choosing_an_option_approves_it_and_records_the_signed_in_person() {
         "Releases on: answered (unverified desktop answer)"
     );
     assert_eq!(pending_count(&db, PROJECT).await.unwrap(), 0);
+
+    let json = serde_json::to_value(&view).unwrap();
+    assert_eq!(json["statement"], "X is done via Y, not Z.");
+    assert_eq!(json["verdict"], "yes");
+    for retired in ["question", "options", "selectedOption", "text", "rejected"] {
+        assert!(json.get(retired).is_none(), "{retired} retired: {json}");
+    }
 }
 
 #[tokio::test]
-async fn your_call_adopts_option_one_and_a_desktop_answer_records_its_device() {
+async fn your_call_approves_and_a_desktop_answer_records_its_device() {
     let db = fixture("tenets-your-call.db").await;
-    let tenet = propose_ok(&db, &design(), proposal("How?", &["via Y", "via Z"])).await;
+    let tenet = propose_ok(&db, &design(), proposal("Via Y.")).await;
     let row = answer_with(&db, tenet.number, by(Verdict::YourCall, machine()))
         .await
         .unwrap()
         .tenet;
     assert_eq!(row.status, TenetStatus::Approved);
-    assert_eq!(row.verdict.as_deref(), Some("your_call"));
-    assert_eq!(row.selected_option, Some(0));
+    assert_eq!(row.verdict, Some(Verdict::YourCall));
     assert_eq!(row.answer_source, Some(AnswerSource::Device));
     let view = view(&db, tenet.number).await;
-    assert_eq!(view.text.as_deref(), Some("via Y"));
     assert_eq!(
         view.answerer_label.as_deref(),
         Some("anonymous device dev42")
@@ -240,56 +222,42 @@ async fn your_call_adopts_option_one_and_a_desktop_answer_records_its_device() {
 }
 
 #[tokio::test]
-async fn none_declines_and_rejects_every_option() {
-    let db = fixture("tenets-none.db").await;
-    let tenet = propose_ok(&db, &design(), proposal("How?", &["via Y", "via Z"])).await;
-    let row = answer_with(&db, tenet.number, by(Verdict::None, human()))
+async fn no_declines() {
+    let db = fixture("tenets-no.db").await;
+    let tenet = propose_ok(&db, &design(), proposal("Via Y.")).await;
+    let row = answer_with(&db, tenet.number, by(Verdict::No, human()))
         .await
         .unwrap()
         .tenet;
     assert_eq!(row.status, TenetStatus::Declined);
-    assert_eq!(row.verdict.as_deref(), Some("none"));
-    assert_eq!(row.selected_option, None);
-    let view = view(&db, tenet.number).await;
-    assert_eq!(view.text, None);
-    assert_eq!(view.rejected, vec!["via Y", "via Z"]);
+    assert_eq!(row.verdict, Some(Verdict::No));
+    assert_eq!(row.statement, "Via Y.");
 }
 
 #[tokio::test]
-async fn agents_cannot_answer_and_a_verdict_is_given_once_and_in_range() {
+async fn agents_cannot_answer_and_a_verdict_is_given_once() {
     let db = fixture("tenets-answer-refusals.db").await;
-    let tenet = propose_ok(&db, &design(), proposal("How?", &["via Y", "via Z"])).await;
+    let tenet = propose_ok(&db, &design(), proposal("How?")).await;
 
-    let agent = answer_with(
-        &db,
-        tenet.number,
-        by(Verdict::Option(1), design().principal),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(agent, AGENT_VERDICT_REFUSAL);
-
-    let range = answer_with(&db, tenet.number, by(Verdict::Option(3), human()))
+    let agent = answer_with(&db, tenet.number, by(Verdict::Yes, design().principal))
         .await
         .unwrap_err();
-    assert!(
-        range.contains("option 3 is out of range") && range.contains("has 2 options"),
-        "{range}"
-    );
+    assert_eq!(agent, AGENT_VERDICT_REFUSAL);
+
     assert_eq!(
         view(&db, tenet.number).await.row.status,
         TenetStatus::Proposed
     );
 
-    answer_with(&db, tenet.number, by(Verdict::Option(1), human()))
+    answer_with(&db, tenet.number, by(Verdict::Yes, human()))
         .await
         .unwrap();
-    let again = answer_with(&db, tenet.number, by(Verdict::None, human()))
+    let again = answer_with(&db, tenet.number, by(Verdict::No, human()))
         .await
         .unwrap_err();
     assert!(again.contains("already approved"), "{again}");
 
-    let missing = answer_with(&db, 99, by(Verdict::None, human()))
+    let missing = answer_with(&db, 99, by(Verdict::No, human()))
         .await
         .unwrap_err();
     assert!(missing.contains("no tenet #99"), "{missing}");
@@ -299,8 +267,8 @@ async fn agents_cannot_answer_and_a_verdict_is_given_once_and_in_range() {
 async fn only_the_proposing_thread_withdraws_and_only_before_a_verdict() {
     let db = fixture("tenets-withdraw.db").await;
     let emitter = CapturingEmitter::new();
-    let first = propose_ok(&db, &design(), proposal("First?", &["a"])).await;
-    let second = propose_ok(&db, &design(), proposal("Second?", &["a"])).await;
+    let first = propose_ok(&db, &design(), proposal("First?")).await;
+    let second = propose_ok(&db, &design(), proposal("Second?")).await;
 
     let foreign = withdraw(&db, &emitter, 30, PROJECT, first.number, CHANNELS)
         .await
@@ -319,12 +287,12 @@ async fn only_the_proposing_thread_withdraws_and_only_before_a_verdict() {
         .await
         .unwrap_err();
     assert!(twice.contains("already withdrawn"), "{twice}");
-    let answer_withdrawn = answer_with(&db, first.number, by(Verdict::Option(1), human()))
+    let answer_withdrawn = answer_with(&db, first.number, by(Verdict::Yes, human()))
         .await
         .unwrap_err();
     assert!(answer_withdrawn.contains("withdrawn"), "{answer_withdrawn}");
 
-    answer_with(&db, second.number, by(Verdict::Option(1), human()))
+    answer_with(&db, second.number, by(Verdict::Yes, human()))
         .await
         .unwrap();
     let after_verdict = withdraw(&db, &emitter, 30, PROJECT, second.number, DESIGN)
@@ -338,8 +306,8 @@ async fn only_the_proposing_thread_withdraws_and_only_before_a_verdict() {
 #[tokio::test]
 async fn supersession_applies_only_on_approval() {
     let db = fixture("tenets-supersede.db").await;
-    let original = propose_ok(&db, &design(), proposal("How?", &["old way"])).await;
-    answer_with(&db, original.number, by(Verdict::Option(1), human()))
+    let original = propose_ok(&db, &design(), proposal("How?")).await;
+    answer_with(&db, original.number, by(Verdict::Yes, human()))
         .await
         .unwrap();
 
@@ -348,7 +316,7 @@ async fn supersession_applies_only_on_approval() {
         view(&db, original.number).await.row.status,
         TenetStatus::Approved
     );
-    answer_with(&db, declined.number, by(Verdict::None, human()))
+    answer_with(&db, declined.number, by(Verdict::No, human()))
         .await
         .unwrap();
     let still = view(&db, original.number).await;
@@ -399,15 +367,15 @@ async fn supersession_applies_only_on_approval() {
     );
 
     let approved = propose_ok(&db, &design(), successor("Change it now?", original.number)).await;
-    let answered = answer_with(&db, approved.number, by(Verdict::Option(1), human()))
+    let answered = answer_with(&db, approved.number, by(Verdict::Yes, human()))
         .await
         .unwrap();
     assert_eq!(answered.superseded, Some(original.number));
     let replaced = view(&db, original.number).await;
     assert_eq!(replaced.row.status, TenetStatus::Superseded);
     assert_eq!(
-        replaced.row.verdict.as_deref(),
-        Some("option"),
+        replaced.row.verdict,
+        Some(Verdict::Yes),
         "a superseded tenet keeps its verdict"
     );
     assert_eq!(replaced.superseded_by, Some(approved.number));
@@ -433,7 +401,7 @@ async fn supersedes_must_name_an_approved_tenet_and_a_tenet_is_superseded_once()
     let db = fixture("tenets-double-supersede.db").await;
     let who = design();
     let emitter = CapturingEmitter::new();
-    let pending = propose_ok(&db, &who, proposal("Pending?", &["a"])).await;
+    let pending = propose_ok(&db, &who, proposal("Pending?")).await;
     let refused = propose(&db, &emitter, 10, &who, successor("x", pending.number))
         .await
         .unwrap_err();
@@ -446,17 +414,17 @@ async fn supersedes_must_name_an_approved_tenet_and_a_tenet_is_superseded_once()
         .unwrap_err();
     assert!(missing.contains("names no tenet"), "{missing}");
 
-    let base = propose_ok(&db, &who, proposal("Base?", &["a"])).await;
-    answer_with(&db, base.number, by(Verdict::Option(1), human()))
+    let base = propose_ok(&db, &who, proposal("Base?")).await;
+    answer_with(&db, base.number, by(Verdict::Yes, human()))
         .await
         .unwrap();
     // Two successors race for the same predecessor.
     let left = propose_ok(&db, &who, successor("Left?", base.number)).await;
     let right = propose_ok(&db, &who, successor("Right?", base.number)).await;
-    answer_with(&db, left.number, by(Verdict::Option(1), human()))
+    answer_with(&db, left.number, by(Verdict::Yes, human()))
         .await
         .unwrap();
-    let late = answer_with(&db, right.number, by(Verdict::Option(1), human()))
+    let late = answer_with(&db, right.number, by(Verdict::Yes, human()))
         .await
         .unwrap_err();
     assert!(
@@ -473,7 +441,7 @@ async fn supersedes_must_name_an_approved_tenet_and_a_tenet_is_superseded_once()
         Some(left.number)
     );
     // The loser can still be declined; that supersedes nothing.
-    answer_with(&db, right.number, by(Verdict::None, human()))
+    answer_with(&db, right.number, by(Verdict::No, human()))
         .await
         .unwrap();
 
@@ -527,16 +495,14 @@ async fn a_proposer_needs_thread_lineage_which_a_delegated_task_inherits() {
 #[tokio::test]
 async fn a_migrated_slug_resolves_to_its_canonical_number() {
     let db = fixture("tenets-slug.db").await;
-    propose_ok(&db, &design(), proposal("Unrelated", &["a"])).await;
+    propose_ok(&db, &design(), proposal("Unrelated")).await;
     let new = NewTenet {
         project_id: PROJECT.into(),
         proposing_thread_id: DESIGN.into(),
         slug: Some("rulings-become-tenets".into()),
-        question: "Rulings become tenets".into(),
-        options: vec!["Rulings become tenets".into()],
+        statement: "Rulings become tenets".into(),
         status: TenetStatus::Approved,
-        verdict: Some("option"),
-        selected_option: Some(0),
+        verdict: Some(Verdict::Yes),
         comment: None,
         answered_by: None,
         answer_source: Some(AnswerSource::Migrated),
@@ -586,13 +552,8 @@ async fn a_migrated_slug_resolves_to_its_canonical_number() {
 #[tokio::test]
 async fn views_name_the_executions_a_tenet_gates_and_filter_by_thread() {
     let db = fixture("tenets-gates.db").await;
-    let tenet = propose_ok(&db, &design(), proposal("Gate?", &["a"])).await;
-    propose_ok(
-        &db,
-        &proposer(CHANNELS, "channels"),
-        proposal("Other?", &["a"]),
-    )
-    .await;
+    let tenet = propose_ok(&db, &design(), proposal("Gate?")).await;
+    propose_ok(&db, &proposer(CHANNELS, "channels"), proposal("Other?")).await;
     db.execute(
         "INSERT INTO execution_gates (id, execution_id, seq, predicate_json, created_at)
          VALUES ('g', 'e', 0, ?1, 1)",
@@ -672,8 +633,8 @@ async fn views_name_the_executions_a_tenet_gates_and_filter_by_thread() {
 #[tokio::test]
 async fn deleting_a_thread_keeps_decided_tenets_and_drops_unanswered_ones() {
     let db = fixture("tenets-thread-delete.db").await;
-    let decided = propose_ok(&db, &design(), proposal("Decided?", &["a"])).await;
-    answer_with(&db, decided.number, by(Verdict::Option(1), human()))
+    let decided = propose_ok(&db, &design(), proposal("Decided?")).await;
+    answer_with(&db, decided.number, by(Verdict::Yes, human()))
         .await
         .unwrap();
     let emitter = CapturingEmitter::new();
@@ -691,8 +652,8 @@ async fn deleting_a_thread_keeps_decided_tenets_and_drops_unanswered_ones() {
         .is_some());
 
     let channels = proposer(CHANNELS, "channels");
-    let pending = propose_ok(&db, &channels, proposal("Pending?", &["a"])).await;
-    let withdrawn = propose_ok(&db, &channels, proposal("Withdrawn?", &["a"])).await;
+    let pending = propose_ok(&db, &channels, proposal("Pending?")).await;
+    let withdrawn = propose_ok(&db, &channels, proposal("Withdrawn?")).await;
     withdraw(
         &db,
         &CapturingEmitter::new(),
@@ -720,21 +681,31 @@ async fn deleting_a_thread_keeps_decided_tenets_and_drops_unanswered_ones() {
 }
 
 #[test]
-fn a_verdict_parses_from_a_number_or_a_word() {
+fn a_verdict_is_yes_no_or_your_call() {
     use serde_json::json;
-    assert_eq!(Verdict::from_value(&json!(2)).unwrap(), Verdict::Option(2));
-    assert_eq!(
-        Verdict::from_value(&json!("3")).unwrap(),
-        Verdict::Option(3)
-    );
-    assert_eq!(Verdict::from_value(&json!("none")).unwrap(), Verdict::None);
+    assert_eq!(Verdict::from_value(&json!("yes")).unwrap(), Verdict::Yes);
+    assert_eq!(Verdict::from_value(&json!(" no ")).unwrap(), Verdict::No);
     assert_eq!(
         Verdict::from_value(&json!("your_call")).unwrap(),
         Verdict::YourCall
     );
-    for bad in [json!(0), json!(-1), json!("maybe"), json!(true)] {
-        assert!(Verdict::from_value(&bad).is_err(), "{bad}");
+    for bad in [
+        json!(1),
+        json!("1"),
+        json!("none"),
+        json!("maybe"),
+        json!(true),
+    ] {
+        let refusal = Verdict::from_value(&bad).unwrap_err();
+        assert!(
+            refusal.contains("\"yes\", \"no\", or \"your_call\""),
+            "{bad}: {refusal}"
+        );
     }
+    assert_eq!(
+        serde_json::to_value(Verdict::YourCall).unwrap(),
+        json!("your_call")
+    );
 }
 
 #[tokio::test]

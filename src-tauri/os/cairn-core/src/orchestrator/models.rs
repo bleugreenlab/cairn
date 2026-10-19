@@ -550,7 +550,7 @@ pub(crate) mod tests {
     use crate::models::UpdateSettings;
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use cairn_models::types::catalog::{claude_models, DiscoveredModel, ProviderModelCatalog};
     use cairn_models::types::usage::{ProviderUsageScope, ProviderUsageWindow};
     use std::sync::Arc;
@@ -571,9 +571,7 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap().keep();
         let config_dir = root.join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
-        let db = LocalDb::open(root.join("orch.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(root.join("orch.db"))
             .await
             .unwrap();
         let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());

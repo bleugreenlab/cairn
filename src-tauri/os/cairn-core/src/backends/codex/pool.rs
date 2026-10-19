@@ -1,7 +1,7 @@
 //! Credential refresh and workflow failure policy for the session-owned pool.
 use crate::orchestrator::Orchestrator;
 use cairn_models::codex::app_server::AppServerClient;
-use cairn_models::codex::token_requests::token_request_reply;
+use cairn_models::codex::token_requests::{standing_refusal_notice, token_request_reply};
 use cairn_models::codex::tokens::CodexAuthState;
 pub use cairn_session::backends::codex::pool::*;
 use serde_json::Value;
@@ -36,5 +36,8 @@ impl PoolHost for CorePoolHost {
                 "codex pooled app-server closed",
             );
         }
+    }
+    fn standing_token_refusal(&self) -> Option<String> {
+        standing_refusal_notice(self.oauth_state.as_ref())
     }
 }

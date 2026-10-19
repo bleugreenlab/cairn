@@ -33,6 +33,7 @@ pub use types::{
 
 use crate::mcp::vcs::{acquire_store_lock, STORE_LOCK_TIMEOUT};
 use crate::orchestrator::JjStoreOperationTrace;
+use crate::stack::off_frame;
 use crate::storage::RowExt;
 use commit_barrier::{run_commit_barrier, CommitBarrierOutcome};
 use std::path::Path;
@@ -4173,7 +4174,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 status_before,
                 marker_escape: marker_escape.clone(),
             };
-            return run_routed_batch(orch, settlement, placement, batch).await;
+            return off_frame(|| run_routed_batch(orch, settlement, placement, batch)).await;
         }
     }
 
@@ -4184,15 +4185,17 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         let mut outcomes: Vec<ItemOutcome> = Vec::with_capacity(resolved.len());
         for (index, (header, spec)) in resolved.into_iter().enumerate() {
             let stream_id = run_item_stream_id(&tool_use_id, index);
-            let outcome = run_one(
-                orch,
-                request,
-                &cwd,
-                &stream_id,
-                run_context.as_ref(),
-                header,
-                spec,
-            )
+            let outcome = off_frame(|| {
+                run_one(
+                    orch,
+                    request,
+                    &cwd,
+                    &stream_id,
+                    run_context.as_ref(),
+                    header,
+                    spec,
+                )
+            })
             .await;
             // A suspend stops the (sequential) batch: the whole call re-runs on
             // resume once the fence is answered.
@@ -4261,16 +4264,18 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         status_before,
         marker_escape,
     };
-    let settled = settle_run_batch(
-        orch,
-        &settlement,
-        BatchResidence::Home,
-        outcomes,
-        None,
-        None,
-        None,
-        None,
-    )
+    let settled = off_frame(|| {
+        settle_run_batch(
+            orch,
+            &settlement,
+            BatchResidence::Home,
+            outcomes,
+            None,
+            None,
+            None,
+            None,
+        )
+    })
     .await;
     if settled.suspended {
         return run_envelope(RUN_ITEM_SUSPENDED_MARKER.to_string(), Vec::new());
@@ -4948,14 +4953,17 @@ async fn run_routed_batch(
     });
     match tokio::time::timeout(run_grace_window(), &mut handle).await {
         Ok(joined) => {
-            let settled = settle_joined_batch(orch, &settlement, joined, None).await;
+            let settled = off_frame(|| settle_joined_batch(orch, &settlement, joined, None)).await;
             if settled.suspended {
                 return run_envelope(RUN_ITEM_SUSPENDED_MARKER.to_string(), Vec::new());
             }
             run_envelope(settled.text, settled.images)
         }
         Err(_) => {
-            suspend_until_batch_settles(orch, settlement, handle, request_id, cancelled).await
+            off_frame(|| {
+                suspend_until_batch_settles(orch, settlement, handle, request_id, cancelled)
+            })
+            .await
         }
     }
 }
@@ -5196,7 +5204,7 @@ async fn suspend_until_batch_settles(
         // Nothing to park (no correlatable call, no active turn): hold the call
         // open rather than abandoning a running batch.
         let joined = handle.await;
-        let settled = settle_joined_batch(orch, &settlement, joined, None).await;
+        let settled = off_frame(|| settle_joined_batch(orch, &settlement, joined, None)).await;
         if settled.suspended {
             return run_envelope(RUN_ITEM_SUSPENDED_MARKER.to_string(), Vec::new());
         }
@@ -5221,7 +5229,8 @@ async fn suspend_until_batch_settles(
                 (handle.await, Some(RUN_CEILING_DETAIL.to_string()))
             }
         };
-        let settled = settle_joined_batch(&owned_orch, &settlement, joined, ceiling).await;
+        let settled =
+            off_frame(|| settle_joined_batch(&owned_orch, &settlement, joined, ceiling)).await;
         // Nothing resumes the run until the predecessor turn is actually parked.
         if !handoff.parked().await {
             log::warn!(
@@ -5476,15 +5485,17 @@ async fn settle_joined_batch(
     };
     match placed {
         PlacedBatch::Cell(outcome, residence, notes) => {
-            settle_routed_run_batch(
-                orch,
-                settlement,
-                residence,
-                *outcome,
-                grant_without_result.clone(),
-                ceiling,
-                notes,
-            )
+            off_frame(|| {
+                settle_routed_run_batch(
+                    orch,
+                    settlement,
+                    residence,
+                    *outcome,
+                    grant_without_result.clone(),
+                    ceiling,
+                    notes,
+                )
+            })
             .await
         }
         PlacedBatch::Refused(refusal) => refused(format!("{refusal}.")),
@@ -5559,16 +5570,18 @@ async fn settle_routed_run_batch(
             );
         }
     };
-    settle_run_batch(
-        orch,
-        settlement,
-        residence,
-        outcomes,
-        routed_delta,
-        routed_tracked_modifications,
-        publication_request.as_ref(),
-        notes.executed(),
-    )
+    off_frame(|| {
+        settle_run_batch(
+            orch,
+            settlement,
+            residence,
+            outcomes,
+            routed_delta,
+            routed_tracked_modifications,
+            publication_request.as_ref(),
+            notes.executed(),
+        )
+    })
     .await
 }
 

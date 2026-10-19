@@ -825,7 +825,7 @@ pub fn turn_from_row(row: &cairn_db::turso::Row) -> DbResult<Turn> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+
     use cairn_platform::services::emitter::EventEmitter;
     use serde_json::Value;
 
@@ -842,13 +842,11 @@ mod tests {
     }
 
     async fn test_db() -> LocalDb {
-        let db = LocalDb::open(tempfile::tempdir().unwrap().keep().join("turn-queries.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
+        let db = LocalDb::open_migrated_for_test(
+            tempfile::tempdir().unwrap().keep().join("turn-queries.db"),
+        )
+        .await
+        .unwrap();
         db
     }
 

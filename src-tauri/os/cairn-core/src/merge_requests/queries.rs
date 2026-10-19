@@ -1,4 +1,4 @@
-use crate::models::{Check, MergeableState, PrCache, PrDataSummary, PrState, WebhookEvent};
+use crate::models::{Check, MergeableState, PrCache, PrDataSummary, PrState};
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_db::turso::params;
 
@@ -275,53 +275,4 @@ async fn pr_summary_for_job(
     )
     .await
     .map_err(|e| format!("Failed to load PR summary: {e}"))
-}
-
-pub async fn get_webhook_events(db: &LocalDb, pr_number: i64) -> Result<Vec<WebhookEvent>, String> {
-    db.query_all(
-        "SELECT id, event_type, action, repo_full_name, pr_number,
-                payload_summary, processed_at
-         FROM webhook_events
-         WHERE pr_number = ?1
-         ORDER BY processed_at DESC
-         LIMIT 100",
-        params![pr_number],
-        webhook_event_from_row,
-    )
-    .await
-    .map_err(|e| format!("Failed to load webhook events: {e}"))
-}
-
-pub async fn get_webhook_events_for_job(
-    db: &LocalDb,
-    job_id: &str,
-) -> Result<Vec<WebhookEvent>, String> {
-    let Some(pr_number) = db
-        .query_opt(
-            "SELECT github_pr_number FROM merge_requests WHERE job_id = ?1",
-            params![job_id],
-            |row| row.opt_i64(0),
-        )
-        .await
-        .map_err(|e| format!("Failed to load webhook events for job: {e}"))?
-        .flatten()
-    else {
-        return Ok(Vec::new());
-    };
-
-    get_webhook_events(db, pr_number)
-        .await
-        .map_err(|e| format!("Failed to load webhook events for job: {e}"))
-}
-
-fn webhook_event_from_row(row: &cairn_db::turso::Row) -> DbResult<WebhookEvent> {
-    Ok(WebhookEvent {
-        id: row.text(0)?,
-        event_type: row.text(1)?,
-        action: row.text(2)?,
-        repo_full_name: row.text(3)?,
-        pr_number: row.opt_i64(4)?,
-        payload_summary: row.text(5)?,
-        processed_at: row.i64(6)?,
-    })
 }

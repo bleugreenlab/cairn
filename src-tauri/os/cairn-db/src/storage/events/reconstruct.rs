@@ -1,7 +1,8 @@
 //! Transparent reconstruction of archived events on the read path.
 //!
 //! Events are recorded `full` on the hot path and rewritten to git coordinates
-//! (with a zstd backstop) at worktree teardown, the immutability boundary. This
+//! (with a zstd backstop) at issue teardown (and by the recurring sweep), the
+//! immutability boundary. This
 //! module restores them on read so every event consumer — transcripts, search,
 //! the frontend — sees the original rendered content without knowing archival
 //! exists. [`reconstruct_events`] is strict identity when every row is `full`
@@ -895,10 +896,19 @@ fn commit_diff_sections(
     }
 }
 
-/// Inject the regenerated diff into each file change's `payload.diff`. A change
-/// whose file is absent from the diff (resource target, or no textual change) is
-/// left payload-free; when the coordinate is wholly unresolvable, each file
-/// change gets a labeled stub instead.
+/// The repo paths a commit's diff touches, split exactly as write
+/// reconstruction splits it, or `None` when the commit is unresolvable. The
+/// archival writer drops a change's payload only for a path in this set, so
+/// every payload it drops is one [`inject_change_diffs`] fills back in.
+pub fn commit_diff_paths(commit_hex: &str, store: &ObjectStore) -> Option<HashSet<String>> {
+    commit_diff_sections(commit_hex, Some(store)).map(|sections| sections.into_keys().collect())
+}
+
+/// Inject the regenerated diff into each payload-free file change's
+/// `payload.diff`. A change that kept its payload (a resource target, a rename,
+/// a `unified_patch` envelope, a failed item) is left as stored, and a file
+/// absent from the diff stays payload-free; when the coordinate is wholly
+/// unresolvable, each payload-free file change gets a labeled stub instead.
 fn inject_change_diffs(
     tool: &mut Value,
     commit_hex: &str,
@@ -916,6 +926,9 @@ fn inject_change_diffs(
         let Some(obj) = change.as_object_mut() else {
             continue;
         };
+        if obj.contains_key("payload") {
+            continue;
+        }
         let Some(target) = obj
             .get("target")
             .and_then(|v| v.as_str())

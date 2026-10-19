@@ -342,16 +342,12 @@ pub(super) async fn apply_memory_triage_action(
 mod tests {
     use super::parse_deferred_scope;
     use crate::models::MemoryScope;
-    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::LocalDb;
     use serde_json::json;
 
     async fn db_with_project() -> LocalDb {
         let temp = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("defer-scope-test.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("defer-scope-test.db"))
             .await
             .unwrap();
         db.execute(

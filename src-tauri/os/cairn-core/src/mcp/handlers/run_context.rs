@@ -315,13 +315,11 @@ pub(crate) async fn project_path(db: &LocalDb, project_id: &str) -> Result<Optio
 mod tests {
     use super::*;
     use crate::db::DbState;
-    use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::SearchIndex;
 
     async fn local_dbs() -> std::sync::Arc<DbState> {
         let dir = tempfile::tempdir().unwrap().keep();
-        let db = LocalDb::open(dir.join("p.turso.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(dir.join("p.turso.db"))
             .await
             .unwrap();
         let search = SearchIndex::open_or_create(dir.join("p.search")).unwrap();
@@ -517,7 +515,7 @@ mod tests {
             .await
             .expect("a thread-owned job may not commit");
         assert!(
-            refusal.contains("thread-owned job") && refusal.contains("child issue"),
+            refusal.contains("thread-owned job") && refusal.contains("cairn:~/branches"),
             "the refusal must carry the posture and where the work belongs: {refusal}"
         );
 

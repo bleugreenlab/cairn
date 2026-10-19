@@ -35,7 +35,7 @@ pub use references::validate_references;
 pub use worker::spawn_fact_log_worker;
 pub(crate) use worker::{addressed_via, explain_thread_triggers};
 #[cfg(test)]
-pub(crate) use worker::{drain_fact_log, drain_fact_log_within};
+pub(crate) use worker::{drain_fact_log, drain_fact_log_within, fixture};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

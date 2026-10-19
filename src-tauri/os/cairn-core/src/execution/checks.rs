@@ -462,22 +462,6 @@ fn sealed_coordinates(
         .collect()
 }
 
-#[derive(Clone)]
-pub(crate) struct ReviewTreeOwner {
-    pub(crate) project_key: String,
-    pub(crate) revision: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReviewTreeCheckScope {
-    /// Synchronous integration landing: only checks whose policy gates the merge.
-    Gates,
-    /// Default-branch health: every applicable review check, including advisory,
-    /// run in its declared whole-suite form. The synthetic whole-tree change set
-    /// establishes applicability only; it must never become selector arguments.
-    All,
-}
-
 fn substrate_failure_kind(failure: &SubstrateFailure) -> CheckFailureKind {
     if failure.shape() == SubstrateFailureShape::Capacity {
         CheckFailureKind::Capacity
@@ -816,8 +800,8 @@ fn require_snapshot_command(expected: &str, submitted: &str) -> Result<(), Check
 }
 
 #[derive(Debug, Clone)]
-struct ManualCheckContractSnapshot {
-    context: ManualCheckCacheContext,
+pub(crate) struct CheckContractSnapshot {
+    pub(crate) context: ManualCheckCacheContext,
     sealed_coordinate: crate::execution::cache::SealedCheckCoordinate,
     repository_path: String,
     /// The branch whose fork point with the sealed head is this run's base. See
@@ -932,7 +916,7 @@ async fn resolve_manual_check_contract_snapshot(
     check_name: &str,
     branch: Option<&str>,
     placement_override: Option<&crate::execution::check_placement::CheckPlacementOverride>,
-) -> Result<ManualCheckContractSnapshot, String> {
+) -> Result<CheckContractSnapshot, String> {
     let db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
         .await
         .map_err(|error| error.to_string())?;
@@ -978,6 +962,58 @@ async fn resolve_manual_check_contract_snapshot(
                 other => other.to_string(),
             })?,
     };
+    resolve_check_contract_at_commit(
+        orch,
+        db,
+        CheckRunTarget {
+            job_id,
+            project_id,
+            project_key,
+            repository_path,
+            attribution_target,
+        },
+        commit,
+        check_name,
+        placement_override,
+    )
+    .await
+}
+
+/// Who a configured check run belongs to and what it is measured against.
+///
+/// `job_id` is the identity the observation records. For a manual run it is the
+/// requesting run's job; for the main cadence it is the synthetic
+/// `main:{project_id}` owner, which names no job row.
+pub(crate) struct CheckRunTarget {
+    pub(crate) job_id: String,
+    pub(crate) project_id: String,
+    pub(crate) project_key: String,
+    pub(crate) repository_path: String,
+    /// The branch whose fork point with the evaluated commit is this run's
+    /// base. See [`manual_attribution_target`].
+    pub(crate) attribution_target: String,
+}
+
+/// Resolve every mutable input to one configured check at one already-resolved
+/// commit: the definition that commit declares, its placement, its whole-suite
+/// plan, and its input key. This is the run-independent half of the trusted
+/// manual producer, shared with the main cadence so both record the same shape.
+pub(crate) async fn resolve_check_contract_at_commit(
+    orch: &Orchestrator,
+    db: Arc<LocalDb>,
+    target: CheckRunTarget,
+    commit: String,
+    check_name: &str,
+    placement_override: Option<&crate::execution::check_placement::CheckPlacementOverride>,
+) -> Result<CheckContractSnapshot, String> {
+    let CheckRunTarget {
+        job_id,
+        project_id,
+        project_key,
+        repository_path,
+        attribution_target,
+    } = target;
+    let repository = PathBuf::from(&repository_path);
     let CommitChecksContract {
         contract: ChecksContract {
             checks,
@@ -1037,7 +1073,7 @@ async fn resolve_manual_check_contract_snapshot(
         &tree_hash,
         &input_hash,
     );
-    Ok(ManualCheckContractSnapshot {
+    Ok(CheckContractSnapshot {
         context: ManualCheckCacheContext {
             project_id,
             project_key,
@@ -1385,11 +1421,56 @@ pub async fn run_manual_configured_check_with_progress(
         placement.as_ref(),
     )
     .await?;
-    let placement = contract.placement;
-    let context = contract.context;
-    let db = crate::execution::routing::owning_db_for_job(&orch.db, &context.job_id)
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, &contract.context.job_id)
         .await
         .map_err(|error| error.to_string())?;
+    let job_id = contract.context.job_id.clone();
+    execute_check_contract(
+        orch,
+        db,
+        contract,
+        CheckRunProducer {
+            tool_use_id: format!("manual-check:{run_id}:{check_name}"),
+            node_kind: "manual-check".to_string(),
+            owner_job_id: Some(job_id),
+            purpose: None,
+        },
+        retry,
+        progress,
+    )
+    .await
+}
+
+/// The producer a configured check run records itself as.
+pub(crate) struct CheckRunProducer {
+    /// Stream identity. Its prefix decides the observation's `cadence` label
+    /// (see [`observation_cadence`]).
+    pub(crate) tool_use_id: String,
+    /// How the run's build cell names its owner on the Work surface.
+    pub(crate) node_kind: String,
+    /// The real job this run serves, when there is one. The main cadence has
+    /// none: its `main:{project}` identity names no job row.
+    pub(crate) owner_job_id: Option<String>,
+    /// The standing question this run answers, when at most one live answer
+    /// may exist at a time.
+    pub(crate) purpose: Option<crate::fleet::purpose::PurposeKey>,
+}
+
+/// Execute one resolved configured-check contract and record its observation.
+/// The executing half of the trusted manual producer, shared with the main
+/// cadence.
+pub(crate) async fn execute_check_contract(
+    orch: &Orchestrator,
+    db: Arc<LocalDb>,
+    contract: CheckContractSnapshot,
+    producer: CheckRunProducer,
+    retry: bool,
+    progress: ManualCheckProgress,
+) -> Result<ManualConfiguredCheckResult, String> {
+    let check_name = contract.plan.name.clone();
+    let check_name = check_name.as_str();
+    let placement = contract.placement;
+    let context = contract.context;
     let repository_path = contract.repository_path;
     let repository = PathBuf::from(&repository_path);
     let plan = contract.plan;
@@ -1432,7 +1513,12 @@ pub async fn run_manual_configured_check_with_progress(
     );
     let timeout_ms = contract.timeout_ms;
     let store_dir = crate::jj::project_store_dir(&orch.config_dir, &repository);
-    let tool_use_id = format!("manual-check:{run_id}:{check_name}");
+    let CheckRunProducer {
+        tool_use_id,
+        node_kind,
+        owner_job_id,
+        purpose,
+    } = producer;
     let project_id = context.project_id.clone();
     let job_id = context.job_id.clone();
     let commit_sha = context.commit_sha.clone();
@@ -1500,6 +1586,9 @@ pub async fn run_manual_configured_check_with_progress(
             let item_template = item_template.clone();
             let snapshot_command = snapshot_command.clone();
             let status_board = status_board.clone();
+            let node_kind = node_kind.clone();
+            let owner_job_id = owner_job_id.clone();
+            let purpose = purpose.clone();
             async move {
                 require_snapshot_command(&snapshot_command, &command)?;
                 submit_planned_check_batch(
@@ -1514,9 +1603,9 @@ pub async fn run_manual_configured_check_with_progress(
                             project_id,
                             project_key: None,
                             issue_number: None,
-                            job_id: Some(job_id.clone()),
+                            job_id: owner_job_id,
                             execution_seq: None,
-                            node_kind: Some("manual-check".to_string()),
+                            node_kind: Some(node_kind),
                         },
                         affinity_key: Some(job_id),
                         priority: CellPriority::ReviewCheck,
@@ -1529,7 +1618,7 @@ pub async fn run_manual_configured_check_with_progress(
                         run_context: None,
                         mutation_policy: MutationPolicy::PureVerdict,
                         status_board: Some(status_board.clone()),
-                        purpose: None,
+                        purpose,
                     },
                 )
                 .await?
@@ -2845,19 +2934,12 @@ pub(crate) async fn submit_planned_check_batch(
     orch: &Orchestrator,
     batch: PlannedCheckBatchRequest,
 ) -> Result<PlannedCheckBatchOutcome, String> {
-    submit_planned_check_batch_with_topology(orch, batch, CheckBatchTopology::Partitioned).await
+    submit_admitted_check_batch(orch, batch).await
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CheckBatchTopology {
-    Partitioned,
-    Unified,
-}
-
-async fn submit_planned_check_batch_with_topology(
+async fn submit_admitted_check_batch(
     orch: &Orchestrator,
     mut batch: PlannedCheckBatchRequest,
-    topology: CheckBatchTopology,
 ) -> Result<PlannedCheckBatchOutcome, String> {
     let unplaceable = refuse_unplaceable_items(&orch.fleet, &mut batch.items);
     let (admitted, mut refused) = reserve_batch_items(
@@ -2889,8 +2971,7 @@ async fn submit_planned_check_batch_with_topology(
         .collect::<Vec<_>>()
         .join(", ");
     let mut outcome = loop {
-        let presented =
-            submit_reserved_check_batch(orch, batch.clone(), &patience, topology).await?;
+        let presented = submit_reserved_check_batch(orch, batch.clone(), &patience).await?;
         let CapacityRetry::Again { backoff } = capacity_retry_decision(&presented.outcome) else {
             break presented.outcome;
         };
@@ -2991,17 +3072,16 @@ struct PresentedBatch {
     outcome: PlannedCheckBatchOutcome,
 }
 
-fn partitions_by_placement(policy: &MutationPolicy, topology: CheckBatchTopology) -> bool {
-    *policy == MutationPolicy::PureVerdict && topology == CheckBatchTopology::Partitioned
+fn partitions_by_placement(policy: &MutationPolicy) -> bool {
+    *policy == MutationPolicy::PureVerdict
 }
 
 async fn submit_reserved_check_batch(
     orch: &Orchestrator,
     mut batch: PlannedCheckBatchRequest,
     patience: &CheckPatience,
-    topology: CheckBatchTopology,
 ) -> Result<PresentedBatch, String> {
-    if partitions_by_placement(&batch.mutation_policy, topology) {
+    if partitions_by_placement(&batch.mutation_policy) {
         let mut groups = partition_check_items_by_placement(std::mem::take(&mut batch.items));
         if groups.len() > 1 {
             let mut combined = PlannedCheckBatchOutcome {
@@ -6572,14 +6652,7 @@ fn fresh_observation_write(
         run_id: tool_use_id
             .strip_prefix("manual-check:")
             .and_then(|value| value.split_once(':').map(|(run_id, _)| run_id.to_string())),
-        cadence: if tool_use_id.starts_with("turn-checks:") {
-            "review"
-        } else if tool_use_id.starts_with("manual-check:") {
-            "manual"
-        } else {
-            "write"
-        }
-        .to_string(),
+        cadence: observation_cadence(tool_use_id).to_string(),
         executor_id: provenance.map(|meta| meta.executor_id.clone()),
         executor_device_id: provenance.map(|meta| meta.executor_device_id.clone()),
         executor_connection_generation: provenance
@@ -6598,6 +6671,24 @@ fn fresh_observation_write(
         target_results_json: parsed.and_then(|result| serde_json::to_string(result).ok()),
         tests,
         infra_reset_scopes,
+    }
+}
+
+/// Stream prefix of a main-cadence lane. Its observations record
+/// `cadence = 'main'` and `job_id = 'main:{project_id}'`; see
+/// [`crate::execution::checks_main`].
+pub(crate) const MAIN_CADENCE_STREAM_PREFIX: &str = "main-cadence:";
+
+/// The `cadence` an observation records, decided by its producer's stream prefix.
+fn observation_cadence(tool_use_id: &str) -> &'static str {
+    if tool_use_id.starts_with("turn-checks:") {
+        "review"
+    } else if tool_use_id.starts_with("manual-check:") {
+        "manual"
+    } else if tool_use_id.starts_with(MAIN_CADENCE_STREAM_PREFIX) {
+        "main"
+    } else {
+        "write"
     }
 }
 
@@ -8532,11 +8623,8 @@ pub(crate) async fn verify_review_tree(
     tree_hash: &str,
     tree_entries: &[(String, String)],
     changed: &[GraphFileChange],
-    attributed_changed: Option<&[GraphFileChange]>,
     requesting_job_id: &str,
     priority: CellPriority,
-    scope: ReviewTreeCheckScope,
-    main_owner: Option<ReviewTreeOwner>,
 ) -> ReviewTreeGateResult {
     if changed.is_empty() {
         return ReviewTreeGateResult::Green;
@@ -8568,16 +8656,7 @@ pub(crate) async fn verify_review_tree(
     };
     let snapshot = TreeSnapshot::new(Some(tree_entries), &blobs);
     let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
-    let plans = match scope {
-        ReviewTreeCheckScope::Gates => {
-            applicable_combined_tree_gate_checks(&checks, &inputs, changed, planning_root)
-        }
-        ReviewTreeCheckScope::All => resolve_full_tree_plans(
-            applicable_turn_end_checks(&checks, &inputs, changed, planning_root),
-            &checks,
-        ),
-    };
-    let mut plans = plans;
+    let mut plans = applicable_combined_tree_gate_checks(&checks, &inputs, changed, planning_root);
     retain_gating_platform_plans(
         &mut plans,
         &checks,
@@ -8604,9 +8683,7 @@ pub(crate) async fn verify_review_tree(
         toolchain,
     );
 
-    // Full main-health uses the whole tree only to decide which suites apply.
-    // Protocol attribution must remain the actual integration-base diff.
-    let attributed_changed = attributed_changed.unwrap_or(changed);
+    let attributed_changed = changed;
     let base_content = if keyed
         .iter()
         .any(|(plan, _)| needs_executor_base_content(&plan.name))
@@ -8709,141 +8786,8 @@ pub(crate) async fn verify_review_tree(
                 execution_seq: Some(coords.exec_seq),
                 node_kind: Some(coords.node_segment),
             });
-    let main_owner = main_owner.map(|owner| (owner.project_key, owner.revision));
     let keyed_ref = &keyed;
-    let outcomes = if scope == ReviewTreeCheckScope::All {
-        // Resolve reusable verdicts before placement. The lookup is admitted by
-        // each suite's declared platform trust set, so hits do not depend on which
-        // executor a miss would select and consume no fleet capacity.
-        let miss_indices: Vec<usize> = keyed
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (plan, input_hash))| {
-                needs_execution(result_db.clone(), project_id, plan, input_hash, &env)
-                    .then_some(index)
-            })
-            .collect();
-        let batched_results = if miss_indices.is_empty() {
-            HashMap::new()
-        } else {
-            let Some((_project_key, revision)) = main_owner.clone() else {
-                return ReviewTreeGateResult::InfrastructureFailure(
-                    "main-health batch has no display identity".into(),
-                );
-            };
-            let items = miss_indices
-                .iter()
-                .map(|index| PlannedCheckBatchItem {
-                    index: *index,
-                    name: keyed[*index].0.name.clone(),
-                    input_hash: keyed[*index].1.clone(),
-                    resource_identity: command_identity_inputs[*index].clone(),
-                    command: keyed[*index].0.command.clone(),
-                    stream_id: crate::mcp::handlers::run::check_stream_id(
-                        &format!("main-health:{project_id}:{commit_id}"),
-                        *index,
-                    ),
-                    env: env.clone(),
-                    verdict_environment_names: keyed[*index].0.verdict_environment_names.clone(),
-                    timeout_ms: timeouts[*index].into(),
-                    executor: executors[*index].clone(),
-                    verdict_platforms: checks
-                        .get(&keyed[*index].0.name)
-                        .map(crate::execution::check_identity::verdict_platforms)
-                        .unwrap_or_default(),
-                    resource_class: keyed[*index].0.resource_class,
-                    infra_scopes: infra_scopes[*index].clone(),
-                    avoid_executor_ids: Vec::new(),
-                })
-                .collect();
-            let store_dir = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repository));
-            match submit_planned_check_batch_with_topology(
-                orch,
-                PlannedCheckBatchRequest {
-                    project_id: project.clone(),
-                    repository: repository.clone(),
-                    store_dir,
-                    sealed_commit: commit.clone(),
-                    requesting_job_id: job.clone(),
-                    owner: cairn_common::executor_protocol::CellOwnerRef {
-                        project_id: project.clone(),
-                        project_key: None,
-                        issue_number: None,
-                        job_id: None,
-                        execution_seq: None,
-                        node_kind: Some(format!("main-health @ {revision}")),
-                    },
-                    affinity_key: None,
-                    priority,
-                    env: env.clone(),
-                    items,
-                    run_context: None,
-                    mutation_policy: MutationPolicy::PureVerdict,
-                    status_board: None,
-                    // One attestation slot per project. Arming a newer tip
-                    // replaces the older one by this key, so two concurrent
-                    // attestations of one project are unrepresentable rather
-                    // than prevented by cooperative cancellation. The key names
-                    // the project and never the revision — a newer tip is a
-                    // newer answer to the same standing question.
-                    purpose: Some(crate::fleet::purpose::PurposeKey::main_attestation(
-                        &project,
-                    )),
-                },
-                CheckBatchTopology::Unified,
-            )
-            .await
-            {
-                Ok(outcome) => outcome.results,
-                Err(error) => {
-                    PlannedCheckBatchOutcome::failed(
-                        miss_indices,
-                        SubstrateFailure::new(SubstrateFailureShape::Dispatch, error),
-                    )
-                    .results
-                }
-            }
-        };
-        let batched_results = Arc::new(std::sync::Mutex::new(batched_results));
-        let commit = CheckRunCommit {
-            evaluated: commit_id,
-            defined_by: &defined_by_commit,
-        };
-        let sealed_coordinates = sealed_coordinates(commit, tree_hash, &keyed);
-        run_planned_checks_at_commit_with_env_and_coordinates(
-            result_db,
-            project_id,
-            commit,
-            tree_hash,
-            requesting_job_id,
-            &keyed,
-            &sealed_coordinates,
-            &infra_scopes,
-            &format!("main-health:{requesting_job_id}"),
-            CheckExecMode::Shared,
-            Some(orch),
-            &env,
-            move |index, _command, _stream_id| {
-                let batched_results = batched_results.clone();
-                async move {
-                    batched_results
-                        .lock()
-                        .unwrap()
-                        .remove(&index)
-                        .unwrap_or_else(|| {
-                            Err(CheckExecutionFailure::substrate(
-                                SubstrateFailureShape::Result,
-                                format!(
-                                    "missing main-health batched outcome for plan index {index}"
-                                ),
-                            ))
-                        })
-                }
-            },
-            |_| {},
-        )
-        .await
-    } else {
+    let outcomes = {
         let execution_env = env.clone();
         let commit_coordinate = CheckRunCommit {
             evaluated: commit_id,
@@ -9158,15 +9102,9 @@ mod tests {
     /// contradictory machines is refused as the configuration error it is rather
     /// than becoming a placement problem.
     #[test]
-    fn main_health_unified_topology_never_partitions_its_pure_verdict_unit() {
-        assert!(partitions_by_placement(
-            &MutationPolicy::PureVerdict,
-            CheckBatchTopology::Partitioned,
-        ));
-        assert!(!partitions_by_placement(
-            &MutationPolicy::PureVerdict,
-            CheckBatchTopology::Unified,
-        ));
+    fn only_a_pure_verdict_batch_partitions_by_placement() {
+        assert!(partitions_by_placement(&MutationPolicy::PureVerdict));
+        assert!(!partitions_by_placement(&MutationPolicy::AllowDelta));
     }
 
     #[test]
@@ -9358,16 +9296,14 @@ mod tests {
     use crate::db::DbState;
     use crate::execution::selection::CheckScope;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tempfile::TempDir;
 
     async fn test_orchestrator(config_dir: &Path) -> Orchestrator {
-        let local = LocalDb::open(config_dir.join("checks.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        let local = LocalDb::open_migrated_for_test(config_dir.join("checks.db"))
             .await
             .unwrap();
         let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
@@ -11184,6 +11120,7 @@ cairn-common = { path = "../cairn-common" }
             verdict_environment: Vec::new(),
             verdict_platforms: None,
             fixes: false,
+            main_cadence: None,
         }
     }
 
@@ -12260,6 +12197,7 @@ cairn-common = { path = "../cairn-common" }
     fn fixing_check(command: &str, impact: Option<&[&str]>) -> CheckCommand {
         CheckCommand {
             fixes: true,
+            main_cadence: None,
             ..check(command, impact, CheckWhen::Write)
         }
     }

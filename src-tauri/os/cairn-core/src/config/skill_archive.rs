@@ -49,10 +49,7 @@ pub(crate) fn validate_portable_relative_path(path: &str) -> Result<(), String> 
 }
 
 fn ignored_metadata_path(path: &str) -> bool {
-    path == ".DS_Store"
-        || path.ends_with("/.DS_Store")
-        || path == "__MACOSX"
-        || path.starts_with("__MACOSX/")
+    super::pack::is_os_metadata_path(Path::new(path))
 }
 
 /// Parse a bounded `.skill` ZIP payload without extracting it to disk.

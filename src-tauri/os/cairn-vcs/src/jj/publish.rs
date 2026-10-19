@@ -463,22 +463,8 @@ impl Drop for DeltaObjectPin {
 /// closed — an unreadable tree here is "could not check", which on a publication
 /// path is not "checked and fine".
 fn refuse_conflict_scaffolding(repository: &Path, commit: &str) -> Result<(), String> {
-    let output = cairn_platform::env::git()
-        .args(["ls-tree", "--name-only", commit])
-        .current_dir(repository)
-        .output()
-        .map_err(|error| {
-            format!("inspect delta tree root {commit} for conflict scaffolding: {error}")
-        })?;
-    if !output.status.success() {
-        return Err(format!(
-            "inspect delta tree root {commit} for conflict scaffolding: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let entries = cairn_common::conflict_scaffolding::conflict_scaffolding_in_root_listing(
-        &String::from_utf8_lossy(&output.stdout),
-    );
+    let entries = super::export::root_conflict_scaffolding(repository, commit)
+        .map_err(|error| format!("delta {error}"))?;
     if entries.is_empty() {
         return Ok(());
     }

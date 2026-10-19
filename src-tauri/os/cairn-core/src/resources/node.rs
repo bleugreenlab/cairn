@@ -2972,17 +2972,13 @@ pub(super) async fn render_job_chat_event(
 #[cfg(test)]
 mod task_permission_tests {
     use super::{read_node_permission, read_task_permission, read_task_permissions};
-    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::LocalDb;
 
     async fn test_db() -> LocalDb {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("task-perm.db");
         std::mem::forget(temp);
-        let db = LocalDb::open(path).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
+        let db = LocalDb::open_migrated_for_test(path).await.unwrap();
         db
     }
 
@@ -3058,17 +3054,13 @@ mod task_permission_tests {
 #[cfg(test)]
 mod coordinated_child_wakes_tests {
     use super::read_node_wakes;
-    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::LocalDb;
 
     async fn test_db() -> LocalDb {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("coordinated-child-wakes.db");
         std::mem::forget(temp);
-        let db = LocalDb::open(path).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
+        let db = LocalDb::open_migrated_for_test(path).await.unwrap();
         db
     }
 
@@ -3282,19 +3274,15 @@ mod wait_artifact_tests {
     use crate::db::DbState;
     use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use std::sync::Arc;
 
     async fn orch_with_db() -> (Orchestrator, Arc<LocalDb>) {
         let local = Arc::new(
-            LocalDb::open(tempfile::tempdir().unwrap().keep().join("wait.db"))
+            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("wait.db"))
                 .await
                 .unwrap(),
         );
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
-            .await
-            .unwrap();
         let search =
             Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
         let db = Arc::new(DbState::new(local.clone(), search));

@@ -15,7 +15,7 @@ use cairn_common::uri::build_pack_uri;
 
 use crate::config::mcp_servers::{workspace_mcp_entries, NotReady, WorkspaceMcpEntry};
 use crate::config::pack::mcp::McpVarRequirement;
-use crate::config::pack::{self, PackItem, PackItemKind, PackLock, PackManifest};
+use crate::config::pack::{self, ContentHash, PackItem, PackItemKind, PackLock, PackManifest};
 
 /// One pack as the catalog sees it: what the app ships, what the workspace
 /// installed, or both.
@@ -142,6 +142,11 @@ pub struct PackCatalogItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     pub state: PackItemState,
+    /// For the user's copy of a file-backed item: whether the version the app
+    /// ships now differs from it. This is the case worth acting on -- a copy
+    /// that merely equals the shipped one costs nothing to keep.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub behind_shipped: bool,
     /// Why an MCP item cannot connect yet, straight from the registry that
     /// decides it. The UI renders this verdict; it never re-derives one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -209,6 +214,11 @@ pub struct PackCatalogEntry {
     pub items: Vec<PackCatalogItem>,
     /// Live (non-removed) item counts by kind.
     pub counts: Vec<PackContentCount>,
+    /// How many items are the user's copies, and how many of those the app now
+    /// ships differently -- the line a pack row states so a frozen copy is
+    /// visible without opening the pack.
+    pub edited_count: usize,
+    pub behind_count: usize,
     /// The catalog section this entry belongs in: [`PACK_ENTRY_KIND`] for a
     /// bundle, or the kind of the one item it ships. See [`entry_kind`].
     pub entry_kind: String,
@@ -237,12 +247,11 @@ fn entry_kind(items: &[PackCatalogItem]) -> String {
 }
 
 impl PackCatalogEntry {
-    /// Workspace-relative paths of items the user has made theirs.
-    fn edited_paths(&self) -> Vec<&str> {
+    /// Items the user has made theirs.
+    fn edited_items(&self) -> Vec<&PackCatalogItem> {
         self.items
             .iter()
             .filter(|item| item.state == PackItemState::EditedByUser)
-            .filter_map(|item| item.path.as_deref())
             .collect()
     }
 
@@ -333,8 +342,11 @@ fn project(
         .items()
         .into_iter()
         .map(|item| {
-            let state = item_state(&view.id, &item, view.installed.as_ref(), mcp_entries);
-            catalog_item(item, state, mcp_entries)
+            let verdict = file_item_verdict(config_dir, view, &item);
+            let state = item_state(&view.id, &item, verdict.edited, mcp_entries);
+            let mut entry = catalog_item(item, state, mcp_entries);
+            entry.behind_shipped = verdict.behind;
+            entry
         })
         .collect();
     if let Some(lock) = &view.installed {
@@ -395,8 +407,59 @@ fn project(
             })
             .collect(),
         entry_kind: entry_kind(&items),
+        edited_count: items
+            .iter()
+            .filter(|item| item.state == PackItemState::EditedByUser)
+            .count(),
+        behind_count: items.iter().filter(|item| item.behind_shipped).count(),
         items,
     }
+}
+
+#[derive(Default)]
+struct ItemVerdict {
+    edited: bool,
+    behind: bool,
+}
+
+/// Whether one file-backed item is the user's copy, and whether the app ships
+/// something different from it.
+///
+/// Read live from content hashes against the lock baseline and the shipped
+/// source -- never from Git -- so an edit saved a moment ago reads as the
+/// user's copy before the next sync records the fork.
+fn file_item_verdict(config_dir: &Path, view: &PackView, item: &PackItem) -> ItemVerdict {
+    let Some(locked) = view
+        .installed
+        .as_ref()
+        .and_then(|lock| lock.item(item.kind, &item.id))
+    else {
+        return ItemVerdict::default();
+    };
+    let (Some(path), Some(_)) = (&item.path, &locked.content_hash) else {
+        return ItemVerdict {
+            edited: locked.forked,
+            behind: false,
+        };
+    };
+    let current = pack::hash_item_path(item.kind, config_dir, &config_dir.join(path))
+        .unwrap_or(ContentHash::Missing);
+    if current == ContentHash::Missing {
+        return ItemVerdict {
+            edited: locked.forked,
+            behind: false,
+        };
+    }
+    let edited =
+        locked.forked || !pack::matches_baseline(config_dir, locked, &current).unwrap_or(false);
+    let behind = edited
+        && view.available.as_ref().is_some_and(|manifest| {
+            matches!(
+                pack::hash_item_path(item.kind, &manifest.root, &manifest.root.join(path)),
+                Ok(shipped @ ContentHash::Present(_)) if shipped != current
+            )
+        });
+    ItemVerdict { edited, behind }
 }
 
 fn source_info(view: &PackView) -> PackSourceInfo {
@@ -421,7 +484,8 @@ fn source_info(view: &PackView) -> PackSourceInfo {
 
 /// Whether the user has taken ownership of one live item.
 ///
-/// A live item is the user's copy when its install lock records a fork. An MCP
+/// A live item is the user's copy when its lock records a fork or its content
+/// no longer matches the baseline (`edited`, see [`file_item_verdict`]). An MCP
 /// server additionally becomes the user's copy when the resolved registry no
 /// longer attributes it to this pack:
 /// a user who saved their own version of a pack server shadows it in
@@ -429,12 +493,10 @@ fn source_info(view: &PackView) -> PackSourceInfo {
 fn item_state(
     pack_id: &str,
     item: &PackItem,
-    lock: Option<&PackLock>,
+    edited: bool,
     mcp_entries: &BTreeMap<String, WorkspaceMcpEntry>,
 ) -> PackItemState {
-    let forked = lock
-        .and_then(|lock| lock.item(item.kind, &item.id))
-        .is_some_and(|item| item.forked);
+    let forked = edited;
     if item.kind == PackItemKind::Mcp {
         let shadowed = mcp_entries
             .get(&item.id)
@@ -465,8 +527,132 @@ fn catalog_item(
         id: item.id,
         path: item.path,
         state,
+        behind_shipped: false,
         not_ready: entry.and_then(|e| e.not_ready.clone()),
         setup: entry.map(|e| e.setup.clone()).unwrap_or_default(),
+    }
+}
+
+/// The shipped and installed text of one pack item, for a side-by-side view of
+/// what a reset would replace.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackItemDiff {
+    pub pack_id: String,
+    pub kind: String,
+    pub item_id: String,
+    /// One entry per file that differs. A single-file item has at most one; a
+    /// skill or workflow lists only the files its two trees disagree on.
+    pub files: Vec<PackItemFileDiff>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackItemFileDiff {
+    /// Workspace-relative path.
+    pub path: String,
+    /// Absent when the app does not ship this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shipped: Option<String>,
+    /// Absent when the workspace copy has no such file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yours: Option<String>,
+    /// True when either side is not UTF-8; neither text is sent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub binary: bool,
+}
+
+/// Compare one file-backed item of a shipped pack with the workspace copy.
+pub fn pack_item_diff(
+    config_dir: &Path,
+    pack_id: &str,
+    kind: PackItemKind,
+    item_id: &str,
+) -> Result<PackItemDiff, String> {
+    let resource_dir = pack::source_dir(config_dir)
+        .ok_or("This workspace has no recorded app resource directory yet")?;
+    let manifest = pack::available_pack(&resource_dir, pack_id)
+        .ok_or_else(|| format!("No pack `{pack_id}` is shipped"))?;
+    let item = manifest
+        .items()
+        .into_iter()
+        .find(|item| item.kind == kind && item.id == item_id)
+        .ok_or_else(|| {
+            format!(
+                "Pack `{pack_id}` does not ship {} `{item_id}`",
+                kind.as_str()
+            )
+        })?;
+    let path = item
+        .path
+        .ok_or_else(|| format!("{} `{item_id}` has no file to compare", kind.as_str()))?;
+    let shipped_root = manifest.root.join(&path);
+    let yours_root = config_dir.join(&path);
+
+    let mut files = Vec::new();
+    if matches!(kind, PackItemKind::Skill | PackItemKind::Workflow) {
+        let shipped = tree_texts(&shipped_root)?;
+        let yours = tree_texts(&yours_root)?;
+        let names: std::collections::BTreeSet<&String> =
+            shipped.keys().chain(yours.keys()).collect();
+        for name in names {
+            let (a, b) = (shipped.get(name), yours.get(name));
+            if a != b {
+                files.push(file_diff(format!("{path}/{name}"), a.cloned(), b.cloned()));
+            }
+        }
+    } else {
+        let read = |path: &Path| path.is_file().then(|| std::fs::read(path).ok()).flatten();
+        let (a, b) = (read(&shipped_root), read(&yours_root));
+        if a != b {
+            files.push(file_diff(path.clone(), a, b));
+        }
+    }
+    Ok(PackItemDiff {
+        pack_id: pack_id.to_string(),
+        kind: kind.as_str().to_string(),
+        item_id: item_id.to_string(),
+        files,
+    })
+}
+
+fn tree_texts(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let mut out = BTreeMap::new();
+    if !root.is_dir() {
+        return Ok(out);
+    }
+    for file in crate::services::guarded_tree_files(root)? {
+        if pack::is_os_metadata_path(&file.relative_path) {
+            continue;
+        }
+        let name = file
+            .relative_path
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let bytes = std::fs::read(&file.resolved_path)
+            .map_err(|e| format!("Failed to read {:?}: {e}", file.resolved_path))?;
+        out.insert(name, bytes);
+    }
+    Ok(out)
+}
+
+fn file_diff(path: String, shipped: Option<Vec<u8>>, yours: Option<Vec<u8>>) -> PackItemFileDiff {
+    let text = |bytes: Option<Vec<u8>>| bytes.map(String::from_utf8);
+    match (text(shipped), text(yours)) {
+        (Some(Err(_)), _) | (_, Some(Err(_))) => PackItemFileDiff {
+            path,
+            shipped: None,
+            yours: None,
+            binary: true,
+        },
+        (shipped, yours) => PackItemFileDiff {
+            path,
+            shipped: shipped.map(Result::unwrap),
+            yours: yours.map(Result::unwrap),
+            binary: false,
+        },
     }
 }
 
@@ -483,6 +669,9 @@ fn item_label(item: &PackCatalogItem) -> String {
         label.push_str(&format!(" (not ready: {})", reason.summary()));
     }
     match item.state {
+        PackItemState::EditedByUser if item.behind_shipped => {
+            label.push_str(" (your copy, behind shipped)")
+        }
         PackItemState::EditedByUser => label.push_str(" (your copy)"),
         PackItemState::RemovedByUser => label.push_str(" (removed by you)"),
         PackItemState::PackOwned => {}
@@ -625,11 +814,31 @@ fn render_packs(catalog: &PackCatalog, state_filter: Option<&str>) -> String {
             if !entry.description.is_empty() {
                 out.push_str(&format!("{}\n\n", entry.description));
             }
+            if let Some(line) = copies_line(entry) {
+                out.push_str(&format!("{line}\n\n"));
+            }
             render_items(&mut out, entry);
         }
     }
 
     out
+}
+
+/// "2 your copies (1 behind shipped)", or nothing when every item is the pack's.
+pub(crate) fn copies_line(entry: &PackCatalogEntry) -> Option<String> {
+    if entry.edited_count == 0 {
+        return None;
+    }
+    let noun = if entry.edited_count == 1 {
+        "copy"
+    } else {
+        "copies"
+    };
+    let mut line = format!("Your {noun}: {}", entry.edited_count);
+    if entry.behind_count > 0 {
+        line.push_str(&format!(" ({} behind shipped)", entry.behind_count));
+    }
+    Some(line)
 }
 
 /// What is actually in this workspace wins over what the app ships, so a pack
@@ -705,15 +914,23 @@ fn render_pack(entry: &PackCatalogEntry) -> String {
     out.push_str("## Contents\n\n");
     render_items(&mut out, entry);
 
-    let edited = entry.edited_paths();
+    let edited = entry.edited_items();
     if !edited.is_empty() {
         out.push_str("## Your copies\n\n");
         out.push_str(
             "These local copies are yours. Pack updates leave them untouched, and an uninstall \
-             keeps them. Reset an item explicitly to replace it with the current pack version.\n\n",
+             keeps them. One marked behind shipped is frozen at an older version than the app now \
+             ships. Reset an item explicitly with `patch {action:\"reset-item\", kind, itemId}` to \
+             replace it with the current pack version.\n\n",
         );
-        for path in edited {
-            out.push_str(&format!("- `{path}`\n"));
+        for item in edited {
+            let label = item.path.as_deref().unwrap_or(&item.id);
+            let behind = if item.behind_shipped {
+                " — behind shipped"
+            } else {
+                ""
+            };
+            out.push_str(&format!("- {} `{label}`{behind}\n", item.kind));
         }
         out.push('\n');
     }
@@ -753,6 +970,7 @@ mod tests {
             id: id.to_string(),
             path: (kind != "mcp").then(|| format!("{kind}s/{id}")),
             state,
+            behind_shipped: false,
             not_ready: None,
             setup: Vec::new(),
         }
@@ -779,13 +997,18 @@ mod tests {
             installed_at: Some("2026-01-01T00:00:00Z".into()),
             notes: vec![],
             items: vec![
-                item("skill", "matlab", PackItemState::EditedByUser),
+                PackCatalogItem {
+                    behind_shipped: true,
+                    ..item("skill", "matlab", PackItemState::EditedByUser)
+                },
                 item("mcp", "matlab", PackItemState::RemovedByUser),
             ],
             counts: vec![PackContentCount {
                 kind: "skill".into(),
                 count: 1,
             }],
+            edited_count: 1,
+            behind_count: 1,
             entry_kind: PACK_ENTRY_KIND.into(),
         }
     }
@@ -823,10 +1046,21 @@ mod tests {
             page.contains("Update available: the app ships 1.1.0"),
             "{page}"
         );
-        assert!(page.contains("matlab (your copy)"), "{page}");
+        assert!(
+            page.contains("matlab (your copy, behind shipped)"),
+            "{page}"
+        );
+        assert!(
+            page.contains("skill `skills/matlab` — behind shipped"),
+            "{page}"
+        );
+        assert_eq!(
+            copies_line(&entry()).as_deref(),
+            Some("Your copy: 1 (1 behind shipped)")
+        );
         assert!(page.contains("matlab (removed by you)"), "{page}");
         assert!(page.contains("## Your copies"), "{page}");
-        assert!(page.contains("- `skills/matlab`"), "{page}");
+        assert!(page.contains("- skill `skills/matlab`"), "{page}");
         assert!(page.contains("## Removed by you"), "{page}");
         assert!(page.contains("- mcp `matlab`"), "{page}");
     }

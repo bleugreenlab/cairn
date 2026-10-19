@@ -1416,19 +1416,17 @@ mod restart_call_tests {
     use crate::db::DbState;
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::SearchIndex;
     use std::sync::Arc;
 
     async fn orch_with_db() -> (Orchestrator, Arc<LocalDb>) {
         let local = Arc::new(
-            LocalDb::open(tempfile::tempdir().unwrap().keep().join("restart-call.db"))
-                .await
-                .unwrap(),
-        );
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+            LocalDb::open_migrated_for_test(
+                tempfile::tempdir().unwrap().keep().join("restart-call.db"),
+            )
             .await
-            .unwrap();
+            .unwrap(),
+        );
         let search =
             Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
         let db = Arc::new(DbState::new(local.clone(), search));

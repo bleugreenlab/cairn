@@ -1195,16 +1195,10 @@ mod tests {
         );
     }
 
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
-
     /// Migrated DB with a yielded dependency anchor as the current job head.
     async fn migrated_db_with_dependency_anchor() -> LocalDb {
         let temp = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(temp.keep().join("agents-claim-test.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.keep().join("agents-claim-test.db"))
             .await
             .unwrap();
         db.write(|conn| {

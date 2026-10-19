@@ -114,7 +114,8 @@ pub fn discover_codex_models(
     // Discovery needs the installed runtime's live catalog, not the hardened
     // static catalog used by agent sessions. Give it an isolated CODEX_HOME so
     // an earlier session's model_catalog_json cannot freeze model/list and the
-    // user's native MCP configuration is never loaded.
+    // user's native MCP configuration is never loaded. It holds no credential:
+    // discovery signs in through `login_params`, as every Codex launch does.
     let discovery_home = DiscoveryHome(std::env::temp_dir().join(format!(
         "cairn-codex-model-discovery-{}-{}",
         std::process::id(),
@@ -122,11 +123,6 @@ pub fn discover_codex_models(
     )));
     std::fs::create_dir_all(&discovery_home.0)
         .map_err(|error| format!("Failed to create Codex discovery home: {error}"))?;
-    let auth_source = codex_home.join("auth.json");
-    if auth_source.exists() {
-        std::fs::copy(&auth_source, discovery_home.0.join("auth.json"))
-            .map_err(|error| format!("Failed to stage Codex discovery auth: {error}"))?;
-    }
     std::fs::write(
         discovery_home.0.join("config.toml"),
         "[features]\napps = false\nshell_tool = false\nunified_exec = false\nmulti_agent = false\ncollab = false\nmulti_agent_v2 = false\n",
@@ -639,7 +635,7 @@ done
     }
 
     #[test]
-    fn discovery_home_guard_removes_staged_credentials_on_error() {
+    fn discovery_home_guard_removes_the_home_on_error() {
         let path = std::env::temp_dir().join(format!(
             "cairn-codex-discovery-cleanup-test-{}",
             uuid::Uuid::new_v4()
@@ -647,15 +643,12 @@ done
         let forced_error = (|| -> Result<(), String> {
             let home = DiscoveryHome(path.clone());
             std::fs::create_dir_all(&home.0).map_err(|error| error.to_string())?;
-            std::fs::write(home.0.join("auth.json"), "secret")
+            std::fs::write(home.0.join("config.toml"), "[features]\n")
                 .map_err(|error| error.to_string())?;
             Err("forced discovery failure".to_string())
         })();
         assert!(forced_error.is_err());
-        assert!(
-            !path.exists(),
-            "credential-bearing discovery home survived error"
-        );
+        assert!(!path.exists(), "the discovery home survived an error");
     }
 
     #[test]

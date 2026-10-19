@@ -64,6 +64,299 @@ fn pruning_is_the_default_and_only_a_large_first_prune_waits() {
     );
 }
 
+fn objects(packs: u64, kept_packs: u64, loose_objects: u64) -> ObjectStoreCensus {
+    ObjectStoreCensus {
+        packs,
+        kept_packs,
+        loose_objects,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn compaction_is_due_past_gits_own_auto_gc_thresholds() {
+    assert!(compaction_due(&objects(PACK_LIMIT + 1, 0, 0)));
+    assert!(!compaction_due(&objects(PACK_LIMIT, 0, 0)));
+    assert!(
+        !compaction_due(&objects(50, 10, 0)),
+        "kept packs do not count against the limit"
+    );
+    assert!(compaction_due(&objects(61, 10, 0)));
+    assert!(compaction_due(&objects(1, 0, 6_701)));
+    assert!(!compaction_due(&objects(1, 0, LOOSE_OBJECT_LIMIT)));
+}
+
+#[test]
+fn compaction_runs_on_every_store_except_an_opted_out_one() {
+    let large = census(KEEP_REF_THRESHOLD + 1, 1024);
+    let gate = |policy| prune_gate(policy, false, &large);
+    assert_eq!(gate(PrunePolicy::Default), PruneGate::AwaitingConfirmation);
+    assert!(
+        compaction_allowed(gate(PrunePolicy::Default)),
+        "compaction removes nothing, so it does not wait for the first-prune confirmation"
+    );
+    assert!(compaction_allowed(gate(PrunePolicy::Confirmed)));
+    assert!(!compaction_allowed(gate(PrunePolicy::OptedOut)));
+}
+
+#[test]
+fn a_reclaim_is_due_once_per_retention_window() {
+    let now = 100 * DAY as i64;
+    assert!(reclaim_is_due(None, now), "a store never reclaimed is due");
+    assert!(!reclaim_is_due(Some(now - 29 * DAY as i64), now));
+    assert!(reclaim_is_due(Some(now - 30 * DAY as i64), now));
+}
+
+#[test]
+fn the_operators_git_busies_the_object_store_but_a_leftover_packed_refs_lock_does_not() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let git_dir = temp.path();
+    assert_eq!(object_store_busy(git_dir, SystemTime::now()), None);
+
+    std::fs::write(git_dir.join("packed-refs.lock"), "").unwrap();
+    // Read the clock after the write, so the lock's age is at least the offset.
+    let now = SystemTime::now();
+    let fresh = object_store_busy(git_dir, now + Duration::from_secs(60)).unwrap();
+    assert_eq!(fresh, "packed-refs.lock (1m old)");
+    assert_eq!(
+        object_store_busy(git_dir, now + Duration::from_secs(11 * 60)),
+        None,
+        "a packed-refs.lock older than ten minutes is a leftover, not a writer"
+    );
+
+    std::fs::write(git_dir.join("gc.pid"), "123 host").unwrap();
+    let now = SystemTime::now();
+    let gc = object_store_busy(git_dir, now + Duration::from_secs(3 * 3600)).unwrap();
+    assert_eq!(
+        gc, "gc.pid (3h old)",
+        "a gc that runs for hours is still never raced, and the skip names its age"
+    );
+    assert_eq!(
+        object_store_busy(git_dir, now + Duration::from_secs(13 * 3600)),
+        None,
+        "git's own rule: a gc.pid older than twelve hours is a gc that died"
+    );
+    std::fs::remove_file(git_dir.join("gc.pid")).unwrap();
+    std::fs::write(git_dir.join("index.lock"), "").unwrap();
+    let now = SystemTime::now();
+    assert!(object_store_busy(git_dir, now)
+        .unwrap()
+        .starts_with("index.lock"));
+    assert_eq!(
+        object_store_busy(git_dir, now + Duration::from_secs(11 * 60)),
+        None,
+        "a leftover index.lock does not block object maintenance for good"
+    );
+}
+
+mod rows {
+    use super::super::*;
+    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+    use tempfile::TempDir;
+
+    async fn insert_prune(
+        db: &LocalDb,
+        id: &str,
+        started_at: i64,
+        outcome: &str,
+        reclaimed: Option<i64>,
+    ) {
+        db.execute(
+            "INSERT INTO ref_store_samples
+               (id, project_id, store_path, kind, started_at, finished_at, outcome, duration_ms,
+                reclaimed_bytes)
+             VALUES (?1, 'p', '/stores/p', 'prune', ?2, ?2, ?3, 1, ?4)",
+            params![id, started_at, outcome, reclaimed],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_a_prune_that_reclaimed_and_did_not_fail_counts_as_a_reclaim() {
+        let temp = TempDir::new().unwrap();
+        let db = LocalDb::open(temp.path().join("reclaim.db")).await.unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        let store = Path::new("/stores/p");
+        assert_eq!(last_successful_reclaim(&db, store).await, None);
+
+        insert_prune(&db, "reclaimed", 100, "ok", Some(5_000)).await;
+        insert_prune(&db, "no-reclaim", 200, "ok", None).await;
+        insert_prune(
+            &db,
+            "failed",
+            300,
+            "failed:git repack --cruft: no space",
+            Some(0),
+        )
+        .await;
+        assert_eq!(last_successful_reclaim(&db, store).await, Some(100));
+
+        insert_prune(&db, "partial", 400, "partial:refused", Some(0)).await;
+        assert_eq!(
+            last_successful_reclaim(&db, store).await,
+            Some(400),
+            "a partial prune still reclaimed"
+        );
+        insert_prune(
+            &db,
+            "reclaim-failed",
+            500,
+            "partial:reclaim-failed:git repack --cruft: no space",
+            None,
+        )
+        .await;
+        assert_eq!(
+            last_successful_reclaim(&db, store).await,
+            Some(400),
+            "a failed reclaim is retried at the next prune"
+        );
+        assert_eq!(
+            last_successful_prune(&db, store, false).await,
+            Some(500),
+            "but the prune's sweep counts, so the prune is not repeated hourly"
+        );
+    }
+
+    /// A prune that truncated and then failed only its reclaim did truncate, so
+    /// the weekly truncation is not repeated at the next daily prune. A partial
+    /// prune whose truncation was refused records no `ops_reparented` and never
+    /// counts.
+    #[tokio::test]
+    async fn a_truncation_counts_when_only_the_reclaim_failed() {
+        let temp = TempDir::new().unwrap();
+        let db = LocalDb::open(temp.path().join("truncation.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        let store = Path::new("/stores/p");
+        let insert = |id: &'static str, at: i64, outcome: &'static str, reparented: Option<i64>| {
+            let db = &db;
+            async move {
+                db.execute(
+                    "INSERT INTO ref_store_samples
+                       (id, project_id, store_path, kind, started_at, finished_at, outcome,
+                        duration_ms, ops_reparented)
+                     VALUES (?1, 'p', '/stores/p', 'prune', ?2, ?2, ?3, 1, ?4)",
+                    params![id, at, outcome, reparented],
+                )
+                .await
+                .unwrap();
+            }
+        };
+        insert("refused", 100, "partial:truncation refused", None).await;
+        insert("failed", 200, "failed:git update-ref: boom", Some(5)).await;
+        assert_eq!(last_successful_prune(&db, store, true).await, None);
+        insert(
+            "reclaim-failed",
+            300,
+            "partial:reclaim-failed:git repack --cruft: no space",
+            Some(5),
+        )
+        .await;
+        assert_eq!(last_successful_prune(&db, store, true).await, Some(300));
+    }
+
+    /// The rebuild that widens `kind` keeps every row a running installation
+    /// already recorded, and then accepts a `compact` row.
+    #[tokio::test]
+    async fn the_object_store_migration_keeps_existing_rows_and_accepts_compactions() {
+        let temp = TempDir::new().unwrap();
+        let db = LocalDb::open(temp.path().join("migration.db"))
+            .await
+            .unwrap();
+        // Select by name, since a sibling migration can renumber this one, and
+        // filter by version rather than slicing: composition order is not
+        // file-number order.
+        let version = TURSO_MIGRATIONS
+            .iter()
+            .find(|migration| migration.name() == "object_store_maintenance")
+            .expect("the object-store maintenance migration is registered")
+            .version();
+        let head: Vec<_> = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version() < version)
+            .cloned()
+            .collect();
+        MigrationRunner::new(head).run(&db).await.unwrap();
+        db.execute_batch(
+            "INSERT INTO ref_store_samples
+               (id, project_id, store_path, kind, started_at, finished_at, outcome,
+                packed_bytes, packed_entries, loose_refs, ref_locks, duration_ms)
+             VALUES ('m', 'p', '/stores/p', 'measure', 1, 1, 'ok', 10, 2, 3, 0, 5);
+             INSERT INTO ref_store_samples
+               (id, project_id, store_path, kind, started_at, finished_at, outcome,
+                ops_reparented, detail_json, duration_ms)
+             VALUES ('p', 'p', '/stores/p', 'prune', 2, 2, 'ok', 7, '{}', 9);",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        let kept = db
+            .query_all(
+                "SELECT id, kind, outcome, packed_entries, ops_reparented, packs
+                 FROM ref_store_samples ORDER BY id",
+                (),
+                |row| {
+                    Ok((
+                        row.text(0)?,
+                        row.text(1)?,
+                        row.text(2)?,
+                        row.opt_i64(3)?,
+                        row.opt_i64(4)?,
+                        row.opt_i64(5)?,
+                    ))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            kept,
+            vec![
+                (
+                    "m".into(),
+                    "measure".into(),
+                    "ok".into(),
+                    Some(2),
+                    None,
+                    None
+                ),
+                ("p".into(), "prune".into(), "ok".into(), None, Some(7), None),
+            ]
+        );
+        db.execute(
+            "INSERT INTO ref_store_samples
+               (id, project_id, store_path, kind, started_at, finished_at, outcome, duration_ms,
+                packs, kept_packs, pack_bytes, loose_objects, multi_pack_index)
+             VALUES ('c', 'p', '/stores/p', 'compact', 3, 3, 'ok', 1, 2, 1, 100, 0, 1)",
+            (),
+        )
+        .await
+        .expect("a compact row is accepted");
+        assert!(db
+            .execute(
+                "INSERT INTO ref_store_samples
+                   (id, project_id, store_path, kind, started_at, finished_at, outcome,
+                    duration_ms)
+                 VALUES ('x', 'p', '/stores/p', 'gc', 3, 3, 'ok', 1)",
+                (),
+            )
+            .await
+            .is_err());
+    }
+}
+
 #[test]
 fn stranded_refs_name_their_job_only_in_the_two_segment_form() {
     assert_eq!(
@@ -91,7 +384,7 @@ mod pass {
     use crate::db::DbState;
     use crate::jj::tests::{git, git_stdout, init_project, jj_bin};
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::SearchIndex;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -108,11 +401,7 @@ mod pass {
         let temp = TempDir::new().unwrap();
         let config_dir = temp.path().join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
-        let local = LocalDb::open(config_dir.join("maintenance.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        let local = LocalDb::open_migrated_for_test(config_dir.join("maintenance.db"))
             .await
             .unwrap();
         let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
@@ -352,6 +641,121 @@ mod pass {
         assert_eq!(fx.last_prune().await.0, "skipped:operator-git-busy");
     }
 
+    /// Grow the fixture repository by `count` packs, one commit each. An
+    /// incremental `git repack` packs only objects a ref reaches, so each
+    /// round commits what it packs.
+    fn grow_packs(fx: &Fixture, count: usize) {
+        // Past 50 packs every `git commit` would start a detached
+        // `git gc --auto` that repacks everything behind the test's back:
+        // the very repack the pack limit exists to pre-empt.
+        git(&fx.repo, &["config", "gc.auto", "0"]);
+        git(&fx.repo, &["config", "maintenance.auto", "false"]);
+        for index in 0..count {
+            std::fs::write(fx.repo.join("grow.txt"), format!("round {index}\n")).unwrap();
+            git(&fx.repo, &["add", "-A"]);
+            git(&fx.repo, &["commit", "-q", "-m", &format!("round {index}")]);
+            git(&fx.repo, &["repack", "-q", "-d"]);
+        }
+    }
+
+    fn census_now(fx: &Fixture) -> ObjectStoreCensus {
+        crate::jj::census_object_store(&fx.repo.join(".git")).unwrap()
+    }
+
+    /// A store past git's pack limit is compacted by the hourly pass while its
+    /// first prune still waits for confirmation, and the compaction is recorded
+    /// with the census before and after it. An opted-out store is not touched.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn the_hourly_pass_compacts_a_store_over_the_pack_limit_unless_opted_out() {
+        let Some(fx) = fixture().await else {
+            eprintln!("skipping object-store compaction pass test: jj not resolvable");
+            return;
+        };
+        grow_packs(&fx, PACK_LIMIT as usize + 2);
+        assert!(compaction_due(&census_now(&fx)));
+
+        set_prune_confirmed(&fx.orch.db.local, "p-refs", &fx.project.store, false)
+            .await
+            .unwrap();
+        run_pass(&fx.orch).await;
+        assert_eq!(sample_count(&fx, "compact").await, 0, "opted out");
+        assert!(compaction_due(&census_now(&fx)));
+
+        fx.orch
+            .db
+            .local
+            .execute("DELETE FROM ref_store_maintenance", ())
+            .await
+            .unwrap();
+        // A prune (and its reclaim, which repacks everything) ran an hour ago,
+        // so this pass compacts and nothing else.
+        fx.orch
+            .db
+            .local
+            .execute(
+                "INSERT INTO ref_store_samples
+                   (id, project_id, store_path, kind, started_at, finished_at, outcome,
+                    duration_ms, reclaimed_bytes)
+                 VALUES ('earlier', 'p-refs', ?1, 'prune', ?2, ?2, 'ok', 1, 0)",
+                params![store_key(&fx.project.store), unix_now() - 3600],
+            )
+            .await
+            .unwrap();
+        run_pass(&fx.orch).await;
+        assert_eq!(sample_count(&fx, "prune").await, 1, "no prune was due");
+        assert_eq!(sample_count(&fx, "compact").await, 1);
+        let after = census_now(&fx);
+        assert!(!compaction_due(&after), "{after:?}");
+        assert!(after.multi_pack_index);
+
+        let overview = ref_store_overview(&fx.orch, "p-refs", &fx.repo).await;
+        let compaction = overview
+            .last_compaction
+            .expect("the compaction is recorded");
+        assert_eq!(compaction.outcome, "ok");
+        assert!(compaction.before.unwrap().packs > PACK_LIMIT);
+        assert_eq!(compaction.after.unwrap().packs, after.packs);
+        assert_eq!(
+            overview.objects.unwrap().packs,
+            after.packs,
+            "the page reads the census the compaction left"
+        );
+
+        run_pass(&fx.orch).await;
+        assert_eq!(
+            sample_count(&fx, "compact").await,
+            1,
+            "a compacted store is not compacted again"
+        );
+    }
+
+    /// The operator's own gc is never raced; the skip is recorded with the
+    /// lock and its age.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_compaction_waits_out_the_operators_own_gc() {
+        let Some(fx) = fixture().await else {
+            eprintln!("skipping object-store busy test: jj not resolvable");
+            return;
+        };
+        grow_packs(&fx, PACK_LIMIT as usize + 2);
+        std::fs::write(fx.repo.join(".git/gc.pid"), "1 host").unwrap();
+        let git_dir = fx.repo.join(".git");
+        compact(&fx.orch.db.local, &fx.project, &git_dir, census_now(&fx)).await;
+
+        let overview = ref_store_overview(&fx.orch, "p-refs", &fx.repo).await;
+        let compaction = overview.last_compaction.unwrap();
+        assert!(
+            compaction
+                .outcome
+                .starts_with("skipped:operator-git-busy:gc.pid ("),
+            "{}",
+            compaction.outcome
+        );
+        assert!(compaction_due(&census_now(&fx)), "nothing was repacked");
+    }
+
     async fn sample_count(fx: &Fixture, kind: &str) -> i64 {
         fx.orch
             .db
@@ -395,6 +799,15 @@ mod pass {
         assert_eq!(sample_count(&fx, "prune").await, 1, "pruned by default");
         assert_eq!(fx.last_prune().await.0, "ok");
         assert!(!fx.has_ref("refs/cairn/checks/finished"));
+        let overview = ref_store_overview(&fx.orch, "p-refs", &fx.repo).await;
+        let reclaim = overview
+            .last_reclaim
+            .expect("a store never reclaimed is reclaimed by its first prune");
+        assert!(reclaim.after.unwrap().multi_pack_index);
+        assert_eq!(
+            last_successful_reclaim(&fx.orch.db.local, &fx.project.store).await,
+            Some(reclaim.started_at)
+        );
 
         run_pass(&fx.orch).await;
         assert_eq!(

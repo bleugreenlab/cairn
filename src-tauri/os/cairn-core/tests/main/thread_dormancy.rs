@@ -1,12 +1,14 @@
 //! A closed thread takes no new turns — including from the desktop, which never
 //! touches the message-delivery or wake paths that the rest of dormancy gates.
 //!
-//! The composer sends by resuming the thread's session job directly
-//! (`continue_job` → `continue_job_or_enqueue` → `continue_job_impl`), and the
-//! pane's resume-from-digest control and the answer-a-question path do the same.
-//! None of them ask for a session to be established, so a gate that lived only at
-//! session establishment would leave the app's own send path enforced by nothing
-//! but a React prop. These pin the refusal at the funnel all three share.
+//! The composer sends by writing the operator queue for the thread's session job
+//! (`enqueue_user_message`, and the `continue_job` → `continue_job_or_enqueue`
+//! compatibility ingress), which persists before any turn is admitted; the
+//! pane's resume-from-digest control and the answer-a-question path resume the
+//! job directly. None of them ask for a session to be established, so a gate that
+//! lived only at session establishment would leave the app's own send path
+//! enforced by nothing but a React prop. These pin the refusal at both funnels:
+//! the queue's one writer and turn admission.
 
 use crate::common;
 use cairn_core::internal::execution::jobs::{continue_job_or_enqueue, resume_job_from_digest};
@@ -14,6 +16,7 @@ use cairn_core::internal::orchestrator::attention_push::{
     has_pending_waking_live, list_pending, push, Boundary, Wake,
 };
 use cairn_core::internal::storage::{LocalDb, RowExt};
+use cairn_core::messages::queued::{enqueue_idempotent, DeliveryUrgency};
 use cairn_db::turso::params;
 
 async fn seed_thread_session(db: &LocalDb, status: &str) {
@@ -48,6 +51,20 @@ async fn set_status(db: &LocalDb, status: &str) {
 
 fn is_dormancy_refusal(error: &str) -> bool {
     error.contains("closed") && error.contains("Reopen")
+}
+
+/// Operator messages accepted for a job, delivered or not. A message-bearing
+/// send is acknowledged at this durable row and its turn starts behind a
+/// background nudge, which may already have claimed it — so this reads the row,
+/// not its pending state.
+async fn operator_messages(db: &LocalDb, job_id: &str) -> Vec<String> {
+    db.query_all(
+        "SELECT content FROM queued_messages WHERE job_id = ?1 ORDER BY created_at, rowid",
+        params![job_id],
+        |row| row.text(0),
+    )
+    .await
+    .unwrap()
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -88,6 +105,53 @@ async fn the_desktop_send_path_is_refused_on_a_closed_thread() {
     );
 }
 
+/// The composer's own send is the canonical enqueue, which persists before any
+/// turn is admitted — so it takes the refusal at the queue, not at turn start.
+#[tokio::test(flavor = "current_thread")]
+async fn the_composer_enqueue_is_refused_on_a_closed_thread() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    seed_thread_session(&orch.db.local, "closed").await;
+
+    let refused = enqueue_idempotent(
+        &orch.db.local,
+        "job-thread",
+        "still there?",
+        DeliveryUrgency::Queue,
+        "req-1",
+    )
+    .expect_err("a closed thread takes no new operator message");
+    assert!(
+        is_dormancy_refusal(&refused),
+        "the composer sees the same refusal the continue path does: {refused}"
+    );
+    assert!(operator_messages(&orch.db.local, "job-thread").await.is_empty());
+}
+
+/// Closing does not cancel a turn in flight, and a follow-up to that turn is not
+/// new attention: it is kept, and claimed by the thread's next turn on reopen.
+#[tokio::test(flavor = "current_thread")]
+async fn a_follow_up_to_a_turn_still_running_on_a_closed_thread_is_kept() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    seed_thread_session(&orch.db.local, "closed").await;
+    orch.db
+        .local
+        .execute_script(
+            "INSERT INTO runs (id, project_id, job_id, chat_id, status, session_id, created_at, updated_at, start_mode)
+               VALUES ('run-1','proj-1','job-thread',NULL,'live','session-1',1,1,'resume');
+             INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+               VALUES ('turn-1','session-1','run-1','job-thread',1,'running',1,1);",
+        )
+        .await
+        .unwrap();
+
+    continue_job_or_enqueue(&orch, "job-thread", Some("one more thing"), None, Some("req-1"))
+        .expect("a follow-up to the running turn is queued, not refused");
+    assert_eq!(
+        operator_messages(&orch.db.local, "job-thread").await,
+        vec!["one more thing".to_string()]
+    );
+}
+
 /// The pane keeps every control it had while closed, resume-from-digest included
 /// — so that control has to be refused by the backend rather than by whether the
 /// UI happened to hide it.
@@ -111,9 +175,13 @@ async fn a_task_under_a_closed_thread_still_starts_turns() {
     let (_temp, orch) = common::test_orchestrator().await;
     seed_thread_session(&orch.db.local, "closed").await;
 
-    let run = continue_job_or_enqueue(&orch, "job-task", Some("carry on"), None, Some("req-1"))
+    continue_job_or_enqueue(&orch, "job-task", Some("carry on"), None, Some("req-1"))
         .expect("a task the thread spawned is an ordinary job and starts its turn");
-    assert_eq!(run.job_id.as_deref(), Some("job-task"));
+    assert_eq!(
+        operator_messages(&orch.db.local, "job-task").await,
+        vec!["carry on".to_string()],
+        "the send is accepted for the task, where the nudge starts its turn"
+    );
 }
 
 /// Dormancy and retirement both stop a push being delivered, and CAIRN-4182
@@ -199,7 +267,11 @@ async fn reopening_admits_turns_again() {
     ));
 
     set_status(&orch.db.local, "active").await;
-    let run = continue_job_or_enqueue(&orch, "job-thread", Some("hello"), None, Some("req-2"))
+    continue_job_or_enqueue(&orch, "job-thread", Some("hello"), None, Some("req-2"))
         .expect("reopening lets the same send start its turn");
-    assert_eq!(run.job_id.as_deref(), Some("job-thread"));
+    assert_eq!(
+        operator_messages(&orch.db.local, "job-thread").await,
+        vec!["hello".to_string()],
+        "only the send after reopening was accepted"
+    );
 }

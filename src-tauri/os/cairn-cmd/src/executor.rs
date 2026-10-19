@@ -418,20 +418,28 @@ async fn follow_enrollment(
     }
 }
 
+/// The runner's phase in the words it uses itself (`EnrollmentPhase::label`
+/// in cairn-core, which this crate does not depend on). A phase this table
+/// does not know is printed as it came: a newer runner's step is not a
+/// failure.
 fn phase_label(phase: &str) -> &str {
     match phase {
+        "queued" => "waiting for another enrollment of this machine to finish",
+        "awaitingRunnerListener" => "waiting for this runner's executor listener",
         "validating" => "validating the request",
         "probingHost" => "probing the host and its platform",
         "resolvingArtifact" => "resolving an executor build for it",
         "installingBinary" => "installing the executor binary",
         "persistingConfiguration" => "persisting the enrollment configuration",
         "grantingEnrollment" => "granting the enrollment",
-        "startingSupervision" => "starting supervision",
-        "awaitingReady" => "waiting for the executor to report Ready",
+        "verifyingReach" => "verifying the machine can reach this runner",
+        "registeringService" => "asking the machine to register its executor service",
+        "awaitingFirstDial" => "waiting for the machine to dial in",
         "ready" => "ready",
         "cleaningUp" => "rolling back after a failure",
+        "failed" => "failed",
         "retryRemoveRequired" => "failed; rollback incomplete",
-        _ => "failed",
+        other => other,
     }
 }
 

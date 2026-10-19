@@ -32,10 +32,8 @@ mod session;
 mod skill;
 mod snapshot;
 mod thread;
-mod toolkit;
 mod trigger_event;
 mod turn;
-pub mod webhook;
 mod workflow;
 mod workspace;
 
@@ -56,8 +54,8 @@ pub use workspace::{
 pub use project::{
     CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector, CheckWhen, CreateProject,
     HumanBaseMergePolicy, HumanBaseMergePolicyError, HumanBaseMergePolicyReadState,
-    HumanBaseMergePolicyState, MoveProject, PopulateConfig, Project, ProjectRemoteStatus,
-    TerminalCommand, UpdateProject,
+    HumanBaseMergePolicyState, MainCadence, MoveProject, PopulateConfig, Project,
+    ProjectRemoteStatus, TerminalCommand, UpdateProject,
 };
 
 // Context token snapshot types
@@ -130,9 +128,6 @@ pub use agent::{
 // Permission types
 pub use permissions::{Fence, LegacyOnEscape, LegacySandbox};
 
-// Toolkit and MCP types
-pub use toolkit::{ALL_NATIVE_TOOLS, ALWAYS_DISALLOWED_TOOLS};
-
 // Documentation types
 pub use docs::{DocContent, DocFile, DocReference};
 
@@ -176,7 +171,6 @@ pub use memory::{
 pub use trigger_event::{JobEndedEvent, SkillCalledEvent, TriggerEvent};
 
 // Webhook types
-pub use webhook::WebhookEvent;
 
 // Search types
 pub use search::{SearchContentType, SearchFilters, SearchResult};

@@ -2,7 +2,7 @@
 //! team-run content (the per-execution range pack and the content-addressed
 //! system-prompt/init blobs), fetched on demand by hash.
 //!
-//! For a team run, `crate::archival::rewrite::archive_target` offloads those
+//! For a team run, `crate::archival::rewrite::archive_execution` offloads those
 //! bytes to the store keyed by their content hash instead of inlining them into
 //! the synced replica; the replica keeps only rows, git coordinates, and hash
 //! pointers. On read, [`crate::storage::events::reconstruct`] fetches the bytes

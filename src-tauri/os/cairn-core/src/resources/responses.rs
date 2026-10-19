@@ -280,15 +280,13 @@ mod tests {
     use super::*;
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::{LocalDb, SearchIndex};
     use std::sync::Arc;
 
     #[tokio::test]
     async fn a_failed_invocation_shows_its_error_in_history() {
         let temp = tempfile::tempdir().unwrap().keep();
-        let local = LocalDb::open(temp.join("history.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&local)
+        let local = LocalDb::open_migrated_for_test(temp.join("history.db"))
             .await
             .unwrap();
         let search = Arc::new(SearchIndex::open_or_create(temp.join("search")).unwrap());

@@ -8,6 +8,7 @@
 //! error, refusal, duplicate stub, reminder — can skip sanitization.
 
 use crate::security::{CheckedInvocation, Crossing, ObservedSafe, Sanitize};
+use crate::stack::off_frame;
 
 /// A dispatched tool call's result: the handler's `content` plus any
 /// system-reminder bodies the augmentation layer collected for this run.
@@ -457,10 +458,11 @@ async fn execute_tool(
     let request = checked.request();
     match request.tool.as_str() {
         // File and resource mutation tool
-        "write" => crate::mcp::handlers::write::handle_write(orch, request).await,
-        "read" => crate::mcp::handlers::read::handle_read_file(orch, request).await,
+        "write" => off_frame(|| crate::mcp::handlers::write::handle_write(orch, request)).await,
+        "read" => off_frame(|| crate::mcp::handlers::read::handle_read_file(orch, request)).await,
         "read_batch" => {
-            crate::mcp::handlers::read::handle_read_batch(orch, request, read_cursors).await
+            off_frame(|| crate::mcp::handlers::read::handle_read_batch(orch, request, read_cursors))
+                .await
         }
 
         // Host process introspection for `cairn://dev/pid`, which relays this to
@@ -476,22 +478,30 @@ async fn execute_tool(
 
         // Run tools. `check_run` is the trusted configured-suite producer; unlike
         // `run`, its payload cannot carry executable text or asserted evidence.
-        "run" => crate::mcp::handlers::run::handle_run(orch, request).await,
-        "check_run" => crate::mcp::handlers::check_run::handle_check_run(orch, request).await,
+        "run" => off_frame(|| crate::mcp::handlers::run::handle_run(orch, request)).await,
+        "check_run" => {
+            off_frame(|| crate::mcp::handlers::check_run::handle_check_run(orch, request)).await
+        }
 
         // Externally-driven attention long-poll (no polling)
-        "watch" => crate::mcp::handlers::watch::handle_watch(orch, request).await,
+        "watch" => off_frame(|| crate::mcp::handlers::watch::handle_watch(orch, request)).await,
 
         // Web + local-PDF reads (routed from `read` to the active web-fetch
         // provider and PDF service)
-        "read_web" => crate::mcp::handlers::web::handle_read_web(orch, request).await,
+        "read_web" => off_frame(|| crate::mcp::handlers::web::handle_read_web(orch, request)).await,
 
         // Resource tools
         "read_resource" => {
-            crate::mcp::handlers::resources::handle_read_resource(orch, request, read_cursors).await
+            off_frame(|| {
+                crate::mcp::handlers::resources::handle_read_resource(orch, request, read_cursors)
+            })
+            .await
         }
         "read_issue_resource" => {
-            crate::mcp::handlers::issue_resources::handle_read_issue_resource(orch, request).await
+            off_frame(|| {
+                crate::mcp::handlers::issue_resources::handle_read_issue_resource(orch, request)
+            })
+            .await
         }
 
         _ => format!("Unknown tool: {}", request.tool),

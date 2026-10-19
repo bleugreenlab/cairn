@@ -316,6 +316,11 @@ pub struct SettingsFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "buildSlots")]
     pub fleet: Option<crate::fleet::FleetConfig>,
+    /// How this workspace reaches inference control services (today, the
+    /// read-only bginf link). Config-only (YAML, not in the Settings DTO);
+    /// written through `cairn://settings` and preserved across saves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference: Option<crate::inference::InferenceSettings>,
     /// Typed web-fetch provider options, keyed by provider id
     /// (`bmd`/`jina`/`firecrawl`) then option key. Config-only (YAML, not in the
     /// Settings DTO). Validated against the per-provider descriptor in
@@ -712,6 +717,7 @@ impl SettingsFile {
             browser_network_sensitive_names: None,
             build_services: None,
             fleet: None,
+            inference: None,
             accepted_fence_commands: None,
             event_log: None,
             web_fetch: None,
@@ -1018,6 +1024,38 @@ fn mutate_build_services<T>(
                 .map_err(|error| format!("Failed to serialize build services: {error}"))?,
         );
         Ok(result)
+    })
+}
+
+const INFERENCE_KEY: &str = "inference";
+
+/// The workspace's `inference` section, or an empty one when unset.
+pub fn load_inference(config_dir: &std::path::Path) -> crate::inference::InferenceSettings {
+    load_settings_file(config_dir)
+        .ok()
+        .and_then(|file| file.inference)
+        .unwrap_or_default()
+}
+
+/// Replace the `inference` section. Surgical: no other key is touched, and an
+/// empty section removes the key.
+pub fn set_inference(
+    config_dir: &std::path::Path,
+    inference: &crate::inference::InferenceSettings,
+) -> Result<(), String> {
+    inference.validate()?;
+    mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+        let key = serde_yaml::Value::String(INFERENCE_KEY.to_string());
+        if *inference == crate::inference::InferenceSettings::default() {
+            root.remove(&key);
+        } else {
+            root.insert(
+                key,
+                serde_yaml::to_value(inference)
+                    .map_err(|error| format!("Failed to serialize inference settings: {error}"))?,
+            );
+        }
+        Ok(())
     })
 }
 
@@ -2102,6 +2140,35 @@ buildServices:
             load_settings_file(dir).unwrap().log_level,
             Some(LogLevel::Verbose)
         );
+    }
+
+    #[test]
+    fn inference_settings_are_surgical_and_survive_a_general_save() {
+        let dir = tempfile::tempdir().unwrap();
+        save_settings(dir.path(), &test_settings()).unwrap();
+        let link = crate::inference::InferenceSettings {
+            bginf: Some(crate::inference::BginfLinkSettings {
+                url: "http://ctl.example:4100".into(),
+                machines: [("halo".to_string(), "fedora".to_string())].into(),
+            }),
+        };
+        set_inference(dir.path(), &link).unwrap();
+        save_settings(dir.path(), &test_settings()).unwrap();
+        assert_eq!(load_inference(dir.path()), link);
+
+        set_inference(dir.path(), &crate::inference::InferenceSettings::default()).unwrap();
+        let text = std::fs::read_to_string(get_settings_path(dir.path())).unwrap();
+        assert!(!text.contains("inference"), "{text}");
+        assert!(set_inference(
+            dir.path(),
+            &crate::inference::InferenceSettings {
+                bginf: Some(crate::inference::BginfLinkSettings {
+                    url: "ctl.example".into(),
+                    machines: Default::default(),
+                }),
+            }
+        )
+        .is_err());
     }
 
     #[test]

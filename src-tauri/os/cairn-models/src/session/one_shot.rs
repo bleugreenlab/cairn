@@ -204,9 +204,9 @@ fn fold(
                 )
             }
             // On Codex any item other than a message is a tool, and fails the
-            // wait. Claude's tools are refused by the CLI itself (the caller's
-            // disallow list and `--tools ""`), and the one tool that survives
-            // is `StructuredOutput`, the very way a schema-constrained answer
+            // wait. Claude has no tool to call: `--tools ""` declares no
+            // built-in and a tool-free launch has no MCP server. The one tool
+            // left is `StructuredOutput`, the very way a schema-constrained answer
             // arrives; its value rides the terminal result.
             SessionEvent::ToolCall { name, .. }
                 if !claude && images_allowed && name == IMAGE_GENERATION_ITEM =>

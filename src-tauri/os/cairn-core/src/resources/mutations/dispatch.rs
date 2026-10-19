@@ -16,6 +16,7 @@ mod attachments;
 mod browsers;
 mod bug;
 mod channels;
+mod events;
 mod executions;
 mod executors;
 mod feed;
@@ -61,6 +62,7 @@ use super::{
 };
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
+use crate::stack::off_frame;
 use cairn_common::contract::{contract_for, MutationSpec, ResourceKind};
 use cairn_common::uri::CairnResource;
 
@@ -287,6 +289,9 @@ pub(crate) async fn dispatch_resource_change(
     let resource = target_resource_for_request(orch, request, item)
         .await
         .map_err(|e| build_failure(index, item, e))?;
+    if let Some(refusal) = tenets::retired_shape_refusal(&resource, item) {
+        return Err(build_failure(index, item, refusal));
+    }
     if let Some(refusal) = tenets::edit_refusal(orch, &resource, item).await {
         return Err(build_failure(index, item, refusal));
     }
@@ -298,179 +303,180 @@ pub(crate) async fn dispatch_resource_change(
     let mut promoted_memory = None;
 
     let summary = if let Some(summary) =
-        posts::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| posts::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        tenets::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| tenets::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        feed::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| feed::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        threads::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| threads::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
-    } else if let Some(summary) = issues::dispatch(
-        orch,
-        request,
-        index,
-        item,
-        dry_run,
-        &resource,
-        &mut applied_data,
-    )
+    } else if let Some(summary) = {
+        let (resource, applied_data) = (&resource, &mut applied_data);
+        off_frame(move || {
+            issues::dispatch(orch, request, index, item, dry_run, resource, applied_data)
+        })
+    }
     .await?
     {
         summary
     } else if let Some(summary) =
-        messages::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| messages::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        progress::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| progress::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        rebase::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| rebase::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        attachments::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| attachments::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        terminals::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| terminals::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        repls::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| repls::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        browsers::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| browsers::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        executions::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| executions::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        nodes::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| nodes::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        skills::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| skills::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        projects::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| projects::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
-    } else if let Some(summary) = memories::dispatch(
-        orch,
-        request,
-        index,
-        item,
-        dry_run,
-        &resource,
-        &mut promoted_memory,
-    )
+    } else if let Some(summary) = {
+        let (resource, promoted_memory) = (&resource, &mut promoted_memory);
+        off_frame(move || {
+            memories::dispatch(
+                orch,
+                request,
+                index,
+                item,
+                dry_run,
+                resource,
+                promoted_memory,
+            )
+        })
+    }
     .await?
     {
         summary
     } else if let Some(summary) =
-        labels::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| labels::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        grants::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| grants::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        models::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| models::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        models_accounts::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| models_accounts::dispatch(orch, request, index, item, dry_run, &resource))
+            .await?
     {
         summary
-    } else if let Some(summary) = packs::dispatch(
-        orch,
-        request,
-        index,
-        item,
-        dry_run,
-        &resource,
-        &mut applied_data,
-    )
+    } else if let Some(summary) = {
+        let (resource, applied_data) = (&resource, &mut applied_data);
+        off_frame(move || {
+            packs::dispatch(orch, request, index, item, dry_run, resource, applied_data)
+        })
+    }
     .await?
     {
         summary
-    } else if let Some(summary) = todos::dispatch(
-        orch,
-        request,
-        index,
-        item,
-        dry_run,
-        &resource,
-        &mut applied_data,
-    )
+    } else if let Some(summary) = {
+        let (resource, applied_data) = (&resource, &mut applied_data);
+        off_frame(move || {
+            todos::dispatch(orch, request, index, item, dry_run, resource, applied_data)
+        })
+    }
     .await?
     {
         summary
     } else if let Some(summary) =
-        artifacts::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| artifacts::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        bug::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| bug::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        wakes::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| wakes::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        prompts::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| prompts::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        recipes::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| recipes::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        routes::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| routes::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        responses::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| responses::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        agents::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| events::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        actions::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| agents::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        settings::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| actions::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        mcp::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| settings::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        executors::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| mcp::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
-        channels::dispatch(orch, request, index, item, dry_run, &resource).await?
+        off_frame(|| executors::dispatch(orch, request, index, item, dry_run, &resource)).await?
+    {
+        summary
+    } else if let Some(summary) =
+        off_frame(|| channels::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else {

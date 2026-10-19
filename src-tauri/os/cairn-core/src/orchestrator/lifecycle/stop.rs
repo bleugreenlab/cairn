@@ -874,10 +874,16 @@ const STOP_CANCELLED_PROMPT_RESPONSE: &str = "[cancelled by stop]";
 ///    successor and ends the yielded work turn — then recompute so the projection
 ///    reflects a steerable, no-longer-waiting state. The user can immediately send
 ///    a follow-up that starts a fresh turn.
+///
+/// A job with no row has nothing to stop, and that is success: a Stop racing a
+/// deletion must not surface as a failed recompute.
 pub fn stop_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
     // A live run is attached: the run-scoped path is the unchanged behavior.
     if let Some(run_id) = live_run_id_for_job(orch, job_id) {
         return stop_session(orch, &run_id);
+    }
+    if !job_exists(orch, job_id)? {
+        return Ok(());
     }
 
     // No run to attach to. Cascade-stop descendant child runs first, mirroring
@@ -940,6 +946,20 @@ fn descendant_running_run_ids_for_job(orch: &Orchestrator, job_id: &str) -> Vec<
         .map_err(|e| e.to_string())
     })
     .unwrap_or_default()
+}
+
+fn job_exists(orch: &Orchestrator, job_id: &str) -> Result<bool, String> {
+    let dbs = orch.db.clone();
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        db.query_opt_text("SELECT id FROM jobs WHERE id = ?1", (job_id,))
+            .await
+            .map(|row| row.is_some())
+            .map_err(|error| error.to_string())
+    })
 }
 
 fn cancel_provider_holds(orch: &Orchestrator, job_id: &str) -> Result<(), String> {

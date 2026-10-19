@@ -165,10 +165,13 @@ impl AppServerClient {
     ) -> Self {
         let mut responses = std::collections::VecDeque::from(responses);
         Self::for_test_responding(
-            move |_| {
-                responses
-                    .pop_front()
-                    .unwrap_or_else(|| Err("scripted app-server response missing".to_string()))
+            move |request| {
+                responses.pop_front().unwrap_or_else(|| {
+                    Err(format!(
+                        "scripted app-server response missing for {}",
+                        request["method"]
+                    ))
+                })
             },
             requests,
         )

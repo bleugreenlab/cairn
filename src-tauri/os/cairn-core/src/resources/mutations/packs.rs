@@ -368,7 +368,15 @@ pub fn reset_pack_item(
             kind.as_str()
         )
     })?;
-    if !item.forked {
+    // A fork the lock has not recorded yet (an edit since the last sync) is
+    // just as much the user's copy, and the catalog already offers its reset.
+    let unrecorded_edit = kind != PackItemKind::Mcp
+        && item.path.as_deref().is_some_and(|path| {
+            pack::hash_item_path(kind, &orch.config_dir, &orch.config_dir.join(path))
+                .and_then(|current| pack::matches_baseline(&orch.config_dir, &item, &current))
+                .is_ok_and(|matches| !matches)
+        });
+    if !item.forked && !unrecorded_edit {
         return Err(format!(
             "{} `{item_id}` is already using pack `{pack_id}`'s version",
             kind.as_str()
@@ -906,6 +914,60 @@ mod tests {
                 "restored {kind:?} `{id}` in pack `{pack_id}` must return to pack ownership"
             );
         }
+    }
+
+    /// An edit saved between syncs is the user's copy at once: the catalog
+    /// says so, says the app ships something different, shows both sides,
+    /// and its reset works before any sync has recorded the fork.
+    #[tokio::test]
+    async fn an_unsynced_edit_reads_as_a_copy_behind_shipped_and_resets() {
+        let ws = workspace().await;
+        write(&ws.home.join("agents/explore.md"), "my agent\n");
+
+        let entry = pack_catalog(&ws.home).find("core").unwrap().clone();
+        let item = entry
+            .items
+            .iter()
+            .find(|item| item.kind == "agent" && item.id == "explore")
+            .unwrap();
+        assert_eq!(item.state, PackItemState::EditedByUser);
+        assert!(item.behind_shipped);
+        assert_eq!((entry.edited_count, entry.behind_count), (1, 1));
+
+        let diff = crate::resources::packs::pack_item_diff(
+            &ws.home,
+            "core",
+            PackItemKind::Agent,
+            "explore",
+        )
+        .unwrap();
+        assert_eq!(diff.files.len(), 1);
+        assert_eq!(diff.files[0].shipped.as_deref(), Some("bundle agent\n"));
+        assert_eq!(diff.files[0].yours.as_deref(), Some("my agent\n"));
+
+        // A skill differs only in the files that differ; Finder metadata is no file.
+        write(&ws.home.join("skills/example/.DS_Store"), "finder");
+        write(&ws.home.join("skills/example/notes.md"), "mine\n");
+        let skill = crate::resources::packs::pack_item_diff(
+            &ws.home,
+            "core",
+            PackItemKind::Skill,
+            "example",
+        )
+        .unwrap();
+        assert_eq!(skill.files.len(), 1);
+        assert_eq!(skill.files[0].path, "skills/example/notes.md");
+        assert_eq!(skill.files[0].shipped, None);
+
+        reset_pack_item(&ws.orch, "core", PackItemKind::Agent, "explore").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws.home.join("agents/explore.md")).unwrap(),
+            "bundle agent\n"
+        );
+        assert_eq!(
+            item_state(&ws, "core", "agent", "explore"),
+            Some(PackItemState::PackOwned)
+        );
     }
 
     /// The routing worker caches each scope's route set. A pack mutation must

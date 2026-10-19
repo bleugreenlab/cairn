@@ -69,6 +69,7 @@ mod runs;
 mod runtime;
 mod secret_crossings;
 mod source_structure;
+mod stack_headroom;
 mod stale_run_reaper;
 mod synthetic_continuation_event;
 mod team_connect;

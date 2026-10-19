@@ -1415,17 +1415,12 @@ fn tenet_date(at: i64) -> String {
 }
 
 fn render_awaiting_tenet(view: &TenetView) -> String {
-    let mut entry = format!(
+    format!(
         "- **#{}** (proposed {}) — {}\n",
         view.row.number,
         tenet_date(view.row.created_at),
-        view.row.question
-    );
-    for (index, option) in view.row.options.iter().enumerate() {
-        let recommended = if index == 0 { " (recommended)" } else { "" };
-        entry.push_str(&format!("  {}. {option}{recommended}\n", index + 1));
-    }
-    entry
+        view.row.statement
+    )
 }
 
 fn render_full_tenet(view: &TenetView) -> String {
@@ -1447,11 +1442,8 @@ fn render_tenet_entry(view: &TenetView, from_thread: Option<&str>) -> String {
         row.number,
         view.answerer_label.as_deref().unwrap_or("the operator"),
         tenet_date(row.answered_at.unwrap_or(row.updated_at)),
-        view.text.as_deref().unwrap_or(&row.question)
+        row.statement
     );
-    if !view.rejected.is_empty() {
-        entry.push_str(&format!("  rejected: {}\n", view.rejected.join("; ")));
-    }
     if let Some(comment) = &row.comment {
         entry.push_str(&format!("  comment: {comment}\n"));
     }
@@ -1487,12 +1479,11 @@ fn render_tenet_entry(view: &TenetView, from_thread: Option<&str>) -> String {
 
 fn render_index_tenet(view: &TenetView) -> String {
     let row = &view.row;
-    let text = view.text.as_deref().unwrap_or(&row.question);
     let mut line = format!(
         "- #{} · {} · {}",
         row.number,
         row.status.as_str(),
-        tenet_first_sentence(text, TENET_INDEX_SENTENCE_CHARS)
+        tenet_first_sentence(&row.statement, TENET_INDEX_SENTENCE_CHARS)
     );
     if let Some(slug) = &row.slug {
         line.push_str(&format!(" [{slug}]"));
@@ -2275,19 +2266,19 @@ mod tests {
     fn tenet(number: i64, status: TenetStatus, text: &str) -> TenetView {
         use crate::tenets::{AnswerSource, TenetRow};
         let answered = status.has_verdict();
-        let selected = matches!(status, TenetStatus::Approved | TenetStatus::Superseded);
-        let options = vec![text.to_string(), format!("Not {text}")];
         let row = TenetRow {
             id: format!("t{number}"),
             project_id: "p".into(),
             number,
             proposing_thread_id: "thread".into(),
             slug: None,
-            question: format!("Should we {text}?"),
-            options: options.clone(),
+            statement: text.to_string(),
             status,
-            verdict: answered.then(|| if selected { "option" } else { "none" }.to_string()),
-            selected_option: selected.then_some(0),
+            verdict: answered.then_some(if status == TenetStatus::Declined {
+                crate::tenets::Verdict::No
+            } else {
+                crate::tenets::Verdict::Yes
+            }),
             comment: None,
             answered_by: None,
             answer_source: answered.then_some(AnswerSource::Device),
@@ -2308,16 +2299,6 @@ mod tests {
             project_key: "prj".into(),
             proposing_thread: "prj/topic".into(),
             proposing_thread_name: Some("topic".into()),
-            text: selected.then(|| text.to_string()),
-            rejected: if answered {
-                options
-                    .iter()
-                    .skip(usize::from(selected))
-                    .cloned()
-                    .collect()
-            } else {
-                Vec::new()
-            },
             superseded_by: None,
             answerer_label: answered.then(|| "anonymous device d-1".to_string()),
             policy_label: "Releases on: answered".into(),
@@ -2346,14 +2327,14 @@ mod tests {
     }
 
     #[test]
-    fn an_approved_tenet_renders_in_full_with_its_verdict_and_alternatives() {
+    fn an_approved_tenet_renders_in_full_with_its_verdict() {
         let mut successor = tenet(4, TenetStatus::Approved, "Ship the lease change");
         successor.row.comment = Some("Do it this week".into());
         successor.row.supersedes = Some(2);
         let rendered = render_tenets(vec![successor]);
         assert!(
             rendered.contains(
-                "- **#4** (approved by anonymous device d-1, 2023-11-14) — Ship the lease change\n  rejected: Not Ship the lease change\n  comment: Do it this week\n  supersedes #2\n"
+                "- **#4** (approved by anonymous device d-1, 2023-11-14) — Ship the lease change\n  comment: Do it this week\n  supersedes #2\n"
             ),
             "{rendered}"
         );
@@ -2364,15 +2345,12 @@ mod tests {
         let mut migrated = tenet(1, TenetStatus::Approved, "No budget kills");
         migrated.row.origin = TenetOrigin::MigratedRuling;
         migrated.row.slug = Some("no-budget-kills".into());
-        migrated.row.options = vec!["No budget kills".into()];
-        migrated.rejected = Vec::new();
         migrated.answerer_label = Some("migrated ruling".into());
         let rendered = render_tenets(vec![migrated]);
         assert!(
             rendered.contains("- **#1** (approved by migrated ruling, 2023-11-14) — No budget kills\n  slug: `no-budget-kills`\n"),
             "{rendered}"
         );
-        assert!(!rendered.contains("rejected:"), "{rendered}");
     }
 
     #[test]
@@ -2397,7 +2375,7 @@ mod tests {
         });
         assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{rendered}");
         assert!(
-            rendered.contains("- **#3** (proposed 2023-11-03) — Should we Add a timeout?\n  1. Add a timeout (recommended)\n  2. Not Add a timeout\n"),
+            rendered.contains("- **#3** (proposed 2023-11-03) — Add a timeout\n"),
             "{rendered}"
         );
     }
@@ -2415,7 +2393,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("- #2 · declined · Should we Rejected idea?\n"),
+            rendered.contains("- #2 · declined · Rejected idea\n"),
             "{rendered}"
         );
         assert!(!rendered.contains("Withdrawn idea"), "{rendered}");
@@ -3499,16 +3477,12 @@ mod tests {
 
     async fn other_thread_tenet(db: &LocalDb, number: i64, text: &str) {
         db.execute(
-            "INSERT INTO tenets (id, project_id, number, proposing_thread_id, question, options_json,
-                 status, verdict, selected_option, answer_source, answered_at, origin,
+            "INSERT INTO tenets (id, project_id, number, proposing_thread_id, statement,
+                 status, verdict, answer_source, answered_at, origin,
                  proposer_principal_json, created_at, updated_at)
-             VALUES (?1, 'p', ?2, 't-other', 'Which way?', ?3, 'approved', 'option', 0, 'device',
+             VALUES (?1, 'p', ?2, 't-other', ?3, 'approved', 'yes', 'device',
                  10, 'standing', '{\"kind\":\"agent\",\"node\":\"cairn://p/prj/other\",\"run_id\":null}', 1, 1)",
-            params![
-                format!("other-{number}"),
-                number,
-                serde_json::to_string(&[text, "the other way"]).unwrap()
-            ],
+            params![format!("other-{number}"), number, text],
         )
         .await
         .unwrap();
@@ -3692,12 +3666,12 @@ mod tests {
         assert!(!rendered[index..].contains("#10"), "{rendered}");
 
         // With the budget spent on the thread's own tenets, nothing related fits.
-        let long = "word ".repeat(1_100);
+        let long = "word ".repeat(2_200);
         let big = tenet(3, TenetStatus::Approved, &format!("Big. {long}"));
         let mut far = tenet(
             11,
             TenetStatus::Approved,
-            &format!("Far. {}", "w ".repeat(600)),
+            &format!("Far. {}", "w ".repeat(1_200)),
         );
         far.proposing_thread = "prj/other".into();
         let rendered = render_arc_projection(

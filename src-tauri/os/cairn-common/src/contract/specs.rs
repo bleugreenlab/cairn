@@ -237,7 +237,7 @@ pub(crate) const EXECUTION: KeySpec = KeySpec::new(
 pub(crate) const TENET_PROPOSAL: KeySpec = KeySpec::new(
     "proposal",
     KeyType::Object,
-    "{question, options:[...]} (1-5 options, option 1 your recommendation): a thread filing a tenet-gated recipe (planbuild, coordinator, PlanCoord by default) proposes this tenet to the operator and the execution is filed HELD on its verdict. Send exactly one of proposal or tenet on such a filing; `build` stays ungated for repair",
+    "{statement} (how the project does things, for the operator to answer yes or no): a thread filing a tenet-gated recipe (planbuild, coordinator, PlanCoord by default) proposes this tenet to the operator and the execution is filed HELD on its verdict. Send exactly one of proposal or tenet on such a filing; `build` stays ungated for repair",
 );
 pub(crate) const TENET_NUMBER: KeySpec = KeySpec::new(
     "tenet",
@@ -258,11 +258,6 @@ pub(crate) const LAUNCH_OVERRIDES: KeySpec = KeySpec::new(
     "overrides",
     KeyType::Object,
     "ad-hoc adjustments to THIS launch only, never to the recipe others run. `without:[node,...]` removes nodes and splices their edges through, e.g. {without:[\"review\"]} to skip review on a tiny fix; `nodes:{node:{agent}}` rebinds one node to a different agent and re-resolves its snapshot from that agent's config, e.g. {nodes:{\"builder\":{\"agent\":\"coordinator\"}}}; `agents:{agentId:{...}}` merges agent-snapshot fields (prompt, tier, backend, selection, tools, disallowedTools, skills, extras, description) using the same grammar as the post-create snapshot patch. Address a node by its name or by the agent id it runs — recipe-file node ids are not stable and a token matching no node is refused, never skipped. Removing the trigger, the last agent node, or anything that would strand a node from the trigger is refused; a fence is not settable here",
-);
-pub(crate) const ISSUE_KIND: KeySpec = KeySpec::new(
-    "kind",
-    KeyType::Str,
-    "issue (default) | thread; a thread is a durable session anchor that owns no branch and never merges",
 );
 pub(crate) const PARENT: KeySpec = KeySpec::new(
     "parent",
@@ -854,6 +849,11 @@ pub(crate) const SETTINGS_BUILD_SERVICES: KeySpec = KeySpec::new(
     "buildServices",
     KeyType::Object,
     "{upsert[{name,config}], setEnabled[{name,enabled}], remove[names]}",
+);
+pub(crate) const SETTINGS_INFERENCE: KeySpec = KeySpec::new(
+    "inference",
+    KeyType::Object,
+    "{bginf:{url,machines?{node:machine}}|null} replaces the section; the bginf token is a `bginf` account, never a setting",
 );
 pub(crate) const SETTINGS_MAX_THINKING_TOKENS: KeySpec = KeySpec::new(
     "maxThinkingTokens",

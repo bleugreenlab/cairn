@@ -23,9 +23,20 @@ const BUNDLE_COMMIT_SUBJECTS: &[&str] = &[
     "Sync bundled workspace defaults",
 ];
 const PACK_COMMIT_PREFIX: &str = "Sync pack resources: ";
+/// The June bundle-branch sync committed shipped resources, and nothing else,
+/// in a scratch worktree of a dedicated `bundle` branch under this subject. A
+/// path whose last commit carries it holds exactly what that build shipped.
+///
+/// Its two siblings from the same era are deliberately NOT ownership evidence:
+/// `Merge branch 'bundle'` is only ever a path's last commit when the merge
+/// combined the user's side with the bundle's, and `Snapshot workspace config`
+/// committed the user's own pending edits before a sync.
+const BUNDLE_BRANCH_COMMIT_PREFIX: &str = "Update bundled defaults to ";
 
 fn is_pack_authored_subject(subject: &str) -> bool {
-    BUNDLE_COMMIT_SUBJECTS.contains(&subject) || subject.starts_with(PACK_COMMIT_PREFIX)
+    BUNDLE_COMMIT_SUBJECTS.contains(&subject)
+        || subject.starts_with(PACK_COMMIT_PREFIX)
+        || subject.starts_with(BUNDLE_BRANCH_COMMIT_PREFIX)
 }
 
 /// Sync an already resolved source through the canonical pack ownership machinery.
@@ -218,13 +229,10 @@ pub fn uninstall_pack(
             continue;
         }
         let current = current_item_hash(config_dir, pack_id, item)?;
-        let owned = matches!(
-            (&current, item.content_hash.as_deref()),
-            (ContentHash::Present(current), Some(baseline)) if current == baseline
-        );
         if matches!(current, ContentHash::Missing) {
             continue;
         }
+        let owned = matches_baseline(config_dir, item, &current)?;
         if !owned {
             item.forked = true;
             if let Some(path) = &item.path {
@@ -362,15 +370,20 @@ fn migrate_legacy_lock(
                 item.content_hash = source_item_hash(manifest, item, &source_mcp)?;
             }
             ContentHash::Present(hash) => {
-                let history_path = item.path.clone().unwrap_or_else(|| {
-                    format!(
-                        "{}/{}/{}",
-                        pack_lock::PACKS_DIR,
-                        lock.id,
-                        pack::manifest::PACK_MCP_FILE
-                    )
-                });
-                let owned = legacy_path_is_pack_owned(git, config_dir, &history_path);
+                // Bytes identical to what this build ships cannot hold a user
+                // edit worth keeping, so they need no history to be owned.
+                let shipped = source_item_hash(manifest, item, &source_mcp)?;
+                let owned = shipped.as_deref() == Some(hash.as_str()) || {
+                    let history_path = item.path.clone().unwrap_or_else(|| {
+                        format!(
+                            "{}/{}/{}",
+                            pack_lock::PACKS_DIR,
+                            lock.id,
+                            pack::manifest::PACK_MCP_FILE
+                        )
+                    });
+                    legacy_path_is_pack_owned(git, config_dir, &history_path)
+                };
                 item.content_hash = Some(hash);
                 item.forked = !owned;
             }
@@ -428,11 +441,7 @@ fn sync_pack(
             continue;
         }
         let current = current_item_hash(config_dir, &pack_id, &old)?;
-        let owned = !old.forked
-            && matches!(
-                (&current, old.content_hash.as_deref()),
-                (ContentHash::Present(current), Some(baseline)) if current == baseline
-            );
+        let owned = !old.forked && matches_baseline(config_dir, &old, &current)?;
         if owned {
             remove_item_content(fs, config_dir, &pack_id, &old)?;
             if let Some(path) = &old.path {
@@ -481,8 +490,15 @@ fn sync_pack(
                     continue;
                 };
                 if current_hash != baseline {
-                    item.forked = true;
-                } else if current_hash != source_hash {
+                    if !matches_legacy_tree_baseline(config_dir, item, baseline)? {
+                        item.forked = true;
+                        continue;
+                    }
+                    // Same content under the pre-exclusion hash: re-record the
+                    // baseline in today's terms so the fallback is paid once.
+                    item.content_hash = Some(current_hash.clone());
+                }
+                if current_hash != source_hash {
                     materialize_item(fs, config_dir, &pack_id, manifest, item, &source_mcp)?;
                     item.content_hash = Some(source_hash);
                     if let Some(path) = &item.path {
@@ -507,6 +523,38 @@ fn sync_pack(
     // Content always lands before the baseline that claims it.
     pack_lock::write_lock(fs, config_dir, lock)?;
     Ok(())
+}
+
+/// Whether an item's current content is still the bytes Cairn last materialized.
+pub fn matches_baseline(
+    config_dir: &Path,
+    item: &PackLockItem,
+    current: &ContentHash,
+) -> Result<bool, String> {
+    let (ContentHash::Present(current), Some(baseline)) = (current, item.content_hash.as_deref())
+    else {
+        return Ok(false);
+    };
+    Ok(current == baseline || matches_legacy_tree_baseline(config_dir, item, baseline)?)
+}
+
+/// A skill or workflow baseline recorded before OS metadata left the tree hash
+/// matches when the tree, metadata included, still hashes to it.
+fn matches_legacy_tree_baseline(
+    config_dir: &Path,
+    item: &PackLockItem,
+    baseline: &str,
+) -> Result<bool, String> {
+    if !matches!(item.kind, PackItemKind::Skill | PackItemKind::Workflow) {
+        return Ok(false);
+    }
+    let Some(path) = &item.path else {
+        return Ok(false);
+    };
+    Ok(
+        pack::hash_tree_including_os_metadata(&config_dir.join(path))?
+            == ContentHash::Present(baseline.to_string()),
+    )
 }
 
 fn source_item_hash(
@@ -736,7 +784,10 @@ mod tests {
         assert!(is_pack_authored_subject(
             "Sync pack resources: some-third-party"
         ));
+        assert!(is_pack_authored_subject("Update bundled defaults to 0.8.7"));
+        // Both carry the user's own content, so neither may prove ownership.
         assert!(!is_pack_authored_subject("Snapshot workspace config"));
+        assert!(!is_pack_authored_subject("Merge branch 'bundle'"));
         assert!(!is_pack_authored_subject("User edits explore"));
     }
 }

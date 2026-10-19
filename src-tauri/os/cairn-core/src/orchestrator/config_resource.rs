@@ -1115,16 +1115,14 @@ fn title_case(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::project_paths_from_db;
-    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::LocalDb;
     use std::sync::Arc;
     use tempfile::tempdir;
 
     #[tokio::test]
     async fn project_paths_from_db_excludes_workspace_project() {
         let temp = tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("cairn.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(temp.path().join("cairn.db"))
             .await
             .unwrap();
         db.write(|conn| {
@@ -2074,7 +2072,7 @@ mod tests {
         use crate::models::{CreateAgentConfig, UpdateAgentConfig};
         use crate::orchestrator::OrchestratorBuilder;
         use crate::services::testing::TestServicesBuilder;
-        use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+        use crate::storage::{LocalDb, SearchIndex};
         use std::path::Path;
         use std::sync::Arc;
 
@@ -2105,9 +2103,7 @@ mod tests {
         // Unrelated dirty state in the same repo must survive every commit.
         std::fs::write(config_dir.join("settings.yaml"), "tiers: [sm]\n").unwrap();
 
-        let db = LocalDb::open(root.join("test.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(root.join("test.db"))
             .await
             .unwrap();
         let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
@@ -2177,7 +2173,7 @@ mod tests {
         use crate::models::{CreateAgentConfig, UpdateAgentConfig};
         use crate::orchestrator::OrchestratorBuilder;
         use crate::services::testing::TestServicesBuilder;
-        use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+        use crate::storage::{LocalDb, SearchIndex};
         use std::path::Path;
         use std::sync::Arc;
 
@@ -2251,9 +2247,7 @@ mod tests {
         init_bare(&proj_origin);
         set_origin(&project_repo, &proj_origin);
 
-        let db = LocalDb::open(root.join("test.db")).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
+        let db = LocalDb::open_migrated_for_test(root.join("test.db"))
             .await
             .unwrap();
         // Register the project so orch.project_path("project") resolves to its repo.
