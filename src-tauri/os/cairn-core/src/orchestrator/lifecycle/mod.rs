@@ -68,7 +68,7 @@ pub(crate) use watchdog_recovery::{
 #[cfg(test)]
 pub(crate) use finalize::finish_memory_review_if_due;
 #[cfg(test)]
-pub(crate) use finalize::handle_session_crash;
+pub(crate) use finalize::{handle_session_crash, run_digest_reseed_fallback};
 #[cfg(test)]
 pub(crate) use review_push::{record_bounded_rearm_lookup_failure, review_artifact_ref};
 #[cfg(test)]

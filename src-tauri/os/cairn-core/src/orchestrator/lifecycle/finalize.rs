@@ -1161,7 +1161,7 @@ fn finalize_run_inner(
     // backend reported unresolvable. Computed here — before the terminal
     // attention toast — so a planned fallback suppresses the failure alarm.
     let reseed_fallback = if status == RunStatus::Crashed {
-        handle_session_crash(orch, run_id, turn_id.as_deref())
+        handle_session_crash(orch, run_id)
     } else {
         None
     };
@@ -1256,14 +1256,14 @@ fn claim_reseed_fallback(
 ///
 /// Always logs a crashed resume for operator visibility. When the backend
 /// recorded [`BackendFailure::SessionUnresolvable`], claims the one-shot
-/// per-session fallback slot, notes the reconstruction in the transcript, and
-/// returns the plan for the caller to schedule.
+/// per-session fallback slot and returns the plan for the caller to schedule.
+/// The user is told why at the reconstruction itself: the plan's launch writes
+/// a `digest_reseed` session boundary whose reason is `session_unresolvable`.
 ///
 /// [`BackendFailure::SessionUnresolvable`]: crate::backends::BackendFailure::SessionUnresolvable
 pub(crate) fn handle_session_crash(
     orch: &Orchestrator,
     run_id: &str,
-    _turn_id: Option<&str>,
 ) -> Option<DigestReseedFallback> {
     let dbs = orch.db.clone();
     let log_run_id = run_id.to_string();
@@ -1354,36 +1354,41 @@ pub(crate) fn handle_session_crash(
 ///
 /// A thread is required: `finalize_run` runs on the backend's reader thread,
 /// and the continuation does blocking database work and spawns a process.
-/// [`resume_job_from_digest`] is the same entry point the manual **resume from
-/// digest** control uses, so the automatic recovery and the manual one stay one
-/// implementation — including its `head_turn_active_sync` guard, which declines
-/// if a user continuation raced in first.
-///
-/// [`resume_job_from_digest`]: crate::execution::jobs::resume_job_from_digest
 fn spawn_digest_reseed_fallback(orch: &Orchestrator, plan: DigestReseedFallback) {
     let orch = orch.clone();
     let spawn_job_id = plan.job_id.clone();
     if let Err(error) = std::thread::Builder::new()
         .name("session-reseed-fallback".to_string())
-        .spawn(move || {
-            if let Err(error) =
-                crate::execution::jobs::resume_job_from_digest(&orch, &plan.job_id, None)
-            {
-                // Nothing was rotated (an empty digest fails before any
-                // mutation), so the turn stays crashed exactly as it does
-                // today. The claim is not released: retrying will not fix it.
-                log::warn!(
-                    "Digest-reseed fallback for job {} (session {}) did not launch: {}",
-                    plan.job_id,
-                    &plan.session_id[..plan.session_id.len().min(8)],
-                    error
-                );
-            }
-        })
+        .spawn(move || run_digest_reseed_fallback(&orch, &plan))
     {
         log::warn!(
             "Failed to schedule the digest-reseed fallback for job {}: {}",
             spawn_job_id,
+            error
+        );
+    }
+}
+
+/// Launch the digest reseed a claimed fallback planned.
+///
+/// [`recover_unresolvable_session_from_digest`] shares its body with the manual
+/// **resume from digest** control, so the automatic recovery and the manual one
+/// stay one implementation — including its `head_turn_active_sync` guard, which
+/// declines if a user continuation raced in first. What differs is only the
+/// boundary's reason, which is how the user learns this rebuild was a recovery.
+///
+/// [`recover_unresolvable_session_from_digest`]: crate::execution::jobs::recover_unresolvable_session_from_digest
+pub(crate) fn run_digest_reseed_fallback(orch: &Orchestrator, plan: &DigestReseedFallback) {
+    if let Err(error) =
+        crate::execution::jobs::recover_unresolvable_session_from_digest(orch, &plan.job_id)
+    {
+        // Nothing was rotated (an empty digest fails before any mutation), so
+        // the turn stays crashed. The claim is not released: retrying will not
+        // fix it.
+        log::warn!(
+            "Digest-reseed fallback for job {} (session {}) did not launch: {}",
+            plan.job_id,
+            &plan.session_id[..plan.session_id.len().min(8)],
             error
         );
     }

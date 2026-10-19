@@ -164,6 +164,12 @@ struct SessionBoundary {
 /// launch never confirmed.
 const UNCONFIRMED_FIRST_LAUNCH_BOUNDARY_REASON: &str = "unconfirmed_first_launch";
 
+/// The boundary reason for a session rebuilt automatically because the backend
+/// could not resolve its native resume handle. Without it the rebuild reads
+/// exactly like an operator's **resume from digest**, and the user watches a
+/// digest-seeded turn appear with no account of why.
+const SESSION_UNRESOLVABLE_BOUNDARY_REASON: &str = "session_unresolvable";
+
 impl SessionBoundary {
     fn provider_change(from: String, to: String, model: Option<&str>, seed_bytes: usize) -> Self {
         Self {
@@ -1666,7 +1672,11 @@ const FORCED_DIGEST_RESUME_TRIGGER: &str = "Continue from the conversation diges
 #[derive(Debug, Clone)]
 enum ContinuationIntent {
     Normal,
-    ForceDigestReseed,
+    /// Rotate onto a digest-seeded session. `reason` names the cause on the
+    /// `digest_reseed` boundary when the system, not the operator, asked.
+    ForceDigestReseed {
+        reason: Option<&'static str>,
+    },
     /// An operator's cold Compact. Everything live in the old session has
     /// already been torn down under the launch lock this continuation runs
     /// under; the forced reseed rotates with reason `operator_compact` and
@@ -1723,6 +1733,30 @@ pub fn resume_job_from_digest(
     job_id: &str,
     identity_override: Option<crate::identity::UserIdentity>,
 ) -> Result<Run, String> {
+    force_digest_reseed(orch, job_id, identity_override, None)
+}
+
+/// The automatic recovery for a resume whose native session handle the backend
+/// could not resolve: the same forced reseed as [`resume_job_from_digest`],
+/// with a boundary that says why the conversation was rebuilt.
+pub(crate) fn recover_unresolvable_session_from_digest(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Result<Run, String> {
+    force_digest_reseed(
+        orch,
+        job_id,
+        None,
+        Some(SESSION_UNRESOLVABLE_BOUNDARY_REASON),
+    )
+}
+
+fn force_digest_reseed(
+    orch: &Orchestrator,
+    job_id: &str,
+    identity_override: Option<crate::identity::UserIdentity>,
+    reason: Option<&'static str>,
+) -> Result<Run, String> {
     let owning_db = run_db({
         let dbs = orch.db.clone();
         let job_id = job_id.to_string();
@@ -1749,7 +1783,7 @@ pub fn resume_job_from_digest(
             supersede_pending_retry: true,
             ..Default::default()
         }),
-        ContinuationIntent::ForceDigestReseed,
+        ContinuationIntent::ForceDigestReseed { reason },
     )
 }
 
@@ -2650,10 +2684,10 @@ fn continue_job_launch_locked(
     let mut resumes_provider_change = false;
     // Set when the rotation itself committed this continuation's boundary.
     let mut boundary_in_rotation = false;
-    let (forced_reseed, operator_compact) = match &continuation_intent {
-        ContinuationIntent::Normal => (false, None),
-        ContinuationIntent::ForceDigestReseed => (true, None),
-        ContinuationIntent::OperatorCompact(boundary) => (true, Some(boundary.clone())),
+    let (forced_reseed, operator_compact, reseed_reason) = match &continuation_intent {
+        ContinuationIntent::Normal => (false, None, None),
+        ContinuationIntent::ForceDigestReseed { reason } => (true, None, *reason),
+        ContinuationIntent::OperatorCompact(boundary) => (true, Some(boundary.clone()), None),
     };
     let step_started = std::time::Instant::now();
     let mut session_boundary: Option<SessionBoundary> = None;
@@ -2692,10 +2726,14 @@ fn continue_job_launch_locked(
                         // Committed with the session close, or not at all.
                         boundary_in_rotation = true;
                     } else {
-                        session_boundary = Some(SessionBoundary::digest_reseed(
+                        let boundary = SessionBoundary::digest_reseed(
                             session.backend.clone(),
                             outcome.seed_content.len(),
-                        ));
+                        );
+                        session_boundary = Some(match reseed_reason {
+                            Some(reason) => boundary.with_reason(reason),
+                            None => boundary,
+                        });
                     }
                     reseed_outcome = Some(outcome);
                     (new_id, session_start, run_start_mode)

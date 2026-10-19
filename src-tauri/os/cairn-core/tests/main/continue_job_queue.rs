@@ -3,16 +3,19 @@
 //! trip the active-turn guard and return an error the composer surfaces as a 500
 //! (which also drops the typed text).
 //!
-//! Modeled on `queued_direct_messages.rs`: these pin the storage half of the
-//! queue-on-active behavior — a `queued_messages` row with `Queue` delivery and
-//! no new turn — without needing a real worktree/process. The idle/terminal
-//! resume branch stays covered by `continue_job_impl`'s own paths.
+//! Every message-bearing send is now acknowledged at its durable
+//! `queued_messages` row and delivered by a background nudge, whatever the head
+//! turn's state. These pin the acknowledgement — a `Queue` row and no new turn —
+//! and, separately, what a delivery attempt that cannot launch leaves behind,
+//! without needing a real worktree/process.
 
 use crate::common;
 use cairn_core::internal::execution::jobs::{
     continue_job_or_enqueue, continue_job_or_enqueue_with_before_resume_for_test,
 };
 use cairn_core::internal::storage::{LocalDb, RowExt};
+use cairn_core::messages::delivery::nudge_job_for_urgency;
+use cairn_core::messages::queued::{self, Delivery};
 use cairn_db::turso::params;
 
 /// Seed a project/issue/execution/job/session/run whose head turn sits in
@@ -49,7 +52,7 @@ async fn seed_job(db: &LocalDb, turn_state: &str) {
             .await?;
             conn.execute(
                 "INSERT INTO sessions (id, job_id, status, created_at, updated_at)
-                 VALUES ('session-1', 'job-1', 'active', 1, 1)",
+                 VALUES ('session-1', 'job-1', 'open', 1, 1)",
                 (),
             )
             .await?;
@@ -80,7 +83,7 @@ async fn seed_job(db: &LocalDb, turn_state: &str) {
 #[tokio::test(flavor = "current_thread")]
 async fn settling_boundary_queues_instead_of_leaving_a_delivered_orphan() {
     let (_temp, orch) = common::test_orchestrator().await;
-    seed_job(&orch.db.local, "completed").await;
+    seed_job(&orch.db.local, "complete").await;
     let db = orch.db.local.clone();
 
     continue_job_or_enqueue_with_before_resume_for_test(
@@ -103,7 +106,7 @@ async fn settling_boundary_queues_instead_of_leaving_a_delivered_orphan() {
             .unwrap();
         },
     )
-    .expect("a turn winning after classification must convert the send to queue");
+    .expect("a turn going live before the nudge leaves the send queued");
     continue_job_or_enqueue_with_before_resume_for_test(
         &orch,
         "job-1",
@@ -323,26 +326,88 @@ async fn continue_job_or_enqueue_queues_when_head_turn_pending() {
     );
 }
 
-/// A direct idle send is recorded as delivered only after the authoritative
-/// continuation path has accepted it. This fixture has no runnable worktree, so
-/// the continuation fails and must not leave a delivered-only orphan behind.
+/// A send to an idle job is acknowledged the same way a send to a busy one is:
+/// by the durable row, not by a launch. The launch is the nudge's, after the
+/// caller already has its answer.
 #[tokio::test(flavor = "current_thread")]
-async fn a_rejected_idle_send_is_not_stamped_delivered() {
+async fn an_idle_send_is_acknowledged_at_the_durable_row() {
     let (_temp, orch) = common::test_orchestrator().await;
-    seed_job(&orch.db.local, "completed").await;
-    let before_turns = turn_count(&orch.db.local, "job-1").await;
+    seed_job(&orch.db.local, "complete").await;
 
-    assert!(continue_job_or_enqueue(&orch, "job-1", Some("^"), None, None).is_err());
+    let run = continue_job_or_enqueue(&orch, "job-1", Some("^"), None, None)
+        .expect("an idle send is accepted once its row is durable");
 
-    assert!(
-        recorded_rows(&orch.db.local, "job-1").await.is_empty(),
-        "a failed direct dispatch must not claim that the message was delivered"
+    assert_eq!(
+        run.map(|run| run.id).as_deref(),
+        Some("run-1"),
+        "the acknowledgement reports the job's latest run"
     );
     assert_eq!(
-        turn_count(&orch.db.local, "job-1").await,
-        before_turns,
-        "a rejected dispatch must not create a turn"
+        queued_rows(&orch.db.local, "job-1").await,
+        vec![("^".to_string(), "queue".to_string())],
+        "the idle send is the same Queue row a busy one is"
     );
+}
+
+/// Delivery is the resume claiming the row, so a resume that claims it and then
+/// cannot launch is the one place an acknowledged send could be lost: a row
+/// left stamped delivered is a message nobody received and nothing redelivers.
+/// This fixture's execution has no host agent snapshot, so the launch is refused
+/// after it has claimed the row and published its successor turn — the window
+/// under test. The refusal is asserted by name: if the fixture ever becomes
+/// launchable, this should fail as that, not as a confusing delivery assertion.
+///
+/// Driven through the nudge synchronously, on a row enqueued without one, so the
+/// assertions observe the settled outcome rather than racing a background thread.
+#[tokio::test(flavor = "current_thread")]
+async fn a_launch_that_fails_returns_the_claimed_send_to_pending() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    seed_job(&orch.db.local, "complete").await;
+    queued::enqueue(&orch.db.local, "job-1", "^", Delivery::Queue).unwrap();
+
+    let error = nudge_job_for_urgency(&orch, "job-1", Delivery::Queue)
+        .expect_err("an execution with no agent snapshot cannot launch");
+    assert!(
+        error.contains("Execution has no snapshot"),
+        "the launch must fail at the snapshot step, after claiming: {error}"
+    );
+
+    assert_eq!(
+        recorded_rows(&orch.db.local, "job-1").await,
+        vec![("^".to_string(), false)],
+        "a claim whose launch failed must not leave the message reading as delivered"
+    );
+    assert_eq!(
+        turn_states(&orch.db.local, "job-1").await,
+        vec![
+            ("complete".to_string(), None),
+            ("cancelled".to_string(), Some("launch_refused".to_string())),
+        ],
+        "the successor a refused launch published is settled, not left as a live head"
+    );
+}
+
+/// (state, end_reason) of every turn for the job, oldest first.
+async fn turn_states(db: &LocalDb, job_id: &str) -> Vec<(String, Option<String>)> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT state, end_reason FROM turns WHERE job_id = ?1 ORDER BY sequence ASC",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push((row.text(0)?, row.opt_text(1)?));
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .unwrap()
 }
 
 #[tokio::test(flavor = "current_thread")]

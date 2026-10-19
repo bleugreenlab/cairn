@@ -97,7 +97,8 @@ pub use lifecycle::{
     reconcile_stale_active_turn_for_continue_for_test,
 };
 pub(crate) use lifecycle::{
-    current_session_refuses_turns, GoalReactivation, GoalReconciliation, JobRunnable,
+    current_session_refuses_turns, recover_unresolvable_session_from_digest, GoalReactivation,
+    GoalReconciliation, JobRunnable,
 };
 #[cfg(test)]
 pub(crate) use lifecycle::{select_job_coordinate, CoordinateRequest, ParentCoordinate};
