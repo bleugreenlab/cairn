@@ -297,6 +297,11 @@ pub struct Supervision {
     /// launchd `ThrottleInterval`. `None` leaves launchd's 10-second default in
     /// place and omits the key entirely.
     pub launchd_throttle_interval_secs: Option<u64>,
+    /// systemd `TimeoutStopSec`: how long a stop waits between SIGTERM and
+    /// SIGKILL. `None` keeps systemd's 90-second default. Only a daemon that
+    /// bounds its own orderly exit may name a shorter one; the runner's
+    /// retirement ceremony needs up to `SERVICE_MANAGER_EXIT_TIMEOUT_MS`.
+    pub stop_timeout_secs: Option<u64>,
 }
 
 impl Supervision {
@@ -307,6 +312,7 @@ impl Supervision {
             restart_after_clean_exit: true,
             restart_delay_secs: 5,
             launchd_throttle_interval_secs: None,
+            stop_timeout_secs: None,
         }
     }
 
@@ -322,6 +328,16 @@ impl Supervision {
             restart_after_clean_exit: false,
             restart_delay_secs: delay_secs,
             launchd_throttle_interval_secs: Some(delay_secs),
+            stop_timeout_secs: None,
+        }
+    }
+
+    /// Name the window between the stop signal and SIGKILL, for a daemon whose
+    /// orderly exit is bounded in-process well inside it.
+    pub fn with_stop_timeout(self, secs: u64) -> Self {
+        Self {
+            stop_timeout_secs: Some(secs),
+            ..self
         }
     }
 }
@@ -444,19 +460,43 @@ pub fn plist_contents(spec: &ServiceSpec) -> String {
 /// Deliberately absent: `RestartPreventExitStatus`. A daemon that exits refusing
 /// its configuration is fixed by editing that configuration on the machine, and
 /// a stopped unit would make picking the fix up require someone to log in and
-/// start it again. Both managers therefore retry — slowly, on the cadence
-/// [`Supervision::retry_on_failure`] sets — rather than latching off.
+/// start it again. Both managers therefore retry rather than latching off.
+///
+/// Deliberately present, for every daemon:
+///
+/// - `OOMPolicy=continue`. Both daemons supervise children (cargo, rustc, agent
+///   sessions) in their own cgroup, and systemd's default `stop` answers the
+///   kernel killing ONE of them by stopping the whole unit. A child's
+///   out-of-memory kill is that child's batch's problem, named on its result;
+///   ending the daemon turns it into every batch on the machine (cairn/5135).
+/// - `StartLimitIntervalSec=0`. The "retry, never latch off" policy above,
+///   made explicit: with a restart delay of a few seconds, systemd's default
+///   start limit (5 starts in 10 s) could otherwise park the unit as failed.
+///
+/// `TimeoutStopSec` is written only when the spec names one
+/// ([`Supervision::stop_timeout_secs`]), because a short window is only safe
+/// for a daemon that bounds its own exit.
+///
+/// The launchd plist has no counterpart to `OOMPolicy`, and needs none:
+/// launchd has no cgroup memory accounting, so a child the kernel kills is an
+/// ordinary child exit and the job stays loaded. macOS's own memory-pressure
+/// kills (jetsam) pick processes, not jobs.
 pub fn systemd_unit_contents(spec: &ServiceSpec) -> String {
     let mut env_lines = String::new();
     for (k, v) in &spec.env {
         env_lines.push_str(&format!("Environment=\"{k}={v}\"\n"));
     }
+    let stop_timeout = match spec.supervision.stop_timeout_secs {
+        Some(secs) => format!("TimeoutStopSec={secs}\n"),
+        None => String::new(),
+    };
     format!(
         "[Unit]\n\
 Description={description}\n\
 Documentation=https://cairn.computer\n\
 After=network-online.target\n\
 Wants=network-online.target\n\
+StartLimitIntervalSec=0\n\
 \n\
 [Service]\n\
 Type=simple\n\
@@ -465,6 +505,8 @@ ExecStart={command}\n\
 LimitNOFILE={file_descriptor_limit}\n\
 Restart=on-failure\n\
 RestartSec={restart_delay}\n\
+{stop_timeout}\
+OOMPolicy=continue\n\
 \n\
 [Install]\n\
 WantedBy=default.target\n",
@@ -473,7 +515,103 @@ WantedBy=default.target\n",
         env_lines = env_lines,
         file_descriptor_limit = spec.file_descriptor_limit,
         restart_delay = spec.supervision.restart_delay_secs,
+        stop_timeout = stop_timeout,
     )
+}
+
+/// Whether `/proc/self/cgroup` places this process in `unit_name`'s own
+/// cgroup: the unified (v2) `0::` line, or a v1 hierarchy's `name=systemd`
+/// line, whose last path component is the unit.
+///
+/// The Linux analogue of launchd's `getppid() == 1`: the only process that may
+/// rewrite an installed unit is one that unit started. A dev or manual run sits
+/// in a session scope and never matches.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_is_unit(proc_self_cgroup: &str, unit_name: &str) -> bool {
+    proc_self_cgroup.lines().any(|line| {
+        let mut fields = line.trim().splitn(3, ':');
+        let (Some(_), Some(controllers), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        (controllers.is_empty() || controllers == "name=systemd")
+            && path.rsplit('/').next() == Some(unit_name)
+    })
+}
+
+/// What a systemd refresh found.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemdRefresh {
+    /// This process is not the unit's own, so the unit is not its to rewrite.
+    NotTheUnit,
+    /// No unit file is installed.
+    NotInstalled,
+    /// The installed unit already says what this binary generates.
+    Current,
+    /// The file was current but the user manager had not loaded it (an
+    /// earlier reload failed), so it was reloaded.
+    Reloaded,
+    /// The unit was rewritten and the user manager reloaded.
+    Rewritten,
+}
+
+/// Rewrite the installed unit at `unit_path` when it has drifted from what
+/// [`systemd_unit_contents`] generates, then `reload` the user manager. A
+/// current file the manager reports it has not loaded (`needs_reload`) is
+/// reloaded too, so a reload that failed once is not stranded until a reboot.
+///
+/// No restart: after `daemon-reload`, systemd applies `OOMPolicy`, `Restart*`
+/// and `TimeoutStopSec` to the running unit, so the very process that rewrote
+/// its unit is already supervised by the new policy.
+///
+/// The program the installed unit names is kept whenever it resolves to the
+/// running binary. On Linux `current_exe` is `/proc/self/exe`, symlinks
+/// resolved, while the headless runner's unit deliberately launches through
+/// its stable `current/cairn-orch` symlink so an activation swap takes effect;
+/// comparing paths textually would pin that unit to one version's directory.
+#[cfg(any(target_os = "linux", test))]
+fn refresh_systemd_unit(
+    spec: &ServiceSpec,
+    own_cgroup: Option<&str>,
+    unit_path: &std::path::Path,
+    needs_reload: impl FnOnce() -> bool,
+    reload: impl FnOnce() -> Result<(), String>,
+) -> Result<SystemdRefresh, String> {
+    if !own_cgroup.is_some_and(|cgroup| cgroup_is_unit(cgroup, &spec.unit_name)) {
+        return Ok(SystemdRefresh::NotTheUnit);
+    }
+    let Ok(existing) = std::fs::read_to_string(unit_path) else {
+        return Ok(SystemdRefresh::NotInstalled);
+    };
+    let mut spec = spec.clone();
+    if let Some(installed) = parse_systemd_unit(&existing).program {
+        if installed != spec.exe && same_file(&installed, &spec.exe) {
+            spec.exe = installed;
+        }
+    }
+    let desired = systemd_unit_contents(&spec);
+    if existing == desired {
+        if needs_reload() {
+            reload()?;
+            return Ok(SystemdRefresh::Reloaded);
+        }
+        return Ok(SystemdRefresh::Current);
+    }
+    std::fs::write(unit_path, desired)
+        .map_err(|error| format!("write {}: {error}", unit_path.display()))?;
+    reload()?;
+    Ok(SystemdRefresh::Rewritten)
+}
+
+/// Whether two paths name the same file once every symlink is resolved.
+#[cfg(any(target_os = "linux", test))]
+fn same_file(left: &std::path::Path, right: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// Windows per-user Run-key command value. Explorer evaluates this REG_SZ at
@@ -791,14 +929,17 @@ pub fn terminate_run_value_processes(command_line: &str) -> Result<Vec<Terminate
 }
 
 /// Self-heal an installed registration that has drifted from what this binary
-/// generates — a launchd plist whose template changed, or a Windows Run value
-/// pointing at a stale executable path. A no-op on platforms whose registration
-/// carries nothing that can go stale (systemd re-reads its unit on
-/// `daemon-reload`, and the install path always writes it fresh).
+/// generates — a launchd plist or systemd unit whose template changed, or a
+/// Windows Run value pointing at a stale executable path. Only the process the
+/// registration itself started ever rewrites it, so a dev or manual run never
+/// clobbers an installed service.
+///
+/// Without this, a machine keeps the supervision policy of whichever binary
+/// last ran `service install`, however many self-updates later.
 pub fn refresh_if_stale(spec: &ServiceSpec) {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     sys::refresh_if_stale(spec);
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     let _ = spec;
 }
 

@@ -781,6 +781,17 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             "- Last refresh: {}\n",
             render_refresh_timings(refresh)
         ));
+        if !refresh.runtime_blocking.is_empty() {
+            let sites: Vec<String> = refresh
+                .runtime_blocking
+                .iter()
+                .map(|site| format!("{} at {} ×{}", site.what, site.location, site.count))
+                .collect();
+            out.push_str(&format!(
+                "- Blocking work on runtime threads: {}\n",
+                sites.join("; ")
+            ));
+        }
     }
     out.push_str(&format!(
         "- Connection generation: {}\n",
@@ -840,6 +851,14 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
                 bytes(memory.total_bytes)
             )
         })
+    ));
+    out.push_str(&format!(
+        "- Memory pressure: {}\n",
+        reading(
+            &health.host.memory_pressure,
+            executor.captured_at_unix_ms,
+            render_memory_pressure
+        )
     ));
     out.push_str(&format!(
         "- I/O pressure: {}\n",
@@ -2095,6 +2114,9 @@ fn render_prediction(out: &mut String, label: &str, prediction: &PlacementPredic
     if let Some(reliability) = &prediction.reliability {
         out.push_str(&format!("    - Priced: {}\n", reliability.describe()));
     }
+    if let Some(memory) = &prediction.memory_pressure {
+        out.push_str(&format!("    - Memory: {}\n", memory.describe()));
+    }
     // History, not a reading: the reason this machine ranked behind ones that
     // never refused this entry, whatever its numbers say.
     if let Some(decline) = prediction.declined_here {
@@ -2876,6 +2898,15 @@ fn render_refresh_timings(
             phases.join("; ")
         )
     }
+}
+
+fn render_memory_pressure(pressure: &cairn_common::executor_protocol::MemoryPressure) -> String {
+    let share = |millis: u32| format!("{:.1}%", f64::from(millis) / 10.0);
+    format!(
+        "{} of time fully stalled (10 s), {} (60 s)",
+        share(pressure.full_avg10_millis),
+        share(pressure.full_avg60_millis)
+    )
 }
 
 fn render_io_pressure(pressure: &cairn_common::executor_protocol::IoPressure) -> String {
@@ -5960,6 +5991,11 @@ mod tests {
                 timing(LivenessRefreshPhase::SubstrateReport, 58_190, Some(58_100)),
                 timing(LivenessRefreshPhase::WarmRoots, 1, None),
             ],
+            runtime_blocking: vec![cairn_common::executor_protocol::RuntimeBlockingSite {
+                what: "take pool state".into(),
+                location: "cairn-exec/src/lib.rs:14789:32".into(),
+                count: 3,
+            }],
         });
         let rendered = render_executor(&executor);
         assert!(
@@ -5968,16 +6004,25 @@ mod tests {
             ),
             "{rendered}"
         );
+        assert!(
+            rendered.contains(
+                "- Blocking work on runtime threads: take pool state at cairn-exec/src/lib.rs:14789:32 ×3\n"
+            ),
+            "{rendered}"
+        );
 
         executor.health.advertisement.last_refresh = Some(LivenessRefreshTimings {
             pass_started_unix_ms: CAPTURED_AT - 30_000,
             pass_ms: 14,
             phases: vec![timing(LivenessRefreshPhase::Snapshot, 3, Some(0))],
+            runtime_blocking: Vec::new(),
         });
+        let rendered = render_executor(&executor);
         assert!(
-            render_executor(&executor).contains("- Last refresh: 14 ms\n"),
+            rendered.contains("- Last refresh: 14 ms\n"),
             "a quick pass is one number"
         );
+        assert!(!rendered.contains("Blocking work on runtime threads"));
 
         executor.health.advertisement.last_refresh = None;
         assert!(!render_executor(&executor).contains("Last refresh"));
@@ -6006,6 +6051,37 @@ mod tests {
             .contains("- Path: direct (10.10.10.10 → 10.10.10.51:3846)\n"));
         executor.link_path = None;
         assert!(!render_executor(&executor).contains("- Path:"));
+    }
+
+    /// A machine swapping is visible on the page beside CPU, memory and I/O,
+    /// and a platform without PSI says so rather than showing a quiet machine.
+    #[test]
+    fn memory_pressure_renders_beside_cpu_and_io_or_names_its_gap() {
+        use cairn_common::executor_protocol::{MeasurementGap, MemoryPressure};
+        let mut executor = inspection("bgsrv-ub", false);
+        executor.health.host.memory_pressure = Measurement::measured(
+            CAPTURED_AT - 3_000,
+            MemoryPressure {
+                full_avg10_millis: 850,
+                full_avg60_millis: 925,
+            },
+        );
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "- Memory pressure: 85.0% of time fully stalled (10 s), 92.5% (60 s) (measured 3s ago)\n"
+            ),
+            "{rendered}"
+        );
+        let memory = rendered.find("- Memory:").unwrap();
+        let pressure = rendered.find("- Memory pressure:").unwrap();
+        let io = rendered.find("- I/O pressure:").unwrap();
+        assert!(memory < pressure && pressure < io, "{rendered}");
+
+        executor.health.host.memory_pressure =
+            Measurement::unavailable(CAPTURED_AT - 3_000, MeasurementGap::UnsupportedPlatform);
+        assert!(render_executor(&executor)
+            .contains("- Memory pressure: unavailable: this platform has no reading\n"));
     }
 
     /// A drive timing out writes is visible on the page beside CPU and memory,

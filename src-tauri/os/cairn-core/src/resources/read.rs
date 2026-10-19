@@ -3670,8 +3670,10 @@ line2', X'0001020AFF', 2.5),
         .await;
         let lines = parse_db_json_lines(&page.content);
 
+        // The total is still counted, so a `limit=0` read answers "how many";
+        // the renderer, not a missing total, is what keeps it from looping.
         assert_eq!(page.shown_units, Some(0));
-        assert_eq!(page.total_units, None);
+        assert_eq!(page.total_units, Some(3));
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0]["hasMore"], true);
 
@@ -3690,6 +3692,7 @@ line2', X'0001020AFF', 2.5),
             10_000,
             &crate::token_meters::O200K_TOKEN_METER,
         );
+        assert!(rendered.text.contains("[0 of 3 rows] ==="));
         assert!(!rendered.text.contains("continue:"));
     }
 

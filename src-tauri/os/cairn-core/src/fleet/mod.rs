@@ -220,6 +220,10 @@ fn load_context(
             .io_pressure
             .value()
             .map(|pressure| pressure.full_avg10_millis),
+        memory_pressure_full_millis: host
+            .memory_pressure
+            .value()
+            .map(cairn_common::executor_protocol::MemoryPressure::priced_full_millis),
     }
 }
 
@@ -10599,6 +10603,7 @@ impl Fleet {
             let mut prediction = placement_prediction_with_contention(
                 entry, warmth, queue, run, contention, sync_cost,
             );
+            price_memory_pressure(&mut prediction, &entry.health.host, now);
             if let Some(db) = &oracle.db {
                 let identities: Vec<&CommandResourceIdentity> = match plan {
                     Some(plan) if !plan.batch_identities.is_empty() => {
@@ -11359,17 +11364,16 @@ fn prior_predictions(
         let queue = forecast_queue_wait(entry, &prices, request, run.predicted_ms, now_unix_ms);
         let sync_cost = estimate(request, entry);
         sync_costs.insert(entry.identity.executor_id.clone(), sync_cost);
-        predictions.insert(
-            entry.identity.executor_id.clone(),
-            placement_prediction_with_contention(
-                entry,
-                warmth,
-                queue,
-                run,
-                resource_profiles::contention_prior(&candidate_load(entry)),
-                sync_cost,
-            ),
+        let mut prediction = placement_prediction_with_contention(
+            entry,
+            warmth,
+            queue,
+            run,
+            resource_profiles::contention_prior(&candidate_load(entry)),
+            sync_cost,
         );
+        price_memory_pressure(&mut prediction, &entry.health.host, now_unix_ms);
+        predictions.insert(entry.identity.executor_id.clone(), prediction);
     }
     (predictions, sync_costs)
 }
@@ -12403,7 +12407,8 @@ impl<'a> ScoredCandidate<'a> {
             };
             prediction.predicted_verdict_ms = prediction
                 .adjusted_run_ms
-                .saturating_add(prediction.reliability_penalty_ms());
+                .saturating_add(prediction.reliability_penalty_ms())
+                .saturating_add(prediction.memory_pressure_penalty_ms());
         }
         prediction.declined_here = declined_here;
         let admission_accepts = !cpu_blind
@@ -13282,7 +13287,56 @@ fn placement_prediction_with_contention(
         // Set by ranking, which is what knows this entry's declines.
         declined_here: None,
         reliability: None,
+        memory_pressure: None,
     }
+}
+
+/// The largest memory-stall share priced. The multiplier `1/(1-f)` has no
+/// bound as the stall nears total, and a ranking needs a finite price; past
+/// nine-tenths stalled a machine is already priced at ten times its run.
+const MEMORY_STALL_PRICED_CEILING_MILLIS: u32 = 900;
+
+/// Add a machine's memory stall to its time to a verdict: a run that would
+/// take `t` on a machine fully stalled on memory a fraction `f` of the time
+/// takes `t/(1-f)`, so the price is `t * f/(1-f)` on the contention-adjusted
+/// run. A summand like the queue and the run, never an exclusion and never an
+/// admission gate (tenet 1139): an unmeasured or stale reading adds nothing
+/// and the record says why.
+fn price_memory_pressure(
+    prediction: &mut PlacementPrediction,
+    host: &cairn_common::executor_protocol::HostHealth,
+    now_unix_ms: u64,
+) {
+    use cairn_common::executor_protocol::{MeasurementGap, MemoryPressurePrice};
+    let reading = &host.memory_pressure;
+    let price = match reading.value() {
+        None => MemoryPressurePrice::Unmeasured {
+            gap: reading.gap().unwrap_or(MeasurementGap::NotSampled),
+        },
+        Some(_) if reading.age_ms(now_unix_ms) > EXECUTOR_TELEMETRY_STALE_AFTER_MS => {
+            MemoryPressurePrice::Stale {
+                age_ms: reading.age_ms(now_unix_ms),
+            }
+        }
+        Some(pressure) => {
+            let full_millis = pressure
+                .priced_full_millis()
+                .min(MEMORY_STALL_PRICED_CEILING_MILLIS);
+            let penalty_ms = u64::try_from(
+                u128::from(prediction.adjusted_run_ms) * u128::from(full_millis)
+                    / u128::from(1_000 - full_millis),
+            )
+            .unwrap_or(u64::MAX);
+            MemoryPressurePrice::Priced {
+                full_millis,
+                penalty_ms,
+            }
+        }
+    };
+    prediction.predicted_verdict_ms = prediction
+        .predicted_verdict_ms
+        .saturating_add(price.penalty_ms());
+    prediction.memory_pressure = Some(price);
 }
 
 /// Add a machine's own same-signature failure history to its time to a
@@ -20078,6 +20132,138 @@ mod tests {
             SyncCost::Known(0),
         );
         (home, remote, [home_prediction, remote_prediction])
+    }
+
+    /// Two otherwise identical Linux remotes, one fully stalled on memory
+    /// 85% of the time (bgsrv-ub before its kill): the thrashing one is priced
+    /// at `run * 0.85/0.15` and ranks behind the idle one. A machine that
+    /// cannot measure memory pressure is never priced as if it were quiet or
+    /// thrashing: it adds nothing and says why.
+    #[test]
+    fn a_machine_thrashing_on_memory_ranks_behind_an_idle_one() {
+        use cairn_common::executor_protocol::{
+            MeasurementGap, MemoryPressure, MemoryPressurePrice,
+        };
+        let (_, mut thrashing) = fleet_entry("bgsrv-ub", "linux", 0, &[]);
+        let (_, mut idle) = fleet_entry("fedora", "linux", 0, &[]);
+        let (_, unmeasured) = fleet_entry("mini", "linux", 0, &[]);
+        for entry in [&mut thrashing, &mut idle] {
+            measured(entry, 0.1, 8_000_000_000, 8_000_000_000);
+        }
+        Arc::make_mut(&mut thrashing.health).host.memory_pressure = Measurement::measured(
+            NOW,
+            MemoryPressure {
+                full_avg10_millis: 850,
+                full_avg60_millis: 700,
+            },
+        );
+        Arc::make_mut(&mut idle.health).host.memory_pressure =
+            Measurement::measured(NOW, MemoryPressure::default());
+        let warmth = CacheWarmthEvidence::Observed {
+            warmth: ExecutionWarmth::Cold,
+            observed_at_unix_ms: NOW,
+        };
+        let queue = QueueForecast::Forecast {
+            predicted_ms: 0,
+            requests_ahead: 0,
+            running_ahead: 0,
+            fully_measured: true,
+            observed_at_unix_ms: NOW,
+            stalled_head_ms: None,
+        };
+        let mut run = test_prior_duration();
+        run.predicted_ms = 600_000;
+        let contention = ContentionEstimate {
+            co_resident_compile_jobs: 0,
+            co_resident_light_jobs: 0,
+            multiplier_millis: 1_000,
+            source: cairn_common::executor_protocol::ContentionEvidence::Machine,
+            sample_count: 12,
+            fallback: None,
+        };
+        let predict = |entry: &ExecutorConnectionState| {
+            let mut prediction = placement_prediction_with_contention(
+                entry,
+                warmth.clone(),
+                queue.clone(),
+                run.clone(),
+                contention.clone(),
+                SyncCost::Known(0),
+            );
+            price_memory_pressure(&mut prediction, &entry.health.host, NOW);
+            prediction
+        };
+        let thrashing_prediction = predict(&thrashing);
+        let idle_prediction = predict(&idle);
+        let unmeasured_prediction = predict(&unmeasured);
+
+        assert_eq!(
+            thrashing_prediction.memory_pressure,
+            Some(MemoryPressurePrice::Priced {
+                full_millis: 850,
+                penalty_ms: 3_400_000,
+            })
+        );
+        assert_eq!(
+            thrashing_prediction.predicted_verdict_ms,
+            600_000 + 3_400_000
+        );
+        assert_eq!(idle_prediction.predicted_verdict_ms, 600_000);
+        assert_eq!(unmeasured_prediction.predicted_verdict_ms, 600_000);
+        assert!(matches!(
+            unmeasured_prediction.memory_pressure,
+            Some(MemoryPressurePrice::Unmeasured {
+                gap: MeasurementGap::NotSampled
+            })
+        ));
+
+        let request = spillable_request();
+        let scored = vec![
+            ScoredCandidate::new(
+                &thrashing,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                thrashing_prediction,
+                None,
+                None,
+                NOW,
+            ),
+            ScoredCandidate::new(
+                &idle,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                idle_prediction,
+                None,
+                None,
+                NOW,
+            ),
+        ];
+        let (winner, _, _, _, _) = rank_candidates(
+            &scored,
+            false,
+            true,
+            &request,
+            &ActivePlacementPolicy::default_profile(),
+            &ExplorationState::default(),
+        );
+        assert_eq!(winner.unwrap().entry.identity.executor_id, "fedora");
+
+        // A reading past the telemetry bound is not this machine now.
+        Arc::make_mut(&mut thrashing.health).host.memory_pressure = Measurement::measured(
+            NOW - EXECUTOR_TELEMETRY_STALE_AFTER_MS - 1,
+            MemoryPressure {
+                full_avg10_millis: 850,
+                full_avg60_millis: 850,
+            },
+        );
+        let stale = predict(&thrashing);
+        assert_eq!(stale.predicted_verdict_ms, 600_000);
+        assert!(matches!(
+            stale.memory_pressure,
+            Some(MemoryPressurePrice::Stale { .. })
+        ));
     }
 
     fn local_first() -> ActivePlacementPolicy {

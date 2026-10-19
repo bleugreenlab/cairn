@@ -88,6 +88,196 @@ fn systemd_unit_has_execstart_env_and_install_target() {
     assert!(out.contains("WantedBy=default.target"));
 }
 
+/// A child the kernel OOM-kills is not the daemon's end, and a daemon that
+/// keeps failing is retried rather than parked by systemd's start limit.
+#[test]
+fn systemd_unit_survives_a_childs_oom_kill_and_never_latches_off() {
+    let unit = systemd_unit_contents(&spec());
+    assert!(unit.contains("[Service]"));
+    assert!(unit.contains("\nOOMPolicy=continue\n"));
+    let (unit_section, _) = unit.split_once("[Service]").unwrap();
+    assert!(
+        unit_section.contains("\nStartLimitIntervalSec=0\n"),
+        "the start limit is a [Unit] setting"
+    );
+}
+
+/// Only a daemon that bounds its own exit names a short stop window; the rest
+/// keep systemd's default.
+#[test]
+fn systemd_stop_timeout_is_written_only_when_the_spec_names_one() {
+    assert!(!systemd_unit_contents(&spec()).contains("TimeoutStopSec"));
+    let mut bounded = spec();
+    bounded.supervision = Supervision::retry_on_failure(5).with_stop_timeout(15);
+    assert!(systemd_unit_contents(&bounded).contains("\nTimeoutStopSec=15\n"));
+}
+
+const UNIT_CGROUP: &str =
+    "0::/user.slice/user-1000.slice/user@1000.service/app.slice/cairn-test.service\n";
+
+#[test]
+fn the_units_own_cgroup_is_recognized_on_v2_and_v1() {
+    assert!(cgroup_is_unit(UNIT_CGROUP, "cairn-test.service"));
+    assert!(cgroup_is_unit(
+        "12:memory:/user.slice\n1:name=systemd:/user.slice/user@1000.service/cairn-test.service\n",
+        "cairn-test.service"
+    ));
+    // A login session's scope, or another unit, is not this unit.
+    assert!(!cgroup_is_unit(
+        "0::/user.slice/user-1000.slice/session-3.scope\n",
+        "cairn-test.service"
+    ));
+    assert!(!cgroup_is_unit(
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/cairn-orch.service\n",
+        "cairn-test.service"
+    ));
+    assert!(!cgroup_is_unit("", "cairn-test.service"));
+}
+
+#[test]
+fn a_drifted_unit_is_rewritten_and_reloaded_only_by_its_own_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cairn-test.service");
+    std::fs::write(&path, "[Service]\nRestartSec=60\n").unwrap();
+    let spec = spec();
+
+    // Another unit's process (a dev run, a colocated child) leaves it alone.
+    let mut reloaded = false;
+    let outcome = refresh_systemd_unit(
+        &spec,
+        Some("0::/user.slice/user-1000.slice/session-3.scope\n"),
+        &path,
+        || true,
+        || {
+            reloaded = true;
+            Ok(())
+        },
+    );
+    assert_eq!(outcome, Ok(SystemdRefresh::NotTheUnit));
+    assert!(!reloaded);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "[Service]\nRestartSec=60\n"
+    );
+    assert_eq!(
+        refresh_systemd_unit(&spec, None, &path, || true, || Ok(())),
+        Ok(SystemdRefresh::NotTheUnit)
+    );
+
+    // The unit's own process rewrites it and reloads, once.
+    let mut reloads = 0;
+    let outcome = refresh_systemd_unit(
+        &spec,
+        Some(UNIT_CGROUP),
+        &path,
+        || false,
+        || {
+            reloads += 1;
+            Ok(())
+        },
+    );
+    assert_eq!(outcome, Ok(SystemdRefresh::Rewritten));
+    assert_eq!(reloads, 1);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        systemd_unit_contents(&spec)
+    );
+    let outcome = refresh_systemd_unit(
+        &spec,
+        Some(UNIT_CGROUP),
+        &path,
+        || false,
+        || {
+            reloads += 1;
+            Ok(())
+        },
+    );
+    assert_eq!(outcome, Ok(SystemdRefresh::Current));
+    assert_eq!(reloads, 1);
+
+    // A current file whose earlier reload failed is reloaded now.
+    let outcome = refresh_systemd_unit(
+        &spec,
+        Some(UNIT_CGROUP),
+        &path,
+        || true,
+        || {
+            reloads += 1;
+            Ok(())
+        },
+    );
+    assert_eq!(outcome, Ok(SystemdRefresh::Reloaded));
+    assert_eq!(reloads, 2);
+
+    // Nothing installed is nothing to refresh.
+    assert_eq!(
+        refresh_systemd_unit(
+            &spec,
+            Some(UNIT_CGROUP),
+            &dir.path().join("absent.service"),
+            || true,
+            || Ok(())
+        ),
+        Ok(SystemdRefresh::NotInstalled)
+    );
+}
+
+/// The headless runner's shape: its unit launches through a stable
+/// `current/` symlink that activation swaps, while the running binary sees
+/// itself at the versioned path the symlink resolves to. The refresh keeps
+/// the installed program, so the unit never gets pinned to one version.
+#[cfg(unix)]
+#[test]
+fn a_unit_launching_through_a_symlink_keeps_its_symlinked_program() {
+    let dir = tempfile::tempdir().unwrap();
+    let versioned = dir.path().join("versions").join("v1");
+    std::fs::create_dir_all(&versioned).unwrap();
+    std::fs::write(versioned.join("cairn-test"), "binary").unwrap();
+    std::os::unix::fs::symlink(&versioned, dir.path().join("current")).unwrap();
+    let stable = dir.path().join("current").join("cairn-test");
+
+    let mut installed = spec();
+    installed.exe = stable.clone();
+    let path = dir.path().join("cairn-test.service");
+    std::fs::write(&path, systemd_unit_contents(&installed)).unwrap();
+
+    // What the running binary would build: its own resolved path.
+    let mut running = spec();
+    running.exe = std::fs::canonicalize(versioned.join("cairn-test")).unwrap();
+    assert_eq!(
+        refresh_systemd_unit(&running, Some(UNIT_CGROUP), &path, || false, || Ok(())),
+        Ok(SystemdRefresh::Current),
+        "the same binary through its symlink is not drift"
+    );
+
+    // A template drift is rewritten, and still through the symlink.
+    std::fs::write(
+        &path,
+        systemd_unit_contents(&installed).replace("OOMPolicy=continue\n", ""),
+    )
+    .unwrap();
+    assert_eq!(
+        refresh_systemd_unit(&running, Some(UNIT_CGROUP), &path, || false, || Ok(())),
+        Ok(SystemdRefresh::Rewritten)
+    );
+    let rewritten = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(rewritten, systemd_unit_contents(&installed));
+    assert!(rewritten.contains(&format!("ExecStart={} run", stable.display())));
+
+    // A unit naming some other binary is drift, and takes the running one.
+    let mut elsewhere = spec();
+    elsewhere.exe = dir.path().join("old").join("cairn-test");
+    std::fs::write(&path, systemd_unit_contents(&elsewhere)).unwrap();
+    assert_eq!(
+        refresh_systemd_unit(&running, Some(UNIT_CGROUP), &path, || false, || Ok(())),
+        Ok(SystemdRefresh::Rewritten)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        systemd_unit_contents(&running)
+    );
+}
+
 #[test]
 fn systemd_install_restarts_an_active_generation() {
     assert_eq!(

@@ -93,6 +93,43 @@ pub fn install(spec: &ServiceSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// Rewrite the installed unit when its template has drifted, and reload the
+/// user manager so the running unit is supervised by the new policy. Acts only
+/// in the process the unit started (its cgroup names the unit).
+pub fn refresh_if_stale(spec: &ServiceSpec) {
+    let Ok(path) = unit_path(&spec.unit_name) else {
+        return;
+    };
+    let own_cgroup = std::fs::read_to_string("/proc/self/cgroup").ok();
+    let needs_reload = || {
+        Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                &spec.unit_name,
+                "--property=NeedDaemonReload",
+                "--value",
+            ])
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "yes")
+    };
+    match super::refresh_systemd_unit(spec, own_cgroup.as_deref(), &path, needs_reload, || {
+        run_systemctl(&["daemon-reload"])
+    }) {
+        Ok(super::SystemdRefresh::Rewritten) => tracing::info!(
+            unit = %spec.unit_name,
+            path = %path.display(),
+            "systemd unit template drifted; rewrote it and reloaded the user manager"
+        ),
+        Ok(super::SystemdRefresh::Reloaded) => tracing::info!(
+            unit = %spec.unit_name,
+            "systemd unit was current on disk but not loaded; reloaded the user manager"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(unit = %spec.unit_name, %error, "systemd unit refresh failed"),
+    }
+}
+
 pub fn uninstall(spec: &ServiceSpec) -> Result<(), String> {
     // Best-effort disable+stop; ignore errors so a partially-installed unit still
     // cleans up.

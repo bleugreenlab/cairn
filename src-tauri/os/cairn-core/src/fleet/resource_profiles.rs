@@ -2550,6 +2550,7 @@ mod tests {
             co_resident_light_jobs: 0,
             cpu_utilization_millis: Some(700),
             io_pressure_full_millis: None,
+            memory_pressure_full_millis: None,
         };
         let target = duration_context();
         assert_eq!(
@@ -2610,6 +2611,7 @@ mod tests {
                 co_resident_light_jobs: 0,
                 cpu_utilization_millis: None,
                 io_pressure_full_millis: None,
+                memory_pressure_full_millis: None,
             }),
             ..meta
         }

@@ -170,6 +170,7 @@ pub(crate) fn branch_range(repo: &Path, branch: &str) -> ArchiveRange {
         repo_path: repo.to_path_buf(),
         base,
         tip,
+        durable_head: target_head.clone(),
         target_head,
     }
 }

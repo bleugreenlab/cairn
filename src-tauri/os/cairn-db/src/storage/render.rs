@@ -739,7 +739,11 @@ fn render_record_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) 
         && cut.budget_truncated
         && shown == 0
         && (produced_shown > 0 || cut.char_offset.is_some());
+    // A continuation advances `offset` by the units shown under the same
+    // `limit`, so a page that showed none (a `limit=0` read) would hand a
+    // mechanical follower its own URI back forever.
     let more = !blocked_oversized_record
+        && shown > 0
         && meta
             .total_units
             .is_some_and(|total| meta.offset + shown < total);
@@ -1507,6 +1511,26 @@ mod tests {
             .text
             .contains("continue: cairn://p/CAIRN/issues?limit=10&offset=10"));
         assert!(out.meta.truncated);
+    }
+
+    /// A zero-unit page cannot advance: its continue would be its own URI.
+    #[test]
+    fn record_segment_with_zero_shown_reports_total_without_continuation() {
+        let mut r = record_seg(
+            "cairn://p/CAIRN/issues?limit=0",
+            "",
+            Some(142),
+            0,
+            Some("issues"),
+            0,
+        );
+        r.meta.limit = Some(0);
+        let out = render_segment(r, 10_000);
+        assert!(out
+            .text
+            .starts_with("=== cairn://p/CAIRN/issues?limit=0 [0 of 142 issues] ==="));
+        assert!(!out.text.contains("continue:"));
+        assert!(!out.meta.truncated);
     }
 
     #[test]

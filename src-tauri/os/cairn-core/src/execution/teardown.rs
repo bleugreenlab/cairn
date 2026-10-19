@@ -827,6 +827,10 @@ mod tests {
         let node = workspaces.path().join("node");
         crate::jj::add_workspace(&jj, &store, &node, branch, "main", None).unwrap();
         std::fs::write(node.join("branch.rs"), "branch work\n").unwrap();
+        // The files `assistant_write` targets: archival only rewrites a write
+        // whose changes the sealed commit's diff can regenerate.
+        std::fs::write(node.join("a.txt"), "HEAVYPAYLOADALPHA\n").unwrap();
+        std::fs::write(node.join("c.txt"), "HEAVYPAYLOADNEWFILE\n").unwrap();
         crate::jj::seal(&jj, &node, "branch work", None).unwrap();
         let sealed = crate::jj::head_commit(&jj, &node).unwrap();
 
@@ -864,9 +868,17 @@ mod tests {
         );
         let db_state =
             std::sync::Arc::new(crate::db::DbState::new(std::sync::Arc::new(db), search));
+        // Archival runs before the discarded branch is deleted; the mock git
+        // client reports the branch already gone so deletion is a no-op.
+        let mut git = crate::services::testing::MockGitClient::new();
+        git.expect_branch_exists().returning(|_, _| Ok(false));
         let orch = crate::orchestrator::OrchestratorBuilder::new(
             db_state,
-            std::sync::Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            std::sync::Arc::new(
+                crate::services::testing::TestServicesBuilder::new()
+                    .with_git(git)
+                    .build(),
+            ),
             home.path().to_path_buf(),
         )
         .jj_binary_path(bin.clone())

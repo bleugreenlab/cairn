@@ -425,13 +425,14 @@ fn run_commit_sha_takes_the_last_barrier_line_and_only_a_hex_sha() {
 /// Project checks append their verdicts after a write's JSON change report, so
 /// the sha comes from the leading JSON value, not from the whole result.
 #[test]
-fn change_commit_sha_reads_reports_with_appended_check_verdicts() {
+fn parse_change_report_reads_reports_with_appended_check_verdicts() {
+    let sha = |result: &str| parse_change_report(result).map(|report| report.sha);
     let report = r#"{"applied":[],"commit":{"status":"committed","sha":"8c17e7a3"}}"#;
-    assert_eq!(change_commit_sha(report).as_deref(), Some("8c17e7a3"));
+    assert_eq!(sha(report).as_deref(), Some("8c17e7a3"));
     let with_checks =
         format!("{report}\n\nChecks: \u{2717} rust-fmt (exit 1)\n\n```\nstderr:\n```");
-    assert_eq!(change_commit_sha(&with_checks).as_deref(), Some("8c17e7a3"));
-    assert_eq!(change_commit_sha("Checks: \u{2713} lint"), None);
+    assert_eq!(sha(&with_checks).as_deref(), Some("8c17e7a3"));
+    assert_eq!(sha("Checks: \u{2713} lint"), None);
 }
 
 #[test]
@@ -453,7 +454,8 @@ fn read_stub_pins_paths_and_drops_result() {
 /// drops every change payload while keeping the call skeleton.
 #[test]
 fn strip_change_payloads_drops_payload_keeps_skeleton() {
-    let stripped = strip_change_payloads(&assistant_write("w1"));
+    let (stripped, count) = strip_change_payloads(&assistant_write("w1"), |_, _, _| true);
+    assert_eq!(count, 2, "both change payloads counted");
     assert!(
         !stripped.contains("HEAVYPAYLOAD"),
         "heavy payloads stripped"

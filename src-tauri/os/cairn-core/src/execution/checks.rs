@@ -3518,6 +3518,11 @@ pub(crate) enum SubstrateFailureShape {
     /// the tree was decided: a wedged test says where to look, not whether
     /// the change is good.
     CommandStalled,
+    /// The kernel's out-of-memory killer killed part of the check's process
+    /// tree while it ran. Whatever exit the command chose afterwards is the
+    /// consequence of that, so this is the machine's capacity rather than a
+    /// verdict on the code (cairn/5135).
+    CommandOomKilled,
 }
 
 impl SubstrateFailureShape {
@@ -3551,6 +3556,9 @@ impl SubstrateFailureShape {
             }
             Self::CommandStalled => {
                 "This check stopped making progress, so Cairn stopped it before it produced a verdict."
+            }
+            Self::CommandOomKilled => {
+                "The machine ran out of memory while this check ran, and the kernel killed part of it. That is the machine's capacity, not a verdict on the code."
             }
         }
     }
@@ -3784,6 +3792,10 @@ fn infra_repair_domain(
             // command at this head, owned by whoever owns the suite, and no
             // machine repair or fleet change touches it.
             SubstrateFailureShape::CommandStalled => InfraRepairDomain::HeadOnPlatform,
+            // The machine's capacity: a bigger or less loaded machine runs the
+            // same commit. Reaching the bound avoids this machine rather than
+            // refusing the check, and no commit is blamed.
+            SubstrateFailureShape::CommandOomKilled => InfraRepairDomain::Environment,
         };
     }
     // No substrate failure means the command RAN and its own output named the
@@ -8447,8 +8459,20 @@ fn stopped_command_failure(
         cairn_common::executor_protocol::CommandStop::Cancelled => {
             return CheckExecutionFailure::Cancelled(cancel_cause(account));
         }
+        cairn_common::executor_protocol::CommandStop::OomKilled { .. } => SubstrateFailure::new(
+            SubstrateFailureShape::CommandOomKilled,
+            format!("{}.\n\n{output}", capitalized(&stop.describe())),
+        ),
     };
     CheckExecutionFailure::Substrate(failure.ran_as(provenance))
+}
+
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// The cause Cairn recorded for a cancellation the executor reported. The
@@ -9008,10 +9032,11 @@ mod tests {
             (Shape::Storage, Domain::Head),
             (Shape::RunnerFault, Domain::Head),
             (Shape::CommandStalled, Domain::HeadOnPlatform),
+            (Shape::CommandOomKilled, Domain::Environment),
         ];
         assert_eq!(
             table.len(),
-            13,
+            14,
             "a new substrate shape must be classified in this table, not defaulted"
         );
         for (shape, expected) in table {
@@ -13704,7 +13729,7 @@ cairn-common = { path = "../cairn-common" }
     /// against whichever one a specimen happens to use. The match below makes
     /// the list exhaustive by construction: a new shape stops compiling here
     /// until it is added.
-    const ALL_SUBSTRATE_SHAPES: [SubstrateFailureShape; 13] = [
+    const ALL_SUBSTRATE_SHAPES: [SubstrateFailureShape; 14] = [
         SubstrateFailureShape::Dispatch,
         SubstrateFailureShape::Capacity,
         SubstrateFailureShape::MachineUnreachable,
@@ -13718,6 +13743,7 @@ cairn-common = { path = "../cairn-common" }
         SubstrateFailureShape::Storage,
         SubstrateFailureShape::RunnerFault,
         SubstrateFailureShape::CommandStalled,
+        SubstrateFailureShape::CommandOomKilled,
     ];
 
     /// The bound is on the COMPOSED message, so it has to hold for every lead
@@ -13743,7 +13769,8 @@ cairn-common = { path = "../cairn-common" }
                 | SubstrateFailureShape::OutcomeUnknown
                 | SubstrateFailureShape::Storage
                 | SubstrateFailureShape::RunnerFault
-                | SubstrateFailureShape::CommandStalled => {}
+                | SubstrateFailureShape::CommandStalled
+                | SubstrateFailureShape::CommandOomKilled => {}
             }
 
             let message = SubstrateFailure::new(shape, &log).agent_message();

@@ -252,8 +252,12 @@ pub fn tool_result(id: &str, result: &str) -> String {
 /// The short change-report a committed `write` returns as its `toolResult`.
 fn change_report(sha: &str) -> String {
     json!({
-        "applied": [{ "index": 0, "target": "file:a.txt", "mode": "patch",
-            "kind": "file", "summary": "patched a.txt" }],
+        "applied": [
+            { "index": 0, "target": "file:a.txt", "mode": "patch",
+              "kind": "file", "summary": "patched a.txt" },
+            { "index": 1, "target": "file:c.txt", "mode": "create",
+              "kind": "file", "summary": "created c.txt" }
+        ],
         "commit": { "status": "committed", "sha": sha, "prNumber": null, "message": null }
     })
     .to_string()

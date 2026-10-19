@@ -2941,6 +2941,10 @@ pub struct ExecutionLoadContext {
     /// which is never the same as zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub io_pressure_full_millis: Option<u32>,
+    /// [`MemoryPressure::priced_full_millis`], or `None` where it was not
+    /// measured, which is never the same as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_pressure_full_millis: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4633,7 +4637,26 @@ pub struct LearnedResourceEstimate {
 /// trigger, as 137 did: the runner replaces an installed executor only on a
 /// protocol mismatch, so without one no attached machine would run the build
 /// that refreshes its CLI.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 151;
+///
+/// Version 152 (cairn/5135) adds [`CommandStop::OomKilled`]: a command whose
+/// process tree lost a member to the kernel's out-of-memory killer says so,
+/// naming the victim's pid and peak resident bytes, whatever its leader's exit
+/// code was. It is a new enum variant, which a 151 runner cannot decode, and
+/// that is why this is a version. [`HostHealth::memory_pressure`] (memory PSI,
+/// measured the way I/O pressure is),
+/// `ExecutionLoadContext::memory_pressure_full_millis`, and
+/// [`LivenessRefreshTimings::runtime_blocking`] (each call site that blocked a
+/// runtime thread, with a count) are defaulted, so an older executor's
+/// advertisement reads as an unmeasured gap rather than as an idle machine or
+/// a clean runtime. [`PlacementPrediction::memory_pressure`] and
+/// [`MemoryPressurePrice`] are the runner's own decision record, which no
+/// executor decodes. The rest of cairn/5135 is behaviour, not wire: the systemd
+/// unit (`OOMPolicy=continue`, a 5 s restart, a 15 s stop window) and its
+/// self-refresh, a stop bounded by [`EXECUTOR_STOP_DEADLINE_MS`] with a
+/// runtime-free backstop, and children raised above the daemon in the kernel's
+/// OOM ranking. What a runner gets wrong talking to an older executor: nothing
+/// it did not already get wrong, since the handshake admits only equal versions.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 152;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -5051,9 +5074,23 @@ pub const EXECUTOR_RETIREMENT_FORCE_MS: u64 = 3_000;
 /// Nothing in the generated launchd plist overrides it.
 pub const SERVICE_MANAGER_EXIT_TIMEOUT_MS: u64 = 20_000;
 
+/// The whole of a stopping `cairn-executor`'s orderly stop before its runtime
+/// shuts down: draining its queue, reading its resident fences, and stopping
+/// them (whose own share is [`EXECUTOR_RESIDENT_STOP_BUDGET_MS`]).
+///
+/// One deadline for every phase, because a stop that bounds only its last
+/// phase can still wait without limit in the first: a SIGTERM stop on a
+/// thrashing machine once waited on pool state for 90 s until systemd killed it
+/// (cairn/5135). Sized so that this plus the runtime shutdown that follows
+/// clears the runner's grace before it escalates.
+pub const EXECUTOR_STOP_DEADLINE_MS: u64 = 3_500;
+
 const _: () = assert!(
     EXECUTOR_RESIDENT_STOP_BUDGET_MS + EXECUTOR_SHUTDOWN_BUDGET_MS < EXECUTOR_RETIREMENT_GRACE_MS
 );
+const _: () = assert!(EXECUTOR_RESIDENT_STOP_BUDGET_MS < EXECUTOR_STOP_DEADLINE_MS);
+const _: () =
+    assert!(EXECUTOR_STOP_DEADLINE_MS + EXECUTOR_SHUTDOWN_BUDGET_MS < EXECUTOR_RETIREMENT_GRACE_MS);
 // The whole retirement must finish well inside the service manager's window, or
 // a runner stopped by its service manager is killed mid-ceremony and the
 // executor it was retiring is orphaned: the founding shape of cairn/4569.
@@ -5763,6 +5800,23 @@ pub struct LivenessRefreshTimings {
     /// Every phase the pass completed before publishing, in the order it ran.
     #[serde(default)]
     pub phases: Vec<LivenessRefreshPhaseTiming>,
+    /// Every call site that has reached a blocking primitive from a runtime
+    /// thread since this process started, with how often. A release build logs
+    /// each site once and carries on, so the count is what tells one stray call
+    /// from a path the executor takes on every stop (cairn/5135).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_blocking: Vec<RuntimeBlockingSite>,
+}
+
+/// One call site that blocked a runtime thread, and how often it has.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeBlockingSite {
+    /// The primitive that was reached, e.g. `take pool state`.
+    pub what: String,
+    /// `file:line:column` of the call that reached it.
+    pub location: String,
+    pub count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -9441,6 +9495,12 @@ pub struct HostHealth {
     /// than a zero, from an executor too old to report it.
     #[serde(default)]
     pub io_pressure: Measurement<IoPressure>,
+    /// How stalled the host is on memory. A machine swapping is slower for
+    /// every command than its cores say, and is where the next out-of-memory
+    /// kill comes from. Defaulted, and so an unsampled gap rather than a zero,
+    /// from an executor too old to report it.
+    #[serde(default)]
+    pub memory_pressure: Measurement<MemoryPressure>,
     /// Every GPU this machine can measure, read on its own cadence so a wedged
     /// driver can only age this reading, never stall the beat. Defaulted, and
     /// so a `NotSampled` gap rather than "no GPUs", from an executor too old to
@@ -9560,6 +9620,28 @@ pub struct IoPressure {
     /// or `None` before a window exists or when no device wrote or held I/O.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slowest_device: Option<DeviceWriteLatency>,
+}
+
+/// How much of the time every non-idle task on the host was stalled waiting
+/// for memory at once (Linux PSI `full` in `/proc/pressure/memory`): a machine
+/// reclaiming and swapping instead of working. Measured, rendered and priced
+/// the way [`IoPressure`] is, and never an admission gate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryPressure {
+    /// Thousandths of wall time fully stalled on memory, over ten seconds.
+    pub full_avg10_millis: u32,
+    /// The same, over sixty seconds.
+    pub full_avg60_millis: u32,
+}
+
+impl MemoryPressure {
+    /// The share placement prices: the worse of the two windows, so a machine
+    /// that has just begun to thrash and one that is only now recovering are
+    /// both read at their worst.
+    pub fn priced_full_millis(&self) -> u32 {
+        self.full_avg10_millis.max(self.full_avg60_millis)
+    }
 }
 
 /// One block device's writes across a sample window.
@@ -11953,6 +12035,63 @@ pub struct PlacementPrediction {
     /// penalized machine still wins when nothing else can answer sooner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reliability: Option<ReliabilityEstimate>,
+    /// What this machine's memory stall adds to its time to a verdict, or why
+    /// it adds nothing. Produced and read only by the runner; `None` on a
+    /// record from before memory pressure was priced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_pressure: Option<MemoryPressurePrice>,
+}
+
+/// A machine's memory stall, priced into its time to a verdict.
+///
+/// A host fully stalled on memory for a fraction `f` of its time leaves `1-f`
+/// of it to make progress, so a run that would take `t` takes `t/(1-f)`: the
+/// price is the difference, derived from what PSI measures rather than tuned.
+/// A price, never a gate: a thrashing machine still wins when nothing else can
+/// answer sooner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum MemoryPressurePrice {
+    /// `full_millis` is the stall share priced, after the ceiling.
+    Priced { full_millis: u32, penalty_ms: u64 },
+    /// The machine does not measure memory pressure; nothing is added.
+    Unmeasured { gap: MeasurementGap },
+    /// The reading was older than the fleet's telemetry bound; nothing is
+    /// added, because a stale stall is not this machine now.
+    Stale { age_ms: u64 },
+}
+
+impl MemoryPressurePrice {
+    pub fn penalty_ms(&self) -> u64 {
+        match self {
+            Self::Priced { penalty_ms, .. } => *penalty_ms,
+            Self::Unmeasured { .. } | Self::Stale { .. } => 0,
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Priced {
+                full_millis,
+                penalty_ms,
+            } => format!(
+                "memory stalled {:.1}% of the time, +{}",
+                f64::from(*full_millis) / 10.0,
+                compact_duration(*penalty_ms)
+            ),
+            Self::Unmeasured { gap } => {
+                format!("memory pressure not priced: {}", gap.describe())
+            }
+            Self::Stale { age_ms } => format!(
+                "memory pressure not priced: its reading is {} old",
+                compact_duration(*age_ms)
+            ),
+        }
+    }
 }
 
 /// One machine's recent same-signature failures of one command, priced.
@@ -12014,6 +12153,13 @@ impl PlacementPrediction {
             .map_or(0, |reliability| reliability.penalty_ms)
     }
 
+    /// What this machine's memory stall adds to its time to a verdict.
+    pub fn memory_pressure_penalty_ms(&self) -> u64 {
+        self.memory_pressure
+            .as_ref()
+            .map_or(0, MemoryPressurePrice::penalty_ms)
+    }
+
     /// How much of this prediction is this machine's own history rather than a
     /// labeled prior. Lower is better evidence, and it breaks ties between
     /// machines whose predicted totals are equal — never ahead of the totals
@@ -12044,7 +12190,13 @@ impl PlacementPrediction {
             self.reliability
                 .as_ref()
                 .map(|reliability| format!("; priced {}", reliability.describe()))
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                + &self
+                    .memory_pressure
+                    .as_ref()
+                    .filter(|price| price.penalty_ms() > 0)
+                    .map(|price| format!("; {}", price.describe()))
+                    .unwrap_or_default(),
             self.declined_here
                 .map(|decline| format!("; {}", describe_prior_decline(decline)))
                 .unwrap_or_default()
@@ -13141,12 +13293,13 @@ pub struct ProcessBatchItem {
     pub verdict_environment_names: Vec<String>,
 }
 
-/// Why the executor ended a command that had not ended itself, when neither its
-/// own exit nor its elapsed-time bound did it.
+/// Why a command ended without a result about itself, when neither its own
+/// exit nor its elapsed-time bound decided it: the executor ended it, or the
+/// kernel took part of its process tree.
 ///
-/// A stop is Cairn abandoning a command, never a result about the command's
-/// tree, and readers must not turn it into one: a stalled check is a named
-/// non-verdict, and a cancelled one is a withdrawal.
+/// A stop is never a result about the command's tree, and readers must not
+/// turn it into one: a stalled check is a named non-verdict, a cancelled one is
+/// a withdrawal, and an out-of-memory kill is the machine's capacity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(
     tag = "cause",
@@ -13169,6 +13322,34 @@ pub enum CommandStop {
     },
     /// The request the command belonged to was withdrawn while it ran.
     Cancelled,
+    /// The kernel's out-of-memory killer killed a process of the command's tree
+    /// while it ran, and the command then failed. Whatever exit code the leader
+    /// chose afterwards (a cargo whose rustc was killed exits 101) is the
+    /// consequence of the kill, not a verdict on the code.
+    ///
+    /// Named from the executor's cgroup `oom_kill` counter and the tree member
+    /// that left when it advanced, never from the exit code alone.
+    OomKilled {
+        pid: u32,
+        /// The victim's largest resident size the executor saw.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rss_bytes: Option<u64>,
+        /// The machine's physical memory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine_total_bytes: Option<u64>,
+    },
+}
+
+/// Bytes as a reader wants them: GiB from one GiB up, MiB below.
+fn human_bytes(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let value = bytes as f64;
+    if value >= GIB {
+        format!("{:.1} GiB", value / GIB)
+    } else {
+        format!("{:.0} MiB", value / MIB)
+    }
 }
 
 impl CommandStop {
@@ -13202,6 +13383,29 @@ impl CommandStop {
                 )
             }
             Self::Cancelled => "cancelled by its requester while it ran".to_string(),
+            Self::OomKilled {
+                pid,
+                rss_bytes,
+                machine_total_bytes,
+            } => {
+                let resident = rss_bytes
+                    .map(|bytes| format!(" ({} resident)", human_bytes(bytes)))
+                    .unwrap_or_default();
+                let machine = machine_total_bytes
+                    .map(|bytes| format!(" on a machine with {}", human_bytes(bytes)))
+                    .unwrap_or_default();
+                format!(
+                    "the kernel's out-of-memory killer killed pid {pid}{resident} of its process tree{machine} while it ran"
+                )
+            }
+        }
+    }
+
+    /// Whether Cairn itself ended the command, rather than the kernel.
+    pub fn is_cairns_own(&self) -> bool {
+        match self {
+            Self::Silent { .. } | Self::Cancelled => true,
+            Self::OomKilled { .. } => false,
         }
     }
 }
@@ -15584,6 +15788,13 @@ mod tests {
                         in_flight: 4,
                         window_ms: 15_000,
                     }),
+                },
+            ),
+            memory_pressure: Measurement::measured(
+                5,
+                MemoryPressure {
+                    full_avg10_millis: 850,
+                    full_avg60_millis: 925,
                 },
             ),
             gpus: Measurement::measured(

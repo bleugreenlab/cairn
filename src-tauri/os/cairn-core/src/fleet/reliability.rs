@@ -49,6 +49,9 @@ pub(super) enum CommandOutcome {
     Killed { signal: Option<i32> },
 }
 
+/// The signal the kernel's out-of-memory killer sends, on every unix.
+const SIGKILL: i32 = 9;
+
 impl CommandOutcome {
     /// Classify a completion, or `None` when it says nothing about the machine:
     /// a cancelled command was withdrawn, and a lane that selected nothing did
@@ -67,6 +70,14 @@ impl CommandOutcome {
         match stop {
             Some(CommandStop::Cancelled) => return None,
             Some(CommandStop::Silent { .. }) => return Some(Self::Stalled),
+            // The kernel SIGKILLed part of the tree for want of memory on this
+            // machine: the same signal death a wrapper reports as 137, so the
+            // same signature, whatever the leader then exited with.
+            Some(CommandStop::OomKilled { .. }) => {
+                return Some(Self::Killed {
+                    signal: Some(SIGKILL),
+                })
+            }
             None => {}
         }
         if timed_out {
