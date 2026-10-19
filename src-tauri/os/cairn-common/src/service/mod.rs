@@ -653,6 +653,70 @@ pub(crate) fn resolved_unit_dir(default_rel: &[&str]) -> Result<PathBuf, String>
     Ok(dir)
 }
 
+// ─── systemd linger ──────────────────────────────────────────────────────────
+
+/// logind's per-user linger, which decides whether a systemd user manager —
+/// and every user unit it runs — outlives the user's last session. Without it
+/// the manager stops at logout, taking the service and `/run/user/<uid>` with
+/// it, so a user unit only meets this module's "survives logout" promise for a
+/// lingering user. A seam so the ensure-then-verify sequence is provable
+/// without logind; the real control is `SystemLinger` on Linux.
+pub trait Linger {
+    fn linger_enabled(&self, user: &str) -> Result<bool, String>;
+    fn enable_linger(&self, user: &str) -> Result<(), String>;
+}
+
+/// Linger was off and could not be turned on from this session. Its display
+/// names the one command that fixes it; callers add what to re-run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LingerRefusal {
+    pub user: String,
+    pub cause: String,
+}
+
+impl LingerRefusal {
+    pub fn command(&self) -> String {
+        format!("sudo loginctl enable-linger {}", self.user)
+    }
+}
+
+impl std::fmt::Display for LingerRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "systemd stops {user}'s user services at logout unless lingering is enabled for \
+             {user}, and enabling it from here failed ({cause}). Run:\n\n  {command}\n",
+            user = self.user,
+            cause = self.cause,
+            command = self.command(),
+        )
+    }
+}
+
+/// Make `user` linger, or refuse. Already lingering is left alone; otherwise
+/// linger is enabled and then read back, because `enable-linger` succeeding is
+/// not the same fact as logind recording it.
+pub fn ensure_linger<L: Linger + ?Sized>(host: &L, user: &str) -> Result<(), LingerRefusal> {
+    let refusal = |cause: String| LingerRefusal {
+        user: user.to_string(),
+        cause,
+    };
+    if host.linger_enabled(user).map_err(refusal)? {
+        return Ok(());
+    }
+    // polkit lets a user enable their own linger from an ordinary login or ssh
+    // session; a `su` or container shell usually cannot, which is the refusal.
+    host.enable_linger(user).map_err(refusal)?;
+    if host.linger_enabled(user).map_err(refusal)? {
+        Ok(())
+    } else {
+        Err(refusal("loginctl still reports Linger=no".to_string()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use linux::{current_user, SystemLinger};
+
 // ─── Public lifecycle API (dispatches to the active `sys` backend) ───────────
 
 /// Register the daemon as a per-user OS service and start it.

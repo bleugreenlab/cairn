@@ -208,6 +208,14 @@ macro_rules! shared_tail_pr_publish_attempts {
     };
 }
 
+/// cairn/5119: the base-advance sibling lookup seeks its jobs and its open-PR
+/// probe instead of scanning, on both tables either lineage carries.
+macro_rules! shared_tail_sibling_job_lookup_indexes {
+    () => {
+        migration!("0267_index_sibling_job_lookup")
+    };
+}
+
 /// cairn/4987: the base and incoming side a conflict session's committed
 /// resolution was resolved against, and the tip and destination of an
 /// outstanding take-committed-tip request. `jj_reconcile_items` is carried by
@@ -1433,6 +1441,7 @@ macro_rules! team_lineage {
             shared_tail_tenet_evidence!(),
             shared_tail_tenet_evidence_measured_by!(),
             shared_tail_pr_publish_attempts!(),
+            shared_tail_sibling_job_lookup_indexes!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1703,6 +1712,7 @@ macro_rules! private_lineage {
             shared_tail_tenet_evidence_measured_by!(),
             private_command_outcome_history!(),
             shared_tail_pr_publish_attempts!(),
+            shared_tail_sibling_job_lookup_indexes!(),
         ]
     };
 }
@@ -3419,6 +3429,7 @@ mod tests {
                 "tenet_evidence_measured_by",
                 "command_outcome_history",
                 "pr_publish_attempts",
+                "index_sibling_job_lookup",
             ]
         );
         assert_eq!(
@@ -6698,6 +6709,7 @@ mod tests {
                 // cairn/5064: evidence rows record how they were measured.
                 "tenet_evidence_measured_by",
                 "pr_publish_attempts",
+                "index_sibling_job_lookup",
             ]
         );
         assert_eq!(

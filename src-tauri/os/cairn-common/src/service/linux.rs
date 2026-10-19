@@ -2,13 +2,68 @@
 //! `~/.config/systemd/user` and enable/disable it in the `--user` manager. No
 //! elevation — a per-user unit so it reads that user's `~/.cairn`.
 
-use std::path::PathBuf;
+use std::ffi::CStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{
     parse_systemd_unit, resolved_unit_dir, systemd_install_steps, systemd_unit_contents,
-    LegacyIdentity, RegisteredUnit, ServiceSpec,
+    LegacyIdentity, Linger, RegisteredUnit, ServiceSpec,
 };
+
+/// The login name of the user this process runs as.
+pub fn current_user() -> String {
+    // SAFETY: getuid has no preconditions and cannot fail. getpwuid returns a
+    // pointer into static storage or null; the name is copied out before
+    // anything else can call it.
+    let uid = unsafe { libc::getuid() };
+    let name = unsafe {
+        let entry = libc::getpwuid(uid);
+        (!entry.is_null()).then(|| {
+            CStr::from_ptr((*entry).pw_name)
+                .to_string_lossy()
+                .into_owned()
+        })
+    };
+    name.or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| uid.to_string())
+}
+
+/// logind's linger, through `loginctl`.
+pub struct SystemLinger;
+
+impl Linger for SystemLinger {
+    fn linger_enabled(&self, user: &str) -> Result<bool, String> {
+        // logind's own record of lingering users.
+        if Path::new("/var/lib/systemd/linger").join(user).exists() {
+            return Ok(true);
+        }
+        let result = Command::new("loginctl")
+            .args(["show-user", user, "-p", "Linger", "--value"])
+            .output()
+            .map_err(|error| {
+                format!(
+                    "loginctl is not available ({error}); a systemd user service needs \
+                     systemd-logind"
+                )
+            })?;
+        // A user with no session and no linger is "not logged in or lingering",
+        // which loginctl reports as a failure; both mean Linger=no.
+        Ok(result.status.success() && String::from_utf8_lossy(&result.stdout).trim() == "yes")
+    }
+
+    fn enable_linger(&self, user: &str) -> Result<(), String> {
+        let result = Command::new("loginctl")
+            .args(["--no-ask-password", "enable-linger", user])
+            .output()
+            .map_err(|error| format!("loginctl: {error}"))?;
+        if result.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&result.stderr).trim().to_string())
+        }
+    }
+}
 
 fn unit_dir() -> Result<PathBuf, String> {
     resolved_unit_dir(&[".config", "systemd", "user"])

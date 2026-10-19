@@ -5586,6 +5586,24 @@ async fn repoint_children_of_merged_branch(
     Ok(())
 }
 
+/// The live jobs cut from base `?2` in project `?1`, other than job `?3`.
+///
+/// Runs on every base advance, so its plan is pinned by
+/// `sibling_job_statement_seeks_both_lookups`: both the jobs selection and the
+/// open-PR probe inside [`LIVE_JOB_PREDICATE`] must seek (migration 0267). The
+/// probe scanning a project's merge requests once per settled job cost ~60 s
+/// per call on production data.
+fn sibling_jobs_sql() -> String {
+    format!(
+        "SELECT j.id, j.branch, j.base_commit
+           FROM jobs j
+          WHERE j.project_id = ?1
+            AND j.base_branch = ?2
+            AND j.id != ?3
+            AND {LIVE_JOB_PREDICATE}"
+    )
+}
+
 async fn load_sibling_jobs(
     db: &LocalDb,
     project_id: &str,
@@ -5595,14 +5613,7 @@ async fn load_sibling_jobs(
     let project_id = project_id.to_string();
     let base_branch = base_branch.to_string();
     let merged_job_id = merged_job_id.to_string();
-    let sql = format!(
-        "SELECT j.id, j.branch, j.base_commit
-           FROM jobs j
-          WHERE j.project_id = ?1
-            AND j.base_branch = ?2
-            AND j.id != ?3
-            AND {LIVE_JOB_PREDICATE}"
-    );
+    let sql = sibling_jobs_sql();
     db.read(|conn| {
         let project_id = project_id.clone();
         let base_branch = base_branch.clone();
@@ -7287,6 +7298,49 @@ mod tests {
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("base-advance-test.db").await
+    }
+
+    /// Every base advance runs this statement, and both of its lookups must
+    /// seek. Results are identical either way, so only the plan can witness a
+    /// regression: the open-PR probe falling back to `idx_mr_project_status`
+    /// reads every merge request in the project once per settled job, which
+    /// was ~60 s per call on production data before migration 0267.
+    #[tokio::test]
+    async fn sibling_job_statement_seeks_both_lookups() {
+        let db = migrated_db().await;
+        let sql = format!("EXPLAIN QUERY PLAN {}", sibling_jobs_sql());
+        let plan: Vec<String> = db
+            .read(|conn| {
+                let sql = sql.clone();
+                Box::pin(async move {
+                    let mut rows = conn.query(&sql, params!["p", "main", "j"]).await?;
+                    let mut steps = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        steps.push(row.text(3)?);
+                    }
+                    Ok(steps)
+                })
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            plan.iter().any(|step| step
+                == "SEARCH mr USING INDEX idx_mr_project_source_branch \
+                    (project_id=? AND source_branch=?)"),
+            "the open-PR probe must seek on project and branch together, got {plan:?}"
+        );
+        assert!(
+            plan.iter().any(|step| step.starts_with(
+                "SEARCH j USING INDEX idx_jobs_project_base_branch \
+                 (project_id=? AND base_branch=?)"
+            )),
+            "the sibling selection must seek jobs on project and base branch, got {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN ")),
+            "no table in the sibling lookup may be scanned, got {plan:?}"
+        );
     }
 
     fn test_orchestrator(db: LocalDb, git: MockGitClient) -> Orchestrator {

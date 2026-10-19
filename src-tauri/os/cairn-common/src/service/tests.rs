@@ -320,3 +320,92 @@ fn the_runner_identities_are_distinct_on_every_platform() {
     assert_ne!(current.run_value, legacy.run_value);
     assert!(legacy.platform_name().is_some());
 }
+
+/// A logind stand-in: whether the user lingers, whether this session may turn
+/// it on, and whether turning it on actually sticks.
+struct FakeLinger {
+    lingering: std::cell::Cell<bool>,
+    enable: Result<(), String>,
+    enable_sticks: bool,
+    probe: Result<(), String>,
+    enable_calls: std::cell::Cell<u32>,
+}
+
+impl FakeLinger {
+    fn new(lingering: bool) -> Self {
+        Self {
+            lingering: std::cell::Cell::new(lingering),
+            enable: Ok(()),
+            enable_sticks: true,
+            probe: Ok(()),
+            enable_calls: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl Linger for FakeLinger {
+    fn linger_enabled(&self, _user: &str) -> Result<bool, String> {
+        self.probe.clone().map(|()| self.lingering.get())
+    }
+    fn enable_linger(&self, _user: &str) -> Result<(), String> {
+        self.enable_calls.set(self.enable_calls.get() + 1);
+        self.enable.clone()?;
+        if self.enable_sticks {
+            self.lingering.set(true);
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn a_lingering_user_is_left_alone() {
+    let host = FakeLinger::new(true);
+    assert_eq!(ensure_linger(&host, "dev"), Ok(()));
+    assert_eq!(host.enable_calls.get(), 0);
+}
+
+#[test]
+fn linger_this_session_may_enable_is_enabled() {
+    let host = FakeLinger::new(false);
+    assert_eq!(ensure_linger(&host, "dev"), Ok(()));
+    assert_eq!(host.enable_calls.get(), 1);
+    assert!(host.lingering.get());
+}
+
+#[test]
+fn linger_polkit_refuses_is_a_refusal_naming_the_command() {
+    let host = FakeLinger {
+        enable: Err("Access denied".into()),
+        ..FakeLinger::new(false)
+    };
+    let refusal = ensure_linger(&host, "dev").unwrap_err();
+    assert_eq!(refusal.user, "dev");
+    assert_eq!(refusal.cause, "Access denied");
+    let message = refusal.to_string();
+    assert!(message.contains("at logout"), "{message}");
+    assert!(
+        message.contains("\n  sudo loginctl enable-linger dev\n"),
+        "{message}"
+    );
+}
+
+#[test]
+fn an_enable_logind_never_recorded_is_a_refusal() {
+    let host = FakeLinger {
+        enable_sticks: false,
+        ..FakeLinger::new(false)
+    };
+    let refusal = ensure_linger(&host, "dev").unwrap_err();
+    assert_eq!(refusal.cause, "loginctl still reports Linger=no");
+}
+
+#[test]
+fn linger_that_cannot_be_read_is_a_refusal_without_an_enable() {
+    let host = FakeLinger {
+        probe: Err("loginctl is not available".into()),
+        ..FakeLinger::new(false)
+    };
+    let refusal = ensure_linger(&host, "dev").unwrap_err();
+    assert_eq!(refusal.cause, "loginctl is not available");
+    assert_eq!(host.enable_calls.get(), 0);
+}
