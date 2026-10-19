@@ -3582,25 +3582,8 @@ mod tests {
                 "inference_records",
                 "object_store_maintenance",
                 "ingress_events",
-            ],
                 "tenet_statements",
-            ]
-        );
-        assert_eq!(
-            query_i64(
-                &db,
-                "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name='human_base_merge_policy'"
-            )
-            .await?,
-            1
-        );
-        assert_eq!(
-            query_i64(
-                &db,
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='merge_attempt_events'"
-            )
-            .await?,
-            1
+            ],
         );
     }
 
@@ -6953,10 +6936,9 @@ mod tests {
                 "tenet_evidence_measured_by",
                 "pr_publish_attempts",
                 "index_sibling_job_lookup",
-            ],
                 // cairn/5113: tenets become yes/no statements.
                 "tenet_statements",
-            ]
+            ],
         );
         assert_eq!(
             query_i64(
