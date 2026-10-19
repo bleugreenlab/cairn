@@ -70,6 +70,22 @@ fn temp_jj_project() -> TempDir {
     dir
 }
 
+/// Commit `contents` at `path` on a [`temp_jj_project`]'s `main`, before a store
+/// is provisioned from it.
+fn commit_to_project(repo: &Path, path: &str, contents: &str) {
+    let file = repo.join(path);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, contents).unwrap();
+    for args in [&["add", "-A"][..], &["commit", "-q", "-m", path][..]] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+}
+
 /// Provision a jj store for `repo` under `config_dir` with `feature` sealed one
 /// commit ahead of `main`, so a fold of feature→main is a real forward merge.
 /// `config_dir` matches the orchestrator's config dir so `merge_pr_for_job`
@@ -996,14 +1012,23 @@ async fn merge_pr_for_job_marks_merged_and_resolves_issue() {
 }
 
 /// A real remote PR landing on the default branch merges through GitHub's merge
-/// API — not the local jj fold. The repo has NO jj store provisioned, so success
-/// here can only come from the GitHub path; the local fold would have errored
-/// resolving the store. GitHub's success advances the base out of band, and Cairn
-/// then marks the merge request merged and resolves the issue.
+/// API — not the local jj fold. The shared store is provisioned (every merge
+/// reads the executor protocol ledger from it before choosing a route) with
+/// `feature` sealed ahead of `main`, so the local fold COULD land it; the store's
+/// `main` staying put is what shows GitHub took the merge. GitHub's success
+/// advances the base out of band, and Cairn then marks the merge request merged
+/// and resolves the issue.
 #[tokio::test]
 async fn merge_pr_for_job_remote_default_branch_merges_via_github() {
+    let Some(bin) = common::jj_bin() else {
+        eprintln!(
+            "skipping merge_pr_for_job_remote_default_branch_merges_via_github: jj not resolvable"
+        );
+        return;
+    };
     let (_temp, db) = common::migrated_db().await;
-    let repo = temp_git_repo();
+    let repo = temp_jj_project();
+    add_github_origin(repo.path());
     insert_github_app(&db).await;
     let project = create_project(&db, "gh", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
@@ -1022,14 +1047,22 @@ async fn merge_pr_for_job_remote_default_branch_merges_via_github() {
         .respond_to("/pulls/5/reviews", empty_array_response())
         .respond_to("/check-runs", check_runs_response())
         .respond_to("/pulls/5", pr_response("closed", true));
-    let (_cfg, orch) = orchestrator_with_http(db, http).await;
+    let (cfg, orch) = orchestrator_with_http(db, http).await;
+    let config_dir = cfg.path().join("config");
+    provision_jj_merge(&config_dir, repo.path());
+    let base_before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
     let msg = actions::merge_pr_for_job(&orch, &job, None, None)
         .await
         .unwrap();
-    assert!(msg.contains("merged"), "reports a merge: {msg}");
+    assert!(msg.contains("via GitHub"), "reports a GitHub merge: {msg}");
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
     assert_eq!(issue_status(&orch.db.local, &issue).await, "merged");
+    assert_eq!(
+        jj_bookmark_commit(&bin, &config_dir, repo.path(), "main"),
+        base_before,
+        "GitHub owns the landing: the local fold must not advance the store's `main`"
+    );
 }
 
 /// FAIL-CLOSED: when GitHub refuses the merge (405 not-mergeable), Cairn surfaces
@@ -1038,8 +1071,15 @@ async fn merge_pr_for_job_remote_default_branch_merges_via_github() {
 /// the local conflict gate passed).
 #[tokio::test]
 async fn merge_pr_for_job_remote_merge_failure_leaves_unmarked() {
+    let Some(bin) = common::jj_bin() else {
+        eprintln!(
+            "skipping merge_pr_for_job_remote_merge_failure_leaves_unmarked: jj not resolvable"
+        );
+        return;
+    };
     let (_temp, db) = common::migrated_db().await;
-    let repo = temp_git_repo();
+    let repo = temp_jj_project();
+    add_github_origin(repo.path());
     insert_github_app(&db).await;
     let project = create_project(&db, "ghf", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
@@ -1049,7 +1089,10 @@ async fn merge_pr_for_job_remote_merge_failure_leaves_unmarked() {
     let http = MockHttpClient::new()
         .respond_to("access_tokens", token_response())
         .respond_to("/pulls/5/merge", merge_response(405));
-    let (_cfg, orch) = orchestrator_with_http(db, http).await;
+    let (cfg, orch) = orchestrator_with_http(db, http).await;
+    let config_dir = cfg.path().join("config");
+    provision_jj_merge(&config_dir, repo.path());
+    let base_before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
     let err = actions::merge_pr_for_job(&orch, &job, None, None)
         .await
@@ -1057,6 +1100,69 @@ async fn merge_pr_for_job_remote_merge_failure_leaves_unmarked() {
     assert!(
         err.contains("GitHub refused"),
         "points at the PR, not local markers: {err}"
+    );
+    assert_eq!(mr_status(&orch.db.local, &mr).await, "open");
+    assert_eq!(issue_status(&orch.db.local, &issue).await, "active");
+    assert_eq!(
+        jj_bookmark_commit(&bin, &config_dir, repo.path(), "main"),
+        base_before,
+        "a refused GitHub merge must not fall back to the local fold"
+    );
+}
+
+/// The executor protocol ledger gate guards the GitHub route too, and fires
+/// before GitHub is asked: `feature` moves `EXECUTOR_PROTOCOL_VERSION` with no
+/// `/// Version N` paragraph, so the merge is refused even though GitHub would
+/// accept it, and nothing is marked.
+#[tokio::test]
+async fn merge_pr_for_job_remote_refuses_undocumented_protocol_bump_before_github() {
+    let Some(bin) = common::jj_bin() else {
+        eprintln!("skipping merge_pr_for_job_remote_refuses_undocumented_protocol_bump_before_github: jj not resolvable");
+        return;
+    };
+    const PROTOCOL_FILE: &str = "src-tauri/os/cairn-common/src/executor_protocol.rs";
+    let (_temp, db) = common::migrated_db().await;
+    let repo = temp_jj_project();
+    add_github_origin(repo.path());
+    commit_to_project(
+        repo.path(),
+        PROTOCOL_FILE,
+        "/// Version 7 adds the thing.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 7;\n",
+    );
+    insert_github_app(&db).await;
+    let project = create_project(&db, "ghl", repo.path().to_str().unwrap()).await;
+    let issue = create_issue(&db, &project, 1).await;
+    let job = create_job(&db, &project, &issue).await;
+    let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
+
+    // GitHub would merge it: only the gate can stop this.
+    let http = MockHttpClient::new()
+        .respond_to("access_tokens", token_response())
+        .respond_to("/pulls/5/merge", merge_response(200));
+    let (cfg, orch) = orchestrator_with_http(db, http).await;
+    let config_dir = cfg.path().join("config");
+    let ws = config_dir.join("feature-ws");
+    common::provision_jj_workspace(&config_dir, repo.path(), &ws, "feature");
+    std::fs::write(
+        ws.join(PROTOCOL_FILE),
+        "/// Version 7 adds the thing.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 8;\n",
+    )
+    .unwrap();
+    jj::seal(
+        &jj::environment(&bin, &config_dir),
+        &ws,
+        "bump without a paragraph",
+        None,
+    )
+    .unwrap();
+
+    let err = actions::merge_pr_for_job(&orch, &job, None, None)
+        .await
+        .expect_err("an undocumented protocol version must not land");
+    assert!(
+        err.contains("Refusing to merge `feature` into `main`")
+            && err.contains("EXECUTOR_PROTOCOL_VERSION"),
+        "names the ledger violation: {err}"
     );
     assert_eq!(mr_status(&orch.db.local, &mr).await, "open");
     assert_eq!(issue_status(&orch.db.local, &issue).await, "active");
