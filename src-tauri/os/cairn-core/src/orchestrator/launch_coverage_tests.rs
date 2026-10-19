@@ -338,11 +338,11 @@ impl SessionProvider for RecordingCodex {
             panic!("a Codex launch opened a {:?}", spec.provider);
         };
         let (client, notifications) = match &codex.server {
-            CodexServer::Dedicated(client) => {
+            CodexServer::Dedicated { router, .. } => {
                 self.0.record("codex:dedicated");
                 let (tx, rx) = unbounded();
                 self.0.open_notifications.lock().unwrap().push(tx);
-                (client.clone(), Some(rx))
+                (router.client(), Some(rx))
             }
             CodexServer::Shared(router) => {
                 self.0.record("codex:shared");

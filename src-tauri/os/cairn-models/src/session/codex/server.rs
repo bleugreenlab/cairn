@@ -120,7 +120,7 @@ impl SessionProvider for CodexAppServer {
         }
         let native_tools = codex.native_tools;
         let (client, dedicated) = match &codex.server {
-            CodexServer::Dedicated(client) => (client.clone(), true),
+            CodexServer::Dedicated { router, .. } => (router.client(), true),
             CodexServer::Shared(router) => (router.client(), false),
         };
         let approval_policy = codex_approval_policy(approval);
@@ -322,10 +322,9 @@ impl SessionProvider for CodexAppServer {
             current_turn.clone(),
         )
         .with_opening(output_schema, opening_text);
-        let (process, notifications) = if dedicated {
-            (client.child_handle(), Some(client.notifications()))
-        } else {
-            (Arc::new(Mutex::new(None)), None)
+        let (process, notifications) = match &codex.server {
+            CodexServer::Dedicated { events, .. } => (client.child_handle(), Some(events.clone())),
+            CodexServer::Shared(_) => (Arc::new(Mutex::new(None)), None),
         };
         Ok(LaunchedSession {
             control: Box::new(control),
@@ -349,8 +348,9 @@ impl SessionProvider for CodexAppServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex::thread_router::{Scoped, ThreadRouter};
     use crate::interface::session::{
-        ApprovalMode, Cli, CodexSpec, Secret, SecretEnv, SessionControl, SessionError,
+        ApprovalMode, Cli, CodexSpec, Secret, SecretEnv, ServerReply, SessionControl, SessionError,
     };
     use crate::session::mcp::{McpServer, McpServers};
     use crate::wire::MessageContent;
@@ -359,6 +359,7 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::io::{BufRead, BufReader, Read, Write};
+    use std::time::{Duration, Instant};
 
     type Requests = Arc<Mutex<Vec<Value>>>;
 
@@ -380,12 +381,12 @@ mod tests {
             self.spawned.lock().unwrap().push(config);
             let (tx, rx) = unbounded();
             Ok(Box::new(ScriptedChild {
-                stdin: Some(ScriptedStdin {
+                stdin: Some(Box::new(ScriptedStdin {
                     tx,
                     requests: self.requests.clone(),
                     respond: self.respond,
                     buffer: Vec::new(),
-                }),
+                })),
                 stdout: Some(rx),
             }))
         }
@@ -401,8 +402,29 @@ mod tests {
     }
 
     struct ScriptedChild {
-        stdin: Option<ScriptedStdin>,
+        stdin: Option<Box<dyn Write + Send>>,
         stdout: Option<Receiver<Vec<u8>>>,
+    }
+
+    /// A child's stdin that hands each line the client writes to a fake
+    /// server's inbox, for a server that answers on a thread of its own.
+    struct Inbox {
+        tx: Sender<Value>,
+        buffer: Vec<u8>,
+    }
+
+    impl Write for Inbox {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buffer.extend_from_slice(buf);
+            while let Some(end) = self.buffer.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = self.buffer.drain(..=end).collect();
+                let _ = self.tx.send(serde_json::from_slice(&line).unwrap());
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     struct ScriptedStdin {
@@ -468,9 +490,7 @@ mod tests {
             None
         }
         fn take_stdin(&mut self) -> Option<Box<dyn Write + Send>> {
-            self.stdin
-                .take()
-                .map(|stdin| Box::new(stdin) as Box<dyn Write + Send>)
+            self.stdin.take()
         }
         fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
             Ok(None)
@@ -570,8 +590,13 @@ mod tests {
 
     /// `client` as a shared server, routed by a router its test feeds.
     fn shared(client: Arc<AppServerClient>) -> CodexServer {
-        use crate::codex::thread_router::{Scoped, ThreadRouter};
         CodexServer::Shared(ThreadRouter::new(client, |_, _| Scoped::Passed))
+    }
+
+    /// `client` as a session's own server, whose router answers nothing.
+    fn dedicated(client: Arc<AppServerClient>) -> CodexServer {
+        let (router, events) = ThreadRouter::start_owned(client, |_, _| Scoped::Passed);
+        CodexServer::Dedicated { router, events }
     }
 
     fn spec(start: SessionStart, server: CodexServer, goal: NativeGoal) -> SessionSpec {
@@ -635,7 +660,7 @@ mod tests {
                     SessionStart::New {
                         session_id: "session-1".to_string(),
                     },
-                    CodexServer::Dedicated(client),
+                    dedicated(client),
                     NativeGoal::Objective("do the work".to_string()),
                 ),
             )
@@ -745,7 +770,7 @@ mod tests {
                         session_id: "session-1".to_string(),
                         backend_id: "thread-old".to_string(),
                     },
-                    CodexServer::Dedicated(client),
+                    dedicated(client),
                     NativeGoal::Leave,
                 ),
             )
@@ -797,7 +822,7 @@ mod tests {
                     SessionStart::New {
                         session_id: "session-1".to_string(),
                     },
-                    CodexServer::Dedicated(client),
+                    dedicated(client),
                     NativeGoal::Leave,
                 ),
             )
@@ -829,7 +854,7 @@ mod tests {
             SessionStart::New {
                 session_id: "session-1".to_string(),
             },
-            CodexServer::Dedicated(client),
+            dedicated(client),
             NativeGoal::Leave,
         );
         tool_free.mcp = None;
@@ -839,6 +864,100 @@ mod tests {
         assert_eq!(requests[0]["params"]["ephemeral"], true);
         assert_eq!(requests[0]["params"]["environments"], json!([]));
         assert_eq!(requests[0]["params"]["sandbox"], "read-only");
+    }
+
+    /// A token refresh Codex asks for while `thread/start` is pending is
+    /// answered before the start returns. This server holds its `thread/start`
+    /// answer until the refresh is answered or five seconds pass (Codex itself
+    /// gives up on the refresh after ten), and what the router does not answer
+    /// still reaches the session, in order.
+    #[test]
+    fn a_dedicated_server_answers_a_refresh_asked_for_while_its_thread_starts() {
+        let (inbox_tx, inbox) = unbounded::<Value>();
+        let (stdout_tx, stdout_rx) = unbounded::<Vec<u8>>();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let server_order = order.clone();
+        std::thread::spawn(move || {
+            let say = |message: Value| {
+                let _ = stdout_tx.send(format!("{message}\n").into_bytes());
+            };
+            for request in inbox.iter() {
+                if request["method"] != "thread/start" {
+                    continue;
+                }
+                say(json!({"method": "thread/started", "params": {"threadId": "thread-new"}}));
+                say(
+                    json!({"id": 0, "method": "account/chatgptAuthTokens/refresh",
+                    "params": {"reason": "unauthorized"}}),
+                );
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let reply = loop {
+                    match inbox.recv_deadline(deadline) {
+                        Ok(reply) if reply["id"] == 0 => break Some(reply),
+                        Ok(_) => continue,
+                        Err(_) => break None,
+                    }
+                };
+                let mut order = server_order.lock().unwrap();
+                order.push(match reply {
+                    Some(reply) => format!("refresh answered: {}", reply["result"]["accessToken"]),
+                    None => "refresh unanswered".to_string(),
+                });
+                order.push("thread/start answered".to_string());
+                say(json!({"id": request["id"], "result": {"thread": {"id": "thread-new"}}}));
+            }
+        });
+        let client = AppServerClient::launch(
+            move |_| {
+                Ok(Box::new(ScriptedChild {
+                    stdin: Some(Box::new(Inbox {
+                        tx: inbox_tx,
+                        buffer: Vec::new(),
+                    })),
+                    stdout: Some(stdout_rx),
+                }))
+            },
+            SpawnConfig::new("/bin/codex"),
+        )
+        .unwrap();
+        let (router, events) = ThreadRouter::start_owned(Arc::new(client), |client, message| {
+            if message["method"] != "account/chatgptAuthTokens/refresh" {
+                return Scoped::Passed;
+            }
+            let tokens = json!({"accessToken": "fresh", "chatgptAccountId": "acct"});
+            client
+                .reply(&message["id"], ServerReply::Result(tokens))
+                .unwrap();
+            Scoped::Answered
+        });
+        let mut tool_free = spec(
+            SessionStart::New {
+                session_id: "session-1".to_string(),
+            },
+            CodexServer::Dedicated { router, events },
+            NativeGoal::Leave,
+        );
+        tool_free.mcp = None;
+
+        let launched = CodexAppServer.open(&host(empty_result), tool_free).unwrap();
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["refresh answered: \"fresh\"", "thread/start answered"]
+        );
+        let SessionEvents::CodexAppServer {
+            notifications: Some(notifications),
+            ..
+        } = launched.events
+        else {
+            panic!("a dedicated thread has its notifications");
+        };
+        let first = notifications.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(first["method"], "thread/started");
+        assert!(
+            notifications.try_recv().is_err(),
+            "the refresh was the router's to answer, not the session's"
+        );
     }
 
     /// Only a new thread can be tool-free: a resume or fork would continue a

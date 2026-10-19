@@ -51,6 +51,52 @@ pub struct CodexRuntime {
     pub boot_id: String,
     pub host: Arc<dyn CodexHost>,
 }
+
+/// Answer `message` through `host` if it is a server request: the token
+/// refresh from the session's login, anything else through the host's request
+/// handling. Says whether it was one.
+///
+/// A session's own server answers its thread-less requests here from its
+/// router as they arrive, even while a thread is still opening; its reader
+/// answers the rest (a turn's approvals) here too, in stream order behind the
+/// items they concern.
+fn answer_server_request(host: &dyn CodexHost, message: &Value) -> bool {
+    match Notification::parse(message) {
+        Notification::AuthTokensRefreshRequest { id } => {
+            if let Err(e) = host.refresh_tokens(id) {
+                log::warn!("Failed to answer Codex token refresh request: {}", e);
+            }
+            true
+        }
+        Notification::ServerRequest { id, method } => {
+            if let Err(e) = host.server_request(Some(method), message, id) {
+                log::warn!("Failed to answer Codex request {:?}: {}", method, e);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+impl CodexRuntime {
+    /// Route a session's own app-server for it from now on, before its thread
+    /// opens: each thread-less server request (the token refresh) is answered
+    /// through this host as it arrives, and every other message reaches the
+    /// returned channel, in order, for the session's reader.
+    pub fn own_server(
+        &self,
+        client: Arc<AppServerClient>,
+    ) -> (Arc<ThreadRouter>, crossbeam_channel::Receiver<Value>) {
+        let host = self.host.clone();
+        ThreadRouter::start_owned(client, move |_, message| {
+            if answer_server_request(host.as_ref(), message) {
+                Scoped::Answered
+            } else {
+                Scoped::Passed
+            }
+        })
+    }
+}
 use super::events::{
     build_codex_compaction_event, emit_codex_command_complete, emit_codex_command_output_delta,
     emit_streaming_delta, finalize_agent_message, finalize_streaming, handle_agent_message_delta,
@@ -67,6 +113,8 @@ use crate::agent_process::stream::{ToolUseInfo, TranscriptEvent};
 use crate::transcripts::stream_store::append_chunks;
 use cairn_db::storage::LocalDb;
 use cairn_domain::ContextTokenState;
+use cairn_models::codex::app_server::AppServerClient;
+use cairn_models::codex::thread_router::{Scoped, ThreadRouter};
 use cairn_models::usage::codex_rate_limits::codex_rate_limit_snapshot_from_value;
 use cairn_models::wire::claude_stream::Usage;
 use cairn_models::wire::codex_app_server::{
@@ -748,20 +796,10 @@ impl CodexRuntime {
         store_event(host, run_id, session_id.as_deref(), &init_event);
 
         for msg in notifications.iter() {
+            if answer_server_request(host.host.as_ref(), &msg) {
+                continue;
+            }
             let notification = Notification::parse(&msg);
-            if let Notification::AuthTokensRefreshRequest { id } = notification {
-                if let Err(e) = host.host.refresh_tokens(id) {
-                    log::warn!("Failed to answer Codex token refresh request: {}", e);
-                }
-                continue;
-            }
-            if let Notification::ServerRequest { id, method } = notification {
-                let response = host.host.server_request(Some(method), &msg, id);
-                if let Err(e) = response {
-                    log::warn!("Failed to answer Codex request {:?}: {}", method, e);
-                }
-                continue;
-            }
 
             if terminal_tool_called_for_run(host, run_id)
                 && matches!(

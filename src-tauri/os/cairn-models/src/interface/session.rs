@@ -261,8 +261,17 @@ impl fmt::Debug for CodexSpec {
 /// Which app-server a Codex thread opens on. Both came from
 /// [`CodexSessionProvider::start_server`]; they differ in who owns the process.
 pub enum CodexServer {
-    /// This session's own app-server. Stopping the session stops it.
-    Dedicated(Arc<AppServerClient>),
+    /// This session's own app-server, read by an owned router
+    /// ([`ThreadRouter::start_owned`]) from before the thread opens, so a
+    /// server request without a `threadId` (the token refresh) is answered by
+    /// the router's handler as it arrives, even while `thread/start` is still
+    /// pending. `events` is the router's owner channel: every other message,
+    /// in order, which the session reads as its notifications. Stopping the
+    /// session stops the server.
+    Dedicated {
+        router: Arc<ThreadRouter>,
+        events: crossbeam_channel::Receiver<Value>,
+    },
     /// An app-server many threads share. The session holds no process, its
     /// notifications arrive through the server's router (the caller registers
     /// the opened thread on it before the first turn and puts the receiver in
@@ -279,7 +288,7 @@ pub enum CodexServer {
 impl fmt::Debug for CodexServer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Dedicated(_) => "Dedicated",
+            Self::Dedicated { .. } => "Dedicated",
             Self::Shared(_) => "Shared",
         })
     }

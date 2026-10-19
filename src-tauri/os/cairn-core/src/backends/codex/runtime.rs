@@ -301,8 +301,37 @@ const CAPACITY_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(30),
 ];
 impl CodexBackend {
+    /// What a Codex session answers its app-server through: its reader's
+    /// host and, on a session's own server, its router's
+    /// ([`CodexRuntime::own_server`]).
+    pub(super) fn session_runtime(
+        orch: &Orchestrator,
+        run_id: &str,
+        session_id: Option<String>,
+        run_db: Arc<LocalDb>,
+        client: Arc<AppServerClient>,
+        oauth_state: Option<Arc<Mutex<CodexAuthState>>>,
+        cleanup: Option<super::pool::PooledCall>,
+    ) -> CodexRuntime {
+        codex_runtime(
+            super::super::transcript_host::SessionTranscriptHost {
+                orch: orch.clone(),
+                emitter: orch.services.emitter.clone(),
+                run_id: run_id.to_string(),
+                session_id,
+                run_db,
+            },
+            Some(client),
+            oauth_state,
+            cleanup,
+        )
+    }
+
+    /// A dedicated session's reader over `notifications`, run to the end on
+    /// this thread.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn reader_thread_app_server(
+    fn reader_thread_app_server(
         orch: &Orchestrator,
         emitter: &Arc<dyn crate::services::EventEmitter>,
         run_id: &str,
@@ -313,20 +342,17 @@ impl CodexBackend {
         oauth_state: Option<Arc<Mutex<CodexAuthState>>>,
         backend_key: String,
         run_db: Arc<LocalDb>,
-        ephemeral_cleanup: Option<super::pool::PooledCall>,
+        cleanup: Option<super::pool::PooledCall>,
     ) {
-        let ephemeral = ephemeral_cleanup.is_some();
-        let host = codex_runtime(
-            super::super::transcript_host::SessionTranscriptHost {
-                orch: orch.clone(),
-                emitter: emitter.clone(),
-                run_id: run_id.to_string(),
-                session_id: session_id.clone(),
-                run_db: run_db.clone(),
-            },
-            Some(client),
+        let ephemeral = cleanup.is_some();
+        let host = Self::session_runtime(
+            orch,
+            run_id,
+            session_id.clone(),
+            run_db.clone(),
+            client,
             oauth_state,
-            ephemeral_cleanup,
+            cleanup,
         );
         CodexRuntime::reader_thread_app_server(
             &host,

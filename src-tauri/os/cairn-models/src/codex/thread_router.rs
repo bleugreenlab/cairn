@@ -11,6 +11,15 @@
 //! scoped handler and declines any request it leaves unanswered, so the server
 //! never waits on a reply that will not come.
 //!
+//! A server with one owner (a session's own app-server) is read by an owned
+//! router ([`ThreadRouter::start_owned`]) instead: no thread is routed, and
+//! every message the scoped handler leaves goes, in order, to the owner's one
+//! channel rather than being dropped or declined. Its dispatcher runs from
+//! before the session's first thread opens, so a scoped request the server
+//! makes while `thread/start` is pending is answered as it arrives. The token
+//! refresh is the one that matters: the app-server gives up on it after ten
+//! seconds, and a session's own reader only starts once its thread is open.
+//!
 //! When the server's channel closes (the process died) the router closes every
 //! route, so each reader blocked on its channel unwinds, and then tells the
 //! owner once.
@@ -41,6 +50,9 @@ type ScopedHandler = Box<dyn Fn(&AppServerClient, &Value) -> Scoped + Send + Syn
 #[derive(Default)]
 struct Routes {
     senders: HashMap<String, Sender<Value>>,
+    /// An owned router's owner: every message no route claims and the scoped
+    /// handler passed. `None` on a router that drops and declines them.
+    owner: Option<Sender<Value>>,
     /// Set once the server's channel has closed. A thread registered after
     /// that gets a channel that is already closed, so its reader never waits
     /// on a server that is gone.
@@ -65,8 +77,30 @@ impl ThreadRouter {
         closed: impl FnOnce() + Send + 'static,
     ) -> Arc<Self> {
         let router = Self::new(client, scoped);
-        let notifications = router.client.notifications();
-        let dispatcher = router.clone();
+        router.dispatch(closed);
+        router
+    }
+
+    /// Take `client`'s notification channel for its one owner, and route it
+    /// on a dispatcher thread: `scoped` sees every message without a
+    /// `threadId` as it arrives, and every message it passes (and every one
+    /// with a `threadId`) reaches the returned channel, in order. A request
+    /// passed this way is the owner's to answer, never declined. The channel
+    /// closes when the server's does.
+    pub fn start_owned(
+        client: Arc<AppServerClient>,
+        scoped: impl Fn(&AppServerClient, &Value) -> Scoped + Send + Sync + 'static,
+    ) -> (Arc<Self>, Receiver<Value>) {
+        let (owner, events) = unbounded();
+        let router = Self::new(client, scoped);
+        router.routes.lock().unwrap().owner = Some(owner);
+        router.dispatch(|| {});
+        (router, events)
+    }
+
+    fn dispatch(self: &Arc<Self>, closed: impl FnOnce() + Send + 'static) {
+        let notifications = self.client.notifications();
+        let dispatcher = self.clone();
         thread::spawn(move || {
             for message in notifications.iter() {
                 dispatcher.deliver(message);
@@ -74,7 +108,6 @@ impl ThreadRouter {
             dispatcher.close();
             closed();
         });
-        router
     }
 
     /// A router with no dispatcher: its owner reads the server's channel and
@@ -146,7 +179,7 @@ impl ThreadRouter {
     /// already-closed channel; the caller shuts the server down on `true`.
     pub fn close_if_idle(&self) -> bool {
         let mut routes = self.routes.lock().unwrap();
-        if routes.closed || !routes.senders.is_empty() {
+        if routes.closed || !routes.senders.is_empty() || routes.owner.is_some() {
             return false;
         }
         routes.closed = true;
@@ -159,11 +192,13 @@ impl ThreadRouter {
         let mut routes = self.routes.lock().unwrap();
         routes.closed = true;
         routes.senders.clear();
+        routes.owner = None;
     }
 
     /// One message, routed: to its thread's channel, or (for a finalized
     /// thread) dropped and, if it is a request, declined. A message without
-    /// a `threadId` goes to the owner's scoped handler.
+    /// a `threadId` goes to the owner's scoped handler. On an owned router,
+    /// what would be dropped goes to the owner instead.
     pub fn deliver(&self, message: Value) {
         let expects_response = message.get("id").is_some()
             && message.get("result").is_none()
@@ -174,8 +209,12 @@ impl ThreadRouter {
             .and_then(Value::as_str)
             .map(str::to_string)
         else {
-            if (self.scoped)(&self.client, &message) == Scoped::Passed && expects_response {
-                self.decline(&message, "unsupported pool-scoped request");
+            if (self.scoped)(&self.client, &message) == Scoped::Passed {
+                if let Some(message) = self.to_owner(message) {
+                    if expects_response {
+                        self.decline(&message, "unsupported pool-scoped request");
+                    }
+                }
             }
             return;
         };
@@ -185,11 +224,27 @@ impl ThreadRouter {
                 let _ = sender.send(message);
             }
             None => {
+                let Some(message) = self.to_owner(message) else {
+                    return;
+                };
                 if expects_response {
                     self.decline(&message, "pooled call thread no longer active");
                 }
                 log::debug!("codex router: dropping a message for unknown thread {thread_id}");
             }
+        }
+    }
+
+    /// Hand `message` to the owner, if this router has one; give it back if
+    /// it has none.
+    fn to_owner(&self, message: Value) -> Option<Value> {
+        let owner = self.routes.lock().unwrap().owner.clone();
+        match owner {
+            Some(owner) => {
+                let _ = owner.send(message);
+                None
+            }
+            None => Some(message),
         }
     }
 
@@ -365,6 +420,73 @@ mod tests {
             sent[1]["error"]["message"],
             "unsupported pool-scoped request"
         );
+    }
+
+    /// An owned router answers what its handler takes as it arrives, and
+    /// hands everything else, requests included, to its owner in order; the
+    /// owner's channel closes with the server's.
+    #[test]
+    fn an_owned_router_hands_its_owner_everything_its_handler_leaves() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let (client, server) = AppServerClient::for_test_with_notifications(
+            |_| Err("no requests".to_string()),
+            sent.clone(),
+        );
+        let (router, events) = ThreadRouter::start_owned(Arc::new(client), |client, message| {
+            if message["method"] == "account/chatgptAuthTokens/refresh" {
+                let _ = client.respond(&message["id"], json!({"ok": true}));
+                Scoped::Answered
+            } else {
+                Scoped::Passed
+            }
+        });
+
+        server
+            .send(json!({"method": "thread/started", "params": {"threadId": "thread-a"}}))
+            .unwrap();
+        server
+            .send(json!({"id": 0, "method": "account/chatgptAuthTokens/refresh", "params": {}}))
+            .unwrap();
+        server
+            .send(json!({"method": "account/rateLimits/updated", "params": {}}))
+            .unwrap();
+        server
+            .send(json!({"id": 1, "method": "account/somethingElse", "params": {}}))
+            .unwrap();
+        server
+            .send(
+                json!({"id": 2, "method": "item/commandExecution/requestApproval",
+                "params": {"threadId": "thread-a"}}),
+            )
+            .unwrap();
+
+        let methods: Vec<Value> = (0..4)
+            .map(|_| events.recv_timeout(Duration::from_secs(5)).unwrap()["method"].clone())
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "thread/started",
+                "account/rateLimits/updated",
+                "account/somethingElse",
+                "item/commandExecution/requestApproval"
+            ]
+        );
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "the owner's requests are not declined: {sent:?}"
+        );
+        assert_eq!(sent[0]["id"], 0);
+        assert!(!router.close_if_idle(), "an owned router is never idle");
+
+        drop(server);
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(5)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+        assert!(router.is_closed());
     }
 
     #[test]

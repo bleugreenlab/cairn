@@ -24,7 +24,30 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
 
 static CODEX_START_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+use cairn_models::codex::app_server::AppServerClient;
+use cairn_session::backends::codex::runtime::CodexRuntime;
 use std::thread;
+
+/// A session's own app-server that no reader has taken over yet. Its router
+/// holds the client, so letting go of every other handle no longer closes
+/// Codex's stdin and ends the process; a launch that fails before its reader
+/// runs shuts the server down instead.
+struct UnclaimedServer(Option<Arc<AppServerClient>>);
+
+impl UnclaimedServer {
+    /// The session's reader runs: the server is the session's to stop.
+    fn claim(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for UnclaimedServer {
+    fn drop(&mut self) {
+        if let Some(client) = self.0.take() {
+            client.shutdown();
+        }
+    }
+}
 
 use super::super::{
     AgentBackend, CompletionError, CompletionOutcome, CompletionRequest, CompletionShape,
@@ -359,6 +382,22 @@ impl AgentBackend for CodexBackend {
             })?;
         drop(start_guard);
 
+        // The session answers its server from here on, before its thread
+        // opens: a token refresh Codex asks for while `thread/start` is
+        // pending is answered as it arrives, not after the start returns,
+        // by which time Codex has given up on it.
+        let reader_host = CodexBackend::session_runtime(
+            orch,
+            &config.run_id,
+            session_id.clone(),
+            run_db.clone(),
+            client.clone(),
+            oauth_state,
+            None,
+        );
+        let (router, events) = reader_host.own_server(client.clone());
+        let unclaimed = UnclaimedServer(Some(client));
+
         let workspace_instructions = crate::workspace::instructions::read_workspace_instructions();
         let project_instructions = crate::workspace::instructions::read_project_instructions(
             std::path::Path::new(&config.working_dir),
@@ -396,7 +435,7 @@ impl AgentBackend for CodexBackend {
             secrets: SecretEnv::new(),
             account_id,
             provider: ProviderSpec::Codex(CodexSpec {
-                server: CodexServer::Dedicated(client),
+                server: CodexServer::Dedicated { router, events },
                 base_instructions: base_instructions_from_segments(&prompt_segments),
                 developer_instructions: developer_instructions_from_segments(&prompt_segments),
                 service_tier: config.service_tier.clone(),
@@ -443,9 +482,9 @@ impl AgentBackend for CodexBackend {
         }
 
         let SessionEvents::CodexAppServer {
-            client,
             notifications: Some(notification_rx),
             current_turn,
+            ..
         } = launched.events
         else {
             return Err("a dedicated Codex thread opened without its notifications".to_string());
@@ -475,25 +514,23 @@ impl AgentBackend for CodexBackend {
         }
 
         let run_id = config.run_id.clone();
-        let orch_clone = orch.clone();
         let emitter = orch.services.emitter.clone();
         // Use the Cairn UUID for event storage, not the Codex thread_id
         let event_session_id = session_id;
         thread::spawn(move || {
-            Self::reader_thread_app_server(
-                &orch_clone,
+            CodexRuntime::reader_thread_app_server(
+                &reader_host,
                 &emitter,
                 &run_id,
                 event_session_id,
                 notification_rx,
-                client,
                 current_turn,
-                oauth_state,
                 "codex".to_string(),
                 run_db,
-                None,
+                false,
             );
         });
+        unclaimed.claim();
 
         log::info!(
             "[PROFILE] CodexBackend(app-server)::start_session returning: {:?}",
@@ -972,25 +1009,31 @@ fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), S
     // (`start_call_run_now`) after this returns, exactly like the process path.
 
     let run_id = config.run_id.clone();
-    let orch_clone = orch.clone();
     let emitter = orch.services.emitter.clone();
     let event_session_id = session_id;
     let cleanup = super::pool::PooledCall::new(server.clone(), thread_id.clone());
+    let reader_host = CodexBackend::session_runtime(
+        orch,
+        &run_id,
+        event_session_id.clone(),
+        run_db.clone(),
+        client,
+        // Pool-scoped auth-token refresh is answered by the pool dispatcher
+        // (it carries no threadId), so the per-call reader needs no oauth state.
+        None,
+        Some(cleanup),
+    );
     thread::spawn(move || {
-        CodexBackend::reader_thread_app_server(
-            &orch_clone,
+        CodexRuntime::reader_thread_app_server(
+            &reader_host,
             &emitter,
             &run_id,
             event_session_id,
             notification_rx,
-            client,
             current_turn,
-            // Pool-scoped auth-token refresh is answered by the pool dispatcher
-            // (it carries no threadId), so the per-call reader needs no oauth state.
-            None,
             "codex".to_string(),
             run_db,
-            Some(cleanup),
+            true,
         );
     });
 
