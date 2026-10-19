@@ -3393,7 +3393,17 @@ mod tests {
                         10,
                         MeasurementGap::UnsupportedPlatform,
                     ),
-                    ..Default::default()
+                    // Allocator bookkeeping is read only from glibc's
+                    // `mallinfo2`; every other platform names the gap.
+                    allocator: Measurement::unavailable(
+                        10,
+                        MeasurementGap::UnsupportedPlatform,
+                    ),
+                    // Every channel is spelled out rather than defaulted: a
+                    // defaulted channel reads `NotSampled`, which a running
+                    // executor never reports, so a new channel must be placed
+                    // here deliberately.
+                    retained: Default::default(),
                 },
             },
             inventory: Default::default(),
@@ -3412,10 +3422,10 @@ mod tests {
 
     /// A machine whose only missing reading is one it was never going to have.
     ///
-    /// macOS physical footprint has no equivalent anywhere else, and Windows
-    /// has no single quantity that means mapped address space, so a healthy
-    /// executor on those platforms reports both unavailable forever. Counting
-    /// either as a reason made a completely healthy remote hold the entire
+    /// macOS physical footprint has no equivalent anywhere else, Windows has no
+    /// single quantity that means mapped address space, and allocator
+    /// bookkeeping is read only from glibc, so a healthy Windows executor
+    /// reports all three unavailable forever. Counting any of them as a reason made a completely healthy remote hold the entire
     /// fleet at `Unknown` permanently, and conflated the daemon's own size with
     /// the machine pressure placement actually reads.
     #[test]
@@ -3436,6 +3446,10 @@ mod tests {
                 ),
                 (
                     MachineMeasurement::ProcessVirtual,
+                    MeasurementGap::UnsupportedPlatform
+                ),
+                (
+                    MachineMeasurement::ProcessAllocator,
                     MeasurementGap::UnsupportedPlatform
                 )
             ]
