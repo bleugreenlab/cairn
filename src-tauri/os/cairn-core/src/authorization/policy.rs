@@ -33,6 +33,7 @@ const CAPABILITY_BEARING_SETTINGS: &[&str] = &[
     "tierDefaults",
     "backends",
     "tiers",
+    "decisionModel",
     "openrouterRouting",
     "routeCallsViaOpenRouter",
     // Commands this workspace will execute on the host.
@@ -73,7 +74,6 @@ const LOCAL_PREFERENCE_SETTINGS: &[&str] = &[
     "repoTargetSweepDays",
     "seedBudgetTokens",
     "seedEras",
-    "subscriptionFees",
     "thinkingDisplayMode",
     "threadCompactThreshold",
     "transcriptDensity",

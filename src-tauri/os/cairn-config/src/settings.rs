@@ -209,6 +209,10 @@ pub struct SettingsFile {
     /// re-derived from whichever credentials happen to exist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     enabled_providers: Option<Vec<String>>,
+    /// The model or tier a decision node that names none is answered by.
+    /// Absent: the catalog's best decision offer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decision_model: Option<String>,
 
     /// External MCP servers reachable through the `cairn://mcp/...` gateway.
     /// Keyed by server name. Project config overlays this set.
@@ -350,11 +354,6 @@ pub struct SettingsFile {
     /// in the Settings DTO). Absent / `local` = the built-in local extractor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_pdf: Option<String>,
-    /// Flat monthly subscription fee per backend, in USD. A backend absent from
-    /// this map is treated as metered (pay-as-you-go, no normalization). e.g.
-    /// `{"claude": 200.0, "codex": 200.0}`. Drives effective-cost analytics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    subscription_fees: Option<HashMap<String, f64>>,
     /// OpenRouter provider-routing controls (ZDR + sort). Absent = OpenRouter's
     /// normal routing; omitted from YAML when all-default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -507,8 +506,8 @@ impl SettingsFile {
     ///
     /// Every form of dependence counts, because each one is a place the user
     /// already told Cairn this provider matters: a tier that defaults to it, a
-    /// configured account or host, call routing pointed through it, a
-    /// subscription fee recorded against it. Credentials are one signal among
+    /// configured account or host (a subscription sign-in among them), call
+    /// routing pointed through it. Credentials are one signal among
     /// these rather than the rule — this runs exactly once and its answer
     /// becomes durable configuration, so a credential that later expires or is
     /// deleted leaves the provider installed and visible.
@@ -525,13 +524,6 @@ impl SettingsFile {
                 .is_some_and(|routing| *routing != OpenRouterRouting::default());
         if routes_calls {
             evidence.push("openrouter".to_string());
-        }
-        if let Some(fees) = &self.subscription_fees {
-            evidence.extend(
-                fees.iter()
-                    .filter(|(_, fee)| **fee > 0.0)
-                    .map(|(backend, _)| backend.clone()),
-            );
         }
         evidence.retain(|backend| cairn_models_types::catalog::is_supported(backend));
         if evidence.is_empty() {
@@ -608,6 +600,10 @@ impl SettingsFile {
                     .map(str::to_string)
                     .collect(),
             },
+            decision_model: self
+                .decision_model
+                .clone()
+                .filter(|model| !model.trim().is_empty()),
             system_prompt: String::new(), // Deprecated, always empty
             max_thinking_tokens,
             merge_type: self.merge_type.clone().unwrap_or(MergeType::Squash),
@@ -648,7 +644,6 @@ impl SettingsFile {
                 .log_retention_days
                 .unwrap_or(cairn_common::logging::DEFAULT_LOG_RETENTION_DAYS)
                 .max(1),
-            subscription_fees: self.subscription_fees.clone().unwrap_or_default(),
             openrouter_routing: self.openrouter_routing.clone().unwrap_or_default(),
             route_calls_via_openrouter: self.route_calls_via_openrouter.unwrap_or(false),
             // An explicit operator ceiling only. Absent means the private lane
@@ -669,6 +664,7 @@ impl SettingsFile {
             tiers: Some(settings.tiers.clone()),
             backends: Some(settings.backends.clone()),
             enabled_providers: Some(settings.enabled_providers.clone()),
+            decision_model: settings.decision_model.clone(),
             mcp_servers: None,
             default_model: None,
             preferred_models: None,
@@ -695,11 +691,6 @@ impl SettingsFile {
             seed_budget_tokens: Some(clamp_seed_budget_tokens(settings.seed_budget_tokens)),
             seed_eras: Some(clamp_seed_eras(settings.seed_eras)),
             external_replies: Some(settings.external_replies.clone()),
-            subscription_fees: if settings.subscription_fees.is_empty() {
-                None
-            } else {
-                Some(settings.subscription_fees.clone())
-            },
             openrouter_routing: if settings.openrouter_routing == OpenRouterRouting::default() {
                 None
             } else {
@@ -1115,6 +1106,7 @@ const SETTINGS_DTO_KEYS: &[&str] = &[
     "tiers",
     "backends",
     "enabledProviders",
+    "decisionModel",
     // Removed DTO keys remain here so the next save deletes stale YAML.
     "branchPrefix",
     "maxThinkingTokens",
@@ -1130,11 +1122,12 @@ const SETTINGS_DTO_KEYS: &[&str] = &[
     "maxOpenTriageIssuesPerScope",
     "pendingMemoryThreshold",
     "externalReplies",
-    "subscriptionFees",
     "openrouterRouting",
     "routeCallsViaOpenRouter",
     "channels",
     "privateDedicatedProcessCapacity",
+    // Retired, but must stay listed so an existing YAML key is removed on save.
+    "subscriptionFees",
     // Legacy DTO-owned fields are removed once their values have migrated.
     "defaultModel",
     "preferredModels",
@@ -1359,6 +1352,11 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
     if let Some(value) = input.enabled_providers {
         current.enabled_providers = cairn_models_types::catalog::in_catalog_order(value);
     }
+    if let Some(value) = input.decision_model {
+        current.decision_model = value
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty());
+    }
     if let Some(value) = input.max_thinking_tokens {
         current.max_thinking_tokens = value;
     }
@@ -1425,12 +1423,6 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
     }
     if let Some(value) = input.channels {
         current.channels = value;
-    }
-    if let Some(value) = input.subscription_fees {
-        current.subscription_fees = value
-            .into_iter()
-            .filter(|(_, fee)| fee.is_finite() && *fee > 0.0)
-            .collect();
     }
 }
 
@@ -1883,31 +1875,22 @@ externalReplies: disabled
         );
     }
 
+    /// A price used to be typed in per backend; it now comes from each
+    /// account's plan. A file that still carries the old map loads, ignores
+    /// it, and loses it on the next save.
     #[test]
-    fn test_subscription_fees_roundtrip() {
-        let mut fees = HashMap::new();
-        fees.insert("claude".to_string(), 200.0);
-        fees.insert("codex".to_string(), 200.0);
-        let settings = Settings {
-            subscription_fees: fees.clone(),
-            ..test_settings()
-        };
-
-        // DTO -> file -> DTO survives.
-        let file = SettingsFile::from_settings(&settings);
-        let restored = file.to_settings();
-        assert_eq!(restored.subscription_fees, fees);
-
-        // YAML load/save survives, and an empty map serializes to absent.
-        let yaml = serde_yaml::to_string(&file).unwrap();
-        assert!(yaml.contains("subscriptionFees"));
-        let parsed: SettingsFile = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(parsed.to_settings().subscription_fees, fees);
-
-        let empty = SettingsFile::from_settings(&test_settings());
-        assert!(empty.subscription_fees.is_none());
-        let empty_yaml = serde_yaml::to_string(&empty).unwrap();
-        assert!(!empty_yaml.contains("subscriptionFees"));
+    fn the_retired_fee_map_is_ignored_and_dropped_on_save() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            get_settings_path(temp.path()),
+            "tiers: [sm, md, lg]\nsubscriptionFees:\n  claude: 200.0\nmergeType: squash\n",
+        )
+        .unwrap();
+        let settings = load_settings(temp.path());
+        save_settings(temp.path(), &settings).unwrap();
+        let saved = std::fs::read_to_string(get_settings_path(temp.path())).unwrap();
+        assert!(!saved.contains("subscriptionFees"), "{saved}");
+        assert!(saved.contains("mergeType"), "{saved}");
     }
 
     #[test]
@@ -1938,6 +1921,44 @@ externalReplies: disabled
         assert!(empty.openrouter_routing.is_none());
         let empty_yaml = serde_yaml::to_string(&empty).unwrap();
         assert!(!empty_yaml.contains("openrouterRouting"));
+    }
+
+    #[test]
+    fn decision_model_is_set_cleared_and_omitted_when_unset() {
+        assert_eq!(test_settings().decision_model, None);
+        let empty = SettingsFile::from_settings(&test_settings());
+        assert!(!serde_yaml::to_string(&empty)
+            .unwrap()
+            .contains("decisionModel"));
+
+        let mut current = test_settings();
+        apply_settings_update(
+            &mut current,
+            serde_json::from_value(serde_json::json!({ "decisionModel": " qwen36 " })).unwrap(),
+        );
+        assert_eq!(current.decision_model.as_deref(), Some("qwen36"));
+        let yaml = serde_yaml::to_string(&SettingsFile::from_settings(&current)).unwrap();
+        assert!(yaml.contains("decisionModel: qwen36"), "{yaml}");
+        let parsed: SettingsFile = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            parsed.to_settings().decision_model.as_deref(),
+            Some("qwen36")
+        );
+
+        // Omitted leaves it alone; null and blank both return it to the catalog.
+        apply_settings_update(&mut current, UpdateSettings::default());
+        assert_eq!(current.decision_model.as_deref(), Some("qwen36"));
+        apply_settings_update(
+            &mut current,
+            serde_json::from_value(serde_json::json!({ "decisionModel": null })).unwrap(),
+        );
+        assert_eq!(current.decision_model, None);
+        current.decision_model = Some("qwen36".into());
+        apply_settings_update(
+            &mut current,
+            serde_json::from_value(serde_json::json!({ "decisionModel": "  " })).unwrap(),
+        );
+        assert_eq!(current.decision_model, None);
     }
 
     #[test]
@@ -3335,13 +3356,10 @@ routeCallsViaOpenRouter: true
     }
 
     #[test]
-    fn a_recorded_subscription_fee_counts_as_dependence() {
+    fn a_subscription_sign_in_counts_as_dependence() {
         let temp = TempDir::new().unwrap();
-        write_settings(
-            temp.path(),
-            "tiers: [sm, md, lg]\nsubscriptionFees:\n  codex: 200.0\n",
-        );
-        let enabled = migrate_enabled_providers(temp.path(), &[])
+        write_settings(temp.path(), "tiers: [sm, md, lg]\n");
+        let enabled = migrate_enabled_providers(temp.path(), &["codex".to_string()])
             .unwrap()
             .unwrap();
         assert_eq!(enabled, vec!["claude", "codex"]);

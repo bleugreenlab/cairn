@@ -873,11 +873,13 @@ name = "cairn-analytics"
 version = "0.12.34"
 dependencies = [
  "cairn-db",
+ "cairn-models-types",
  "chrono",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

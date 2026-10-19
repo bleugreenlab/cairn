@@ -288,6 +288,11 @@ pub struct Settings {
     /// workspace's tier assignments.
     #[serde(default)]
     pub enabled_providers: Vec<String>,
+    /// The model or tier a decision node that names none is answered by. A
+    /// node's own `model` wins; `None` leaves the choice to the catalog's best
+    /// decision offer.
+    #[serde(default)]
+    pub decision_model: Option<String>,
 
     pub system_prompt: String,
     pub max_thinking_tokens: Option<i32>,
@@ -330,11 +335,6 @@ pub struct Settings {
     pub log_level: LogLevel,
     /// Number of days to retain daily JSONL logs (minimum one).
     pub log_retention_days: u64,
-    /// Flat monthly subscription fee per backend, in USD. Empty = every backend
-    /// is metered (no subscription normalization). Drives effective-cost
-    /// analytics; OpenRouter is always metered regardless of this map.
-    #[serde(default)]
-    pub subscription_fees: HashMap<String, f64>,
     /// OpenRouter provider-routing controls (ZDR + sort). Default = OpenRouter's
     /// normal routing.
     #[serde(default)]
@@ -373,6 +373,10 @@ pub struct UpdateSettings {
     /// Rejected when it would leave a tier default or call routing pointing at
     /// a provider the workspace no longer has.
     pub enabled_providers: Option<Vec<String>>,
+    /// Set the workspace decision default; `null` or blank returns the choice
+    /// to the catalog.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub decision_model: Option<Option<String>>,
 
     /// Deprecated - system_prompt is no longer used
     #[allow(dead_code)]
@@ -414,8 +418,6 @@ pub struct UpdateSettings {
     pub log_level: Option<LogLevel>,
     /// Number of days to retain daily JSONL logs.
     pub log_retention_days: Option<u64>,
-    /// Flat monthly subscription fee per backend, in USD (replaces the whole map).
-    pub subscription_fees: Option<HashMap<String, f64>>,
     /// OpenRouter provider-routing controls (replaces the whole object).
     pub openrouter_routing: Option<OpenRouterRouting>,
     /// Opt-in: route tier-based ephemeral calls through OpenRouter's in-process

@@ -136,10 +136,18 @@ impl std::fmt::Display for DecisionFailure {
     }
 }
 
-/// What a decision node asks the catalog for.
-fn decision_query(decision: &DecisionNode) -> OfferQuery<'_> {
+/// What a decision node asks the catalog for: the model it names, or else the
+/// workspace's decision default (`decisionModel`), or else the best offer.
+fn decision_query<'a>(
+    decision: &'a DecisionNode,
+    workspace_default: Option<&'a str>,
+) -> OfferQuery<'a> {
+    let named = decision
+        .model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty());
     OfferQuery {
-        requested: decision.model.as_deref(),
+        requested: named.or(workspace_default),
         ..OfferQuery::new(VerbKind::Decide)
     }
 }
@@ -180,6 +188,7 @@ impl Orchestrator {
         let scope = ModelScope {
             project_id: project_id.map(str::to_string),
         };
+        let workspace_default = self.get_settings().decision_model;
         // Each pass either returns or records one more offer as unable, which
         // the next catalog read no longer offers, so the walk ends; the bound
         // only guards against an observation expiring mid-walk.
@@ -187,7 +196,7 @@ impl Orchestrator {
             let offer = self
                 .catalog(&scope)
                 .map_err(DecisionFailure::Failed)?
-                .offer_for(decision_query(decision))
+                .offer_for(decision_query(decision, workspace_default.as_deref()))
                 .map_err(|refusal| DecisionFailure::Unanswerable(refusal.to_string()))?;
             if let Some(refusal) = unmeasurable_by(&offer, decision) {
                 return Err(DecisionFailure::Unanswerable(refusal));
@@ -269,6 +278,7 @@ impl Orchestrator {
             project_id: project_id.map(str::to_string),
         };
         let catalog = self.catalog(&scope);
+        let workspace_default = self.get_settings().decision_model;
         nodes
             .iter()
             .filter_map(|node| {
@@ -288,7 +298,9 @@ impl Orchestrator {
                         ))
                     }
                 };
-                let offer = match catalog.offer_for(decision_query(decision)) {
+                let offer = match catalog
+                    .offer_for(decision_query(decision, workspace_default.as_deref()))
+                {
                     Ok(offer) => offer,
                     Err(refusal) => return Some(report(true, format!("can't be answered: {refusal}"))),
                 };
@@ -498,11 +510,19 @@ mod tests {
     }
 
     fn decision_recipe(options: &[String]) -> Recipe {
+        decision_recipe_naming(options, None)
+    }
+
+    /// A one-decision recipe whose node names `model`, or none.
+    fn decision_recipe_naming(options: &[String], model: Option<&str>) -> Recipe {
         let options = options
             .iter()
             .map(|value| format!("{{value: {value}}}"))
             .collect::<Vec<_>>()
             .join(", ");
+        let model = model
+            .map(|model| format!("\n      model: {model}"))
+            .unwrap_or_default();
         let yaml = format!(
             r#"cairnVersion: 1
 name: Decides
@@ -518,7 +538,7 @@ nodes:
     type: decision
     name: Touches the DB?
     position: 200@0
-    config:
+    config:{model}
       questions:
         - name: route
           type: choice
@@ -537,6 +557,56 @@ edges:
 
     fn yes_no() -> Recipe {
         decision_recipe(&["yes".into(), "no".into()])
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_workspace_decision_default_answers_only_a_node_that_names_no_model() {
+        use crate::models::UpdateSettings;
+        let (orch, server) = workspace_with_chat_server(Vec::new()).await;
+        let set_default = |model: Option<&str>| {
+            orch.update_settings(UpdateSettings {
+                decision_model: Some(model.map(str::to_string)),
+                ..Default::default()
+            })
+            .unwrap();
+        };
+        let options = ["yes".to_string(), "no".to_string()];
+        let naming_qwen = decision_recipe_naming(&options, Some("qwen3"));
+        set_default(Some("not-served"));
+
+        // A node naming no model asks for the workspace default.
+        let [report] = orch
+            .decision_diagnostics(&yes_no().nodes, None)
+            .try_into()
+            .unwrap();
+        assert!(report.blocking, "{}", report.message);
+        assert!(
+            report.message.contains("'not-served'"),
+            "{}",
+            report.message
+        );
+        let refused = orch
+            .refuse_unanswerable_decisions(&yes_no().nodes, None)
+            .unwrap_err();
+        assert!(refused.contains("'not-served'"), "{refused}");
+
+        // A node naming its own model ignores it.
+        let [note] = orch
+            .decision_diagnostics(&naming_qwen.nodes, None)
+            .try_into()
+            .unwrap();
+        assert!(!note.blocking, "{}", note.message);
+        assert!(note.message.contains("qwen3 on"), "{}", note.message);
+
+        // Cleared, the catalog chooses again.
+        set_default(None);
+        let [note] = orch
+            .decision_diagnostics(&yes_no().nodes, None)
+            .try_into()
+            .unwrap();
+        assert!(!note.blocking, "{}", note.message);
+        assert!(note.message.contains("qwen3 on"), "{}", note.message);
+        assert_eq!(server.calls(), 0, "nothing was probed");
     }
 
     fn create(orch: &Orchestrator, recipe: Recipe) -> Result<Recipe, String> {

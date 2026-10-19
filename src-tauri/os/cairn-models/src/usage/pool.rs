@@ -9,7 +9,7 @@
 
 use cairn_credentials::CredentialStore;
 use cairn_models_types::pool::{build_provider_pool, PoolAccountInput, ProviderPoolSnapshot};
-use cairn_models_types::usage::{ProviderUsageResetCredits, ProviderUsageSnapshot};
+use cairn_models_types::usage::ProviderUsageSnapshot;
 
 use super::book::UsageBook;
 
@@ -34,7 +34,6 @@ pub fn provider_usage_pool(
             backend,
             Vec::new(),
             shared.as_ref().and_then(|s| s.credits.clone()),
-            Vec::new(),
             shared.as_ref().and_then(|s| s.model_breakdown.clone()),
             shared.and_then(|s| s.unsupported_reason),
             now,
@@ -44,7 +43,6 @@ pub fn provider_usage_pool(
     let roster = store.pool_roster(backend, project_id);
     let single_credential = roster.len() == 1;
     let mut inputs: Vec<PoolAccountInput> = Vec::with_capacity(roster.len());
-    let mut reset_credits: Vec<(String, ProviderUsageResetCredits)> = Vec::new();
     let mut credits = None;
     let mut model_breakdown = None;
     let mut unsupported_reason = None;
@@ -78,9 +76,6 @@ pub fn provider_usage_pool(
             },
         };
 
-        if let Some(account_resets) = snapshot.and_then(|s| s.reset_credits.clone()) {
-            reset_credits.push((account.id.clone(), account_resets));
-        }
         if credits.is_none() {
             credits = snapshot.and_then(|s| s.credits.clone());
         }
@@ -109,6 +104,9 @@ pub fn provider_usage_pool(
             blocked_until: health.and_then(|health| health.blocked_until),
             error: snapshot.and_then(|s| s.error.clone()),
             error_kind: snapshot.and_then(|s| s.error_kind),
+            // Reset credits live only in the live snapshot; health does not
+            // persist them.
+            reset_credits: snapshot.and_then(|s| s.reset_credits.clone()),
         });
     }
 
@@ -116,7 +114,6 @@ pub fn provider_usage_pool(
         backend,
         inputs,
         credits.or_else(|| shared.as_ref().and_then(|s| s.credits.clone())),
-        reset_credits,
         model_breakdown.or_else(|| shared.as_ref().and_then(|s| s.model_breakdown.clone())),
         unsupported_reason.or_else(|| shared.as_ref().and_then(|s| s.unsupported_reason.clone())),
         now,

@@ -299,6 +299,7 @@ fn account(id: &str, label: &str, auth: ProviderAuth) -> ProviderAccount {
         last_used_at: None,
         email: None,
         plan: None,
+        plan_choice: None,
         health: None,
     }
 }

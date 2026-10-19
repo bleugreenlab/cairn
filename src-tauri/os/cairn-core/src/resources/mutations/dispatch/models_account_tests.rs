@@ -15,7 +15,7 @@ use cairn_common::authorization::{
     AuthorityProvenance, AuthorityRequest,
 };
 use cairn_common::identity::PrincipalRef;
-use cairn_models::accounts::RoutedProvider;
+use cairn_models::accounts::{ApiProvider, ProviderAuth, RoutedProvider};
 use cairn_models::subscription::testing::{TempHomes, SIGNED_IN_EMAIL, SIGN_IN_VERIFIER};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -697,4 +697,242 @@ async fn no_account_action_or_read_reveals_a_secret() {
             );
         }
     }
+}
+
+/// A ChatGPT sign-in whose id token names `plan_type`.
+fn chatgpt_auth(plan_type: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let jwt = |claims: Value| format!("h.{}.s", URL_SAFE_NO_PAD.encode(claims.to_string()));
+    json!({
+        "tokens": {
+            "id_token": jwt(json!({"https://api.openai.com/auth": {"chatgpt_plan_type": plan_type}})),
+            "access_token": jwt(json!({"https://api.openai.com/auth": {"chatgpt_account_id": "chatgpt-pro"}})),
+        }
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn set_plan_settles_an_ambiguous_plan_and_its_periods_follow() {
+    let f = fixture().await;
+    let pro = f
+        .orch
+        .add_account(
+            ApiProvider::OpenAI,
+            "Pro seat".into(),
+            ProviderAuth::OAuthToken {
+                value: chatgpt_auth("pro"),
+            },
+            None,
+        )
+        .unwrap()
+        .id;
+
+    let page = read(&f, "cairn://models/accounts").await;
+    assert!(
+        page.contains("plan Pro, no price (set_plan: pro_200 | pro_500)"),
+        "{page}"
+    );
+
+    let refused = act(
+        &f,
+        "cairn://models/accounts",
+        ChangeMode::Patch,
+        json!({"action": "set_plan", "account": pro, "plan": "plus"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("pro_200 | pro_500"), "{refused}");
+
+    let set = act(
+        &f,
+        "cairn://models/accounts",
+        ChangeMode::Patch,
+        json!({"action": "set_plan", "account": pro, "plan": "pro_500"}),
+    )
+    .await
+    .unwrap();
+    assert!(set.contains("Pro 500 $500/mo"), "{set}");
+    let page = read(&f, &format!("cairn://models/accounts/{pro}")).await;
+    assert!(page.contains("plan Pro 500 $500/mo"), "{page}");
+
+    // The unchosen stretch closed when the choice opened a priced one.
+    let periods: Vec<_> = cairn_analytics::subscriptions::plan_periods(&f.orch.db.local)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|period| period.account_id == pro)
+        .map(|period| (period.plan_key, period.ended_at.is_some()))
+        .collect();
+    assert_eq!(
+        periods,
+        [(None, true), (Some("pro_500".to_string()), false)]
+    );
+
+    // Clearing is the same action with null.
+    act(
+        &f,
+        "cairn://models/accounts",
+        ChangeMode::Patch,
+        json!({"action": "set_plan", "account": pro, "plan": null}),
+    )
+    .await
+    .unwrap();
+    let page = read(&f, &format!("cairn://models/accounts/{pro}")).await;
+    assert!(page.contains("plan Pro, no price"), "{page}");
+
+    // An account priced per token has no plan to set.
+    let key = account_id(&f, "Anthropic key");
+    let refused = act(
+        &f,
+        "cairn://models/accounts",
+        ChangeMode::Patch,
+        json!({"action": "set_plan", "account": key, "plan": "pro_500"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("not a subscription"), "{refused}");
+
+    // Removing the account closes its period; the history stays.
+    f.orch.remove_account(&pro).unwrap();
+    let open = cairn_analytics::subscriptions::plan_periods(&f.orch.db.local)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|period| period.account_id == pro && period.ended_at.is_none())
+        .count();
+    assert_eq!(open, 0);
+}
+
+/// A ChatGPT seat, distinct by its ChatGPT account id.
+fn chatgpt_seat(chatgpt_account_id: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let jwt = |claims: Value| format!("h.{}.s", URL_SAFE_NO_PAD.encode(claims.to_string()));
+    json!({
+        "tokens": {
+            "id_token": jwt(json!({"https://api.openai.com/auth": {"chatgpt_plan_type": "plus"}})),
+            "access_token": jwt(json!({"https://api.openai.com/auth": {"chatgpt_account_id": chatgpt_account_id}})),
+        }
+    })
+    .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn use_reset_spends_from_the_named_codex_account_only() {
+    use cairn_models::types::usage::{
+        ProviderUsageResetCredits, ProviderUsageScope, ProviderUsageSnapshot, ProviderUsageWindow,
+    };
+    let homes = TempHomes::new(tempfile::tempdir().unwrap().keep());
+    let now = chrono::Utc::now().timestamp();
+    // What Codex reports once the reset is spent: limits restored, no credit left.
+    homes.script_usage(
+        ProviderUsageSnapshot {
+            backend: "codex".into(),
+            source: "codex_rate_limits".into(),
+            captured_at: now,
+            windows: vec![ProviderUsageWindow {
+                id: "secondary".into(),
+                label: "Weekly".into(),
+                scope: ProviderUsageScope::Weekly,
+                scope_target: None,
+                used_percent: 0.0,
+                remaining_percent: 100.0,
+                resets_at: Some(now + 86_400),
+                reset_at_text: None,
+                window_duration_mins: Some(10_080),
+            }],
+            reset_credits: Some(ProviderUsageResetCredits {
+                available_count: 0,
+                credits: Vec::new(),
+            }),
+            ..Default::default()
+        },
+        None,
+    );
+    homes.script_reset("reset");
+    let f = fixture_on(seeded_orchestrator_with(Arc::new(homes.clone())).await).await;
+    let seat = |label: &str, chatgpt: &str| {
+        f.orch
+            .add_account(
+                ApiProvider::OpenAI,
+                label.into(),
+                ProviderAuth::OAuthToken {
+                    value: chatgpt_seat(chatgpt),
+                },
+                None,
+            )
+            .unwrap()
+            .id
+    };
+    let first = seat("First seat", "chatgpt-first");
+    let second = seat("Second seat", "chatgpt-second");
+
+    let done = act(
+        &f,
+        "cairn://models/accounts",
+        ChangeMode::Patch,
+        json!({"action": "use_reset", "provider": "codex", "account": second}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        done.contains("reset: its 5-hour and weekly limits are restored"),
+        "{done}"
+    );
+    // The row's account, and no other, is the one spent from.
+    assert_eq!(homes.resets_spent(), vec![Some(second.clone())]);
+
+    // What Codex reported afterwards is that account's measurement alone.
+    let pool = f.orch.provider_usage_pool("codex", None);
+    let held = |id: &str| {
+        pool.accounts
+            .iter()
+            .find(|account| account.account_id == id)
+            .expect("account in the pool")
+            .reset_credits
+            .clone()
+    };
+    assert_eq!(held(&second).map(|resets| resets.available_count), Some(0));
+    assert_eq!(held(&first), None);
+    let page = read(&f, "cairn://models/accounts?provider=codex").await;
+    assert!(page.contains("0 usage resets"), "{page}");
+
+    // A dry run says what it would spend and spends nothing.
+    let dry = act_with(
+        &f,
+        "cairn://models/accounts",
+        ChangeMode::Patch,
+        json!({"action": "use_reset", "provider": "codex", "account": first}),
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(dry.contains("Would spend one"), "{dry}");
+    assert_eq!(homes.resets_spent().len(), 1);
+
+    // Claude has no reset API; the refusal says where its resets are redeemed.
+    let refused = act(
+        &f,
+        "cairn://models/accounts",
+        ChangeMode::Patch,
+        json!({"action": "use_reset", "provider": "claude", "account": first}),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("claude.ai/settings/usage"), "{refused}");
+
+    // An API key holds no resets.
+    let key = account_id(&f, "Anthropic key");
+    let refused = act(
+        &f,
+        "cairn://models/accounts",
+        ChangeMode::Patch,
+        json!({"action": "use_reset", "provider": "codex", "account": key}),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("not a subscription sign-in"), "{refused}");
+    assert_eq!(homes.resets_spent().len(), 1);
 }

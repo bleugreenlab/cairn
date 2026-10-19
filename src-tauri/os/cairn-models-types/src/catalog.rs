@@ -642,13 +642,14 @@ pub enum VerbKind {
 }
 
 impl VerbKind {
+    /// Every verb, in the order hosts present them.
     pub const ALL: [VerbKind; 6] = [
         Self::Complete,
         Self::Session,
         Self::Decide,
+        Self::Embed,
         Self::Image,
         Self::Speak,
-        Self::Embed,
     ];
 
     pub fn as_str(self) -> &'static str {

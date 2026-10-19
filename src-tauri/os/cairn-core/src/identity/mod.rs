@@ -77,6 +77,7 @@ impl CredentialStoreExt for CredentialStore {
                 last_used_at: None,
                 email: None,
                 plan: None,
+                plan_choice: None,
                 health: None,
             });
         }
@@ -97,6 +98,7 @@ impl CredentialStoreExt for CredentialStore {
                 last_used_at: None,
                 email: None,
                 plan: None,
+                plan_choice: None,
                 health: None,
             });
         }
@@ -115,6 +117,7 @@ impl CredentialStoreExt for CredentialStore {
                 last_used_at: None,
                 email: None,
                 plan: None,
+                plan_choice: None,
                 health: None,
             });
         }
@@ -284,6 +287,7 @@ mod tests {
             last_used_at: None,
             email: None,
             plan: None,
+            plan_choice: None,
             health: None,
         }
     }

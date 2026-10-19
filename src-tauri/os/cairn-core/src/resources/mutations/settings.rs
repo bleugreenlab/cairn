@@ -39,11 +39,11 @@ pub(crate) const PREF_KEYS: &[&str] = &[
     "seedBudgetTokens",
     "seedEras",
     "externalReplies",
-    "subscriptionFees",
     "tierDefaults",
     "tiers",
     "backends",
     "enabledProviders",
+    "decisionModel",
     "openrouterRouting",
     "routeCallsViaOpenRouter",
     "privateDedicatedProcessCapacity",
@@ -502,9 +502,9 @@ mod tests {
 
     #[test]
     fn accepts_openrouter_routing_and_doc_parity_keys() {
-        // openrouterRouting is the new routing object; logLevel/subscriptionFees
-        // are documented URI-writable prefs that were missing from the allowlist.
-        assert!(validate(&["openrouterRouting", "logLevel", "subscriptionFees"]).is_ok());
+        // openrouterRouting is the new routing object; logLevel is a documented
+        // URI-writable pref that was missing from the allowlist.
+        assert!(validate(&["openrouterRouting", "logLevel"]).is_ok());
     }
 
     #[test]

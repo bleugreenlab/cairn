@@ -8,6 +8,7 @@ use cairn_db::storage::{DbResult, LocalDb};
 
 use super::pricing;
 use super::queries;
+use super::subscriptions;
 use super::types::{
     BackendCostPoint, Bucket, CostPoint, EffectiveCostPoint, ProjectCost, Scope, TimeRange,
 };
@@ -263,34 +264,56 @@ fn split_effective(
     (effective * frac_in, effective * (1.0 - frac_in))
 }
 
+/// The first instant of the month after the one starting at `month_start`.
+fn next_month(month_start: i64) -> i64 {
+    use chrono::{Datelike, TimeZone, Utc};
+    let Some(dt) = Utc.timestamp_opt(month_start, 0).single() else {
+        return month_start;
+    };
+    let (year, month) = if dt.month() == 12 {
+        (dt.year() + 1, 1)
+    } else {
+        (dt.year(), dt.month() + 1)
+    };
+    Utc.with_ymd_and_hms(year, month, 1, 0, 0, 0)
+        .single()
+        .map(|d| d.timestamp())
+        .unwrap_or(month_start)
+}
+
 /// Effective (subscription-normalized) cost per (fine-bucket, backend).
 ///
-/// For each provider-month the workspace-wide list-price cost defines a ratio
-/// against the configured flat subscription fee (`ratio = fee / list_cost`); the
-/// scoped usage's list cost is then multiplied by that ratio to allocate the
-/// provider's share of the fee. By construction the effective costs across a
-/// provider-month sum to the fee when scoped to the whole workspace. Backends
-/// with no configured fee (e.g. OpenRouter) are metered and pass through at real
-/// cost with `ratio = 1`.
+/// A backend some subscription account served in a month is a subscription
+/// that month: what it paid is the summed list price of the plans its
+/// accounts held ([`subscriptions::month_subscriptions`], read from the
+/// `subscription_periods` history), and the month's workspace-wide list-price
+/// cost defines a ratio against it (`ratio = paid / list_cost`). The scoped
+/// usage's list cost times that ratio is its share of what was paid, so the
+/// effective costs across a provider-month sum to what was paid when scoped to
+/// the whole workspace. A subscription month whose plans have no price shows
+/// its list value as effective and no ratio, and reports the unpriced
+/// accounts. A backend no subscription served is metered: it passes through
+/// at its real cost (recorded per-generation cost, else list price) with
+/// `ratio = 1`.
 ///
-/// The flat fee is allocated per calendar **month** (the ratio denominator), but
-/// usage is emitted at the page's `bucket` granularity so the trend follows the
-/// range selector: each fine bucket inherits the ratio of the month that
-/// contains it (mapped via [`month_floor`]). Because the scoped fine-bucket
-/// costs within a month sum to that month's scoped cost, the per-bucket
-/// effective costs still sum to the fee share — exactly for day/hour/month, and
-/// approximately for a week that straddles a month boundary (it is attributed to
-/// the month of its `bucket_start`).
+/// What was paid is allocated per calendar **month** (the ratio denominator),
+/// but usage is emitted at the page's `bucket` granularity so the trend
+/// follows the range selector: each fine bucket inherits the ratio of the
+/// month that contains it (mapped via [`month_floor`]). Because the scoped
+/// fine-bucket costs within a month sum to that month's scoped cost, the
+/// per-bucket effective costs still sum to the paid share — exactly for
+/// day/hour/month, and approximately for a week that straddles a month boundary
+/// (it is attributed to the month of its `bucket_start`).
 pub async fn effective_cost(
     db: &LocalDb,
     scope: &Scope,
     range: &TimeRange,
-    fees: &HashMap<String, f64>,
     bucket: Bucket,
 ) -> DbResult<Vec<EffectiveCostPoint>> {
+    let periods = subscriptions::plan_periods(db).await?;
     // The ratio denominator is always workspace-wide and per calendar month,
     // even when display usage is scoped to a project or shown at a finer bucket:
-    // a project shows its effective share of the shared monthly fee.
+    // a project shows its effective share of what the month paid.
     let workspace = Scope::new(None);
     let workspace_rows = queries::cost_components(db, &workspace, range, Bucket::Month).await?;
     // Scoped usage at the page granularity so the trend follows the range.
@@ -313,16 +336,8 @@ pub async fn effective_cost(
         /// pricing calls (linear, so they add back to the full list cost).
         input_list: f64,
         output_list: f64,
-        /// Whether any event in this group reported a real per-generation cost.
-        /// This — not the absence of a configured fee — is what makes a backend
-        /// genuinely metered (pay-as-you-go, e.g. OpenRouter). Claude/Codex never
-        /// report exact cost, so they are always subscription backends.
-        has_exact: bool,
     }
     let mut fine: HashMap<(i64, String), FineAgg> = HashMap::new();
-    // A (month, backend) is metered iff any of its fine buckets carry a real
-    // per-generation cost; the per-month verdict drives every fine point in it.
-    let mut month_metered: HashMap<(i64, String), bool> = HashMap::new();
     for row in &scoped_rows {
         // Split list price into input/output sides by calling the linear pricing
         // function once per side: input_list + output_list == the full cost.
@@ -345,14 +360,10 @@ pub async fn effective_cost(
         entry.output_tokens += row.output;
         entry.input_list += input_list;
         entry.output_list += output_list;
-        entry.has_exact |= row.exact_cost_count > 0;
-        let month = month_floor(row.bucket_start);
-        *month_metered
-            .entry((month, row.backend.clone()))
-            .or_default() |= row.exact_cost_count > 0;
     }
 
     let current_month = current_month_start();
+    let mut months: HashMap<(i64, String), subscriptions::MonthSubscriptions> = HashMap::new();
     let mut points: Vec<EffectiveCostPoint> = fine
         .into_iter()
         .map(|((bucket_start, backend), agg)| {
@@ -361,37 +372,34 @@ pub async fn effective_cost(
                 .get(&(month_start, backend.clone()))
                 .copied()
                 .unwrap_or(0.0);
-            let metered = month_metered
-                .get(&(month_start, backend.clone()))
-                .copied()
-                .unwrap_or(false);
-            let fee = fees
-                .get(&backend)
-                .copied()
-                .filter(|f| f.is_finite() && *f > 0.0);
+            let month = months
+                .entry((month_start, backend.clone()))
+                .or_insert_with(|| {
+                    subscriptions::month_subscriptions(
+                        &periods,
+                        &backend,
+                        month_start,
+                        next_month(month_start),
+                    )
+                })
+                .clone();
             let provisional = month_start == current_month;
+            let metered = !month.any();
 
-            // Resolve the month's allocation rule into (fee, ratio, effective).
-            let (subscription_fee, ratio, effective_cost) = if metered {
-                // Genuinely metered backend (OpenRouter): pass through real cost.
-                // A real per-generation cost is authoritative even if a fee was
-                // configured, so metering wins over normalization here.
-                (0.0, Some(1.0), agg.cost)
-            } else {
-                // Subscription backend (Claude/Codex). With a fee, normalize;
-                // without one, there is no effective cost yet — the row shows the
-                // list-price estimate and prompts the user to set a fee. The
-                // `subscription_fee == 0 && !metered` shape signals "no fee set".
-                match fee {
-                    Some(fee) if workspace_list > 0.0 => {
-                        let ratio = fee / workspace_list;
-                        (fee, Some(ratio), agg.cost * ratio)
-                    }
-                    // Fee paid but no priced usage: ratio undefined (unrecovered).
-                    Some(fee) => (fee, None, 0.0),
-                    // No fee configured: list-price estimate, no allocation.
-                    None => (0.0, None, 0.0),
+            // Resolve the month's allocation rule into (ratio, effective).
+            let (ratio, effective_cost) = match month.paid {
+                // Nothing subscribed: paid as used, at the real cost.
+                _ if metered => (Some(1.0), agg.cost),
+                Some(paid) if workspace_list > 0.0 => {
+                    let ratio = paid / workspace_list;
+                    (Some(ratio), agg.cost * ratio)
                 }
+                // Paid, but no usage the price table can value: the ratio is
+                // undefined and the paid amount is unrecovered.
+                Some(_) => (None, 0.0),
+                // Subscribed on plans with no price: the list value stands,
+                // never a fabricated $0.
+                None => (None, agg.cost),
             };
             let (effective_input_cost, effective_output_cost) = split_effective(
                 effective_cost,
@@ -406,7 +414,9 @@ pub async fn effective_cost(
                 backend,
                 metered,
                 provisional,
-                subscription_fee,
+                subscription_cost: month.paid,
+                plans: month.plans,
+                unpriced_accounts: month.unpriced,
                 list_cost: workspace_list,
                 scoped_cost: agg.cost,
                 ratio,

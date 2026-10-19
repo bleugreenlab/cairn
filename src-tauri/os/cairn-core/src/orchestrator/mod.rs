@@ -21,6 +21,7 @@ pub mod conflict_session;
 pub mod contended_identifiers;
 pub mod custom_providers;
 mod decide;
+mod subscription_periods;
 pub(crate) use decide::DecisionFailure;
 pub(crate) mod default_branch_sync;
 mod embed;
@@ -125,6 +126,7 @@ pub struct OrchestratorBuilder {
     model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
     provider_usage_snapshots: ProviderUsageSnapshots,
     provider_usage_captures: ProviderUsageCaptures,
+    reconciled_subscriptions: subscription_periods::ReconciledSubscriptions,
     context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
     team_attention_sender: Arc<dyn team_attention_push::TeamAttentionSender>,
     recent_turn_end_check_requests: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
@@ -257,6 +259,7 @@ impl OrchestratorBuilder {
             model_catalog: Arc::new(RwLock::new(HashMap::new())),
             provider_usage_snapshots: Arc::new(cairn_models::usage::book::UsageBook::new()),
             provider_usage_captures: Arc::new(Mutex::new(HashSet::new())),
+            reconciled_subscriptions: Arc::default(),
             context_token_snapshots: Arc::new(RwLock::new(HashMap::new())),
             team_attention_sender: Arc::new(team_attention_push::HttpTeamAttentionSender::default()),
             recent_turn_end_check_requests,
@@ -533,6 +536,7 @@ impl OrchestratorBuilder {
             model_catalog: self.model_catalog,
             provider_usage_snapshots: self.provider_usage_snapshots,
             provider_usage_captures: self.provider_usage_captures,
+            reconciled_subscriptions: self.reconciled_subscriptions,
             sidebar_active_issues: Arc::new(std::sync::RwLock::new(None)),
             sidebar_active_issues_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sidebar_active_issues_rebuild: Arc::new(TokioMutex::new(())),
@@ -1164,6 +1168,9 @@ pub struct Orchestrator {
     /// Account probes are single-flight so concurrent session starts cannot
     /// duplicate provider traffic or race health writes for one account.
     pub(crate) provider_usage_captures: ProviderUsageCaptures,
+    /// What the credential store held when `subscription_periods` was last
+    /// reconciled.
+    pub(crate) reconciled_subscriptions: subscription_periods::ReconciledSubscriptions,
     /// Published Nav-equivalent active issue projection. Mutations invalidate it;
     /// the next tray/sidebar read rebuilds it with bounded per-database queries.
     pub sidebar_active_issues:
@@ -2897,7 +2904,13 @@ impl Orchestrator {
         tokio::spawn(async move {
             {
                 let orch = orch.clone();
-                tokio::task::spawn_blocking(move || orch.migrate_claude_homes());
+                tokio::task::spawn_blocking(move || {
+                    orch.migrate_claude_homes();
+                    // Backfills a first period for every account that
+                    // predates the table, and catches up on any change made
+                    // while Cairn was not running.
+                    orch.reconcile_subscription_periods();
+                });
             }
             let mut interval = tokio::time::interval(SWEEP_INTERVAL);
             // Skip the immediate first tick: at startup the pool is empty, and a

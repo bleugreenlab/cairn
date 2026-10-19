@@ -3,7 +3,8 @@
 //! Which providers exist ([`provider_id`], [`catalog`]), how their usage is
 //! reported ([`usage`]), how per-account measurements pool into one
 //! provider's capacity ([`pool`]), and what an image offer ([`image`]), a
-//! speech offer ([`speech`]) and an embedding offer ([`embedding`]) can do.
+//! speech offer ([`speech`]) and an embedding offer ([`embedding`]) can do,
+//! and what a subscription account's plan costs ([`subscription`]).
 //! Pure values and pure functions only; this crate depends on no other
 //! workspace crate, so anything that only needs to name a provider or render
 //! a usage window can depend on it alone.
@@ -13,6 +14,7 @@ pub mod image;
 pub mod pool;
 pub mod provider_id;
 pub mod speech;
+pub mod subscription;
 pub mod tokenizers;
 pub mod usage;
 

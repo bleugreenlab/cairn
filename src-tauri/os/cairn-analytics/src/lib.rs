@@ -10,6 +10,7 @@ mod backfill;
 mod cost;
 mod economics;
 mod roles;
+pub mod subscriptions;
 mod tokens;
 mod tools;
 

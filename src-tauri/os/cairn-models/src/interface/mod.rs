@@ -160,27 +160,36 @@ impl CatalogProvider {
         })
     }
 
-    /// [`Self::serves_for`] resolved for every model this provider can name
-    /// (each discovered model, hidden ones included; each model a tier binds;
-    /// each model an [`Unable`] names), for hosts that must not re-derive it.
-    pub fn resolved_serves(&self) -> ResolvedServes {
-        let discovered = self
-            .models
-            .as_ref()
-            .map(|catalog| catalog.models.as_slice())
-            .unwrap_or_default();
-        let named = discovered
-            .iter()
-            .flat_map(|model| [model.model.as_str(), model.id.as_str()])
-            .chain(self.tiers.iter().map(|binding| binding.model.as_str()))
-            .chain(self.unable.iter().map(|unable| unable.model.as_str()));
-        let mut models = BTreeMap::new();
-        for model in named {
-            if !models.contains_key(model) {
-                models.insert(model.to_string(), kinds(&self.serves_for(model)));
-            }
+    /// This provider as a [`CatalogListing`] lists it: discovery's models,
+    /// narrowed to those that serve `serves` when it is set, each with what it
+    /// serves resolved by [`Self::serves_for`].
+    pub fn listed(&self, serves: Option<VerbKind>) -> ListedProvider {
+        let catalog = self.models.as_ref().map(|found| ProviderModelCatalog {
+            backend: found.backend.clone(),
+            models: found
+                .models
+                .iter()
+                .filter(|model| {
+                    serves.is_none_or(|verb| !model.hidden && self.serves(&model.model, verb))
+                })
+                .map(|model| DiscoveredModel {
+                    serves: Some(self.serves_for(&model.model)),
+                    ..model.clone()
+                })
+                .collect(),
+            options: found.options.clone(),
+            refreshed_at: found.refreshed_at,
+            error: found.error.clone(),
+        });
+        ListedProvider {
+            descriptor: self.descriptor.clone(),
+            installed: self.installed,
+            tiers: self.tiers.clone(),
+            serves: self.serves.clone(),
+            unable: self.unable.clone(),
+            discovered: self.models.as_ref().map_or(0, |found| found.models.len()),
+            catalog,
         }
-        ResolvedServes { models }
     }
 
     /// Why `model` was observed unable to serve `verb`, when it was.
@@ -225,13 +234,52 @@ impl CatalogProvider {
     }
 }
 
-/// What each model a provider can name serves, by verb: [`CatalogProvider::serves_for`]
-/// already resolved, so a host reads the answer instead of re-deriving the
-/// rule.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+/// The catalog as every host lists it. `cairn://models/catalog` renders it and
+/// the app's settings pages read it through one typed call, so an agent and the
+/// operator are never shown different models.
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ResolvedServes {
-    pub models: BTreeMap<String, Vec<VerbKind>>,
+pub struct CatalogListing {
+    /// Every verb the facet serves, in [`VerbKind::ALL`] order, so a host can
+    /// show a place for each without naming them itself.
+    pub verbs: Vec<VerbKind>,
+    /// The verb this listing is narrowed to, when it is.
+    pub serves: Option<VerbKind>,
+    /// Where a request for `serves` that names no model lands
+    /// ([`Catalog::offer_for`] with nothing requested), when anything serves
+    /// it. Read from what is already known; nothing is probed.
+    pub selected: Option<ListedOffer>,
+    /// Every provider, in [`Catalog::providers`] order.
+    pub providers: Vec<ListedProvider>,
+}
+
+/// One provider's model, as a listing names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListedOffer {
+    pub provider: String,
+    pub model: String,
+}
+
+/// One provider in a [`CatalogListing`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListedProvider {
+    pub descriptor: ProviderDescriptor,
+    pub installed: bool,
+    pub tiers: Vec<TierBinding>,
+    /// What the provider serves for a model whose discovery declares nothing.
+    pub serves: Vec<ServedVerb>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unable: Vec<Unable>,
+    /// What discovery last found, narrowed to the models that serve the
+    /// listing's verb (never a hidden one) when the listing is narrowed. Every
+    /// model's `serves` is its resolved answer ([`CatalogProvider::serves_for`]),
+    /// never absent, so a host reads it instead of re-deriving the rule.
+    /// `None` means discovery never ran.
+    pub catalog: Option<ProviderModelCatalog>,
+    /// How many models discovery found, before any narrowing.
+    pub discovered: usize,
 }
 
 /// The distinct verbs `serves` serves, in the order it lists them.
@@ -467,6 +515,26 @@ impl Catalog {
     /// The installed providers, in order.
     pub fn installed(&self) -> impl Iterator<Item = &CatalogProvider> {
         self.providers.iter().filter(|provider| provider.installed)
+    }
+
+    /// Every provider with its models, narrowed to those serving `serves` when
+    /// it is set: the one listing every host reads.
+    pub fn listing(&self, serves: Option<VerbKind>) -> CatalogListing {
+        CatalogListing {
+            verbs: VerbKind::ALL.to_vec(),
+            serves,
+            selected: serves
+                .and_then(|verb| self.offer_for(OfferQuery::new(verb)).ok())
+                .map(|offer| ListedOffer {
+                    provider: offer.provider,
+                    model: offer.model,
+                }),
+            providers: self
+                .providers
+                .iter()
+                .map(|provider| provider.listed(serves))
+                .collect(),
+        }
     }
 
     /// The catalog-id view: every selectable model on an installed provider,
@@ -922,6 +990,16 @@ impl std::error::Error for RequestsUnavailable {}
 pub trait Models: Send + Sync {
     /// Providers, their discovered models, and how tiers bind to them.
     fn catalog(&self, scope: &ModelScope) -> Result<Catalog, String>;
+
+    /// The catalog as hosts list it, narrowed to the models serving `serves`
+    /// when it is set ([`Catalog::listing`]).
+    fn catalog_listing(
+        &self,
+        scope: &ModelScope,
+        serves: Option<VerbKind>,
+    ) -> Result<CatalogListing, String> {
+        Ok(self.catalog(scope)?.listing(serves))
+    }
 
     /// The accounts visible in `scope`, without any secret value.
     fn accounts(&self, scope: &ModelScope) -> Result<Vec<AccountInfo>, String>;
@@ -1523,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_serves_agrees_with_serves_for_on_every_model_the_provider_names() {
+    fn a_listing_resolves_what_every_model_serves_and_narrows_by_verb() {
         let mut hidden = model("preview", None);
         hidden.hidden = true;
         let mut codex = conversing(provider(
@@ -1547,38 +1625,73 @@ mod tests {
             vec![],
         );
 
-        for provider in [&codex, &go] {
-            let resolved = provider.resolved_serves();
-            for (model, verbs) in &resolved.models {
-                assert_eq!(verbs, &kinds(&provider.serves_for(model)), "{model}");
+        let catalog = Catalog {
+            providers: vec![codex, go],
+        };
+
+        // Unnarrowed: every discovered model, hidden ones included, each
+        // answering for itself exactly as the gate does.
+        let all = catalog.listing(None);
+        assert_eq!(all.verbs, VerbKind::ALL);
+        assert_eq!(all.selected, None);
+        for (listed, provider) in all.providers.iter().zip(&catalog.providers) {
+            let models = &listed.catalog.as_ref().unwrap().models;
+            assert_eq!(models.len(), listed.discovered);
+            for model in models {
+                assert_eq!(
+                    model.serves.as_deref(),
+                    Some(provider.serves_for(&model.model).as_slice()),
+                    "{}",
+                    model.model
+                );
             }
         }
-        let codex_resolved = codex.resolved_serves().models;
+        let names = |listing: &CatalogListing, key: &str| -> Vec<String> {
+            listing
+                .providers
+                .iter()
+                .find(|provider| provider.descriptor.key == key)
+                .and_then(|provider| provider.catalog.as_ref())
+                .map(|catalog| catalog.models.iter().map(|m| m.model.clone()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(names(&all, "codex"), ["gpt-image-2", "gpt-5.5", "preview"]);
+        assert_eq!(names(&all, "opencode-go"), ["unpublished", "kimi-k3"]);
+
+        // Narrowed: exactly the models the gate admits for the verb, never a
+        // hidden one, and where an unnamed request lands.
+        for verb in VerbKind::ALL {
+            let listing = catalog.listing(Some(verb));
+            for provider in &catalog.providers {
+                let expected: Vec<String> = provider
+                    .models
+                    .as_ref()
+                    .unwrap()
+                    .models
+                    .iter()
+                    .filter(|model| !model.hidden && provider.serves(&model.model, verb))
+                    .map(|model| model.model.clone())
+                    .collect();
+                assert_eq!(
+                    names(&listing, &provider.descriptor.key),
+                    expected,
+                    "{verb}"
+                );
+            }
+        }
+        let session = catalog.listing(Some(VerbKind::Session));
+        assert_eq!(names(&session, "codex"), ["gpt-5.5"]);
+        assert_eq!(names(&session, "opencode-go"), ["kimi-k3"]);
         assert_eq!(
-            codex_resolved
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            [
-                "gpt-5.5",
-                "gpt-5.6-sol",
-                "gpt-image-2",
-                "o-reasoner",
-                "preview"
-            ]
+            session.selected,
+            Some(ListedOffer {
+                provider: "codex".into(),
+                model: "gpt-5.5".into()
+            })
         );
-        assert_eq!(codex_resolved["gpt-image-2"], [VerbKind::Image]);
-        assert_eq!(codex_resolved["o-reasoner"], [VerbKind::Session]);
-        let go_resolved = go.resolved_serves().models;
-        assert_eq!(go_resolved["unpublished"], Vec::<VerbKind>::new());
-        assert_eq!(
-            go_resolved["kimi-k3"],
-            [VerbKind::Complete, VerbKind::Session]
-        );
-        assert_eq!(
-            serde_json::to_value(go.resolved_serves()).unwrap(),
-            serde_json::json!({ "models": { "kimi-k3": ["complete", "session"], "unpublished": [] } })
-        );
+        let image = catalog.listing(Some(VerbKind::Image));
+        assert_eq!(names(&image, "codex"), ["gpt-image-2"]);
+        assert_eq!(catalog.listing(Some(VerbKind::Speak)).selected, None);
     }
 
     fn find<'a>(models: &'a [CatalogModel], id: &str) -> &'a CatalogModel {

@@ -73,35 +73,21 @@
         "supportedParameters": [],
         "router": false,
         "modalities": null,
-        "serves": null
+        "serves": [
+          {
+            "verb": "complete",
+            "wire": "codex-app-server"
+          },
+          {
+            "verb": "session",
+            "wire": "codex-app-server"
+          }
+        ]
       }
     ],
     "options": [],
     "refreshedAt": 1790000000,
-    "error": null,
-    "resolvedServes": {
-      "models": {
-        "gpt-5.5": [
-          "complete",
-          "session"
-        ],
-        "gpt-5.6-luna": [
-          "complete",
-          "session"
-        ],
-        "gpt-5.6-sol": [
-          "complete",
-          "session"
-        ],
-        "gpt-5.6-terra": [
-          "complete",
-          "session"
-        ],
-        "gpt-image-2": [
-          "image"
-        ]
-      }
-    }
+    "error": null
   },
   {
     "backend": "opencode-go",
@@ -122,7 +108,7 @@
         "supportedParameters": [],
         "router": false,
         "modalities": null,
-        "serves": null
+        "serves": []
       },
       {
         "id": "kimi-k3",
@@ -154,17 +140,6 @@
     ],
     "options": [],
     "refreshedAt": 1790000000,
-    "error": null,
-    "resolvedServes": {
-      "models": {
-        "glm-5.2": [],
-        "glm-unpublished": [],
-        "kimi-k3": [
-          "complete",
-          "session"
-        ],
-        "mimo-v2.5": []
-      }
-    }
+    "error": null
   }
 ]

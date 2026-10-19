@@ -8,19 +8,21 @@
 
 use cairn_common::query::QueryParam;
 use cairn_models::interface::{
-    Catalog, CatalogProvider, ModelScope, Models, SessionState, SessionView, TierBinding,
+    Catalog, CatalogListing, ListedProvider, ModelScope, Models, SessionState, SessionView,
+    TierBinding,
 };
 use cairn_models::types::catalog::{
     custom_account_id, DiscoveredModel, Modalities, Modality, ModelPricing, ProviderCategory,
-    ServedVerb, Verb, VerbKind, Wire,
+    ProviderDescriptor, ServedVerb, Verb, VerbKind, Wire,
 };
 use cairn_models::types::pool::{
-    ProviderPoolAccountState, ProviderPoolConstraintReach, ProviderPoolSegmentState,
-    ProviderPoolSnapshot,
+    ProviderPoolAccountResets, ProviderPoolAccountState, ProviderPoolConstraintReach,
+    ProviderPoolSegmentState, ProviderPoolSnapshot,
 };
 use cairn_models::types::usage::ProviderUsageWindow;
 use cairn_models::types::usage::{BillingUnit, Charge};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use super::common::find_query_value;
@@ -39,7 +41,7 @@ const INDEX: &[(&str, &str)] = &[
     ),
     (
         "cairn://models/usage",
-        "each provider's pooled capacity, as its Settings → Providers card shows it",
+        "each provider's capacity per account and pooled, as Settings → Analytics shows it",
     ),
     (
         "cairn://models/sessions",
@@ -236,11 +238,8 @@ fn category(category: ProviderCategory) -> &'static str {
     }
 }
 
-fn heading(provider: &CatalogProvider) -> String {
-    format!(
-        "{} (`{}`)",
-        provider.descriptor.display_name, provider.descriptor.key
-    )
+fn heading(descriptor: &ProviderDescriptor) -> String {
+    format!("{} (`{}`)", descriptor.display_name, descriptor.key)
 }
 
 fn binding_line(binding: &TierBinding) -> String {
@@ -262,7 +261,8 @@ fn binding_line(binding: &TierBinding) -> String {
     line
 }
 
-fn model_line(provider: &CatalogProvider, model: &DiscoveredModel) -> String {
+/// One listed model. Its `serves` is the listing's resolved answer.
+fn model_line(model: &DiscoveredModel) -> String {
     let mut line = format!("- `{}`", model.model);
     if model.display_name != model.model {
         let _ = write!(line, " {}", model.display_name);
@@ -286,7 +286,7 @@ fn model_line(provider: &CatalogProvider, model: &DiscoveredModel) -> String {
     } else {
         line.push_str(&capability(
             model.modalities.as_ref(),
-            &provider.serves_for(&model.model),
+            model.serves.as_deref().unwrap_or_default(),
         ));
     }
     line
@@ -297,11 +297,26 @@ fn model_line(provider: &CatalogProvider, model: &DiscoveredModel) -> String {
 /// owns the accounts of its credential provider.
 ///
 /// [`AccountInfo`]: cairn_models::accounts::AccountInfo
-fn account_serves(account: &Value, provider: &CatalogProvider) -> bool {
-    match custom_account_id(&provider.descriptor.key) {
+fn account_serves(account: &Value, provider: &ProviderDescriptor) -> bool {
+    match custom_account_id(&provider.key) {
         Some(id) => account["id"].as_str() == Some(id),
-        None => account["apiProvider"].as_str() == Some(provider.descriptor.api_provider.as_str()),
+        None => account["apiProvider"].as_str() == Some(provider.api_provider.as_str()),
     }
+}
+
+/// Refuse a `provider` filter naming none of `known`, listing them.
+fn unknown_provider<'a>(
+    only: Option<&str>,
+    known: impl Iterator<Item = &'a str>,
+) -> Option<String> {
+    let key = only?;
+    let known: Vec<&str> = known.collect();
+    (!known.contains(&key)).then(|| {
+        format!(
+            "No provider '{key}' in this workspace's catalog. Known: {}.",
+            known.join(", ")
+        )
+    })
 }
 
 fn sorted_accounts(facet: &dyn Models, scope: &ModelScope) -> Result<Vec<Value>, String> {
@@ -341,53 +356,61 @@ pub(crate) fn render_catalog(facet: &dyn Models, params: &[QueryParam]) -> Strin
             }
         },
     };
-    let scope = ModelScope::workspace();
-    let catalog = match facet.catalog(&scope) {
-        Ok(catalog) => catalog,
-        Err(error) => return format!("Could not read the catalog: {error}"),
-    };
     let include_uninstalled = match find_query_value(params, "installed") {
         None => false,
         Some("all") => true,
         Some(other) => return format!("Unknown installed='{other}' for {URI}; expected all."),
     };
     let only = find_query_value(params, "provider");
-    if let Some(key) = only {
-        if !catalog
-            .providers
-            .iter()
-            .any(|provider| provider.descriptor.key == key)
-        {
-            let known: Vec<&str> = catalog
+    let scope = ModelScope::workspace();
+    match find_query_value(params, "view") {
+        // The providers view is the catalog listing, the same answer the app's
+        // settings pages read.
+        None | Some("providers") => {
+            let listing = match facet.catalog_listing(&scope, serving) {
+                Ok(listing) => listing,
+                Err(error) => return format!("Could not read the catalog: {error}"),
+            };
+            let keys = listing
                 .providers
                 .iter()
-                .map(|provider| provider.descriptor.key.as_ref())
-                .collect();
-            return format!(
-                "No provider '{key}' in this workspace's catalog. Known: {}.",
-                known.join(", ")
-            );
-        }
-    }
-    match find_query_value(params, "view") {
-        None | Some("providers") => {
+                .map(|provider| provider.descriptor.key.as_ref());
+            if let Some(refusal) = unknown_provider(only, keys) {
+                return refusal;
+            }
             let accounts = sorted_accounts(facet, &scope).unwrap_or_default();
-            render_providers(&catalog, &accounts, only, include_uninstalled, serving)
+            render_providers(&listing, &accounts, only, include_uninstalled)
         }
-        Some("models") => render_models(&catalog, only, serving),
+        // The catalog-id view is the projection offer selection walks.
+        Some("models") => {
+            let catalog = match facet.catalog(&scope) {
+                Ok(catalog) => catalog,
+                Err(error) => return format!("Could not read the catalog: {error}"),
+            };
+            let keys = catalog
+                .providers
+                .iter()
+                .map(|provider| provider.descriptor.key.as_ref());
+            if let Some(refusal) = unknown_provider(only, keys) {
+                return refusal;
+            }
+            render_models(&catalog, only, serving)
+        }
         Some(other) => format!("Unknown view '{other}' for {URI}; expected providers or models."),
     }
 }
 
 fn render_providers(
-    catalog: &Catalog,
+    listing: &CatalogListing,
     accounts: &[Value],
     only: Option<&str>,
     include_uninstalled: bool,
-    serving: Option<VerbKind>,
 ) -> String {
-    let installed: Vec<&CatalogProvider> = catalog
-        .installed()
+    let serving = listing.serves;
+    let installed: Vec<&ListedProvider> = listing
+        .providers
+        .iter()
+        .filter(|provider| provider.installed)
         .filter(|provider| only.is_none_or(|key| provider.descriptor.key == key))
         .collect();
     let mut out = String::from("# Model catalog\n\n");
@@ -402,12 +425,12 @@ fn render_providers(
         let _ = writeln!(
             out,
             "\n## {} — {}",
-            heading(provider),
+            heading(descriptor),
             category(descriptor.category)
         );
         let configured = accounts
             .iter()
-            .filter(|account| account_serves(account, provider))
+            .filter(|account| account_serves(account, descriptor))
             .count();
         if configured == 0 {
             let _ = writeln!(out, "Needs setup: {}", descriptor.setup_requirement);
@@ -439,46 +462,38 @@ fn render_providers(
                 unable.model, unable.verb, unable.why
             );
         }
-        match &provider.models {
+        match &provider.catalog {
             None => out.push_str("Models: not discovered yet\n"),
             Some(models) => {
                 let refreshed = models
                     .refreshed_at
                     .map(|at| format!(", refreshed {}", when(at)))
                     .unwrap_or_default();
-                let listed: Vec<&DiscoveredModel> = models
-                    .models
-                    .iter()
-                    .filter(|model| {
-                        serving
-                            .is_none_or(|verb| !model.hidden && provider.serves(&model.model, verb))
-                    })
-                    .collect();
                 match serving {
                     None => {
-                        let _ = writeln!(out, "Models ({}{refreshed}):", models.models.len());
+                        let _ = writeln!(out, "Models ({}{refreshed}):", provider.discovered);
                     }
                     Some(verb) => {
                         let _ = writeln!(
                             out,
                             "Models serving {verb} ({} of {}{refreshed}):",
-                            listed.len(),
-                            models.models.len()
+                            models.models.len(),
+                            provider.discovered
                         );
                     }
                 }
                 if let Some(error) = &models.error {
                     let _ = writeln!(out, "Discovery error: {error}");
                 }
-                for model in listed {
-                    out.push_str(&model_line(provider, model));
+                for model in &models.models {
+                    out.push_str(&model_line(model));
                     out.push('\n');
                 }
             }
         }
     }
     if include_uninstalled {
-        let absent: Vec<&CatalogProvider> = catalog
+        let absent: Vec<&ListedProvider> = listing
             .providers
             .iter()
             .filter(|provider| !provider.installed)
@@ -489,7 +504,7 @@ fn render_providers(
             let _ = writeln!(
                 out,
                 "- {} — {}. {}",
-                heading(provider),
+                heading(&provider.descriptor),
                 category(provider.descriptor.category),
                 provider.descriptor.summary
             );
@@ -616,15 +631,76 @@ fn window_line(window: &Value, captured_at: Option<i64>, now: i64) -> String {
     line
 }
 
-fn account_block(account: &Value, now: i64, pending: &[PendingSignIn], out: &mut String) {
+/// ` · plan Max 20x $200/mo`, ` · plan Pro, no price (set_plan: pro_200 |
+/// pro_500)`, or the provider's raw plan for an account that is not priced
+/// by plan.
+fn plan_text(account: &Value) -> String {
+    let subscription = &account["subscription"];
+    let Some(label) = subscription["label"].as_str() else {
+        return account["plan"]
+            .as_str()
+            .map(|plan| format!(" · plan {plan}"))
+            .unwrap_or_default();
+    };
+    let mut text = match subscription["monthlyUsd"].as_u64() {
+        Some(usd) => format!(" · plan {label} ${usd}/mo"),
+        None => format!(" · plan {label}, no price"),
+    };
+    let options: Vec<&str> = subscription["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|option| option["key"].as_str())
+        .collect();
+    if !options.is_empty() {
+        let _ = write!(text, " (set_plan: {})", options.join(" | "));
+    }
+    text
+}
+
+/// `1 usage reset, soonest expires …`: what an account holds to spend with
+/// `use_reset`.
+fn resets_text(resets: &ProviderPoolAccountResets) -> String {
+    let mut text = format!(
+        "{} usage reset{}",
+        resets.available_count,
+        if resets.available_count == 1 { "" } else { "s" }
+    );
+    if let Some(expires) = resets.soonest_expires_at {
+        let _ = write!(text, ", soonest expires {}", when(expires));
+    }
+    text
+}
+
+/// Each account's usage-reset credits. Only the live usage snapshot holds
+/// them, so they are read from the pools rather than the stored account.
+fn account_resets(
+    facet: &dyn Models,
+    scope: &ModelScope,
+) -> HashMap<String, ProviderPoolAccountResets> {
+    facet
+        .usage(scope, None)
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|pool| pool.accounts)
+        .filter_map(|account| Some((account.account_id, account.reset_credits?)))
+        .collect()
+}
+
+fn account_block(
+    account: &Value,
+    now: i64,
+    pending: &[PendingSignIn],
+    resets: &HashMap<String, ProviderPoolAccountResets>,
+    out: &mut String,
+) {
     let label = account["label"].as_str().unwrap_or("(unnamed)");
     let id = account["id"].as_str().unwrap_or_default();
     let _ = write!(out, "- **{label}** `{id}` — {}", credential_kind(account));
-    for key in ["email", "plan"] {
-        if let Some(value) = account[key].as_str() {
-            let _ = write!(out, " · {key} {value}");
-        }
+    if let Some(email) = account["email"].as_str() {
+        let _ = write!(out, " · email {email}");
     }
+    out.push_str(&plan_text(account));
     match account["projectId"].as_str() {
         Some(project) => {
             let _ = write!(out, " · private to project {project}");
@@ -661,6 +737,9 @@ fn account_block(account: &Value, now: i64, pending: &[PendingSignIn], out: &mut
             let _ = writeln!(out, "  - {}", window_line(window, captured, now));
         }
     }
+    if let Some(held) = resets.get(id) {
+        let _ = writeln!(out, "  - {}", resets_text(held));
+    }
     let id = account["id"].as_str();
     if let Some(sign_in) = pending
         .iter()
@@ -690,6 +769,7 @@ pub(crate) fn render_accounts(
     };
     let only = find_query_value(params, "provider");
     let now = chrono::Utc::now().timestamp();
+    let resets = account_resets(facet, &scope);
     let mut out = String::from(
         "# Model accounts\n\nGrouped by installed provider, in priority order. A credential is described, never shown. Append {provider: claude|codex} here to start a subscription sign-in, or use Settings → Providers, or `cairn auth login claude` for a managed Claude account.\n",
     );
@@ -697,7 +777,7 @@ pub(crate) fn render_accounts(
     let mut shown = 0;
     for provider in catalog.installed() {
         let mine: Vec<usize> = (0..accounts.len())
-            .filter(|index| account_serves(&accounts[*index], provider))
+            .filter(|index| account_serves(&accounts[*index], &provider.descriptor))
             .collect();
         for index in &mine {
             placed[*index] = true;
@@ -706,12 +786,12 @@ pub(crate) fn render_accounts(
             continue;
         }
         shown += 1;
-        let _ = writeln!(out, "\n## {}", heading(provider));
+        let _ = writeln!(out, "\n## {}", heading(&provider.descriptor));
         if mine.is_empty() {
             let _ = writeln!(out, "No account. {}", provider.descriptor.setup_requirement);
         }
         for index in mine {
-            account_block(&accounts[index], now, pending, &mut out);
+            account_block(&accounts[index], now, pending, &resets, &mut out);
         }
         // A new Codex account has no row until its sign-in completes.
         for sign_in in pending.iter().filter(|sign_in| {
@@ -739,7 +819,7 @@ pub(crate) fn render_accounts(
     if !others.is_empty() {
         out.push_str("\n## Serving no installed provider\n");
         for account in others {
-            account_block(account, now, pending, &mut out);
+            account_block(account, now, pending, &resets, &mut out);
         }
     }
     out
@@ -811,7 +891,8 @@ pub(crate) fn render_account(facet: &dyn Models, id: &str, sign_ins: &AccountSig
         "# Model account {}\n\n",
         account["label"].as_str().unwrap_or(id)
     );
-    account_block(account, now, &sign_ins.pending, &mut out);
+    let resets = account_resets(facet, &ModelScope::workspace());
+    account_block(account, now, &sign_ins.pending, &resets, &mut out);
     let serves: Vec<&str> = account["compatibleBackends"]
         .as_array()
         .into_iter()
@@ -933,6 +1014,9 @@ fn pool_block(pool: &ProviderPoolSnapshot, label: &str, out: &mut String) {
         if let Some(captured) = account.captured_at {
             let _ = write!(out, ", measured {}", when(captured));
         }
+        if let Some(resets) = &account.reset_credits {
+            let _ = write!(out, ", {}", resets_text(resets));
+        }
         out.push('\n');
     }
     if let Some(credits) = &pool.credits {
@@ -950,9 +1034,6 @@ fn pool_block(pool: &ProviderPoolSnapshot, label: &str, out: &mut String) {
         if !parts.is_empty() {
             let _ = writeln!(out, "- Credits: {}", parts.join(", "));
         }
-    }
-    if let Some(resets) = &pool.reset_credits {
-        let _ = writeln!(out, "- Usage resets available: {}", resets.available_count);
     }
     if let Some(rows) = &pool.model_breakdown {
         if rows.is_empty() {
@@ -1000,7 +1081,7 @@ pub(crate) fn render_usage(facet: &dyn Models, params: &[QueryParam]) -> String 
                     .iter()
                     .find(|provider| provider.descriptor.key == key)
             })
-            .map(heading)
+            .map(|provider| heading(&provider.descriptor))
             .unwrap_or_else(|| format!("`{key}`"))
     };
     let mut out = String::from(
@@ -1249,10 +1330,66 @@ mod tests {
         let bad = read(&orch, "cairn://models/catalog?serves=speech").await;
         assert!(
             bad.starts_with(
-                "Unknown serves='speech' for cairn://models/catalog; expected one of complete, session, decide, image, speak, embed."
+                "Unknown serves='speech' for cairn://models/catalog; expected one of complete, session, decide, embed, image, speak."
             ),
             "{bad}"
         );
+    }
+
+    /// The app's settings pages read `get_catalog_listing`, which answers
+    /// `Models::catalog_listing`. This resource must list exactly the same
+    /// models, provider by provider, for every verb.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_resource_lists_exactly_what_the_app_reads_for_every_verb() {
+        use cairn_models::interface::{ModelScope, Models};
+        use cairn_models::types::catalog::VerbKind;
+        let orch = seeded_orchestrator().await;
+        for key in orch.enabled_providers() {
+            if key.starts_with("custom:") {
+                orch.run_provider_model_catalog_refresh(&key).await.unwrap();
+            }
+        }
+        let section = |rendered: &str, heading: &str| -> String {
+            let start = rendered
+                .find(heading)
+                .unwrap_or_else(|| panic!("no {heading} in:\n{rendered}"));
+            let rest = &rendered[start + heading.len()..];
+            rest[..rest.find("\n## ").unwrap_or(rest.len())].to_string()
+        };
+        let mut listed_any = 0;
+        for verb in VerbKind::ALL {
+            let listing = orch
+                .catalog_listing(&ModelScope::workspace(), Some(verb))
+                .unwrap();
+            let rendered = read(&orch, &format!("cairn://models/catalog?serves={verb}")).await;
+            for provider in listing
+                .providers
+                .iter()
+                .filter(|provider| provider.installed)
+            {
+                let heading = format!(
+                    "\n## {} (`{}`)",
+                    provider.descriptor.display_name, provider.descriptor.key
+                );
+                let rendered_models: Vec<String> = section(&rendered, &heading)
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("- `"))
+                    .map(|rest| rest.split('`').next().unwrap_or_default().to_string())
+                    .collect();
+                let listed: Vec<String> = provider
+                    .catalog
+                    .iter()
+                    .flat_map(|catalog| catalog.models.iter().map(|model| model.model.clone()))
+                    .collect();
+                assert_eq!(
+                    rendered_models, listed,
+                    "{verb} on {}",
+                    provider.descriptor.key
+                );
+                listed_any += listed.len();
+            }
+        }
+        assert!(listed_any > 0, "the seeded workspace serves something");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1506,7 +1643,6 @@ mod tests {
                 "families": [],
                 "constraints": [],
                 "credits": {"balance": 12.5, "totalGranted": 20.0, "totalUsed": 7.5, "currency": "USD"},
-                "resetCredits": null,
                 "modelBreakdown": [
                     {"model": "z-ai/glm-4.6", "costUsd": 0.4213, "tokens": 120000, "runs": 3},
                     {"model": "openai/gpt-5", "costUsd": 1.0, "tokens": null, "runs": null}

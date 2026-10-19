@@ -1,6 +1,8 @@
 //! Re-measuring a provider's usage on demand: the one path behind the
 //! Settings card's refresh button, the per-account usage refresh, and
-//! `cairn://models/accounts` `refresh_usage`.
+//! `cairn://models/accounts` `refresh_usage`. Spending an account's usage reset
+//! lives here too, as the one path behind an account row's `Use` and
+//! `cairn://models/accounts` `use_reset`.
 //!
 //! A Claude or Codex account is probed under the same single-flight
 //! reservation a background capture takes, its result is kept only if the
@@ -13,7 +15,7 @@
 
 use std::time::Duration;
 
-use cairn_models::types::usage::ProviderUsageSnapshot;
+use cairn_models::types::usage::{ProviderUsageResetResult, ProviderUsageSnapshot};
 
 use super::identity::ProviderUsageCaptureReservation;
 use super::Orchestrator;
@@ -98,7 +100,69 @@ fn timed_out(backend: &str) -> ProviderUsageSnapshot {
     )
 }
 
+/// Why a provider's account has no reset to spend here. Claude's limit resets
+/// and usage credits are redeemed only in claude.ai's own web or desktop UI;
+/// there is no API for them.
+pub fn usage_reset_unsupported(backend: &str) -> String {
+    match backend {
+        "claude" => "Claude has no reset API: limit resets and usage credits are redeemed only at https://claude.ai/settings/usage.".to_string(),
+        other => format!("{other} has no usage resets; only Codex accounts hold them."),
+    }
+}
+
+fn reset_failed(error: String) -> ProviderUsageResetResult {
+    ProviderUsageResetResult {
+        outcome: "error".to_string(),
+        snapshot: ProviderUsageSnapshot::error("codex", "codex_rate_limit_reset", error, None),
+    }
+}
+
 impl Orchestrator {
+    /// Spend one of `account_id`'s usage resets, and keep the usage the
+    /// provider reports after it as that account's measurement.
+    ///
+    /// The outcome is the provider's own word: `reset`, `alreadyRedeemed`,
+    /// `nothingToReset` or `noCredit`; `unsupported` for a provider with no
+    /// resets, and `error` when the attempt itself failed.
+    pub async fn use_usage_reset(
+        &self,
+        backend: &str,
+        account_id: &str,
+    ) -> ProviderUsageResetResult {
+        if backend != "codex" {
+            return ProviderUsageResetResult {
+                outcome: "unsupported".to_string(),
+                snapshot: ProviderUsageSnapshot::unsupported(
+                    backend,
+                    "unsupported_provider_usage_reset",
+                    usage_reset_unsupported(backend),
+                ),
+            };
+        }
+        let orch = self.clone();
+        let account = account_id.to_string();
+        let consume = tokio::task::spawn_blocking(move || {
+            orch.subscriptions()
+                .consume_usage_reset(&orch, RoutedProvider::Codex, Some(&account))
+        });
+        let result = match tokio::time::timeout(USAGE_REFRESH_TIMEOUT, consume).await {
+            Ok(Ok(Ok(result))) => result,
+            Ok(Ok(Err(error))) => reset_failed(error),
+            Ok(Err(join_error)) => {
+                reset_failed(format!("usage reset probe panicked: {join_error}"))
+            }
+            Err(_) => reset_failed(format!(
+                "Timed out after {}s waiting for Codex to use a reset.",
+                USAGE_REFRESH_TIMEOUT.as_secs()
+            )),
+        };
+        self.store_provider_account_usage_snapshot(
+            Some(account_id.to_string()),
+            result.snapshot.clone(),
+        );
+        result
+    }
+
     /// Re-measure a provider's usage now. Every result is recorded against the
     /// account it belongs to and nothing else: one failed probe never hides the
     /// capacity the others still report.

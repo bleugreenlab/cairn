@@ -53,6 +53,9 @@ pub fn model_scope_matches(scope_target: &str, requested_model: &str) -> bool {
 pub struct ProviderUsageFamily {
     pub key: String,
     pub label: String,
+    /// The family's name where its provider already gives the context: a row
+    /// or a column under that provider (`Session`, `Week`, `Fable`, `5-hour`).
+    pub name: String,
     pub scope: ProviderUsageScope,
     pub scope_target: Option<String>,
 }
@@ -102,6 +105,26 @@ impl ProviderUsageWindow {
         })
     }
 
+    /// The short name of this window's family. A rolling window is named by
+    /// its length, because Claude, Codex and OpenCode label the same five hours
+    /// three different ways.
+    fn family_name(&self) -> String {
+        match (self.scope, self.scope_target.as_deref()) {
+            (ProviderUsageScope::Session, _) => "Session".to_string(),
+            (ProviderUsageScope::Weekly, None) => "Week".to_string(),
+            (ProviderUsageScope::Weekly, Some(model)) => model.to_string(),
+            (ProviderUsageScope::RollingWindow, _) => match self.window_duration_mins {
+                Some(mins) if mins > 0 && mins % (24 * 60) == 0 => {
+                    format!("{}-day", mins / (24 * 60))
+                }
+                Some(mins) if mins > 0 && mins % 60 == 0 => format!("{}-hour", mins / 60),
+                Some(mins) if mins > 0 => format!("{mins}-minute"),
+                _ => self.label.clone(),
+            },
+            (ProviderUsageScope::Custom, _) => self.label.clone(),
+        }
+    }
+
     /// The pooled allowance this window is a measurement of.
     ///
     /// The key has to be stable across accounts and across providers that name
@@ -135,6 +158,7 @@ impl ProviderUsageWindow {
         ProviderUsageFamily {
             key,
             label,
+            name: self.family_name(),
             scope: self.scope,
             scope_target: self.scope_target.clone(),
         }

@@ -377,6 +377,7 @@ impl Orchestrator {
             chrono::Utc::now().timestamp(),
         );
         self.save_credential_store(store)?;
+        self.reconcile_subscription_periods();
 
         self.emit_config_changed();
         self.spawn_model_catalog_refresh();
@@ -415,6 +416,7 @@ impl Orchestrator {
             chrono::Utc::now().timestamp(),
         )?;
         self.save_credential_store(store)?;
+        self.reconcile_subscription_periods();
         self.emit_config_changed();
         self.spawn_model_catalog_refresh();
         Ok(info)
@@ -439,6 +441,7 @@ impl Orchestrator {
         self.credential_store.persist_locked(store)?;
         drop(guard);
         self.clear_provider_account_usage_snapshot("claude", id);
+        self.reconcile_subscription_periods();
         self.emit_config_changed();
         // A completed sign-in is a credential change: it can be what makes
         // Claude's models usable at all.
@@ -676,6 +679,24 @@ impl Orchestrator {
         }
         let info = AccountInfo::from(&*account);
         self.save_credential_store(store)?;
+        self.reconcile_subscription_periods();
+        self.emit_config_changed();
+        Ok(info)
+    }
+
+    /// Record which of its candidate plans an ambiguous subscription account
+    /// is on, or clear the choice with `None`. The one writer of a plan
+    /// choice: Settings and `cairn://models/accounts` both reach it.
+    pub fn set_account_plan(&self, id: &str, plan: Option<String>) -> Result<AccountInfo, String> {
+        let mut guard = self
+            .credential_store
+            .lock()
+            .map_err(|_| "Identity store lock poisoned".to_string())?;
+        let store = guard.as_mut().ok_or("No identity store")?;
+        let info = store.set_plan_choice(id, plan)?;
+        self.credential_store.persist_locked(store)?;
+        drop(guard);
+        self.reconcile_subscription_periods();
         self.emit_config_changed();
         Ok(info)
     }
@@ -704,6 +725,7 @@ impl Orchestrator {
         self.provider_usage_snapshots.remove("claude", Some(id));
         self.provider_usage_snapshots.remove("codex", Some(id));
         drop(guard);
+        self.reconcile_subscription_periods();
         self.emit_config_changed();
         self.spawn_model_catalog_refresh();
         Ok(())
@@ -922,6 +944,7 @@ impl cairn_models::subscription::ModelHost for Orchestrator {
     }
 
     fn credentials_published(&self) {
+        self.reconcile_subscription_periods();
         self.emit_config_changed();
         self.claude_credentials_published();
     }

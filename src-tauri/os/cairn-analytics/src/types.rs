@@ -4,6 +4,7 @@
 //! `TimeRange`, `Bucket`) are constructed by the Tauri command layer from raw
 //! optional arguments.
 
+use crate::subscriptions::{PlanCount, UnpricedAccount};
 use serde::{Deserialize, Serialize};
 
 /// Query scope: a single project, or the whole workspace when `project_id` is
@@ -185,39 +186,46 @@ pub struct CostPoint {
     pub(crate) billable_tokens: i64,
 }
 
-/// One (fine-bucket, backend) effective-cost point. `effective_cost` allocates a
-/// provider's flat subscription fee across its usage, or passes through real
-/// metered cost. The flat fee is allocated per calendar month, but points are
-/// emitted at the page's bucket granularity (`bucket_start`) so the trend can
-/// follow the range selector; each fine bucket inherits the ratio of the month
-/// that contains it. See `analytics::effective_cost`.
+/// One (fine-bucket, backend) effective-cost point. `effective_cost` allocates
+/// what a provider's subscriptions paid in a month across its usage, or passes
+/// through real metered cost. What was paid is allocated per calendar month,
+/// but points are emitted at the page's bucket granularity (`bucket_start`) so
+/// the trend can follow the range selector; each fine bucket inherits the ratio
+/// and the subscription facts of the month that contains it. See
+/// `analytics::effective_cost`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EffectiveCostPoint {
     /// First-of-month epoch seconds (UTC) of the month this point belongs to;
-    /// the ratio/fee allocation is keyed on this.
+    /// the ratio and the subscription facts are keyed on this.
     pub(crate) month_start: i64,
     /// Start epoch seconds of the fine bucket (day/week/hour/month) this point
     /// covers. Equals `month_start` when the page bucket is Month.
     pub(crate) bucket_start: i64,
     pub(crate) backend: String,
-    /// True only when this backend reports a real per-generation cost
-    /// (genuinely pay-as-you-go, e.g. OpenRouter). Subscription backends
-    /// (Claude/Codex) are never metered, even before a fee is configured.
+    /// True when no subscription account served this backend that month, so
+    /// its usage was paid for as it was used.
     pub(crate) metered: bool,
     /// True when the month contains "now" (running estimate, not yet settled).
     pub(crate) provisional: bool,
-    /// The flat monthly fee for a subscription backend; 0 for metered.
-    pub(crate) subscription_fee: f64,
+    /// The month's summed monthly list price of the priced plans its accounts
+    /// held; `None` when metered, or when no plan held that month has a price.
+    pub(crate) subscription_cost: Option<f64>,
+    /// The priced plans held that month and how many accounts held each.
+    pub(crate) plans: Vec<PlanCount>,
+    /// Accounts whose plan that month has no price; left out of
+    /// `subscription_cost`.
+    pub(crate) unpriced_accounts: Vec<UnpricedAccount>,
     /// Workspace-wide list-price cost for (month, backend); drives the ratio.
     pub(crate) list_cost: f64,
     /// List/real-price cost of the displayed (scoped) usage.
     pub(crate) scoped_cost: f64,
-    /// `fee / workspace_list_cost` for subscriptions; `1.0` for metered;
-    /// `None` when undefined (a fee is paid but there is no priced usage).
+    /// `subscription_cost / workspace_list_cost` for a priced subscription;
+    /// `1.0` for metered; `None` when undefined (no plan has a price, or
+    /// nothing used was priced).
     pub(crate) ratio: Option<f64>,
-    /// Effective cost of the scoped usage: `scoped_cost * ratio` for a
-    /// subscription, or real metered cost. 0 when the fee is unrecovered.
+    /// Effective cost of the scoped usage: `scoped_cost * ratio` for a priced
+    /// subscription, the list value for an unpriced one, or real metered cost.
     pub(crate) effective_cost: f64,
     /// Billable tokens in the scoped usage for this (bucket, backend).
     pub(crate) billable_tokens: i64,

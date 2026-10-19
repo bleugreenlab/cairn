@@ -70,6 +70,15 @@ macro_rules! private_ingress_events {
     };
 }
 
+/// cairn/5120: which subscription plan each provider account was on, and when,
+/// so effective cost can price a past month after an account is removed.
+/// Private like the credential history it complements.
+macro_rules! private_subscription_periods {
+    () => {
+        migration!("0273_subscription_periods")
+    };
+}
+
 /// Machines that could not prepare a project's cells because a setup command
 /// was not found there. Describes this installation's own fleet only.
 macro_rules! private_executor_preparation_refusals {
@@ -1775,6 +1784,8 @@ macro_rules! private_lineage {
             private_ingress_events!(),
             shared_tail_tenet_statements!(),
             shared_tail_check_observation_platform_relabels!(),
+            shared_tail_check_observation_platform_relabels!(),
+            private_subscription_periods!(),
         ]
     };
 }
@@ -2042,6 +2053,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // sign-in on this install and how it ended.
     (
         "account_credential_events",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    // Which subscription plan each provider account held, and when: the
+    // install's own billing history, priced by effective cost.
+    (
+        "subscription_periods",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
     // Execution offers belong to one runner incarnation, never a team replica.
@@ -3602,6 +3619,9 @@ mod tests {
                 "tenet_statements",
                 "check_observation_platform_relabels",
             ],
+                "check_observation_platform_relabels",
+                "subscription_periods",
+            ],
         );
     }
 
@@ -5075,6 +5095,179 @@ mod tests {
             .unwrap(),
             1,
             "the rebuild keeps the evidence that references a tenet"
+        );
+    }
+
+    /// cairn/5175: a claim-only observation (an executor named, no executor
+    /// device) that took the coordinator's platform is relabelled from the
+    /// platform its machine attested on its own rows, and the correction is
+    /// recorded. Rows that agree, belong to the colocated executor, or name a
+    /// machine whose attested platform is unknown or ambiguous are untouched.
+    #[tokio::test]
+    async fn check_observation_platform_relabels_follow_the_attesting_machine() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("platform-relabels.turso.db"))
+            .await
+            .unwrap();
+        let head = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < "0272")
+            .cloned()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(head).run(&db).await.unwrap();
+        db.execute_batch(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('project', 'default', 'Project', 'project', '/tmp/project', 1, 1);",
+        )
+        .await
+        .unwrap();
+
+        // (id, executor, device, platform, arch); every row also carries the
+        // coordinator's toolchain and environment hash.
+        let rows = [
+            (
+                "fedora-attested-1",
+                "fedora",
+                Some("fedora-device"),
+                "linux",
+                "x86_64",
+            ),
+            (
+                "fedora-attested-2",
+                "fedora",
+                Some("fedora-device"),
+                "linux",
+                "x86_64",
+            ),
+            ("fedora-claim", "fedora", None, "macos", "aarch64"),
+            (
+                "mac-attested",
+                "bgsrv-mac",
+                Some("mac-device"),
+                "macos",
+                "aarch64",
+            ),
+            ("mac-claim", "bgsrv-mac", None, "macos", "aarch64"),
+            ("local-claim", "colocated", None, "macos", "aarch64"),
+            (
+                "mixed-linux",
+                "mixed",
+                Some("mixed-device"),
+                "linux",
+                "x86_64",
+            ),
+            (
+                "mixed-windows",
+                "mixed",
+                Some("mixed-device"),
+                "windows",
+                "x86_64",
+            ),
+            ("mixed-claim", "mixed", None, "macos", "aarch64"),
+            ("ghost-claim", "ghost", None, "macos", "aarch64"),
+        ];
+        for (id, executor, device, platform, arch) in rows {
+            let device = device.map_or("NULL".to_string(), |device| format!("'{device}'"));
+            db.execute_batch(&format!(
+                "INSERT INTO check_result_observations
+                     (id, project_id, commit_sha, tree_hash, check_name, input_hash,
+                      environment_fingerprint, exit_code, verdict, failure_kind, complete,
+                      reusable, parser_version, result_schema_version, ran_at, duration_ms,
+                      cadence, output_tail, executor_id, executor_device_id,
+                      toolchain_fingerprint, verdict_platform, verdict_arch,
+                      verdict_environment_hash)
+                 VALUES ('{id}', 'project', 'commit', 'tree', 'rust-tests', 'input-{id}',
+                         'env', -1, 'failed', 'infrastructure', 0, 0, 1, 1, 1, 1, 'manual',
+                         'lost', '{executor}', {device}, 'coordinator-tools', '{platform}',
+                         '{arch}', 'coordinator-env');"
+            ))
+            .await
+            .unwrap();
+        }
+        db.execute_batch(
+            "INSERT INTO check_result_cache
+                 (project_id, tree_hash, input_hash, check_name, environment_fingerprint,
+                  result_schema_version, source_observation_id, exit_code, passed,
+                  output_tail, duration_ms, ran_at, executor_id, toolchain_fingerprint,
+                  verdict_platform, verdict_arch, verdict_environment_hash)
+             VALUES ('project', 'tree', 'input-fedora-claim', 'rust-tests', 'env', 1,
+                     'fedora-claim', -1, 0, 'lost', 1, 1, 'fedora', 'coordinator-tools',
+                     'macos', 'aarch64', 'coordinator-env');",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT group_concat(observation_id || ':' || recorded_platform || '/'
+                         || recorded_arch || '->' || corrected_platform || '/' || corrected_arch)
+                   FROM check_observation_relabels",
+            )
+            .await
+            .unwrap(),
+            "fedora-claim:macos/aarch64->linux/x86_64",
+            "exactly the disagreeing claim-only row is corrected, and its old label kept"
+        );
+        let label = |id: &'static str| {
+            let db = &db;
+            async move {
+                db.query_opt_text(
+                    &format!(
+                        "SELECT verdict_platform || '/' || verdict_arch || ' '
+                                || COALESCE(toolchain_fingerprint, '-') || ' '
+                                || COALESCE(verdict_environment_hash, '-')
+                           FROM check_result_observations WHERE id = '{id}'"
+                    ),
+                    (),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            }
+        };
+        assert_eq!(label("fedora-claim").await, "linux/x86_64 - -");
+        for unchanged in [
+            "fedora-attested-1",
+            "mac-claim",
+            "local-claim",
+            "mixed-claim",
+            "ghost-claim",
+        ] {
+            assert!(
+                label(unchanged)
+                    .await
+                    .ends_with(" coordinator-tools coordinator-env"),
+                "{unchanged} must be left as recorded"
+            );
+        }
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT verdict_platform || '/' || verdict_arch || ' '
+                        || COALESCE(toolchain_fingerprint, '-')
+                   FROM check_result_cache WHERE source_observation_id = 'fedora-claim'",
+            )
+            .await
+            .unwrap(),
+            "linux/x86_64 -",
+            "the hot projection follows its source observation"
+        );
+        let rewrite = db
+            .execute_batch(
+                "UPDATE check_result_observations SET verdict_platform = 'plan9'
+                  WHERE id = 'fedora-claim';",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            rewrite.to_string().contains("immutable"),
+            "the correction restores immutability for every later writer: {rewrite}"
         );
     }
 

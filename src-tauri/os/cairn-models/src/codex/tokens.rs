@@ -424,23 +424,12 @@ pub fn parse_codex_oauth_tokens(auth_json: &str) -> Result<CodexOAuthTokens, Str
     })
 }
 
-/// Decode a JWT payload without verifying its signature.
-///
-/// These tokens were just issued to Cairn by the OAuth endpoint over TLS and
-/// are read only to label and key the account they belong to; the provider
-/// verifies them for every call that actually spends them.
-fn jwt_payload(jwt: &str) -> Option<Value> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-
-    let payload_b64 = jwt.split('.').nth(1)?;
-    let payload_bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
-    serde_json::from_slice(&payload_bytes).ok()
-}
-
 /// Extract `chatgpt_account_id` from a Codex access token JWT without signature verification.
 pub fn extract_chatgpt_account_id_from_jwt(jwt: &str) -> Option<String> {
-    json_string(jwt_payload(jwt)?.pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id"))
+    json_string(
+        crate::accounts::jwt_claims(jwt)?
+            .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id"),
+    )
 }
 
 /// Which ChatGPT subscription a Codex `auth.json` belongs to.
@@ -462,7 +451,7 @@ pub fn codex_account_identity(auth_json: &str) -> Result<CodexAccountIdentity, S
     let chatgpt_account_id = tokens
         .chatgpt_account_id
         .ok_or_else(|| "Missing ChatGPT account id in Codex auth tokens".to_string())?;
-    let claims = jwt_payload(&tokens.id_token).unwrap_or(Value::Null);
+    let claims = crate::accounts::jwt_claims(&tokens.id_token).unwrap_or(Value::Null);
     let email = json_string(claims.get("email"))
         .or_else(|| json_string(claims.pointer("/https:~1~1api.openai.com~1profile/email")));
     let plan = json_string(claims.pointer("/https:~1~1api.openai.com~1auth/chatgpt_plan_type"));

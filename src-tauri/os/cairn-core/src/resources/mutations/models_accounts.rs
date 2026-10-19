@@ -9,8 +9,9 @@
 //! Starting a sign-in — `append` on the list, `sign_in` on an account — crosses
 //! the `workspace/default/settings/accounts:write` boundary, the place
 //! `cairn://settings` `accounts` writes reach. Finishing or abandoning a
-//! pending sign-in continues an authorized start, and re-measuring usage
-//! expands no authority, so neither is gated.
+//! pending sign-in continues an authorized start, and re-measuring usage,
+//! naming which plan an account is on, or spending one of its usage resets
+//! expands no authority, so none of those is gated.
 
 use cairn_common::authorization::{AuthorityReason, AuthorityRequest};
 use cairn_common::uri::{parse_uri, CairnResource};
@@ -48,6 +49,13 @@ pub(crate) enum ModelAccountChange {
         account_id: String,
         backend: Option<String>,
     },
+    /// Name which candidate plan an ambiguous account is on; `None` clears it.
+    SetPlan {
+        account_id: String,
+        plan: Option<String>,
+    },
+    /// Spend one of a Codex account's usage resets.
+    UseReset { account_id: String },
 }
 
 impl ModelAccountChange {
@@ -154,10 +162,14 @@ pub(crate) fn parse_models_account_change(
         (CairnResource::ModelsAccounts, ChangeMode::Patch) => {
             match payload_text(payload, "action") {
                 Some("refresh_usage") => refresh_provider(orch, payload_text(payload, "provider")),
+                Some("set_plan") => set_plan(orch, payload),
+                Some("use_reset") => use_reset(orch, payload),
                 Some(other) => Err(format!(
-                    "payload.action '{other}' is not supported on cairn://models/accounts; refresh_usage re-measures one provider's accounts. To sign in, append {{provider}}; to act on one account, patch cairn://models/accounts/<id>."
+                    "payload.action '{other}' is not supported on cairn://models/accounts; refresh_usage re-measures one provider's accounts, set_plan names an account's plan, and use_reset spends one of a Codex account's usage resets. To sign in, append {{provider}}; to act on one account, patch cairn://models/accounts/<id>."
                 )),
-                None => Err("payload.action is required: refresh_usage.".to_string()),
+                None => Err(
+                    "payload.action is required: refresh_usage | set_plan | use_reset.".to_string(),
+                ),
             }
         }
         (CairnResource::ModelsAccount { id }, ChangeMode::Patch) => {
@@ -165,6 +177,78 @@ pub(crate) fn parse_models_account_change(
         }
         _ => return None,
     })
+}
+
+/// `{action:"set_plan", account, plan}`: `plan` is one of the account's
+/// candidate plan keys, or null to clear the choice.
+fn set_plan(orch: &Orchestrator, payload: Option<&Value>) -> Result<ModelAccountChange, String> {
+    let id = payload_text(payload, "account")
+        .filter(|id| !id.is_empty())
+        .ok_or("payload.account is required with set_plan: the account id.")?;
+    let account = workspace_account(orch, id)?;
+    let Some(subscription) = account.subscription() else {
+        return Err(format!(
+            "Account `{id}` is not a subscription, so it has no plan to set."
+        ));
+    };
+    let keys: Vec<&str> = subscription
+        .options
+        .iter()
+        .map(|option| option.key.as_str())
+        .collect();
+    if keys.is_empty() {
+        return Err(format!(
+            "Account `{id}`'s plan is {}, as its provider reports it; there is nothing to choose.",
+            subscription.label
+        ));
+    }
+    let plan = match payload.and_then(|payload| payload.get("plan")) {
+        None => {
+            return Err(format!(
+                "payload.plan is required with set_plan: {} (or null to clear).",
+                keys.join(" | ")
+            ))
+        }
+        Some(Value::Null) => None,
+        Some(Value::String(plan)) if keys.contains(&plan.trim()) => Some(plan.trim().to_string()),
+        Some(other) => {
+            return Err(format!(
+                "payload.plan {other} is not one of account `{id}`'s plans: {} (or null to clear).",
+                keys.join(" | ")
+            ))
+        }
+    };
+    Ok(ModelAccountChange::SetPlan {
+        account_id: account.id,
+        plan,
+    })
+}
+
+/// `{action:"use_reset", provider, account}`: the account must be a
+/// subscription sign-in of `provider`, and the provider one with resets.
+fn use_reset(orch: &Orchestrator, payload: Option<&Value>) -> Result<ModelAccountChange, String> {
+    let provider = payload_text(payload, "provider")
+        .filter(|provider| !provider.is_empty())
+        .ok_or("payload.provider is required with use_reset: codex.")?;
+    let id = payload_text(payload, "account")
+        .filter(|id| !id.is_empty())
+        .ok_or("payload.account is required with use_reset: the account id.")?;
+    if provider != "codex" {
+        return Err(crate::orchestrator::usage_refresh::usage_reset_unsupported(
+            provider,
+        ));
+    }
+    let account = workspace_account(orch, id)?;
+    match subscription_of(&account) {
+        Ok(RoutedProvider::Codex) => Ok(ModelAccountChange::UseReset {
+            account_id: account.id,
+        }),
+        Ok(other) => Err(format!(
+            "Account `{id}` is a {} sign-in, not a codex one.",
+            other.backend()
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 fn refresh_provider(

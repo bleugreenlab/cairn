@@ -823,6 +823,11 @@ pub(crate) const SETTINGS_ENABLED_PROVIDERS: KeySpec = KeySpec::new(
     KeyType::Array,
     "providers installed in this workspace, e.g. [claude, openrouter]; refused when it would strand a tier default or call routing",
 );
+pub(crate) const SETTINGS_DECISION_MODEL: KeySpec = KeySpec::new(
+    "decisionModel",
+    KeyType::Str,
+    "model or tier a decision node naming none is answered by; null returns it to the catalog's choice",
+);
 pub(crate) const SETTINGS_MERGE_TYPE: KeySpec =
     KeySpec::new("mergeType", KeyType::Str, "squash|merge|rebase");
 pub(crate) const SETTINGS_MEMORY_REVIEW_ENABLED: KeySpec = KeySpec::new(
@@ -931,11 +936,6 @@ pub(crate) const SETTINGS_EXTERNAL_REPLIES: KeySpec = KeySpec::new(
     "externalReplies",
     KeyType::Str,
     "policy for replies addressed to an external correspondent",
-);
-pub(crate) const SETTINGS_SUBSCRIPTION_FEES: KeySpec = KeySpec::new(
-    "subscriptionFees",
-    KeyType::Object,
-    "backend -> flat monthly fee in USD; replaces the whole map",
 );
 pub(crate) const SETTINGS_OPENROUTER_ROUTING: KeySpec = KeySpec::new(
     "openrouterRouting",

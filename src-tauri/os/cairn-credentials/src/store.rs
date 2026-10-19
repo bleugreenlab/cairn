@@ -110,6 +110,8 @@ struct AccountFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plan: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_choice: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     health: Option<super::ProviderAccountHealth>,
 }
 
@@ -450,6 +452,7 @@ fn migrate_v1_to_store(file: IdentityFileV1, machine_id: &str) -> Result<Credent
             last_used_at: None,
             email: None,
             plan: None,
+            plan_choice: None,
             health: None,
         }),
         None => {}
@@ -477,6 +480,7 @@ fn migrate_v1_to_store(file: IdentityFileV1, machine_id: &str) -> Result<Credent
             last_used_at: None,
             email: None,
             plan: None,
+            plan_choice: None,
             health: None,
         });
     }
@@ -496,6 +500,7 @@ fn migrate_v1_to_store(file: IdentityFileV1, machine_id: &str) -> Result<Credent
             last_used_at: None,
             email: None,
             plan: None,
+            plan_choice: None,
             health: None,
         });
     }
@@ -644,6 +649,7 @@ fn store_from_v2_file(
             last_used_at: acc_file.last_used_at,
             email: acc_file.email,
             plan: acc_file.plan,
+            plan_choice: acc_file.plan_choice,
             health: acc_file.health,
         });
     }
@@ -763,6 +769,7 @@ fn store_to_v2_file(
             last_used_at: account.last_used_at,
             email: account.email.clone(),
             plan: account.plan.clone(),
+            plan_choice: account.plan_choice.clone(),
             health: account.health.clone(),
         });
     }
@@ -824,6 +831,7 @@ mod tests {
             last_used_at,
             email: None,
             plan: None,
+            plan_choice: None,
             health: None,
         }
     }
@@ -1189,6 +1197,7 @@ accounts:
             last_used_at: None,
             email: None,
             plan: None,
+            plan_choice: None,
             health: None,
         });
         save_credential_store(dir.path(), &store).unwrap();

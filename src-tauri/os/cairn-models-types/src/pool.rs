@@ -1,10 +1,10 @@
 //! One provider's capacity, pooled across every account signed into it.
 //!
-//! Subscription logins are interchangeable token faucets, so the question a
-//! user actually asks is "how much of this provider do I have left", not "how
-//! much does account three have left". This module answers that question and
-//! nothing else: it is pure aggregation over per-account measurements, with no
-//! knowledge of where those measurements came from.
+//! Every account's segment of every window family sits beside the family's
+//! pooled total, so one snapshot answers both "how much of this provider is
+//! left" and "how much does this account have". This module is pure
+//! aggregation over per-account measurements, with no knowledge of where those
+//! measurements came from.
 //!
 //! Two invariants carry the weight here. Missing data is *unknown* and never
 //! silently becomes capacity. And exhaustion is computed per window family with
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::usage::{
     ProviderCreditsSnapshot, ProviderModelUsageRow, ProviderUsageErrorKind, ProviderUsageFamily,
-    ProviderUsageResetCredit, ProviderUsageResetCredits, ProviderUsageScope, ProviderUsageWindow,
+    ProviderUsageResetCredits, ProviderUsageScope, ProviderUsageWindow,
 };
 
 /// One provider's pooled capacity as the settings surface renders it.
@@ -32,7 +32,6 @@ pub struct ProviderPoolSnapshot {
     /// its exhaustion actually reaches.
     pub constraints: Vec<ProviderPoolConstraint>,
     pub credits: Option<ProviderCreditsSnapshot>,
-    pub reset_credits: Option<ProviderPoolResetCredits>,
     pub model_breakdown: Option<Vec<ProviderModelUsageRow>>,
     pub unsupported_reason: Option<String>,
     /// The OLDEST contributing capture, so "Updated" never overstates freshness.
@@ -53,6 +52,18 @@ pub struct ProviderPoolAccount {
     pub blocked_until: Option<i64>,
     pub error: Option<String>,
     pub error_kind: Option<ProviderUsageErrorKind>,
+    /// The usage resets this account holds, for a provider that has them.
+    /// A reset is spent from one account, so the account is where it lives.
+    pub reset_credits: Option<ProviderPoolAccountResets>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPoolAccountResets {
+    pub available_count: i64,
+    /// The soonest expiry among the account's credits, or None when no credit
+    /// reports one.
+    pub soonest_expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +80,9 @@ pub enum ProviderPoolAccountState {
 pub struct ProviderPoolFamily {
     pub key: String,
     pub label: String,
+    /// The short name a row or column under the provider uses: `Session`,
+    /// `Week`, `Fable`, `5-hour`.
+    pub name: String,
     pub scope: ProviderUsageScope,
     pub scope_target: Option<String>,
     /// 100 x pool size. The denominator the UI renders.
@@ -110,17 +124,6 @@ pub enum ProviderPoolSegmentState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct ProviderPoolResetCredits {
-    pub available_count: i64,
-    pub credits: Vec<ProviderUsageResetCredit>,
-    /// Which account a "Use reset" consumes from: the one holding the
-    /// soonest-expiring credit, so the credit nearest to being lost is spent
-    /// first. Chosen here rather than in the UI so the policy has one home.
-    pub consume_account_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct ProviderPoolConstraint {
     /// The exhausted family, or None when every account is blocked outright
     /// and no single window is at fault.
@@ -130,9 +133,6 @@ pub struct ProviderPoolConstraint {
     /// Some("Fable") for a model-scoped family; None for a global one.
     pub scope_target: Option<String>,
     pub next_reset_at: Option<i64>,
-    /// Whether a family card already carries this on screen, which decides
-    /// between a card status line and a provider-wide notice.
-    pub displayed: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -156,9 +156,23 @@ pub struct PoolAccountInput {
     pub blocked_until: Option<i64>,
     pub error: Option<String>,
     pub error_kind: Option<ProviderUsageErrorKind>,
+    pub reset_credits: Option<ProviderUsageResetCredits>,
 }
 
 impl PoolAccountInput {
+    fn resets(&self) -> Option<ProviderPoolAccountResets> {
+        self.reset_credits
+            .as_ref()
+            .map(|credits| ProviderPoolAccountResets {
+                available_count: credits.available_count,
+                soonest_expires_at: credits
+                    .credits
+                    .iter()
+                    .filter_map(|credit| credit.expires_at)
+                    .min(),
+            })
+    }
+
     fn is_blocked(&self, now: i64) -> bool {
         self.blocked_until.is_some_and(|until| until > now)
     }
@@ -232,30 +246,19 @@ impl PoolAccountInput {
     }
 }
 
-/// Which families a provider shows as standing usage sections.
-///
-/// The Codex question is weekly capacity. Its shorter rolling window still
-/// gates routing, and surfaces as a constraint when it is what actually stops a
-/// launch, rather than standing on the card as a second number that answers a
-/// question nobody asked.
-fn family_is_displayed(backend: &str, family: &ProviderUsageFamily) -> bool {
-    match backend {
-        "codex" => matches!(family.scope, ProviderUsageScope::Weekly),
-        _ => true,
-    }
-}
-
 /// Aggregate per-account measurements into one provider pool.
+///
+/// Every family any account reports live is in the pool, Codex's five-hour
+/// window included: each account's line and the usage table show every
+/// window the provider measures, so none is filtered here.
 // The provider-level passthroughs (credits, breakdown, unsupported reason) are
 // separate measurements a backend may report beside its windows, not facets of
 // one object; bundling them purely to shorten this signature would make callers
 // build a bag whose fields have no relationship to each other.
-#[allow(clippy::too_many_arguments)]
 pub fn build_provider_pool(
     backend: &str,
     inputs: Vec<PoolAccountInput>,
     credits: Option<ProviderCreditsSnapshot>,
-    reset_credits: Vec<(String, ProviderUsageResetCredits)>,
     model_breakdown: Option<Vec<ProviderModelUsageRow>>,
     unsupported_reason: Option<String>,
     now: i64,
@@ -271,6 +274,7 @@ pub fn build_provider_pool(
             blocked_until: input.blocked_until.filter(|until| *until > now),
             error: input.error.clone(),
             error_kind: input.error_kind,
+            reset_credits: input.resets(),
         })
         .collect();
 
@@ -309,7 +313,6 @@ pub fn build_provider_pool(
             .collect();
         measured_resets.sort_unstable();
         measured_resets.dedup();
-        let displayed = family_is_displayed(backend, family);
 
         // The same predicate routing applies: an account is out of this family
         // when it is blocked, or when its live window for the family measures
@@ -335,24 +338,22 @@ pub fn build_provider_pool(
                 },
                 scope_target: family.scope_target.clone(),
                 next_reset_at: segments.iter().filter_map(|s| s.resets_at).min(),
-                displayed,
             });
         }
 
-        if displayed {
-            families.push(ProviderPoolFamily {
-                key: family.key.clone(),
-                label: family.label.clone(),
-                scope: family.scope,
-                scope_target: family.scope_target.clone(),
-                capacity_percent,
-                remaining_percent,
-                unknown_count,
-                segments,
-                next_reset_at: measured_resets.first().copied(),
-                resets_differ: measured_resets.len() > 1,
-            });
-        }
+        families.push(ProviderPoolFamily {
+            key: family.key.clone(),
+            label: family.label.clone(),
+            name: family.name.clone(),
+            scope: family.scope,
+            scope_target: family.scope_target.clone(),
+            capacity_percent,
+            remaining_percent,
+            unknown_count,
+            segments,
+            next_reset_at: measured_resets.first().copied(),
+            resets_differ: measured_resets.len() > 1,
+        });
     }
 
     if all_blocked {
@@ -362,7 +363,6 @@ pub fn build_provider_pool(
             reach: ProviderPoolConstraintReach::Provider,
             scope_target: None,
             next_reset_at: inputs.iter().filter_map(|input| input.blocked_until).min(),
-            displayed: false,
         });
     }
 
@@ -372,7 +372,6 @@ pub fn build_provider_pool(
         families,
         constraints,
         credits,
-        reset_credits: pool_reset_credits(reset_credits),
         model_breakdown,
         unsupported_reason,
         // An account still measuring on stale data is what "Updated" has to
@@ -385,45 +384,10 @@ pub fn build_provider_pool(
     }
 }
 
-/// Pool the reset credits, and name the account a "Use reset" should spend.
-///
-/// The credit nearest to expiring is the one worth spending first, so its
-/// account is the one named. An account holding credits with no reported expiry
-/// sorts last, breaking ties by the order the caller listed accounts in.
-fn pool_reset_credits(
-    reset_credits: Vec<(String, ProviderUsageResetCredits)>,
-) -> Option<ProviderPoolResetCredits> {
-    if reset_credits.is_empty() {
-        return None;
-    }
-    let consume_account_id = reset_credits
-        .iter()
-        .filter(|(_, credits)| credits.available_count > 0)
-        .min_by_key(|(_, credits)| {
-            credits
-                .credits
-                .iter()
-                .filter_map(|credit| credit.expires_at)
-                .min()
-                .unwrap_or(i64::MAX)
-        })
-        .map(|(account_id, _)| account_id.clone());
-    Some(ProviderPoolResetCredits {
-        available_count: reset_credits
-            .iter()
-            .map(|(_, credits)| credits.available_count)
-            .sum(),
-        credits: reset_credits
-            .into_iter()
-            .flat_map(|(_, credits)| credits.credits)
-            .collect(),
-        consume_account_id,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage::ProviderUsageResetCredit;
 
     const NOW: i64 = 1_000;
     const LATER: i64 = 9_000;
@@ -508,7 +472,7 @@ mod tests {
     }
 
     fn pool(backend: &str, inputs: Vec<PoolAccountInput>) -> ProviderPoolSnapshot {
-        build_provider_pool(backend, inputs, None, Vec::new(), None, None, NOW)
+        build_provider_pool(backend, inputs, None, None, None, NOW)
     }
 
     fn family<'a>(pool: &'a ProviderPoolSnapshot, key: &str) -> &'a ProviderPoolFamily {
@@ -535,6 +499,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["session", "weekly", "weekly:fable"]
         );
+        assert_eq!(
+            pool.families
+                .iter()
+                .map(|family| family.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Session", "Week", "Fable"]
+        );
         for family in &pool.families {
             assert_eq!(family.capacity_percent, 200.0);
             assert_eq!(family.segments.len(), 2);
@@ -552,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_pools_one_weekly_family_and_hides_its_rolling_window() {
+    fn codex_accounts_each_carry_their_five_hour_and_weekly_windows() {
         let pool = pool(
             "codex",
             vec![
@@ -564,12 +535,21 @@ mod tests {
         assert_eq!(
             pool.families
                 .iter()
-                .map(|family| family.key.as_str())
+                .map(|family| (family.key.as_str(), family.name.as_str()))
                 .collect::<Vec<_>>(),
-            vec!["weekly"]
+            vec![("rolling:300", "5-hour"), ("weekly", "Week")]
+        );
+        // Each account's own five-hour number, on its own segment.
+        let five_hour = family(&pool, "rolling:300");
+        assert_eq!(
+            five_hour
+                .segments
+                .iter()
+                .map(|segment| (segment.account_id.as_str(), segment.remaining_percent))
+                .collect::<Vec<_>>(),
+            vec![("a", Some(82.0)), ("b", Some(10.0))]
         );
         assert_eq!(family(&pool, "weekly").remaining_percent, 120.0);
-        assert_eq!(family(&pool, "weekly").capacity_percent, 200.0);
     }
 
     #[test]
@@ -747,7 +727,6 @@ mod tests {
         assert_eq!(constraint.family_key.as_deref(), Some("weekly:fable"));
         assert_eq!(constraint.reach, ProviderPoolConstraintReach::Model);
         assert_eq!(constraint.scope_target.as_deref(), Some("Fable"));
-        assert!(constraint.displayed);
         // Claiming the provider is out would contradict the two families above.
         assert!(pool
             .constraints
@@ -756,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exhausted_hidden_codex_window_constrains_the_whole_provider() {
+    fn an_exhausted_codex_five_hour_window_constrains_the_whole_provider() {
         let pool = pool(
             "codex",
             vec![codex_account("a", 0.0, 70.0), codex_account("b", 0.0, 50.0)],
@@ -766,8 +745,6 @@ mod tests {
         let constraint = &pool.constraints[0];
         assert_eq!(constraint.family_key.as_deref(), Some("rolling:300"));
         assert_eq!(constraint.reach, ProviderPoolConstraintReach::Provider);
-        // Nothing on screen carries it, so the UI has to say it contextually.
-        assert!(!constraint.displayed);
         assert_eq!(constraint.next_reset_at, Some(LATER));
     }
 
@@ -835,81 +812,65 @@ mod tests {
         assert_eq!(pool.captured_at, None);
     }
 
-    #[test]
-    fn reset_credits_pool_and_name_the_soonest_expiring_account() {
-        let pool = build_provider_pool(
-            "codex",
-            vec![
-                codex_account("a", 80.0, 70.0),
-                codex_account("b", 60.0, 50.0),
-            ],
-            None,
-            vec![
-                (
-                    "a".to_string(),
-                    ProviderUsageResetCredits {
-                        available_count: 1,
-                        credits: vec![ProviderUsageResetCredit {
-                            expires_at: Some(9_999),
-                            expires_at_text: None,
-                        }],
-                    },
-                ),
-                (
-                    "b".to_string(),
-                    ProviderUsageResetCredits {
-                        available_count: 2,
-                        credits: vec![ProviderUsageResetCredit {
-                            expires_at: Some(4_444),
-                            expires_at_text: None,
-                        }],
-                    },
-                ),
-            ],
-            None,
-            None,
-            NOW,
-        );
-
-        let credits = pool.reset_credits.expect("reset credits pooled");
-        assert_eq!(credits.available_count, 3);
-        assert_eq!(credits.credits.len(), 2);
-        assert_eq!(credits.consume_account_id.as_deref(), Some("b"));
+    fn resets(available_count: i64, expiries: &[i64]) -> ProviderUsageResetCredits {
+        ProviderUsageResetCredits {
+            available_count,
+            credits: expiries
+                .iter()
+                .map(|at| ProviderUsageResetCredit {
+                    expires_at: Some(*at),
+                    expires_at_text: None,
+                })
+                .collect(),
+        }
     }
 
     #[test]
-    fn reset_credits_skip_an_account_with_none_available() {
-        let pool = build_provider_pool(
-            "codex",
-            vec![
-                codex_account("a", 80.0, 70.0),
-                codex_account("b", 60.0, 50.0),
-            ],
-            None,
-            vec![
-                (
-                    "a".to_string(),
-                    ProviderUsageResetCredits {
-                        available_count: 0,
-                        credits: Vec::new(),
-                    },
-                ),
-                (
-                    "b".to_string(),
-                    ProviderUsageResetCredits {
-                        available_count: 1,
-                        credits: Vec::new(),
-                    },
-                ),
-            ],
-            None,
-            None,
-            NOW,
-        );
+    fn each_account_carries_its_own_reset_credits() {
+        let mut a = codex_account("a", 80.0, 70.0);
+        a.reset_credits = Some(resets(1, &[9_999]));
+        let mut b = codex_account("b", 60.0, 50.0);
+        b.reset_credits = Some(resets(2, &[7_777, 4_444]));
+        let c = codex_account("c", 40.0, 30.0);
+        let pool = pool("codex", vec![a, b, c]);
 
-        let credits = pool.reset_credits.expect("reset credits pooled");
-        assert_eq!(credits.available_count, 1);
-        assert_eq!(credits.consume_account_id.as_deref(), Some("b"));
+        let held: Vec<_> = pool
+            .accounts
+            .iter()
+            .map(|account| {
+                (
+                    account.account_id.as_str(),
+                    account
+                        .reset_credits
+                        .as_ref()
+                        .map(|r| (r.available_count, r.soonest_expires_at)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            held,
+            vec![
+                ("a", Some((1, Some(9_999)))),
+                // The soonest of the account's own credits.
+                ("b", Some((2, Some(4_444)))),
+                // An account the provider reported no credits for says nothing.
+                ("c", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_account_with_none_left_reports_zero_rather_than_nothing() {
+        let mut a = codex_account("a", 80.0, 70.0);
+        a.reset_credits = Some(resets(0, &[]));
+        let pool = pool("codex", vec![a]);
+        assert_eq!(
+            pool.accounts[0].reset_credits,
+            Some(ProviderPoolAccountResets {
+                available_count: 0,
+                soonest_expires_at: None,
+            })
+        );
     }
 
     #[test]
@@ -919,6 +880,7 @@ mod tests {
         assert_eq!(json["families"][0]["capacityPercent"], 100.0);
         assert_eq!(json["families"][0]["remainingPercent"], 60.0);
         assert_eq!(json["families"][0]["unknownCount"], 0);
+        assert_eq!(json["families"][0]["name"], "Session");
         assert_eq!(json["families"][0]["segments"][0]["accountId"], "a");
         assert_eq!(json["families"][0]["segments"][0]["state"], "measured");
     }

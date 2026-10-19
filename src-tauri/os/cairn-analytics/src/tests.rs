@@ -1,7 +1,9 @@
 use super::*;
+use crate::subscriptions::{
+    plan_periods, reconcile_periods, HeldSubscription, PlanCount, UnpricedAccount,
+};
 use cairn_db::storage::{LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
 use cairn_db::turso::params;
-use std::collections::HashMap;
 use std::time::Instant;
 use tempfile::tempdir;
 
@@ -806,8 +808,48 @@ async fn add_event(
     queries::fold_token_rollup(db).await.unwrap();
 }
 
-fn fees(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
-    pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+/// Record that `account` held `plan_key` (labelled `plan`) on `backend` from
+/// `from` until `to` (still held when `None`).
+async fn hold(
+    db: &LocalDb,
+    account: &str,
+    backend: &str,
+    plan_key: Option<&str>,
+    plan: &str,
+    from: i64,
+    to: Option<i64>,
+) {
+    db.execute(
+        "INSERT INTO subscription_periods
+            (id, account_id, provider, plan_key, plan_label, account_label, started_at, ended_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        cairn_db::turso::params![
+            format!("{account}@{from}"),
+            account,
+            backend,
+            plan_key.map(str::to_string),
+            plan,
+            format!("{account}@example.com"),
+            from,
+            to
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+/// One Max 20x account on claude since before January 2025.
+async fn max_20x(db: &LocalDb, account: &str) {
+    hold(
+        db,
+        account,
+        "claude",
+        Some("max_20x"),
+        "Max 20x",
+        JAN_2025 - 86_400,
+        None,
+    )
+    .await;
 }
 
 fn point<'a>(
@@ -824,6 +866,7 @@ fn point<'a>(
 #[tokio::test]
 async fn effective_cost_ratio_allocates_the_fee() {
     let db = cost_db().await;
+    max_20x(&db, "acct-1").await;
     // One claude assistant turn: 1M input + 1M output of sonnet =>
     // list cost (1e6*3 + 1e6*15)/1e6 = $18.
     seed_run(&db, "c", "claude", "sonnet").await;
@@ -839,15 +882,9 @@ async fn effective_cost_ratio_allocates_the_fee() {
     )
     .await;
 
-    let points = effective_cost(
-        &db,
-        &Scope::default(),
-        &TimeRange::default(),
-        &fees(&[("claude", 200.0)]),
-        Bucket::Month,
-    )
-    .await
-    .unwrap();
+    let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), Bucket::Month)
+        .await
+        .unwrap();
 
     let p = point(&points, JAN_2025, "claude");
     assert!(!p.metered);
@@ -856,7 +893,14 @@ async fn effective_cost_ratio_allocates_the_fee() {
         "list_cost {}",
         p.list_cost
     );
-    assert!((p.subscription_fee - 200.0).abs() < 1e-9);
+    assert_eq!(p.subscription_cost, Some(200.0));
+    assert_eq!(
+        p.plans,
+        vec![PlanCount {
+            label: "Max 20x".to_string(),
+            count: 1
+        }]
+    );
     let ratio = p.ratio.expect("ratio present");
     assert!((ratio - 200.0 / 18.0).abs() < 1e-9, "ratio {ratio}");
     // Workspace scope: effective cost allocates the whole flat fee.
@@ -891,6 +935,7 @@ async fn effective_cost_ratio_allocates_the_fee() {
 #[tokio::test]
 async fn effective_cost_sums_to_fee_across_models() {
     let db = cost_db().await;
+    max_20x(&db, "acct-1").await;
     // Two claude models in the same month roll up to one (month, backend)
     // point whose effective cost is exactly the fee.
     seed_run(&db, "son", "claude", "sonnet").await;
@@ -918,15 +963,9 @@ async fn effective_cost_sums_to_fee_across_models() {
     )
     .await;
 
-    let points = effective_cost(
-        &db,
-        &Scope::default(),
-        &TimeRange::default(),
-        &fees(&[("claude", 200.0)]),
-        Bucket::Month,
-    )
-    .await
-    .unwrap();
+    let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), Bucket::Month)
+        .await
+        .unwrap();
     let claude: Vec<_> = points.iter().filter(|p| p.backend == "claude").collect();
     assert_eq!(claude.len(), 1, "one claude point per month");
     assert!((claude[0].effective_cost - 200.0).abs() < 1e-6);
@@ -935,33 +974,27 @@ async fn effective_cost_sums_to_fee_across_models() {
 #[tokio::test]
 async fn effective_cost_zero_priced_usage_yields_no_ratio() {
     let db = cost_db().await;
+    max_20x(&db, "acct-1").await;
     // An unpriced model: billable tokens exist but list cost is $0, so the
     // ratio is undefined rather than NaN/Inf.
     seed_run(&db, "m", "claude", "mystery-model").await;
     add_event(&db, "m1", "m", "assistant", JAN_2025 + 5, 1000, 1000, None).await;
 
-    let points = effective_cost(
-        &db,
-        &Scope::default(),
-        &TimeRange::default(),
-        &fees(&[("claude", 200.0)]),
-        Bucket::Month,
-    )
-    .await
-    .unwrap();
+    let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), Bucket::Month)
+        .await
+        .unwrap();
     let p = point(&points, JAN_2025, "claude");
     assert!(p.ratio.is_none());
     assert_eq!(p.effective_cost, 0.0);
-    assert!((p.subscription_fee - 200.0).abs() < 1e-9);
+    assert_eq!(p.subscription_cost, Some(200.0));
     assert!(p.effective_cost.is_finite());
 }
 
 #[tokio::test]
-async fn effective_cost_subscription_without_fee_is_not_metered() {
+async fn effective_cost_backend_no_subscription_served_is_metered_at_list() {
     let db = cost_db().await;
-    // Claude is a subscription backend: with no configured fee and no real
-    // per-generation cost, it must NOT be reported as metered. The card
-    // shows the list-price estimate ($18) rather than a fabricated "actual".
+    // Claude usage with no subscription account behind it (an API key) is
+    // paid as used: list price passes through at ratio 1.
     seed_run(&db, "c", "claude", "sonnet").await;
     add_event(
         &db,
@@ -975,24 +1008,327 @@ async fn effective_cost_subscription_without_fee_is_not_metered() {
     )
     .await;
 
-    let points = effective_cost(
-        &db,
-        &Scope::default(),
-        &TimeRange::default(),
-        &fees(&[]),
-        Bucket::Month,
-    )
-    .await
-    .unwrap();
+    let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), Bucket::Month)
+        .await
+        .unwrap();
     let p = point(&points, JAN_2025, "claude");
-    assert!(!p.metered, "claude is a subscription backend, not metered");
-    assert_eq!(p.subscription_fee, 0.0);
-    assert!(p.ratio.is_none());
+    assert!(p.metered);
+    assert_eq!(p.subscription_cost, None);
+    assert!(p.plans.is_empty());
+    assert_eq!(p.ratio, Some(1.0));
     assert!(
-        (p.scoped_cost - 18.0).abs() < 1e-9,
-        "list estimate {}",
-        p.scoped_cost
+        (p.effective_cost - 18.0).abs() < 1e-9,
+        "{}",
+        p.effective_cost
     );
+}
+
+#[tokio::test]
+async fn effective_cost_two_max_20x_accounts_pay_for_two_subscriptions() {
+    let db = cost_db().await;
+    max_20x(&db, "acct-1").await;
+    max_20x(&db, "acct-2").await;
+    seed_run(&db, "c", "claude", "sonnet").await;
+    add_event(
+        &db,
+        "c1",
+        "c",
+        "assistant",
+        JAN_2025 + 100,
+        1_000_000,
+        1_000_000,
+        None,
+    )
+    .await;
+
+    let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), Bucket::Month)
+        .await
+        .unwrap();
+    let p = point(&points, JAN_2025, "claude");
+    assert!(!p.metered);
+    assert_eq!(p.subscription_cost, Some(400.0));
+    assert_eq!(
+        p.plans,
+        vec![PlanCount {
+            label: "Max 20x".to_string(),
+            count: 2
+        }]
+    );
+    assert!(p.unpriced_accounts.is_empty());
+    assert!((p.effective_cost - 400.0).abs() < 1e-6);
+    assert!((p.ratio.unwrap() - 400.0 / 18.0).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn effective_cost_counts_a_removed_account_for_the_months_it_was_held() {
+    let db = cost_db().await;
+    max_20x(&db, "kept").await;
+    // Removed on February 10th: it paid for January and February, not March.
+    hold(
+        &db,
+        "removed",
+        "claude",
+        Some("max_5x"),
+        "Max 5x",
+        JAN_2025 - 86_400,
+        Some(FEB_2025 + 9 * 86_400),
+    )
+    .await;
+    let mar_2025 = FEB_2025 + 28 * 86_400;
+    seed_run(&db, "c", "claude", "sonnet").await;
+    for (id, ts) in [
+        ("j", JAN_2025 + 100),
+        ("f", FEB_2025 + 100),
+        ("m", mar_2025 + 100),
+    ] {
+        add_event(&db, id, "c", "assistant", ts, 1000, 1000, None).await;
+    }
+
+    let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), Bucket::Month)
+        .await
+        .unwrap();
+    assert_eq!(
+        point(&points, JAN_2025, "claude").subscription_cost,
+        Some(300.0)
+    );
+    let feb = point(&points, FEB_2025, "claude");
+    assert_eq!(feb.subscription_cost, Some(300.0));
+    assert_eq!(
+        feb.plans
+            .iter()
+            .map(|plan| (plan.label.as_str(), plan.count))
+            .collect::<Vec<_>>(),
+        [("Max 20x", 1), ("Max 5x", 1)]
+    );
+    assert_eq!(
+        point(&points, mar_2025, "claude").subscription_cost,
+        Some(200.0)
+    );
+}
+
+#[tokio::test]
+async fn effective_cost_reports_an_unpriced_account_and_leaves_it_out_of_what_was_paid() {
+    let db = cost_db().await;
+    max_20x(&db, "priced").await;
+    hold(
+        &db,
+        "seat",
+        "claude",
+        None,
+        "Enterprise",
+        JAN_2025 - 86_400,
+        None,
+    )
+    .await;
+    // A provider whose only subscription has no price shows its list value.
+    hold(
+        &db,
+        "go",
+        "opencode-go",
+        None,
+        "Go",
+        JAN_2025 - 86_400,
+        None,
+    )
+    .await;
+    seed_run(&db, "c", "claude", "sonnet").await;
+    add_event(
+        &db,
+        "c1",
+        "c",
+        "assistant",
+        JAN_2025 + 100,
+        1_000_000,
+        1_000_000,
+        None,
+    )
+    .await;
+    seed_run(&db, "g", "opencode-go", "sonnet").await;
+    add_event(
+        &db,
+        "g1",
+        "g",
+        "assistant",
+        JAN_2025 + 100,
+        1_000_000,
+        1_000_000,
+        None,
+    )
+    .await;
+
+    let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), Bucket::Month)
+        .await
+        .unwrap();
+    let claude = point(&points, JAN_2025, "claude");
+    assert_eq!(claude.subscription_cost, Some(200.0));
+    assert_eq!(
+        claude.unpriced_accounts,
+        vec![UnpricedAccount {
+            account_id: "seat".to_string(),
+            label: "seat@example.com".to_string(),
+            plan: "Enterprise".to_string(),
+        }]
+    );
+
+    let go = point(&points, JAN_2025, "opencode-go");
+    assert!(!go.metered, "a subscription, even without a price");
+    assert_eq!(go.subscription_cost, None);
+    assert_eq!(go.ratio, None);
+    assert_eq!(go.unpriced_accounts.len(), 1);
+    // Never a fabricated $0: the list value stands.
+    assert!(go.effective_cost > 0.0);
+    assert!((go.effective_cost - go.scoped_cost).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn a_plan_toggled_within_a_month_counts_once_at_the_plan_last_held() {
+    let db = cost_db().await;
+    // Unchosen Pro, then Pro 200, then corrected to Pro 500, all in January.
+    hold(
+        &db,
+        "pro",
+        "codex",
+        None,
+        "Pro",
+        JAN_2025,
+        Some(JAN_2025 + 10),
+    )
+    .await;
+    hold(
+        &db,
+        "pro",
+        "codex",
+        Some("pro_200"),
+        "Pro 200",
+        JAN_2025 + 10,
+        Some(JAN_2025 + 20),
+    )
+    .await;
+    hold(
+        &db,
+        "pro",
+        "codex",
+        Some("pro_500"),
+        "Pro 500",
+        JAN_2025 + 20,
+        None,
+    )
+    .await;
+    hold(&db, "plus", "codex", Some("plus"), "Plus", JAN_2025, None).await;
+    seed_run(&db, "x", "codex", "gpt-5").await;
+    add_event(
+        &db,
+        "x1",
+        "x",
+        "result:success",
+        JAN_2025 + 100,
+        1000,
+        1000,
+        None,
+    )
+    .await;
+
+    let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), Bucket::Month)
+        .await
+        .unwrap();
+    let p = point(&points, JAN_2025, "codex");
+    assert_eq!(p.subscription_cost, Some(520.0));
+    assert_eq!(
+        p.plans
+            .iter()
+            .map(|plan| plan.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Plus", "Pro 500"]
+    );
+    assert!(p.unpriced_accounts.is_empty());
+}
+
+fn held(account: &str, plan_key: Option<&str>, plan: &str, created_at: i64) -> HeldSubscription {
+    HeldSubscription {
+        account_id: account.to_string(),
+        account_label: format!("{account}@example.com"),
+        provider: "codex".to_string(),
+        plan_key: plan_key.map(str::to_string),
+        plan_label: plan.to_string(),
+        created_at,
+    }
+}
+
+#[tokio::test]
+async fn periods_open_close_and_backfill_from_the_credential_lifecycle() {
+    let db = cost_db().await;
+    // First sight backfills from when each account was added.
+    let now = FEB_2025;
+    let both = [
+        held("a", Some("plus"), "Plus", JAN_2025),
+        held("b", None, "Pro", JAN_2025 + 5),
+    ];
+    assert!(reconcile_periods(&db, &both, now).await.unwrap());
+    // Nothing changed: nothing written.
+    assert!(!reconcile_periods(&db, &both, now + 1).await.unwrap());
+    let periods = plan_periods(&db).await.unwrap();
+    assert_eq!(
+        periods
+            .iter()
+            .map(|p| (p.account_id.as_str(), p.started_at, p.ended_at))
+            .collect::<Vec<_>>(),
+        [("a", JAN_2025, None), ("b", JAN_2025 + 5, None)]
+    );
+
+    // b's plan is chosen: its period closes and a new one opens now; a
+    // rename updates the open period in place.
+    let mut renamed = held("a", Some("plus"), "Plus", JAN_2025);
+    renamed.account_label = "ops@example.com".to_string();
+    let chosen = [renamed, held("b", Some("pro_200"), "Pro 200", JAN_2025 + 5)];
+    assert!(reconcile_periods(&db, &chosen, now + 100).await.unwrap());
+    // a is removed.
+    assert!(reconcile_periods(&db, &chosen[1..], now + 200)
+        .await
+        .unwrap());
+
+    let periods = plan_periods(&db).await.unwrap();
+    let shape: Vec<_> = periods
+        .iter()
+        .map(|p| {
+            (
+                p.account_id.as_str(),
+                p.account_label.as_str(),
+                p.plan_key.as_deref(),
+                p.started_at,
+                p.ended_at,
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (
+                "a",
+                "ops@example.com",
+                Some("plus"),
+                JAN_2025,
+                Some(now + 200)
+            ),
+            ("b", "b@example.com", None, JAN_2025 + 5, Some(now + 100)),
+            ("b", "b@example.com", Some("pro_200"), now + 100, None),
+        ]
+    );
+
+    // An account that returns after its periods closed starts now, not at
+    // its creation.
+    let back = [
+        held("a", Some("plus"), "Plus", JAN_2025),
+        held("b", Some("pro_200"), "Pro 200", JAN_2025 + 5),
+    ];
+    assert!(reconcile_periods(&db, &back, now + 300).await.unwrap());
+    let reopened = plan_periods(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.account_id == "a" && p.ended_at.is_none())
+        .map(|p| p.started_at)
+        .collect::<Vec<_>>();
+    assert_eq!(reopened, [now + 300]);
 }
 
 #[tokio::test]
@@ -1025,15 +1361,9 @@ async fn effective_cost_metered_backend_uses_real_cost() {
     )
     .await;
 
-    let points = effective_cost(
-        &db,
-        &Scope::default(),
-        &TimeRange::default(),
-        &fees(&[("claude", 200.0)]),
-        Bucket::Month,
-    )
-    .await
-    .unwrap();
+    let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), Bucket::Month)
+        .await
+        .unwrap();
     let p = point(&points, JAN_2025, "openrouter");
     assert!(p.metered);
     assert_eq!(p.ratio, Some(1.0));
@@ -1048,6 +1378,7 @@ async fn effective_cost_metered_backend_uses_real_cost() {
 #[tokio::test]
 async fn effective_cost_fine_buckets_inherit_month_ratio_and_sum_to_fee() {
     let db = cost_db().await;
+    max_20x(&db, "acct-1").await;
     // Two claude turns in January on different days. At Day granularity each
     // day is its own point, both attributed to January, each inheriting
     // January's workspace ratio, and the day points sum to the flat fee.
@@ -1076,15 +1407,9 @@ async fn effective_cost_fine_buckets_inherit_month_ratio_and_sum_to_fee() {
     )
     .await;
 
-    let points = effective_cost(
-        &db,
-        &Scope::default(),
-        &TimeRange::default(),
-        &fees(&[("claude", 200.0)]),
-        Bucket::Day,
-    )
-    .await
-    .unwrap();
+    let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), Bucket::Day)
+        .await
+        .unwrap();
 
     let claude: Vec<_> = points.iter().filter(|p| p.backend == "claude").collect();
     assert_eq!(claude.len(), 2, "two distinct day points");
@@ -1134,15 +1459,9 @@ async fn effective_cost_metered_split_apportions_by_list_fraction() {
     )
     .await;
 
-    let points = effective_cost(
-        &db,
-        &Scope::default(),
-        &TimeRange::default(),
-        &fees(&[]),
-        Bucket::Month,
-    )
-    .await
-    .unwrap();
+    let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), Bucket::Month)
+        .await
+        .unwrap();
     let p = point(&points, JAN_2025, "openrouter");
     assert!(p.metered);
     assert!(
@@ -1300,15 +1619,9 @@ async fn effective_cost_buckets_by_calendar_month_and_flags_provisional() {
     )
     .await;
 
-    let points = effective_cost(
-        &db,
-        &Scope::default(),
-        &TimeRange::default(),
-        &fees(&[]),
-        Bucket::Month,
-    )
-    .await
-    .unwrap();
+    let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), Bucket::Month)
+        .await
+        .unwrap();
 
     assert!(!point(&points, JAN_2025, "claude").provisional);
     assert!(!point(&points, FEB_2025, "claude").provisional);

@@ -260,6 +260,54 @@ pub(super) async fn dispatch(
                 )
             }
         }
+        ModelAccountChange::SetPlan { account_id, plan } => {
+            if dry_run {
+                return Ok(Some(match plan {
+                    Some(plan) => format!("Would set account `{account_id}`'s plan to `{plan}`."),
+                    None => format!("Would clear account `{account_id}`'s plan choice."),
+                }));
+            }
+            let info = orch
+                .set_account_plan(&account_id, plan)
+                .map_err(fail)?;
+            let shown = info
+                .subscription()
+                .map(|plan| match plan.monthly_usd {
+                    Some(usd) => format!("{} ${usd}/mo", plan.label),
+                    None => format!("{}, no price", plan.label),
+                })
+                .unwrap_or_default();
+            format!(
+                "Account `{account_id}` is on {shown}. Read {}.",
+                account_uri(&account_id)
+            )
+        }
+        ModelAccountChange::UseReset { account_id } => {
+            if dry_run {
+                return Ok(Some(format!(
+                    "Would spend one of account `{account_id}`'s usage resets."
+                )));
+            }
+            let result = orch.use_usage_reset("codex", &account_id).await;
+            let outcome = match result.outcome.as_str() {
+                "reset" => "reset: its 5-hour and weekly limits are restored".to_string(),
+                "alreadyRedeemed" => "reset (this reset was already redeemed)".to_string(),
+                "nothingToReset" => "nothing to reset: no window was limited, so no reset was spent".to_string(),
+                "noCredit" => "no credit: the account holds no usage reset".to_string(),
+                _ => format!(
+                    "no reset applied: {}",
+                    result
+                        .snapshot
+                        .error
+                        .as_deref()
+                        .unwrap_or(&result.outcome)
+                ),
+            };
+            format!(
+                "Account `{account_id}`: {outcome}. Read {}.",
+                account_uri(&account_id)
+            )
+        }
         ModelAccountChange::RefreshAccount {
             account_id,
             backend: None,

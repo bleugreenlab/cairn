@@ -1,8 +1,9 @@
 //! The cairn-models facet's resources: `cairn://models/*`.
 //!
-//! Reads render what Settings → Providers shows for the workspace; nothing here
-//! reveals a credential value. The writes are a session's stop and the
-//! accounts' sign-in and usage-refresh actions. Starting a sign-in crosses the
+//! Reads render what Settings → Providers and Analytics show for the
+//! workspace; nothing here reveals a credential value. The writes are a
+//! session's stop and the accounts' sign-in, usage-refresh, plan and reset
+//! actions. Starting a sign-in crosses the
 //! `workspace/default/settings/accounts:write` boundary, the place
 //! `cairn://settings` `accounts` writes reach.
 //!
@@ -29,6 +30,42 @@ const MODELS_ACCOUNTS_ACTION: KeySpec = KeySpec::new(
     "action",
     KeyType::Str,
     "refresh_usage — re-measure every account of one installed provider now (an account measured in the last minute answers from that measurement)",
+);
+
+const MODELS_SET_PLAN_ACTION: KeySpec = KeySpec::new(
+    "action",
+    KeyType::Str,
+    "set_plan — name which of its candidate plans an account is on, where its provider's signal cannot tell (ChatGPT pro, a Team or Business seat, OpenCode Go)",
+);
+
+const MODELS_SET_PLAN_ACCOUNT: KeySpec = KeySpec::new(
+    "account",
+    KeyType::Str,
+    "ID — the account whose plan to set",
+);
+
+const MODELS_SET_PLAN_PLAN: KeySpec = KeySpec::new(
+    "plan",
+    KeyType::Str,
+    "KEY — one of the account's candidate plans as listed on it (e.g. pro_200, pro_500), or null to clear the choice",
+);
+
+const MODELS_USE_RESET_ACTION: KeySpec = KeySpec::new(
+    "action",
+    KeyType::Str,
+    "use_reset — spend one of an account's usage resets now, restoring its 5-hour and weekly limits; it cannot be undone. Codex only: Claude has no reset API, and its resets and usage credits are redeemed at claude.ai/settings/usage",
+);
+
+const MODELS_USE_RESET_PROVIDER: KeySpec = KeySpec::new(
+    "provider",
+    KeyType::Str,
+    "codex — the provider the account belongs to",
+);
+
+const MODELS_USE_RESET_ACCOUNT: KeySpec = KeySpec::new(
+    "account",
+    KeyType::Str,
+    "ID — the account to spend a reset from; its usage resets are listed under it",
 );
 
 const MODELS_USAGE_PROVIDER: KeySpec = KeySpec::new(
@@ -85,7 +122,7 @@ pub(crate) const MODELS_ACCOUNTS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ModelsAccounts,
     uri_template: "cairn://models/accounts",
     name: "Model accounts",
-    description: "Every provider account visible to the workspace, grouped by provider in priority order: label, the kind of credential it holds (a Cairn-managed Claude sign-in, a ChatGPT sign-in, an API key, a host, a custom endpoint) but never the credential itself, email and plan where the provider reports them, and its usage windows (remaining percent and reset time) with when they were measured and any block still in force. A window whose reset has passed since it was measured is shown as expired history, not as remaining capacity. A sign-in still in the user's hands shows under its provider. Append {provider: claude|codex} to start a sign-in for a new subscription account: a browser opens on this machine, the result names the page to open if it did not, and the account appears here when the user finishes. Starting a sign-in needs the `workspace/default/settings/accounts:write` grant, the same place `cairn://settings` `accounts` writes reach: an Ask run is prompted for it and a Deny run is refused. Patch {action:\"refresh_usage\", provider} to re-measure one provider's accounts now. People sign in through Settings → Providers or `cairn auth login claude`; all three doors run the same sign-in.",
+    description: "Every provider account visible to the workspace, grouped by provider in priority order: label, the kind of credential it holds (a Cairn-managed Claude sign-in, a ChatGPT sign-in, an API key, a host, a custom endpoint) but never the credential itself, email, the subscription plan and its monthly list price (or no price) where the account is a subscription, with the candidate plans when the provider cannot say which it is, and its usage windows (remaining percent and reset time) with when they were measured and any block still in force. A window whose reset has passed since it was measured is shown as expired history, not as remaining capacity. A sign-in still in the user's hands shows under its provider. Append {provider: claude|codex} to start a sign-in for a new subscription account: a browser opens on this machine, the result names the page to open if it did not, and the account appears here when the user finishes. Starting a sign-in needs the `workspace/default/settings/accounts:write` grant, the same place `cairn://settings` `accounts` writes reach: an Ask run is prompted for it and a Deny run is refused. Patch {action:\"refresh_usage\", provider} to re-measure one provider's accounts now, {action:\"set_plan\", account, plan} to name which candidate plan an account is on, as Settings → Providers' plan toggle does, or {action:\"use_reset\", provider:\"codex\", account} to spend one of a Codex account's usage resets, as its row's Use does. Each account lists the usage resets it holds. People sign in through Settings → Providers or `cairn auth login claude`; all three doors run the same sign-in.",
     read_projections: &[ProjectionSpec { key: "provider", values: "KEY — one provider's accounts, e.g. claude, codex, ollama" }],
     related: &[RelatedSpec { label: "pooled capacity per provider", kind: ResourceKind::ModelsUsage, actions: false }],
     cross_actions: NO_CROSS_ACTIONS,
@@ -103,6 +140,20 @@ pub(crate) const MODELS_ACCOUNTS_CONTRACT: ResourceContract = ResourceContract {
             optional: &[],
             label: "re-measure one provider's accounts now",
             example: r#"write({changes:[{target:"cairn://models/accounts",mode:"patch",payload:{action:"refresh_usage",provider:"claude"}}]})"#,
+        },
+        MutationSpec {
+            mode: ChangeMode::Patch,
+            required: &[MODELS_SET_PLAN_ACTION, MODELS_SET_PLAN_ACCOUNT, MODELS_SET_PLAN_PLAN],
+            optional: &[],
+            label: "name which candidate plan an account is on",
+            example: r#"write({changes:[{target:"cairn://models/accounts",mode:"patch",payload:{action:"set_plan",account:"ACCOUNT_ID",plan:"pro_200"}}]})"#,
+        },
+        MutationSpec {
+            mode: ChangeMode::Patch,
+            required: &[MODELS_USE_RESET_ACTION, MODELS_USE_RESET_PROVIDER, MODELS_USE_RESET_ACCOUNT],
+            optional: &[],
+            label: "spend one of a Codex account's usage resets (cannot be undone)",
+            example: r#"write({changes:[{target:"cairn://models/accounts",mode:"patch",payload:{action:"use_reset",provider:"codex",account:"ACCOUNT_ID"}}]})"#,
         },
     ],
 };
@@ -128,7 +179,7 @@ pub(crate) const MODELS_USAGE_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ModelsUsage,
     uri_template: "cairn://models/usage",
     name: "Model usage",
-    description: "Each installed provider's capacity as its Settings → Providers card shows it: the pooled usage windows across every account (remaining out of total, next reset), each account's share, what the pool is currently exhausted on, credits or recorded cost where the provider has them, when it was measured, and the last probe error. A pure read of what was already measured; it never probes a provider.",
+    description: "Each installed provider's capacity, as Settings → Analytics shows it: every usage window the provider measures, each account's remaining share of it, and the pooled total (remaining out of total, next reset); what the pool is currently exhausted on; each account's usage resets; credits or recorded cost where the provider has them; when it was measured; and the last probe error. A pure read of what was already measured; it never probes a provider.",
     read_projections: &[
         ProjectionSpec { key: "provider", values: "KEY — one installed provider" },
         ProjectionSpec { key: "view", values: "card (default) | requests — per-request usage rows (not recorded yet; says what exists instead)" },

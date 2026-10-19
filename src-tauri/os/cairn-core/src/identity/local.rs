@@ -156,6 +156,7 @@ fn update_account_from_auth(
                 last_used_at: None,
                 email: None,
                 plan: None,
+                plan_choice: None,
                 health: None,
             });
         }
@@ -197,6 +198,7 @@ mod tests {
             last_used_at,
             email: None,
             plan: None,
+            plan_choice: None,
             health: None,
         }
     }

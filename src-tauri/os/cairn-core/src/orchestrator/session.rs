@@ -3810,6 +3810,7 @@ mod tests {
             last_used_at: None,
             email: Some("profile@example.com".to_string()),
             plan: Some("max".to_string()),
+            plan_choice: None,
             health: Some(crate::credentials::ProviderAccountHealth {
                 windows: Vec::new(),
                 blocked_until: Some(chrono::Utc::now().timestamp() + 300),

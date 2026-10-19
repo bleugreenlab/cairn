@@ -400,6 +400,8 @@ pub mod testing {
         usage: Arc<Mutex<Option<ScriptedUsage>>>,
         generation: Arc<Mutex<Option<String>>>,
         probes: Arc<std::sync::atomic::AtomicUsize>,
+        reset_outcome: Arc<Mutex<Option<String>>>,
+        resets_spent: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     /// A scripted probe's answer: the snapshot, and the credential generation
@@ -810,7 +812,20 @@ pub mod testing {
                 usage: Arc::default(),
                 generation: Arc::default(),
                 probes: Arc::default(),
+                reset_outcome: Arc::default(),
+                resets_spent: Arc::default(),
             }
+        }
+
+        /// Answer every usage-reset consume with `outcome` and the scripted
+        /// usage, recording which account it was asked to spend from.
+        pub fn script_reset(&self, outcome: &str) {
+            *self.reset_outcome.lock().unwrap() = Some(outcome.to_string());
+        }
+
+        /// The accounts each usage-reset consume was asked to spend from.
+        pub fn resets_spent(&self) -> Vec<Option<String>> {
+            self.resets_spent.lock().unwrap().clone()
         }
 
         pub fn home(&self, account_id: &str) -> PathBuf {
@@ -988,7 +1003,18 @@ pub mod testing {
             provider: RoutedProvider,
             account_id: Option<&str>,
         ) -> Result<ProviderUsageResetResult, String> {
-            Unsubscribed.consume_usage_reset(host, provider, account_id)
+            self.resets_spent
+                .lock()
+                .unwrap()
+                .push(account_id.map(ToString::to_string));
+            let Some(outcome) = self.reset_outcome.lock().unwrap().clone() else {
+                return Unsubscribed.consume_usage_reset(host, provider, account_id);
+            };
+            let snapshot = match self.usage.lock().unwrap().clone() {
+                Some((snapshot, _)) => snapshot,
+                None => unsupported_usage(provider),
+            };
+            Ok(ProviderUsageResetResult { outcome, snapshot })
         }
 
         fn codex_session_login(

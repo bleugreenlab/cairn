@@ -5,10 +5,12 @@
 pub mod crypto;
 mod handle;
 pub mod lease;
+mod plan;
 pub mod store;
 
 pub use cairn_models_types::ApiProvider;
 pub use handle::CredentialStoreHandle;
+pub use plan::{jwt_claims, subscription_plan};
 
 use cairn_models_types::image::ImageCapabilities;
 use serde::{Deserialize, Serialize};
@@ -929,6 +931,10 @@ pub struct ProviderAccount {
     pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// Which of its candidate plans an account whose provider cannot say is
+    /// on (ChatGPT `pro`, a Team seat), as the operator chose it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_choice: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<ProviderAccountHealth>,
 }
@@ -1241,6 +1247,7 @@ impl CredentialStore {
             last_used_at: None,
             email: None,
             plan: None,
+            plan_choice: None,
             health: None,
         };
         let info = AccountInfo::from(&account);
@@ -1306,6 +1313,7 @@ impl CredentialStore {
             last_used_at: Some(now),
             email: login.email,
             plan: login.plan,
+            plan_choice: None,
             health: None,
         };
         let info = AccountInfo::from(&account);
@@ -1768,7 +1776,18 @@ pub struct AccountInfo {
     last_used_at: Option<i64>,
     email: Option<String>,
     plan: Option<String>,
+    /// The subscription plan this account is on and what it costs, with the
+    /// operator's choice applied. Absent for an account billed per token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subscription: Option<cairn_models_types::subscription::AccountPlan>,
     health: Option<ProviderAccountHealth>,
+}
+
+impl AccountInfo {
+    /// The subscription plan this account is on, when it is a subscription.
+    pub fn subscription(&self) -> Option<&cairn_models_types::subscription::AccountPlan> {
+        self.subscription.as_ref()
+    }
 }
 
 impl From<&ProviderAccount> for AccountInfo {
@@ -1849,6 +1868,7 @@ impl From<&ProviderAccount> for AccountInfo {
             last_used_at: account.last_used_at,
             email: account.email.clone(),
             plan: account.plan.clone(),
+            subscription: account.account_plan(),
             health: account.health.clone(),
         }
     }
@@ -2076,6 +2096,7 @@ mod tests {
             last_used_at: None,
             email: None,
             plan: None,
+            plan_choice: None,
             health: None,
         }
     }
