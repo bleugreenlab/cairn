@@ -756,7 +756,6 @@ mod tests {
         for start in &starts {
             let params = &start["params"];
             assert_eq!(params["model"], "gpt-worker");
-            assert_eq!(params["reasoningEffort"], "low");
             assert_eq!(params["baseInstructions"], WORKER_INSTRUCTIONS);
             assert_eq!(params["ephemeral"], true);
             assert_eq!(params["environments"], json!([]));
@@ -768,6 +767,7 @@ mod tests {
                     "tools.update_plan.enabled": false,
                     "tools.experimental_request_user_input.enabled": false,
                     "features.image_generation": true,
+                    "model_reasoning_effort": "low",
                 })
             );
         }

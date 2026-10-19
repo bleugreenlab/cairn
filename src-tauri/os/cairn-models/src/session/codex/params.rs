@@ -48,6 +48,7 @@ pub fn build_thread_start_params(
         "serviceName": "cairn",
         "baseInstructions": base_instructions,
     });
+    let mut config = serde_json::Map::new();
     if tool_free {
         // No rollout persisted, no shell or environment, nothing writable, and
         // every tool Codex would offer without one switched off for this
@@ -59,7 +60,6 @@ pub fn build_thread_start_params(
         params["ephemeral"] = serde_json::json!(true);
         params["environments"] = serde_json::json!([]);
         params["sandbox"] = serde_json::json!("read-only");
-        let mut config = serde_json::Map::new();
         for server in process_mcp_servers {
             config.insert(
                 crate::session::mcp::codex_thread_disable_key(server),
@@ -85,13 +85,13 @@ pub fn build_thread_start_params(
                 serde_json::json!(true),
             );
         }
+    }
+    insert_effort_override(&mut config, reasoning_effort);
+    if !config.is_empty() {
         params["config"] = Value::Object(config);
     }
     if let Some(model) = model {
         params["model"] = serde_json::json!(model);
-    }
-    if let Some(effort) = reasoning_effort {
-        params["reasoningEffort"] = serde_json::json!(effort);
     }
     if let Some(tier) = service_tier {
         params["serviceTier"] = serde_json::json!(tier);
@@ -100,6 +100,23 @@ pub fn build_thread_start_params(
         params["developerInstructions"] = serde_json::json!(instructions);
     }
     params
+}
+
+/// The thread methods (`thread/start`, `resume`, `fork`) have no effort
+/// field; Codex takes a thread's effort only as a `config` override of
+/// `model_reasoning_effort`. A key the protocol lacks is silently dropped,
+/// which is how a top-level `reasoningEffort` went unapplied from March to
+/// October 2026. Without an override the model's catalog default applies.
+fn insert_effort_override(
+    config: &mut serde_json::Map<String, Value>,
+    reasoning_effort: Option<&str>,
+) {
+    if let Some(effort) = reasoning_effort {
+        config.insert(
+            "model_reasoning_effort".to_string(),
+            serde_json::json!(effort),
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -119,14 +136,15 @@ pub fn build_thread_resume_params(
         "cwd": cwd,
         "approvalPolicy": approval_policy,
         "sandbox": sandbox_mode,
-        "serviceName": "cairn",
         "baseInstructions": base_instructions,
     });
+    let mut config = serde_json::Map::new();
+    insert_effort_override(&mut config, reasoning_effort);
+    if !config.is_empty() {
+        params["config"] = Value::Object(config);
+    }
     if let Some(model) = model {
         params["model"] = serde_json::json!(model);
-    }
-    if let Some(effort) = reasoning_effort {
-        params["reasoningEffort"] = serde_json::json!(effort);
     }
     if let Some(tier) = service_tier {
         params["serviceTier"] = serde_json::json!(tier);
@@ -379,9 +397,14 @@ mod tests {
         assert_eq!(params["baseInstructions"], "BASE");
         assert_eq!(params["developerInstructions"], "agent content");
         assert_eq!(params["serviceTier"], "priority");
-        for key in ["ephemeral", "environments", "config"] {
+        for key in ["ephemeral", "environments"] {
             assert!(params.get(key).is_none(), "{key} on a session with tools");
         }
+        // A session with tools carries no tool-free overrides, only its effort.
+        assert_eq!(
+            params["config"],
+            serde_json::json!({ "model_reasoning_effort": "medium" })
+        );
     }
 
     /// A tool-free thread persists nothing, reaches no environment, can write
@@ -552,6 +575,158 @@ mod tests {
 
         assert_eq!(params["baseInstructions"], "BASE");
         assert!(params.get("developerInstructions").is_none());
+    }
+
+    fn key_names(params: &Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = params
+            .as_object()
+            .expect("params are an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The exact keys `thread/start` sends, checked against Codex 0.163.0's
+    /// `ThreadStartParams`: it has no reasoning-effort field, so the effort
+    /// rides in the `config` override map as `model_reasoning_effort`.
+    #[test]
+    fn thread_start_sends_only_protocol_keys_with_effort_in_config() {
+        let params = build_thread_start_params(
+            "/tmp/worktree",
+            "on-request",
+            "workspace-write",
+            Some("gpt-test"),
+            Some("high"),
+            Some("priority"),
+            "BASE",
+            Some("AGENT"),
+            false,
+            &[],
+            CodexNativeTools::None,
+        );
+        assert_eq!(
+            key_names(&params),
+            [
+                "approvalPolicy",
+                "baseInstructions",
+                "config",
+                "cwd",
+                "developerInstructions",
+                "model",
+                "sandbox",
+                "serviceName",
+                "serviceTier",
+            ]
+        );
+        assert_eq!(
+            params["config"],
+            serde_json::json!({ "model_reasoning_effort": "high" })
+        );
+    }
+
+    /// `thread/resume` has neither a reasoning-effort field nor `serviceName`
+    /// in Codex 0.163.0's `ThreadResumeParams`.
+    #[test]
+    fn thread_resume_sends_only_protocol_keys_with_effort_in_config() {
+        let params = build_thread_resume_params(
+            "thread-1",
+            "/tmp/worktree",
+            "on-request",
+            "workspace-write",
+            Some("gpt-test"),
+            Some("high"),
+            Some("priority"),
+            "BASE",
+            Some("AGENT"),
+        );
+        assert_eq!(
+            key_names(&params),
+            [
+                "approvalPolicy",
+                "baseInstructions",
+                "config",
+                "cwd",
+                "developerInstructions",
+                "model",
+                "sandbox",
+                "serviceTier",
+                "threadId",
+            ]
+        );
+        assert_eq!(
+            params["config"],
+            serde_json::json!({ "model_reasoning_effort": "high" })
+        );
+    }
+
+    /// `thread/fork` is resume's keys plus `deferGoalContinuation`, which
+    /// 0.163.0 declares only in its experimental schema.
+    #[test]
+    fn thread_fork_sends_only_protocol_keys_with_effort_in_config() {
+        let params = build_thread_fork_params(
+            "thread-1",
+            "/tmp/worktree",
+            "on-request",
+            "workspace-write",
+            Some("gpt-test"),
+            Some("high"),
+            Some("priority"),
+            "BASE",
+            Some("AGENT"),
+        );
+        assert_eq!(
+            key_names(&params),
+            [
+                "approvalPolicy",
+                "baseInstructions",
+                "config",
+                "cwd",
+                "deferGoalContinuation",
+                "developerInstructions",
+                "model",
+                "sandbox",
+                "serviceTier",
+                "threadId",
+            ]
+        );
+        assert_eq!(
+            params["config"],
+            serde_json::json!({ "model_reasoning_effort": "high" })
+        );
+    }
+
+    /// With no configured effort nothing is overridden: the thread keeps
+    /// the model's catalog default, and a resume sends no `config` at all.
+    #[test]
+    fn no_configured_effort_sends_no_effort_override() {
+        let resumed = build_thread_resume_params(
+            "thread-1",
+            "/tmp/worktree",
+            "on-request",
+            "workspace-write",
+            None,
+            None,
+            None,
+            "BASE",
+            None,
+        );
+        assert!(resumed.get("config").is_none());
+        let started = build_thread_start_params(
+            "/tmp/worktree",
+            "on-request",
+            "workspace-write",
+            None,
+            None,
+            None,
+            "BASE",
+            None,
+            false,
+            &[],
+            CodexNativeTools::None,
+        );
+        assert!(started.get("config").is_none());
     }
 
     #[test]

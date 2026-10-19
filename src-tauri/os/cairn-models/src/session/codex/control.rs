@@ -201,8 +201,10 @@ impl CodexControl {
         if let Some(ref model) = self.model {
             params["model"] = serde_json::json!(model);
         }
+        // `TurnStartParams` spells it `effort`; it applies to this turn and
+        // every later one on the thread.
         if let Some(ref effort) = self.reasoning_effort {
-            params["reasoningEffort"] = serde_json::json!(effort);
+            params["effort"] = serde_json::json!(effort);
         }
         if let Some(ref tier) = self.service_tier {
             params["serviceTier"] = serde_json::json!(tier);

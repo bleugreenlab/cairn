@@ -691,7 +691,8 @@ mod tests {
             json!({
                 "model": "gpt-test", "cwd": "/work", "approvalPolicy": "on-request",
                 "sandbox": "workspace-write", "serviceName": "cairn", "baseInstructions": "BASE",
-                "reasoningEffort": "high", "serviceTier": "priority", "developerInstructions": "AGENT"
+                "config": {"model_reasoning_effort": "high"},
+                "serviceTier": "priority", "developerInstructions": "AGENT"
             })
         );
         assert_eq!(
@@ -1032,8 +1033,21 @@ mod tests {
             })
             .unwrap();
         let requests = requests.lock().unwrap();
-        assert_eq!(requests[0]["params"]["reasoningEffort"], "high");
-        assert_eq!(requests[0]["params"]["serviceTier"], "priority");
-        assert!(requests[0]["params"].get("outputSchema").is_none());
+        // Exactly the keys Codex 0.163.0's `TurnStartParams` declares: the
+        // effort field is `effort`.
+        let params = &requests[0]["params"];
+        let mut keys: Vec<&str> = params
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["cwd", "effort", "input", "model", "serviceTier", "threadId"]
+        );
+        assert_eq!(params["effort"], "high");
+        assert_eq!(params["serviceTier"], "priority");
     }
 }
