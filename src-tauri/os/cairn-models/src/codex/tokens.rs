@@ -105,7 +105,9 @@ impl CodexAuthState {
     /// Unix time its `exp` claim names. `None` for a token with no readable
     /// expiry, which can only be presented as it is.
     pub fn access_token_expires_at(&self) -> Option<i64> {
-        jwt_payload(&self.tokens.access_token)?.get("exp")?.as_i64()
+        crate::accounts::jwt_claims(&self.tokens.access_token)?
+            .get("exp")?
+            .as_i64()
     }
 
     /// The Cairn account this session's credential came from, for attributing

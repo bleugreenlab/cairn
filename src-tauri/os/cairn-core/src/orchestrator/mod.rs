@@ -3408,10 +3408,7 @@ mod tests {
                     ),
                     // Allocator bookkeeping is read only from glibc's
                     // `mallinfo2`; every other platform names the gap.
-                    allocator: Measurement::unavailable(
-                        10,
-                        MeasurementGap::UnsupportedPlatform,
-                    ),
+                    allocator: Measurement::unavailable(10, MeasurementGap::UnsupportedPlatform),
                     // Every channel is spelled out rather than defaulted: a
                     // defaulted channel reads `NotSampled`, which a running
                     // executor never reports, so a new channel must be placed
