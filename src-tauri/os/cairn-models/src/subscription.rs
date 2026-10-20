@@ -151,12 +151,14 @@ pub trait Subscriptions: Send + Sync {
         provider: RoutedProvider,
         account_id: &str,
     ) -> Option<String>;
-    /// Spend one of the subscription's usage-reset credits.
+    /// Spend one of `account_id`'s usage-reset credits. There is no default
+    /// account here: a credit cannot be refunded, so it is only ever spent
+    /// from the account the caller names.
     fn consume_usage_reset(
         &self,
         host: &dyn ModelHost,
         provider: RoutedProvider,
-        account_id: Option<&str>,
+        account_id: &str,
     ) -> Result<ProviderUsageResetResult, String>;
 
     /// The `account/login/start` params that sign a Codex app-server in as
@@ -293,7 +295,7 @@ impl Subscriptions for Unsubscribed {
         &self,
         _host: &dyn ModelHost,
         _provider: RoutedProvider,
-        _account_id: Option<&str>,
+        _account_id: &str,
     ) -> Result<ProviderUsageResetResult, String> {
         Err(format!(
             "Usage resets are unavailable: {NO_SUBSCRIPTION_SUPPORT}."
@@ -401,7 +403,7 @@ pub mod testing {
         generation: Arc<Mutex<Option<String>>>,
         probes: Arc<std::sync::atomic::AtomicUsize>,
         reset_outcome: Arc<Mutex<Option<String>>>,
-        resets_spent: Arc<Mutex<Vec<Option<String>>>>,
+        resets_spent: Arc<Mutex<Vec<String>>>,
     }
 
     /// A scripted probe's answer: the snapshot, and the credential generation
@@ -556,7 +558,7 @@ pub mod testing {
             &self,
             host: &dyn ModelHost,
             provider: RoutedProvider,
-            account_id: Option<&str>,
+            account_id: &str,
         ) -> Result<ProviderUsageResetResult, String> {
             Unsubscribed.consume_usage_reset(host, provider, account_id)
         }
@@ -715,7 +717,7 @@ pub mod testing {
             &self,
             host: &dyn ModelHost,
             provider: RoutedProvider,
-            account_id: Option<&str>,
+            account_id: &str,
         ) -> Result<ProviderUsageResetResult, String> {
             Unsubscribed.consume_usage_reset(host, provider, account_id)
         }
@@ -824,7 +826,7 @@ pub mod testing {
         }
 
         /// The accounts each usage-reset consume was asked to spend from.
-        pub fn resets_spent(&self) -> Vec<Option<String>> {
+        pub fn resets_spent(&self) -> Vec<String> {
             self.resets_spent.lock().unwrap().clone()
         }
 
@@ -1001,12 +1003,12 @@ pub mod testing {
             &self,
             host: &dyn ModelHost,
             provider: RoutedProvider,
-            account_id: Option<&str>,
+            account_id: &str,
         ) -> Result<ProviderUsageResetResult, String> {
             self.resets_spent
                 .lock()
                 .unwrap()
-                .push(account_id.map(ToString::to_string));
+                .push(account_id.to_string());
             let Some(outcome) = self.reset_outcome.lock().unwrap().clone() else {
                 return Unsubscribed.consume_usage_reset(host, provider, account_id);
             };

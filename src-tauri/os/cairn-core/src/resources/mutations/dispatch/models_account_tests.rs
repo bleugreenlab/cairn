@@ -868,6 +868,13 @@ async fn use_reset_spends_from_the_named_codex_account_only() {
     };
     let first = seat("First seat", "chatgpt-first");
     let second = seat("Second seat", "chatgpt-second");
+    grant(
+        &f,
+        &normalize::usage_reset_spend(RoutedProvider::Codex, &second),
+        AuthorityLifetimeKind::Standing,
+        vec![],
+    )
+    .await;
 
     let done = act(
         &f,
@@ -882,7 +889,7 @@ async fn use_reset_spends_from_the_named_codex_account_only() {
         "{done}"
     );
     // The row's account, and no other, is the one spent from.
-    assert_eq!(homes.resets_spent(), vec![Some(second.clone())]);
+    assert_eq!(homes.resets_spent(), vec![second.clone()]);
 
     // What Codex reported afterwards is that account's measurement alone.
     let pool = f.orch.provider_usage_pool("codex", None);
@@ -935,4 +942,113 @@ async fn use_reset_spends_from_the_named_codex_account_only() {
     .unwrap_err();
     assert!(refused.contains("not a subscription sign-in"), "{refused}");
     assert_eq!(homes.resets_spent().len(), 1);
+}
+
+/// An agent spends a usage reset only with the operator's approval: the write
+/// names that account's own boundary and says the credit is gone for good, it
+/// spends nothing until a grant covers it, a grant for one account covers no
+/// other, and a once-grant spends exactly one. Re-measuring and naming a plan
+/// stay ungated.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_spends_a_usage_reset_only_with_the_operators_approval() {
+    use crate::authorization::prepare::{prepare_batch, Prepared};
+    let homes = TempHomes::new(tempfile::tempdir().unwrap().keep());
+    homes.script_reset("reset");
+    let f = fixture_on(seeded_orchestrator_with(Arc::new(homes.clone())).await).await;
+    let seat = |label: &str, auth: String| {
+        f.orch
+            .add_account(
+                ApiProvider::OpenAI,
+                label.into(),
+                ProviderAuth::OAuthToken { value: auth },
+                None,
+            )
+            .unwrap()
+            .id
+    };
+    let first = seat("First seat", chatgpt_seat("chatgpt-first"));
+    let second = seat("Pro seat", chatgpt_auth("pro"));
+    let use_reset =
+        |account: &str| json!({"action": "use_reset", "provider": "codex", "account": account});
+    let scope = |account: &str| format!("account/codex/{account}:write");
+    let crossings = |payload: Value, target: &str| {
+        let item = change_item(target, ChangeMode::Patch, Some(payload));
+        let f = &f;
+        async move { prepare_batch(&f.orch, &as_run(&f.run_id), &[item]).await }
+    };
+
+    let prepared = crossings(use_reset(&second), "cairn://models/accounts").await;
+    let request = match &prepared[..] {
+        [(_, Prepared::Authority(request))] => request.clone(),
+        other => panic!("expected the account's boundary, got {other:?}"),
+    };
+    assert_eq!(request.scope.shorthand(), scope(&second));
+    assert!(
+        request.summary.contains(&second) && request.summary.contains("cannot be refunded"),
+        "{}",
+        request.summary
+    );
+
+    // Unapproved, the spend is refused naming what would need approving.
+    let refused = act(
+        &f,
+        "cairn://models/accounts",
+        ChangeMode::Patch,
+        use_reset(&second),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains(&scope(&second)), "{refused}");
+    assert!(homes.resets_spent().is_empty());
+
+    // Approving one account's reset does not approve another's.
+    grant(&f, &request, AuthorityLifetimeKind::Once, vec![]).await;
+    let refused = act(
+        &f,
+        "cairn://models/accounts",
+        ChangeMode::Patch,
+        use_reset(&first),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains(&scope(&first)), "{refused}");
+    assert!(homes.resets_spent().is_empty());
+
+    // The once-grant spends exactly one, from the account it names.
+    act(
+        &f,
+        "cairn://models/accounts",
+        ChangeMode::Patch,
+        use_reset(&second),
+    )
+    .await
+    .unwrap();
+    assert_eq!(homes.resets_spent(), vec![second.clone()]);
+    act(
+        &f,
+        "cairn://models/accounts",
+        ChangeMode::Patch,
+        use_reset(&second),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(homes.resets_spent().len(), 1);
+
+    for (target, payload) in [
+        (
+            "cairn://models/accounts".to_string(),
+            json!({"action": "refresh_usage", "provider": "codex"}),
+        ),
+        (
+            format!("cairn://models/accounts/{second}"),
+            json!({"action": "refresh_usage"}),
+        ),
+        (
+            "cairn://models/accounts".to_string(),
+            json!({"action": "set_plan", "account": second, "plan": "pro_500"}),
+        ),
+    ] {
+        let prepared = crossings(payload.clone(), &target).await;
+        assert!(prepared.is_empty(), "{payload} crossed: {prepared:?}");
+    }
 }

@@ -127,10 +127,7 @@ pub fn provider_sign_in(
         },
         AuthorityAction::Write,
     );
-    let provider_name = match provider {
-        cairn_models::accounts::RoutedProvider::Claude => "Claude",
-        cairn_models::accounts::RoutedProvider::Codex => "Codex (ChatGPT)",
-    };
+    let provider_name = provider_name(provider);
     match account_id {
         None => AuthorityRequest::new(
             scope,
@@ -143,6 +140,42 @@ pub fn provider_sign_in(
             format!("re-authenticate workspace account {account_id} ({provider_name})"),
         ),
     }
+}
+
+fn provider_name(provider: cairn_models::accounts::RoutedProvider) -> &'static str {
+    match provider {
+        cairn_models::accounts::RoutedProvider::Claude => "Claude",
+        cairn_models::accounts::RoutedProvider::Codex => "Codex (ChatGPT)",
+    }
+}
+
+/// Spending one of a subscription account's usage-reset credits through
+/// `cairn://models/accounts` → `ExternalAccount(provider, account) + Write`.
+///
+/// The place is the account at its provider, not the `accounts` settings
+/// section: a reset writes nothing in Cairn's credential store, and keying it
+/// there would let a grant to sign an account in also spend its resets. Each
+/// account is its own place, so approving a reset on one never covers another.
+/// `account_id` is the workspace account id the write resolved to.
+pub fn usage_reset_spend(
+    provider: cairn_models::accounts::RoutedProvider,
+    account_id: &str,
+) -> AuthorityRequest {
+    let scope = AuthorityScope::new(
+        AuthorityPlace::ExternalAccount {
+            provider: provider.backend().to_string(),
+            account_id: account_id.to_string(),
+        },
+        AuthorityAction::Write,
+    );
+    AuthorityRequest::new(
+        scope,
+        AuthorityMutation::Update,
+        format!(
+            "spend one of {} account {account_id}'s usage-reset credits; a spent credit cannot be refunded",
+            provider_name(provider)
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -230,5 +263,24 @@ mod tests {
             new.summary
         );
         assert!(again.summary.contains("acc_1"), "{}", again.summary);
+    }
+
+    /// A reset is spent at its account, never at the credential store a
+    /// sign-in writes, and one account's place is not another's.
+    #[test]
+    fn a_usage_reset_reaches_its_own_account_and_says_it_is_final() {
+        use cairn_models::accounts::RoutedProvider;
+        let spend = usage_reset_spend(RoutedProvider::Codex, "acc_1");
+        let other = usage_reset_spend(RoutedProvider::Codex, "acc_2");
+        let sign_in = provider_sign_in("default", RoutedProvider::Codex, Some("acc_1"));
+        assert_eq!(spend.scope.shorthand(), "account/codex/acc_1:write");
+        assert_ne!(spend.scope, other.scope);
+        assert_ne!(spend.scope, sign_in.scope);
+        assert!(spend.summary.contains("acc_1"), "{}", spend.summary);
+        assert!(
+            spend.summary.contains("cannot be refunded"),
+            "{}",
+            spend.summary
+        );
     }
 }

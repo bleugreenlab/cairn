@@ -27,9 +27,11 @@
 //!
 //! # What v1 enforces
 //!
-//! Only two places are wired to policy: [`AuthorityPlace::WorkspaceSettings`]
-//! and [`AuthorityPlace::Tool`] with [`ToolKind::McpServer`] at workspace
-//! scope. The remaining places exist so the follow-on adapters named in
+//! Three places are wired to policy: [`AuthorityPlace::WorkspaceSettings`],
+//! [`AuthorityPlace::Tool`] with [`ToolKind::McpServer`] at workspace scope,
+//! and [`AuthorityPlace::ExternalAccount`] with [`AuthorityAction::Write`],
+//! which spending a subscription account's usage-reset credit reaches. The
+//! remaining places and actions exist so the follow-on adapters named in
 //! [`FOLLOW_ON_ADAPTERS`] normalize into this vocabulary rather than inventing
 //! parallel names later; they carry no enforcement today.
 
@@ -59,7 +61,7 @@ pub const FOLLOW_ON_ADAPTERS: &[(&str, &str)] = &[
         "a trusted machine gains a broader data or host domain; placement and routine Run stay direct",
     ),
     (
-        "ExternalAccount + Write/Run",
+        "ExternalAccount + Run",
         "operator identity misuse",
     ),
     (
@@ -869,6 +871,10 @@ pub enum AuthorityReason {
     /// Installing, removing, enabling, or reconfiguring a workspace MCP server
     /// wires executable or network capability for every future agent.
     WorkspaceToolCapability,
+    /// Changing state on an account the operator holds with an outside
+    /// provider that Cairn cannot undo, such as spending a usage-reset credit,
+    /// which the provider does not refund.
+    ExternalAccountWrite,
     /// Within the actor's established authority; no blast radius expansion.
     WithinExistingAuthority,
     /// Structurally invalid or an invariant violation. Approval cannot legalize
@@ -884,6 +890,7 @@ impl AuthorityReason {
                 "unclassified_workspace_settings_section"
             }
             AuthorityReason::WorkspaceToolCapability => "workspace_tool_capability",
+            AuthorityReason::ExternalAccountWrite => "external_account_write",
             AuthorityReason::WithinExistingAuthority => "within_existing_authority",
             AuthorityReason::StructurallyInvalid => "structurally_invalid",
         }

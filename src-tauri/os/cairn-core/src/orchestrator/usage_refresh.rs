@@ -143,7 +143,7 @@ impl Orchestrator {
         let account = account_id.to_string();
         let consume = tokio::task::spawn_blocking(move || {
             orch.subscriptions()
-                .consume_usage_reset(&orch, RoutedProvider::Codex, Some(&account))
+                .consume_usage_reset(&orch, RoutedProvider::Codex, &account)
         });
         let result = match tokio::time::timeout(USAGE_REFRESH_TIMEOUT, consume).await {
             Ok(Ok(Ok(result))) => result,

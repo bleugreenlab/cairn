@@ -15,8 +15,8 @@
 use std::fmt::Write as _;
 
 use super::super::{
-    authorize_sign_in, build_failure, parse_models_account_change, ModelAccountChange,
-    ResourceMutationResult,
+    authorize_account_change, authorize_sign_in, build_failure, parse_models_account_change,
+    ModelAccountChange, ResourceMutationResult,
 };
 use crate::mcp::types::{ChangeItem, McpCallbackRequest};
 use crate::orchestrator::usage_refresh::{UsageMeasurement, UsageRefresh, UsageRefreshTarget};
@@ -169,6 +169,8 @@ pub(super) async fn dispatch(
     };
     let change = change.map_err(|error| build_failure(index, item, error))?;
     let fail = |error: String| build_failure(index, item, error);
+    // The boundary the gate prompted for, read from the same change.
+    let authority = change.authority();
 
     let summary = match change {
         ModelAccountChange::StartSignIn { provider }
@@ -177,9 +179,7 @@ pub(super) async fn dispatch(
                 ModelAccountChange::ReSignIn { account_id, .. } => Some(account_id.clone()),
                 _ => None,
             };
-            let authority = change
-                .authority()
-                .expect("a sign-in start crosses the accounts boundary");
+            let authority = authority.expect("a sign-in start crosses the accounts boundary");
             if dry_run {
                 return Ok(Some(format!(
                     "Would {} (scope {}); a browser would open on this machine.",
@@ -283,11 +283,16 @@ pub(super) async fn dispatch(
             )
         }
         ModelAccountChange::UseReset { account_id } => {
+            let authority = authority.expect("spending a reset crosses its account's boundary");
             if dry_run {
                 return Ok(Some(format!(
-                    "Would spend one of account `{account_id}`'s usage resets."
+                    "Would spend one of account `{account_id}`'s usage resets (scope {}); a spent reset cannot be refunded.",
+                    authority.scope.shorthand()
                 )));
             }
+            authorize_account_change(orch, request, &authority)
+                .await
+                .map_err(fail)?;
             let result = orch.use_usage_reset("codex", &account_id).await;
             let outcome = match result.outcome.as_str() {
                 "reset" => "reset: its 5-hour and weekly limits are restored".to_string(),

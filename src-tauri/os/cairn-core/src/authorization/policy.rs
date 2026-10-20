@@ -121,10 +121,22 @@ pub fn classify(scope: &AuthorityScope, owned_by_actor: bool) -> AuthorityPolicy
             AuthorityPolicy::RequiresApproval(AuthorityReason::WorkspaceToolCapability)
         }
 
+        // ── External accounts ───────────────────────────────────────────
+        // Writing to an account the operator holds with an outside provider
+        // changes something there that Cairn cannot take back: a spent Codex
+        // usage-reset credit is not refunded. Not blast radius, but the one
+        // place a scarce, irreversible spend crosses, so the operator decides.
+        // Using the account's credential is `Run` at the same place and stays
+        // direct below: the broker resolves it for every launch.
+        (AuthorityPlace::ExternalAccount { .. }, AuthorityAction::Write) => {
+            AuthorityPolicy::RequiresApproval(AuthorityReason::ExternalAccountWrite)
+        }
+
         // ── Everything else ─────────────────────────────────────────────
         // Ordinary work stays direct: project reads, writes, and runs; project
         // settings and project MCP configuration under the project's own
-        // authority; invoking an already-configured server. Executor places are
+        // authority; invoking an already-configured server; using an external
+        // account's credential. Executor places are
         // deliberately unclassified in v1 — placement is not authorization, and
         // enrollment has no adapter yet, so nothing here should start prompting
         // for a routine remote command.
@@ -215,6 +227,25 @@ mod tests {
         assert_eq!(classify(&run_tool, false), AuthorityPolicy::Direct);
         let read_settings = AuthorityScope::new(settings("backends").place, AuthorityAction::Read);
         assert_eq!(classify(&read_settings, false), AuthorityPolicy::Direct);
+    }
+
+    #[test]
+    fn writing_an_external_account_requires_approval_but_using_its_credential_does_not() {
+        let place = AuthorityPlace::ExternalAccount {
+            provider: "codex".to_string(),
+            account_id: "acc_1".to_string(),
+        };
+        assert_eq!(
+            classify(
+                &AuthorityScope::new(place.clone(), AuthorityAction::Write),
+                false
+            ),
+            AuthorityPolicy::RequiresApproval(AuthorityReason::ExternalAccountWrite)
+        );
+        assert_eq!(
+            classify(&AuthorityScope::new(place, AuthorityAction::Run), false),
+            AuthorityPolicy::Direct
+        );
     }
 
     #[test]

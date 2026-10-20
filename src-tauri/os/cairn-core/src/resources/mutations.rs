@@ -25,7 +25,8 @@ pub(crate) use dispatch::dispatch_resource_change;
 pub(crate) use hash::hash_resource_target;
 pub(crate) use mcp::workspace_mcp_authority;
 pub(crate) use models_accounts::{
-    authorize_sign_in, models_account_authority, parse_models_account_change, ModelAccountChange,
+    authorize_account_change, authorize_sign_in, models_account_authority,
+    parse_models_account_change, ModelAccountChange,
 };
 pub(crate) use projects::project_write_crossing_path;
 pub(crate) use settings::workspace_settings_authority;

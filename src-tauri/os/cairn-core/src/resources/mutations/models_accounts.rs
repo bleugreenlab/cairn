@@ -8,12 +8,17 @@
 //!
 //! Starting a sign-in — `append` on the list, `sign_in` on an account — crosses
 //! the `workspace/default/settings/accounts:write` boundary, the place
-//! `cairn://settings` `accounts` writes reach. Finishing or abandoning a
-//! pending sign-in continues an authorized start, and re-measuring usage,
-//! naming which plan an account is on, or spending one of its usage resets
-//! expands no authority, so none of those is gated.
+//! `cairn://settings` `accounts` writes reach. Spending a usage reset —
+//! `use_reset` — crosses that account's own boundary,
+//! `account/codex/<id>:write`: a reset credit is scarce and the provider does
+//! not refund it, so an agent spends one only with the operator's approval,
+//! and approving one account's reset never covers another's. The operator's
+//! own Use in Settings → Providers is not a write through this resource and
+//! asks nothing. Finishing or abandoning a pending sign-in continues an
+//! authorized start, and re-measuring usage or naming which plan an account is
+//! on is cheap and reversible, so none of those is gated.
 
-use cairn_common::authorization::{AuthorityReason, AuthorityRequest};
+use cairn_common::authorization::{AuthorityDecision, AuthorityRequest};
 use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_models::accounts::{AccountInfo, ApiProvider, RoutedProvider};
 use cairn_models::interface::{ModelScope, Models};
@@ -61,19 +66,29 @@ pub(crate) enum ModelAccountChange {
 impl ModelAccountChange {
     /// The boundary this change crosses, if it crosses one.
     pub(crate) fn authority(&self) -> Option<AuthorityRequest> {
-        let (provider, account_id) = match self {
-            Self::StartSignIn { provider } => (*provider, None),
+        use crate::authorization::{normalize, WORKSPACE_ID};
+        match self {
+            Self::StartSignIn { provider } => {
+                Some(normalize::provider_sign_in(WORKSPACE_ID, *provider, None))
+            }
             Self::ReSignIn {
                 account_id,
                 provider,
-            } => (*provider, Some(account_id.as_str())),
-            _ => return None,
-        };
-        Some(crate::authorization::normalize::provider_sign_in(
-            crate::authorization::WORKSPACE_ID,
-            provider,
-            account_id,
-        ))
+            } => Some(normalize::provider_sign_in(
+                WORKSPACE_ID,
+                *provider,
+                Some(account_id),
+            )),
+            Self::UseReset { account_id } => Some(normalize::usage_reset_spend(
+                RoutedProvider::Codex,
+                account_id,
+            )),
+            Self::SubmitCode { .. }
+            | Self::CancelSignIn { .. }
+            | Self::RefreshProvider { .. }
+            | Self::RefreshAccount { .. }
+            | Self::SetPlan { .. } => None,
+        }
     }
 }
 
@@ -322,29 +337,38 @@ pub(crate) fn models_account_authority(
     }
 }
 
-/// The final check before a sign-in starts, re-derived from the change about
-/// to happen and consuming a once-grant. Answers with the start's attribution:
-/// the calling run as initiator, and the decision row that allowed it.
+/// The final check before a gated account change acts, re-derived from the
+/// change about to happen and consuming a once-grant. Answers with the id of
+/// the decision row that allowed it.
+pub(crate) async fn authorize_account_change(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    authority: &AuthorityRequest,
+) -> Result<Option<String>, String> {
+    let Some(actor) = crate::authorization::resolve_actor(orch, request).await else {
+        return Err(format!(
+            "Denied: only an authenticated run can be authorized to {}.",
+            authority.summary
+        ));
+    };
+    let (decision, event_id) = crate::authorization::authorize_recorded(&actor, authority).await?;
+    match decision {
+        AuthorityDecision::Direct | AuthorityDecision::AllowedByGrant { .. } => Ok(event_id),
+        AuthorityDecision::ApprovalRequired(reason) | AuthorityDecision::Forbidden(reason) => {
+            Err(crate::authorization::refusal_message(authority, reason))
+        }
+    }
+}
+
+/// [`authorize_account_change`] for a sign-in start, answering with the
+/// start's attribution: the calling run as initiator, and the decision row
+/// that allowed it.
 pub(crate) async fn authorize_sign_in(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     authority: &AuthorityRequest,
 ) -> Result<SignInInitiator, String> {
-    let Some(actor) = crate::authorization::resolve_actor(orch, request).await else {
-        return Err(
-            "Denied: starting a provider sign-in requires an authenticated run to authorize."
-                .to_string(),
-        );
-    };
-    let (decision, event_id) = crate::authorization::authorize_recorded(&actor, authority).await?;
-    if !decision.is_allowed() {
-        return Err(crate::authorization::refusal_message(
-            authority,
-            decision
-                .reason()
-                .unwrap_or(AuthorityReason::WorkspaceSettingsCapability),
-        ));
-    }
+    let event_id = authorize_account_change(orch, request, authority).await?;
     let agent = crate::mcp::handlers::run_context::authenticated_agent(&orch.db, request).await?;
     let (principal, appearance) = agent.appearance(orch.services.clock.now())?;
     SignInInitiator::attributed(principal, appearance, event_id)

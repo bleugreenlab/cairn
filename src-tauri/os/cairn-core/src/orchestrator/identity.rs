@@ -1120,7 +1120,7 @@ mod tests {
             &self,
             host: &dyn ModelHost,
             provider: RoutedProvider,
-            id: Option<&str>,
+            id: &str,
         ) -> Result<cairn_models::types::usage::ProviderUsageResetResult, String> {
             Unsubscribed.consume_usage_reset(host, provider, id)
         }
