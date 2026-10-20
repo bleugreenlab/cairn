@@ -226,6 +226,11 @@ impl QueueEntry {
         )
     }
 
+    /// When this entry's request began waiting; see the field.
+    pub(crate) fn queued_at_unix_ms(&self) -> u64 {
+        self.queued_at_unix_ms
+    }
+
     /// What this entry tells a machine it is being offered.
     ///
     /// Built from `attempt`, the request as placement resolved it for this one

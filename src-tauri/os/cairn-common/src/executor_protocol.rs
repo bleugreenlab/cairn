@@ -4656,7 +4656,18 @@ pub struct LearnedResourceEstimate {
 /// runtime-free backstop, and children raised above the daemon in the kernel's
 /// OOM ranking. What a runner gets wrong talking to an older executor: nothing
 /// it did not already get wrong, since the handshake admits only equal versions.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 152;
+///
+/// Version 153 (cairn/5178) makes [`ExecutorSubstrateReport::predicted_relief_ms`]
+/// honour the runner's occupancy contract. An older executor forecasts the
+/// drain from only the occupants that carry a learned duration they have not
+/// yet outlived, silently dropping the rest, so a machine held for hours by a
+/// whole-suite run past its estimate reported relief in minutes and a parked
+/// check printed that forecast for its whole wait. A 153 executor reports
+/// `None` when any occupant is unestimated or overdue, which the runner already
+/// renders as unforecastable. No frame changes shape and an older runner reads
+/// `None` as it always has. The number moves as a rollout trigger, as 137 and
+/// 151 did: without it no attached machine would run the corrected forecast.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 153;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -10448,7 +10459,10 @@ pub struct ExecutorSubstrateReport {
     /// machine's reported executing set and pricing each entry against learned
     /// estimates. The machine knows when each of its own requests actually
     /// started; the runner only knew when it dispatched them. `None` when
-    /// nothing is running, or when nothing running carries an estimate.
+    /// nothing is running, and `None` when any running command has no learned
+    /// duration or has already outlived it: the occupancy contract in the
+    /// runner's `fleet/occupancy.rs` reads either as unforecastable, and a
+    /// drain predicted from the remaining occupants would be a guess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predicted_relief_ms: Option<u64>,
     /// Every slot this machine holds, warm or idle — the inventory cache

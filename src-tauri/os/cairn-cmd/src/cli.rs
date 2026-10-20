@@ -569,16 +569,17 @@ pub(crate) async fn run_cli_check(
     retry: bool,
     os: Option<String>,
     executor: Option<String>,
-) -> bool {
+) -> i32 {
     let placement = check_placement(os, executor, env::var(BATCH_EXECUTOR_ENV).ok());
     let callback_url = cli_callback_url();
     if !ensure_callback_reachable(&callback_url).await {
         print_unreachable_callback(&callback_url);
-        return false;
+        return 1;
     }
     let client = build_cli_client(callback_url);
     let requests = suites
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|suite| check_run_request(&client, suite, branch.clone(), retry, placement.as_ref()));
     let outcomes = futures::future::join_all(requests.map(|request| {
         let client = &client;
@@ -586,7 +587,8 @@ pub(crate) async fn run_cli_check(
     }))
     .await;
     let mut all_passed = true;
-    for outcome in outcomes {
+    let mut started = Vec::new();
+    for (suite, outcome) in suites.into_iter().zip(outcomes) {
         if !outcome.transport_ok {
             eprintln!("cairn check run: {}", outcome.result.trim_end());
             all_passed = false;
@@ -619,61 +621,38 @@ pub(crate) async fn run_cli_check(
             all_passed = false;
             continue;
         };
-        let mut last_state = String::new();
-        let final_response = loop {
-            let status = client
-                .callback(&check_run_status_request(&client, handle))
-                .await;
-            if !status.transport_ok {
-                eprintln!("cairn check run: {}", status.result.trim_end());
-                all_passed = false;
-                break None;
-            }
-            let observation = match parse_check_run_observation(&status.result) {
-                Ok(observation) => observation,
-                Err(error) => {
-                    eprintln!("cairn check run: {error}");
-                    all_passed = false;
-                    break None;
-                }
-            };
-            let state = observation
-                .get("state")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            if state != last_state && matches!(state, "queued" | "running" | "parked") {
-                let diagnostic = observation
-                    .get("diagnostic")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(state);
-                eprintln!("cairn check run: {diagnostic}");
-                last_state = state.to_string();
-            }
-            match state {
-                "complete" => {
-                    break Some(
-                        serde_json::json!({
-                            "ok": true,
-                            "result": observation.get("result").cloned().unwrap_or_default()
-                        })
-                        .to_string(),
-                    )
-                }
-                "failed" => {
+        eprintln!(
+            "cairn check run: {}",
+            check_run_start_line(&suite, handle, retry)
+        );
+        started.push((suite, handle.to_string()));
+    }
+    let stop = stop_requested();
+    tokio::pin!(stop);
+    for (position, (suite, handle)) in started.iter().enumerate() {
+        let last = std::sync::Mutex::new(None);
+        let final_response = tokio::select! {
+            settled = watch_check_run(&client, suite, handle, &last) => settled,
+            exit_code = &mut stop => {
+                let now = unix_now_ms();
+                let last = last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                eprintln!(
+                    "cairn check run: {}",
+                    check_run_stop_line(last.as_ref(), suite, handle, now)
+                );
+                for (suite, handle) in &started[position + 1..] {
                     eprintln!(
                         "cairn check run: {}",
-                        observation
-                            .get("error")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("manual check failed")
+                        check_run_stop_line(None, suite, handle, now)
                     );
-                    all_passed = false;
-                    break None;
                 }
-                _ => tokio::time::sleep(Duration::from_secs(1)).await,
+                // The signal's conventional code, never 1: an abandoned wait
+                // is not a failed check.
+                return exit_code;
             }
         };
         let Some(final_response) = final_response else {
+            all_passed = false;
             continue;
         };
         match render_check_run_response(&final_response) {
@@ -687,7 +666,230 @@ pub(crate) async fn run_cli_check(
             }
         }
     }
-    all_passed
+    if all_passed {
+        0
+    } else {
+        1
+    }
+}
+
+/// How often a waiting `cairn check run` restates where its check stands. A
+/// requester can be killed without warning (a run item's timeout, SIGKILL), so
+/// this bounds how stale the last line it printed can be.
+const CHECK_RUN_HEARTBEAT: Duration = Duration::from_secs(10 * 60);
+
+/// Where one manual check stands, as its requester last observed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckWatch {
+    state: String,
+    diagnostic: String,
+    executor: Option<String>,
+    since_unix_ms: Option<u64>,
+}
+
+impl CheckWatch {
+    /// `None` for a settled observation.
+    fn from_observation(observation: &serde_json::Value) -> Option<Self> {
+        let state = observation.get("state")?.as_str()?;
+        if !matches!(state, "queued" | "running" | "parked") {
+            return None;
+        }
+        let text = |key: &str| {
+            observation
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        Some(Self {
+            state: state.to_string(),
+            diagnostic: text("diagnostic").unwrap_or_else(|| state.to_string()),
+            executor: text("executor"),
+            since_unix_ms: observation
+                .get("sinceUnixMs")
+                .and_then(serde_json::Value::as_u64),
+        })
+    }
+
+    /// The state, the machine, or the start time moved since `previous`.
+    fn is_news_after(&self, previous: Option<&Self>) -> bool {
+        previous.is_none_or(|previous| {
+            previous.state != self.state
+                || previous.executor != self.executor
+                || previous.since_unix_ms != self.since_unix_ms
+        })
+    }
+
+    /// Where the check stands, for a line that may be the last one printed:
+    /// `RUNNING on fedora since 09:48:09Z (1h10m elapsed)`.
+    fn standing(&self, now_unix_ms: u64) -> String {
+        let state = self.state.to_uppercase();
+        match (&self.executor, self.since_unix_ms) {
+            (Some(executor), Some(since)) if self.state == "running" => format!(
+                "{state} on {executor} since {} ({} elapsed)",
+                clock_utc(since),
+                describe_elapsed(now_unix_ms.saturating_sub(since)),
+            ),
+            (_, Some(since)) => format!(
+                "{state} since {} ({} elapsed): {}",
+                clock_utc(since),
+                describe_elapsed(now_unix_ms.saturating_sub(since)),
+                self.diagnostic,
+            ),
+            (_, None) => format!("{state}: {}", self.diagnostic),
+        }
+    }
+
+    fn heartbeat_line(&self, suite: &str, now_unix_ms: u64) -> String {
+        format!("{suite} is still {}", self.standing(now_unix_ms))
+    }
+}
+
+fn check_run_start_line(suite: &str, handle: &str, retry: bool) -> String {
+    // Both halves are what the runner does: an identical request coalesces onto
+    // the execution in flight whatever `--retry` says, and without `--retry` a
+    // reusable recorded row answers before anything is placed.
+    let rejoin = if retry {
+        "re-running with --retry joins it while it runs, and runs it afresh once its row is recorded"
+    } else {
+        "re-running the same command joins it while it runs, and reuses its verdict once recorded where that verdict is reusable"
+    };
+    format!(
+        "{suite} observation {handle}; the check runs to its recorded row even if this command is stopped; {rejoin}"
+    )
+}
+
+fn check_run_stop_line(
+    last: Option<&CheckWatch>,
+    suite: &str,
+    handle: &str,
+    now_unix_ms: u64,
+) -> String {
+    let standing = last.map_or_else(
+        || "was started".to_string(),
+        |watch| format!("is {}", watch.standing(now_unix_ms)),
+    );
+    format!(
+        "stopped waiting; {suite} {standing}; its row will still be recorded (observation {handle})"
+    )
+}
+
+/// Poll one observation until it settles: the result to render, or `None`
+/// once a failure has been reported. `last` always holds the latest unsettled
+/// observation, for the line printed if the wait is abandoned.
+async fn watch_check_run(
+    client: &CairnMcpServer,
+    suite: &str,
+    handle: &str,
+    last: &std::sync::Mutex<Option<CheckWatch>>,
+) -> Option<String> {
+    let mut last_printed = tokio::time::Instant::now();
+    loop {
+        let status = client
+            .callback(&check_run_status_request(client, handle))
+            .await;
+        if !status.transport_ok {
+            eprintln!("cairn check run: {}", status.result.trim_end());
+            return None;
+        }
+        let observation = match parse_check_run_observation(&status.result) {
+            Ok(observation) => observation,
+            Err(error) => {
+                eprintln!("cairn check run: {error}");
+                return None;
+            }
+        };
+        if let Some(watch) = CheckWatch::from_observation(&observation) {
+            let mut last = last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if watch.is_news_after(last.as_ref()) {
+                eprintln!("cairn check run: {}", watch.diagnostic);
+                last_printed = tokio::time::Instant::now();
+            } else if last_printed.elapsed() >= CHECK_RUN_HEARTBEAT {
+                eprintln!(
+                    "cairn check run: {}",
+                    watch.heartbeat_line(suite, unix_now_ms())
+                );
+                last_printed = tokio::time::Instant::now();
+            }
+            *last = Some(watch);
+        }
+        match observation.get("state").and_then(serde_json::Value::as_str) {
+            Some("complete") => {
+                return Some(
+                    serde_json::json!({
+                        "ok": true,
+                        "result": observation.get("result").cloned().unwrap_or_default()
+                    })
+                    .to_string(),
+                )
+            }
+            Some("failed") => {
+                eprintln!(
+                    "cairn check run: {}",
+                    observation
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("manual check failed")
+                );
+                return None;
+            }
+            _ => tokio::time::sleep(Duration::from_secs(1)).await,
+        }
+    }
+}
+
+/// Resolves when this process is asked to stop, with the exit code a process
+/// ended by that signal reports: 130 for Ctrl-C, 143 for SIGTERM. SIGKILL
+/// cannot be caught, which is why [`CHECK_RUN_HEARTBEAT`] exists. A signal that
+/// cannot be registered never resolves, rather than reading as a request to
+/// stop.
+async fn stop_requested() -> i32 {
+    const INTERRUPTED: i32 = 130;
+    async fn interrupted() {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+    #[cfg(unix)]
+    {
+        const TERMINATED: i32 = 143;
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            return tokio::select! {
+                () = interrupted() => INTERRUPTED,
+                _ = terminate.recv() => TERMINATED,
+            };
+        }
+    }
+    interrupted().await;
+    INTERRUPTED
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// `09:48:09Z`, the form the runner's own check diagnostics use.
+fn clock_utc(unix_ms: u64) -> String {
+    let seconds = unix_ms / 1_000 % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}Z",
+        seconds / 3_600,
+        seconds % 3_600 / 60,
+        seconds % 60
+    )
+}
+
+fn describe_elapsed(elapsed_ms: u64) -> String {
+    let seconds = elapsed_ms / 1_000;
+    match (seconds / 3_600, seconds % 3_600 / 60) {
+        (0, 0) => format!("{seconds}s"),
+        (0, minutes) => format!("{minutes}m"),
+        (hours, minutes) => format!("{hours}h{minutes}m"),
+    }
 }
 
 pub(crate) async fn run_cli_change(json: Option<String>, commit_msg: Option<String>) -> bool {
@@ -894,6 +1096,104 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("unknown or expired"));
+    }
+
+    /// 2026-10-19T09:48:09Z.
+    const CLAIMED_AT: u64 = 1_792_403_289_000;
+
+    fn running_on_fedora() -> CheckWatch {
+        CheckWatch::from_observation(&serde_json::json!({
+            "state": "running",
+            "diagnostic": "running on fedora since 09:48:09Z",
+            "executor": "fedora",
+            "sinceUnixMs": CLAIMED_AT,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn check_run_start_line_names_the_handle_and_what_rerunning_does() {
+        let line = check_run_start_line("rust-tests", "obs-1", false);
+        assert_eq!(
+            line,
+            "rust-tests observation obs-1; the check runs to its recorded row even if this command is stopped; re-running the same command joins it while it runs, and reuses its verdict once recorded where that verdict is reusable"
+        );
+        assert!(check_run_start_line("rust-tests", "obs-1", true)
+            .contains("runs it afresh once its row is recorded"));
+    }
+
+    #[test]
+    fn check_run_news_is_a_move_of_state_machine_or_since() {
+        let running = running_on_fedora();
+        assert!(running.is_news_after(None));
+        assert!(!running.is_news_after(Some(&running)));
+        let mut parked = running.clone();
+        parked.state = "parked".into();
+        parked.executor = None;
+        assert!(running.is_news_after(Some(&parked)));
+        let mut reworded = running.clone();
+        reworded.diagnostic = "another wording".into();
+        assert!(
+            !running.is_news_after(Some(&reworded)),
+            "a reworded diagnostic waits for the heartbeat"
+        );
+    }
+
+    #[test]
+    fn check_run_heartbeat_counts_from_the_claim() {
+        let line = running_on_fedora().heartbeat_line("rust-tests", CLAIMED_AT + 70 * 60_000);
+        assert_eq!(
+            line,
+            "rust-tests is still RUNNING on fedora since 09:48:09Z (1h10m elapsed)"
+        );
+        let parked = CheckWatch::from_observation(&serde_json::json!({
+            "state": "parked",
+            "diagnostic": "parked since 09:48:09Z; wait unpredictable (forecast 4m52s at 09:48:09Z, waited 10m)",
+            "sinceUnixMs": CLAIMED_AT,
+        }))
+        .unwrap();
+        assert_eq!(
+            parked.heartbeat_line("rust-tests", CLAIMED_AT + 12 * 60_000),
+            "rust-tests is still PARKED since 09:48:09Z (12m elapsed): parked since 09:48:09Z; wait unpredictable (forecast 4m52s at 09:48:09Z, waited 10m)"
+        );
+    }
+
+    /// The line a requester leaves behind says the check goes on, and never
+    /// that it timed out.
+    #[test]
+    fn check_run_stop_line_says_the_check_goes_on() {
+        let line = check_run_stop_line(
+            Some(&running_on_fedora()),
+            "rust-tests",
+            "obs-1",
+            CLAIMED_AT + 3 * 3_600_000 + 5 * 60_000,
+        );
+        assert_eq!(
+            line,
+            "stopped waiting; rust-tests is RUNNING on fedora since 09:48:09Z (3h5m elapsed); its row will still be recorded (observation obs-1)"
+        );
+        assert!(!line.contains("timed out"));
+        assert_eq!(
+            check_run_stop_line(None, "lint", "obs-2", CLAIMED_AT),
+            "stopped waiting; lint was started; its row will still be recorded (observation obs-2)"
+        );
+    }
+
+    /// A runner that predates the machine and the start time still renders.
+    #[test]
+    fn check_run_observation_without_since_still_reads() {
+        let watch = CheckWatch::from_observation(&serde_json::json!({
+            "state": "running",
+            "diagnostic": "running configured check",
+        }))
+        .unwrap();
+        assert_eq!(
+            watch.standing(CLAIMED_AT),
+            "RUNNING: running configured check"
+        );
+        assert!(
+            CheckWatch::from_observation(&serde_json::json!({ "state": "complete" })).is_none()
+        );
     }
 
     #[test]

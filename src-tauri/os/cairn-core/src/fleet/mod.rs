@@ -536,6 +536,44 @@ struct InFlightRegistry {
     subscriber_keys: HashMap<RequestIdentity, CheckResultIdentity>,
 }
 
+/// Where the execution a pure-verdict check subscriber is waiting on stands,
+/// read from facts the fleet already holds. See [`Fleet::check_dispatch_phase`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckDispatch {
+    pub(crate) phase: CheckDispatchPhase,
+    /// Set when the execution is another request's that this subscriber
+    /// coalesced onto: that request's owner, as an occupant is named (for
+    /// example `cairn-5178`), or `another request` when it states none.
+    pub(crate) joined: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CheckDispatchPhase {
+    /// The leader's inputs (objects, the sealed ref) are still being prepared,
+    /// and nothing has entered the queue yet.
+    Preparing { since_unix_ms: u64 },
+    /// In the queue, waiting for a machine: queued or offered and unanswered.
+    /// `since_unix_ms` is when the request began waiting.
+    Placing {
+        since_unix_ms: u64,
+        /// The latest answer from each machine that declined it.
+        declines: Vec<CheckDispatchDecline>,
+    },
+    /// A machine claimed it at `since_unix_ms`, so it is running there.
+    Running {
+        executor_name: String,
+        since_unix_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckDispatchDecline {
+    pub(crate) executor_name: String,
+    pub(crate) reason: DeclineReason,
+    pub(crate) detail: Option<String>,
+    pub(crate) at_unix_ms: u64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PublicationCoordination {
     state: Arc<PublicationState>,
@@ -5119,6 +5157,114 @@ impl Fleet {
             .by_key
             .get(result_identity)
             .map(|execution| execution.leader.clone())
+    }
+
+    /// Where the execution behind one pure-verdict check subscriber stands:
+    /// preparing, placing (with each machine's latest decline), or running on
+    /// a named machine since its claim, and whose run it is when it coalesced
+    /// onto another request's.
+    ///
+    /// `subscriber` is the public identity [`Self::submit_pure_verdict_batch`]
+    /// mints per item, `{request_id}:check-{index}`. `None` when no execution
+    /// is known for it, or the one it had is between leaving the queue and
+    /// settling; a caller treats that as nothing new to say.
+    ///
+    /// A pure read. The in-flight registry is released before the queue and
+    /// the preparation table are read, so it never holds two of those locks.
+    pub(crate) fn check_dispatch_phase(
+        &self,
+        subscriber: &RequestIdentity,
+    ) -> Option<CheckDispatch> {
+        let leader = self.coalesced_leader(subscriber)?;
+        let own = subscriber
+            .0
+            .rsplit_once(":check-")
+            .is_some_and(|(request_id, _)| request_id == leader.0);
+        let queued = self.queue.with_entry_by_identity(&leader, |entry| {
+            let declines: Vec<_> = entry
+                .declined
+                .iter()
+                .map(|(executor_id, decline)| {
+                    (
+                        executor_id.clone(),
+                        decline.reason,
+                        decline.detail.clone(),
+                        decline.at_unix_ms,
+                    )
+                })
+                .collect();
+            (
+                entry.state.clone(),
+                entry.queued_at_unix_ms(),
+                declines,
+                entry
+                    .request
+                    .owner
+                    .as_ref()
+                    .and_then(occupancy::describe_owner),
+            )
+        });
+        let (phase, owner) = match queued {
+            Some((
+                queue::EntryState::Claimed {
+                    executor_id,
+                    at_unix_ms,
+                    ..
+                },
+                _,
+                _,
+                owner,
+            )) => (
+                CheckDispatchPhase::Running {
+                    executor_name: self.executor_name_for_text(&executor_id),
+                    since_unix_ms: at_unix_ms,
+                },
+                owner,
+            ),
+            Some((_, since_unix_ms, raw_declines, owner)) => {
+                let mut declines: Vec<_> = raw_declines
+                    .into_iter()
+                    .map(
+                        |(executor_id, reason, detail, at_unix_ms)| CheckDispatchDecline {
+                            executor_name: self.executor_name_for_text(&executor_id),
+                            reason,
+                            detail,
+                            at_unix_ms,
+                        },
+                    )
+                    .collect();
+                declines.sort_by(|a, b| {
+                    b.at_unix_ms
+                        .cmp(&a.at_unix_ms)
+                        .then_with(|| a.executor_name.cmp(&b.executor_name))
+                });
+                (
+                    CheckDispatchPhase::Placing {
+                        since_unix_ms,
+                        declines,
+                    },
+                    owner,
+                )
+            }
+            None => {
+                let preparing = self
+                    .preparing_leaders
+                    .lock()
+                    .unwrap()
+                    .get(&leader)
+                    .copied()?;
+                (
+                    CheckDispatchPhase::Preparing {
+                        since_unix_ms: preparing.since_unix_ms,
+                    },
+                    None,
+                )
+            }
+        };
+        Some(CheckDispatch {
+            phase,
+            joined: (!own).then(|| owner.unwrap_or_else(|| "another request".to_string())),
+        })
     }
 
     fn leader_substrate_hold(
@@ -17112,6 +17258,188 @@ mod tests {
                 unix_time_ms(),
             )
             .expect("a fresh request identity enqueues")
+    }
+
+    /// A pure-verdict execution led by `leader`, with its own first item and
+    /// one other request's item coalesced onto it, the identities
+    /// `submit_pure_verdict_batch` mints.
+    fn dispatched_check(
+        pool: &Fleet,
+        leader: &RequestIdentity,
+    ) -> (RequestIdentity, RequestIdentity) {
+        let own = (
+            format!("{}:check-0", leader.0),
+            format!("{}:check-0", leader.1),
+        );
+        let joined = (
+            "other-request:check-2".to_string(),
+            "other-attempt:check-2".to_string(),
+        );
+        let subscriber = || {
+            let (waiter, _) = oneshot::channel();
+            CoalescedSubscriber {
+                waiter,
+                priority: CellPriority::ReviewCheck,
+                requesting_job_id: None,
+            }
+        };
+        let mut registry = pool.in_flight.lock().unwrap();
+        registry
+            .subscriber_keys
+            .insert(own.clone(), result_identity());
+        registry
+            .subscriber_keys
+            .insert(joined.clone(), result_identity());
+        registry.by_key.insert(
+            result_identity(),
+            InFlightExecution {
+                leader: leader.clone(),
+                subscribers: HashMap::from([
+                    (own.clone(), subscriber()),
+                    (joined.clone(), subscriber()),
+                ]),
+                publication: PublicationCoordination::new(),
+            },
+        );
+        (own, joined)
+    }
+
+    fn enqueue_owned_entry(pool: &Fleet, key: &RequestIdentity) -> String {
+        let mut request = provenance_request();
+        request.request_id.clone_from(&key.0);
+        request.attempt_id.clone_from(&key.1);
+        request.owner = Some(cairn_common::executor_protocol::CellOwnerRef {
+            project_id: "p".into(),
+            project_key: Some("cairn".into()),
+            issue_number: Some(5178),
+            job_id: None,
+            execution_seq: None,
+            node_kind: Some("builder".into()),
+        });
+        request.waiting_since_unix_ms = 1_000;
+        pool.queue
+            .enqueue(
+                queue::NewEntry {
+                    request,
+                    admission_kind: CellAdmissionKind::Command,
+                    interactive: false,
+                    execution_residency: None,
+                },
+                unix_time_ms(),
+            )
+            .expect("a fresh request identity enqueues")
+            .0
+    }
+
+    #[test]
+    fn check_dispatch_phase_reports_preparation_before_the_queue() {
+        let pool = Fleet::default();
+        let leader = ("leader".to_string(), "leader-attempt".to_string());
+        let (own, _) = dispatched_check(&pool, &leader);
+        pool.preparing_leaders.lock().unwrap().insert(
+            leader.clone(),
+            LeaderPreparation {
+                since_unix_ms: 42,
+                last_progress_unix_ms: 42,
+            },
+        );
+        assert_eq!(
+            pool.check_dispatch_phase(&own),
+            Some(CheckDispatch {
+                phase: CheckDispatchPhase::Preparing { since_unix_ms: 42 },
+                joined: None,
+            })
+        );
+    }
+
+    #[test]
+    fn check_dispatch_phase_reports_placing_with_the_latest_decline() {
+        let pool = Fleet::default();
+        let leader = ("leader".to_string(), "leader-attempt".to_string());
+        let (own, _) = dispatched_check(&pool, &leader);
+        let entry = enqueue_owned_entry(&pool, &leader);
+        assert!(pool.queue.offer(&entry, "fedora", "fedora", 3, 2_000));
+        pool.queue.decline(
+            &entry,
+            "fedora",
+            3,
+            DeclineReason::Pressure,
+            Some("memory floor".into()),
+            None,
+            None,
+            2_500,
+        );
+        assert_eq!(
+            pool.check_dispatch_phase(&own),
+            Some(CheckDispatch {
+                phase: CheckDispatchPhase::Placing {
+                    since_unix_ms: 1_000,
+                    declines: vec![CheckDispatchDecline {
+                        executor_name: "fedora".into(),
+                        reason: DeclineReason::Pressure,
+                        detail: Some("memory floor".into()),
+                        at_unix_ms: 2_500,
+                    }],
+                },
+                joined: None,
+            })
+        );
+    }
+
+    #[test]
+    fn check_dispatch_phase_reports_running_from_the_claim_and_who_a_joiner_joined() {
+        let pool = Fleet::default();
+        let leader = ("leader".to_string(), "leader-attempt".to_string());
+        let (own, joined) = dispatched_check(&pool, &leader);
+        let entry = enqueue_owned_entry(&pool, &leader);
+        assert!(pool.queue.offer(&entry, "fedora", "fedora", 3, 2_000));
+        assert_eq!(
+            pool.queue.claim(&entry, "fedora", 3, 2_100),
+            queue::ClaimVerdict::Granted
+        );
+        let running = CheckDispatchPhase::Running {
+            executor_name: "fedora".into(),
+            since_unix_ms: 2_100,
+        };
+        assert_eq!(
+            pool.check_dispatch_phase(&own),
+            Some(CheckDispatch {
+                phase: running.clone(),
+                joined: None,
+            })
+        );
+        assert_eq!(
+            pool.check_dispatch_phase(&joined),
+            Some(CheckDispatch {
+                phase: running,
+                joined: Some("cairn-5178".into()),
+            }),
+            "a subscriber that coalesced onto another request names whose run it joined"
+        );
+    }
+
+    #[test]
+    fn check_dispatch_phase_is_none_once_the_execution_settles() {
+        let pool = Fleet::default();
+        let leader = ("leader".to_string(), "leader-attempt".to_string());
+        let (own, _) = dispatched_check(&pool, &leader);
+        let entry = enqueue_owned_entry(&pool, &leader);
+        assert!(pool.queue.offer(&entry, "fedora", "fedora", 3, 2_000));
+        assert!(pool.queue.settle(
+            &leader,
+            None,
+            queue::TerminalState::Completed,
+            CellOutcome::Cancelled {
+                request_id: leader.0.clone(),
+                attempt_id: leader.1.clone(),
+            },
+            3_000,
+        ));
+        assert_eq!(pool.check_dispatch_phase(&own), None);
+        assert_eq!(
+            pool.check_dispatch_phase(&("unknown:check-0".into(), "unknown:check-0".into())),
+            None
+        );
     }
 
     fn provenance_request() -> CellRequest {

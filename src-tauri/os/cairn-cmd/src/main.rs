@@ -393,7 +393,7 @@ async fn async_main() -> Result<()> {
                     executor,
                 },
         }) => {
-            let ok = run_cli_check(
+            let code = run_cli_check(
                 suites.clone(),
                 branch.clone(),
                 *retry,
@@ -401,7 +401,7 @@ async fn async_main() -> Result<()> {
                 executor.clone(),
             )
             .await;
-            std::process::exit(if ok { 0 } else { 1 });
+            std::process::exit(code);
         }
         Some(Command::Executor { command }) => {
             let ok = executor::run(command.clone()).await;

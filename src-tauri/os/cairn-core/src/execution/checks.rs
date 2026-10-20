@@ -486,6 +486,7 @@ fn check_phase_status(
         phase: phase.map(str::to_string),
         label,
         diagnostic,
+        ..CheckPhaseStatus::default()
     }
 }
 
@@ -667,11 +668,16 @@ where
     .await
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CheckPhaseStatus {
     phase: Option<String>,
     label: Option<String>,
     diagnostic: Option<String>,
+    /// The machine running the batch, once one has claimed it.
+    executor: Option<String>,
+    /// When the current phase began: when the batch started waiting, was
+    /// claimed, or started being prepared.
+    since_unix_ms: Option<u64>,
 }
 
 type CheckStatusNotify = Arc<dyn Fn(Vec<CheckStatusEntry>, CheckPhaseStatus) + Send + Sync>;
@@ -741,7 +747,7 @@ impl CheckStatusBoard {
             *self.phase.lock().unwrap() = CheckPhaseStatus {
                 phase: Some("running".into()),
                 label: Some("running checks".into()),
-                diagnostic: None,
+                ..CheckPhaseStatus::default()
             };
         } else if self
             .entries
@@ -757,6 +763,12 @@ impl CheckStatusBoard {
 
     fn set_phase(&self, phase: Option<&str>, label: Option<&str>, diagnostic: Option<String>) {
         *self.phase.lock().unwrap() = check_phase_status(phase, label, diagnostic);
+        self.emit();
+    }
+
+    /// Show a phase [`DispatchNarrator`] rendered, machine and time included.
+    fn show_phase(&self, status: CheckPhaseStatus) {
+        *self.phase.lock().unwrap() = status;
         self.emit();
     }
 }
@@ -1397,12 +1409,53 @@ pub async fn run_manual_configured_check(
         branch,
         placement,
         false,
-        Arc::new(|_, _| {}),
+        Arc::new(|_| {}),
     )
     .await
 }
 
-type ManualCheckProgress = Arc<dyn Fn(&str, String) + Send + Sync>;
+/// One step of a manual check's progress, as its requester is shown it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualCheckProgressUpdate {
+    /// `parked`, `queued`, `running`, or the check's own board state.
+    pub state: String,
+    pub diagnostic: String,
+    /// The machine running it, once one has claimed it.
+    pub executor: Option<String>,
+    /// When the current state began.
+    pub since_unix_ms: Option<u64>,
+}
+
+type ManualCheckProgress = Arc<dyn Fn(ManualCheckProgressUpdate) + Send + Sync>;
+
+/// What a manual check's requester is shown for one board update.
+///
+/// The board's own diagnostic passes through. Replacing a running check's
+/// "running on fedora since 09:48:09Z" with "running configured check" would
+/// drop the one fact the requester is polling for.
+fn manual_progress_update(
+    checks: &[CheckStatusEntry],
+    phase: CheckPhaseStatus,
+) -> ManualCheckProgressUpdate {
+    let state = match phase.phase.as_deref() {
+        Some("queued") => "parked".to_string(),
+        Some("provisioning") => "queued".to_string(),
+        Some("running") => "running".to_string(),
+        _ => checks
+            .first()
+            .map_or_else(|| "running".to_string(), |check| check.state.clone()),
+    };
+    let diagnostic = phase.diagnostic.unwrap_or_else(|| match state.as_str() {
+        "parked" => "parked waiting for check capacity".to_string(),
+        state => format!("{state} configured check"),
+    });
+    ManualCheckProgressUpdate {
+        state,
+        diagnostic,
+        executor: phase.executor,
+        since_unix_ms: phase.since_unix_ms,
+    }
+}
 
 pub async fn run_manual_configured_check_with_progress(
     orch: &Orchestrator,
@@ -1494,22 +1547,7 @@ pub(crate) async fn execute_check_contract(
     let progress_notify = progress.clone();
     let status_board = CheckStatusBoard::new(
         &keyed,
-        Arc::new(move |checks, phase| {
-            if phase.phase.as_deref() == Some("queued") {
-                progress_notify(
-                    "parked",
-                    phase
-                        .diagnostic
-                        .unwrap_or_else(|| "parked waiting for check capacity".into()),
-                );
-            } else {
-                let state = checks
-                    .first()
-                    .map(|check| check.state.as_str())
-                    .unwrap_or("running");
-                progress_notify(state, format!("{state} configured check"));
-            }
-        }),
+        Arc::new(move |checks, phase| progress_notify(manual_progress_update(&checks, phase))),
     );
     let timeout_ms = contract.timeout_ms;
     let store_dir = crate::jj::project_store_dir(&orch.config_dir, &repository);
@@ -2854,8 +2892,13 @@ struct CheckPatience {
     work_class: crate::fleet::PlacementWorkClass,
 }
 
+#[derive(Clone)]
 struct GroupWait {
     description: String,
+    /// The relief this wait quoted, when the machines it waits on forecast one.
+    relief_ms: Option<u64>,
+    /// What holds the machines has no measured duration, or has outlived it.
+    unforecastable: bool,
 }
 
 impl CheckPatience {
@@ -2899,25 +2942,37 @@ impl CheckPatience {
 
 impl GroupWait {
     fn from_occupancy(occupancy: crate::fleet::occupancy::MachineOccupancy) -> Self {
-        let description = match occupancy {
+        match occupancy {
             crate::fleet::occupancy::MachineOccupancy::Predicted(forecast) => {
+                // Every occupant of the machine, not the ones blocking this
+                // request: a count of blockers would claim a queue position
+                // the occupancy read does not know.
                 let others = match forecast.occupant_count.saturating_sub(1) {
                     0 => String::new(),
-                    1 => ", behind 1 other cell".to_string(),
-                    more => format!(", behind {more} other cells"),
+                    1 => ", with 1 other cell running there".to_string(),
+                    more => format!(", with {more} other cells running there"),
                 };
-                format!(
-                    "parked behind {}, predicted to finish in {}{others}; holding this check's queue entry until capacity is released",
-                    forecast.blocking,
-                    describe_ms(forecast.relief_ms),
-                )
+                Self {
+                    description: format!(
+                        "parked behind {}, predicted to finish in {}{others}; holding this check's queue entry until capacity is released",
+                        forecast.blocking,
+                        describe_ms(forecast.relief_ms),
+                    ),
+                    relief_ms: Some(forecast.relief_ms),
+                    unforecastable: false,
+                }
             }
-            crate::fleet::occupancy::MachineOccupancy::Unforecastable =>
-                "parked behind resident or external work with no measured duration; holding this check's queue entry until capacity is released".into(),
-            crate::fleet::occupancy::MachineOccupancy::Idle =>
-                "parked in the admission queue; holding this check's queue entry until capacity is released".into(),
-        };
-        Self { description }
+            crate::fleet::occupancy::MachineOccupancy::Unforecastable => Self {
+                description: "parked behind resident or external work with no measured duration; holding this check's queue entry until capacity is released".into(),
+                relief_ms: None,
+                unforecastable: true,
+            },
+            crate::fleet::occupancy::MachineOccupancy::Idle => Self {
+                description: "parked in the admission queue; holding this check's queue entry until capacity is released".into(),
+                relief_ms: None,
+                unforecastable: false,
+            },
+        }
     }
 }
 
@@ -2927,6 +2982,311 @@ fn describe_ms(value_ms: u64) -> String {
         (0, seconds) => format!("{seconds}s"),
         (minutes, 0) => format!("{minutes}m"),
         (minutes, seconds) => format!("{minutes}m{seconds}s"),
+    }
+}
+
+/// A wait as an operator reads it in a status line, in whole minutes so a line
+/// that quotes it changes at most once a minute.
+fn describe_waited(value_ms: u64) -> String {
+    let minutes = value_ms / 60_000;
+    match (minutes / 60, minutes % 60) {
+        (0, 0) => "under a minute".into(),
+        (0, minutes) => format!("{minutes}m"),
+        (hours, 0) => format!("{hours}h"),
+        (hours, minutes) => format!("{hours}h{minutes}m"),
+    }
+}
+
+/// A wall-clock instant as a status line names it: `09:48:09Z`.
+fn clock_utc(unix_ms: u64) -> String {
+    i64::try_from(unix_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map_or_else(
+            || format!("{unix_ms}ms"),
+            |at| at.format("%H:%M:%SZ").to_string(),
+        )
+}
+
+fn decline_reason_words(reason: cairn_common::executor_protocol::DeclineReason) -> &'static str {
+    use cairn_common::executor_protocol::DeclineReason;
+    match reason {
+        DeclineReason::Capacity => "full",
+        DeclineReason::Pressure => "host pressure",
+        DeclineReason::Disk => "low disk",
+        DeclineReason::Constraint => "cannot run it",
+        DeclineReason::Unknown => "declined",
+        DeclineReason::ProjectProvisioning => "provisioning another cell for this project",
+    }
+}
+
+/// The machines that declined a parked request, latest first, so a wait that
+/// is really a disk or pressure hold says so instead of reading as a queue.
+fn describe_declines(declines: &[crate::fleet::CheckDispatchDecline]) -> Option<String> {
+    const NAMED: usize = 3;
+    if declines.is_empty() {
+        return None;
+    }
+    let named = declines
+        .iter()
+        .take(NAMED)
+        .map(|decline| {
+            let reason = decline_reason_words(decline.reason);
+            match decline
+                .detail
+                .as_deref()
+                .filter(|detail| !detail.is_empty())
+            {
+                Some(detail) => format!("{} ({reason}: {detail})", decline.executor_name),
+                None => format!("{} ({reason})", decline.executor_name),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(match declines.len().saturating_sub(NAMED) {
+        0 => format!("declined by {named}"),
+        more => format!("declined by {named}, and {more} more"),
+    })
+}
+
+/// How often an outstanding pure-verdict batch re-reads where its execution
+/// stands.
+const DISPATCH_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How stale a parked batch's occupancy forecast may grow before it is read
+/// again.
+const PARKED_FORECAST_REFRESH_MS: u64 = 30_000;
+
+/// The status a pure-verdict batch shows while the fleet holds it, rendered
+/// from where its execution stands ([`crate::fleet::CheckDispatch`]).
+///
+/// A forecast retires itself. The first finite relief forecast `F` for a wait
+/// is remembered with when it was made; once the wait has outlasted `2F`, or
+/// the machines' occupancy reads as unforecastable, the wait is reported as
+/// unpredictable and no finite forecast is shown for it again. A forecast that
+/// kept being quoted while it went unmet is the line that told a requester
+/// "predicted to finish in 4m52s" for three hours.
+struct DispatchNarrator {
+    wait: GroupWait,
+    wait_read_at_unix_ms: u64,
+    first_forecast: Option<FirstForecast>,
+    unpredictable: bool,
+    /// A machine claimed the execution. Back in the queue after that (its
+    /// machine was lost), it is a new wait with its own forecast.
+    claimed: bool,
+    shown: Option<CheckPhaseStatus>,
+}
+
+#[derive(Clone, Copy)]
+struct FirstForecast {
+    relief_ms: u64,
+    at_unix_ms: u64,
+}
+
+impl DispatchNarrator {
+    fn new(wait: GroupWait, now_unix_ms: u64) -> Self {
+        let mut narrator = Self {
+            wait: wait.clone(),
+            wait_read_at_unix_ms: now_unix_ms,
+            first_forecast: None,
+            unpredictable: false,
+            claimed: false,
+            shown: None,
+        };
+        narrator.absorb_wait(wait, now_unix_ms);
+        narrator
+    }
+
+    /// Track the claim, and start a fresh wait when a claimed execution is
+    /// queued again: the earlier wait's forecast and its verdict on that
+    /// forecast belong to that wait alone, and its occupancy reading is stale.
+    fn note_phase(&mut self, phase: &crate::fleet::CheckDispatchPhase) {
+        match phase {
+            crate::fleet::CheckDispatchPhase::Running { .. } => self.claimed = true,
+            crate::fleet::CheckDispatchPhase::Placing { .. } if self.claimed => {
+                self.claimed = false;
+                self.first_forecast = None;
+                self.unpredictable = false;
+                self.wait_read_at_unix_ms = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn wait_is_stale(&self, now_unix_ms: u64) -> bool {
+        now_unix_ms.saturating_sub(self.wait_read_at_unix_ms) >= PARKED_FORECAST_REFRESH_MS
+    }
+
+    fn absorb_wait(&mut self, wait: GroupWait, now_unix_ms: u64) {
+        self.unpredictable |= wait.unforecastable;
+        if self.first_forecast.is_none() && !self.unpredictable {
+            self.first_forecast = wait.relief_ms.map(|relief_ms| FirstForecast {
+                relief_ms,
+                at_unix_ms: now_unix_ms,
+            });
+        }
+        self.wait = wait;
+        self.wait_read_at_unix_ms = now_unix_ms;
+    }
+
+    /// The status to show for `dispatch`, or `None` when it is what was last
+    /// shown.
+    fn next(
+        &mut self,
+        dispatch: &crate::fleet::CheckDispatch,
+        now_unix_ms: u64,
+    ) -> Option<CheckPhaseStatus> {
+        let status = self.render(dispatch, now_unix_ms);
+        if self.shown.as_ref() == Some(&status) {
+            return None;
+        }
+        self.shown = Some(status.clone());
+        Some(status)
+    }
+
+    fn render(
+        &mut self,
+        dispatch: &crate::fleet::CheckDispatch,
+        now_unix_ms: u64,
+    ) -> CheckPhaseStatus {
+        use crate::fleet::CheckDispatchPhase;
+        let joined = dispatch.joined.as_deref();
+        let joined_prefix = joined
+            .map(|owner| format!("joined {owner}'s run; "))
+            .unwrap_or_default();
+        match &dispatch.phase {
+            CheckDispatchPhase::Running {
+                executor_name,
+                since_unix_ms,
+            } => {
+                let at = clock_utc(*since_unix_ms);
+                CheckPhaseStatus {
+                    executor: Some(executor_name.clone()),
+                    since_unix_ms: Some(*since_unix_ms),
+                    ..check_phase_status(
+                        Some("running"),
+                        Some("running checks"),
+                        Some(match joined {
+                            Some(owner) => {
+                                format!("joined {owner}'s run on {executor_name} since {at}")
+                            }
+                            None => format!("running on {executor_name} since {at}"),
+                        }),
+                    )
+                }
+            }
+            CheckDispatchPhase::Preparing { since_unix_ms } => CheckPhaseStatus {
+                since_unix_ms: Some(*since_unix_ms),
+                ..check_phase_status(
+                    Some("provisioning"),
+                    Some("preparing"),
+                    Some(format!(
+                        "{joined_prefix}preparing the check's inputs since {}",
+                        clock_utc(*since_unix_ms)
+                    )),
+                )
+            },
+            CheckDispatchPhase::Placing {
+                since_unix_ms,
+                declines,
+            } => {
+                if let Some(first) = self.first_forecast {
+                    if now_unix_ms.saturating_sub(first.at_unix_ms)
+                        > first.relief_ms.saturating_mul(2)
+                    {
+                        self.unpredictable = true;
+                    }
+                }
+                let since = clock_utc(*since_unix_ms);
+                let mut diagnostic = match (self.unpredictable, self.first_forecast) {
+                    (true, Some(first)) => format!(
+                        "parked since {since}; wait unpredictable (forecast {} at {}, waited {})",
+                        describe_ms(first.relief_ms),
+                        clock_utc(first.at_unix_ms),
+                        describe_waited(now_unix_ms.saturating_sub(*since_unix_ms)),
+                    ),
+                    (true, None) => format!(
+                        "parked since {since}; wait unpredictable: what holds the eligible machines has no measured duration"
+                    ),
+                    (false, _) => format!("{}; parked since {since}", self.wait.description),
+                };
+                if let Some(declined) = describe_declines(declines) {
+                    diagnostic.push_str("; ");
+                    diagnostic.push_str(&declined);
+                }
+                CheckPhaseStatus {
+                    since_unix_ms: Some(*since_unix_ms),
+                    ..check_phase_status(
+                        Some("queued"),
+                        Some("queued"),
+                        Some(format!("{joined_prefix}{diagnostic}")),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// Where a pure-verdict batch's execution stands, from its items' subscriber
+/// identities. Items can coalesce onto different executions, so the batch
+/// reports its furthest-along one: running before placing before preparing,
+/// and its own run before one it joined.
+fn batch_dispatch(
+    fleet: &crate::fleet::Fleet,
+    subscribers: &[(String, String)],
+) -> Option<crate::fleet::CheckDispatch> {
+    use crate::fleet::CheckDispatchPhase;
+    subscribers
+        .iter()
+        .filter_map(|subscriber| fleet.check_dispatch_phase(subscriber))
+        .max_by_key(|dispatch| {
+            let rank = match dispatch.phase {
+                CheckDispatchPhase::Running { .. } => 2,
+                CheckDispatchPhase::Placing { .. } => 1,
+                CheckDispatchPhase::Preparing { .. } => 0,
+            };
+            (rank, dispatch.joined.is_none())
+        })
+}
+
+/// Await `submission`, showing where its execution stands every
+/// [`DISPATCH_PROGRESS_INTERVAL`] and only when that changes.
+///
+/// The board said `queued` from submission until settlement before this
+/// existed: the fleet's pure-verdict path reports no item start to a board, so
+/// a check that a machine claimed in two seconds and ran for three hours read
+/// as parked behind the forecast it was submitted with for all three.
+async fn narrate_dispatch<T>(
+    submission: impl std::future::Future<Output = T>,
+    wait: &GroupWait,
+    read_dispatch: impl Fn() -> Option<crate::fleet::CheckDispatch>,
+    refresh_wait: impl Fn() -> GroupWait,
+    show: impl Fn(CheckPhaseStatus),
+) -> T {
+    let mut narrator = DispatchNarrator::new(wait.clone(), unix_time_ms_for_checks());
+    tokio::pin!(submission);
+    let mut ticks = tokio::time::interval(DISPATCH_PROGRESS_INTERVAL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            delivered = &mut submission => return delivered,
+            _ = ticks.tick() => {
+                let Some(dispatch) = read_dispatch() else {
+                    continue;
+                };
+                let now = unix_time_ms_for_checks();
+                narrator.note_phase(&dispatch.phase);
+                if matches!(dispatch.phase, crate::fleet::CheckDispatchPhase::Placing { .. })
+                    && narrator.wait_is_stale(now)
+                {
+                    narrator.absorb_wait(refresh_wait(), now);
+                }
+                if let Some(status) = narrator.next(&dispatch, now) {
+                    show(status);
+                }
+            }
+        }
     }
 }
 
@@ -3111,6 +3471,7 @@ async fn submit_reserved_check_batch(
                         ..batch.clone()
                     },
                     &wait,
+                    patience,
                 )
                 .await?;
                 attribute_capacity_wait(&mut outcome, &wait);
@@ -3134,7 +3495,7 @@ async fn submit_reserved_check_batch(
         &forecast_verdict_platforms,
         &forecast_avoid,
     );
-    let mut outcome = submit_single_planned_check_batch(orch, batch, &wait).await?;
+    let mut outcome = submit_single_planned_check_batch(orch, batch, &wait, patience).await?;
     attribute_capacity_wait(&mut outcome, &wait);
     Ok(PresentedBatch { outcome })
 }
@@ -3249,6 +3610,7 @@ async fn submit_single_planned_check_batch(
     orch: &Orchestrator,
     batch: PlannedCheckBatchRequest,
     wait: &GroupWait,
+    patience: &CheckPatience,
 ) -> Result<PlannedCheckBatchOutcome, String> {
     // Configuration conflicts are deterministic caller errors and must surface
     // before any transient infrastructure preflight can obscure them.
@@ -3293,6 +3655,12 @@ async fn submit_single_planned_check_batch(
             ))
         }
     };
+    // What the parked forecast is re-read against while the batch waits.
+    let wait_scope = (
+        executor.clone(),
+        verdict_platforms.clone(),
+        avoided_executor_ids.clone(),
+    );
     let wire = build_check_batch_wire(
         &batch,
         request_id,
@@ -3314,15 +3682,49 @@ async fn submit_single_planned_check_batch(
     }
     let submitted_at = std::time::Instant::now();
     let submitted = if mutation_policy == MutationPolicy::PureVerdict {
-        orch.fleet
-            .submit_pure_verdict_batch(
-                orch,
-                request.clone(),
-                items,
-                batch.run_context,
-                batch.purpose,
-            )
-            .await
+        // The identities `submit_pure_verdict_batch` mints for its items.
+        let subscribers: Vec<(String, String)> = (0..items.len())
+            .map(|index| {
+                (
+                    format!("{}:check-{index}", request.request_id),
+                    format!("{}:check-{index}", request.attempt_id),
+                )
+            })
+            .collect();
+        let wait_batch = PlannedCheckBatchRequest {
+            items: Vec::new(),
+            status_board: None,
+            ..batch.clone()
+        };
+        let board = batch.status_board.clone();
+        let submission = orch.fleet.submit_pure_verdict_batch(
+            orch,
+            request.clone(),
+            items,
+            batch.run_context,
+            batch.purpose,
+        );
+        match board {
+            None => submission.await,
+            Some(board) => {
+                narrate_dispatch(
+                    submission,
+                    wait,
+                    || batch_dispatch(&orch.fleet, &subscribers),
+                    || {
+                        patience.for_group(
+                            orch,
+                            &wait_batch,
+                            wait_scope.0.as_ref(),
+                            &wait_scope.1,
+                            &wait_scope.2,
+                        )
+                    },
+                    |status| board.show_phase(status),
+                )
+                .await
+            }
+        }
     } else {
         let processes = items.into_iter().map(|item| item.process).collect();
         // The queued row says what it is queued BEHIND. "Waiting for build
@@ -13417,7 +13819,7 @@ cairn-common = { path = "../cairn-common" }
         let known = GroupWait::from_occupancy(predicted(240_000, 3));
         assert_eq!(
             known.description,
-            "parked behind cairn-3414's rust-tests, predicted to finish in 4m, behind 2 other cells; holding this check's queue entry until capacity is released"
+            "parked behind cairn-3414's rust-tests, predicted to finish in 4m, with 2 other cells running there; holding this check's queue entry until capacity is released"
         );
         let unmeasured =
             GroupWait::from_occupancy(crate::fleet::occupancy::MachineOccupancy::Unforecastable);
@@ -13425,6 +13827,247 @@ cairn-common = { path = "../cairn-common" }
         assert!(unmeasured
             .description
             .contains("holding this check's queue entry"));
+    }
+
+    /// 2026-10-19T09:48:00Z.
+    const PARKED_AT: u64 = 1_792_403_280_000;
+
+    fn placing(since_unix_ms: u64) -> crate::fleet::CheckDispatch {
+        crate::fleet::CheckDispatch {
+            phase: crate::fleet::CheckDispatchPhase::Placing {
+                since_unix_ms,
+                declines: Vec::new(),
+            },
+            joined: None,
+        }
+    }
+
+    fn running_on(
+        executor_name: &str,
+        since_unix_ms: u64,
+        joined: Option<&str>,
+    ) -> crate::fleet::CheckDispatch {
+        crate::fleet::CheckDispatch {
+            phase: crate::fleet::CheckDispatchPhase::Running {
+                executor_name: executor_name.into(),
+                since_unix_ms,
+            },
+            joined: joined.map(str::to_string),
+        }
+    }
+
+    /// The live case: forecast 4m52s, still parked ten minutes later. Past
+    /// twice its own prediction the forecast is withdrawn for the rest of the
+    /// wait, even when a fresher reading offers a new finite number.
+    #[test]
+    fn a_parked_forecast_is_quoted_until_twice_its_own_prediction() {
+        let mut narrator =
+            DispatchNarrator::new(GroupWait::from_occupancy(predicted(292_000, 1)), PARKED_AT);
+        let early = narrator
+            .next(&placing(PARKED_AT), PARKED_AT + 60_000)
+            .unwrap();
+        assert_eq!(early.phase.as_deref(), Some("queued"));
+        assert_eq!(
+            early.diagnostic.as_deref(),
+            Some("parked behind cairn-3414's rust-tests, predicted to finish in 4m52s; holding this check's queue entry until capacity is released; parked since 09:48:00Z")
+        );
+        assert_eq!(early.since_unix_ms, Some(PARKED_AT));
+
+        let late = narrator
+            .next(&placing(PARKED_AT), PARKED_AT + 600_000)
+            .unwrap();
+        assert_eq!(
+            late.diagnostic.as_deref(),
+            Some("parked since 09:48:00Z; wait unpredictable (forecast 4m52s at 09:48:00Z, waited 10m)")
+        );
+
+        narrator.absorb_wait(
+            GroupWait::from_occupancy(predicted(60_000, 1)),
+            PARKED_AT + 630_000,
+        );
+        let after = narrator.render(&placing(PARKED_AT), PARKED_AT + 660_000);
+        assert_eq!(
+            after.diagnostic.as_deref(),
+            Some("parked since 09:48:00Z; wait unpredictable (forecast 4m52s at 09:48:00Z, waited 11m)")
+        );
+    }
+
+    /// A claimed execution that is queued again (its machine was lost) waits
+    /// afresh: the first wait's withdrawn forecast does not follow it.
+    #[test]
+    fn a_requeued_check_starts_a_new_wait_with_its_own_forecast() {
+        let mut narrator =
+            DispatchNarrator::new(GroupWait::from_occupancy(predicted(292_000, 1)), PARKED_AT);
+        narrator.note_phase(&placing(PARKED_AT).phase);
+        narrator.render(&placing(PARKED_AT), PARKED_AT + 600_000);
+        assert!(narrator.unpredictable, "the first wait outlived its forecast");
+
+        let claimed = running_on("fedora", PARKED_AT + 610_000, None);
+        narrator.note_phase(&claimed.phase);
+        let requeued_at = PARKED_AT + 3_600_000;
+        narrator.note_phase(&placing(requeued_at).phase);
+        assert!(narrator.wait_is_stale(requeued_at), "the new wait re-reads occupancy");
+        narrator.absorb_wait(GroupWait::from_occupancy(predicted(60_000, 1)), requeued_at);
+        let status = narrator.render(&placing(requeued_at), requeued_at + 10_000);
+        assert_eq!(
+            status.diagnostic.as_deref(),
+            Some("parked behind cairn-3414's rust-tests, predicted to finish in 1m; holding this check's queue entry until capacity is released; parked since 10:48:00Z")
+        );
+    }
+
+    #[test]
+    fn an_unforecastable_machine_is_an_unpredictable_wait_for_good() {
+        let mut narrator = DispatchNarrator::new(
+            GroupWait::from_occupancy(crate::fleet::occupancy::MachineOccupancy::Unforecastable),
+            PARKED_AT,
+        );
+        narrator.absorb_wait(
+            GroupWait::from_occupancy(predicted(60_000, 1)),
+            PARKED_AT + 30_000,
+        );
+        let status = narrator.render(&placing(PARKED_AT), PARKED_AT + 31_000);
+        assert_eq!(
+            status.diagnostic.as_deref(),
+            Some("parked since 09:48:00Z; wait unpredictable: what holds the eligible machines has no measured duration")
+        );
+    }
+
+    #[test]
+    fn a_claimed_check_says_where_it_runs_and_whose_run_it_joined() {
+        let mut narrator =
+            DispatchNarrator::new(GroupWait::from_occupancy(predicted(292_000, 1)), PARKED_AT);
+        let own = narrator
+            .next(
+                &running_on("fedora", PARKED_AT + 9_000, None),
+                PARKED_AT + 10_000,
+            )
+            .unwrap();
+        assert_eq!(own.phase.as_deref(), Some("running"));
+        assert_eq!(
+            own.diagnostic.as_deref(),
+            Some("running on fedora since 09:48:09Z")
+        );
+        assert_eq!(own.executor.as_deref(), Some("fedora"));
+        assert_eq!(own.since_unix_ms, Some(PARKED_AT + 9_000));
+        assert_eq!(
+            narrator.next(
+                &running_on("fedora", PARKED_AT + 9_000, None),
+                PARKED_AT + 3_600_000
+            ),
+            None,
+            "an unchanged phase emits nothing, however long it runs"
+        );
+
+        let joined = narrator.render(
+            &running_on("fedora", PARKED_AT + 9_000, Some("cairn-5096")),
+            PARKED_AT + 20_000,
+        );
+        assert_eq!(
+            joined.diagnostic.as_deref(),
+            Some("joined cairn-5096's run on fedora since 09:48:09Z")
+        );
+    }
+
+    #[test]
+    fn a_parked_check_names_the_machines_that_declined_it() {
+        let mut narrator = DispatchNarrator::new(
+            GroupWait::from_occupancy(crate::fleet::occupancy::MachineOccupancy::Idle),
+            PARKED_AT,
+        );
+        let dispatch = crate::fleet::CheckDispatch {
+            phase: crate::fleet::CheckDispatchPhase::Placing {
+                since_unix_ms: PARKED_AT,
+                declines: vec![crate::fleet::CheckDispatchDecline {
+                    executor_name: "colocated".into(),
+                    reason: cairn_common::executor_protocol::DeclineReason::Disk,
+                    detail: Some("12 GiB free, floor 20 GiB".into()),
+                    at_unix_ms: PARKED_AT + 1_000,
+                }],
+            },
+            joined: None,
+        };
+        let diagnostic = narrator
+            .render(&dispatch, PARKED_AT + 2_000)
+            .diagnostic
+            .unwrap();
+        assert!(
+            diagnostic.ends_with(
+                "; parked since 09:48:00Z; declined by colocated (low disk: 12 GiB free, floor 20 GiB)"
+            ),
+            "{diagnostic}"
+        );
+    }
+
+    /// The board follows the execution while the submission is outstanding,
+    /// and says each phase once.
+    #[tokio::test(start_paused = true)]
+    async fn an_outstanding_batch_moves_from_parked_to_running_on_its_board() {
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let shown = std::sync::Mutex::new(Vec::new());
+        let delivered = narrate_dispatch(
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+                "delivered"
+            },
+            &GroupWait::from_occupancy(predicted(292_000, 1)),
+            || {
+                Some(
+                    match reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                        0 | 1 => placing(PARKED_AT),
+                        _ => running_on("fedora", PARKED_AT + 9_000, None),
+                    },
+                )
+            },
+            || -> GroupWait { unreachable!("the forecast stays fresh for 30s") },
+            |status| shown.lock().unwrap().push(status),
+        )
+        .await;
+        assert_eq!(delivered, "delivered");
+        assert!(reads.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+        let phases: Vec<_> = shown
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .map(|status| (status.phase.unwrap(), status.executor))
+            .collect();
+        assert_eq!(
+            phases,
+            vec![
+                ("queued".to_string(), None),
+                ("running".to_string(), Some("fedora".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_manual_requester_keeps_the_running_diagnostic_and_its_machine() {
+        let update = manual_progress_update(
+            &[],
+            CheckPhaseStatus {
+                executor: Some("fedora".into()),
+                since_unix_ms: Some(PARKED_AT + 9_000),
+                ..check_phase_status(
+                    Some("running"),
+                    Some("running checks"),
+                    Some("running on fedora since 09:48:09Z".into()),
+                )
+            },
+        );
+        assert_eq!(
+            update,
+            ManualCheckProgressUpdate {
+                state: "running".into(),
+                diagnostic: "running on fedora since 09:48:09Z".into(),
+                executor: Some("fedora".into()),
+                since_unix_ms: Some(PARKED_AT + 9_000),
+            }
+        );
+        let parked = manual_progress_update(
+            &[],
+            check_phase_status(Some("queued"), Some("queued"), None),
+        );
+        assert_eq!(parked.state, "parked");
+        assert_eq!(parked.diagnostic, "parked waiting for check capacity");
     }
 
     /// The named wait reaches the agent. A capacity row that says only "there
@@ -18464,6 +19107,29 @@ mod executor_base_content_tests {
         check_name: &str,
         transport: Vec<(String, String)>,
     ) -> Vec<(String, String)> {
+        let mut items = manual_check_wire(check_name, transport).items;
+        assert_eq!(items.len(), 1);
+        items.remove(0).process.env
+    }
+
+    /// A parked check has no admission deadline. However long its wait, it
+    /// can never become a `Capacity` failure that counts toward the
+    /// infrastructure breaker; only the requester's own cancellation removes
+    /// it from the queue, and a manual check's requester is a runner task, not
+    /// the CLI that asked for it.
+    #[test]
+    fn a_parked_check_never_ages_out_of_its_queue() {
+        let wire = manual_check_wire("rust-tests", Vec::new());
+        assert_eq!(wire.request.wait_horizon_unix_ms, u64::MAX);
+        assert_eq!(wire.request.mutation_policy, MutationPolicy::PureVerdict);
+    }
+
+    /// One manual run's batch, through the same wire builder every placement
+    /// uses.
+    fn manual_check_wire(
+        check_name: &str,
+        transport: Vec<(String, String)>,
+    ) -> crate::execution::wire::CheckBatchWire {
         let check: CheckCommand = serde_json::from_value(serde_json::json!({
             "command": "bun run check:executor-protocol",
         }))
@@ -18511,17 +19177,14 @@ mod executor_base_content_tests {
             status_board: None,
             purpose: None,
         };
-        let wire = crate::execution::wire::build_check_batch_wire(
+        crate::execution::wire::build_check_batch_wire(
             &request,
             "request".into(),
             "attempt".into(),
             None,
             Vec::new(),
             Vec::new(),
-        );
-        let mut items = wire.items;
-        assert_eq!(items.len(), 1);
-        items.remove(0).process.env
+        )
     }
 
     #[test]

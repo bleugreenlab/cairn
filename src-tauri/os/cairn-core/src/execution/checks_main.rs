@@ -505,7 +505,7 @@ async fn attempt_lane(
         },
         // A detector never answers with a verdict another run produced.
         true,
-        Arc::new(|_, _| {}),
+        Arc::new(|_| {}),
     )
     .await
     {

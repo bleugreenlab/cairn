@@ -136,7 +136,7 @@ fn describe_occupant(occupant: &ExecutingCellRequest) -> String {
     }
 }
 
-fn describe_owner(owner: &CellOwnerRef) -> Option<String> {
+pub(crate) fn describe_owner(owner: &CellOwnerRef) -> Option<String> {
     match (owner.project_key.as_deref(), owner.issue_number) {
         (Some(key), Some(number)) => Some(format!("{key}-{number}")),
         (Some(key), None) => Some(key.to_string()),
