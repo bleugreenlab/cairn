@@ -127,7 +127,12 @@ fn orchestrator_without_executor(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrat
             .with_process(RealProcessSpawner)
             .build(),
     );
-    Orchestrator::builder(db_state, services, temp.path().join("config")).build()
+    // Owns every seeded run, as `common::orchestrator` does: a child's call that
+    // the executor relays arrives through `dispatch_tool`, whose ownership fence
+    // refuses runs that predate the host's boot.
+    Orchestrator::builder(db_state, services, temp.path().join("config"))
+        .boot_at(0)
+        .build()
 }
 
 /// Run `work` against the test machine's pool on the blocking pool, where the
@@ -1884,6 +1889,122 @@ async fn a_scheduled_automation_runs_its_procedure_under_the_thread_fence() {
             .await
             .as_deref(),
         Some("completed")
+    );
+}
+
+/// A stored procedure's body is the agent's own code acting on the host from a
+/// child process, so the whole composition is under test here: procedure
+/// expansion, the SDK the runner ships with the batch, the executor's callback
+/// relay and its per-batch capability, run identity on the relayed call, and
+/// `cairn:~/db` resolving to the invoking thread's store. Each half has its own
+/// tests; this is the one place they meet.
+///
+/// The refused write is the other half of the contract: a procedure whose write
+/// the host rejects must fail where its author can see it and persist nothing.
+/// Before cairn/4759 such a write returned an ignorable string, and two
+/// collectors reported success for two weeks while writing nothing.
+///
+/// `bun` is required, not probed: the test runner itself runs under bun, so a
+/// lane without it is broken rather than one where this may quietly pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_thread_procedure_persists_its_sdk_writes_to_the_thread_database() {
+    assert!(
+        binary_available("bun"),
+        "bun must be on PATH: it runs the test suite and every TypeScript procedure body"
+    );
+    let run_id = "run-sdk-procedure";
+    let (_temp, db, orch, cwd) = setup(run_id).await;
+    convert_run_to_thread_session(&db, run_id, "fast-pass").await;
+    let created = handle_write(
+        &orch,
+        &request(
+            &cwd,
+            Some(run_id),
+            json!({"changes": [{
+                "target": "cairn:~/db",
+                "mode": "patch",
+                "payload": {"sql": "CREATE TABLE fast_pass_runs(id TEXT PRIMARY KEY, items INTEGER)"}
+            }]}),
+        ),
+    )
+    .await;
+    assert!(created.contains("Applied 1 statements"), "{created}");
+
+    let procedure = |name: &str, sql: &str| {
+        json!({"changes": [{
+            "target": "cairn://p/rhg/fast-pass/procedures",
+            "mode": "create",
+            "payload": {
+                "name": name,
+                "body": {"commands": [{
+                    "interpreter": "typescript",
+                    "code": format!(
+                        "import {{ write }} from \"@cairn/sdk\";\n\
+                         const report = await write([{{ target: \"cairn:~/db\", mode: \"patch\", payload: {{ sql: {sql:?} }} }}]);\n\
+                         console.log(`applied=${{report.applied.length}}`);"
+                    )
+                }]}
+            }
+        }]})
+    };
+    for (name, sql) in [
+        (
+            "collect",
+            "INSERT INTO fast_pass_runs(id, items) VALUES ('run-1', 38)",
+        ),
+        (
+            "collect-misspelled",
+            "INSERT INTO fast_pass_runz(id, items) VALUES ('run-2', 4)",
+        ),
+    ] {
+        let authored =
+            handle_write(&orch, &request(&cwd, Some(run_id), procedure(name, sql))).await;
+        assert!(
+            authored.contains(&format!(
+                "Created procedure cairn://p/rhg/fast-pass/procedures/{name}"
+            )),
+            "procedure authoring failed: {authored}"
+        );
+    }
+    let invoke = |name: &str| {
+        let orch = orch.clone();
+        let request = request(
+            &cwd,
+            Some(run_id),
+            json!({"commands": [{"target": format!("cairn:~/procedures/{name}")}]}),
+        );
+        async move { run_text(&handle_run(&orch, &request).await) }
+    };
+    let rows = || {
+        common::read_resource(
+            &orch,
+            "cairn://p/rhg/fast-pass/db?sql=SELECT id, items FROM fast_pass_runs ORDER BY id",
+        )
+    };
+
+    let collected = invoke("collect").await;
+    assert!(
+        collected.contains("applied=1"),
+        "the procedure's SDK write must be applied by the host: {collected}"
+    );
+    let persisted = rows().await;
+    assert!(
+        persisted.contains("run-1") && persisted.contains("38"),
+        "the row the procedure wrote must be in the thread's database: {persisted}"
+    );
+
+    let refused = invoke("collect-misspelled").await;
+    assert!(
+        refused.contains("Exit code:") && refused.contains("no such table"),
+        "a write the host refuses must fail the procedure with the host's reason: {refused}"
+    );
+    assert!(
+        !refused.contains("applied="),
+        "a refused write must not be reported as applied: {refused}"
+    );
+    assert!(
+        !rows().await.contains("run-2"),
+        "a refused write must persist nothing"
     );
 }
 

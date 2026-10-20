@@ -4,20 +4,28 @@
 
 pub mod sync_server;
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Json, Router};
 
 use cairn_common::executor_protocol::{
     DeclineReason, ExecutorAdvertisement, ExecutorCapabilities, ExecutorIdentity, ExecutorMessage,
     ObjectChannelCredential, OfferSummary, ResidencyRuntimeConfig,
 };
 use cairn_core::internal::db::DbState;
+use cairn_core::internal::dispatch::{dispatch_tool, DispatchOutput};
 use cairn_core::internal::jj;
 use cairn_core::internal::mcp::handlers::issue_resources::handle_read_issue_resource;
 use cairn_core::internal::mcp::handlers::write::handle_write;
-use cairn_core::internal::mcp::types::McpCallbackRequest;
+use cairn_core::internal::mcp::types::{McpCallbackRequest, McpCallbackResponse};
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::TestServicesBuilder;
 use cairn_core::internal::storage::{DbError, DbResult, LocalDb, RowExt, SearchIndex};
@@ -347,6 +355,140 @@ pub fn forget_lost_claim(pool: &ExecutorPool, entry_id: &str) {
     }
 }
 
+/// The per-batch MCP callback relay a real executor runs, so a test's child
+/// processes can call back into the test's own host.
+///
+/// Production splits this across the link: the `cairn-exec` binary binds a
+/// loopback `/api/mcp`, injects it into each item of a batch that carries a
+/// runner callback context, and forwards whatever arrives bearing that context
+/// as an `McpRelayRequest` frame; the runner's link handler authorizes the frame
+/// against the executor session and the run (`Fleet::authorize_mcp_relay`) and
+/// dispatches it. The test executor has no link to carry frames over, so this
+/// does both halves in one place, with the same checks in the same order.
+///
+/// Unlike a real executor it rewrites `CAIRN_CALLBACK_URL` on every batch, not
+/// only those with a context. A colocated test executor's children inherit the
+/// test process's environment, and a test run from an agent shell carries the
+/// LIVE host's callback URL and secret there; without the rewrite, a child that
+/// called the SDK or the CLI would act on that host.
+#[derive(Clone)]
+struct TestMcpRelay {
+    url: String,
+    live_contexts: Arc<Mutex<HashSet<String>>>,
+    orch: Orchestrator,
+    executor_id: &'static str,
+    generation: Arc<AtomicU64>,
+    read_cursors: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+/// Revokes a batch's callback context on the executor side when the batch ends.
+struct LiveContext {
+    id: String,
+    live_contexts: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for LiveContext {
+    fn drop(&mut self) {
+        self.live_contexts.lock().unwrap().remove(&self.id);
+    }
+}
+
+impl TestMcpRelay {
+    fn start(orch: &Orchestrator, executor_id: &'static str, generation: Arc<AtomicU64>) -> Self {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind the test executor's callback relay");
+        listener
+            .set_nonblocking(true)
+            .expect("make the callback relay non-blocking");
+        let address = listener
+            .local_addr()
+            .expect("read the callback relay address");
+        let relay = Self {
+            url: format!("http://{address}/api/mcp"),
+            live_contexts: Arc::default(),
+            orch: orch.clone(),
+            executor_id,
+            generation,
+            read_cursors: Arc::default(),
+        };
+        let router = Router::new()
+            .route("/api/mcp", post(relay_test_callback))
+            .layer(DefaultBodyLimit::max(
+                cairn_common::paths::MCP_CALLBACK_MAX_BODY_BYTES,
+            ))
+            .with_state(relay.clone());
+        let listener =
+            tokio::net::TcpListener::from_std(listener).expect("serve the callback relay");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        relay
+    }
+
+    /// Point every item of `batch` at this relay, and admit its callback
+    /// context for as long as the returned guard lives.
+    fn admit(
+        &self,
+        batch: Option<&mut cairn_common::executor_protocol::ProcessBatch>,
+    ) -> Option<LiveContext> {
+        let batch = batch?;
+        let context = batch.runner_context_id.clone();
+        for item in &mut batch.items {
+            item.env.retain(|(name, _)| {
+                name != "CAIRN_CALLBACK_URL" && (context.is_none() || name != "CAIRN_MCP_SECRET")
+            });
+            item.env
+                .push(("CAIRN_CALLBACK_URL".into(), self.url.clone()));
+            if let Some(context) = &context {
+                item.env.push(("CAIRN_MCP_SECRET".into(), context.clone()));
+            }
+        }
+        let id = context?;
+        self.live_contexts.lock().unwrap().insert(id.clone());
+        Some(LiveContext {
+            id,
+            live_contexts: self.live_contexts.clone(),
+        })
+    }
+}
+
+async fn relay_test_callback(
+    State(relay): State<TestMcpRelay>,
+    headers: HeaderMap,
+    Json(request): Json<McpCallbackRequest>,
+) -> Response {
+    let context = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|context| relay.live_contexts.lock().unwrap().contains(*context));
+    let Some(context) = context else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "invalid or expired callback context",
+        )
+            .into_response();
+    };
+    if let Err(diagnostic) = relay.orch.fleet.authorize_mcp_relay(
+        relay.executor_id,
+        relay.generation.load(Ordering::Acquire),
+        context,
+        &request,
+    ) {
+        return (StatusCode::FORBIDDEN, diagnostic).into_response();
+    }
+    let DispatchOutput { content, reminders } =
+        dispatch_tool(&relay.orch, &request, &relay.read_cursors)
+            .await
+            .into_inner();
+    Json(McpCallbackResponse {
+        result: content,
+        artifact_uri: None,
+        reminders,
+    })
+    .into_response()
+}
+
 fn attach_executor(
     orch: &Orchestrator,
     executor_home: PathBuf,
@@ -437,6 +579,7 @@ fn attach_executor(
         )
         .expect("attach the test executor");
     generation.store(attached_generation, Ordering::Release);
+    let relay = TestMcpRelay::start(orch, executor_id, generation.clone());
     executor_pool.configure_object_channel(
         object_channel,
         executor_id.to_owned(),
@@ -468,7 +611,7 @@ fn attach_executor(
                     entry_id,
                     config,
                     request,
-                    batch,
+                    mut batch,
                 } => {
                     let pool = executor_pool.clone();
                     let reservation = request.resource_reservation.clone();
@@ -480,10 +623,16 @@ fn attach_executor(
                     let executor_pool = executor_pool.clone();
                     let core_pool = core_pool.clone();
                     let projects_served = projects_served.clone();
+                    let relay = relay.clone();
                     tokio::spawn(async move {
                         let request_id = request.request_id.clone();
                         let attempt_id = request.attempt_id.clone();
+                        let context = relay.admit(batch.as_mut());
                         let outcome = executor_pool.run_granted(request, batch).await;
+                        drop(context);
+                        // The link handler revokes a batch's callback contexts
+                        // when its result arrives, before applying the result.
+                        core_pool.settle_runner_contexts_for_request(&request_id, &attempt_id);
                         core_pool.handle_executor_message(
                             executor_id,
                             attached_generation,

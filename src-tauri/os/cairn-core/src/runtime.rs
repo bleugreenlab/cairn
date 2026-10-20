@@ -5,7 +5,7 @@
 //! rather than a resolver hook is the mechanism. This module owns WHAT is
 //! installed: the version-matched `@cairn/sdk` that ships with this build, read
 //! from the runtime the app provisions into `<CAIRN_HOME>/runtime` (or, in a
-//! development build, straight from the repository's `packages/`).
+//! development build, straight from the checkout it was compiled from).
 //!
 //! One source serves every surface that runs Cairn-owned JavaScript -- workflows,
 //! inline TypeScript and JavaScript, and the TypeScript REPL -- so those surfaces
@@ -22,28 +22,30 @@ pub const SCOPE: &str = "@cairn";
 ///
 /// A release build reads the tree the app provisioned into `<CAIRN_HOME>/runtime`
 /// (see `workspace::bundle::provision_workflow_runtime`). A development build
-/// falls back to the repository's own `packages/`, so a `cargo run` with no
-/// staged runtime still has a version-matched SDK -- the same one the developer
-/// is editing.
+/// reads the checkout it was compiled from first, because that is the only copy
+/// guaranteed to match it: a runtime provisioned under `CAIRN_HOME` by some
+/// earlier app launch is whatever that launch staged, and a debug binary or test
+/// that shipped it would exercise an SDK nobody is reviewing.
 pub fn runtime_package(name: &str) -> Result<PathBuf, String> {
+    #[cfg(debug_assertions)]
+    if let Some(checkout) = checkout_runtime_package(name) {
+        return Ok(checkout);
+    }
     if let Some(installed) = installed_runtime_package(&cairn_common::paths::cairn_home(), name) {
         return Ok(installed);
-    }
-    #[cfg(debug_assertions)]
-    {
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let repo = manifest
-            .ancestors()
-            .nth(4)
-            .ok_or("cannot locate Cairn development repository root")?;
-        let dev = repo.join("packages").join(name);
-        if dev.join("package.json").is_file() {
-            return Ok(dev);
-        }
     }
     Err(format!(
         "Cairn runtime package {SCOPE}/{name} is not installed under CAIRN_HOME/runtime/node_modules"
     ))
+}
+
+/// The package in the checkout this binary was compiled from. The crate sits at
+/// `src-tauri/os/cairn-core`, three levels under the repository root.
+#[cfg(debug_assertions)]
+fn checkout_runtime_package(name: &str) -> Option<PathBuf> {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(3)?;
+    let package = repo.join("packages").join(name);
+    package.join("package.json").is_file().then_some(package)
 }
 
 fn installed_runtime_package(home: &Path, name: &str) -> Option<PathBuf> {
@@ -120,6 +122,28 @@ mod tests {
         assert_eq!(
             installed_runtime_package(temp.path(), "harness"),
             Some(package)
+        );
+    }
+
+    /// A development build ships the SDK from its own checkout, whatever a
+    /// previous app launch provisioned under `CAIRN_HOME`. The expected path is
+    /// spelled relative to the manifest rather than through the same ancestor
+    /// walk, so an off-by-one in that walk cannot agree with itself.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_development_build_ships_the_sdk_from_its_own_checkout() {
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../packages/sdk")
+            .canonicalize()
+            .expect("the repository carries packages/sdk");
+        let resolved = runtime_package("sdk").expect("a development build resolves the SDK");
+        assert_eq!(resolved.canonicalize().unwrap(), expected);
+        assert!(
+            sdk_packages()
+                .unwrap()
+                .iter()
+                .any(|asset| asset.path == "@cairn/sdk/src/client.ts"),
+            "the shipped assets must be the checkout's SDK source"
         );
     }
 
