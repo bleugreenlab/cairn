@@ -191,7 +191,11 @@ async fn resolve_and_unresolve_update_issue_and_close_open_sessions() {
     )
     .await
     .unwrap();
-    assert_eq!(closed, vec!["session-1".to_string()]);
+    assert_eq!(closed.closed_sessions, vec!["session-1".to_string()]);
+    assert!(
+        closed.became_terminal,
+        "an open issue resolving crosses the terminal edge"
+    );
 
     let closed_issue = crud::get(&db, &issue.id).await.unwrap().unwrap();
     assert_eq!(closed_issue.status, IssueStatus::Closed);
@@ -215,7 +219,7 @@ async fn resolve_and_unresolve_update_issue_and_close_open_sessions() {
     )
     .await
     .unwrap();
-    crud::resolve(
+    let merged = crud::resolve(
         &db,
         &FixedClock(650),
         &issue.id,
@@ -224,6 +228,10 @@ async fn resolve_and_unresolve_update_issue_and_close_open_sessions() {
     )
     .await
     .unwrap();
+    assert!(
+        !merged.became_terminal,
+        "an issue that was already closed crosses no edge, so it is not announced again"
+    );
     let merged_issue = crud::get(&db, &issue.id).await.unwrap().unwrap();
     assert_eq!(merged_issue.status, IssueStatus::Merged);
     assert_eq!(merged_issue.progress, IssueProgress::Merged);

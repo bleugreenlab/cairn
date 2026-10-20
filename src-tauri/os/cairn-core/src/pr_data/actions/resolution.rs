@@ -798,6 +798,94 @@ mod tests {
         }
     }
 
+    /// The close door announces exactly as the merge door does. Neither the
+    /// UI close nor the recipe `close_issue` action calls anything after the
+    /// cascade, so the announcement has to come from the cascade itself.
+    #[tokio::test(flavor = "current_thread")]
+    async fn operator_ui_close_notifies_parent() {
+        use crate::orchestrator::attention_delivery::render_push_resolved;
+        use crate::orchestrator::attention_push::{list_pending, Wake};
+
+        let db = migrated_db().await;
+        seed_pr_node_merge_request_for_artifact_job(&db).await;
+        seed_parent_coordinator(&db, false).await;
+        let orch = test_orchestrator(db, MockGitClient::new());
+
+        resolve_pr_node(
+            &orch,
+            "builder-job",
+            PrNodeResolution::Close,
+            Some(PrResolutionAttribution::operator_ui()),
+        )
+        .await
+        .expect("the operator UI close resolves the child");
+
+        let pushes = list_pending(&orch.db.local, "parent-coordinator")
+            .await
+            .unwrap();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].wake, Wake::Wake);
+        let rendered = render_push_resolved(&orch, &pushes[0]).await;
+        assert!(rendered.contains("proj-3 \"Issue\" closed"), "{rendered}");
+    }
+
+    /// Resolving an issue that is already terminal crosses no edge, so it is
+    /// not a second announcement — even though it restamps the resolution
+    /// instant the push fingerprint is keyed to, which is exactly what would
+    /// let a delivered notice fire again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolving_an_already_resolved_issue_announces_nothing_new() {
+        use crate::orchestrator::attention_push::list_pending;
+
+        let db = migrated_db().await;
+        seed_pr_node_merge_request_for_artifact_job(&db).await;
+        seed_parent_coordinator(&db, false).await;
+        let orch = test_orchestrator(db, MockGitClient::new());
+
+        resolve_pr_node(
+            &orch,
+            "builder-job",
+            PrNodeResolution::Merge,
+            Some(PrResolutionAttribution::operator_ui()),
+        )
+        .await
+        .expect("the merge resolves the child");
+        assert_eq!(
+            list_pending(&orch.db.local, "parent-coordinator")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        orch.db
+            .local
+            .execute(
+                "UPDATE attention_pushes SET delivered_event_id = 'delivered'
+                  WHERE recipient = 'parent-coordinator'",
+                (),
+            )
+            .await
+            .unwrap();
+
+        crate::issues::status::resolve_terminal(
+            &orch,
+            &orch.db.local,
+            "issue-pr-node",
+            Resolution::Merged,
+            crate::issues::status::StopFailure::Escalates,
+        )
+        .await
+        .expect("a repeat resolution lands");
+
+        assert!(
+            list_pending(&orch.db.local, "parent-coordinator")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the coordinator already heard about this resolution"
+        );
+    }
+
     /// The PR merge is the door CAIRN-3241 came through: the PR merged, the issue
     /// row flipped, and the builder went on running test suites against a merged
     /// issue — because this path resolved the issue directly instead of running

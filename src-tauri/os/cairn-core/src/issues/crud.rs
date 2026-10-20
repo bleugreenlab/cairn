@@ -662,6 +662,20 @@ pub async fn complete(
         .map(|_| ())
 }
 
+/// What [`resolve`] recorded.
+#[derive(Debug)]
+pub struct ResolveOutcome {
+    /// Sessions the resolution closed.
+    pub closed_sessions: Vec<String>,
+    /// The issue crossed from non-terminal to terminal in THIS write.
+    ///
+    /// A resolution is announced on its edge, and the write that crosses it is
+    /// the only place that can say so: the recomputes that follow see an issue
+    /// that is already terminal and cross nothing. Re-resolving an issue that
+    /// was already terminal reports `false`, so it is not announced again.
+    pub became_terminal: bool,
+}
+
 /// Record an issue's terminal resolution, and in the same write snapshot it as
 /// a tenet evidence event owned by `device_id` (this machine's stable id).
 pub async fn resolve(
@@ -670,7 +684,7 @@ pub async fn resolve(
     id: &str,
     resolution: Resolution,
     device_id: &str,
-) -> Result<Vec<String>, CairnError> {
+) -> Result<ResolveOutcome, CairnError> {
     let device_id = device_id.to_string();
     let id = id.to_string();
     let now = clock.now();
@@ -678,6 +692,23 @@ pub async fn resolve(
         let id = id.clone();
         let device_id = device_id.clone();
         Box::pin(async move {
+            // Read in the same write as the flip, so the edge is the one this
+            // write crossed and not one a concurrent resolution crossed first.
+            let mut prior = conn
+                .query(
+                    "SELECT status FROM issues WHERE id = ?1",
+                    params![id.as_str()],
+                )
+                .await?;
+            let became_terminal = match prior.next().await? {
+                Some(row) => !row
+                    .opt_text(0)?
+                    .and_then(|status| status.parse::<IssueStatus>().ok())
+                    .is_some_and(|status| status.is_terminal()),
+                None => false,
+            };
+            drop(prior);
+
             let reason = match resolution {
                 Resolution::Merged => {
                     conn.execute(
@@ -734,7 +765,11 @@ pub async fn resolve(
             )
             .await?;
 
-            close_sessions_for_issue_conn(conn, &id, reason, now).await
+            let closed_sessions = close_sessions_for_issue_conn(conn, &id, reason, now).await?;
+            Ok(ResolveOutcome {
+                closed_sessions,
+                became_terminal,
+            })
         })
     })
     .await

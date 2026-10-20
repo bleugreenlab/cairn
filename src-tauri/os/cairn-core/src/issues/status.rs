@@ -286,7 +286,11 @@ pub async fn update_status(
     );
     orch.invalidate_sidebar_active_issues();
 
-    orch.wake_for_issue(id).await;
+    // A terminal resolution was announced by `resolve_terminal` on the edge it
+    // crossed; waking here as well would emit the same `Resolved` fact twice.
+    if !is_terminal_state {
+        orch.wake_for_issue(id).await;
+    }
 
     if is_terminal_state {
         let orch_clone = orch.clone();
@@ -405,7 +409,10 @@ pub(crate) async fn resolve_terminal(
         }
     }
 
-    let closed_sessions = crud::resolve(
+    let crud::ResolveOutcome {
+        closed_sessions,
+        became_terminal,
+    } = crud::resolve(
         owning_db,
         &*orch.services.clock,
         issue_id,
@@ -435,6 +442,10 @@ pub(crate) async fn resolve_terminal(
 
     settle_job_projection_for_issue(orch, owning_db, issue_id).await;
 
+    if became_terminal {
+        announce_resolution(orch, owning_db, issue_id).await;
+    }
+
     // Every terminal resolution comes through here — the status patch, a PR
     // merge or close, the recipe action — so this is where `issue_resolution`
     // and `pr_state` gates hear about it.
@@ -442,6 +453,40 @@ pub(crate) async fn resolve_terminal(
     orch.notify_tenet_evidence();
 
     Ok(())
+}
+
+/// Announce the resolution [`resolve_terminal`] just recorded to the issue's
+/// watchers — its parent coordinator among them.
+///
+/// The recompute sweep announces only the terminal edges it crosses itself, so
+/// that a sweep over an old merged issue never replays the merge. A resolution
+/// through this door crosses the edge in `crud::resolve`, before any recompute
+/// runs, which leaves the sweep nothing to announce: the door that crossed the
+/// edge has to. Runs after the job projection settles, so a watcher roused by
+/// it reads the issue's work already at rest.
+async fn announce_resolution(orch: &Orchestrator, db: &LocalDb, issue_id: &str) {
+    let ctx = match crate::orchestrator::attention::read_issue_for_attention(db, issue_id).await {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            log::warn!("Could not announce the resolution of issue {issue_id}: {error}");
+            return;
+        }
+    };
+    // Reopened in between: there is no resolution left to announce.
+    if !ctx.status.is_terminal() {
+        return;
+    }
+    orch.emit_attention_event(crate::orchestrator::AttentionEvent {
+        issue_id: issue_id.to_string(),
+        issue_uri: ctx.issue_uri(),
+        fact: crate::orchestrator::AttentionFact::Resolved {
+            final_status: ctx.status.clone(),
+        },
+        attention: ctx.attention,
+        status: ctx.status,
+        updated_at: ctx.updated_at,
+        route_provenance: None,
+    });
 }
 
 /// Re-derive every job on a just-resolved issue, so none rests Running,

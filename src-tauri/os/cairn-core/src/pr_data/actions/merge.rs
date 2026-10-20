@@ -560,7 +560,6 @@ async fn merge_remote_pr_via_github(
     attribution: Option<super::PrResolutionAttribution>,
 ) -> Result<String, String> {
     let repo_path = merge_context.mr.repo_path.clone();
-    let issue_id = merge_context.issue_id.clone();
     let source_branch = merge_context.source_branch.clone();
     let target_branch = merge_context.target_branch.clone();
     let pr_number = merge_context
@@ -613,12 +612,6 @@ async fn merge_remote_pr_via_github(
         "merge_pr_for_job[{job_id}]: resolve_pr_node took {:?}",
         resolve_started.elapsed()
     );
-
-    if let Some(issue_id) = issue_id.as_deref() {
-        // Terminal transition — wake any in-flight `cairn watch` on this issue,
-        // matching the PR-webhook merge path.
-        orch.wake_for_issue(issue_id).await;
-    }
 
     // BEST-EFFORT: delete the merged source branch on GitHub. Nothing downstream
     // depends on it.
@@ -705,7 +698,6 @@ async fn merge_pr_for_job_past_barrier(
         .map_err(|e| e.to_string())?;
     let merge_context = resolve_merge_mr_context_for_job(&db, job_id).await?;
     let repo_path = merge_context.mr.repo_path.clone();
-    let issue_id = merge_context.issue_id.clone();
 
     // Per-phase timing for the synchronous merge path. The downstream sibling
     // reconcile no longer runs here (it is spawned inside `resolve_pr_node`), so
@@ -1037,13 +1029,6 @@ async fn merge_pr_for_job_past_barrier(
         "merge_pr_for_job[{job_id}]: resolve_pr_node took {:?}",
         resolve_started.elapsed()
     );
-
-    if let Some(issue_id) = issue_id.as_deref() {
-        // Terminal transition — wake any in-flight `cairn watch` on this issue,
-        // matching the PR-webhook merge path. Typed emit re-reads the live
-        // projection and sends `Resolved` since the issue just became terminal.
-        orch.wake_for_issue(issue_id).await;
-    }
 
     // Background reconciliation, shared with the GitHub webhook merge path. The
     // local fold already advanced the checkout ref, so reconciliation repairs the
