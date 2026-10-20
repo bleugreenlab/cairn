@@ -1026,6 +1026,10 @@ mod tests {
     use std::sync::Arc;
 
     async fn test_orchestrator() -> Orchestrator {
+        test_builder().await.build()
+    }
+
+    async fn test_builder() -> OrchestratorBuilder {
         let root = tempfile::tempdir().unwrap().keep();
         let config_dir = root.join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
@@ -1035,7 +1039,6 @@ mod tests {
         let services = Arc::new(TestServicesBuilder::new().build());
         OrchestratorBuilder::new(db_state, services, config_dir.clone())
             .subscriptions(Arc::new(TempHomes::new(config_dir.join("claude-profiles"))))
-            .build()
     }
 
     /// Reports whatever credential generation a test sets; every other
@@ -1486,6 +1489,98 @@ mod tests {
             orch.get_model_catalog().is_empty(),
             "saving the identity store ran provider discovery inline; it must be spawned off the async task"
         );
+    }
+
+    /// A test orchestrator does not rediscover models on its own. Rediscovery
+    /// visits every enabled provider over the network, so in a unit test it is
+    /// a request leaving the machine and a race with any catalog the test
+    /// seeded. The awaited startup pass and the refresh `add_account` spawns go
+    /// through the same switch, so awaiting the former shows the latter was a
+    /// no-op too; a refresh that ran would record an entry per enabled
+    /// provider even if every one of them failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_test_orchestrator_does_not_rediscover_models_when_an_account_is_added() {
+        let orch = test_orchestrator().await;
+        assert!(!orch.enabled_providers().is_empty());
+
+        orch.add_account(
+            ApiProvider::OpenAI,
+            "Key".to_string(),
+            ProviderAuth::ApiKey {
+                value: "sk-test".to_string(),
+            },
+            None,
+        )
+        .unwrap();
+        orch.run_model_catalog_refresh().await;
+
+        assert!(
+            orch.get_model_catalog().is_empty(),
+            "a test orchestrator rediscovered models: {:?}",
+            orch.get_model_catalog()
+        );
+    }
+
+    /// A test about rediscovery opts in, and stays offline by enabling only
+    /// providers that answer from what is stored: Claude behind an API key,
+    /// and a custom provider whose models are declared rather than listed.
+    /// Claude stays enabled because it serves the default tiers. The accounts
+    /// are stored without `add_account` so no refresh starts before the
+    /// enabled set is narrowed to them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_opted_in_test_orchestrator_rediscovers_its_enabled_providers() {
+        use crate::credentials::{CustomModelPolicy, CustomProtocol, CustomSampling};
+        let orch = test_builder().await.catalog_rediscovery(true).build();
+        let mut store = crate::identity::local::credential_store_from_git_config(&orch.config_dir);
+        store.add_account(
+            ApiProvider::Anthropic,
+            "Key".to_string(),
+            ProviderAuth::ApiKey {
+                value: "sk-ant-test".to_string(),
+            },
+            None,
+            0,
+        );
+        let account = store.add_account(
+            ApiProvider::Custom,
+            "Local".to_string(),
+            ProviderAuth::custom_endpoint(
+                "http://127.0.0.1:9/v1",
+                CustomProtocol::OpenAiChatCompletions,
+                None,
+                &[],
+                CustomModelPolicy::Explicit {
+                    ids: vec!["local-model".to_string()],
+                },
+                CustomSampling::default(),
+                32_768,
+            )
+            .unwrap(),
+            None,
+            0,
+        );
+        orch.save_credential_store(store).unwrap();
+        let key = cairn_models::types::catalog::custom_key(&account.id);
+        orch.update_settings(crate::models::UpdateSettings {
+            enabled_providers: Some(vec!["claude".to_string(), key.clone()]),
+            ..Default::default()
+        })
+        .unwrap();
+
+        orch.run_model_catalog_refresh().await;
+
+        let catalog = orch.get_model_catalog();
+        assert_eq!(
+            catalog
+                .iter()
+                .map(|entry| (entry.backend.as_str(), entry.error.as_deref()))
+                .collect::<Vec<_>>(),
+            [("claude", None), (key.as_str(), None)]
+        );
+        assert!(catalog[1]
+            .models
+            .iter()
+            .any(|model| model.id == "local-model"));
     }
 
     /// Claude's models are offered on the strength of a configured credential,

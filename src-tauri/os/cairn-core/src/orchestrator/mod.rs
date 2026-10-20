@@ -124,6 +124,7 @@ pub struct OrchestratorBuilder {
     effect_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEffect>>,
     browser_command_tx: Option<crate::browsers::BrowserCommandTx>,
     model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
+    catalog_rediscovery: bool,
     provider_usage_snapshots: ProviderUsageSnapshots,
     provider_usage_captures: ProviderUsageCaptures,
     reconciled_subscriptions: subscription_periods::ReconciledSubscriptions,
@@ -257,6 +258,9 @@ impl OrchestratorBuilder {
             effect_tx: None,
             browser_command_tx: None,
             model_catalog: Arc::new(RwLock::new(HashMap::new())),
+            // Off in test builds, with no way to turn it off in any other; see
+            // `Orchestrator::catalog_rediscovery`.
+            catalog_rediscovery: !cfg!(any(test, feature = "test-utils")),
             provider_usage_snapshots: Arc::new(cairn_models::usage::book::UsageBook::new()),
             provider_usage_captures: Arc::new(Mutex::new(HashSet::new())),
             reconciled_subscriptions: Arc::default(),
@@ -404,6 +408,17 @@ impl OrchestratorBuilder {
         self
     }
 
+    /// Let this test orchestrator rediscover every enabled provider's models
+    /// the way production does: after each credential change and when startup
+    /// maintenance asks. Test builds leave it off (see
+    /// [`Orchestrator::catalog_rediscovery`]); a test that turns it on must
+    /// enable only providers that answer without leaving the machine.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn catalog_rediscovery(mut self, enabled: bool) -> Self {
+        self.catalog_rediscovery = enabled;
+        self
+    }
+
     #[cfg(test)]
     fn team_attention_sender(
         mut self,
@@ -534,6 +549,7 @@ impl OrchestratorBuilder {
             mcp_gateway: Arc::new(OnceLock::new()),
             desktop_facades: Arc::default(),
             model_catalog: self.model_catalog,
+            catalog_rediscovery: self.catalog_rediscovery,
             provider_usage_snapshots: self.provider_usage_snapshots,
             provider_usage_captures: self.provider_usage_captures,
             reconciled_subscriptions: self.reconciled_subscriptions,
@@ -1163,6 +1179,15 @@ pub struct Orchestrator {
 
     /// Cached provider model catalog loaded at startup and refreshed on demand.
     model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
+    /// Whether [`Self::refresh_model_catalog`] rediscovers anything. Always on
+    /// outside test builds. Test builds default it off, because a full refresh
+    /// is the one discovery nobody asked for by name: it fires from
+    /// `add_account` and the other credential paths on a detached thread,
+    /// reaches every enabled provider over the network, and on failure stamps
+    /// an error onto each entry, which hides whatever catalog the test seeded.
+    /// A scoped single-provider refresh is an explicit request and is not
+    /// gated.
+    catalog_rediscovery: bool,
     /// Latest usage snapshots keyed by backend and requested account.
     pub provider_usage_snapshots: ProviderUsageSnapshots,
     /// Account probes are single-flight so concurrent session starts cannot
@@ -3229,7 +3254,13 @@ impl Orchestrator {
     /// one of them leaves clients holding a catalog they fetched before
     /// discovery finished. A scoped single-backend refresh deliberately stays
     /// silent: it hands the new entry straight back to the caller that asked.
+    ///
+    /// Every full refresh, detached or awaited, passes through here, so this is
+    /// where [`Self::catalog_rediscovery`] holds it back.
     fn refresh_model_catalog(&self) {
+        if !self.catalog_rediscovery {
+            return;
+        }
         // Only what this workspace installed. A provider it never enabled has
         // no models anyone can choose, so discovering them would be an
         // unprompted network call on a credential the user did not offer.
