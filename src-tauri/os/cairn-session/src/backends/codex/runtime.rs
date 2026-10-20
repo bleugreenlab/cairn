@@ -118,9 +118,9 @@ use cairn_models::codex::thread_router::{Scoped, ThreadRouter};
 use cairn_models::usage::codex_rate_limits::codex_rate_limit_snapshot_from_value;
 use cairn_models::wire::claude_stream::Usage;
 use cairn_models::wire::codex_app_server::{
-    context_usage, extract_command_execution, extract_mcp_result,
-    extract_raw_response_message_text, is_selected_model_capacity_error, normalize_capacity_error,
-    notification_turn_id, summarize_command_result, summarize_file_change_result,
+    context_usage, extract_command_execution, extract_raw_response_message_text,
+    is_selected_model_capacity_error, normalize_capacity_error, notification_turn_id,
+    summarize_command_result, summarize_file_change_result, summarize_mcp_tool_call,
     CodexTurnUsageAccumulator, Notification, ProviderTurnStatus,
 };
 use serde_json::Value;
@@ -1162,9 +1162,8 @@ impl CodexRuntime {
                             }
                             "mcpToolCall" => {
                                 let tool_use_id = json_string(item.pointer("/id"));
-                                let result_value = item.pointer("/result").cloned();
                                 let (result_text, is_err, raw_value) =
-                                    extract_mcp_result(&result_value);
+                                    summarize_mcp_tool_call(item);
                                 let event = codex_tool_result_event(
                                     session_id.clone(),
                                     tool_use_id.clone(),

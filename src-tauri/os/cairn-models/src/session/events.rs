@@ -298,8 +298,8 @@ pub mod claude {
 pub mod codex {
     use super::*;
     use crate::wire::codex_app_server::{
-        CodexTurnUsageAccumulator, ImageGenerationItem, Notification, ProviderTurnStatus,
-        IMAGE_GENERATION_ITEM,
+        summarize_mcp_tool_call, CodexTurnUsageAccumulator, ImageGenerationItem, Notification,
+        ProviderTurnStatus, IMAGE_GENERATION_ITEM,
     };
 
     /// The items that are conversation, not tools. Every other item kind is
@@ -323,20 +323,31 @@ pub mod codex {
     }
 
     fn tool_result(item: &Value) -> SessionEvent {
+        let failed = item.get("status").and_then(Value::as_str) == Some("failed")
+            || item.get("error").is_some_and(|error| !error.is_null());
+        let (content, is_error) = match item.get("type").and_then(Value::as_str) {
+            Some("mcpToolCall") => {
+                let (text, is_error, _raw) = summarize_mcp_tool_call(item);
+                (text, is_error)
+            }
+            _ => (tool_output(item), false),
+        };
         SessionEvent::ToolResult {
             tool_use_id: item
                 .get("id")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            content: tool_output(item),
-            is_error: item.get("status").and_then(Value::as_str) == Some("failed")
-                || item.get("error").is_some_and(|error| !error.is_null()),
+            content,
+            is_error: failed || is_error,
         }
     }
 
+    /// A non-MCP tool item's output. `result` is not read: the items that
+    /// carry one are MCP calls (read above) and image generations, whose
+    /// `result` is base64.
     fn tool_output(item: &Value) -> String {
-        ["result", "aggregatedOutput", "output", "error"]
+        ["aggregatedOutput", "output", "error"]
             .iter()
             .find_map(|field| item.get(*field).filter(|value| !value.is_null()))
             .map(content_text)
@@ -837,6 +848,71 @@ mod tests {
         assert!(
             matches!(&events[1], SessionEvent::ToolResult { tool_use_id, is_error: false, .. } if tool_use_id == "call-1")
         );
+    }
+
+    fn codex_mcp_result(item: Value) -> (String, bool) {
+        let mut mapper = codex::EventMapper::new();
+        let events = mapper.map(&json!({"method": "item/completed", "params": {"item": item}}));
+        let [SessionEvent::ToolResult {
+            content, is_error, ..
+        }] = events.as_slice()
+        else {
+            panic!("{events:?}");
+        };
+        (content.clone(), *is_error)
+    }
+
+    /// An MCP result reads as its text, with a marker for an image and never
+    /// the image's base64 or the result's JSON around it.
+    #[test]
+    fn codex_mcp_results_read_as_their_text() {
+        let data = "UklGRlYAAABXRUJQVlA4".repeat(500);
+        let (content, is_error) = codex_mcp_result(json!({
+            "id": "call-1", "type": "mcpToolCall", "status": "completed",
+            "server": "studio", "tool": "render", "error": null,
+            "result": {"content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image", "mimeType": "image/png", "data": data},
+            ], "structured_content": null}}));
+        assert!(content.contains("hi"), "{content}");
+        assert!(content.contains("[image: image/png]"), "{content}");
+        assert!(!content.contains("UklGRlYAAABXRUJQVlA4"), "{content}");
+        assert!(!content.contains("structured_content"), "{content}");
+        assert!(
+            serde_json::from_str::<Value>(&content).is_err(),
+            "{content}"
+        );
+        assert!(!is_error);
+
+        let (content, is_error) = codex_mcp_result(json!({
+            "id": "call-2", "type": "mcpToolCall", "status": "completed",
+            "result": {"content": [{"type": "text", "text": "plain"}], "structured_content": null}}));
+        assert_eq!((content.as_str(), is_error), ("plain", false));
+    }
+
+    #[test]
+    fn codex_mcp_errors_read_as_errors() {
+        let (content, is_error) = codex_mcp_result(json!({
+            "id": "call-1", "type": "mcpToolCall", "status": "completed",
+            "result": {"content": [{"type": "text", "text": "no such scene"}], "is_error": true}}));
+        assert_eq!((content.as_str(), is_error), ("no such scene", true));
+
+        let (content, is_error) = codex_mcp_result(json!({
+            "id": "call-2", "type": "mcpToolCall", "status": "failed",
+            "result": null, "error": {"message": "server disconnected"}}));
+        assert_eq!(
+            (content.as_str(), is_error),
+            ("Error: server disconnected", true)
+        );
+    }
+
+    /// An image generation the image reader cannot parse falls back to a
+    /// tool result without its base64 `result`.
+    #[test]
+    fn an_unparsed_image_generation_does_not_read_its_base64() {
+        let (content, _) = codex_mcp_result(json!({
+            "id": "ig-1", "type": "imageGeneration", "result": "iVBORw0KGgo="}));
+        assert!(!content.contains("iVBORw0KGgo"), "{content}");
     }
 
     #[test]

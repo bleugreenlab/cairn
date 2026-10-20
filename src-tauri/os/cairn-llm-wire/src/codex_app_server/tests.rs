@@ -517,6 +517,56 @@ fn mcp_results_keep_raw_only_for_non_text_content() {
 }
 
 #[test]
+fn mcp_media_reads_as_a_marker_and_never_its_payload() {
+    let data = "iVBORw0KGgo".repeat(200);
+    let result = Some(json!({"content": [
+        {"type": "text", "text": "rendered"},
+        {"type": "image", "mimeType": "image/png", "data": data},
+        {"type": "audio", "data": data},
+        {"type": "resource_link", "uri": "file:///a.txt", "name": "a"},
+    ], "structured_content": null}));
+    let (text, is_error, raw) = extract_mcp_result(&result);
+    assert_eq!(
+        text,
+        "rendered\n[image: image/png]\n[audio]\n[resource: file:///a.txt]"
+    );
+    assert!(!is_error);
+    assert_eq!(raw, result, "the raw result is kept beside the text");
+
+    let image_only = Some(json!({"content": [
+        {"type": "image", "mimeType": "image/webp", "data": data},
+    ]}));
+    assert_eq!(extract_mcp_result(&image_only).0, "[image: image/webp]");
+}
+
+#[test]
+fn mcp_tool_call_items_read_their_result_or_their_error() {
+    let completed = json!({"type": "mcpToolCall", "status": "completed",
+        "result": {"content": [{"type": "text", "text": "hi"}], "structured_content": null},
+        "error": null});
+    let (text, is_error, _) = summarize_mcp_tool_call(&completed);
+    assert_eq!((text.as_str(), is_error), ("hi", false));
+
+    let failed = json!({"type": "mcpToolCall", "status": "failed", "result": null,
+        "error": {"message": "tool timed out"}});
+    assert_eq!(
+        summarize_mcp_tool_call(&failed),
+        ("Error: tool timed out".to_string(), true, None)
+    );
+
+    let failed_bare = json!({"type": "mcpToolCall", "status": "failed"});
+    assert_eq!(
+        summarize_mcp_tool_call(&failed_bare),
+        ("Error".to_string(), true, None)
+    );
+
+    let tool_error = json!({"type": "mcpToolCall", "status": "completed",
+        "result": {"content": [{"type": "text", "text": "bad input"}], "is_error": true}});
+    let (text, is_error, _) = summarize_mcp_tool_call(&tool_error);
+    assert_eq!((text.as_str(), is_error), ("bad input", true));
+}
+
+#[test]
 fn raw_response_messages_join_their_text_parts() {
     let item = json!({"type": "message", "content": [{"type": "output_text", "text": "a"}, {"type": "output_text", "text": ""}, {"type": "output_text", "text": "b"}]});
     assert_eq!(

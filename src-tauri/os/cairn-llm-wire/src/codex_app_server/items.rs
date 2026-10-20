@@ -85,20 +85,13 @@ pub fn extract_mcp_result(result: &Option<Value>) -> (String, bool, Option<Value
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Extract text from content array: [{"type":"text","text":"..."}, ...]
     let text = call_result
         .get("content")
         .and_then(|v| v.as_array())
         .map(|items| {
             items
                 .iter()
-                .filter_map(|item| {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        item.get("text").and_then(|t| t.as_str())
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(mcp_content_block_text)
                 .collect::<Vec<_>>()
                 .join("\n")
         })
@@ -130,6 +123,53 @@ pub fn extract_mcp_result(result: &Option<Value>) -> (String, bool, Option<Value
     };
 
     (display, is_err, raw)
+}
+
+/// One MCP content block as display text: a text block's text, and a short
+/// marker for media and resources so a result that was only an image still
+/// says what it returned. Never a block's payload: image and audio data are
+/// base64 the transcript has no use for.
+fn mcp_content_block_text(block: &Value) -> Option<String> {
+    let field = |name: &str| block.get(name).and_then(Value::as_str);
+    match field("type")? {
+        "text" => field("text").map(str::to_string),
+        kind @ ("image" | "audio") => Some(match field("mimeType") {
+            Some(mime) => format!("[{kind}: {mime}]"),
+            None => format!("[{kind}]"),
+        }),
+        "resource_link" => field("uri").map(|uri| format!("[resource: {uri}]")),
+        "resource" => block
+            .pointer("/resource/uri")
+            .and_then(Value::as_str)
+            .map(|uri| format!("[resource: {uri}]")),
+        _ => None,
+    }
+}
+
+/// A completed `mcpToolCall` item's result text, whether it failed, and its
+/// raw result for storage (see [`extract_mcp_result`]). A failed call carries
+/// `error: {message}` and no result, and its status says `failed`.
+pub fn summarize_mcp_tool_call(item: &Value) -> (String, bool, Option<Value>) {
+    let failed = item.get("status").and_then(Value::as_str) == Some("failed");
+    let error = item.get("error").filter(|error| !error.is_null());
+    match item.get("result").filter(|result| !result.is_null()) {
+        Some(result) => {
+            let (text, is_error, raw) = extract_mcp_result(&Some(result.clone()));
+            (text, is_error || failed || error.is_some(), raw)
+        }
+        None => match error {
+            Some(error) => {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| error.as_str())
+                    .unwrap_or("the MCP tool call failed");
+                (format!("Error: {message}"), true, None)
+            }
+            None if failed => ("Error".to_string(), true, None),
+            None => ("Completed".to_string(), false, None),
+        },
+    }
 }
 
 /// A completed `commandExecution` item's result text and whether it failed.
