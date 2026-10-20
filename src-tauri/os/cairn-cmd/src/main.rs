@@ -249,7 +249,8 @@ mod cli_parse_tests {
 /// request and forward it to the running Cairn app over the same HTTP callback
 /// the MCP server uses, then print the result to stdout. The binary never opens
 /// the database itself (Turso holds a process-exclusive lock; the app is the
-/// sole owner). If the app is unreachable, we autostart it and retry once.
+/// sole owner). It never starts the runner: an unreachable runner is reported,
+/// and one a person stopped is named as stopped.
 #[derive(clap::Subcommand)]
 enum Command {
     /// Run the stdio MCP server.

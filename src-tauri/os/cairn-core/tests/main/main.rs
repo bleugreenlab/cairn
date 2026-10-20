@@ -11,6 +11,7 @@ mod common;
 mod account;
 mod accumulator;
 mod action_runs;
+mod artifact_revision_delivery;
 mod artifact_seen;
 mod authority_protected_document;
 mod concurrent_job_launch;

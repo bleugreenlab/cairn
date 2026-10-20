@@ -276,16 +276,6 @@ pub(crate) fn path_is_registered(path: &str) -> bool {
     registered_paths().contains(path)
 }
 
-/// Files whose conflicting content this pass knows how to union rather than hand
-/// to an agent: the registration registries, whose tails two branches append to
-/// independently.
-pub(crate) fn union_resolvable_paths() -> BTreeSet<String> {
-    SEQUENTIAL_FILE_LINEAGES
-        .iter()
-        .map(|lineage| lineage.registry_file.to_string())
-        .collect()
-}
-
 /// One file mutation the resolver will apply to a materialized tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FileEdit {

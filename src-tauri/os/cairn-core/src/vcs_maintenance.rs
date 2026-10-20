@@ -14,9 +14,16 @@
 //! 1. Cairn's own refs whose lifecycle ended: `refs/cairn/checks/*` that no
 //!    check batch holds, `refs/cairn/stranded/*` whose issue was resolved more
 //!    than the retention window ago, and `refs/cairn/rescued/*` older than it.
-//! 2. At most weekly, under the store lock, the operation log older than the
+//! 2. Under the store lock, the store's view: every visible commit that no
+//!    bookmark, remote bookmark, tag, working copy, or base reaches is hidden,
+//!    after any bookmark conflicted between two replays of one branch is settled
+//!    on the newer one (`cairn_vcs::jj::sweep_store_view`). Superseded history
+//!    that some step made visible again would otherwise stay visible for good,
+//!    as divergent twins and unreferenced heads that keep their objects alive.
+//!    Hiding changes only the view; objects go only through step 4's reclaim.
+//! 3. At most weekly, under the store lock, the operation log older than the
 //!    window.
-//! 3. Outside the store lock, unreachable operations and keep refs for anything
+//! 4. Outside the store lock, unreachable operations and keep refs for anything
 //!    that is not an index head; then, at most once per window and outside
 //!    every Cairn lock, a cruft repack that reclaims unreferenced Git objects
 //!    older than the window. `cairn_vcs::jj::reclaim_unreachable_objects`
@@ -41,7 +48,6 @@
 //! gets one. `refStorePrune: false` opts a store out: it is measured and never
 //! pruned. See [`prune_gate`].
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -114,6 +120,10 @@ const STALE_GC_PID: Duration = Duration::from_secs(12 * 60 * 60);
 
 const STORE_LOCK_WAIT: Duration = Duration::from_secs(600);
 
+/// A commit younger than this is never hidden by the view sweep: a writer
+/// outside the store lock may not yet have named it.
+const VIEW_SWEEP_GRACE: Duration = Duration::from_secs(60 * 60);
+
 const CHECK_PREFIX: &str = "refs/cairn/checks/";
 const STRANDED_PREFIX: &str = "refs/cairn/stranded/";
 const RESCUED_PREFIX: &str = "refs/cairn/rescued/";
@@ -123,6 +133,8 @@ const RESCUED_PREFIX: &str = "refs/cairn/rescued/";
 pub(crate) struct ProjectStore {
     pub(crate) project_id: String,
     pub(crate) store: PathBuf,
+    /// The base branches of every project the store serves.
+    pub(crate) base_branches: Vec<String>,
 }
 
 impl Orchestrator {
@@ -387,23 +399,38 @@ async fn record_awaiting_confirmation(db: &LocalDb, project: &ProjectStore) {
 /// Every project with a repository on this machine and a jj store beside it,
 /// once per store however many databases name it.
 async fn project_stores(orch: &Orchestrator) -> Vec<ProjectStore> {
-    let mut seen = HashSet::new();
-    let mut stores = Vec::new();
+    let mut stores: Vec<ProjectStore> = Vec::new();
     for db in orch.db.all_dbs().await {
         let Ok(rows) = db
             .query_all(
-                "SELECT id, repo_path FROM projects WHERE repo_path != ''",
+                "SELECT id, repo_path, COALESCE(default_branch, '') FROM projects
+                 WHERE repo_path != ''",
                 (),
-                |row| Ok((row.text(0)?, row.text(1)?)),
+                |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
             )
             .await
         else {
             continue;
         };
-        for (project_id, repo_path) in rows {
+        for (project_id, repo_path, base) in rows {
             let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
-            if store.join(".jj").is_dir() && seen.insert(store.clone()) {
-                stores.push(ProjectStore { project_id, store });
+            if !store.join(".jj").is_dir() {
+                continue;
+            }
+            let index = match stores.iter().position(|known| known.store == store) {
+                Some(index) => index,
+                None => {
+                    stores.push(ProjectStore {
+                        project_id,
+                        store,
+                        base_branches: Vec::new(),
+                    });
+                    stores.len() - 1
+                }
+            };
+            let bases = &mut stores[index].base_branches;
+            if !base.is_empty() && !bases.contains(&base) {
+                bases.push(base);
             }
         }
     }
@@ -712,6 +739,31 @@ async fn run_prune(
         .await
         .map_err(failed)?;
 
+    // The view sweep only hides; a skipped or failed one leaves residue the
+    // next prune collects, so it never holds back the rest of this one.
+    match sweep_view(orch, project).await {
+        Ok(sweep) => {
+            if sweep.commits_hidden > 0 || !sweep.bookmarks_resolved.is_empty() {
+                log::info!(
+                    "store view sweep of {}: hid {} head(s) and {} commit(s), settled {} \
+                     replayed-twin bookmark(s) ({}); undo point: operation {}",
+                    store.display(),
+                    sweep.heads_hidden,
+                    sweep.commits_hidden,
+                    sweep.bookmarks_resolved.len(),
+                    sweep
+                        .bookmarks_resolved
+                        .iter()
+                        .map(|settled| format!("{} -> {}", settled.bookmark, settled.kept))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    sweep.operation_before
+                );
+            }
+        }
+        Err(outcome) => log::warn!("store view sweep of {}: {outcome}", store.display()),
+    }
+
     let now = unix_now();
     let truncation_due = last_successful_prune(&orch.db.local, &store, true)
         .await
@@ -810,6 +862,34 @@ async fn run_prune(
     report.after = Some(census);
     report.store_bytes_after = Some(bytes);
     Ok(())
+}
+
+/// Sweep the store's view under the store lock, which every reconcile and
+/// replay takes, so no rewrite is between naming a commit and anchoring it.
+async fn sweep_view(
+    orch: &Orchestrator,
+    project: &ProjectStore,
+) -> Result<crate::jj::StoreViewSweep, String> {
+    let Ok(_guard) = orch
+        .acquire_jj_store_lock_with_timeout(
+            &project.store,
+            crate::orchestrator::StoreLockClass::Background,
+            "ref-store maintenance: sweep the store view",
+            Some(STORE_LOCK_WAIT),
+        )
+        .await
+    else {
+        return Err("skipped:store-busy".into());
+    };
+    if reconcile_in_flight(orch, &project.store).await {
+        return Err("skipped:reconcile-in-flight".into());
+    }
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let store = project.store.clone();
+    let bases = project.base_branches.clone();
+    blocking(move || crate::jj::sweep_store_view(&jj, &store, &bases, VIEW_SWEEP_GRACE))
+        .await
+        .map_err(failed)
 }
 
 fn failed(error: String) -> String {

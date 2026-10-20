@@ -80,7 +80,12 @@ pub fn build_claude_args(config: &ClaudeArgsConfig) -> Vec<String> {
     // Add model flag if specified
     if let Some(ref model) = config.model {
         args.push("--model".to_string());
-        // Opus has 1M context now, but the default alias hasn't caught up yet
+        // `opus[1m]` asks for Opus's 1M window on every CLI Cairn meets: 2.1.220
+        // resolves bare `opus` to `claude-opus-5` at 200k, while 2.1.302+
+        // resolves it to `claude-opus-5-5`, already 1M, where the suffix only
+        // adds the long-context beta header. The other aliases stay bare: on the
+        // older CLI `haiku` is Haiku 4.5, which has no 1M window to ask for.
+        // Revisit once the CLI is pinned (cairn/5106) past 2.1.302.
         let model_str = if model.as_str() == Model::OPUS {
             "opus[1m]".to_string()
         } else {

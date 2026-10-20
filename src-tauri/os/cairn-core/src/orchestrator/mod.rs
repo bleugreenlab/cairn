@@ -32,6 +32,7 @@ pub mod executor_registry; // Synced visibility; live placement remains in fleet
 pub(crate) mod generation_cache;
 pub mod identity;
 pub mod inference;
+pub(crate) mod landing;
 pub mod lifecycle;
 pub mod models;
 pub mod object_plane;
@@ -131,6 +132,7 @@ pub struct OrchestratorBuilder {
     context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
     team_attention_sender: Arc<dyn team_attention_push::TeamAttentionSender>,
     recent_turn_end_check_requests: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
+    artifact_revision_quiet: std::time::Duration,
     boot_at: i64,
 }
 
@@ -267,8 +269,17 @@ impl OrchestratorBuilder {
             context_token_snapshots: Arc::new(RwLock::new(HashMap::new())),
             team_attention_sender: Arc::new(team_attention_push::HttpTeamAttentionSender::default()),
             recent_turn_end_check_requests,
+            artifact_revision_quiet: crate::execution::artifact_revisions::DEFAULT_QUIET_PERIOD,
             boot_at: chrono::Utc::now().timestamp(),
         }
+    }
+
+    /// Override how long an artifact must go unwritten before its revision is
+    /// delivered to the jobs launched with an earlier version. Tests shorten it
+    /// so the real write path delivers within the test.
+    pub fn artifact_revision_quiet(mut self, quiet: std::time::Duration) -> Self {
+        self.artifact_revision_quiet = quiet;
+        self
     }
 
     /// Override when this host began owning runs. See [`Orchestrator::boot_at`].
@@ -475,13 +486,16 @@ impl OrchestratorBuilder {
         let fleet = Arc::new(crate::fleet::Fleet::with_residency_route_path(
             self.config_dir.join("build-slot-residency-routes.json"),
         ));
+        // One identity for this process in every journal it writes. The
+        // runner-event journal attaches first, so its `runner_started` row is
+        // the incarnation's first: that row is where this process's connection
+        // generations begin, which is what makes them joinable at all.
+        let runner_incarnation = format!("runner-{}", crate::fleet::unix_time_ms());
+        fleet.attach_runner_event_journal(self.db.local.clone(), runner_incarnation.clone());
         // The execution queue explains its own bindings durably, keyed by this
         // process. Entries a previous incarnation left open are closed rather
         // than resurrected: the futures waiting on them ended with that process.
-        fleet.attach_queue_journal(
-            self.db.local.clone(),
-            format!("runner-{}", crate::fleet::unix_time_ms()),
-        );
+        fleet.attach_queue_journal(self.db.local.clone(), runner_incarnation);
         // Machines that could not prepare a project's cells stay excluded for
         // that project across a runner restart, until their evidence changes.
         fleet.attach_preparation_store(self.db.local.clone());
@@ -576,6 +590,11 @@ impl OrchestratorBuilder {
             turn_end_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             recent_turn_end_check_requests: self.recent_turn_end_check_requests,
             main_cadence: Arc::new(Mutex::new(Default::default())),
+            artifact_revisions: Arc::new(
+                crate::execution::artifact_revisions::RevisionDeliveries::new(
+                    self.artifact_revision_quiet,
+                ),
+            ),
             write_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             node_check_status_cache: Arc::new(
                 crate::execution::checks_status::NodeCheckStatusCache::default(),
@@ -1034,6 +1053,9 @@ pub struct Orchestrator {
     /// The main cadence's per-project slot: one pass in flight, at most one
     /// queued successor.
     pub(crate) main_cadence: Arc<Mutex<crate::execution::checks_main::CadenceSlots>>,
+    /// Per-artifact quiet-period debouncer for delivering a revised artifact to
+    /// the jobs launched with an earlier version. Runtime-only.
+    pub(crate) artifact_revisions: Arc<crate::execution::artifact_revisions::RevisionDeliveries>,
     /// Job ids with a synchronous when:write batch in flight. Runtime-only.
     write_checks_in_flight: Arc<Mutex<HashMap<String, usize>>>,
     /// Exact settled node-check projection, generation-fenced and single-flight.
@@ -2323,6 +2345,14 @@ impl Orchestrator {
         crate::execution::advancement::heal_stuck_delegated_children(self).await;
     }
 
+    /// Deliver artifact revisions whose quiet-period timer was lost with the
+    /// previous host process, so a job launched with an older version still
+    /// hears about the newer one. Runs after crashed runs have settled, since a
+    /// delivery may wake an idle consumer. Idempotent.
+    pub async fn deliver_pending_artifact_revisions_on_startup(&self) {
+        crate::execution::artifact_revisions::deliver_pending_revisions(self).await;
+    }
+
     /// Fail-fast ephemeral calls left in-flight by a host crash (CAIRN-2548) so a
     /// queued Claude call can never strand `starting` forever once the admission
     /// ceiling makes queuing reachable. Must run at startup BEFORE
@@ -3139,8 +3169,22 @@ impl Orchestrator {
                 None
             }
         }?;
-        let context_window =
-            self.context_window_for_context_tokens(&snapshot.backend, snapshot.model.as_deref());
+        let context_window = if snapshot
+            .backend
+            .eq_ignore_ascii_case(crate::backends::CLAUDE_FAMILY_BACKEND)
+        {
+            use cairn_models::types::catalog::{
+                claude_reported_context_window, claude_session_window,
+            };
+            let resolved = snapshot.resolved_model.as_deref();
+            let reported = snapshot
+                .model_usage
+                .as_ref()
+                .and_then(|usage| claude_reported_context_window(usage, resolved));
+            claude_session_window(reported, resolved, snapshot.model.as_deref())
+        } else {
+            self.context_window_for_context_tokens(&snapshot.backend, snapshot.model.as_deref())
+        };
         let state = snapshot.into_state(context_window);
 
         if let Ok(mut guard) = self.context_token_snapshots.write() {
@@ -4084,7 +4128,7 @@ mod tests {
                     parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
                     cache_create_tokens, output_tokens, thinking_tokens)
                  VALUES ('event-assistant-final', 'run-claude-ctx', 'session-claude-ctx', 10, 10, 'assistant',
-                    json_object('raw', json_object('message', json_object('model', 'claude-opus-5'))),
+                    json_object('raw', json_object('message', json_object('model', 'claude-opus-5-5'))),
                     NULL, 10, 7, 31468, 6200, 38, 12);
                 INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
                     parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
@@ -4109,7 +4153,7 @@ mod tests {
             .unwrap();
         assert_eq!(state.run_id, "run-claude-ctx");
         assert_eq!(state.backend, "claude");
-        assert_eq!(state.model, Some("claude-opus-5".to_string()));
+        assert_eq!(state.model, Some("claude-opus-5-5".to_string()));
         assert_eq!(state.context_window, Some(1_000_000));
         assert_eq!(state.used_tokens, 37_713);
         assert_ne!(state.used_tokens, 157_045);
@@ -4184,6 +4228,141 @@ mod tests {
         assert_eq!(state.used_tokens, 170_000);
         // 170k of a 1M window is nowhere near the compaction threshold.
         assert!(!window_pressure_reached(occupancy_of(&state), 0.8));
+    }
+
+    /// A Claude session whose job selected `job_model`, which its CLI resolved
+    /// to `init_model` at init, with its latest inference `used` tokens full and,
+    /// when given, a result whose `modelUsage` is `model_usage`.
+    async fn insert_claude_session(
+        db: &DbState,
+        prefix: &str,
+        job_model: &str,
+        init_model: &str,
+        model_usage: Option<&str>,
+        used: i64,
+    ) {
+        let result = model_usage
+            .map(|usage| {
+                format!(
+                    "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                        parent_tool_use_id, created_at)
+                     VALUES ('{prefix}-result', '{prefix}-run', '{prefix}-session', 3, 11,
+                        'result:success', '{{\"raw\":{{\"modelUsage\":{usage}}}}}', NULL, 11);"
+                )
+            })
+            .unwrap_or_default();
+        db.local
+            .execute_script(&format!(
+                "
+                INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('{prefix}-project', 'default', 'Claude', '{prefix}', '/tmp/{prefix}', 1, 1);
+                INSERT INTO jobs(id, project_id, status, model, created_at, updated_at)
+                 VALUES ('{prefix}-job', '{prefix}-project', 'running', '{job_model}', 1, 1);
+                INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+                 VALUES ('{prefix}-session', '{prefix}-job', 'CLAUDE', 'open', 1, 1, 1);
+                INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+                 VALUES ('{prefix}-run', '{prefix}-project', '{prefix}-job', 'exited', '{prefix}-session', 1, 1);
+                INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                    parent_tool_use_id, created_at)
+                 VALUES ('{prefix}-init', '{prefix}-run', '{prefix}-session', 1, 5, 'system:init',
+                    '{{\"raw\":{{\"model\":\"{init_model}\"}}}}', NULL, 5);
+                INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                    parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
+                    cache_create_tokens, output_tokens, thinking_tokens)
+                 VALUES ('{prefix}-assistant', '{prefix}-run', '{prefix}-session', 2, 10, 'assistant', '{{}}',
+                    NULL, 10, 0, {used}, 0, 0, NULL);
+                {result}
+                "
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn claude_state(db: Arc<DbState>, session_id: &str) -> ContextTokenState {
+        let orch = OrchestratorBuilder::new(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+        orch.get_context_token_state(session_id).await.unwrap()
+    }
+
+    /// The default `md` tier selects `sonnet`, which CLI 2.1.302 runs as Sonnet
+    /// 5.5 with a 1M window. Read as the 200k alias, 160k already crossed the
+    /// 0.8 compaction threshold; read through the model the CLI resolved, it is
+    /// a sixth of the window.
+    #[tokio::test]
+    async fn a_default_tier_sonnet_5_5_session_is_not_compacted_at_160k() {
+        use cairn_models::continuation::window_pressure_reached;
+        let db = test_db().await;
+        insert_claude_session(&db, "SON55", "sonnet", "claude-sonnet-5-5", None, 160_000).await;
+
+        let state = claude_state(db, "SON55-session").await;
+        assert_eq!(state.model.as_deref(), Some("sonnet"));
+        assert_eq!(state.context_window, Some(1_000_000));
+        assert_eq!(state.used_tokens, 160_000);
+        assert!(!window_pressure_reached(occupancy_of(&state), 0.8));
+        assert!(window_pressure_reached(Some((160_000, 200_000)), 0.8));
+    }
+
+    #[tokio::test]
+    async fn a_haiku_5_5_session_reads_the_1m_window_its_cli_reports() {
+        use cairn_models::continuation::window_pressure_reached;
+        let db = test_db().await;
+        insert_claude_session(
+            &db,
+            "HAI55",
+            "haiku",
+            "claude-haiku-5-5",
+            Some(r#"{"claude-haiku-5-5":{"contextWindow":1000000}}"#),
+            170_000,
+        )
+        .await;
+
+        let state = claude_state(db, "HAI55-session").await;
+        assert_eq!(state.context_window, Some(1_000_000));
+        assert!(!window_pressure_reached(occupancy_of(&state), 0.8));
+    }
+
+    /// CLI 2.1.220 resolves `haiku` to Haiku 4.5, whose window really is 200k:
+    /// that session must still compact before it overruns.
+    #[tokio::test]
+    async fn an_older_clis_haiku_4_5_session_keeps_its_200k_window() {
+        use cairn_models::continuation::window_pressure_reached;
+        let db = test_db().await;
+        insert_claude_session(
+            &db,
+            "HAI45",
+            "haiku",
+            "claude-haiku-4-5-20251001",
+            Some(r#"{"claude-haiku-4-5-20251001":{"contextWindow":200000}}"#),
+            170_000,
+        )
+        .await;
+
+        let state = claude_state(db, "HAI45-session").await;
+        assert_eq!(state.context_window, Some(200_000));
+        assert!(window_pressure_reached(occupancy_of(&state), 0.8));
+    }
+
+    /// The table reads `claude-sonnet-5` as 200k because one CLI sizes it so;
+    /// where the session's own CLI reported 1M, that report decides.
+    #[tokio::test]
+    async fn the_window_the_cli_reported_outranks_the_table() {
+        let db = test_db().await;
+        insert_claude_session(
+            &db,
+            "SON5",
+            "sonnet",
+            "claude-sonnet-5",
+            Some(r#"{"claude-sonnet-5":{"contextWindow":1000000}}"#),
+            170_000,
+        )
+        .await;
+
+        let state = claude_state(db, "SON5-session").await;
+        assert_eq!(state.context_window, Some(1_000_000));
     }
 
     #[tokio::test]

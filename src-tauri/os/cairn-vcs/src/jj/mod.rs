@@ -11,11 +11,13 @@
 //! `EDITOR=true`/`JJ_EDITOR=true` and points `JJ_CONFIG` at a Cairn-managed file.
 
 mod bookmark;
+mod combine;
 mod conflict;
 mod diff;
 mod env;
 mod errors;
 mod export;
+mod landing_gate;
 mod maintenance;
 mod merge;
 mod packed_refs;
@@ -33,11 +35,13 @@ mod tests;
 pub mod testing;
 
 pub use bookmark::*;
+pub use combine::{TwinStack, VersionBase};
 pub use conflict::*;
 pub use diff::*;
 pub use env::*;
 pub use errors::*;
 pub use export::*;
+pub use landing_gate::*;
 pub use maintenance::*;
 pub use merge::*;
 pub use packed_refs::{

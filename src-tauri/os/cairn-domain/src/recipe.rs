@@ -442,15 +442,19 @@ impl std::str::FromStr for RecipeEdgeType {
     }
 }
 
-/// Context port handles. Every agent node exposes three context ports:
-/// `context-in` (N inputs the run starts with), `context-out` (the terminal
-/// artifact the run produces — writing it ends the turn and moves the DAG, and
-/// may fan out to direct agent consumers), and `context-self` (N living
-/// working-doc artifacts the node owns and patches across its whole life, which
-/// never end the turn or satisfy the output contract). All three ride the
+/// Context port handles. Every agent node exposes four context ports:
+/// `context-in` (N inputs the run starts with, embedded in its launch prompt),
+/// `context-ref` (N artifacts the run is pointed at by URI and version rather
+/// than given a copy of — it reads the current version itself), `context-out`
+/// (the terminal artifact the run produces — writing it ends the turn and moves
+/// the DAG, and may fan out to direct agent consumers), and `context-self` (N
+/// living working-doc artifacts the node owns and patches across its whole life,
+/// which never end the turn or satisfy the output contract). All four ride the
 /// `context` edge type; the source handle distinguishes terminal/fanout output
-/// edges from self-owned living-doc edges.
+/// edges from self-owned living-doc edges, and the target handle distinguishes
+/// an embedded input from a referenced one.
 pub const CONTEXT_IN_HANDLE: &str = "context-in";
+pub const CONTEXT_REF_HANDLE: &str = "context-ref";
 pub const CONTEXT_OUT_HANDLE: &str = "context-out";
 pub const CONTEXT_SELF_HANDLE: &str = "context-self";
 

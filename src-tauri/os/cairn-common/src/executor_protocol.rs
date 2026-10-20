@@ -4667,6 +4667,27 @@ pub struct LearnedResourceEstimate {
 /// renders as unforecastable. No frame changes shape and an older runner reads
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
+///
+/// cairn/5194 does not move the number. It journals the runner's own lifecycle
+/// facts (attaches, detaches, link resets, listener restages, runtime stalls)
+/// into the runner-private `runner_events` table, from the runner-only
+/// `fleet/mod.rs` and the transport route. Nothing is added to, removed from,
+/// or reinterpreted in any frame: the fleet records what it already decided
+/// and the route records what it already logs. `abandon_stalled_colocated_link`
+/// returning a struct instead of a bool is a runner-internal signature. A
+/// runner talking to an older executor gets nothing wrong, because the
+/// executor never sees the journal.
+///
+/// cairn/5209 changes which runner requests share one pure-verdict execution,
+/// without a bump. The runner's in-flight coalescing registry now keys an
+/// execution by its leader as well as its content, and a request joins only a
+/// leader whose `verdict_platforms`, `executor`, `pinned_executor_id` and
+/// `avoided_executor_ids` are at least as strict as its own; otherwise it is
+/// submitted as its own request. The registry is runner state that never
+/// crosses the link, and each submission is an ordinary request in fields that
+/// already exist. What a runner gets wrong talking to an older executor:
+/// nothing; the older executor receives one more ordinary request when two
+/// placement demands disagree, and runs it as it runs any other.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 153;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.

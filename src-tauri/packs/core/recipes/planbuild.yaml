@@ -98,3 +98,6 @@ edges:
 - from: pr-1@open
   to: review-1@control-in
   type: control
+- from: plan-1@context-out
+  to: review-1@context-ref
+  type: context

@@ -113,10 +113,16 @@ impl CallbackSink for HttpCallbackSink {
                     },
                 }
             }
-            Err(e) => CallbackOutcome {
-                result: format!("Error calling Tauri: {}", e),
-                ..Default::default()
-            },
+            Err(e) => {
+                let stopped = e
+                    .is_connect()
+                    .then(|| crate::cli::operator_stop_explanation(&self.callback_url))
+                    .flatten();
+                CallbackOutcome {
+                    result: stopped.unwrap_or_else(|| format!("Error calling Tauri: {}", e)),
+                    ..Default::default()
+                }
+            }
         }
     }
 }

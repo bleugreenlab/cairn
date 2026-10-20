@@ -431,6 +431,8 @@ fn context_state(
         session_id: session_id.to_string(),
         backend: backend_key.to_string(),
         model: Some(model.to_string()),
+        resolved_model: None,
+        model_usage: None,
         input_tokens: counts.input.map(i64::from),
         cache_read_tokens: counts.cache_read.map(i64::from),
         cache_create_tokens: counts.cache_create.map(i64::from),

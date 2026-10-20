@@ -344,6 +344,9 @@ pub struct RunHandle {
     /// The model the provider reported running this session on (Claude's
     /// `system:init`), whatever was or was not selected.
     reported_model: Option<String>,
+    /// The context window the provider reported this session runs with
+    /// (Claude's `result.modelUsage`), once a turn has ended.
+    reported_context_window: Option<i64>,
     /// Concrete provider account whose credentials were frozen into this child
     /// at launch. Warm reuse compares this with the durable session pin.
     pub account_id: Option<String>,
@@ -440,6 +443,7 @@ impl RunHandle {
             goal_pause: Arc::new(Mutex::new(GoalPauseClaim::default())),
             model: None,
             reported_model: None,
+            reported_context_window: None,
             account_id: None,
             credential_feed: None,
             terminal_tool_called: Arc::new(AtomicBool::new(false)),
@@ -1352,6 +1356,32 @@ impl AgentProcessState {
         false
     }
 
+    /// Record the context window the provider reported for a process. Returns
+    /// true if the run exists.
+    pub fn set_reported_context_window(&self, run_id: &str, window: i64) -> bool {
+        if let Ok(mut processes) = self.processes.lock() {
+            if let Some(process) = processes.get_mut(run_id) {
+                process.reported_context_window = Some(window);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// What the provider itself reported for a process: the model it named and
+    /// the context window it runs with, each `None` until reported.
+    pub fn reported_model_and_window(&self, run_id: &str) -> (Option<String>, Option<i64>) {
+        let Ok(processes) = self.processes.lock() else {
+            return (None, None);
+        };
+        processes.get(run_id).map_or((None, None), |process| {
+            (
+                process.reported_model.clone(),
+                process.reported_context_window,
+            )
+        })
+    }
+
     /// The model a live session runs on: the selected model when one was set,
     /// otherwise the model the provider reported. The persisted context-token
     /// read applies the same rule from the events table.
@@ -1989,6 +2019,23 @@ mod tests {
 
         assert!(state.set_model("run-1", "sonnet"));
         assert_eq!(state.effective_model("run-1").as_deref(), Some("sonnet"));
+        // The selection does not hide what the provider resolved it to.
+        assert_eq!(
+            state.reported_model_and_window("run-1"),
+            (Some("claude-opus-5-5".to_string()), None)
+        );
+    }
+
+    #[test]
+    fn a_reported_context_window_is_kept_per_process() {
+        let state = state_with_run("run-1");
+        assert!(!state.set_reported_context_window("ghost", 1_000_000));
+        assert_eq!(state.reported_model_and_window("ghost"), (None, None));
+        assert!(state.set_reported_context_window("run-1", 1_000_000));
+        assert_eq!(
+            state.reported_model_and_window("run-1"),
+            (None, Some(1_000_000))
+        );
     }
 
     #[test]

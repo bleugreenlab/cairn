@@ -269,6 +269,10 @@ impl ConflictSession {
         self.condition == ConflictCondition::BaseDrift.as_str()
     }
 
+    pub(crate) fn is_unparseable(&self) -> bool {
+        self.condition == ConflictCondition::Unparseable.as_str()
+    }
+
     pub(crate) fn is_open(&self) -> bool {
         self.resolution_state.as_deref() == Some(ResolutionState::Open.as_str())
     }

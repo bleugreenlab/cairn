@@ -46,6 +46,12 @@ pub fn uninstall(spec: &ServiceSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// Nothing supervises a Run value, so there is no restart policy to suspend: the
+/// caller ends the running process, and the value itself acts only at logon.
+pub fn stop(_spec: &ServiceSpec) -> Result<(), String> {
+    Ok(())
+}
+
 /// Ensure the Run value points at this binary and spawn the current daemon. This
 /// is the Windows adoption path after an app update: the new binary is launched
 /// directly, since the Run key alone would not take effect until the next logon.

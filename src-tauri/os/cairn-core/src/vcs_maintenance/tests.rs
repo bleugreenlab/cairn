@@ -410,6 +410,7 @@ mod pass {
             Arc::new(TestServicesBuilder::new().build()),
             config_dir.clone(),
         )
+        .jj_binary_path(bin.clone())
         .build();
 
         let repo = temp.path().join("repo");
@@ -435,6 +436,7 @@ mod pass {
             project: ProjectStore {
                 project_id: "p-refs".into(),
                 store,
+                base_branches: vec!["main".into()],
             },
             commit,
         })
@@ -547,6 +549,70 @@ mod pass {
         );
         assert!(!fx.has_ref(&format!("refs/cairn/rescued/old/{old_ms}")));
         assert!(fx.has_ref(&format!("refs/cairn/rescued/new/{now_ms}")));
+        assert!(fx.has_ref("refs/heads/main"));
+    }
+
+    /// The prune hides a commit nothing references once it is older than the
+    /// grace window, and leaves the base and the operator's branches alone.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn the_prune_hides_an_old_commit_nothing_references() {
+        let Some(fx) = fixture().await else {
+            eprintln!("skipping the view-sweep prune test: jj not resolvable");
+            return;
+        };
+        let jj = crate::jj::environment(&fx.orch.jj_binary_path, &fx.orch.config_dir);
+        let jj_at = |args: &[&str], timestamp: Option<&str>| {
+            let mut command = cairn_platform::env::command(jj.binary_path());
+            command.current_dir(&fx.project.store).args(args);
+            for (key, value) in jj.shell_env() {
+                command.env(key, value);
+            }
+            if let Some(timestamp) = timestamp {
+                command.env("JJ_TIMESTAMP", timestamp);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "jj {args:?}: {output:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        jj_at(
+            &[
+                "new",
+                "--no-edit",
+                "-r",
+                "main",
+                "-m",
+                "superseded long ago",
+                "--ignore-working-copy",
+            ],
+            Some("2020-01-01T00:00:00+00:00"),
+        );
+        let stray_revset = "children(main) & description(substring:\"superseded long ago\")";
+        let visible = |revset: &str| {
+            jj_at(
+                &[
+                    "log",
+                    "-r",
+                    &format!("({revset}) & ::visible_heads()"),
+                    "--no-graph",
+                    "-T",
+                    "commit_id",
+                    "--ignore-working-copy",
+                ],
+                None,
+            )
+        };
+        let stray = visible(stray_revset);
+        assert!(
+            !stray.is_empty(),
+            "precondition: the stray commit is visible"
+        );
+
+        prune(&fx.orch, &fx.project).await;
+
+        assert_eq!(fx.last_prune().await.0, "ok");
+        assert_eq!(visible(&stray), "", "the unreferenced commit is hidden");
+        assert_eq!(visible("main"), fx.commit, "the base is untouched");
         assert!(fx.has_ref("refs/heads/main"));
     }
 

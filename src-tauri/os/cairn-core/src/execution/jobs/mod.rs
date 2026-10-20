@@ -88,8 +88,8 @@ pub(crate) use lifecycle::{
 #[cfg(test)]
 pub(crate) use lifecycle::goal_pause_notice;
 pub use lifecycle::{
-    continue_job_impl, continue_job_or_enqueue, on_job_complete_impl, prepare_job,
-    preview_job_digest, resume_job_from_digest, DigestPreview, ResumeContext,
+    compose_launch_inputs, continue_job_impl, continue_job_or_enqueue, on_job_complete_impl,
+    prepare_job, preview_job_digest, resume_job_from_digest, DigestPreview, ResumeContext,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use lifecycle::{

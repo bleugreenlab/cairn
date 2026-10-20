@@ -3,6 +3,62 @@
 pub struct ResolvedInput {
     pub artifact_type: String,
     pub data: serde_json::Value,
+    /// The stored artifact version this input resolved to. `None` for trigger
+    /// context, static content, and transcript fallbacks: those have no version
+    /// chain a later write could supersede.
+    pub source: Option<ArtifactInputSource>,
+}
+
+/// Which stored artifact version a launch input resolved to, and how the
+/// consumer receives it. This is the structural record of what a job was
+/// launched with, so a later revision of the same artifact can be delivered to
+/// it as a diff against exactly the version it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactInputSource {
+    pub producer_job_id: String,
+    /// The artifact's name, the key of its version chain on the producer.
+    pub output_name: String,
+    pub version: i64,
+    /// The artifact's canonical resource URI: the producer's home URI plus the
+    /// artifact name, the same address the write path reports.
+    pub uri: String,
+    pub delivery: InputDelivery,
+}
+
+/// How an artifact input reaches its consumer, decided by the port its context
+/// edge lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputDelivery {
+    /// `context-in`: the content is embedded in the launch prompt.
+    Content,
+    /// `context-ref`: only the URI and version are given; the consumer reads
+    /// the current version itself.
+    Reference,
+}
+
+/// The line set beside an embedded artifact naming where it lives and which
+/// version the prompt holds. The text below it is a launch snapshot; the
+/// artifact is what stays true.
+fn authority_note(source: &ArtifactInputSource) -> String {
+    format!(
+        "> Embedded below: version {} of `{}`, as it stood when you launched. The artifact is authoritative. If it is revised while you work, the revision reaches you as a message carrying the changes, and it supersedes this copy.",
+        source.version, source.uri
+    )
+}
+
+/// A referenced artifact: its identity and the version current at launch, never
+/// its content, so nothing in the prompt can be mistaken for the current text.
+fn format_reference(input: &ResolvedInput, source: &ArtifactInputSource) -> String {
+    let heading = input
+        .data
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|title| format!("## Artifact of record `{}`: {title}", source.output_name))
+        .unwrap_or_else(|| format!("## Artifact of record `{}`", source.output_name));
+    format!(
+        "{heading}\n\n`{}` (version {} when you launched). Read it there. Its current version is authoritative over any copy of it quoted elsewhere, including the text another node was launched with. If it is revised while you work, the revision reaches you as a message.",
+        source.uri, source.version
+    )
 }
 
 /// Format resolved inputs as markdown for injection into agent prompt.
@@ -14,6 +70,14 @@ pub fn format_resolved_inputs(inputs: &[ResolvedInput]) -> String {
     let mut sections = Vec::new();
 
     for input in inputs {
+        if let Some(source) = input
+            .source
+            .as_ref()
+            .filter(|source| source.delivery == InputDelivery::Reference)
+        {
+            sections.push(format_reference(input, source));
+            continue;
+        }
         let section = match input.artifact_type.as_str() {
             "trigger_context" => {
                 let has_event = input.data.get("event").is_some();
@@ -168,6 +232,10 @@ pub fn format_resolved_inputs(inputs: &[ResolvedInput]) -> String {
                 )
             }
         };
+        let section = match input.source.as_ref() {
+            Some(source) => format!("{}\n\n{section}", authority_note(source)),
+            None => section,
+        };
         sections.push(section);
     }
 
@@ -180,6 +248,7 @@ mod tests {
     #[test]
     fn format_trigger_context_with_issue_only() {
         let inputs = vec![ResolvedInput {
+            source: None,
             artifact_type: "trigger_context".to_string(),
             data: serde_json::json!({
                 "issue": {
@@ -201,6 +270,7 @@ mod tests {
         // it as a heading above the message states it twice and reads as a work
         // item rather than as something the user said.
         let inputs = vec![ResolvedInput {
+            source: None,
             artifact_type: "trigger_context".to_string(),
             data: serde_json::json!({
                 "issue": {
@@ -218,6 +288,7 @@ mod tests {
     #[test]
     fn a_thread_with_nothing_said_still_names_itself() {
         let inputs = vec![ResolvedInput {
+            source: None,
             artifact_type: "trigger_context".to_string(),
             data: serde_json::json!({
                 "issue": {
@@ -236,6 +307,7 @@ mod tests {
         // An issue's title is its objective and the body is the detail, so the
         // heading is carrying real information there.
         let inputs = vec![ResolvedInput {
+            source: None,
             artifact_type: "trigger_context".to_string(),
             data: serde_json::json!({
                 "issue": {
@@ -255,6 +327,7 @@ mod tests {
     #[test]
     fn format_trigger_context_with_event_only() {
         let inputs = vec![ResolvedInput {
+            source: None,
             artifact_type: "trigger_context".to_string(),
             data: serde_json::json!({
                 "event": {
@@ -275,6 +348,7 @@ mod tests {
     #[test]
     fn format_trigger_context_with_issue_and_event() {
         let inputs = vec![ResolvedInput {
+            source: None,
             artifact_type: "trigger_context".to_string(),
             data: serde_json::json!({
                 "issue": {
@@ -299,6 +373,7 @@ mod tests {
     #[test]
     fn format_trigger_context_empty_data_falls_through() {
         let inputs = vec![ResolvedInput {
+            source: None,
             artifact_type: "trigger_context".to_string(),
             data: serde_json::json!({}),
         }];
@@ -310,6 +385,7 @@ mod tests {
     #[test]
     fn format_trigger_context_issue_without_description() {
         let inputs = vec![ResolvedInput {
+            source: None,
             artifact_type: "trigger_context".to_string(),
             data: serde_json::json!({
                 "issue": {
@@ -328,6 +404,7 @@ mod tests {
     #[test]
     fn format_trigger_context_accumulated_multiple_issues() {
         let inputs = vec![ResolvedInput {
+            source: None,
             artifact_type: "trigger_context".to_string(),
             data: serde_json::json!({
                 "issues": [
@@ -359,5 +436,61 @@ mod tests {
         assert!(output.contains("Login page crashes"));
         assert!(output.contains("### proj-55 — Update deps"));
         assert!(output.contains("## Trigger Event"));
+    }
+
+    fn plan_source(delivery: InputDelivery) -> ArtifactInputSource {
+        ArtifactInputSource {
+            producer_job_id: "j-planner".to_string(),
+            output_name: "plan".to_string(),
+            version: 2,
+            uri: "cairn://p/cairn/5073/1/planner/plan".to_string(),
+            delivery,
+        }
+    }
+
+    #[test]
+    fn an_embedded_artifact_names_its_uri_version_and_authority() {
+        let inputs = vec![ResolvedInput {
+            artifact_type: "plan".to_string(),
+            data: serde_json::json!({"title": "Match colon forms", "content": "Use exact colon-prefixed Go forms."}),
+            source: Some(plan_source(InputDelivery::Content)),
+        }];
+        let output = format_resolved_inputs(&inputs);
+        assert!(
+            output.contains("version 2 of `cairn://p/cairn/5073/1/planner/plan`"),
+            "{output}"
+        );
+        assert!(output.contains("The artifact is authoritative"), "{output}");
+        assert!(output.contains("reaches you as a message"), "{output}");
+        // The note sits beside the text it qualifies, which is still embedded.
+        assert!(output.contains("**Match colon forms**\n\nUse exact colon-prefixed Go forms."));
+        assert!(output.find("authoritative") < output.find("**Match colon forms**"));
+    }
+
+    #[test]
+    fn a_referenced_artifact_gives_its_identity_and_never_its_text() {
+        let inputs = vec![ResolvedInput {
+            artifact_type: "plan".to_string(),
+            data: serde_json::json!({"title": "Match colon forms", "content": "SECRET PLAN BODY"}),
+            source: Some(plan_source(InputDelivery::Reference)),
+        }];
+        let output = format_resolved_inputs(&inputs);
+        assert!(
+            output.contains("`cairn://p/cairn/5073/1/planner/plan` (version 2"),
+            "{output}"
+        );
+        assert!(output.contains("Match colon forms"), "{output}");
+        assert!(output.contains("authoritative over any copy"), "{output}");
+        assert!(!output.contains("SECRET PLAN BODY"), "{output}");
+    }
+
+    #[test]
+    fn an_input_without_a_stored_version_carries_no_authority_note() {
+        let inputs = vec![ResolvedInput {
+            artifact_type: "context".to_string(),
+            data: serde_json::json!({"title": "Packet", "content": "static"}),
+            source: None,
+        }];
+        assert_eq!(format_resolved_inputs(&inputs), "## Packet\n\nstatic");
     }
 }

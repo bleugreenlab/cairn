@@ -1587,10 +1587,8 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
     create_initial_turn(orch, &turn_id, &session_id, job_id)?;
 
     // ---- Resolve inputs + build prompt ----------------------------------
-    let (resolved_inputs, artifact_schema_info) =
-        run_db(resolve_inputs_and_schema(owning_db.clone(), job.clone()))?;
-
-    let mut prompt = format_resolved_inputs(&resolved_inputs);
+    let (mut prompt, artifact_schema_info) =
+        run_db(compose_launch_inputs(owning_db.clone(), job_id.to_string()))?;
     // Provenance rides in the opening prompt rather than a side channel: it is
     // the one piece of context a successor must not be able to miss, and this is
     // the event a rebuilt or compacted session re-reads.
@@ -1641,6 +1639,26 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         start_reason: TurnStartReason::Initial,
         launch_claim: Some(launch_claim),
     })
+}
+
+/// A job's launch prompt as composed from its resolved inputs, recording which
+/// version of each upstream artifact it embeds or references.
+///
+/// The record is what lets a revision written after launch reach the job as a
+/// diff against exactly the version it holds (`execution::artifact_revisions`).
+/// Failing to write it costs only that later notice, never the launch.
+pub async fn compose_launch_inputs(
+    db: Arc<LocalDb>,
+    job_id: String,
+) -> Result<(String, Option<crate::models::OutputSchemaInfo>), String> {
+    let job = load_job(db.clone(), job_id.clone(), "Job not found").await?;
+    let (inputs, schema) = resolve_inputs_and_schema(db.clone(), job).await?;
+    if let Err(error) =
+        crate::execution::artifact_revisions::record_launch_inputs(&db, &job_id, &inputs).await
+    {
+        log::warn!("[prepare_job] job {job_id}: {error}");
+    }
+    Ok((format_resolved_inputs(&inputs), schema))
 }
 
 // ============================================================================

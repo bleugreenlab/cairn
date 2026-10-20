@@ -155,24 +155,30 @@ impl ReplayBaseline {
     }
 }
 
-/// Resolve the one conflict shape this subsystem owns: every conflicting path is
-/// a registered migration registry, and retaining destination then branch entries
-/// is proven lossless before and after the candidate is committed.
+/// Settle a replay's conflict by the structural merges the destination declares
+/// (`landing.merge` in its `.cairn/config.yaml`). Every conflicting path needs a
+/// declared merge that settles it into a file that still parses, and the result
+/// is proven lossless before and after it is committed; otherwise nothing is
+/// touched and the conflict stays the agent's.
 ///
 /// Each path merges from its [`ReplayBaseline`]. Merged from the stale fork, a
 /// registry the branch already resolved against an earlier base would see that
 /// base's entries on both sides and keep them twice.
-fn try_union_registry_conflict(
+fn try_structural_merge(
     jj: &crate::jj::JjEnv,
     store: &Path,
     branch: &str,
     destination: &str,
     diagnostic: &crate::jj::ConflictDiagnostic,
     baseline: &ReplayBaseline,
+    rules: &crate::orchestrator::landing::MergeRules,
 ) -> Result<Option<crate::jj::ReconcileReport>, String> {
+    // Base drift has nothing to merge: the files already agree.
+    if diagnostic.condition == crate::jj::ConflictCondition::BaseDrift {
+        return Ok(None);
+    }
     let paths = diagnostic.conflicting_paths();
-    let allowed = crate::orchestrator::contended_identifiers::union_resolvable_paths();
-    if paths.is_empty() || paths.iter().any(|path| !allowed.contains(path)) {
+    if paths.is_empty() || paths.iter().any(|path| rules.kind_for(path).is_none()) {
         return Ok(None);
     }
     let (Some(fork), Some(ours), Some(theirs)) = (
@@ -211,15 +217,9 @@ fn try_union_registry_conflict(
         else {
             return Ok(None);
         };
-        let candidate = crate::jj::union_completion_candidate(base_text, ours_text, theirs_text);
-        let proof = crate::jj::assess_whole_file_restore(&crate::jj::MergeSides {
-            base: sides.base.clone(),
-            ours: crate::jj::FileContent::Text(candidate.clone()),
-            theirs: sides.theirs.clone(),
-        });
-        if proof != crate::jj::RestoreVerdict::Lossless {
+        let Some(candidate) = rules.proven_merge(&path, base_text, ours_text, theirs_text) else {
             return Ok(None);
-        }
+        };
         plan.edits.push(
             crate::orchestrator::contended_identifiers::FileEdit::Rewrite {
                 path,
@@ -230,21 +230,29 @@ fn try_union_registry_conflict(
 
     let pre_op = crate::jj::operation_id(jj, store)?;
     let result = (|| {
-        apply_resolution_plan(jj, store, branch, ours, &plan)?;
+        seal_resolution_plan(
+            jj,
+            store,
+            branch,
+            ours,
+            &plan,
+            "Merge declared registry lists element-wise after base advance",
+        )?;
         let committed = crate::jj::bookmark_commit(jj, store, branch)
-            .ok_or_else(|| format!("registry union commit left `{branch}` unresolved"))?;
+            .ok_or_else(|| format!("structural merge commit left `{branch}` unresolved"))?;
         for (_, sides) in sides_at(&committed) {
             let sides = sides.map_err(|error| {
-                format!("could not prove committed registry union lossless: {error}")
+                format!("could not prove committed structural merge lossless: {error}")
             })?;
             if crate::jj::assess_whole_file_restore(&sides) != crate::jj::RestoreVerdict::Lossless {
                 return Err(
-                    "committed registry union did not make whole-file replay lossless".to_string(),
+                    "committed structural merge did not make whole-file replay lossless"
+                        .to_string(),
                 );
             }
         }
-        // The committed union already holds the destination's entries, so the
-        // replay lands it whole.
+        // The committed merge already holds the destination's entries, so the
+        // replay lands it whole, and the replay's own parse gate re-checks it.
         crate::jj::reconcile_resolved_sibling_without_publication(
             jj,
             store,
@@ -258,7 +266,7 @@ fn try_union_registry_conflict(
         Err(error) => {
             crate::jj::restore_operation(jj, store, &pre_op).map_err(|rollback| {
                 format!(
-                    "automatic registry union failed ({error}) and rollback to {pre_op} failed: {rollback}"
+                    "automatic structural merge failed ({error}) and rollback to {pre_op} failed: {rollback}"
                 )
             })?;
             Err(error)
@@ -731,6 +739,26 @@ fn apply_resolution_plan(
     tip: &str,
     plan: &crate::orchestrator::contended_identifiers::ResolutionPlan,
 ) -> Result<(), String> {
+    seal_resolution_plan(
+        jj,
+        store,
+        bookmark,
+        tip,
+        plan,
+        "Resolve contended sequential identifiers after base advance",
+    )
+}
+
+/// Apply `plan` on `tip` and seal it onto `bookmark` as one commit named by
+/// what produced it.
+fn seal_resolution_plan(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    bookmark: &str,
+    tip: &str,
+    plan: &crate::orchestrator::contended_identifiers::ResolutionPlan,
+    message: &str,
+) -> Result<(), String> {
     use crate::orchestrator::contended_identifiers::FileEdit;
     if plan.is_empty() {
         return Ok(());
@@ -755,14 +783,7 @@ fn apply_resolution_plan(
         }
         let paths = plan.touched_paths();
         let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
-        crate::jj::seal_paths(
-            jj,
-            workspace,
-            "Resolve contended sequential identifiers after base advance",
-            None,
-            &path_refs,
-            Some(bookmark),
-        )?;
+        crate::jj::seal_paths(jj, workspace, message, None, &path_refs, Some(bookmark))?;
         Ok(())
     })
 }
@@ -798,10 +819,10 @@ impl CarryPlan {
 /// touched the path since takes the committed file whole — today's restore,
 /// exactly right. One that changed it elsewhere has those changes merged in.
 /// One that changed the very region the agent resolved has produced a conflict
-/// nobody has resolved, and is refused unless the file is a registration
-/// registry, whose entries commute and are unioned (the lineage renumber after
-/// the rebase then separates any colliding numbers). An incoming hunk is
-/// therefore always kept: merged in, unioned in, or the replay is refused.
+/// nobody has resolved, and is refused unless the destination declares a
+/// structural merge for the file (`landing.merge`) that settles it into a file
+/// that still parses. An incoming hunk is therefore always kept: merged in,
+/// merged structurally, or the replay is refused.
 ///
 /// The committed side is the tip the request was assessed at; the rebase
 /// refuses if the branch has moved off it since.
@@ -835,7 +856,7 @@ fn plan_resolution_carry(
             .or_default()
             .push(path);
     }
-    let registries = crate::orchestrator::contended_identifiers::union_resolvable_paths();
+    let rules = crate::orchestrator::landing::merge_rules_at(jj, store, destination);
     let mut carried = Vec::new();
     let mut refused = Vec::new();
     for (resolved_against, paths) in groups {
@@ -850,14 +871,24 @@ fn plan_resolution_carry(
             match outcome {
                 Ok(Carried::Unchanged) => carried.push((path, CarriedContent::FromTip)),
                 Ok(Carried::Merged(text)) => carried.push((path, CarriedContent::Text(text))),
-                Ok(Carried::Conflicted { .. }) if registries.contains(&path) => {
+                Ok(Carried::Conflicted { .. }) if rules.kind_for(&path).is_some() => {
                     let read = |revision: &str| text_at_revision(jj, store, revision, &path);
-                    let union = crate::jj::union_completion_candidate(
+                    let merged = rules.proven_merge(
+                        &path,
                         &read(&resolved_against)?,
                         &read(&committed)?,
                         &read(destination)?,
                     );
-                    carried.push((path, CarriedContent::Text(union)));
+                    match merged {
+                        Some(merged) => carried.push((path, CarriedContent::Text(merged))),
+                        None => refused.push((
+                            path,
+                            format!(
+                                "`{destination}` changed the region you resolved in a way its \
+                                 declared structural merge could not settle"
+                            ),
+                        )),
+                    }
                 }
                 Ok(Carried::Conflicted { .. }) => {
                     let why = match baseline.resolved_against(&path) {
@@ -2612,7 +2643,8 @@ async fn retry_pending_materializations(orch: &Orchestrator, db: &LocalDb) {
             ours: session.ours.clone(),
             theirs: session.theirs.clone(),
             conflicted_tip: session.conflicted_tip.clone(),
-            condition: Default::default(),
+            condition: crate::jj::ConflictCondition::from_stored(&session.condition),
+            validation: None,
             incoming: session
                 .files
                 .iter()
@@ -4023,24 +4055,26 @@ async fn execute_reconcile_claim(
                     .acquire_jj_store_lock(
                         &store,
                         crate::orchestrator::StoreLockClass::Background,
-                        format!("migration registry union ({label}): {branch}"),
+                        format!("structural merge ({label}): {branch}"),
                     )
                     .await;
                 let _phase =
-                    guard.phase(format!("prove and replay registry union branch={branch}"));
+                    guard.phase(format!("prove and replay structural merge branch={branch}"));
+                let rules = crate::orchestrator::landing::merge_rules_at(&jj, &store, &pinned_dest);
                 let baseline = contended_context
                     .as_ref()
                     .map(|(baseline, _, _)| baseline.clone())
                     .unwrap_or_else(|| {
                         ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap_or_default())
                     });
-                match try_union_registry_conflict(
+                match try_structural_merge(
                     &jj,
                     &store,
                     branch,
                     &pinned_dest,
                     &diagnostic,
                     &baseline,
+                    &rules,
                 ) {
                     Ok(Some(resolved)) => {
                         item_report = resolved;
@@ -4050,7 +4084,7 @@ async fn execute_reconcile_claim(
                     }
                     Ok(None) => {}
                     Err(error) => log::warn!(
-                        "jj reconcile ({label}): automatic registry union for `{branch}` declined after rollback: {error}"
+                        "jj reconcile ({label}): automatic structural merge for `{branch}` declined after rollback: {error}"
                     ),
                 }
             }
@@ -4996,9 +5030,14 @@ fn append_conflict_diagnostic(
              write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"replay\"}}]})."
                 .to_string()
         }
+        (None, crate::jj::ConflictCondition::Unparseable) => {
+            unparseable_guidance(diagnostic.validation.as_ref())
+        }
     };
     let conflicting_label = if diagnostic.scaffolding.is_some() {
         "Changed on both sides, merged by jj without a recorded conflict"
+    } else if diagnostic.condition == crate::jj::ConflictCondition::Unparseable {
+        "Changed on both sides, merged by jj into files that do not parse"
     } else {
         "Conflicting files, yours to merge"
     };
@@ -5010,6 +5049,23 @@ fn append_conflict_diagnostic(
         render_incoming_group(conflicting_label, &conflicting),
         render_incoming_group("Also arriving with this change, cleanly on retry", &clean),
         marker_guidance(marker_state, diagnostic.condition),
+    )
+}
+
+/// What an agent is told when its replay merged "cleanly" into a file that
+/// does not parse: the parser's first error per file, which is the whole
+/// diagnosis, since there are no markers to find.
+fn unparseable_guidance(refusal: Option<&crate::jj::ValidationRefusal>) -> String {
+    let failures = refusal
+        .map(|refusal| format!("\n{}", crate::jj::render_failures(&refusal.failures)))
+        .unwrap_or_default();
+    format!(
+        "\nThis replay MERGED WITHOUT A RECORDED CONFLICT INTO FILES THAT DO NOT PARSE: each side \
+         parsed on its own and the line merge of the two did not, so the replay was rolled back \
+         and your branch is still on its old base. The parser's first error in each file:{failures}\n\
+         Read both versions of each file, write the merged result with ordinary edits (usually a \
+         list closed twice or an entry left outside its brackets), and commit it on your branch; \
+         the next replay is checked the same way. Never rebase or force-push by hand."
     )
 }
 
@@ -6829,6 +6885,7 @@ mod tests {
         .unwrap();
 
         let diagnostic = crate::jj::ConflictDiagnostic {
+            validation: None,
             base: Some("b".repeat(40)),
             ours: Some("o".repeat(40)),
             theirs: Some("t".repeat(40)),
@@ -6933,6 +6990,7 @@ mod tests {
             .await
             .unwrap();
             let diagnostic = crate::jj::ConflictDiagnostic {
+                validation: None,
                 base: Some("b".repeat(40)),
                 ours: Some("o".repeat(40)),
                 theirs: Some(dest.to_string()),
@@ -6986,6 +7044,7 @@ mod tests {
 
     fn list_conflict(ours: &str, theirs: &str) -> crate::jj::ConflictDiagnostic {
         crate::jj::ConflictDiagnostic {
+            validation: None,
             base: Some("fork".to_string()),
             ours: Some(ours.to_string()),
             theirs: Some(theirs.to_string()),
@@ -8137,6 +8196,7 @@ mod tests {
         let message = append_conflict_diagnostic(
             &note,
             Some(&crate::jj::ConflictDiagnostic {
+                validation: None,
                 base: Some("b".repeat(40)),
                 ours: Some("o".repeat(40)),
                 theirs: Some("t".repeat(40)),
@@ -8188,6 +8248,7 @@ mod tests {
         let drift = append_conflict_diagnostic(
             &note,
             Some(&crate::jj::ConflictDiagnostic {
+                validation: None,
                 base: Some("b".repeat(40)),
                 ours: Some("o".repeat(40)),
                 theirs: Some("t".repeat(40)),
@@ -8215,6 +8276,7 @@ mod tests {
         let content = append_conflict_diagnostic(
             &note,
             Some(&crate::jj::ConflictDiagnostic {
+                validation: None,
                 base: Some("b".repeat(40)),
                 ours: Some("o".repeat(40)),
                 theirs: Some("t".repeat(40)),
@@ -8261,6 +8323,7 @@ mod tests {
     fn only_a_confirmed_materialization_tells_the_agent_to_resolve_markers() {
         let note = build_jj_conflict_note("main", Some(42), None);
         let diagnostic = crate::jj::ConflictDiagnostic {
+            validation: None,
             base: Some("b".repeat(40)),
             ours: Some("o".repeat(40)),
             theirs: Some("t".repeat(40)),
@@ -8676,6 +8739,7 @@ mod tests {
         diagnostics.insert(
             "agent/proj-2-builder-0".to_string(),
             crate::jj::ConflictDiagnostic {
+                validation: None,
                 base: Some("b".repeat(40)),
                 ours: Some("o".repeat(40)),
                 theirs: Some("t".repeat(40)),
@@ -9354,6 +9418,14 @@ mod real_store_collision_tests {
         std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
         std::fs::create_dir_all(repo.path().join("src-tauri/turso_migrations")).unwrap();
         std::fs::create_dir_all(repo.path().join("src-tauri/os/cairn-common/src")).unwrap();
+        std::fs::create_dir_all(repo.path().join(".cairn")).unwrap();
+        // The destination's declared landing rules, which every replay onto
+        // `main` reads at `main`.
+        std::fs::write(
+            repo.path().join(".cairn/config.yaml"),
+            "landing:\n  merge:\n    - paths: [src-tauri/os/cairn-db/src/storage/migrations.rs]\n      kind: ordered-set\n",
+        )
+        .unwrap();
         std::fs::write(
             registry,
             "fn migrations() {\n    vec![\n        migration!(\"0227_before\"),\n        migration!(\"0229_after\"),\n    ];\n}\n",
@@ -9450,6 +9522,93 @@ mod real_store_collision_tests {
 
     #[test]
     #[serial_test::serial(jj)]
+    fn sibling_insertions_into_one_registry_list_replay_clean_across_advances() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let fx = fixture(&bin);
+        let registry = "src-tauri/os/cairn-db/src/storage/migrations.rs";
+        let workspace = |name: &str, bookmark: &str| {
+            let path = fx.workspaces.path().join(name);
+            crate::jj::add_workspace(&fx.jj, &fx.store, &path, bookmark, "main", None).unwrap();
+            path
+        };
+        let land = |name: &str, stem: &str| {
+            let bookmark = format!("agent/registry-{name}");
+            let path = workspace(name, &bookmark);
+            add_migration(&path, stem);
+            crate::jj::seal(&fx.jj, &path, name, None).unwrap();
+            set_main(
+                &fx,
+                &crate::jj::bookmark_commit(&fx.jj, &fx.store, &bookmark).unwrap(),
+            );
+        };
+        let replay = |branch: &str| {
+            let crate::jj::RebaseOutcome::Conflicted { diagnostic } =
+                crate::jj::rebase_branch_onto(&fx.jj, &fx.store, branch, "main").unwrap()
+            else {
+                panic!("insertions at one place in one list must conflict line-wise")
+            };
+            let report = try_structural_merge(
+                &fx.jj,
+                &fx.store,
+                branch,
+                "main",
+                &diagnostic,
+                &ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap()),
+                &crate::orchestrator::landing::merge_rules_at(&fx.jj, &fx.store, "main"),
+            )
+            .unwrap()
+            .expect("the declared list merge settles it");
+            assert_eq!(report.rebased_clean, vec![branch.to_string()]);
+            let tip = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+            text_at(&fx, &tip, registry)
+        };
+        let entries = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|line| line.trim().strip_prefix("migration!(\""))
+                .filter_map(|rest| rest.strip_suffix("\"),"))
+                .map(ToOwned::to_owned)
+                .collect()
+        };
+
+        let branch = "agent/registry-branch";
+        let branch_ws = workspace("branch", branch);
+        add_migration(&branch_ws, "0230_branch");
+        crate::jj::seal(&fx.jj, &branch_ws, "branch migration", None).unwrap();
+
+        land("first", "0228_first");
+        let once = replay(branch);
+        assert!(
+            cairn_vcs::parse_gate::parse_failure(registry, &once).is_none(),
+            "{once}"
+        );
+        assert_eq!(
+            entries(&once),
+            ["0227_before", "0228_first", "0230_branch", "0229_after"]
+        );
+
+        land("second", "0228_second");
+        let twice = replay(branch);
+        assert!(
+            cairn_vcs::parse_gate::parse_failure(registry, &twice).is_none(),
+            "{twice}"
+        );
+        assert_eq!(
+            entries(&twice),
+            [
+                "0227_before",
+                "0228_first",
+                "0228_second",
+                "0230_branch",
+                "0229_after"
+            ],
+            "every entry once, the landed ones first"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
     fn migrations_union_then_renumber_in_a_real_store() {
         let Some(bin) = crate::jj::tests::jj_bin() else {
             return;
@@ -9495,13 +9654,14 @@ mod real_store_collision_tests {
             diagnostic.conflicting_paths(),
             vec!["src-tauri/os/cairn-db/src/storage/migrations.rs"]
         );
-        let report = try_union_registry_conflict(
+        let report = try_structural_merge(
             &fx.jj,
             &fx.store,
             branch,
             "main",
             &diagnostic,
             &ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap()),
+            &crate::orchestrator::landing::merge_rules_at(&fx.jj, &fx.store, "main"),
         )
         .unwrap()
         .expect("registered conflict has no human path");
@@ -10923,13 +11083,14 @@ mod real_store_collision_tests {
             panic!("outside path must conflict")
         };
         assert_eq!(diagnostic.conflicting_paths(), vec!["outside.txt"]);
-        assert!(try_union_registry_conflict(
+        assert!(try_structural_merge(
             &fx.jj,
             &fx.store,
             branch,
             "main",
             &diagnostic,
             &ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap()),
+            &crate::orchestrator::landing::merge_rules_at(&fx.jj, &fx.store, "main"),
         )
         .unwrap()
         .is_none());

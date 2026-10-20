@@ -15,14 +15,21 @@
 //!
 //! 1. Hold the session's [`CodexAuthState`] in an `Arc<Mutex<_>>` for as long
 //!    as the session lives.
-//! 2. Pass every [`SessionEvent`] the session emits to [`observe`], with the
-//!    session's control. It answers the token request and leaves every other
-//!    event alone.
-//! 3. Never call it on an async executor's thread: a renewal can wait on the
-//!    machine-wide lease another process holds.
+//! 2. Answer the token request with [`token_request_reply`] from the scoped
+//!    handler of the [`ThreadRouter`](crate::codex::thread_router::ThreadRouter)
+//!    the session's app-server is read through, shared or the session's own.
+//!    The handler sees the request as it arrives, even while `thread/start`
+//!    is still pending, and Codex gives up on a refresh after ten seconds.
+//! 3. Never answer on an async executor's thread: a renewal can wait on the
+//!    machine-wide lease another process holds. A router's dispatcher is a
+//!    thread of its own.
 //!
-//! Cairn's own pooled and dedicated readers answer through
-//! [`token_request_reply`] from the seams they route the request to.
+//! Cairn's pooled and dedicated servers answer this way, and so does the
+//! external example host (`examples/llm-host`). [`observe`] answers the
+//! request from the session's [`SessionEvent`]s instead, for a host whose
+//! handler passes it on; that answer waits until the session's reader runs,
+//! so a refresh asked for while the thread is still opening can come too
+//! late.
 //!
 //! Before any of that, a host launching a Codex app-server on a subscription
 //! passes the session's tokens through [`renew_for_launch`], so the app-server

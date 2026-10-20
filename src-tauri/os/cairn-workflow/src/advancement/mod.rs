@@ -35,7 +35,7 @@ pub use actions::{
     rerun_checkpoint_job, wake_upstream_after_checkpoint_failure, AdvanceError,
 };
 pub use core::advance_execution_impl;
-pub use inputs::{format_resolved_inputs, ResolvedInput};
+pub use inputs::{format_resolved_inputs, ArtifactInputSource, InputDelivery, ResolvedInput};
 pub use job_creation::{
     create_jobs_for_execution, create_jobs_for_execution_conn, create_jobs_for_new_nodes,
     create_jobs_for_new_nodes_conn,

@@ -332,6 +332,7 @@ const COPY_ORDER: &[TableCopySpec] = &[
     spec("turn_end_check_attempts", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("artifact_content", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("artifacts", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
+    spec("job_artifact_inputs", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("checkpoint_command_cache", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("checkpoint_runs", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("file_changes", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),

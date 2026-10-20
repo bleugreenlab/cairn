@@ -16,7 +16,7 @@ use cairn_common::ids;
 use cairn_db::storage::LocalDb;
 use cairn_domain::ContextTokenState;
 use cairn_models::session::events::SessionEvent;
-use cairn_models::types::catalog::{context_window, CLAUDE_FAMILY_BACKEND};
+use cairn_models::types::catalog::{claude_reported_context_window, claude_session_window};
 use cairn_models::types::usage::{ProviderUsageScope, ProviderUsageSnapshot, ProviderUsageWindow};
 use cairn_models::wire::claude_stream::{
     extract_tool_start, message_start_usage, parse_thinking_tokens_estimate,
@@ -734,14 +734,19 @@ pub(crate) fn claude_context_used_tokens(usage: &Usage) -> i64 {
 /// Build a context-token snapshot from a single inference's usage. The Claude
 /// CLI's `message_delta` usage carries the full per-inference occupancy
 /// (prompt + cache + output), so the summed figure is the live context fill for
-/// the current model call. Pure (no orchestrator), so it can be unit-tested.
+/// the current model call. The window is the one the CLI reported, else the
+/// one for the model it resolved at init, else for `model`, the effective
+/// model ([`claude_session_window`]). Pure (no orchestrator), so it can be
+/// unit-tested.
 pub(crate) fn build_claude_context_snapshot(
     run_id: &str,
     session_id: Option<&str>,
     model: Option<String>,
+    resolved_model: Option<&str>,
+    reported_window: Option<i64>,
     usage: &Usage,
 ) -> ContextTokenState {
-    let context_window = context_window(CLAUDE_FAMILY_BACKEND, model.as_deref(), &[]);
+    let context_window = claude_session_window(reported_window, resolved_model, model.as_deref());
     ContextTokenState {
         run_id: run_id.to_string(),
         session_id: session_id.map(str::to_string),
@@ -771,9 +776,29 @@ pub(crate) fn emit_claude_context_snapshot(
     usage: &Usage,
 ) {
     let model = host.process_state.effective_model(run_id);
+    let (resolved, reported_window) = host.process_state.reported_model_and_window(run_id);
     host.host.context_snapshot(build_claude_context_snapshot(
-        run_id, session_id, model, usage,
+        run_id,
+        session_id,
+        model,
+        resolved.as_deref(),
+        reported_window,
+        usage,
     ));
+}
+
+/// Keep the context window a turn's `result` reports for the session's model
+/// (`modelUsage[model].contextWindow`): the CLI's own answer, which depends on
+/// its version as much as on the model, outranks any table.
+fn record_claude_reported_window(host: &ClaudeRuntime, run_id: &str, result: &serde_json::Value) {
+    let (resolved, _) = host.process_state.reported_model_and_window(run_id);
+    if let Some(window) = result
+        .get("modelUsage")
+        .and_then(|usage| claude_reported_context_window(usage, resolved.as_deref()))
+    {
+        host.process_state
+            .set_reported_context_window(run_id, window);
+    }
 }
 
 /// Build a coarse usage snapshot from a `rate_limit_event`. The CLI reports a
@@ -2117,7 +2142,8 @@ impl ClaudeRuntime {
                         let event_counts = TokenCounts::default();
 
                         if transcript_event.parent_tool_use_id.is_none() {
-                            if let ClaudeEvent::Result { .. } = &event {
+                            if let ClaudeEvent::Result { data, .. } = &event {
+                                record_claude_reported_window(host, run_id, data);
                                 if let Some(usage) = pending_delta_usage.as_ref() {
                                     emit_claude_context_snapshot(
                                         host,
@@ -2443,6 +2469,8 @@ mod tests {
             "run-1",
             Some("session-durable"),
             Some("sonnet".to_string()),
+            None,
+            None,
             &usage,
         );
 
@@ -2450,8 +2478,49 @@ mod tests {
         assert_eq!(state.session_id.as_deref(), Some("session-durable"));
         assert_eq!(state.backend, "claude");
         assert_eq!(state.used_tokens, 29_648);
+        // Before init the bare alias is all there is, and `sonnet` is 200k on
+        // CLIs before the 5.5 aliases.
         assert_eq!(state.context_window, Some(200_000));
         assert_eq!(state.last_output_tokens, Some(4_147));
+    }
+
+    /// CLI 2.1.302 resolves `sonnet` and `haiku` to the 5.5 generation, whose
+    /// window is 1M; the alias alone would read 200k.
+    #[test]
+    fn build_claude_context_snapshot_reads_5_5_windows_from_the_resolved_model() {
+        let usage = Usage {
+            input_tokens: 4,
+            cache_creation_input_tokens: Some(9_000),
+            cache_read_input_tokens: Some(150_000),
+            output_tokens: 996,
+            output_tokens_details: None,
+        };
+        for (alias, resolved) in [
+            ("sonnet", "claude-sonnet-5-5"),
+            ("haiku", "claude-haiku-5-5"),
+        ] {
+            let state = build_claude_context_snapshot(
+                "run-1",
+                Some("session"),
+                Some(alias.to_string()),
+                Some(resolved),
+                None,
+                &usage,
+            );
+            assert_eq!(state.model.as_deref(), Some(alias));
+            assert_eq!(state.context_window, Some(1_000_000), "{alias}");
+            assert_eq!(state.used_tokens, 160_000);
+        }
+        // The window the CLI reported outranks every table answer.
+        let state = build_claude_context_snapshot(
+            "run-1",
+            Some("session"),
+            Some("haiku".to_string()),
+            Some("claude-haiku-4-5-20251001"),
+            Some(200_000),
+            &usage,
+        );
+        assert_eq!(state.context_window, Some(200_000));
     }
 
     #[test]
@@ -2464,7 +2533,8 @@ mod tests {
             output_tokens_details: None,
         };
 
-        let state = build_claude_context_snapshot("run-1", Some("session"), None, &usage);
+        let state =
+            build_claude_context_snapshot("run-1", Some("session"), None, None, None, &usage);
 
         assert_eq!(state.model, None);
         assert_eq!(state.context_window, None);
@@ -2764,6 +2834,85 @@ mod depletion_order_tests {
         assert_eq!(snapshot.used_tokens, 117_000);
         assert_eq!(snapshot.model.as_deref(), Some("claude-opus-5-5"));
         assert_eq!(snapshot.context_window, Some(1_000_000));
+    }
+
+    // The table reads `claude-sonnet-5` as 200k, the window CLI 2.1.220 gives
+    // it; a CLI that reports 1M for it in a turn's result is believed from then
+    // on, for every later inference of the process.
+    #[tokio::test]
+    async fn the_live_gauge_adopts_the_window_a_result_reports() {
+        let db = Arc::new(cairn_db::storage::migrated_test_db("claude-reported-window.db").await);
+        let host = Arc::new(RecordingHost::default());
+        let process_state = Arc::new(AgentProcessState::default());
+        process_state.processes.lock().unwrap().register(
+            "run-window".to_string(),
+            crate::agent_process::process::RunHandle::test_handle(None, None),
+        );
+        let runtime = ClaudeRuntime {
+            process_state: process_state.clone(),
+            emitter: Arc::new(cairn_platform::services::emitter::CapturingEmitter::default()),
+            boot_id: "boot".to_string(),
+            host: host.clone(),
+        };
+        let init = serde_json::json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": "s1",
+            "model": "claude-sonnet-5",
+            "tools": crate::agent_process::toolkits::CORE_VERBS,
+        });
+        let delta = serde_json::json!({
+            "type": "stream_event",
+            "session_id": "s1",
+            "event": {
+                "type": "message_delta",
+                "delta": {},
+                "usage": {
+                    "input_tokens": 4,
+                    "cache_read_input_tokens": 170_000,
+                    "cache_creation_input_tokens": 0,
+                    "output_tokens": 996
+                }
+            }
+        });
+        let result = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "session_id": "s1",
+            "is_error": false,
+            "result": "done",
+            "modelUsage": {
+                "claude-sonnet-5": {"contextWindow": 1_000_000, "maxOutputTokens": 64_000}
+            }
+        });
+        let stdout = format!("{init}\n{delta}\n{result}\n{delta}\n");
+        std::thread::spawn(move || {
+            ClaudeRuntime::reader_thread(
+                &runtime,
+                "run-window",
+                None,
+                false,
+                Box::new(std::io::Cursor::new(stdout.into_bytes())),
+                None,
+                db,
+            );
+        })
+        .join()
+        .expect("reader thread");
+
+        assert_eq!(
+            process_state.reported_model_and_window("run-window"),
+            (Some("claude-sonnet-5".to_string()), Some(1_000_000))
+        );
+        let windows: Vec<Option<i64>> = host
+            .snapshots
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|snapshot| snapshot.context_window)
+            .collect();
+        assert_eq!(windows.first(), Some(&Some(200_000)), "{windows:?}");
+        assert_eq!(windows.last(), Some(&Some(1_000_000)), "{windows:?}");
     }
 
     // The credits shape: a structured synthetic error, then a generic error

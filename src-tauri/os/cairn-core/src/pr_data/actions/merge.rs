@@ -576,6 +576,25 @@ async fn merge_remote_pr_via_github(
     let auth = installation_authority(&orch.db.local, &owner).await?;
     let http = &*orch.services.http;
 
+    // The default branch must never receive a file that stops parsing. GitHub
+    // merges outside the store, so the branch head is judged here, before the
+    // request: a file the branch changed that parsed at its fork and on the
+    // target, and does not parse at its head, refuses the merge.
+    let parse_refusal = {
+        let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+        let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
+        let (target, source) = (target_branch.clone(), source_branch.clone());
+        tokio::task::spawn_blocking(move || {
+            crate::jj::branch_parse_refusal(&jj, &store, &target, &source)
+        })
+        .await
+        .ok()
+        .flatten()
+    };
+    if let Some(refusal) = parse_refusal {
+        return Err(refusal);
+    }
+
     // FAIL-CLOSED: on any failure, surface it and mark/advance NOTHING locally.
     let github_started = std::time::Instant::now();
     let merge_commit = api::merge_pr(http, &auth, &owner, &repo, pr_number, &method)

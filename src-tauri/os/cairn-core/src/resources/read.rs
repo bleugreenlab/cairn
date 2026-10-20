@@ -100,6 +100,7 @@ pub(crate) async fn run_condition_sql(
         },
     )
     .await
+    .map(|page| (page.body, page.shown, page.total))
 }
 
 async fn resolve_thread_for_resource(
@@ -530,17 +531,17 @@ async fn produce_sql_resource(
         Err(error) => return RenderedResource::line(error, affordance, None, None),
     };
     match run_sql_projection(db, &projection).await {
-        Ok((body, shown, total)) => RenderedResource {
-            content: body,
+        Ok(page) => RenderedResource {
+            content: page.body,
             natural_unit: NaturalUnit::Record,
             unit_noun: Some("rows"),
-            total_units: total,
-            shown_units: Some(shown),
+            total_units: page.total,
+            shown_units: Some(page.shown),
             offset: Some(projection.offset as i64),
             limit: Some(projection.limit),
             match_count: None,
             grep_shown: None,
-            record_prelude_lines: (projection.format == DbSqlFormat::Json).then_some(1),
+            record_prelude_lines: Some(page.prelude_lines),
             affordance,
             images: Vec::new(),
         },
@@ -736,10 +737,21 @@ async fn produce_dev_pid_resource(
     )
 }
 
+/// One windowed SQL result. Both formats are line-framed: `prelude_lines`
+/// leading lines of metadata (the TSV column row, or the JSON `columns` line),
+/// then exactly one line per row — TSV escapes newlines inside values — so a
+/// budget cut on a line boundary can be translated back into a row count.
+struct SqlPage {
+    body: String,
+    shown: usize,
+    total: Option<usize>,
+    prelude_lines: usize,
+}
+
 async fn run_sql_projection(
     db: &LocalDb,
     projection: &DbSqlProjection,
-) -> crate::storage::DbResult<(String, usize, Option<usize>)> {
+) -> crate::storage::DbResult<SqlPage> {
     let sql = projection
         .sql
         .trim()
@@ -757,6 +769,10 @@ async fn run_sql_projection(
             let _ = conn.execute("PRAGMA query_only = ON", ()).await;
             let mut rows = conn.query(&sql, ()).await?;
             let columns = rows.column_names();
+            let prelude_lines = match format {
+                DbSqlFormat::Text => usize::from(!columns.is_empty()),
+                DbSqlFormat::Json => 1,
+            };
             let mut rendered_rows = Vec::new();
             let mut seen = 0usize;
             let mut has_more = false;
@@ -801,7 +817,12 @@ async fn run_sql_projection(
                     render_sql_json_lines(columns, &rendered_rows, offset, limit, has_more)
                 }
             };
-            Ok((body, rendered_rows.len(), total))
+            Ok(SqlPage {
+                body,
+                shown: rendered_rows.len(),
+                total,
+                prelude_lines,
+            })
         })
     })
     .await
@@ -1941,6 +1962,18 @@ async fn render_resource_body(
                         orch.fleet.colocated_substrate().as_ref(),
                         &orch.fleet.colocated_supervision(),
                         executors.iter().any(|executor| executor.colocated),
+                        captured_at,
+                    ));
+                    let runner_events = crate::fleet::runner_events::load_window(
+                        &orch.db.local,
+                        captured_at.saturating_sub(60 * 60 * 1_000),
+                    )
+                    .await
+                    .map_err(|error| error.to_string());
+                    rendered.push_str(&crate::resources::executors::render_runner_events(
+                        &runner_events,
+                        &orch.fleet.runner_events().journal_state(),
+                        |executor_id| orch.fleet.executor_name_for_text(executor_id),
                         captured_at,
                     ));
                     match orch.private_lane_budgets().await {
@@ -3697,6 +3730,10 @@ line2', X'0001020AFF', 2.5),
     }
 
     async fn render_db_test_uri(orch: &Orchestrator, uri: &str) -> String {
+        render_db_test_uri_at(orch, uri, 10_000).await
+    }
+
+    async fn render_db_test_uri_at(orch: &Orchestrator, uri: &str, budget: u32) -> String {
         let request = McpCallbackRequest {
             thread_id: None,
             cwd: String::new(),
@@ -3716,10 +3753,64 @@ line2', X'0001020AFF', 2.5),
         meta.record_prelude_lines = rendered.record_prelude_lines;
         crate::storage::render::render_segment(
             cairn_common::read::ReadSegment::text(rendered.content, meta),
-            10_000,
+            budget,
             &crate::token_meters::O200K_TOKEN_METER,
         )
         .text
+    }
+
+    /// A TSV page cut by the read budget reports the rows it rendered, and a
+    /// pager that only follows continue footers walks every row exactly once.
+    #[tokio::test]
+    async fn db_sql_tsv_budget_cut_pages_every_row_exactly_once() {
+        let (orch, _db_dir) = db_projection_orch().await;
+        let sql = "SELECT a.id * 100 + b.id * 10 + c.id AS n, a.label || '-' || b.label || '-' || c.label AS name FROM db_projection_rows a, db_projection_rows b, db_projection_rows c ORDER BY n";
+        let expected: Vec<String> = {
+            let full = render_db_test_uri(&orch, &format!("cairn://db?sql={sql}&limit=1000")).await;
+            assert!(full.contains("[27 of 27 rows] ==="), "{full}");
+            full.lines()
+                .filter(|line| {
+                    line.split('\t')
+                        .next()
+                        .is_some_and(|n| n.parse::<u32>().is_ok())
+                })
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(expected.len(), 27);
+
+        let mut uri = format!("cairn://db?sql={sql}&limit=1000&offset=0");
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages <= 27, "pager did not converge");
+            let page = render_db_test_uri_at(&orch, &uri, 160).await;
+            assert!(!page.contains("SQL query failed"), "{page}");
+            let rows: Vec<String> = page
+                .lines()
+                .filter(|line| {
+                    line.split('\t')
+                        .next()
+                        .is_some_and(|n| n.parse::<u32>().is_ok())
+                })
+                .map(str::to_string)
+                .collect();
+            let head = page.lines().next().unwrap();
+            assert!(
+                head.ends_with(&format!("[{} of 27 rows] ===", rows.len())),
+                "header must count the rendered rows: {page}"
+            );
+            seen.extend(rows);
+            let marker = "continue: ";
+            let Some(start) = page.find(marker).map(|at| at + marker.len()) else {
+                break;
+            };
+            let end = page[start..].find(']').unwrap() + start;
+            uri = page[start..end].to_string();
+        }
+        assert!(pages > 1, "the budget must cut the first page");
+        assert_eq!(seen, expected);
     }
 
     #[tokio::test]

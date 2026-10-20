@@ -845,36 +845,99 @@ pub struct ProviderModelCatalog {
     pub error: Option<String>,
 }
 
-/// Claude context window opt-in state.
+const CLAUDE_LONG_WINDOW: i64 = 1_000_000;
+const CLAUDE_DEFAULT_WINDOW: i64 = 200_000;
+
+/// The context window assumed for a Claude model the CLI has not yet reported a
+/// window for. Once it has, [`claude_reported_context_window`] is the authority.
 ///
-/// Cairn currently uses subscription auth by default. Sonnet's 1M long-context
-/// beta switches billing to API pricing, so callers pass `Subscription` until
-/// that opt-in is explicitly wired through configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ClaudeContextOptIn {
-    #[default]
-    Subscription,
-    #[allow(dead_code)]
-    LongContext1M,
+/// A Claude window is a fact of the CLI as much as of the model: the CLI sizes
+/// every request, and a CLI that predates a model treats it as a 200k model.
+/// What the CLI reports (`result.modelUsage[model].contextWindow`, OAuth
+/// subscription auth):
+///
+/// - CLI 2.1.302 gives the 5.x generation 1M with no opt-in, and every 4.x ID
+///   (4.5 and 4.6 alike) 200k.
+/// - CLI 2.1.220 gives every ID 200k, `claude-haiku-5-5` included, and resolves
+///   the bare aliases to the generation before 5.5 (`sonnet` to
+///   `claude-sonnet-5`, `haiku` to Haiku 4.5, `fable` to `claude-fable-5`).
+/// - Both give 1M to a model named with the CLI's `[1m]` suffix.
+///
+/// So this answers 1M only where every observed CLI agrees, or where the name
+/// itself proves a CLI new enough: a `[1m]` name; the `opus` alias, which Cairn
+/// always launches as `opus[1m]`; and an ID from fable 5.1 / the 5.5
+/// generation onward, which only a CLI that knows that generation resolves an
+/// alias to. Every other name reads 200k: the other bare aliases, 5.0 and 4.x
+/// IDs, and unrecognized names. A window that is too small only compacts
+/// early; one that is too large lets a session overrun its real context before
+/// compaction fires.
+pub fn claude_context_window(model: &str) -> i64 {
+    let model = model.to_ascii_lowercase();
+    if model.ends_with("[1m]") || model == "opus" {
+        return CLAUDE_LONG_WINDOW;
+    }
+    match claude_generation(&model) {
+        Some(generation) if generation >= (5, 1) => CLAUDE_LONG_WINDOW,
+        _ => CLAUDE_DEFAULT_WINDOW,
+    }
 }
 
-/// Subscription-auth context windows by Claude model family. Sonnet's 1M
-/// long-context beta switches billing to API pricing and is not wired in Cairn,
-/// so Sonnet stays at its 200k subscription window. Opus and Fable offer 1M.
-/// Haiku is a confirmed 200k model. Unknown models use the conservative 200k
-/// default.
-pub fn claude_context_window(model: &str, opt_in: ClaudeContextOptIn) -> i64 {
+/// The `(major, minor)` version of a Claude model ID named family-first
+/// (`claude-haiku-5-5`, `claude-opus-5`, `claude-sonnet-4-5-20250929`). A date
+/// stamp is not a minor version, so `claude-opus-4-20250514` is `(4, 0)`. A bare
+/// alias or a version-first name (`claude-3-5-sonnet`) has none.
+pub fn claude_generation(model: &str) -> Option<(u32, u32)> {
     let model = model.to_ascii_lowercase();
-    if model.contains("opus") || model.contains("fable") {
-        return 1_000_000;
-    }
-    if model.contains("sonnet") {
-        return match opt_in {
-            ClaudeContextOptIn::LongContext1M => 1_000_000,
-            ClaudeContextOptIn::Subscription => 200_000,
-        };
-    }
-    200_000
+    let rest = ["opus", "sonnet", "haiku", "fable"]
+        .iter()
+        .find_map(|family| model.split_once(&format!("{family}-")))
+        .map(|(_, rest)| rest)?;
+    // A version part is one or two digits; anything longer is a date stamp.
+    let version = |part: &str| {
+        (1..=2)
+            .contains(&part.len())
+            .then(|| part.parse::<u32>().ok())
+            .flatten()
+    };
+    let mut parts = rest.split(['-', '.', '[']);
+    let major = version(parts.next()?)?;
+    let minor = parts.next().and_then(version).unwrap_or(0);
+    Some((major, minor))
+}
+
+/// The context window the Claude CLI reported in a `result` event's
+/// `modelUsage` object, for `resolved_model` (the model its `system:init` event
+/// named, which is the key it reports usage under). With no such entry, a
+/// `modelUsage` naming exactly one model is that model's report; one naming
+/// several, none of them `resolved_model`, answers nothing rather than guess.
+pub fn claude_reported_context_window(
+    model_usage: &serde_json::Value,
+    resolved_model: Option<&str>,
+) -> Option<i64> {
+    let usage = model_usage.as_object()?;
+    let entry = resolved_model
+        .and_then(|model| usage.get(model))
+        .or_else(|| {
+            let mut entries = usage.values();
+            entries.next().filter(|_| entries.next().is_none())
+        })?;
+    entry
+        .get("contextWindow")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|window| *window > 0)
+}
+
+/// The window a Claude session runs with: the one its CLI reported, else
+/// [`claude_context_window`] for the model the CLI resolved at init, else for
+/// the model selected. The resolved ID outranks the selected alias because it
+/// says which generation this CLI runs (`haiku` is Haiku 5.5 on one CLI and
+/// Haiku 4.5 on another). No model at all means no known window.
+pub fn claude_session_window(
+    reported_window: Option<i64>,
+    resolved_model: Option<&str>,
+    selected_model: Option<&str>,
+) -> Option<i64> {
+    reported_window.or_else(|| resolved_model.or(selected_model).map(claude_context_window))
 }
 
 /// The Claude models Cairn ships: the Claude CLI's own aliases.
@@ -900,7 +963,7 @@ pub fn claude_models() -> Vec<DiscoveredModel> {
         is_default,
         default_reasoning_effort: None,
         supported_reasoning_efforts: vec![],
-        context_window: Some(claude_context_window(alias, ClaudeContextOptIn::default())),
+        context_window: Some(claude_context_window(alias)),
         canonical_slug: None,
         serving_account_ids: Vec::new(),
         pricing: None,
@@ -915,9 +978,10 @@ pub fn claude_models() -> Vec<DiscoveredModel> {
 
 /// The context window `model` is read with on `provider`.
 ///
-/// Claude's windows are a fact of its subscription plans, answered from
-/// [`claude_context_window`]; a Claude session with no known model has no
-/// known window, since the plans differ by model. Every other provider reports
+/// Claude has no discovery, so its answer is [`claude_context_window`]'s table;
+/// a Claude *session* reads [`claude_session_window`] instead, which prefers
+/// what its CLI reported. A Claude model that is not named has no known
+/// window, since windows differ by model. Every other provider reports
 /// its windows through discovery, so the answer comes from `discovered`, that
 /// provider's discovered models; a model the catalog does not carry has no known window. The
 /// provider only needs to be *supported*, not enabled: this also reads windows
@@ -929,7 +993,7 @@ pub fn context_window(
     discovered: &[DiscoveredModel],
 ) -> Option<i64> {
     if provider.eq_ignore_ascii_case(CLAUDE_FAMILY_BACKEND) {
-        return model.map(|model| claude_context_window(model, ClaudeContextOptIn::default()));
+        return model.map(claude_context_window);
     }
     if !is_supported(&provider.to_ascii_lowercase()) {
         return None;
@@ -1242,24 +1306,121 @@ mod tests {
         assert!(!is_supported("not-a-provider"));
     }
 
+    /// Each expectation is what CLI 2.1.302 and 2.1.220 both reported for the
+    /// model (`result.modelUsage[..].contextWindow`), or the smaller of the two
+    /// where they disagree, except where the ID itself proves the newer CLI.
     #[test]
-    fn claude_context_window_matches_subscription_catalog() {
-        let sub = ClaudeContextOptIn::Subscription;
-        assert_eq!(claude_context_window("opus", sub), 1_000_000);
-        assert_eq!(claude_context_window("fable", sub), 1_000_000);
-        assert_eq!(claude_context_window("claude-opus-5", sub), 1_000_000);
-        assert_eq!(claude_context_window("sonnet", sub), 200_000);
+    fn claude_context_window_is_the_window_every_observed_cli_grants() {
+        // The 5.5 generation and Fable 5.1: 1M on the CLI that resolves to them.
+        assert_eq!(claude_context_window("claude-haiku-5-5"), 1_000_000);
+        assert_eq!(claude_context_window("claude-sonnet-5-5"), 1_000_000);
+        assert_eq!(claude_context_window("claude-opus-5-5"), 1_000_000);
+        assert_eq!(claude_context_window("claude-fable-5-1"), 1_000_000);
+        assert_eq!(claude_context_window("claude-sonnet-6"), 1_000_000);
+        // 4.x is 200k on both CLIs, 4.6 included.
+        assert_eq!(claude_context_window("claude-haiku-4-5"), 200_000);
+        assert_eq!(claude_context_window("claude-haiku-4-5-20251001"), 200_000);
+        assert_eq!(claude_context_window("claude-sonnet-4-5-20250929"), 200_000);
+        assert_eq!(claude_context_window("claude-opus-4-6"), 200_000);
+        // 5.0 is 1M on 2.1.302 but 200k on 2.1.220, which is the CLI that
+        // resolves the bare aliases to it.
+        assert_eq!(claude_context_window("claude-opus-5"), 200_000);
+        assert_eq!(claude_context_window("claude-sonnet-5"), 200_000);
+        // The `[1m]` suffix is 1M on both CLIs, whatever the model.
+        assert_eq!(claude_context_window("claude-opus-5[1m]"), 1_000_000);
+        assert_eq!(claude_context_window("claude-opus-5-5[1m]"), 1_000_000);
+        assert_eq!(claude_context_window("sonnet[1m]"), 1_000_000);
+        // Bare aliases mean whatever the executor's CLI resolves them to: 1M
+        // on 2.1.302, 200k on 2.1.220. Only `opus` is launched as `opus[1m]`,
+        // which is 1M on both.
+        assert_eq!(claude_context_window("opus"), 1_000_000);
+        assert_eq!(claude_context_window("sonnet"), 200_000);
+        assert_eq!(claude_context_window("haiku"), 200_000);
+        assert_eq!(claude_context_window("fable"), 200_000);
+        assert_eq!(claude_context_window("mystery"), 200_000);
+    }
+
+    #[test]
+    fn claude_generation_reads_the_version_after_the_family() {
+        assert_eq!(claude_generation("claude-haiku-5-5"), Some((5, 5)));
+        assert_eq!(claude_generation("claude-opus-5-5[1m]"), Some((5, 5)));
+        assert_eq!(claude_generation("claude-fable-5-1"), Some((5, 1)));
+        assert_eq!(claude_generation("claude-opus-5"), Some((5, 0)));
         assert_eq!(
-            claude_context_window("claude-sonnet-4-5-20250929", sub),
-            200_000
+            claude_generation("Claude-Sonnet-4-5-20250929"),
+            Some((4, 5))
+        );
+        // A date stamp is not a minor version.
+        assert_eq!(claude_generation("claude-opus-4-20250514"), Some((4, 0)));
+        assert_eq!(claude_generation("claude-opus-4.1"), Some((4, 1)));
+        assert_eq!(claude_generation("opus"), None);
+        assert_eq!(claude_generation("claude-3-5-sonnet-20241022"), None);
+    }
+
+    #[test]
+    fn the_reported_window_is_the_resolved_models_entry() {
+        // Recorded from CLI 2.1.302: the init event named `claude-opus-5-5[1m]`
+        // and the result reports usage under that same key.
+        let usage = serde_json::json!({
+            "claude-opus-5-5[1m]": {"contextWindow": 1_000_000, "maxOutputTokens": 128_000},
+            "claude-haiku-4-5-20251001": {"contextWindow": 200_000}
+        });
+        assert_eq!(
+            claude_reported_context_window(&usage, Some("claude-opus-5-5[1m]")),
+            Some(1_000_000)
         );
         assert_eq!(
-            claude_context_window("sonnet", ClaudeContextOptIn::LongContext1M),
-            1_000_000
+            claude_reported_context_window(&usage, Some("claude-haiku-4-5-20251001")),
+            Some(200_000)
         );
-        assert_eq!(claude_context_window("haiku", sub), 200_000);
-        // A named Claude model outside the 1M families reads the plan default.
-        assert_eq!(claude_context_window("claude-haiku-4-5", sub), 200_000);
+        // Several models, none the resolved one: no guess.
+        assert_eq!(claude_reported_context_window(&usage, Some("other")), None);
+        assert_eq!(claude_reported_context_window(&usage, None), None);
+
+        // One model is that model's report, whatever it is keyed under.
+        let single = serde_json::json!({"claude-haiku-5-5": {"contextWindow": 1_000_000}});
+        assert_eq!(
+            claude_reported_context_window(&single, Some("haiku")),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            claude_reported_context_window(&single, None),
+            Some(1_000_000)
+        );
+
+        // An older CLI's result without the figure, or a nonsense one.
+        let no_window = serde_json::json!({"claude-sonnet-5": {"inputTokens": 1}});
+        assert_eq!(claude_reported_context_window(&no_window, None), None);
+        let zero = serde_json::json!({"claude-sonnet-5": {"contextWindow": 0}});
+        assert_eq!(claude_reported_context_window(&zero, None), None);
+        assert_eq!(
+            claude_reported_context_window(&serde_json::Value::Null, None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_claude_session_window_prefers_the_cli_report_then_the_resolved_model() {
+        // What the CLI reported wins over every table answer.
+        assert_eq!(
+            claude_session_window(Some(200_000), Some("claude-haiku-5-5"), Some("haiku")),
+            Some(200_000)
+        );
+        // Before any report, the resolved ID says which generation `haiku` is.
+        assert_eq!(
+            claude_session_window(None, Some("claude-haiku-5-5"), Some("haiku")),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            claude_session_window(None, Some("claude-haiku-4-5-20251001"), Some("haiku")),
+            Some(200_000)
+        );
+        // Before init, the selected model is all there is.
+        assert_eq!(
+            claude_session_window(None, None, Some("sonnet")),
+            Some(200_000)
+        );
+        assert_eq!(claude_session_window(None, None, None), None);
     }
 
     #[test]
@@ -1269,13 +1430,7 @@ mod tests {
         assert_eq!(ids, vec!["haiku", "sonnet", "opus", "fable"]);
         assert_eq!(models.iter().filter(|m| m.is_default).count(), 1);
         for model in &models {
-            assert_eq!(
-                model.context_window,
-                Some(claude_context_window(
-                    &model.id,
-                    ClaudeContextOptIn::default()
-                ))
-            );
+            assert_eq!(model.context_window, Some(claude_context_window(&model.id)));
             // The CLI decides which version an alias means.
             assert_eq!(model.canonical_slug, None);
         }

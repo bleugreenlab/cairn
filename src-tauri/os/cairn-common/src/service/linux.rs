@@ -143,6 +143,32 @@ pub fn uninstall(spec: &ServiceSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// `systemctl --user stop` the unit and its pre-rename name. A stop job is not a
+/// failure, so `Restart=` does not fire; the unit stays enabled and starts again
+/// at the next login. A unit that is not loaded makes `stop` fail, which is
+/// nothing to stop, so only a unit still active afterwards is an error.
+pub fn stop(spec: &ServiceSpec) -> Result<(), String> {
+    let legacy = spec
+        .legacy
+        .as_ref()
+        .and_then(|legacy| legacy.unit_name.as_deref());
+    super::stop_each(
+        std::iter::once(spec.unit_name.as_str()).chain(legacy),
+        |unit| {
+            let stopped = run_systemctl(&["stop", unit]);
+            let still_active = Command::new("systemctl")
+                .args(["--user", "is-active", "--quiet", unit])
+                .status()
+                .is_ok_and(|status| status.success());
+            match (still_active, stopped) {
+                (false, _) => Ok(()),
+                (true, Err(error)) => Err(format!("{unit} is still active: {error}")),
+                (true, Ok(())) => Err(format!("{unit} is still active after systemctl stop")),
+            }
+        },
+    )
+}
+
 /// Bounce the systemd user unit in place with `systemctl --user restart` — no
 /// unit-file rewrite. Falls back to [`install`] when the unit is not known to
 /// systemd (never installed, or written but not `daemon-reload`ed).

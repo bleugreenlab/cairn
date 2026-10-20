@@ -1,4 +1,4 @@
-use crate::advancement::ResolvedInput;
+use crate::advancement::{ArtifactInputSource, InputDelivery, ResolvedInput};
 use crate::dag::{recipe_edge_to_db, recipe_node_to_db};
 use crate::db_records::{DbJob, DbRecipeEdge, DbRecipeNode};
 use crate::models::{ExecutionSnapshot, OutputSchema, OutputSchemaInfo, RecipeNode};
@@ -193,12 +193,21 @@ async fn resolve_job_inputs_conn(
                                 "content": content,
                                 "title": source_node.name
                             }),
+                            source: None,
                         });
                     }
                 }
             }
             continue;
         }
+
+        // The port the edge lands on decides whether the consumer is given the
+        // artifact's content or only its identity.
+        let delivery = if edge.target_handle == crate::models::CONTEXT_REF_HANDLE {
+            InputDelivery::Reference
+        } else {
+            InputDelivery::Content
+        };
 
         if source_node.node_type == "artifact" {
             // Port model: the consumer reads from an ArtifactNode. Load the
@@ -211,6 +220,7 @@ async fn resolve_job_inputs_conn(
                 &rnode_map,
                 &all_edges,
                 edge.source_node_id.as_str(),
+                delivery,
             )
             .await?
             {
@@ -261,14 +271,13 @@ async fn resolve_job_inputs_conn(
             .as_deref()
             .unwrap_or(edge.source_handle.as_str());
 
-        if let Some((artifact_type, data_json)) =
+        if let Some(stored) =
             load_artifact_for_edge_conn(conn, &source_job.id, load_name, &ctx_self_names).await?
         {
-            let data = serde_json::from_str(&data_json).unwrap_or_default();
-            inputs.push(ResolvedInput {
-                artifact_type,
-                data,
-            });
+            if let Some(input) = artifact_input_conn(conn, &source_job.id, stored, delivery).await?
+            {
+                inputs.push(input);
+            }
         } else if source_job.status == "complete" {
             let last_msg = load_last_assistant_message_conn(conn, &source_job.id).await?;
             if let Some(content) = last_msg {
@@ -278,6 +287,7 @@ async fn resolve_job_inputs_conn(
                         "source_node": source_node.name,
                         "content": content,
                     }),
+                    source: None,
                 });
             }
         }
@@ -298,6 +308,7 @@ async fn load_artifact_node_input_conn(
     rnode_map: &HashMap<&str, &RecipeNode>,
     all_edges: &[DbRecipeEdge],
     artifact_node_id: &str,
+    delivery: InputDelivery,
 ) -> DbResult<Option<ResolvedInput>> {
     let Some(artifact_node) = rnode_map.get(artifact_node_id).copied() else {
         return Ok(None);
@@ -327,14 +338,10 @@ async fn load_artifact_node_input_conn(
         .await?
         {
             let ctx_self_names = ctx_self_names_from_edges(rnode_map, all_edges, &producer_id);
-            if let Some((artifact_type, data_json)) =
+            if let Some(stored) =
                 load_artifact_for_edge_conn(conn, &producer_job.id, &name, &ctx_self_names).await?
             {
-                let data = serde_json::from_str(&data_json).unwrap_or_default();
-                return Ok(Some(ResolvedInput {
-                    artifact_type,
-                    data,
-                }));
+                return artifact_input_conn(conn, &producer_job.id, stored, delivery).await;
             }
         }
         return Ok(None);
@@ -348,6 +355,7 @@ async fn load_artifact_node_input_conn(
                 "content": content,
                 "title": artifact_node.name,
             }),
+            source: None,
         }));
     }
 
@@ -422,6 +430,7 @@ async fn build_trigger_context_conn(
     Ok(ResolvedInput {
         artifact_type: "trigger_context".to_string(),
         data,
+        source: None,
     })
 }
 
@@ -494,6 +503,48 @@ fn ctx_self_names_from_edges(
         .collect()
 }
 
+/// The latest stored version of a producer's artifact, as a consumer edge loaded
+/// it.
+#[derive(Debug)]
+struct StoredArtifact {
+    artifact_type: String,
+    data: String,
+    version: i64,
+    output_name: Option<String>,
+}
+
+/// Build the consumer's input from a loaded artifact version, naming the version
+/// and URI it came from. A by-reference input with no addressable identity (a
+/// legacy unnamed row, or a producer with no home URI) has nothing to point at,
+/// so it contributes nothing rather than a pointer that resolves nowhere.
+async fn artifact_input_conn(
+    conn: &cairn_db::turso::Connection,
+    producer_job_id: &str,
+    stored: StoredArtifact,
+    delivery: InputDelivery,
+) -> DbResult<Option<ResolvedInput>> {
+    let source = match stored.output_name.filter(|name| !name.is_empty()) {
+        Some(output_name) => cairn_db::lineage::home_uri_for_job_conn(conn, producer_job_id)
+            .await?
+            .map(|home| ArtifactInputSource {
+                producer_job_id: producer_job_id.to_string(),
+                uri: format!("{home}/{output_name}"),
+                output_name,
+                version: stored.version,
+                delivery,
+            }),
+        None => None,
+    };
+    if delivery == InputDelivery::Reference && source.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ResolvedInput {
+        artifact_type: stored.artifact_type,
+        data: serde_json::from_str(&stored.data).unwrap_or_default(),
+        source,
+    }))
+}
+
 /// Load a producer's artifact for a consumer edge.
 ///
 /// Match first by the resolved artifact `output_name` (the terminal/ArtifactNode
@@ -508,22 +559,30 @@ async fn load_artifact_for_edge_conn(
     job_id: &str,
     output_name: &str,
     exclude_from_fallback: &[String],
-) -> DbResult<Option<(String, String)>> {
+) -> DbResult<Option<StoredArtifact>> {
+    let stored = |row: &cairn_db::turso::Row| -> DbResult<StoredArtifact> {
+        Ok(StoredArtifact {
+            artifact_type: row.text(0)?,
+            data: row.text(1)?,
+            version: row.i64(2)?,
+            output_name: row.opt_text(3)?,
+        })
+    };
     let mut exact = conn
         .query(
-            "SELECT id, artifact_type, data FROM artifacts
+            "SELECT artifact_type, data, version, output_name FROM artifacts
              WHERE job_id = ?1 AND output_name = ?2
              ORDER BY version DESC LIMIT 1",
             params![job_id, output_name],
         )
         .await?;
     if let Some(row) = exact.next().await? {
-        return Ok(Some((row.text(1)?, row.text(2)?)));
+        return Ok(Some(stored(&row)?));
     }
 
     let mut fallback = conn
         .query(
-            "SELECT id, artifact_type, data, output_name FROM artifacts
+            "SELECT artifact_type, data, version, output_name FROM artifacts
              WHERE job_id = ?1 ORDER BY version DESC",
             (job_id,),
         )
@@ -537,7 +596,7 @@ async fn load_artifact_for_edge_conn(
                 continue;
             }
         }
-        return Ok(Some((row.text(1)?, row.text(2)?)));
+        return Ok(Some(stored(&row)?));
     }
 
     Ok(None)
@@ -1453,6 +1512,81 @@ mod port_model_tests {
             plan_input.data.get("content").and_then(|v| v.as_str()),
             Some("do the thing")
         );
+        // The input names exactly which stored version it embeds, so a later
+        // revision can be delivered against it.
+        assert_eq!(
+            plan_input.source,
+            Some(ArtifactInputSource {
+                producer_job_id: "j-planner".to_string(),
+                output_name: "plan".to_string(),
+                version: 1,
+                uri: "cairn://p/p/1/1/planner/plan".to_string(),
+                delivery: InputDelivery::Content,
+            })
+        );
+    }
+
+    /// A context edge landing on an agent's `context-ref` port resolves to the
+    /// artifact's identity and current version; the planbuild review node is
+    /// wired this way so it reads the plan of record rather than a snapshot.
+    #[tokio::test]
+    async fn a_context_ref_edge_resolves_to_a_reference_at_the_latest_version() {
+        let db = test_db().await;
+        let mut snap = planbuild_snapshot(false);
+        snap.recipe.nodes.push(agent("reviewer"));
+        snap.recipe.edges.push(ctx_edge(
+            "e9",
+            "plan-node",
+            "context-out",
+            "reviewer",
+            crate::models::CONTEXT_REF_HANDLE,
+        ));
+        let snapshot_json = snap.to_json().unwrap();
+        db.write(move |conn| {
+            let snapshot_json = snapshot_json.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','p','/tmp/p',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-1','recipe-1','i-1','p-1','running',1,1,?1)", (snapshot_json.as_str(),)).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-planner','e-1','planner','i-1','p-1','complete','planner','planner',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-reviewer','e-1','reviewer','i-1','p-1','running','reviewer','reviewer',1,1)", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-plan-1','j-planner','plan',1,'{\"title\":\"Plan A\",\"content\":\"old\"}',1,'plan',1,1)", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-plan-3','j-planner','plan',1,'{\"title\":\"Plan A\",\"content\":\"LATEST PLAN BODY\"}',3,'plan',2,2)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let inputs = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let reviewer = crate::db_records::load_live_job_by_execution_node_conn(
+                        conn, "e-1", "reviewer",
+                    )
+                    .await?
+                    .expect("reviewer job");
+                    resolve_job_inputs_conn(conn, &reviewer).await
+                })
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(inputs.len(), 1, "{inputs:?}");
+        let source = inputs[0].source.as_ref().expect("a referenced artifact");
+        assert_eq!(source.delivery, InputDelivery::Reference);
+        assert_eq!(source.version, 3);
+        assert_eq!(source.uri, "cairn://p/p/1/1/planner/plan");
+        let rendered = crate::advancement::format_resolved_inputs(&inputs);
+        assert!(
+            rendered.contains("`cairn://p/p/1/1/planner/plan` (version 3"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("LATEST PLAN BODY"),
+            "no plan text: {rendered}"
+        );
     }
 
     /// The latest-across-job fallback must skip a higher-versioned context-self
@@ -1493,13 +1627,13 @@ mod port_model_tests {
             .unwrap();
 
         // Exact match by contract name returns create-pr.
-        assert_eq!(by_name.unwrap().0, "create-pr");
+        assert_eq!(by_name.unwrap().artifact_type, "create-pr");
         // Handle keying misses; the fallback skips the higher-versioned ctx-self
         // `plan` and returns create-pr.
-        assert_eq!(by_handle_excluded.unwrap().0, "create-pr");
+        assert_eq!(by_handle_excluded.unwrap().artifact_type, "create-pr");
         // Without the exclusion, the latest-across-job fallback returns `plan`
         // — the exact pre-fix behavior that opened the PR with the wrong content.
-        assert_eq!(by_handle_unfiltered.unwrap().0, "plan");
+        assert_eq!(by_handle_unfiltered.unwrap().artifact_type, "plan");
     }
 
     /// A delegated sub-agent task is materialized into the DAG as a trigger +

@@ -5,15 +5,36 @@
 //! stored `jobs.model` value by substring so both short aliases (`opus`,
 //! `sonnet`, `fable`) and dated full names (`claude-sonnet-4-20250514`,
 //! `gpt-5.6-sol`) resolve to a tier. Classification is version-aware where pricing
-//! changed across versions (legacy Opus 4/4.1 cost 3x the current Opus 4.5+).
+//! changed across versions: each Claude family reads its generation with
+//! [`claude_generation`], so Opus 4/4.1, Opus 4.5 to 5.0 and Opus 5.5+ are three
+//! prices, and Sonnet and Haiku each split at 5.5. A bare Claude alias is priced
+//! as the generation the current CLI resolves it to (5.5); an executor on an
+//! older CLI runs the alias on an older, dearer model, which this underprices.
 //! Truly unrecognized models return `None` and are reported as unpriced.
+//!
+//! For Claude agent sessions this table is the only cost source: they never
+//! record `events.cost_usd`, because a subscription's per-turn cost figure is
+//! notional. Only a one-shot completion on an API-key account records the CLI's
+//! own `total_cost_usd`, and [`crate::cost`] prefers that recorded figure.
+//!
+//! Haiku 5.5 is priced by each request's prompt length (input + cache reads +
+//! cache writes): $0.10 / $0.50 up to 100k tokens, five times that above. This
+//! table prices rows already summed per (hour, run, model) in `token_rollup`,
+//! where request length is gone, so Haiku 5.5 is priced at the up-to-100k tier
+//! throughout. That underprices long sessions: on 2026-10-19, 37% of this
+//! install's `haiku` agent requests since the 5.5 launch were over 100k, and
+//! their exact tiered cost was about 2.9x this estimate. Pricing each request
+//! at its own tier needs the rollup to keep long-prompt components apart
+//! (cairn/5218).
 //!
 //! `cache_write` is the 5-minute cache-write rate. Codex cost ignores cache
 //! entirely (its `input` already subsumes cache), so the cache fields are unused
 //! for codex tiers.
 
+use cairn_models_types::catalog::claude_generation;
+
 /// Date the price table was last reviewed against public list prices.
-pub(crate) const PRICE_SOURCE_DATE: &str = "2026-07-09";
+pub(crate) const PRICE_SOURCE_DATE: &str = "2026-10-19";
 
 /// Per-million-token USD prices for one model tier.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -36,11 +57,15 @@ impl ModelPrice {
 }
 
 // Claude tiers.
-const FABLE: ModelPrice = ModelPrice::new(10.0, 1.0, 12.50, 50.0);
-const OPUS_CURRENT: ModelPrice = ModelPrice::new(5.0, 0.50, 6.25, 25.0); // Opus 4.5+
+const FABLE: ModelPrice = ModelPrice::new(10.0, 1.0, 12.50, 50.0); // Fable 5 / 5.1
+const OPUS_5_5: ModelPrice = ModelPrice::new(4.0, 0.40, 5.0, 20.0); // Opus 5.5+
+const OPUS_4_5: ModelPrice = ModelPrice::new(5.0, 0.50, 6.25, 25.0); // Opus 4.5 to 5
 const OPUS_LEGACY: ModelPrice = ModelPrice::new(15.0, 1.50, 18.75, 75.0); // Opus 4 / 4.1
-const SONNET: ModelPrice = ModelPrice::new(3.0, 0.30, 3.75, 15.0);
-const HAIKU: ModelPrice = ModelPrice::new(1.0, 0.10, 1.25, 5.0); // Haiku 4.5
+const SONNET_5_5: ModelPrice = ModelPrice::new(2.0, 0.20, 2.50, 10.0); // Sonnet 5.5+
+const SONNET_4: ModelPrice = ModelPrice::new(3.0, 0.30, 3.75, 15.0); // Sonnet 4 to 5
+/// Haiku 5.5 at its up-to-100k-token prompt tier; see the module doc.
+const HAIKU_5_5: ModelPrice = ModelPrice::new(0.10, 0.01, 0.125, 0.50);
+const HAIKU_4_5: ModelPrice = ModelPrice::new(1.0, 0.10, 1.25, 5.0); // Haiku 4.5
 
 // GPT-5 / Codex tiers.
 const GPT_5_6_SOL: ModelPrice = ModelPrice::new(5.0, 0.50, 6.25, 30.0);
@@ -58,15 +83,25 @@ fn price_for(model: Option<&str>) -> Option<ModelPrice> {
     if model.contains("fable") || model.contains("mythos") {
         Some(FABLE)
     } else if model.contains("opus") {
-        Some(if is_legacy_opus(&model) {
-            OPUS_LEGACY
+        Some(if at_least(&model, "opus", (5, 5)) {
+            OPUS_5_5
+        } else if at_least(&model, "opus", (4, 5)) {
+            OPUS_4_5
         } else {
-            OPUS_CURRENT
+            OPUS_LEGACY
         })
     } else if model.contains("sonnet") {
-        Some(SONNET)
+        Some(if at_least(&model, "sonnet", (5, 5)) {
+            SONNET_5_5
+        } else {
+            SONNET_4
+        })
     } else if model.contains("haiku") {
-        Some(HAIKU)
+        Some(if at_least(&model, "haiku", (5, 5)) {
+            HAIKU_5_5
+        } else {
+            HAIKU_4_5
+        })
     } else if model.contains("gpt") || model.contains("codex") {
         Some(
             if model.contains("5.6-luna") || model.contains("5-6-luna") {
@@ -93,14 +128,15 @@ fn price_for(model: Option<&str>) -> Option<ModelPrice> {
     }
 }
 
-/// Legacy Opus 4 and 4.1 were priced 3x the current Opus 4.5+ line. Detect the
-/// original dated build (`opus-4-2025…`) and the 4.1 line; everything else
-/// (bare `opus`, `opus-4.5`+) uses the current price.
-fn is_legacy_opus(model: &str) -> bool {
-    model.contains("opus-4-1")
-        || model.contains("opus-4.1")
-        || model.contains("opus-4-2025")
-        || model.contains("opus-4-0")
+/// Whether `model`, a lowercased name in `family`, is at least `generation`.
+/// The bare alias (`opus`, `opus[1m]`) is the current generation; any other
+/// name without a readable family-first version (`claude-3-5-haiku-…`) is an
+/// old one.
+fn at_least(model: &str, family: &str, generation: (u32, u32)) -> bool {
+    match claude_generation(model) {
+        Some(version) => version >= generation,
+        None => model.trim_end_matches("[1m]") == family,
+    }
 }
 
 /// Compute USD cost for a normalized token-component bundle. Persisted
@@ -129,15 +165,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_short_and_dated_aliases() {
+    fn bare_aliases_price_as_the_generation_the_cli_resolves_them_to() {
         assert_eq!(price_for(Some("fable")), Some(FABLE));
+        assert_eq!(price_for(Some("claude-fable-5-1")), Some(FABLE));
+        assert_eq!(price_for(Some("opus")), Some(OPUS_5_5));
+        assert_eq!(price_for(Some("opus[1m]")), Some(OPUS_5_5));
+        assert_eq!(price_for(Some("sonnet")), Some(SONNET_5_5));
+        assert_eq!(price_for(Some("haiku")), Some(HAIKU_5_5));
+    }
+
+    #[test]
+    fn each_claude_family_is_priced_by_generation() {
+        // 5.5: the published 2026-10 list prices.
+        assert_eq!(price_for(Some("claude-opus-5-5")), Some(OPUS_5_5));
+        assert_eq!(price_for(Some("claude-opus-5-5[1m]")), Some(OPUS_5_5));
+        assert_eq!(price_for(Some("claude-sonnet-5-5")), Some(SONNET_5_5));
+        assert_eq!(price_for(Some("claude-haiku-5-5")), Some(HAIKU_5_5));
+        // 4.x and 5.0 keep their own prices.
+        assert_eq!(price_for(Some("claude-opus-5")), Some(OPUS_4_5));
+        assert_eq!(price_for(Some("claude-opus-4-5")), Some(OPUS_4_5));
+        assert_eq!(price_for(Some("claude-sonnet-5")), Some(SONNET_4));
         assert_eq!(
-            price_for(Some("claude-sonnet-4-20250514")),
-            price_for(Some("sonnet"))
+            price_for(Some("claude-sonnet-4-5-20250929")),
+            Some(SONNET_4)
         );
-        // Bare alias and current dated build share the current Opus price.
-        assert_eq!(price_for(Some("opus")), Some(OPUS_CURRENT));
-        assert_eq!(price_for(Some("claude-opus-4-5")), Some(OPUS_CURRENT));
+        assert_eq!(price_for(Some("claude-sonnet-4-20250514")), Some(SONNET_4));
+        assert_eq!(
+            price_for(Some("claude-haiku-4-5-20251001")),
+            Some(HAIKU_4_5)
+        );
+        // A version-first name is an old model, not the current alias.
+        assert_eq!(
+            price_for(Some("claude-3-5-haiku-20241022")),
+            Some(HAIKU_4_5)
+        );
     }
 
     #[test]
@@ -147,6 +208,22 @@ mod tests {
             Some(OPUS_LEGACY)
         );
         assert_eq!(price_for(Some("claude-opus-4-20250514")), Some(OPUS_LEGACY));
+        assert_eq!(price_for(Some("claude-opus-4.1")), Some(OPUS_LEGACY));
+    }
+
+    /// The 5.5 rates agree with the CLI's own `modelUsage[..].costUSD`, observed
+    /// from CLI 2.1.302 for a 1-input, 3-output-token turn.
+    #[test]
+    fn five_five_prices_match_the_clis_own_cost() {
+        for (model, cli_cost) in [
+            ("claude-haiku-5-5", 0.000_001_6),
+            ("claude-sonnet-5-5", 0.000_032),
+            ("claude-opus-5-5", 0.000_064),
+            ("claude-fable-5-1", 0.000_16),
+        ] {
+            let cost = cost_usd("claude", Some(model), 1, 0, 0, 3);
+            assert!((cost - cli_cost).abs() < 1e-12, "{model}: {cost}");
+        }
     }
 
     #[test]
@@ -184,7 +261,7 @@ mod tests {
 
     #[test]
     fn claude_cost_prices_each_component() {
-        // sonnet: 1M input(3) + 1M cache_read(0.30) + 1M cache_write(3.75) + 1M output(15)
+        // sonnet 5.5: 1M input(2) + 1M cache_read(0.20) + 1M cache_write(2.50) + 1M output(10)
         let cost = cost_usd(
             "claude",
             Some("sonnet"),
@@ -193,6 +270,6 @@ mod tests {
             1_000_000,
             1_000_000,
         );
-        assert!((cost - 22.05).abs() < 1e-9, "got {cost}");
+        assert!((cost - 14.70).abs() < 1e-9, "got {cost}");
     }
 }

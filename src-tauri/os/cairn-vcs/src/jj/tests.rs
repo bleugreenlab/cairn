@@ -2,6 +2,7 @@ use super::testing::*;
 use super::*;
 use crate::PublicationIdentity;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tempfile::TempDir;
 
 #[test]
@@ -232,6 +233,302 @@ fn committed_tip_resolution_lands_same_hunk_replay() {
     let range = format!("{dest}..bookmarks(exact:{:?})", fx.branch);
     assert_eq!(count_commits(&fx.jj, &fx.store, &range), 1);
     assert!(conflicted_commits(&fx.jj, &fx.store, &range).is_empty());
+}
+
+/// Visible commits whose change id more than one visible commit shares.
+fn divergent_commits(jj: &JjEnv, store: &Path) -> Vec<String> {
+    jj.run(
+        store,
+        &[
+            "log",
+            "-r",
+            "divergent()",
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+            "--ignore-working-copy",
+        ],
+        "divergent commits",
+    )
+    .unwrap()
+    .lines()
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
+fn is_visible(jj: &JjEnv, store: &Path, commit: &str) -> bool {
+    count_commits(jj, store, &format!("{commit} & ::visible_heads()")) == 1
+}
+
+/// A replay that carries a committed resolution as TEXT builds that text in a
+/// scratch commit. Built off the pre-replay tip, which the rebase has just
+/// hidden, the scratch made the whole superseded stack visible again, and it
+/// stayed behind as a divergent twin of the rebased branch once the scratch was
+/// abandoned. A replay hides what it supersedes.
+#[test]
+#[serial_test::serial(jj)]
+fn a_replay_carrying_a_text_resolution_leaves_no_twin_of_the_superseded_branch() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping a_replay_carrying_a_text_resolution: jj not resolvable");
+        return;
+    };
+    let fx = setup_conflicting_advance(&bin);
+    // Agents work in git worktrees, not jj workspaces; the fixture's workspace
+    // would otherwise keep its own working copy's ancestry visible.
+    forget_workspace(&fx.jj, &fx.store, fx.branch).unwrap();
+    assert!(divergent_commits(&fx.jj, &fx.store).is_empty());
+
+    let carry = ResolutionCarry {
+        expected_pre_tip: fx.pre_tip.clone(),
+        paths: vec![(
+            "shared.rs".to_string(),
+            CarriedContent::Text("RESOLVED\n".to_string()),
+        )],
+    };
+    let outcome =
+        rebase_branch_onto_with_resolution(&fx.jj, &fx.store, fx.branch, "main", Some(&carry))
+            .unwrap();
+    assert_eq!(outcome, RebaseOutcome::Rebased);
+    assert_eq!(
+        String::from_utf8_lossy(&file_show(&fx.jj, &fx.store, fx.branch, "shared.rs").unwrap()),
+        "RESOLVED\n"
+    );
+    assert_eq!(
+        divergent_commits(&fx.jj, &fx.store),
+        Vec::<String>::new(),
+        "the replay left a twin of the branch it superseded"
+    );
+    assert!(
+        !is_visible(&fx.jj, &fx.store, &fx.pre_tip),
+        "the pre-replay tip is still visible"
+    );
+}
+
+struct SweepFixture {
+    _home: TempDir,
+    _proj: TempDir,
+    wts: TempDir,
+    jj: JjEnv,
+    store: PathBuf,
+}
+
+fn sweep_fixture(bin: &str) -> SweepFixture {
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    SweepFixture {
+        _home: home,
+        _proj: proj,
+        wts,
+        jj,
+        store,
+    }
+}
+
+impl SweepFixture {
+    /// Seal one file onto `branch`, cut from `base`, through a workspace that is
+    /// then forgotten, so no working copy anchors anything. Returns the tip.
+    fn seal_branch(&self, branch: &str, base: &str, file: &str) -> String {
+        let ws = self.wts.path().join(branch.replace('/', "-"));
+        add_workspace(&self.jj, &self.store, &ws, branch, base, None).unwrap();
+        std::fs::write(ws.join(file), format!("{file}\n")).unwrap();
+        seal(&self.jj, &ws, &format!("add {file}"), None).unwrap();
+        forget_workspace(&self.jj, &self.store, branch).unwrap();
+        bookmark_commit(&self.jj, &self.store, branch).unwrap()
+    }
+
+    /// Advance `main` by one commit adding `file`.
+    fn advance_main(&self, file: &str) -> String {
+        let scratch = format!("agent/advance-{}", file.replace('.', "-"));
+        let tip = self.seal_branch(&scratch, "main", file);
+        self.jj
+            .run(
+                &self.store,
+                &[
+                    "bookmark",
+                    "set",
+                    "main",
+                    "-r",
+                    &tip,
+                    "--ignore-working-copy",
+                ],
+                "advance main",
+            )
+            .unwrap();
+        self.jj
+            .run(
+                &self.store,
+                &["bookmark", "delete", &scratch, "--ignore-working-copy"],
+                "drop the advance bookmark",
+            )
+            .unwrap();
+        tip
+    }
+
+    /// An unbookmarked child of `parent`.
+    fn stray(&self, parent: &str, message: &str) -> String {
+        self.jj
+            .run(
+                &self.store,
+                &[
+                    "new",
+                    "--no-edit",
+                    "-r",
+                    parent,
+                    "-m",
+                    message,
+                    "--ignore-working-copy",
+                ],
+                "stray commit",
+            )
+            .unwrap();
+        self.jj
+            .run(
+                &self.store,
+                &[
+                    "log",
+                    "-r",
+                    &format!("children({parent}) & description(substring:{message:?})"),
+                    "--no-graph",
+                    "-T",
+                    "commit_id",
+                    "--ignore-working-copy",
+                ],
+                "stray commit id",
+            )
+            .unwrap()
+    }
+}
+
+/// The sweep hides exactly what nothing references: a stray stack off the base,
+/// a stray child of a live branch, nothing a bookmark or a recent write still
+/// holds, and without rewriting anything it keeps.
+#[test]
+#[serial_test::serial(jj)]
+fn the_store_sweep_hides_only_what_nothing_references() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping the_store_sweep_hides_only_what_nothing_references: jj not resolvable");
+        return;
+    };
+    let fx = sweep_fixture(&bin);
+    let branch = "agent/cairn-7001-builder-0";
+    let tip = fx.seal_branch(branch, "main", "kept.rs");
+    let main = bookmark_commit(&fx.jj, &fx.store, "main").unwrap();
+    let stray_root = fx.stray(&main, "stray root");
+    let stray_tip = fx.stray(&stray_root, "stray tip");
+    let off_branch = fx.stray(&tip, "stray off the branch");
+    let bases = vec!["main".to_string()];
+
+    let recent = sweep_store_view(&fx.jj, &fx.store, &bases, Duration::from_secs(3600)).unwrap();
+    assert_eq!(
+        (recent.heads_hidden, recent.commits_hidden),
+        (0, 0),
+        "a commit younger than the grace window is spared"
+    );
+
+    let sweep = sweep_store_view(&fx.jj, &fx.store, &bases, Duration::ZERO).unwrap();
+    assert_eq!((sweep.heads_hidden, sweep.commits_hidden), (2, 3));
+    for hidden in [&stray_root, &stray_tip, &off_branch] {
+        assert!(
+            !is_visible(&fx.jj, &fx.store, hidden),
+            "{hidden} is still visible"
+        );
+    }
+    assert_eq!(bookmark_commit(&fx.jj, &fx.store, branch).unwrap(), tip);
+    assert_eq!(bookmark_commit(&fx.jj, &fx.store, "main").unwrap(), main);
+    assert!(is_visible(&fx.jj, &fx.store, &tip));
+    assert!(!sweep.operation_before.is_empty());
+
+    let again = sweep_store_view(&fx.jj, &fx.store, &bases, Duration::ZERO).unwrap();
+    assert_eq!((again.heads_hidden, again.commits_hidden), (0, 0));
+}
+
+/// A bookmark conflicted between two replays of one branch onto successive base
+/// tips (two concurrent operations, the shape the live store accumulated) is
+/// settled on the replay onto the newer base, and the older replay is hidden.
+#[test]
+#[serial_test::serial(jj)]
+fn the_store_sweep_settles_a_bookmark_conflicted_between_two_replays() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping the_store_sweep_settles_a_bookmark_conflicted: jj not resolvable");
+        return;
+    };
+    let fx = sweep_fixture(&bin);
+    let branch = "agent/cairn-7002-builder-0";
+    fx.seal_branch(branch, "main", "own.rs");
+    let first = fx.advance_main("first.rs");
+    let second = fx.advance_main("second.rs");
+    let fork = operation_id(&fx.jj, &fx.store).unwrap();
+    fx.jj
+        .run(
+            &fx.store,
+            &[
+                "rebase",
+                "-b",
+                branch,
+                "-o",
+                &second,
+                "--ignore-working-copy",
+            ],
+            "replay onto the newer base",
+        )
+        .unwrap();
+    fx.jj
+        .run(
+            &fx.store,
+            &[
+                "--at-op",
+                &fork,
+                "rebase",
+                "-b",
+                branch,
+                "-o",
+                &first,
+                "--ignore-working-copy",
+            ],
+            "concurrent replay onto the older base",
+        )
+        .unwrap();
+    let conflicted = fx
+        .jj
+        .run(
+            &fx.store,
+            &[
+                "bookmark",
+                "list",
+                "--conflicted",
+                "--ignore-working-copy",
+                "-T",
+                "name ++ \"\\n\"",
+            ],
+            "conflicted bookmarks",
+        )
+        .unwrap();
+    assert!(
+        conflicted.contains(branch),
+        "precondition: the bookmark is conflicted: {conflicted:?}"
+    );
+    assert_eq!(divergent_commits(&fx.jj, &fx.store).len(), 2);
+
+    let sweep = sweep_store_view(&fx.jj, &fx.store, &["main".to_string()], Duration::ZERO).unwrap();
+    assert_eq!(sweep.bookmarks_resolved.len(), 1, "{sweep:?}");
+    let settled = bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+    assert_eq!(settled, sweep.bookmarks_resolved[0].kept);
+    assert_eq!(
+        count_commits(&fx.jj, &fx.store, &format!("{second} & ::{settled}")),
+        1,
+        "the kept version sits on the newer base"
+    );
+    assert!(!is_visible(
+        &fx.jj,
+        &fx.store,
+        &sweep.bookmarks_resolved[0].dropped[0]
+    ));
+    assert_eq!(divergent_commits(&fx.jj, &fx.store), Vec::<String>::new());
 }
 
 /// Tree identity sees through a stale base coordinate; the changed-file diff
@@ -4337,6 +4634,65 @@ fn restore_bookmark_resets_a_squashed_branch() {
     );
 }
 
+/// The squash moves the bookmark sideways onto a fresh commit, which hides
+/// nothing by itself; the branch's old commits are then reachable from no
+/// bookmark and must not stay visible.
+#[test]
+#[serial_test::serial(jj)]
+fn squash_branch_onto_hides_the_history_it_replaced() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping squash_branch_onto_hides_the_history_it_replaced: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let branch = "agent/CAIRN-2002-builder-0";
+    let ws = wts.path().join("src");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    for i in 1..=3 {
+        std::fs::write(ws.join(format!("change{i}.rs")), format!("change {i}\n")).unwrap();
+        seal(&jj, &ws, &format!("change {i}"), None).unwrap();
+    }
+    forget_workspace(&jj, &store, branch).unwrap();
+    let old: Vec<String> = jj
+        .run(
+            &store,
+            &[
+                "log",
+                "-r",
+                &format!("main..bookmarks(exact:{branch:?})"),
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\"",
+                "--ignore-working-copy",
+            ],
+            "old branch commits",
+        )
+        .unwrap()
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect();
+    assert_eq!(old.len(), 3);
+
+    squash_branch_onto(&jj, &store, branch, "main", "Squashed PR title").unwrap();
+
+    for commit in &old {
+        assert!(
+            !is_visible(&jj, &store, commit),
+            "{commit} of the replaced history is still visible"
+        );
+    }
+    assert_eq!(
+        count_commits(&jj, &store, &format!("main..bookmarks(exact:{branch:?})")),
+        1
+    );
+}
+
 /// `squash_branch_onto` collapses a multi-commit branch into a single commit
 /// on top of a base, preserving the branch's tree and taking the given
 /// message — the store-side primitive that restores the squash shape at a
@@ -6610,24 +6966,38 @@ fn a_genuinely_divergent_branch_is_reported_rather_than_settled() {
         )),
         "{commands}"
     );
-    for (keep, replay) in [(&store_side, &git_side), (&git_side, &store_side)] {
-        assert!(
-            commands.contains(&format!(
-                "jj -R '{store}' --ignore-working-copy rebase -r 'fork_point({keep}|{replay})..{replay}' -d {keep}"
-            )),
-            "{commands}"
-        );
-        assert!(
-            commands.contains(&format!(
-                "jj -R '{store}' --ignore-working-copy bookmark set '{branch}' --allow-backwards -r '{keep}:: & change_id({})'",
-                change_of(&fx, replay)
-            )),
-            "{commands}"
-        );
-    }
-    // Both sides only add files, so either ordering combines cleanly.
+    // `git_side` is origin's `main`: it has no commits of its own, so the
+    // ordering that would replay it (rewriting `main`) is withheld, and only
+    // the store side's own commit is replayed onto it.
+    let foreign =
+        format!("::(bookmarks(~exact:\"{branch}\") | remote_bookmarks(~exact:\"{branch}\"))");
     assert!(
-        commands.contains("expected to replay cleanly"),
+        commands.contains(&format!(
+            "jj -R '{store}' --ignore-working-copy rebase -r '({git_side}..{store_side}) ~ {foreign}' -d {git_side}"
+        )),
+        "{commands}"
+    );
+    assert!(
+        commands.contains(&format!(
+            "jj -R '{store}' --ignore-working-copy bookmark set '{branch}' --allow-backwards -r '{git_side}:: & change_id({})'",
+            change_of(&fx, &store_side)
+        )),
+        "{commands}"
+    );
+    assert!(
+        commands.contains(&format!(
+            "# Not offered: keeping {store_side} and replaying {git_side}'s commits onto it"
+        )),
+        "{commands}"
+    );
+    assert!(
+        !commands.contains(&format!("-d {store_side}")),
+        "{commands}"
+    );
+    assert_no_rebase_touches_main(&fx, &refusal.commands);
+    // The store side only adds a file, and the in-memory replay says so.
+    assert!(
+        commands.contains("(tried in memory: replays cleanly)"),
         "{commands}"
     );
     // Never a command that keeps one side and drops the other.
@@ -6640,14 +7010,15 @@ fn a_genuinely_divergent_branch_is_reported_rather_than_settled() {
     );
 
     // The rebase page's read-only view of the same name says the same thing.
-    let (conflict, outlook) = assess_conflicted_bookmark_name(&fx.jj, &fx.store, branch)
+    let assessment = assess_conflicted_bookmark_name(&fx.jj, &fx.store, branch, None)
         .unwrap()
         .expect("the name is conflicted");
-    assert_eq!(conflict, refusal.conflict);
+    assert_eq!(assessment.conflict, refusal.conflict);
     assert_eq!(
-        outlook,
+        assessment.outlook,
         ConflictedNameOutlook::Refused(Box::new(refusal.clone()))
     );
+    assert!(assessment.bases.is_empty(), "no base branch was named");
 
     // And the offered repair works as written. `git_side` is origin's `main`,
     // which jj holds immutable, so the ordering that keeps it is the one a
@@ -6662,6 +7033,365 @@ fn a_genuinely_divergent_branch_is_reported_rather_than_settled() {
     }
     assert!(!bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap());
     for side in [&store_side, &git_side] {
+        assert!(
+            revset_commit(
+                &fx.jj,
+                &fx.store,
+                &format!("::{branch} & change_id({})", change_of(&fx, side))
+            )
+            .is_some(),
+            "{side} survives the offered repair"
+        );
+    }
+}
+
+/// Every rebase a refusal offers replays only commits `main` does not hold:
+/// evaluated against the store, each `-r` range intersected with `::main` is
+/// empty.
+fn assert_no_rebase_touches_main(fx: &TrackedOrigin, commands: &[String]) {
+    for line in commands.iter().filter(|line| line.contains(" rebase -r '")) {
+        let revset = line
+            .split(" rebase -r '")
+            .nth(1)
+            .and_then(|rest| rest.split("' -d ").next())
+            .unwrap_or_else(|| panic!("unparseable rebase: {line}"));
+        let touched = fx
+            .jj
+            .run(
+                &fx.store,
+                &[
+                    "log",
+                    "-r",
+                    &format!("({revset}) & ::main"),
+                    "--no-graph",
+                    "-T",
+                    "commit_id ++ \"\\n\"",
+                    "--ignore-working-copy",
+                ],
+                "offered rebase range against main",
+            )
+            .unwrap();
+        assert!(
+            touched.trim().is_empty(),
+            "the offered `{line}` would rewrite main's commits: {touched}"
+        );
+    }
+}
+
+/// Visible commits of `revset`, for counting copies of a change.
+fn visible_commits(fx: &TrackedOrigin, revset: &str) -> Vec<String> {
+    fx.jj
+        .run(
+            &fx.store,
+            &[
+                "log",
+                "-r",
+                &format!("({revset}) & ::visible_heads()"),
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\"",
+                "--ignore-working-copy",
+            ],
+            "test visible commits",
+        )
+        .unwrap()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// Advance origin's `main` onto a new commit and let the store observe it, so
+/// the store's `main` and `main@origin` both hold it. Returns the commit.
+fn advance_main(fx: &TrackedOrigin, file: &str) -> String {
+    let advanced = advance_origin_from(fx, &fx.base, file, "base advance\n");
+    import_git(&fx.jj, &fx.store).unwrap();
+    assert_eq!(
+        revset_commit(&fx.jj, &fx.store, "main").as_deref(),
+        Some(advanced.as_str()),
+        "the store's main follows origin"
+    );
+    advanced
+}
+
+/// THE twin-stack specimen (cairn/5195's builder branch). Version A holds two
+/// commits on base N; version B holds the SAME two change ids, replayed by the
+/// store onto N+1, plus a newer commit. Both are visible, because the git side
+/// re-introduced A after the store rewrote it.
+///
+/// With `edit_twin`, B's copy of A's second commit gets a different
+/// description, so it is no longer provably a copy. Returns `(a, b, n1)`.
+fn drive_twin_specimen(
+    fx: &TrackedOrigin,
+    branch: &str,
+    edit_twin: bool,
+) -> (String, String, String) {
+    let n1 = advance_main(fx, "n1.txt");
+    let a1 = git_commit_on(fx, &fx.base, "a1.txt", "one\n", "A one");
+    let a2 = git_commit_on(fx, &a1, "a2.txt", "two\n", "A two");
+    import_commits(fx, &[&a1, &a2]);
+
+    // Exported at a1; the store then holds a2.
+    create_bookmark_at(&fx.jj, &fx.store, branch, &a1).unwrap();
+    export_git_preserving_checkout(&fx.jj, &fx.store, true, "export a1").unwrap();
+    set_bookmark_at(&fx.jj, &fx.store, branch, &a2).unwrap();
+    park_working_copy(fx);
+
+    // The store's replay onto N+1, then newer work on top.
+    fx.jj
+        .run(
+            &fx.store,
+            &["rebase", "-s", &a1, "-d", &n1, "--ignore-working-copy"],
+            "replay A onto n1",
+        )
+        .unwrap();
+    let twin_tip = bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+    assert_eq!(change_of(fx, &twin_tip), change_of(fx, &a2));
+    if edit_twin {
+        fx.jj
+            .run(
+                &fx.store,
+                &[
+                    "describe",
+                    "-r",
+                    &twin_tip,
+                    "-m",
+                    "A two, reworded",
+                    "--ignore-working-copy",
+                ],
+                "reword the twin",
+            )
+            .unwrap();
+    }
+    let twin_tip = bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+    let b = store_child_of(fx, &twin_tip, "B three");
+    park_working_copy(fx);
+    set_bookmark_at(&fx.jj, &fx.store, branch, &b).unwrap();
+
+    // The git side brings A back.
+    git(
+        fx.proj.path(),
+        &["update-ref", &format!("refs/heads/{branch}"), &a2],
+    );
+    import_git(&fx.jj, &fx.store).unwrap();
+    assert!(bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap());
+    assert_eq!(
+        visible_commits(fx, &format!("change_id({})", change_of(fx, &a1))).len(),
+        2,
+        "both copies of A's first change are visible"
+    );
+    (a2, b, n1)
+}
+
+/// Acceptance for cairn/5210: on the specimen the page offers no rebase at all,
+/// only "keep B, abandon A's twins", and the store settles it itself: B kept,
+/// A's copies gone, `main` untouched, nothing copied a third time.
+#[test]
+#[serial_test::serial(jj)]
+fn a_twin_stack_keeps_the_superset_version_and_abandons_the_twins() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping twin_stack_keeps_the_superset_version: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let branch = "agent/cairn-5195-builder-5";
+    let (a, b, n1) = drive_twin_specimen(&fx, branch, false);
+    let a1_change = change_of(&fx, &format!("{a}-"));
+
+    let assessment = assess_conflicted_bookmark_name(&fx.jj, &fx.store, branch, Some("main"))
+        .unwrap()
+        .expect("conflicted");
+    let ConflictedNameOutlook::Settleable { how, commands } = &assessment.outlook else {
+        panic!(
+            "a twin stack nothing else references settles itself: {:?}",
+            assessment.outlook
+        );
+    };
+    assert!(
+        how.contains(&format!("keep `{b}`")) && how.contains("abandon the 2 twin commit(s)"),
+        "{how}"
+    );
+    assert!(commands.is_empty(), "{commands:?}");
+
+    // The versions table can say which version is on the newer base.
+    let base_of = |version: &str| {
+        let index = assessment
+            .conflict
+            .added
+            .iter()
+            .position(|target| target.commit == version)
+            .unwrap();
+        assessment.bases[index].clone().expect("a base")
+    };
+    assert_eq!(base_of(&b).commit, n1);
+    assert_eq!(base_of(&b).pull_request, Some(1));
+    assert!(base_of(&b).newest);
+    assert_eq!(base_of(&a).commit, fx.base);
+    assert!(!base_of(&a).newest);
+
+    // The by-hand commands are the same single ordering, and replay nothing.
+    let refusal = repair_refusal(
+        &fx.jj,
+        &fx.store,
+        assessment.conflict.clone(),
+        String::new(),
+    );
+    assert!(
+        !refusal
+            .commands
+            .iter()
+            .any(|line| line.contains(" rebase ")),
+        "{:#?}",
+        refusal.commands
+    );
+    assert!(
+        refusal
+            .commands
+            .iter()
+            .any(|line| line.ends_with(&format!("abandon '{b}..{a}'"))),
+        "{:#?}",
+        refusal.commands
+    );
+    assert_no_rebase_touches_main(&fx, &refusal.commands);
+
+    let settled = repair_conflicted_bookmark_name(&fx.jj, &fx.store, branch)
+        .unwrap()
+        .expect("settled");
+
+    assert_eq!(settled, b);
+    assert!(!bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap());
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, branch).as_deref(),
+        Some(b.as_str())
+    );
+    assert_eq!(proj_ref(&fx, branch), b);
+    assert_eq!(
+        revset_commit(&fx.jj, &fx.store, "main").as_deref(),
+        Some(n1.as_str()),
+        "main is untouched"
+    );
+    assert_eq!(
+        visible_commits(&fx, &format!("change_id({a1_change})")).len(),
+        1,
+        "one copy of each change remains, and it is B's"
+    );
+    assert!(
+        visible_commits(&fx, &a).is_empty(),
+        "A's copies are abandoned"
+    );
+    import_git(&fx.jj, &fx.store).unwrap();
+    assert!(
+        !bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap(),
+        "a settlement the next import undoes is not a settlement"
+    );
+}
+
+/// The same topology, but B's copy of a commit was reworded, so it is not a
+/// proven copy and nothing is abandoned. The orderings that remain still never
+/// rebase a `main` commit: replaying B onto A (whose range would include N+1)
+/// is withheld as a newer base, and only A's own commits are offered onto B.
+#[test]
+#[serial_test::serial(jj)]
+fn twins_that_differ_are_not_abandoned_and_no_ordering_rebases_main() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping twins_that_differ_are_not_abandoned: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let branch = "agent/cairn-5195-builder-5";
+    let (a, b, n1) = drive_twin_specimen(&fx, branch, true);
+
+    // The range the page used to print for keeping A contains main's commit.
+    assert_eq!(
+        visible_commits(&fx, &format!("(fork_point({a}|{b})..{b}) & ::main")),
+        vec![n1.clone()],
+        "the fixture reproduces the specimen's shared-history range"
+    );
+
+    assert_refused_without_writing(&fx, branch, "neither version is a rewrite");
+    let refusal = repair_conflicted_bookmark_name(&fx.jj, &fx.store, branch)
+        .unwrap_err()
+        .refusal()
+        .cloned()
+        .expect("a refusal");
+    let commands = refusal.commands.join("\n");
+    assert_no_rebase_touches_main(&fx, &refusal.commands);
+    assert!(
+        commands.contains(&format!(
+            "# Not offered: keeping {a} and replaying {b}'s commits onto it, because `{b}` sits on \
+             a newer base than `{a}`"
+        )),
+        "{commands}"
+    );
+    assert!(
+        commands.contains(&format!("rebase -r '({b}..{a}) ~ "))
+            && commands.contains(&format!("-d {b}")),
+        "{commands}"
+    );
+    assert!(
+        commands.contains("(tried in memory: replays cleanly)"),
+        "{commands}"
+    );
+    assert!(!commands.contains(" abandon "), "{commands}");
+}
+
+/// Two versions with different work, one on a newer base. Keeping the older
+/// one and replaying the newer used to sweep the base advance into the range;
+/// now that ordering is withheld, and the one offered runs as printed without
+/// moving `main`.
+#[test]
+#[serial_test::serial(jj)]
+fn a_version_on_a_newer_base_is_never_replayed_with_its_base() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping version_on_a_newer_base: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let branch = "agent/cairn-11-builder-0";
+    let n1 = advance_main(&fx, "n1.txt");
+    let a = git_commit_on(&fx, &fx.base, "a.txt", "a\n", "A's work");
+    let b = git_commit_on(&fx, &n1, "b.txt", "b\n", "B's work");
+    import_commits(&fx, &[&a, &b]);
+    create_bookmark_at(&fx.jj, &fx.store, branch, &fx.base).unwrap();
+    export_git_preserving_checkout(&fx.jj, &fx.store, true, "export the base").unwrap();
+    set_bookmark_at(&fx.jj, &fx.store, branch, &b).unwrap();
+    git(
+        fx.proj.path(),
+        &["update-ref", &format!("refs/heads/{branch}"), &a],
+    );
+    import_git(&fx.jj, &fx.store).unwrap();
+    assert!(bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap());
+    park_working_copy(&fx);
+
+    let error = repair_conflicted_bookmark_name(&fx.jj, &fx.store, branch)
+        .expect_err("different work is never settled by picking one");
+    let refusal = error.refusal().cloned().expect("a refusal");
+    let commands = refusal.commands.join("\n");
+    assert_no_rebase_touches_main(&fx, &refusal.commands);
+    assert!(
+        commands.contains(&format!(
+            "# Not offered: keeping {a} and replaying {b}'s commits"
+        )),
+        "{commands}"
+    );
+    assert_eq!(commands.matches(" rebase ").count(), 1, "{commands}");
+
+    let keep_b = refusal
+        .commands
+        .iter()
+        .position(|line| line.contains(" rebase ") && line.ends_with(&format!("-d {b}")))
+        .expect("an ordering keeping the newer-base version");
+    for line in &refusal.commands[keep_b..keep_b + 2] {
+        run_offered_command(&fx, line);
+    }
+    assert!(!bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap());
+    assert_eq!(
+        revset_commit(&fx.jj, &fx.store, "main").as_deref(),
+        Some(n1.as_str()),
+        "main is untouched"
+    );
+    for side in [&a, &b] {
         assert!(
             revset_commit(
                 &fx.jj,
@@ -7071,15 +7801,16 @@ fn the_specimen_sequence_wedges_and_then_settles() {
         revset_commit(&fx.jj, &fx.store, &format!("{branch}@origin")).as_deref(),
         Some(c.as_str())
     );
-    let (_, outlook) = assess_conflicted_bookmark_name(&fx.jj, &fx.store, branch)
+    let outlook = assess_conflicted_bookmark_name(&fx.jj, &fx.store, branch, None)
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .outlook;
     assert!(
         matches!(
             &outlook,
             ConflictedNameOutlook::Settleable { how, commands }
                 if how.contains("replay 1 commit(s)")
-                    && commands.iter().any(|line| line.contains(&format!("'{r}..{c}'")))
+                    && commands.iter().any(|line| line.contains(&format!("'({r}..{c}) ~ ")))
         ),
         "{outlook:?}"
     );
@@ -7275,7 +8006,10 @@ fn a_rewritten_base_whose_replay_conflicts_is_rolled_back_and_refused() {
         .unwrap_or_else(|| panic!("not a refusal: {error}"));
     assert!(refusal.reason.contains("conflicts"), "{}", refusal.reason);
     assert!(
-        refusal.commands.join("\n").contains("expected to conflict"),
+        refusal
+            .commands
+            .join("\n")
+            .contains("(tried in memory: conflicts)"),
         "{:?}",
         refusal.commands
     );
@@ -7297,21 +8031,26 @@ fn a_rewritten_base_whose_replay_conflicts_is_rolled_back_and_refused() {
 
     // The rebase page, read after the refusal, says the same: refused, with
     // the one combination that keeps both, flagged as expected to conflict.
-    let (_, outlook) = assess_conflicted_bookmark_name(&fx.jj, &fx.store, branch)
+    let outlook = assess_conflicted_bookmark_name(&fx.jj, &fx.store, branch, None)
         .unwrap()
-        .expect("still conflicted");
+        .expect("still conflicted")
+        .outlook;
     let ConflictedNameOutlook::Refused(refusal) = outlook else {
         panic!("a replay known to conflict must not read as settleable: {outlook:?}");
     };
     assert!(
-        refusal.reason.contains("expected to conflict"),
+        refusal.reason.contains("conflicts when tried in memory"),
         "{}",
         refusal.reason
     );
     let commands = refusal.commands.join("\n");
-    assert!(commands.contains("(expected to conflict)"), "{commands}");
     assert!(
-        commands.contains(&format!("rebase -r '{r}..{c}' -d {rewrite}")),
+        commands.contains("(tried in memory: conflicts)"),
+        "{commands}"
+    );
+    assert!(
+        commands.contains(&format!("rebase -r '({r}..{c}) ~ "))
+            && commands.contains(&format!("-d {rewrite}")),
         "{commands}"
     );
     assert_eq!(
@@ -10490,5 +11229,131 @@ fn a_rebase_whose_export_loses_the_lock_is_rolled_back_and_retried() {
         retried.rebased_clean,
         vec![fx.branch.to_string()],
         "{retried:?}"
+    );
+}
+
+fn advance_main_to(jj: &JjEnv, store: &Path, wts: &Path, name: &str, path: &str, content: &str) {
+    let bookmark = format!("agent/CAIRN-9-{name}-0");
+    let workspace = wts.join(name);
+    add_workspace(jj, store, &workspace, &bookmark, "main", None).unwrap();
+    std::fs::write(workspace.join(path), content).unwrap();
+    seal(jj, &workspace, name, None).unwrap();
+    let tip = bookmark_commit(jj, store, &bookmark).unwrap();
+    jj.run(
+        store,
+        &[
+            "bookmark",
+            "set",
+            "main",
+            "-r",
+            &tip,
+            "--ignore-working-copy",
+        ],
+        "advance main",
+    )
+    .unwrap();
+}
+
+/// A fold whose child left a file unparseable that parses on the target is
+/// refused before the target moves, naming the file and the parser's line.
+#[test]
+#[serial_test::serial(jj)]
+fn a_fold_that_breaks_a_parseable_file_is_refused_and_the_target_stays() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping a_fold_that_breaks_a_parseable_file_is_refused: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let int = "agent/CAIRN-2-coordinator-0";
+    let child = "agent/CAIRN-3-builder-0";
+    let ws_int = wts.path().join("int");
+    add_workspace(&jj, &store, &ws_int, int, "main", None).unwrap();
+    std::fs::write(
+        ws_int.join("registry.rs"),
+        "const A: &[u8] = &[\n    1,\n];\n",
+    )
+    .unwrap();
+    seal(&jj, &ws_int, "registry", None).unwrap();
+    let int_tip = bookmark_commit(&jj, &store, int).unwrap();
+
+    let ws_child = wts.path().join("child");
+    add_workspace(&jj, &store, &ws_child, child, int, None).unwrap();
+    std::fs::write(
+        ws_child.join("registry.rs"),
+        "const A: &[u8] = &[\n    1,\n];\n    2,\n];\n",
+    )
+    .unwrap();
+    seal(&jj, &ws_child, "an entry after the closing bracket", None).unwrap();
+
+    let refusal = merge_into_bookmark(&jj, &store, int, child).unwrap_err();
+    assert!(refusal.contains("- registry.rs:5:"), "{refusal}");
+    assert!(refusal.contains("a file that parses"), "{refusal}");
+    assert_eq!(bookmark_commit(&jj, &store, int).unwrap(), int_tip);
+}
+
+/// A replay jj merges without a recorded conflict into a file that does not
+/// parse is rolled back and recorded as an unparseable conflict. Each side's
+/// TOML is valid; together they define one key twice.
+#[test]
+#[serial_test::serial(jj)]
+fn a_clean_replay_into_an_unparseable_file_is_rolled_back_as_a_conflict() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping a_clean_replay_into_an_unparseable_file: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let base = "[t]\na = 1\n\n\nb = 2\n";
+    advance_main_to(&jj, &store, wts.path(), "seed", "settings.toml", base);
+
+    let branch = "agent/CAIRN-4-builder-0";
+    let ws_branch = wts.path().join("branch");
+    add_workspace(&jj, &store, &ws_branch, branch, "main", None).unwrap();
+    std::fs::write(
+        ws_branch.join("settings.toml"),
+        "[t]\na = 1\nc = 3\n\n\nb = 2\n",
+    )
+    .unwrap();
+    seal(&jj, &ws_branch, "add c", None).unwrap();
+    let pre_tip = bookmark_commit(&jj, &store, branch).unwrap();
+
+    advance_main_to(
+        &jj,
+        &store,
+        wts.path(),
+        "incoming",
+        "settings.toml",
+        "[t]\na = 1\n\n\nc = 4\n",
+    );
+
+    let RebaseOutcome::Conflicted { diagnostic } =
+        rebase_branch_onto(&jj, &store, branch, "main").unwrap()
+    else {
+        panic!("a clean merge that does not parse must be refused");
+    };
+    assert_eq!(diagnostic.condition, ConflictCondition::Unparseable);
+    assert_eq!(diagnostic.conflicting_paths(), vec!["settings.toml"]);
+    let refusal = diagnostic
+        .validation
+        .expect("the parser's failures ride along");
+    assert_eq!(refusal.failures.len(), 1);
+    assert_eq!(refusal.failures[0].path, "settings.toml");
+    assert_eq!(
+        bookmark_commit(&jj, &store, branch).unwrap(),
+        pre_tip,
+        "the branch stays on its old base"
     );
 }

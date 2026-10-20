@@ -161,7 +161,7 @@ async fn scope_project_path(
     }
 }
 
-/// Whether a change target is written using either run-relative shorthand.
+/// Whether a target is written using either run-relative shorthand.
 pub(crate) fn is_home_relative_target(target: &str) -> bool {
     super::common::home_relative_suffix(target).is_some()
         || super::common::project_relative_suffix(target).is_some()

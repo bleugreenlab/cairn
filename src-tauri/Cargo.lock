@@ -1059,6 +1059,7 @@ dependencies = [
  "chrono-tz",
  "crossbeam-channel",
  "crypto_box",
+ "diffy",
  "dirs 5.0.1",
  "filetime",
  "futures-util",
@@ -1405,10 +1406,15 @@ dependencies = [
  "kstring",
  "libc",
  "log",
+ "proc-macro2",
+ "serde",
  "serde_json",
+ "serde_yaml",
  "serial_test",
+ "syn",
  "tempfile",
  "tokio",
+ "toml",
  "uuid",
 ]
 

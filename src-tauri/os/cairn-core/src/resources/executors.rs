@@ -2532,6 +2532,136 @@ pub(crate) fn render_colocated_supervision(
     out
 }
 
+/// The runner's own lifecycle facts over the last hour, read from the
+/// `runner_events` journal: a local table read, never a probe.
+///
+/// The footer always says what clears the table, because a window that shows
+/// nothing is only evidence of a quiet hour if nothing pruned or dropped it.
+pub(crate) fn render_runner_events(
+    window: &Result<crate::fleet::runner_events::RunnerEventsWindow, String>,
+    journal: &crate::fleet::runner_events::JournalState,
+    executor_name: impl Fn(&str) -> String,
+    captured_at_unix_ms: u64,
+) -> String {
+    use crate::fleet::runner_events::{RECENT_EVENTS_SHOWN, RETENTION_MS, RETENTION_ROWS};
+    const CAUSE_SHOWN_CHARS: usize = 240;
+    let stamp = |at: u64| {
+        crate::clock::stamp_millis_with_seconds(at as i64)
+            .unwrap_or_else(|| "an unknown time".to_string())
+    };
+    let mut out = String::from("\n## Runner events (last hour)\n\n");
+    let window = match window {
+        Ok(window) => window,
+        Err(error) => {
+            out.push_str(&format!(
+                "Unavailable: could not read the runner event journal ({error}).\n"
+            ));
+            return out;
+        }
+    };
+    let total: u64 = window.counts.iter().map(|(_, count)| count).sum();
+    if total == 0 {
+        out.push_str("No runner events in the last hour.\n");
+    } else {
+        let counts: Vec<String> = window
+            .counts
+            .iter()
+            .map(|(kind, count)| format!("{count} {kind}"))
+            .collect();
+        out.push_str(&format!("{}.\n", counts.join(", ")));
+        for refusal in &window.protocol_refusals {
+            out.push_str(&format!(
+                "{} {} refused on protocol: expected {}, received {}.\n",
+                refusal.machines,
+                if refusal.machines == 1 {
+                    "machine"
+                } else {
+                    "machines"
+                },
+                refusal.expected,
+                refusal.received,
+            ));
+        }
+        out.push('\n');
+        for event in &window.recent {
+            let mut line = format!("- {} {}", stamp(event.occurred_at_ms), event.kind);
+            if let Some(executor_id) = &event.executor_id {
+                line.push(' ');
+                line.push_str(&executor_name(executor_id));
+            }
+            if let Some(generation) = event.generation {
+                line.push_str(&format!(" gen {generation}"));
+            }
+            if let Some(cause) = &event.cause {
+                let shown: String = cause.chars().take(CAUSE_SHOWN_CHARS).collect();
+                let ellipsis = if shown.len() < cause.len() { "…" } else { "" };
+                line.push_str(&format!(": {shown}{ellipsis}"));
+            }
+            if let Some(lanes) = window.lanes_lost.get(&event.id).filter(|lanes| **lanes > 0) {
+                line.push_str(&format!(
+                    "; {lanes} check {} ended on this generation",
+                    if *lanes == 1 { "lane" } else { "lanes" }
+                ));
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+        if total > window.recent.len() as u64 {
+            out.push_str(&format!(
+                "\nShowing the newest {} of {total}.\n",
+                window.recent.len().min(RECENT_EVENTS_SHOWN)
+            ));
+        }
+    }
+    let oldest = window
+        .oldest_retained_ms
+        .map(|at| format!("oldest row {}", stamp(at)))
+        .unwrap_or_else(|| "the table is empty".to_string());
+    let gap = match &window.last_gap {
+        Some(gap) => format!(
+            "last gap {}, {} rows, {}",
+            gap.detail["reason"].as_str().unwrap_or("unknown"),
+            gap.detail["count"].as_u64().unwrap_or(0),
+            stamp(gap.occurred_at_ms)
+        ),
+        None => "no gap recorded".to_string(),
+    };
+    out.push_str(&format!(
+        "\nRetained {} days or {} rows; {oldest}; {gap}.\n",
+        RETENTION_MS / (24 * 60 * 60 * 1_000),
+        group_thousands(RETENTION_ROWS),
+    ));
+    if !journal.attached {
+        out.push_str("The journal is not attached: events are held in memory only.\n");
+    }
+    if journal.dropped > 0 {
+        out.push_str(&format!(
+            "{} events dropped and not yet recorded as a gap.\n",
+            journal.dropped
+        ));
+    }
+    if let Some(error) = &journal.last_error {
+        out.push_str(&format!("Journal writer: {error}.\n"));
+    }
+    out.push_str(&format!(
+        "Full history: `cairn://db?sql=SELECT occurred_at_ms, kind, executor_id, generation, cause, detail_json FROM runner_events WHERE occurred_at_ms >= {} ORDER BY occurred_at_ms DESC`\n",
+        window.since_ms.min(captured_at_unix_ms)
+    ));
+    out
+}
+
+fn group_thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
 fn generation_hold_cause(hold: &ColocatedGenerationHold, captured_at_unix_ms: u64) -> String {
     let holder = match hold.holder_pid {
         Some(pid) => format!("pid {pid}"),
@@ -4169,6 +4299,168 @@ mod tests {
     };
 
     const CAPTURED_AT: u64 = 1_000_000;
+
+    fn runner_event(
+        id: &str,
+        kind: &str,
+        at: u64,
+        executor_id: Option<&str>,
+        generation: Option<u64>,
+        cause: Option<&str>,
+    ) -> crate::fleet::runner_events::StoredRunnerEvent {
+        crate::fleet::runner_events::StoredRunnerEvent {
+            id: id.into(),
+            kind: kind.into(),
+            occurred_at_ms: at,
+            executor_id: executor_id.map(Into::into),
+            generation,
+            cause: cause.map(Into::into),
+            detail: serde_json::json!({}),
+        }
+    }
+
+    fn attached_journal() -> crate::fleet::runner_events::JournalState {
+        crate::fleet::runner_events::JournalState {
+            attached: true,
+            ..Default::default()
+        }
+    }
+
+    fn executor_name(id: &str) -> String {
+        match id {
+            "colocated" => "local".into(),
+            "fedora-id" => "fedora".into(),
+            other => other.into(),
+        }
+    }
+
+    #[test]
+    fn runner_events_name_machines_generations_and_the_lanes_each_end_took() {
+        let mut gap = runner_event("gap", "journal_gap", 400_000, None, None, None);
+        gap.detail = serde_json::json!({"reason": "pruned_age", "count": 12});
+        let window = crate::fleet::runner_events::RunnerEventsWindow {
+            since_ms: CAPTURED_AT.saturating_sub(3_600_000),
+            recent: vec![
+                runner_event(
+                    "detach",
+                    "executor_detached",
+                    CAPTURED_AT - 1_000,
+                    Some("fedora-id"),
+                    Some(5),
+                    Some("read executor message failed: Connection reset by peer"),
+                ),
+                runner_event(
+                    "reset",
+                    "executor_link_reset",
+                    CAPTURED_AT - 2_000,
+                    Some("colocated"),
+                    Some(2),
+                    Some("heartbeats kept arriving but the facts they carry were last measured 1009658ms ago"),
+                ),
+                runner_event("stall", "runtime_stall", CAPTURED_AT - 3_000, None, None, Some("Runner Tokio runtime stall detected")),
+            ],
+            counts: vec![
+                ("executor_detached".into(), 1),
+                ("executor_link_reset".into(), 1),
+                ("executor_protocol_incompatible".into(), 9),
+                ("runtime_stall".into(), 1),
+            ],
+            protocol_refusals: vec![crate::fleet::runner_events::ProtocolRefusals {
+                expected: 151,
+                received: 150,
+                machines: 4,
+            }],
+            lanes_lost: [("detach".to_string(), 3), ("reset".to_string(), 1)].into(),
+            oldest_retained_ms: Some(300_000),
+            last_gap: Some(gap),
+        };
+        let rendered =
+            render_runner_events(&Ok(window), &attached_journal(), executor_name, CAPTURED_AT);
+        assert!(
+            rendered.contains("## Runner events (last hour)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("1 executor_detached, 1 executor_link_reset, 9 executor_protocol_incompatible, 1 runtime_stall."), "{rendered}");
+        assert!(
+            rendered.contains("4 machines refused on protocol: expected 151, received 150."),
+            "{rendered}"
+        );
+        assert!(rendered.contains("executor_detached fedora gen 5: read executor message failed: Connection reset by peer; 3 check lanes ended on this generation"), "{rendered}");
+        assert!(
+            rendered.contains("executor_link_reset local gen 2: heartbeats kept arriving"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("; 1 check lane ended on this generation"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Showing the newest 3 of 12."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Retained 14 days or 200,000 rows; oldest row "),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("last gap pruned_age, 12 rows, "),
+            "{rendered}"
+        );
+        assert!(rendered.contains("`cairn://db?sql=SELECT occurred_at_ms, kind, executor_id, generation, cause, detail_json FROM runner_events WHERE occurred_at_ms >= "), "{rendered}");
+        assert!(!rendered.contains("not attached"), "{rendered}");
+    }
+
+    #[test]
+    fn a_quiet_hour_still_says_what_clears_the_table() {
+        let window = crate::fleet::runner_events::RunnerEventsWindow {
+            since_ms: CAPTURED_AT.saturating_sub(3_600_000),
+            ..Default::default()
+        };
+        let journal = crate::fleet::runner_events::JournalState {
+            attached: true,
+            dropped: 7,
+            last_error: Some("runner event journal write failed: disk full".into()),
+        };
+        let rendered = render_runner_events(&Ok(window), &journal, executor_name, CAPTURED_AT);
+        assert!(
+            rendered.contains("No runner events in the last hour."),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("Retained 14 days or 200,000 rows; the table is empty; no gap recorded."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("7 events dropped and not yet recorded as a gap."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Journal writer: runner event journal write failed: disk full."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_journal_renders_as_unavailable() {
+        let rendered = render_runner_events(
+            &Err("no such table: runner_events".into()),
+            &attached_journal(),
+            executor_name,
+            CAPTURED_AT,
+        );
+        assert!(rendered.contains("## Runner events (last hour)"));
+        assert!(rendered.contains(
+            "Unavailable: could not read the runner event journal (no such table: runner_events)."
+        ));
+    }
+
+    #[test]
+    fn thousands_are_grouped() {
+        assert_eq!(group_thousands(200_000), "200,000");
+        assert_eq!(group_thousands(1_234_567), "1,234,567");
+        assert_eq!(group_thousands(999), "999");
+    }
 
     fn cached_slot() -> cairn_common::executor_protocol::PersistentCellState {
         serde_json::from_value(serde_json::json!({

@@ -462,12 +462,18 @@ fn image_reference_trailer(images: &[ImageBlock], target: &str) -> String {
 }
 
 fn header(meta: &SegmentMeta, shown: usize, truncated: bool) -> String {
+    header_with_suffix(
+        meta,
+        segment_suffix(meta, shown).or_else(|| truncated.then(|| "truncated".into())),
+    )
+}
+
+fn header_with_suffix(meta: &SegmentMeta, suffix: Option<String>) -> String {
     match meta.kind {
         SegmentKind::Error => return format!("=== {} [error] ===", meta.uri),
         SegmentKind::Duplicate => return format!("=== {} [duplicate] ===", meta.uri),
         _ => {}
     }
-    let suffix = segment_suffix(meta, shown).or_else(|| truncated.then(|| "truncated".into()));
     // The revision leads: which tree answered comes before how much of it is
     // shown, so a stale or mid-sync read cannot pass as a current one.
     let suffix = match (meta.revision.as_deref(), suffix) {
@@ -698,11 +704,74 @@ pub(crate) fn render_section_text(seg: ReadSegment, meter: &dyn TokenMeter) -> S
     render_segment(seg, u32::MAX, meter).text
 }
 
+/// The records a budget-cut body still carries. An uncut body carries the
+/// producer's whole window. A cut body can be counted only when the producer
+/// declared its line framing (`record_prelude_lines` leading lines, then one
+/// line per record); without it the count is unknown, and reporting the
+/// producer's window instead would hand out a continuation that skips every
+/// record the cut dropped.
+fn retained_records(meta: &SegmentMeta, cut: &BodyCut, produced_shown: usize) -> Option<usize> {
+    if !cut.budget_truncated {
+        return Some(produced_shown);
+    }
+    let prelude_lines = meta.record_prelude_lines?;
+    // A character-fallback cut keeps only a prefix of the first line, which
+    // is never a complete record.
+    let complete_lines = if cut.char_offset.is_some() {
+        0
+    } else {
+        cut.shown_lines
+    };
+    Some(
+        complete_lines
+            .saturating_sub(prelude_lines)
+            .min(produced_shown),
+    )
+}
+
+/// The `limit` a re-read of an uncounted cut page should ask for: the window
+/// scaled by the fraction of the body that fit, always strictly smaller than
+/// the window so repeated re-reads converge on a page that fits whole. `None`
+/// when the window is already a single record.
+fn smaller_record_limit(
+    meta: &SegmentMeta,
+    produced_shown: usize,
+    body: &str,
+    kept: &str,
+) -> Option<usize> {
+    let window = meta
+        .limit
+        .map_or(produced_shown, |limit| limit.min(produced_shown));
+    if window < 2 {
+        return None;
+    }
+    let scaled = window as u128 * kept.len() as u128 / body.len().max(1) as u128;
+    Some((scaled as usize).clamp(1, window - 1))
+}
+
+/// Footer for a budget-cut page whose records could not be counted. Its
+/// continuation keeps the page's start and lowers `limit`, so following it can
+/// repeat records but never skip one.
+fn uncounted_record_footer(uri: &str, noun: &str, smaller_limit: Option<usize>) -> String {
+    match smaller_limit {
+        Some(limit) => format!(
+            "[output truncated to fit budget partway through this page of {noun}, which cannot be counted; continue re-reads from the same start with a smaller limit — continue: {}]",
+            target_with_query_param(uri, "limit", limit),
+        ),
+        None => format!(
+            "[output truncated to fit budget; this page holds a single one of its {noun}, so no smaller page exists]"
+        ),
+    }
+}
+
 /// Render a `Record` collection page. The body is already item-windowed by the
 /// producer, so the item counts (`shown`/`total`) come from `meta`, never from
 /// body line counts. Budget truncation on line boundaries is only a safety net;
-/// the agent's `limit` is what bounds the page. The continue footer advances
-/// `offset` by the items the producer emitted.
+/// the agent's `limit` is what bounds the page. The header, footer, and the
+/// continuation's `offset` always describe the records actually rendered: a
+/// cut page is recounted through its declared line framing, and a cut page
+/// with no framing claims no count and continues from its own start under a
+/// smaller `limit` (see [`retained_records`]).
 fn render_record_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) -> RenderedSegment {
     let ReadSegment {
         body,
@@ -728,17 +797,30 @@ fn render_record_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) 
     );
     let body_budget = budget.saturating_sub(meter.count(&fixed));
     let cut = cut_body(&body, body_budget, false, None, meter);
-    let shown = match meta.record_prelude_lines {
-        Some(prelude_lines) if cut.budget_truncated => cut
-            .shown_lines
-            .saturating_sub(prelude_lines)
-            .min(produced_shown),
-        _ => produced_shown,
+    let Some(shown) = retained_records(&meta, &cut, produced_shown) else {
+        let noun = meta.unit_noun.clone().unwrap_or_else(|| "records".into());
+        let suffix = match meta.total_units {
+            Some(total) => format!("partial page of {total} {noun}; cut by read budget"),
+            None => "truncated".into(),
+        };
+        let smaller_limit = smaller_record_limit(&meta, produced_shown, &body, &cut.body);
+        // Zero is the only count this page can vouch for; `truncated` says
+        // the body holds more than that.
+        meta.shown_units = 0;
+        meta.truncated = true;
+        let mut text = header_with_suffix(&meta, Some(suffix));
+        if !cut.body.is_empty() {
+            text.push('\n');
+            text.push_str(&cut.body);
+        }
+        text.push('\n');
+        text.push_str(&uncounted_record_footer(&meta.uri, &noun, smaller_limit));
+        text.push_str(&image_trailer);
+        text.push_str(&history_suffix);
+        return RenderedSegment { text, meta, images };
     };
-    let blocked_oversized_record = meta.record_prelude_lines.is_some()
-        && cut.budget_truncated
-        && shown == 0
-        && (produced_shown > 0 || cut.char_offset.is_some());
+    let blocked_oversized_record =
+        cut.budget_truncated && shown == 0 && (produced_shown > 0 || cut.char_offset.is_some());
     // A continuation advances `offset` by the units shown under the same
     // `limit`, so a page that showed none (a `limit=0` read) would hand a
     // mechanical follower its own URI back forever.
@@ -1568,6 +1650,130 @@ mod tests {
         for line in out.text.lines().filter(|line| line.starts_with('{')) {
             serde_json::from_str::<serde_json::Value>(line).unwrap();
         }
+    }
+
+    /// The TSV projection's prelude is its column-name row. A cut that keeps it
+    /// and two rows reports two rows and continues at the third.
+    #[test]
+    fn tsv_record_budget_cut_counts_rendered_rows() {
+        let rows: Vec<String> = (1..=40)
+            .map(|id| format!("{id}\t{}", "title words ".repeat(6)))
+            .collect();
+        let body = format!("id\ttitle\n{}", rows.join("\n"));
+        let uri = "cairn://db?sql=SELECT id, title FROM issues&limit=40&offset=0";
+        let mut segment = record_seg(uri, &body, Some(6581), 40, Some("rows"), 0);
+        segment.meta.limit = Some(40);
+        segment.meta.record_prelude_lines = Some(1);
+
+        let out = render_segment(segment, 300);
+
+        let rendered_rows = out
+            .text
+            .lines()
+            .filter(|line| {
+                line.split('\t')
+                    .next()
+                    .is_some_and(|id| id.parse::<usize>().is_ok())
+            })
+            .count();
+        assert!(rendered_rows > 0 && rendered_rows < 40, "{}", out.text);
+        assert_eq!(out.meta.shown_units, rendered_rows);
+        assert!(out
+            .text
+            .starts_with(&format!("=== {uri} [{rendered_rows} of 6581 rows] ===")));
+        assert!(out.text.contains(&format!(
+            "[rows 1\u{2013}{rendered_rows} of 6581 \u{2014} continue: cairn://db?sql=SELECT id, title FROM issues&limit=40&offset={rendered_rows}]"
+        )));
+    }
+
+    /// A producer that declares no framing cannot have its cut counted, so the
+    /// page claims no count and its continuation re-reads the same start under a
+    /// smaller limit: it may repeat records but can never skip one.
+    #[test]
+    fn unframed_record_budget_cut_claims_no_count_and_never_skips() {
+        let entries: Vec<String> = (1..=50)
+            .map(|n| {
+                format!(
+                    "- [CAIRN-{n}] issue title {}\n  - held: waiting",
+                    "x".repeat(40)
+                )
+            })
+            .collect();
+        let body = format!(
+            "# Issues \u{2014} CAIRN\n\n50 issue(s)\n\n{}",
+            entries.join("\n")
+        );
+        let uri = "cairn://p/CAIRN/issues?limit=50&offset=100";
+        let mut segment = record_seg(uri, &body, Some(6581), 50, Some("issues"), 100);
+        segment.meta.limit = Some(50);
+
+        let out = render_segment(segment, 400);
+
+        assert!(out.meta.truncated);
+        assert_eq!(out.meta.shown_units, 0);
+        assert!(!out.text.contains("50 of 6581"), "{}", out.text);
+        assert!(out.text.starts_with(&format!(
+            "=== {uri} [partial page of 6581 issues; cut by read budget] ==="
+        )));
+        assert!(!out.text.contains("offset=150"), "{}", out.text);
+        let marker = "continue: ";
+        let start = out.text.find(marker).unwrap() + marker.len();
+        let end = out.text[start..].find(']').unwrap() + start;
+        let continuation = &out.text[start..end];
+        let params = split_target_query(continuation).unwrap().params;
+        let value = |key: &str| {
+            params
+                .iter()
+                .find(|param| param.key == key)
+                .map(|param| param.value.parse::<usize>().unwrap())
+        };
+        assert_eq!(value("offset"), Some(100));
+        let limit = value("limit").unwrap();
+        assert!((1..50).contains(&limit), "{continuation}");
+    }
+
+    /// An uncounted cut of a single-record page has no smaller page to offer.
+    #[test]
+    fn unframed_single_record_budget_cut_offers_no_continuation() {
+        let body = format!("## Turn 1\n{}", "word ".repeat(400));
+        let mut segment = record_seg(
+            "cairn://p/CAIRN/1/1/builder/chat?limit=1",
+            &body,
+            Some(9),
+            1,
+            Some("turns"),
+            0,
+        );
+        segment.meta.natural_unit = NaturalUnit::Turn;
+        segment.meta.limit = Some(1);
+
+        let out = render_segment(segment, 200);
+
+        assert!(out.meta.truncated);
+        assert_eq!(out.meta.shown_units, 0);
+        assert!(!out.text.contains("continue:"), "{}", out.text);
+        assert!(out.text.contains("no smaller page exists"), "{}", out.text);
+    }
+
+    /// A zero-line prelude whose first record alone exceeds the budget keeps
+    /// only a prefix of that record, which is no complete record at all.
+    #[test]
+    fn line_framed_record_char_fallback_counts_no_rows() {
+        let body = format!("{}\nshort", "x".repeat(4_000));
+        let mut segment = record_seg(
+            "cairn://db?sql=SELECT v&limit=2",
+            &body,
+            Some(2),
+            2,
+            Some("rows"),
+            0,
+        );
+        segment.meta.record_prelude_lines = Some(0);
+
+        let out = render_segment(segment, 200);
+
+        assert_eq!(out.meta.shown_units, 0);
+        assert!(!out.text.contains("continue:"), "{}", out.text);
     }
 
     #[test]

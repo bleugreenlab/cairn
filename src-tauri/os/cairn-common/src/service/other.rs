@@ -22,6 +22,10 @@ pub fn uninstall(_spec: &ServiceSpec) -> Result<(), String> {
     Err("service uninstall is unsupported on this platform".to_string())
 }
 
+pub fn stop(_spec: &ServiceSpec) -> Result<(), String> {
+    Ok(())
+}
+
 pub fn restart(_spec: &ServiceSpec) -> Result<(), String> {
     Err("service restart is unsupported on this platform".to_string())
 }

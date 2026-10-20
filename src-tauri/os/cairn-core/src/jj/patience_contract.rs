@@ -62,6 +62,21 @@ const REF_WRITERS: &[(&str, &str, &str)] = &[
         "pub fn squash_branch_onto(",
     ),
     (
+        "superseded-history hide",
+        include_str!("../../../cairn-vcs/src/jj/merge.rs"),
+        "pub(crate) fn hide_superseded_history(",
+    ),
+    (
+        "store view sweep",
+        include_str!("../../../cairn-vcs/src/jj/maintenance.rs"),
+        "pub fn sweep_store_view(",
+    ),
+    (
+        "replayed-twin bookmark settle",
+        include_str!("../../../cairn-vcs/src/jj/maintenance.rs"),
+        "fn resolve_twin_bookmark_conflicts(",
+    ),
+    (
         "flatten twin cleanup",
         include_str!("../../../cairn-vcs/src/jj/reconcile.rs"),
         "pub fn flatten_branch_recovery(",

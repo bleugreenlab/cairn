@@ -22,7 +22,7 @@ cairn-packs = { path = "../cairn-packs" }
 cairn-checkenv = { path = "../cairn-checkenv" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.0", features = ["v4", "serde"] }
+uuid = { version = "1.0", features = ["v4", "v7", "serde"] }
 unigram = "0.2"
 regex = "1"
 pulldown-cmark = "0.13"
@@ -78,6 +78,8 @@ cairn-tokenize = { path = "../cairn-tokenize" }
 cairn-sandbox = { path = "../cairn-sandbox" }
 ignore = "0.4"
 globset = "0.4"
+# The line merge the ordered-set landing merge re-runs around merged lists.
+diffy = "0.5"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 tempfile = "3"

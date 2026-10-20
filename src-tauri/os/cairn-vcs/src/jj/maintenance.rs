@@ -929,6 +929,282 @@ fn git_capture(git_dir: &Path, args: &[&str], context: &str) -> Result<String, S
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// What one sweep of a store's view changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoreViewSweep {
+    /// The operation the store was at before the sweep wrote anything: restoring
+    /// it undoes the whole sweep.
+    pub operation_before: String,
+    /// Conflicted bookmarks settled on the version that supersets the others.
+    pub bookmarks_resolved: Vec<ResolvedTwinBookmark>,
+    /// Visible heads the sweep hid, and every commit hidden with them.
+    pub heads_hidden: u64,
+    pub commits_hidden: u64,
+}
+
+/// A conflicted bookmark whose versions were the same branch on different
+/// bases, settled on the one replayed onto the newest base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTwinBookmark {
+    pub bookmark: String,
+    pub kept: String,
+    pub dropped: Vec<String>,
+}
+
+/// Hide everything in a store's view that nothing references, after settling
+/// the bookmark conflicts that are only a replay seen twice.
+///
+/// A commit stays visible while a local bookmark, a remote bookmark, a tag, a
+/// working copy, or `trunk()` reaches it, or while it is younger than `grace`
+/// (a writer outside the store lock may not yet have named it). Everything else
+/// is superseded or abandoned history: the old version of a rebased branch that
+/// a later step made visible again, a branch a squash moved its bookmark off,
+/// scratch left by an interrupted rewrite. Every visible head keeps its objects
+/// alive and every twin makes `divergent()` noise, so it is hidden. The hidden
+/// set excludes every anchor's whole ancestry, so it is closed under
+/// descendants and the abandon rebases nothing.
+///
+/// This changes the store's view only. Hidden commits still resolve by id, and
+/// their objects stay until the object reclaim, which honours every git ref and
+/// worktree HEAD, so a slot checked out at a hidden commit keeps it.
+///
+/// `base_branches` names the project base branches the twin rule measures base
+/// advances against; `trunk()` stands in when none is given. The caller holds
+/// the store lock.
+pub fn sweep_store_view(
+    jj: &super::JjEnv,
+    store: &Path,
+    base_branches: &[String],
+    grace: Duration,
+) -> Result<StoreViewSweep, String> {
+    let mut sweep = StoreViewSweep {
+        operation_before: super::operation_id(jj, store)?,
+        ..StoreViewSweep::default()
+    };
+    let bases = if base_branches.is_empty() {
+        "trunk()".to_string()
+    } else {
+        base_branches
+            .iter()
+            .map(|base| format!("bookmarks(exact:{base:?}) | remote_bookmarks(exact:{base:?})"))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    sweep.bookmarks_resolved = resolve_twin_bookmark_conflicts(jj, store, &bases)?;
+
+    let stray = format!(
+        "all() ~ ::(bookmarks() | remote_bookmarks() | tags() | working_copies() | trunk() | \
+         root() | committer_date(after:\"{} seconds ago\"))",
+        grace.as_secs()
+    );
+    sweep.heads_hidden = count_revset(jj, store, &format!("heads({stray})"))?;
+    if sweep.heads_hidden == 0 {
+        return Ok(sweep);
+    }
+    sweep.commits_hidden = count_revset(jj, store, &stray)?;
+    super::run_store_rewrite(
+        jj,
+        store,
+        &["abandon", &stray, "--ignore-working-copy"],
+        "jj abandon (unreferenced commits)",
+    )?;
+    Ok(sweep)
+}
+
+/// Settle each conflicted local bookmark whose versions are one branch replayed
+/// onto different bases, keeping the version on the newest base.
+///
+/// One version supersets another when it carries the same changes (the same
+/// change ids above the base), sits on a strictly newer base, and differs from
+/// it by exactly what the base advanced (`jj diff --summary` between the two
+/// versions equals it between their bases). A bookmark is settled only when
+/// one version supersets every other; a conflict with a deleted side, or with
+/// versions carrying different work, is a real disagreement and is left alone.
+fn resolve_twin_bookmark_conflicts(
+    jj: &super::JjEnv,
+    store: &Path,
+    bases: &str,
+) -> Result<Vec<ResolvedTwinBookmark>, String> {
+    let listing = jj.run(
+        store,
+        &[
+            "bookmark",
+            "list",
+            "--conflicted",
+            "--ignore-working-copy",
+            "-T",
+            "if(!self.remote(), name ++ \"\\t\" ++ \
+             self.added_targets().map(|c| c.commit_id()).join(\",\") ++ \"\\t\" ++ \
+             self.removed_targets().map(|c| c.commit_id()).join(\",\") ++ \"\\n\")",
+        ],
+        "jj bookmark list (conflicted)",
+    )?;
+    let mut resolved = Vec::new();
+    for line in listing.lines() {
+        let mut fields = line.split('\t');
+        let (Some(name), Some(adds), Some(removes)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let split = |list: &str| -> Vec<String> {
+            list.split(',')
+                .filter(|id| !id.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        };
+        let (adds, removes) = (split(adds), split(removes));
+        // An absent side (the bookmark deleted on one side) is dropped from the
+        // listing, so the counts disagree: that is a delete against a move.
+        if adds.len() < 2 || adds.len() != removes.len() + 1 {
+            continue;
+        }
+        let Some(kept) = superset_version(jj, store, bases, &adds)? else {
+            continue;
+        };
+        super::run_store_rewrite(
+            jj,
+            store,
+            &[
+                "bookmark",
+                "set",
+                name,
+                "-r",
+                &kept,
+                "--allow-backwards",
+                "--ignore-working-copy",
+            ],
+            "jj bookmark set (settle a replayed twin)",
+        )?;
+        resolved.push(ResolvedTwinBookmark {
+            bookmark: name.to_string(),
+            dropped: adds.iter().filter(|id| **id != kept).cloned().collect(),
+            kept,
+        });
+    }
+    Ok(resolved)
+}
+
+/// The one version among `versions` that supersets every other, if there is one.
+fn superset_version(
+    jj: &super::JjEnv,
+    store: &Path,
+    bases: &str,
+    versions: &[String],
+) -> Result<Option<String>, String> {
+    struct Version {
+        commit: String,
+        base: String,
+        changes: Vec<String>,
+    }
+    let mut described = Vec::with_capacity(versions.len());
+    for commit in versions {
+        let base = log_ids(
+            jj,
+            store,
+            &format!("heads(::{commit} & ::({bases}))"),
+            "commit_id",
+        )?;
+        let [base] = base.as_slice() else {
+            return Ok(None);
+        };
+        let mut changes = log_ids(jj, store, &format!("::{commit} ~ ::({bases})"), "change_id")?;
+        changes.sort();
+        described.push(Version {
+            commit: commit.clone(),
+            base: base.clone(),
+            changes,
+        });
+    }
+    let supersets = |newer: &Version, older: &Version| -> Result<bool, String> {
+        if newer.changes != older.changes || newer.base == older.base {
+            return Ok(false);
+        }
+        if count_revset(jj, store, &format!("{} & ::{}", older.base, newer.base))? != 1 {
+            return Ok(false);
+        }
+        Ok(diff_summary(jj, store, &older.commit, &newer.commit)?
+            == diff_summary(jj, store, &older.base, &newer.base)?)
+    };
+    let mut winner = None;
+    for candidate in &described {
+        let mut all = true;
+        for other in described
+            .iter()
+            .filter(|other| other.commit != candidate.commit)
+        {
+            if !supersets(candidate, other)? {
+                all = false;
+                break;
+            }
+        }
+        if all {
+            if winner.is_some() {
+                return Ok(None);
+            }
+            winner = Some(candidate.commit.clone());
+        }
+    }
+    Ok(winner)
+}
+
+fn log_ids(
+    jj: &super::JjEnv,
+    store: &Path,
+    revset: &str,
+    field: &str,
+) -> Result<Vec<String>, String> {
+    Ok(jj
+        .run(
+            store,
+            &[
+                "log",
+                "-r",
+                revset,
+                "--no-graph",
+                "-T",
+                &format!("{field} ++ \"\\n\""),
+                "--ignore-working-copy",
+            ],
+            "jj log (store sweep)",
+        )?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+fn count_revset(jj: &super::JjEnv, store: &Path, revset: &str) -> Result<u64, String> {
+    Ok(log_ids(jj, store, revset, "commit_id")?.len() as u64)
+}
+
+fn diff_summary(
+    jj: &super::JjEnv,
+    store: &Path,
+    from: &str,
+    to: &str,
+) -> Result<Vec<String>, String> {
+    let mut lines: Vec<String> = jj
+        .run(
+            store,
+            &[
+                "diff",
+                "--summary",
+                "--from",
+                from,
+                "--to",
+                to,
+                "--ignore-working-copy",
+            ],
+            "jj diff --summary (store sweep)",
+        )?
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect();
+    lines.sort();
+    Ok(lines)
+}
+
 async fn load_repo(store: &Path) -> Result<std::sync::Arc<ReadonlyRepo>, String> {
     crate::load_workspace(store)?
         .repo_loader()

@@ -23,6 +23,7 @@
 pub mod dependency;
 pub mod engine;
 pub mod grammar;
+pub mod lists;
 pub mod nav;
 pub mod outline;
 pub mod rename;

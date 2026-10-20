@@ -52,69 +52,6 @@ pub enum FileContent {
     Binary,
 }
 
-/// Resolve every overlapping region by retaining both sides, destination
-/// (`theirs`) first and branch (`ours`) second. This is intentionally narrower
-/// than [`completion_candidate`]: it is used only for registry tail appends whose
-/// entries are independent and commute.
-pub fn union_completion_candidate(base: &str, ours: &str, theirs: &str) -> String {
-    match merge_preview(base, ours, theirs) {
-        MergePreview::Clean(text) => text,
-        MergePreview::Conflicted { text, .. } => collapse_conflicts_to_union(&text),
-    }
-}
-
-fn collapse_conflicts_to_union(merged: &str) -> String {
-    #[derive(Clone, Copy)]
-    enum Region {
-        Body,
-        Ours,
-        Original,
-        Theirs,
-    }
-    let mut out = String::with_capacity(merged.len());
-    let mut ours = String::new();
-    let mut theirs = String::new();
-    let mut state = Region::Body;
-    for line in merged.split_inclusive('\n') {
-        let bare = line.trim_end_matches(['\n', '\r']);
-        match state {
-            Region::Body => {
-                if is_marker(bare, '<') {
-                    ours.clear();
-                    theirs.clear();
-                    state = Region::Ours;
-                } else {
-                    out.push_str(line);
-                }
-            }
-            Region::Ours => {
-                if is_marker(bare, '|') {
-                    state = Region::Original;
-                } else if is_marker(bare, '=') {
-                    state = Region::Theirs;
-                } else {
-                    ours.push_str(line);
-                }
-            }
-            Region::Original => {
-                if is_marker(bare, '=') {
-                    state = Region::Theirs;
-                }
-            }
-            Region::Theirs => {
-                if is_marker(bare, '>') {
-                    out.push_str(&theirs);
-                    out.push_str(&ours);
-                    state = Region::Body;
-                } else {
-                    theirs.push_str(line);
-                }
-            }
-        }
-    }
-    out
-}
-
 /// Every file below one repo-relative directory at an immutable revision.
 /// This is the directory companion to [`paths_present_at`]: callers discovering
 /// branch-added migrations cannot name the files before asking the tree.
@@ -790,40 +727,6 @@ fn paths_mentioned_in_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn registry_tail_union_keeps_destination_then_branch_and_is_lossless() {
-        let base = "        migration!(\"0227_base\"),\n    ]\n";
-        let ours =
-            "        migration!(\"0227_base\"),\n        migration!(\"0228_ours\"),\n    ]\n";
-        let theirs =
-            "        migration!(\"0227_base\"),\n        migration!(\"0228_theirs\"),\n    ]\n";
-        let candidate = union_completion_candidate(base, ours, theirs);
-        assert_eq!(
-            candidate,
-            "        migration!(\"0227_base\"),\n        migration!(\"0228_theirs\"),\n        migration!(\"0228_ours\"),\n    ]\n",
-            "the destination's established tail stays first"
-        );
-        assert_eq!(
-            assess_whole_file_restore(&sides(base, &candidate, theirs)),
-            RestoreVerdict::Lossless,
-            "committing the union makes whole-file replay lossless"
-        );
-    }
-
-    #[test]
-    fn registry_union_preserves_non_overlapping_changes_outside_the_tail() {
-        let base = "header\nentry:a\nfooter\n";
-        let ours = "branch-header\nentry:a\nentry:ours\nfooter\n";
-        let theirs = "header\nentry:a\nentry:theirs\nfooter\nincoming-footer\n";
-        let candidate = union_completion_candidate(base, ours, theirs);
-        assert!(candidate.contains("branch-header"), "{candidate}");
-        assert!(
-            candidate.contains("entry:theirs\nentry:ours"),
-            "{candidate}"
-        );
-        assert!(candidate.contains("incoming-footer"), "{candidate}");
-    }
 
     fn text(value: &str) -> FileContent {
         FileContent::Text(value.to_string())

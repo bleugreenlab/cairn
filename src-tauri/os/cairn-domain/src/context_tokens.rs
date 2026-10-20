@@ -24,7 +24,14 @@ pub struct ContextTokenEventSnapshot {
     pub run_id: String,
     pub session_id: String,
     pub backend: String,
+    /// The session's effective model: selected, else what the provider named.
     pub model: Option<String>,
+    /// The model the provider itself named the session's model as (Claude's
+    /// `system:init`), which can be more specific than the selected alias.
+    pub resolved_model: Option<String>,
+    /// The `modelUsage` object of the session's latest top-level result since
+    /// its latest init: Claude's own per-model report, window included.
+    pub model_usage: Option<serde_json::Value>,
     pub input_tokens: Option<i64>,
     pub cache_read_tokens: Option<i64>,
     pub cache_create_tokens: Option<i64>,
@@ -68,6 +75,8 @@ mod tests {
             session_id: "session".to_string(),
             backend: backend.to_string(),
             model: Some("model".to_string()),
+            resolved_model: None,
+            model_usage: None,
             input_tokens: Some(1000),
             cache_read_tokens: Some(400),
             cache_create_tokens: Some(50),

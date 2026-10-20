@@ -22,6 +22,16 @@ log = "0.4"
 # checkout; neither is more authoritative than the other, since the real replay
 # is judged by jj's own merge.
 diffy = "0.5"
+# The parse gate a replay and a landing pass before a tree reaches a branch
+# tip (see `parse_gate`). `syn` is the exact Rust grammar, in process, so no
+# toolchain is needed where the store runs; `span-locations` is what lets a
+# refusal name the line and column of the first error.
+syn = { version = "2", default-features = false, features = ["full", "parsing"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+serde = "1"
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 # The runner must read an unreferenced Git commit by backend ID and rewrite one
@@ -36,7 +46,6 @@ tokio = { version = "1", features = ["rt", "time"] }
 kstring = "=2.0.2"
 
 [dev-dependencies]
-serde_json = "1"
 cairn-platform = { path = "../cairn-platform", features = ["test-utils"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serial_test = "3"

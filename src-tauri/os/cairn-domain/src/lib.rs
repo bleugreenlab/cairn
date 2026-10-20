@@ -106,7 +106,7 @@ pub use recipe::{
     ScheduleAt, ScheduleConfig, ScheduleEvery, ScheduleInterval, SchedulePeriod, SchemaConfig,
     TriggerConfig, TriggerScope, UpdateRecipe,
 };
-pub use recipe::{CONTEXT_IN_HANDLE, CONTEXT_OUT_HANDLE, CONTEXT_SELF_HANDLE};
+pub use recipe::{CONTEXT_IN_HANDLE, CONTEXT_OUT_HANDLE, CONTEXT_REF_HANDLE, CONTEXT_SELF_HANDLE};
 
 // Recipe file types (export/import)
 pub use recipe_file::{RecipeFile, RecipeFileValidation};

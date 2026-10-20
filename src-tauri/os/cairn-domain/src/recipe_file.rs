@@ -698,6 +698,34 @@ impl RecipeFile {
             }
         }
 
+        // A `context-ref` port hands an agent an artifact's URI and version, so
+        // only an Artifact node — something with an address and a version chain —
+        // can feed it. Anything else would resolve to nothing at launch.
+        {
+            let node_type_by_id: HashMap<&str, RecipeNodeType> = self
+                .nodes
+                .iter()
+                .map(|n| (n.id.as_str(), n.node_type.clone()))
+                .collect();
+            for edge in &self.edges {
+                let (target_node, target_handle) = parse_node_handle(&edge.to);
+                if target_handle != Some(crate::recipe::CONTEXT_REF_HANDLE) {
+                    continue;
+                }
+                let (source_node, source_handle) = parse_node_handle(&edge.from);
+                let wired = edge.edge_type == RecipeEdgeType::Context
+                    && node_type_by_id.get(target_node) == Some(&RecipeNodeType::Agent)
+                    && node_type_by_id.get(source_node) == Some(&RecipeNodeType::Artifact)
+                    && source_handle.unwrap_or("context-out") == "context-out";
+                if !wired {
+                    errors.push(format!(
+                        "Edge '{}' -> '{}': an agent's context-ref port takes a context edge from an Artifact node's context-out; it gives the agent that artifact's URI and version",
+                        edge.from, edge.to
+                    ));
+                }
+            }
+        }
+
         errors.extend(self.decision_errors());
 
         // Declaring the `base` branch target means an execution may be launched
@@ -2028,6 +2056,71 @@ edges:
                 .any(|e| e.contains("Instruction node")),
             "errors: {:?}",
             validation.errors
+        );
+    }
+
+    #[test]
+    fn context_ref_takes_only_an_artifact_node() {
+        let recipe = |from: &str| {
+            format!(
+                r#"
+cairnVersion: 1
+name: Ref
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+- id: planner-1
+  type: agent
+  name: Planner
+  position: 0@0
+  config:
+    agent: planner
+- id: plan-1
+  type: artifact
+  name: Plan
+  position: 0@0
+  config:
+    artifactType: plan
+    schema:
+      type: object
+- id: review-1
+  type: agent
+  name: Review
+  position: 0@0
+  config:
+    agent: pr-review
+edges:
+- from: trigger-1@control-out
+  to: planner-1@control-in
+  type: control
+- from: planner-1@context-out
+  to: plan-1@context-in
+  type: context
+- from: {from}
+  to: review-1@context-ref
+  type: context
+"#
+            )
+        };
+        let good = RecipeFile::from_yaml(&recipe("plan-1@context-out"))
+            .unwrap()
+            .validate();
+        assert!(good.valid, "errors: {:?}", good.errors);
+
+        // An agent has no version chain to point at.
+        let bad = RecipeFile::from_yaml(&recipe("planner-1@context-out"))
+            .unwrap()
+            .validate();
+        assert!(!bad.valid);
+        assert!(
+            bad.errors.iter().any(|e| e.contains("context-ref")),
+            "errors: {:?}",
+            bad.errors
         );
     }
 

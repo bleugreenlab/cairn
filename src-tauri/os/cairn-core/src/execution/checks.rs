@@ -1247,7 +1247,8 @@ pub struct ManualConfiguredCheckResult {
     /// knows the concrete cause.
     pub not_recorded: Option<String>,
     /// `fresh` when this run produced the verdict, `cached` when a stored
-    /// observation answered it without running anything.
+    /// observation answered it without running anything, and `unmet` when the
+    /// verdict came from a placement this request did not demand.
     pub disposition: String,
     pub passed: bool,
     /// Whether a successful exit carried canonical evidence that work ran.
@@ -1266,6 +1267,9 @@ pub struct ManualConfiguredCheckResult {
     /// Why the batch pin this request inherited was not applied, when it
     /// contradicted the suite's configuration.
     pub placement_note: Option<String>,
+    /// Why the reported verdict does not answer the placement this request
+    /// demanded, when it does not. Such a verdict is not this request's answer.
+    pub placement_unmet: Option<String>,
 }
 
 /// A machine as a check result names it.
@@ -1368,6 +1372,7 @@ fn manual_configured_check_result(
         executor: None,
         verdict_platform: None,
         placement_note: None,
+        placement_unmet: None,
     }
 }
 
@@ -1702,8 +1707,123 @@ pub(crate) async fn execute_check_contract(
         });
         result.verdict_platform = verdict_platform;
     }
+    result.placement_unmet = unmet_placement(
+        &placement,
+        result.executor.as_ref(),
+        result.verdict_platform.as_deref(),
+    );
+    if result.placement_unmet.is_some() {
+        result.disposition = "unmet".to_string();
+    }
     result.placement_note = placement.note;
     Ok(result)
+}
+
+/// Why the verdict a manual run is about to report does not answer the
+/// placement the run demanded, if it does not.
+///
+/// Reuse and coalescing each honour the demand on their own, so this should
+/// stay empty. It is checked on the reply anyway because the caller reads a
+/// `fresh` verdict as one produced where it asked, and an answer from anywhere
+/// else must never read that way. A verdict whose platform or machine is
+/// unknown is not flagged: there is nothing to compare.
+fn unmet_placement(
+    placement: &crate::execution::check_placement::EffectiveCheckPlacement,
+    executor: Option<&CheckMachine>,
+    verdict_platform: Option<&str>,
+) -> Option<String> {
+    let machine = executor
+        .map(|machine| format!(" on {}", machine.name))
+        .unwrap_or_default();
+    if let Some(platform) = verdict_platform {
+        if !placement.verdict_platforms.is_empty()
+            && !placement
+                .verdict_platforms
+                .iter()
+                .any(|counted| counted.eq_ignore_ascii_case(platform))
+        {
+            return Some(format!(
+                "this verdict was produced{machine} for {platform}, but this request counts only \
+                 verdicts for {}",
+                placement.verdict_platforms.join(", ")
+            ));
+        }
+    }
+    if let (Some(wanted), Some(machine)) = (placement.executor_name.as_deref(), executor) {
+        if !cairn_common::executor_protocol::executor_names_match(&machine.name, wanted) {
+            return Some(format!(
+                "this verdict was produced on executor {}, but this request named executor \
+                 {wanted}",
+                machine.name
+            ));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod unmet_placement_tests {
+    use super::*;
+    use crate::execution::check_placement::EffectiveCheckPlacement;
+
+    fn placement(platforms: &[&str], name: Option<&str>) -> EffectiveCheckPlacement {
+        EffectiveCheckPlacement {
+            selector: None,
+            verdict_platforms: platforms.iter().map(|p| p.to_string()).collect(),
+            executor_name: name.map(Into::into),
+            note: None,
+        }
+    }
+
+    fn fedora() -> CheckMachine {
+        CheckMachine {
+            name: "fedora".into(),
+            os: "linux".into(),
+        }
+    }
+
+    #[test]
+    fn a_linux_verdict_does_not_answer_a_macos_demand() {
+        let unmet = unmet_placement(&placement(&["macos"], None), Some(&fedora()), Some("linux"))
+            .expect("a linux verdict must not stand in for a macos demand");
+        assert!(unmet.contains("on fedora for linux"), "{unmet}");
+        assert!(unmet.contains("counts only verdicts for macos"), "{unmet}");
+    }
+
+    #[test]
+    fn a_verdict_inside_the_demand_or_without_one_is_met() {
+        assert_eq!(
+            unmet_placement(&placement(&["linux"], None), Some(&fedora()), Some("Linux")),
+            None
+        );
+        assert_eq!(
+            unmet_placement(&placement(&[], None), Some(&fedora()), Some("linux")),
+            None
+        );
+        assert_eq!(
+            unmet_placement(&placement(&["macos"], None), None, None),
+            None,
+            "no recorded machine leaves nothing to compare"
+        );
+    }
+
+    #[test]
+    fn a_named_machine_demand_is_met_only_by_that_machine() {
+        assert!(unmet_placement(
+            &placement(&[], Some("bglab-mac")),
+            Some(&fedora()),
+            Some("linux")
+        )
+        .is_some_and(|unmet| unmet.contains("named executor bglab-mac")));
+        assert_eq!(
+            unmet_placement(
+                &placement(&[], Some("fedora")),
+                Some(&fedora()),
+                Some("linux")
+            ),
+            None
+        );
+    }
 }
 
 fn format_fixed_batch_summary(summary: &str, commit: &str, paths: &[String]) -> String {
@@ -13900,13 +14020,19 @@ cairn-common = { path = "../cairn-common" }
             DispatchNarrator::new(GroupWait::from_occupancy(predicted(292_000, 1)), PARKED_AT);
         narrator.note_phase(&placing(PARKED_AT).phase);
         narrator.render(&placing(PARKED_AT), PARKED_AT + 600_000);
-        assert!(narrator.unpredictable, "the first wait outlived its forecast");
+        assert!(
+            narrator.unpredictable,
+            "the first wait outlived its forecast"
+        );
 
         let claimed = running_on("fedora", PARKED_AT + 610_000, None);
         narrator.note_phase(&claimed.phase);
         let requeued_at = PARKED_AT + 3_600_000;
         narrator.note_phase(&placing(requeued_at).phase);
-        assert!(narrator.wait_is_stale(requeued_at), "the new wait re-reads occupancy");
+        assert!(
+            narrator.wait_is_stale(requeued_at),
+            "the new wait re-reads occupancy"
+        );
         narrator.absorb_wait(GroupWait::from_occupancy(predicted(60_000, 1)), requeued_at);
         let status = narrator.render(&placing(requeued_at), requeued_at + 10_000);
         assert_eq!(

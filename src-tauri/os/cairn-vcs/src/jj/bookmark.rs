@@ -1,4 +1,5 @@
 //! Bookmark / git-ref resolution, export, and publishing to origin.
+use super::combine::{self, log_lines, OrderingCheck};
 use super::*;
 use std::path::Path;
 #[cfg(test)]
@@ -951,16 +952,45 @@ pub enum ConflictedNameOutlook {
     Refused(Box<RepairRefusal>),
 }
 
-/// [`describe_conflicted_bookmark`] plus what the repair would make of it. Reads
-/// only; never imports, rebases, or moves a bookmark.
+/// A conflicted name as the rebase page shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictedNameAssessment {
+    pub conflict: ConflictedBookmark,
+    /// Each of `conflict.added`'s nearest base-branch ancestor, in the same
+    /// order. Empty when no base branch was named.
+    pub bases: Vec<Option<VersionBase>>,
+    pub outlook: ConflictedNameOutlook,
+}
+
+/// [`describe_conflicted_bookmark`] plus what the repair would make of it, and
+/// which base each version sits on when `base_branch` is named. Reads only;
+/// never imports, rebases, or moves a bookmark.
 pub fn assess_conflicted_bookmark_name(
     jj: &JjEnv,
     store: &Path,
     branch: &str,
-) -> Result<Option<(ConflictedBookmark, ConflictedNameOutlook)>, String> {
+    base_branch: Option<&str>,
+) -> Result<Option<ConflictedNameAssessment>, String> {
     let Some(conflict) = describe_conflicted_bookmark(jj, store, branch)? else {
         return Ok(None);
     };
+    let bases = base_branch
+        .filter(|base| !base.is_empty())
+        .map(|base| combine::version_bases(jj, store, &conflict, base))
+        .unwrap_or_default();
+    let outlook = conflicted_name_outlook(jj, store, &conflict)?;
+    Ok(Some(ConflictedNameAssessment {
+        conflict,
+        bases,
+        outlook,
+    }))
+}
+
+fn conflicted_name_outlook(
+    jj: &JjEnv,
+    store: &Path,
+    conflict: &ConflictedBookmark,
+) -> Result<ConflictedNameOutlook, String> {
     let added = conflict
         .added
         .iter()
@@ -969,24 +999,53 @@ pub fn assess_conflicted_bookmark_name(
     if let Some(winner) = target_containing_the_rest(jj, store, &added) {
         let how = format!("settle on `{winner}`, which contains every other version");
         let commands = Vec::new();
-        return Ok(Some((
-            conflict,
-            ConflictedNameOutlook::Settleable { how, commands },
-        )));
+        return Ok(ConflictedNameOutlook::Settleable { how, commands });
     }
-    let outlook = match rewritten_base_with_child(jj, store, &conflict)? {
-        // A replay git already expects to conflict will be refused when it is
-        // tried, so it is reported as the refusal it will be.
+    match combine::find_twin_stack(jj, store, conflict) {
+        Ok(Some(stack)) if stack.referenced_by.is_empty() => {
+            return Ok(ConflictedNameOutlook::Settleable {
+                how: format!(
+                    "keep `{}`, which already carries every change of `{}`, and abandon the {} \
+                     twin commit(s) `{}` holds",
+                    stack.keep,
+                    stack.drop,
+                    stack.twins.len(),
+                    stack.drop
+                ),
+                commands: Vec::new(),
+            })
+        }
+        Ok(Some(stack)) => {
+            return Ok(ConflictedNameOutlook::Refused(Box::new(repair_refusal(
+                jj,
+                store,
+                conflict.clone(),
+                twin_refusal_reason(&stack),
+            ))))
+        }
+        Ok(None) => {}
+        Err(error) => log::warn!(
+            "jj repair: could not tell whether `{}`'s versions are twins: {error}",
+            conflict.branch
+        ),
+    }
+    let outlook = match rewritten_base_with_child(jj, store, conflict)? {
+        // A replay that conflicts in memory will be refused when the store
+        // tries it, so it is reported as the refusal it will be.
         Shape::Matches(shape)
-            if predict_replay_conflict(store, &shape.removed, &shape.rewrite, &shape.child)
-                == Some(true) =>
+            if combine::replay_revset_in_memory(
+                jj,
+                store,
+                &format!("{}..{}", shape.removed, shape.child),
+                &shape.rewrite,
+            ) == Some(true) =>
         {
             ConflictedNameOutlook::Refused(Box::new(repair_refusal(
                 jj,
                 store,
                 conflict.clone(),
                 format!(
-                    "replaying `{}`'s commits onto `{}` is expected to conflict",
+                    "replaying `{}`'s commits onto `{}` conflicts when tried in memory",
                     shape.child, shape.rewrite
                 ),
             )))
@@ -1008,7 +1067,104 @@ pub fn assess_conflicted_bookmark_name(
             reason,
         ))),
     };
-    Ok(Some((conflict, outlook)))
+    Ok(outlook)
+}
+
+fn twin_refusal_reason(stack: &TwinStack) -> String {
+    format!(
+        "every commit `{}` has over `{}` has a content-identical twin in it, but {} still \
+         reference(s) those {} commit(s), so the store will not abandon them itself",
+        stack.drop,
+        stack.keep,
+        stack.referenced_by.join(", "),
+        stack.twins.len()
+    )
+}
+
+/// What [`settle_twin_stack`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TwinSettlement {
+    /// The name now holds `tip`, and `abandoned` twin commits were abandoned.
+    Settled { tip: String, abandoned: usize },
+    /// The versions are twins, but something else references the copies the
+    /// settlement would abandon.
+    Referenced { reason: String },
+    /// The versions are not a twin stack.
+    NotTwins,
+}
+
+/// Settle a conflicted name whose two versions hold the same work: one is the
+/// other's commits replayed onto a newer base, possibly with more on top. The
+/// name moves to that superset version and the other's copies are abandoned.
+///
+/// A replay of either version onto the other would copy every shared commit a
+/// third time, so this is the only combination that keeps everything without
+/// duplicating it. It is a convergence rather than a choice because every
+/// abandoned commit was proven to have a twin with the same change id, the
+/// same description, and the same content once replayed onto the twin's parent
+/// (see [`combine::find_twin_stack`]). Declines when anything besides this
+/// branch's own names references the copies.
+///
+/// The caller MUST hold the per-store lock.
+pub fn settle_twin_stack(jj: &JjEnv, store: &Path, branch: &str) -> Result<TwinSettlement, String> {
+    let Some(conflict) = describe_conflicted_bookmark(jj, store, branch)? else {
+        return Ok(TwinSettlement::NotTwins);
+    };
+    let Some(stack) = combine::find_twin_stack(jj, store, &conflict)? else {
+        return Ok(TwinSettlement::NotTwins);
+    };
+    if !stack.referenced_by.is_empty() {
+        return Ok(TwinSettlement::Referenced {
+            reason: twin_refusal_reason(&stack),
+        });
+    }
+    let pre_op = operation_id(jj, store)?;
+    let rewrite = set_bookmark_backwards(
+        jj,
+        store,
+        branch,
+        &stack.keep,
+        "jj repair: settle twin stack",
+    )
+    .and_then(|()| {
+        jj.run(
+            store,
+            &["abandon", &stack.twins.join(" | "), "--ignore-working-copy"],
+            "jj abandon (twin stack)",
+        )
+        .map(|_| ())
+    });
+    if let Err(error) = rewrite {
+        restore_operation(jj, store, &pre_op)?;
+        return Err(error);
+    }
+    hold_git_ref_to_bookmark(jj, store, branch, &stack.keep)?;
+    if bookmark_name_is_conflicted(jj, store, branch)? {
+        return Err(format!(
+            "branch `{branch}` is still conflicted after settling on `{}` and abandoning `{}`'s \
+             twins",
+            stack.keep, stack.drop
+        ));
+    }
+    let after = bookmark_commit(jj, store, branch);
+    if after.as_deref() != Some(stack.keep.as_str()) {
+        return Err(format!(
+            "branch `{branch}` did not settle on `{}`: it is at {} instead",
+            stack.keep,
+            after.as_deref().unwrap_or("no single commit")
+        ));
+    }
+    log::info!(
+        "jj repair: bookmark `{branch}` held twin stacks; kept {} and abandoned {} twin \
+         commit(s) of {}",
+        stack.keep,
+        stack.twins.len(),
+        stack.drop
+    );
+    Ok(TwinSettlement::Settled {
+        tip: stack.keep,
+        abandoned: stack.twins.len(),
+    })
 }
 
 /// The first of `targets` that descends from every other, if any.
@@ -1095,6 +1251,24 @@ fn rewritten_base_with_child(
             child.commit, removed.commit
         )));
     }
+    let shared = log_lines(
+        jj,
+        store,
+        &format!(
+            "({suffix_revset}) & {}",
+            combine::foreign_ancestry(&conflict.branch)
+        ),
+        "commit_id",
+    )?;
+    if !shared.is_empty() {
+        return Ok(Shape::Declined(format!(
+            "commits between `{}` and `{}` are already held by another branch ({}), and \
+             replaying them would rewrite it",
+            removed.commit,
+            child.commit,
+            shared.join(", ")
+        )));
+    }
     if super::conflict::revset_has_conflict(jj, store, &suffix_revset)? {
         return Ok(Shape::Declined(format!(
             "commits between `{}` and `{}` already carry a conflict",
@@ -1140,28 +1314,6 @@ fn rewritten_base_with_child(
         child_change: child.change.clone(),
         suffix,
     }))
-}
-
-fn log_lines(jj: &JjEnv, store: &Path, revset: &str, field: &str) -> Result<Vec<String>, String> {
-    Ok(jj
-        .run(
-            store,
-            &[
-                "log",
-                "-r",
-                revset,
-                "--no-graph",
-                "-T",
-                &format!("{field} ++ \"\\n\""),
-                "--ignore-working-copy",
-            ],
-            "jj log (conflicted name settlement)",
-        )?
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
 }
 
 /// What [`settle_rewritten_base_with_child`] did.
@@ -1282,22 +1434,27 @@ pub fn settle_rewritten_base_with_child(
 
 /// Build the refusal for a conflicted name, with a maintainer's commands.
 ///
-/// The commands only ever COMBINE versions: for each ordering, keep one as the
-/// base and replay the other's own commits onto it. Nothing here keeps one side
-/// and drops the other, because that is exactly the silent loss a refusal
-/// exists to prevent.
-fn repair_refusal(
+/// The commands only ever COMBINE versions without losing any commit; see
+/// [`maintainer_commands`].
+pub(crate) fn repair_refusal(
     jj: &JjEnv,
     store: &Path,
     conflict: ConflictedBookmark,
     reason: String,
 ) -> RepairRefusal {
-    let commands = maintainer_commands(store, &conflict, |keep, replay, fork| {
-        let fork = match fork {
-            Fork::Commit(commit) => Some(commit.to_string()),
-            Fork::Point => revset_commit(jj, store, &format!("fork_point({keep}|{replay})")),
-        }?;
-        predict_replay_conflict(store, &fork, keep, replay)
+    let twins = combine::find_twin_stack(jj, store, &conflict).unwrap_or_else(|error| {
+        log::warn!(
+            "jj repair: could not tell whether `{}`'s versions are twins: {error}",
+            conflict.branch
+        );
+        None
+    });
+    let commands = maintainer_commands(store, &conflict, twins.as_ref(), |keep, replay, fork| {
+        let from = match fork {
+            Fork::Commit(commit) => commit,
+            Fork::Point => keep,
+        };
+        combine::check_ordering(jj, store, &conflict.branch, from, keep, replay)
     });
     RepairRefusal {
         branch: conflict.branch.clone(),
@@ -1313,7 +1470,8 @@ enum Fork<'a> {
     /// From this commit: the removed target, when the kept version is its
     /// rewrite, so only the child's own commits move.
     Commit(&'a str),
-    /// From the two versions' fork point.
+    /// From the kept version: everything the replayed version has that it
+    /// lacks.
     Point,
 }
 
@@ -1321,18 +1479,25 @@ enum Fork<'a> {
 /// orderings that combine its versions without leaving any out.
 ///
 /// Only ever COMBINES: keep one version as the base and replay the other's own
-/// commits onto it, so nothing either side holds is left behind. There is no
-/// keep-one-side command, because that is exactly the silent loss a refusal
-/// exists to prevent. For the same reason a name with more than two versions
-/// gets no mutating commands at all: a pairwise replay followed by a bookmark
-/// move would drop every version outside the pair.
+/// commits onto it, so nothing either side holds is left behind. A name with
+/// more than two versions gets no mutating commands at all: a pairwise replay
+/// followed by a bookmark move would drop every version outside the pair.
 ///
-/// `predict(keep, replay, fork)` says whether that replay is expected to
-/// conflict, for the annotation.
+/// A replay range never includes a commit another name holds: each is
+/// `(from..replay) ~ <foreign ancestry>`, and `check(keep, replay, fork)`
+/// withholds an ordering whose replayed version sits on such commits (a newer
+/// base) or has other work built on its own. Its in-memory replay outcome is
+/// the annotation; an ordering not tried says so.
+///
+/// The one command that keeps one version and drops the other is for a
+/// [`TwinStack`], where every dropped commit was proven to be a copy of one the
+/// kept version holds. There, a replay is the loss: it would copy each shared
+/// commit a third time.
 fn maintainer_commands(
     store: &Path,
     conflict: &ConflictedBookmark,
-    predict: impl Fn(&str, &str, Fork<'_>) -> Option<bool>,
+    twins: Option<&TwinStack>,
+    check: impl Fn(&str, &str, Fork<'_>) -> OrderingCheck,
 ) -> Vec<String> {
     let jj_cmd = format!(
         "jj -R {} --ignore-working-copy",
@@ -1360,6 +1525,27 @@ fn maintainer_commands(
         ));
         return commands;
     };
+    if let Some(stack) = twins {
+        commands.push(format!(
+            "# Keep {keep}: every one of the {count} commit(s) {drop} has over it has a twin in it \
+             (same change, same description, same content once replayed onto the twin's parent), \
+             so replaying either version onto the other would only copy them again. Move the \
+             branch to {keep}, then abandon {drop}'s copies.",
+            keep = stack.keep,
+            drop = stack.drop,
+            count = stack.twins.len(),
+        ));
+        commands.push(format!(
+            "{jj_cmd} bookmark set {} --allow-backwards -r {}",
+            shell_quote(branch),
+            stack.keep
+        ));
+        commands.push(format!(
+            "{jj_cmd} abandon {}",
+            shell_quote(&stack.twins_revset())
+        ));
+        return commands;
+    }
     // When one version is the removed target's own rewrite, the other's
     // commits since the removed target are exactly its own work; replaying the
     // rewrite's ancestry instead would drag whatever it was rewritten onto.
@@ -1377,22 +1563,32 @@ fn maintainer_commands(
         _ => vec![(first, second, Fork::Point), (second, first, Fork::Point)],
     };
     for (keep, replay, fork) in orderings {
-        let expectation = match predict(&keep.commit, &replay.commit, fork) {
-            Some(true) => "expected to conflict",
-            Some(false) => "expected to replay cleanly",
-            None => "not predicted",
+        let conflicts = match check(&keep.commit, &replay.commit, fork) {
+            OrderingCheck::Offer { conflicts } => conflicts,
+            OrderingCheck::Withhold { why } => {
+                commands.push(format!(
+                    "# Not offered: keeping {} and replaying {}'s commits onto it, because {why}.",
+                    keep.commit, replay.commit
+                ));
+                continue;
+            }
+        };
+        let tried = match conflicts {
+            Some(true) => "tried in memory: conflicts",
+            Some(false) => "tried in memory: replays cleanly",
+            None => "not tried",
         };
         let from = match fork {
-            Fork::Commit(commit) => commit.to_string(),
-            Fork::Point => format!("fork_point({}|{})", keep.commit, replay.commit),
+            Fork::Commit(commit) => commit,
+            Fork::Point => keep.commit.as_str(),
         };
         commands.push(format!(
-            "# Keep {} as the base and replay {}'s own commits onto it ({expectation})",
+            "# Keep {} as the base and replay {}'s own commits onto it ({tried})",
             keep.commit, replay.commit
         ));
         commands.push(format!(
             "{jj_cmd} rebase -r {} -d {}",
-            shell_quote(&format!("{from}..{}", replay.commit)),
+            shell_quote(&combine::own_commits_revset(branch, from, &replay.commit)),
             keep.commit
         ));
         commands.push(format!(
@@ -1402,32 +1598,6 @@ fn maintainer_commands(
         ));
     }
     commands
-}
-
-/// Whether replaying `tip`'s commits from `fork` onto `onto` is expected to
-/// conflict, from git's three-way tree merge of the same three commits. A
-/// prediction, not a proof: a multi-commit replay can conflict partway through
-/// even where the end states merge. `None` when git could not say.
-fn predict_replay_conflict(store: &Path, fork: &str, onto: &str, tip: &str) -> Option<bool> {
-    let checkout = super::export::resolve_backing_checkout(store)?;
-    let status = cairn_platform::env::git()
-        .args([
-            "merge-tree",
-            "--write-tree",
-            &format!("--merge-base={fork}"),
-            onto,
-            tip,
-        ])
-        .current_dir(checkout)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?;
-    match status.code() {
-        Some(0) => Some(false),
-        Some(1) => Some(true),
-        _ => None,
-    }
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1522,9 +1692,15 @@ pub fn repair_conflicted_bookmark_name(
 
     let targets = conflicted_bookmark_targets(jj, store, branch)?;
     let Some(winner) = target_containing_the_rest(jj, store, &targets) else {
-        let reason = match settle_rewritten_base_with_child(jj, store, branch)? {
-            RewrittenBaseSettlement::Settled { tip, .. } => return Ok(Some(tip)),
-            RewrittenBaseSettlement::Declined { reason } => reason,
+        let reason = match settle_twin_stack(jj, store, branch)? {
+            TwinSettlement::Settled { tip, .. } => return Ok(Some(tip)),
+            TwinSettlement::Referenced { reason } => reason,
+            TwinSettlement::NotTwins => {
+                match settle_rewritten_base_with_child(jj, store, branch)? {
+                    RewrittenBaseSettlement::Settled { tip, .. } => return Ok(Some(tip)),
+                    RewrittenBaseSettlement::Declined { reason } => reason,
+                }
+            }
         };
         let conflict = describe_conflicted_bookmark(jj, store, branch)?.ok_or_else(|| {
             format!("branch `{branch}` stopped being conflicted while its repair was refusing")
@@ -1753,8 +1929,13 @@ mod tests {
     }
 
     fn commands(conflict: &ConflictedBookmark) -> Vec<String> {
-        maintainer_commands(Path::new("/store"), conflict, |_, _, _| None)
+        maintainer_commands(Path::new("/store"), conflict, None, |_, _, _| {
+            OrderingCheck::Offer { conflicts: None }
+        })
     }
+
+    const FOREIGN: &str =
+        "::(bookmarks(~exact:\"agent/x\") | remote_bookmarks(~exact:\"agent/x\"))";
 
     /// A pairwise replay plus a bookmark move would drop every version outside
     /// the pair, so three or more versions get the inspection and nothing that
@@ -1785,24 +1966,122 @@ mod tests {
         );
     }
 
+    /// Each replay range is the replayed version's commits over the kept one,
+    /// minus everything another name holds, so the base branch can never be in
+    /// it whatever the topology.
     #[test]
-    fn two_unrelated_versions_get_both_orderings_from_their_fork_point() {
+    fn two_unrelated_versions_get_both_orderings_without_shared_history() {
         let lines = commands(&conflict(
             vec![target("0000", "zzzz")],
             vec![target("aaaa", "kkkk"), target("bbbb", "llll")],
         ));
-        assert!(lines.contains(
-            &"jj -R '/store' --ignore-working-copy rebase -r 'fork_point(aaaa|bbbb)..bbbb' -d aaaa"
-                .to_string()
-        ));
-        assert!(lines.contains(
-            &"jj -R '/store' --ignore-working-copy rebase -r 'fork_point(bbbb|aaaa)..aaaa' -d bbbb"
-                .to_string()
-        ));
+        assert!(
+            lines.contains(&format!(
+                "jj -R '/store' --ignore-working-copy rebase -r '(aaaa..bbbb) ~ {FOREIGN}' -d aaaa"
+            )),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.contains(&format!(
+                "jj -R '/store' --ignore-working-copy rebase -r '(bbbb..aaaa) ~ {FOREIGN}' -d bbbb"
+            )),
+            "{lines:#?}"
+        );
         assert!(lines.contains(
             &"jj -R '/store' --ignore-working-copy bookmark set 'agent/x' --allow-backwards -r 'aaaa:: & change_id(llll)'"
                 .to_string()
         ));
+        // Nothing was tried, so nothing is promised.
+        assert!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("# Keep"))
+                .all(|line| line.ends_with("(not tried)")),
+            "{lines:#?}"
+        );
+    }
+
+    /// A withheld ordering prints its reason and no command that mutates.
+    #[test]
+    fn a_withheld_ordering_says_why_and_offers_nothing_to_run() {
+        let lines = maintainer_commands(
+            Path::new("/store"),
+            &conflict(
+                vec![target("0000", "zzzz")],
+                vec![target("aaaa", "kkkk"), target("bbbb", "llll")],
+            ),
+            None,
+            |keep, _, _| match keep {
+                "aaaa" => OrderingCheck::Withhold {
+                    why: "`bbbb` sits on a newer base than `aaaa`".into(),
+                },
+                _ => OrderingCheck::Offer {
+                    conflicts: Some(false),
+                },
+            },
+        );
+        assert!(
+            lines.contains(
+                &"# Not offered: keeping aaaa and replaying bbbb's commits onto it, because \
+                  `bbbb` sits on a newer base than `aaaa`."
+                    .to_string()
+            ),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.ends_with("-d aaaa")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.contains(
+                &"# Keep bbbb as the base and replay aaaa's own commits onto it (tried in memory: \
+                  replays cleanly)"
+                    .to_string()
+            ),
+            "{lines:#?}"
+        );
+    }
+
+    /// A twin stack gets exactly one ordering, and it replays nothing.
+    #[test]
+    fn a_twin_stack_gets_one_keep_and_abandon_ordering() {
+        let stack = TwinStack {
+            keep: "bbbb".into(),
+            drop: "aaaa".into(),
+            twins: vec!["a111".into(), "aaaa".into()],
+            referenced_by: vec!["bookmark `other`".into()],
+        };
+        let lines = maintainer_commands(
+            Path::new("/store"),
+            &conflict(
+                vec![target("0000", "zzzz")],
+                vec![target("aaaa", "kkkk"), target("bbbb", "kkkk")],
+            ),
+            Some(&stack),
+            |_, _, _| panic!("a twin stack is never offered a replay"),
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains(" rebase ")),
+            "{lines:#?}"
+        );
+        let mutating = lines
+            .iter()
+            .filter(|line| !line.starts_with('#') && !line.contains(" log -r "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mutating,
+            vec![
+                "jj -R '/store' --ignore-working-copy bookmark set 'agent/x' --allow-backwards -r bbbb",
+                "jj -R '/store' --ignore-working-copy abandon 'bbbb..aaaa'",
+            ],
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("# Keep bbbb: every one of the 2 commit(s)")),
+            "{lines:#?}"
+        );
     }
 
     /// Where one version is the removed target's rewrite, only the child's own
@@ -1817,10 +2096,13 @@ mod tests {
         let rebases = lines
             .iter()
             .filter(|line| line.contains(" rebase "))
+            .cloned()
             .collect::<Vec<_>>();
         assert_eq!(
             rebases,
-            vec!["jj -R '/store' --ignore-working-copy rebase -r 'rrrr..cccc' -d aaaa"],
+            vec![format!(
+                "jj -R '/store' --ignore-working-copy rebase -r '(rrrr..cccc) ~ {FOREIGN}' -d aaaa"
+            )],
             "{lines:?}"
         );
     }

@@ -4,6 +4,7 @@
 //! the cached UI snapshot. Scheduling, workspaces, processes, cancellation, and
 //! mutation sealing exist only in the executor process.
 
+mod coalescing;
 pub(crate) mod decline_condition;
 pub mod desktop;
 pub mod link_clock;
@@ -18,6 +19,7 @@ mod reliability;
 pub(crate) mod repair;
 pub(crate) mod residency;
 mod resource_profiles;
+pub mod runner_events;
 pub(crate) mod service_placement;
 pub mod telemetry;
 
@@ -382,6 +384,25 @@ impl LinkStallCause {
         }
     }
 
+    /// The cause's measurements as fields, for a `runner_events` row: the
+    /// numbers `describe` carries only as prose.
+    pub fn detail(&self) -> serde_json::Value {
+        match self {
+            Self::Silence {
+                silence_ms,
+                pump_silence_ms,
+            } => serde_json::json!({
+                "stall_kind": "silence",
+                "silence_ms": silence_ms,
+                "pump_silence_ms": pump_silence_ms,
+            }),
+            Self::TelemetryFrozen { facts_age_ms } => serde_json::json!({
+                "stall_kind": "telemetry_frozen",
+                "facts_age_ms": facts_age_ms,
+            }),
+        }
+    }
+
     /// Whether this cause has to wait its turn behind another machine's
     /// recovery. Only frozen telemetry does: it is the failure that arrives on
     /// many machines at once.
@@ -405,6 +426,17 @@ pub struct LinkStallBounds {
     pub telemetry_ms: u64,
 }
 
+/// What abandoning a stalled colocated link did, for the supervisor's reset
+/// row and log line. All zero, with `disconnected` false, when the generation
+/// no longer owned the link and nothing was touched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StalledLinkAbandonment {
+    pub disconnected: bool,
+    pub abandoned_attempts: usize,
+    pub abandoned_in_flight: usize,
+    pub last_known_state: Option<ExecutorSubstrateState>,
+}
+
 impl Default for LinkStallBounds {
     fn default() -> Self {
         Self {
@@ -417,7 +449,7 @@ impl Default for LinkStallBounds {
 struct CoalescedLeaderCompletionGuard {
     pool: Fleet,
     leader: RequestIdentity,
-    result_identities: Vec<CheckResultIdentity>,
+    keys: Vec<CoalescingKey>,
     runner_context_id: Option<String>,
     armed: bool,
 }
@@ -455,12 +487,9 @@ impl Drop for CoalescedLeaderCompletionGuard {
             "coalesced leader {:?} ended without publishing a terminal outcome",
             self.leader
         );
-        for result_identity in &self.result_identities {
-            self.pool.complete_coalesced_for_leader(
-                result_identity,
-                &self.leader,
-                LeaderSettlement::Vanished,
-            );
+        for key in &self.keys {
+            self.pool
+                .complete_coalesced_for_leader(key, LeaderSettlement::Vanished);
         }
     }
 }
@@ -517,6 +546,7 @@ struct PendingDrainResult {
 }
 
 use crate::execution::cache::CheckResultIdentity;
+use coalescing::{CoalescingKey, PlacementDemand};
 
 struct CoalescedSubscriber {
     waiter: oneshot::Sender<CoalescedDelivery>,
@@ -524,16 +554,83 @@ struct CoalescedSubscriber {
     requesting_job_id: Option<String>,
 }
 
+/// One shared execution. Its leader is the request its key names.
 struct InFlightExecution {
-    leader: RequestIdentity,
+    /// What the leader was submitted to satisfy, which bounds who may join.
+    demand: PlacementDemand,
     subscribers: HashMap<RequestIdentity, CoalescedSubscriber>,
     publication: PublicationCoordination,
 }
 
+/// Every coalesced execution in flight, and which one each subscriber waits on.
+///
+/// Keyed by content AND leader: one content identity may have several
+/// executions in flight at once when their placement demands are incompatible,
+/// such as one lane demanded on linux and another on macos.
 #[derive(Default)]
 struct InFlightRegistry {
-    by_key: HashMap<CheckResultIdentity, InFlightExecution>,
-    subscriber_keys: HashMap<RequestIdentity, CheckResultIdentity>,
+    by_key: HashMap<CoalescingKey, InFlightExecution>,
+    subscriber_keys: HashMap<RequestIdentity, CoalescingKey>,
+}
+
+impl InFlightRegistry {
+    /// Admit `identity` as a subscriber to `result`: onto an execution whose
+    /// leader's demand meets `demand`, or onto a new one `leader` leads.
+    /// Returns the execution's key and whether it was opened by this call.
+    ///
+    /// An execution with the same demand is preferred over a merely stricter
+    /// one, so that the join is deterministic when several qualify.
+    fn admit(
+        &mut self,
+        result: CheckResultIdentity,
+        demand: &PlacementDemand,
+        leader: &RequestIdentity,
+        identity: RequestIdentity,
+        subscriber: CoalescedSubscriber,
+    ) -> (CoalescingKey, bool) {
+        let joinable = self
+            .by_key
+            .iter()
+            .filter(|(key, execution)| key.result == result && execution.demand.meets(demand))
+            .min_by_key(|(key, execution)| (execution.demand != *demand, key.leader.clone()))
+            .map(|(key, _)| key.clone());
+        let Some(key) = joinable else {
+            let key = self.open(
+                CoalescingKey::new(result, leader.clone()),
+                demand.clone(),
+                HashMap::from([(identity, subscriber)]),
+            );
+            return (key, true);
+        };
+        self.by_key
+            .get_mut(&key)
+            .expect("a joinable execution is in the registry it was found in")
+            .subscribers
+            .insert(identity.clone(), subscriber);
+        self.subscriber_keys.insert(identity, key.clone());
+        (key, false)
+    }
+
+    /// Open the execution `key` names, indexing each of `subscribers` to it.
+    fn open(
+        &mut self,
+        key: CoalescingKey,
+        demand: PlacementDemand,
+        subscribers: HashMap<RequestIdentity, CoalescedSubscriber>,
+    ) -> CoalescingKey {
+        for identity in subscribers.keys() {
+            self.subscriber_keys.insert(identity.clone(), key.clone());
+        }
+        self.by_key.insert(
+            key.clone(),
+            InFlightExecution {
+                demand,
+                subscribers,
+                publication: PublicationCoordination::new(),
+            },
+        );
+        key
+    }
 }
 
 /// Where the execution a pure-verdict check subscriber is waiting on stands,
@@ -1167,6 +1264,12 @@ pub struct Fleet {
     /// How long a claimed attempt may go without its machine accounting for
     /// it; see [`CLAIMED_ATTEMPT_SILENCE_BOUND_MS`].
     claimed_attempt_silence: ClaimedAttemptSilenceBound,
+    /// The one sink for this runner's lifecycle facts; see [`runner_events`].
+    /// Unattached (memory only) on a bare `Fleet::default()`.
+    runner_events: runner_events::RunnerEvents,
+    /// This runner process's identity in every journal it writes, set once
+    /// when the journals attach.
+    runner_incarnation: Arc<std::sync::OnceLock<String>>,
 }
 
 /// Grace after a residency response's link stops reporting progress.
@@ -1962,6 +2065,31 @@ impl Fleet {
         runner_incarnation: String,
     ) {
         queue::spawn_queue_journal(db, runner_incarnation, self.queue.clone());
+    }
+
+    /// Give this runner's lifecycle facts a durable journal, opening it with
+    /// the `runner_started` row that marks where this process's connection
+    /// generations begin. Attach it before the queue journal, so that row is
+    /// the first this incarnation writes anywhere.
+    pub(crate) fn attach_runner_event_journal(
+        &self,
+        db: Arc<crate::storage::LocalDb>,
+        runner_incarnation: String,
+    ) {
+        if let Err(error) = self.runner_events.attach_journal(db, &runner_incarnation) {
+            log::error!("runner event journal did not attach: {error}");
+        }
+        let _ = self.runner_incarnation.set(runner_incarnation);
+    }
+
+    /// The sink every runner lifecycle fact is recorded through.
+    pub fn runner_events(&self) -> &runner_events::RunnerEvents {
+        &self.runner_events
+    }
+
+    /// This runner process's journal identity, once its journals attached.
+    pub fn runner_incarnation(&self) -> Option<&str> {
+        self.runner_incarnation.get().map(String::as_str)
     }
 
     /// Give preparation refusals a durable store, and adopt what it holds.
@@ -3297,7 +3425,24 @@ impl Fleet {
     /// a watch notification so connected executors can persist rotations and
     /// endpoint changes without polling.
     pub fn publish_executor_listener(&self, advertisement: ExecutorListenerAdvertisement) {
-        *self.executor_listener.current.lock().unwrap() = Some(advertisement.clone());
+        let previous = self
+            .executor_listener
+            .current
+            .lock()
+            .unwrap()
+            .replace(advertisement.clone());
+        // A republication of the same advertisement is not a restage, and
+        // every connected machine would otherwise read it as one.
+        if previous.as_ref() != Some(&advertisement) {
+            self.runner_events.record(
+                runner_events::RunnerEvent::new(runner_events::RunnerEventKind::ListenerRestaged)
+                    .detail(serde_json::json!({
+                        "previous_cert_sha256": previous.map(|previous| previous.cert_sha256),
+                        "cert_sha256": advertisement.cert_sha256,
+                        "endpoints": advertisement.endpoints,
+                    })),
+            );
+        }
         self.executor_listener
             .updates
             .send_replace(Some(advertisement));
@@ -3847,12 +3992,30 @@ impl Fleet {
         diagnostic: String,
     ) {
         let now = unix_time_ms();
-        {
+        let (failing_since, failed_attempts) = {
             let mut supervision = self.colocated_supervision.lock().unwrap();
-            supervision.failing_since_unix_ms.get_or_insert(now);
+            let failing_since = *supervision.failing_since_unix_ms.get_or_insert(now);
             supervision.failed_attempts = supervision.failed_attempts.saturating_add(1);
             supervision.last_cause = Some(diagnostic.clone());
-        }
+            (failing_since, supervision.failed_attempts)
+        };
+        self.runner_events.record(
+            runner_events::RunnerEvent::new(
+                runner_events::RunnerEventKind::ExecutorSubstrateFailed,
+            )
+            .at(now)
+            .executor(COLOCATED_EXECUTOR_ID)
+            .cause(diagnostic.clone())
+            .detail(serde_json::json!({
+                "state": match state {
+                    ExecutorSubstrateState::SupervisorRespawning => "supervisor_respawning".to_string(),
+                    ExecutorSubstrateState::PermanentRefusal => "permanent_refusal".to_string(),
+                    other => format!("{other:?}"),
+                },
+                "failed_attempts": failed_attempts,
+                "failing_since_ms": failing_since,
+            })),
+        );
         let mut evidence = ExecutorSubstrateEvidence::without_queue(state, now, now);
         evidence.diagnostic = Some(diagnostic);
         *self.colocated_substrate_state.lock().unwrap() = Some(evidence);
@@ -4194,22 +4357,26 @@ impl Fleet {
     /// subscribers that are still waiting pause their deadlines rather than
     /// expiring against an environment that is coming back.
     ///
-    /// Returns false without any side effect when `generation` no longer owns the
-    /// link — a reattach that landed between assessment and action owns it now,
-    /// and bouncing that would strand the healthy connection that replaced the
-    /// sick one.
+    /// Returns an empty abandonment, without any side effect, when `generation`
+    /// no longer owns the link — a reattach that landed between assessment and
+    /// action owns it now, and bouncing that would strand the healthy
+    /// connection that replaced the sick one.
+    ///
+    /// Records no runner event: the supervisor that decided the reset writes
+    /// the one `executor_link_reset` row, because only it knows the pid, how
+    /// many resets ran consecutively, and how the retirement went.
     pub fn abandon_stalled_colocated_link(
         &self,
         executor_id: &str,
         generation: u64,
         cause: LinkStallCause,
-    ) -> bool {
+    ) -> StalledLinkAbandonment {
         if !self
             .lock_connections()
             .get(executor_id)
             .is_some_and(|entry| entry.generation == generation)
         {
-            return false;
+            return StalledLinkAbandonment::default();
         }
         // Captured before the disconnect, which clears this link's entries on
         // its way through the generation-end sweep. These identities are how an
@@ -4245,7 +4412,12 @@ impl Fleet {
             abandoned_leaders.len(),
             cause = cause.describe(),
         );
-        disconnected
+        StalledLinkAbandonment {
+            disconnected,
+            abandoned_attempts: abandoned_leaders.len(),
+            abandoned_in_flight,
+            last_known_state,
+        }
     }
 
     /// Resolve every coalesced execution led by one of `leaders` to a typed
@@ -4285,20 +4457,19 @@ impl Fleet {
         };
         let mut resolved = 0;
         for leader in leaders {
-            let led: Vec<CheckResultIdentity> = self
+            let led: Vec<CoalescingKey> = self
                 .in_flight
                 .lock()
                 .unwrap()
                 .by_key
-                .iter()
-                .filter(|(_, execution)| &execution.leader == leader)
-                .map(|(result_identity, _)| result_identity.clone())
+                .keys()
+                .filter(|key| &key.leader == leader)
+                .cloned()
                 .collect();
-            for result_identity in led {
+            for key in led {
                 // Leader-fenced, so whichever of this and the leader's own
                 // publication runs second is a no-op rather than a double send.
-                if self.complete_coalesced_for_leader(&result_identity, leader, settlement.clone())
-                {
+                if self.complete_coalesced_for_leader(&key, settlement.clone()) {
                     resolved += 1;
                 }
             }
@@ -5152,11 +5323,11 @@ impl Fleet {
 
     fn coalesced_leader(&self, identity: &RequestIdentity) -> Option<RequestIdentity> {
         let registry = self.in_flight.lock().unwrap();
-        let result_identity = registry.subscriber_keys.get(identity)?;
+        let key = registry.subscriber_keys.get(identity)?;
         registry
             .by_key
-            .get(result_identity)
-            .map(|execution| execution.leader.clone())
+            .contains_key(key)
+            .then(|| key.leader.clone())
     }
 
     /// Where the execution behind one pure-verdict check subscriber stands:
@@ -5857,8 +6028,8 @@ impl Fleet {
             .lock()
             .unwrap()
             .by_key
-            .values()
-            .map(|execution| (execution.leader.clone(), execution.subscribers.len()))
+            .iter()
+            .map(|(key, execution)| (key.leader.clone(), execution.subscribers.len()))
             .collect();
         for cell in &mut aggregate.cells {
             if let Some(active) = cell.occupancy.command.as_mut() {
@@ -6367,26 +6538,21 @@ impl Fleet {
         }
     }
 
+    /// Deliver a leader's settlement to everyone waiting on the execution `key`
+    /// names. The key carries the leader, so a completion can only ever settle
+    /// the execution its own leader opened, never a later one for the same
+    /// content.
     fn complete_coalesced_for_leader(
         &self,
-        result_identity: &CheckResultIdentity,
-        expected_leader: &RequestIdentity,
+        key: &CoalescingKey,
         settlement: impl Into<LeaderSettlement>,
     ) -> bool {
         let settlement = settlement.into();
         let execution = {
             let mut registry = self.in_flight.lock().unwrap();
-            if registry
-                .by_key
-                .get(result_identity)
-                .is_none_or(|execution| &execution.leader != expected_leader)
-            {
+            let Some(execution) = registry.by_key.remove(key) else {
                 return false;
-            }
-            let execution = registry
-                .by_key
-                .remove(result_identity)
-                .expect("leader-fenced coalesced execution disappeared while locked");
+            };
             for identity in execution.subscribers.keys() {
                 registry.subscriber_keys.remove(identity);
             }
@@ -6397,13 +6563,10 @@ impl Fleet {
             .lock()
             .unwrap()
             .by_key
-            .values()
-            .any(|candidate| candidate.leader == execution.leader);
+            .keys()
+            .any(|candidate| candidate.leader == key.leader);
         if !leader_still_active {
-            self.coalesced_leaders
-                .lock()
-                .unwrap()
-                .remove(&execution.leader);
+            self.coalesced_leaders.lock().unwrap().remove(&key.leader);
         }
         for (identity, subscriber) in execution.subscribers {
             let delivery = match &settlement {
@@ -6543,22 +6706,22 @@ impl Fleet {
         let removed;
         let leader_to_cancel = {
             let mut registry = self.in_flight.lock().unwrap();
-            let Some(result_identity) = registry.subscriber_keys.remove(identity) else {
+            let Some(key) = registry.subscriber_keys.remove(identity) else {
                 return Detachment::Unknown;
             };
-            let Some(execution) = registry.by_key.get_mut(&result_identity) else {
+            let Some(execution) = registry.by_key.get_mut(&key) else {
                 return Detachment::Unknown;
             };
             removed = execution.subscribers.remove(identity);
             remaining = execution.subscribers.len();
             if execution.subscribers.is_empty() {
-                let leader = execution.leader.clone();
+                let leader = key.leader.clone();
                 // Keep the empty execution as a tombstone until the leader publishes its
                 // terminal outcome. Cancellation is asynchronous at the executor, so removing
                 // the result key here would let an immediate cadence retry become a second
                 // leader while the first command is still queued, running, or recovering.
-                let group_still_consumed = registry.by_key.values().any(|candidate| {
-                    candidate.leader == leader && !candidate.subscribers.is_empty()
+                let group_still_consumed = registry.by_key.iter().any(|(candidate, execution)| {
+                    candidate.leader == leader && !execution.subscribers.is_empty()
                 });
                 if group_still_consumed {
                     None
@@ -8451,65 +8614,48 @@ impl Fleet {
         let wait_horizon_unix_ms = request.wait_horizon_unix_ms;
         let (tx, rx) = oneshot::channel();
         let mut leader_request = None;
-        {
+        let demand = PlacementDemand::of(&request);
+        let key = {
             let mut registry = self.in_flight.lock().unwrap();
             if registry.subscriber_keys.contains_key(&public_identity) {
                 return Err(CoalescedWaitError::refused(executor_unavailable(
                     "duplicate coalesced subscriber identity".into(),
                 )));
             }
-            if let Some(execution) = registry.by_key.get_mut(&result_identity) {
-                execution.subscribers.insert(
-                    public_identity.clone(),
-                    CoalescedSubscriber {
-                        waiter: tx,
-                        priority: request.priority,
-                        requesting_job_id: request.requesting_job_id.clone(),
-                    },
-                );
-            } else {
-                let publication = PublicationCoordination::new();
-                let mut subscribers = HashMap::new();
-                subscribers.insert(
-                    public_identity.clone(),
-                    CoalescedSubscriber {
-                        waiter: tx,
-                        priority: request.priority,
-                        requesting_job_id: request.requesting_job_id.clone(),
-                    },
-                );
-                registry.by_key.insert(
-                    result_identity.clone(),
-                    InFlightExecution {
-                        leader: public_identity.clone(),
-                        subscribers,
-                        publication,
-                    },
-                );
+            let (key, opened) = registry.admit(
+                result_identity,
+                &demand,
+                &public_identity,
+                public_identity.clone(),
+                CoalescedSubscriber {
+                    waiter: tx,
+                    priority: request.priority,
+                    requesting_job_id: request.requesting_job_id.clone(),
+                },
+            );
+            if opened {
                 self.coalesced_leaders
                     .lock()
                     .unwrap()
                     .insert(public_identity.clone());
                 leader_request = Some(request);
             }
-            registry
-                .subscriber_keys
-                .insert(public_identity.clone(), result_identity.clone());
-        }
+            key
+        };
         if let Some(mut request) = leader_request {
-            if let Some(priority) = self
-                .in_flight
-                .lock()
-                .unwrap()
-                .by_key
-                .get(&result_identity)
-                .and_then(|execution| {
-                    execution
-                        .subscribers
-                        .values()
-                        .map(|subscriber| subscriber.priority)
-                        .max()
-                })
+            if let Some(priority) =
+                self.in_flight
+                    .lock()
+                    .unwrap()
+                    .by_key
+                    .get(&key)
+                    .and_then(|execution| {
+                        execution
+                            .subscribers
+                            .values()
+                            .map(|subscriber| subscriber.priority)
+                            .max()
+                    })
             {
                 // Executor protocol has no queued priority update. Subscribers that arrive
                 // after this send inherit the admitted priority until that protocol grows one.
@@ -8519,19 +8665,13 @@ impl Fleet {
             let completion_guard = CoalescedLeaderCompletionGuard {
                 pool: pool.clone(),
                 leader: (request.request_id.clone(), request.attempt_id.clone()),
-                result_identities: vec![result_identity.clone()],
+                keys: vec![key.clone()],
                 runner_context_id: None,
                 armed: true,
             };
             tokio::spawn(async move {
                 let mut completion_guard = completion_guard;
-                if !pool
-                    .in_flight
-                    .lock()
-                    .unwrap()
-                    .by_key
-                    .contains_key(&result_identity)
-                {
+                if !pool.in_flight.lock().unwrap().by_key.contains_key(&key) {
                     let identity = (request.request_id.clone(), request.attempt_id.clone());
                     pool.cancelled_leaders.lock().unwrap().remove(&identity);
                     pool.coalesced_leaders.lock().unwrap().remove(&identity);
@@ -8545,8 +8685,7 @@ impl Fleet {
                 pool.cancelled_leaders.lock().unwrap().remove(&leader);
                 pool.coalesced_leaders.lock().unwrap().remove(&leader);
                 pool.complete_coalesced_for_leader(
-                    &result_identity,
-                    &leader,
+                    &key,
                     LeaderSettlement::Settled {
                         outcome: executed.outcome,
                         account: executed.account,
@@ -8821,46 +8960,31 @@ impl Fleet {
         let wait_horizon_unix_ms = request.wait_horizon_unix_ms;
         let mut receivers = Vec::with_capacity(items.len());
         let mut newly_claimed = Vec::new();
+        let mut keys = Vec::new();
+        let demand = PlacementDemand::of(&request);
         {
             let mut registry = self.in_flight.lock().unwrap();
             for (index, item) in items.into_iter().enumerate() {
-                let result_identity = item.result_identity.clone();
                 let public_identity = (
                     format!("{}:check-{index}", request.request_id),
                     format!("{}:check-{index}", request.attempt_id),
                 );
                 let (tx, rx) = oneshot::channel();
-                if let Some(execution) = registry.by_key.get_mut(&result_identity) {
-                    execution.subscribers.insert(
-                        public_identity.clone(),
-                        CoalescedSubscriber {
-                            waiter: tx,
-                            priority: request.priority,
-                            requesting_job_id: request.requesting_job_id.clone(),
-                        },
-                    );
-                } else {
-                    let publication = PublicationCoordination::new();
-                    registry.by_key.insert(
-                        result_identity.clone(),
-                        InFlightExecution {
-                            leader: leader.clone(),
-                            subscribers: HashMap::from([(
-                                public_identity.clone(),
-                                CoalescedSubscriber {
-                                    waiter: tx,
-                                    priority: request.priority,
-                                    requesting_job_id: request.requesting_job_id.clone(),
-                                },
-                            )]),
-                            publication,
-                        },
-                    );
+                let (key, opened) = registry.admit(
+                    item.result_identity.clone(),
+                    &demand,
+                    &leader,
+                    public_identity.clone(),
+                    CoalescedSubscriber {
+                        waiter: tx,
+                        priority: request.priority,
+                        requesting_job_id: request.requesting_job_id.clone(),
+                    },
+                );
+                if opened {
+                    keys.push(key);
                     newly_claimed.push(item);
                 }
-                registry
-                    .subscriber_keys
-                    .insert(public_identity.clone(), result_identity);
                 receivers.push((public_identity, rx));
             }
         }
@@ -8877,10 +9001,6 @@ impl Fleet {
                     last_progress_unix_ms: now,
                 },
             );
-            let keys: Vec<_> = newly_claimed
-                .iter()
-                .map(|item| item.result_identity.clone())
-                .collect();
             let coalesced_output = output_guard::RelayedOutput::shared();
             let flushed_context = run_context.clone();
             let runner_context_id = run_context.map(|run_context| {
@@ -8913,7 +9033,7 @@ impl Fleet {
             let completion_guard = CoalescedLeaderCompletionGuard {
                 pool: pool.clone(),
                 leader: leader.clone(),
-                result_identities: keys.clone(),
+                keys: keys.clone(),
                 runner_context_id: runner_context_id.clone(),
                 armed: true,
             };
@@ -8971,7 +9091,6 @@ impl Fleet {
                                 let item_meta = metadata.for_batch_item(&result);
                                 pool.complete_coalesced_for_leader(
                                     key,
-                                    &leader,
                                     settled(CellOutcome::Completed {
                                         request_id: leader.0.clone(),
                                         attempt_id: leader.1.clone(),
@@ -8997,11 +9116,7 @@ impl Fleet {
                                 ),
                             };
                             for key in &keys {
-                                pool.complete_coalesced_for_leader(
-                                    key,
-                                    &leader,
-                                    settled(failure.clone()),
-                                );
+                                pool.complete_coalesced_for_leader(key, settled(failure.clone()));
                             }
                         }
                         Err(error) => {
@@ -9011,11 +9126,7 @@ impl Fleet {
                                 diagnostic: format!("decode typed check batch outcomes: {error}"),
                             };
                             for key in &keys {
-                                pool.complete_coalesced_for_leader(
-                                    key,
-                                    &leader,
-                                    settled(failure.clone()),
-                                );
+                                pool.complete_coalesced_for_leader(key, settled(failure.clone()));
                             }
                         }
                     },
@@ -9031,20 +9142,12 @@ impl Fleet {
                                     .into(),
                         };
                         for key in &keys {
-                            pool.complete_coalesced_for_leader(
-                                key,
-                                &leader,
-                                settled(failure.clone()),
-                            );
+                            pool.complete_coalesced_for_leader(key, settled(failure.clone()));
                         }
                     }
                     _ => {
                         for key in &keys {
-                            pool.complete_coalesced_for_leader(
-                                key,
-                                &leader,
-                                settled(outcome.clone()),
-                            );
+                            pool.complete_coalesced_for_leader(key, settled(outcome.clone()));
                         }
                     }
                 }
@@ -17283,23 +17386,13 @@ mod tests {
                 requesting_job_id: None,
             }
         };
-        let mut registry = pool.in_flight.lock().unwrap();
-        registry
-            .subscriber_keys
-            .insert(own.clone(), result_identity());
-        registry
-            .subscriber_keys
-            .insert(joined.clone(), result_identity());
-        registry.by_key.insert(
-            result_identity(),
-            InFlightExecution {
-                leader: leader.clone(),
-                subscribers: HashMap::from([
-                    (own.clone(), subscriber()),
-                    (joined.clone(), subscriber()),
-                ]),
-                publication: PublicationCoordination::new(),
-            },
+        pool.in_flight.lock().unwrap().open(
+            CoalescingKey::new(result_identity(), leader.clone()),
+            PlacementDemand::default(),
+            HashMap::from([
+                (own.clone(), subscriber()),
+                (joined.clone(), subscriber()),
+            ]),
         );
         (own, joined)
     }
@@ -17655,7 +17748,7 @@ mod tests {
     type ColocatedLeaderLink = (
         Fleet,
         u64,
-        CheckResultIdentity,
+        CoalescingKey,
         RequestIdentity,
         oneshot::Receiver<CellOutcome>,
         Vec<(RequestIdentity, oneshot::Receiver<CoalescedDelivery>)>,
@@ -17671,8 +17764,8 @@ mod tests {
         let (sender, _executor) = mpsc::unbounded_channel();
         std::mem::forget(_executor);
         let generation = pool.attach_executor(sender);
-        let result_identity = result_identity();
         let leader: RequestIdentity = ("leader-request".into(), "leader-attempt".into());
+        let result_identity = CoalescingKey::new(result_identity(), leader.clone());
 
         let leader_rx = claim_entry(
             &pool,
@@ -17682,7 +17775,6 @@ mod tests {
             Some("job"),
         );
 
-        let publication = PublicationCoordination::new();
         let mut subscribers = HashMap::new();
         let mut follower_waiters = Vec::new();
         for index in 0..followers {
@@ -17703,19 +17795,11 @@ mod tests {
         }
         {
             let mut registry = pool.in_flight.lock().unwrap();
-            registry.by_key.insert(
+            registry.open(
                 result_identity.clone(),
-                InFlightExecution {
-                    leader: leader.clone(),
-                    subscribers,
-                    publication,
-                },
+                PlacementDemand::default(),
+                subscribers,
             );
-            for (identity, _) in &follower_waiters {
-                registry
-                    .subscriber_keys
-                    .insert(identity.clone(), result_identity.clone());
-            }
         }
         pool.coalesced_leaders
             .lock()
@@ -17898,14 +17982,17 @@ mod tests {
             ),
             LinkRemediation::Healthy
         );
-        assert!(!pool.abandon_stalled_colocated_link(
-            COLOCATED_EXECUTOR_ID,
-            1,
-            LinkStallCause::Silence {
-                silence_ms: 0,
-                pump_silence_ms: Some(0),
-            },
-        ));
+        assert_eq!(
+            pool.abandon_stalled_colocated_link(
+                COLOCATED_EXECUTOR_ID,
+                1,
+                LinkStallCause::Silence {
+                    silence_ms: 0,
+                    pump_silence_ms: Some(0),
+                },
+            ),
+            StalledLinkAbandonment::default()
+        );
     }
 
     /// The regression guard for the whole issue: a subscriber whose execution had
@@ -17934,14 +18021,22 @@ mod tests {
             "a started subscriber must not expire against its own deadline"
         );
 
-        assert!(pool.abandon_stalled_colocated_link(
+        let abandonment = pool.abandon_stalled_colocated_link(
             COLOCATED_EXECUTOR_ID,
             generation,
             LinkStallCause::Silence {
                 silence_ms: EXECUTOR_LINK_STALL_REMEDIATION_MS + 1,
                 pump_silence_ms: Some(EXECUTOR_LINK_STALL_REMEDIATION_MS + 1),
             },
-        ));
+        );
+        assert!(abandonment.disconnected);
+        assert_eq!(abandonment.abandoned_attempts, 1);
+        // The fleet leaves the reset row to the supervisor that decided it.
+        assert!(pool
+            .runner_events()
+            .recent()
+            .iter()
+            .all(|event| { event.kind != runner_events::RunnerEventKind::ExecutorLinkReset }));
 
         // Resolution arrives as a published coalesced outcome rather than a
         // subscriber-side error: the attempt really was decided, and the verdict
@@ -18018,20 +18113,98 @@ mod tests {
         let replacement = pool.attach_executor(sender);
         assert!(replacement > stale_generation);
 
-        assert!(!pool.abandon_stalled_colocated_link(
-            COLOCATED_EXECUTOR_ID,
-            stale_generation,
-            LinkStallCause::Silence {
-                silence_ms: EXECUTOR_LINK_STALL_REMEDIATION_MS + 1,
-                pump_silence_ms: Some(EXECUTOR_LINK_STALL_REMEDIATION_MS + 1),
-            },
-        ));
+        assert!(
+            !pool
+                .abandon_stalled_colocated_link(
+                    COLOCATED_EXECUTOR_ID,
+                    stale_generation,
+                    LinkStallCause::Silence {
+                        silence_ms: EXECUTOR_LINK_STALL_REMEDIATION_MS + 1,
+                        pump_silence_ms: Some(EXECUTOR_LINK_STALL_REMEDIATION_MS + 1),
+                    },
+                )
+                .disconnected
+        );
         assert_eq!(pool.executor_generation(), Some(replacement));
         assert_eq!(
             pool.assess_colocated_link(unix_time_ms(), LinkStallBounds::default()),
             LinkRemediation::Healthy
         );
         drop(replacement_executor);
+    }
+
+    /// A restage is a change of advertisement. Republishing the same one, which
+    /// every endpoint refresh and colocated reset may do, records nothing.
+    #[test]
+    fn only_a_changed_listener_advertisement_is_recorded_as_a_restage() {
+        let pool = Fleet::default();
+        let advertisement = |cert: &str| ExecutorListenerAdvertisement {
+            endpoints: vec!["wss://runner:3850/api/executor".into()],
+            cert_sha256: vec![cert.into()],
+        };
+        pool.publish_executor_listener(advertisement("aa"));
+        pool.publish_executor_listener(advertisement("aa"));
+        pool.publish_executor_listener(advertisement("bb"));
+        let restages: Vec<_> = pool
+            .runner_events()
+            .recent()
+            .into_iter()
+            .filter(|event| event.kind == runner_events::RunnerEventKind::ListenerRestaged)
+            .collect();
+        assert_eq!(restages.len(), 2);
+        assert_eq!(
+            restages[0].detail["previous_cert_sha256"],
+            serde_json::Value::Null
+        );
+        assert_eq!(restages[1].detail["previous_cert_sha256"][0], "aa");
+        assert_eq!(restages[1].detail["cert_sha256"][0], "bb");
+    }
+
+    #[test]
+    fn a_colocated_substrate_failure_is_recorded_once_per_declaration() {
+        let pool = Fleet::default();
+        pool.declare_colocated_substrate_failure("spawn failed: no such file".into());
+        pool.declare_colocated_permanent_refusal("protocol mismatch".into());
+        let failures: Vec<_> = pool
+            .runner_events()
+            .recent()
+            .into_iter()
+            .filter(|event| event.kind == runner_events::RunnerEventKind::ExecutorSubstrateFailed)
+            .collect();
+        assert_eq!(failures.len(), 2);
+        assert_eq!(
+            failures[0].executor_id.as_deref(),
+            Some(COLOCATED_EXECUTOR_ID)
+        );
+        assert_eq!(
+            failures[0].cause.as_deref(),
+            Some("spawn failed: no such file")
+        );
+        assert_eq!(failures[0].detail["state"], "supervisor_respawning");
+        assert_eq!(failures[1].detail["state"], "permanent_refusal");
+        assert_eq!(failures[1].detail["failed_attempts"], 2);
+        assert_eq!(
+            failures[1].detail["failing_since_ms"],
+            failures[0].detail["failing_since_ms"]
+        );
+    }
+
+    #[test]
+    fn a_stall_cause_carries_its_measurements_as_fields() {
+        let frozen = LinkStallCause::TelemetryFrozen {
+            facts_age_ms: 1_009_658,
+        }
+        .detail();
+        assert_eq!(frozen["stall_kind"], "telemetry_frozen");
+        assert_eq!(frozen["facts_age_ms"], 1_009_658);
+        let silent = LinkStallCause::Silence {
+            silence_ms: 70_000,
+            pump_silence_ms: None,
+        }
+        .detail();
+        assert_eq!(silent["stall_kind"], "silence");
+        assert_eq!(silent["silence_ms"], 70_000);
+        assert_eq!(silent["pump_silence_ms"], serde_json::Value::Null);
     }
 
     /// Put this connection's published facts that far in the past while leaving
@@ -18604,25 +18777,21 @@ mod tests {
     async fn dropped_coalesced_leader_publishes_terminal_outcome() {
         let pool = Fleet::default();
         let leader = ("leader".to_string(), "attempt".to_string());
-        let key = result_identity();
+        let key = CoalescingKey::new(result_identity(), leader.clone());
         let (tx, rx) = oneshot::channel();
         {
             let mut registry = pool.in_flight.lock().unwrap();
-            registry.subscriber_keys.insert(leader.clone(), key.clone());
-            registry.by_key.insert(
+            registry.open(
                 key.clone(),
-                InFlightExecution {
-                    leader: leader.clone(),
-                    subscribers: HashMap::from([(
-                        leader.clone(),
-                        CoalescedSubscriber {
-                            waiter: tx,
-                            priority: CellPriority::ReviewCheck,
-                            requesting_job_id: None,
-                        },
-                    )]),
-                    publication: PublicationCoordination::new(),
-                },
+                PlacementDemand::default(),
+                HashMap::from([(
+                    leader.clone(),
+                    CoalescedSubscriber {
+                        waiter: tx,
+                        priority: CellPriority::ReviewCheck,
+                        requesting_job_id: None,
+                    },
+                )]),
             );
         }
         pool.coalesced_leaders
@@ -18637,7 +18806,7 @@ mod tests {
         drop(CoalescedLeaderCompletionGuard {
             pool: pool.clone(),
             leader: leader.clone(),
-            result_identities: vec![key.clone()],
+            keys: vec![key.clone()],
             runner_context_id: None,
             armed: true,
         });
@@ -18657,29 +18826,23 @@ mod tests {
     #[tokio::test]
     async fn old_leader_completion_cannot_complete_a_recycled_result_key() {
         let pool = Fleet::default();
-        let key = result_identity();
         let leader_a = ("leader-a".to_string(), "attempt-a".to_string());
+        let key = CoalescingKey::new(result_identity(), leader_a.clone());
         let subscriber_a = ("subscriber-a".to_string(), "attempt-a".to_string());
         let (tx_a, _rx_a) = oneshot::channel();
         {
             let mut registry = pool.in_flight.lock().unwrap();
-            registry
-                .subscriber_keys
-                .insert(subscriber_a.clone(), key.clone());
-            registry.by_key.insert(
+            registry.open(
                 key.clone(),
-                InFlightExecution {
-                    leader: leader_a.clone(),
-                    subscribers: HashMap::from([(
-                        subscriber_a.clone(),
-                        CoalescedSubscriber {
-                            waiter: tx_a,
-                            priority: CellPriority::ReviewCheck,
-                            requesting_job_id: None,
-                        },
-                    )]),
-                    publication: PublicationCoordination::new(),
-                },
+                PlacementDemand::default(),
+                HashMap::from([(
+                    subscriber_a.clone(),
+                    CoalescedSubscriber {
+                        waiter: tx_a,
+                        priority: CellPriority::ReviewCheck,
+                        requesting_job_id: None,
+                    },
+                )]),
             );
         }
         pool.coalesced_leaders
@@ -18689,7 +18852,7 @@ mod tests {
         let guard_a = CoalescedLeaderCompletionGuard {
             pool: pool.clone(),
             leader: leader_a,
-            result_identities: vec![key.clone()],
+            keys: vec![key.clone()],
             runner_context_id: None,
             armed: true,
         };
@@ -18698,26 +18861,21 @@ mod tests {
 
         let leader_b = ("leader-b".to_string(), "attempt-b".to_string());
         let subscriber_b = ("subscriber-b".to_string(), "attempt-b".to_string());
+        let key_b = CoalescingKey::new(result_identity(), leader_b.clone());
         let (tx_b, mut rx_b) = oneshot::channel();
         {
             let mut registry = pool.in_flight.lock().unwrap();
-            registry
-                .subscriber_keys
-                .insert(subscriber_b.clone(), key.clone());
-            registry.by_key.insert(
-                key.clone(),
-                InFlightExecution {
-                    leader: leader_b.clone(),
-                    subscribers: HashMap::from([(
-                        subscriber_b.clone(),
-                        CoalescedSubscriber {
-                            waiter: tx_b,
-                            priority: CellPriority::ReviewCheck,
-                            requesting_job_id: None,
-                        },
-                    )]),
-                    publication: PublicationCoordination::new(),
-                },
+            registry.open(
+                key_b.clone(),
+                PlacementDemand::default(),
+                HashMap::from([(
+                    subscriber_b.clone(),
+                    CoalescedSubscriber {
+                        waiter: tx_b,
+                        priority: CellPriority::ReviewCheck,
+                        requesting_job_id: None,
+                    },
+                )]),
             );
         }
         pool.coalesced_leaders
@@ -18727,15 +18885,11 @@ mod tests {
 
         drop(guard_a);
 
-        assert_eq!(
-            pool.in_flight
-                .lock()
-                .unwrap()
-                .by_key
-                .get(&key)
-                .map(|execution| execution.leader.clone()),
-            Some(leader_b.clone())
-        );
+        {
+            let registry = pool.in_flight.lock().unwrap();
+            assert!(!registry.by_key.contains_key(&key));
+            assert!(registry.by_key.contains_key(&key_b));
+        }
         assert!(tokio::time::timeout(Duration::from_millis(10), &mut rx_b)
             .await
             .is_err());
@@ -18744,7 +18898,7 @@ mod tests {
             request_id: leader_b.0.clone(),
             attempt_id: leader_b.1.clone(),
         };
-        assert!(pool.complete_coalesced_for_leader(&key, &leader_b, completed.clone()));
+        assert!(pool.complete_coalesced_for_leader(&key_b, completed.clone()));
         assert_eq!(
             rx_b.await.unwrap().unwrap().outcome,
             restamp_outcome(&completed, &subscriber_b)
@@ -18756,27 +18910,21 @@ mod tests {
         let pool = Fleet::default();
         let leader = ("leader".to_string(), "attempt".to_string());
         let subscriber = ("subscriber".to_string(), "attempt".to_string());
-        let key = result_identity();
+        let key = CoalescingKey::new(result_identity(), leader.clone());
         let (tx, rx) = oneshot::channel();
         {
             let mut registry = pool.in_flight.lock().unwrap();
-            registry
-                .subscriber_keys
-                .insert(subscriber.clone(), key.clone());
-            registry.by_key.insert(
+            registry.open(
                 key.clone(),
-                InFlightExecution {
-                    leader: leader.clone(),
-                    subscribers: HashMap::from([(
-                        subscriber.clone(),
-                        CoalescedSubscriber {
-                            waiter: tx,
-                            priority: CellPriority::ReviewCheck,
-                            requesting_job_id: None,
-                        },
-                    )]),
-                    publication: PublicationCoordination::new(),
-                },
+                PlacementDemand::default(),
+                HashMap::from([(
+                    subscriber.clone(),
+                    CoalescedSubscriber {
+                        waiter: tx,
+                        priority: CellPriority::ReviewCheck,
+                        requesting_job_id: None,
+                    },
+                )]),
             );
         }
         let now = unix_time_ms();
@@ -18792,7 +18940,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(30)).await;
             completion_pool.complete_coalesced_for_leader(
                 &key,
-                &("leader".to_string(), "attempt".to_string()),
                 CellOutcome::Cancelled {
                     request_id: "leader".into(),
                     attempt_id: "attempt".into(),
@@ -18814,7 +18961,7 @@ mod tests {
         let generation = pool.attach_executor(sender);
         let leader = ("leader".to_string(), "attempt".to_string());
         let subscriber = ("subscriber".to_string(), "attempt".to_string());
-        let key = result_identity();
+        let key = CoalescingKey::new(result_identity(), leader.clone());
         let _pending_rx = claim_entry(&pool, &leader, COLOCATED_EXECUTOR_ID, generation, None);
         let now = unix_time_ms();
         assert!(pool.set_executor_snapshot(
@@ -18858,23 +19005,17 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         {
             let mut registry = pool.in_flight.lock().unwrap();
-            registry
-                .subscriber_keys
-                .insert(subscriber.clone(), key.clone());
-            registry.by_key.insert(
+            registry.open(
                 key.clone(),
-                InFlightExecution {
-                    leader: leader.clone(),
-                    subscribers: HashMap::from([(
-                        subscriber.clone(),
-                        CoalescedSubscriber {
-                            waiter: tx,
-                            priority: CellPriority::ReviewCheck,
-                            requesting_job_id: None,
-                        },
-                    )]),
-                    publication: PublicationCoordination::new(),
-                },
+                PlacementDemand::default(),
+                HashMap::from([(
+                    subscriber.clone(),
+                    CoalescedSubscriber {
+                        waiter: tx,
+                        priority: CellPriority::ReviewCheck,
+                        requesting_job_id: None,
+                    },
+                )]),
             );
         }
         let completion_pool = pool.clone();
@@ -18882,7 +19023,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(30)).await;
             completion_pool.complete_coalesced_for_leader(
                 &key,
-                &leader,
                 CellOutcome::Cancelled {
                     request_id: leader.0.clone(),
                     attempt_id: leader.1.clone(),
@@ -27269,39 +27409,35 @@ mod tests {
     #[tokio::test]
     async fn coalesced_completion_fans_out_and_restamps_public_identities() {
         let pool = Fleet::default();
-        let publication = PublicationCoordination::new();
         let (first_tx, first_rx) = oneshot::channel();
         let (second_tx, second_rx) = oneshot::channel();
         let first = ("first".to_string(), "attempt-1".to_string());
         let second = ("second".to_string(), "attempt-2".to_string());
-        pool.in_flight.lock().unwrap().by_key.insert(
-            result_identity(),
-            InFlightExecution {
-                leader: first.clone(),
-                subscribers: HashMap::from([
-                    (
-                        first.clone(),
-                        CoalescedSubscriber {
-                            waiter: first_tx,
-                            priority: CellPriority::ReviewCheck,
-                            requesting_job_id: Some("job-a".into()),
-                        },
-                    ),
-                    (
-                        second.clone(),
-                        CoalescedSubscriber {
-                            waiter: second_tx,
-                            priority: CellPriority::WriteCheck,
-                            requesting_job_id: Some("job-b".into()),
-                        },
-                    ),
-                ]),
-                publication,
-            },
+        let key = CoalescingKey::new(result_identity(), first.clone());
+        pool.in_flight.lock().unwrap().open(
+            key.clone(),
+            PlacementDemand::default(),
+            HashMap::from([
+                (
+                    first.clone(),
+                    CoalescedSubscriber {
+                        waiter: first_tx,
+                        priority: CellPriority::ReviewCheck,
+                        requesting_job_id: Some("job-a".into()),
+                    },
+                ),
+                (
+                    second.clone(),
+                    CoalescedSubscriber {
+                        waiter: second_tx,
+                        priority: CellPriority::WriteCheck,
+                        requesting_job_id: Some("job-b".into()),
+                    },
+                ),
+            ]),
         );
         pool.complete_coalesced_for_leader(
-            &result_identity(),
-            &first,
+            &key,
             CellOutcome::Cancelled {
                 request_id: first.0.clone(),
                 attempt_id: first.1.clone(),
@@ -27352,34 +27488,29 @@ mod tests {
         let second = ("second".to_string(), "attempt-2".to_string());
         let (first_tx, _) = oneshot::channel();
         let (second_tx, _) = oneshot::channel();
-        let key = result_identity();
+        let key = CoalescingKey::new(result_identity(), first.clone());
         let mut registry = pool.in_flight.lock().unwrap();
-        registry.subscriber_keys.insert(first.clone(), key.clone());
-        registry.subscriber_keys.insert(second.clone(), key.clone());
-        registry.by_key.insert(
+        registry.open(
             key.clone(),
-            InFlightExecution {
-                leader: first.clone(),
-                subscribers: HashMap::from([
-                    (
-                        first.clone(),
-                        CoalescedSubscriber {
-                            waiter: first_tx,
-                            priority: CellPriority::ReviewCheck,
-                            requesting_job_id: Some("job-a".into()),
-                        },
-                    ),
-                    (
-                        second.clone(),
-                        CoalescedSubscriber {
-                            waiter: second_tx,
-                            priority: CellPriority::ReviewCheck,
-                            requesting_job_id: Some("job-b".into()),
-                        },
-                    ),
-                ]),
-                publication: PublicationCoordination::new(),
-            },
+            PlacementDemand::default(),
+            HashMap::from([
+                (
+                    first.clone(),
+                    CoalescedSubscriber {
+                        waiter: first_tx,
+                        priority: CellPriority::ReviewCheck,
+                        requesting_job_id: Some("job-a".into()),
+                    },
+                ),
+                (
+                    second.clone(),
+                    CoalescedSubscriber {
+                        waiter: second_tx,
+                        priority: CellPriority::ReviewCheck,
+                        requesting_job_id: Some("job-b".into()),
+                    },
+                ),
+            ]),
         );
         drop(registry);
         pool.coalesced_leaders.lock().unwrap().insert(first.clone());
@@ -27410,44 +27541,132 @@ mod tests {
         let (first_tx, _) = oneshot::channel();
         let (second_tx, _) = oneshot::channel();
         let mut registry = pool.in_flight.lock().unwrap();
-        registry
-            .subscriber_keys
-            .insert(first.clone(), result_identity());
-        registry
-            .subscriber_keys
-            .insert(second.clone(), result_identity());
-        registry.by_key.insert(
-            result_identity(),
-            InFlightExecution {
-                leader: first.clone(),
-                subscribers: HashMap::from([
-                    (
-                        first.clone(),
-                        CoalescedSubscriber {
-                            waiter: first_tx,
-                            priority: CellPriority::ReviewCheck,
-                            requesting_job_id: Some("job-a".into()),
-                        },
-                    ),
-                    (
-                        second.clone(),
-                        CoalescedSubscriber {
-                            waiter: second_tx,
-                            priority: CellPriority::ReviewCheck,
-                            requesting_job_id: Some("job-a".into()),
-                        },
-                    ),
-                ]),
-                publication: PublicationCoordination::new(),
-            },
+        let key = CoalescingKey::new(result_identity(), first.clone());
+        registry.open(
+            key.clone(),
+            PlacementDemand::default(),
+            HashMap::from([
+                (
+                    first.clone(),
+                    CoalescedSubscriber {
+                        waiter: first_tx,
+                        priority: CellPriority::ReviewCheck,
+                        requesting_job_id: Some("job-a".into()),
+                    },
+                ),
+                (
+                    second.clone(),
+                    CoalescedSubscriber {
+                        waiter: second_tx,
+                        priority: CellPriority::ReviewCheck,
+                        requesting_job_id: Some("job-a".into()),
+                    },
+                ),
+            ]),
         );
         drop(registry);
         pool.detach_coalesced_subscriber(&first, None);
         let registry = pool.in_flight.lock().unwrap();
-        assert_eq!(registry.by_key[&result_identity()].subscribers.len(), 1);
-        assert!(registry.by_key[&result_identity()]
-            .subscribers
-            .contains_key(&second));
+        assert_eq!(registry.by_key[&key].subscribers.len(), 1);
+        assert!(registry.by_key[&key].subscribers.contains_key(&second));
+    }
+
+    /// Admit `request` to `registry` the way both pure-verdict submission
+    /// paths do, as its own subscriber and would-be leader.
+    fn admit_request(
+        registry: &mut InFlightRegistry,
+        request: &CellRequest,
+    ) -> (CoalescingKey, bool) {
+        let identity = (request.request_id.clone(), request.attempt_id.clone());
+        let (waiter, _) = oneshot::channel();
+        registry.admit(
+            result_identity(),
+            &PlacementDemand::of(request),
+            &identity,
+            identity.clone(),
+            CoalescedSubscriber {
+                waiter,
+                priority: request.priority,
+                requesting_job_id: request.requesting_job_id.clone(),
+            },
+        )
+    }
+
+    fn check_request_on(id: &str, os: Option<&str>) -> CellRequest {
+        let mut request = provenance_request();
+        request.request_id = id.into();
+        request.attempt_id = format!("{id}-attempt");
+        if let Some(os) = os {
+            request.executor = Some(ExecutorSelector {
+                os: Some(os.into()),
+                ..ExecutorSelector::default()
+            });
+            request.verdict_platforms = vec![os.into()];
+        }
+        request
+    }
+
+    /// `cairn check run --os linux` and `--os macos` on one commit hash to the
+    /// same content identity. Each must lead its own execution, so that each
+    /// verdict is produced under the placement its own request demanded.
+    #[test]
+    fn requests_demanding_different_platforms_lead_separate_executions() {
+        let mut registry = InFlightRegistry::default();
+        let linux = check_request_on("linux", Some("linux"));
+        let macos = check_request_on("macos", Some("macos"));
+        let (linux_key, linux_opened) = admit_request(&mut registry, &linux);
+        let (macos_key, macos_opened) = admit_request(&mut registry, &macos);
+
+        assert!(linux_opened && macos_opened, "neither joins the other");
+        assert_ne!(linux_key, macos_key);
+        assert_eq!(linux_key.result, macos_key.result);
+        assert_eq!(registry.by_key.len(), 2);
+        for (key, request) in [(&linux_key, &linux), (&macos_key, &macos)] {
+            let execution = &registry.by_key[key];
+            assert_eq!(
+                key.leader,
+                (request.request_id.clone(), request.attempt_id.clone()),
+                "each request leads the execution it waits on"
+            );
+            assert_eq!(execution.demand, PlacementDemand::of(request));
+            assert_eq!(execution.subscribers.len(), 1);
+        }
+
+        // A later request for either platform joins the execution that
+        // demanded it, never the other one.
+        let (joined, opened) =
+            admit_request(&mut registry, &check_request_on("macos-2", Some("macos")));
+        assert!(!opened);
+        assert_eq!(joined, macos_key);
+    }
+
+    /// The existing behaviour stays: requests without a demand share one
+    /// execution, and a request without a demand may join one that has one.
+    #[test]
+    fn requests_without_a_platform_demand_still_coalesce() {
+        let mut registry = InFlightRegistry::default();
+        let (first_key, first_opened) =
+            admit_request(&mut registry, &check_request_on("first", None));
+        let (second_key, second_opened) =
+            admit_request(&mut registry, &check_request_on("second", None));
+        assert!(first_opened);
+        assert!(!second_opened);
+        assert_eq!(first_key, second_key);
+        assert_eq!(registry.by_key.len(), 1);
+        assert_eq!(registry.by_key[&first_key].subscribers.len(), 2);
+
+        // A linux demand cannot ride the unconstrained leader, but an
+        // unconstrained request may still ride a linux one.
+        let mut pinned_first = InFlightRegistry::default();
+        let (linux_key, _) =
+            admit_request(&mut pinned_first, &check_request_on("linux", Some("linux")));
+        let (anywhere_key, anywhere_opened) =
+            admit_request(&mut pinned_first, &check_request_on("anywhere", None));
+        assert!(!anywhere_opened);
+        assert_eq!(anywhere_key, linux_key);
+        let (_, linux_opened) =
+            admit_request(&mut registry, &check_request_on("linux", Some("linux")));
+        assert!(linux_opened);
     }
 
     /// Register one coalesced execution led by `leader`, with each of
@@ -27456,8 +27675,8 @@ mod tests {
         pool: &Fleet,
         leader: &RequestIdentity,
         subscribers: Vec<(RequestIdentity, oneshot::Sender<CoalescedDelivery>, &str)>,
-    ) -> CheckResultIdentity {
-        let key = result_identity();
+    ) -> CoalescingKey {
+        let key = CoalescingKey::new(result_identity(), leader.clone());
         let mut registry = pool.in_flight.lock().unwrap();
         let mut waiting = HashMap::new();
         for (identity, waiter, job) in subscribers {
@@ -27473,14 +27692,7 @@ mod tests {
                 },
             );
         }
-        registry.by_key.insert(
-            key.clone(),
-            InFlightExecution {
-                leader: leader.clone(),
-                subscribers: waiting,
-                publication: PublicationCoordination::new(),
-            },
-        );
+        registry.open(key.clone(), PlacementDemand::default(), waiting);
         drop(registry);
         pool.coalesced_leaders
             .lock()
@@ -27527,11 +27739,7 @@ mod tests {
         let mut request = provenance_request();
         request.request_id.clone_from(&wave.0);
         request.attempt_id.clone_from(&wave.1);
-        pool.complete_coalesced_for_leader(
-            &key,
-            &wave,
-            completed_for(&request, COLOCATED_EXECUTOR_ID, 1),
-        );
+        pool.complete_coalesced_for_leader(&key, completed_for(&request, COLOCATED_EXECUTOR_ID, 1));
         let delivered = manual_rx
             .await
             .expect("the sibling's waiter is answered")
@@ -27599,11 +27807,7 @@ mod tests {
         let mut request = provenance_request();
         request.request_id.clone_from(&leader.0);
         request.attempt_id.clone_from(&leader.1);
-        pool.complete_coalesced_for_leader(
-            &key,
-            &leader,
-            completed_for(&request, COLOCATED_EXECUTOR_ID, 1),
-        );
+        pool.complete_coalesced_for_leader(&key, completed_for(&request, COLOCATED_EXECUTOR_ID, 1));
         let delivered = follower_rx
             .await
             .unwrap()
@@ -27706,7 +27910,6 @@ mod tests {
         };
         pool.complete_coalesced_for_leader(
             &key,
-            &leader,
             LeaderSettlement::Settled {
                 outcome: CellOutcome::Cancelled {
                     request_id: leader.0.clone(),
@@ -27791,25 +27994,21 @@ mod tests {
         ));
         let leader = ("leader".to_string(), "attempt-1".to_string());
         let resubmitted = ("resubmitted".to_string(), "attempt-2".to_string());
-        let key = result_identity();
+        let key = CoalescingKey::new(result_identity(), leader.clone());
         let (first_tx, _first_rx) = oneshot::channel();
         {
             let mut registry = pool.in_flight.lock().unwrap();
-            registry.subscriber_keys.insert(leader.clone(), key.clone());
-            registry.by_key.insert(
+            registry.open(
                 key.clone(),
-                InFlightExecution {
-                    leader: leader.clone(),
-                    subscribers: HashMap::from([(
-                        leader.clone(),
-                        CoalescedSubscriber {
-                            waiter: first_tx,
-                            priority: CellPriority::ReviewCheck,
-                            requesting_job_id: Some("job".into()),
-                        },
-                    )]),
-                    publication: PublicationCoordination::new(),
-                },
+                PlacementDemand::default(),
+                HashMap::from([(
+                    leader.clone(),
+                    CoalescedSubscriber {
+                        waiter: first_tx,
+                        priority: CellPriority::ReviewCheck,
+                        requesting_job_id: Some("job".into()),
+                    },
+                )]),
             );
         }
         let _entry = claim_entry(
@@ -27829,23 +28028,22 @@ mod tests {
 
         let (resubmit_tx, _resubmit_rx) = oneshot::channel();
         let mut registry = pool.in_flight.lock().unwrap();
-        let retained_leader = {
-            let execution = registry
-                .by_key
-                .get_mut(&key)
-                .expect("the cancelling leader remains the coalescing authority");
-            execution.subscribers.insert(
-                resubmitted.clone(),
-                CoalescedSubscriber {
-                    waiter: resubmit_tx,
-                    priority: CellPriority::ReviewCheck,
-                    requesting_job_id: Some("job".into()),
-                },
-            );
-            execution.leader.clone()
-        };
-        registry.subscriber_keys.insert(resubmitted, key);
-        assert_eq!(retained_leader, leader);
+        let (joined, opened) = registry.admit(
+            result_identity(),
+            &PlacementDemand::default(),
+            &resubmitted,
+            resubmitted.clone(),
+            CoalescedSubscriber {
+                waiter: resubmit_tx,
+                priority: CellPriority::ReviewCheck,
+                requesting_job_id: Some("job".into()),
+            },
+        );
+        assert!(
+            !opened,
+            "the cancelling leader remains the coalescing authority"
+        );
+        assert_eq!(joined, key);
     }
 
     fn register_held_subscriber(
@@ -27854,27 +28052,19 @@ mod tests {
         identity: RequestIdentity,
         waiter: oneshot::Sender<CoalescedDelivery>,
         state: ExecutorSubstrateState,
-    ) -> CheckResultIdentity {
-        let key = result_identity();
-        pool.in_flight
-            .lock()
-            .unwrap()
-            .subscriber_keys
-            .insert(identity.clone(), key.clone());
-        pool.in_flight.lock().unwrap().by_key.insert(
+    ) -> CoalescingKey {
+        let key = CoalescingKey::new(result_identity(), identity.clone());
+        pool.in_flight.lock().unwrap().open(
             key.clone(),
-            InFlightExecution {
-                leader: identity.clone(),
-                subscribers: HashMap::from([(
-                    identity.clone(),
-                    CoalescedSubscriber {
-                        waiter,
-                        priority: CellPriority::ReviewCheck,
-                        requesting_job_id: Some("job".into()),
-                    },
-                )]),
-                publication: PublicationCoordination::new(),
-            },
+            PlacementDemand::default(),
+            HashMap::from([(
+                identity.clone(),
+                CoalescedSubscriber {
+                    waiter,
+                    priority: CellPriority::ReviewCheck,
+                    requesting_job_id: Some("job".into()),
+                },
+            )]),
         );
         let _pending_rx = claim_entry(
             pool,
@@ -27949,7 +28139,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(30)).await;
             completion_pool.complete_coalesced_for_leader(
                 &key,
-                &completed_identity,
                 CellOutcome::Cancelled {
                     request_id: completed_identity.0.clone(),
                     attempt_id: completed_identity.1.clone(),
@@ -27991,7 +28180,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(30)).await;
             completion_pool.complete_coalesced_for_leader(
                 &key,
-                &completed_identity,
                 CellOutcome::Cancelled {
                     request_id: completed_identity.0.clone(),
                     attempt_id: completed_identity.1.clone(),
@@ -28059,25 +28247,21 @@ mod tests {
     fn ownerless_preparing_leader_rewrites_stale_capacity_as_connected_stalled() {
         let pool = Fleet::default();
         let leader = ("leader".to_string(), "attempt".to_string());
-        let key = result_identity();
+        let key = CoalescingKey::new(result_identity(), leader.clone());
         let (tx, _rx) = oneshot::channel();
         {
             let mut registry = pool.in_flight.lock().unwrap();
-            registry.subscriber_keys.insert(leader.clone(), key.clone());
-            registry.by_key.insert(
+            registry.open(
                 key,
-                InFlightExecution {
-                    leader: leader.clone(),
-                    subscribers: HashMap::from([(
-                        leader.clone(),
-                        CoalescedSubscriber {
-                            waiter: tx,
-                            priority: CellPriority::ReviewCheck,
-                            requesting_job_id: Some("job".into()),
-                        },
-                    )]),
-                    publication: PublicationCoordination::new(),
-                },
+                PlacementDemand::default(),
+                HashMap::from([(
+                    leader.clone(),
+                    CoalescedSubscriber {
+                        waiter: tx,
+                        priority: CellPriority::ReviewCheck,
+                        requesting_job_id: Some("job".into()),
+                    },
+                )]),
             );
         }
         let last_progress_unix_ms =

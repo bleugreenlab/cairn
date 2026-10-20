@@ -599,3 +599,24 @@ fn linger_that_cannot_be_read_is_a_refusal_without_an_enable() {
     assert_eq!(refusal.cause, "loginctl is not available");
     assert_eq!(host.enable_calls.get(), 0);
 }
+
+/// A stop covers the current identity and the pre-rename one. One failing must
+/// not leave the other running, so every identity is attempted before the
+/// failures are reported together.
+#[test]
+fn stop_attempts_every_identity_before_reporting_a_failure() {
+    let mut attempted = Vec::new();
+    let error = stop_each(["computer.cairn.orch", "computer.cairn.runner"], |name| {
+        attempted.push(name.to_string());
+        if name == "computer.cairn.orch" {
+            Err("current bootout failed".into())
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap_err();
+
+    assert_eq!(attempted, ["computer.cairn.orch", "computer.cairn.runner"]);
+    assert_eq!(error, "current bootout failed");
+    assert_eq!(stop_each(["a", "b"], |_| Ok(())), Ok(()));
+}

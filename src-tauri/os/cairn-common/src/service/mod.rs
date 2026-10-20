@@ -867,6 +867,42 @@ pub fn uninstall(spec: &ServiceSpec) -> Result<(), String> {
     sys::uninstall(spec)
 }
 
+/// Stop the running service and keep its manager from restarting it, without
+/// removing the registration. The pre-rename identity is stopped too, so a
+/// mixed install cannot keep a second generation alive. A service that is not
+/// loaded is already stopped and is not an error.
+///
+/// This is the transient half of a stop: the next login or install starts the
+/// service again. What makes a person's stop durable is the marker in
+/// [`crate::operator_stop`], which the caller records first.
+///
+/// On Windows there is no supervisor to tell. The Run value acts only at logon,
+/// so the caller ends the running process itself.
+pub fn stop(spec: &ServiceSpec) -> Result<(), String> {
+    sys::stop(spec)
+}
+
+/// Stop each named identity, attempting every one before reporting, so one
+/// failure cannot leave a later identity running.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", test)),
+    allow(dead_code)
+)]
+fn stop_each<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    mut stop_one: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let errors: Vec<String> = names
+        .into_iter()
+        .filter_map(|name| stop_one(name).err())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 /// Bounce the installed service in place WITHOUT rewriting the unit file, so
 /// local edits survive and the restart is atomic where the platform allows it.
 /// Falls back to [`install`] when nothing is registered, so a repair path still

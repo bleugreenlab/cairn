@@ -71,40 +71,21 @@ pub(crate) async fn handle_read_batch(
         .as_deref()
         .filter(|_| !crate::dispatch::is_standalone_cli(request))
     {
-        for segment in &mut segments {
-            // Browser reads are snapshots of an interactive surface; repeating the
-            // same URI is an intentional poll/visual re-check, not flailing over
-            // a static resource. Always return the fresh browser read result.
-            if is_browser_resource_target(&segment.meta.uri)
-                || crate::dispatch::is_explicitly_paged_target(&segment.meta.uri)
-            {
-                continue;
-            }
-            // A `?wait` long-poll is an intentional repeated read of the same
-            // call URI until it resolves; consecutive pending results are
-            // identical by design, so it must bypass flail dedup.
-            if is_wait_poll_target(&segment.meta.uri) {
-                continue;
-            }
-            let fingerprint = format!("read_batch_target\u{1}{}", segment.meta.uri);
-            let hash = crate::dispatch::hash_content(&segment.body);
-            if let crate::agent_process::process::DedupOutcome::Duplicate {
-                count,
-                distinct_dupes,
-            } = orch
-                .process_state
-                .check_and_record_content(run_id, &fingerprint, hash)
-            {
-                let stub = crate::dispatch::build_dup_stub(
-                    "read",
-                    &segment.meta.uri,
-                    count,
-                    distinct_dupes,
-                );
-                let uri = segment.meta.uri.clone();
-                *segment = duplicate_segment(uri, stub);
-            }
-        }
+        // Deictic targets are classified on the resource they name, so the home
+        // is resolved once for the batch, and only when some target needs it. A
+        // failed lookup leaves deictic targets unresolved; their producer failed
+        // the same lookup, so each is already an error segment.
+        let home_uri = if segments
+            .iter()
+            .any(|segment| crate::resources::mutations::is_home_relative_target(&segment.meta.uri))
+        {
+            crate::mcp::handlers::run_context::lookup_home_uri_routed(&orch.db, request)
+                .await
+                .ok()
+        } else {
+            None
+        };
+        apply_flail_dedup(orch, run_id, home_uri.as_deref(), &mut segments);
     }
 
     // Session-scoped affordance collapse (CAIRN-2592): the full affordance block
@@ -218,32 +199,99 @@ fn is_cairn_resource_target(target: &str) -> bool {
     target.starts_with("cairn://") || target == "cairn:~" || target.starts_with("cairn:~/")
 }
 
+/// Per-target flail dedup over a produced batch (CAIRN-1271).
+///
+/// Each segment is keyed and classified by its CANONICAL target: a deictic
+/// `cairn:~`/`cairn:@` target is joined onto `home_uri` first, because the URI
+/// parser cannot read the deictic form and every exemption below is a parse.
+/// The stub still names the target as the agent typed it.
+fn apply_flail_dedup(
+    orch: &Orchestrator,
+    run_id: &str,
+    home_uri: Option<&str>,
+    segments: &mut [ReadSegment],
+) {
+    for segment in segments {
+        let target = home_uri
+            .and_then(|home| {
+                crate::resources::resolve_home_relative_against(home, &segment.meta.uri)
+            })
+            .unwrap_or_else(|| segment.meta.uri.clone());
+        if is_flail_dedup_exempt(&target) {
+            continue;
+        }
+        let fingerprint = format!("read_batch_target\u{1}{target}");
+        if let crate::agent_process::process::DedupOutcome::Duplicate {
+            count,
+            distinct_dupes,
+        } = orch.process_state.check_and_record_content(
+            run_id,
+            &fingerprint,
+            segment_content_hash(segment),
+        ) {
+            let stub =
+                crate::dispatch::build_dup_stub("read", &segment.meta.uri, count, distinct_dupes);
+            let uri = segment.meta.uri.clone();
+            *segment = duplicate_segment(uri, stub);
+        }
+    }
+}
+
+/// Targets whose repeated read is intentional rather than flailing.
+///
+/// Browser reads are snapshots of an interactive surface, so a repeat is a
+/// visual re-check of a page that may have changed. An explicitly paged read is
+/// navigation. A `?wait` long-poll repeats until it resolves, and its pending
+/// results are identical by design. `target` must be canonical.
+fn is_flail_dedup_exempt(target: &str) -> bool {
+    is_browser_resource_target(target)
+        || crate::dispatch::is_explicitly_paged_target(target)
+        || is_wait_poll_target(target)
+}
+
+/// The resource a canonical target names, normalized the way the dispatchers
+/// normalize it, so a thread home's descendants classify as the node-family
+/// resources they stand for.
+fn classify_resource(target: &str) -> Option<(CairnResource, Vec<QueryParam>)> {
+    let split = split_target_query(target).ok()?;
+    let resource =
+        crate::resources::delegate_thread_descendant(parse_uri(&split.identity)?).ok()?;
+    Some((resource, split.params))
+}
+
 fn is_browser_resource_target(target: &str) -> bool {
-    let Ok(split) = split_target_query(target) else {
-        return false;
-    };
     matches!(
-        parse_uri(&split.identity),
-        Some(CairnResource::NodeBrowser { .. })
-            | Some(CairnResource::TaskBrowser { .. })
-            | Some(CairnResource::ProjectBrowser { .. })
+        classify_resource(target),
+        Some((
+            CairnResource::NodeBrowser { .. }
+                | CairnResource::TaskBrowser { .. }
+                | CairnResource::ProjectBrowser { .. },
+            _
+        ))
     )
 }
 
 /// A `?wait` long-poll on a call/task-artifact URI (the harness `agent()`
-/// await). Repeated reads of the same URI are intentional polling, not flailing,
-/// so this target bypasses the batch dedup.
+/// await).
 fn is_wait_poll_target(target: &str) -> bool {
-    let Ok(split) = split_target_query(target) else {
-        return false;
-    };
-    if !split.params.iter().any(|p| p.key == "wait") {
-        return false;
-    }
     matches!(
-        parse_uri(&split.identity),
-        Some(CairnResource::TaskArtifact { .. })
+        classify_resource(target),
+        Some((CairnResource::TaskArtifact { .. }, params)) if params.iter().any(|p| p.key == "wait")
     )
+}
+
+/// Everything a segment returns to the agent, hashed: the body and every image
+/// block. A read whose content lives partly outside the body (a screenshot, an
+/// image file) must not be judged unchanged on its text alone.
+fn segment_content_hash(segment: &ReadSegment) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    segment.body.hash(&mut hasher);
+    for image in &segment.images {
+        image.mime_type.hash(&mut hasher);
+        image.data.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Grep-family params peeled off a materialized body (web URL, terminal buffer)
@@ -1282,8 +1330,51 @@ mod tests {
         assert!(is_browser_resource_target(
             "cairn://p/X/1/1/builder/task/explore/browser/preview?screenshot"
         ));
+        // A thread home's browser parses as a thread sub-path; it is a browser
+        // once normalized the way the dispatchers normalize it.
+        assert!(is_browser_resource_target("cairn://p/X/devops/browser"));
+        assert!(is_browser_resource_target(
+            "cairn://p/X/devops/task/scout/browser?screenshot"
+        ));
         assert!(!is_browser_resource_target("cairn://p/X/1"));
         assert!(!is_browser_resource_target("file:src/lib.rs"));
+    }
+
+    /// The forms every doc teaches are home-relative, and the URI parser cannot
+    /// read them. The exemptions hold only for the canonical form the dedup pass
+    /// resolves them to, from every kind of home.
+    #[test]
+    fn home_relative_targets_are_exempt_on_their_canonical_form() {
+        let homes = [
+            "cairn://p/X/1/1/builder",
+            "cairn://p/X/1/1/builder/task/explore",
+            "cairn://p/X/devops",
+            "cairn://p/X/devops/task/scout",
+        ];
+        let exempt = |home: &str, target: &str| {
+            let canonical = crate::resources::resolve_home_relative_against(home, target)
+                .unwrap_or_else(|| panic!("{target} resolves against {home}"));
+            is_flail_dedup_exempt(&canonical)
+        };
+        for home in homes {
+            for target in [
+                "cairn:~/browser",
+                "cairn:~/browser?screenshot",
+                "cairn:~/browser?format=text",
+                "cairn:~/browser/preview?screenshot",
+            ] {
+                assert!(exempt(home, target), "{target} from {home}");
+            }
+            assert!(!exempt(home, "cairn:~/todos"), "todos from {home}");
+        }
+        assert!(exempt("cairn://p/X/1/1/builder", "cairn:@/browser/main"));
+
+        // A `?wait` long-poll on a task artifact, reached home-relatively.
+        let node = "cairn://p/X/1/1/builder";
+        assert!(exempt(node, "cairn:~/task/explore/result?wait"));
+        assert!(exempt(node, "cairn:~/task/explore/artifact?wait=30"));
+        assert!(!exempt(node, "cairn:~/task/explore/result"));
+        assert!(!exempt(node, "cairn:~/todos?wait"));
     }
 
     async fn read_batch_envelope(
@@ -1541,6 +1632,82 @@ mod tests {
         .await;
         assert!(second.text.contains("# Browser main"), "{}", second.text);
         assert!(!second.text.contains("[duplicate call]"), "{}", second.text);
+    }
+
+    /// The specimen: a headless screenshot is its url/title header alone, so
+    /// two captures hash equal however much the page changed between them. The
+    /// home-relative form must reach the browser exemption anyway.
+    #[tokio::test]
+    async fn read_batch_does_not_dedupe_repeated_home_relative_browser_reads() {
+        let orch = seeded_orch().await;
+        seed_home_run(&orch).await;
+        register_turn(&orch, "run-rb", "turn-rb");
+
+        for target in ["cairn:~/browser?screenshot", "cairn:~/browser"] {
+            for attempt in 0..2 {
+                let envelope =
+                    read_batch_envelope_for_run(&orch, serde_json::json!([target]), Some("run-rb"))
+                        .await;
+                assert_ne!(
+                    envelope.segments[0].kind,
+                    SegmentKind::Duplicate,
+                    "{target} read {attempt}: {}",
+                    envelope.text
+                );
+                assert!(
+                    !envelope.text.contains("[duplicate call]"),
+                    "{target} read {attempt}: {}",
+                    envelope.text
+                );
+                assert!(
+                    envelope.text.contains("# Browser default"),
+                    "{target} read {attempt}: {}",
+                    envelope.text
+                );
+            }
+        }
+    }
+
+    /// Whether a segment changed is a question about everything it returns. An
+    /// image-bearing read with an unchanged body and new pixels is fresh; the
+    /// same pixels again are a real duplicate.
+    #[tokio::test]
+    async fn flail_dedup_hashes_image_blocks_alongside_the_body() {
+        let orch = seeded_orch().await;
+        register_turn(&orch, "run-img", "turn-img");
+        let target = "cairn://p/RB/images/fixture";
+        let segment = |data: &str| {
+            let mut segment = ReadSegment::text(
+                "same header",
+                SegmentMeta::new(target, SegmentKind::Resource, NaturalUnit::Line),
+            );
+            segment
+                .images
+                .push(cairn_common::read::ImageBlock::inline("image/png", data));
+            segment
+        };
+        let dedup = |data: &str| {
+            let mut segments = vec![segment(data)];
+            apply_flail_dedup(&orch, "run-img", None, &mut segments);
+            segments.remove(0)
+        };
+
+        let first = dedup("pixels-before");
+        assert_eq!(first.meta.kind, SegmentKind::Resource);
+        assert_eq!(first.images.len(), 1);
+
+        let changed = dedup("pixels-after");
+        assert_eq!(changed.meta.kind, SegmentKind::Resource, "{}", changed.body);
+        assert_eq!(changed.images[0].data, "pixels-after");
+
+        let repeated = dedup("pixels-after");
+        assert_eq!(repeated.meta.kind, SegmentKind::Duplicate);
+        assert!(
+            repeated.body.contains("[duplicate call]"),
+            "{}",
+            repeated.body
+        );
+        assert!(repeated.images.is_empty());
     }
 
     #[tokio::test]

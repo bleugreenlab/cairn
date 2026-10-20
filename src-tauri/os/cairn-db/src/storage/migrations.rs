@@ -113,6 +113,15 @@ macro_rules! private_ref_store_maintenance {
     };
 }
 
+/// cairn/5194: the runner's own lifecycle facts (runtime stalls, executor
+/// generations attaching and detaching, link resets, listener restages) as
+/// rows. Facts about this runner process and this machine's links, so private.
+macro_rules! private_runner_events {
+    () => {
+        migration!("0274_runner_events")
+    };
+}
+
 /// cairn/5085: the shape of each store's Git object database beside its refs,
 /// and the `compact` rows of its geometric compaction. Rebuilds the
 /// private-only `ref_store_samples` to widen its `kind` CHECK.
@@ -263,6 +272,15 @@ macro_rules! shared_tail_pr_publish_attempts {
 macro_rules! shared_tail_sibling_job_lookup_indexes {
     () => {
         migration!("0267_index_sibling_job_lookup")
+    };
+}
+
+/// cairn/5126: the artifact version each job was launched with, so a later
+/// revision reaches the job as a diff. A consumer job lives wherever its
+/// execution does, so the record is carried by both lineages.
+macro_rules! shared_tail_job_artifact_inputs {
+    () => {
+        migration!("0275_job_artifact_inputs")
     };
 }
 
@@ -1508,6 +1526,7 @@ macro_rules! team_lineage {
             shared_tail_sibling_job_lookup_indexes!(),
             shared_tail_tenet_statements!(),
             shared_tail_check_observation_platform_relabels!(),
+            shared_tail_job_artifact_inputs!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1785,6 +1804,8 @@ macro_rules! private_lineage {
             shared_tail_tenet_statements!(),
             shared_tail_check_observation_platform_relabels!(),
             private_subscription_periods!(),
+            private_runner_events!(),
+            shared_tail_job_artifact_inputs!(),
         ]
     };
 }
@@ -2075,6 +2096,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "ref_store_maintenance",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // The runner's own lifecycle facts: this process's stalls and this
+    // machine's executor links, meaningless on any other installation.
+    (
+        "runner_events",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     // ── ProjectScoped: the durable shared collaboration surface ──────────────
     ("action_configs", TableScope::ProjectScoped),
     ("action_runs", TableScope::ProjectScoped),
@@ -2115,6 +2142,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("checkpoint_command_cache", TableScope::ProjectScoped),
     ("checkpoint_runs", TableScope::ProjectScoped),
     ("pr_publish_attempts", TableScope::ProjectScoped),
+    ("job_artifact_inputs", TableScope::ProjectScoped),
     // A code map is a projection of a commit, not a fact about the work. Any
     // replica holding that commit rebuilds it locally in one walk, so shipping
     // the payload would be pure transfer for nothing.
@@ -2717,6 +2745,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "pr_publish_attempts",
         id_columns: &["id", "action_run_id"],
+    },
+    RekeyTableManifest {
+        table: "job_artifact_inputs",
+        id_columns: &["job_id", "producer_job_id"],
     },
     RekeyTableManifest {
         table: "comments",
@@ -3618,6 +3650,8 @@ mod tests {
                 "tenet_statements",
                 "check_observation_platform_relabels",
                 "subscription_periods",
+                "runner_events",
+                "job_artifact_inputs",
             ],
         );
     }
@@ -7147,6 +7181,7 @@ mod tests {
                 // cairn/5113: tenets become yes/no statements.
                 "tenet_statements",
                 "check_observation_platform_relabels",
+                "job_artifact_inputs",
             ],
         );
         assert_eq!(

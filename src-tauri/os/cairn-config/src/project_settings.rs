@@ -81,6 +81,52 @@ pub struct ProjectSettingsFile {
     pub mcp_servers: Option<HashMap<String, cairn_packs::server_config::McpServerConfig>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contextual_packages: Option<ContextualPackagesConfig>,
+    /// How the store lands work: which registry files merge by structure
+    /// rather than by lines. Read from the commit being landed onto, never from
+    /// the branch being landed, so no branch can change the rules it lands by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing: Option<LandingSettings>,
+}
+
+/// The `landing` section of `.cairn/config.yaml`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LandingSettings {
+    /// Paths whose conflicts the store settles structurally, first match wins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merge: Vec<LandingMergeRule>,
+}
+
+/// One declared structural merge: a merge kind and the path globs it covers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LandingMergeRule {
+    /// Repo-relative globs (`*` stays within a path segment, `**` crosses
+    /// them).
+    pub paths: Vec<String>,
+    /// The merge kind's wire name. Kept as written so a kind this build does
+    /// not know survives a settings round trip; [`LandingMergeRule::merge_kind`]
+    /// is the typed reading.
+    pub kind: String,
+}
+
+/// The structural merges the store knows how to perform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LandingMergeKind {
+    /// The elements of a list merge as a set in base order: both sides'
+    /// insertions are kept, an identical insertion once.
+    OrderedSet,
+}
+
+impl LandingMergeRule {
+    /// The kind this build can perform, or `None` for one it does not know,
+    /// whose paths keep the line merge.
+    pub fn merge_kind(&self) -> Option<LandingMergeKind> {
+        match self.kind.as_str() {
+            "ordered-set" => Some(LandingMergeKind::OrderedSet),
+            _ => None,
+        }
+    }
 }
 
 impl ProjectSettingsFile {
@@ -133,6 +179,8 @@ struct LegacyProjectSettingsFile {
     mcp_servers: Option<HashMap<String, cairn_packs::server_config::McpServerConfig>>,
     #[serde(default)]
     contextual_packages: Option<ContextualPackagesConfig>,
+    #[serde(default)]
+    landing: Option<LandingSettings>,
 }
 
 /// Legacy terminal command with persistent field
@@ -377,6 +425,7 @@ pub fn parse_project_settings(content: &str) -> Result<(ProjectSettingsFile, boo
         backends: legacy.backends,
         mcp_servers: legacy.mcp_servers,
         contextual_packages: legacy.contextual_packages,
+        landing: legacy.landing,
     };
 
     if let Some(policy) = &mut settings.contextual_packages {
@@ -469,6 +518,12 @@ pub fn checks_contract_from(file: ProjectSettingsFile) -> Option<ChecksContract>
     })
 }
 
+/// The landing rules carried by already-parsed settings; none declared is the
+/// empty set, under which every path keeps the line merge.
+pub fn landing_from(file: &ProjectSettingsFile) -> LandingSettings {
+    file.landing.clone().unwrap_or_default()
+}
+
 /// Managed top-level config keys: the current schema fields plus the legacy keys
 /// the migration removes. A top-level key on disk that is NOT in this set is a
 /// user-authored key the comment-preserving merge leaves untouched.
@@ -485,6 +540,7 @@ const MANAGED_TOP_LEVEL_KEYS: &[&str] = &[
     "backends",
     "mcpServers",
     "contextualPackages",
+    "landing",
     // Legacy keys the load-path migration strips.
     "ciCommands",
     "copyFiles",

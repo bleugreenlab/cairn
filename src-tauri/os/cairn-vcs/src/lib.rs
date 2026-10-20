@@ -8,6 +8,7 @@
 pub mod checkout;
 pub mod git;
 pub mod jj;
+pub mod parse_gate;
 
 use std::collections::HashMap;
 use std::path::Path;

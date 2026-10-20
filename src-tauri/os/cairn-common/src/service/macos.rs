@@ -121,6 +121,43 @@ pub fn uninstall(spec: &ServiceSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// `launchctl bootout` the job and its pre-rename label. Bootout both stops the
+/// process and removes the job from the GUI domain, so `KeepAlive` has nothing
+/// left to respawn until the next login or bootstrap.
+pub fn stop(spec: &ServiceSpec) -> Result<(), String> {
+    let domain = gui_domain();
+    let legacy = spec
+        .legacy
+        .as_ref()
+        .and_then(|legacy| legacy.label.as_deref());
+    super::stop_each(
+        std::iter::once(spec.label.as_str()).chain(legacy),
+        |label| {
+            let target = format!("{domain}/{label}");
+            let output = Command::new("launchctl")
+                .args(["bootout", &target])
+                .output()
+                .map_err(|error| format!("launchctl bootout {target}: {error}"))?;
+            if output.status.success() {
+                return Ok(());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let lower = stderr.to_lowercase();
+            if lower.contains("not bootstrapped")
+                || lower.contains("no such process")
+                || lower.contains("could not find")
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "launchctl bootout {target} failed: {}",
+                    stderr.trim()
+                ))
+            }
+        },
+    )
+}
+
 /// Bounce the launchd job in place with `launchctl kickstart -k` — no plist
 /// rewrite, no bootout/bootstrap flap. Falls back to a full [`install`] when the
 /// job is on disk but not bootstrapped in this GUI domain (kickstart then fails

@@ -112,6 +112,11 @@ pub fn conflicted_ancestry_refusal(
 /// agent, so it is never echoed. For a fold whose target advances out of band
 /// (the project default branch), callers use `rebase_then_fold_into`, which
 /// rebases first so this path is never reached.
+///
+/// This is the one primitive every store fold moves a target through, so it is
+/// where the landing parse gate lives: a fold whose tree would leave a file
+/// unparseable that parses on the target is refused before the bookmark moves
+/// (see [`landing_parse_refusal`]).
 pub fn merge_into_bookmark(
     jj: &JjEnv,
     store: &Path,
@@ -119,6 +124,9 @@ pub fn merge_into_bookmark(
     child_branch: &str,
 ) -> Result<(), String> {
     let child_rev = format!("bookmarks(exact:{child_branch:?})");
+    if let Some(refusal) = landing_parse_refusal(jj, store, integration_branch, child_branch) {
+        return Err(refusal);
+    }
     if let Err(e) = jj.run(
         store,
         &[
@@ -188,11 +196,18 @@ pub fn rebase_then_fold_into(
     match rebase_branch_onto(jj, store, source_branch, dest)? {
         RebaseOutcome::Rebased => {}
         RebaseOutcome::Conflicted { diagnostic } => {
+            if let Some(refusal) = &diagnostic.validation {
+                return Err(unparseable_landing_refusal(
+                    target_branch,
+                    source_branch,
+                    &refusal.failures,
+                ));
+            }
             return Err(base_conflict_refusal(
                 target_branch,
                 source_branch,
                 &diagnostic.conflicting_paths(),
-            ))
+            ));
         }
         RebaseOutcome::RebasedOverConflictedAncestry { paths } => {
             return Err(conflicted_ancestry_refusal(
@@ -318,7 +333,87 @@ pub fn squash_branch_onto(
     // so the project's `refs/heads/<branch>` tracks the squashed commit. The
     // restore minted a fresh commit id, so the expectation is read back from the
     // bookmark rather than assumed to be `squashed`.
-    export_bookmark_advance(jj, store, true, branch, "jj git export (squash)")
+    export_bookmark_advance(jj, store, true, branch, "jj git export (squash)")?;
+    // The repoint was sideways, so jj hid nothing: the branch's old commits are
+    // now reachable from no bookmark at all.
+    hide_superseded_history_logged(jj, store, branch, &source_tree_rev, base_rev);
+    Ok(())
+}
+
+/// Hide the history a rewrite of a branch superseded: the commits in
+/// `superseded`'s ancestry above `base` that nothing else still reaches.
+/// Returns how many were hidden.
+///
+/// jj hides what its own rebase rewrites, but a sideways bookmark move hides
+/// nothing, and any later step that touches a hidden commit (a workspace based
+/// on it, a bookmark set to it) makes its whole ancestry visible again. Left
+/// visible, each superseded commit is a divergent twin of its rewrite or an
+/// unreferenced head, and keeps its objects alive for good.
+///
+/// What is still anchored stays: a local bookmark, a tag, a working copy, or
+/// another visible head reaching the commit. The branch's own `@origin` copy is
+/// deliberately not an anchor: it names the pre-rewrite tip until the next push,
+/// exactly as it does after jj's own rebase hides that tip. Because every
+/// anchor's ancestry is excluded, no abandoned commit has a visible descendant
+/// left behind, so the abandon rebases nothing. The caller holds the store lock.
+pub(crate) fn hide_superseded_history(
+    jj: &JjEnv,
+    store: &Path,
+    superseded: &str,
+    base: &str,
+) -> Result<usize, String> {
+    let anchors =
+        format!("bookmarks() | tags() | working_copies() | (visible_heads() ~ ::({superseded}))");
+    let revset = format!("((::({superseded}) ~ ::({base})) & all()) ~ ::({anchors})");
+    let hidden = jj
+        .run(
+            store,
+            &[
+                "log",
+                "-r",
+                &revset,
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\"",
+                "--ignore-working-copy",
+            ],
+            "jj log (superseded history)",
+        )?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    if hidden == 0 {
+        return Ok(0);
+    }
+    run_store_rewrite(
+        jj,
+        store,
+        &["abandon", &revset, "--ignore-working-copy"],
+        "jj abandon (superseded history)",
+    )?;
+    Ok(hidden)
+}
+
+/// [`hide_superseded_history`] as the tail of a rewrite that already landed: a
+/// failure leaves only residue the store's own sweep collects, so it is logged
+/// rather than failing the rewrite.
+fn hide_superseded_history_logged(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    superseded: &str,
+    base: &str,
+) {
+    match hide_superseded_history(jj, store, superseded, base) {
+        Ok(0) => {}
+        Ok(hidden) => log::info!(
+            "jj: hid {hidden} commit(s) of `{branch}` superseded by its rewrite (old tip {superseded})"
+        ),
+        Err(error) => log::warn!(
+            "jj: could not hide the history of `{branch}` its rewrite superseded (old tip \
+             {superseded}); the store sweep will: {error}"
+        ),
+    }
 }
 
 /// Commit ids of the direct children of `rev` in the shared store. Used to
@@ -512,6 +607,12 @@ pub enum ConflictCondition {
     /// runner's private jj store, so no agent-side operation can move a branch's
     /// ancestry. The remedy is store-side.
     BaseDrift,
+    /// jj merged the two sides without recording a conflict, and the result
+    /// does not parse: a file both sides changed parsed on each of them and not
+    /// in the merge. Line merges cannot see syntax, so two appends to one list
+    /// can merge "cleanly" into a list closed twice. The remedy is the content
+    /// one, guided by the parser's first error rather than by markers.
+    Unparseable,
 }
 
 impl ConflictCondition {
@@ -520,6 +621,17 @@ impl ConflictCondition {
         match self {
             Self::ContentConflict => "content_conflict",
             Self::BaseDrift => "base_drift",
+            Self::Unparseable => "unparseable",
+        }
+    }
+
+    /// The condition a stored name means. A name this build does not know
+    /// reads as a content conflict, the condition whose remedy is always safe.
+    pub fn from_stored(name: &str) -> Self {
+        match name {
+            "base_drift" => Self::BaseDrift,
+            "unparseable" => Self::Unparseable,
+            _ => Self::ContentConflict,
         }
     }
 }
@@ -592,6 +704,11 @@ pub struct ConflictDiagnostic {
     /// `conflicted_tip` is that refused commit and the conflicting paths are the
     /// files both sides changed, since jj named none.
     pub scaffolding: Option<ScaffoldingRefusal>,
+    /// Set when jj recorded NO conflict but the rebased tree does not parse at
+    /// a path both sides changed (see [`ConflictCondition::Unparseable`]). Then
+    /// `conflicted_tip` is that refused commit and the conflicting paths are
+    /// exactly the files that failed to parse.
+    pub validation: Option<ValidationRefusal>,
 }
 
 /// A rebased tip refused at export because its tree root carried jj conflict
@@ -786,14 +903,21 @@ impl ResolutionCarry {
 
 /// Lay a carry plan's content into the rebased tip commit itself, the way
 /// `jj restore --into` does: the tip's own tree changes, and no commit is added
-/// above it. Text content is first sealed into a scratch commit off `pre_tip`,
-/// because jj restores trees between commits and has no way to write bytes at
-/// a revision; the scratch commit is abandoned once its tree has been copied.
+/// above it. Text content is first sealed into a scratch commit, because jj
+/// restores trees between commits and has no way to write bytes at a revision;
+/// the scratch commit is abandoned once its tree has been copied.
+///
+/// The scratch is based on `dest`, never on `pre_tip`. Only the carried paths
+/// are read back out of it, so its base is immaterial, but its visibility is
+/// not: the rebase has just hidden `pre_tip`, and a workspace based on a hidden
+/// commit makes that commit and its whole ancestry visible again, as a divergent
+/// twin of every commit the replay rewrote.
 fn apply_resolution_carry(
     jj: &JjEnv,
     store: &Path,
     branch: &str,
     pre_tip: &str,
+    dest: &str,
     carry: &ResolutionCarry,
 ) -> Result<(), String> {
     let branch_revset = format!("bookmarks(exact:{branch:?})");
@@ -840,7 +964,7 @@ fn apply_resolution_carry(
         return Ok(());
     }
     let text_paths: Vec<&str> = texts.iter().map(|(path, _)| *path).collect();
-    let scratch = with_transient_workspace(jj, store, pre_tip, |workspace| {
+    let scratch = with_transient_workspace(jj, store, dest, |workspace| {
         for (path, text) in &texts {
             let target = workspace.join(path);
             if let Some(parent) = target.parent() {
@@ -1057,7 +1181,7 @@ pub(crate) fn rebase_branch_onto_with_resolution(
         let resolution = pre_tip
             .as_deref()
             .ok_or_else(|| format!("resolved rebase: branch `{branch}` had no pre-rebase tip"))?;
-        if let Err(error) = apply_resolution_carry(jj, store, branch, resolution, carry) {
+        if let Err(error) = apply_resolution_carry(jj, store, branch, resolution, dest, carry) {
             return Err(roll_back_rebase(
                 jj,
                 store,
@@ -1122,6 +1246,44 @@ pub(crate) fn rebase_branch_onto_with_resolution(
         return Ok(RebaseOutcome::Conflicted { diagnostic });
     }
 
+    // jj called the merge clean, which is a statement about lines, not syntax.
+    // Every file both sides changed must still parse before the tip can be
+    // exported; one that parsed on each side and not in the merge is refused
+    // and rolled back exactly as a recorded conflict is.
+    let post_tip = bookmark_commit(jj, store, branch);
+    let selection = match (pre_tip.as_deref(), post_tip.as_deref()) {
+        (Some(pre), Some(post)) if pre != post => {
+            Some(rebase_side_selection(jj, store, dest, pre, post))
+        }
+        _ => None,
+    };
+    if let (Some(selection), Some(pre), Some(post)) =
+        (selection.as_ref(), pre_tip.as_deref(), post_tip.as_deref())
+    {
+        let failures =
+            introduced_parse_failures(jj, store, post, &[pre, dest], &selection.overlapping);
+        if !failures.is_empty() {
+            let paths: Vec<String> = failures
+                .iter()
+                .map(|failure| failure.path.clone())
+                .collect();
+            let mut diagnostic =
+                capture_conflict_diagnostic(jj, store, branch, dest, Some(pre), paths);
+            diagnostic.condition = ConflictCondition::Unparseable;
+            diagnostic.validation = Some(ValidationRefusal {
+                commit: post.to_string(),
+                failures: failures.clone(),
+            });
+            roll_back_conflicting_rebase(jj, store, branch, dest, &pre_op)?;
+            log::warn!(
+                "jj rebase: `{branch}` onto `{dest}` merged without a recorded conflict into \
+                 {post}, which does not parse; rolled back to {pre} and recorded as a conflict.\n{}",
+                render_failures(&failures)
+            );
+            return Ok(RebaseOutcome::Conflicted { diagnostic });
+        }
+    }
+
     reached_step("rebase: before export");
     match export_bookmark_advance_guarded(jj, store, true, branch, "jj git export (rebase)") {
         Ok(()) => {}
@@ -1183,6 +1345,9 @@ pub(crate) fn rebase_branch_onto_with_resolution(
             ));
         }
     }
+    if let Some(pre_tip) = pre_tip.as_deref() {
+        hide_superseded_history_logged(jj, store, branch, pre_tip, dest);
+    }
 
     // A clean TIP is not a clean branch. Enumerate the whole rebased range: a
     // conflict-flagged ancestor is invisible to `branch_has_conflict` and would
@@ -1220,14 +1385,10 @@ pub(crate) fn rebase_branch_onto_with_resolution(
     // the same region jj can pick a winner and record no conflict at all, and the
     // branch's version is simply gone from a tree that looks perfectly ordinary.
     // Prevention is not proven here; detection in the log is.
-    if let (Some(pre_tip), Some(post_tip)) = (
-        pre_tip.as_deref(),
-        bookmark_commit(jj, store, branch).as_deref(),
-    ) {
-        if pre_tip != post_tip {
-            let selection = rebase_side_selection(jj, store, dest, pre_tip, post_tip);
-            log_rebase_side_selection(branch, dest, pre_tip, post_tip, &selection);
-        }
+    if let (Some(selection), Some(pre_tip), Some(post_tip)) =
+        (selection.as_ref(), pre_tip.as_deref(), post_tip.as_deref())
+    {
+        log_rebase_side_selection(branch, dest, pre_tip, post_tip, selection);
     }
     Ok(RebaseOutcome::Rebased)
 }
@@ -1396,6 +1557,7 @@ pub(crate) fn capture_conflict_diagnostic(
         condition,
         incoming,
         scaffolding: None,
+        validation: None,
     }
 }
 

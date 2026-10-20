@@ -508,8 +508,17 @@ async fn conflicted_name_section(
     if !crate::jj::is_jj_dir(&store) {
         return String::new();
     }
-    match crate::jj::assess_conflicted_bookmark_name(&jj, &store, branch) {
-        Ok(Some((conflict, outlook))) => render_conflicted_name(&conflict, &outlook),
+    // The base names the column that says which version sits on the newer
+    // base; without it the table still renders, just without that column.
+    let base_branch = match load_base_candidates(conn, job_id).await {
+        Ok(candidates) => match resolve_base(&jj, &store, branch, &candidates) {
+            Ok(resolved) => Some(resolved.branch),
+            Err(_) => candidates.recorded.or(candidates.project_default),
+        },
+        Err(_) => None,
+    };
+    match crate::jj::assess_conflicted_bookmark_name(&jj, &store, branch, base_branch.as_deref()) {
+        Ok(Some(assessment)) => render_conflicted_name(&assessment),
         Ok(None) => String::new(),
         Err(error) => {
             log::warn!(
@@ -520,30 +529,48 @@ async fn conflicted_name_section(
     }
 }
 
-fn render_conflicted_name(
-    conflict: &crate::jj::ConflictedBookmark,
-    outlook: &crate::jj::ConflictedNameOutlook,
-) -> String {
+fn render_conflicted_name(assessment: &crate::jj::ConflictedNameAssessment) -> String {
+    let crate::jj::ConflictedNameAssessment {
+        conflict,
+        bases,
+        outlook,
+    } = assessment;
     let cell = |text: &str| text.replace('|', "\\|");
     let mut out = format!(
         "# Branch name is conflicted\n\nThe store records {} versions of `{}`, so no read, write, \
          or replay can use the name until they are combined. Nothing has been discarded: every \
-         version is still readable by its commit id.\n\n| | commit | change | description |\n|---|---|---|---|\n",
+         version is still readable by its commit id.\n\n| | commit | change | base | description \
+         |\n|---|---|---|---|---|\n",
         conflict.added.len(),
         conflict.branch,
     );
-    for (role, targets) in [
-        ("moved away from", &conflict.removed),
-        ("version", &conflict.added),
-    ] {
-        for target in targets {
-            out.push_str(&format!(
-                "| {role} | `{}` | `{}` | {} |\n",
-                target.commit,
-                target.change,
-                cell(&target.description)
-            ));
-        }
+    for target in &conflict.removed {
+        out.push_str(&format!(
+            "| moved away from | `{}` | `{}` | | {} |\n",
+            target.commit,
+            target.change,
+            cell(&target.description)
+        ));
+    }
+    for (index, target) in conflict.added.iter().enumerate() {
+        let base = match bases.get(index) {
+            Some(Some(base)) => format!(
+                "`{}`{}{}",
+                base.commit,
+                base.pull_request
+                    .map(|pr| format!(" (#{pr})"))
+                    .unwrap_or_default(),
+                if base.newest { ", newest" } else { "" }
+            ),
+            Some(None) => "unknown".to_string(),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "| version | `{}` | `{}` | {base} | {} |\n",
+            target.commit,
+            target.change,
+            cell(&target.description)
+        ));
     }
     match outlook {
         crate::jj::ConflictedNameOutlook::Settleable { how, commands } => {
@@ -894,31 +921,53 @@ fn render_summary(
         )
     };
 
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let store = std::path::PathBuf::from(&session.store_path);
+
     let (condition, replay_payload) = if session.is_base_drift() {
         (
             "**Condition: base drift.** Every conflicting file is already byte-identical between your \
              branch and the new base, so there is nothing to merge — what is stale is your branch's \
              ANCESTRY. Editing files will not clear this, and you cannot repair it from your checkout: \
              slot refs are downstream exports of the runner's private jj store. Request the replay \
-             below.",
+             below."
+                .to_string(),
             "action:\"replay\"",
+        )
+    } else if session.is_unparseable() {
+        (
+            format!(
+                "**Condition: unparseable merge.** jj merged the two sides without a recorded \
+                 conflict, and the result does not parse, so the replay was rolled back.{} The \
+                 merged view below IS that unparseable text: do not commit it as is. Read both \
+                 sides of each file, write it so it holds both sides' changes and parses (after two \
+                 appends to one list, usually: one closing bracket, every entry inside it), commit \
+                 it on your branch, then request the replay below.",
+                unparseable_failures(&jj, &store, session)
+            ),
+            "action:\"replay\",resolution:\"take-committed-tip\"",
         )
     } else {
         (
             "**Condition: content conflict.** The two sides genuinely disagree. Read both versions of \
              each conflicting file, write the merged result with ordinary edits, and commit it on your \
              branch. Then request the replay below so the branch actually moves onto the base — \
-             resolving the content does not by itself change your branch's ancestry.",
+             resolving the content does not by itself change your branch's ancestry."
+                .to_string(),
             "action:\"replay\",resolution:\"take-committed-tip\"",
         )
+    };
+    let merged_warning = if session.is_unparseable() {
+        " **For this session the merged file is the defect: it does not parse. Do not commit it \
+         as is.**"
+    } else {
+        ""
     };
 
     // One store probe answers three questions: has the agent committed anything
     // since, does that commit already contain both sides, and would the
     // whole-file restore drop anything. Computed once so the sections below can
     // never disagree with each other or with the guard on the replay itself.
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let store = std::path::PathBuf::from(&session.store_path);
     let assessment = assess_session_tip(&jj, &store, session);
 
     format!(
@@ -929,7 +978,7 @@ fn render_summary(
          coordinates\n\n{coords}\nThese are immutable commits. Read any file as of either side \
          with `?branch=<commit>`, or read the merge:\n\n- `{base}?view=merged` — the two sides \
          merged line-wise, with everything non-overlapping already resolved. Add `file=PATH` for \
-         the complete merged file to commit.\n- `{base}?view=base-ours` — what your branch \
+         the complete merged file to commit.{merged_warning}\n- `{base}?view=base-ours` — what your branch \
          did\n- `{base}?view=base-theirs` — what arrived\n\nAll three accept `file=PATH`, \
          `offset=N`, and `limit=N`.\n{resolution_section}{conflicting_table}{dropped_section}{collision_section}{clean_table}\n## Next \
          action\n\n```\nwrite({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",payload:{{{replay_payload}}}}}]}})\n```\n\nThis \
@@ -956,6 +1005,53 @@ fn render_summary(
         recorded = crate::clock::stamp(session.updated_at)
             .unwrap_or_else(|| "at an unrecorded time".to_string()),
         replay_payload = replay_payload,
+        merged_warning = merged_warning,
+    )
+}
+
+/// The parser's first error in each conflicting file's line merge, recomputed
+/// from the session's three coordinates: a session stores its condition, not
+/// the failures that set it.
+fn unparseable_failures(
+    jj: &crate::jj::JjEnv,
+    store: &std::path::Path,
+    session: &ConflictSession,
+) -> String {
+    let (Some(base), Some(ours), Some(theirs)) = (
+        session.base.as_deref(),
+        session.ours.as_deref(),
+        session.theirs.as_deref(),
+    ) else {
+        return String::new();
+    };
+    let paths: Vec<String> = session
+        .conflicting()
+        .map(|file| file.path.clone())
+        .collect();
+    let failures: Vec<cairn_vcs::parse_gate::ParseFailure> =
+        crate::jj::read_sides_for_paths(jj, store, base, ours, theirs, &paths)
+            .into_iter()
+            .filter_map(|(path, sides)| {
+                let sides = sides.ok()?;
+                let merged = match crate::jj::merge_preview(
+                    sides.base.mergeable()?,
+                    sides.ours.mergeable()?,
+                    sides.theirs.mergeable()?,
+                ) {
+                    crate::jj::MergePreview::Clean(text) => text,
+                    crate::jj::MergePreview::Conflicted { .. } => return None,
+                };
+                cairn_vcs::parse_gate::parse_failure(&path, &merged)
+            })
+            .collect();
+    if failures.is_empty() {
+        return " The parser's errors could not be recomputed from the coordinates below; read \
+                the merged view of each conflicting file."
+            .to_string();
+    }
+    format!(
+        " The parser's first error in each file's line merge:\n\n{}\n",
+        crate::jj::render_failures(&failures)
     )
 }
 
@@ -1021,13 +1117,24 @@ fn render_merged(
         .unwrap_or_else(|| session.ours.clone().unwrap_or_default());
     let tip_moved = session.ours.as_deref() != Some(ours_rev.as_str());
 
-    match request.file {
+    let view = match request.file {
         Some(file) => render_merged_file(
             &jj, &store, base_rev, &ours_rev, theirs_rev, file, tip_moved, request, &uri,
         ),
         None => render_merged_overview(
             &jj, &store, base_rev, &ours_rev, theirs_rev, session, tip_moved, &uri,
         ),
+    };
+    if session.is_unparseable() {
+        // The line merge of an unparseable session reports no conflict, so
+        // nothing below looks wrong; it is the very text that was refused.
+        format!(
+            "> ⚠️ This session is an **unparseable merge**: the line merge below reports no \
+             conflict and does not parse. It is the defect, not a resolution: do not commit it \
+             as is. `{uri}` names the parser's first error in each file.\n\n{view}"
+        )
+    } else {
+        view
     }
 }
 
@@ -2024,19 +2131,28 @@ mod tests {
             ("c4e36dd2", "uvxqtrvw", "flatten"),
             ("f1c676bc", "sxznpoqz", "docs | protocol"),
         ]);
-        let page = render_conflicted_name(
-            &conflict,
-            &crate::jj::ConflictedNameOutlook::Settleable {
+        let page = render_conflicted_name(&crate::jj::ConflictedNameAssessment {
+            conflict,
+            bases: vec![
+                Some(crate::jj::VersionBase {
+                    commit: "ad06afa2".into(),
+                    description: "Newer thing (#4167)".into(),
+                    pull_request: Some(4167),
+                    newest: true,
+                }),
+                None,
+            ],
+            outlook: crate::jj::ConflictedNameOutlook::Settleable {
                 how: "replay 1 commit(s) of `f1c676bc` onto `c4e36dd2`".into(),
                 commands: vec!["jj -R '/store' --ignore-working-copy rebase -r '5dc58aff..f1c676bc' -d c4e36dd2".into()],
             },
-        );
+        });
 
         assert!(page.starts_with("# Branch name is conflicted"), "{page}");
         for line in [
-            "| moved away from | `5dc58aff` | `uvxqtrvw` | flatten |",
-            "| version | `c4e36dd2` | `uvxqtrvw` | flatten |",
-            "| version | `f1c676bc` | `sxznpoqz` | docs \\| protocol |",
+            "| moved away from | `5dc58aff` | `uvxqtrvw` | | flatten |",
+            "| version | `c4e36dd2` | `uvxqtrvw` | `ad06afa2` (#4167), newest | flatten |",
+            "| version | `f1c676bc` | `sxznpoqz` | unknown | docs \\| protocol |",
         ] {
             assert!(page.contains(line), "{page}");
         }
@@ -2066,14 +2182,15 @@ mod tests {
             conflict: conflict.clone(),
             reason: "neither version is a rewrite of the commit both moved away from".into(),
             commands: vec![
-                "# Keep aaaa1111 as the base and replay bbbb2222's own commits onto it (expected to replay cleanly)".into(),
-                "jj -R '/store' --ignore-working-copy rebase -r 'fork_point(aaaa1111|bbbb2222)..bbbb2222' -d aaaa1111".into(),
+                "# Keep aaaa1111 as the base and replay bbbb2222's own commits onto it (tried in memory: replays cleanly)".into(),
+                "jj -R '/store' --ignore-working-copy rebase -r '(aaaa1111..bbbb2222) ~ ::(bookmarks(~exact:\"agent/cairn-4966-builder-0\") | remote_bookmarks(~exact:\"agent/cairn-4966-builder-0\"))' -d aaaa1111".into(),
             ],
         };
-        let page = render_conflicted_name(
-            &conflict,
-            &crate::jj::ConflictedNameOutlook::Refused(Box::new(refusal.clone())),
-        );
+        let page = render_conflicted_name(&crate::jj::ConflictedNameAssessment {
+            conflict,
+            bases: Vec::new(),
+            outlook: crate::jj::ConflictedNameOutlook::Refused(Box::new(refusal.clone())),
+        });
 
         assert!(
             page.contains("**Not settleable automatically:** neither version is a rewrite"),

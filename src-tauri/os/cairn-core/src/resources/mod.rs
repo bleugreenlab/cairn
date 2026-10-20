@@ -50,7 +50,9 @@ mod workflows;
 
 pub(crate) use common::resolve_node_owner_id;
 pub(crate) use common::{connect_and_find_node_job, node_branch, node_job_not_found_message};
-pub(crate) use common::{pointer_affordance_block, resolve_home_relative_resource_uri};
+pub(crate) use common::{
+    pointer_affordance_block, resolve_home_relative_against, resolve_home_relative_resource_uri,
+};
 pub(crate) use node::{
     render_reseed_digest, reseed_verbatim_baseline_bytes, resolve_node_or_task_job_id,
     resolve_node_or_task_job_id_for_read,

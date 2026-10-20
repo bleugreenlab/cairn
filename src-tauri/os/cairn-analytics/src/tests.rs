@@ -867,9 +867,9 @@ fn point<'a>(
 async fn effective_cost_ratio_allocates_the_fee() {
     let db = cost_db().await;
     max_20x(&db, "acct-1").await;
-    // One claude assistant turn: 1M input + 1M output of sonnet =>
+    // One claude assistant turn: 1M input + 1M output of Sonnet 4.5 =>
     // list cost (1e6*3 + 1e6*15)/1e6 = $18.
-    seed_run(&db, "c", "claude", "sonnet").await;
+    seed_run(&db, "c", "claude", "claude-sonnet-4-5").await;
     add_event(
         &db,
         "c1",
@@ -938,7 +938,7 @@ async fn effective_cost_sums_to_fee_across_models() {
     max_20x(&db, "acct-1").await;
     // Two claude models in the same month roll up to one (month, backend)
     // point whose effective cost is exactly the fee.
-    seed_run(&db, "son", "claude", "sonnet").await;
+    seed_run(&db, "son", "claude", "claude-sonnet-4-5").await;
     seed_run(&db, "op", "claude", "opus").await;
     add_event(
         &db,
@@ -995,7 +995,7 @@ async fn effective_cost_backend_no_subscription_served_is_metered_at_list() {
     let db = cost_db().await;
     // Claude usage with no subscription account behind it (an API key) is
     // paid as used: list price passes through at ratio 1.
-    seed_run(&db, "c", "claude", "sonnet").await;
+    seed_run(&db, "c", "claude", "claude-sonnet-4-5").await;
     add_event(
         &db,
         "c1",
@@ -1028,7 +1028,7 @@ async fn effective_cost_two_max_20x_accounts_pay_for_two_subscriptions() {
     let db = cost_db().await;
     max_20x(&db, "acct-1").await;
     max_20x(&db, "acct-2").await;
-    seed_run(&db, "c", "claude", "sonnet").await;
+    seed_run(&db, "c", "claude", "claude-sonnet-4-5").await;
     add_event(
         &db,
         "c1",
@@ -1075,7 +1075,7 @@ async fn effective_cost_counts_a_removed_account_for_the_months_it_was_held() {
     )
     .await;
     let mar_2025 = FEB_2025 + 28 * 86_400;
-    seed_run(&db, "c", "claude", "sonnet").await;
+    seed_run(&db, "c", "claude", "claude-sonnet-4-5").await;
     for (id, ts) in [
         ("j", JAN_2025 + 100),
         ("f", FEB_2025 + 100),
@@ -1131,7 +1131,7 @@ async fn effective_cost_reports_an_unpriced_account_and_leaves_it_out_of_what_wa
         None,
     )
     .await;
-    seed_run(&db, "c", "claude", "sonnet").await;
+    seed_run(&db, "c", "claude", "claude-sonnet-4-5").await;
     add_event(
         &db,
         "c1",
@@ -1382,8 +1382,8 @@ async fn effective_cost_fine_buckets_inherit_month_ratio_and_sum_to_fee() {
     // Two claude turns in January on different days. At Day granularity each
     // day is its own point, both attributed to January, each inheriting
     // January's workspace ratio, and the day points sum to the flat fee.
-    seed_run(&db, "d1", "claude", "sonnet").await;
-    seed_run(&db, "d2", "claude", "sonnet").await;
+    seed_run(&db, "d1", "claude", "claude-sonnet-4-5").await;
+    seed_run(&db, "d2", "claude", "claude-sonnet-4-5").await;
     add_event(
         &db,
         "e1",
@@ -1536,7 +1536,7 @@ async fn model_role_economics_costs_match_the_shared_rule() {
     )
     .await;
     // No exact cost, priced model: the price table supplies the estimate.
-    seed_run(&db, "s", "claude", "sonnet").await;
+    seed_run(&db, "s", "claude", "claude-sonnet-4-5").await;
     add_event(&db, "s1", "s", "assistant", JAN_2025 + 20, 1000, 1000, None).await;
     // Neither: no recorded cost and a model the price table does not know.
     seed_run(&db, "u", "openrouter", "z-ai/glm-air").await;
@@ -1596,7 +1596,7 @@ async fn model_role_economics_costs_match_the_shared_rule() {
 async fn effective_cost_buckets_by_calendar_month_and_flags_provisional() {
     use chrono::{Datelike, TimeZone, Utc};
     let db = cost_db().await;
-    seed_run(&db, "c", "claude", "sonnet").await;
+    seed_run(&db, "c", "claude", "claude-sonnet-4-5").await;
     // One event in January, one in February: two distinct month buckets.
     add_event(&db, "j", "c", "assistant", JAN_2025 + 100, 1000, 1000, None).await;
     add_event(&db, "f", "c", "assistant", FEB_2025 + 100, 1000, 1000, None).await;
@@ -2483,7 +2483,7 @@ async fn per_event_rollup_matches_refold() {
     // Seed only dimension rows, then insert events through the real insert
     // seam so the per-event maintenance (not the fold) populates the rollup.
     let db = cost_db().await;
-    seed_run(&db, "a", "claude", "sonnet").await;
+    seed_run(&db, "a", "claude", "claude-sonnet-4-5").await;
     seed_run(&db, "b", "codex", "gpt-5").await;
     seed_run(&db, "c", "openrouter", "sonnet").await;
 
@@ -2600,7 +2600,7 @@ async fn per_event_rollup_matches_refold() {
 #[tokio::test]
 async fn hourly_bucket_serves_subday_window_from_rollup() {
     let db = cost_db().await;
-    seed_run(&db, "h", "claude", "sonnet").await;
+    seed_run(&db, "h", "claude", "claude-sonnet-4-5").await;
     // Three assistant turns one hour apart inside a 24h window. add_event
     // folds after each insert, so the hour rows are in the rollup. base is
     // hour-aligned so the rollup's bucket_start range filter includes the
@@ -2868,7 +2868,7 @@ async fn tool_error_rate_is_errors_over_total_per_bucket() {
 #[tokio::test]
 async fn usage_heatmap_applies_tz_offset_to_local_day() {
     let db = cost_db().await;
-    seed_run(&db, "h", "claude", "sonnet").await;
+    seed_run(&db, "h", "claude", "claude-sonnet-4-5").await;
     // 1970-01-04 (Sunday) 01:00:00 UTC = epoch 262800 (a whole-hour floor).
     // A claude assistant turn there: billable = input + output = 10 + 5 = 15.
     add_event(&db, "h1", "h", "assistant", 262800, 10, 5, None).await;
@@ -2893,7 +2893,7 @@ async fn usage_heatmap_applies_tz_offset_to_local_day() {
 #[tokio::test]
 async fn usage_heatmap_sums_billable_tokens_per_cell() {
     let db = cost_db().await;
-    seed_run(&db, "h", "claude", "sonnet").await;
+    seed_run(&db, "h", "claude", "claude-sonnet-4-5").await;
     // Two assistant turns in the same UTC hour (Sunday 01:00): 15 + 25 = 40.
     add_event(&db, "h1", "h", "assistant", 262800, 10, 5, None).await;
     add_event(&db, "h2", "h", "assistant", 262800 + 120, 20, 5, None).await;

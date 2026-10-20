@@ -162,9 +162,47 @@ pub(crate) async fn ensure_callback_reachable(callback_url: &str) -> bool {
 }
 
 pub(crate) fn print_unreachable_callback(callback_url: &str) {
-    eprintln!(
-        "cairn: requires a running Cairn runner or server at {callback_url} (set CAIRN_CALLBACK_URL to override)."
-    );
+    eprintln!("{}", unreachable_callback_message(callback_url));
+}
+
+pub(crate) fn unreachable_callback_message(callback_url: &str) -> String {
+    match operator_stop_explanation(callback_url) {
+        Some(refusal) => format!("cairn: {refusal}"),
+        None => format!(
+            "cairn: requires a running Cairn runner or server at {callback_url} (set CAIRN_CALLBACK_URL to override)."
+        ),
+    }
+}
+
+/// Why a local callback is not answering, when the reason is a person's stop.
+///
+/// A stopped orchestrator is a state someone chose, not a fault, and the useful
+/// answer names it and who can lift it. Only a loopback callback is explained
+/// this way: the stop recorded in this machine's Cairn home says nothing about
+/// a server elsewhere.
+pub(crate) fn operator_stop_explanation(callback_url: &str) -> Option<String> {
+    stop_explanation_for(
+        callback_url,
+        cairn_common::operator_stop::read(&cairn_common::paths::cairn_home()),
+        cairn_common::operator_stop::unix_time_ms(),
+    )
+}
+
+fn stop_explanation_for(
+    callback_url: &str,
+    stop: Option<cairn_common::operator_stop::OperatorStop>,
+    now_unix_ms: u64,
+) -> Option<String> {
+    let (host, _) = callback_host_port(callback_url)?;
+    let loopback = host == "localhost"
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !loopback {
+        return None;
+    }
+    stop.map(|stop| stop.refusal(now_unix_ms))
 }
 
 /// Parse a `ChangeInput` from a JSON object (with `changes`) or a bare array.
@@ -462,6 +500,27 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
     let machine = check_machine_clause(result, disposition)
         .map(|machine| format!(" · {machine}"))
         .unwrap_or_default();
+
+    // A verdict from a placement the request did not demand is not its
+    // answer, whatever it says about the tree, so it never renders as one.
+    if let Some(unmet) = result
+        .get("placementUnmet")
+        .and_then(serde_json::Value::as_str)
+    {
+        let observation = result
+            .get("observationRef")
+            .and_then(serde_json::Value::as_str)
+            .map(|reference| format!(" · {reference}"))
+            .unwrap_or_default();
+        return Ok((
+            format!(
+                "{cache}\n⚠ {suite} has no verdict for the placement you asked for on \
+                 {short_commit} ({disposition}){machine}{observation} — {unmet}. Run the \
+                 command again."
+            ),
+            false,
+        ));
+    }
 
     // A run that produced no verdict is a fact about Cairn, never a red against
     // the tree, so it renders from its own named cause instead of a ✗ line.
@@ -934,6 +993,35 @@ pub(crate) async fn run_cli_change(json: Option<String>, commit_msg: Option<Stri
 mod tests {
     use super::*;
 
+    /// While a person's stop stands, an agent or CLI call to the local runner
+    /// learns that state and who can lift it, not a connection error. A remote
+    /// callback is never explained by this machine's stop.
+    #[test]
+    fn a_local_runner_stopped_by_a_person_is_named_as_stopped() {
+        let stop = cairn_common::operator_stop::OperatorStop {
+            at_unix_ms: 1_000,
+            via: "the Cairn app's quit dialog".to_string(),
+        };
+        for local in [
+            "http://127.0.0.1:3849/api/mcp",
+            "http://localhost:3849/api/mcp",
+            "http://[::1]:3849/api/mcp",
+        ] {
+            let refusal = stop_explanation_for(local, Some(stop.clone()), 61_000)
+                .unwrap_or_else(|| panic!("{local} is the local runner"));
+            assert!(refusal.contains("is stopped"), "{refusal}");
+            assert!(refusal.contains("cairn-orch start"), "{refusal}");
+        }
+        assert_eq!(
+            stop_explanation_for("https://runner.example.com/api/mcp", Some(stop), 61_000),
+            None
+        );
+        assert_eq!(
+            stop_explanation_for("http://127.0.0.1:3849/api/mcp", None, 61_000),
+            None
+        );
+    }
+
     #[test]
     fn explicit_relay_callback_and_capability_win_unchanged() {
         let callback = "http://127.0.0.1:49152/api/mcp".to_string();
@@ -1273,6 +1361,37 @@ mod tests {
         assert!(
             noted.starts_with("batch pin os=windows not applied: no\ncache miss"),
             "{noted}"
+        );
+    }
+
+    /// A verdict produced for another placement than the one demanded never
+    /// reads as this request's fresh answer, and the command does not succeed.
+    #[test]
+    fn check_run_response_refuses_a_verdict_for_another_placement() {
+        let (rendered, ok) = render_check_run_response(
+            &serde_json::json!({
+                "ok": true,
+                "result": {
+                    "checkName": "rust-tests",
+                    "commitSha": "f69ed3b1ed36aa",
+                    "disposition": "unmet",
+                    "passed": false,
+                    "verified": false,
+                    "reusable": false,
+                    "observationRef": "cairn://p/cairn/check-observations/h",
+                    "executor": { "name": "fedora", "os": "linux" },
+                    "verdictPlatform": "linux",
+                    "placementUnmet": "this verdict was produced on fedora for linux, but this request counts only verdicts for macos",
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(!ok);
+        assert!(!rendered.contains("(fresh)"), "{rendered}");
+        assert!(
+            rendered.contains("⚠ rust-tests has no verdict for the placement you asked for on f69ed3b1ed36 (unmet) · fedora (linux) · cairn://p/cairn/check-observations/h — this verdict was produced on fedora for linux, but this request counts only verdicts for macos."),
+            "{rendered}"
         );
     }
 

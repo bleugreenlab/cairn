@@ -27,7 +27,20 @@ pub async fn get_latest_context_token_event(
                     AND i.event_type = 'system:init'
                     AND i.parent_tool_use_id IS NULL
                   ORDER BY i.created_at DESC, i.sequence DESC
-                  LIMIT 1) AS init_data
+                  LIMIT 1) AS init_data,
+                -- The latest result from the process the latest init started:
+                -- an older process's result may describe another model.
+                (SELECT r.data FROM events r
+                  WHERE r.session_id = e.session_id
+                    AND r.event_type LIKE 'result%'
+                    AND r.parent_tool_use_id IS NULL
+                    AND r.created_at >= COALESCE(
+                        (SELECT MAX(i.created_at) FROM events i
+                          WHERE i.session_id = e.session_id
+                            AND i.event_type = 'system:init'
+                            AND i.parent_tool_use_id IS NULL), 0)
+                  ORDER BY r.created_at DESC, r.sequence DESC
+                  LIMIT 1) AS result_data
          FROM events e
          LEFT JOIN runs r ON r.id = e.run_id
          LEFT JOIN sessions s ON s.id = e.session_id
@@ -49,17 +62,25 @@ pub async fn get_latest_context_token_event(
             let db_model = row.opt_text(3)?;
             let data = row.text(10)?;
             let init_data = row.opt_text(11)?;
-            // The effective-model rule (the live path applies it through
-            // `AgentProcessState::effective_model`): selected, else the model
-            // the provider reported at init, else the one this event names.
-            let model = db_model
-                .or_else(|| init_data.as_deref().and_then(extract_model_from_event_data))
+            let result_data = row.opt_text(12)?;
+            // What the provider named the model as: at init, else on this event.
+            let resolved_model = init_data
+                .as_deref()
+                .and_then(extract_model_from_event_data)
                 .or_else(|| extract_model_from_event_data(&data));
+            // The effective-model rule (the live path applies it through
+            // `AgentProcessState::effective_model`): selected, else resolved.
+            let model = db_model.or_else(|| resolved_model.clone());
+            let model_usage = result_data
+                .and_then(|data| serde_json::from_str::<Value>(&data).ok())
+                .and_then(|data| data.pointer("/raw/modelUsage").cloned());
             Ok(ContextTokenEventSnapshot {
                 run_id: row.text(0)?,
                 session_id: row.text(1)?,
                 backend: row.text(2)?.to_ascii_lowercase(),
                 model,
+                resolved_model,
+                model_usage,
                 input_tokens: row.opt_i64(4)?,
                 cache_read_tokens: row.opt_i64(5)?,
                 cache_create_tokens: row.opt_i64(6)?,
@@ -149,6 +170,50 @@ mod tests {
             .unwrap();
         assert_eq!(event.model.as_deref(), Some("init-model"));
         assert_eq!(event.captured_at, 10);
+        // The only result so far carries no per-model report.
+        assert_eq!(event.model_usage, None);
+
+        // A result after the init carries the CLI's per-model report.
+        db.execute_script(
+            r#"
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                parent_tool_use_id, created_at)
+              VALUES
+                ('result-2', 'ctx-run', 'ctx-session', 7, 15, 'result:success',
+                 '{"raw":{"modelUsage":{"init-model":{"contextWindow":1000000}}}}', NULL, 15),
+                ('child-result', 'ctx-run', 'ctx-session', 8, 16, 'result:success',
+                 '{"raw":{"modelUsage":{"child-model":{"contextWindow":200000}}}}', 'tool', 16);
+        "#,
+        )
+        .await
+        .unwrap();
+        let event = get_latest_context_token_event(db.clone(), "ctx-session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            event.model_usage,
+            Some(serde_json::json!({"init-model": {"contextWindow": 1000000}}))
+        );
+        assert_eq!(event.resolved_model.as_deref(), Some("init-model"));
+
+        // A later process's init makes that result an earlier process's.
+        db.execute_script(
+            r#"
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                parent_tool_use_id, created_at)
+              VALUES ('init-2', 'ctx-run', 'ctx-session', 9, 20, 'system:init',
+                '{"raw":{"model":"init-model-2"}}', NULL, 20);
+        "#,
+        )
+        .await
+        .unwrap();
+        let event = get_latest_context_token_event(db.clone(), "ctx-session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.resolved_model.as_deref(), Some("init-model-2"));
+        assert_eq!(event.model_usage, None);
 
         // The selected model wins over everything the provider reported.
         db.execute_script("UPDATE jobs SET model = 'job-pinned-model' WHERE id = 'ctx-job'")
@@ -159,5 +224,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(event.model.as_deref(), Some("job-pinned-model"));
+        // The selection does not hide what the provider resolved it to.
+        assert_eq!(event.resolved_model.as_deref(), Some("init-model-2"));
     }
 }

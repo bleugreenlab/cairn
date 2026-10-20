@@ -895,6 +895,19 @@ pub(crate) async fn write_artifact_change(
         }
     }
 
+    // A job launched with an earlier version of this artifact hears about the
+    // new one. The write stays a pure edit: nothing is re-gated or restarted.
+    if let Some(name) = stored.output_name.as_deref() {
+        crate::execution::artifact_revisions::schedule_after_write(
+            orch,
+            &db,
+            &job_id,
+            name,
+            request.run_id.as_deref(),
+        )
+        .await;
+    }
+
     if should_arm_terminal_interrupt {
         arm_terminal_interrupt_for_job(orch, &job_id);
     }
