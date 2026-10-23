@@ -74,10 +74,10 @@ pub(crate) async fn job_residency_request(
             reclaim_grace_ms: JOB_EXECUTION_RECLAIM_GRACE_MS,
         },
         priority: CellPriority::AgentInteractive,
-        // The acquiring caller's horizon, not this function's. A batch that is
-        // acquiring its job's home before running has its own answer to how long
-        // that is worth waiting for, and acquiring the home is part of placing
-        // the batch rather than a precondition with a separate clock.
+        // The acquiring caller's horizon, not this function's. A `run` batch
+        // passes its ceiling rather than its declared budget: the home is the
+        // job's, and the budget measures the batch's own wait for room once the
+        // home is in hand.
         wait_horizon_unix_ms,
         waiting_since_unix_ms: waiting_since_unix_ms.min(crate::fleet::unix_time_ms()),
     })

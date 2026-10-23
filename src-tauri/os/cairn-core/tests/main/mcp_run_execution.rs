@@ -2711,6 +2711,27 @@ async fn explicit_timeout_kills_the_item_and_creates_no_terminal() {
     kill_all_sessions(&orch);
 }
 
+/// A declared timeout bounds the batch's wait for room, not the standing-up of
+/// its job's execution home. A cold job's first batch whose item declares far
+/// less time than provisioning takes (seconds on a loaded host) still reaches
+/// the machine instead of being refused at the horizon. The bound still has to
+/// cover the batch's own offer and claim on an idle machine, which is why it is
+/// a quarter second and not a millisecond.
+#[tokio::test]
+async fn a_declared_timeout_shorter_than_provisioning_still_places_a_cold_jobs_first_batch() {
+    let (_temp, _db, orch, cwd) = setup("run-cold-short").await;
+    let payload = json!({
+        "commands": [{ "command": "true", "timeout": 250 }],
+    });
+    let result = handle_run(&orch, &request(&cwd, Some("run-cold-short"), payload)).await;
+
+    assert!(
+        !result.contains("No commands ran") && !result.contains("could not execute"),
+        "provisioning the job's home was charged to the item's timeout: {result}"
+    );
+    kill_all_sessions(&orch);
+}
+
 /// The same contract inside a sub-task job, which used to get its own minted
 /// `run-N` terminal from the runner callback.
 #[tokio::test]

@@ -3518,20 +3518,40 @@ fn declared_capacity_wait_budget(
     )))
 }
 
-/// The instant past which nobody is waiting for this batch.
+/// The batch ceiling as an instant: past it, nothing about this batch is wanted.
+///
+/// The authority that already cancels a batch which never ends, so no horizon
+/// derived for the batch ever reaches past it.
+fn batch_ceiling_horizon_unix_ms() -> u64 {
+    crate::fleet::unix_time_ms().saturating_add(RUN_BATCH_CEILING.as_millis() as u64)
+}
+
+/// The instant past which nobody is waiting for room for this batch.
 ///
 /// The one number both sides honour: the executor holds this batch's queue entry
 /// until here, and the runner waits for it until here. It is the batch's own
-/// declared bound when it made one, and the batch ceiling otherwise — the same
-/// authority that already cancels a batch which never ends, so a batch is never
-/// held for longer than something above it would allow anyway.
+/// declared bound when it made one, and the batch ceiling otherwise.
 ///
-/// Computed once, at the top of placement, and never refreshed. A refreshed
-/// horizon measures the attempt rather than the batch, which is exactly how a
-/// twenty-second queue budget came to stand in for an agent's real patience.
-fn batch_wait_horizon_unix_ms(payload: &RunPayload, sequential: bool) -> u64 {
-    let budget = declared_capacity_wait_budget(payload, sequential).unwrap_or(RUN_BATCH_CEILING);
-    crate::fleet::unix_time_ms().saturating_add(budget.as_millis() as u64)
+/// A declared bound counts from when the batch starts waiting for room, which
+/// is after its job's execution home is in hand, never from when the call
+/// arrived. Provisioning the home is not waiting for a busy machine: an idle
+/// host can take seconds to stand one up, and charging that to a batch whose
+/// items declared one second would refuse the batch with no contention
+/// anywhere.
+///
+/// Computed once per batch and never refreshed. A refreshed horizon measures
+/// the attempt rather than the batch, which is exactly how a twenty-second queue
+/// budget came to stand in for an agent's real patience.
+fn room_wait_horizon_unix_ms(
+    budget: Option<std::time::Duration>,
+    ceiling_horizon_unix_ms: u64,
+) -> u64 {
+    match budget {
+        Some(budget) => crate::fleet::unix_time_ms()
+            .saturating_add(budget.as_millis() as u64)
+            .min(ceiling_horizon_unix_ms),
+        None => ceiling_horizon_unix_ms,
+    }
 }
 
 /// Settle every process item's kill bound once, before the dispatch seam, so no
@@ -4118,6 +4138,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         if let Some((repository, base_commit, relative_cwd, mutation_policy)) = slot_target {
             let project_id = repository.project_id().to_string();
             let (command, command_class) = build_slot_command_parts(&resolved);
+            let ceiling_horizon_unix_ms = batch_ceiling_horizon_unix_ms();
             let template = CellRequest {
                 request_id: Uuid::new_v4().to_string(),
                 // Minted per attempt. A batch that waits for room is presented
@@ -4174,11 +4195,10 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 )
                 .collect(),
                 priority: CellPriority::AgentInteractive,
-                // Computed once, below, and carried unchanged by every
-                // presentation. Refreshing it per attempt would make the number
-                // measure the attempt instead of the batch, which is the drift
-                // the horizon exists to remove.
-                wait_horizon_unix_ms: batch_wait_horizon_unix_ms(&payload, sequential),
+                // The ceiling until the batch starts waiting for room, when
+                // `BatchPlacement::begin_waiting_for_room` narrows it to the
+                // batch's declared bound, once, for every later presentation.
+                wait_horizon_unix_ms: ceiling_horizon_unix_ms,
                 waiting_since_unix_ms: crate::fleet::unix_time_ms(),
                 timeout_ms: batch_execution_budget_ms(&resolved, sequential).into(),
                 mutation_policy,
@@ -4225,6 +4245,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 residence: batch_residence,
                 commit_present,
                 capacity_wait_budget: declared_capacity_wait_budget(&payload, sequential),
+                ceiling_horizon_unix_ms,
                 template,
             };
             let batch = ResolvedRunBatch {
@@ -5093,11 +5114,26 @@ struct BatchPlacement {
     /// Whether the batch declared a `commit_msg`, which decides whether its
     /// edits are kept or undone inside a shared execution home.
     commit_present: bool,
-    /// How long the agent itself allowed this batch to spend looking for room.
+    /// How long the agent itself allowed this batch to spend looking for room,
+    /// counted from [`BatchPlacement::begin_waiting_for_room`].
     capacity_wait_budget: Option<std::time::Duration>,
+    /// The batch ceiling as an instant, fixed when placement began. Acquiring
+    /// the job's execution home waits on this rather than on the declared
+    /// budget, and the declared horizon is capped by it.
+    ceiling_horizon_unix_ms: u64,
 }
 
 impl BatchPlacement {
+    /// Start the batch's own clock: from here its declared budget bounds how
+    /// long it waits for room, both in the executor's queue (the horizon every
+    /// later presentation carries) and across re-presentations (the returned
+    /// wait). Called once, when the batch first has the home it runs in.
+    fn begin_waiting_for_room(&mut self) -> CapacityWait {
+        self.template.wait_horizon_unix_ms =
+            room_wait_horizon_unix_ms(self.capacity_wait_budget, self.ceiling_horizon_unix_ms);
+        CapacityWait::new(self.capacity_wait_budget)
+    }
+
     /// One attempt at placing this batch: its own identity, and the execution
     /// home it just acquired.
     ///
@@ -5410,7 +5446,7 @@ async fn place_and_run_batch(
 /// `grant_without_result` every attempt a machine was granted and never answered.
 async fn place_and_run_attempts(
     orch: &Orchestrator,
-    placement: BatchPlacement,
+    mut placement: BatchPlacement,
     batch: ResolvedRunBatch,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     grant_without_result: &mut Option<crate::fleet::GrantWithoutResult>,
@@ -5422,7 +5458,12 @@ async fn place_and_run_attempts(
     // batch whose declared executor contradicts where it must run is answered
     // now, with the contradiction, rather than after a queue it was never going
     // to leave.
-    let mut wait = CapacityWait::new(placement.capacity_wait_budget);
+    //
+    // Until the home is in hand the batch is being provisioned, not waiting for
+    // room, so a capacity refusal of the acquisition itself is paced but bounded
+    // only by the ceiling. The batch's own wait begins with its first home.
+    let mut provisioning = CapacityWait::new(None);
+    let mut waiting_for_room: Option<CapacityWait> = None;
     // Learned from a home attempt placement refused because the home can never
     // hold this batch, and kept for every later attempt: a machine's size does
     // not change between them.
@@ -5440,21 +5481,26 @@ async fn place_and_run_attempts(
         }
         let fence = match placement.environment.as_ref() {
             None => None,
-            // Acquiring the home is part of placing this batch, so it waits on
-            // the batch's own horizon. A cold cell that legitimately takes
-            // minutes is then slow rather than refused.
+            // The home is the job's, shared with its terminals, REPLs, and
+            // later batches, so standing it up waits on the batch ceiling
+            // rather than on this batch's declared budget. A cold cell that
+            // legitimately takes minutes is then slow rather than refused, and
+            // a job whose batches all declare short timeouts still gets a home:
+            // an acquisition abandoned at a one-second bound is cancelled, and
+            // the next batch would only start it over.
             Some(environment) => match crate::fleet::residency::acquire_job_residency(
                 orch,
                 &environment.db,
                 &environment.job_id,
                 &environment.base_commit,
-                placement.template.wait_horizon_unix_ms,
+                placement.ceiling_horizon_unix_ms,
                 placement.template.waiting_since_unix_ms,
             )
             .await
             {
                 Ok(fence) => Some(fence),
                 Err(refusal) if refusal.verdict.is_capacity() => {
+                    let wait = waiting_for_room.as_mut().unwrap_or(&mut provisioning);
                     match wait.hold(&request_id, &refusal.diagnostic).await {
                         Ok(()) => continue,
                         Err(spent) => return PlacedBatch::NoRoom(spent),
@@ -5463,6 +5509,9 @@ async fn place_and_run_attempts(
                 Err(refusal) => return PlacedBatch::NoEnvironment(refusal.diagnostic),
             },
         };
+        if waiting_for_room.is_none() {
+            waiting_for_room = Some(placement.begin_waiting_for_room());
+        }
         let home = resolve_home_executor(orch, fence.as_ref());
         let residence = match placement
             .residence_for(orch, home.as_ref(), cannot_hold.as_ref())
@@ -5517,6 +5566,9 @@ async fn place_and_run_attempts(
             CellOutcome::Unavailable { diagnostic, .. } => diagnostic.clone(),
             _ => String::new(),
         };
+        let wait = waiting_for_room
+            .as_mut()
+            .expect("the batch began waiting for room before its first presentation");
         match wait.hold(&request_id, &diagnostic).await {
             Ok(()) => {}
             Err(spent) => return PlacedBatch::NoRoom(spent),
@@ -6997,6 +7049,7 @@ mod tests {
             residence: BatchResidence::Home,
             commit_present,
             capacity_wait_budget: None,
+            ceiling_horizon_unix_ms: u64::MAX,
         }
     }
 
@@ -7181,6 +7234,46 @@ mod tests {
     /// is the same class of disagreement that lost the original suite's output.
     fn payload(value: serde_json::Value) -> RunPayload {
         serde_json::from_value(value).expect("a run payload")
+    }
+
+    #[test]
+    fn a_declared_budget_counts_from_when_the_batch_starts_waiting_for_room() {
+        let mut placement = test_placement(false);
+        placement.capacity_wait_budget = Some(std::time::Duration::from_secs(1));
+        placement.ceiling_horizon_unix_ms = batch_ceiling_horizon_unix_ms();
+        placement.template.wait_horizon_unix_ms = placement.ceiling_horizon_unix_ms;
+        // Provisioning time passes before the home is in hand. None of it may
+        // come out of the declared second.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let before = crate::fleet::unix_time_ms();
+        let wait = placement.begin_waiting_for_room();
+        let after = crate::fleet::unix_time_ms();
+        let horizon = placement.template.wait_horizon_unix_ms;
+        assert!(
+            (before + 1_000..=after + 1_000).contains(&horizon),
+            "horizon {horizon} not one second from [{before}, {after}]"
+        );
+        assert_eq!(wait.budget, Some(std::time::Duration::from_secs(1)));
+        // Every later presentation carries the same number.
+        let home = HomeExecutor {
+            executor_id: "local".into(),
+        };
+        let attempt = placement.attempt(Some(&home), true, BatchResidence::Home);
+        assert_eq!(attempt.wait_horizon_unix_ms, horizon);
+    }
+
+    #[test]
+    fn no_horizon_derived_for_a_batch_reaches_past_its_ceiling() {
+        let now = crate::fleet::unix_time_ms();
+        let ceiling = now + 500;
+        assert_eq!(
+            room_wait_horizon_unix_ms(Some(std::time::Duration::from_secs(60)), ceiling),
+            ceiling
+        );
+        assert_eq!(room_wait_horizon_unix_ms(None, ceiling), ceiling);
+        let declared =
+            room_wait_horizon_unix_ms(Some(std::time::Duration::from_millis(1)), now + 60_000);
+        assert!(declared < now + 60_000, "{declared}");
     }
 
     /// Waiting for room is bounded by what the agent itself declared, and only
