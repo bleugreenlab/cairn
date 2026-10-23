@@ -5038,6 +5038,15 @@ pub struct LearnedResourceEstimate {
 /// relays verbatim, and the exit status and every other field are untouched.
 /// What a runner gets wrong talking to an older executor: nothing; it relays a
 /// body without the paragraph.
+///
+/// cairn/5289 does not move the number. The executor now classifies a placed
+/// batch's Cargo dependency catalog from the batch's items, which already carry
+/// every command line it runs, rather than from [`CellRequest::command`], which
+/// for a batch is a display label of the items' headers. Nothing new is sent and
+/// the label is still sent and read as one. What a runner gets wrong talking to
+/// an older executor: nothing it would decode differently; that executor keeps
+/// classifying the label, and so prepares no catalog for a run batch, until
+/// the update directive brings it a build carrying this.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 157;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
@@ -6489,6 +6498,10 @@ pub struct CellRequest {
     pub project_id: String,
     pub repository: RepositoryLocator,
     pub base_commit: String,
+    /// The process a single-command request runs. For a request that carries a
+    /// [`ProcessBatch`], a display label only (the items' headers, which may be
+    /// an agent's descriptions): what runs, and what the dependency catalog is
+    /// classified from, is the batch's items.
     pub command: String,
     #[serde(default)]
     pub command_class: CellCommandClass,

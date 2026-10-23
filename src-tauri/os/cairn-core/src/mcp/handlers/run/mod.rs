@@ -3281,7 +3281,15 @@ use resolve::resolve_run_item;
 use types::ItemOutcome;
 pub(crate) use types::RunSpec;
 
-fn build_slot_command_parts(
+/// The command label and class a slot-bound batch's `CellRequest` carries.
+///
+/// The label is the items' headers, the agent's descriptions when it gave them,
+/// because the label is what the queue and the desktop show. It is never an
+/// executable command line: the executor runs, and classifies its dependency
+/// catalog from, the batch's items (`cairn_exec::dependency_catalog_launch`).
+/// The class alone is judged from the executable commands, since it is a
+/// placement input the label cannot answer.
+pub(crate) fn build_slot_command_parts(
     resolved: &[(String, Result<RunSpec, String>)],
 ) -> (String, cairn_common::executor_protocol::CellCommandClass) {
     let display_command = resolved

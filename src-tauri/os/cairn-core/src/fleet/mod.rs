@@ -19456,6 +19456,64 @@ mod tests {
     /// ten-minute cap, which is the exact case whose output the socket used to
     /// discard — an omitted bound must become the batch ceiling rather than any
     /// smaller default, and only the ceiling itself may shorten a request.
+    /// A run batch's request carries its items' descriptions as its command, and
+    /// the executor's dependency catalog must never classify that label. Both
+    /// halves of the crossing are asserted together: the label the queue and the
+    /// desktop read, and the Cargo item the executor selects from the serialized
+    /// batch. Classifying the label is how no run batch was ever offered a
+    /// catalog (cairn/5289).
+    #[test]
+    fn a_run_batch_hands_the_catalog_its_cargo_item_and_keeps_its_label_for_display() {
+        let resolved = vec![
+            (
+                "Warm up".to_string(),
+                Ok(RunSpec::Shell {
+                    command: "echo warm".into(),
+                    timeout: None,
+                    args: Vec::new(),
+                }),
+            ),
+            (
+                "Run exec tests".to_string(),
+                Ok(RunSpec::Shell {
+                    command: "cargo test -p cairn-exec".into(),
+                    timeout: None,
+                    args: Vec::new(),
+                }),
+            ),
+        ];
+        let (command, command_class) =
+            crate::mcp::handlers::run::build_slot_command_parts(&resolved);
+        let mut run_batch = resolved_process_batch(Vec::new(), true, true);
+        run_batch.resolved = resolved;
+        let batch = serialize_process_batch(
+            run_batch,
+            &[],
+            "runner-context".into(),
+            ProcessSandboxMode::Confined,
+            None,
+        )
+        .unwrap();
+        let mut request = provenance_request();
+        request.command = command;
+        request.command_class = command_class;
+
+        assert_eq!(request.command, "Warm up && Run exec tests");
+        assert_eq!(
+            request.command_class,
+            cairn_common::executor_protocol::CellCommandClass::CargoTest
+        );
+        let launch = cairn_exec::dependency_catalog_launch(&request, Some(&batch))
+            .expect("the batch's Cargo item is offered to the catalog");
+        assert_eq!(launch.command, "cargo test -p cairn-exec");
+        assert_eq!(
+            cairn_exec::dependency_catalog_launch(&request, None)
+                .map(|launch| launch.command.into_owned()),
+            None,
+            "the label alone runs no Cargo, so it is nothing to classify"
+        );
+    }
+
     #[test]
     fn process_batch_serialization_preserves_millisecond_timeouts_and_flags() {
         let ceiling = cairn_common::run_contract::RUN_BATCH_CEILING_MS;
