@@ -746,7 +746,7 @@ pub(crate) mod tests {
         let (snapshot_fleet, snapshot_generation) = (fleet.clone(), generation.clone());
         let (event_fleet, event_generation) = (fleet.clone(), generation.clone());
         let runtime = ExecutorRuntime::new(home)
-            .with_snapshot_callback(move |snapshot, health| {
+            .with_snapshot_callback(move |_reason, snapshot, health| {
                 snapshot_fleet.handle_executor_message(
                     EXECUTOR_ID,
                     snapshot_generation.load(Ordering::Acquire),

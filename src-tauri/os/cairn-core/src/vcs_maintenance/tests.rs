@@ -379,6 +379,62 @@ fn rescued_refs_carry_their_capture_time() {
     );
 }
 
+/// The record shapes the live database carries: a pull request whose two
+/// status sources disagree is terminal if either says so, a draft never
+/// published to GitHub follows its issue, and anything not done holds.
+#[test]
+fn a_branch_is_finished_only_by_records_with_nothing_still_holding_it() {
+    let merged = Some(("merged", 100));
+    let finish = |build: &dyn Fn(&mut BranchLifecycle)| {
+        let mut lifecycle = BranchLifecycle::default();
+        build(&mut lifecycle);
+        lifecycle.finished_by(1_000)
+    };
+    assert!(finish(&|b| b.job("complete", merged)));
+    assert!(finish(&|b| b.job("cancelled", Some(("closed", 100)))));
+    assert!(!finish(&|b| b.job("complete", Some(("active", 100)))));
+    assert!(
+        !finish(&|b| b.job("idle", merged)),
+        "a node not done holds it"
+    );
+    assert!(
+        !finish(&|b| b.job("complete", Some(("merged", 2_000)))),
+        "inside the grace"
+    );
+    assert!(!finish(&|_| {}), "no record, no finish");
+
+    assert!(finish(&|b| b.pull_request(
+        "open",
+        Some("MERGED"),
+        true,
+        100,
+        merged
+    )));
+    assert!(finish(&|b| b.pull_request(
+        "merged",
+        Some("OPEN"),
+        true,
+        100,
+        merged
+    )));
+    assert!(finish(&|b| b.pull_request(
+        "open",
+        None,
+        false,
+        100,
+        Some(("closed", 100))
+    )));
+    assert!(finish(&|b| b.pull_request("closed", None, true, 100, None)));
+    assert!(
+        !finish(&|b| b.pull_request("open", Some("OPEN"), true, 100, merged)),
+        "a published pull request still open holds it"
+    );
+    assert!(!finish(&|b| {
+        b.job("complete", merged);
+        b.pull_request("open", None, true, 100, merged);
+    }));
+}
+
 mod pass {
     use super::super::*;
     use crate::db::DbState;
@@ -444,7 +500,50 @@ mod pass {
 
     impl Fixture {
         fn create_ref(&self, name: &str) {
-            git(&self.repo, &["update-ref", name, &self.commit]);
+            self.create_ref_at(name, &self.commit);
+        }
+
+        fn create_ref_at(&self, name: &str, commit: &str) {
+            git(&self.repo, &["update-ref", name, commit]);
+        }
+
+        /// An issue resolved as `status` at `resolved`, with one node on
+        /// `branch` in `job_status`.
+        async fn branch_record(
+            &self,
+            number: i64,
+            branch: &str,
+            status: &str,
+            resolved: i64,
+            job_status: &str,
+        ) {
+            let issue = format!("issue-{number}");
+            let (merged_at, closed_at) = match status {
+                "merged" => (Some(resolved), None),
+                _ => (None, Some(resolved)),
+            };
+            self.orch
+                .db
+                .local
+                .execute(
+                    "INSERT INTO issues (id, project_id, number, title, status, progress, attention,
+                                         created_at, updated_at, merged_at, closed_at)
+                     VALUES (?1, 'p-refs', ?2, ?1, ?3, 'backlog', 'none', 1, ?4, ?5, ?6)",
+                    params![issue.as_str(), number, status, resolved, merged_at, closed_at],
+                )
+                .await
+                .unwrap();
+            self.orch
+                .db
+                .local
+                .execute(
+                    "INSERT INTO jobs (id, project_id, issue_id, branch, status, created_at,
+                                       updated_at)
+                     VALUES (?1, 'p-refs', ?2, ?3, ?4, 1, 1)",
+                    params![format!("job-{number}"), issue.as_str(), branch, job_status],
+                )
+                .await
+                .unwrap();
         }
 
         fn has_ref(&self, name: &str) -> bool {
@@ -614,6 +713,161 @@ mod pass {
         assert_eq!(visible(&stray), "", "the unreferenced commit is hidden");
         assert_eq!(visible("main"), fx.commit, "the base is untouched");
         assert!(fx.has_ref("refs/heads/main"));
+    }
+
+    /// The prune retires the origin tracking ref of a branch Cairn's records
+    /// finish, and the history only that ref held is hidden. A branch whose
+    /// published pull request is still open, one a running node is on, and one
+    /// no record names all keep their refs, though origin advertises none of
+    /// them: the sweep never asks the remote.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn the_prune_retires_tracking_refs_only_of_branches_the_records_finish() {
+        let Some(fx) = fixture().await else {
+            eprintln!("skipping the tracking-ref retirement test: jj not resolvable");
+            return;
+        };
+        let origin = fx._temp.path().join("origin.git");
+        git(
+            fx._temp.path(),
+            &["init", "-q", "--bare", &origin.to_string_lossy()],
+        );
+        git(
+            &fx.repo,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        );
+
+        let finished = "agent/refs-1-builder-0";
+        let open_pr = "agent/refs-2-builder-0";
+        let live = "agent/refs-3-builder-0";
+        let unnamed = "agent/refs-4-builder-0";
+        let tree = git_stdout(&fx.repo, &["rev-parse", "main^{tree}"]);
+        let mut tips = std::collections::HashMap::new();
+        for branch in [finished, open_pr, live, unnamed] {
+            let output = cairn_platform::env::git()
+                .args(["commit-tree", &tree, "-p", &fx.commit, "-m", branch])
+                .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00+00:00")
+                .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00+00:00")
+                .current_dir(&fx.repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let tip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            fx.create_ref_at(&format!("refs/remotes/origin/{branch}"), &tip);
+            tips.insert(branch, tip);
+        }
+        let jj = crate::jj::environment(&fx.orch.jj_binary_path, &fx.orch.config_dir);
+        crate::jj::import_git(&jj, &fx.project.store).unwrap();
+        jj.run(
+            &fx.project.store,
+            &[
+                "bookmark",
+                "track",
+                "glob:agent/*",
+                "--remote=origin",
+                "--ignore-working-copy",
+            ],
+            "track the pushed branches",
+        )
+        .unwrap();
+        // Cairn deletes a branch's local bookmark when its work lands, so each
+        // branch is held only by its origin tracking ref, as on the live store.
+        jj.run(
+            &fx.project.store,
+            &[
+                "bookmark",
+                "delete",
+                "glob:agent/*",
+                "--ignore-working-copy",
+            ],
+            "delete the local bookmarks",
+        )
+        .unwrap();
+        jj.run(
+            &fx.project.store,
+            &["git", "export", "--ignore-working-copy"],
+            "export the deletions",
+        )
+        .unwrap();
+        let visible = |commit: &str| {
+            !jj.run(
+                &fx.project.store,
+                &[
+                    "log",
+                    "-r",
+                    &format!("{commit} & ::visible_heads()"),
+                    "--no-graph",
+                    "-T",
+                    "commit_id",
+                    "--ignore-working-copy",
+                ],
+                "visible",
+            )
+            .unwrap()
+            .trim()
+            .is_empty()
+        };
+        assert!(visible(&tips[finished]), "precondition: origin anchors it");
+
+        let long_ago = unix_now() - 40 * DAY as i64;
+        fx.branch_record(1, finished, "merged", long_ago, "complete")
+            .await;
+        fx.branch_record(2, open_pr, "closed", long_ago, "complete")
+            .await;
+        fx.orch
+            .db
+            .local
+            .execute(
+                "INSERT INTO merge_requests (id, job_id, project_id, issue_id, title,
+                                             source_branch, target_branch, status, opened_at,
+                                             updated_at, github_pr_number, github_state)
+                 VALUES ('mr-2', 'job-2', 'p-refs', 'issue-2', 'open', ?1, 'main', 'open', 1, 1,
+                         42, 'OPEN')",
+                params![open_pr],
+            )
+            .await
+            .unwrap();
+        fx.branch_record(3, live, "merged", long_ago, "running")
+            .await;
+
+        prune(&fx.orch, &fx.project).await;
+
+        assert_eq!(fx.last_prune().await.0, "ok");
+        assert!(!fx.has_ref(&format!("refs/remotes/origin/{finished}")));
+        assert!(
+            !visible(&tips[finished]),
+            "the history only it held is hidden"
+        );
+        for kept in [open_pr, live, unnamed] {
+            assert!(fx.has_ref(&format!("refs/remotes/origin/{kept}")), "{kept}");
+            assert!(visible(&tips[kept]), "{kept}");
+        }
+        let detail: serde_json::Value = serde_json::from_str(
+            &fx.orch
+                .db
+                .local
+                .query_one(
+                    "SELECT detail_json FROM ref_store_samples WHERE kind = 'prune'
+                     ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                    (),
+                    |row| row.text(0),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let retired = &detail["origin_tracking_refs"];
+        assert_eq!(retired["retired"], 1, "{detail}");
+        assert_eq!(
+            retired["refs"],
+            json!([{
+                "ref": format!("refs/remotes/origin/{finished}"),
+                "oid": tips[finished],
+            }]),
+            "the record carries what re-creating the ref takes"
+        );
+        assert!(!retired["operation_before"].as_str().unwrap().is_empty());
+        assert!(detail["view_sweep"]["commits_hidden"].as_u64().is_some());
     }
 
     #[tokio::test]

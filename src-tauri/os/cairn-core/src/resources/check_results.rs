@@ -131,9 +131,10 @@ fn parse_query(params: &[QueryParam]) -> Result<CheckResultsQuery, String> {
     let environment =
         environment.ok_or_else(|| "Missing required query parameter 'environment'".to_string())?;
     if let Some(value) = status.as_deref() {
-        if !matches!(value, "passed" | "failed" | "skipped") {
+        if !matches!(value, "passed" | "failed" | "skipped" | "deferred") {
             return Err(
-                "Query parameter 'status' must be one of: passed, failed, skipped".to_string(),
+                "Query parameter 'status' must be one of: passed, failed, skipped, deferred"
+                    .to_string(),
             );
         }
     }
@@ -354,7 +355,24 @@ fn render_observation(
         format!("- Ran at: {}", millis_stamp(observation.ran_at)),
         format!("- Duration: {} ms", observation.duration_ms),
         format!("- Cadence: {}", observation.cadence),
+        format!(
+            "- Selection: {}",
+            observation
+                .selection
+                .as_deref()
+                .unwrap_or("unrecorded (legacy row)")
+        ),
     ];
+    // A fast-tier observation has a row for every test it deferred, so a test
+    // with no row here was not selected; it was never silently unobserved.
+    if observation.selection.as_deref()
+        == Some(crate::execution::check_parsers::FAST_TIER_SELECTION)
+    {
+        body.push(format!(
+            "- Fast tier: {} deferred (ran past the per-test budget; not judged by this verdict)",
+            observation.deferred_count
+        ));
+    }
     if let Some(generation) = observation.executor_connection_generation {
         body.push(format!("- Executor generation: {generation}"));
     }
@@ -403,12 +421,22 @@ fn render_observation(
         .iter()
         .filter(|test| test.status == "skipped")
         .count();
+    let deferred = observation
+        .tests
+        .iter()
+        .filter(|test| test.status == "deferred")
+        .count();
+    let deferred = if deferred > 0 || observation.deferred_count > 0 {
+        format!(", {deferred} deferred")
+    } else {
+        String::new()
+    };
     body.extend([
         String::new(),
         "## Tests".to_string(),
         String::new(),
         format!(
-            "{} passed, {} failed, {} skipped on this page",
+            "{} passed, {} failed, {} skipped{deferred} on this page",
             passed, failed, skipped
         ),
         format!("- Total: {}", observation.test_total),
@@ -677,6 +705,8 @@ mod tests {
                     flaky: true,
                 },
             ],
+            selection: Some("filtered".into()),
+            deferred_count: 0,
             test_total: 3,
             test_offset: 0,
         }

@@ -533,6 +533,7 @@ pub fn capabilities(wire: Wire, model: &str) -> Option<SpeechCapabilities> {
         | Wire::AnthropicMessages
         | Wire::OpenAiResponses
         | Wire::OpenAiDecisions
+        | Wire::SystemOne
         | Wire::ClaudeStreamJson
         | Wire::CodexAppServer
         | Wire::OpenRouterImages

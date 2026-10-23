@@ -24,12 +24,13 @@
 //!    machine-wide lease another process holds. A router's dispatcher is a
 //!    thread of its own.
 //!
-//! Cairn's pooled and dedicated servers answer this way, and so does the
-//! external example host (`examples/llm-host`). [`observe`] answers the
-//! request from the session's [`SessionEvent`]s instead, for a host whose
-//! handler passes it on; that answer waits until the session's reader runs,
-//! so a refresh asked for while the thread is still opening can come too
-//! late.
+//! That handler is the one place the request is answered. Every Codex
+//! app-server is read through a router (a dedicated session's through
+//! [`ThreadRouter::start_owned`](crate::codex::thread_router::ThreadRouter::start_owned)),
+//! and a handler that passes the request on leaves it to the session's
+//! reader, which starts only once the thread is open, too late for a refresh
+//! asked for during the start. Cairn's pooled and dedicated servers answer
+//! this way, and so does the external example host (`examples/llm-host`).
 //!
 //! Before any of that, a host launching a Codex app-server on a subscription
 //! passes the session's tokens through [`renew_for_launch`], so the app-server
@@ -52,10 +53,8 @@ use crate::codex::tokens::{
     codex_refresh_generation, refresh_session_tokens, CodexAuthState, CodexOAuthTokens,
     CodexRefreshFailure, CodexRefreshFailureKind,
 };
-use crate::interface::session::{ServerReply, SessionControl};
-use crate::session::events::SessionEvent;
+use crate::interface::session::ServerReply;
 use crate::subscription::{ModelHost, Subscriptions};
-use crate::wire::codex_app_server::AUTH_TOKENS_REFRESH_METHOD;
 
 /// The JSON-RPC error code a token request is refused with.
 pub const TOKEN_REQUEST_REFUSED: i32 = -32000;
@@ -178,12 +177,12 @@ fn renew_and_adopt(
 /// How near its expiry a session's access token may be and still be launched
 /// on.
 ///
-/// Codex asks for fresh tokens only once the ones it holds are refused, and a
-/// dedicated session answers a request made while it is still starting only
-/// after the start returns, by which time Codex has stopped waiting for it. A
-/// token that would expire during startup or a turn's first minutes is
-/// therefore renewed before launch instead. ChatGPT access tokens live for
-/// days, so the margin costs at most one early rotation per token.
+/// Codex asks for fresh tokens only once the ones it holds are refused, and
+/// gives up on its request after ten seconds. A token that would expire during
+/// startup or a turn's first minutes is therefore renewed before launch, so
+/// the session's first turn never waits on a refresh at all. ChatGPT access
+/// tokens live for days, so the margin costs at most one early rotation per
+/// token.
 pub const LAUNCH_RENEWAL_MARGIN_SECS: i64 = 30 * 60;
 
 /// Make the tokens a Codex app-server is about to be signed in on worth
@@ -264,38 +263,16 @@ pub fn standing_refusal_notice(auth: Option<&Arc<Mutex<CodexAuthState>>>) -> Opt
     ))
 }
 
-/// Answer `event` through `control` if it is the token request. Answers
-/// whether it was; any other event is left alone.
-pub fn observe(
-    host: &dyn ModelHost,
-    subscriptions: &dyn Subscriptions,
-    auth: &Arc<Mutex<CodexAuthState>>,
-    event: &SessionEvent,
-    control: &mut dyn SessionControl,
-) -> Result<bool, String> {
-    let SessionEvent::ServerRequest { id, method, .. } = event else {
-        return Ok(false);
-    };
-    if method != AUTH_TOKENS_REFRESH_METHOD {
-        return Ok(false);
-    }
-    control.reply(id, token_request_reply(host, subscriptions, Some(auth)))?;
-    Ok(true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use cairn_platform::services::process::{ProcessSpawner, RealProcessSpawner};
-    use serde_json::Value;
 
     use crate::accounts::{AccountInfo, CredentialStoreHandle, RoutedProvider};
     use crate::codex::tokens::CodexRefreshFailureKind;
-    use crate::interface::session::SessionInput;
     use crate::subscription::testing::RenewingCodex;
     use crate::subscription::{SignInOutcome, SignInRecordError, SignInTarget};
-    use crate::wire::MessageContent;
 
     /// The least a host is: a store, and every secret it is handed.
     struct Host {
@@ -587,35 +564,6 @@ mod tests {
         assert_eq!(standing_refusal_notice(None), None);
     }
 
-    /// Every `(id, reply)` sent to the session.
-    #[derive(Default)]
-    struct RecordingControl(Vec<(Value, ServerReply)>);
-
-    impl SessionControl for RecordingControl {
-        fn open_turn(&mut self, _content: &MessageContent) -> Result<(), String> {
-            Ok(())
-        }
-        fn send(&mut self, _input: &SessionInput<'_>) -> Result<(), String> {
-            Ok(())
-        }
-        fn interrupt(&mut self) -> Result<(), String> {
-            Ok(())
-        }
-        fn set_model(&mut self, _model: &str) -> Result<(), String> {
-            Ok(())
-        }
-        fn set_permission_mode(&mut self, _mode: &str) -> Result<(), String> {
-            Ok(())
-        }
-        fn reply(&mut self, id: &Value, reply: ServerReply) -> Result<(), String> {
-            self.0.push((id.clone(), reply));
-            Ok(())
-        }
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-            self
-        }
-    }
-
     /// An unsigned JWT whose `exp` is `secs_from_now` away. Codex reads
     /// nothing else of an access token at launch.
     fn access_token_expiring_in(secs_from_now: i64) -> String {
@@ -746,30 +694,5 @@ mod tests {
                 warned[0]
             );
         }
-    }
-
-    #[test]
-    fn observe_answers_the_token_request_and_nothing_else() {
-        let host = host();
-        let auth = session_auth(&host);
-        let authority = RenewingCodex::default();
-        let mut control = RecordingControl::default();
-        let approval = SessionEvent::ServerRequest {
-            id: json!(7),
-            method: "item/commandExecution/requestApproval".to_string(),
-            params: json!({}),
-        };
-        let token_request = SessionEvent::ServerRequest {
-            id: json!(8),
-            method: AUTH_TOKENS_REFRESH_METHOD.to_string(),
-            params: json!({"reason": "unauthorized"}),
-        };
-
-        assert!(!observe(&host, &authority, &auth, &approval, &mut control).unwrap());
-        assert!(control.0.is_empty());
-        assert!(observe(&host, &authority, &auth, &token_request, &mut control).unwrap());
-        assert_eq!(control.0.len(), 1);
-        assert_eq!(control.0[0].0, json!(8));
-        assert!(matches!(control.0[0].1, ServerReply::Result(_)));
     }
 }

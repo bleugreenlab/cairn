@@ -108,9 +108,9 @@ pub enum McpTaskOutcome {
 
 /// A tool advertised by an external MCP server.
 ///
-/// `Deserialize` lets the persisted MCP tool store (`config::mcp_tools`) round-
-/// trip these defs through its sidecar JSON file, so the agent affordance block
-/// can render terse per-tool contracts synchronously without spawning servers.
+/// These definitions are untrusted server content. They may be persisted in
+/// the bound catalog store and returned by authorized resource reads, but never
+/// rendered into trusted prompt instructions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolDef {
     pub name: String,
@@ -124,6 +124,9 @@ pub struct McpToolDef {
 /// A complete `tools/list` catalog and its server-provided cache hints.
 #[derive(Debug, Clone, Default)]
 pub struct McpToolCatalog {
+    /// Negotiated by the connection that produced this catalog. Absence is
+    /// unknown, never an invitation to fabricate a protocol binding.
+    pub protocol_version: Option<String>,
     pub tools: Vec<McpToolDef>,
     pub ttl_ms: Option<u64>,
     pub cache_scope: Option<String>,
@@ -251,6 +254,57 @@ impl McpResourceDef {
     }
 }
 
+/// What the gateway can say about the pooled connection one session holds to one
+/// server.
+///
+/// It is shown on that server's `cairn://mcp/<server>` read, so an agent whose
+/// calls start failing can see whether the server is gone, how it ended, and
+/// whether its next call will reconnect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpConnectionStatus {
+    pub state: McpConnectionState,
+    /// How the most recent server process (or remote transport) behind this
+    /// pool entry ended, if one has.
+    pub last_exit: Option<McpProcessExit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpConnectionState {
+    /// Nothing is pooled; the next call opens a connection.
+    NotConnected,
+    /// A live connection is pooled and the next call is sent on it.
+    Connected,
+    /// A connection is pooled but its transport has closed; the next call
+    /// replaces it before sending anything.
+    Closed,
+}
+
+/// How a stdio server process, or the transport to a remote server, ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpProcessExit {
+    /// What happened, in words: "exited with code 3", "killed by signal 9
+    /// (SIGKILL)", "still running (pid 4242) with its connection closed".
+    pub status: String,
+    /// When it happened, in epoch milliseconds, when known.
+    pub at_ms: Option<u64>,
+    /// The last lines the process wrote to stderr, oldest first. Untrusted
+    /// server output, already bounded by the gateway.
+    pub stderr_tail: Vec<String>,
+}
+
+impl McpProcessExit {
+    /// One line for an error message or a log: the status, then the last
+    /// `stderr_lines` lines of stderr.
+    pub fn summary(&self, stderr_lines: usize) -> String {
+        let tail = &self.stderr_tail[self.stderr_tail.len().saturating_sub(stderr_lines)..];
+        if tail.is_empty() {
+            self.status.clone()
+        } else {
+            format!("{}; last stderr: {}", self.status, tail.join(" | "))
+        }
+    }
+}
+
 /// Host-implemented bridge to external MCP servers.
 ///
 /// All methods take a `session_key` (the run's job id) so connections are
@@ -296,6 +350,29 @@ pub trait McpGateway: Send + Sync {
         server: &str,
         config: &BrokeredMcpConfig,
     ) -> Result<McpToolCatalog, String>;
+
+    /// List tools over a connection opened for this call alone and closed after.
+    ///
+    /// A catalog is only cacheable if it was fetched with the credentials its
+    /// witness describes. A pooled connection may have been opened with
+    /// credentials expanded long before, so discovery never reuses one, cached
+    /// or not. The default refuses; a host without it cannot serve discovery.
+    async fn list_tools_fresh(
+        &self,
+        server: &str,
+        config: &BrokeredMcpConfig,
+    ) -> Result<McpToolCatalog, String> {
+        let _ = (server, config);
+        Err("this host cannot open an unpooled MCP connection".to_string())
+    }
+
+    /// Protocol versions this host can negotiate on a [`Self::list_tools_fresh`]
+    /// connection. A cached catalog verifies only if the protocol it was fetched
+    /// under is still one of these. Empty, the default, means this host neither
+    /// records nor reuses catalogs; discovery is still unpooled.
+    fn catalog_capture_protocols(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// List the resources advertised by `server` (empty if unsupported).
     async fn list_resources(
@@ -394,6 +471,24 @@ pub trait McpGateway: Send + Sync {
         ))
     }
 
+    /// The state of `session_key`'s pooled connection to `server`. `None` means
+    /// this host cannot observe its connections, which is different from
+    /// having none.
+    fn connection_status(&self, session_key: &str, server: &str) -> Option<McpConnectionStatus> {
+        let _ = (session_key, server);
+        None
+    }
+
+    /// Drop `session_key`'s pooled connection to `server` so its next call
+    /// reconnects. This is for a server that is alive but wedged, which the
+    /// repair-before-dispatch check cannot see because its transport is still
+    /// open. A call in flight on the dropped connection fails rather than being
+    /// re-sent. Returns whether a connection was pooled.
+    async fn restart_connection(&self, session_key: &str, server: &str) -> Result<bool, String> {
+        let _ = (session_key, server);
+        Err("this host cannot restart MCP connections".to_string())
+    }
+
     /// Tear down all pooled connections for a finished session.
     async fn close_session(&self, session_key: &str);
 }
@@ -401,6 +496,53 @@ pub trait McpGateway: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Supplementary source guard: aliases and refactors can bypass a textual
+    /// scan. Behavioral prompt tests hold the trust boundary; this guard makes
+    /// introducing a direct remote-catalog provider channel an explicit change.
+    #[test]
+    fn remote_catalog_tool_definitions_do_not_enter_provider_crates() {
+        let os = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("cairn-core belongs to the os workspace");
+        let mut files = 0;
+        // Every crate that shapes provider requests. A rename fails this test
+        // on the missing directory rather than silently scanning nothing.
+        for name in [
+            "cairn-models",
+            "cairn-models-types",
+            "cairn-llm-wire",
+            "cairn-inference",
+        ] {
+            let mut directories = vec![os.join(name).join("src")];
+            while let Some(directory) = directories.pop() {
+                for entry in std::fs::read_dir(&directory).unwrap_or_else(|error| {
+                    panic!("cannot inspect {}: {error}", directory.display())
+                }) {
+                    let entry = entry.expect("provider source directory entry");
+                    let path = entry.path();
+                    if entry
+                        .file_type()
+                        .expect("provider source file type")
+                        .is_dir()
+                    {
+                        directories.push(path);
+                    } else if path.extension().is_some_and(|extension| extension == "rs") {
+                        let source = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                            panic!("cannot inspect {}: {error}", path.display())
+                        });
+                        files += 1;
+                        assert!(
+                            !source.contains("McpToolDef"),
+                            "{} imports remote catalog metadata into the provider layer",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+        assert!(files > 0, "provider guard must inspect real source files");
+    }
 
     #[test]
     fn call_outcomes_round_trip_all_continuation_fields() {

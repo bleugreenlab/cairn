@@ -72,6 +72,11 @@ const REF_WRITERS: &[(&str, &str, &str)] = &[
         "pub fn sweep_store_view(",
     ),
     (
+        "finished-branch tracking ref retirement",
+        include_str!("../../../cairn-vcs/src/jj/maintenance.rs"),
+        "pub fn retire_remote_tracking_refs(",
+    ),
+    (
         "replayed-twin bookmark settle",
         include_str!("../../../cairn-vcs/src/jj/maintenance.rs"),
         "fn resolve_twin_bookmark_conflicts(",

@@ -35,6 +35,7 @@ pub mod dag;
 pub mod delegation;
 pub mod dispatch;
 pub mod gates;
+pub(crate) mod impact_slice;
 pub mod inputs;
 pub mod jobs;
 pub mod model_routing;

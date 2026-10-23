@@ -44,25 +44,22 @@ pub async fn migrated_db() -> (TempDir, LocalDb) {
     (temp, db)
 }
 
-/// The exact jj executable this host's integration suite should use.
+/// The exact jj executable this host's integration suite should use, as a file
+/// path the snapshot below can copy.
 ///
-/// Prefer the build-slot artifact provisioned before Cargo starts. Installed app
-/// sidecars are shared mutable state, and a reused slot may contain artifacts for
-/// several foreign targets, so neither `CAIRN_JJ_BIN` nor a prefix scan is a
-/// trustworthy first answer.
+/// The resolution itself is `cairn_vcs::jj::testing::resolve_jj`, the one
+/// definition every suite shares: the build-slot artifact first, then
+/// `CAIRN_JJ_BIN`, then PATH, with Cairn's own jj shim unwrapped to the binary
+/// it forwards to (a shim here would exec itself until timeout). That answer
+/// may be a bare program name found on PATH, which is located to a path here.
 fn jj_candidate() -> Option<PathBuf> {
-    if let Some(bundled) = cairn_vcs::jj::testing::provisioned_jj() {
-        return Some(bundled);
+    let bin = cairn_vcs::jj::testing::resolve_jj()?;
+    let path = PathBuf::from(&bin);
+    if path.components().count() > 1 {
+        Some(path)
+    } else {
+        cairn_common::toolchain_path::locate_program(&bin)
     }
-
-    // Provisioning is best-effort on an offline fresh checkout. Preserve the
-    // historical supported path where jj is explicitly configured or installed
-    // on PATH even though no bundled artifact could be fetched.
-    std::env::var("CAIRN_JJ_BIN")
-        .ok()
-        .map(PathBuf::from)
-        .filter(|bin| bin.is_file())
-        .or_else(|| cairn_common::toolchain_path::locate_program("jj"))
 }
 
 /// A process-lifetime snapshot of the real jj executable.
@@ -508,7 +505,7 @@ fn attach_executor(
     let resident_event_pool = core_pool.clone();
     let resident_event_generation = generation.clone();
     let runtime = ExecutorRuntime::new(executor_home)
-        .with_snapshot_callback(move |snapshot, health| {
+        .with_snapshot_callback(move |_reason, snapshot, health| {
             snapshot_pool.handle_executor_message(
                 executor_id,
                 snapshot_generation.load(Ordering::Acquire),
@@ -973,18 +970,17 @@ pub async fn create_job(
     id
 }
 
-/// The jj binary for the test, or `None` to self-skip when jj is unavailable.
-/// jj-backed integration tests gate on this and print a skip note rather than
-/// fail when jj cannot be resolved. The exact host build-slot artifact wins;
-/// `CAIRN_JJ_BIN` and PATH are offline-checkout fallbacks.
+/// The jj binary for the test, or `None` once the calling test has been recorded
+/// as a `jj-unavailable` skip (`cairn_vcs::jj::testing::skip_unless_jj`). The
+/// guard behind every `let Some(bin) = common::jj_bin() else { return }`.
 pub fn jj_bin() -> Option<String> {
-    let bin = jj_candidate()?;
-    Command::new(&bin)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-        .then(|| bin.to_string_lossy().into_owned())
+    cairn_vcs::jj::testing::skip_unless_jj(resolve_jj(), record_skip)
+}
+
+/// The jj binary on this machine as a path, with no skip recorded, for a caller
+/// that is not a skip guard. Resolved (and probed) by [`jj_candidate`].
+pub fn resolve_jj() -> Option<String> {
+    jj_candidate().map(|bin| bin.to_string_lossy().into_owned())
 }
 
 /// The git `HEAD` commit sha of `repo`, used to base a jj workspace on the
@@ -1124,24 +1120,4 @@ pub fn skip_if_fenced(test: &str) -> bool {
     true
 }
 
-/// Best-effort: append `name<TAB>reason` to `$CAIRN_SKIP_LOG` (set by
-/// `scripts/test-rust.ts`) so the runner moves this test out of `passed` and
-/// checks it against `src-tauri/skip-manifest.toml`. libtest counts an early
-/// return as a pass and swallows its message, so without this record the skip is
-/// indistinguishable from real coverage (#157). `reason` comes from the
-/// manifest's closed vocabulary, which is what lets the runner tell a declared
-/// capability gap from an inherited habit.
-pub fn record_skip(test: &str, reason: &str) {
-    if let Some(log) = std::env::var_os("CAIRN_SKIP_LOG") {
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log)
-        {
-            // One write_all (vs writeln!'s multiple syscalls) keeps the append
-            // atomic when parallel test threads all skip at once.
-            let _ = f.write_all(format!("{test}\t{reason}\n").as_bytes());
-        }
-    }
-}
+pub use cairn_common::skip_ledger::record_skip;

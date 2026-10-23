@@ -46,6 +46,7 @@ pub(crate) mod tenets;
 pub(crate) mod thread_seed;
 mod threads;
 mod transcript;
+mod vcs;
 mod workflows;
 
 pub(crate) use common::resolve_node_owner_id;
@@ -59,6 +60,7 @@ pub(crate) use node::{
 };
 pub(crate) use read::run_condition_sql;
 pub(crate) use read::{produce_cairn_resource, read_cairn_resource};
+pub(crate) use rebase::node_base_branch;
 pub(crate) use thread_seed::{compose_thread_seed_with_policy, SeedPolicy, ThreadSeed};
 /// The one interpretation of a thread sub-path, shared by the read dispatcher,
 /// the write dispatcher, and anything that resolves a thread-addressed resource.

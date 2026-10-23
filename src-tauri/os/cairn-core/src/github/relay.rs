@@ -311,18 +311,19 @@ pub enum ProcessEventOutcome {
     Ignored,
     UnmappedMention,
     Routed,
-    /// A push to a repository's default branch, handed to the default-branch
-    /// sync in the background.
-    DefaultBranchPush,
+    /// A push to one of a repository's branches, handed to the base-branch
+    /// sync in the background, which decides whether the branch is one it
+    /// tracks.
+    BranchPush,
 }
 
-/// The `push` fields the default-branch sync needs, when this is a push to the
-/// repository's own default branch.
-fn default_branch_push(event_type: &str, payload: &Value) -> Option<DefaultBranchPush> {
+/// The `push` fields the base-branch sync needs, when this is a push that left
+/// a branch (not a tag, not a deletion) at a new commit.
+fn branch_push(event_type: &str, payload: &Value) -> Option<BranchPush> {
     if event_type != "push" || payload["deleted"].as_bool() == Some(true) {
         return None;
     }
-    let push = DefaultBranchPush {
+    let push = BranchPush {
         repository: payload["repository"]["full_name"].as_str()?.to_string(),
         git_ref: payload["ref"].as_str()?.to_string(),
         default_branch: payload["repository"]["default_branch"]
@@ -330,44 +331,114 @@ fn default_branch_push(event_type: &str, payload: &Value) -> Option<DefaultBranc
             .to_string(),
         after: payload["after"].as_str()?.to_string(),
     };
-    crate::projects::remote::is_default_branch_push(&push.git_ref, &push.default_branch)
-        .then_some(push)
+    push.branch().is_some().then_some(push)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DefaultBranchPush {
+struct BranchPush {
     repository: String,
     git_ref: String,
     default_branch: String,
     after: String,
 }
 
-/// Map a default-branch push onto its project, fast-forward the operator's
-/// checkout when that is safe, and tell the default-branch sync where origin
-/// now points.
-async fn handle_default_branch_push(
+impl BranchPush {
+    fn branch(&self) -> Option<&str> {
+        self.git_ref
+            .strip_prefix("refs/heads/")
+            .filter(|branch| !branch.is_empty())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BranchPushOutcome {
+    /// A push to the repository's default branch, with what the checkout pull
+    /// made of it.
+    Default(crate::projects::remote::PushRemoteSyncOutcome),
+    NoMatchingProject,
+    /// A branch nothing live is cut from: the store's own, and none of the
+    /// sync's business. Cairn's own pushes of agent branches land here.
+    Untracked,
+    /// A tracked base branch; the sync was told where origin now points.
+    Observed {
+        project_id: String,
+    },
+}
+
+/// Map a branch push onto its project and tell the base-branch sync where
+/// origin now points, when the branch is one it tracks. A default-branch push
+/// also fast-forwards the operator's checkout when that is safe.
+async fn handle_branch_push(
     orch: &Orchestrator,
-    push: &DefaultBranchPush,
-) -> Result<crate::projects::remote::PushRemoteSyncOutcome, String> {
-    let outcome = crate::projects::remote::pull_project_on_default_branch_push(
+    push: &BranchPush,
+) -> Result<BranchPushOutcome, String> {
+    let Some(branch) = push.branch() else {
+        return Ok(BranchPushOutcome::Untracked);
+    };
+    let source = crate::orchestrator::base_branch_sync::Source::Push;
+    if crate::projects::remote::is_default_branch_push(&push.git_ref, &push.default_branch) {
+        let outcome = crate::projects::remote::pull_project_on_default_branch_push(
+            &orch.db.local,
+            orch.services.git.as_ref(),
+            &push.repository,
+            &push.git_ref,
+            &push.default_branch,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if let crate::projects::remote::PushRemoteSyncOutcome::Pulled {
+            project_id,
+            default_branch,
+        } = &outcome
+        {
+            crate::orchestrator::base_branch_sync::observe_remote_tip(
+                orch,
+                project_id,
+                default_branch,
+                &push.after,
+                source,
+            )
+            .await;
+        }
+        return Ok(BranchPushOutcome::Default(outcome));
+    }
+    let Some(project) = crate::projects::remote::find_project_by_remote_full_name(
         &orch.db.local,
         orch.services.git.as_ref(),
         &push.repository,
-        &push.git_ref,
-        &push.default_branch,
     )
     .await
-    .map_err(|error| error.to_string())?;
-    if let crate::projects::remote::PushRemoteSyncOutcome::Pulled { project_id, .. } = &outcome {
-        crate::orchestrator::default_branch_sync::observe_remote_tip(
-            orch,
-            project_id,
-            &push.after,
-            crate::orchestrator::default_branch_sync::Source::Push,
-        )
-        .await;
+    .map_err(|error| error.to_string())?
+    else {
+        return Ok(BranchPushOutcome::NoMatchingProject);
+    };
+    let default_branch = project
+        .default_branch
+        .clone()
+        .unwrap_or_else(|| push.default_branch.clone());
+    let db = crate::execution::routing::owning_db_for_project(&orch.db, &project.id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let tracked = crate::orchestrator::base_advance::load_tracked_base_branches(
+        &db,
+        &project.id,
+        &default_branch,
+    )
+    .await?;
+    if !tracked.iter().any(|tracked| tracked == branch) {
+        return Ok(BranchPushOutcome::Untracked);
     }
-    Ok(outcome)
+    crate::orchestrator::base_branch_sync::observe_remote_tip(
+        orch,
+        &project.id,
+        branch,
+        &push.after,
+        source,
+    )
+    .await;
+    Ok(BranchPushOutcome::Observed {
+        project_id: project.id,
+    })
 }
 
 pub async fn process_event(
@@ -377,25 +448,27 @@ pub async fn process_event(
     payload: &Value,
     app_slug: &str,
 ) -> Result<ProcessEventOutcome, String> {
-    if let Some(push) = default_branch_push(event_type, payload) {
+    if let Some(push) = branch_push(event_type, payload) {
         // Like minting, the relay's obligation ends at handing the push off:
         // the checkout pull and store sync run detached, so a slow fetch can
         // never hold the relay cursor.
         let orch = orch.clone();
         tokio::spawn(async move {
-            match handle_default_branch_push(&orch, &push).await {
+            match handle_branch_push(&orch, &push).await {
                 Ok(outcome) => log::debug!(
-                    "GitHub relay event {event_id}: default-branch push to {} at {}: {outcome:?}",
+                    "GitHub relay event {event_id}: push of {} to {} at {}: {outcome:?}",
+                    push.git_ref,
                     push.repository,
                     push.after
                 ),
                 Err(error) => log::warn!(
-                    "GitHub relay event {event_id}: default-branch push to {} failed: {error}",
+                    "GitHub relay event {event_id}: push of {} to {} failed: {error}",
+                    push.git_ref,
                     push.repository
                 ),
             }
         });
-        return Ok(ProcessEventOutcome::DefaultBranchPush);
+        return Ok(ProcessEventOutcome::BranchPush);
     }
     let TriggerDecision::Comment(comment) = trigger_for_event(event_type, payload, app_slug) else {
         log::debug!(
@@ -780,20 +853,26 @@ mod tests {
     }
 
     #[test]
-    fn only_a_push_to_the_default_branch_is_a_default_branch_push() {
-        let push_event =
-            default_branch_push("push", &push("refs/heads/main", "acme/repo")).unwrap();
+    fn a_push_that_leaves_a_branch_at_a_new_commit_is_a_branch_push() {
+        let push_event = branch_push("push", &push("refs/heads/main", "acme/repo")).unwrap();
         assert_eq!(push_event.after, "9e77a2750000000000000000000000000000000b");
         assert_eq!(push_event.repository, "acme/repo");
+        assert_eq!(push_event.branch(), Some("main"));
         assert_eq!(
-            default_branch_push("push", &push("refs/heads/feature", "acme/repo")),
+            branch_push("push", &push("refs/heads/agent/p-1-builder-0", "acme/repo"))
+                .unwrap()
+                .branch(),
+            Some("agent/p-1-builder-0")
+        );
+        assert_eq!(
+            branch_push("push", &push("refs/tags/v1", "acme/repo")),
             None
         );
         let mut deleted = push("refs/heads/main", "acme/repo");
         deleted["deleted"] = json!(true);
-        assert_eq!(default_branch_push("push", &deleted), None);
+        assert_eq!(branch_push("push", &deleted), None);
         assert_eq!(
-            default_branch_push("issue_comment", &push("refs/heads/main", "acme/repo")),
+            branch_push("issue_comment", &push("refs/heads/main", "acme/repo")),
             None
         );
     }
@@ -833,26 +912,61 @@ mod tests {
         )
         .build();
 
-        let mapped = default_branch_push("push", &push("refs/heads/main", "acme/repo")).unwrap();
-        let outcome = handle_default_branch_push(&orch, &mapped).await.unwrap();
+        let mapped = branch_push("push", &push("refs/heads/main", "acme/repo")).unwrap();
+        let outcome = handle_branch_push(&orch, &mapped).await.unwrap();
         assert!(matches!(
             outcome,
-            crate::projects::remote::PushRemoteSyncOutcome::Pulled { ref project_id, .. } if project_id == "proj"
+            BranchPushOutcome::Default(crate::projects::remote::PushRemoteSyncOutcome::Pulled { ref project_id, .. }) if project_id == "proj"
         ));
-        let state = orch.default_branch_sync.snapshot("proj").unwrap();
+        let state = orch.base_branch_sync.snapshot("proj", "main").unwrap();
         assert_eq!(
             state.remote_tip.as_deref(),
             Some("9e77a2750000000000000000000000000000000b")
         );
         assert_eq!(
             state.remote_tip_source,
-            Some(crate::orchestrator::default_branch_sync::Source::Push)
+            Some(crate::orchestrator::base_branch_sync::Source::Push)
         );
 
-        let unmapped = default_branch_push("push", &push("refs/heads/main", "other/repo")).unwrap();
+        let unmapped = branch_push("push", &push("refs/heads/main", "other/repo")).unwrap();
         assert_eq!(
-            handle_default_branch_push(&orch, &unmapped).await.unwrap(),
-            crate::projects::remote::PushRemoteSyncOutcome::NoMatchingProject
+            handle_branch_push(&orch, &unmapped).await.unwrap(),
+            BranchPushOutcome::Default(
+                crate::projects::remote::PushRemoteSyncOutcome::NoMatchingProject
+            )
+        );
+
+        // An agent branch nothing is cut from is the store's own business.
+        let untracked = branch_push("push", &push("refs/heads/agent/solo", "acme/repo")).unwrap();
+        assert_eq!(
+            handle_branch_push(&orch, &untracked).await.unwrap(),
+            BranchPushOutcome::Untracked
+        );
+        assert_eq!(orch.base_branch_sync.snapshot("proj", "agent/solo"), None);
+
+        // A parent's integration branch with a live child is tracked: the
+        // push reaches the sync for that branch.
+        db.execute(
+            "INSERT INTO jobs (id, project_id, status, branch, base_branch, created_at, updated_at)
+             VALUES ('child', 'proj', 'running', 'agent/child', 'agent/parent', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        let parent = branch_push("push", &push("refs/heads/agent/parent", "acme/repo")).unwrap();
+        assert_eq!(
+            handle_branch_push(&orch, &parent).await.unwrap(),
+            BranchPushOutcome::Observed {
+                project_id: "proj".into()
+            }
+        );
+        assert_eq!(
+            orch.base_branch_sync
+                .snapshot("proj", "agent/parent")
+                .unwrap()
+                .remote_tip
+                .as_deref(),
+            Some("9e77a2750000000000000000000000000000000b")
         );
     }
 
@@ -868,12 +982,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(outcome, ProcessEventOutcome::DefaultBranchPush);
+        assert_eq!(outcome, ProcessEventOutcome::BranchPush);
         let outcome = process_event(
             &orch,
             103,
             "push",
-            &push("refs/heads/feature", "acme/repo"),
+            &push("refs/tags/v1", "acme/repo"),
             "cairn-app",
         )
         .await

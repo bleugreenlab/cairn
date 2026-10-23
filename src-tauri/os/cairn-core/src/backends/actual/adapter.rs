@@ -43,11 +43,12 @@ impl ActualAdapter {
         request: CompletionRequest,
     ) -> Result<CompletionOutcome, CompletionError> {
         let requested_model = request.model.clone();
-        let body = completion_body(&request)?;
+        let family = self.chat_family();
+        let body = completion_body(&request, &family)?;
         let started = Instant::now();
         let response = llm
             .complete(CompletionCall::whole(
-                CompletionWire::Chat(&self.endpoint),
+                CompletionWire::Chat(&family.endpoint),
                 body,
                 request.timeout,
             ))
@@ -81,6 +82,20 @@ impl ActualAdapter {
             latency_ms: started.elapsed().as_millis() as u64,
             account_id: None,
         })
+    }
+
+    /// The chat family an agent turn and a one-shot completion are both built
+    /// from.
+    fn chat_family(&self) -> ChatFamily {
+        ChatFamily {
+            endpoint: self.endpoint.clone(),
+            dialect: ChatDialect {
+                reasoning: ChatReasoning::Omit,
+                response_format: false,
+                ..ChatDialect::default()
+            },
+            extras: Map::new(),
+        }
     }
 }
 
@@ -137,15 +152,7 @@ impl WireAdapter for ActualAdapter {
     }
 
     fn family(&self, _: &Connection) -> Result<ChatFamily, String> {
-        Ok(ChatFamily {
-            endpoint: self.endpoint.clone(),
-            dialect: ChatDialect {
-                reasoning: ChatReasoning::Omit,
-                response_format: false,
-                ..ChatDialect::default()
-            },
-            extras: Map::new(),
-        })
+        Ok(self.chat_family())
     }
 
     fn explain_error(&self, error: CompletionError) -> String {
@@ -227,7 +234,7 @@ mod tests {
             ],
             model: "google/gemma-4-e2b-it".into(),
             project_id: None,
-            extras: json!({"temperature": 0.2}),
+            options: Default::default(),
             output_schema: None,
             timeout: Duration::from_secs(1),
         }
@@ -267,17 +274,20 @@ mod tests {
     }
 
     #[test]
-    fn completion_body_is_tool_free_and_preserves_messages_and_options() {
+    fn completion_body_is_tool_free_and_preserves_messages_and_schema() {
         let mut request = request();
         request.output_schema = Some(json!({
             "type": "object",
             "properties": {"answer": {"type": "string"}},
             "required": ["answer"]
         }));
-        let body = completion_body(&request).unwrap();
+        request.options.reasoning_effort = Some("high".to_string());
+        let family = ActualAdapter::for_target(local_target()).chat_family();
+        let body = completion_body(&request, &family).unwrap();
         assert_eq!(body["model"], "google/gemma-4-e2b-it");
         assert_eq!(body["stream"], false);
-        assert_eq!(body["temperature"], 0.2);
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoningEffort").is_none());
         assert_eq!(
             body["messages"][0],
             json!({"role": "system", "content": "Be concise"})
@@ -408,13 +418,10 @@ mod tests {
         let mut empty = request();
         empty.messages.clear();
         assert!(matches!(
-            completion_body(&empty),
-            Err(CompletionError::InvalidRequest(_))
-        ));
-        let mut bad_extras = request();
-        bad_extras.extras = json!("not an object");
-        assert!(matches!(
-            completion_body(&bad_extras),
+            completion_body(
+                &empty,
+                &ActualAdapter::for_target(local_target()).chat_family()
+            ),
             Err(CompletionError::InvalidRequest(_))
         ));
     }

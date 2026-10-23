@@ -64,6 +64,16 @@ pub(super) fn responses_adapter() -> OpenAiResponsesAdapter {
     }
 }
 
+/// Go's chat family on `api_key`: the one an agent turn and a one-shot
+/// completion are both built from.
+pub(super) fn chat_family(api_key: &str) -> ChatFamily {
+    ChatFamily {
+        endpoint: super::http::endpoint(api_key),
+        dialect: ChatDialect::default(),
+        extras: Map::new(),
+    }
+}
+
 pub(super) struct OpenCodeAdapter;
 
 impl WireAdapter for OpenCodeAdapter {
@@ -96,11 +106,7 @@ impl WireAdapter for OpenCodeAdapter {
             .api_key
             .as_deref()
             .ok_or_else(|| "OpenCode Go connection missing API key".to_string())?;
-        Ok(ChatFamily {
-            endpoint: super::http::endpoint(api_key),
-            dialect: ChatDialect::default(),
-            extras: Map::new(),
-        })
+        Ok(chat_family(api_key))
     }
 
     fn build_conversation(

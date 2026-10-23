@@ -25,4 +25,5 @@ pub mod changes;
 mod condition_sql;
 pub mod lineage;
 pub mod relations;
+pub mod sql;
 pub mod todos;

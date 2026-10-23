@@ -394,6 +394,36 @@ async fn load_diff_coords(
     })
 }
 
+/// The content of `base..tip` read from the object store: the unified patch and
+/// one row per changed path. The single diff computation node `/diff` and
+/// `cairn://p/{project}/vcs/diff` share, so the two cannot render one range two
+/// ways.
+pub(super) struct RangeDiff {
+    pub patch: String,
+    pub rows: Vec<FileChangeRow>,
+}
+
+pub(super) fn diff_data_between(
+    store: &ObjectStore,
+    base: &str,
+    tip: &str,
+) -> Result<RangeDiff, String> {
+    let patch = render_range_diff(store, base, tip)?;
+    let rows = render_range_file_diffs(store, base, tip)?
+        .into_iter()
+        .map(|file| {
+            (
+                file.path,
+                file.status,
+                Some(file.additions as i32),
+                Some(file.deletions as i32),
+                file.previous_path,
+            )
+        })
+        .collect();
+    Ok(RangeDiff { patch, rows })
+}
+
 async fn load_live_data(orch: &Orchestrator, coords: &DiffCoords) -> Option<DiffData> {
     let branch = coords.branch.as_deref()?;
     let repo = Path::new(&coords.repo_path);
@@ -414,20 +444,7 @@ async fn load_live_data(orch: &Orchestrator, coords: &DiffCoords) -> Option<Diff
     };
     let (base, tip, base_head) = (range.base, range.tip, range.target_head);
     let store = ObjectStore::new(repo, None).ok()?;
-    let patch = render_range_diff(&store, &base, &tip).ok()?;
-    let file_diffs = render_range_file_diffs(&store, &base, &tip).ok()?;
-    let rows = file_diffs
-        .into_iter()
-        .map(|file| {
-            (
-                file.path,
-                file.status,
-                Some(file.additions as i32),
-                Some(file.deletions as i32),
-                file.previous_path,
-            )
-        })
-        .collect::<Vec<_>>();
+    let RangeDiff { patch, rows } = diff_data_between(&store, &base, &tip).ok()?;
     let commits = list_range_commits(&store, &base, &tip)
         .unwrap_or_default()
         .into_iter()
@@ -498,20 +515,7 @@ async fn load_archived_data(
     let content_source =
         archived_content_source(&coords.repo_path, &tip, &pack, retain_content_source);
     let store = ObjectStore::new(Path::new(&coords.repo_path), pack).ok()?;
-    let patch = render_range_diff(&store, &base, &tip).ok()?;
-    let file_diffs = render_range_file_diffs(&store, &base, &tip).ok()?;
-    let rows = file_diffs
-        .into_iter()
-        .map(|file| {
-            (
-                file.path,
-                file.status,
-                Some(file.additions as i32),
-                Some(file.deletions as i32),
-                file.previous_path,
-            )
-        })
-        .collect::<Vec<_>>();
+    let RangeDiff { patch, rows } = diff_data_between(&store, &base, &tip).ok()?;
     let commits = list_range_commits(&store, &base, &tip)
         .unwrap_or_default()
         .into_iter()
@@ -898,16 +902,20 @@ fn push_findings(out: &mut String, label: &str, findings: &[LineFinding], total:
     }
 }
 
-fn short(value: Option<&str>) -> &str {
+pub(super) fn short(value: Option<&str>) -> &str {
     let value = value.unwrap_or("unavailable");
     value.get(..value.len().min(12)).unwrap_or(value)
 }
 
-fn escape_table(value: &str) -> String {
+pub(super) fn escape_table(value: &str) -> String {
     value.replace('|', "\\|").replace('\n', " ")
 }
 
-fn filter_patch(patch: &str, file: Option<&str>, glob: Option<&globset::GlobMatcher>) -> String {
+pub(super) fn filter_patch(
+    patch: &str,
+    file: Option<&str>,
+    glob: Option<&globset::GlobMatcher>,
+) -> String {
     split_patch_sections(patch)
         .into_iter()
         .filter(|section| {

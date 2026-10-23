@@ -80,6 +80,12 @@ pub(crate) enum Condition {
         /// existed carry no label and must stay readable.
         #[serde(default)]
         label: Option<String>,
+        /// The batch executes on the host (a response item, with whatever host
+        /// items share its batch) and holds no working tree, so it cannot
+        /// commit and does not hold its branch at the base-advance boundary.
+        /// Defaults to false so rows written before this existed keep holding.
+        #[serde(default)]
+        host: bool,
     },
 }
 
@@ -124,6 +130,22 @@ pub(crate) async fn relinquish_to_inner_wait(
     } else {
         Ok(RelinquishOutcome::Absent)
     }
+}
+
+/// Whether an external stop cancelled this suspension. A stop marks the row
+/// and nothing else (`orchestrator::lifecycle::stop`), so a resolver holding
+/// work only it can end looks here. An unreadable row reads as not cancelled:
+/// the work then runs to its own bound, which is the safe side.
+pub(crate) async fn was_cancelled(db: &LocalDb, id: &str) -> bool {
+    db.query_text(
+        "SELECT state FROM agent_waits WHERE id=?1",
+        (id.to_string(),),
+    )
+    .await
+    .ok()
+    .flatten()
+    .as_deref()
+        == Some("cancelled")
 }
 
 /// The inverse of [`relinquish_to_inner_wait`], for an inner wait that was
@@ -1794,6 +1816,7 @@ mod tests {
             request_id: "request-1".into(),
             commits,
             label: label.map(str::to_string),
+            host: false,
         }
     }
 
@@ -1802,6 +1825,7 @@ mod tests {
             request_id: "request".to_string(),
             commits: false,
             label: None,
+            host: false,
         };
         record
     }

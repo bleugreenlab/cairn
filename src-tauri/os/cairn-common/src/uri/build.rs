@@ -119,6 +119,12 @@ pub fn build_project_check_results_uri(project: &str, revision: &str) -> String 
     format!("{}/check-results/{}", build_project_uri(project), revision)
 }
 
+/// `cairn://p/{project}/vcs/{op}` for one store-served source-control operation
+/// (`diff`, `ancestry`, `log`, `blame`).
+pub fn build_project_vcs_uri(project: &str, op: &str) -> String {
+    format!("{}/vcs/{}", build_project_uri(project), op)
+}
+
 pub fn build_project_threads_uri(project: &str) -> String {
     format!("{}/threads", build_project_uri(project))
 }
@@ -998,6 +1004,10 @@ impl CairnResource {
             Self::ProjectCheckResults { project, revision } => {
                 build_project_check_results_uri(project, revision)
             }
+            Self::ProjectVcsDiff { project } => build_project_vcs_uri(project, "diff"),
+            Self::ProjectVcsAncestry { project } => build_project_vcs_uri(project, "ancestry"),
+            Self::ProjectVcsLog { project } => build_project_vcs_uri(project, "log"),
+            Self::ProjectVcsBlame { project } => build_project_vcs_uri(project, "blame"),
             Self::ProjectCheckObservation { project, handle } => {
                 build_project_check_observation_uri(project, handle)
             }
@@ -1388,6 +1398,7 @@ impl CairnResource {
             Self::Grant { id } => format!("cairn://grants/{id}"),
             Self::Models => "cairn://models".to_string(),
             Self::ModelsCatalog => "cairn://models/catalog".to_string(),
+            Self::ModelsDecide => "cairn://models/decide".to_string(),
             Self::ModelsAccounts => "cairn://models/accounts".to_string(),
             Self::ModelsAccount { id } => format!("cairn://models/accounts/{id}"),
             Self::ModelsUsage => "cairn://models/usage".to_string(),

@@ -52,6 +52,11 @@ pub struct CodexPin {
     pub tag: String,
     /// Why this version was chosen.
     pub reason: String,
+    /// Releases a bump must never select: the rollback hold for an upstream
+    /// version found broken after it was published. A pin's own `version` is
+    /// never in it.
+    #[serde(default)]
+    pub skip: Vec<String>,
     /// The release's `codex-package-<target>.tar.gz`, by target.
     pub packages: BTreeMap<String, CodexPackage>,
 }
@@ -85,14 +90,17 @@ impl CodexPin {
                 self.integration
             ));
         }
-        let version_ok = !self.version.is_empty()
-            && self.version.starts_with(|c: char| c.is_ascii_digit())
-            && self
-                .version
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
-        if !version_ok {
+        if !is_well_formed_version(&self.version) {
             return Err(format!("the pin's version {:?} is malformed", self.version));
+        }
+        if let Some(entry) = self.skip.iter().find(|v| !is_well_formed_version(v)) {
+            return Err(format!("the pin's skip entry {entry:?} is malformed"));
+        }
+        if self.skip.contains(&self.version) {
+            return Err(format!(
+                "the pin selects {}, which its own skip list holds back",
+                self.version
+            ));
         }
         if self.tag != format!("rust-v{}", self.version) {
             return Err(format!(
@@ -128,6 +136,15 @@ impl CodexPin {
     pub fn package(&self, target: &str) -> Option<&CodexPackage> {
         self.packages.get(target)
     }
+}
+
+/// A version as OpenAI tags it: a leading digit, then ASCII letters, digits,
+/// dots and dashes, so it can never steer a package URL off the release.
+fn is_well_formed_version(version: &str) -> bool {
+    version.starts_with(|c: char| c.is_ascii_digit())
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
 }
 
 /// The pin this build was compiled with.
@@ -229,5 +246,35 @@ mod tests {
         let mut pin = embedded_pin();
         pin.packages.get_mut("x86_64-apple-darwin").unwrap().sha256 = "ABC".into();
         assert!(pin.validate().unwrap_err().contains("sha256"));
+    }
+
+    #[test]
+    fn the_embedded_pin_does_not_select_a_version_it_skips() {
+        let pin = embedded_pin();
+        assert!(!pin.skip.contains(&pin.version));
+    }
+
+    #[test]
+    fn a_pin_may_hold_back_versions_but_never_its_own() {
+        let mut pin = embedded_pin();
+        pin.skip = vec!["0.1.0".into(), "0.2.0-alpha.1".into()];
+        pin.validate()
+            .expect("well-formed skips other than the version are fine");
+
+        pin.skip.push(pin.version.clone());
+        assert!(pin.validate().unwrap_err().contains("skip list"));
+
+        let mut pin = embedded_pin();
+        pin.skip = vec!["../evil".into()];
+        assert!(pin.validate().unwrap_err().contains("skip entry"));
+    }
+
+    #[test]
+    fn a_pin_without_skip_reads_as_skipping_nothing() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../../../codex-pin.json")).unwrap();
+        value.as_object_mut().unwrap().remove("skip");
+        let pin = CodexPin::parse(&value.to_string()).expect("skip is optional");
+        assert!(pin.skip.is_empty());
     }
 }

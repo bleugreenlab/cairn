@@ -495,6 +495,10 @@ pub(crate) fn get_repo_remote(repo_path: &str) -> Result<String, String> {
 // ── API Operations ──────────────────────────────────────────────
 
 /// Merge a PR via REST API.
+///
+/// `expected_head_sha` binds the merge to one head: GitHub refuses (409) when
+/// the PR's head is no longer that commit, so a branch that moved after the
+/// caller verified it cannot land in its place.
 pub(crate) async fn merge_pr(
     http: &dyn HttpClient,
     auth: &InstallationAuthority,
@@ -502,13 +506,17 @@ pub(crate) async fn merge_pr(
     repo: &str,
     pr_number: i32,
     merge_method: &str,
+    expected_head_sha: Option<&str>,
 ) -> Result<Option<String>, String> {
     let url = format!(
         "{}/repos/{}/{}/pulls/{}/merge",
         GITHUB_API_BASE, owner, repo, pr_number
     );
 
-    let body = serde_json::json!({ "merge_method": merge_method });
+    let mut body = serde_json::json!({ "merge_method": merge_method });
+    if let Some(sha) = expected_head_sha {
+        body["sha"] = serde_json::Value::String(sha.to_string());
+    }
     let resp = auth.put(http, &url, body).await?;
 
     check_rate_limit(&resp)?;
@@ -1073,8 +1081,44 @@ mod tests {
     async fn merge_pr_success() {
         let http = mock_with_token_and("pulls/42/merge", 200);
         let auth = test_authority();
-        let result = merge_pr(&http, &auth, "owner", "repo", 42, "squash").await;
+        let result = merge_pr(&http, &auth, "owner", "repo", 42, "squash", None).await;
         assert_eq!(result, Ok(None), "an empty body still merged");
+        let merge = http
+            .requests()
+            .into_iter()
+            .find(|request| request.url.contains("pulls/42/merge"))
+            .unwrap();
+        assert_eq!(
+            merge.body,
+            Some(serde_json::json!({"merge_method": "squash"})),
+            "no expected head means no `sha` binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_pr_binds_the_expected_head_through_sha() {
+        let http = mock_with_token_and("pulls/42/merge", 200);
+        let auth = test_authority();
+        merge_pr(
+            &http,
+            &auth,
+            "owner",
+            "repo",
+            42,
+            "squash",
+            Some("0123abcd"),
+        )
+        .await
+        .unwrap();
+        let merge = http
+            .requests()
+            .into_iter()
+            .find(|request| request.url.contains("pulls/42/merge"))
+            .unwrap();
+        assert_eq!(
+            merge.body,
+            Some(serde_json::json!({"merge_method": "squash", "sha": "0123abcd"}))
+        );
     }
 
     #[tokio::test]
@@ -1085,7 +1129,7 @@ mod tests {
             serde_json::json!({"sha": "9e77a275", "merged": true, "message": "Pull Request successfully merged"}),
         );
         let auth = test_authority();
-        let result = merge_pr(&http, &auth, "owner", "repo", 42, "squash").await;
+        let result = merge_pr(&http, &auth, "owner", "repo", 42, "squash", None).await;
         assert_eq!(result, Ok(Some("9e77a275".to_string())));
     }
 
@@ -1093,7 +1137,7 @@ mod tests {
     async fn merge_pr_failure_returns_error() {
         let http = mock_with_token_and("pulls/42/merge", 405);
         let auth = test_authority();
-        let result = merge_pr(&http, &auth, "owner", "repo", 42, "merge").await;
+        let result = merge_pr(&http, &auth, "owner", "repo", 42, "merge", None).await;
         assert!(result.is_err());
     }
 
@@ -1101,7 +1145,7 @@ mod tests {
     async fn merge_pr_rate_limited() {
         let http = mock_with_token_and("pulls/1/merge", 429);
         let auth = test_authority();
-        let result = merge_pr(&http, &auth, "owner", "repo", 1, "merge").await;
+        let result = merge_pr(&http, &auth, "owner", "repo", 1, "merge", None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("rate limit"));
     }

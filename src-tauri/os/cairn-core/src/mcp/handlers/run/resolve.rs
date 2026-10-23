@@ -110,6 +110,17 @@ pub(super) async fn resolve_run_item(
                         timeout: item.timeout,
                     }),
                 ),
+                Some(CairnResource::ModelsDecide) => (
+                    header,
+                    Ok(RunSpec::Decide {
+                        args: item
+                            .payload
+                            .as_ref()
+                            .and_then(|payload| payload.args_json.clone())
+                            .unwrap_or_else(|| serde_json::json!({})),
+                        timeout: item.timeout,
+                    }),
+                ),
                 Some(CairnResource::ProjectResponse { project, response_id }) => (
                     header,
                     Ok(RunSpec::ResponseCall {

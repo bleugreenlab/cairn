@@ -34,6 +34,8 @@ const CAPABILITY_BEARING_SETTINGS: &[&str] = &[
     "backends",
     "tiers",
     "decisionModel",
+    "imageModel",
+    "speechModel",
     "openrouterRouting",
     "routeCallsViaOpenRouter",
     // Commands this workspace will execute on the host.

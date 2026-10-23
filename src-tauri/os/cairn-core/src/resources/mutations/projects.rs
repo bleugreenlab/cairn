@@ -89,6 +89,15 @@ fn project_create_repo_path(payload: Option<&Value>) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The destination of a `cairn://p/PROJECT` patch with `action: "export"`.
+fn project_export_path(payload: Option<&Value>) -> Option<PathBuf> {
+    let payload = payload?;
+    if opt_trimmed(payload, &["action"]).as_deref() != Some("export") {
+        return None;
+    }
+    opt_trimmed(payload, &["path"]).map(PathBuf::from)
+}
+
 /// True when a `cairn://p/PROJECT` patch carries a non-empty `remoteUrl` — the
 /// only project-patch field that runs git on the repo (rename/hide are pure DB).
 fn project_patch_has_remote(payload: Option<&Value>) -> bool {
@@ -100,26 +109,49 @@ fn project_patch_has_remote(payload: Option<&Value>) -> bool {
         .unwrap_or(false)
 }
 
+/// A project write that reaches a path outside the worktree.
+pub(crate) struct ProjectCrossing {
+    pub(crate) path: PathBuf,
+    /// Whether a caller with no run (the operator's own shell, holding this
+    /// home's local secret) may proceed. An export only reads the database that
+    /// caller already owns and writes where it says, so it may; creating a
+    /// project or running git on one still needs an authenticated run.
+    pub(crate) ambient_allowed: bool,
+}
+
 /// If `item` is a project write that creates/inits or runs git on a repo outside
-/// the worktree, return that repo path so the change handler can gate it through
-/// the same worktree fence as workspace settings/MCP writes. Pure-DB writes
-/// (rename/hide, or a create with an empty repoPath) return `None`.
+/// the worktree, or exports the project to a local directory, return that path
+/// so the change handler can gate it through the same worktree fence as
+/// workspace settings/MCP writes. Pure-DB writes (rename/hide, or a create with
+/// an empty repoPath) return `None`.
 pub(crate) async fn project_write_crossing_path(
     orch: &Orchestrator,
     item: &ChangeItem,
-) -> Option<PathBuf> {
+) -> Option<ProjectCrossing> {
     match parse_uri(&item.target) {
         Some(CairnResource::Projects) if item.mode == ChangeMode::Create => {
-            project_create_repo_path(item.payload.as_ref())
+            project_create_repo_path(item.payload.as_ref()).map(|path| ProjectCrossing {
+                path,
+                ambient_allowed: false,
+            })
         }
         Some(CairnResource::Project { project }) if item.mode == ChangeMode::Patch => {
+            if let Some(path) = project_export_path(item.payload.as_ref()) {
+                return Some(ProjectCrossing {
+                    path,
+                    ambient_allowed: true,
+                });
+            }
             if !project_patch_has_remote(item.payload.as_ref()) {
                 return None;
             }
             resolve_project(orch, &project)
                 .await
                 .ok()
-                .map(|(_, _, repo_path, _)| PathBuf::from(repo_path))
+                .map(|(_, _, repo_path, _)| ProjectCrossing {
+                    path: PathBuf::from(repo_path),
+                    ambient_allowed: false,
+                })
         }
         _ => None,
     }
@@ -231,6 +263,9 @@ pub(super) async fn apply_project_patch(
     payload: &Value,
     dry_run: bool,
 ) -> Result<String, String> {
+    if let Some(action) = opt_trimmed(payload, &["action"]) {
+        return apply_project_action(orch, project_key, &action, payload, dry_run).await;
+    }
     let (db, id, repo_path, default_branch) = resolve_project(orch, project_key).await?;
     let mut ops: Vec<&str> = Vec::new();
 
@@ -293,6 +328,58 @@ pub(super) async fn apply_project_patch(
     }
     let verb = if dry_run { "Would patch" } else { "Patched" };
     Ok(format!("{verb} project {project_key}: {}", ops.join(", ")))
+}
+
+/// A project patch that performs an action rather than setting fields.
+async fn apply_project_action(
+    orch: &Orchestrator,
+    project_key: &str,
+    action: &str,
+    payload: &Value,
+    dry_run: bool,
+) -> Result<String, String> {
+    if action != "export" {
+        return Err(format!(
+            "unknown project action '{action}' (supported: export)"
+        ));
+    }
+    let mixed: Vec<&str> = payload
+        .as_object()
+        .map(|fields| {
+            fields
+                .keys()
+                .map(String::as_str)
+                .filter(|key| !matches!(*key, "action" | "path"))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !mixed.is_empty() {
+        return Err(format!(
+            "action:export takes only path; patch {} in a separate change",
+            mixed.join(", ")
+        ));
+    }
+    let destination = PathBuf::from(req_str(payload, &["path"], "path")?);
+    resolve_project(orch, project_key).await?;
+    let owning_db = orch.db.for_project(project_key).await;
+    if dry_run {
+        return crate::projects::export::plan_summary(&owning_db, project_key, &destination).await;
+    }
+    // Detached so the export runs to its manifest even if the request that
+    // started it is dropped: an export of a large project outlives a socket
+    // more often than not, and a half-written archive with no manifest is
+    // exactly what this guards against.
+    let key = project_key.to_string();
+    let task = tokio::spawn(crate::projects::export::export_project(
+        orch.db.local.clone(),
+        owning_db,
+        key.clone(),
+        destination,
+    ));
+    let report = task
+        .await
+        .map_err(|error| format!("project export task failed: {error}"))??;
+    Ok(report.summary(&key))
 }
 
 struct ReferenceOps {
@@ -843,6 +930,27 @@ mod tests {
             None
         );
         assert_eq!(project_create_repo_path(None), None);
+    }
+
+    #[test]
+    fn export_crossing_path_only_for_the_export_action() {
+        let export = json!({"action": "export", "path": "/tmp/rs-export"});
+        assert_eq!(
+            project_export_path(Some(&export)),
+            Some(PathBuf::from("/tmp/rs-export"))
+        );
+        // A path on any other patch is not a destination.
+        assert_eq!(project_export_path(Some(&json!({"path": "/tmp/x"}))), None);
+        assert_eq!(
+            project_export_path(Some(&json!({"action": "prune", "path": "/tmp/x"}))),
+            None
+        );
+        // An export with no path crosses nothing; the action itself rejects it.
+        assert_eq!(
+            project_export_path(Some(&json!({"action": "export"}))),
+            None
+        );
+        assert_eq!(project_export_path(None), None);
     }
 
     #[test]

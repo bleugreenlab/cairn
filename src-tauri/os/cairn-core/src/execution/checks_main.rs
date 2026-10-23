@@ -24,9 +24,12 @@
 //! detection regime, a silent detector is the dangerous case.
 //!
 //! Store identity: cadence observations record `cadence = 'main'` and
-//! `job_id = 'main:{project_id}'`. A lane's previous row is the newest such
+//! `job_id = 'main:{project_id}'`. A row is measured against the newest such
 //! observation for the same check and `verdict_platform` that classifies as
-//! complete.
+//! complete and ran on the **same executor**: two hosts of one platform differ
+//! by provisioning and load as well as by tree, so a diff across hosts reports
+//! the hosts as movement. Only when the executor has no complete row does the
+//! platform's newest row stand in, and the message says so (see [`Comparison`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -350,13 +353,13 @@ async fn refresh_default_branch(
     if orch.services.git.remote_get_url(repo_root).is_err() {
         return Ok(());
     }
-    crate::orchestrator::default_branch_sync::fetch_origin_serialized(
+    crate::orchestrator::base_branch_sync::fetch_origin_serialized(
         orch,
         repo_root,
         default_branch,
-        Some(crate::orchestrator::default_branch_sync::FetchRecord {
+        Some(crate::orchestrator::base_branch_sync::FetchRecord {
             project_id,
-            source: crate::orchestrator::default_branch_sync::Source::Fetch,
+            source: crate::orchestrator::base_branch_sync::Source::Fetch,
         }),
     )
     .await
@@ -466,14 +469,19 @@ async fn attempt_lane(
         Ok(contract) => contract,
         Err(error) => return death(error),
     };
+    let names = |executor: &str| orch.fleet.executor_name_for_text(executor);
+    // A complete row on any executor of the platform covers these inputs: the
+    // question is whether a verdict is owed, not what to diff against.
     match latest_complete_row(
-        orch,
         &db,
         context.project_id,
         context.project_key,
         lane,
-        Some(&contract.context.input_hash),
-        None,
+        RowFilter {
+            input_hash: Some(&contract.context.input_hash),
+            ..RowFilter::default()
+        },
+        &names,
     )
     .await
     {
@@ -530,7 +538,7 @@ async fn attempt_lane(
             ),
         });
     };
-    match load_row(orch, &db, context.project_key, observation_id).await {
+    match load_row(&db, context.project_key, observation_id, &names).await {
         Ok(row) => LaneAttempt::Verdict(classify_row(row)),
         Err(error) => LaneAttempt::Verdict(CadenceVerdict::NoVerdict {
             row: None,
@@ -550,22 +558,14 @@ async fn report_lane(
     commit: Option<&str>,
     verdict: CadenceVerdict,
 ) {
-    let current = verdict.row().map(|row| row.id.clone());
-    let previous = latest_complete_row(
-        orch,
-        db,
-        project_id,
-        project_key,
-        lane,
-        None,
-        current.as_deref(),
-    )
-    .await
-    .unwrap_or_else(|error| {
-        log::warn!("main cadence previous-row lookup failed: {error}");
-        None
-    });
-    let bracket = match (previous.as_ref(), repository, commit) {
+    let names = |executor: &str| orch.fleet.executor_name_for_text(executor);
+    let comparison = comparison_for(db, project_id, project_key, lane, verdict.row(), &names)
+        .await
+        .unwrap_or_else(|error| {
+            log::warn!("main cadence previous-row lookup failed: {error}");
+            Comparison::Baseline
+        });
+    let bracket = match (comparison.previous(), repository, commit) {
         (Some(previous), Some(repository), Some(commit)) => {
             merge_bracket(
                 orch,
@@ -585,7 +585,7 @@ async fn report_lane(
         platform: &lane.platform,
         commit,
         verdict: &verdict,
-        previous: previous.as_ref(),
+        comparison: &comparison,
         bracket: &bracket,
         now_ms: now_ms(),
     });
@@ -725,6 +725,9 @@ pub(crate) struct CadenceRow {
     pub(crate) reference: String,
     pub(crate) commit: String,
     pub(crate) platform: String,
+    /// The executor identity the row recorded: what previous rows are keyed by.
+    pub(crate) executor_id: Option<String>,
+    /// The executor's public name, for display.
     pub(crate) executor: Option<String>,
     pub(crate) ran_at_ms: i64,
     pub(crate) verdict_passed: bool,
@@ -820,11 +823,14 @@ fn classify_row(row: CadenceRow) -> CadenceVerdict {
     }
 }
 
+/// Resolves a recorded executor identity to its public name.
+type ExecutorNames<'a> = &'a (dyn Fn(&str) -> String + Sync);
+
 async fn load_row(
-    orch: &Orchestrator,
     db: &LocalDb,
     project_key: &str,
     observation_id: &str,
+    names: ExecutorNames<'_>,
 ) -> Result<CadenceRow, String> {
     let head = db
         .query_opt(
@@ -875,7 +881,8 @@ async fn load_row(
         id,
         commit,
         platform,
-        executor: executor_id.map(|executor| orch.fleet.executor_name_for_text(&executor)),
+        executor: executor_id.as_deref().map(names),
+        executor_id,
         ran_at_ms: ran_at,
         verdict_passed: verdict == "passed",
         exit_code,
@@ -885,17 +892,26 @@ async fn load_row(
     })
 }
 
-/// The newest cadence row for `lane` that classifies as complete, optionally
-/// restricted to one input key and excluding one row.
-#[allow(clippy::too_many_arguments)]
+/// Narrows [`latest_complete_row`]'s candidates; every field is optional.
+#[derive(Clone, Copy, Default)]
+struct RowFilter<'a> {
+    /// Only rows recorded for this input key.
+    input_hash: Option<&'a str>,
+    /// Only rows recorded on this executor.
+    executor_id: Option<&'a str>,
+    /// Never this row.
+    excluding: Option<&'a str>,
+}
+
+/// The newest cadence row for `lane` that classifies as complete and passes
+/// `filter`.
 async fn latest_complete_row(
-    orch: &Orchestrator,
     db: &LocalDb,
     project_id: &str,
     project_key: &str,
     lane: &CadenceLane,
-    input_hash: Option<&str>,
-    excluding: Option<&str>,
+    filter: RowFilter<'_>,
+    names: ExecutorNames<'_>,
 ) -> Result<Option<CadenceRow>, String> {
     let candidates = db
         .query_all(
@@ -903,13 +919,15 @@ async fn latest_complete_row(
               WHERE project_id = ?1 AND check_name = ?2 AND cadence = 'main'
                 AND verdict_platform = ?3 AND complete = 1 AND id != ?4
                 AND (?5 = '' OR input_hash = ?5)
+                AND (?6 = '' OR executor_id = ?6)
               ORDER BY ran_at DESC LIMIT 8",
             (
                 project_id.to_string(),
                 lane.check.clone(),
                 lane.platform.clone(),
-                excluding.unwrap_or("").to_string(),
-                input_hash.unwrap_or("").to_string(),
+                filter.excluding.unwrap_or("").to_string(),
+                filter.input_hash.unwrap_or("").to_string(),
+                filter.executor_id.unwrap_or("").to_string(),
             ),
             |row| row.text(0),
         )
@@ -917,12 +935,122 @@ async fn latest_complete_row(
         .map_err(|error| error.to_string())?;
     for id in candidates {
         if let CadenceVerdict::Complete(row) =
-            classify_row(load_row(orch, db, project_key, &id).await?)
+            classify_row(load_row(db, project_key, &id, names).await?)
         {
             return Ok(Some(row));
         }
     }
     Ok(None)
+}
+
+/// What a cadence attempt is measured against. Two hosts of one platform
+/// differ by provisioning and load as well as by tree, so the previous row is
+/// chosen by executor first, and a comparison that crosses hosts says so.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum Comparison {
+    /// No complete row exists for the lane on any executor.
+    #[default]
+    Baseline,
+    /// The previous complete row on the attempt's own executor: the diff is
+    /// tree movement. `neighbour` is another executor's complete row that ran
+    /// after `previous`, when one did: the other host's view of the same
+    /// window, which separates the host census from movement.
+    SameExecutor {
+        previous: CadenceRow,
+        neighbour: Option<Box<CadenceRow>>,
+    },
+    /// The attempt's executor has no earlier complete row, so the platform's
+    /// newest (another executor's) stands in, and host differences cannot be
+    /// told from movement.
+    OtherExecutor { previous: CadenceRow },
+    /// The attempt names no executor (a death), so the platform's newest
+    /// complete row on any executor stands in.
+    AnyExecutor { previous: CadenceRow },
+}
+
+impl Comparison {
+    fn previous(&self) -> Option<&CadenceRow> {
+        match self {
+            Comparison::Baseline => None,
+            Comparison::SameExecutor { previous, .. }
+            | Comparison::OtherExecutor { previous }
+            | Comparison::AnyExecutor { previous } => Some(previous),
+        }
+    }
+}
+
+/// Choose the comparison for an attempt on `executor_id` from that executor's
+/// newest complete row and the platform's newest complete row on any executor.
+fn select_comparison(
+    executor_id: Option<&str>,
+    same_executor: Option<CadenceRow>,
+    newest: Option<CadenceRow>,
+) -> Comparison {
+    let Some(executor_id) = executor_id else {
+        return newest.map_or(Comparison::Baseline, |previous| Comparison::AnyExecutor {
+            previous,
+        });
+    };
+    match same_executor {
+        Some(previous) => {
+            let neighbour = newest.filter(|row| {
+                row.executor_id.as_deref() != Some(executor_id)
+                    && row.ran_at_ms > previous.ran_at_ms
+            });
+            Comparison::SameExecutor {
+                previous,
+                neighbour: neighbour.map(Box::new),
+            }
+        }
+        None => newest.map_or(Comparison::Baseline, |previous| Comparison::OtherExecutor {
+            previous,
+        }),
+    }
+}
+
+/// What `current` (the attempt's own row, when it recorded one) is measured
+/// against.
+async fn comparison_for(
+    db: &LocalDb,
+    project_id: &str,
+    project_key: &str,
+    lane: &CadenceLane,
+    current: Option<&CadenceRow>,
+    names: ExecutorNames<'_>,
+) -> Result<Comparison, String> {
+    let excluding = current.map(|row| row.id.as_str());
+    let executor_id = current.and_then(|row| row.executor_id.as_deref());
+    let same_executor = match executor_id {
+        Some(executor_id) => {
+            latest_complete_row(
+                db,
+                project_id,
+                project_key,
+                lane,
+                RowFilter {
+                    executor_id: Some(executor_id),
+                    excluding,
+                    ..RowFilter::default()
+                },
+                names,
+            )
+            .await?
+        }
+        None => None,
+    };
+    let newest = latest_complete_row(
+        db,
+        project_id,
+        project_key,
+        lane,
+        RowFilter {
+            excluding,
+            ..RowFilter::default()
+        },
+        names,
+    )
+    .await?;
+    Ok(select_comparison(executor_id, same_executor, newest))
 }
 
 /// The line of a failure excerpt that says what went wrong. A Rust panic opens
@@ -1143,8 +1271,8 @@ pub(crate) struct CadenceReport<'a> {
     /// The tip the lane attempted, when it was resolved.
     pub(crate) commit: Option<&'a str>,
     pub(crate) verdict: &'a CadenceVerdict,
-    /// The lane's previous complete row.
-    pub(crate) previous: Option<&'a CadenceRow>,
+    /// What the attempt is measured against.
+    pub(crate) comparison: &'a Comparison,
     pub(crate) bracket: &'a Bracket,
     pub(crate) now_ms: i64,
 }
@@ -1171,6 +1299,18 @@ fn thousands(value: usize) -> String {
         out.push(digit);
     }
     out
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+fn host(row: &CadenceRow) -> &str {
+    row.executor.as_deref().unwrap_or("unknown")
 }
 
 fn age(now_ms: i64, then_ms: i64) -> String {
@@ -1268,11 +1408,193 @@ fn newly_red_groups<'a>(
     groups
 }
 
+/// Pass/fail of one test in a row; `None` when it was skipped or absent.
+fn passed_in(row: &CadenceRow, test: &str) -> Option<bool> {
+    match row.tests.get(test)? {
+        TestOutcome::Passed => Some(true),
+        TestOutcome::Failed(_) => Some(false),
+        TestOutcome::Skipped => None,
+    }
+}
+
+/// Tests that differ from another host's row while agreeing with this host's
+/// previous row: a difference between the hosts, not movement in the tree.
+#[derive(Debug, Default)]
+struct HostCensus<'a> {
+    /// Red here, passed on the other host.
+    red_here: Vec<&'a str>,
+    /// Passed here, red on the other host.
+    green_here: Vec<&'a str>,
+}
+
+fn host_census<'a>(
+    current: &'a CadenceRow,
+    previous: &CadenceRow,
+    neighbour: &CadenceRow,
+) -> HostCensus<'a> {
+    let mut census = HostCensus::default();
+    for test in current.tests.keys() {
+        let Some(here) = passed_in(current, test) else {
+            continue;
+        };
+        if passed_in(neighbour, test).is_none_or(|there| there == here)
+            || passed_in(previous, test) != Some(here)
+        {
+            continue;
+        }
+        if here {
+            census.green_here.push(test);
+        } else {
+            census.red_here.push(test);
+        }
+    }
+    census
+}
+
+/// The one-host tag on a newly-red group: how many of its tests passed on the
+/// other host's row in the same window.
+fn one_host(tests: &[&str], neighbour: Option<&CadenceRow>) -> String {
+    let Some(neighbour) = neighbour else {
+        return String::new();
+    };
+    let passed = tests
+        .iter()
+        .filter(|test| passed_in(neighbour, test) == Some(true))
+        .count();
+    if passed == 0 {
+        String::new()
+    } else if passed == tests.len() {
+        format!(" · **one host**: passed on `{}`", host(neighbour))
+    } else {
+        format!(
+            " · **one host** for {passed} of {}: passed on `{}`",
+            tests.len(),
+            host(neighbour)
+        )
+    }
+}
+
+fn render_tests(out: &mut String, indent: &str, tests: &[&str]) {
+    for test in tests.iter().take(MAX_GREEN) {
+        out.push_str(&format!("{indent}- `{test}`\n"));
+    }
+    if tests.len() > MAX_GREEN {
+        out.push_str(&format!(
+            "{indent}- … and {} more\n",
+            tests.len() - MAX_GREEN
+        ));
+    }
+}
+
+fn render_groups(out: &mut String, groups: &[(&str, Vec<&str>)], neighbour: Option<&CadenceRow>) {
+    for (signature, tests) in groups.iter().take(MAX_GROUPS) {
+        out.push_str(&format!(
+            "- **{} test{}**{} — `{}`\n",
+            tests.len(),
+            plural(tests.len()),
+            one_host(tests, neighbour),
+            signature.replace('`', "'")
+        ));
+        for test in tests.iter().take(MAX_IDS_PER_GROUP) {
+            out.push_str(&format!("  - `{test}`\n"));
+        }
+        if tests.len() > MAX_IDS_PER_GROUP {
+            out.push_str(&format!(
+                "  - … and {} more\n",
+                tests.len() - MAX_IDS_PER_GROUP
+            ));
+        }
+    }
+    if groups.len() > MAX_GROUPS {
+        let rest: usize = groups[MAX_GROUPS..]
+            .iter()
+            .map(|(_, tests)| tests.len())
+            .sum();
+        out.push_str(&format!(
+            "- … and {} more group{} ({rest} tests)\n",
+            groups.len() - MAX_GROUPS,
+            plural(groups.len() - MAX_GROUPS)
+        ));
+    }
+}
+
+/// The "Compared with" line: which row the diff is against, and on which host.
+fn render_basis(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow) {
+    let line = match report.comparison {
+        Comparison::Baseline => format!(
+            "nothing. No earlier complete cadence row exists for {} on {}, so this row is the baseline and every failure is listed as newly red.",
+            report.check, report.platform
+        ),
+        Comparison::SameExecutor { previous, .. } => format!(
+            "{}, the previous row on `{}` (commit `{}`, ran {} earlier)",
+            previous.reference,
+            host(previous),
+            short_commit(&previous.commit),
+            age(row.ran_at_ms, previous.ran_at_ms)
+        ),
+        Comparison::OtherExecutor { previous } => format!(
+            "{} on `{}` (commit `{}`, ran {} earlier). No earlier complete row exists on `{}`, so this is a **cross-host comparison**: what differs below may be the two hosts (provisioning, load, toolchain) rather than the tree, and none of it is reported as newly red or green.",
+            previous.reference,
+            host(previous),
+            short_commit(&previous.commit),
+            age(row.ran_at_ms, previous.ran_at_ms),
+            host(row)
+        ),
+        Comparison::AnyExecutor { previous } => format!(
+            "{} on `{}` (commit `{}`, ran {} earlier). This row names no executor, so the comparison may cross hosts.",
+            previous.reference,
+            host(previous),
+            short_commit(&previous.commit),
+            age(row.ran_at_ms, previous.ran_at_ms)
+        ),
+    };
+    out.push_str(&format!("- Compared with: {line}\n"));
+}
+
+fn render_host_census(
+    out: &mut String,
+    row: &CadenceRow,
+    previous: &CadenceRow,
+    neighbour: &CadenceRow,
+) {
+    let census = host_census(row, previous, neighbour);
+    let total = census.red_here.len() + census.green_here.len();
+    if total == 0 {
+        return;
+    }
+    let (here, there) = (host(row), host(neighbour));
+    out.push_str(&format!(
+        "\n**HOST CENSUS against `{there}`: {total}** — these differ from {} (`{there}`, commit `{}`, ran {} earlier) but match this host's previous row, so they are a difference between the hosts, not movement in the tree.\n",
+        neighbour.reference,
+        short_commit(&neighbour.commit),
+        age(row.ran_at_ms, neighbour.ran_at_ms)
+    ));
+    if !census.red_here.is_empty() {
+        out.push_str(&format!(
+            "- Red on `{here}`, passed on `{there}`: {}\n",
+            census.red_here.len()
+        ));
+        render_tests(out, "  ", &census.red_here);
+    }
+    if !census.green_here.is_empty() {
+        out.push_str(&format!(
+            "- Passed on `{here}`, red on `{there}`: {}\n",
+            census.green_here.len()
+        ));
+        render_tests(out, "  ", &census.green_here);
+    }
+}
+
 fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow) {
-    let groups = newly_red_groups(row, report.previous);
+    let previous = report.comparison.previous();
+    let (neighbour, cross_host) = match report.comparison {
+        Comparison::SameExecutor { neighbour, .. } => (neighbour.as_deref(), None),
+        Comparison::OtherExecutor { previous } => (None, Some(host(previous))),
+        Comparison::Baseline | Comparison::AnyExecutor { .. } => (None, None),
+    };
+    let groups = newly_red_groups(row, previous);
     let newly_red: usize = groups.iter().map(|(_, tests)| tests.len()).sum();
-    let (newly_green, unreported): (Vec<&str>, Vec<&str>) = report
-        .previous
+    let (newly_green, unreported): (Vec<&str>, Vec<&str>) = previous
         .map(|previous| {
             previous
                 .tests
@@ -1290,74 +1612,42 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
     } else {
         format!("{} failed", thousands(row.failed()))
     };
+    let movement = match cross_host {
+        Some(other) => format!(
+            "cross-host against `{other}`: {newly_red} red here only, {} green here only",
+            newly_green.len()
+        ),
+        None => format!("{newly_red} newly red, {} newly green", newly_green.len()),
+    };
     out.push_str(&format!(
-        "**Main cadence · {} · {} · `{}`: {headline} — {newly_red} newly red, {} newly green**\n\n",
+        "**Main cadence · {} · {} on `{}` · `{}`: {headline} — {movement}**\n\n",
         report.check,
         report.platform,
-        short_commit(&row.commit),
-        newly_green.len()
+        host(row),
+        short_commit(&row.commit)
     ));
     row_identity(out, row);
-    match report.previous {
-        Some(previous) => out.push_str(&format!(
-            "- Compared with: {} (commit `{}`, ran {} earlier)\n",
-            previous.reference,
-            short_commit(&previous.commit),
-            age(row.ran_at_ms, previous.ran_at_ms)
-        )),
-        None => out.push_str(&format!(
-            "- Compared with: nothing. No earlier complete cadence row exists for {} on {}, so this row is the baseline and every failure is listed as newly red.\n",
-            report.check, report.platform
-        )),
-    }
+    render_basis(out, report, row);
     if newly_red > 0 {
+        let title = match cross_host {
+            Some(other) => format!("RED HERE, NOT RED ON `{other}`"),
+            None => "NEWLY RED".to_string(),
+        };
         out.push_str(&format!(
-            "\n**NEWLY RED: {newly_red} test{} in {} failure group{}**\n",
-            if newly_red == 1 { "" } else { "s" },
+            "\n**{title}: {newly_red} test{} in {} failure group{}**\n",
+            plural(newly_red),
             groups.len(),
-            if groups.len() == 1 { "" } else { "s" }
+            plural(groups.len())
         ));
-        for (signature, tests) in groups.iter().take(MAX_GROUPS) {
-            out.push_str(&format!(
-                "- **{} test{}** — `{}`\n",
-                tests.len(),
-                if tests.len() == 1 { "" } else { "s" },
-                signature.replace('`', "'")
-            ));
-            for test in tests.iter().take(MAX_IDS_PER_GROUP) {
-                out.push_str(&format!("  - `{test}`\n"));
-            }
-            if tests.len() > MAX_IDS_PER_GROUP {
-                out.push_str(&format!(
-                    "  - … and {} more\n",
-                    tests.len() - MAX_IDS_PER_GROUP
-                ));
-            }
-        }
-        if groups.len() > MAX_GROUPS {
-            let rest: usize = groups[MAX_GROUPS..]
-                .iter()
-                .map(|(_, tests)| tests.len())
-                .sum();
-            out.push_str(&format!(
-                "- … and {} more group{} ({rest} tests)\n",
-                groups.len() - MAX_GROUPS,
-                if groups.len() - MAX_GROUPS == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            ));
-        }
+        render_groups(out, &groups, neighbour);
     }
     if !newly_green.is_empty() {
-        out.push_str(&format!("\n**NEWLY GREEN: {}**\n", newly_green.len()));
-        for test in newly_green.iter().take(MAX_GREEN) {
-            out.push_str(&format!("- `{test}`\n"));
-        }
-        if newly_green.len() > MAX_GREEN {
-            out.push_str(&format!("- … and {} more\n", newly_green.len() - MAX_GREEN));
-        }
+        let title = match cross_host {
+            Some(other) => format!("GREEN HERE, RED ON `{other}`"),
+            None => "NEWLY GREEN".to_string(),
+        };
+        out.push_str(&format!("\n**{title}: {}**\n", newly_green.len()));
+        render_tests(out, "", &newly_green);
     }
     if !unreported.is_empty() {
         out.push_str(&format!(
@@ -1367,10 +1657,22 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
             if unreported.len() == 1 { "it is" } else { "they are" }
         ));
     }
-    if report.previous.is_some() {
-        out.push_str(&format!("\n**Still red:** {still_red} (not listed)\n"));
+    if previous.is_some() {
+        let label = if cross_host.is_some() {
+            "Red on both hosts"
+        } else {
+            "Still red"
+        };
+        out.push_str(&format!("\n**{label}:** {still_red} (not listed)\n"));
     }
-    if report.previous.is_some() {
+    if let Comparison::SameExecutor {
+        previous,
+        neighbour: Some(neighbour),
+    } = report.comparison
+    {
+        render_host_census(out, row, previous, neighbour);
+    }
+    if previous.is_some() {
         render_bracket(out, "Merges since the compared row", report.bracket);
     }
 }
@@ -1416,19 +1718,41 @@ fn render_incomplete(
             ));
         }
     }
-    match report.previous {
-        Some(previous) => out.push_str(&format!(
-            "- Last complete row: {} at commit `{}`, ran {} ago.\n",
-            previous.reference,
+    let since = |previous: &CadenceRow| {
+        format!(
+            "commit `{}`, ran {} ago",
             short_commit(&previous.commit),
             age(report.now_ms, previous.ran_at_ms)
-        )),
-        None => out.push_str(&format!(
+        )
+    };
+    match report.comparison {
+        Comparison::Baseline => out.push_str(&format!(
             "- Last complete row: none. No complete cadence row has ever been recorded for {} on {}.\n",
             report.check, report.platform
         )),
+        Comparison::SameExecutor { previous, .. } => out.push_str(&format!(
+            "- Last complete row: {}, the previous row on `{}`, at {}.\n",
+            previous.reference,
+            host(previous),
+            since(previous)
+        )),
+        Comparison::OtherExecutor { previous } => out.push_str(&format!(
+            "- Last complete row: none on `{}`. The newest complete row on {} is {} on `{}`, at {}.\n",
+            row.map_or("this executor", host),
+            report.platform,
+            previous.reference,
+            host(previous),
+            since(previous)
+        )),
+        Comparison::AnyExecutor { previous } => out.push_str(&format!(
+            "- Last complete row: {} on `{}` (the newest on {}, any executor), at {}.\n",
+            previous.reference,
+            host(previous),
+            report.platform,
+            since(previous)
+        )),
     }
-    if report.previous.is_some() && report.commit.is_some() {
+    if report.comparison.previous().is_some() && report.commit.is_some() {
         render_bracket(out, "Merges not covered by a complete row", report.bracket);
     }
 }
@@ -1485,6 +1809,7 @@ mod tests {
             reference: format!("cairn://p/cairn/check-observations/{id}"),
             commit: commit.to_string(),
             platform: "linux".to_string(),
+            executor_id: Some("bbs".to_string()),
             executor: Some("bbs".to_string()),
             ran_at_ms,
             verdict_passed: !tests
@@ -1511,19 +1836,29 @@ mod tests {
         TestOutcome::Failed(signature.to_string())
     }
 
+    /// `row` as recorded on another executor.
+    fn on(executor: &str, mut row: CadenceRow) -> CadenceRow {
+        row.executor_id = Some(executor.to_string());
+        row.executor = Some(executor.to_string());
+        row
+    }
+
+    fn same(previous: &CadenceRow) -> Comparison {
+        Comparison::SameExecutor {
+            previous: previous.clone(),
+            neighbour: None,
+        }
+    }
+
     const HOUR: i64 = 60 * 60 * 1000;
 
-    fn report<'a>(
-        verdict: &'a CadenceVerdict,
-        previous: Option<&'a CadenceRow>,
-        bracket: &'a Bracket,
-    ) -> String {
+    fn report(verdict: &CadenceVerdict, comparison: &Comparison, bracket: &Bracket) -> String {
         render_report(&CadenceReport {
             check: "rust-tests",
             platform: "linux",
             commit: Some("bbbbbbbbbbbbbbbbbbbb"),
             verdict,
-            previous,
+            comparison,
             bracket,
             now_ms: 10 * HOUR,
         })
@@ -1655,8 +1990,21 @@ mod tests {
             ],
         );
         let verdict = CadenceVerdict::Complete(current);
-        let text = report(&verdict, Some(&previous), &Bracket::default());
+        let text = report(&verdict, &same(&previous), &Bracket::default());
 
+        assert!(text.contains("4 newly red, 1 newly green"), "{text}");
+        assert!(
+            text.contains(
+                "Compared with: cairn://p/cairn/check-observations/prev, the previous row on `bbs`"
+            ),
+            "the comparison names its host: {text}"
+        );
+        assert!(
+            !text.contains("HOST CENSUS")
+                && !text.contains("one host")
+                && !text.contains("cross-host"),
+            "no other host ran in the window: {text}"
+        );
         assert!(
             text.contains("cairn://p/cairn/check-observations/cur"),
             "{text}"
@@ -1713,7 +2061,7 @@ mod tests {
             &[("a", failed("x")), ("b", TestOutcome::Passed)],
         );
         let verdict = CadenceVerdict::Complete(current);
-        let text = report(&verdict, None, &Bracket::default());
+        let text = report(&verdict, &Comparison::Baseline, &Bracket::default());
         assert!(text.contains("this row is the baseline"), "{text}");
         assert!(
             text.contains("NEWLY RED: 1 test in 1 failure group"),
@@ -1758,7 +2106,7 @@ mod tests {
             unavailable: None,
         };
         let verdict = CadenceVerdict::Complete(current);
-        let text = report(&verdict, Some(&previous), &bracket);
+        let text = report(&verdict, &same(&previous), &bracket);
         assert!(text.contains("all 1 passed"), "{text}");
         assert!(
             text.contains("**Merges since the compared row (2)**"),
@@ -1789,7 +2137,8 @@ mod tests {
         let verdict = CadenceVerdict::Death {
             cause: "infrastructure: the command stopped making progress".into(),
         };
-        let text = report(&verdict, Some(&previous), &Bracket::default());
+        let comparison = Comparison::AnyExecutor { previous };
+        let text = report(&verdict, &comparison, &Bracket::default());
         assert!(
             text.starts_with("🚨 **MAIN CADENCE DID NOT COMPLETE"),
             "{text}"
@@ -1817,7 +2166,7 @@ mod tests {
         empty.verdict_passed = false;
         empty.output_tail = "error[E0599]: no method named `turn_id`".into();
         let verdict = classify_row(empty);
-        let text = report(&verdict, None, &Bracket::default());
+        let text = report(&verdict, &Comparison::Baseline, &Bracket::default());
         assert!(
             text.starts_with("🚨 **MAIN CADENCE DID NOT COMPLETE"),
             "{text}"
@@ -1844,8 +2193,324 @@ mod tests {
         let mut green_but_empty = row("cur2", "bbbbbbbbbbbb", HOUR, &[]);
         green_but_empty.verdict_passed = true;
         green_but_empty.exit_code = 0;
-        let text = report(&classify_row(green_but_empty), None, &Bracket::default());
+        let text = report(
+            &classify_row(green_but_empty),
+            &Comparison::Baseline,
+            &Bracket::default(),
+        );
         assert!(text.contains("Cause class: **no-verdict**"), "{text}");
+    }
+
+    #[test]
+    fn a_cross_host_fallback_names_both_hosts_and_claims_no_movement() {
+        let on_bbs = row(
+            "prev",
+            "aaaaaaaaaaaaaaaa",
+            2 * HOUR,
+            &[
+                ("core::lock_wait", failed("Blocking waiting for file lock")),
+                ("core::load", failed("timed out")),
+                ("core::both", failed("assertion failed")),
+                ("core::here_only", TestOutcome::Passed),
+            ],
+        );
+        let on_fedora = on(
+            "fedora",
+            row(
+                "cur",
+                "bbbbbbbbbbbbbbbb",
+                3 * HOUR,
+                &[
+                    ("core::lock_wait", TestOutcome::Passed),
+                    ("core::load", TestOutcome::Passed),
+                    ("core::both", failed("assertion failed")),
+                    ("core::here_only", failed("left == right")),
+                ],
+            ),
+        );
+        let comparison = Comparison::OtherExecutor { previous: on_bbs };
+        let text = report(
+            &CadenceVerdict::Complete(on_fedora),
+            &comparison,
+            &Bracket::default(),
+        );
+        assert!(text.contains("linux on `fedora`"), "{text}");
+        assert!(
+            text.contains("cross-host against `bbs`: 1 red here only, 2 green here only"),
+            "{text}"
+        );
+        assert!(
+            text.contains("check-observations/prev on `bbs`")
+                && text.contains("No earlier complete row exists on `fedora`"),
+            "the basis names both hosts: {text}"
+        );
+        assert!(
+            text.contains("RED HERE, NOT RED ON `bbs`: 1 test")
+                && text.contains("GREEN HERE, RED ON `bbs`: 2")
+                && text.contains("**Red on both hosts:** 1"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("NEWLY")
+                && !text.contains("newly red,")
+                && !text.contains("newly green**"),
+            "a cross-host difference is never reported as movement: {text}"
+        );
+        assert!(text.contains("Merges since the compared row"), "{text}");
+    }
+
+    #[test]
+    fn another_hosts_row_in_the_window_splits_the_host_census_from_movement() {
+        let previous = on(
+            "fedora",
+            row(
+                "prev",
+                "aaaaaaaaaaaaaaaa",
+                HOUR,
+                &[
+                    ("core::lock_a", TestOutcome::Passed),
+                    ("core::lock_b", TestOutcome::Passed),
+                    ("core::fedora_only", failed("refresh computed twice")),
+                    ("core::moved", TestOutcome::Passed),
+                    ("core::moved_everywhere", TestOutcome::Passed),
+                    ("core::fixed", failed("stale")),
+                ],
+            ),
+        );
+        let neighbour = row(
+            "other",
+            "cccccccccccccccc",
+            2 * HOUR,
+            &[
+                ("core::lock_a", failed("Blocking waiting for file lock")),
+                ("core::lock_b", failed("Blocking waiting for file lock")),
+                ("core::fedora_only", TestOutcome::Passed),
+                ("core::moved", TestOutcome::Passed),
+                ("core::moved_everywhere", failed("index out of bounds")),
+                ("core::fixed", failed("stale")),
+            ],
+        );
+        let current = on(
+            "fedora",
+            row(
+                "cur",
+                "bbbbbbbbbbbbbbbb",
+                3 * HOUR,
+                &[
+                    ("core::lock_a", TestOutcome::Passed),
+                    ("core::lock_b", TestOutcome::Passed),
+                    ("core::fedora_only", failed("refresh computed twice")),
+                    ("core::moved", failed("left == right")),
+                    ("core::moved_everywhere", failed("index out of bounds")),
+                    ("core::fixed", TestOutcome::Passed),
+                ],
+            ),
+        );
+        let comparison = Comparison::SameExecutor {
+            previous,
+            neighbour: Some(Box::new(neighbour)),
+        };
+        let text = report(
+            &CadenceVerdict::Complete(current),
+            &comparison,
+            &Bracket::default(),
+        );
+        // Movement is measured on fedora's own history only.
+        assert!(text.contains("2 newly red, 1 newly green"), "{text}");
+        assert!(text.contains("the previous row on `fedora`"), "{text}");
+        assert!(
+            text.contains("**1 test** · **one host**: passed on `bbs` — `left == right`"),
+            "a red the other host's newer row passed is flagged: {text}"
+        );
+        assert!(
+            text.contains("**1 test** — `index out of bounds`"),
+            "a red on both hosts is not one-host: {text}"
+        );
+        assert!(
+            text.contains("**HOST CENSUS against `bbs`: 3**")
+                && text.contains("check-observations/other"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- Red on `fedora`, passed on `bbs`: 1\n  - `core::fedora_only`"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "- Passed on `fedora`, red on `bbs`: 2\n  - `core::lock_a`\n  - `core::lock_b`"
+            ),
+            "{text}"
+        );
+        let green = text.find("NEWLY GREEN").unwrap();
+        let census = text.find("HOST CENSUS").unwrap();
+        assert!(
+            !text[green..census].contains("lock_"),
+            "the host census is not reported as newly green: {text}"
+        );
+        assert!(text[green..census].contains("`core::fixed`"), "{text}");
+    }
+
+    #[test]
+    fn a_no_verdict_on_a_host_without_history_names_the_other_hosts_row() {
+        let previous = row(
+            "prev",
+            "aaaaaaaaaaaaaaaa",
+            HOUR,
+            &[("a", TestOutcome::Passed)],
+        );
+        let mut partial = on(
+            "fedora",
+            row(
+                "cur",
+                "bbbbbbbbbbbb",
+                2 * HOUR,
+                &[("a", TestOutcome::Passed)],
+            ),
+        );
+        partial.complete = false;
+        let comparison = Comparison::OtherExecutor { previous };
+        let text = report(&classify_row(partial), &comparison, &Bracket::default());
+        assert!(
+            text.contains("Last complete row: none on `fedora`. The newest complete row on linux is cairn://p/cairn/check-observations/prev on `bbs`"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("has ever been recorded"),
+            "a complete row exists on the platform: {text}"
+        );
+    }
+
+    async fn insert_observation(
+        db: &LocalDb,
+        id: &str,
+        executor: &str,
+        ran_at: i64,
+        cadence: &str,
+        tests: &[(&str, &str)],
+    ) {
+        // A failing exit with no failing test is not a verdict, so a row's
+        // verdict follows its tests; a row with no tests is a compile failure.
+        let (exit_code, verdict) = if tests.is_empty() {
+            (101, "failed")
+        } else if tests.iter().any(|(_, status)| *status == "failed") {
+            (100, "failed")
+        } else {
+            (0, "passed")
+        };
+        let mut script = format!(
+            "INSERT INTO check_result_observations
+               (id, project_id, commit_sha, tree_hash, check_name, input_hash,
+                environment_fingerprint, exit_code, verdict, complete, reusable,
+                parser_version, result_schema_version, ran_at, duration_ms, job_id,
+                cadence, output_tail, executor_id, verdict_platform, public_handle)
+             VALUES('{id}','p','c-{id}','t','rust-tests','i-{id}','env',{exit_code},'{verdict}',1,0,
+                    1,1,{ran_at},5,'main:p','{cadence}','','{executor}','linux','h-{id}');"
+        );
+        for (test, status) in tests {
+            script.push_str(&format!(
+                "INSERT INTO check_test_results (observation_id, test_id, status, failure_excerpt)
+                 VALUES('{id}','{test}','{status}','boom');"
+            ));
+        }
+        db.execute_script(script).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_previous_row_is_the_same_executors_with_a_platform_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open_migrated_for_test(temp.path().join("cadence.db"))
+            .await
+            .unwrap();
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p','w','Project','cairn','/tmp/repo',1,1);",
+        )
+        .await
+        .unwrap();
+        let lane = CadenceLane {
+            check: "rust-tests".into(),
+            platform: "linux".into(),
+            notify: "testing".into(),
+        };
+        let names = |executor: &str| format!("{executor}-host");
+        let comparison = |current: Option<CadenceRow>| {
+            let db = &db;
+            let lane = &lane;
+            async move {
+                comparison_for(db, "p", "cairn", lane, current.as_ref(), &names)
+                    .await
+                    .unwrap()
+            }
+        };
+        let load = |id: &'static str| {
+            let db = &db;
+            async move { load_row(db, "cairn", id, &names).await.unwrap() }
+        };
+        let id_of = |row: Option<&CadenceRow>| row.map(|row| row.id.clone());
+
+        // Interleaved hosts, plus rows the lookup must never pick: a complete
+        // flag with no tests (a compile failure), a manual run, another platform.
+        insert_observation(&db, "b1", "bbs", 1, "main", &[("a", "failed")]).await;
+        insert_observation(&db, "f1", "fedora", 2, "main", &[("a", "passed")]).await;
+        insert_observation(&db, "b2", "bbs", 3, "main", &[("a", "failed")]).await;
+        insert_observation(&db, "fz", "fedora", 4, "main", &[]).await;
+        insert_observation(&db, "fm", "fedora", 5, "manual", &[("a", "passed")]).await;
+
+        // bbs's newest is diffed against bbs's previous; fedora's f1 ran in
+        // between, so it is the window's neighbour.
+        let b2 = load("b2").await;
+        assert_eq!(b2.executor.as_deref(), Some("bbs-host"));
+        match comparison(Some(b2)).await {
+            Comparison::SameExecutor {
+                previous,
+                neighbour,
+            } => {
+                assert_eq!(previous.id, "b1");
+                assert_eq!(id_of(neighbour.as_deref()).as_deref(), Some("f1"));
+            }
+            other => panic!("expected a same-executor comparison, got {other:?}"),
+        }
+
+        // fedora's next row skips the newer bbs row and the unusable fedora
+        // rows, and keeps b2 as the neighbour.
+        insert_observation(&db, "f2", "fedora", 6, "main", &[("a", "passed")]).await;
+        match comparison(Some(load("f2").await)).await {
+            Comparison::SameExecutor {
+                previous,
+                neighbour,
+            } => {
+                assert_eq!(previous.id, "f1");
+                assert_eq!(id_of(neighbour.as_deref()).as_deref(), Some("b2"));
+            }
+            other => panic!("expected a same-executor comparison, got {other:?}"),
+        }
+
+        // Consecutive rows on one host: no neighbour, the pre-existing shape.
+        insert_observation(&db, "f3", "fedora", 7, "main", &[("a", "passed")]).await;
+        match comparison(Some(load("f3").await)).await {
+            Comparison::SameExecutor {
+                previous,
+                neighbour,
+            } => {
+                assert_eq!(previous.id, "f2");
+                assert!(neighbour.is_none(), "{neighbour:?}");
+            }
+            other => panic!("expected a same-executor comparison, got {other:?}"),
+        }
+
+        // A host with no history falls back to the platform's newest row.
+        insert_observation(&db, "n1", "nuc", 8, "main", &[("a", "passed")]).await;
+        match comparison(Some(load("n1").await)).await {
+            Comparison::OtherExecutor { previous } => assert_eq!(previous.id, "f3"),
+            other => panic!("expected a cross-host fallback, got {other:?}"),
+        }
+
+        // A death names no executor: the platform's newest on any executor.
+        match comparison(None).await {
+            Comparison::AnyExecutor { previous } => assert_eq!(previous.id, "n1"),
+            other => panic!("expected the platform's newest, got {other:?}"),
+        }
     }
 
     #[test]

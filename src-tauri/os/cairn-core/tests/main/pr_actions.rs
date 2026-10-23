@@ -1003,12 +1003,245 @@ async fn merge_pr_for_job_marks_merged_and_resolves_issue() {
     let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
     provision_jj_merge(&cfg.path().join("config"), repo.path());
 
-    let msg = actions::merge_pr_for_job(&orch, &job, None, None)
+    let msg = actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .unwrap();
     assert!(msg.contains("merged"));
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
     assert_eq!(issue_status(&orch.db.local, &issue).await, "merged");
+}
+
+const PIN_BUMP_CONFIG: &str = "checks:
+  pin-tests:
+    command: cargo nextest run pin
+    verdictPlatforms: [linux, macos]
+pinBumps:
+  tool:
+    pin: tools/tool-pin.json
+    frozen: [integration]
+    checks: [pin-tests]
+    platforms: [linux, macos]
+";
+
+fn tool_pin(version: &str) -> String {
+    format!("{{\"integration\": 1, \"version\": \"{version}\", \"skip\": []}}\n")
+}
+
+/// A project whose `main` declares a pinBumps gate over `tools/tool-pin.json`
+/// at 1.0.0, with `feature` sealed one commit ahead bumping only that pin to
+/// 1.1.0. Returns the feature head commit.
+fn provision_pin_bump(bin: &str, config_dir: &Path) -> (TempDir, String) {
+    let repo = temp_jj_project();
+    std::fs::create_dir_all(repo.path().join(".cairn")).unwrap();
+    std::fs::create_dir_all(repo.path().join("tools")).unwrap();
+    std::fs::write(repo.path().join(".cairn/config.yaml"), PIN_BUMP_CONFIG).unwrap();
+    std::fs::write(repo.path().join("tools/tool-pin.json"), tool_pin("1.0.0")).unwrap();
+    for args in [
+        &["add", "-A"][..],
+        &["commit", "-q", "-m", "declare the pin gate"],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+    let ws = config_dir.join("feature-ws");
+    common::provision_jj_workspace(config_dir, repo.path(), &ws, "feature");
+    let jj = jj::environment(bin, config_dir);
+    std::fs::write(ws.join("tools/tool-pin.json"), tool_pin("1.1.0")).unwrap();
+    jj::seal(&jj, &ws, "bump tool to 1.1.0", None).unwrap();
+    let head = jj_bookmark_commit(bin, config_dir, repo.path(), "feature");
+    (repo, head)
+}
+
+/// Record a verified nextest pass for `check` on `platform` at `commit`, the
+/// way a fresh observation lands: observation, verdict cache row, commit alias.
+async fn record_verified_verdict(
+    db: &LocalDb,
+    project_id: &str,
+    commit: &str,
+    check: &str,
+    platform: &str,
+) -> String {
+    let id = format!("obs-{check}-{platform}");
+    let environment = format!("env-{platform}");
+    let parsed = r#"{"parser":"nextest","complete":true,"selection":"full","passed":3,"failed":0,"skipped":0,"failures":[]}"#;
+    db.execute(
+        "INSERT INTO check_result_observations (
+            id, project_id, commit_sha, tree_hash, check_name, input_hash,
+            environment_fingerprint, exit_code, verdict, complete, reusable,
+            parser_version, result_schema_version, ran_at, duration_ms, cadence,
+            output_tail, verdict_platform
+         ) VALUES (?1, ?2, ?3, 'tree', ?4, 'input', ?5, 0, 'passed', 1, 1, 1, 1, 10, 10,
+                   'review', '', ?6)",
+        params![
+            id.as_str(),
+            project_id,
+            commit,
+            check,
+            environment.as_str(),
+            platform
+        ],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO check_result_cache (
+            project_id, tree_hash, input_hash, check_name, environment_fingerprint,
+            result_schema_version, source_observation_id, exit_code, passed, output_tail,
+            duration_ms, ran_at, target_results_json, verdict_platform
+         ) VALUES (?1, 'tree', 'input', ?2, ?3, 1, ?4, 0, 1, '', 10, 10, ?5, ?6)",
+        params![
+            project_id,
+            check,
+            environment.as_str(),
+            id.as_str(),
+            parsed,
+            platform
+        ],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO check_result_commit_aliases (
+            project_id, commit_sha, check_name, environment_fingerprint,
+            result_schema_version, source_observation_id, tree_hash, input_hash,
+            disposition, evaluated_at
+         ) VALUES (?1, ?2, ?3, ?4, 1, ?5, 'tree', 'input', 'fresh', 10)",
+        params![project_id, commit, check, environment.as_str(), id.as_str()],
+    )
+    .await
+    .unwrap();
+    id
+}
+
+/// `(sequence, state, detail)` for every journal event of one merge request.
+async fn merge_journal(db: &LocalDb, mr_id: &str) -> Vec<(i64, String, Option<String>)> {
+    let mr_id = mr_id.to_string();
+    db.read(|conn| {
+        let mr_id = mr_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT sequence, state, detail FROM merge_attempt_events
+                      WHERE merge_request_id = ?1 ORDER BY created_at, sequence",
+                    params![mr_id.as_str()],
+                )
+                .await?;
+            let mut events = Vec::new();
+            while let Some(row) = rows.next().await? {
+                events.push((row.i64(0)?, row.text(1)?, row.opt_text(2)?));
+            }
+            Ok(events)
+        })
+    })
+    .await
+    .unwrap()
+}
+
+/// Without verdicts at the head, a pin bump is refused naming the missing
+/// verdict, journaled as a `violation`, and nothing lands.
+#[tokio::test]
+async fn pin_bump_merge_refuses_without_head_verdicts_and_journals_the_violation() {
+    let bin =
+        common::jj_bin().expect("jj must be provisioned in the build slot or available on PATH");
+    let (_temp, db) = common::migrated_db().await;
+    let cfg = tempfile::tempdir().unwrap();
+    let (repo, head) = provision_pin_bump(&bin, &cfg.path().join("config"));
+    let project = create_project(&db, "pbr", repo.path().to_str().unwrap()).await;
+    let issue = create_issue(&db, &project, 1).await;
+    insert_execution(&db, "exec-pbr", &project, &issue).await;
+    let job = create_job_with_execution(&db, &project, &issue, Some("exec-pbr")).await;
+    let mr = create_local_merge_request(&db, &job, &project, &issue).await;
+    let orch = orchestrator_with_http_in(db, MockHttpClient::new(), &cfg).await;
+
+    let error = actions::merge_pr_for_job(
+        &orch,
+        &job,
+        None,
+        None,
+        Some(actions::MergePrecondition::PinBump),
+    )
+    .await
+    .expect_err("a bump without verdicts must be refused");
+    assert!(
+        error.starts_with("Refusing to merge `feature` as a pin bump: verdict missing"),
+        "{error}"
+    );
+    assert!(
+        error.contains("pin-tests") && error.contains(&head),
+        "{error}"
+    );
+
+    let journal = merge_journal(&orch.db.local, &mr).await;
+    assert_eq!(journal.len(), 2, "{journal:?}");
+    assert_eq!(
+        (journal[0].0, journal[0].1.as_str()),
+        (0, "policy_disabled")
+    );
+    assert_eq!((journal[1].0, journal[1].1.as_str()), (1, "violation"));
+    assert!(
+        journal[1]
+            .2
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("pinBump: verdict missing")),
+        "{journal:?}"
+    );
+    assert_eq!(mr_status(&orch.db.local, &mr).await, "open");
+    assert_ne!(
+        jj_bookmark_commit(&bin, &cfg.path().join("config"), repo.path(), "main"),
+        head,
+        "nothing landed"
+    );
+}
+
+/// With a verified verdict on every required platform at the head, the bump
+/// lands and the outcome event records the evidence it landed on.
+#[tokio::test]
+async fn pin_bump_merge_lands_a_verified_bump_and_records_its_evidence() {
+    let bin =
+        common::jj_bin().expect("jj must be provisioned in the build slot or available on PATH");
+    let (_temp, db) = common::migrated_db().await;
+    let cfg = tempfile::tempdir().unwrap();
+    let (repo, head) = provision_pin_bump(&bin, &cfg.path().join("config"));
+    let project = create_project(&db, "pbm", repo.path().to_str().unwrap()).await;
+    let issue = create_issue(&db, &project, 1).await;
+    insert_execution(&db, "exec-pbm", &project, &issue).await;
+    let job = create_job_with_execution(&db, &project, &issue, Some("exec-pbm")).await;
+    let mr = create_local_merge_request(&db, &job, &project, &issue).await;
+    let mut observations = Vec::new();
+    for platform in ["linux", "macos"] {
+        observations
+            .push(record_verified_verdict(&db, &project, &head, "pin-tests", platform).await);
+    }
+    let orch = orchestrator_with_http_in(db, MockHttpClient::new(), &cfg).await;
+
+    let message = actions::merge_pr_for_job(
+        &orch,
+        &job,
+        None,
+        None,
+        Some(actions::MergePrecondition::PinBump),
+    )
+    .await
+    .unwrap();
+    assert!(message.contains("merged"), "{message}");
+    assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
+
+    let journal = merge_journal(&orch.db.local, &mr).await;
+    assert_eq!(journal.len(), 2, "{journal:?}");
+    assert_eq!((journal[1].0, journal[1].1.as_str()), (1, "succeeded"));
+    let detail = journal[1].2.clone().unwrap_or_default();
+    assert!(
+        detail.contains("pinBump: tool `tools/tool-pin.json` 1.0.0 -> 1.1.0"),
+        "{detail}"
+    );
+    assert!(detail.contains(&head), "{detail}");
+    for observation in &observations {
+        assert!(detail.contains(observation.as_str()), "{detail}");
+    }
 }
 
 /// A real remote PR landing on the default branch merges through GitHub's merge
@@ -1052,7 +1285,7 @@ async fn merge_pr_for_job_remote_default_branch_merges_via_github() {
     provision_jj_merge(&config_dir, repo.path());
     let base_before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
-    let msg = actions::merge_pr_for_job(&orch, &job, None, None)
+    let msg = actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .unwrap();
     assert!(msg.contains("via GitHub"), "reports a GitHub merge: {msg}");
@@ -1094,7 +1327,7 @@ async fn merge_pr_for_job_remote_merge_failure_leaves_unmarked() {
     provision_jj_merge(&config_dir, repo.path());
     let base_before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
-    let err = actions::merge_pr_for_job(&orch, &job, None, None)
+    let err = actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .expect_err("a GitHub-refused merge must fail closed");
     assert!(
@@ -1156,7 +1389,7 @@ async fn merge_pr_for_job_remote_refuses_undocumented_protocol_bump_before_githu
     )
     .unwrap();
 
-    let err = actions::merge_pr_for_job(&orch, &job, None, None)
+    let err = actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .expect_err("an undocumented protocol version must not land");
     assert!(
@@ -1187,7 +1420,7 @@ async fn merge_pr_for_job_refuses_conflicted_source_with_actionable_detail() {
     let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
     provision_jj_conflict(&bin, &cfg.path().join("config"), repo.path());
 
-    let err = actions::merge_pr_for_job(&orch, &job, None, None)
+    let err = actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .expect_err("a conflicted source must be refused");
     assert!(
@@ -1470,7 +1703,7 @@ async fn merge_pr_for_job_squashes_multiple_commits_to_one() {
     let pre = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
     // `None` selects the default `squash` shape.
-    actions::merge_pr_for_job(&orch, &job, None, None)
+    actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .unwrap();
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
@@ -1524,7 +1757,7 @@ async fn merge_pr_for_job_squash_retry_is_idempotent() {
     provision_jj_merge_multi(&config_dir, repo.path());
 
     // First merge: squashes the three commits to one.
-    actions::merge_pr_for_job(&orch, &job, None, None)
+    actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .unwrap();
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
@@ -1535,7 +1768,7 @@ async fn merge_pr_for_job_squash_retry_is_idempotent() {
     // idempotence guard must keep the default tip put. The retry's later
     // resolution may no-op or error on the already-merged node, but the store
     // tip is settled before that point, so assert on it directly.
-    let _ = actions::merge_pr_for_job(&orch, &job, None, None).await;
+    let _ = actions::merge_pr_for_job(&orch, &job, None, None, None).await;
     let after_retry = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
     assert_eq!(
         landed, after_retry,
@@ -1567,7 +1800,7 @@ async fn merge_pr_for_job_workspace_keeps_real_commits() {
 
     let pre = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
-    actions::merge_pr_for_job(&orch, &job, None, None)
+    actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .unwrap();
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
@@ -1726,7 +1959,7 @@ async fn merge_pr_for_job_advances_producing_execution() {
     let (cfg, orch, mut rx) = orchestrator_with_effect_channel(db, MockHttpClient::new()).await;
     provision_jj_merge(&cfg.path().join("config"), repo.path());
 
-    actions::merge_pr_for_job(&orch, &job, None, None)
+    actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .unwrap();
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");

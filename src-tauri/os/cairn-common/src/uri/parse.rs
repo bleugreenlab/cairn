@@ -110,6 +110,7 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         }),
         ["models"] => Some(CairnResource::Models),
         ["models", "catalog"] => Some(CairnResource::ModelsCatalog),
+        ["models", "decide"] => Some(CairnResource::ModelsDecide),
         ["models", "accounts"] => Some(CairnResource::ModelsAccounts),
         ["models", "accounts", id] => Some(CairnResource::ModelsAccount {
             id: (*id).to_string(),
@@ -150,6 +151,19 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         // A stored image, in each of the three forms that address one. The hash
         // arm must come first: a 64-hex string is never a valid ordinal, but
         // testing it explicitly keeps the permalink form unambiguous.
+        // The store-served source-control family. `vcs` is a reserved project
+        // segment, so these precede the thread arms that would read it as a
+        // thread name.
+        [PROJECT_SCOPE, project, "vcs", op] => {
+            let project = canonical_project(project);
+            match *op {
+                "diff" => Some(CairnResource::ProjectVcsDiff { project }),
+                "ancestry" => Some(CairnResource::ProjectVcsAncestry { project }),
+                "log" => Some(CairnResource::ProjectVcsLog { project }),
+                "blame" => Some(CairnResource::ProjectVcsBlame { project }),
+                _ => None,
+            }
+        }
         [PROJECT_SCOPE, project, "check-results", revision] if !revision.is_empty() => {
             Some(CairnResource::ProjectCheckResults {
                 project: canonical_project(project),

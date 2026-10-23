@@ -4,15 +4,27 @@
 //!   - allow everything by default (so the toolchain's broad reads/execs work),
 //!   - deny all filesystem writes,
 //!   - re-allow writes under the worktree, temp dirs, granted crossings, /dev,
-//!   - deny reads of the sensitive denylist.
+//!   - deny reads of the sensitive denylist,
+//!   - and, last, the operator credential boundary, which nothing re-allows.
 
-use super::{NestedSandboxWriteProbe, SandboxPolicy};
+use super::{
+    escape_sbpl, Confinement, NestedSandboxWriteProbe, OperatorCredentialFloor, SandboxPolicy,
+};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 pub(crate) fn current_process_is_confined() -> bool {
-    static CONFINED: OnceLock<bool> = OnceLock::new();
+    process_confinement().unwrap_or(true)
+}
+
+/// Whether this process runs under an inherited profile, or `None` when the
+/// question could not be asked because `sandbox-exec` did not launch.
+///
+/// A profile cannot be removed from a running process, so the answer holds for
+/// the life of the process and is measured once.
+pub(crate) fn process_confinement() -> Option<bool> {
+    static CONFINED: OnceLock<Option<bool>> = OnceLock::new();
     *CONFINED.get_or_init(|| {
         // Seatbelt profiles are inherited and cannot be replaced. Applying an
         // allow-default profile in a disposable child therefore succeeds only
@@ -29,50 +41,70 @@ pub(crate) fn current_process_is_confined() -> bool {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map_or(true, |status| !status.success())
+            .ok()
+            .map(|status| !status.success())
     })
 }
 
-pub(crate) fn probe_nested_sandbox_write() -> NestedSandboxWriteProbe {
+/// Spawn a command exactly as a spawn under `outer` is wrapped, and inside it
+/// apply a nested profile exactly as a fenced agent command is wrapped, then
+/// attempt a write that nested profile permits.
+///
+/// That is what a sandbox test running under `outer` does, so this measures
+/// the workload's own path rather than this process's.
+pub(crate) fn probe_nested_sandbox_write_under(outer: &Confinement) -> NestedSandboxWriteProbe {
     let outcome = tempfile::tempdir().map(|dir| {
-        let root = dir.path().canonicalize().unwrap_or_else(|_| dir.path().into());
+        let root = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().into());
         let probe = root.join("probe");
-        let profile = format!(
-            "(version 1)(allow default)(deny file-write* (subpath \"/\"))(allow file-write* (subpath \"{}\"))",
-            root.display()
+        let inner = Confinement::Fenced(SandboxPolicy::for_run(&root, &[], Vec::new()));
+        let (inner_program, inner_args) = inner.wrap_argv(
+            "/bin/sh",
+            &["-c".to_string(), "echo ok > probe".to_string()],
         );
-        let ran = Command::new("/usr/bin/sandbox-exec")
-            .args(["-p", &profile, "/bin/sh", "-c", "echo ok > probe"])
-            .current_dir(&root)
-            .output();
-        match ran {
+        let (program, args) = outer.wrap_argv(&inner_program, &inner_args);
+        let mut command = Command::new(&program);
+        command.args(&args).current_dir(&root).stdin(Stdio::null());
+        outer.install_pre_exec(&mut command);
+        match command.output() {
             Ok(output) if output.status.success() && probe.exists() => NestedSandboxWriteProbe {
                 available: true,
+                apply_refused: false,
                 detail: "an in-bounds temp write succeeded under a nested Seatbelt profile".into(),
             },
-            Ok(output) => NestedSandboxWriteProbe {
-                available: false,
-                detail: format!(
-                    "nested Seatbelt in-bounds temp write refused (exit {:?}): {}",
-                    output.status.code(),
-                    String::from_utf8_lossy(&output.stderr).lines().next().unwrap_or("no stderr")
-                ),
-            },
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                NestedSandboxWriteProbe {
+                    available: false,
+                    apply_refused: output.status.code() == Some(71)
+                        && stderr.contains("sandbox_apply"),
+                    detail: format!(
+                        "nested Seatbelt in-bounds temp write refused (exit {:?}): {}",
+                        output.status.code(),
+                        stderr.lines().next().unwrap_or("no stderr")
+                    ),
+                }
+            }
             Err(error) => NestedSandboxWriteProbe {
                 available: false,
+                apply_refused: false,
                 detail: format!("could not launch nested Seatbelt probe: {error}"),
             },
         }
     });
     outcome.unwrap_or_else(|error| NestedSandboxWriteProbe {
         available: false,
+        apply_refused: false,
         detail: format!("could not create nested Seatbelt probe directory: {error}"),
     })
 }
 use std::time::SystemTime;
 
-/// Generate the SBPL profile string for a policy.
-pub(crate) fn sbpl_profile(policy: &SandboxPolicy) -> String {
+/// Generate the SBPL profile string for a policy, closed by the operator
+/// credential boundary `floor` describes.
+pub(crate) fn sbpl_profile(policy: &SandboxPolicy, floor: &OperatorCredentialFloor) -> String {
     let mut out = String::new();
     out.push_str("(version 1)\n");
     out.push_str("(allow default)\n");
@@ -116,6 +148,10 @@ pub(crate) fn sbpl_profile(policy: &SandboxPolicy) -> String {
         out.push_str(&format!("(allow file-read* {})\n", read_allow_rules));
     }
 
+    // The operator credential boundary goes after every allow above, so no
+    // worktree, grant, or read re-allow can reopen it.
+    out.push_str(&floor.sbpl_rules());
+
     out
 }
 
@@ -150,7 +186,19 @@ pub(crate) fn wrap_argv(
     args: &[String],
     policy: &SandboxPolicy,
 ) -> (String, Vec<String>) {
-    let profile = sbpl_profile(policy);
+    wrap_argv_with_profile(
+        program,
+        args,
+        sbpl_profile(policy, &OperatorCredentialFloor::for_this_machine()),
+    )
+}
+
+/// Rewrite argv to run under an already-generated SBPL profile.
+pub(crate) fn wrap_argv_with_profile(
+    program: &str,
+    args: &[String],
+    profile: String,
+) -> (String, Vec<String>) {
     let mut wrapped = vec!["-p".to_string(), profile, program.to_string()];
     wrapped.extend(args.iter().cloned());
     ("/usr/bin/sandbox-exec".to_string(), wrapped)
@@ -180,11 +228,6 @@ fn subpath_rules(paths: &[PathBuf]) -> String {
 /// kernel reports.
 fn canonicalize_best_effort(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// Escape a string for an SBPL double-quoted literal.
-fn escape_sbpl(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Recover the denied path for a sandbox violation by `pid` from the unified
@@ -293,7 +336,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
         };
-        let profile = sbpl_profile(&policy);
+        let profile = sbpl_profile(&policy, &test_floor());
         assert!(profile.starts_with("(version 1)\n(allow default)\n"));
         assert!(profile.contains("(deny file-write* (subpath \"/\"))"));
         assert!(profile.contains("(allow file-write*"));
@@ -308,6 +351,34 @@ mod tests {
             read_allow_idx > deny_idx,
             "worktree read re-allow must come after deny-read"
         );
+    }
+
+    /// A floor pinned to a fixed home, so a profile's text does not depend on
+    /// the machine running the test.
+    fn test_floor() -> OperatorCredentialFloor {
+        OperatorCredentialFloor::new(Some(PathBuf::from("/Users/tester")), [])
+    }
+
+    #[test]
+    fn the_operator_credential_boundary_closes_every_profile() {
+        // A worktree inside a Cairn home and a session grant of the home itself
+        // are both re-allowed for reads; the boundary must still come after
+        // them, because Seatbelt applies the last matching rule.
+        let policy = SandboxPolicy::for_run(
+            Path::new("/Users/tester/.cairn/scratch/job"),
+            &["/Users/tester/.cairn-dev-x".to_string()],
+            vec![],
+        );
+        let profile = sbpl_profile(&policy, &test_floor());
+        let boundary = profile
+            .find("(deny file-read-data file-write* (regex")
+            .expect("the boundary is in every fenced profile");
+        let last_allow = profile.rfind("(allow ").unwrap();
+        assert!(
+            boundary > last_allow,
+            "the boundary must follow every allow:\n{profile}"
+        );
+        assert!(profile.contains(r#"^/Users/tester/\.cairn[^/]*/operator_auth_secret$"#));
     }
 
     #[test]
@@ -417,28 +488,8 @@ mod tests {
             return false;
         }
         eprintln!("skipping {test}: a nested sandbox-exec cannot write inside its own profile");
-        record_skip(test, "nested-sandbox-exec");
+        cairn_common::skip_ledger::record_skip(test, "nested-sandbox-exec");
         true
-    }
-
-    // Best-effort: append `name<TAB>reason` to `$CAIRN_SKIP_LOG` (set by
-    // `scripts/test-rust.ts`) so the runner moves this test out of `passed` and
-    // checks it against `src-tauri/skip-manifest.toml`. libtest counts an early
-    // return as a pass and swallows its message, so without this record the skip
-    // is indistinguishable from real coverage (#157).
-    fn record_skip(test: &str, reason: &str) {
-        if let Some(log) = std::env::var_os("CAIRN_SKIP_LOG") {
-            use std::io::Write as _;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log)
-            {
-                // One write_all (vs writeln!'s multiple syscalls) keeps the
-                // append atomic when parallel test threads all skip at once.
-                let _ = f.write_all(format!("{test}\t{reason}\n").as_bytes());
-            }
-        }
     }
 
     #[test]
@@ -677,7 +728,7 @@ mod tests {
     #[test]
     fn nested_write_probe_is_authoritative_when_allow_default_false_negatives() {
         let allow_default_claims_unconfined = !current_process_is_confined();
-        let measured = probe_nested_sandbox_write();
+        let measured = crate::probe_nested_sandbox_write();
         if allow_default_claims_unconfined && !measured.available {
             assert!(
                 measured.detail.contains("refused") || measured.detail.contains("could not"),
@@ -687,7 +738,10 @@ mod tests {
         }
         // Capability classification is the behavioral result in every state;
         // the allow-default probe is intentionally not consulted.
-        assert_eq!(measured.available, probe_nested_sandbox_write().available);
+        assert_eq!(
+            measured.available,
+            crate::probe_nested_sandbox_write().available
+        );
     }
 
     #[test]
@@ -737,7 +791,7 @@ mod tests {
         // drops it from the write-allow, so a kernel write into it is denied.
         let checkout = PathBuf::from("/project/live");
         let policy = SandboxPolicy::for_readonly_checkout(&checkout, &[], vec![]);
-        let profile = sbpl_profile(&policy);
+        let profile = sbpl_profile(&policy, &test_floor());
 
         // The checkout appears in the final read re-allow.
         let read_allow = profile.rfind("(allow file-read*").unwrap();
@@ -760,7 +814,7 @@ mod tests {
     fn for_run_profile_writes_cwd() {
         let wt = PathBuf::from("/work/wt");
         let policy = SandboxPolicy::for_run(&wt, &[], vec![]);
-        let profile = sbpl_profile(&policy);
+        let profile = sbpl_profile(&policy, &test_floor());
         let write_allow_line = profile
             .lines()
             .find(|l| l.starts_with("(allow file-write*"))
@@ -778,13 +832,277 @@ mod tests {
             &["/home/u/.cairn/worktrees/**/target/**".to_string()],
             vec![],
         );
-        let profile = sbpl_profile(&policy);
+        let profile = sbpl_profile(&policy, &test_floor());
         assert!(profile.contains("(allow file-write*"));
         // The worktrees-target glob is emitted as an anchored SBPL regex.
         assert!(
             profile.contains("(regex #\"^/home/u/\\.cairn/worktrees/.*/target/.*\")"),
             "profile missing worktrees-target regex allow:\n{profile}"
         );
+    }
+
+    /// A throwaway OS home holding a normal Cairn home and a dev-instance home,
+    /// each with both secrets, plus a same-named fixture outside any home.
+    struct CredentialFixture {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        os_home: PathBuf,
+        floor: OperatorCredentialFloor,
+    }
+
+    const SECRET_MARKER: &str = "OPERATOR-SECRET-MARKER-32-BYTES!";
+
+    impl CredentialFixture {
+        fn new() -> Self {
+            let dir = tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let os_home = root.join("home");
+            for home in [".cairn", ".cairn-dev-agent-cairn-1-builder-0"] {
+                let home = os_home.join(home);
+                std::fs::create_dir_all(&home).unwrap();
+                std::fs::write(home.join("operator_auth_secret"), SECRET_MARKER).unwrap();
+                std::fs::write(home.join("mcp_auth_secret"), "mcp-secret").unwrap();
+            }
+            std::fs::create_dir_all(root.join("fixture")).unwrap();
+            std::fs::write(root.join("fixture/operator_auth_secret"), "fixture").unwrap();
+            let floor = OperatorCredentialFloor::new(Some(os_home.clone()), []);
+            Self {
+                _dir: dir,
+                root,
+                os_home,
+                floor,
+            }
+        }
+
+        fn dev_secret(&self) -> PathBuf {
+            self.os_home
+                .join(".cairn-dev-agent-cairn-1-builder-0/operator_auth_secret")
+        }
+
+        fn run(&self, profile: &str, script: &str) -> std::process::Output {
+            let (program, args) = wrap_argv_with_profile(
+                "/bin/bash",
+                &["-c".into(), script.into()],
+                profile.to_string(),
+            );
+            Command::new(program)
+                .args(args)
+                .current_dir(&self.root)
+                .output()
+                .unwrap()
+        }
+
+        fn floor_only_profile(&self) -> String {
+            format!("(version 1)\n(allow default)\n{}", self.floor.sbpl_rules())
+        }
+    }
+
+    fn leaked(out: &std::process::Output) -> bool {
+        String::from_utf8_lossy(&out.stdout).contains(SECRET_MARKER)
+    }
+
+    // Live: every way of naming a Cairn home's operator credential that the
+    // boundary exists to refuse, under the floor an unfenced agent spawn gets.
+    #[test]
+    fn operator_credential_boundary_refuses_every_spelling_live() {
+        if skip_without_nested_sandbox_exec(
+            "operator_credential_boundary_refuses_every_spelling_live",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::MetadataExt as _;
+
+        let fixture = CredentialFixture::new();
+        let profile = fixture.floor_only_profile();
+        let secret = fixture.dev_secret();
+        let home = secret.parent().unwrap().to_path_buf();
+        let root = &fixture.root;
+        let metadata = std::fs::metadata(&secret).unwrap();
+        let mut attempts = vec![
+            ("direct", format!("cat {}", secret.display())),
+            (
+                "normal home",
+                format!("cat {}/.cairn/operator_auth_secret", fixture.os_home.display()),
+            ),
+            (
+                "relative",
+                format!("cd {} && cat operator_auth_secret", home.display()),
+            ),
+            (
+                "dot segments",
+                format!(
+                    "cd {} && cat ./.cairn/../.cairn-dev-agent-cairn-1-builder-0/./operator_auth_secret",
+                    fixture.os_home.display()
+                ),
+            ),
+            (
+                "symlinked file",
+                format!("ln -s {} {r}/l1 && cat {r}/l1", secret.display(), r = root.display()),
+            ),
+            (
+                "symlinked home",
+                format!(
+                    "ln -s {} {r}/l2 && cat {r}/l2/operator_auth_secret",
+                    home.display(),
+                    r = root.display()
+                ),
+            ),
+            (
+                "case variant",
+                format!("cat {}/OPERATOR_AUTH_SECRET", home.display()),
+            ),
+            (
+                "hard link",
+                format!("ln {} {r}/h1 && cat {r}/h1", secret.display(), r = root.display()),
+            ),
+            (
+                "APFS clone",
+                format!("cp -c {} {r}/c1 && cat {r}/c1", secret.display(), r = root.display()),
+            ),
+            (
+                "inode path",
+                format!("cat /.vol/{}/{}", metadata.dev(), metadata.ino()),
+            ),
+            (
+                "rename the file",
+                format!("mv {} {r}/m1 && cat {r}/m1", secret.display(), r = root.display()),
+            ),
+            (
+                "rename the home",
+                format!(
+                    "mv {} {r}/moved && cat {r}/moved/operator_auth_secret",
+                    home.display(),
+                    r = root.display()
+                ),
+            ),
+        ];
+        let firmlink = Path::new("/System/Volumes/Data");
+        if firmlink.is_dir() {
+            attempts.push((
+                "data-volume firmlink",
+                format!("cat {}{}", firmlink.display(), secret.display()),
+            ));
+        }
+
+        for (spelling, script) in attempts {
+            let out = fixture.run(&profile, &script);
+            assert!(
+                !leaked(&out),
+                "{spelling} read the operator credential: {script}"
+            );
+        }
+        assert!(
+            secret.exists(),
+            "no attempt may move the credential out from under its home"
+        );
+    }
+
+    // Live: the boundary takes nothing else. The MCP secret beside it, the
+    // home's other files, a new dev-instance home, and a same-named fixture in a
+    // temp directory all behave exactly as they do with no profile at all.
+    #[test]
+    fn operator_credential_boundary_leaves_ordinary_work_alone_live() {
+        if skip_without_nested_sandbox_exec(
+            "operator_credential_boundary_leaves_ordinary_work_alone_live",
+        ) {
+            return;
+        }
+        let fixture = CredentialFixture::new();
+        let profile = fixture.floor_only_profile();
+        let home = fixture.dev_secret().parent().unwrap().to_path_buf();
+        for (what, script) in [
+            ("read the MCP secret", format!("cat {}/mcp_auth_secret", home.display())),
+            ("stat the credential", format!("ls -l {}", fixture.dev_secret().display())),
+            (
+                "write inside a home",
+                format!("echo x > {h}/new && mkdir {h}/sub", h = home.display()),
+            ),
+            (
+                "create a new dev-instance home",
+                format!(
+                    "mkdir {h}/.cairn-dev-new && echo x > {h}/.cairn-dev-new/f",
+                    h = fixture.os_home.display()
+                ),
+            ),
+            (
+                "use a same-named fixture outside any home",
+                format!(
+                    "cat {r}/fixture/operator_auth_secret && echo y > {r}/fixture/operator_auth_secret",
+                    r = fixture.root.display()
+                ),
+            ),
+        ] {
+            let out = fixture.run(&profile, &script);
+            assert!(
+                out.status.success(),
+                "{what} must still work: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    // Live: a family home that is a symlink to a directory elsewhere is read
+    // through its real location, which the family pattern never spells; the
+    // discovered floor covers it there. And no agent may plant such a link.
+    #[test]
+    fn a_relocated_home_and_a_planted_link_are_both_refused_live() {
+        if skip_without_nested_sandbox_exec(
+            "a_relocated_home_and_a_planted_link_are_both_refused_live",
+        ) {
+            return;
+        }
+        let fixture = CredentialFixture::new();
+        let peer = fixture.root.join("volumes/peer-home");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::fs::write(peer.join("operator_auth_secret"), SECRET_MARKER).unwrap();
+        std::os::unix::fs::symlink(&peer, fixture.os_home.join(".cairn-dev-peer")).unwrap();
+        let floor = OperatorCredentialFloor::discovered(Some(fixture.os_home.clone()), []);
+        let profile = format!("(version 1)\n(allow default)\n{}", floor.sbpl_rules());
+
+        for spelling in [
+            peer.join("operator_auth_secret"),
+            fixture.os_home.join(".cairn-dev-peer/operator_auth_secret"),
+        ] {
+            let out = fixture.run(&profile, &format!("cat {}", spelling.display()));
+            assert!(!leaked(&out), "{} was readable", spelling.display());
+        }
+
+        let planted = fixture.os_home.join(".cairn-dev-future");
+        let out = fixture.run(
+            &profile,
+            &format!("ln -s {} {}", fixture.root.display(), planted.display()),
+        );
+        assert!(
+            !out.status.success() && !planted.exists(),
+            "a symlink planted at a family name would relocate a future home"
+        );
+        let out = fixture.run(&profile, &format!("mkdir {}", planted.display()));
+        assert!(out.status.success(), "creating a real home stays allowed");
+    }
+
+    // Live: a fenced profile whose worktree and grants cover a Cairn home still
+    // refuses its credential, because the boundary is the profile's last word.
+    #[test]
+    fn a_fenced_profile_cannot_reopen_the_operator_credential_live() {
+        if skip_without_nested_sandbox_exec(
+            "a_fenced_profile_cannot_reopen_the_operator_credential_live",
+        ) {
+            return;
+        }
+        let fixture = CredentialFixture::new();
+        let home = fixture.dev_secret().parent().unwrap().to_path_buf();
+        let policy = SandboxPolicy {
+            worktree: home.clone(),
+            writable_extra: vec![fixture.os_home.clone()],
+            deny_read: vec![],
+            writable_regex: vec![],
+            worktree_writable: true,
+        };
+        let profile = sbpl_profile(&policy, &fixture.floor);
+        let out = fixture.run(&profile, &format!("cat {}", fixture.dev_secret().display()));
+        assert!(!leaked(&out), "a fence grant reopened the credential");
+        let out = fixture.run(&profile, &format!("cat {}/mcp_auth_secret", home.display()));
+        assert!(out.status.success(), "the worktree itself stays readable");
     }
 
     // Live: a service sandbox writes worktree `target/` trees (the cross-worktree

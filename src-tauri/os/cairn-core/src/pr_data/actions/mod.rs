@@ -12,6 +12,7 @@ mod conflict;
 mod context;
 mod create_pr;
 mod merge;
+mod pin_bump;
 pub(crate) mod refresh;
 mod resolution;
 mod store_merge;
@@ -27,7 +28,10 @@ pub use context::{
     try_resolve_mr_context_for_job, MergeMrContext, MrContext, PrNodeResolution,
 };
 pub(crate) use create_pr::{publish_pr_branch_for_job, sync_create_pr_artifact_for_job};
-pub use merge::{merge_pr_for_job, reconcile_after_merge, CheckoutReconciliation};
+pub use merge::{
+    merge_pr_for_job, parse_merge_precondition, reconcile_after_merge, CheckoutReconciliation,
+    MergePrecondition,
+};
 pub use refresh::{
     close_pr_for_job, refresh_pr_for_job, refresh_pr_for_job_live, render_live_pr_section,
 };

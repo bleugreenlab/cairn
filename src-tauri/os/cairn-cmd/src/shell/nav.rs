@@ -15,6 +15,10 @@ use serde_json::Value;
 
 use super::actions;
 
+/// The commands colon dispatch resolves before any resource action, so a
+/// resource action can never be reached by one of these words.
+pub(crate) const BUILTINS: &[&str] = &["help", "ls", "pwd", "quit", "exit", "read", "watch"];
+
 /// What the loop should do with one understood line.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Intent {
@@ -249,6 +253,15 @@ impl Shell {
                 action.uri_template
             ));
         };
+        // The shell's actions are writes; a run target is invoked, so say how
+        // rather than send it as a write the gate would refuse.
+        if action.mode == "run" {
+            return Intent::Print(format!(
+                "`{}` is invoked with run, not written: {}",
+                actions::verb_slug(&action.label),
+                action.example
+            ));
+        }
         let payload = match actions::build_payload(action, args) {
             Ok(payload) => payload,
             Err(message) => return Intent::Print(message),
@@ -262,6 +275,9 @@ impl Shell {
     }
 
     /// The current resource's affordances, printed as the commands they are.
+    ///
+    /// Each action is named by its canonical slug, the same name completion and
+    /// every error message use; an unambiguous shorthand rides along after it.
     fn help(&self) -> Intent {
         let mut out = String::new();
         match self.spec.as_ref() {
@@ -280,18 +296,17 @@ impl Shell {
                         .collect::<Vec<_>>()
                         .join("; ");
                         out.push_str(&format!(
-                            "  :{:<24} {}{}\n",
-                            actions::preferred_verb(
-                                spec,
-                                action,
-                                &["help", "ls", "pwd", "quit", "exit", "read", "watch"],
-                            ),
+                            "  :{:<24} {}{}{}\n",
+                            actions::verb_slug(&action.label),
                             action.mode,
                             if keys.is_empty() {
                                 String::new()
                             } else {
                                 format!(" · {keys}")
-                            }
+                            },
+                            actions::shorthand(spec, action, BUILTINS)
+                                .map(|short| format!(" · or :{short}"))
+                                .unwrap_or_default()
                         ));
                     }
                 }
@@ -339,27 +354,70 @@ mod tests {
     use super::*;
     use cairn_common::read::{ActionSpec, KeyInfo};
 
+    fn key(name: &str) -> KeyInfo {
+        KeyInfo {
+            key: name.to_string(),
+            ty: "str".to_string(),
+            note: String::new(),
+            aliases: Vec::new(),
+        }
+    }
+
+    fn action(label: &str, mode: &str, uri: &str, required: Vec<KeyInfo>) -> ActionSpec {
+        ActionSpec {
+            label: label.to_string(),
+            mode: mode.to_string(),
+            uri_template: "cairn://p/{project}/{number}".to_string(),
+            uri: Some(uri.to_string()),
+            required,
+            optional: Vec::new(),
+            example: String::new(),
+            guidance: None,
+        }
+    }
+
+    /// The actions an issue read advertises. The projection from the contract
+    /// table lives in cairn-core, which this crate only meets over the wire,
+    /// so the wire shape is written out here.
     fn issue_spec() -> AffordanceSpec {
         AffordanceSpec {
             kind: "issue".to_string(),
             name: "Issue".to_string(),
             links: Vec::new(),
             filters: Vec::new(),
-            actions: vec![ActionSpec {
-                label: "append comment".to_string(),
-                mode: "append".to_string(),
-                uri_template: "cairn://p/{project}/{number}".to_string(),
-                uri: Some("cairn://p/cairn/4279".to_string()),
-                required: vec![KeyInfo {
-                    key: "content".to_string(),
-                    ty: "str".to_string(),
-                    note: String::new(),
-                    aliases: Vec::new(),
-                }],
-                optional: Vec::new(),
-                example: String::new(),
-                guidance: None,
-            }],
+            actions: vec![
+                action("patch issue", "patch", "cairn://p/cairn/4279", Vec::new()),
+                action(
+                    "append comment",
+                    "append",
+                    "cairn://p/cairn/4279",
+                    vec![key("content")],
+                ),
+                action("delete issue", "delete", "cairn://p/cairn/4279", Vec::new()),
+                action(
+                    "append message",
+                    "append",
+                    "cairn://p/cairn/4279/messages",
+                    vec![key("content")],
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_run_action_prints_its_invocation_instead_of_writing() {
+        let mut shell = Shell::new();
+        navigate(&mut shell, "models/decide");
+        let mut spec = issue_spec();
+        spec.actions[0].label = "answer typed questions".to_string();
+        spec.actions[0].mode = "run".to_string();
+        spec.actions[0].uri = Some("cairn://models/decide".to_string());
+        spec.actions[0].example =
+            "run({commands:[{target:\"cairn://models/decide\"}]})".to_string();
+        shell.record(String::new(), Some(spec));
+        match shell.dispatch(":answer") {
+            Intent::Print(text) => assert!(text.contains("invoked with run"), "{text}"),
+            other => panic!("expected a printed invocation, got {other:?}"),
         }
     }
 
@@ -536,12 +594,26 @@ mod tests {
         let mut shell = Shell::new();
         navigate(&mut shell, "p/cairn");
         navigate(&mut shell, "4279");
-        shell.record(String::new(), Some(issue_spec()));
+        let spec = issue_spec();
+        shell.record(String::new(), Some(spec.clone()));
         let Intent::Print(text) = shell.dispatch("?") else {
             panic!("expected help")
         };
-        assert!(text.contains(":append-comment"), "{text}");
+        // Every advertised action appears under the name completion and the
+        // dispatcher's own messages use for it.
+        for action in &spec.actions {
+            let command = format!(":{}", actions::verb_slug(&action.label));
+            assert!(text.contains(&command), "{command} missing from\n{text}");
+        }
         assert!(text.contains("content(str)"), "{text}");
+        // The shorthand is offered beside the slug, and only one that dispatches
+        // to the same action.
+        assert!(text.contains("or :comment"), "{text}");
+        assert!(!text.contains("or :append"), "{text}");
+        assert_eq!(
+            actions::resolve_verb(&spec, "comment").unwrap().label,
+            "append comment"
+        );
         assert!(text.contains(":quit"), "{text}");
     }
 

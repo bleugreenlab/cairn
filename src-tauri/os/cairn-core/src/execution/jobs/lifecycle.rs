@@ -1420,6 +1420,22 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
     // Agent jobs own only durable store coordinates. No directory is allocated
     // here: the backend process resides in the job scratch directory and command
     // execution obtains disposable executor projections separately.
+    // A child of an issue parent is cut from the parent's integration branch,
+    // which can advance on origin without Cairn (a sibling's pull request merged
+    // in GitHub's UI). Take that advance before the mint, so the child does not
+    // start from a tip origin has moved past; when it cannot be taken, the
+    // child's opening prompt says so.
+    let base_note = match job.base_branch.as_deref() {
+        Some(base) if mints_branch && job.branch.is_none() && !base.is_empty() => {
+            crate::orchestrator::base_branch_sync::bring_base_current_for_mint(
+                orch,
+                &job.project_id,
+                base,
+            )
+        }
+        _ => None,
+    };
+
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
     let git_rev_parse = |revision: &str| {
@@ -1592,11 +1608,11 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
     // Provenance rides in the opening prompt rather than a side channel: it is
     // the one piece of context a successor must not be able to miss, and this is
     // the event a rebuilt or compacted session re-reads.
-    if let Some(briefing) = continuation.briefing() {
+    for note in [continuation.briefing(), base_note].into_iter().flatten() {
         if !prompt.is_empty() {
             prompt.push_str("\n\n");
         }
-        prompt.push_str(&briefing);
+        prompt.push_str(&note);
     }
     let prompt = prompt;
 
@@ -1637,6 +1653,9 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         turn_id,
         launch_event_id,
         start_reason: TurnStartReason::Initial,
+        // A cold start is background work unless the operator's own start
+        // command marks it otherwise (the transport's `start_job` handler).
+        origin: crate::storage::LaunchOrigin::Background,
         launch_claim: Some(launch_claim),
     })
 }
@@ -3762,6 +3781,7 @@ fn continue_job_launch_locked(
                 turn_id: turn_id.clone(),
                 launch_event_id,
                 start_reason: TurnStartReason::FollowUp,
+                origin: continuation_origin(has_queued, prompt_resume.as_ref(), &drained_pushes),
                 launch_claim: None,
             },
             identity_override,
@@ -3898,6 +3918,37 @@ struct ResumeTrigger {
     /// [`SYNTHETIC_CONTINUATION_PROMPT`] — Cairn's own text. Every attribution
     /// decision downstream keys off this flag.
     synthetic: bool,
+}
+
+/// Who a continuation launch serves, read from the typed records of what it
+/// carries, never from delivery urgency (a peer may send `interrupt`, and an
+/// operator's Enter is `queue`). It serves an operator when it claimed a
+/// `queued_messages` row (only operator ingress writes that table, see
+/// `messages::queued`), when its resume context carries an operator goal
+/// reactivation (an explicit resume), or when it drained a direct push keyed
+/// with the operator-message marker (an operator's thread message, routed as a
+/// `WakeSource::User` wake). Peer messages, wakes, owned-wait resolutions,
+/// retries and watchdog recovery are background work.
+fn continuation_origin(
+    claimed_queued_messages: bool,
+    prompt_resume: Option<&ResumeContext>,
+    drained_pushes: &[crate::orchestrator::attention_push::Push],
+) -> crate::storage::LaunchOrigin {
+    let operator = claimed_queued_messages
+        || prompt_resume.is_some_and(|context| {
+            matches!(
+                context.goal_reactivation,
+                Some(GoalReactivation::Operator { .. })
+            )
+        })
+        || drained_pushes.iter().any(|push| {
+            crate::orchestrator::attention_push::operator_message_id_from_key(&push.key).is_some()
+        });
+    if operator {
+        crate::storage::LaunchOrigin::Operator
+    } else {
+        crate::storage::LaunchOrigin::Background
+    }
 }
 
 /// Decide what a resume leads with, given the caller's message and whether the
@@ -5722,6 +5773,197 @@ mod tests {
             });
             Ok(())
         }
+    }
+
+    /// Registers a process for each launch and serves its turn, so a cold
+    /// continuation completes its admission without a real provider.
+    struct RegisteringBackend;
+
+    impl crate::backends::AgentBackend for RegisteringBackend {
+        fn name(&self) -> &str {
+            "Claude"
+        }
+        fn is_available(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn discover_models(
+            &self,
+        ) -> Result<Vec<cairn_models::types::catalog::DiscoveredModel>, String> {
+            Ok(Vec::new())
+        }
+        fn serves(
+            &self,
+            _: &crate::orchestrator::Orchestrator,
+            _: Option<&str>,
+        ) -> Vec<cairn_models::types::catalog::ServedVerb> {
+            Vec::new()
+        }
+        fn resolve_tools(&self, _: &[String], _: &[String]) -> crate::backends::ResolvedTools {
+            crate::backends::ResolvedTools {
+                allowed: Vec::new(),
+                disallowed: Vec::new(),
+            }
+        }
+        fn supports_resume(&self) -> bool {
+            true
+        }
+        fn supports_warm_processes(&self) -> bool {
+            true
+        }
+        fn start_session(
+            &self,
+            config: crate::backends::SessionConfig,
+            orch: &Orchestrator,
+            _admitted: crate::backends::Admitted,
+        ) -> Result<(), String> {
+            let session_id = config.session_start.session_id().to_string();
+            orch.process_state
+                .register_process(
+                    config.run_id.clone(),
+                    RunHandle::test_handle(Some(&session_id), Some("j")),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        }
+    }
+
+    /// A Claude job whose last turn completed and whose process is gone, so its
+    /// next continuation launches cold through ordinary admission.
+    async fn idle_cold_job(name: &str) -> Orchestrator {
+        let orch = test_orchestrator(migrated_test_db(name).await);
+        orch.db.local.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',1,'I','active',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,status,node_name,uri_segment,current_session_id,model,created_at,updated_at)
+               VALUES('j','p','i','running','builder','builder','sess-a','opus',1,1);
+             INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at)
+               VALUES('sess-a','j','claude',NULL,'open',1,1,1);
+             INSERT INTO runs(id,job_id,session_id,status,started_at,start_mode,created_at,updated_at)
+               VALUES('run-0','j','sess-a','exited',2,'fresh',1,3);
+             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,ended_at,updated_at)
+               VALUES('turn-0','sess-a','run-0','j',1,'complete','initial',1,3,3);
+             INSERT INTO events(id,run_id,session_id,turn_id,sequence,timestamp,event_type,data,parent_tool_use_id,created_at)
+               VALUES('e-0','run-0','sess-a','turn-0',1,2,'user','{\"content\":\"start the work\"}',NULL,2);",
+        )
+        .await
+        .unwrap();
+        orch
+    }
+
+    /// A direct message to `j` from `sender_run_id` (`None` is a human), with
+    /// the push its delivery creates.
+    async fn direct_message(orch: &Orchestrator, id: &str, sender_run_id: Option<&str>) {
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO messages(id,channel_type,channel_id,sender_run_id,sender_name,recipient_run_id,content,created_at) VALUES(?1,'direct',NULL,?2,'sender','run-0','please look',2)",
+                params![id, sender_run_id],
+            )
+            .await
+            .unwrap();
+        let operator_trigger = sender_run_id.is_none().then_some(id);
+        let (orch, id, operator_trigger) = (
+            orch.clone(),
+            id.to_string(),
+            operator_trigger.map(str::to_string),
+        );
+        tokio::task::spawn_blocking(move || {
+            crate::messages::delivery::enqueue_direct_push_with_operator_trigger(
+                &orch,
+                "j",
+                &id,
+                crate::messages::queued::Delivery::Queue,
+                operator_trigger.as_deref(),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    /// Resume `j` cold and return its admission row's priority and the origin
+    /// its prepared launch recorded.
+    async fn continue_cold(
+        orch: &Orchestrator,
+        message: Option<&'static str>,
+        resume: Option<super::ResumeContext>,
+    ) -> (i64, String) {
+        use crate::storage::RowExt as _;
+        let _backend =
+            crate::orchestrator::session::install_orchestrator_test_session_backend(orch, || {
+                Box::new(RegisteringBackend)
+            });
+        let launcher = orch.clone();
+        tokio::task::spawn_blocking(move || {
+            super::continue_job_impl(&launcher, "j", message, None, resume)
+        })
+        .await
+        .unwrap()
+        .expect("the continuation is admitted");
+        orch.db
+            .local
+            .query_opt(
+                "SELECT r.priority, p.origin FROM runtime_admission_requests r JOIN prepared_ordinary_launches p USING(request_id) WHERE p.job_id='j' ORDER BY r.enqueue_seq DESC LIMIT 1",
+                (),
+                |row| Ok((row.i64(0)?, row.text(1)?)),
+            )
+            .await
+            .unwrap()
+            .expect("a cold continuation enqueues an admission row")
+    }
+
+    /// An operator's composer send to an idle session is admitted ahead of
+    /// background work, and its prepared launch says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operator_message_to_an_idle_cold_session_enqueues_urgent() {
+        let orch = idle_cold_job("origin-operator-composer").await;
+        super::enqueue_continuation_message(&orch.db.local, "j", "please look", None).unwrap();
+        assert_eq!(
+            continue_cold(&orch, None, None).await,
+            (1, "operator".to_string())
+        );
+    }
+
+    /// An operator's thread message arrives as a direct push keyed with the
+    /// operator-message marker; that typed fact, not its urgency, makes it urgent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operator_thread_message_enqueues_urgent() {
+        let orch = idle_cold_job("origin-operator-thread").await;
+        direct_message(&orch, "m-operator", None).await;
+        assert_eq!(
+            continue_cold(&orch, None, None).await,
+            (1, "operator".to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_agent_to_agent_message_enqueues_ordinary() {
+        let orch = idle_cold_job("origin-peer-message").await;
+        direct_message(&orch, "m-peer", Some("peer-run")).await;
+        assert_eq!(
+            continue_cold(&orch, None, None).await,
+            (0, "background".to_string())
+        );
+    }
+
+    /// A machinery resume (an owned-wait resolution, a delegation result) carries
+    /// its text in memory. Carrying a message does not make it the operator's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_machinery_resume_carrying_a_message_enqueues_ordinary() {
+        let orch = idle_cold_job("origin-machinery-resume").await;
+        assert_eq!(
+            continue_cold(
+                &orch,
+                Some("the wait resolved"),
+                Some(super::ResumeContext {
+                    suppress_user_event: true,
+                    ..Default::default()
+                }),
+            )
+            .await,
+            (0, "background".to_string())
+        );
     }
 
     /// cairn/4978 #2: settling a Claude death within a second must not turn a

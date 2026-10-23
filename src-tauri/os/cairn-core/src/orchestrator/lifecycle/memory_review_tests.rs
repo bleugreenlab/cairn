@@ -47,13 +47,15 @@ async fn seed_job(db: &LocalDb, review_state: Option<&str>) {
 /// inserted first and `j-review.parent_job_id` points at it, so the job
 /// reads back as a sub-agent task.
 async fn seed_job_row(db: &LocalDb, review_state: Option<&str>, is_task: bool) {
+    let snapshot = crate::test_support::shipping_execution_snapshot_json("i-review", "p-review");
     db.write(|conn| {
             let review_state = review_state.map(str::to_string);
+            let snapshot = snapshot.clone();
             Box::pin(async move {
                 conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-review','W',1,1)", ()).await?;
                 conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-review','w-review','P','prj','/tmp/prj',1,1)", ()).await?;
                 conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-review','p-review',2,'T','active','none',1,1)", ()).await?;
-                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e-review','recipe','i-review','p-review','running',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-review','recipe','i-review','p-review','running',1,1,?1)", (snapshot.as_str(),)).await?;
                 let parent_job_id = if is_task {
                     conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-parent','e-review','coordinator','i-review','p-review','complete','coordinator','coordinator',1,1)", ()).await?;
                     Some("j-parent")

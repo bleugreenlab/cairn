@@ -84,7 +84,7 @@ impl SessionHost for LocalSessionHost {
             models::refresh_codex_model_cache(
                 &codex_path,
                 &self.codex_home,
-                login.map(|login| login.expose().clone()),
+                login,
                 &HashMap::new(),
             )
             .map_err(SessionError::Setup)?;

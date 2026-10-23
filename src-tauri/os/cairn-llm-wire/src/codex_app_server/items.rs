@@ -33,33 +33,6 @@ pub fn extract_command_execution(command: &Value) -> (String, Vec<String>) {
     (command_display, command_vec)
 }
 
-/// The text of a raw Responses `message` item, or `None` for any other item or
-/// one with no text.
-pub fn extract_raw_response_message_text(item: &Value) -> Option<String> {
-    if item.get("type").and_then(|v| v.as_str()) != Some("message") {
-        return None;
-    }
-
-    let content = item.get("content")?.as_array()?;
-    let parts: Vec<&str> = content
-        .iter()
-        .filter_map(|entry| {
-            let item_type = entry.get("type").and_then(|v| v.as_str())?;
-            match item_type {
-                "output_text" | "input_text" => entry.get("text").and_then(|v| v.as_str()),
-                _ => None,
-            }
-        })
-        .filter(|text| !text.is_empty())
-        .collect();
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n"))
-    }
-}
-
 /// Extract display text from a Codex MCP CallToolResult.
 ///
 /// The wire format is `Result<CallToolResult, String>` serialized as:

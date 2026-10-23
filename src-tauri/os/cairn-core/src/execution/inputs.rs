@@ -329,11 +329,47 @@ pub(crate) fn any_check_declares_inputs<'a>(
         .any(|check| check.impact.is_some() || check.scope.is_some())
 }
 
+/// Why a `tree: impact` declaration cannot run, when it cannot.
+///
+/// An impact-slice check sees only the files its `impact` globs select, so it
+/// needs globs to select with; a `scope` closure keys on manifests the slice
+/// would have to carry wholesale; and a fixer has no tree to write its fix back
+/// to. Each is a declaration error, reported on the one check like any other
+/// config error rather than failing the project's whole contract.
+pub(crate) fn impact_tree_config_error(check: &CheckCommand) -> Option<String> {
+    if check.tree != crate::config::project_settings::CheckTree::Impact {
+        return None;
+    }
+    let problem = if check.impact.as_ref().is_none_or(|globs| globs.is_empty()) {
+        "declares no `impact` globs, and an impact-slice check sees exactly the files they select"
+    } else if check.scope.is_some() {
+        "declares `scope`, whose closure keys on the whole tree's manifests rather than a bounded slice"
+    } else if check.fixes {
+        "declares `fixes: true`, and a slice has no tree to write a fix back to"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "check declares `tree: impact` but {problem}. Use `tree: full` (the default) or fix \
+         the declaration. Nothing was run."
+    ))
+}
+
 fn resolve_selector(
     check: &CheckCommand,
     extra_inputs: &HashMap<String, Vec<String>>,
     graph: Option<&Arc<ProjectGraph>>,
 ) -> InputSelector {
+    if let Some(error) = impact_tree_config_error(check) {
+        let mut definition = check.impact.clone().unwrap_or_default();
+        definition.push("tree:impact".to_string());
+        definition.sort();
+        return InputSelector {
+            kind: SelectorKind::Unresolved,
+            definition,
+            config_error: Some(error),
+        };
+    }
     match (check.impact.as_ref(), check.scope.as_ref()) {
         (Some(globs), Some(scope)) => {
             // One mechanism per lane. Both declared means the project asked two
@@ -1282,7 +1318,7 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{real_workspace, TreeFixture};
+    use super::fixtures::{real_workspace, repo_root, TreeFixture};
     use super::*;
     use crate::config::project_settings::{CheckPolicy, CheckResourceClass, CheckWhen};
 
@@ -1303,6 +1339,7 @@ mod tests {
             verdict_platforms: None,
             fixes: false,
             main_cadence: None,
+            tree: Default::default(),
         }
     }
 
@@ -1360,10 +1397,38 @@ mod tests {
         let fixture = real_workspace();
         let rust = domain_of(&fixture, Domain::Rust);
 
+        // The member list is read here independently of the derivation, so a
+        // member the derivation drops, merges, or roots elsewhere fails this,
+        // while a crate added to the workspace is covered without an edit.
+        let manifest: toml::Value =
+            std::fs::read_to_string(repo_root().join("src-tauri/Cargo.toml"))
+                .expect("the workspace manifest is readable")
+                .parse()
+                .expect("the workspace manifest parses");
+        let declared: BTreeSet<String> = manifest["workspace"]["members"]
+            .as_array()
+            .expect("members is an array")
+            .iter()
+            .map(
+                |member| match member.as_str().expect("a member is a string") {
+                    "." => "src-tauri/".to_string(),
+                    member => format!("src-tauri/{}/", member.trim_end_matches('/')),
+                },
+            )
+            .collect();
+        let rooted: BTreeSet<String> = rust
+            .nodes
+            .values()
+            .flat_map(|node| node.roots.iter().cloned())
+            .collect();
+        assert_eq!(
+            rooted, declared,
+            "every declared workspace member becomes a node rooted at its own directory"
+        );
         assert_eq!(
             rust.nodes.len(),
-            18,
-            "every declared workspace member becomes a node: {:?}",
+            declared.len(),
+            "one node per member: {:?}",
             rust.nodes.keys().collect::<Vec<_>>()
         );
         // A path dependency reachable ONLY through cairn-symbols. A hand-written
@@ -1381,21 +1446,46 @@ mod tests {
             vec![
                 "ast-grep-outline",
                 "cairn-analytics",
+                "cairn-attention",
                 "cairn-cell",
+                "cairn-channels",
+                "cairn-checkenv",
                 "cairn-codec",
                 "cairn-common",
+                "cairn-config",
                 "cairn-core",
+                "cairn-credentials",
                 "cairn-db",
+                "cairn-domain",
                 "cairn-exec",
+                "cairn-image-wire",
+                "cairn-inference",
+                "cairn-llm-wire",
+                "cairn-mcp-server",
+                "cairn-models",
+                "cairn-models-subscriptions",
+                "cairn-models-types",
+                "cairn-packs",
+                "cairn-platform",
                 "cairn-sandbox",
+                "cairn-session",
+                "cairn-speech-wire",
                 "cairn-symbols",
                 "cairn-tokenize",
+                "cairn-toks",
+                "cairn-transport",
                 "cairn-vcs",
+                "cairn-workflow",
             ]
         );
         assert_eq!(
             names(&rust.forward_closure(&seed("cairn-cmd"))),
-            vec!["cairn-cell", "cairn-cmd", "cairn-common"]
+            vec![
+                "cairn-cell",
+                "cairn-cmd",
+                "cairn-common",
+                "cairn-mcp-server"
+            ]
         );
     }
 
@@ -1650,14 +1740,22 @@ mid = { path = "os/mid", package = "cairn-mid" }
             &check(
                 "cargo test",
                 None,
-                Some(&["rust:cairn-core", "rust:cairn-runner"]),
+                Some(&["rust:cairn-core", "rust:cairn-orch"]),
             ),
             &HashMap::new(),
             &fixture,
         );
-        // cairn-transport is reachable only through cairn-runner.
-        assert!(selector.matches("src-tauri/cairn-transport/src/lib.rs"));
+        // An unknown token degrades the whole selector to every path, which
+        // would make the negative assertion below fail for the wrong reason.
+        assert!(
+            selector.narrows(),
+            "every scope token names a workspace member"
+        );
+        // cairn-orch's own sources are reachable only through cairn-orch, and
+        // cairn-vcs only through cairn-core: the union holds both.
+        assert!(selector.matches("src-tauri/cairn-orch/src/main.rs"));
         assert!(selector.matches("src-tauri/os/cairn-vcs/src/lib.rs"));
+        // No workspace member depends on cairn-cmd, so neither closure holds it.
         assert!(!selector.matches("src-tauri/os/cairn-cmd/src/main.rs"));
     }
 

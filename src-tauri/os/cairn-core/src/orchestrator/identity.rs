@@ -1491,10 +1491,18 @@ mod tests {
         );
     }
 
+    /// Discovery's blocking HTTP clients may not run on a runtime thread.
+    async fn await_full_catalog_refresh(orch: &Orchestrator) {
+        let orch = orch.clone();
+        tokio::task::spawn_blocking(move || orch.refresh_model_catalog())
+            .await
+            .unwrap();
+    }
+
     /// A test orchestrator does not rediscover models on its own. Rediscovery
     /// visits every enabled provider over the network, so in a unit test it is
     /// a request leaving the machine and a race with any catalog the test
-    /// seeded. The awaited startup pass and the refresh `add_account` spawns go
+    /// seeded. An awaited full refresh and the one `add_account` spawns go
     /// through the same switch, so awaiting the former shows the latter was a
     /// no-op too; a refresh that ran would record an entry per enabled
     /// provider even if every one of them failed.
@@ -1512,7 +1520,7 @@ mod tests {
             None,
         )
         .unwrap();
-        orch.run_model_catalog_refresh().await;
+        await_full_catalog_refresh(&orch).await;
 
         assert!(
             orch.get_model_catalog().is_empty(),
@@ -1567,7 +1575,7 @@ mod tests {
         })
         .unwrap();
 
-        orch.run_model_catalog_refresh().await;
+        await_full_catalog_refresh(&orch).await;
 
         let catalog = orch.get_model_catalog();
         assert_eq!(

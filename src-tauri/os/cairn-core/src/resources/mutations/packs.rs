@@ -410,12 +410,22 @@ pub fn reset_pack_item(
         }
     };
 
+    if kind == PackItemKind::Mcp {
+        crate::config::mcp_tools::remove_server(
+            &orch.config_dir,
+            crate::config::mcp_tools::ToolScope::Workspace,
+            item_id,
+        )?;
+    }
     let previous_lock = lock.clone();
     lock.reset_item_baseline(kind, item_id, baseline);
     pack::lock::rewrite_lock(&RealFileSystem, &orch.config_dir, &lock)?;
     if kind == PackItemKind::Mcp {
+        // The shadow only: deleting the server would record it as removed from
+        // the pack, and the re-sync below would then withhold the very
+        // definition this reset restores.
         if let Err(error) =
-            crate::config::mcp_servers::delete_workspace_mcp_server(&orch.config_dir, item_id)
+            crate::config::mcp_servers::delete_workspace_mcp_shadow(&orch.config_dir, item_id)
         {
             let _ = pack::lock::rewrite_lock(&RealFileSystem, &orch.config_dir, &previous_lock);
             return Err(error);
@@ -560,7 +570,41 @@ pub fn apply_pack_action(
 }
 
 pub fn apply_pack_delete(orch: &Orchestrator, pack_id: &str) -> Result<PackMutationResult, String> {
+    let lock = pack::lock::read_lock(&orch.config_dir, pack_id)
+        .ok_or_else(|| format!("Pack `{pack_id}` is not installed"))?;
+    // Evict before discarding the lock: a failed sidecar write must leave the
+    // names available for retry. A surviving user fork or another pack may
+    // need to refetch, but neither its configuration nor credentials are ours
+    // to delete. Project catalogs belong to a separate scope.
+    let servers: BTreeSet<_> = lock
+        .items
+        .iter()
+        .filter(|item| item.kind == PackItemKind::Mcp)
+        .map(|item| item.id.as_str())
+        .chain(
+            lock.removed
+                .iter()
+                .filter(|item| item.kind == PackItemKind::Mcp)
+                .map(|item| item.id.as_str()),
+        )
+        .collect();
+    for server in &servers {
+        crate::config::mcp_tools::remove_server(
+            &orch.config_dir,
+            crate::config::mcp_tools::ToolScope::Workspace,
+            server,
+        )?;
+    }
     let result = uninstall_pack(&RealGitClient, &RealFileSystem, &orch.config_dir, pack_id)?;
+    // Again after the registry no longer offers them: a capture published
+    // between the eviction above and the uninstall would otherwise survive it.
+    for server in &servers {
+        crate::config::mcp_tools::remove_server(
+            &orch.config_dir,
+            crate::config::mcp_tools::ToolScope::Workspace,
+            server,
+        )?;
+    }
     let mut summary = format!(
         "Uninstalled pack '{pack_id}' — removed {} item(s)",
         result.removed.len()
@@ -600,6 +644,15 @@ pub fn apply_pack_item_removal(
 ) -> Result<PackMutationResult, String> {
     let lock = pack::lock::read_lock(&orch.config_dir, pack_id)
         .ok_or_else(|| format!("Pack `{pack_id}` is not installed"))?;
+    if kind == PackItemKind::Mcp
+        && (lock.is_removed(kind, item_id) || lock.item(kind, item_id).is_some())
+    {
+        crate::config::mcp_tools::remove_server(
+            &orch.config_dir,
+            crate::config::mcp_tools::ToolScope::Workspace,
+            item_id,
+        )?;
+    }
     if lock.is_removed(kind, item_id) {
         return Ok(PackMutationResult {
             action: "remove-item".to_string(),
@@ -641,9 +694,12 @@ pub fn apply_pack_item_removal(
         PackItemKind::Workflow => {
             crate::config::workflows::delete_workflow(config_dir, item_id, None)?
         }
-        PackItemKind::Mcp => {
-            crate::config::mcp_servers::delete_workspace_mcp_server(config_dir, item_id)?
-        }
+        PackItemKind::Mcp => crate::config::mcp_tools::withdraw_and_unregister(
+            config_dir,
+            crate::config::mcp_tools::ToolScope::Workspace,
+            item_id,
+            || crate::config::mcp_servers::delete_workspace_mcp_server(config_dir, item_id),
+        )?,
     }
 
     // The delete above records the removal against whichever installed pack
@@ -812,6 +868,122 @@ mod tests {
             resources,
             _temp: temp,
         }
+    }
+
+    // Legacy rows exercise physical removal without depending on the current
+    // binding schema or treating an unverifiable record as a cache hit.
+    fn seed_catalogs(ws: &Workspace) -> serde_json::Value {
+        let fixture = serde_json::json!({
+            "workspace": {"matlab": [], "unrelated": []},
+            "projects": {"/repo/project": {"matlab": []}}
+        });
+        write(
+            &ws.home.join("mcp_tools.json"),
+            &serde_json::to_string(&fixture).unwrap(),
+        );
+        fixture
+    }
+
+    fn assert_workspace_catalog_withdrawn(ws: &Workspace, before: &serde_json::Value) {
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(ws.home.join("mcp_tools.json")).unwrap())
+                .unwrap();
+        assert!(after["workspace"].get("matlab").is_none());
+        assert_eq!(
+            after["workspace"]["unrelated"],
+            before["workspace"]["unrelated"]
+        );
+        assert_eq!(after["projects"], before["projects"]);
+    }
+
+    #[tokio::test]
+    async fn uninstall_withdraws_catalog_without_deleting_a_user_fork() {
+        let ws = workspace().await;
+        apply_pack_action(&ws.orch, "install", "matlab").unwrap();
+        write(
+            &ws.home.join("settings.yaml"),
+            "mcpServers:\n  matlab:\n    type: stdio\n    command: user-matlab\n",
+        );
+        let settings = std::fs::read(ws.home.join("settings.yaml")).unwrap();
+        let before = seed_catalogs(&ws);
+
+        apply_pack_delete(&ws.orch, "matlab").unwrap();
+
+        assert_workspace_catalog_withdrawn(&ws, &before);
+        assert_eq!(
+            std::fs::read(ws.home.join("settings.yaml")).unwrap(),
+            settings
+        );
+        assert!(pack::lock::read_lock(&ws.home, "matlab").is_none());
+        assert_eq!(
+            crate::config::mcp_servers::load_workspace_mcp_servers(&ws.home)["matlab"]
+                .command
+                .as_deref(),
+            Some("user-matlab")
+        );
+    }
+
+    #[tokio::test]
+    async fn item_removal_and_retry_withdraw_only_workspace_catalog() {
+        let ws = workspace().await;
+        apply_pack_action(&ws.orch, "install", "matlab").unwrap();
+        for _ in 0..2 {
+            let before = seed_catalogs(&ws);
+            apply_pack_item_removal(&ws.orch, "matlab", PackItemKind::Mcp, "matlab").unwrap();
+            assert_workspace_catalog_withdrawn(&ws, &before);
+            assert!(pack::lock::read_lock(&ws.home, "matlab")
+                .unwrap()
+                .is_removed(PackItemKind::Mcp, "matlab"));
+            assert!(
+                !crate::config::mcp_servers::load_workspace_mcp_servers(&ws.home)
+                    .contains_key("matlab")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn uninstall_withdraws_orphan_catalog_for_a_previously_removed_item() {
+        let ws = workspace().await;
+        apply_pack_action(&ws.orch, "install", "matlab").unwrap();
+        apply_pack_item_removal(&ws.orch, "matlab", PackItemKind::Mcp, "matlab").unwrap();
+        let before = seed_catalogs(&ws);
+
+        apply_pack_delete(&ws.orch, "matlab").unwrap();
+
+        assert_workspace_catalog_withdrawn(&ws, &before);
+    }
+
+    #[tokio::test]
+    async fn reset_withdraws_the_fork_catalog_before_restoring_pack_definition() {
+        let ws = workspace().await;
+        apply_pack_action(&ws.orch, "install", "matlab").unwrap();
+        // An MCP fork is an edit to the pack's installed layer; a settings entry
+        // only shadows it. Make both, so the reset must undo both.
+        write(
+            &pack::lock::mcp_path(&ws.home, "matlab"),
+            "mcpServers:\n  matlab:\n    type: stdio\n    command: forked-matlab\n",
+        );
+        write(
+            &ws.home.join("settings.yaml"),
+            "mcpServers:\n  matlab:\n    type: stdio\n    command: user-matlab\n",
+        );
+        apply_pack_action(&ws.orch, "update", "matlab").unwrap();
+        assert!(
+            pack::lock::read_lock(&ws.home, "matlab")
+                .unwrap()
+                .item(PackItemKind::Mcp, "matlab")
+                .unwrap()
+                .forked
+        );
+        let before = seed_catalogs(&ws);
+
+        reset_pack_item(&ws.orch, "matlab", PackItemKind::Mcp, "matlab").unwrap();
+
+        assert_workspace_catalog_withdrawn(&ws, &before);
+        assert!(
+            !crate::config::mcp_servers::load_settings_mcp_servers(&ws.home).contains_key("matlab")
+        );
+        assert!(pack::mcp::load_pack_mcp_servers(&ws.home).contains_key("matlab"));
     }
 
     fn pack_events(ws: &Workspace) -> usize {

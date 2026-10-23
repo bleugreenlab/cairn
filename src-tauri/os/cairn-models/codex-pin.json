@@ -2,7 +2,8 @@
   "integration": 1,
   "version": "0.163.0",
   "tag": "rust-v0.163.0",
-  "reason": "Upstream stable bump from 0.153.3 with integration 1 unchanged; app-server contract verified by the codex-contract lanes.",
+  "reason": "Upstream stable bump from 0.153.3 with integration 1 unchanged. Merged by hand before the codex-contract lane existed (cairn/5104, PR #4109); the post-merge codex:pin verify smoke passed.",
+  "skip": [],
   "packages": {
     "aarch64-apple-darwin": { "sha256": "b0344fc2e41f15e0071147e5869008047b8ff4bf2c4a8897975d3bae3f103b34", "size": 133412281 },
     "x86_64-apple-darwin": { "sha256": "0c182d6194da7003943678dc87866b54b3dee719edaf8d092f304affbc6b57d1", "size": 144982749 },

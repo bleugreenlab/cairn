@@ -66,10 +66,17 @@ async fn cancelled_wave_rearms_after_a_dormant_nodes_base_advances() {
     let stale = orch
         .try_begin_turn_end_checks("j-prod")
         .expect("claim the stale wave's single-flight slot");
-    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod").await;
+    crate::execution::checks::cancel_stale_review_on_branch_advance(
+        &orch,
+        "j-prod",
+        crate::execution::checks::BranchAdvance::BaseReplay {
+            patch_unchanged: false,
+        },
+    )
+    .await;
     assert!(
         stale.is_cancelled(),
-        "the base advance cancels the stale wave"
+        "a base advance that altered the patch cancels the stale wave"
     );
 
     orch.end_turn_end_checks("j-prod");
@@ -100,6 +107,7 @@ fn waited_on_lanes(
                 passed: None,
                 failed: None,
                 skipped: None,
+                deferred: None,
                 parser: None,
                 complete: None,
                 selection: None,
@@ -109,6 +117,7 @@ fn waited_on_lanes(
                 failure_kind: None,
                 suppressed_after: None,
                 executor: None,
+                verified_on: None,
             },
         )
         .collect();
@@ -226,6 +235,7 @@ async fn bounded_rearm_resolves_agent_branch_from_managed_store() {
     let candidate = super::review_push::BoundedRearmCandidate {
         job_id: "j-prod".to_string(),
         tree_hash,
+        input_hash: "input".to_string(),
         ran_at: 1,
         check_name: "review".to_string(),
         failure_kind: "infrastructure".to_string(),
@@ -349,6 +359,303 @@ async fn a_dormant_not_placeable_lane_is_rearmed_once_a_machine_that_can_take_it
         wave_scheduled(&orch, "j-prod"),
         "and dispatches the wave that runs it"
     );
+}
+
+/// The scope set a review wave for `j-prod` at `commit` reads `check` against.
+async fn review_wave_scopes(
+    orch: &Orchestrator,
+    repository: &str,
+    commit: &str,
+    check: &crate::config::project_settings::CheckCommand,
+) -> crate::execution::cache::InfraScopes {
+    crate::execution::checks_turn_end::review_infra_scopes(
+        orch,
+        "p-rev",
+        "j-prod",
+        commit,
+        repository,
+        &[crate::execution::checks_turn_end::review_check_placement_question(Some(check))],
+    )
+    .await
+    .pop()
+    .unwrap()
+}
+
+/// cairn/4983. An enrolled-but-detached machine is a wait, not a refusal, so
+/// the lane goes to placement, fails as infrastructure, and is bounded in the
+/// FLEET domain. No timer repairs that: the dormant re-arm used to zero the
+/// fleet counter every cooldown, and nominate the job every tick off the
+/// streak-zero re-stamp a suppressed wave leaves behind, so the lane ran three
+/// more times every five minutes for as long as the machine stayed away.
+///
+/// The wave is simulated with the real counter: a cleared claim is one
+/// execution and stores a fleet-domain infrastructure failure, a suppressed
+/// claim re-stamps the head row exactly as `hold_back_suppressed` does.
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn a_fleet_bounded_lane_is_never_released_on_a_timer_and_runs_once_its_machine_attaches() {
+    use crate::execution::cache::{CheckExecutionClaim, CheckResultCacheWrite};
+    let Some(bin) = crate::jj::tests::jj_bin() else {
+        return;
+    };
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    let orch = test_orchestrator(db);
+    let repository = tempfile::tempdir().unwrap();
+    crate::jj::tests::init_project(repository.path());
+    let store = crate::jj::project_store_dir(&orch.config_dir, repository.path());
+    let jj = crate::jj::environment(&bin, &orch.config_dir);
+    crate::jj::ensure_project_store(&jj, &store, repository.path()).unwrap();
+    let workspaces = tempfile::tempdir().unwrap();
+    let workspace = workspaces.path().join("builder");
+    let branch = "agent/cairn-4983-builder-0";
+    crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
+    let platform = if std::env::consts::OS == "windows" {
+        "linux"
+    } else {
+        "windows"
+    };
+    std::fs::create_dir_all(workspace.join(".cairn")).unwrap();
+    std::fs::write(
+        workspace.join(".cairn/config.yaml"),
+        format!(
+            "checks:\n  executor-windows-check:\n    command: cargo check --locked\n    executor:\n      requiredToolchains:\n      - rust\n    verdictPlatforms:\n    - {platform}\n    when: review\n"
+        ),
+    )
+    .unwrap();
+    crate::jj::seal(
+        &jj,
+        &workspace,
+        "declare a lane on a detached machine",
+        None,
+    )
+    .unwrap();
+    let commit = crate::jj::head_commit(&jj, &workspace).unwrap();
+    let tree_hash = crate::jj::logical_tree_hash(&jj, &store, &commit).unwrap();
+    let repo_path = repository.path().to_string_lossy().to_string();
+    orch.db
+        .local
+        .execute(
+            "UPDATE projects SET repo_path=?1 WHERE id='p-rev'",
+            (repo_path.as_str(),),
+        )
+        .await
+        .unwrap();
+    insert_artifact(&orch.db.local, "create-pr", 1).await;
+    attach_planbuild_topology(&orch.db.local, "j-prod", NodeRole::Builder).await;
+    orch.db
+        .local
+        .execute("UPDATE jobs SET branch=?1 WHERE id='j-prod'", (branch,))
+        .await
+        .unwrap();
+    // Enrolled, never attached: placeable in principle, so this is a wait.
+    orch.fleet
+        .declare_enrolled_remote("bgsrv-win", "bgsrv-win", platform, "x86_64");
+
+    let check_name = "executor-windows-check";
+    let input_hash = "ih-windows";
+    let check =
+        crate::execution::checks::load_checks_contract_at_commit(repository.path(), &commit)
+            .await
+            .and_then(|loaded| loaded.contract.checks.get(check_name).cloned())
+            .expect("the lane is declared at the sealed commit");
+    assert!(
+        orch.fleet
+            .unplaceable_reason(
+                check.executor.as_ref(),
+                &crate::execution::check_identity::verdict_platforms(&check),
+            )
+            .is_none(),
+        "an enrolled machine makes the lane a wait, not a refusal"
+    );
+    let detached = review_wave_scopes(&orch, &repo_path, &commit, &check).await;
+    let fleet_scope = detached
+        .fleet
+        .clone()
+        .expect("a review wave sees the fleet");
+
+    let db = orch.db.local.clone();
+    let mut executions = 0;
+    let mut wave = |scopes: &crate::execution::cache::InfraScopes| {
+        match crate::execution::cache::claim_check_execution(
+            db.clone(),
+            "p-rev",
+            check_name,
+            input_hash,
+            scopes,
+        )
+        .unwrap()
+        {
+            CheckExecutionClaim::Clear { .. } => {
+                executions += 1;
+                crate::execution::cache::store_check_result(
+                    db.clone(),
+                    CheckResultCacheWrite {
+                        project_id: "p-rev".to_string(),
+                        tree_hash: tree_hash.clone(),
+                        input_hash: input_hash.to_string(),
+                        check_name: check_name.to_string(),
+                        exit_code: -1,
+                        passed: false,
+                        output_tail: "NoMatchingExecutor".to_string(),
+                        duration_ms: 0,
+                        target_results_json: None,
+                        job_id: Some("j-prod".to_string()),
+                        cached: Some(false),
+                        failure_kind: Some("infrastructure".to_string()),
+                        executor_id: None,
+                        executor_device_id: None,
+                        executor_connection_generation: None,
+                        executor_cell_id: None,
+                        executor_lease_epoch: None,
+                        executor_started_at_unix_ms: None,
+                        executor_finished_at_unix_ms: None,
+                        toolchain_fingerprint: None,
+                        defined_by_commit_sha: Some(commit.clone()),
+                        environment_fingerprint: scopes
+                            .fleet
+                            .clone()
+                            .expect("a review wave sees the fleet"),
+                        verdict_platform: None,
+                        verdict_arch: None,
+                        verdict_environment_hash: None,
+                    },
+                )
+                .unwrap();
+            }
+            CheckExecutionClaim::Suppressed(bounded) => {
+                crate::execution::checks::record_suppressed_check(
+                    &db, &tree_hash, "j-prod", &commit, check_name, &bounded,
+                );
+            }
+        }
+    };
+
+    // The turn that pushed the commit, plus the waves its own agent triggers.
+    for _ in 0..6 {
+        wave(&detached);
+    }
+    // Every row is now well past the cooldown.
+    orch.db
+        .local
+        .execute(
+            "UPDATE check_result_cache SET ran_at = ran_at - ?1",
+            ((DORMANT_INFRA_RETRY_COOLDOWN_SECONDS + 60) * 1000,),
+        )
+        .await
+        .unwrap();
+
+    for tick in 0..20 {
+        let nominated = super::review_push::bounded_rearm_candidate_job(&orch)
+            .await
+            .unwrap();
+        assert_eq!(
+            nominated, None,
+            "tick {tick}: neither the cooled fleet row nor the re-stamp the suppressed wave \
+             left behind makes a fleet-bounded lane due"
+        );
+        release_cooled_infrastructure_suppression(&orch, "j-prod")
+            .await
+            .unwrap();
+        if let Some(job) = nominated {
+            assert_eq!(job, "j-prod");
+            wave(&review_wave_scopes(&orch, &repo_path, &commit, &check).await);
+        }
+    }
+    let fleet_streak: i64 = orch
+        .db
+        .local
+        .read(move |conn| {
+            let fleet_scope = fleet_scope.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT infra_failure_streak FROM check_result_cache
+                          WHERE environment_fingerprint = ?1",
+                        (fleet_scope.as_str(),),
+                    )
+                    .await?;
+                rows.next().await?.expect("the fleet row").i64(0)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        fleet_streak,
+        crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+        "the release never zeroes a fleet-domain counter, however long it has cooled"
+    );
+    assert!(!rearm_one_bounded_failed_review(&orch).await);
+    assert!(!wave_scheduled(&orch, "j-prod"));
+    assert_eq!(
+        executions,
+        crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+        "three executions for this input hash while the fleet stays as it is"
+    );
+
+    // The machine attaches. Its arrival moves the fleet's capability identity,
+    // which is this domain's repair.
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    std::mem::forget(receiver);
+    orch.fleet
+        .attach_advertised_executor(
+            cairn_common::executor_protocol::ExecutorAdvertisement {
+                identity: cairn_common::executor_protocol::ExecutorIdentity {
+                    device_id: "bgsrv-win-device".into(),
+                    executor_id: "bgsrv-win".into(),
+                    display_name: "bgsrv-win".into(),
+                },
+                capabilities: cairn_common::executor_protocol::ExecutorCapabilities {
+                    os: platform.into(),
+                    arch: "x86_64".into(),
+                    logical_cores: 8,
+                    concurrency_capacity: None,
+                    toolchains: vec!["rust".into()],
+                    projects_served: Vec::new(),
+                    disk_budget_bytes: None,
+                    memory_budget_bytes: None,
+                    sandbox: None,
+                    toolchain_detection: None,
+                    build_prerequisites: None,
+                    containment: None,
+                },
+                current_load: 0,
+                warm_roots: Vec::new(),
+                observed_at_unix_ms: chrono::Utc::now().timestamp_millis() as u64,
+                liveness_observed_at_unix_ms: None,
+                facts_stale_refresh_blocked: None,
+                last_refresh: None,
+            },
+            sender,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+    let attached = review_wave_scopes(&orch, &repo_path, &commit, &check).await;
+    assert_ne!(
+        attached.fleet, detached.fleet,
+        "an attached machine that can take the lane moves the capability identity"
+    );
+    assert!(
+        matches!(
+            crate::execution::cache::claim_check_execution(
+                orch.db.local.clone(),
+                "p-rev",
+                check_name,
+                input_hash,
+                &attached,
+            )
+            .unwrap(),
+            CheckExecutionClaim::Clear { .. }
+        ),
+        "the next wave executes the lane"
+    );
+    assert!(
+        rearm_one_bounded_failed_review(&orch).await,
+        "the first tick after the machine attaches nominates the dormant owner"
+    );
+    assert!(wave_scheduled(&orch, "j-prod"));
 }
 
 #[tokio::test]
@@ -1763,7 +2070,12 @@ async fn branch_advance_cancels_the_in_flight_review_suite() {
         .expect("claim the job's single-flight slot");
     assert!(!cancel.is_cancelled());
 
-    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod").await;
+    crate::execution::checks::cancel_stale_review_on_branch_advance(
+        &orch,
+        "j-prod",
+        crate::execution::checks::BranchAdvance::Commit,
+    )
+    .await;
     assert!(
         cancel.is_cancelled(),
         "a sealed commit cancels the in-flight review suite for the job"
@@ -1772,8 +2084,67 @@ async fn branch_advance_cancels_the_in_flight_review_suite() {
     orch.end_turn_end_checks("j-prod");
     // No suite in flight ⇒ the branch-advance cancel is a harmless no-op, and the
     // single-flight slot remains claimable.
-    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod").await;
+    crate::execution::checks::cancel_stale_review_on_branch_advance(
+        &orch,
+        "j-prod",
+        crate::execution::checks::BranchAdvance::Commit,
+    )
+    .await;
     assert!(orch.try_begin_turn_end_checks("j-prod").is_some());
+}
+
+/// A base advance that replays the branch without changing its own patch leaves
+/// the running wave alone, however many land while it runs: its verdict is still
+/// the verdict about the change the branch claims, and withdrawing it on every
+/// merge is how cairn/4210 lost four waves in fifteen minutes and recorded
+/// nothing. Nothing is re-armed when it ends, because nothing was superseded. A
+/// commit, or a replay that altered the patch, still withdraws it.
+#[tokio::test]
+async fn a_base_replay_that_keeps_the_patch_keeps_the_wave_and_a_commit_withdraws_it() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    let orch = test_orchestrator(db);
+    let kept = crate::execution::checks::BranchAdvance::BaseReplay {
+        patch_unchanged: true,
+    };
+
+    let wave = orch
+        .try_begin_turn_end_checks("j-prod")
+        .expect("claim the wave's single-flight slot");
+    for _ in 0..4 {
+        crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod", kept)
+            .await;
+    }
+    assert!(
+        !wave.is_cancelled(),
+        "four patch-preserving base advances withdraw nothing"
+    );
+    assert!(orch.turn_end_checks_in_flight("j-prod"));
+    orch.end_turn_end_checks("j-prod");
+    finish_superseded_turn_end_checks(&orch, "j-prod", wave.is_cancelled());
+    assert!(
+        !wave_scheduled(&orch, "j-prod"),
+        "a wave that finished on its own head arms no successor"
+    );
+
+    for advance in [
+        crate::execution::checks::BranchAdvance::Commit,
+        crate::execution::checks::BranchAdvance::BaseReplay {
+            patch_unchanged: false,
+        },
+    ] {
+        let wave = orch
+            .try_begin_turn_end_checks("j-prod")
+            .expect("the slot is free again");
+        crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod", advance)
+            .await;
+        assert!(
+            wave.is_cancelled(),
+            "{advance:?} changes the patch and withdraws the wave"
+        );
+        orch.end_turn_end_checks("j-prod");
+    }
 }
 
 /// Two jobs on one branch and one job on another, so a branch-advance can be
@@ -1820,7 +2191,12 @@ async fn a_commit_supersedes_every_review_suite_on_the_same_branch() {
     let node = orch.try_begin_turn_end_checks("j-node").unwrap();
     let other = orch.try_begin_turn_end_checks("j-other").unwrap();
 
-    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-task").await;
+    crate::execution::checks::cancel_stale_review_on_branch_advance(
+        &orch,
+        "j-task",
+        crate::execution::checks::BranchAdvance::Commit,
+    )
+    .await;
 
     assert!(
         node.is_cancelled(),
@@ -1845,7 +2221,12 @@ async fn a_commit_spares_a_same_named_branch_in_another_project() {
     let near = orch.try_begin_turn_end_checks("j-node").unwrap();
     let far = orch.try_begin_turn_end_checks("j-far").unwrap();
 
-    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-task").await;
+    crate::execution::checks::cancel_stale_review_on_branch_advance(
+        &orch,
+        "j-task",
+        crate::execution::checks::BranchAdvance::Commit,
+    )
+    .await;
 
     assert!(
         near.is_cancelled(),
@@ -1866,7 +2247,12 @@ async fn a_branchless_job_still_cancels_its_own_suite() {
     let orch = test_orchestrator(db);
 
     let own = orch.try_begin_turn_end_checks("j-unknown").unwrap();
-    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-unknown").await;
+    crate::execution::checks::cancel_stale_review_on_branch_advance(
+        &orch,
+        "j-unknown",
+        crate::execution::checks::BranchAdvance::Commit,
+    )
+    .await;
     assert!(own.is_cancelled());
 }
 

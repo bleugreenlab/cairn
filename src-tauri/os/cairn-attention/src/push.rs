@@ -26,6 +26,7 @@ pub const CHILD_STALL_PUSH_PREFIX: &str = "child-stalled";
 use std::collections::{HashMap, HashSet};
 
 use cairn_common::uri::{parse_uri, CairnResource};
+use cairn_db::sql::placeholders;
 use cairn_db::turso::{params, Value};
 use uuid::Uuid;
 
@@ -1353,11 +1354,6 @@ fn subject_of(key: &str, content_ref: &str) -> Option<Subject> {
         project_key,
         number,
     })
-}
-
-/// `?, ?, ?` for an `IN (...)` list of `n` bound values.
-fn placeholders(n: usize) -> String {
-    (0..n).map(|_| "?").collect::<Vec<_>>().join(", ")
 }
 
 fn text_params(values: &[String]) -> Vec<Value> {

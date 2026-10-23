@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 
 fn core_source(relative: &str) -> String {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -134,19 +135,32 @@ fn workspace_rust_files() -> Vec<(PathBuf, String)> {
 }
 
 /// Assert a needle appears nowhere in workspace Rust outside an allowlist of
-/// files, ignoring test modules.
+/// files, ignoring test code.
 ///
 /// This file is always exempt: a ban has to be able to spell what it bans.
 fn assert_only_in(needles: &[&str], allowed: &[&str], why: &str) {
+    let offenders = offenders_outside(&workspace_rust_files(), needles, allowed);
+    assert!(offenders.is_empty(), "{why}: {offenders:?}");
+}
+
+/// Every `path:line (needle)` in `files` outside the allowlist, skipping
+/// inline test modules and whole files compiled only for tests.
+fn offenders_outside(
+    files: &[(PathBuf, String)],
+    needles: &[&str],
+    allowed: &[&str],
+) -> Vec<String> {
+    let test_only = test_only_module_files(files);
     let mut offenders = Vec::new();
-    for (path, source) in workspace_rust_files() {
+    for (path, source) in files {
         let display = path.to_string_lossy().into_owned();
         if display.ends_with("tests/main/source_structure.rs")
             || allowed.iter().any(|allow| display.ends_with(allow))
+            || test_only.contains(path)
         {
             continue;
         }
-        for (line_number, line) in non_test_lines(&source) {
+        for (line_number, line) in non_test_lines(source) {
             for needle in needles {
                 if line.contains(needle) {
                     offenders.push(format!("{display}:{line_number} ({needle})"));
@@ -154,7 +168,167 @@ fn assert_only_in(needles: &[&str], allowed: &[&str], why: &str) {
             }
         }
     }
-    assert!(offenders.is_empty(), "{why}: {offenders:?}");
+    offenders
+}
+
+/// Files the compiler builds only under `cfg(test)`, which the bans skip whole
+/// the way [`non_test_lines`] skips an inline test module.
+///
+/// A file is test-only when every declaration of it is: `#[cfg(test)] mod
+/// launch_coverage_tests;` (with or without `#[path]`), a declaration inside an
+/// inline test module, or any declaration made by a file that is itself
+/// test-only. Following the gate rather than a naming convention means a file
+/// named `*_tests.rs` that is compiled into production is still scanned.
+///
+/// Only declarations at a file's top level are resolved. One nested in an
+/// inline module block resolves to a path that does not exist, which leaves
+/// its file scanned — the safe direction.
+fn test_only_module_files(files: &[(PathBuf, String)]) -> HashSet<PathBuf> {
+    let known: HashSet<&Path> = files.iter().map(|(path, _)| path.as_path()).collect();
+    // Each declared file, with every (declaring file, gated) that names it.
+    let mut declarations: HashMap<PathBuf, Vec<(&Path, bool)>> = HashMap::new();
+    for (path, source) in files {
+        let live: HashSet<usize> = non_test_lines(source)
+            .into_iter()
+            .map(|(number, _)| number)
+            .collect();
+        let lines: Vec<&str> = source.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let Some(name) = declared_module(line) else {
+                continue;
+            };
+            let mut gated = !live.contains(&(index + 1));
+            let mut path_attribute = None;
+            for attribute in lines[..index]
+                .iter()
+                .rev()
+                .map(|line| line.trim_start())
+                .take_while(|line| line.starts_with("#[") || line.starts_with("//"))
+            {
+                gated |= gates_on_test(attribute);
+                if let Some(rest) = attribute.strip_prefix("#[path") {
+                    path_attribute = rest.split('"').nth(1);
+                }
+            }
+            if let Some(file) = resolve_module_file(path, name, path_attribute, &known) {
+                declarations.entry(file).or_default().push((path, gated));
+            }
+        }
+    }
+    let mut test_only: HashSet<PathBuf> = HashSet::new();
+    loop {
+        let grown: Vec<PathBuf> = declarations
+            .iter()
+            .filter(|(file, _)| !test_only.contains(*file))
+            .filter(|(_, by)| {
+                by.iter()
+                    .all(|(declarer, gated)| *gated || test_only.contains(*declarer))
+            })
+            .map(|(file, _)| file.clone())
+            .collect();
+        if grown.is_empty() {
+            return test_only;
+        }
+        test_only.extend(grown);
+    }
+}
+
+/// The module a `mod name;` line declares out of line, through any visibility.
+fn declared_module(line: &str) -> Option<&str> {
+    let mut rest = line.trim();
+    if let Some(after) = rest.strip_prefix("pub") {
+        rest = after.trim_start();
+        if rest.starts_with('(') {
+            rest = rest.split_once(')')?.1.trim_start();
+        }
+    }
+    let name = rest.strip_prefix("mod ")?.strip_suffix(';')?.trim();
+    (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then_some(name)
+}
+
+/// The file `mod name;` in `declaring` loads, by Rust's module-path rules: a
+/// `#[path]` is relative to the declaring file's directory; otherwise a
+/// `mod.rs`/`lib.rs`/`main.rs` looks beside itself and any other file looks
+/// in the directory named for it.
+fn resolve_module_file(
+    declaring: &Path,
+    name: &str,
+    path_attribute: Option<&str>,
+    known: &HashSet<&Path>,
+) -> Option<PathBuf> {
+    let dir = declaring.parent()?;
+    let candidates = match path_attribute {
+        Some(relative) => vec![lexically_normal(&dir.join(relative))],
+        None => {
+            let base = if matches!(
+                declaring.file_name()?.to_str()?,
+                "mod.rs" | "lib.rs" | "main.rs"
+            ) {
+                dir.to_path_buf()
+            } else {
+                dir.join(declaring.file_stem()?)
+            };
+            vec![
+                base.join(format!("{name}.rs")),
+                base.join(name).join("mod.rs"),
+            ]
+        }
+    };
+    candidates
+        .into_iter()
+        .find(|candidate| known.contains(candidate.as_path()))
+}
+
+fn lexically_normal(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normal.pop();
+            }
+            Component::CurDir => {}
+            other => normal.push(other),
+        }
+    }
+    normal
+}
+
+/// The bans skip a file the compiler builds only for tests, and nothing else:
+/// the gate on the file's declaration decides, not its name. A test-only file
+/// whose exposure went unrecognised is what turned the brokered-plaintext ban
+/// red on main with nothing wrong in production.
+#[test]
+fn whole_test_files_are_skipped_by_the_gate_on_their_declaration() {
+    let root = PathBuf::from("/ws/crate/src");
+    let file = |relative: &str, source: &str| (root.join(relative), source.to_string());
+    let exposure = "fn run(login: &Secret<Value>) { send(login.expose()); }\n";
+    let files = vec![
+        file(
+            "lib.rs",
+            "#[cfg(test)]\npub(crate) mod launch_coverage_tests;\nmod live;\nmod ordering_tests;\nmod routes;\n",
+        ),
+        file("launch_coverage_tests.rs", &format!("mod helpers;\n{exposure}")),
+        file("launch_coverage_tests/helpers.rs", exposure),
+        file("live.rs", exposure),
+        file("ordering_tests.rs", exposure),
+        file("routes/mod.rs", "mod worker;\n"),
+        file(
+            "routes/worker.rs",
+            "/// Posts.\n#[cfg(test)]\n#[path = \"worker_posts_tests.rs\"]\nmod posts_tests;\n",
+        ),
+        file("routes/worker_posts_tests.rs", exposure),
+    ];
+    let offenders = offenders_outside(&files, &[".expose()"], &[]);
+    let expected: Vec<String> = ["live.rs", "ordering_tests.rs"]
+        .iter()
+        .map(|name| format!("{}:1 (.expose())", root.join(name).display()))
+        .collect();
+    assert_eq!(
+        offenders, expected,
+        "a gated test file (and what it declares) is skipped; its live sibling, and \
+         an ungated file merely named *_tests.rs, are caught"
+    );
 }
 
 /// Credential stores are reachable only through the broker.
@@ -223,8 +397,10 @@ fn the_github_app_key_is_signed_with_only_in_the_broker() {
 
 /// Credential plaintext is unwrapped only where it is injected.
 ///
-/// `BrokeredSecret::expose` and `Presented::expose` are the two ways brokered
-/// plaintext becomes a `&str`. Everything else in the subsystem — the carriers,
+/// `BrokeredSecret::expose` and `Presented::expose` are the ways brokered
+/// plaintext becomes a `&str`, and `cairn-models`' `Secret::expose` is how a
+/// credential the caller handed a session leaves it. Everything else in the
+/// subsystem — the carriers,
 /// the leases, the receipts — exists so that this list stays short and so that
 /// every entry on it is a *transport boundary*: an HTTP header, a request body,
 /// a child process's environment, a file only the operator can read.
@@ -257,6 +433,17 @@ fn brokered_plaintext_is_unwrapped_only_where_it_is_injected() {
             // A run's MCP bearer: injected into its agent's environment, and
             // compared in constant time where `/mcp` receives it.
             "mcp/run_bearer.rs",
+            // A Codex subscription login: the `account/login/start` params,
+            // written onto the stdin of the session's app-server, of the
+            // short-lived app-server that discovers the account's models, and
+            // of the probe app-server that reads the account's rate limits.
+            "cairn-models/src/session/codex/server.rs",
+            "cairn-models/src/session/codex/models.rs",
+            // The usage probe's login is the injection models designed for it:
+            // the subscription's access token or an API key, never the refresh
+            // token, which `the_usage_probe_never_hands_codex_a_refresh_token`
+            // pins beside it.
+            "cairn-models-subscriptions/src/usage/codex.rs",
         ],
         "brokered plaintext must be unwrapped only at a transport boundary",
     );
@@ -598,12 +785,25 @@ fn non_test_lines(source: &str) -> Vec<(usize, &str)> {
         let opens = line.matches('{').count() as i32;
         let closes = line.matches('}').count() as i32;
         if test_module_depth.is_none() {
-            if pending_cfg_test && line.contains("mod ") && line.contains('{') {
+            let trimmed = line.trim_start();
+            if (pending_cfg_test || gates_on_test(line))
+                && line.contains("mod ")
+                && line.contains('{')
+            {
                 test_module_depth = Some(depth);
                 pending_cfg_test = false;
             } else {
+                // A gate binds the next item only: attributes and comments
+                // may sit between them, but any other line is that item, so
+                // `#[cfg(test)] mod fixtures;` must not arm the gate for a
+                // live module further down.
                 if gates_on_test(line) {
                     pending_cfg_test = true;
+                } else if !(trimmed.is_empty()
+                    || trimmed.starts_with("#[")
+                    || trimmed.starts_with("//"))
+                {
+                    pending_cfg_test = false;
                 }
                 out.push((index + 1, line));
             }
@@ -638,6 +838,16 @@ fn the_test_module_detector_excludes_compound_cfg_gates() {
     assert!(gates_on_test("#[cfg(test)]"));
     assert!(!gates_on_test("#[cfg(feature = \"latest\")]"));
     assert!(!gates_on_test("#[cfg(feature = \"test-utils\")]"));
+
+    // A gate spent on an out-of-line module or a test-only item does not carry
+    // over to a live module further down.
+    let source = "#[cfg(test)]\nmod fixtures;\n#[cfg(test)]\nfn helper() {}\npub mod live {\n    fn still_live() {}\n}\n";
+    assert!(
+        non_test_lines(source)
+            .iter()
+            .any(|(_, line)| line.contains("fn still_live")),
+        "a spent test gate must not hide a later live module"
+    );
 }
 
 /// Every durable transcript row's `data` comes from the sanitized wrapper.

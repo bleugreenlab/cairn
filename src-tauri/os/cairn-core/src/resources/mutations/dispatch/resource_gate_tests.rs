@@ -33,10 +33,27 @@ fn gate_accepts_the_rebase_replay_action() {
         })),
     );
     let spec = gate(&it).expect("the replay mutation is gated in");
-    assert_eq!(
-        spec.label,
-        "replay this branch or discharge an incorrect identifier obligation"
-    );
+    assert_eq!(spec.label, REBASE_LABEL);
+}
+
+const REBASE_LABEL: &str = "replay this branch, take origin's fast-forward of it or its base, or discharge an incorrect identifier obligation";
+
+/// The sanctioned repair for a branch the store holds behind origin (cairn/5038)
+/// has to reach dispatch, for the node's own branch and for its base.
+#[test]
+fn gate_accepts_fast_forward_from_origin() {
+    for payload in [
+        serde_json::json!({"action": "fast-forward-from-origin"}),
+        serde_json::json!({"action": "fast-forward-from-origin", "branch": "base"}),
+    ] {
+        let it = item(
+            "cairn://p/cairn/1/1/builder/rebase",
+            ChangeMode::Patch,
+            Some(payload),
+        );
+        let spec = gate(&it).expect("the fast-forward mutation is gated in");
+        assert_eq!(spec.label, REBASE_LABEL);
+    }
 }
 
 #[test]
@@ -51,10 +68,7 @@ fn gate_accepts_identifier_obligation_discharge() {
         })),
     );
     let spec = gate(&it).expect("the explicit discharge mutation is gated in");
-    assert_eq!(
-        spec.label,
-        "replay this branch or discharge an incorrect identifier obligation"
-    );
+    assert_eq!(spec.label, REBASE_LABEL);
 }
 
 /// A rebase session is read and replayed, never created or deleted by hand.

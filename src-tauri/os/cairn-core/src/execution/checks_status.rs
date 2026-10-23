@@ -1,26 +1,33 @@
-use crate::config::project_settings::{CheckPolicy, CheckWhen};
-use crate::execution::cache::{list_check_results_for_job, CheckResultCacheEntry, HeadVerdictKeys};
+use crate::config::project_settings::{CheckCommand, CheckPolicy, CheckWhen, ChecksContract};
+use crate::execution::cache::{
+    list_check_results_for_job, observed_commit_for_job, resolve_job_logical_head,
+    CheckResultCacheEntry, HeadVerdictKeys, OwnedHeadVerdictKeys,
+};
 use crate::execution::check_parsers::{
     extract_running_tests, format_failure_excerpt, format_failure_names, report_excerpt,
-    tail_chars, ParsedCheckResult, MAX_FAILURE_NAMES, RUST_LINT_PARSER,
+    tail_chars, ParsedCheckResult, VerdictFacts, MAX_FAILURE_NAMES, RUST_LINT_PARSER,
 };
 use crate::execution::checks::{
-    check_input_hashes, head_verdicts, load_checks_contract_at_commit, CheckFailureKind,
+    check_input_hashes, head_verdicts, head_verdicts_conn, load_checks_contract_at_commit,
+    CheckFailureKind,
 };
 use crate::execution::checks_turn_end::{
-    read_turn_end_log_tail, resolve_job_coords, turn_end_check_started,
+    read_turn_end_log_tail, resolve_job_coords, turn_end_check_started, JobCoords,
 };
 use crate::execution::inputs::{
     any_check_declares_inputs, ResolvedInputs, TreeBlobs, TreeSnapshot,
 };
 use crate::execution::selection::plan_checks;
-use crate::jj::{logical_changed_files, logical_tree_hash};
+use crate::jj::{logical_changed_files, logical_tree_hash, own_patch_against, OwnPatch};
 use crate::orchestrator::generation_cache::GenerationCache;
 use crate::orchestrator::Orchestrator;
-use std::collections::HashMap;
+use crate::storage::LocalDb;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// In-process materialization of the exact settled check planner projection.
 ///
@@ -31,35 +38,143 @@ use std::sync::Mutex;
 /// invalidation retries against the new generation instead of returning stale
 /// work.
 ///
-/// The one thing layered on top of the primitive here is a job-to-project map, so
+/// Two things are layered on top of the primitive here: a job-to-project map, so
 /// a check result recorded for a project can invalidate every job of that project
-/// without the caller having to enumerate them.
+/// without the caller having to enumerate them; and a memo of the checks
+/// contract each commit declares.
+///
+/// While a wave is in flight the same cache serves the live projection through
+/// [`LIVE_CHECK_POLL_WINDOW`], so every observer of one job shares one
+/// computation per window. Submission and settlement of a wave advance the
+/// job's generation, which is what keeps one cache correct across the switch.
 pub(crate) struct NodeCheckStatusCache {
     cache: GenerationCache<Vec<NodeCheckStatus>>,
     projects: Mutex<HashMap<String, String>>,
+    contracts: Mutex<HashMap<String, Arc<ChecksContract>>>,
     settled_projection_reads: AtomicU64,
-    in_flight_bypasses: AtomicU64,
+    live_window_reads: AtomicU64,
+}
+
+/// How long one live projection serves every observer of a job while a check
+/// wave runs.
+///
+/// A running lane's verdicts and output tail move continuously and nothing
+/// announces each move, so the live projection cannot be fenced by invalidation
+/// alone. One second matches the 1 Hz tail poll the surfaces run, so each
+/// observer still sees a new tail every tick, now from one computation per job
+/// however many panes, windows, or query keys are watching it.
+const LIVE_CHECK_POLL_WINDOW: Duration = Duration::from_secs(1);
+
+/// How many commits' contracts the memo holds before it starts over. A job's
+/// head moves a commit at a time, so this is many jobs' worth of heads.
+const CONTRACT_MEMO_LIMIT: usize = 256;
+
+/// A status computation slower than this logs where its time went.
+const SLOW_STATUS_LOG_THRESHOLD: Duration = Duration::from_secs(1);
+
+/// What one recorded check exit establishes about the tree it ran on.
+///
+/// The single answer to "is this green verified?": the `/checks` board, the
+/// manual check reply, the channel state card, and the `pinBump` merge
+/// precondition all classify through [`verdict_evidence`], so a lane can never
+/// count as passed on one surface and unverified on another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerdictEvidence {
+    Failed,
+    Verified,
+    Unverified(UnverifiedReason),
+}
+
+/// Why a successful exit vouches for nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnverifiedReason {
+    /// The lint never ran to completion (nothing selected, cargo missing,
+    /// clippy died without a verdict).
+    IncompleteLint,
+    EmptySelection,
+    AllSkipped(usize),
+    IncompleteEnumeration,
+    NoTestsRan,
+    NoStructuredResult,
+}
+
+impl std::fmt::Display for UnverifiedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncompleteLint => f.write_str("the lint did not run to completion"),
+            Self::EmptySelection => f.write_str("no tests matched the selection"),
+            Self::AllSkipped(skipped) => write!(f, "no tests ran; {skipped} skipped"),
+            Self::IncompleteEnumeration => f.write_str("test enumeration was incomplete"),
+            Self::NoTestsRan => f.write_str("no tests ran"),
+            Self::NoStructuredResult => {
+                f.write_str("the command produced no structured coverage result")
+            }
+        }
+    }
+}
+
+/// Classify a recorded exit. Exit zero establishes only that nothing
+/// contradicted the command: a test runner that ran nothing, an incomplete
+/// enumeration, or no canonical artifact at all establishes no verified green.
+/// A non-test parse (tsc, a complete lint) vouches for itself.
+pub(crate) fn verdict_evidence(
+    passed: bool,
+    parsed: Option<&ParsedCheckResult>,
+) -> VerdictEvidence {
+    verdict_evidence_from_facts(
+        passed,
+        parsed.map(ParsedCheckResult::verdict_facts).as_ref(),
+    )
+}
+
+/// [`verdict_evidence`] over only the fields it reads, for a reader that
+/// projected them from storage instead of parsing the whole result.
+pub(crate) fn verdict_evidence_from_facts(
+    passed: bool,
+    parsed: Option<&VerdictFacts<'_>>,
+) -> VerdictEvidence {
+    if !passed {
+        return VerdictEvidence::Failed;
+    }
+    let Some(parsed) = parsed else {
+        return VerdictEvidence::Unverified(UnverifiedReason::NoStructuredResult);
+    };
+    let reason = if parsed.is_incomplete_lint() {
+        UnverifiedReason::IncompleteLint
+    } else if !parsed.is_test_runner() {
+        return VerdictEvidence::Verified;
+    } else if parsed.selection == "empty" {
+        UnverifiedReason::EmptySelection
+    } else if parsed.tests_run() == 0 && parsed.skipped > 0 {
+        UnverifiedReason::AllSkipped(parsed.skipped)
+    } else if !parsed.complete {
+        UnverifiedReason::IncompleteEnumeration
+    } else if parsed.tests_run() == 0 {
+        UnverifiedReason::NoTestsRan
+    } else {
+        return VerdictEvidence::Verified;
+    };
+    VerdictEvidence::Unverified(reason)
 }
 
 pub(crate) fn check_state_from_evidence(
     passed: bool,
     parsed: Option<&ParsedCheckResult>,
 ) -> NodeCheckState {
-    if !passed {
-        NodeCheckState::Failed
-    } else if parsed.is_some_and(ParsedCheckResult::is_incomplete_lint) {
-        // The lint never ran to completion (nothing selected, cargo missing,
-        // clippy died without a verdict), so its exit zero vouches for nothing.
-        NodeCheckState::Unverified
-    } else if parsed.is_some_and(|result| {
-        !result.is_test_runner() || (result.complete && result.tests_run() > 0)
-    }) {
-        NodeCheckState::Passed
-    } else {
-        // Exit zero establishes only that nothing contradicted the command.
-        // A test runner that ran nothing, an incomplete artifact, or no
-        // canonical artifact at all establishes no verified green.
-        NodeCheckState::Unverified
+    check_state_from_facts(
+        passed,
+        parsed.map(ParsedCheckResult::verdict_facts).as_ref(),
+    )
+}
+
+pub(crate) fn check_state_from_facts(
+    passed: bool,
+    parsed: Option<&VerdictFacts<'_>>,
+) -> NodeCheckState {
+    match verdict_evidence_from_facts(passed, parsed) {
+        VerdictEvidence::Failed => NodeCheckState::Failed,
+        VerdictEvidence::Verified => NodeCheckState::Passed,
+        VerdictEvidence::Unverified(_) => NodeCheckState::Unverified,
     }
 }
 
@@ -68,28 +183,61 @@ impl Default for NodeCheckStatusCache {
         Self {
             cache: GenerationCache::new("node check projection"),
             projects: Mutex::new(HashMap::new()),
+            contracts: Mutex::new(HashMap::new()),
             settled_projection_reads: AtomicU64::new(0),
-            in_flight_bypasses: AtomicU64::new(0),
+            live_window_reads: AtomicU64::new(0),
         }
     }
 }
 
 impl NodeCheckStatusCache {
-    fn record_read_branch(&self, bypassed_for_in_flight_checks: bool) {
-        let counter = if bypassed_for_in_flight_checks {
-            &self.in_flight_bypasses
+    fn record_read_branch(&self, live: bool) {
+        let counter = if live {
+            &self.live_window_reads
         } else {
             &self.settled_projection_reads
         };
         let count = counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
         log::debug!(
             "node check projection branch={} count={count}",
-            if bypassed_for_in_flight_checks {
-                "in-flight-bypass"
+            if live {
+                "live-window"
             } else {
                 "settled-projection"
             }
         );
+    }
+
+    /// The checks contract `commit` declares, read once per commit.
+    ///
+    /// A commit is immutable and so is the contract it declares, so the memo
+    /// needs no invalidation. A read that finds no contract is not remembered:
+    /// absence can be a read that failed.
+    async fn contract_at_commit(
+        &self,
+        object_repository: &Path,
+        commit: &str,
+    ) -> Option<Arc<ChecksContract>> {
+        if let Some(contract) = self
+            .contracts
+            .lock()
+            .ok()
+            .and_then(|memo| memo.get(commit).cloned())
+        {
+            return Some(contract);
+        }
+        let contract = Arc::new(
+            load_checks_contract_at_commit(object_repository, commit)
+                .await?
+                .contract,
+        );
+        if let Ok(mut memo) = self.contracts.lock() {
+            if memo.len() >= CONTRACT_MEMO_LIMIT {
+                memo.clear();
+            }
+            memo.insert(commit.to_string(), contract.clone());
+        }
+        Some(contract)
     }
 
     fn bind_project(&self, job_id: &str, project_id: &str) {
@@ -126,6 +274,93 @@ impl NodeCheckStatusCache {
     {
         self.cache.get_or_compute(job_id, compute).await
     }
+
+    async fn get_or_compute_live<F, Fut>(
+        &self,
+        job_id: &str,
+        compute: F,
+    ) -> Option<Vec<NodeCheckStatus>>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Option<Vec<NodeCheckStatus>>>,
+    {
+        self.cache
+            .get_or_compute_within(job_id, LIVE_CHECK_POLL_WINDOW, compute)
+            .await
+    }
+}
+
+/// Which cadences have a wave in flight for a job.
+#[derive(Clone, Copy, Debug)]
+struct WaveCadence {
+    review: bool,
+    write: bool,
+}
+
+impl WaveCadence {
+    fn of(orch: &Orchestrator, job_id: &str) -> Self {
+        Self {
+            review: orch.turn_end_checks_in_flight(job_id),
+            write: orch.write_checks_in_flight(job_id),
+        }
+    }
+
+    fn any(self) -> bool {
+        self.review || self.write
+    }
+}
+
+/// Wall-clock time per phase of one status computation, logged when the whole
+/// computation is slow, so a slow poll in the profiler can be attributed to
+/// the step that cost it.
+struct PhaseClock {
+    started: Instant,
+    lap_started: Instant,
+    phases: Vec<(&'static str, Duration)>,
+}
+
+impl PhaseClock {
+    fn start() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            lap_started: now,
+            phases: Vec::new(),
+        }
+    }
+
+    /// Close the phase that began at the previous lap.
+    fn lap(&mut self, phase: &'static str) {
+        let now = Instant::now();
+        self.phases.push((phase, now - self.lap_started));
+        self.lap_started = now;
+    }
+
+    /// Record a phase measured inside another, such as a step of a blocking
+    /// task, without moving the lap boundary.
+    fn record(&mut self, phase: &'static str, elapsed: Duration) {
+        self.phases.push((phase, elapsed));
+    }
+
+    fn breakdown(&self) -> String {
+        self.phases
+            .iter()
+            .map(|(phase, elapsed)| format!("{phase}_ms={}", elapsed.as_millis()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn report(&self, job_id: &str, branch: &'static str) {
+        let total = self.started.elapsed();
+        if total < SLOW_STATUS_LOG_THRESHOLD {
+            return;
+        }
+        log::info!(
+            "node check status slow job={job_id} branch={branch} total_ms={} {}",
+            total.as_millis(),
+            self.breakdown()
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -145,6 +380,9 @@ pub struct NodeCheckStatus {
     pub(crate) passed: Option<usize>,
     pub(crate) failed: Option<usize>,
     pub(crate) skipped: Option<usize>,
+    /// Tests a fast-tier lane terminated at its per-test budget. Never part of
+    /// `passed`; rendered beside it so a fast green is never a bare one.
+    pub(crate) deferred: Option<usize>,
     /// Structured runner coverage metadata. Absence means the command supplied no
     /// canonical evidence that its successful exit verified anything.
     pub(crate) parser: Option<String>,
@@ -170,6 +408,21 @@ pub struct NodeCheckStatus {
     /// source machine, for a reused one), so a mis-placed lane is visible
     /// without reading its log.
     pub(crate) executor: Option<String>,
+    /// Set when the lane's verdict was recorded against an earlier head of this
+    /// branch than the node's current one: a head the branch was replayed off
+    /// by a base advance that kept its own patch. The verdict is about the same
+    /// change, on the base that head was on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) verified_on: Option<VerifiedHead>,
+}
+
+/// The head, and the fork point it was on, that a lane's verdict was recorded
+/// against when that head is not the node's current one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifiedHead {
+    pub(crate) head: String,
+    pub(crate) base: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -188,24 +441,29 @@ pub async fn node_check_statuses(
     orch: &Orchestrator,
     job_id: &str,
 ) -> Option<Vec<NodeCheckStatus>> {
-    // Running lanes deliberately bypass the settled projection. Their planner
-    // inputs come from the sealed runtime snapshot and their output tails live on
-    // disk, so each read remains current without rebuilding the settled jj/diff
-    // projection.
-    if orch.turn_end_checks_in_flight(job_id) || orch.write_checks_in_flight(job_id) {
-        orch.node_check_status_cache.record_read_branch(true);
-        return compute_node_check_statuses(orch, job_id).await;
+    // Both branches go through one cache. While a wave runs, its lanes move
+    // with nothing to announce each move, so the live branch is bounded by age
+    // rather than fenced by invalidation; either way every concurrent observer
+    // of the job joins one computation.
+    let live = WaveCadence::of(orch, job_id).any();
+    orch.node_check_status_cache.record_read_branch(live);
+    let compute = || compute_node_check_statuses(orch, job_id);
+    if live {
+        orch.node_check_status_cache
+            .get_or_compute_live(job_id, compute)
+            .await
+    } else {
+        orch.node_check_status_cache
+            .get_or_compute(job_id, compute)
+            .await
     }
-    orch.node_check_status_cache.record_read_branch(false);
-    orch.node_check_status_cache
-        .get_or_compute(job_id, || compute_node_check_statuses(orch, job_id))
-        .await
 }
 
 async fn compute_node_check_statuses(
     orch: &Orchestrator,
     job_id: &str,
 ) -> Option<Vec<NodeCheckStatus>> {
+    let mut clock = PhaseClock::start();
     // Route to the database that owns this job (team replica or private DB); the
     // job coordinates and cached check results for a team node live in its
     // replica. A closed replica yields no statuses rather than a wrong read
@@ -213,9 +471,136 @@ async fn compute_node_check_statuses(
     let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
         .await
         .ok()?;
+    clock.lap("owning_db");
     let coords = resolve_job_coords(&db, job_id).await.ok().flatten()?;
+    clock.lap("coords");
     orch.node_check_status_cache
         .bind_project(job_id, &coords.project_id);
+    let cadence = WaveCadence::of(orch, job_id);
+    let (branch, statuses) = if cadence.any() {
+        (
+            "live",
+            live_statuses(orch, job_id, &db, &coords, cadence, &mut clock).await,
+        )
+    } else {
+        (
+            "settled",
+            settled_statuses(orch, job_id, &db, &coords, cadence, &mut clock).await,
+        )
+    };
+    clock.report(job_id, branch);
+    statuses
+}
+
+/// The projection while a wave is in flight.
+///
+/// It reads only what the wave published when it planned: its sealed commit,
+/// the contract that commit declares, its tree, and every check's input hash at
+/// it. So it resolves no repository, loads no jj workspace, computes no fork
+/// point, and reads no config. Keying by the wave's sealed commit rather than
+/// the job's live head is also what keeps the key consistent with the wave's
+/// tree hash when the branch moves on mid-wave.
+async fn live_statuses(
+    orch: &Orchestrator,
+    job_id: &str,
+    db: &Arc<LocalDb>,
+    coords: &JobCoords,
+    cadence: WaveCadence,
+    clock: &mut PhaseClock,
+) -> Option<Vec<NodeCheckStatus>> {
+    let Some(status) = orch.turn_end_check_runtime_status(job_id) else {
+        // Planning has not published yet, or only the write cadence is running.
+        // Every lane stays pending rather than showing stale rows from an
+        // earlier run of this long-lived job, which needs only the check names:
+        // the contract at the node's logical head.
+        let logical_head = resolve_job_logical_head(orch, job_id).await.ok()?;
+        clock.lap("logical_head");
+        let contract = orch
+            .node_check_status_cache
+            .contract_at_commit(Path::new(&coords.repository_path), &logical_head)
+            .await?;
+        clock.lap("contract");
+        return Some(assemble_statuses(
+            orch,
+            job_id,
+            &contract.checks,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            &orch.recent_turn_end_check_request_ids(job_id),
+            cadence,
+        ));
+    };
+    if status.checks.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let rows = {
+        let project_id = coords.project_id.clone();
+        let checks = status.checks.clone();
+        let head = OwnedHeadVerdictKeys {
+            tree_hash: status.tree_hash.clone(),
+            input_hashes: status.input_hashes.clone(),
+            job_id: job_id.to_string(),
+            commit_sha: status.sealed_commit.clone(),
+        };
+        db.read(move |conn| {
+            Box::pin(
+                async move { head_verdicts_conn(conn, &project_id, &checks, head.keys()).await },
+            )
+        })
+        .await
+    };
+    clock.lap("head_verdicts");
+    let rows = rows
+        .map_err(|error| log::debug!("node {job_id} live check verdicts unreadable: {error}"))
+        .map(|rows| attribute_reuse(rows, &status.tree_hash))
+        .unwrap_or_default();
+    // Only a base replay that kept the branch's patch moves the head without
+    // withdrawing the wave, so a wave pinned to an earlier head is answering
+    // for the same change on the base that head was on, and its lanes say which
+    // head that was. Reading the node's head is the one VCS step this branch
+    // takes, and only when there is a verdict to label; the live window bounds
+    // it to once per poll tick per job.
+    let mut verified_on = HashMap::new();
+    if !rows.is_empty() {
+        let head = resolve_job_logical_head(orch, job_id).await.ok();
+        clock.lap("logical_head");
+        if head.is_some_and(|head| head != status.sealed_commit) {
+            let verified = VerifiedHead {
+                head: status.sealed_commit.clone(),
+                base: status.base.clone(),
+            };
+            verified_on = rows
+                .iter()
+                .map(|row| (row.check_name.clone(), verified.clone()))
+                .collect();
+        }
+    }
+    Some(assemble_statuses(
+        orch,
+        job_id,
+        &status.checks,
+        &rows_by_name(rows),
+        Some(&status.applicable_names),
+        &verified_on,
+        &status.request_ids,
+        cadence,
+    ))
+}
+
+/// The exact settled projection: what applies to this head and which verdict
+/// answers each check, resolved against the same sealed tree the runners key by.
+/// It is computed once per generation, so its VCS work is paid once per
+/// change rather than once per poll.
+async fn settled_statuses(
+    orch: &Orchestrator,
+    job_id: &str,
+    db: &Arc<LocalDb>,
+    coords: &JobCoords,
+    cadence: WaveCadence,
+    clock: &mut PhaseClock,
+) -> Option<Vec<NodeCheckStatus>> {
     let project_root = std::path::PathBuf::from(&coords.repository_path);
     let logical_repository = {
         let jj_binary_path = orch.jj_binary_path.clone();
@@ -229,29 +614,31 @@ async fn compute_node_check_statuses(
         .ok()?
         .ok()?
     };
-    let logical_head = crate::execution::cache::resolve_job_logical_head(orch, job_id)
-        .await
-        .ok()?;
+    clock.lap("coordinate_repository");
+    let logical_head = resolve_job_logical_head(orch, job_id).await.ok()?;
+    clock.lap("logical_head");
     // The same live fork point the review cadence gates on. Reading the
     // recorded `jobs.base_commit` here would show a node checks that its own
     // suite never planned, because that row does not follow a base advance.
-    let live_base =
-        crate::diff::live_job_branch_range(&db, job_id, &orch.jj_binary_path, &orch.config_dir)
+    let live_range =
+        crate::diff::live_job_branch_range(db, job_id, &orch.jj_binary_path, &orch.config_dir)
             .await
             .map_err(|error| {
                 log::debug!("node {job_id} check status: no live base coordinate ({error})");
             })
             .ok()
-            .flatten()
-            .map(|range| range.base);
+            .flatten();
+    clock.lap("live_range");
     // The status a node renders must be the suite its own cadences plan, so the
     // contract comes from the node's logical head — the same commit the cadences
     // read it from. Reading the project checkout here would show a node checks
     // that its own suite never selected (CAIRN-3333).
-    let contract = load_checks_contract_at_commit(&project_root, &logical_head).await?;
-    let checks = contract.contract.checks;
-    let extra_inputs = contract.contract.extra_inputs;
-    if checks.is_empty() {
+    let contract = orch
+        .node_check_status_cache
+        .contract_at_commit(&project_root, &logical_head)
+        .await?;
+    clock.lap("contract");
+    if contract.checks.is_empty() {
         return Some(Vec::new());
     }
 
@@ -259,202 +646,295 @@ async fn compute_node_check_statuses(
     // bridge. Routing and config loading above stay async; the complete status
     // snapshot below belongs on the blocking pool so rendering `/checks` cannot
     // park a runtime worker.
-    let review_in_flight = orch.turn_end_checks_in_flight(job_id);
-    let write_in_flight = orch.write_checks_in_flight(job_id);
-    let in_flight = review_in_flight || write_in_flight;
-    let runtime_status = orch.turn_end_check_runtime_status(job_id);
-    let request_ids = runtime_status
-        .as_ref()
-        .map(|status| status.request_ids.clone())
-        .unwrap_or_else(|| orch.recent_turn_end_check_request_ids(job_id));
     let status_db = db.clone();
     let status_job_id = job_id.to_string();
     let status_project_id = coords.project_id.clone();
-    let status_base = live_base;
-    let status_repository = logical_repository;
-    let status_head = logical_head;
-    let status_root = project_root;
-    let status_checks = checks.clone();
-    let status_extra_inputs = extra_inputs.clone();
+    let status_contract = contract.clone();
     let status_jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let (rows_by_name, applicable_names) = tokio::task::spawn_blocking(move || {
-        // A running review suite publishes its sealed tree and applicable check
-        // names once planning finishes. The 1 Hz live-tail poll therefore needs
-        // only that immutable snapshot plus current-tree cache rows; re-running jj
-        // tree resolution and the cumulative diff on every tick is both redundant
-        // and, under repository load, orders of magnitude more expensive than the
-        // rest of this handler.
-        // Once the suite settles, take the full VCS-backed snapshot exactly once
-        // so not-applicable checks and cross-equivalent-tree cache hits are exact.
-        let (rows, applicable_names) = if in_flight {
-            match runtime_status {
-                Some(status) => (
-                    head_verdicts(
-                        status_db,
-                        &status_project_id,
-                        &status_checks,
-                        HeadVerdictKeys {
-                            tree_hash: &status.tree_hash,
-                            input_hashes: &status.input_hashes,
-                            job_id: &status_job_id,
-                            commit_sha: &status_head,
-                        },
-                    )
-                    .map(|rows| attribute_reuse(rows, &status.tree_hash))
-                    .unwrap_or_default(),
-                    Some(status.applicable_names),
-                ),
-                // Planning has not published its sealed-tree snapshot yet. Keep
-                // every review check pending rather than showing stale rows from
-                // an earlier run of this long-lived job.
-                None => (Vec::new(), None),
-            }
-        } else {
+    let (rows_by_name, applicable_names, verified_on, verdicts_elapsed) =
+        tokio::task::spawn_blocking(move || {
+            let checks = &status_contract.checks;
             // The projection must answer both "does this check apply" and "which
             // verdict answers it" exactly as the runners do, so it resolves each
             // check's inputs against the same sealed tree they key by, once.
-            let entries = if any_check_declares_inputs(status_checks.values()) {
-                crate::jj::tree_entries(&status_jj, &status_repository, &status_head).ok()
+            let entries = if any_check_declares_inputs(checks.values()) {
+                crate::jj::tree_entries(&status_jj, &logical_repository, &logical_head).ok()
             } else {
                 None
             };
             let blobs = TreeBlobs {
                 jj: &status_jj,
-                repository: &status_repository,
+                repository: &logical_repository,
             };
             let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
-            let inputs = ResolvedInputs::resolve(&status_checks, &status_extra_inputs, &snapshot);
-            let live_rows = logical_tree_hash(&status_jj, &status_repository, &status_head)
-                .ok()
-                .and_then(|tree_hash| {
-                    let input_hashes =
-                        check_input_hashes(&status_checks, &inputs, entries.as_deref(), &tree_hash);
-                    head_verdicts(
-                        status_db.clone(),
-                        &status_project_id,
-                        &status_checks,
-                        HeadVerdictKeys {
-                            tree_hash: &tree_hash,
-                            input_hashes: &input_hashes,
-                            job_id: &status_job_id,
-                            commit_sha: &status_head,
-                        },
-                    )
-                    .ok()
-                    .map(|rows| attribute_reuse(rows, &tree_hash))
-                });
-            let rows = live_rows
-                .or_else(|| list_check_results_for_job(status_db, &status_job_id).ok())
+            let inputs = ResolvedInputs::resolve(checks, &status_contract.extra_inputs, &snapshot);
+            let mut verdicts_elapsed = Duration::ZERO;
+            let head_tree = logical_tree_hash(&status_jj, &logical_repository, &logical_head).ok();
+            let live_rows = head_tree.as_deref().and_then(|tree_hash| {
+                let input_hashes =
+                    check_input_hashes(checks, &inputs, entries.as_deref(), tree_hash);
+                let verdicts_started = Instant::now();
+                let rows = head_verdicts(
+                    status_db.clone(),
+                    &status_project_id,
+                    checks,
+                    HeadVerdictKeys {
+                        tree_hash,
+                        input_hashes: &input_hashes,
+                        job_id: &status_job_id,
+                        commit_sha: &logical_head,
+                    },
+                );
+                verdicts_elapsed = verdicts_started.elapsed();
+                rows.ok().map(|rows| attribute_reuse(rows, tree_hash))
+            });
+            let mut rows = live_rows
+                .or_else(|| list_check_results_for_job(status_db.clone(), &status_job_id).ok())
                 .unwrap_or_default();
-            let changed = status_base.as_deref().and_then(|base| {
-                logical_changed_files(&status_jj, &status_repository, base, &status_head)
+            let changed = live_range.as_ref().and_then(|range| {
+                logical_changed_files(&status_jj, &logical_repository, &range.base, &logical_head)
+                    .inspect_err(|error| {
+                        log::debug!(
+                            "check status: changed files of {}..{logical_head} unreadable: {error}",
+                            range.base
+                        );
+                    })
+                    .ok()
             });
             let applicable_names = changed.as_ref().map(|changed| {
-                plan_checks(&status_checks, &inputs, changed, &status_root)
+                plan_checks(checks, &inputs, changed, &project_root)
                     .into_iter()
                     .filter(|plan| plan.applies)
                     .map(|plan| plan.name)
-                    .collect::<std::collections::HashSet<_>>()
+                    .collect::<HashSet<_>>()
             });
-            (rows, applicable_names)
-        };
-        let rows_by_name: HashMap<String, CheckResultCacheEntry> = rows
-            .into_iter()
-            .map(|row| (row.check_name.clone(), row))
-            .collect();
-        (rows_by_name, applicable_names)
-    })
-    .await
-    .ok()?;
+            // An applicable lane with no verdict at this head may still hold one
+            // this job recorded on an earlier head carrying the same change, when
+            // base advances replayed the branch while its wave ran.
+            let mut verified_on = HashMap::new();
+            if let (Some(head_tree), Some(range), Some(applicable)) = (
+                head_tree.as_deref(),
+                live_range.as_ref(),
+                applicable_names.as_ref(),
+            ) {
+                let missing: HashSet<String> = applicable
+                    .iter()
+                    .filter(|name| !rows.iter().any(|row| &row.check_name == *name))
+                    .cloned()
+                    .collect();
+                if !missing.is_empty() {
+                    let job_rows = list_check_results_for_job(status_db.clone(), &status_job_id)
+                        .unwrap_or_default();
+                    for (row, verified) in carry_forward_unchanged_patch(
+                        &missing,
+                        &logical_head,
+                        head_tree,
+                        job_rows,
+                        |row| {
+                            observed_commit_for_job(status_db.clone(), &status_job_id, row)
+                                .ok()
+                                .flatten()
+                        },
+                        |commit| {
+                            own_patch_against(
+                                &status_jj,
+                                &logical_repository,
+                                commit,
+                                &range.target_head,
+                            )
+                            .ok()
+                        },
+                    ) {
+                        verified_on.insert(row.check_name.clone(), verified);
+                        rows.push(row);
+                    }
+                }
+            }
+            (
+                rows_by_name(rows),
+                applicable_names,
+                verified_on,
+                verdicts_elapsed,
+            )
+        })
+        .await
+        .ok()?;
+    clock.lap("blocking");
+    clock.record("blocking.head_verdicts", verdicts_elapsed);
 
+    Some(assemble_statuses(
+        orch,
+        job_id,
+        &contract.checks,
+        &rows_by_name,
+        applicable_names.as_ref(),
+        &verified_on,
+        &orch.recent_turn_end_check_request_ids(job_id),
+        cadence,
+    ))
+}
+
+fn rows_by_name(rows: Vec<CheckResultCacheEntry>) -> HashMap<String, CheckResultCacheEntry> {
+    rows.into_iter()
+        .map(|row| (row.check_name.clone(), row))
+        .collect()
+}
+
+/// One status row per configured check, in name order, from what the branch
+/// resolved: the verdict rows by check, which checks apply (`None` when that
+/// could not be decided), the earlier head each carried verdict was recorded
+/// on, and the fabric request each lane was submitted as.
+fn assemble_statuses(
+    orch: &Orchestrator,
+    job_id: &str,
+    checks: &HashMap<String, CheckCommand>,
+    rows_by_name: &HashMap<String, CheckResultCacheEntry>,
+    applicable_names: Option<&HashSet<String>>,
+    verified_on: &HashMap<String, VerifiedHead>,
+    request_ids: &HashMap<String, String>,
+    cadence: WaveCadence,
+) -> Vec<NodeCheckStatus> {
     let mut names = checks.keys().cloned().collect::<Vec<_>>();
     names.sort();
-    Some(
-        names
-            .into_iter()
-            .map(|name| {
-                let check = checks.get(&name).expect("name came from checks map");
+    names
+        .into_iter()
+        .map(|name| {
+            let check = checks.get(&name).expect("name came from checks map");
 
-                // A review check does not apply when the impact gate excluded it
-                // from this tree's plan; it will never run, so it is neither
-                // running nor pending.
-                let not_applicable = applicable_names
-                    .as_ref()
-                    .is_some_and(|names| !names.contains(&name));
+            // A review check does not apply when the impact gate excluded it
+            // from this tree's plan; it will never run, so it is neither
+            // running nor pending.
+            let not_applicable = applicable_names.is_some_and(|names| !names.contains(&name));
 
-                // `LaneEvidence::Recorded` outranks everything below, and this
-                // returns before the `started` probe so a lane that already holds
-                // a verdict never pays for a filesystem check it cannot use.
-                if let Some(row) = rows_by_name.get(&name) {
-                    return status_from_row(
-                        job_id,
-                        request_ids.get(&name).cloned(),
-                        &name,
-                        check.policy,
-                        check.when,
-                        row,
-                        row.executor_id
-                            .as_deref()
-                            .map(|id| orch.fleet.executor_name_for_text(id)),
-                    );
-                }
+            // `LaneEvidence::Recorded` outranks everything below, and this
+            // returns before the `started` probe so a lane that already holds
+            // a verdict never pays for a filesystem check it cannot use.
+            if let Some(row) = rows_by_name.get(&name) {
+                let mut status = status_from_row(
+                    job_id,
+                    request_ids.get(&name).cloned(),
+                    &name,
+                    check.policy,
+                    check.when,
+                    row,
+                    row.executor_id
+                        .as_deref()
+                        .map(|id| orch.fleet.executor_name_for_text(id)),
+                );
+                status.verified_on = verified_on.get(&name).cloned();
+                return status;
+            }
 
-                // Turn-end review checks run CONCURRENTLY in isolated COW clones
-                // (or sequentially in the shared worktree on the clone-unavailable
-                // fallback), each into its OWN log file created the instant it
-                // starts. Existence of that file — not a non-empty tail — is the
-                // RUNNING signal, so a silent-but-active check is not mistaken for a
-                // queued one; under isolation several checks read as running at
-                // once, while a not-yet-started (or fallback-queued) check has no
-                // file yet and stays pending. The tail is read separately and is
-                // None while a running check has yet to emit.
-                let started = (review_in_flight && check.when == CheckWhen::Review
-                    || write_in_flight && check.when == CheckWhen::Write)
-                    && !not_applicable
-                    && (write_in_flight || turn_end_check_started(orch, job_id, &name));
+            // Turn-end review checks run CONCURRENTLY in isolated COW clones
+            // (or sequentially in the shared worktree on the clone-unavailable
+            // fallback), each into its OWN log file created the instant it
+            // starts. Existence of that file — not a non-empty tail — is the
+            // RUNNING signal, so a silent-but-active check is not mistaken for a
+            // queued one; under isolation several checks read as running at
+            // once, while a not-yet-started (or fallback-queued) check has no
+            // file yet and stays pending. The tail is read separately and is
+            // None while a running check has yet to emit.
+            let started = (cadence.review && check.when == CheckWhen::Review
+                || cadence.write && check.when == CheckWhen::Write)
+                && !not_applicable
+                && (cadence.write || turn_end_check_started(orch, job_id, &name));
 
-                let state = match lane_evidence(false, not_applicable, started) {
-                    LaneEvidence::NotApplicable => NodeCheckState::NotApplicable,
-                    LaneEvidence::Running => NodeCheckState::Running,
-                    // `Recorded` is unreachable here: the row arm returned above.
-                    LaneEvidence::Recorded | LaneEvidence::Pending => NodeCheckState::Pending,
-                };
+            let state = match lane_evidence(false, not_applicable, started) {
+                LaneEvidence::NotApplicable => NodeCheckState::NotApplicable,
+                LaneEvidence::Running => NodeCheckState::Running,
+                // `Recorded` is unreachable here: the row arm returned above.
+                LaneEvidence::Recorded | LaneEvidence::Pending => NodeCheckState::Pending,
+            };
 
-                // Only the actively-running check carries a live tail (and it may
-                // still be None before its first line); pending and not-applicable
-                // rows have none.
-                let output_tail = if started {
-                    read_turn_end_log_tail(orch, job_id, &name)
-                } else {
-                    None
-                };
+            // Only the actively-running check carries a live tail (and it may
+            // still be None before its first line); pending and not-applicable
+            // rows have none.
+            let output_tail = if started {
+                read_turn_end_log_tail(orch, job_id, &name)
+            } else {
+                None
+            };
 
-                NodeCheckStatus {
-                    job_id: job_id.to_string(),
-                    request_id: request_ids.get(&name).cloned(),
-                    name,
-                    state,
-                    policy: check.policy.as_str().to_string(),
-                    when: check.when.as_str().to_string(),
-                    cached: None,
-                    duration_ms: None,
-                    ran_at: None,
-                    passed: None,
-                    failed: None,
-                    skipped: None,
-                    parser: None,
-                    complete: None,
-                    selection: None,
-                    suite_failures: None,
-                    failure_names: Vec::new(),
-                    output_tail,
-                    failure_kind: None,
-                    suppressed_after: None,
-                    executor: None,
-                }
-            })
-            .collect(),
-    )
+            NodeCheckStatus {
+                job_id: job_id.to_string(),
+                request_id: request_ids.get(&name).cloned(),
+                name,
+                state,
+                policy: check.policy.as_str().to_string(),
+                when: check.when.as_str().to_string(),
+                cached: None,
+                duration_ms: None,
+                ran_at: None,
+                passed: None,
+                failed: None,
+                skipped: None,
+                deferred: None,
+                parser: None,
+                complete: None,
+                selection: None,
+                suite_failures: None,
+                failure_names: Vec::new(),
+                output_tail,
+                failure_kind: None,
+                suppressed_after: None,
+                executor: None,
+                verified_on: None,
+            }
+        })
+        .collect()
+}
+
+/// Verdicts this job recorded on an earlier head whose own patch is the current
+/// head's, for the `missing` lanes: those the current head applies but holds no
+/// verdict for.
+///
+/// A base advance that replays a branch without changing its patch does not
+/// withdraw the review wave running on it, so that wave records against the
+/// pre-replay head, whose tree (and usually its lanes' input hashes) the current
+/// head does not share. The verdict is still about the change the branch claims,
+/// so the lane carries it, naming the head and base it was recorded on. A head
+/// whose patch differs (a commit since, a conflict resolution, a replay that
+/// altered a hunk) carries nothing, and neither does anything unreadable.
+///
+/// `commit_of` names the commit a row was observed on; `patch_of` reads a head's
+/// own patch against the integration target. Each head's patch is read once.
+fn carry_forward_unchanged_patch(
+    missing: &HashSet<String>,
+    head: &str,
+    head_tree: &str,
+    job_rows: Vec<CheckResultCacheEntry>,
+    mut commit_of: impl FnMut(&CheckResultCacheEntry) -> Option<String>,
+    mut patch_of: impl FnMut(&str) -> Option<OwnPatch>,
+) -> Vec<(CheckResultCacheEntry, VerifiedHead)> {
+    let mut patches: HashMap<String, Option<OwnPatch>> = HashMap::new();
+    let mut carried = Vec::new();
+    for row in job_rows {
+        if !missing.contains(&row.check_name) || row.tree_hash == head_tree {
+            continue;
+        }
+        let Some(commit) = commit_of(&row).filter(|commit| commit != head) else {
+            continue;
+        };
+        if !patches.contains_key(head) {
+            patches.insert(head.to_string(), patch_of(head));
+        }
+        if !patches.contains_key(&commit) {
+            let patch = patch_of(&commit);
+            patches.insert(commit.clone(), patch);
+        }
+        let (Some(Some(current)), Some(Some(earlier))) = (patches.get(head), patches.get(&commit))
+        else {
+            continue;
+        };
+        if current.patch == earlier.patch {
+            let verified = VerifiedHead {
+                head: commit,
+                base: earlier.base.clone(),
+            };
+            carried.push((row, verified));
+        }
+    }
+    carried
 }
 
 /// Mark every row reached from another tree as `cached`.
@@ -580,6 +1060,7 @@ fn status_from_row(
         passed: parsed.as_ref().map(|p| p.passed),
         failed: parsed.as_ref().map(|p| p.failed),
         skipped: parsed.as_ref().map(|p| p.skipped),
+        deferred: parsed.as_ref().map(|p| p.deferred),
         parser: parsed.as_ref().map(|p| p.parser.clone()),
         complete: parsed.as_ref().map(|p| p.complete),
         selection: parsed.as_ref().map(|p| p.selection.clone()),
@@ -591,7 +1072,20 @@ fn status_from_row(
             >= crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND)
             .then_some(row.infra_failure_streak),
         executor,
+        verified_on: None,
     }
+}
+
+/// The fast-tier label for a lane whose stored parse declared `selection: fast`.
+fn status_fast_tier_label(status: &NodeCheckStatus) -> Option<String> {
+    (status.selection.as_deref() == Some(crate::execution::check_parsers::FAST_TIER_SELECTION))
+        .then(|| {
+            crate::execution::check_parsers::fast_tier_label(
+                status.passed.unwrap_or(0) + status.failed.unwrap_or(0),
+                status.deferred.unwrap_or(0),
+                status.skipped.unwrap_or(0),
+            )
+        })
 }
 
 pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<String> {
@@ -634,7 +1128,12 @@ pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<Strin
                 (Some("nextest" | "vitest"), Some(passed), Some(failed)) => Some((passed, failed)),
                 _ => None,
             };
-            if let Some((passed, failed)) = test_counts {
+            if let Some(label) = status_fast_tier_label(status) {
+                // A fast-tier green covers the change's own tests and every
+                // test that fit the budget, never the whole suite; its label
+                // says so in place of the bare test count.
+                parts.push(label);
+            } else if let Some((passed, failed)) = test_counts {
                 let total = passed + failed;
                 // Mirrors `execution::checks::summary_annotation`: a skipped test
                 // never disappears into a green, and a suite that skipped itself
@@ -668,6 +1167,10 @@ pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<Strin
             ) {
                 parts.push(annotation);
             }
+            // A red fast-tier lane still names what it did not judge.
+            if let Some(label) = status_fast_tier_label(status) {
+                parts.push(label);
+            }
         }
         _ => {}
     }
@@ -677,11 +1180,22 @@ pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<Strin
     if status.cached == Some(true) {
         parts.push("cached".to_string());
     }
+    if let Some(verified) = &status.verified_on {
+        parts.push(format!(
+            "verified on earlier head {} over base {}; base since advanced, diff unchanged",
+            short_commit(&verified.head),
+            short_commit(&verified.base)
+        ));
+    }
     if parts.is_empty() {
         None
     } else {
         Some(parts.join(", "))
     }
+}
+
+fn short_commit(commit: &str) -> &str {
+    &commit[..commit.len().min(12)]
 }
 
 /// The line a not-placeable lane renders as: the fleet's first sentence of why,
@@ -973,6 +1487,7 @@ pub(crate) fn formatted_failure_names(status: &NodeCheckStatus) -> Option<String
         failed: status.failed.unwrap_or(status.failure_names.len()),
         skipped: status.skipped.unwrap_or(0),
         suite_failures: status.suite_failures.unwrap_or(0),
+        deferred: 0,
         report: None,
         failures: status
             .failure_names
@@ -1003,7 +1518,67 @@ mod tests {
             cache.settled_projection_reads.load(AtomicOrdering::Relaxed),
             2
         );
-        assert_eq!(cache.in_flight_bypasses.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(cache.live_window_reads.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    /// Every observer polling a running wave at once shares one computation:
+    /// the fleet overlay, the PR view, and each window's own query key all
+    /// resolve to the same job, which is where the fan-out is cut.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_live_polls_for_one_job_compute_once() {
+        let cache = Arc::new(NodeCheckStatusCache::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(11));
+        let mut readers = Vec::new();
+        for _ in 0..11 {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            let barrier = barrier.clone();
+            readers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                cache
+                    .get_or_compute_live("job", || {
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            Some(Vec::new())
+                        }
+                    })
+                    .await
+            }));
+        }
+        for reader in readers {
+            assert_eq!(reader.await.unwrap(), Some(Vec::new()));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Settlement advances the generation, so the next read, live or not,
+        // never serves the live value.
+        cache.invalidate("job", "check-settlement");
+        cache
+            .get_or_compute("job", || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Some(Vec::new())
+                }
+            })
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn the_phase_breakdown_names_each_phase_in_order() {
+        let mut clock = PhaseClock::start();
+        clock.lap("owning_db");
+        clock.record("blocking.head_verdicts", Duration::from_millis(42));
+        let breakdown = clock.breakdown();
+        assert!(breakdown.starts_with("owning_db_ms="), "{breakdown}");
+        assert!(
+            breakdown.ends_with(" blocking.head_verdicts_ms=42"),
+            "{breakdown}"
+        );
     }
 
     #[tokio::test]
@@ -1155,6 +1730,93 @@ mod tests {
         }
     }
 
+    fn own_patch(base: &str, patch: &str) -> crate::jj::OwnPatch {
+        crate::jj::OwnPatch {
+            base: base.to_string(),
+            patch: patch.to_string(),
+        }
+    }
+
+    /// A wave kept across base replays records on the pre-replay head. A lane
+    /// the current head has no verdict for carries that verdict exactly when the
+    /// earlier head's own patch is the current head's, naming that head and the
+    /// base it was on; a head whose patch differs carries nothing, and a lane
+    /// that already holds a verdict here, or a row from this very tree, is left
+    /// alone.
+    #[test]
+    fn a_verdict_carries_forward_only_from_a_head_with_the_same_patch() {
+        let row = |name: &str, tree: &str| CheckResultCacheEntry {
+            tree_hash: tree.to_string(),
+            ..verdict_row(name, name != "red")
+        };
+        let rows = vec![
+            row("red", "tree-replayed-off"),
+            row("green", "tree-replayed-off"),
+            row("edited", "tree-before-commit"),
+            row("answered", "tree-replayed-off"),
+            row("here", "tree-head"),
+        ];
+        let missing: HashSet<String> = ["red", "green", "edited", "here"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let mut patch_reads = Vec::new();
+        let carried = carry_forward_unchanged_patch(
+            &missing,
+            "head",
+            "tree-head",
+            rows,
+            |row| {
+                Some(match row.tree_hash.as_str() {
+                    "tree-replayed-off" => "replayed-off".to_string(),
+                    "tree-before-commit" => "before-commit".to_string(),
+                    _ => "head".to_string(),
+                })
+            },
+            |commit| {
+                patch_reads.push(commit.to_string());
+                Some(match commit {
+                    "head" => own_patch("main-now", "+change\n"),
+                    "replayed-off" => own_patch("main-then", "+change\n"),
+                    _ => own_patch("main-then", "+partial\n"),
+                })
+            },
+        );
+        let names: Vec<_> = carried
+            .iter()
+            .map(|(row, verified)| (row.check_name.as_str(), verified.clone()))
+            .collect();
+        let verified = VerifiedHead {
+            head: "replayed-off".to_string(),
+            base: "main-then".to_string(),
+        };
+        assert_eq!(
+            names,
+            vec![("red", verified.clone()), ("green", verified)],
+            "a red carries as faithfully as a green"
+        );
+        patch_reads.sort();
+        assert_eq!(
+            patch_reads,
+            vec!["before-commit", "head", "replayed-off"],
+            "each head's patch is read once"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_patch_carries_nothing() {
+        let missing: HashSet<String> = ["rust".to_string()].into_iter().collect();
+        let carried = carry_forward_unchanged_patch(
+            &missing,
+            "head",
+            "tree-head",
+            vec![verdict_row("rust", true)],
+            |_| Some("earlier".to_string()),
+            |commit| (commit == "earlier").then(|| own_patch("main", "+x\n")),
+        );
+        assert!(carried.is_empty());
+    }
+
     fn parsed_json(passed: usize, failures: &[&str]) -> String {
         serde_json::to_string(&ParsedCheckResult {
             schema_version: 1,
@@ -1167,6 +1829,7 @@ mod tests {
             failed: failures.len(),
             skipped: 0,
             suite_failures: 0,
+            deferred: 0,
             report: None,
             failures: failures
                 .iter()
@@ -1329,6 +1992,49 @@ mod tests {
         assert_eq!(lane_evidence(false, false, false), LaneEvidence::Pending);
     }
 
+    /// The one classification every surface shares, case by case.
+    #[test]
+    fn verdict_evidence_classifies_each_shape_of_exit() {
+        let nextest = |passed: usize, skipped: usize, complete: bool, selection: &str| {
+            let mut parsed: ParsedCheckResult =
+                serde_json::from_str(&parsed_json(passed, &[])).unwrap();
+            parsed.parser = "nextest".into();
+            parsed.skipped = skipped;
+            parsed.complete = complete;
+            parsed.selection = selection.into();
+            parsed
+        };
+        assert_eq!(verdict_evidence(false, None), VerdictEvidence::Failed);
+        assert_eq!(
+            verdict_evidence(true, None),
+            VerdictEvidence::Unverified(UnverifiedReason::NoStructuredResult)
+        );
+        assert_eq!(
+            verdict_evidence(true, Some(&nextest(3, 0, true, "full"))),
+            VerdictEvidence::Verified
+        );
+        assert_eq!(
+            verdict_evidence(true, Some(&nextest(0, 0, true, "empty"))),
+            VerdictEvidence::Unverified(UnverifiedReason::EmptySelection)
+        );
+        assert_eq!(
+            verdict_evidence(true, Some(&nextest(0, 4, true, "full"))),
+            VerdictEvidence::Unverified(UnverifiedReason::AllSkipped(4))
+        );
+        assert_eq!(
+            verdict_evidence(true, Some(&nextest(3, 0, false, "full"))),
+            VerdictEvidence::Unverified(UnverifiedReason::IncompleteEnumeration)
+        );
+        assert_eq!(
+            verdict_evidence(true, Some(&nextest(0, 0, true, "full"))),
+            VerdictEvidence::Unverified(UnverifiedReason::NoTestsRan)
+        );
+        assert_eq!(
+            UnverifiedReason::AllSkipped(4).to_string(),
+            "no tests ran; 4 skipped"
+        );
+    }
+
     #[test]
     fn successful_test_runs_without_executed_tests_are_unverified() {
         for (selection, skipped, expected) in
@@ -1384,6 +2090,7 @@ mod tests {
             passed: 0,
             failed: 0,
             suite_failures: 0,
+            deferred: 0,
             report: None,
             skipped: 0,
             failures: vec![],
@@ -1415,6 +2122,7 @@ mod tests {
                 failed: failures.len(),
                 skipped: 0,
                 suite_failures: 0,
+                deferred: 0,
                 report: Some("✓ clippy: no new findings in your diff".to_string()),
                 failures: failures
                     .iter()
@@ -1588,6 +2296,7 @@ mod tests {
             passed: Some(12),
             failed: Some(0),
             skipped: Some(1),
+            deferred: None,
             parser: Some("nextest".into()),
             complete: Some(true),
             selection: Some("full".into()),
@@ -1597,6 +2306,7 @@ mod tests {
             failure_kind: None,
             suppressed_after: None,
             executor: None,
+            verified_on: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -1618,6 +2328,63 @@ mod tests {
         status.failed = None;
         status.cached = Some(false);
         assert_eq!(format_status_annotation(&status).as_deref(), Some("4.1s"));
+        status.verified_on = Some(VerifiedHead {
+            head: "0123456789abcdef0123".into(),
+            base: "fedcba9876543210fedc".into(),
+        });
+        assert_eq!(
+            format_status_annotation(&status).as_deref(),
+            Some(
+                "4.1s, verified on earlier head 0123456789ab over base fedcba987654; \
+                 base since advanced, diff unchanged"
+            ),
+            "a lane verified on an earlier head names that head and its base"
+        );
+    }
+
+    /// A fast-tier green is never a bare one: the label names how many tests it
+    /// ran and how many it deferred, so its population cannot merge with a
+    /// whole-suite green's. A red fast lane says the same beside its failures.
+    #[test]
+    fn a_fast_tier_lane_renders_its_population_green_or_red() {
+        let mut status = NodeCheckStatus {
+            job_id: "job".to_string(),
+            request_id: None,
+            name: "rust-tests".to_string(),
+            state: NodeCheckState::Passed,
+            policy: "advisory".to_string(),
+            when: "review".to_string(),
+            cached: Some(false),
+            duration_ms: Some(90_000),
+            ran_at: Some(1),
+            passed: Some(8_501),
+            failed: Some(0),
+            skipped: Some(0),
+            deferred: Some(3_596),
+            parser: Some("nextest".into()),
+            complete: Some(true),
+            selection: Some("fast".into()),
+            suite_failures: None,
+            failure_names: Vec::new(),
+            output_tail: None,
+            failure_kind: None,
+            suppressed_after: None,
+            executor: None,
+            verified_on: None,
+        };
+        assert_eq!(
+            format_status_annotation(&status).as_deref(),
+            Some("fast tier: 8501 ran, 3596 deferred")
+        );
+
+        status.state = NodeCheckState::Failed;
+        status.passed = Some(8_499);
+        status.failed = Some(2);
+        status.failure_names = vec!["c t::a".into(), "c t::b".into()];
+        assert_eq!(
+            format_status_annotation(&status).as_deref(),
+            Some("2 of 8501 failed, fast tier: 8501 ran, 3596 deferred")
+        );
     }
 
     /// A verdict reached from another tree is reused, never fresh, on the head
@@ -1679,6 +2446,7 @@ mod tests {
             passed: Some(0),
             failed: Some(0),
             skipped: Some(12),
+            deferred: None,
             parser: Some("nextest".into()),
             complete: Some(true),
             selection: Some("full".into()),
@@ -1688,6 +2456,7 @@ mod tests {
             failure_kind: None,
             suppressed_after: None,
             executor: None,
+            verified_on: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -1718,6 +2487,7 @@ mod tests {
             passed: Some(881),
             failed: Some(0),
             skipped: Some(0),
+            deferred: None,
             parser: Some("nextest".into()),
             complete: Some(true),
             selection: Some("full".into()),
@@ -1727,6 +2497,7 @@ mod tests {
             failure_kind: None,
             suppressed_after: None,
             executor: None,
+            verified_on: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -1766,6 +2537,7 @@ mod tests {
             passed: None,
             failed: None,
             skipped: None,
+            deferred: None,
             parser: None,
             complete: None,
             selection: None,
@@ -1775,6 +2547,7 @@ mod tests {
             failure_kind: Some("timed_out".to_string()),
             suppressed_after: None,
             executor: None,
+            verified_on: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -1845,6 +2618,7 @@ mod tests {
             passed: None,
             failed: None,
             skipped: None,
+            deferred: None,
             parser: None,
             complete: None,
             selection: None,
@@ -1854,6 +2628,7 @@ mod tests {
             failure_kind: Some("infrastructure".to_string()),
             suppressed_after: Some(3),
             executor: None,
+            verified_on: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -1942,6 +2717,7 @@ mod tests {
             passed: None,
             failed: None,
             skipped: None,
+            deferred: None,
             parser: None,
             complete: None,
             selection: None,
@@ -1951,6 +2727,7 @@ mod tests {
             failure_kind: Some("spawn_error".to_string()),
             suppressed_after: None,
             executor: None,
+            verified_on: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),

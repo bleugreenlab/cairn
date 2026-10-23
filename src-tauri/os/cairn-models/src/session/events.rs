@@ -411,7 +411,7 @@ pub mod codex {
                         parent_tool_use_id: None,
                     }]
                 }
-                Notification::ItemCompleted { item } => {
+                Notification::ItemCompleted { item, .. } => {
                     let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
                     match kind {
                         "agentMessage" => match item.get("text").and_then(Value::as_str) {

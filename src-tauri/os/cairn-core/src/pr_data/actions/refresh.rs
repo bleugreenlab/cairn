@@ -20,6 +20,7 @@ use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_db::turso::params;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use super::conflict::{
     conflict_recovery_hint, format_conflicted_commits, source_conflict_report, SourceConflictReport,
@@ -449,16 +450,18 @@ impl PrSnapshot {
 /// one GitHub fetch and one bounded set of `jj` probes, and a read of unchanged
 /// state performs neither.
 ///
-/// `live` is explicit operator refresh: it advances the generation once and then
-/// joins the single flight that advance created, so a burst of refresh presses
-/// still costs one refresh.
+/// `refresh_demanded_at` is explicit operator refresh, made at that instant: the
+/// answer must not be a projection that had already settled by then. A burst of
+/// refresh presses advances the generation once and every press joins or
+/// consumes the single flight that advance created, so the burst still costs
+/// one refresh however its requests are scheduled.
 pub(crate) async fn pr_snapshot_for_job(
     orch: &Orchestrator,
     job_id: &str,
-    live: bool,
+    refresh_demanded_at: Option<Instant>,
 ) -> Result<Arc<PrSnapshot>, String> {
     let cache = &orch.pr_refresh_cache;
-    if !live {
+    if refresh_demanded_at.is_none() {
         // Every mounted reader observes the same expired snapshot at the moment
         // a freshness window elapses, so the decision to advance has to be made
         // under the same lock as the advance itself.
@@ -486,10 +489,9 @@ pub(crate) async fn pr_snapshot_for_job(
     };
     // An explicit demand chooses and reserves the replacement generation in one
     // cache operation. Ordinary reads simply join or consume that generation.
-    let snapshot = if live {
-        cache.refresh_or_compute(job_id, compute).await
-    } else {
-        cache.get_or_compute(job_id, compute).await
+    let snapshot = match refresh_demanded_at {
+        Some(demanded_at) => cache.refresh_or_compute(job_id, demanded_at, compute).await,
+        None => cache.get_or_compute(job_id, compute).await,
     };
 
     match snapshot {
@@ -659,16 +661,24 @@ async fn compute_pr_snapshot(orch: &Orchestrator, job_id: &str) -> Result<PrSnap
 
 /// The PR projection for a job, served from the generation-fenced snapshot.
 pub async fn refresh_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<PrCache, String> {
-    Ok(pr_snapshot_for_job(orch, job_id, false)
+    Ok(pr_snapshot_for_job(orch, job_id, None).await?.cache.clone())
+}
+
+/// Explicit operator refresh: a projection that had not yet settled when the
+/// demand was made.
+///
+/// `demanded_at` belongs to the boundary the demand arrived at. Taking it there
+/// rather than here is what keeps the time a request spends waiting to be
+/// scheduled from splitting one burst of presses into several refreshes.
+pub async fn refresh_pr_for_job_live(
+    orch: &Orchestrator,
+    job_id: &str,
+    demanded_at: Instant,
+) -> Result<PrCache, String> {
+    Ok(pr_snapshot_for_job(orch, job_id, Some(demanded_at))
         .await?
         .cache
         .clone())
-}
-
-/// Explicit operator refresh: advance the generation once, then join the single
-/// flight that advance created.
-pub async fn refresh_pr_for_job_live(orch: &Orchestrator, job_id: &str) -> Result<PrCache, String> {
-    Ok(pr_snapshot_for_job(orch, job_id, true).await?.cache.clone())
 }
 
 /// The publication facts behind an artifact with no pull request bound to it,
@@ -1055,7 +1065,7 @@ fn render_unbound_section(cache: &PrCache, unbound: &UnboundFacts, artifact_uri:
         // A local-only change really is an open PR: it merges through the branch
         // store, so the full action set applies.
         PrState::Open => out.push_str(&format!(
-            "\n## actions\n- [merge]({uri}): patch with action:\"merge\" (optional method, default squash).\n- [close]({uri}): patch with action:\"close\".\n- [refresh]({uri}): patch with action:\"refresh\".",
+            "\n## actions\n- [merge]({uri}): patch with action:\"merge\" (optional method, default squash; optional precondition:\"pinBump\" lands only a verified upstream tool-pin bump).\n- [close]({uri}): patch with action:\"close\".\n- [refresh]({uri}): patch with action:\"refresh\".",
             uri = artifact_uri
         )),
         // Nothing is open, so there is nothing to merge. `refresh` is the repair:
@@ -1110,7 +1120,7 @@ pub async fn render_live_pr_section(
         Err(e) => return Some(format!("## Pull Request\n\n(failed to resolve PR: {e})\n")),
     };
 
-    let snapshot = match pr_snapshot_for_job(orch, job_id, false).await {
+    let snapshot = match pr_snapshot_for_job(orch, job_id, None).await {
         Ok(snapshot) => snapshot,
         Err(e) => return Some(format!("## Pull Request\n\n(failed to refresh: {e})\n")),
     };
@@ -1153,6 +1163,16 @@ pub async fn render_live_pr_section(
             super::ensure_unjournaled_merge_observation(orch, &db, &mr_context.mr_id, job_id).await
         {
             log::error!("{error}");
+        }
+        // A merge Cairn did not perform moved the target on origin and nothing
+        // told the store. Take it now rather than at the next poll.
+        if let (Some(project_id), Some((_, target))) =
+            (mr_context.project_id.clone(), source_branches.clone())
+        {
+            let orch = orch.clone();
+            tokio::spawn(async move {
+                crate::orchestrator::base_branch_sync::sync(&orch, &project_id, &target).await;
+            });
         }
         attribution = super::latest_resolution_attribution(&db, &mr_context.mr_id).await;
     }
@@ -1290,7 +1310,7 @@ pub async fn render_live_pr_section(
 /// moved past.
 fn open_pr_actions(uri: &str, offer_publish: bool) -> String {
     let mut actions = format!(
-        "\n## actions\n- [merge]({uri}): patch with action:\"merge\" (optional method, default squash). e.g. write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"merge\",method:\"squash\"}}}}]}})\n- [close]({uri}): patch with action:\"close\". e.g. write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"close\"}}}}]}})\n- [refresh]({uri}): patch with action:\"refresh\" to re-fetch live PR state. e.g. write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"refresh\"}}}}]}})"
+        "\n## actions\n- [merge]({uri}): patch with action:\"merge\" (optional method, default squash; optional precondition:\"pinBump\" lands only a verified upstream tool-pin bump). e.g. write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"merge\",method:\"squash\"}}}}]}})\n- [close]({uri}): patch with action:\"close\". e.g. write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"close\"}}}}]}})\n- [refresh]({uri}): patch with action:\"refresh\" to re-fetch live PR state. e.g. write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"refresh\"}}}}]}})"
     );
     if offer_publish {
         actions.push_str(&format!(
@@ -1864,7 +1884,9 @@ mod tests {
         refresh_pr_for_job(&orch, "job-c").await.unwrap();
         assert_eq!(orch.pr_refresh_cache.counters().misses, 1);
 
-        refresh_pr_for_job_live(&orch, "job-c").await.unwrap();
+        refresh_pr_for_job_live(&orch, "job-c", Instant::now())
+            .await
+            .unwrap();
         assert_eq!(orch.pr_refresh_cache.counters().misses, 2);
 
         refresh_pr_for_job(&orch, "job-c").await.unwrap();
@@ -1881,6 +1903,11 @@ mod tests {
     /// coalescing at all: each advance rejects the readers already computing, so
     /// N simultaneous demands would run the GitHub fetch and the `jj` probes N
     /// times over.
+    ///
+    /// The sixteen demands are made at one instant and then race into the cache.
+    /// How late any of them gets there is the scheduler's business: on a loaded
+    /// host one of them is routinely not polled until the refresh has published,
+    /// and it must consume that refresh rather than start another.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_explicit_refreshes_compute_once() {
         let orch =
@@ -1892,6 +1919,7 @@ mod tests {
         let warm_counters = orch.pr_refresh_cache.counters();
         let warm_generation = orch.pr_refresh_cache.generation("job-c");
 
+        let demanded_at = Instant::now();
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
         let mut readers = Vec::new();
         for _ in 0..16 {
@@ -1899,7 +1927,10 @@ mod tests {
             let barrier = barrier.clone();
             readers.push(tokio::spawn(async move {
                 barrier.wait().await;
-                refresh_pr_for_job_live(&orch, "job-c").await.unwrap().state
+                refresh_pr_for_job_live(&orch, "job-c", demanded_at)
+                    .await
+                    .unwrap()
+                    .state
             }));
         }
         for reader in readers {

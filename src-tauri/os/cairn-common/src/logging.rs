@@ -820,11 +820,43 @@ pub fn init(config: LogConfig) -> Result<LogGuard, Box<dyn std::error::Error>> {
         );
     }
 
+    // Reached once per process: a second `init` has already failed above.
+    install_panic_logging(config.process);
+
     Ok(LogGuard {
         _worker: worker,
         file_error,
         _housekeeper: housekeeper,
     })
+}
+
+/// Route every panic, on any thread, into this process's log, then run the hook
+/// it replaced.
+///
+/// Rust's default hook prints to stderr alone, which no service manager here
+/// carries into the JSONL file. A panic in a spawned Tokio task is worse off
+/// still: the runtime catches it and hands it to a `JoinHandle` that a detached
+/// task's spawner has already dropped, so the process keeps running and the only
+/// trace left is whatever the task's destructors did on the way out. Installed
+/// by [`init`] so that no binary can forget it; the previous hook still runs
+/// afterwards, so stderr keeps its usual report and a binary may wrap this one
+/// with its own.
+fn install_panic_logging(process: ProcessTag) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        let thread = std::thread::current();
+        let location = panic
+            .location()
+            .map_or_else(|| "<unknown>".to_string(), ToString::to_string);
+        tracing::error!(
+            thread = thread.name().unwrap_or("<unnamed>"),
+            %location,
+            panic = panic.payload_as_str().unwrap_or("<non-string payload>"),
+            "{} panicked",
+            process.prefix()
+        );
+        previous(panic);
+    }));
 }
 
 /// Check if stderr is a TTY (for ANSI color support).
@@ -838,6 +870,51 @@ mod tests {
     use super::*;
     use std::fs::FileTimes;
     use std::str::FromStr;
+
+    /// A panic on a worker thread reaches the structured log with what a reader
+    /// needs to find it: the message, where it was raised, and which thread.
+    #[test]
+    fn a_panic_on_any_thread_reaches_the_log_with_its_message_location_and_thread() {
+        #[derive(Clone, Default)]
+        struct Errors(Arc<Mutex<Vec<serde_json::Map<String, serde_json::Value>>>>);
+        impl<S: Subscriber> Layer<S> for Errors {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                if *event.metadata().level() == Level::ERROR {
+                    let mut fields = FieldVisitor::default();
+                    event.record(&mut fields);
+                    self.0.lock().unwrap().push(fields.0);
+                }
+            }
+        }
+
+        install_panic_logging(ProcessTag::Runner);
+        let errors = Errors::default();
+        let subscriber = tracing_subscriber::registry().with(errors.clone());
+        let joined = std::thread::Builder::new()
+            .name("leader-task".into())
+            .spawn(move || {
+                tracing::subscriber::with_default(subscriber, || {
+                    panic!("the in-flight entry was already gone");
+                })
+            })
+            .unwrap()
+            .join();
+
+        assert!(joined.is_err(), "the thread panicked");
+        let errors = errors.0.lock().unwrap();
+        let logged = errors
+            .iter()
+            .find(|fields| fields["message"] == "cairn-orch panicked")
+            .unwrap_or_else(|| panic!("the panic was not logged: {errors:?}"));
+        assert_eq!(logged["thread"], "leader-task");
+        assert_eq!(logged["panic"], "the in-flight entry was already gone");
+        assert!(
+            logged["location"]
+                .as_str()
+                .is_some_and(|location| location.contains("logging.rs:")),
+            "{logged:?}"
+        );
+    }
 
     #[test]
     fn level_directives_are_stable() {

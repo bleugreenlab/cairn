@@ -409,19 +409,31 @@ fn all_candidate_paths(changed_files: &[GraphFileChange]) -> Vec<String> {
 /// (over-invalidate, never a false reuse).
 pub(crate) fn check_input_hash(entries: &[(String, String)], selector: &InputSelector) -> String {
     use sha2::{Digest, Sha256};
-    let mut matched: Vec<&(String, String)> = entries
-        .iter()
-        .filter(|(path, _)| selector.matches(path))
-        .collect();
-    matched.sort();
     let mut hasher = Sha256::new();
-    for (path, blob) in matched {
+    for (path, blob) in selected_entries(entries, selector) {
         hasher.update(path.as_bytes());
         hasher.update([0u8]);
         hasher.update(blob.as_bytes());
         hasher.update([0u8]);
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// The `(path, blob)` entries `selector` takes from a tree listing, sorted.
+///
+/// The one selection both [`check_input_hash`] and the impact slice
+/// (`execution::impact_slice`) are built from, so a `tree: impact` check sees
+/// exactly the entries its cache key hashes and the two cannot drift.
+pub(crate) fn selected_entries<'a>(
+    entries: &'a [(String, String)],
+    selector: &InputSelector,
+) -> Vec<&'a (String, String)> {
+    let mut matched: Vec<&(String, String)> = entries
+        .iter()
+        .filter(|(path, _)| selector.matches(path))
+        .collect();
+    matched.sort();
+    matched
 }
 
 /// Build a [`globset::GlobSet`] from pattern strings, matching the worktree
@@ -682,6 +694,7 @@ mod tests {
             verdict_platforms: None,
             fixes: false,
             main_cadence: None,
+            tree: Default::default(),
         }
     }
 

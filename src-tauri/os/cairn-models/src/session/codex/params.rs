@@ -182,11 +182,6 @@ pub fn build_thread_fork_params(
     params
 }
 
-pub fn is_missing_rollout_error(err: &str, thread_id: &str) -> bool {
-    err.contains("no rollout found for thread id")
-        && (thread_id.is_empty() || err.contains(thread_id))
-}
-
 pub fn codex_strict_output_schema(schema: &serde_json::Value) -> serde_json::Value {
     let mut schema = schema.clone();
     normalize_codex_strict_schema_node(&mut schema);

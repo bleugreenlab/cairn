@@ -1329,35 +1329,7 @@ async fn a_thread_cannot_commit_from_a_run_and_an_ordinary_issue_still_can() {
     );
 
     let (_thread_temp, thread_db, thread_orch, thread_cwd) = setup("run-posture-thread").await;
-    // `execute_script`, not `execute`: this fixture is several statements, and
-    // `execute` runs only the first. Re-pointing the job at the thread is the
-    // statement that makes it thread-owned, so losing it left an ordinary
-    // issue-owned job that the fence then correctly declined to refuse.
-    //
-    // The run is detached from the issue before the issue is deleted, because
-    // `runs.issue_id` cascades — and because that IS a thread session's shape:
-    // it has a job and a run, and no issue anywhere in the chain.
-    thread_db
-        .execute_script(
-            "INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) SELECT id,project_id,'posture-thread','active','none',created_at,updated_at FROM issues WHERE id='issue-run-posture-thread'; UPDATE jobs SET thread_id='issue-run-posture-thread',issue_id=NULL,execution_id=NULL WHERE issue_id='issue-run-posture-thread'; UPDATE runs SET issue_id=NULL WHERE issue_id='issue-run-posture-thread'; DELETE FROM executions WHERE issue_id='issue-run-posture-thread'; DELETE FROM issues WHERE id='issue-run-posture-thread'",
-        )
-        .await
-        .unwrap();
-    // The conversion is the whole experiment, so it is asserted rather than
-    // assumed: a fixture that inserts a thread row but leaves the job
-    // issue-owned tests nothing. The `write` half asserts the same invariant
-    // against its own fixture, so both verbs prove one thing (CAIRN-3874).
-    assert_eq!(
-        common::scalar_text_by_id(
-            &thread_db,
-            "SELECT thread_id FROM jobs WHERE id = ?1",
-            "job-run-posture-thread"
-        )
-        .await
-        .as_deref(),
-        Some("issue-run-posture-thread"),
-        "the job under test must actually belong to the thread"
-    );
+    convert_run_to_thread_session(&thread_db, "run-posture-thread", "posture-thread").await;
 
     let refusal = run_text(
         &handle_run(
@@ -2060,15 +2032,7 @@ async fn a_thread_is_refused_before_a_workflow_target_can_suspend_the_caller() {
 
     let (_thread_temp, thread_db, thread_orch, thread_cwd) =
         setup_without_executor("run-workflow-thread").await;
-    // `execute_script`, not `execute` — see the sibling posture test: `execute`
-    // runs only the first of these four statements, which left the job
-    // issue-owned and sent the batch on to workflow dispatch.
-    thread_db
-        .execute_script(
-            "INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) SELECT id,project_id,'workflow-thread','active','none',created_at,updated_at FROM issues WHERE id='issue-run-workflow-thread'; UPDATE jobs SET thread_id='issue-run-workflow-thread',issue_id=NULL,execution_id=NULL WHERE issue_id='issue-run-workflow-thread'; UPDATE runs SET issue_id=NULL WHERE issue_id='issue-run-workflow-thread'; DELETE FROM executions WHERE issue_id='issue-run-workflow-thread'; DELETE FROM issues WHERE id='issue-run-workflow-thread'",
-        )
-        .await
-        .unwrap();
+    convert_run_to_thread_session(&thread_db, "run-workflow-thread", "workflow-thread").await;
 
     let refusal = run_text(
         &handle_run(
@@ -2865,30 +2829,78 @@ async fn tree_bound_item_without_resolvable_context_fails_before_execution() {
     );
 }
 
-// A child that calls setsid escapes the SIGKILL'd process group and holds the
-// stdout pipe write end open, so an unbounded reader join would hang forever.
-// The bounded reaping must return before the 8s escapee exits naturally, with
-// partial output. The public call also includes lazy slot acquisition and
-// materialization, so its wall-clock bound leaves room for substrate setup.
+/// How long the setsid escapee holds the stdout pipe before exiting on its own.
+/// A call that waited for the pipe to close would take at least this long.
+const SETSID_ESCAPEE_LIFETIME: Duration = Duration::from_secs(60);
+
+// A child that calls setsid leaves the command's process group and keeps the
+// stdout pipe write end open after the command itself has exited, so an
+// unbounded reader join would hang until the escapee chose to exit. The call
+// must return while the escapee is still alive and holding the pipe, with the
+// output written before the command exited.
+//
+// Every ordering here is causal rather than raced against a clock:
+// - A warm-up batch acquires the job's execution home first, so environment
+//   acquisition is not inside the measured call.
+// - The escapee batch declares no `timeout`. A declared timeout also bounds
+//   how long placement may wait, and an item that exits at once never needs
+//   one; a short one only lets acquisition refuse the batch.
+// - The parent perl exits only after the child has called setsid and printed,
+//   so the output is in the pipe before the command exits and the escape has
+//   definitely happened.
 // (Uses perl for setsid so it works on macOS, which lacks the binary.)
 #[tokio::test]
 async fn setsid_escapee_does_not_hang_the_call() {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::{getsid, Pid};
+
     let (_temp, _db, orch, cwd) = setup("run-setsid").await;
-    let escapee = "perl -e 'STDOUT->autoflush(1); if (fork()) { exit 0 } require POSIX; POSIX::setsid(); print \"started\\n\"; sleep 8'";
-    let payload = json!({
-        "commands": [{ "command": escapee, "timeout": 800 }],
-    });
+    let warm = handle_run(
+        &orch,
+        &request(
+            &cwd,
+            Some("run-setsid"),
+            json!({ "commands": [{ "command": "true" }] }),
+        ),
+    )
+    .await;
+    assert!(
+        warm.contains("(no output)"),
+        "the warm-up batch must acquire the job's execution home and run: {warm}"
+    );
+
+    let escapee = format!(
+        r#"perl -e 'pipe(my $r, my $w) or die "pipe: $!"; defined(my $pid = fork()) or die "fork: $!"; if ($pid) {{ close $w; <$r>; exit 0 }} close $r; require POSIX; POSIX::setsid() or die "setsid: $!"; $| = 1; print "escaped $$\n"; close $w; sleep {}'"#,
+        SETSID_ESCAPEE_LIFETIME.as_secs()
+    );
+    let payload = json!({ "commands": [{ "command": escapee }] });
     let start = Instant::now();
     let result = handle_run(&orch, &request(&cwd, Some("run-setsid"), payload)).await;
     let elapsed = start.elapsed();
 
+    let pid = result
+        .split("escaped ")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse::<i32>().ok())
+        .map(Pid::from_raw)
+        .unwrap_or_else(|| {
+            panic!("output written before the command exited must be captured: {result}")
+        });
+    let escapee_alive = kill(pid, None).is_ok();
+    // Only the escapee is the leader of its own session; anything else at this
+    // pid is not ours to signal.
+    if getsid(Some(pid)) == Ok(pid) {
+        let _ = kill(pid, Signal::SIGKILL);
+    }
+
     assert!(
-        elapsed < Duration::from_secs(7),
-        "a setsid escapee holding the pipe must return before natural exit; took {elapsed:?}"
+        escapee_alive,
+        "the escapee must still hold the pipe when the call returns, or this test proves nothing: {result}"
     );
     assert!(
-        result.contains("started"),
-        "partial output before the escape should still be captured: {result}"
+        elapsed < SETSID_ESCAPEE_LIFETIME,
+        "the call must return without waiting for the escapee to release the pipe; took {elapsed:?}"
     );
 }
 

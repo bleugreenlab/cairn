@@ -240,6 +240,8 @@ mod tests {
 
     /// Stand-ins for rustc and bun that report the launch context they were
     /// given, so the test sees exactly what a real toolchain resolver would.
+    /// They use only shell builtins and expansions: the probe's PATH holds just
+    /// this directory, so an external program such as `dirname` is not found.
     #[cfg(unix)]
     fn reporting_toolchain(root: &Path) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -250,7 +252,7 @@ mod tests {
                 "rustc",
                 "echo \"dir=$(pwd -P) toolchain=${RUSTUP_TOOLCHAIN:-none} auto=${RUSTUP_AUTO_INSTALL:-unset}\"",
             ),
-            ("bun", "echo \"bun-from-$(dirname \"$0\")\""),
+            ("bun", "echo \"bun-from-${0%/*}\""),
         ] {
             let path = bin.join(name);
             std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();

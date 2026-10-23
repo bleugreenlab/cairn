@@ -238,7 +238,7 @@ async fn store_merge_child_inner(
             // The caller holds the store lock; the fetch lock is only ever
             // taken inside it, never the other way round.
             let fetched =
-                crate::orchestrator::default_branch_sync::with_fetch_lock(orch, &store, || async {
+                crate::orchestrator::base_branch_sync::with_fetch_lock(orch, &store, || async {
                     crate::jj::fetch_remote_branch(&jj, &store, "origin", target_branch)
                 })
                 .await;
@@ -505,6 +505,56 @@ async fn store_merge_child_inner(
         // Snapshot the store BEFORE the target preflight so a preflight failure (a
         // flatten guard refusal, or a failed PUBLISH of the repair) rewinds cleanly
         // to the pre-merge state (exact under the per-store lock the caller holds).
+        // Origin's copy of the integration branch can be ahead of the store's:
+        // a sibling's pull request merged in GitHub's UI. Folding onto the
+        // store's stale tip would push a commit origin refuses. Take origin's
+        // copy first when it is a pure fast-forward, and refuse, naming both
+        // commits, when the two have diverged. The caller holds the store lock;
+        // the fetch lock is only ever taken inside it.
+        if has_remote {
+            let observed =
+                crate::orchestrator::base_branch_sync::with_fetch_lock(orch, &store, || async {
+                    crate::jj::fetch_origin_observation(&store, target_branch)
+                })
+                .await;
+            match observed.map(|observed| {
+                observed.map(|observed| {
+                    crate::jj::fast_forward_branch_from_origin(
+                        &jj,
+                        &store,
+                        target_branch,
+                        &observed,
+                    )
+                })
+            }) {
+                Ok(Some(Ok(crate::jj::OriginFastForward::Diverged { local, remote }))) => {
+                    return Err(format!(
+                        "Refusing to merge into `{target_branch}`: origin's copy is at `{remote}`, \
+                         which the store's `{local}` does not contain, and each holds commits the \
+                         other lacks. Merging onto the store's copy would push a commit that does \
+                         not descend from origin's tip. The integration branch's owner has to \
+                         combine them first; its `cairn:~/rebase` page shows both."
+                    ));
+                }
+                Ok(Some(Ok(crate::jj::OriginFastForward::Advanced { from, to }))) => log::info!(
+                    "jj store merge: took origin's advance of {target_branch} ({from} -> {to}) \
+                     before folding {source_branch}"
+                ),
+                // The fold's push replaces origin's copy, leased on it.
+                Ok(Some(Ok(crate::jj::OriginFastForward::Superseded { local, remote }))) => {
+                    log::info!(
+                        "jj store merge: origin's {target_branch} ({remote}) is the store's own \
+                         publication, since rewritten to {local}; folding {source_branch}"
+                    )
+                }
+                Ok(Some(Ok(_))) | Ok(None) => {}
+                Ok(Some(Err(error))) | Err(error) => log::warn!(
+                    "jj store merge: could not check origin's {target_branch} before folding \
+                     (continuing; the push fails closed if origin moved): {error}"
+                ),
+            }
+        }
+
         let pre_repair_op = crate::jj::operation_id(&jj, &store)?;
 
         // Target preflight (the load-bearing fix). Every other conflict probe on
@@ -545,20 +595,14 @@ async fn store_merge_child_inner(
                     ));
                 }
                 Ok(crate::jj::FlattenState::IntermediateOnly) => {
-                    let message = {
-                        let desc = crate::jj::branch_description(&jj, &store, target_branch);
-                        if desc.is_empty() {
-                            squash_title.to_string()
-                        } else {
-                            desc
-                        }
-                    };
-                    if let Err(e) = crate::jj::flatten_branch_recovery(
+                    // Healed in place, never collapsed: the integration branch's
+                    // history is published and carries every child PR folded
+                    // into it so far.
+                    if let Err(e) = crate::jj::heal_conflicted_ancestry(
                         &jj,
                         &store,
                         target_branch,
                         &dest_commit,
-                        &message,
                     ) {
                         return Err(rollback_merge(
                             orch,
@@ -569,13 +613,13 @@ async fn store_merge_child_inner(
                             source_branch,
                             Some(target_branch),
                             format!(
-                                "Refusing to merge into `{target_branch}`: its history has a clean tip over conflicted intermediate commit(s) that could not be safely flattened ({e})."
+                                "Refusing to merge into `{target_branch}`: its history has a clean tip over conflicted intermediate commit(s) that could not be healed in place ({e}). The integration branch's coordinator can resolve it from its `cairn:~/rebase` page."
                             ),
                         )
                         .await);
                     }
                     // Publish the repair to origin FAIL-CLOSED. If it cannot land,
-                    // roll the flatten (and worktree re-parent) back to the
+                    // roll the heal (and worktree re-parent) back to the
                     // pre-repair state so local and origin stay identical (both
                     // wedged) rather than leaving origin behind a locally-clean
                     // target; a retry re-attempts the repair. Nothing source-side
@@ -591,7 +635,7 @@ async fn store_merge_child_inner(
                                 source_branch,
                                 Some(target_branch),
                                 format!(
-                                    "Refusing to merge: the integration branch `{target_branch}` had a clean tip over conflicted intermediate commit(s), but the flatten that repairs it could not be published to origin ({e})."
+                                    "Refusing to merge: the integration branch `{target_branch}` had a clean tip over conflicted intermediate commit(s), but the heal that repairs it could not be published to origin ({e})."
                                 ),
                             )
                             .await);
@@ -622,44 +666,31 @@ async fn store_merge_child_inner(
                     &diagnostic.conflicting_paths(),
                 ))
             }
-            // Handled below: the child is flattened to one clean commit on the
-            // integration tip before the fold, so conflicted ancestry is
-            // discarded rather than folded into the integration branch.
+            // Handled below: the child's conflicted ancestry is healed in place
+            // before the fold, so no conflict-flagged commit is folded into the
+            // integration branch.
             crate::jj::RebaseOutcome::RebasedOverConflictedAncestry { .. }
             | crate::jj::RebaseOutcome::Rebased => {}
         }
 
         // Clean tip: if a base advance baked conflicts into INTERMEDIATE commits
-        // (clean net tip, conflicted ancestors), flatten the child to ONE clean
-        // commit on the integration tip before folding — otherwise `merge_into_bookmark`
-        // preserves the child's lineage and poisons the integration branch with
-        // conflicted ancestors (exactly the CAIRN-2269 failure). The per-child
-        // lineage is ephemeral (collapsed again at default-landing), so flattening
-        // it changes nothing on main. On guard failure, keep the existing refuse +
-        // materialize path.
+        // (clean net tip, conflicted ancestors), heal the child in place before
+        // folding — otherwise `merge_into_bookmark` preserves the child's lineage
+        // and poisons the integration branch with conflicted ancestors (exactly the
+        // CAIRN-2269 failure). The fold preserves the child's commits, so the heal
+        // does too, rather than collapsing them under the tip's message. On guard
+        // failure, keep the existing refuse + materialize path.
         match crate::jj::flatten_state(&jj, &store, target_branch, source_branch) {
             Ok(crate::jj::FlattenState::IntermediateOnly) => {
                 let dest_commit = crate::jj::bookmark_commit(&jj, &store, target_branch)
                     .ok_or_else(|| {
-                        format!(
-                            "integration bookmark `{target_branch}` did not resolve for flatten"
-                        )
+                        format!("integration bookmark `{target_branch}` did not resolve for the heal")
                     })?;
-                let desc = crate::jj::branch_description(&jj, &store, source_branch);
-                let message = if desc.is_empty() {
-                    squash_title.to_string()
-                } else {
-                    desc
-                };
-                if let Err(e) = crate::jj::flatten_branch_recovery(
-                    &jj,
-                    &store,
-                    source_branch,
-                    &dest_commit,
-                    &message,
-                ) {
+                if let Err(e) =
+                    crate::jj::heal_conflicted_ancestry(&jj, &store, source_branch, &dest_commit)
+                {
                     let base_err = format!(
-                        "Refusing to merge: could not safely flatten `{source_branch}` onto the integration branch `{target_branch}` ({e}).{detail}",
+                        "Refusing to merge: could not heal `{source_branch}`'s conflict-flagged history on the integration branch `{target_branch}` ({e}).{detail}",
                         detail = conflicted_history_detail(
                             &jj,
                             &store,

@@ -2,6 +2,9 @@
 
 use crate::codex::app_server::AppServerClient;
 use crate::interface::session::{ServerReply, SessionControl, SessionInput};
+use crate::wire::codex_app_server::errors::{
+    active_turn_id_from_mismatch, is_no_active_turn_error,
+};
 #[cfg(test)]
 use crate::wire::codex_app_server::goal::GoalClearResponse;
 use crate::wire::codex_app_server::goal::{parse_response, Goal, GoalResponse, GoalStatus};
@@ -271,35 +274,6 @@ impl CodexControl {
         self.client.send_request("turn/interrupt", params)?;
         Ok(())
     }
-}
-
-fn json_rpc_error_message(error: &str) -> String {
-    serde_json::from_str::<Value>(error)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| value.pointer("/error/message").and_then(Value::as_str))
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| error.to_string())
-}
-
-fn is_no_active_turn_error(error: &str) -> bool {
-    json_rpc_error_message(error).contains("no active turn to interrupt")
-}
-
-fn active_turn_id_from_mismatch(error: &str) -> Option<String> {
-    let message = json_rpc_error_message(error);
-    let found = message.split(" but found ").nth(1)?.trim();
-    let active_turn_id = found
-        .trim_matches(|ch: char| ch == '`' || ch == '\'' || ch == '"')
-        .split_whitespace()
-        .next()?
-        .trim_matches(|ch: char| ch == '`' || ch == '\'' || ch == '"' || ch == '.' || ch == ',');
-    (!active_turn_id.is_empty() && active_turn_id != "none" && active_turn_id != "null")
-        .then(|| active_turn_id.to_string())
 }
 
 impl SessionControl for CodexControl {

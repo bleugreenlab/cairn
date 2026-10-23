@@ -195,8 +195,11 @@ fn is_web_target(target: &str) -> bool {
     base.to_lowercase().ends_with(".pdf")
 }
 
+/// A canonical `cairn://` target, or a deictic `cairn:~` / `cairn:@` one. The
+/// deictic half is the resolver's own predicate, so the read path admits exactly
+/// the shorthands the resolver can expand.
 fn is_cairn_resource_target(target: &str) -> bool {
-    target.starts_with("cairn://") || target == "cairn:~" || target.starts_with("cairn:~/")
+    target.starts_with("cairn://") || crate::resources::mutations::is_home_relative_target(target)
 }
 
 /// Per-target flail dedup over a produced batch (CAIRN-1271).
@@ -398,14 +401,11 @@ async fn produce_resource_segment(
     read_cursors: &ReadCursorState,
     target: &str,
 ) -> ReadSegment {
-    // Resolve a home-relative terminal before classifying it. The generic
-    // resource producer resolves all other `cairn:~` targets itself, but terminal
-    // reads must be intercepted first because they use the live-buffer/cursor
-    // adapter rather than the ordinary resource renderer.
-    let unresolved_identity = split_target_query(target)
-        .map(|split| split.identity)
-        .unwrap_or_else(|_| target.to_string());
-    let resolved_target = if unresolved_identity.starts_with("cairn:~/terminal/") {
+    // Resolve a deictic (`cairn:~` / `cairn:@`) target before classifying it:
+    // only the canonical form parses, and a terminal must be recognized here
+    // because it reads through the live-buffer/cursor adapter rather than the
+    // ordinary resource renderer. Segment headers keep the target as typed.
+    let resolved_target = if crate::resources::mutations::is_home_relative_target(target) {
         match crate::resources::resolve_home_relative_resource_uri(&orch.db, request, target).await
         {
             Ok(resolved) => resolved,
@@ -441,7 +441,7 @@ async fn produce_resource_segment(
         }
     }
 
-    let rendered = crate::resources::produce_cairn_resource(orch, request, target).await;
+    let rendered = crate::resources::produce_cairn_resource(orch, request, &resolved_target).await;
     let affordance = rendered.affordance;
     // Image blocks (e.g. a browser screenshot) ride alongside the text body into
     // the segment; `assemble` lifts them into the envelope and cairn-cmd emits
@@ -1129,11 +1129,46 @@ mod tests {
         assert_eq!(envelope.segments[0].kind, SegmentKind::Resource);
     }
 
+    #[tokio::test]
+    async fn read_batch_project_relative_targets_resolve_against_the_run_project() {
+        let orch = seeded_orch().await;
+        seed_home_run(&orch).await;
+
+        let envelope = read_batch_envelope_for_run(
+            &orch,
+            serde_json::json!(["cairn:@", "cairn:@/issues"]),
+            Some("run-rb"),
+        )
+        .await;
+
+        assert!(
+            !envelope.text.contains("Invalid target"),
+            "{}",
+            envelope.text
+        );
+        assert_eq!(envelope.segments.len(), 2, "{}", envelope.text);
+        for segment in &envelope.segments {
+            assert_eq!(segment.kind, SegmentKind::Resource, "{}", envelope.text);
+        }
+        assert!(envelope.text.contains("=== cairn:@ "), "{}", envelope.text);
+        assert!(
+            envelope.text.contains("=== cairn:@/issues"),
+            "{}",
+            envelope.text
+        );
+        // The collection is the run's project's: its seeded issue is listed.
+        assert!(envelope.text.contains("First"), "{}", envelope.text);
+    }
+
     #[test]
     fn cairn_home_targets_are_classified_as_resources() {
         assert!(is_cairn_resource_target("cairn://p/X/1"));
         assert!(is_cairn_resource_target("cairn:~"));
         assert!(is_cairn_resource_target("cairn:~/todos"));
+        assert!(is_cairn_resource_target("cairn:@"));
+        assert!(is_cairn_resource_target("cairn:@/issues"));
+        assert!(is_cairn_resource_target("cairn:@4321"));
+        assert!(is_cairn_resource_target("cairn:@performance"));
         assert!(!is_cairn_resource_target("cairn:other"));
         assert!(!is_cairn_resource_target("file:src/lib.rs"));
     }
@@ -2149,6 +2184,31 @@ omega-24')",
         assert!(text.contains("=== cairn:~/terminal/ci"), "{text}");
         assert!(text.contains("[terminal ci:"), "{text}");
         assert!(text.contains("ready"), "{text}");
+        assert!(!text.contains("read_resource"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn project_relative_terminal_read_routes_through_terminal_adapter() {
+        let orch = seeded_orch().await;
+        seed_home_run(&orch).await;
+        exec(
+            &orch,
+            "INSERT INTO job_terminals
+               (id, job_id, project_id, run_id, session_id, command, status, created_at, slug)
+             VALUES ('term-rb', NULL, 'proj-rb', NULL, 'sess-rb', 'sleep 1', 'running', 1, 'ci')",
+        )
+        .await;
+
+        let envelope = read_batch_envelope_for_run(
+            &orch,
+            serde_json::json!(["cairn:@/terminal/ci"]),
+            Some("run-rb"),
+        )
+        .await;
+        let text = &envelope.text;
+
+        assert!(text.contains("=== cairn:@/terminal/ci"), "{text}");
+        assert!(text.contains("[terminal ci:"), "{text}");
         assert!(!text.contains("read_resource"), "{text}");
     }
 

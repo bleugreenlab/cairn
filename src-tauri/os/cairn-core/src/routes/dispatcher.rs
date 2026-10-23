@@ -333,6 +333,8 @@ pub async fn test_definition(
                     project_id,
                     project_path,
                 },
+                None,
+                None,
             )
             .await
             .map(|outcome| outcome.text)
@@ -611,10 +613,17 @@ async fn dispatch_into(
                 if response == HANGING_RESPONSE {
                     std::future::pending::<()>().await;
                 }
-                responses::invoke(&orch, &response, &args, ResponseCaller::Internal { label })
-                    .await
-                    .map(|outcome| outcome.text)
-                    .map_err(|error| error.to_string())
+                responses::invoke(
+                    &orch,
+                    &response,
+                    &args,
+                    ResponseCaller::Internal { label },
+                    None,
+                    None,
+                )
+                .await
+                .map(|outcome| outcome.text)
+                .map_err(|error| error.to_string())
             })
         };
         let walked = walk(&graph, fact, presence, &run).await;

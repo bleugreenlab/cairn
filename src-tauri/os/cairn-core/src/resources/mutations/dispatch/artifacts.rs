@@ -76,6 +76,11 @@ pub(super) async fn dispatch(
                         "payload.action must be a string (merge|close|refresh|publish)",
                     )
                 })?;
+                let precondition = crate::pr_data::actions::parse_merge_precondition(
+                    payload.get("precondition"),
+                    action,
+                )
+                .map_err(|error| build_failure(index, item, error))?;
                 let job_id = crate::resources::resolve_node_or_task_job_id(
                     &orch.db.local,
                     project,
@@ -116,13 +121,17 @@ pub(super) async fn dispatch(
                                 .as_deref()
                                 .map(|m| format!(" (method={m})"))
                                 .unwrap_or_default();
-                            format!("Would merge PR for {node_id}/{artifact_label}{suffix}")
+                            let gate = precondition
+                                .map(|_| " (precondition=pinBump)")
+                                .unwrap_or_default();
+                            format!("Would merge PR for {node_id}/{artifact_label}{suffix}{gate}")
                         } else {
                             crate::pr_data::actions::merge_pr_for_job(
                                 orch,
                                 &job_id,
                                 method,
                                 resolution_attribution(orch, request).await,
+                                precondition,
                             )
                             .await
                             .map_err(|error| build_failure(index, item, error))?

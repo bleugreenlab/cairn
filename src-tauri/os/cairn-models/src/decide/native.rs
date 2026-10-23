@@ -1,5 +1,6 @@
-//! The native route: Cairn's questions onto the Decisions wire, and its
-//! answers back onto Cairn's answer type.
+//! The native route over OpenAI's Decisions wire: Cairn's questions onto it,
+//! and its answers back onto Cairn's answer type. The question mapping is
+//! shared with the System One route, which takes the same wire questions.
 
 use cairn_domain::decision::{
     choice_confidence, most_probable, score_confidence, DecisionAnswer, DecisionQuestion,

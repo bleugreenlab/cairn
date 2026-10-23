@@ -580,7 +580,7 @@ pub async fn repl_sandbox(
         Some(ctx) => Some(ctx.run_id.clone()),
         None => crate::jobs::queries::latest_run_id_for_job(&orch.db.local, job_id).await,
     };
-    let policy = crate::mcp::handlers::run::build_run_sandbox_policy(
+    let confinement = crate::mcp::handlers::run::resolve_run_confinement(
         orch,
         policy_checkout,
         checkout_kind,
@@ -588,18 +588,13 @@ pub async fn repl_sandbox(
         Some(project_id),
         None,
     )
-    .await
-    .map(|(policy, _)| policy);
+    .await;
     // No policy means the owner's fence resolved to `allow`, or resolved to
-    // nothing at all: an unfenced spawn, declared as one rather than dressed up
-    // in a mode the executor would then have to invent a policy for.
-    let mode = match (policy.is_some(), checkout_kind) {
-        (false, _) => ProcessSandboxMode::Unconfined,
-        (true, crate::mcp::handlers::run::RunCheckout::AgentOwned) => ProcessSandboxMode::Confined,
-        (true, crate::mcp::handlers::run::RunCheckout::ProjectLive) => {
-            ProcessSandboxMode::ReadOnlyCheckout
-        }
-    };
+    // nothing at all: a spawn with no fence profile, declared as the credential
+    // floor rather than dressed up in a mode the executor would then have to
+    // invent a policy for.
+    let mode = confinement.sandbox_mode(checkout_kind);
+    let policy = confinement.fenced().map(|(policy, _)| policy.clone());
     (mode, policy)
 }
 

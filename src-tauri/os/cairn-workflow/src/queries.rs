@@ -12,12 +12,24 @@ use cairn_db::turso::params;
 use crate::db_records::{db_job_from_row, DbActionRun, DbExecution, DbJob, JOB_COLUMNS};
 use crate::models::{
     ActionRun, Execution, ExecutionDetail, ExecutionFilters, ExecutionListItem,
-    ExecutionListResult, ExecutionSnapshot, ExecutionStatus, Job, RecipeNode, TriggerType,
+    ExecutionListResult, ExecutionSnapshot, ExecutionStatus, Job, TriggerType,
 };
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
 const EXECUTION_COLUMNS: &str = "id, recipe_id, issue_id, project_id, status, started_at,
     completed_at, snapshot, seq, initiator_sub, initiator_org_id,
+    triggered_by, runner_device_id, lifecycle, released_at, release_override_json";
+
+/// [`EXECUTION_COLUMNS`] with the snapshot read as NULL, for the queries that
+/// only build [`Execution`] values, which never carry it.
+///
+/// A snapshot runs to hundreds of kilobytes; selecting it on a list the DTO
+/// then drops was most of a nine-second issue route under load (cairn/5206).
+/// Positions match [`EXECUTION_COLUMNS`] exactly, so [`db_execution_from_row`]
+/// and [`EXECUTION_COLUMN_COUNT`] serve both;
+/// `execution_list_columns_match_execution_columns` holds that.
+const EXECUTION_LIST_COLUMNS: &str = "id, recipe_id, issue_id, project_id, status, started_at,
+    completed_at, NULL AS snapshot, seq, initiator_sub, initiator_org_id,
     triggered_by, runner_device_id, lifecycle, released_at, release_override_json";
 
 /// How many columns [`EXECUTION_COLUMNS`] selects.
@@ -118,7 +130,7 @@ pub fn get_execution_for_issue(
     run_query_db(async move {
         db.query_opt(
             format!(
-                "SELECT {EXECUTION_COLUMNS}
+                "SELECT {EXECUTION_LIST_COLUMNS}
                  FROM executions
                  WHERE issue_id = ?1
                  LIMIT 1"
@@ -146,7 +158,7 @@ pub fn list_executions_for_issue(
                     let mut rows = conn
                         .query(
                             &format!(
-                                "SELECT {EXECUTION_COLUMNS}
+                                "SELECT {EXECUTION_LIST_COLUMNS}
                                  FROM executions
                                  WHERE issue_id = ?1
                                  ORDER BY started_at DESC"
@@ -438,19 +450,6 @@ async fn get_execution_detail_async(
 
 // ── Job queries ──────────────────────────────────────────────────
 
-pub struct JobTabs {
-    pub available_tabs: Vec<String>,
-    pub initial_tab: String,
-}
-
-pub fn compute_tabs_for_jobs(
-    db: Arc<LocalDb>,
-    job_ids: &[String],
-) -> Result<HashMap<String, JobTabs>, String> {
-    let job_ids = job_ids.to_vec();
-    run_query_db(async move { compute_tabs_for_jobs_async(&db, &job_ids).await })
-}
-
 fn run_query_db<T, Fut>(future: Fut) -> Result<T, String>
 where
     T: Send + 'static,
@@ -475,7 +474,6 @@ where
 async fn load_jobs(db: &LocalDb, column: &'static str, value: &str) -> Result<Vec<DbJob>, String> {
     let value = value.to_string();
     let sql = match column {
-        "id" => format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1"),
         "issue_id" => {
             format!("SELECT {JOB_COLUMNS} FROM jobs WHERE issue_id = ?1 ORDER BY created_at ASC")
         }
@@ -496,132 +494,6 @@ async fn load_jobs(db: &LocalDb, column: &'static str, value: &str) -> Result<Ve
     db.query_all(sql, params![value.as_str()], db_job_from_row)
         .await
         .map_err(|e| e.to_string())
-}
-
-async fn compute_tabs_for_jobs_async(
-    db: &LocalDb,
-    job_ids: &[String],
-) -> Result<HashMap<String, JobTabs>, String> {
-    if job_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut result = HashMap::new();
-    for job_id in job_ids {
-        let db_jobs = load_jobs(db, "id", job_id).await?;
-        let Some(db_job) = db_jobs.into_iter().next() else {
-            continue;
-        };
-        let job = Job::try_from(db_job)?;
-        result.insert(job_id.clone(), tabs_for_job(db, &job).await?);
-    }
-    Ok(result)
-}
-
-async fn tabs_for_job(db: &LocalDb, job: &Job) -> Result<JobTabs, String> {
-    let has_artifact = job_has_artifact(db, &job.id).await?;
-    let has_downstream_action = match (job.recipe_node_id.as_deref(), job.execution_id.as_deref()) {
-        (Some(node_id), Some(execution_id)) => {
-            has_single_downstream_action(db, node_id, execution_id).await?
-        }
-        _ => false,
-    };
-    // An artifact that feeds a single downstream action is normally surfaced on
-    // that action's node, not here. But an *unconfirmed* artifact under a `user`
-    // confirm policy is pending human review on this node — it must be visible
-    // here so the human can review and confirm it.
-    let artifact_unconfirmed = has_artifact && latest_artifact_unconfirmed(db, &job.id).await?;
-    let show_artifact = has_artifact && (!has_downstream_action || artifact_unconfirmed);
-    let available_tabs = if show_artifact {
-        vec!["chat".to_string(), "artifact".to_string()]
-    } else {
-        vec!["chat".to_string()]
-    };
-    let initial_tab = if job.status.to_string() == "running" {
-        "chat".to_string()
-    } else if available_tabs.iter().any(|tab| tab == "artifact") {
-        "artifact".to_string()
-    } else {
-        "chat".to_string()
-    };
-    Ok(JobTabs {
-        available_tabs,
-        initial_tab,
-    })
-}
-
-async fn job_has_artifact(db: &LocalDb, job_id: &str) -> Result<bool, String> {
-    let job_id = job_id.to_string();
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT 1 FROM artifacts WHERE job_id = ?1 LIMIT 1",
-                    params![job_id.as_str()],
-                )
-                .await?;
-            Ok(rows.next().await?.is_some())
-        })
-    })
-    .await
-    .map_err(|e| e.to_string())
-}
-
-/// True when the job's latest artifact version is unconfirmed (`confirmed = 0`),
-/// i.e. it is pending human confirmation under a `user` confirm policy.
-async fn latest_artifact_unconfirmed(db: &LocalDb, job_id: &str) -> Result<bool, String> {
-    let job_id = job_id.to_string();
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT confirmed FROM artifacts WHERE job_id = ?1 ORDER BY version DESC LIMIT 1",
-                    params![job_id.as_str()],
-                )
-                .await?;
-            Ok(match rows.next().await? {
-                Some(row) => row.opt_i64(0)?.unwrap_or(0) == 0,
-                None => false,
-            })
-        })
-    })
-    .await
-    .map_err(|e| e.to_string())
-}
-
-async fn has_single_downstream_action(
-    db: &LocalDb,
-    node_id: &str,
-    execution_id: &str,
-) -> Result<bool, String> {
-    let Some(snapshot) = get_execution_snapshot_async(db, execution_id).await? else {
-        return Ok(false);
-    };
-
-    let node_map: HashMap<&str, &RecipeNode> = snapshot
-        .recipe
-        .nodes
-        .iter()
-        .map(|n| (n.id.as_str(), n))
-        .collect();
-    let target_node_ids: Vec<&str> = snapshot
-        .recipe
-        .edges
-        .iter()
-        .filter(|e| e.edge_type.to_string() == "context" && e.source_node_id == node_id)
-        .map(|e| e.target_node_id.as_str())
-        .collect();
-
-    if target_node_ids.len() != 1 {
-        return Ok(false);
-    }
-
-    Ok(node_map
-        .get(target_node_ids[0])
-        .map(|n| n.node_type.to_string() == "action")
-        .unwrap_or(false))
 }
 
 async fn execution_job_counts(db: &LocalDb, execution_id: &str) -> Result<(i64, i64), String> {
@@ -826,6 +698,53 @@ mod tests {
             EXECUTION_COLUMNS.split(',').count(),
             "EXECUTION_COLUMN_COUNT must equal the number of columns EXECUTION_COLUMNS selects"
         );
+    }
+
+    /// The list columns are the full columns with only the snapshot nulled, in
+    /// the same positions, so one row mapper reads both.
+    #[test]
+    fn execution_list_columns_match_execution_columns() {
+        let full: Vec<&str> = EXECUTION_COLUMNS.split(',').map(str::trim).collect();
+        let list: Vec<&str> = EXECUTION_LIST_COLUMNS.split(',').map(str::trim).collect();
+        assert_eq!(full.len(), list.len());
+        for (full, list) in full.iter().zip(&list) {
+            match *full {
+                "snapshot" => assert_eq!(*list, "NULL AS snapshot"),
+                _ => assert_eq!(full, list),
+            }
+        }
+    }
+
+    /// An issue's executions list without their snapshot and still map every
+    /// other column.
+    #[tokio::test]
+    async fn issue_executions_list_without_reading_the_snapshot() {
+        let db = migrated_db().await;
+        exec(
+            &db,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('proj-1','default','Cairn','cairn','/tmp/repo',1,1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('issue-1','proj-1',42,'T','active',1,1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, snapshot, started_at, seq, released_at)
+             VALUES ('exec-1','r','issue-1','proj-1','running','{\"not\":\"read\"}',1,3,5)",
+        )
+        .await;
+        let db = Arc::new(db);
+        let listed = list_executions_for_issue(db.clone(), "issue-1").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].seq, Some(3));
+        assert_eq!(listed[0].released_at, Some(5));
+        let one = get_execution_for_issue(db, "issue-1").unwrap().unwrap();
+        assert_eq!(one.id, "exec-1");
     }
 
     async fn exec(db: &LocalDb, sql: &'static str) {

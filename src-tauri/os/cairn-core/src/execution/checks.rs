@@ -259,11 +259,20 @@ fn needs_executor_base_content(check_name: &str) -> bool {
     check_name == EXECUTOR_PROTOCOL_CHECK
 }
 
+/// The environment of each process in a write-check batch: the build slot's own
+/// environment plus the change transport.
+///
+/// The transport belongs to the processes alone. Every lane that runs a check
+/// reads it from the item (the fleet spills it into batch files, the impact
+/// slice into scratch files), and the cell request's environment is launch
+/// context the executor never hands a batch process. A second copy on the
+/// request is megabytes of executor base content carried for nothing, and on a
+/// lane that overlays the two it is a second copy to spill.
 fn write_check_transport_env(
-    shell_env: Vec<(String, String)>,
+    cell_env: &[(String, String)],
     transport: Vec<(String, String)>,
 ) -> Vec<(String, String)> {
-    let mut env = slot_check_env(shell_env);
+    let mut env = cell_env.to_vec();
     env.extend(transport);
     env
 }
@@ -330,7 +339,7 @@ fn base_bundle_serializes_absent_wanted_paths_as_null() {
 #[test]
 fn write_transport_carries_changed_paths_and_base_content_together() {
     let env = write_check_transport_env(
-        Vec::new(),
+        &[],
         check_transport_env(
             &[GraphFileChange {
                 path: "src-tauri/cairn-exec/src/new_wire.rs".to_string(),
@@ -1145,8 +1154,9 @@ async fn base_relative_transport(
     let head = head.to_string();
     let carries_protocol_base = needs_executor_base_content(check_name);
     tokio::task::spawn_blocking(move || {
-        let changed = logical_changed_files(&jj, &repository, &base, &head)
-            .ok_or_else(|| format!("the changed files of {base}..{head} could not be read"))?;
+        let changed = logical_changed_files(&jj, &repository, &base, &head).map_err(|error| {
+            format!("the changed files of {base}..{head} could not be read: {error}")
+        })?;
         let base_content = carries_protocol_base
             .then(|| executor_base_content_bundle(&jj, &repository, &base, &changed))
             .transpose()
@@ -1254,6 +1264,9 @@ pub struct ManualConfiguredCheckResult {
     /// Whether a successful exit carried canonical evidence that work ran.
     pub verified: bool,
     pub unverified_reason: Option<String>,
+    /// `fast tier: N ran, D deferred` when the run was the rust-tests fast
+    /// tier, so a reader never takes its green for a whole-suite one.
+    pub tier: Option<String>,
     pub exit_code: Option<i32>,
     /// Set when the run produced NO VERDICT about the tree.
     pub no_verdict: Option<ManualCheckNoVerdict>,
@@ -1314,27 +1327,20 @@ fn manual_configured_check_result(
     outcome: CheckOutcome,
 ) -> ManualConfiguredCheckResult {
     let no_verdict = manual_check_no_verdict(&outcome);
-    let unverified_reason = if outcome.passed {
-        match outcome.parsed.as_ref() {
-            Some(parsed) if parsed.is_incomplete_lint() => {
-                Some("the lint did not run to completion".to_string())
-            }
-            Some(parsed) if !parsed.is_test_runner() => None,
-            Some(parsed) if parsed.selection == "empty" => {
-                Some("no tests matched the selection".to_string())
-            }
-            Some(parsed) if parsed.tests_run() == 0 && parsed.skipped > 0 => {
-                Some(format!("no tests ran; {} skipped", parsed.skipped))
-            }
-            Some(parsed) if !parsed.complete => Some("test enumeration was incomplete".to_string()),
-            Some(parsed) if parsed.tests_run() == 0 => Some("no tests ran".to_string()),
-            Some(_) => None,
-            None => Some("the command produced no structured coverage result".to_string()),
+    let unverified_reason = match crate::execution::checks_status::verdict_evidence(
+        outcome.passed,
+        outcome.parsed.as_ref(),
+    ) {
+        crate::execution::checks_status::VerdictEvidence::Unverified(reason) => {
+            Some(reason.to_string())
         }
-    } else {
-        None
+        _ => None,
     };
     let verified = outcome.passed && unverified_reason.is_none();
+    let tier = outcome
+        .parsed
+        .as_ref()
+        .and_then(ParsedCheckResult::fast_tier_label);
     let not_recorded = outcome.not_recorded.clone();
     let disposition = if outcome.cached { "cached" } else { "fresh" }.to_string();
     let (observation_id, observation_ref, ran_at, environment_fingerprint, reusable) =
@@ -1366,6 +1372,7 @@ fn manual_configured_check_result(
         passed: outcome.passed,
         verified,
         unverified_reason,
+        tier,
         exit_code: outcome.exit_code,
         no_verdict,
         output_tail: outcome.output_tail,
@@ -3137,6 +3144,7 @@ fn decline_reason_words(reason: cairn_common::executor_protocol::DeclineReason) 
         DeclineReason::Constraint => "cannot run it",
         DeclineReason::Unknown => "declined",
         DeclineReason::ProjectProvisioning => "provisioning another cell for this project",
+        DeclineReason::BuildVolumeAbsent => "its build volume is not mounted",
     }
 }
 
@@ -3421,17 +3429,40 @@ async fn submit_admitted_check_batch(
     orch: &Orchestrator,
     mut batch: PlannedCheckBatchRequest,
 ) -> Result<PlannedCheckBatchOutcome, String> {
-    let unplaceable = refuse_unplaceable_items(&orch.fleet, &mut batch.items);
-    let (admitted, mut refused) = reserve_batch_items(
-        orch.db.local.clone(),
-        &batch.project_id,
-        std::mem::take(&mut batch.items),
-    );
+    use crate::execution::impact_slice::{run_lanes, runner_globs};
+    // `tree: impact` lanes the runner can answer never meet the fleet, so the
+    // fleet's placeability says nothing about them; only cell lanes are asked.
+    let (runner_items, mut cell_items): (Vec<_>, Vec<_>) = std::mem::take(&mut batch.items)
+        .into_iter()
+        .partition(|item| runner_globs(item).is_some());
+    let unplaceable = refuse_unplaceable_items(&orch.fleet, &mut cell_items);
+    cell_items.extend(runner_items);
+    let (admitted, mut refused) =
+        reserve_batch_items(orch.db.local.clone(), &batch.project_id, cell_items);
     refused.extend(unplaceable);
-    batch.items = admitted;
-    // Nothing survived the reservation: launch no command and request no cell, so
-    // a fully suppressed suite costs no build-slot admission whatsoever.
+    // Runner lanes leave the batch after the reservation (so their suppression
+    // budgets are the cell path's own) and run beside the cell lanes rather
+    // than ahead of them, so a slice never delays a cell in the same batch.
+    let (sliced, celled): (Vec<_>, Vec<_>) = admitted
+        .into_iter()
+        .partition(|item| runner_globs(item).is_some());
+    batch.items = celled;
+    let sliced = sliced
+        .into_iter()
+        .filter_map(|item| runner_globs(&item).map(|globs| (item, globs)))
+        .collect::<Vec<_>>();
+    let slice_batch = batch.clone();
+    let slice_run = async move {
+        if sliced.is_empty() {
+            HashMap::new()
+        } else {
+            run_lanes(&slice_batch, sliced).await
+        }
+    };
+    // Nothing survived the reservation for a cell: request no cell, so a fully
+    // suppressed (or fully runner-answered) suite costs no build-slot admission.
     if batch.items.is_empty() {
+        refused.extend(slice_run.await);
         return Ok(PlannedCheckBatchOutcome {
             results: refused,
             request: None,
@@ -3439,29 +3470,35 @@ async fn submit_admitted_check_batch(
             store_dir: Some(batch.store_dir.clone()),
         });
     }
-    // The reservation above is claimed ONCE and the retries below sit inside it,
-    // so an immediate retry cannot spend the persisted per-check
-    // infrastructure-failure budget. That budget remains the outer circuit
-    // breaker across cadences; this loop is the inner one within a single ask.
-    let patience = CheckPatience::declare(&batch);
-    let names = batch
-        .items
-        .iter()
-        .map(|item| item.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut outcome = loop {
-        let presented = submit_reserved_check_batch(orch, batch.clone(), &patience).await?;
-        let CapacityRetry::Again { backoff } = capacity_retry_decision(&presented.outcome) else {
-            break presented.outcome;
-        };
-        log::info!(
-            "check batch [{names}] retained no executor queue entry after a capacity response; re-presenting for placement — {}",
-            describe_capacity_waits(&presented.outcome)
-        );
-        tokio::time::sleep(backoff).await;
+    let cell_run = async {
+        // The reservation above is claimed ONCE and the retries below sit inside
+        // it, so an immediate retry cannot spend the persisted per-check
+        // infrastructure-failure budget. That budget remains the outer circuit
+        // breaker across cadences; this loop is the inner one within a single ask.
+        let patience = CheckPatience::declare(&batch);
+        let names = batch
+            .items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        loop {
+            let presented = submit_reserved_check_batch(orch, batch.clone(), &patience).await?;
+            let CapacityRetry::Again { backoff } = capacity_retry_decision(&presented.outcome)
+            else {
+                break Ok::<_, String>(presented.outcome);
+            };
+            log::info!(
+                "check batch [{names}] retained no executor queue entry after a capacity response; re-presenting for placement — {}",
+                describe_capacity_waits(&presented.outcome)
+            );
+            tokio::time::sleep(backoff).await;
+        }
     };
+    let (slice_results, outcome) = tokio::join!(slice_run, cell_run);
+    let mut outcome = outcome?;
     outcome.results.extend(refused);
+    outcome.results.extend(slice_results);
     Ok(outcome)
 }
 
@@ -4045,6 +4082,15 @@ pub(crate) enum SubstrateFailureShape {
     /// consequence of that, so this is the machine's capacity rather than a
     /// verdict on the code (cairn/5135).
     CommandOomKilled,
+    /// The machine keeps its cells on a volume that is not mounted, so it took
+    /// no work that needs one. Like a drain, a fact about the fleet's shape
+    /// right now and not about this head or this machine's health.
+    BuildVolumeAbsent,
+    /// The volume holding the check's cell went away while the check ran.
+    /// Whatever the command reported was read from a tree that vanished, so
+    /// it is not a verdict; the machine is the one to avoid until the volume
+    /// is back.
+    BuildVolumeLost,
 }
 
 impl SubstrateFailureShape {
@@ -4081,6 +4127,12 @@ impl SubstrateFailureShape {
             }
             Self::CommandOomKilled => {
                 "The machine ran out of memory while this check ran, and the kernel killed part of it. That is the machine's capacity, not a verdict on the code."
+            }
+            Self::BuildVolumeAbsent => {
+                "The machine that would run this check keeps its cells on a volume that is not mounted, so this check did not start there."
+            }
+            Self::BuildVolumeLost => {
+                "The volume holding this check's working tree went away while it ran, so whatever it reported is not a verdict on the code."
             }
         }
     }
@@ -4263,6 +4315,8 @@ fn no_start(reason: &cairn_common::executor_protocol::CellUnavailableReason) -> 
         | CellUnavailableReason::Preparation
         | CellUnavailableReason::PreparationCommandNotFound { .. } => Substrate(Shape::Preparation),
         CellUnavailableReason::SlotUnhealthy => Substrate(Shape::EnvironmentRetired),
+        CellUnavailableReason::BuildVolumeAbsent { .. } => Substrate(Shape::BuildVolumeAbsent),
+        CellUnavailableReason::BuildVolumeLost { .. } => Substrate(Shape::BuildVolumeLost),
         // The environment was ready and the command still could not be launched,
         // which is Cairn's own machinery failing rather than the machine's state.
         CellUnavailableReason::Spawn
@@ -4291,9 +4345,12 @@ fn infra_repair_domain(
             // No commit and no machine repair satisfies a selector nothing in
             // the fleet matches, or a fleet draining itself out from under the
             // work. Only the capability set changing fixes either.
-            SubstrateFailureShape::NoMachine | SubstrateFailureShape::Draining => {
-                InfraRepairDomain::Fleet
-            }
+            // An unmounted build volume is the same kind of fact: the machine
+            // is fine and the head is fine, and the fleet's shape is what
+            // changes when the volume returns.
+            SubstrateFailureShape::NoMachine
+            | SubstrateFailureShape::Draining
+            | SubstrateFailureShape::BuildVolumeAbsent => InfraRepairDomain::Fleet,
             // Cell races, lost links, capacity, storage, cancellation:
             // conditions local to one attempt at one head, which must stay
             // narrow and remain retryable elsewhere. `Preparation` stays here
@@ -4318,6 +4375,9 @@ fn infra_repair_domain(
             // same commit. Reaching the bound avoids this machine rather than
             // refusing the check, and no commit is blamed.
             SubstrateFailureShape::CommandOomKilled => InfraRepairDomain::Environment,
+            // The machine lost the ground under the work: avoid it, keyed to
+            // its environment, and blame no commit.
+            SubstrateFailureShape::BuildVolumeLost => InfraRepairDomain::Environment,
         };
     }
     // No substrate failure means the command RAN and its own output named the
@@ -5162,8 +5222,44 @@ fn without_result_artifact_lines(output: &str) -> std::borrow::Cow<'_, str> {
     )
 }
 
-/// Cancel any in-flight `when:review` check suite for `job_id` when a commit
-/// seals mid-turn. The branch just advanced, so that suite — launched at the
+/// Why a branch's tip moved, as far as a review wave running on it is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BranchAdvance {
+    /// A commit sealed onto the branch: the change the branch claims is a
+    /// different change now.
+    Commit,
+    /// The branch was replayed onto an advanced base. `patch_unchanged` is
+    /// whether its own diff against its fork point is the same before and after
+    /// the replay ([`crate::jj::own_patch_against`]).
+    BaseReplay { patch_unchanged: bool },
+}
+
+impl BranchAdvance {
+    /// Whether a wave verifying the pre-advance tip is no longer worth finishing.
+    ///
+    /// A replay that kept the patch leaves the branch claiming the same change,
+    /// so the wave's verdict is still the verdict about that change; the new
+    /// base's own reds belong to the base. Withdrawing it would buy nothing, and
+    /// when merges land faster than a long lane runs it guarantees the branch
+    /// never records a verdict at all (cairn/4210: four waves withdrawn in
+    /// fifteen minutes, zero rows).
+    pub(crate) fn supersedes_review(self) -> bool {
+        !matches!(
+            self,
+            Self::BaseReplay {
+                patch_unchanged: true
+            }
+        )
+    }
+}
+
+/// Cancel any in-flight `when:review` check suite for `job_id` when its branch
+/// advances in a way that changes its patch: a commit sealing mid-turn, or a
+/// base replay that altered the change. A replay that kept the patch keeps the
+/// wave; it finishes and records against the head it ran on, and the `/checks`
+/// projection names that head and its base for the lanes it answers.
+///
+/// For a commit, the branch just advanced, so that suite — launched at the
 /// previous turn-end against the now-superseded tree — is validating a tree
 /// nobody will look at again, while its bounded concurrent full Rust compiles
 /// (each in its own COW clone) saturate CPU and I/O. That starves this commit's
@@ -5180,7 +5276,20 @@ fn without_result_artifact_lines(output: &str) -> std::borrow::Cow<'_, str> {
 /// cancels exactly its suite. A sub-agent/task that commits into the builder's
 /// inherited worktree under a *different* job id would not hit the builder's
 /// suite; that edge case is deliberately left as-is.
-pub(crate) async fn cancel_stale_review_on_branch_advance(orch: &Orchestrator, job_id: &str) {
+pub(crate) async fn cancel_stale_review_on_branch_advance(
+    orch: &Orchestrator,
+    job_id: &str,
+    advance: BranchAdvance,
+) {
+    if !advance.supersedes_review() {
+        if orch.turn_end_checks_in_flight(job_id) {
+            log::info!(
+                "review wave for job {}: kept across a base advance — the branch's own patch is unchanged",
+                &job_id[..job_id.len().min(8)]
+            );
+        }
+        return;
+    }
     for stale in jobs_sharing_branch(&orch.db.local, job_id).await {
         // Name the tree the withdrawn wave was verifying. A supersession logged
         // as "cancelled" alone leaves a reader unable to tell a wave stopped for
@@ -5590,7 +5699,14 @@ async fn run_write_checks_after_seal_inner(
     let planning_started = std::time::Instant::now();
     let planned = tokio::task::spawn_blocking(move || {
         let changed =
-            logical_changed_files(&planning_jj, &planning_repo, &planning_base, &planning_head)?;
+            logical_changed_files(&planning_jj, &planning_repo, &planning_base, &planning_head)
+                .inspect_err(|error| {
+                    log::warn!(
+                        "write-cadence checks: changed files of {planning_base}..{planning_head} \
+                         unreadable; nothing planned: {error}"
+                    );
+                })
+                .ok()?;
         if changed.is_empty() {
             return None;
         }
@@ -5729,7 +5845,8 @@ async fn run_write_checks_after_seal_inner(
             resolve_check_timeout_ms(checks.get(&plan.name), DEFAULT_WRITE_CHECK_TIMEOUT_MS)
         })
         .collect();
-    let slot_env = write_check_transport_env(jj.shell_env(), transport);
+    let cell_env = slot_check_env(jj.shell_env());
+    let process_env = write_check_transport_env(&cell_env, transport);
     // Reuse follows the suite's declared trust set, not the environment of the
     // executor that a miss may eventually select. Filter hits before placement so
     // a stored verdict consumes no build-slot capacity.
@@ -5742,7 +5859,7 @@ async fn run_write_checks_after_seal_inner(
                 &run_context.project_id,
                 plan,
                 input_hash,
-                &slot_env,
+                &process_env,
             )
             .then_some(index)
         })
@@ -5800,7 +5917,8 @@ async fn run_write_checks_after_seal_inner(
                     order: &fixer_first_submission_order(&keyed, &checks, &miss_indices),
                     timeouts: &timeouts,
                     sealed_commit: &sealed_commit,
-                    slot_env: &slot_env,
+                    cell_env: &cell_env,
+                    process_env: &process_env,
                     tool_use_id,
                     status_board: Some(status_board.clone()),
                 },
@@ -5930,7 +6048,8 @@ async fn run_write_checks_after_seal_inner(
                 order: &miss_indices,
                 timeouts: &timeouts,
                 sealed_commit: &sealed_commit,
-                slot_env: &slot_env,
+                cell_env: &cell_env,
+                process_env: &process_env,
                 tool_use_id,
                 status_board: Some(status_board.clone()),
             },
@@ -5975,7 +6094,8 @@ async fn run_write_checks_after_seal_inner(
     let retry_checks = checks.clone();
     let retry_timeouts = timeouts.clone();
     let retry_commit = observation_commit.to_string();
-    let retry_env = slot_env.clone();
+    let retry_cell_env = cell_env.clone();
+    let retry_process_env = process_env.clone();
     let retry_repository = resolve_check_repository(
         orch,
         &run_context.project_id,
@@ -6008,7 +6128,7 @@ async fn run_write_checks_after_seal_inner(
         CheckExecMode::Shared,
         Some(orch),
         Some(status_board),
-        &slot_env,
+        &process_env,
         false,
         move |index, command, stream_id| {
             let batched_results = batched_results.clone();
@@ -6018,7 +6138,8 @@ async fn run_write_checks_after_seal_inner(
             let checks = retry_checks.clone();
             let timeouts = retry_timeouts.clone();
             let sealed_commit = retry_commit.clone();
-            let env = retry_env.clone();
+            let cell_env = retry_cell_env.clone();
+            let process_env = retry_process_env.clone();
             let repository = retry_repository.clone();
             async move {
                 if !command.starts_with(UNCACHED_RETRY_PREFIX) {
@@ -6061,7 +6182,7 @@ async fn run_write_checks_after_seal_inner(
                         },
                         affinity_key: Some(context.job_id.clone()),
                         priority: CellPriority::WriteCheck,
-                        env: env.clone(),
+                        env: cell_env,
                         items: vec![PlannedCheckBatchItem {
                             index,
                             name: plan.name.clone(),
@@ -6072,7 +6193,7 @@ async fn run_write_checks_after_seal_inner(
                             },
                             command,
                             stream_id,
-                            env,
+                            env: process_env,
                             verdict_environment_names: plan.verdict_environment_names.clone(),
                             timeout_ms: timeouts[index].into(),
                             executor: configured.executor.clone(),
@@ -6148,7 +6269,11 @@ struct WriteCheckBatchRequest<'a> {
     order: &'a [usize],
     timeouts: &'a [u32],
     sealed_commit: &'a str,
-    slot_env: &'a [(String, String)],
+    /// The build slot's environment: the cell request's, without the transport.
+    cell_env: &'a [(String, String)],
+    /// Each check process's environment: `cell_env` plus the change transport,
+    /// built by [`write_check_transport_env`].
+    process_env: &'a [(String, String)],
     tool_use_id: &'a str,
     status_board: Option<CheckStatusBoard>,
 }
@@ -6169,7 +6294,8 @@ async fn submit_write_check_batch_for(
         order,
         timeouts,
         sealed_commit,
-        slot_env,
+        cell_env,
+        process_env,
         tool_use_id,
         status_board,
     } = batch;
@@ -6188,7 +6314,7 @@ async fn submit_write_check_batch_for(
             },
             command: keyed[*index].0.command.clone(),
             stream_id: crate::mcp::handlers::run::check_stream_id(tool_use_id, *index),
-            env: slot_env.to_vec(),
+            env: process_env.to_vec(),
             verdict_environment_names: keyed[*index].0.verdict_environment_names.clone(),
             timeout_ms: timeouts[*index].into(),
             executor: checks
@@ -6240,7 +6366,7 @@ async fn submit_write_check_batch_for(
                     },
                     affinity_key: Some(run_context.job_id.clone()),
                     priority: CellPriority::WriteCheck,
-                    env: slot_env.to_vec(),
+                    env: cell_env.to_vec(),
                     items,
                     run_context: Some(run_context.clone()),
                     mutation_policy: MutationPolicy::AllowDelta,
@@ -6363,6 +6489,12 @@ async fn rekey_wave_onto_fix(
                 .collect();
             let attributed = fix_is_attributed_to_declared_fixers(&fixed_paths, &fixers);
             let changed = logical_changed_files(&jj, &planning_repository, &base, &planning_head)
+                .inspect_err(|error| {
+                    log::warn!(
+                        "fixer rekey: changed files of {base}..{planning_head} unreadable; \
+                         rekeying against an empty change set: {error}"
+                    );
+                })
                 .unwrap_or_default();
             let mut rekeyed = Vec::with_capacity(plans.len());
             let mut invalidated = Vec::new();
@@ -6411,7 +6543,7 @@ async fn rekey_wave_onto_fix(
                 &wave.run_context.project_id,
                 &rekeyed[*index].0,
                 &rekeyed[*index].1,
-                wave.slot_env,
+                wave.process_env,
             )
         })
         .collect();
@@ -7295,6 +7427,8 @@ fn fresh_observation_write(
         toolchain_fingerprint: observed_on.toolchain_fingerprint(),
         output_tail: output_tail.to_string(),
         target_results_json: parsed.and_then(|result| serde_json::to_string(result).ok()),
+        selection: parsed.map(|result| result.selection.clone()),
+        deferred_count: parsed.map(|result| result.deferred as i64).unwrap_or(0),
         tests,
         infra_reset_scopes,
     }
@@ -7462,8 +7596,11 @@ pub(crate) fn reusable_verdict_for_plan(
 /// turn-end wave asks (`TURN_END_EFFECTIVE_ENV` is empty). A plan's trust set
 /// and verdict-environment names are derived from its configured check by these
 /// same two functions, so the two entry points cannot disagree.
-pub(crate) fn reusable_verdict_for_check(
-    db: Arc<LocalDb>,
+///
+/// It reads on a connection the caller already holds, so a projection asking
+/// it for every check makes all of its reads in one transaction.
+pub(crate) async fn reusable_verdict_for_check_conn(
+    conn: &cairn_db::turso::Connection,
     project_id: &str,
     name: &str,
     check: &CheckCommand,
@@ -7473,8 +7610,8 @@ pub(crate) fn reusable_verdict_for_check(
         crate::execution::check_identity::verdict_environment_names(check),
         |variable| std::env::var(variable).ok(),
     );
-    reusable_verdict(
-        db,
+    reusable_verdict_conn(
+        conn,
         project_id,
         name,
         input_hash,
@@ -7482,6 +7619,7 @@ pub(crate) fn reusable_verdict_for_check(
         None,
         &environment_hash,
     )
+    .await
 }
 
 fn reusable_verdict(
@@ -7493,8 +7631,48 @@ fn reusable_verdict(
     executor_ids: Option<&[String]>,
     verdict_environment_hash: &str,
 ) -> Option<ReusedCheckVerdict> {
-    let reused = get_reusable_check_result(
-        db.clone(),
+    let project_id = project_id.to_string();
+    let check_name = check_name.to_string();
+    let input_hash = input_hash.to_string();
+    let verdict_platforms = verdict_platforms.to_vec();
+    let executor_ids = executor_ids.map(<[String]>::to_vec);
+    let verdict_environment_hash = verdict_environment_hash.to_string();
+    crate::execution::cache::run_checkpoint_cache_db(async move {
+        db.read(move |conn| {
+            Box::pin(async move {
+                Ok(reusable_verdict_conn(
+                    conn,
+                    &project_id,
+                    &check_name,
+                    &input_hash,
+                    &verdict_platforms,
+                    executor_ids.as_deref(),
+                    &verdict_environment_hash,
+                )
+                .await)
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())
+    })
+    .ok()
+    .flatten()
+}
+
+/// The reusable verdict and its citation, read in one transaction. A lookup
+/// that fails reads as no reuse, which runs the check rather than trusting a
+/// verdict that could not be read.
+async fn reusable_verdict_conn(
+    conn: &cairn_db::turso::Connection,
+    project_id: &str,
+    check_name: &str,
+    input_hash: &str,
+    verdict_platforms: &[String],
+    executor_ids: Option<&[String]>,
+    verdict_environment_hash: &str,
+) -> Option<ReusedCheckVerdict> {
+    let reused = crate::execution::cache::get_reusable_check_result_conn(
+        conn,
         ReusableCheckLookup {
             project_id,
             check_name,
@@ -7507,13 +7685,15 @@ fn reusable_verdict(
                 as i64,
         },
     )
+    .await
     .ok()
     .flatten()?;
-    let public_handle = crate::execution::cache::get_check_observation_public_handle(
-        db,
+    let public_handle = crate::execution::cache::get_check_observation_public_handle_conn(
+        conn,
         project_id,
         &reused.source_observation_id,
     )
+    .await
     .ok()
     .flatten()?;
     Some(ReusedCheckVerdict {
@@ -7532,7 +7712,7 @@ fn reusable_verdict(
 /// evidence and always count. Evidence from any OTHER tree counts only when it
 /// is the verdict the engine would serve for the check's input hash without
 /// executing it, decided by the engine's own reuse predicate
-/// ([`reusable_verdict_for_check`]): reusable, complete, inside the check's
+/// ([`reusable_verdict_for_check_conn`]): reusable, complete, inside the check's
 /// verdict-platform trust set, same runner and verdict environment. A weaker
 /// cross-tree rule would mark a lane answered that the next wave would
 /// actually run, and a waiter would settle on it while that wave was running.
@@ -7540,14 +7720,40 @@ fn reusable_verdict(
 /// When both sources hold a row, the newer one wins. Reuse records only a
 /// commit alias and leaves the source row on the tree that produced it, so a
 /// row whose tree differs from the head's was reused here, not produced here.
+///
+/// This entry point is for synchronous callers: every read happens in one
+/// transaction on one off-runtime hop. An async caller uses
+/// [`head_verdicts_conn`] directly and makes no hop at all.
 pub(crate) fn head_verdicts(
     db: Arc<LocalDb>,
     project_id: &str,
     checks: &HashMap<String, CheckCommand>,
     head: crate::execution::cache::HeadVerdictKeys<'_>,
 ) -> Result<Vec<CheckResultCacheEntry>, String> {
+    let project_id = project_id.to_string();
+    let checks = checks.clone();
+    let head = crate::execution::cache::OwnedHeadVerdictKeys::from(head);
+    crate::execution::cache::run_checkpoint_cache_db(async move {
+        db.read(move |conn| {
+            Box::pin(
+                async move { head_verdicts_conn(conn, &project_id, &checks, head.keys()).await },
+            )
+        })
+        .await
+        .map_err(|error| format!("Failed to read head verdicts: {error}"))
+    })
+}
+
+/// [`head_verdicts`] on a connection the caller already holds.
+pub(crate) async fn head_verdicts_conn(
+    conn: &cairn_db::turso::Connection,
+    project_id: &str,
+    checks: &HashMap<String, CheckCommand>,
+    head: crate::execution::cache::HeadVerdictKeys<'_>,
+) -> crate::storage::DbResult<Vec<CheckResultCacheEntry>> {
     let mut by_name: HashMap<String, CheckResultCacheEntry> =
-        crate::execution::cache::list_check_results_for_inputs(db.clone(), project_id, head)?
+        crate::execution::cache::list_check_results_for_inputs_conn(conn, project_id, head)
+            .await?
             .into_iter()
             .map(|row| (row.check_name.clone(), row))
             .collect();
@@ -7556,7 +7762,7 @@ pub(crate) fn head_verdicts(
             continue;
         };
         let Some(reused) =
-            reusable_verdict_for_check(db.clone(), project_id, name, check, input_hash)
+            reusable_verdict_for_check_conn(conn, project_id, name, check, input_hash).await
         else {
             continue;
         };
@@ -8624,7 +8830,9 @@ pub(crate) fn format_check_summary(results: &[CheckOutcome]) -> String {
 /// - Passing non-test check (tsc/api/dead-code): `4.1s` on a fresh run (duration
 ///   is the only meaningful signal; a test count would be a lie).
 /// - Failing TEST-RUNNER check: `2 of 40 failed, exit 101`, or `1 suite failed
-///   to load, exit 1` when a file threw during collection and so ran no test.
+///   to load, exit 1` when a file threw during collection and so ran no test,
+///   or `3 undeclared skips, exit 1` when the skip ledger failed a run nothing
+///   else failed.
 /// - Failing non-test check: `exit 101`, or `failed to run` on a spawn error.
 /// - A cache hit appends `cached` so a reused verdict never masquerades as fresh.
 ///
@@ -8641,6 +8849,8 @@ fn summary_annotation(o: &CheckOutcome) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if o.passed {
         match test_parse {
+            // A fast-tier green names its population instead of a bare count.
+            Some(p) if p.is_fast_tier() && p.tests_run() > 0 => parts.extend(p.fast_tier_label()),
             Some(p) if p.tests_run() == 0 && p.skipped > 0 => {
                 parts.push(format!("no tests ran, {} skipped", p.skipped))
             }
@@ -8689,12 +8899,22 @@ fn summary_annotation(o: &CheckOutcome) -> Option<String> {
                     .exit_code
                     .map(|c| format!(", exit {c}"))
                     .unwrap_or_default();
-                // A file that failed to collect ran no test, so folding it into
-                // the assertion tally would read as "0 of 882 failed" — a red
-                // check pointing at nothing. Count the two separately.
+                // A file that failed to collect ran no test, and a run the skip
+                // ledger failed for an undeclared skip may have no failing test
+                // at all, so folding either into the assertion tally would read
+                // as "0 of 882 failed" — a red check pointing at nothing. Count
+                // each separately.
                 let mut segments = Vec::new();
-                if p.failed > 0 || p.suite_failures == 0 {
+                if p.failed > 0 || (p.suite_failures == 0 && p.undeclared_skips == 0) {
                     segments.push(format!("{} of {} failed", p.failed, p.tests_run()));
+                }
+                if p.undeclared_skips > 0 {
+                    let noun = if p.undeclared_skips == 1 {
+                        "skip"
+                    } else {
+                        "skips"
+                    };
+                    segments.push(format!("{} undeclared {noun}", p.undeclared_skips));
                 }
                 if p.suite_failures > 0 {
                     let noun = if p.suite_failures == 1 {
@@ -8705,6 +8925,7 @@ fn summary_annotation(o: &CheckOutcome) -> Option<String> {
                     segments.push(format!("{} {noun} failed to load", p.suite_failures));
                 }
                 parts.push(format!("{}{exit}", segments.join(", ")));
+                parts.extend(p.fast_tier_label());
             }
             None => match o.exit_code {
                 Some(code) => parts.push(format!("exit {code}")),
@@ -9555,10 +9776,12 @@ mod tests {
             (Shape::RunnerFault, Domain::Head),
             (Shape::CommandStalled, Domain::HeadOnPlatform),
             (Shape::CommandOomKilled, Domain::Environment),
+            (Shape::BuildVolumeAbsent, Domain::Fleet),
+            (Shape::BuildVolumeLost, Domain::Environment),
         ];
         assert_eq!(
             table.len(),
-            14,
+            16,
             "a new substrate shape must be classified in this table, not defaulted"
         );
         for (shape, expected) in table {
@@ -11516,7 +11739,8 @@ cairn-common = { path = "../cairn-common" }
             let expected: &[&str] = match name.as_str() {
                 "infra-stacks" => &["bun", "node", "npm"],
                 "rust-fmt" | "lockfile" | "licenses" | "rust-lint" | "rust-tests"
-                | "external-host" => &["bun", "rust"],
+                | "external-host" | "codex-pin" | "codex-contract" | "invoke-admission"
+                | "check-inputs" => &["bun", "rust"],
                 "executor-windows-check" | "executor-linux-check" | "executor-macos-check" => {
                     &["rust"]
                 }
@@ -11740,6 +11964,7 @@ cairn-common = { path = "../cairn-common" }
             verdict_platforms: None,
             fixes: false,
             main_cadence: None,
+            tree: Default::default(),
         }
     }
 
@@ -12575,6 +12800,7 @@ cairn-common = { path = "../cairn-common" }
             failed,
             skipped: 0,
             suite_failures: 0,
+            deferred: 0,
             report: None,
             failures: (0..failed)
                 .map(|i| crate::execution::check_parsers::CheckFailure {
@@ -12583,6 +12809,40 @@ cairn-common = { path = "../cairn-common" }
                 })
                 .collect(),
         }
+    }
+
+    /// Rulings 695/691: a label that merges populations destroys attribution. A
+    /// fast-tier green names how many it ran and deferred, and a red one still
+    /// says what it deferred beside its failures.
+    #[test]
+    fn a_fast_tier_verdict_never_renders_as_a_bare_green() {
+        let fast = |passed, failed| {
+            let mut parse = runner_parse("nextest", passed, failed);
+            parse.selection = "fast".to_string();
+            parse.complete = true;
+            parse.deferred = 3_596;
+            parse
+        };
+        let mut green = outcome("rust-tests", true, Some(0));
+        green.parsed = Some(fast(8_501, 0));
+        let annotation = summary_annotation(&green).unwrap();
+        assert!(
+            annotation.starts_with("fast tier: 8501 ran, 3596 deferred"),
+            "{annotation}"
+        );
+        assert!(!annotation.contains("8501 tests"), "{annotation}");
+
+        let mut red = outcome("rust-tests", false, Some(100));
+        red.parsed = Some(fast(8_499, 2));
+        let annotation = summary_annotation(&red).unwrap();
+        assert!(
+            annotation.starts_with("2 of 8501 failed, exit 100"),
+            "{annotation}"
+        );
+        assert!(
+            annotation.contains("fast tier: 8501 ran, 3596 deferred"),
+            "{annotation}"
+        );
     }
 
     #[test]
@@ -12732,6 +12992,22 @@ cairn-common = { path = "../cairn-common" }
             "got: {s}"
         );
         assert!(s.contains("Cannot find module"), "got: {s}");
+    }
+
+    #[test]
+    fn summary_names_undeclared_skips_instead_of_a_zero_failure_tally() {
+        // Every test that ran passed, but jj was missing, so the jj-gated tests
+        // skipped without a declaration and the ledger failed the run. The red
+        // has to point at the skips, not read "0 of 4800 failed".
+        let mut parse = runner_parse("nextest", 4800, 0);
+        parse.skipped = 236;
+        parse.undeclared_skips = 236;
+        let o = parsed_outcome("rust-tests", false, Some(1), parse, false);
+        let s = format_check_summary(&[o]);
+        assert!(
+            s.starts_with("\u{2717} rust-tests (236 undeclared skips, exit 1)"),
+            "got: {s}"
+        );
     }
 
     #[test]
@@ -13309,6 +13585,7 @@ cairn-common = { path = "../cairn-common" }
                 toolchain_fingerprint: None,
                 containment: None,
                 stop: None,
+                cell_origin: None,
             },
             mutation_delta: Some(Box::new(cairn_common::executor_protocol::MutationDelta {
                 base_commit: "base".to_string(),
@@ -13610,7 +13887,9 @@ cairn-common = { path = "../cairn-common" }
             | CellUnavailableReason::ObjectInfrastructure(_)
             | CellUnavailableReason::HomeCannotHold { .. }
             | CellUnavailableReason::RunnerStopping { .. }
-            | CellUnavailableReason::ClaimedAttemptSilent { .. } => {}
+            | CellUnavailableReason::ClaimedAttemptSilent { .. }
+            | CellUnavailableReason::BuildVolumeAbsent { .. }
+            | CellUnavailableReason::BuildVolumeLost { .. } => {}
         }
         let cases = [
             (
@@ -13689,6 +13968,18 @@ cairn-common = { path = "../cairn-common" }
             (
                 CellUnavailableReason::NoMatchingExecutor,
                 SubstrateFailureShape::NoMachine,
+            ),
+            (
+                CellUnavailableReason::BuildVolumeAbsent {
+                    path: "/Volumes/Builds/cairn".into(),
+                },
+                SubstrateFailureShape::BuildVolumeAbsent,
+            ),
+            (
+                CellUnavailableReason::BuildVolumeLost {
+                    path: "/Volumes/Builds/cairn".into(),
+                },
+                SubstrateFailureShape::BuildVolumeLost,
             ),
             (
                 CellUnavailableReason::Provisioning,
@@ -14498,7 +14789,7 @@ cairn-common = { path = "../cairn-common" }
     /// against whichever one a specimen happens to use. The match below makes
     /// the list exhaustive by construction: a new shape stops compiling here
     /// until it is added.
-    const ALL_SUBSTRATE_SHAPES: [SubstrateFailureShape; 14] = [
+    const ALL_SUBSTRATE_SHAPES: [SubstrateFailureShape; 16] = [
         SubstrateFailureShape::Dispatch,
         SubstrateFailureShape::Capacity,
         SubstrateFailureShape::MachineUnreachable,
@@ -14513,6 +14804,8 @@ cairn-common = { path = "../cairn-common" }
         SubstrateFailureShape::RunnerFault,
         SubstrateFailureShape::CommandStalled,
         SubstrateFailureShape::CommandOomKilled,
+        SubstrateFailureShape::BuildVolumeAbsent,
+        SubstrateFailureShape::BuildVolumeLost,
     ];
 
     /// The bound is on the COMPOSED message, so it has to hold for every lead
@@ -14539,7 +14832,9 @@ cairn-common = { path = "../cairn-common" }
                 | SubstrateFailureShape::Storage
                 | SubstrateFailureShape::RunnerFault
                 | SubstrateFailureShape::CommandStalled
-                | SubstrateFailureShape::CommandOomKilled => {}
+                | SubstrateFailureShape::CommandOomKilled
+                | SubstrateFailureShape::BuildVolumeAbsent
+                | SubstrateFailureShape::BuildVolumeLost => {}
             }
 
             let message = SubstrateFailure::new(shape, &log).agent_message();
@@ -14818,6 +15113,7 @@ cairn-common = { path = "../cairn-common" }
             toolchain_fingerprint: None,
             containment: None,
             stop: None,
+            cell_origin: None,
         };
         let results = run_planned_checks(
             db.clone(),
@@ -15431,6 +15727,8 @@ cairn-common = { path = "../cairn-common" }
             id: format!("obs-{check_name}"),
             public_handle: format!("handle-{check_name}"),
             infra_reset_scopes: Vec::new(),
+            selection: None,
+            deferred_count: 0,
             project_id: "project-a".to_string(),
             commit_sha: "commit-source".to_string(),
             defined_by_commit_sha: "commit-source".to_string(),
@@ -15525,6 +15823,7 @@ cairn-common = { path = "../cairn-common" }
                 toolchain_fingerprint: None,
                 containment: None,
                 stop: None,
+                cell_origin: None,
             }),
             publication: None,
         })
@@ -18397,6 +18696,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             failed,
             skipped: 0,
             suite_failures: 0,
+            deferred: 0,
             report: None,
             failures: Vec::new(),
         }
@@ -19147,6 +19447,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             passed: 1,
             failed: 0,
             suite_failures: 0,
+            deferred: 0,
             report: None,
             skipped: 0,
             failures: Vec::new(),

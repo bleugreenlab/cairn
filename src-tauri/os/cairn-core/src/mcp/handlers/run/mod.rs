@@ -24,7 +24,7 @@ mod types;
 pub(crate) use checks::{check_stream_id, run_item_stream_id, CheckExecResult};
 pub(crate) use process::{cache_checkpoint_callback, MAX_BUFFER_SIZE};
 pub(crate) use redact::redact_command;
-pub(crate) use sandbox_policy::{build_run_sandbox_policy, RunCheckout};
+pub(crate) use sandbox_policy::{resolve_run_confinement, RunCheckout};
 pub use types::{
     CheckStatusEntry, CheckStatusPayload, ChecksWaitEvent, ChecksWaitKind, RunCompletePayload,
     RunItem, RunItemPayload, RunOutputPayload, RunPayload, TerminalWaitEvent, TerminalWaitKind,
@@ -763,7 +763,11 @@ fn make_delta_objects_available(
     };
     let installed = cairn_codec::transfer::install_pack(&objects_dir, &validated)
         .map_err(|error| format!("install managed delta pack: {error}"))?;
-    cairn_codec::transfer::verify_commit_closure(&objects_dir, &[], &delta.delta_commit)
+    // A shallow canonical repository's history stops at its own boundary, and
+    // the walk's throwaway repository cannot see that file unless it is passed.
+    let shallow = cairn_codec::transfer::shallow_commits(repository)
+        .map_err(|error| format!("read canonical repository shallow boundary: {error}"))?;
+    cairn_codec::transfer::verify_commit_closure(&objects_dir, &[], &shallow, &delta.delta_commit)
         .map_err(|error| format!("verify imported managed delta closure: {error}"))?;
     verify_available_delta(repository, delta)?;
     Ok((true, Some(installed.pack_path)))
@@ -3299,6 +3303,7 @@ fn build_slot_command_parts(
                 RunSpec::McpCall(_)
                 | RunSpec::ExecutorAction(_)
                 | RunSpec::ResponseCall { .. }
+                | RunSpec::Decide { .. }
                 | RunSpec::ReplSend { .. },
             )
             | Err(_) => None,
@@ -3354,7 +3359,8 @@ pub(crate) fn clamp_run_item_timeout_ms(requested: Option<u32>) -> u32 {
 /// This is deliberately NOT [`MAX_RUN_ITEM_TIMEOUT_MS`]. Letting a host item ask
 /// for six hours would advertise a bound the transport underneath it cannot
 /// honor, which is the exact class of defect this file exists to remove.
-const MAX_HOST_ITEM_TIMEOUT_MS: u32 = cairn_common::run_contract::RUN_GRACE_WINDOW_MS as u32;
+pub(crate) const MAX_HOST_ITEM_TIMEOUT_MS: u32 =
+    cairn_common::run_contract::RUN_GRACE_WINDOW_MS as u32;
 
 /// The ordering between the two item bounds is the whole point, so it is checked
 /// at compile time rather than by a test that could be deleted.
@@ -3367,6 +3373,70 @@ const _: () = assert!(MAX_HOST_ITEM_TIMEOUT_MS < MAX_RUN_ITEM_TIMEOUT_MS);
 pub(crate) fn clamp_host_item_timeout_ms(requested: Option<u32>) -> Option<u32> {
     requested.map(|ms| ms.min(MAX_HOST_ITEM_TIMEOUT_MS))
 }
+
+/// Why a decision made from `run` cannot outlive [`MAX_HOST_ITEM_TIMEOUT_MS`],
+/// for the agent whose call just hit it. A `cairn.run` from @cairn/sdk inside a
+/// shell or script item lands on this same host path, so it is named too;
+/// otherwise it reads as the way around the cap.
+///
+/// Decide keeps the cap on purpose: it is single-pass, bounded by its own
+/// per-request and probe timeouts, and a decision that needs minutes is the
+/// wrong verb rather than a reason to suspend.
+pub(crate) const HOST_ITEM_CAP_WHY: &str = "Decide items run on the host and cannot suspend past it, and a `cairn.run` call from @cairn/sdk inside a shell or script item is held to the same cap, so there is no longer route to retry through.";
+
+/// The bound a decide item runs under: its own ask when that fits under the
+/// host-item cap, the cap otherwise. The ask is carried along so a timeout can
+/// say which of the two decided it.
+pub(crate) fn host_item_bound(requested: Option<u32>) -> crate::responses::InvocationBound {
+    let limit = clamp_host_item_timeout_ms(requested).unwrap_or(MAX_HOST_ITEM_TIMEOUT_MS);
+    let duration = |ms: u32| std::time::Duration::from_millis(u64::from(ms));
+    crate::responses::InvocationBound {
+        limit: duration(limit),
+        cap: (requested != Some(limit)).then(|| crate::responses::BoundCap {
+            name: "host-item cap",
+            requested: requested.map(duration),
+            why: HOST_ITEM_CAP_WHY,
+        }),
+    }
+}
+
+/// Why a response item cannot outlive the run-item ceiling.
+pub(crate) const RUN_ITEM_CEILING_WHY: &str = "A response item suspends with its batch and runs as long as its definition declares, up to the 6-hour ceiling on a single `run` batch, which no item outlives.";
+
+/// The bound a response item runs under: its own ask up to the run-item
+/// ceiling, and the ceiling when it asked for nothing, so that the definition's
+/// own timeout governs each provider request. A response item can reach the
+/// ceiling because its batch suspends ([`run_suspendable_host_batch`]).
+pub(crate) fn response_item_bound(requested: Option<u32>) -> crate::responses::InvocationBound {
+    let limit = clamp_run_item_timeout_ms(requested);
+    let duration = |ms: u32| std::time::Duration::from_millis(u64::from(ms));
+    crate::responses::InvocationBound {
+        limit: duration(limit),
+        cap: (requested != Some(limit)).then(|| crate::responses::BoundCap {
+            name: "run-item ceiling",
+            requested: requested.map(duration),
+            why: RUN_ITEM_CEILING_WHY,
+        }),
+    }
+}
+
+/// Why a response item ended at the host-item window although response items
+/// can otherwise suspend: the call had nothing to park on, so its answer had
+/// to arrive while the transport above it was still waiting.
+pub(crate) const UNPARKED_RESPONSE_WHY: &str = "This call had no `run` tool call of its own to suspend on, so it had to answer inside the window its transport waits for. A `cairn.run` from @cairn/sdk inside a shell or script item is the usual case; two byte-identical `run` calls issued together are the other. Call the response as a top-level `run` item to let it run to its declared timeout.";
+
+/// What a response item journals when the run that called it was stopped.
+const RUN_STOPPED_REASON: &str = "the run that called it was stopped before it answered";
+
+/// What a response item journals when the `run` call carrying it was dropped
+/// before it could suspend (the transport went away).
+const CALL_ABANDONED_REASON: &str =
+    "the `run` call that issued it was abandoned before it answered";
+
+/// How often a suspended host batch looks for the stop that cancels it. A stop
+/// marks the suspension row and nothing else, and only this batch's own task
+/// can end its response items, so it has to look.
+const HOST_BATCH_STOP_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What this batch may legally take: sequential items run one after another,
 /// parallel items overlap, and the whole is bounded by the ceiling.
@@ -3458,13 +3528,14 @@ fn batch_wait_horizon_unix_ms(payload: &RunPayload, sequential: bool) -> u64 {
 
 /// Settle every process item's kill bound once, before the dispatch seam, so no
 /// layer below has to re-derive it.
+///
+/// Response and decide items keep the caller's ask instead: when one times out,
+/// its failure has to say what was asked as well as what was enforced, and
+/// [`host_item_bound`] derives both where the item runs.
 fn apply_run_item_timeouts(resolved: &mut [(String, Result<RunSpec, String>)]) {
     for (_, spec) in resolved {
         if let Ok(RunSpec::Shell { timeout, .. } | RunSpec::Script { timeout, .. }) = spec {
             *timeout = Some(clamp_run_item_timeout_ms(*timeout));
-        } else if let Ok(RunSpec::ResponseCall { timeout, .. }) = spec {
-            *timeout =
-                Some(clamp_host_item_timeout_ms(*timeout).unwrap_or(MAX_HOST_ITEM_TIMEOUT_MS));
         } else if let Ok(RunSpec::ExecutorAction(action)) = spec {
             action.timeout = Some(
                 clamp_host_item_timeout_ms(action.timeout).unwrap_or(MAX_HOST_ITEM_TIMEOUT_MS),
@@ -3493,6 +3564,7 @@ use cairn_common::executor_protocol::{ExecutorSelector, RepositoryLocator};
 use crate::mcp::handlers::tool_use_correlation::Claim;
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
+use crate::responses::{Interrupter, Interruption, InvocationInterrupt};
 use cairn_vcs::PublicationIdentity;
 use uuid::Uuid;
 
@@ -3773,7 +3845,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // same label a read header carries.
     let revision_label = match branch_target.as_ref() {
         Some(target) => Some(
-            crate::orchestrator::default_branch_sync::revision_label(
+            crate::orchestrator::base_branch_sync::revision_label(
                 orch,
                 &target.project_id,
                 &target.rev,
@@ -3898,9 +3970,12 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     let has_host_rpc = resolved
         .iter()
         .any(|(_, spec)| matches!(spec, Ok(RunSpec::McpCall(_) | RunSpec::ExecutorAction(_))));
-    let has_response = resolved
-        .iter()
-        .any(|(_, spec)| matches!(spec, Ok(RunSpec::ResponseCall { .. })));
+    let has_response = resolved.iter().any(|(_, spec)| {
+        matches!(
+            spec,
+            Ok(RunSpec::ResponseCall { .. } | RunSpec::Decide { .. })
+        )
+    });
     let has_repl = resolved
         .iter()
         .any(|(_, spec)| matches!(spec, Ok(RunSpec::ReplSend { .. })));
@@ -4178,74 +4253,18 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         }
     }
 
-    // Everything below runs on the host: MCP gateway calls, REPL sends, and
-    // items that failed to resolve. Tree-bound shell and script items never
-    // reach here — a process batch that cannot be placed is refused above.
-    let outcomes = if sequential {
-        let mut outcomes: Vec<ItemOutcome> = Vec::with_capacity(resolved.len());
-        for (index, (header, spec)) in resolved.into_iter().enumerate() {
-            let stream_id = run_item_stream_id(&tool_use_id, index);
-            let outcome = off_frame(|| {
-                run_one(
-                    orch,
-                    request,
-                    &cwd,
-                    &stream_id,
-                    run_context.as_ref(),
-                    header,
-                    spec,
-                )
-            })
-            .await;
-            // A suspend stops the (sequential) batch: the whole call re-runs on
-            // resume once the fence is answered.
-            let stop = outcome.suspended || (!outcome.succeeded && stop_on_error);
-            outcomes.push(outcome);
-            if stop {
-                break;
-            }
-        }
-        outcomes
-    } else {
-        // Parallel: each item runs on its own task so one item's wait never stalls
-        // the others. Each handle is wrapped in an abort-on-drop guard so dropping
-        // this handler future (client disconnect / MCP cancel) aborts every
-        // in-flight item, which drops each item's kill-on-drop guard and reaps its
-        // process group — detached `tokio::spawn` tasks would otherwise outlive
-        // the cancelled request.
-        let mut handles = Vec::with_capacity(resolved.len());
-        for (index, (header, spec)) in resolved.into_iter().enumerate() {
-            let orch = orch.clone();
-            let cwd = cwd.clone();
-            let stream_id = run_item_stream_id(&tool_use_id, index);
-            let run_context = run_context.clone();
-            let request = request.clone();
-            handles.push(AbortOnDrop(tokio::spawn(async move {
-                run_one(
-                    &orch,
-                    &request,
-                    &cwd,
-                    &stream_id,
-                    run_context.as_ref(),
-                    header,
-                    spec,
-                )
-                .await
-            })));
-        }
-        let mut outcomes = Vec::with_capacity(handles.len());
-        for handle in &mut handles {
-            match (&mut handle.0).await {
-                Ok(outcome) => outcomes.push(outcome),
-                Err(e) => outcomes.push(ItemOutcome::failed(
-                    "<item>".to_string(),
-                    format!("Failed to join run task: {e}"),
-                )),
-            }
-        }
-        outcomes
+    // Everything below runs on the host: MCP gateway calls, REPL sends, model
+    // calls, and items that failed to resolve. Tree-bound shell and script items
+    // never reach here — a process batch that cannot be placed is refused above.
+    let batch = HostBatch {
+        request: request.clone(),
+        cwd: cwd.clone(),
+        tool_use_id: tool_use_id.clone(),
+        run_context: run_context.clone(),
+        resolved,
+        sequential,
+        stop_on_error,
     };
-
     let settlement = RunBatchSettlement {
         request: request.clone(),
         run_context,
@@ -4264,23 +4283,334 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         status_before,
         marker_escape,
     };
-    let settled = off_frame(|| {
-        settle_run_batch(
-            orch,
-            &settlement,
-            BatchResidence::Home,
-            outcomes,
-            None,
-            None,
-            None,
-            None,
-        )
-    })
-    .await;
+    if batch.may_outlive_grace() {
+        return off_frame(|| {
+            run_suspendable_host_batch(orch, settlement, batch, run_grace_window())
+        })
+        .await;
+    }
+    let outcomes = off_frame(|| run_host_items(orch, batch, None)).await;
+    let settled = off_frame(|| settle_host_batch(orch, &settlement, outcomes)).await;
+    host_batch_envelope(settled)
+}
+
+/// A host-executed batch's items and what each needs to run, owned so the
+/// batch can run on a task of its own when it may outlive its call.
+struct HostBatch {
+    request: McpCallbackRequest,
+    cwd: String,
+    tool_use_id: String,
+    run_context: Option<crate::mcp::handlers::RunContext>,
+    resolved: Vec<(String, Result<RunSpec, String>)>,
+    sequential: bool,
+    stop_on_error: bool,
+}
+
+impl HostBatch {
+    /// Whether the batch holds an item allowed to run past the grace window. A
+    /// response item is: it runs as long as its definition declares. Every
+    /// other host item is capped at the window and never needs to suspend.
+    fn may_outlive_grace(&self) -> bool {
+        self.resolved
+            .iter()
+            .any(|(_, spec)| matches!(spec, Ok(RunSpec::ResponseCall { .. })))
+    }
+}
+
+/// Run a host batch's items: in order with fail-fast, or each on its own task.
+/// `interrupt` reaches every response item, and once it fires a sequential
+/// batch starts nothing further.
+async fn run_host_items(
+    orch: &Orchestrator,
+    batch: HostBatch,
+    interrupt: Option<&InvocationInterrupt>,
+) -> Vec<ItemOutcome> {
+    let HostBatch {
+        request,
+        cwd,
+        tool_use_id,
+        run_context,
+        resolved,
+        sequential,
+        stop_on_error,
+    } = batch;
+    if sequential {
+        let mut outcomes: Vec<ItemOutcome> = Vec::with_capacity(resolved.len());
+        for (index, (header, spec)) in resolved.into_iter().enumerate() {
+            if interrupt.is_some_and(|interrupt| interrupt.fired().is_some()) {
+                break;
+            }
+            let stream_id = run_item_stream_id(&tool_use_id, index);
+            let outcome = off_frame(|| {
+                run_one(
+                    orch,
+                    &request,
+                    &cwd,
+                    &stream_id,
+                    run_context.as_ref(),
+                    header,
+                    spec,
+                    interrupt,
+                )
+            })
+            .await;
+            // A suspend stops the (sequential) batch: the whole call re-runs on
+            // resume once the fence is answered.
+            let stop = outcome.suspended || (!outcome.succeeded && stop_on_error);
+            outcomes.push(outcome);
+            if stop {
+                break;
+            }
+        }
+        return outcomes;
+    }
+    // Parallel: each item runs on its own task so one item's wait never stalls
+    // the others. Each handle is wrapped in an abort-on-drop guard so dropping
+    // this future (client disconnect / MCP cancel) aborts every in-flight item,
+    // which drops each item's kill-on-drop guard and reaps its process group —
+    // detached `tokio::spawn` tasks would otherwise outlive the cancelled request.
+    let mut handles = Vec::with_capacity(resolved.len());
+    for (index, (header, spec)) in resolved.into_iter().enumerate() {
+        let orch = orch.clone();
+        let cwd = cwd.clone();
+        let stream_id = run_item_stream_id(&tool_use_id, index);
+        let run_context = run_context.clone();
+        let request = request.clone();
+        let interrupt = interrupt.cloned();
+        handles.push(AbortOnDrop(tokio::spawn(async move {
+            run_one(
+                &orch,
+                &request,
+                &cwd,
+                &stream_id,
+                run_context.as_ref(),
+                header,
+                spec,
+                interrupt.as_ref(),
+            )
+            .await
+        })));
+    }
+    let mut outcomes = Vec::with_capacity(handles.len());
+    for handle in &mut handles {
+        match (&mut handle.0).await {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(e) => outcomes.push(ItemOutcome::failed(
+                "<item>".to_string(),
+                format!("Failed to join run task: {e}"),
+            )),
+        }
+    }
+    outcomes
+}
+
+/// The host batch tail: the same settlement every batch takes, from the home.
+async fn settle_host_batch(
+    orch: &Orchestrator,
+    settlement: &RunBatchSettlement,
+    outcomes: Vec<ItemOutcome>,
+) -> SettledRunBatch {
+    settle_run_batch(
+        orch,
+        settlement,
+        BatchResidence::Home,
+        outcomes,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+fn host_batch_envelope(settled: SettledRunBatch) -> String {
     if settled.suspended {
         return run_envelope(RUN_ITEM_SUSPENDED_MARKER.to_string(), Vec::new());
     }
     run_envelope(settled.text, settled.images)
+}
+
+fn joined_host_outcomes(
+    joined: Result<Vec<ItemOutcome>, tokio::task::JoinError>,
+) -> Vec<ItemOutcome> {
+    joined.unwrap_or_else(|error| {
+        vec![ItemOutcome::failed(
+            "<batch>".to_string(),
+            format!("Failed to join run task: {error}"),
+        )]
+    })
+}
+
+/// Interrupts a host batch's response items when the call carrying them is
+/// dropped before it hands them to a suspension. The host batch's counterpart
+/// of [`AbortOnDrop`]: aborting would end the items without their journal rows.
+struct InterruptOnDrop(Option<Interrupter>);
+
+impl InterruptOnDrop {
+    fn interrupt(&self, interruption: Interruption) {
+        if let Some(interrupter) = &self.0 {
+            interrupter.interrupt(interruption);
+        }
+    }
+
+    /// Hand the interrupter to whoever owns the batch from here on.
+    fn disarm(mut self) -> Interrupter {
+        self.0.take().expect("an armed interrupter")
+    }
+}
+
+impl Drop for InterruptOnDrop {
+    fn drop(&mut self) {
+        if let Some(interrupter) = self.0.take() {
+            interrupter.interrupt(Interruption::Cancelled(CALL_ABANDONED_REASON.into()));
+        }
+    }
+}
+
+/// Run a host batch holding a response item, which may legitimately take
+/// minutes, racing it against the grace window exactly as a routed batch is
+/// raced ([`run_routed_batch`]).
+///
+/// Past grace the call parks on the same durable suspension a routed batch
+/// takes, marked as holding no tree, and the batch keeps running on its own
+/// task until it settles, is stopped, or reaches the batch ceiling.
+///
+/// A call with no `run` tool call of its own to park on (a `cairn.run` from
+/// @cairn/sdk inside a shell or script item) cannot suspend, and nothing above
+/// the host would still be listening past grace: the callback contract sizes
+/// every wrapper just above it. So its response items are ended at grace with
+/// a bound failure that says why, journaled like any other outcome, rather
+/// than left to finish for a caller that has already gone.
+async fn run_suspendable_host_batch(
+    orch: &Orchestrator,
+    settlement: RunBatchSettlement,
+    batch: HostBatch,
+    grace: std::time::Duration,
+) -> String {
+    let request_id = Uuid::new_v4().to_string();
+    let (interrupter, interrupt) = crate::responses::interruption();
+    let interrupter = InterruptOnDrop(Some(interrupter));
+    let task_orch = orch.clone();
+    let mut handle =
+        tokio::spawn(async move { run_host_items(&task_orch, batch, Some(&interrupt)).await });
+    let joined = match tokio::time::timeout(grace, &mut handle).await {
+        Ok(joined) => joined,
+        Err(_) => match begin_batch_suspension(orch, &settlement, &request_id, true).await {
+            Some((record, db, handoff)) => {
+                let interrupter = interrupter.disarm();
+                let owned_orch = orch.clone();
+                tokio::spawn(async move {
+                    settle_suspended_host_batch(
+                        &owned_orch,
+                        settlement,
+                        handle,
+                        interrupter,
+                        SuspendedCall {
+                            record,
+                            db,
+                            handoff,
+                        },
+                        grace,
+                    )
+                    .await;
+                });
+                return run_envelope(RUN_BATCH_SUSPENDED_MARKER.to_string(), Vec::new());
+            }
+            None => {
+                interrupter.interrupt(Interruption::Capped {
+                    limit: grace,
+                    name: "host-item cap",
+                    why: UNPARKED_RESPONSE_WHY,
+                });
+                handle.await
+            }
+        },
+    };
+    let settled =
+        off_frame(|| settle_host_batch(orch, &settlement, joined_host_outcomes(joined))).await;
+    host_batch_envelope(settled)
+}
+
+/// The suspension a call parked on: its row, the database holding it, and the
+/// handoff that says when its turn has actually parked.
+struct SuspendedCall {
+    record: crate::mcp::handlers::durable_suspend::Record,
+    db: std::sync::Arc<crate::storage::LocalDb>,
+    handoff: crate::mcp::handlers::durable_suspend::ParkHandoff,
+}
+
+/// Await a parked host batch off-call and answer its call with the result.
+///
+/// The batch ceiling is enforced here as it is for a routed batch. A stop is
+/// enforced here too: it cancels the suspension row, which this task watches,
+/// and the response items still running are interrupted so they journal the
+/// stop and release their provider requests to their own timeouts. The stop
+/// itself already answered the call and ended the turn, so nothing resolves.
+async fn settle_suspended_host_batch(
+    orch: &Orchestrator,
+    settlement: RunBatchSettlement,
+    mut handle: tokio::task::JoinHandle<Vec<ItemOutcome>>,
+    interrupter: Interrupter,
+    call: SuspendedCall,
+    grace: std::time::Duration,
+) {
+    use crate::mcp::handlers::durable_suspend;
+
+    let SuspendedCall {
+        record,
+        db,
+        handoff,
+    } = call;
+    let ceiling = tokio::time::Instant::now() + RUN_BATCH_CEILING.saturating_sub(grace);
+    let joined = loop {
+        tokio::select! {
+            joined = &mut handle => break joined,
+            () = tokio::time::sleep_until(ceiling) => {
+                interrupter.interrupt(Interruption::Capped {
+                    limit: RUN_BATCH_CEILING,
+                    name: "run batch ceiling",
+                    why: RUN_ITEM_CEILING_WHY,
+                });
+                break (&mut handle).await;
+            }
+            () = tokio::time::sleep(HOST_BATCH_STOP_POLL) => {
+                if durable_suspend::was_cancelled(&db, &record.id).await {
+                    interrupter.interrupt(Interruption::Cancelled(RUN_STOPPED_REASON.into()));
+                    let _ = (&mut handle).await;
+                    return;
+                }
+            }
+        }
+    };
+    let settled =
+        off_frame(|| settle_host_batch(orch, &settlement, joined_host_outcomes(joined))).await;
+    // Nothing resumes the run until the predecessor turn is actually parked.
+    if !handoff.parked().await {
+        log::warn!(
+            "host run batch suspension {} was never parked; leaving it for startup reconciliation",
+            record.id
+        );
+        return;
+    }
+    // An item's own suspension (an MCP continuation) owns the call now.
+    if settled.suspended {
+        return;
+    }
+    durable_suspend::await_inner_wait_release(&db, &record).await;
+    // A resumed call carries text only, so an MCP item's images in a batch that
+    // also held a long response item cannot ride along; say so rather than
+    // drop them silently.
+    let mut text = settled.text;
+    if !settled.images.is_empty() {
+        text.push_str(&format!(
+            "\n\n{} image block(s) from this batch could not be carried across its suspension; run the MCP item that produced them in a batch of its own to see them.",
+            settled.images.len()
+        ));
+    }
+    if let Err(error) = durable_suspend::resolve(orch, &db, &record, &text, false).await {
+        log::warn!("host run batch suspension resolution failed: {error}");
+    }
 }
 
 /// A `run` call returns synchronously when its batch settles inside this window.
@@ -5199,7 +5529,7 @@ async fn suspend_until_batch_settles(
 ) -> String {
     use crate::mcp::handlers::durable_suspend;
 
-    let suspended = begin_batch_suspension(orch, &settlement, &request_id).await;
+    let suspended = begin_batch_suspension(orch, &settlement, &request_id, false).await;
     let Some((record, db, handoff)) = suspended else {
         // Nothing to park (no correlatable call, no active turn): hold the call
         // open rather than abandoning a running batch.
@@ -5363,13 +5693,16 @@ fn batch_label(payload: &serde_json::Value) -> Option<String> {
     Some(format!("{head}\u{2026}"))
 }
 
-/// Persist the suspension row for a routed batch and park its run. `None` means
-/// this call cannot be resumed durably (no correlatable tool call, no run
-/// context, or no active turn), so the caller must keep awaiting inline.
+/// Persist the suspension row for a batch and park its run. `None` means this
+/// call cannot be resumed durably (no correlatable tool call, no run context,
+/// or no active turn). A routed batch then keeps awaiting inline; a host batch
+/// ends its response items at grace ([`run_suspendable_host_batch`]). `host`
+/// marks a batch that executes on the host and so holds no working tree.
 async fn begin_batch_suspension(
     orch: &Orchestrator,
     settlement: &RunBatchSettlement,
     request_id: &str,
+    host: bool,
 ) -> Option<(
     crate::mcp::handlers::durable_suspend::Record,
     std::sync::Arc<crate::storage::LocalDb>,
@@ -5427,6 +5760,7 @@ async fn begin_batch_suspension(
             request_id: request_id.to_string(),
             commits: settlement.commit_msg.is_some(),
             label: batch_label(&settlement.request.payload),
+            host,
         },
         deadline: None,
         created: chrono::Utc::now().timestamp_millis(),
@@ -5543,6 +5877,7 @@ async fn settle_routed_run_batch(
         output,
         mutation_delta,
         tracked_modifications,
+        metadata,
         ..
     } = outcome
     else {
@@ -5580,9 +5915,23 @@ async fn settle_routed_run_batch(
             routed_tracked_modifications,
             publication_request.as_ref(),
             notes.executed(),
+            metadata.cell_origin.as_ref(),
         )
     })
     .await
+}
+
+/// The first line of a verdict-only result: the revision it ran against and,
+/// when the executor said, where the cell came from, so a cold run reads as
+/// cold rather than as slow.
+fn ran_against_line(
+    label: &str,
+    cell_origin: Option<&cairn_common::executor_protocol::CellOrigin>,
+) -> String {
+    match cell_origin {
+        Some(origin) => format!("ran against {label}, {}", origin.describe()),
+        None => format!("ran against {label}"),
+    }
 }
 
 /// What the agent reads when its execution environment was rebuilt under it.
@@ -5642,6 +5991,7 @@ async fn settle_run_batch(
     >,
     publication_request: Option<&CellRequest>,
     placement_note: Option<String>,
+    cell_origin: Option<&cairn_common::executor_protocol::CellOrigin>,
 ) -> SettledRunBatch {
     // Suspension is backend control flow, not item output. This guard is the
     // common settlement boundary for host-local and routed batches and must run
@@ -5660,7 +6010,7 @@ async fn settle_run_batch(
     }
     let mut result = compose_run_output(&outcomes);
     if let Some(label) = &s.revision_label {
-        result = format!("ran against {label}\n\n{result}");
+        result = format!("{}\n\n{result}", ran_against_line(label, cell_origin));
     }
     let residence_note = [residence.note(s.selector.as_ref()), placement_note]
         .into_iter()
@@ -6057,8 +6407,12 @@ async fn settle_run_batch(
         // turn-end. See cancel_stale_review_on_branch_advance for the rationale
         // and the deliberate job-id scoping.
         if let Some(ctx) = s.run_context.as_ref() {
-            crate::execution::checks::cancel_stale_review_on_branch_advance(orch, &ctx.job_id)
-                .await;
+            crate::execution::checks::cancel_stale_review_on_branch_advance(
+                orch,
+                &ctx.job_id,
+                crate::execution::checks::BranchAdvance::Commit,
+            )
+            .await;
         }
         if let Some(summary) = crate::execution::checks::run_write_checks_after_seal(
             orch,
@@ -6758,21 +7112,59 @@ mod tests {
                 if spec.timeout == Some(MAX_HOST_ITEM_TIMEOUT_MS)
         ));
 
+        // A response or decide item keeps its ask through the seam, so its
+        // timeout can name both the ask and the cap that overrode it.
         let mut resolved = vec![(
             "response".into(),
             Ok(RunSpec::ResponseCall {
                 response_id: "test".into(),
                 project: None,
                 args: serde_json::json!({}),
-                timeout: None,
+                timeout: Some(310_000),
             }),
         )];
         apply_run_item_timeouts(&mut resolved);
         assert!(matches!(
             &resolved[0].1,
-            Ok(RunSpec::ResponseCall { timeout: Some(timeout), .. })
-                if *timeout == MAX_HOST_ITEM_TIMEOUT_MS
+            Ok(RunSpec::ResponseCall {
+                timeout: Some(310_000),
+                ..
+            })
         ));
+    }
+
+    /// A model call's bound is the cap whenever the cap is what holds it, and
+    /// then carries the ask it overrode; an ask under the cap is its own bound.
+    #[test]
+    fn a_model_items_bound_records_whether_the_cap_or_the_caller_set_it() {
+        use std::time::Duration;
+        let cap = Duration::from_millis(u64::from(MAX_HOST_ITEM_TIMEOUT_MS));
+
+        let over = host_item_bound(Some(310_000));
+        assert_eq!(over.limit, cap);
+        let capped = over.cap.as_ref().expect("the cap decided it");
+        assert_eq!(capped.requested, Some(Duration::from_secs(310)));
+        assert_eq!(
+            over.describe(Some(Duration::from_secs(300))),
+            format!(
+                "timed out at the 120 s host-item cap (requested 310 s; the definition declares 300 s). {HOST_ITEM_CAP_WHY}"
+            )
+        );
+        assert!(HOST_ITEM_CAP_WHY.contains("@cairn/sdk"));
+
+        let unasked = host_item_bound(None);
+        assert_eq!(unasked.limit, cap);
+        assert!(unasked
+            .describe(None)
+            .starts_with("timed out at the 120 s host-item cap (no timeout was requested)."));
+
+        let under = host_item_bound(Some(300));
+        assert_eq!(under.limit, Duration::from_millis(300));
+        assert_eq!(under.cap, None);
+        assert_eq!(
+            under.describe(Some(Duration::from_secs(15))),
+            "timed out at the 0.3 s bound its caller requested (the definition declares 15 s)."
+        );
     }
 
     /// `CellRequest.timeout_ms` is the request's own bound. Sequential items add
@@ -7243,5 +7635,674 @@ mod barrier_lock_scope_tests {
                 .find("finalize_delta_receipt(")
                 .expect("routed arms finalize receipts");
         assert!(lock < landing && landing < release && release < arms && arms < finalize);
+    }
+}
+
+/// `run cairn://models/decide` (and the response door beside it): resolution,
+/// the batch it may sit in, the body it returns, and how a timeout releases the
+/// caller and names what bounded it.
+#[cfg(test)]
+mod decide_door_tests {
+    use super::resolve::resolve_run_item;
+    use super::types::{RunItem, RunSpec};
+    use crate::credentials::CustomProtocol;
+    use crate::mcp::types::McpCallbackRequest;
+    use crate::orchestrator::decide_fixtures::{
+        choosing_b, with_logprobs, workspace_with_server, DecideOutcome,
+    };
+    use serde_json::{json, Value};
+    use std::time::{Duration, Instant};
+
+    fn request(payload: Value) -> McpCallbackRequest {
+        McpCallbackRequest {
+            thread_id: None,
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            run_id: None,
+            tool: "run".to_string(),
+            tool_use_id: None,
+            payload,
+        }
+    }
+
+    fn decide_item(timeout: Option<u32>) -> Value {
+        json!({
+            "target": "cairn://models/decide",
+            "payload": {"args_json": {
+                "model": "qwen3",
+                "input": "The checkout page times out for every customer.",
+                "questions": [{"name": "scale", "type": "choice", "instructions": "How large is this issue?",
+                               "options": [{"value": "small"}, {"value": "large"}]}]
+            }},
+            "timeout": timeout,
+        })
+    }
+
+    /// The run result's text, out of its envelope.
+    async fn run(orch: &crate::orchestrator::Orchestrator, commands: Value) -> String {
+        let envelope = super::handle_run(orch, &request(json!({ "commands": commands }))).await;
+        serde_json::from_str::<Value>(&envelope)
+            .ok()
+            .and_then(|value| value["text"].as_str().map(str::to_string))
+            .unwrap_or(envelope)
+    }
+
+    /// Every advertised run target reaches its own dispatch arm, never the
+    /// skill-script fallback: the table and the resolver cannot drift apart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_run_target_resolves_to_its_own_spec() {
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
+        for target in cairn_common::contract::RUN_TARGETS {
+            let sample = cairn_common::uri::samples::every_resource_variant()
+                .into_iter()
+                .find(|sample| sample.resource.kind() == target.kind)
+                .expect("every run target has a URI");
+            let item: RunItem = serde_json::from_value(json!({
+                "target": sample.resource.to_uri(),
+                "payload": {"args_json": {}},
+                "timeout": 5000,
+            }))
+            .unwrap();
+            let (_, spec) = resolve_run_item(&orch, &request(json!({})), None, &item).await;
+            match spec {
+                Ok(RunSpec::Decide { args, timeout }) => {
+                    assert_eq!(args, json!({}));
+                    assert_eq!(timeout, Some(5000));
+                }
+                Ok(_) => panic!("{:?} resolved to another spec", target.kind),
+                Err(error) => panic!("{:?} did not resolve: {error}", target.kind),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_decide_item_returns_the_decision_and_stays_out_of_tree_bound_batches() {
+        let (orch, server, key) = workspace_with_server(
+            CustomProtocol::OpenAiChatCompletions,
+            None,
+            "qwen3",
+            vec![with_logprobs(), choosing_b()],
+        )
+        .await;
+
+        let text = run(&orch, json!([decide_item(None)])).await;
+        let outcome: DecideOutcome = serde_json::from_str(&text)
+            .unwrap_or_else(|error| panic!("the item body is a decision ({error}):\n{text}"));
+        assert_eq!(outcome.offer.provider, key);
+        assert_eq!(outcome.decision.answers[0].pick(), Some("large"));
+        assert_eq!(server.calls(), 2);
+
+        let mixed = run(&orch, json!([decide_item(None), {"command": "true"}])).await;
+        assert!(mixed.contains("may not mix"), "{mixed}");
+        assert_eq!(server.calls(), 2, "a refused batch asks nothing");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bad_argument_shape_fails_the_item_naming_the_shape() {
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
+        let text = run(
+            &orch,
+            json!([{"target": "cairn://models/decide",
+                    "payload": {"args_json": {"model": "qwen3", "question": []}}}]),
+        )
+        .await;
+        assert!(
+            text.contains("{model, input, questions, provider?}"),
+            "{text}"
+        );
+    }
+
+    /// The facet's decide cannot be cancelled mid-request, so the item's
+    /// timeout is what releases the caller; the abandoned call ends on its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timeout_releases_the_caller_while_the_provider_hangs() {
+        let (orch, server, _) = workspace_with_server(
+            CustomProtocol::OpenAiChatCompletions,
+            None,
+            "qwen3",
+            vec![with_logprobs(), choosing_b()],
+        )
+        .await;
+        server.hold_each_reply(Duration::from_secs(3));
+
+        let started = Instant::now();
+        let text = run(&orch, json!([decide_item(Some(300))])).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "released after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            text.contains("Decision timed out at the 0.3 s bound its caller requested."),
+            "the failure names the bound and that the caller set it: {text}"
+        );
+    }
+
+    /// A response item cut off by its bound says which bound and what the
+    /// definition declared, and the call is still journaled: the history is the
+    /// one place a later reader looks for a model call's fate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_response_timeout_names_its_bound_and_is_journaled() {
+        let (orch, server, key) = workspace_with_server(
+            CustomProtocol::OpenAiChatCompletions,
+            None,
+            "qwen3",
+            vec![json!({"model": "qwen3", "choices": [{"message": {"role": "assistant", "content": "late"}}]})],
+        )
+        .await;
+        server.hold_each_reply(Duration::from_secs(3));
+        let responses = orch.config_dir.join("responses");
+        std::fs::create_dir_all(&responses).unwrap();
+        std::fs::write(
+            responses.join("slow.md"),
+            format!("---\nname: Slow\ndescription: a reasoning call\nmodel: qwen3\nbackend: {key}\ntimeout: 300s\n---\nLabel this."),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let text = run(
+            &orch,
+            json!([{"target": "cairn://responses/slow", "payload": {"args_json": {}}, "timeout": 300}]),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "released after {:?}",
+            started.elapsed()
+        );
+        let named = "response timed out at the 0.3 s bound its caller requested (the definition declares 300 s).";
+        assert!(text.contains(named), "{text}");
+        assert_eq!(server.calls(), 1, "the provider was reached");
+
+        let journal =
+            crate::storage::list_response_invocations(&orch.db.local, "workspace", "slow", 10)
+                .await
+                .unwrap();
+        assert_eq!(journal.len(), 1, "the timed-out call has its row");
+        assert_eq!(journal[0].status, "failed");
+        assert_eq!(journal[0].error.as_deref(), Some(named));
+        assert_eq!(journal[0].model.as_deref(), Some("qwen3"));
+        assert_eq!(journal[0].backend.as_deref(), Some(key.as_str()));
+        assert_eq!(journal[0].rendered_prompt, "Label this.");
+    }
+}
+
+/// A batch holding a response item takes the durable-suspend path a long shell
+/// batch takes, driven here directly with a short grace window and a stand-in
+/// provider, against a seeded run whose turn can park.
+#[cfg(test)]
+mod host_batch_tests {
+    use super::types::RunSpec;
+    use super::*;
+    use crate::backends::{CompletionOutcome, CompletionRequest};
+    use crate::db::DbState;
+    use crate::responses::ResponseError;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, SearchIndex};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// One live run in a turn that can park, and a workspace response `slow`
+    /// declaring 300 s.
+    async fn env() -> Orchestrator {
+        let root = tempfile::tempdir().unwrap().keep();
+        let local = LocalDb::open_migrated_for_test(root.join("test.db"))
+            .await
+            .unwrap();
+        for sql in [
+            "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1)",
+            "INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
+            "INSERT INTO issues (id,project_id,number,title,status,created_at,updated_at) VALUES ('i','p',1,'T','active',1,1)",
+            "INSERT INTO executions (id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES ('e','recipe','i','p','running',1,1)",
+            "INSERT INTO jobs (id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at,uri_segment) VALUES ('job-1','e','i','p','Builder','running',1,1,'builder')",
+            "INSERT INTO sessions (id,job_id,status,backend_id,created_at,updated_at) VALUES ('session-1','job-1','open','handle-1',1,1)",
+            "INSERT INTO runs (id,issue_id,project_id,job_id,status,session_id,created_at,updated_at) VALUES ('run-1','i','p','job-1','live','session-1',1,1)",
+            "INSERT INTO turns (id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES ('pred-turn','session-1','run-1','job-1',1,'running','initial',1,1)",
+            "UPDATE jobs SET current_session_id='session-1', current_turn_id='pred-turn' WHERE id='job-1'",
+        ] {
+            local.execute(sql, ()).await.unwrap();
+        }
+        let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(Arc::new(local), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            root.join("config"),
+        )
+        .build();
+        let mut handle = crate::agent_process::process::RunHandle::new(
+            Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(std::sync::Mutex::new(None)),
+            Some("session-1".to_string()),
+            Some("job-1".to_string()),
+        );
+        handle.backend = Some("codex".to_string());
+        handle.begin_turn("pred-turn");
+        orch.process_state
+            .processes
+            .lock()
+            .unwrap()
+            .register("run-1".to_string(), handle);
+        let responses = orch.config_dir.join("responses");
+        std::fs::create_dir_all(&responses).unwrap();
+        std::fs::write(
+            responses.join("slow.md"),
+            "---\nname: Slow\ndescription: a reasoning call\nmodel: test-model\nbackend: openrouter\ntimeout: 300s\n---\nLabel this.",
+        )
+        .unwrap();
+        orch
+    }
+
+    /// A provider that takes `delay` (or the request's own timeout, if that is
+    /// shorter, as a real one would) and records the timeout it was sent.
+    fn provider(orch: &Orchestrator, delay: Duration) -> Arc<Mutex<Option<Duration>>> {
+        let sent = Arc::new(Mutex::new(None));
+        let recorded = sent.clone();
+        crate::responses::test_completion::install(
+            &orch.config_dir,
+            Arc::new(move |_, request: CompletionRequest, _| {
+                *recorded.lock().unwrap() = Some(request.timeout);
+                if request.timeout < delay {
+                    std::thread::sleep(request.timeout);
+                    return Err(ResponseError::Timeout);
+                }
+                std::thread::sleep(delay);
+                Ok(CompletionOutcome {
+                    text: "the long answer".into(),
+                    parsed: None,
+                    model: "test-model".into(),
+                    usage: Default::default(),
+                    latency_ms: delay.as_millis() as u64,
+                    account_id: None,
+                })
+            }),
+        );
+        sent
+    }
+
+    /// One response item, from a call that can park when `parkable` (it names
+    /// its tool call) and from a nested `cairn.run` that cannot otherwise.
+    async fn batch(
+        orch: &Orchestrator,
+        timeout: Option<u32>,
+        parkable: bool,
+    ) -> (RunBatchSettlement, HostBatch) {
+        let request = McpCallbackRequest {
+            thread_id: None,
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            run_id: Some("run-1".into()),
+            tool: "run".into(),
+            tool_use_id: parkable.then(|| "tool-1".to_string()),
+            payload: json!({"commands": [{"target": "cairn://responses/slow"}]}),
+        };
+        let context = crate::mcp::handlers::run_context::lookup_run_by_id(&orch.db.local, "run-1")
+            .await
+            .unwrap();
+        // A live job's batch settles against its branch resolution, which needs
+        // a repository this fixture does not have. Verdict-only settles through
+        // the same publication-free tail a host batch's result reaches anyway.
+        let settlement = RunBatchSettlement {
+            request: request.clone(),
+            run_context: Some(context.clone()),
+            commit_msg: None,
+            verdict_only: true,
+            revision_label: None,
+            selector: None,
+            logical_resolution: None,
+            store_lock: None,
+            routed_request: None,
+            cwd: request.cwd.clone(),
+            tool_use_id: "tool-1".into(),
+            cd_advisory: String::new(),
+            interpreter_tip: None,
+            vcs: None,
+            status_before: None,
+            marker_escape: None,
+        };
+        let batch = HostBatch {
+            request: request.clone(),
+            cwd: request.cwd.clone(),
+            tool_use_id: "tool-1".into(),
+            run_context: Some(context),
+            resolved: vec![(
+                "cairn://responses/slow".into(),
+                Ok(RunSpec::ResponseCall {
+                    response_id: "slow".into(),
+                    project: None,
+                    args: json!({}),
+                    timeout,
+                }),
+            )],
+            sequential: false,
+            stop_on_error: true,
+        };
+        (settlement, batch)
+    }
+
+    async fn journal(orch: &Orchestrator) -> Vec<cairn_db::storage::ResponseInvocationRecord> {
+        crate::storage::list_response_invocations(&orch.db.local, "workspace", "slow", 10)
+            .await
+            .unwrap()
+    }
+
+    /// Poll for up to `limit` until `found` yields something.
+    async fn eventually<T, F, Fut>(limit: Duration, mut found: F) -> Option<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<T>>,
+    {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(value) = found().await {
+                return Some(value);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn wait_row(orch: &Orchestrator) -> (String, String) {
+        orch.db
+            .local
+            .query_one(
+                "SELECT state, condition_json FROM agent_waits WHERE run_id='run-1'",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?)),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn tool_result_containing(orch: &Orchestrator, needle: &str) -> Option<String> {
+        let needle = format!("%{needle}%");
+        orch.db
+            .local
+            .query_text(
+                "SELECT data FROM events WHERE event_type='tool_result' AND data LIKE ?1 LIMIT 1",
+                (needle,),
+            )
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// The ruling's contract: a response runs past the synchronous window by
+    /// suspending, keeps running while the turn is parked, and the resumed
+    /// call carries its answer, journaled like any other.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_response_that_outlives_grace_suspends_and_resumes_with_its_answer() {
+        let orch = env().await;
+        let sent = provider(&orch, Duration::from_millis(800));
+        let (settlement, batch) = batch(&orch, None, true).await;
+
+        let text =
+            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(100)).await;
+        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
+        let (state, condition) = wait_row(&orch).await;
+        assert_eq!(state, "pending");
+        assert!(
+            condition.contains("\"host\":true"),
+            "a host batch holds no tree: {condition}"
+        );
+        assert!(journal(&orch).await.is_empty(), "still running when parked");
+
+        let result = eventually(Duration::from_secs(10), || {
+            tool_result_containing(&orch, "the long answer")
+        })
+        .await
+        .expect("the parked call resumes with the response");
+        // A one-item batch composes as the item's body alone.
+        let resumed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            resumed["toolUseId"], "tool-1",
+            "it answers the call that parked"
+        );
+        assert_eq!(resumed["toolResult"], "the long answer");
+        assert_eq!(resumed["isError"], false);
+
+        let rows = journal(&orch).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "ok");
+        assert_eq!(rows[0].output_text.as_deref(), Some("the long answer"));
+        assert_eq!(
+            *sent.lock().unwrap(),
+            Some(Duration::from_secs(300)),
+            "with no item timeout, the definition's own timeout governs the request"
+        );
+    }
+
+    /// The item's own bound still ends it, in 5250's words, with its row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_response_items_own_timeout_names_its_bound_and_is_journaled() {
+        let orch = env().await;
+        provider(&orch, Duration::from_secs(5));
+        let (settlement, batch) = batch(&orch, Some(200), true).await;
+
+        let started = Instant::now();
+        let text =
+            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_secs(5)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let named = "response timed out at the 0.2 s bound its caller requested (the definition declares 300 s).";
+        assert!(text.contains(named), "{text}");
+        let rows = journal(&orch).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "failed");
+        assert_eq!(rows[0].error.as_deref(), Some(named));
+    }
+
+    /// A stop cancels the suspension row and nothing else. The batch notices,
+    /// interrupts its response item at once, and the item journals the stop;
+    /// the abandoned request was held to the item's bound, so it ends on its
+    /// own within it. The stop already answered the call, so nothing resumes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopping_the_run_interrupts_a_suspended_response_and_journals_it() {
+        let orch = env().await;
+        let sent = provider(&orch, Duration::from_secs(30));
+        let (settlement, batch) = batch(&orch, Some(4_000), true).await;
+
+        let text =
+            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(100)).await;
+        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
+        orch.db
+            .local
+            .execute(
+                "UPDATE agent_waits SET state='cancelled' WHERE run_id='run-1' AND state='pending'",
+                (),
+            )
+            .await
+            .unwrap();
+        let stopped = Instant::now();
+
+        let rows = eventually(Duration::from_secs(5), || async {
+            let rows = journal(&orch).await;
+            (!rows.is_empty()).then_some(rows)
+        })
+        .await
+        .expect("the interrupted call is journaled");
+        assert!(
+            stopped.elapsed() < Duration::from_millis(2_500),
+            "released {:?} after the stop, while the provider still had seconds to run",
+            stopped.elapsed()
+        );
+        assert_eq!(rows[0].status, "failed");
+        assert_eq!(
+            rows[0].error.as_deref(),
+            Some("response cancelled: the run that called it was stopped before it answered")
+        );
+        let sent = sent.lock().unwrap().expect("the request was sent");
+        assert!(
+            sent <= Duration::from_secs(4),
+            "the abandoned request is bounded by the item's bound: {sent:?}"
+        );
+        assert!(tool_result_containing(&orch, "slow").await.is_none());
+    }
+
+    /// A nested `cairn.run` has no tool call of its own to park on, and nothing
+    /// above the host listens past grace. Its response is ended at the window
+    /// with a failure saying why and how to get the full timeout, and journaled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_that_cannot_park_ends_its_response_at_the_window_and_says_why() {
+        let orch = env().await;
+        provider(&orch, Duration::from_secs(6));
+        let (settlement, batch) = batch(&orch, None, false).await;
+
+        let started = Instant::now();
+        let text =
+            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(200)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        let named = format!(
+            "response timed out at the 0.2 s host-item cap (no timeout was requested; the definition declares 300 s). {UNPARKED_RESPONSE_WHY}"
+        );
+        assert!(text.contains(&named), "{text}");
+        assert!(UNPARKED_RESPONSE_WHY.contains("@cairn/sdk"));
+        let rows = journal(&orch).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].error.as_deref(), Some(named.as_str()));
+        let parked: i64 = orch
+            .db
+            .local
+            .query_one("SELECT COUNT(*) FROM agent_waits", (), |row| row.i64(0))
+            .await
+            .unwrap();
+        assert_eq!(parked, 0, "nothing was parked");
+    }
+
+    /// Responses take the run-item ceiling; decide keeps the 120 s host-item
+    /// cap and never makes its batch suspendable.
+    #[test]
+    fn a_response_is_bounded_by_the_ceiling_and_decide_by_the_host_item_cap() {
+        let ceiling = Duration::from_millis(u64::from(MAX_RUN_ITEM_TIMEOUT_MS));
+        let asked = response_item_bound(Some(310_000));
+        assert_eq!(asked.limit, Duration::from_secs(310));
+        assert_eq!(asked.cap, None, "an ask under the ceiling is its own bound");
+        let unasked = response_item_bound(None);
+        assert_eq!(unasked.limit, ceiling);
+        assert!(unasked
+            .describe(None)
+            .starts_with("timed out at the 21600 s run-item ceiling (no timeout was requested)."));
+        assert_eq!(response_item_bound(Some(u32::MAX)).limit, ceiling);
+        assert!(RUN_ITEM_CEILING_WHY.contains(&format!(
+            "{}-hour",
+            cairn_common::run_contract::RUN_BATCH_CEILING_HOURS
+        )));
+
+        let decide = host_item_bound(Some(310_000));
+        assert_eq!(decide.limit, Duration::from_secs(120));
+        assert_eq!(
+            decide.cap.as_ref().map(|cap| cap.name),
+            Some("host-item cap")
+        );
+        assert!(!HOST_ITEM_CAP_WHY.contains("Response"));
+
+        let host = |spec: RunSpec| HostBatch {
+            request: McpCallbackRequest {
+                thread_id: None,
+                cwd: String::new(),
+                run_id: None,
+                tool: "run".into(),
+                tool_use_id: None,
+                payload: json!({}),
+            },
+            cwd: String::new(),
+            tool_use_id: String::new(),
+            run_context: None,
+            resolved: vec![(String::new(), Ok(spec))],
+            sequential: false,
+            stop_on_error: true,
+        };
+        assert!(!host(RunSpec::Decide {
+            args: json!({}),
+            timeout: None
+        })
+        .may_outlive_grace());
+        assert!(host(RunSpec::ResponseCall {
+            response_id: "slow".into(),
+            project: None,
+            args: json!({}),
+            timeout: None,
+        })
+        .may_outlive_grace());
+    }
+}
+
+#[cfg(test)]
+mod ran_against_line_tests {
+    use super::ran_against_line;
+    use cairn_common::cache_distance::CacheDistance;
+    use cairn_common::executor_protocol::{CellOrigin, CellProvenance, CellSeed};
+
+    fn origin(cell: &str, provenance: CellProvenance) -> CellOrigin {
+        CellOrigin {
+            cell_id: cell.into(),
+            provenance,
+            warmth: None,
+        }
+    }
+
+    #[test]
+    fn names_how_the_cell_was_seeded_or_reused() {
+        let cloned = origin(
+            "slot-7",
+            CellProvenance::Seeded {
+                seed: CellSeed::Clone {
+                    source_cell_id: "slot-3".into(),
+                    source_holder: Some("cairn/5105".into()),
+                    source_commit: "659e638aabbccdd".into(),
+                    distance: Some(CacheDistance {
+                        files: 12,
+                        crates: 3,
+                        ..Default::default()
+                    }),
+                    cloned_at_unix_ms: 1,
+                    clone_ms: 900,
+                },
+            },
+        );
+        let catalog = origin(
+            "slot-7",
+            CellProvenance::Seeded {
+                seed: CellSeed::Catalog {
+                    generation: "g1".into(),
+                },
+            },
+        );
+        let cold = origin(
+            "slot-7",
+            CellProvenance::Seeded {
+                seed: CellSeed::Cold,
+            },
+        );
+        let reused = origin(
+            "slot-3",
+            CellProvenance::Reused {
+                distance: Some(CacheDistance::default()),
+            },
+        );
+        assert_eq!(
+            ran_against_line("main", Some(&cloned)),
+            "ran against main, cell 7 cloned from cell 3 (held by cairn/5105; warm: 12 files / 3 crates from 659e638)"
+        );
+        assert_eq!(
+            ran_against_line("main", Some(&catalog)),
+            "ran against main, cell 7 seeded from the dependency catalog"
+        );
+        assert_eq!(
+            ran_against_line("main", Some(&cold)),
+            "ran against main, cell 7 (cold: no clone source)"
+        );
+        assert_eq!(
+            ran_against_line("main", Some(&reused)),
+            "ran against main, cell 3 (warm: 0 files / 0 crates)"
+        );
+        assert_eq!(ran_against_line("main", None), "ran against main");
     }
 }

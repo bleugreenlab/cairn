@@ -364,9 +364,12 @@ pub enum CustomProtocol {
     /// measured from logprobs when the server returns them.
     #[serde(rename = "openai-chat")]
     OpenAiChatCompletions,
-    /// The Decisions wire (`POST {base}/decisions`): OpenAI's Decisions API,
-    /// the Vercel AI Gateway, or TypeSafe. It answers decisions and nothing
-    /// else, so it never serves an agent turn or a response.
+    /// OpenAI's Decisions wire (`POST {base}/decisions`): OpenAI's Decisions
+    /// API, and the Vercel AI Gateway's decisions route, which documents the
+    /// same shape (whether the other vendors' models it serves there answer
+    /// it faithfully is unverified). TypeSafe speaks System One instead, a
+    /// different wire. It answers decisions and nothing else, so it never
+    /// serves an agent turn or a response.
     #[serde(rename = "openai-decisions")]
     Decisions,
     /// The OpenAI Images API (`{base}/images/generations` and

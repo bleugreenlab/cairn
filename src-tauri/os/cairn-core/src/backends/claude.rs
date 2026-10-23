@@ -1669,6 +1669,12 @@ impl AgentBackend for ClaudeBackend {
 
         let thread_session_id = session_id.clone();
 
+        // The reader below reports this process's first output, so a boot-ramp
+        // spawn keeps warming past registration until it does. Marked here,
+        // before the reader exists and before this start returns, so the
+        // promoter never reads it unset.
+        crate::execution::jobs::spawn_reports_first_output(&orch, &run_id);
+
         // Spawn thread to read stdout and emit events
         thread::spawn(move || {
             Self::reader_thread(
@@ -1746,7 +1752,7 @@ impl AgentBackend for ClaudeBackend {
     ) -> Result<CompletionOutcome, CompletionError> {
         use super::one_shot::{
             instructions, map_one_shot_error, map_open_error, one_shot_timeout,
-            response_scratch_dir, runtime_extras,
+            response_scratch_dir,
         };
         use cairn_models::interface::session::{ApprovalMode, PlacedFile, SessionStart};
         use cairn_models::session::one_shot::await_one_shot;
@@ -1772,7 +1778,7 @@ impl AgentBackend for ClaudeBackend {
             Some(crate::credentials::ClaudeAuth::ApiKey(_))
         );
         let scratch = response_scratch_dir()?;
-        let extras = runtime_extras(&request);
+        let extras = request.options.clone();
         let spec = SessionSpec {
             start: SessionStart::New {
                 session_id: uuid::Uuid::new_v4().to_string(),
@@ -3259,6 +3265,9 @@ impl ClaudeHost for ClaudeReaderHost {
                 RunStatus::Crashed,
             );
         }
+    }
+    fn first_output(&self) {
+        crate::execution::jobs::spawn_produced_first_output(&self.orch, &self.run_id);
     }
     fn initialized(&self) {
         let orch = &self.orch;

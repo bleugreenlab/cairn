@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use cairn_models::embed::families;
 use cairn_models::types::catalog::{
-    DiscoveredModel, DiscoveredReasoningEffort, Modalities, Modality, ModelPricing, Price,
-    ServedVerb, Verb, Wire,
+    DiscoveredModel, DiscoveredReasoningEffort, ListedArchitecture, Modalities, Modality,
+    ModelPricing, Price, ServedVerb, Verb, VerbKind, Wire,
 };
 use cairn_models::types::embedding::BatchLimits;
 use cairn_models::types::tokenizers::tokenizer_for;
@@ -15,33 +15,40 @@ use serde_json::Value;
 
 const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 const OPENROUTER_EMBEDDING_MODELS_URL: &str = "https://openrouter.ai/api/v1/embeddings/models";
+/// The decision models: the default listing never includes them.
+const OPENROUTER_DECISION_MODELS_URL: &str =
+    "https://openrouter.ai/api/v1/models?output_modalities=decisions";
 
 /// Bounds the embeddings listing, read beside the chat listing on a refresh.
 const EMBEDDING_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+/// Bounds the decisions listing, read beside the chat listing on a refresh.
+const DECISION_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// At most this many texts per OpenRouter embeddings request. Its API states
 /// no cap; this keeps one request well under every upstream's (OpenAI's is
 /// 2048, Cohere's 96 is enforced by OpenRouter itself).
 const OPENROUTER_EMBED_MAX_TEXTS: u32 = 128;
 
-/// Every model OpenRouter serves: the chat listing, with the image and
-/// embeddings listings merged in, and what went wrong with any of them.
-/// `previous` is the last catalog the refresh kept.
+/// Every model OpenRouter serves: the chat listing, with the image,
+/// embeddings and decisions listings merged in, and what went wrong with any
+/// of them. `previous` is the last catalog the refresh kept.
 ///
-/// The three listings are read side by side, and a listing that fails is never
+/// The four listings are read side by side, and a listing that fails is never
 /// silent. A failed chat listing answers no models, so the refresh keeps its
 /// last catalog whole rather than replacing it with media models alone. A
 /// failed image listing keeps the chat models and says `image models
-/// unavailable: ...`. A failed embeddings listing keeps the fresh chat models,
-/// carries the last listing's embedding offers onto them, and says `embedding
-/// models unavailable: ...`.
+/// unavailable: ...`. A failed embeddings or decisions listing keeps the fresh
+/// chat models, carries the last listing's offers of that verb onto them, and
+/// says `embedding models unavailable: ...` or `decision models unavailable:
+/// ...`.
 pub(crate) fn discover_catalog_blocking(
     previous: &[DiscoveredModel],
 ) -> (Vec<DiscoveredModel>, Option<String>) {
-    let (chat, images, embeddings) = std::thread::scope(|scope| {
+    let (chat, images, embeddings, decisions) = std::thread::scope(|scope| {
         let images =
             scope.spawn(|| cairn_models::image::openrouter::discover(IMAGE_DISCOVERY_TIMEOUT));
         let embeddings = scope.spawn(discover_embedding_models_blocking);
+        let decisions = scope.spawn(discover_decision_models_blocking);
         let chat = discover_models_blocking(None);
         let images = images
             .join()
@@ -49,14 +56,17 @@ pub(crate) fn discover_catalog_blocking(
         let embeddings = embeddings
             .join()
             .unwrap_or_else(|_| Err("embedding discovery panicked".to_string()));
-        (chat, images, embeddings)
+        let decisions = decisions
+            .join()
+            .unwrap_or_else(|_| Err("decision discovery panicked".to_string()));
+        (chat, images, embeddings, decisions)
     });
-    let (mut models, embedding_error) = assemble(chat, embeddings, previous);
+    let (mut models, listing_error) = assemble(chat, embeddings, decisions, previous);
     if models.is_empty() {
         // The chat listing failed: answer nothing, keeping the last catalog.
-        return (models, embedding_error);
+        return (models, listing_error);
     }
-    let mut errors: Vec<String> = embedding_error.into_iter().collect();
+    let mut errors: Vec<String> = listing_error.into_iter().collect();
     match images {
         Ok(found) => {
             if let Some(first) = found.failures.first() {
@@ -75,60 +85,86 @@ pub(crate) fn discover_catalog_blocking(
 fn assemble(
     chat: Result<Vec<DiscoveredModel>, String>,
     embeddings: Result<Vec<DiscoveredModel>, String>,
+    decisions: Result<Vec<DiscoveredModel>, String>,
     previous: &[DiscoveredModel],
 ) -> (Vec<DiscoveredModel>, Option<String>) {
     let mut models = match chat {
         Ok(models) => models,
         Err(error) => return (Vec::new(), Some(error)),
     };
-    match embeddings {
+    let errors: Vec<String> = [
+        merge_listing(
+            &mut models,
+            embeddings,
+            previous,
+            VerbKind::Embed,
+            "embedding",
+        ),
+        merge_listing(
+            &mut models,
+            decisions,
+            previous,
+            VerbKind::Decide,
+            "decision",
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (models, (!errors.is_empty()).then(|| errors.join("; ")))
+}
+
+/// Merge one verb's listing into the chat listing, or, when it failed, the
+/// last catalog's offers of that verb, saying so.
+fn merge_listing(
+    models: &mut Vec<DiscoveredModel>,
+    listing: Result<Vec<DiscoveredModel>, String>,
+    previous: &[DiscoveredModel],
+    verb: VerbKind,
+    what: &str,
+) -> Option<String> {
+    match listing {
         Ok(found) => {
-            merge_embedding_models(&mut models, found);
-            (models, None)
+            merge_listed_models(models, found);
+            None
         }
         Err(error) => {
-            merge_embedding_models(&mut models, previous_embedding_offers(previous));
-            (
-                models,
-                Some(format!(
-                    "embedding models unavailable: {error}; the last listing's embedding models are kept"
-                )),
-            )
+            merge_listed_models(models, previous_offers(previous, verb));
+            Some(format!(
+                "{what} models unavailable: {error}; the last listing's {what} models are kept"
+            ))
         }
     }
 }
 
-/// The embedding offers in a previous catalog, each reduced to the `embed`
-/// verbs it served, ready to merge onto a fresh chat listing.
-fn previous_embedding_offers(previous: &[DiscoveredModel]) -> Vec<DiscoveredModel> {
+/// The offers of `verb` in a previous catalog, each reduced to the verbs of
+/// that kind it served, ready to merge onto a fresh chat listing.
+fn previous_offers(previous: &[DiscoveredModel], verb: VerbKind) -> Vec<DiscoveredModel> {
     previous
         .iter()
         .filter_map(|model| {
-            let embed: Vec<ServedVerb> = model
+            let kept: Vec<ServedVerb> = model
                 .serves
                 .as_ref()?
                 .iter()
-                .filter(|served| matches!(served.verb, Verb::Embed(_)))
+                .filter(|served| served.verb.kind() == verb)
                 .cloned()
                 .collect();
-            (!embed.is_empty()).then(|| DiscoveredModel {
-                serves: Some(embed),
+            (!kept.is_empty()).then(|| DiscoveredModel {
+                serves: Some(kept),
                 ..model.clone()
             })
         })
         .collect()
 }
 
-/// Merge the embeddings listing into the chat listing by id. A model already
-/// listed keeps what it serves and gains `embed`; a new one is added as the
-/// embeddings listing describes it.
-pub(crate) fn merge_embedding_models(
-    models: &mut Vec<DiscoveredModel>,
-    embeddings: Vec<DiscoveredModel>,
-) {
-    for embedding in embeddings {
-        let Some(model) = models.iter_mut().find(|model| model.id == embedding.id) else {
-            models.push(embedding);
+/// Merge a verb's listing (embeddings, decisions) into the chat listing by
+/// id. A model already listed keeps what it serves and gains the listing's
+/// verbs; a new one is added as the listing describes it.
+pub(crate) fn merge_listed_models(models: &mut Vec<DiscoveredModel>, listed: Vec<DiscoveredModel>) {
+    for entry in listed {
+        let Some(model) = models.iter_mut().find(|model| model.id == entry.id) else {
+            models.push(entry);
             continue;
         };
         // No claim from chat discovery meant OpenRouter's provider-wide
@@ -137,10 +173,54 @@ pub(crate) fn merge_embedding_models(
             .serves
             .take()
             .unwrap_or_else(|| ServedVerb::conversation(Wire::OpenAiChatCompletions));
-        serves.extend(embedding.serves.unwrap_or_default());
+        serves.extend(entry.serves.unwrap_or_default());
         model.serves = Some(serves);
     }
 }
+
+/// The `output_modalities=decisions` listing.
+fn discover_decision_models_blocking() -> Result<Vec<DiscoveredModel>, String> {
+    let body = listing(
+        OPENROUTER_DECISION_MODELS_URL,
+        None,
+        "decision model catalog",
+        Some(DECISION_DISCOVERY_TIMEOUT),
+    )?;
+    decode_decision_models(&body)
+}
+
+/// Each decisions listing entry as a model serving `decide` over System One,
+/// which is what OpenRouter's Decisions API speaks for every model it lists
+/// there. Prices are the listing's own: input per token, output `0`.
+///
+/// Only an entry whose outputs name `decisions` is declared, so a listing
+/// that ignored its filter cannot turn chat models into decision offers.
+pub(crate) fn decode_decision_models(body: &str) -> Result<Vec<DiscoveredModel>, String> {
+    let response: ModelsResponse = serde_json::from_str(body)
+        .map_err(|error| format!("OpenRouter decision model catalog JSON failed: {error}"))?;
+    let decisions = Modality::from(DECISIONS_MODALITY);
+    Ok(response
+        .data
+        .into_iter()
+        .map(map_model)
+        .filter(|model| {
+            model
+                .modalities
+                .as_ref()
+                .is_some_and(|modalities| modalities.outputs(&decisions))
+        })
+        .map(|mut model| {
+            model.serves = Some(vec![ServedVerb {
+                verb: Verb::Decide,
+                wire: Wire::SystemOne,
+            }]);
+            model
+        })
+        .collect())
+}
+
+/// What OpenRouter names a decision model's output.
+const DECISIONS_MODALITY: &str = "decisions";
 
 /// The public `/api/v1/embeddings/models` listing.
 fn discover_embedding_models_blocking() -> Result<Vec<DiscoveredModel>, String> {
@@ -286,7 +366,7 @@ struct OpenRouterModel {
     #[serde(default)]
     top_provider: Option<TopProvider>,
     #[serde(default)]
-    architecture: Option<Architecture>,
+    architecture: Option<ListedArchitecture>,
     /// Every price key the provider sent, so a key Cairn cannot place is kept
     /// rather than dropped by a fixed struct.
     #[serde(default)]
@@ -307,14 +387,6 @@ struct OpenRouterModel {
 struct TopProvider {
     #[serde(default)]
     context_length: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Architecture {
-    #[serde(default)]
-    input_modalities: Option<Vec<String>>,
-    #[serde(default)]
-    output_modalities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,28 +454,19 @@ fn map_model(model: OpenRouterModel) -> DiscoveredModel {
 /// rather than left to the provider-wide default; an embedding model gains
 /// `embed` from the embeddings listing.
 fn capabilities(
-    architecture: Option<Architecture>,
+    architecture: Option<ListedArchitecture>,
 ) -> (Option<Modalities>, Option<Vec<ServedVerb>>) {
     let Some(architecture) = architecture else {
         return (None, None);
     };
-    let side = |values: Option<Vec<String>>| -> Option<Vec<Modality>> {
-        values.map(|values| values.into_iter().map(Modality::from).collect())
-    };
-    let input = side(architecture.input_modalities);
-    let output = side(architecture.output_modalities);
-    let serves = output.as_ref().map(|output| {
+    let serves = architecture.output_modalities.as_ref().map(|output| {
         if output.contains(&Modality::Text) {
             ServedVerb::conversation(Wire::OpenAiChatCompletions)
         } else {
             Vec::new()
         }
     });
-    let modalities = (input.is_some() || output.is_some()).then(|| Modalities {
-        input: input.unwrap_or_default(),
-        output: output.unwrap_or_default(),
-    });
-    (modalities, serves)
+    (architecture.modalities(), serves)
 }
 
 /// The meter each OpenRouter price key is charged on. Every price is USD per
@@ -458,7 +521,7 @@ fn pricing(raw: BTreeMap<String, Value>) -> ModelPricing {
 
 #[cfg(test)]
 mod tests {
-    use super::{assemble, decode_embedding_models, decode_models};
+    use super::{assemble, decode_decision_models, decode_embedding_models, decode_models};
     use cairn_models::types::catalog::{
         DiscoveredModel, Modality, ServedVerb, Verb, VerbKind, Wire,
     };
@@ -467,6 +530,10 @@ mod tests {
 
     /// A slice of the live `/api/v1/embeddings/models` listing (2026-10-17).
     const EMBEDDINGS: &str = include_str!("testdata/embeddings_models.json");
+
+    /// A slice of the live `/api/v1/models?output_modalities=decisions`
+    /// listing (2026-10-20), verbatim.
+    const DECISIONS: &str = include_str!("testdata/decisions_models.json");
 
     fn embed_capabilities(
         model: &DiscoveredModel,
@@ -490,7 +557,7 @@ mod tests {
         let chat = decode_models(LIVE).unwrap();
         let chat_count = chat.len();
         let embeddings = decode_embedding_models(EMBEDDINGS).unwrap();
-        let (models, error) = assemble(Ok(chat), Ok(embeddings), &[]);
+        let (models, error) = assemble(Ok(chat), Ok(embeddings), Ok(Vec::new()), &[]);
         assert_eq!(error, None);
         // voyage-code-4 is in both listings: merged, not duplicated.
         assert_eq!(models.len(), chat_count + 3);
@@ -539,7 +606,12 @@ mod tests {
     fn a_failed_embeddings_listing_keeps_fresh_chat_models_and_the_last_embedding_offers() {
         let previous = previous_catalog();
         let chat = decode_models(LIVE).unwrap();
-        let (models, error) = assemble(Ok(chat), Err("HTTP 503".into()), &previous);
+        let (models, error) = assemble(
+            Ok(chat),
+            Err("HTTP 503".into()),
+            decode_decision_models(DECISIONS),
+            &previous,
+        );
         assert_eq!(
             error.as_deref(),
             Some("embedding models unavailable: HTTP 503; the last listing's embedding models are kept")
@@ -568,21 +640,130 @@ mod tests {
         let (models, error) = assemble(
             Err("chat down".into()),
             decode_embedding_models(EMBEDDINGS),
+            decode_decision_models(DECISIONS),
             &previous_catalog(),
         );
         assert!(models.is_empty());
         assert_eq!(error.as_deref(), Some("chat down"));
     }
 
-    /// The catalog a previous refresh kept: both listings, merged.
+    /// The catalog a previous refresh kept: every listing, merged.
     fn previous_catalog() -> Vec<DiscoveredModel> {
         let (models, error) = assemble(
             decode_models(LIVE),
             decode_embedding_models(EMBEDDINGS),
+            decode_decision_models(DECISIONS),
             &[],
         );
         assert_eq!(error, None);
         models
+    }
+
+    fn kinds(models: &[DiscoveredModel], id: &str) -> Vec<(VerbKind, Wire)> {
+        model(models, id)
+            .serves
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|served| (served.verb.kind(), served.wire))
+            .collect()
+    }
+
+    /// Every decision model serves `decide` over System One and nothing
+    /// else, priced as listed: input per token, output free. TypeSafe's
+    /// chat-listed router stays a chat model.
+    #[test]
+    fn the_decisions_listing_serves_decide_over_system_one_at_its_listed_prices() {
+        let chat = decode_models(LIVE).unwrap();
+        let chat_count = chat.len();
+        let (models, error) = assemble(
+            Ok(chat),
+            Ok(Vec::new()),
+            decode_decision_models(DECISIONS),
+            &[],
+        );
+        assert_eq!(error, None);
+        assert_eq!(models.len(), chat_count + 5);
+        for (id, input) in [
+            ("typesafe/jev-1.14", "0.000000042"),
+            ("~typesafe/jev-latest", "0.000000042"),
+            ("openai/gpt-6-luna-decisions", "0.0000001"),
+        ] {
+            assert_eq!(
+                kinds(&models, id),
+                vec![(VerbKind::Decide, Wire::SystemOne)],
+                "{id}"
+            );
+            let found = model(&models, id);
+            let pricing = found.pricing.as_ref().unwrap();
+            assert_eq!(
+                pricing.usd_per(Charge::Input, None, BillingUnit::Tokens),
+                Some(input),
+                "{id}"
+            );
+            assert_eq!(
+                pricing.usd_per(Charge::Output, None, BillingUnit::Tokens),
+                Some("0"),
+                "{id}"
+            );
+            let modalities = found.modalities.as_ref().unwrap();
+            assert_eq!(modalities.input, vec![Modality::Text, Modality::Image]);
+            assert_eq!(modalities.output, vec![Modality::from("decisions")]);
+        }
+        assert_eq!(
+            model(&models, "typesafe/jev-1.14").display_name,
+            "TypeSafe: Jev 1.14"
+        );
+        assert_eq!(
+            kinds(&models, "typesafe/jev-router"),
+            vec![
+                (VerbKind::Complete, Wire::OpenAiChatCompletions),
+                (VerbKind::Session, Wire::OpenAiChatCompletions)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_decisions_listing_keeps_fresh_chat_models_and_the_last_decision_offers() {
+        let previous = previous_catalog();
+        let (models, error) = assemble(
+            decode_models(LIVE),
+            decode_embedding_models(EMBEDDINGS),
+            Err("HTTP 502".into()),
+            &previous,
+        );
+        assert_eq!(
+            error.as_deref(),
+            Some("decision models unavailable: HTTP 502; the last listing's decision models are kept")
+        );
+        assert_eq!(models.len(), previous.len());
+        assert_eq!(
+            kinds(&models, "typesafe/jev-1.14"),
+            vec![(VerbKind::Decide, Wire::SystemOne)]
+        );
+        // Both failing are both reported.
+        let (_, error) = assemble(
+            decode_models(LIVE),
+            Err("HTTP 503".into()),
+            Err("HTTP 502".into()),
+            &previous,
+        );
+        let error = error.unwrap();
+        assert!(
+            error.starts_with("embedding models unavailable: HTTP 503"),
+            "{error}"
+        );
+        assert!(
+            error.contains("; decision models unavailable: HTTP 502"),
+            "{error}"
+        );
+    }
+
+    /// A listing that ignored its filter would hand back chat models; none of
+    /// them is declared a decision model.
+    #[test]
+    fn only_entries_that_output_decisions_are_declared_decision_models() {
+        assert!(decode_decision_models(LIVE).unwrap().is_empty());
     }
 
     /// A slice of the live `/api/v1/models` listing (2026-10-15), descriptions
@@ -858,6 +1039,116 @@ mod tests {
         assert_eq!(kinds("black-forest-labs/flux.2-pro"), vec![VerbKind::Image]);
         // Embeddings still serve nothing.
         assert!(kinds("voyageai/voyage-code-4").is_empty());
+    }
+
+    /// Reads the live decisions listing through discovery and, when
+    /// `OPENROUTER_API_KEY` is set, asks `typesafe/jev-1.14` one predicate, one
+    /// choice and one score question over System One through the facet's real
+    /// `HttpComplete`, printing the typed answers and what the reply says it
+    /// cost. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "reaches openrouter.ai, and spends from the key when one is set"]
+    fn live_decision_models_and_one_decision() {
+        use crate::models::decision::{DecisionOption, DecisionQuestion, QuestionKind, ScoreLevel};
+        use cairn_models::interface::decide::{DecisionCall, DecisionRoute};
+        use cairn_models::types::catalog::DiscoveredModel;
+        use cairn_models::wire::decisions::http::DecisionsEndpoint;
+
+        let models: Vec<DiscoveredModel> = super::discover_decision_models_blocking().unwrap();
+        println!("{} decision models", models.len());
+        for model in &models {
+            let pricing = model.pricing.as_ref();
+            println!(
+                "  {}: in {:?}, out {:?}, {}",
+                model.id,
+                pricing.and_then(|p| p.usd_per(Charge::Input, None, BillingUnit::Tokens)),
+                pricing.and_then(|p| p.usd_per(Charge::Output, None, BillingUnit::Tokens)),
+                model
+                    .modalities
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            );
+        }
+        for id in [
+            "typesafe/jev-1.14",
+            "~typesafe/jev-latest",
+            "openai/gpt-6-luna-decisions",
+        ] {
+            assert!(models.iter().any(|model| model.id == id), "{id} is listed");
+        }
+
+        let Ok(api_key) = std::env::var("OPENROUTER_API_KEY") else {
+            println!("OPENROUTER_API_KEY unset: no decision asked");
+            return;
+        };
+        let route = DecisionRoute::SystemOne(DecisionsEndpoint {
+            provider_name: "OpenRouter".into(),
+            backend_key: "openrouter".into(),
+            url: format!("{}/decisions", super::super::OPENROUTER_DECISIONS_BASE),
+            headers: super::super::http::openrouter_headers(&api_key),
+        });
+        let option = |value: &str, description: &str| DecisionOption {
+            value: value.into(),
+            description: Some(description.into()),
+        };
+        let questions = vec![
+            DecisionQuestion {
+                name: "is_bug".into(),
+                instructions: "Is the customer reporting a software defect?".into(),
+                kind: QuestionKind::Predicate,
+            },
+            DecisionQuestion {
+                name: "team".into(),
+                instructions: "Which team should own this ticket?".into(),
+                kind: QuestionKind::Choice {
+                    options: vec![
+                        option("account", "Login, permissions, or profile issues."),
+                        option(
+                            "frontend",
+                            "Rendering, layout, or browser compatibility issues.",
+                        ),
+                        option(
+                            "payments",
+                            "Checkout, billing, or payment processing issues.",
+                        ),
+                    ],
+                },
+            },
+            DecisionQuestion {
+                name: "urgency".into(),
+                instructions: "How urgent is this ticket?".into(),
+                kind: QuestionKind::Score {
+                    levels: [
+                        "Can wait for the next release",
+                        "Should be fixed this week",
+                        "Blocking revenue right now",
+                    ]
+                    .into_iter()
+                    .map(|label| ScoreLevel {
+                        label: label.into(),
+                        description: None,
+                    })
+                    .collect(),
+                },
+            },
+        ];
+        let decision = cairn_models::decide::decide(
+            &cairn_models::complete::HttpComplete,
+            DecisionCall {
+                route: &route,
+                model: "typesafe/jev-1.14",
+                input: "My checkout page shows a blank screen after I click Pay. I have tried two browsers. We are an enterprise customer.",
+                questions: &questions,
+                timeout: std::time::Duration::from_secs(30),
+            },
+        )
+        .unwrap();
+        println!("{}", serde_json::to_string_pretty(&decision).unwrap());
+        assert!(decision
+            .answers
+            .iter()
+            .all(|answer| answer.pick().is_some() && answer.confidence().is_some()));
     }
 
     /// Reads the real catalog through discovery. Run it with `--ignored` to

@@ -14,13 +14,20 @@
 //! 1. Cairn's own refs whose lifecycle ended: `refs/cairn/checks/*` that no
 //!    check batch holds, `refs/cairn/stranded/*` whose issue was resolved more
 //!    than the retention window ago, and `refs/cairn/rescued/*` older than it.
-//! 2. Under the store lock, the store's view: every visible commit that no
-//!    bookmark, remote bookmark, tag, working copy, or base reaches is hidden,
-//!    after any bookmark conflicted between two replays of one branch is settled
-//!    on the newer one (`cairn_vcs::jj::sweep_store_view`). Superseded history
-//!    that some step made visible again would otherwise stay visible for good,
-//!    as divergent twins and unreferenced heads that keep their objects alive.
-//!    Hiding changes only the view; objects go only through step 4's reclaim.
+//! 2. Under the store lock, the store's view. First the origin tracking ref of
+//!    every agent branch Cairn's records say is finished
+//!    ([`BranchLifecycle`]) is retired with its `<branch>@origin` remote
+//!    bookmark (`cairn_vcs::jj::retire_remote_tracking_refs`): the store never
+//!    prunes its fetches, so without this a tracking ref outlives the branch
+//!    GitHub deleted after the merge and anchors its history for good. The
+//!    remote's advertisement is never the key, because it can lag the store's
+//!    own push. Then every visible commit that no bookmark, remote bookmark,
+//!    tag, working copy, or base reaches is hidden, after any bookmark
+//!    conflicted between two replays of one branch is settled on the newer one
+//!    (`cairn_vcs::jj::sweep_store_view`). Superseded history that some step
+//!    made visible again would otherwise stay visible for good, as divergent
+//!    twins and unreferenced heads that keep their objects alive. Hiding
+//!    changes only the view; objects go only through step 4's reclaim.
 //! 3. At most weekly, under the store lock, the operation log older than the
 //!    window.
 //! 4. Outside the store lock, unreachable operations and keep refs for anything
@@ -123,6 +130,13 @@ const STORE_LOCK_WAIT: Duration = Duration::from_secs(600);
 /// A commit younger than this is never hidden by the view sweep: a writer
 /// outside the store lock may not yet have named it.
 const VIEW_SWEEP_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// A branch finished more recently than this keeps its tracking ref: the merge
+/// or close that finished it may still be pushing or deleting it.
+const FINISHED_BRANCH_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// The remote whose tracking refs of finished branches the prune retires.
+const TRACKING_REMOTE: &str = "origin";
 
 const CHECK_PREFIX: &str = "refs/cairn/checks/";
 const STRANDED_PREFIX: &str = "refs/cairn/stranded/";
@@ -651,6 +665,10 @@ struct PruneReport {
     store_bytes_before: Option<u64>,
     store_bytes_after: Option<u64>,
     cairn: CairnRefSweep,
+    /// Finished branches whose origin tracking ref the view sweep retired, or
+    /// why it could not.
+    tracking_refs: Option<Result<crate::jj::RetiredTrackingRefs, String>>,
+    view: Option<crate::jj::StoreViewSweep>,
     truncation: Option<OperationLogTruncation>,
     truncation_refusal: Option<String>,
     gc: Option<StoreGarbageCollection>,
@@ -742,7 +760,30 @@ async fn run_prune(
     // The view sweep only hides; a skipped or failed one leaves residue the
     // next prune collects, so it never holds back the rest of this one.
     match sweep_view(orch, project).await {
-        Ok(sweep) => {
+        Ok((tracking, sweep)) => {
+            match &tracking {
+                Ok(retired) if !retired.refs.is_empty() => log::info!(
+                    "store view sweep of {}: retired the origin tracking refs of {} finished \
+                     branch(es) ({}); undo point: operation {}, then re-create each ref at \
+                     the object named",
+                    store.display(),
+                    retired.refs.len(),
+                    retired
+                        .refs
+                        .iter()
+                        .map(|target| format!("{} {}", target.name, target.oid))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    retired.operation_before
+                ),
+                Ok(_) => {}
+                Err(error) => log::warn!(
+                    "store view sweep of {}: retiring finished branches' tracking refs: {error}",
+                    store.display()
+                ),
+            }
+            report.tracking_refs = Some(tracking);
+            report.view = Some(sweep.clone());
             if sweep.commits_hidden > 0 || !sweep.bookmarks_resolved.is_empty() {
                 log::info!(
                     "store view sweep of {}: hid {} head(s) and {} commit(s), settled {} \
@@ -864,12 +905,20 @@ async fn run_prune(
     Ok(())
 }
 
-/// Sweep the store's view under the store lock, which every reconcile and
-/// replay takes, so no rewrite is between naming a commit and anchoring it.
+/// Retire finished branches' tracking refs, then sweep the store's view, under
+/// the store lock, which every reconcile and replay takes, so no rewrite is
+/// between naming a commit and anchoring it. A retirement that fails is
+/// reported beside the sweep and does not stop it.
 async fn sweep_view(
     orch: &Orchestrator,
     project: &ProjectStore,
-) -> Result<crate::jj::StoreViewSweep, String> {
+) -> Result<
+    (
+        Result<crate::jj::RetiredTrackingRefs, String>,
+        crate::jj::StoreViewSweep,
+    ),
+    String,
+> {
     let Ok(_guard) = orch
         .acquire_jj_store_lock_with_timeout(
             &project.store,
@@ -884,12 +933,199 @@ async fn sweep_view(
     if reconcile_in_flight(orch, &project.store).await {
         return Err("skipped:reconcile-in-flight".into());
     }
+    let cutoff = unix_now() - FINISHED_BRANCH_GRACE.as_secs() as i64;
+    let finished = finished_branches(orch, project, cutoff).await;
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let store = project.store.clone();
     let bases = project.base_branches.clone();
-    blocking(move || crate::jj::sweep_store_view(&jj, &store, &bases, VIEW_SWEEP_GRACE))
-        .await
-        .map_err(failed)
+    blocking(move || {
+        let tracking = finished.and_then(|finished| {
+            crate::jj::retire_remote_tracking_refs(&jj, &store, TRACKING_REMOTE, &finished)
+        });
+        let sweep = crate::jj::sweep_store_view(&jj, &store, &bases, VIEW_SWEEP_GRACE)?;
+        Ok((tracking, sweep))
+    })
+    .await
+    .map_err(failed)
+}
+
+/// What Cairn's own records say about one agent branch: whether anything has
+/// finished it, and whether anything still holds it.
+///
+/// A branch is finished once an issue it belongs to was resolved (merged or
+/// closed) or a pull request from it was merged or closed, provided nothing
+/// holds it: no node on it that is not done, no published pull request from it
+/// that is still open, and no issue it belongs to that is unresolved. A branch
+/// no record names is never finished, whatever the remote says about it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BranchLifecycle {
+    /// The latest moment a record finished the branch.
+    pub(crate) finished_at: Option<i64>,
+    pub(crate) held: bool,
+}
+
+impl BranchLifecycle {
+    /// A node on the branch, with the issue it works for.
+    pub(crate) fn job(&mut self, status: &str, issue: Option<(&str, i64)>) {
+        if !matches!(status, "complete" | "failed" | "cancelled") {
+            self.held = true;
+        }
+        self.issue(issue);
+    }
+
+    /// A pull request from the branch, with the issue it belongs to.
+    ///
+    /// Either Cairn's own status or GitHub's last observed state saying merged
+    /// or closed makes it terminal: each lags the other in recorded history. An
+    /// open one never published to GitHub is a draft whose lifecycle is its
+    /// issue's.
+    pub(crate) fn pull_request(
+        &mut self,
+        status: &str,
+        github_state: Option<&str>,
+        published: bool,
+        settled_at: i64,
+        issue: Option<(&str, i64)>,
+    ) {
+        let terminal = is_resolution(status)
+            || github_state.is_some_and(|state| is_resolution(&state.to_ascii_lowercase()));
+        if terminal {
+            self.finish(settled_at);
+        } else if published {
+            self.held = true;
+        }
+        self.issue(issue);
+    }
+
+    fn issue(&mut self, issue: Option<(&str, i64)>) {
+        match issue {
+            Some((status, resolved_at)) if is_resolution(status) => self.finish(resolved_at),
+            Some(_) => self.held = true,
+            None => {}
+        }
+    }
+
+    fn finish(&mut self, at: i64) {
+        self.finished_at = Some(self.finished_at.map_or(at, |known| known.max(at)));
+    }
+
+    /// Finished, and by no record later than `cutoff`.
+    pub(crate) fn finished_by(&self, cutoff: i64) -> bool {
+        !self.held && self.finished_at.is_some_and(|at| at <= cutoff)
+    }
+}
+
+fn is_resolution(status: &str) -> bool {
+    matches!(status, "merged" | "closed")
+}
+
+/// The agent branches of `project`'s store that every database's records say
+/// were finished by `cutoff`. An unreadable record is not evidence that nothing
+/// holds a branch, so any read failure retires nothing.
+async fn finished_branches(
+    orch: &Orchestrator,
+    project: &ProjectStore,
+    cutoff: i64,
+) -> Result<Vec<String>, String> {
+    let mut serves_store = std::collections::HashMap::<String, bool>::new();
+    let mut on_store = |repo_path: &str| {
+        *serves_store
+            .entry(repo_path.to_string())
+            .or_insert_with(|| {
+                crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path))
+                    == project.store
+            })
+    };
+    let mut branches = std::collections::BTreeMap::<String, BranchLifecycle>::new();
+    for db in orch.db.all_dbs().await {
+        let jobs = db
+            .query_all(
+                "SELECT p.repo_path, j.branch, j.status, i.status,
+                        COALESCE(i.merged_at, i.closed_at, i.updated_at)
+                 FROM jobs j
+                 JOIN projects p ON p.id = j.project_id
+                 LEFT JOIN issues i ON i.id = j.issue_id
+                 WHERE j.branch LIKE 'agent/%'",
+                (),
+                |row| {
+                    Ok((
+                        row.text(0)?,
+                        row.text(1)?,
+                        row.text(2)?,
+                        row.opt_text(3)?,
+                        row.opt_i64(4)?,
+                    ))
+                },
+            )
+            .await
+            .map_err(|error| format!("read the nodes on agent branches: {error}"))?;
+        for (repo_path, branch, status, issue_status, resolved_at) in jobs {
+            if on_store(&repo_path) {
+                let issue = issue_status
+                    .as_deref()
+                    .map(|s| (s, resolved_at.unwrap_or(0)));
+                branches.entry(branch).or_default().job(&status, issue);
+            }
+        }
+
+        let pull_requests = db
+            .query_all(
+                "SELECT p.repo_path, m.source_branch, m.status, m.github_state,
+                        m.github_pr_number IS NOT NULL,
+                        COALESCE(m.merged_at, m.closed_at, m.updated_at),
+                        i.status, COALESCE(i.merged_at, i.closed_at, i.updated_at)
+                 FROM merge_requests m
+                 JOIN projects p ON p.id = m.project_id
+                 LEFT JOIN issues i ON i.id = m.issue_id
+                 WHERE m.source_branch LIKE 'agent/%'",
+                (),
+                |row| {
+                    Ok((
+                        row.text(0)?,
+                        row.text(1)?,
+                        row.text(2)?,
+                        row.opt_text(3)?,
+                        row.i64(4)? != 0,
+                        row.i64(5)?,
+                        row.opt_text(6)?,
+                        row.opt_i64(7)?,
+                    ))
+                },
+            )
+            .await
+            .map_err(|error| format!("read the pull requests from agent branches: {error}"))?;
+        for (
+            repo_path,
+            branch,
+            status,
+            github_state,
+            published,
+            settled_at,
+            issue_status,
+            resolved_at,
+        ) in pull_requests
+        {
+            if on_store(&repo_path) {
+                let issue = issue_status
+                    .as_deref()
+                    .map(|s| (s, resolved_at.unwrap_or(0)));
+                branches.entry(branch).or_default().pull_request(
+                    &status,
+                    github_state.as_deref(),
+                    published,
+                    settled_at,
+                    issue,
+                );
+            }
+        }
+    }
+    Ok(branches
+        .into_iter()
+        .filter(|(branch, lifecycle)| {
+            lifecycle.finished_by(cutoff) && !project.base_branches.contains(branch)
+        })
+        .map(|(branch, _)| branch)
+        .collect())
 }
 
 fn failed(error: String) -> String {
@@ -1094,6 +1330,26 @@ async fn record_prune(
             "stranded_unattributed": report.cairn.stranded_unattributed,
             "locked": report.cairn.locked,
         },
+        "origin_tracking_refs": match &report.tracking_refs {
+            // Deleting a ref deletes its reflog, so the refs and objects
+            // recorded here are the only way to re-create them.
+            Some(Ok(retired)) => json!({
+                "retired": retired.refs.len(),
+                "locked": retired.locked,
+                "operation_before": retired.operation_before,
+                "refs": retired.refs.iter()
+                    .map(|target| json!({ "ref": target.name, "oid": target.oid }))
+                    .collect::<Vec<_>>(),
+            }),
+            Some(Err(error)) => json!({ "failed": error }),
+            None => serde_json::Value::Null,
+        },
+        "view_sweep": report.view.as_ref().map(|sweep| json!({
+            "operation_before": sweep.operation_before,
+            "heads_hidden": sweep.heads_hidden,
+            "commits_hidden": sweep.commits_hidden,
+            "bookmarks_settled": sweep.bookmarks_resolved.len(),
+        })),
         "truncation": report.truncation.as_ref().map(|truncation| json!({
             "reparented": truncation.reparented,
             "truncate_ms": truncation.truncate.as_millis() as u64,

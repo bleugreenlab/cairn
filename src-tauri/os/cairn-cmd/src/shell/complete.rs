@@ -15,9 +15,7 @@ use cairn_common::read::AffordanceSpec;
 use cairn_common::uri::{scan_uris, ROOT_URI};
 
 use super::actions;
-
-/// Builtins that exist at every location.
-const BUILTINS: &[&str] = &["help", "ls", "pwd", "quit", "read", "watch"];
+use super::nav::BUILTINS;
 
 /// Completions for the word being typed at `cwd`.
 ///

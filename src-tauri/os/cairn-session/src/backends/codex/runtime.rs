@@ -99,8 +99,8 @@ impl CodexRuntime {
 }
 use super::events::{
     build_codex_compaction_event, emit_codex_command_complete, emit_codex_command_output_delta,
-    emit_streaming_delta, finalize_agent_message, finalize_streaming, handle_agent_message_delta,
-    handle_reasoning_delta, store_event, terminal_tool_called_for_run,
+    finalize_agent_message, finalize_streaming, handle_agent_message_delta, handle_reasoning_delta,
+    store_event, terminal_tool_called_for_run,
 };
 use super::json_string;
 use super::protocol::StreamingState;
@@ -110,7 +110,6 @@ use crate::agent_process::completion::{
 };
 use crate::agent_process::stream::TokenCounts;
 use crate::agent_process::stream::{ToolUseInfo, TranscriptEvent};
-use crate::transcripts::stream_store::append_chunks;
 use cairn_db::storage::LocalDb;
 use cairn_domain::ContextTokenState;
 use cairn_models::codex::app_server::AppServerClient;
@@ -118,10 +117,10 @@ use cairn_models::codex::thread_router::{Scoped, ThreadRouter};
 use cairn_models::usage::codex_rate_limits::codex_rate_limit_snapshot_from_value;
 use cairn_models::wire::claude_stream::Usage;
 use cairn_models::wire::codex_app_server::{
-    context_usage, extract_command_execution, extract_raw_response_message_text,
-    is_selected_model_capacity_error, normalize_capacity_error, notification_turn_id,
-    summarize_command_result, summarize_file_change_result, summarize_mcp_tool_call,
-    CodexTurnUsageAccumulator, Notification, ProviderTurnStatus,
+    context_usage, extract_command_execution, is_selected_model_capacity_error,
+    normalize_capacity_error, notification_turn_id, summarize_command_result,
+    summarize_file_change_result, summarize_mcp_tool_call, CodexTurnUsageAccumulator, Notification,
+    ProviderTurnStatus,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -612,7 +611,7 @@ pub(crate) fn codex_tool_result_event(
 }
 
 pub(crate) fn codex_compaction_event_from_completed_item(msg: &Value) -> Option<TranscriptEvent> {
-    let Notification::ItemCompleted { item } = Notification::parse(msg) else {
+    let Notification::ItemCompleted { item, .. } = Notification::parse(msg) else {
         return None;
     };
     if item.get("type").and_then(|v| v.as_str()) != Some("contextCompaction") {
@@ -761,8 +760,10 @@ impl CodexRuntime {
         log::debug!("codex_app_server: reader started");
         let mut streaming_state: Option<StreamingState> = None;
         let mut usage_accumulator = CodexTurnUsageAccumulator::default();
-        let mut last_direct_assistant_text: Option<String> = None;
-        let mut finalized_assistant_by_turn: HashMap<String, String> = HashMap::new();
+        let mut last_agent_message_text: Option<String> = None;
+        // The last agent message of each provider turn: its final output, which
+        // the repeated-output safety pause observes when the turn completes.
+        let mut final_output_by_turn: HashMap<String, String> = HashMap::new();
         let mut pending_tool_ids: HashSet<String> = HashSet::new();
         let mut tool_output_chars: HashMap<String, i32> = HashMap::new();
         let mut terminal_tool_suspended = false;
@@ -804,9 +805,7 @@ impl CodexRuntime {
             if terminal_tool_called_for_run(host, run_id)
                 && matches!(
                     notification,
-                    Notification::AgentMessageDelta { .. }
-                        | Notification::ReasoningDelta { .. }
-                        | Notification::RawResponseItemCompleted { .. }
+                    Notification::AgentMessageDelta { .. } | Notification::ReasoningDelta { .. }
                 )
             {
                 continue;
@@ -1085,7 +1084,7 @@ impl CodexRuntime {
                         }
                     }
                 }
-                Notification::ItemCompleted { item } => {
+                Notification::ItemCompleted { turn_id, item } => {
                     if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
                         match item_type {
                             "agentMessage" => {
@@ -1097,10 +1096,13 @@ impl CodexRuntime {
                                 }
                                 if let Some(text) = item.pointer("/text").and_then(|v| v.as_str()) {
                                     recorded_item_after_tool_result = true;
-                                    if streaming_state.is_none()
-                                        && last_direct_assistant_text.as_deref() == Some(text)
-                                    {
-                                        continue;
+                                    if !ephemeral {
+                                        if let Some(provider_turn_id) =
+                                            turn_id_or_cached(turn_id, &current_turn_id)
+                                        {
+                                            final_output_by_turn
+                                                .insert(provider_turn_id, text.to_string());
+                                        }
                                     }
                                     finalize_agent_message(
                                         host,
@@ -1111,9 +1113,7 @@ impl CodexRuntime {
                                         &mut streaming_state,
                                         text,
                                     );
-                                    if streaming_state.is_none() {
-                                        last_direct_assistant_text = Some(text.to_string());
-                                    }
+                                    last_agent_message_text = Some(text.to_string());
                                 }
                             }
                             "commandExecution" => {
@@ -1195,67 +1195,6 @@ impl CodexRuntime {
                         }
                     }
                 }
-                Notification::RawResponseItemCompleted { turn_id, item } => {
-                    if let Ok(mut watchdog) = progress_watchdog.lock() {
-                        watchdog.record_forward_progress(Instant::now());
-                    }
-                    if let Some(text) = extract_raw_response_message_text(item) {
-                        if !ephemeral {
-                            if let Some(provider_turn_id) =
-                                turn_id_or_cached(turn_id, &current_turn_id)
-                            {
-                                finalized_assistant_by_turn.insert(provider_turn_id, text.clone());
-                            }
-                        }
-                        if let Some(ref mut state) = streaming_state {
-                            // Codex streamed no content deltas but produced a final raw
-                            // message: seed it once so the stream isn't empty.
-                            if state.acc.content_is_empty() {
-                                state.acc.push_content(&text);
-                                match append_chunks(
-                                    run_db.clone(),
-                                    &state.stream_id,
-                                    state.version,
-                                    &state.acc.take_pending(),
-                                ) {
-                                    Ok(result) => {
-                                        recorded_item_after_tool_result = true;
-                                        state.version = result.version;
-                                        let d = state.acc.take_emit_delta();
-                                        emit_streaming_delta(emitter, run_id, &state.stream_id, &d);
-                                    }
-                                    Err(error) => {
-                                        log::warn!(
-                                            "Failed to append Codex raw message for {}: {}",
-                                            run_id,
-                                            error
-                                        );
-                                    }
-                                }
-                            }
-                        } else if last_direct_assistant_text.as_deref() != Some(text.as_str()) {
-                            let event = TranscriptEvent {
-                                event_type: "assistant".to_string(),
-                                session_id: session_id.clone(),
-                                parent_tool_use_id: None,
-                                content: Some(text.clone()),
-                                thinking: None,
-                                tool_name: None,
-                                tool_input: None,
-                                tool_uses: None,
-                                tool_use_id: None,
-                                tool_result: None,
-                                is_error: false,
-                                thinking_ms: None,
-                                queued_message_id: None,
-                                raw: None,
-                            };
-                            store_event(host, run_id, session_id.as_deref(), &event);
-                            recorded_item_after_tool_result = true;
-                            last_direct_assistant_text = Some(text);
-                        }
-                    }
-                }
                 Notification::TurnCompleted { turn_id, status } => {
                     let completed_provider_turn_id = turn_id_or_cached(turn_id, &current_turn_id);
                     let mut repeat_safety_pause = false;
@@ -1265,8 +1204,7 @@ impl CodexRuntime {
                             completed_provider_turn_id.as_deref(),
                             host.process_state.get_current_turn_id(run_id),
                         ) {
-                            if let Some(text) = finalized_assistant_by_turn.remove(provider_turn_id)
-                            {
+                            if let Some(text) = final_output_by_turn.remove(provider_turn_id) {
                                 if let Some(notice) = host.host.observe_final_output(
                                     &cairn_turn_id,
                                     provider_turn_id,
@@ -1282,7 +1220,7 @@ impl CodexRuntime {
                             }
                         }
                     } else if let Some(provider_turn_id) = completed_provider_turn_id.as_deref() {
-                        finalized_assistant_by_turn.remove(provider_turn_id);
+                        final_output_by_turn.remove(provider_turn_id);
                     }
                     clear_provider_turn_if_current(
                         completed_provider_turn_id.as_deref(),
@@ -1315,7 +1253,7 @@ impl CodexRuntime {
                     // cairn:~/return), so non-call turns and schema-less codex
                     // sessions are unaffected.
                     if status == ProviderTurnStatus::Completed {
-                        if let Some(value) = last_direct_assistant_text
+                        if let Some(value) = last_agent_message_text
                             .as_deref()
                             .and_then(|text| serde_json::from_str::<Value>(text).ok())
                         {
@@ -1331,7 +1269,7 @@ impl CodexRuntime {
                         let state = provider_turn_failures
                             .entry(turn_id.to_string())
                             .or_default();
-                        if status.as_str() == "failed"
+                        if status.is_failed()
                             && !state.terminalized
                             && state.capacity_message.is_some()
                         {

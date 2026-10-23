@@ -652,8 +652,8 @@ impl Catalog {
     /// serving the verb ([`Self::offers_serving`]). A tier (`sm`, or
     /// `provider/sm`) takes that tier's binding on a provider that serves the
     /// verb, the best wire first and then the tier's default provider.
-    /// Anything else is an exact model, matched by native id, catalog id, or
-    /// alias. A selection that lands only on offers that do not serve the
+    /// Anything else is an exact model, matched by native id, catalog id,
+    /// alias, or `provider/native-id`. A selection that lands only on offers that do not serve the
     /// verb is refused, never served by something that does. `provider` and
     /// `account` narrow every branch.
     pub fn offer_for(&self, query: OfferQuery<'_>) -> Result<SelectedOffer, NoOffer> {
@@ -832,15 +832,29 @@ impl Catalog {
             });
         }
 
-        let matching: Vec<CatalogOffer> = self
-            .models()
+        // `provider/native-id` names that provider's offer of that native id,
+        // the form refusals and listings name offers in. The native id may
+        // itself hold a slash (`openrouter/typesafe/jev-1.14`), and a model
+        // with a canonical slug has a catalog id that is neither, so this is
+        // matched on the offer rather than the catalog id.
+        let names_offer = |offer: &CatalogOffer| {
+            qualifier.is_some_and(|key| offer.provider == key && offer.model == tier)
+        };
+        let models = self.models();
+        let qualified = models
+            .iter()
+            .flat_map(|model| &model.offers)
+            .any(names_offer);
+        let matching: Vec<CatalogOffer> = models
             .into_iter()
             .filter(|model| {
-                model.catalog_id == requested
+                qualified
+                    || model.catalog_id == requested
                     || model.aliases.iter().any(|alias| alias == requested)
                     || model.offers.iter().any(|offer| offer.model == requested)
             })
             .flat_map(|model| model.offers)
+            .filter(|offer| !qualified || names_offer(offer))
             .filter(|offer| query.admits_offer(offer))
             .collect();
         if matching.is_empty() {
@@ -1197,6 +1211,56 @@ mod tests {
             decide(&catalog, Some("  ")).unwrap().provider,
             "custom:acc_gateway"
         );
+    }
+
+    /// An OpenRouter decision model is named the way a refusal names it,
+    /// `provider/native-id`, though its native id holds a slash and its
+    /// catalog id is its canonical slug; that names only this provider's
+    /// offer.
+    #[test]
+    fn a_provider_qualified_native_id_selects_that_providers_offer() {
+        let mut jev = model("typesafe/jev-1.14", Some("typesafe/jev-1.14-20261014"));
+        jev.serves = Some(vec![ServedVerb {
+            verb: Verb::Decide,
+            wire: Wire::SystemOne,
+        }]);
+        let catalog = Catalog {
+            providers: vec![
+                deciding(
+                    custom("acc_gateway", &["typesafe/jev-1.14"], vec![]),
+                    MeasuredBy::Native,
+                ),
+                provider("openrouter", Some(vec![jev]), vec![]),
+            ],
+        };
+        let selected = decide(&catalog, Some("openrouter/typesafe/jev-1.14")).unwrap();
+        assert_eq!(
+            selected,
+            SelectedOffer {
+                provider: "openrouter".into(),
+                model: "typesafe/jev-1.14".into(),
+                served: ServedVerb {
+                    verb: Verb::Decide,
+                    wire: Wire::SystemOne,
+                },
+            }
+        );
+        assert_eq!(selected.measured_by(), Some(MeasuredBy::Native));
+        // The canonical slug still selects it, and the bare native id is
+        // offered by both providers.
+        assert_eq!(
+            decide(&catalog, Some("typesafe/jev-1.14-20261014"))
+                .unwrap()
+                .provider,
+            "openrouter"
+        );
+        assert_eq!(
+            decide(&catalog, Some("typesafe/jev-1.14"))
+                .unwrap()
+                .provider,
+            "custom:acc_gateway"
+        );
+        assert!(decide(&catalog, Some("openrouter/typesafe/jev-9")).is_err());
     }
 
     #[test]

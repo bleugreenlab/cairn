@@ -208,13 +208,57 @@ fn row_for_status(
     .with_send_affordance()
 }
 
+/// The slice of a provider's runtime status that every one of its conversation
+/// rows carries.
+#[derive(Debug, Clone)]
+struct ProviderRowStatus {
+    state: &'static str,
+    detail: Option<String>,
+    last_send_error: Option<String>,
+    failed_count: i64,
+}
+
 pub async fn configured_conversations(orch: &Orchestrator) -> Vec<ConversationRow> {
     let channels = crate::config::settings::load_settings(&orch.config_dir).channels;
-    let mut rows = Vec::new();
     let bindings = match ledger::list_active_bindings(&orch.db.local).await {
         Ok(bindings) => bindings,
         Err(_) => return vec![],
     };
+    conversation_rows(
+        bindings,
+        |provider| match provider {
+            ConversationProvider::IMessage => channels.imessage.enabled,
+            ConversationProvider::Telegram => channels.telegram.enabled,
+            ConversationProvider::Discord => channels.discord.enabled,
+        },
+        |provider| async move {
+            let status = runtime_status(orch, provider.id()).await;
+            ProviderRowStatus {
+                state: status.state,
+                detail: status.detail,
+                last_send_error: status.last_send_error,
+                failed_count: status.failed_count,
+            }
+        },
+    )
+    .await
+}
+
+/// Project active bindings onto conversation rows. A provider's status depends
+/// only on the provider, and reading it costs several database queries, so it is
+/// looked up once per enabled provider and shared by all of that provider's
+/// rows -- Discord alone carries a structural binding per issue thread.
+async fn conversation_rows<Status, StatusFuture>(
+    bindings: Vec<ledger::ActiveBinding>,
+    enabled: impl Fn(ConversationProvider) -> bool,
+    mut status_of: Status,
+) -> Vec<ConversationRow>
+where
+    Status: FnMut(ConversationProvider) -> StatusFuture,
+    StatusFuture: std::future::Future<Output = ProviderRowStatus>,
+{
+    let mut statuses = std::collections::HashMap::<ConversationProvider, ProviderRowStatus>::new();
+    let mut rows = Vec::with_capacity(bindings.len());
     for binding in bindings {
         let provider = match binding.provider.as_str() {
             "imessage" => ConversationProvider::IMessage,
@@ -222,15 +266,17 @@ pub async fn configured_conversations(orch: &Orchestrator) -> Vec<ConversationRo
             "discord" => ConversationProvider::Discord,
             _ => continue,
         };
-        let enabled = match provider {
-            ConversationProvider::IMessage => channels.imessage.enabled,
-            ConversationProvider::Telegram => channels.telegram.enabled,
-            ConversationProvider::Discord => channels.discord.enabled,
-        };
-        if !enabled {
+        if !enabled(provider) {
             continue;
         }
-        let status = runtime_status(orch, provider.id()).await;
+        let status = match statuses.get(&provider) {
+            Some(status) => status.clone(),
+            None => {
+                let status = status_of(provider).await;
+                statuses.insert(provider, status.clone());
+                status
+            }
+        };
         match binding.conversation.parse::<ConversationAddress>() {
             Ok(address) => rows.push(row_for_status(
                 address,
@@ -800,6 +846,197 @@ mod tests {
             set_agent_text(&db, "Discord:1/2", "cairn://p/cairn/general", true)
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_status_is_looked_up_once_per_enabled_provider_not_per_binding() {
+        use crate::channels::bindings::BindingKind;
+        let db = crate::storage::migrated_test_db("channels-status-per-provider.db").await;
+        let bind = |provider: &'static str, conversation: String| {
+            let db = &db;
+            async move {
+                assert!(ledger::bind_target(
+                    db,
+                    provider,
+                    &conversation,
+                    "cairn://p/cairn/general",
+                    BindingKind::Structural,
+                    MESSAGE_CLASSES_ALL,
+                    1,
+                    0,
+                )
+                .await
+                .unwrap());
+            }
+        };
+        for channel in 0..200 {
+            bind("discord", format!("discord:1/{channel}")).await;
+        }
+        bind("telegram", "telegram:42".into()).await;
+        bind("telegram", "telegram:43".into()).await;
+        bind("imessage", "imessage:a@example.com".into()).await;
+        let bindings = ledger::list_active_bindings(&db).await.unwrap();
+        assert_eq!(bindings.len(), 203);
+
+        let mut lookups = std::collections::HashMap::<ConversationProvider, usize>::new();
+        let rows = conversation_rows(
+            bindings,
+            |provider| provider != ConversationProvider::IMessage,
+            |provider| {
+                *lookups.entry(provider).or_default() += 1;
+                async move {
+                    match provider {
+                        ConversationProvider::Discord => ProviderRowStatus {
+                            state: RUNTIME_DEGRADED,
+                            detail: Some("cards are not being pinned".into()),
+                            last_send_error: Some("thread is locked".into()),
+                            failed_count: 3,
+                        },
+                        _ => ProviderRowStatus {
+                            state: RUNTIME_UP,
+                            detail: None,
+                            last_send_error: None,
+                            failed_count: 0,
+                        },
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            lookups,
+            std::collections::HashMap::from([
+                (ConversationProvider::Discord, 1),
+                (ConversationProvider::Telegram, 1),
+            ])
+        );
+        assert_eq!(
+            rows.len(),
+            202,
+            "the disabled provider's binding is skipped"
+        );
+        let discord = rows
+            .iter()
+            .filter(|row| row.provider == "discord")
+            .collect::<Vec<_>>();
+        assert_eq!(discord.len(), 200);
+        for row in discord {
+            assert_eq!(row.runtime_state, RUNTIME_DEGRADED);
+            assert_eq!(
+                row.runtime_detail.as_deref(),
+                Some("cards are not being pinned")
+            );
+            assert_eq!(row.last_error.as_deref(), Some("thread is locked"));
+            assert_eq!(row.failed_count, 3);
+        }
+        for row in rows.iter().filter(|row| row.provider == "telegram") {
+            assert_eq!(row.deliverability, ConversationDeliverability::Ready);
+            assert_eq!(row.failed_count, 0);
+        }
+    }
+
+    /// The enumeration's cost at the registry's live shape: 871 active bindings
+    /// (discord 863, imessage 6, telegram 2) over a ~6,300-row outbound ledger.
+    /// The status lookup issues the same queries `runtime_status` does. Run with
+    /// `bun run test:rust -p cairn-core --lib -E 'test(/measure_conversation_enumeration/)' --run-ignored only --no-capture`.
+    #[tokio::test]
+    #[ignore = "measurement: seeds a live-sized binding registry and outbound ledger"]
+    async fn measure_conversation_enumeration_at_live_scale() {
+        use crate::channels::{bindings::BindingKind, state_card};
+        use std::time::Instant;
+        const OUTBOUND: usize = 6_296;
+
+        let db = crate::storage::migrated_test_db("channels-enumeration-scale.db").await;
+        let conversation = |provider: &str, n: usize| match provider {
+            "discord" => format!("discord:1/{n}"),
+            "imessage" => format!("imessage:user{n}@example.com"),
+            _ => format!("telegram:{}", 100 + n),
+        };
+        for (provider, count) in [("discord", 863), ("imessage", 6), ("telegram", 2)] {
+            for n in 0..count {
+                assert!(ledger::bind_target(
+                    &db,
+                    provider,
+                    &conversation(provider, n),
+                    &format!("cairn://p/cairn/{}", n + 1),
+                    BindingKind::Structural,
+                    MESSAGE_CLASSES_ALL,
+                    1,
+                    0,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{provider} binding {n}: {error}")));
+            }
+        }
+        for chunk in (0..OUTBOUND).collect::<Vec<_>>().chunks(500) {
+            let values = chunk
+                .iter()
+                .map(|&n| {
+                    let channel = match n % 20 {
+                        0 => "imessage",
+                        1 => "telegram",
+                        _ => "discord",
+                    };
+                    let to = conversation(channel, 0);
+                    if n % 25 == 0 {
+                        format!("('o-{n}','{channel}','review','ref-{n}','{to}','text','text','failed',{n},NULL,NULL,'send failed',{n})")
+                    } else {
+                        format!("('o-{n}','{channel}','review','ref-{n}','{to}','text','text','sent',{n},'g-{n}',{n},NULL,NULL)")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            db.execute_batch(&format!(
+                "INSERT INTO channel_outbound (id, channel, kind, binding_ref, conversation, rendered_text, rendering, status, created_at, provider_guid, sent_at, last_error, last_attempt_at) VALUES {values};"
+            ))
+            .await
+            .unwrap();
+        }
+
+        let status_of = |provider: ConversationProvider| {
+            let db = &db;
+            async move {
+                if provider == ConversationProvider::Discord {
+                    state_card::latest_pin_failure(db, "discord", 0)
+                        .await
+                        .unwrap();
+                }
+                ledger::list_inbound(db, provider.id(), 50).await.unwrap();
+                let (last_send_error, undelivered) =
+                    crate::channels::outbound_status(db, provider.id()).await;
+                ProviderRowStatus {
+                    state: RUNTIME_UP,
+                    detail: None,
+                    last_send_error,
+                    failed_count: undelivered.failed,
+                }
+            }
+        };
+        let bindings = ledger::list_active_bindings(&db).await.unwrap();
+        assert_eq!(bindings.len(), 871);
+
+        // The per-binding lookup the enumeration used to make.
+        let started = Instant::now();
+        for binding in &bindings {
+            let provider = match binding.provider.as_str() {
+                "imessage" => ConversationProvider::IMessage,
+                "telegram" => ConversationProvider::Telegram,
+                _ => ConversationProvider::Discord,
+            };
+            status_of(provider).await;
+        }
+        let per_binding = started.elapsed();
+
+        let started = Instant::now();
+        let rows = conversation_rows(bindings, |_| true, status_of).await;
+        let per_provider = started.elapsed();
+        assert_eq!(rows.len(), 871);
+
+        eprintln!(
+            "871 bindings, {OUTBOUND} outbound rows: per-binding status {per_binding:?} ({:?}/lookup), per-provider enumeration {per_provider:?}",
+            per_binding / 871
         );
     }
 

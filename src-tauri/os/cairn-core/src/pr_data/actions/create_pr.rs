@@ -267,14 +267,18 @@ async fn publish_pr_branch_past_barrier(
             "this pull request is merged or closed, so its branch was not published".to_string(),
         );
     }
-    let live = crate::pr_data::actions::refresh::pr_snapshot_for_job(orch, &mr.job_id, true)
-        .await
-        .map_err(|error| {
-            format!(
-                "could not confirm the pull request is still open, so its branch was not \
+    let live = crate::pr_data::actions::refresh::pr_snapshot_for_job(
+        orch,
+        &mr.job_id,
+        Some(std::time::Instant::now()),
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "could not confirm the pull request is still open, so its branch was not \
                  published: {error}"
-            )
-        })?;
+        )
+    })?;
     if live.unbound.is_some() || !matches!(live.cache.state, PrState::Open) {
         return Err(format!(
             "GitHub reports this pull request as {}, so its branch was not published",
@@ -294,8 +298,12 @@ async fn publish_pr_branch_past_barrier(
     .ok()
     .flatten();
     orch.invalidate_pr_refresh(&mr.job_id, "branch-published");
-    let refreshed =
-        crate::pr_data::actions::refresh::pr_snapshot_for_job(orch, &mr.job_id, true).await;
+    let refreshed = crate::pr_data::actions::refresh::pr_snapshot_for_job(
+        orch,
+        &mr.job_id,
+        Some(std::time::Instant::now()),
+    )
+    .await;
     Ok(publish_outcome_message(
         &branch,
         origin_tip.as_deref(),

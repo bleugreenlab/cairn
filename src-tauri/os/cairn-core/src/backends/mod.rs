@@ -74,6 +74,21 @@ impl From<&SessionConfig> for cairn_models::wire::GenerationConfig {
     }
 }
 
+/// The generation knobs of a one-shot completion: the caller's reasoning and
+/// output schema, and no tools. The tool-free twin of the session conversion
+/// above, so an HTTP provider builds a completion with the same wire builder,
+/// and maps the caller's options the same way, as it builds a session turn.
+pub(crate) fn completion_generation(
+    request: &CompletionRequest,
+) -> cairn_models::wire::GenerationConfig {
+    cairn_models::wire::GenerationConfig {
+        reasoning_effort: request.options.reasoning_effort.clone(),
+        max_thinking_tokens: request.options.max_thinking_tokens,
+        output_schema: request.output_schema.clone(),
+        tools: Vec::new(),
+    }
+}
+
 pub use cairn_models::interface::session::SessionStart;
 use cairn_models::session::mcp::{McpServer, McpServers};
 
@@ -82,6 +97,8 @@ use cairn_models::session::mcp::{McpServer, McpServers};
 pub(crate) fn cairn_servers(server: &McpServer) -> McpServers {
     McpServers::new(vec![server.clone()]).expect("Cairn's own MCP server name is valid")
 }
+use cairn_models::interface::decide::DecisionRoute;
+use cairn_models::interface::SelectedOffer;
 use cairn_models::types::catalog::{DiscoveredModel, ProviderOptionDescriptor, ServedVerb};
 pub use cairn_session::config::*;
 
@@ -200,6 +217,20 @@ pub trait AgentBackend: Send + Sync {
     /// this is what every other model serves, including one a tier is bound to
     /// that discovery has not reported.
     fn serves(&self, orch: &Orchestrator, project_id: Option<&str>) -> Vec<ServedVerb>;
+
+    /// The deployment that measures `offer`'s decisions: the catalog chose
+    /// `offer` because this backend's catalog said it serves `decide` over
+    /// `offer.served.wire`, and the backend knows where that wire is reached
+    /// and with what credentials. A backend that serves no `decide` keeps the
+    /// refusal.
+    fn decision_route(
+        &self,
+        _orch: &Orchestrator,
+        _project_id: Option<&str>,
+        offer: &SelectedOffer,
+    ) -> Result<DecisionRoute, String> {
+        Err(format!("{} cannot answer a decision", offer.provider))
+    }
 
     /// Models Cairn itself declares this backend serves, whatever discovery
     /// finds or whether it has run: an offer the facet owns rather than one

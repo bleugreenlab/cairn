@@ -11,16 +11,27 @@
 //! back on the wire as `model`, so a tidied-up version of it is a name that no
 //! longer resolves.
 //!
+//! A listing entry may say what its model outputs, in OpenRouter's
+//! `architecture.output_modalities`. That is the server's word and is
+//! believed: an embeddings-only model serves `embed` alone, one that outputs
+//! text keeps the provider-wide claim, and one that outputs something else
+//! serves nothing. An entry that says nothing serves what the provider does.
+//! Nothing is inferred from the id, which on a custom endpoint is often the
+//! operator's alias (`embed`, `big`).
+//!
 //! Embedding models the operator declared ride on top of either shape: a
-//! listed id they name serves `embed` (and only `embed`), and one the listing
-//! did not name is added. Because they are the operator's word, they stay
-//! offered when the listing fails.
+//! listed id they name serves `embed` (and only `embed`) at the declared
+//! width, and one the listing did not name is added. Because they are the
+//! operator's word, they stay offered when the listing fails.
 
 use super::CustomProviderConfig;
 use crate::credentials::{CustomModelPolicy, CustomProtocol};
 use cairn_models::embed::{families, local_server_limits};
 use cairn_models::interface::speak;
-use cairn_models::types::catalog::{DiscoveredModel, Modalities, Modality, ServedVerb, Verb, Wire};
+use cairn_models::types::catalog::{
+    DiscoveredModel, ListedArchitecture, Modalities, Modality, ServedVerb, Verb, Wire,
+};
+use cairn_models::types::embedding::EmbeddingCapabilities;
 use cairn_models::types::tokenizers::tokenizer_for;
 use serde::Deserialize;
 use std::error::Error;
@@ -46,6 +57,10 @@ struct ModelEntry {
     /// was started from one (a local path otherwise, which pins nothing).
     #[serde(default)]
     root: Option<String>,
+    /// What the model takes and gives, on servers that say (OpenRouter's
+    /// shape; the plain OpenAI listing has no such field).
+    #[serde(default)]
+    architecture: Option<ListedArchitecture>,
 }
 
 /// The models one custom provider serves, and any error worth surfacing.
@@ -66,36 +81,78 @@ pub(crate) fn discover_blocking(
 
 /// Each declared embedding model, serving `embed` over the embeddings route at
 /// its declared width. Purpose handling comes from the model's family.
+///
+/// A listed model the server already labelled an embedding model is merged
+/// with, not replaced: the declaration wins on width and widths, and the
+/// server's reported modalities stand.
 fn declare_embeddings(config: &CustomProviderConfig, models: &mut Vec<DiscoveredModel>) {
     for declared in &config.embeddings {
-        let mut capabilities = families::capabilities(
-            &declared.id,
-            Some(declared.dims),
-            false,
-            local_server_limits(None),
-        );
-        capabilities.widths = declared.widths.clone();
-        let serves = Some(vec![ServedVerb {
-            verb: Verb::Embed(capabilities),
-            wire: Wire::OpenAiEmbeddings,
-        }]);
-        let modalities = Some(Modalities {
-            input: vec![Modality::Text],
-            output: vec![Modality::Embeddings],
-        });
-        match models.iter_mut().find(|model| model.id == declared.id) {
-            Some(model) => {
-                model.serves = serves;
-                model.modalities = modalities;
-            }
+        let index = match models.iter().position(|model| model.id == declared.id) {
+            Some(index) => index,
             None => {
-                let mut model = model(config, declared.id.clone(), None, None);
-                model.serves = serves;
-                model.modalities = modalities;
-                models.push(model);
+                models.push(model(config, declared.id.clone(), None, None));
+                models.len() - 1
             }
+        };
+        let model = &mut models[index];
+        let mut capabilities = model
+            .serves
+            .as_ref()
+            .and_then(|serves| {
+                serves.iter().find_map(|served| match &served.verb {
+                    Verb::Embed(capabilities) => Some(capabilities.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| embedding_capabilities(&declared.id, None));
+        capabilities.native_dims = Some(declared.dims);
+        capabilities.widths = declared.widths.clone();
+        model.serves = Some(serves_embed(capabilities));
+        let labelled = model
+            .modalities
+            .as_ref()
+            .is_some_and(|modalities| modalities.output == [Modality::Embeddings]);
+        if !labelled {
+            model.modalities = Some(Modalities {
+                input: vec![Modality::Text],
+                output: vec![Modality::Embeddings],
+            });
         }
     }
+}
+
+/// What an embedding model serves on a local server, before any declaration:
+/// purpose and native width from its family, `native_dims` when the caller
+/// knows better, and native-only widths.
+fn embedding_capabilities(id: &str, native_dims: Option<u32>) -> EmbeddingCapabilities {
+    families::capabilities(id, native_dims, false, local_server_limits(None))
+}
+
+fn serves_embed(capabilities: EmbeddingCapabilities) -> Vec<ServedVerb> {
+    vec![ServedVerb {
+        verb: Verb::Embed(capabilities),
+        wire: Wire::OpenAiEmbeddings,
+    }]
+}
+
+/// A `/v1/models` entry as a model, believing what its `architecture` says it
+/// outputs. Text keeps the provider-wide claim (`serves: None`); embeddings
+/// alone serve `embed`; any other output serves nothing, its modality kept
+/// verbatim. No `architecture`, or no outputs in it, says nothing.
+fn listed_model(config: &CustomProviderConfig, entry: ModelEntry) -> DiscoveredModel {
+    let mut model = model(config, entry.id, entry.max_model_len, entry.root);
+    let Some(architecture) = entry.architecture else {
+        return model;
+    };
+    model.modalities = architecture.modalities();
+    if let Some(output) = &architecture.output_modalities {
+        if architecture.embeds_only() {
+            model.serves = Some(serves_embed(embedding_capabilities(&model.id, None)));
+        } else if !output.contains(&Modality::Text) {
+            model.serves = Some(Vec::new());
+        }
+    }
+    model
 }
 
 fn listed(config: &CustomProviderConfig) -> (Vec<DiscoveredModel>, Option<String>) {
@@ -110,7 +167,7 @@ fn listed(config: &CustomProviderConfig) -> (Vec<DiscoveredModel>, Option<String
             Ok(entries) => (
                 entries
                     .into_iter()
-                    .map(|entry| model(config, entry.id, entry.max_model_len, entry.root))
+                    .map(|entry| listed_model(config, entry))
                     .collect(),
                 None,
             ),
@@ -207,8 +264,11 @@ fn fetch(config: &CustomProviderConfig) -> Result<Vec<ModelEntry>, String> {
         | CustomProtocol::OpenAiSpeech
         | CustomProtocol::ElevenLabs => {}
     }
-    let body = listing(config)?;
-    let parsed: ModelsResponse = serde_json::from_str(&body)
+    decode_listing(&listing(config)?)
+}
+
+fn decode_listing(body: &str) -> Result<Vec<ModelEntry>, String> {
+    let parsed: ModelsResponse = serde_json::from_str(body)
         .map_err(|error| format!("model listing was not an OpenAI model list: {error}"))?;
     if parsed.data.is_empty() {
         return Err(
@@ -388,6 +448,173 @@ mod tests {
             .unwrap()
             .iter()
             .any(|served| served.verb.kind() == VerbKind::Complete));
+    }
+
+    /// The Local provider's nine models in the listing shape agreed with the
+    /// models thread: `{id, object, created, owned_by, architecture}`, the
+    /// field present on every entry but one, alias entries (`embed`) included.
+    const ARCHITECTURE_LISTING: &str = include_str!("testdata/architecture_models.json");
+
+    /// What a discovering provider makes of `body`, declarations applied.
+    fn discovered_from(config: &CustomProviderConfig, body: &str) -> Vec<DiscoveredModel> {
+        let mut models: Vec<DiscoveredModel> = decode_listing(body)
+            .unwrap()
+            .into_iter()
+            .map(|entry| listed_model(config, entry))
+            .collect();
+        declare_embeddings(config, &mut models);
+        models
+    }
+
+    fn undeclared() -> CustomProviderConfig {
+        CustomProviderConfig {
+            embeddings: vec![],
+            ..config("http://hub.invalid/v1", CustomModelPolicy::Discover)
+        }
+    }
+
+    fn listing(entries: serde_json::Value) -> String {
+        serde_json::json!({ "object": "list", "data": entries }).to_string()
+    }
+
+    /// The verbs `model` is offered for: its own claim, else the provider's.
+    fn offered(config: &CustomProviderConfig, model: &DiscoveredModel) -> Vec<VerbKind> {
+        model
+            .serves
+            .clone()
+            .unwrap_or_else(|| config.serves())
+            .iter()
+            .map(|served| served.verb.kind())
+            .collect()
+    }
+
+    #[test]
+    fn an_entry_that_outputs_embeddings_serves_only_embed() {
+        let config = undeclared();
+        let models = discovered_from(
+            &config,
+            &listing(serde_json::json!([{
+                "id": "qwen/qwen3-embedding-4b",
+                "object": "model",
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["embeddings"]}
+            }])),
+        );
+        let qwen = find(&models, "qwen/qwen3-embedding-4b");
+        assert_eq!(offered(&config, qwen), [VerbKind::Embed]);
+        let capabilities = embed_capabilities(qwen);
+        // No width from the server: the family's.
+        assert_eq!(capabilities.native_dims, Some(2560));
+        assert_eq!(capabilities.widths, EmbeddingWidths::NativeOnly);
+        assert_eq!(
+            qwen.modalities,
+            Some(Modalities {
+                input: vec![Modality::Text],
+                output: vec![Modality::Embeddings],
+            })
+        );
+    }
+
+    #[test]
+    fn an_entry_that_outputs_text_keeps_the_provider_claim_and_one_silent_is_unchanged() {
+        let config = undeclared();
+        let models = discovered_from(
+            &config,
+            &listing(serde_json::json!([
+                {"id": "big", "object": "model",
+                 "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text"]}},
+                {"id": "fast", "object": "model"}
+            ])),
+        );
+        let big = find(&models, "big");
+        assert_eq!(big.serves, None);
+        assert_eq!(
+            big.modalities,
+            Some(Modalities {
+                input: vec![Modality::Text, Modality::Image],
+                output: vec![Modality::Text],
+            })
+        );
+        let fast = find(&models, "fast");
+        assert_eq!(fast.serves, None);
+        assert_eq!(fast.modalities, None);
+        for model in [big, fast] {
+            assert_eq!(
+                offered(&config, model),
+                [VerbKind::Complete, VerbKind::Session, VerbKind::Decide],
+                "{}",
+                model.id
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_output_is_kept_verbatim_and_serves_nothing() {
+        let config = undeclared();
+        let models = discovered_from(
+            &config,
+            &listing(serde_json::json!([{
+                "id": "ranker",
+                "object": "model",
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["scores"]}
+            }])),
+        );
+        let ranker = find(&models, "ranker");
+        assert_eq!(ranker.serves, Some(vec![]));
+        assert_eq!(
+            ranker.modalities.as_ref().unwrap().output,
+            [Modality::Other("scores".into())]
+        );
+    }
+
+    #[test]
+    fn a_declaration_the_server_also_labels_keeps_the_declared_width() {
+        let config = config("http://hub.invalid/v1", CustomModelPolicy::Discover);
+        let models = discovered_from(
+            &config,
+            &listing(serde_json::json!([{
+                "id": "nomic-embed-text",
+                "object": "model",
+                "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["embeddings"]}
+            }])),
+        );
+        let nomic = find(&models, "nomic-embed-text");
+        let capabilities = embed_capabilities(nomic);
+        assert_eq!(capabilities.native_dims, Some(768));
+        assert_eq!(capabilities.widths, EmbeddingWidths::UpTo { min: 64 });
+        // The server's account of what it takes stands.
+        assert_eq!(
+            nomic.modalities.as_ref().unwrap().input,
+            [Modality::Text, Modality::Image]
+        );
+    }
+
+    #[test]
+    fn the_local_listing_offers_its_embedders_for_embed_and_its_chat_models_for_text() {
+        let config = undeclared();
+        let models = discovered_from(&config, ARCHITECTURE_LISTING);
+        assert_eq!(models.len(), 9);
+        for id in ["qwen/qwen3-embedding-4b", "embed"] {
+            assert_eq!(
+                offered(&config, find(&models, id)),
+                [VerbKind::Embed],
+                "{id}"
+            );
+        }
+        for id in [
+            "deepseek/deepseek-v4-flash-vision-exp",
+            "qwen/qwen3.6-35b-a3b",
+            "big",
+            "dsv4-flash",
+            "fast",
+            "qwen36",
+            "vision",
+        ] {
+            assert_eq!(
+                offered(&config, find(&models, id)),
+                [VerbKind::Complete, VerbKind::Session, VerbKind::Decide],
+                "{id}"
+            );
+        }
     }
 
     #[test]

@@ -228,10 +228,14 @@ fn read_disk(
     // any post superseding it, and for ranking to no hold, which are the safe
     // directions.
     let floor = disk_floor_bytes(view, view.provisions(request, machine), request, health);
+    // The executor judges disk on the volume cells grow on: the build root's
+    // while it is here, the home's otherwise.
     let free = health
         .machine
-        .volume
-        .value()
+        .build_volume
+        .as_ref()
+        .and_then(|volume| volume.value())
+        .or_else(|| health.machine.volume.value())
         .map(|volume| volume.free_bytes);
     let headroom = free.map(|free| i128::from(free) - i128::from(floor));
     let short = disk.watermark_bytes > 0 && headroom.is_some_and(|headroom| headroom < 0);
@@ -354,6 +358,10 @@ pub(crate) enum PostedCondition {
         entry_id: Option<String>,
         since_unix_ms: u64,
     },
+    /// The machine posts its build volume absent. The decline stands exactly
+    /// as long as that post does, and the first post saying the volume is
+    /// present supersedes it, with nothing for anyone to mark repaired.
+    BuildVolumeAbsent { root: String },
 }
 
 impl PostedCondition {
@@ -428,6 +436,16 @@ pub(crate) fn posted_condition(
                 });
         }
         DeclineReason::ProjectProvisioning => read_provisioning(view, request, machine),
+        DeclineReason::BuildVolumeAbsent => {
+            return machine
+                .health
+                .build_volume
+                .as_ref()
+                .filter(|volume| volume.is_absent())
+                .map(|volume| PostedCondition::BuildVolumeAbsent {
+                    root: volume.root.clone(),
+                });
+        }
         DeclineReason::Constraint | DeclineReason::Unknown => None,
     };
     reading.map(|reading| reading.condition)
@@ -533,6 +551,54 @@ mod tests {
             }],
             ..FleetSnapshot::default()
         }
+    }
+
+    /// A build-volume decline holds exactly as long as the machine posts the
+    /// volume absent, and the first post saying present supersedes it, with
+    /// nobody marking anything repaired.
+    #[test]
+    fn a_build_volume_decline_clears_when_the_volume_is_posted_present() {
+        use cairn_common::executor_protocol::{BuildVolumeReport, BuildVolumeState};
+        let request = request();
+        let snapshot = FleetSnapshot::default();
+        let report = |state| BuildVolumeReport {
+            root: "/Volumes/Builds/cairn".into(),
+            state,
+            since_unix_ms: NOW,
+            suspended_cells: Vec::new(),
+            readopted_cells: 0,
+        };
+        let mut absent = health();
+        absent.build_volume = Some(report(BuildVolumeState::Absent {
+            reason: "not mounted".into(),
+        }));
+        let recorded = condition(
+            DeclineReason::BuildVolumeAbsent,
+            &request,
+            &snapshot,
+            &absent,
+        )
+        .expect("an absent volume explains the decline");
+        assert!(recorded.still_holds(
+            condition(
+                DeclineReason::BuildVolumeAbsent,
+                &request,
+                &snapshot,
+                &absent
+            )
+            .as_ref()
+        ));
+        let mut present = health();
+        present.build_volume = Some(report(BuildVolumeState::Present { mount_point: None }));
+        assert!(!recorded.still_holds(
+            condition(
+                DeclineReason::BuildVolumeAbsent,
+                &request,
+                &snapshot,
+                &present
+            )
+            .as_ref()
+        ));
     }
 
     fn existing_checkout(mut request: CellRequest) -> CellRequest {

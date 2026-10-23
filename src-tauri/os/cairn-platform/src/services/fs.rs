@@ -16,44 +16,6 @@ pub struct GuardedTreeFile {
     pub size: u64,
 }
 
-#[cfg(target_os = "macos")]
-fn rename_exclusive(from: &Path, to: &Path) -> Result<(), String> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    const RENAME_EXCL: u32 = 0x0000_0004;
-
-    #[link(name = "System")]
-    unsafe extern "C" {
-        fn renamex_np(
-            from: *const std::os::raw::c_char,
-            to: *const std::os::raw::c_char,
-            flags: u32,
-        ) -> i32;
-    }
-
-    let from = CString::new(from.as_os_str().as_bytes())
-        .map_err(|_| format!("Source path contains an interior NUL byte: {from:?}"))?;
-    let to = CString::new(to.as_os_str().as_bytes())
-        .map_err(|_| format!("Destination path contains an interior NUL byte: {to:?}"))?;
-
-    if unsafe { renamex_np(from.as_ptr(), to.as_ptr(), RENAME_EXCL) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().to_string())
-    }
-}
-
-fn remove_staged_clone(path: &Path, operation_error: String) -> String {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => operation_error,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => operation_error,
-        Err(error) => format!(
-            "{operation_error}; additionally failed to clean staged clone {path:?}: {error}"
-        ),
-    }
-}
-
 pub fn guarded_resolve_file(root: &Path, path: &Path) -> Result<PathBuf, String> {
     let canonical_root = root
         .canonicalize()
@@ -286,16 +248,6 @@ pub trait FileSystem: Send + Sync {
     /// destination if they don't exist.
     fn reflink_file(&self, from: &Path, to: &Path) -> Result<(), String>;
 
-    /// STRICTLY copy-on-write clone a directory tree, with NO byte-copy fallback.
-    /// Returns `Err` whenever a cheap COW clone is unavailable (a non-APFS volume,
-    /// a cross-volume destination, or a clone failure) so the caller can route to a
-    /// non-cloning path instead of silently deep-copying a multi-GB build tree
-    /// (`src-tauri/target`, `node_modules`). The destination must not already
-    /// exist. macOS-only for now; other platforms always `Err` (a Linux
-    /// reflink-per-file variant can come later — the sequential fallback covers
-    /// those hosts).
-    fn try_clone_dir_cow(&self, from: &Path, to: &Path) -> Result<(), String>;
-
     /// Create a symbolic link at `link` pointing to `target`.
     /// On Windows, uses a directory junction for directories.
     fn symlink(&self, target: &Path, link: &Path) -> Result<(), String>;
@@ -310,33 +262,6 @@ pub trait FileSystem: Send + Sync {
 
 /// Production filesystem implementation using std::fs.
 pub struct RealFileSystem;
-
-#[cfg(target_os = "macos")]
-fn clonefile_dir(from: &Path, to: &Path) -> Result<(), String> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    #[link(name = "System")]
-    unsafe extern "C" {
-        fn clonefile(
-            src: *const std::os::raw::c_char,
-            dst: *const std::os::raw::c_char,
-            flags: u32,
-        ) -> i32;
-    }
-
-    let src = CString::new(from.as_os_str().as_bytes())
-        .map_err(|_| format!("Source path contains an interior NUL byte: {:?}", from))?;
-    let dst = CString::new(to.as_os_str().as_bytes())
-        .map_err(|_| format!("Destination path contains an interior NUL byte: {:?}", to))?;
-
-    let result = unsafe { clonefile(src.as_ptr(), dst.as_ptr(), 0) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().to_string())
-    }
-}
 
 impl FileSystem for RealFileSystem {
     fn exists(&self, path: &Path) -> bool {
@@ -397,54 +322,6 @@ impl FileSystem for RealFileSystem {
                 "Failed to reflink or copy {:?} to {:?}: {}",
                 from, to, e
             )),
-        }
-    }
-
-    fn try_clone_dir_cow(&self, from: &Path, to: &Path) -> Result<(), String> {
-        if to.exists() || self.is_symlink(to) {
-            return Err(format!(
-                "Destination already exists and cannot be COW-cloned: {:?}",
-                to
-            ));
-        }
-        if let Some(parent) = to.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create parent directory: {}", e))?;
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let parent = to
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            let destination_name = to
-                .file_name()
-                .ok_or_else(|| format!("COW clone destination has no file name: {to:?}"))?
-                .to_string_lossy();
-            let staging = parent.join(format!(
-                ".{destination_name}.cairn-clone-{}",
-                uuid::Uuid::new_v4()
-            ));
-
-            if let Err(error) = clonefile_dir(from, &staging) {
-                return Err(remove_staged_clone(
-                    &staging,
-                    format!("Failed to COW-clone directory {from:?}: {error}"),
-                ));
-            }
-            if let Err(error) = rename_exclusive(&staging, to) {
-                return Err(remove_staged_clone(
-                    &staging,
-                    format!("Failed to atomically publish COW clone at {to:?}: {error}"),
-                ));
-            }
-            Ok(())
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = from;
-            Err("COW directory clone not supported on this platform".to_string())
         }
     }
 
@@ -702,69 +579,6 @@ mod tests {
         fs.reflink_file(&src, &dst).unwrap();
 
         assert_eq!(fs.read_to_string(&dst).unwrap(), "new content");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn real_fs_clone_dir_cow_publishes_complete_independent_tree() {
-        let (temp, fs) = real_fs_fixture();
-        let source = temp.path().join("catalog");
-        let destination = temp.path().join("slot-target");
-        fs.create_dir_all(&source.join("debug/deps")).unwrap();
-        fs.write_str(&source.join("debug/deps/library.rlib"), "artifact")
-            .unwrap();
-
-        fs.try_clone_dir_cow(&source, &destination).unwrap();
-        assert_eq!(
-            fs.read_to_string(&destination.join("debug/deps/library.rlib"))
-                .unwrap(),
-            "artifact"
-        );
-
-        fs.remove_dir_all(&source).unwrap();
-        assert_eq!(
-            fs.read_to_string(&destination.join("debug/deps/library.rlib"))
-                .unwrap(),
-            "artifact"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn real_fs_clone_dir_cow_refuses_existing_destination_without_modifying_it() {
-        let (temp, fs) = real_fs_fixture();
-        let source = temp.path().join("catalog");
-        let destination = temp.path().join("slot-target");
-        fs.create_dir_all(&source).unwrap();
-        fs.write_str(&source.join("new"), "new").unwrap();
-        fs.create_dir_all(&destination).unwrap();
-        fs.write_str(&destination.join("existing"), "existing")
-            .unwrap();
-
-        let error = fs.try_clone_dir_cow(&source, &destination).unwrap_err();
-
-        assert!(error.contains("Destination already exists"));
-        assert_eq!(
-            fs.read_to_string(&destination.join("existing")).unwrap(),
-            "existing"
-        );
-        assert!(!destination.join("new").exists());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn real_fs_clone_dir_cow_cleans_staging_after_clone_failure() {
-        let (temp, fs) = real_fs_fixture();
-        let source = temp.path().join("missing-catalog");
-        let destination = temp.path().join("slot-target");
-
-        assert!(fs.try_clone_dir_cow(&source, &destination).is_err());
-        assert!(!destination.exists());
-        let names = std::fs::read_dir(temp.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<Vec<_>>();
-        assert!(names.is_empty(), "staging residue remained: {names:?}");
     }
 
     #[test]

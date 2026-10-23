@@ -334,7 +334,13 @@ impl ProjectRoots {
     fn new(config_dir: &Path, logical: Option<&BranchResolution>) -> Self {
         let mut repository = Vec::new();
         let mut copies = Vec::new();
+        // Both the home's inventory and a build root's: cells move to the
+        // latter, and what stays behind in the former is no fresher.
         push_root(&mut copies, &config_dir.join("build-slots"));
+        let inventory = crate::config::settings::colocated_cell_inventory(config_dir);
+        if inventory != config_dir.join("build-slots") {
+            push_root(&mut copies, &inventory);
+        }
         if let Some(resolution) = logical {
             push_root(&mut repository, &resolution.object_repository_path);
             if resolution.repository_path != resolution.object_repository_path {

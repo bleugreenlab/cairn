@@ -161,6 +161,102 @@ pub fn tree_entries(jj: &JjEnv, ws: &Path, treeish: &str) -> Result<Vec<(String,
     Ok(parse_ls_tree(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// The change a branch carries on top of an integration target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnPatch {
+    /// The branch's fork point: the merge base of its head with the target.
+    pub base: String,
+    /// The branch's change from `base` to its head, as [`normalize_own_patch`]
+    /// renders it.
+    pub patch: String,
+}
+
+/// The change `head` carries on top of `target`, measured from their merge base.
+///
+/// Two heads with equal [`OwnPatch::patch`] carry the same change, whatever
+/// their bases: a replay onto an advanced base that applied cleanly and moved
+/// nothing the branch touched compares equal to the tip it replaced.
+///
+/// Read through the store's git object database rather than jj, because the
+/// heads this compares include a branch's pre-replay tip, which jj hides once a
+/// base advance rewrites it while the object database still holds it. Every
+/// option that shapes the diff text is pinned on the command line, so two
+/// readings never disagree because a user's git config chose a different diff
+/// algorithm, context width, or path prefix.
+pub fn own_patch_against(
+    jj: &JjEnv,
+    repository: &Path,
+    head: &str,
+    target: &str,
+) -> Result<OwnPatch, String> {
+    let git_dir = git_backend_root(jj, repository)?;
+    let out = bounded_command_output(
+        cairn_platform::env::git().args(["--git-dir", &git_dir, "merge-base", head, target]),
+        JJ_DEFAULT_TIMEOUT,
+        "git merge-base",
+    )?;
+    let base = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || base.is_empty() {
+        return Err(format!(
+            "git merge-base {head} {target} found no fork point: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let out = bounded_command_output(
+        cairn_platform::env::git().args([
+            "--git-dir",
+            &git_dir,
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--binary",
+            "--diff-algorithm=myers",
+            "--unified=3",
+            "--inter-hunk-context=0",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            &base,
+            head,
+        ]),
+        JJ_DEFAULT_TIMEOUT,
+        "git diff (own patch)",
+    )?;
+    if !out.status.success() {
+        return Err(format!(
+            "git diff {base} {head} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(OwnPatch {
+        base,
+        patch: normalize_own_patch(&String::from_utf8_lossy(&out.stdout)),
+    })
+}
+
+/// A git patch with everything that depends on the base rather than on the
+/// change removed: `index` lines (whose pre-image blob ids move whenever the
+/// base edits the same file anywhere) and hunk-header positions (which move
+/// whenever the base adds or removes lines above a hunk). Every added, removed,
+/// and context line stays, so a base edit close enough to show in a hunk's
+/// context still reads as a different patch.
+///
+/// Neither shape can be confused with content: inside a hunk every line begins
+/// with ` `, `+`, `-`, or `\`, and a `--binary` literal line begins with its
+/// length character and holds no space.
+pub fn normalize_own_patch(patch: &str) -> String {
+    let mut out = String::with_capacity(patch.len());
+    for line in patch.lines() {
+        if line.starts_with("index ") {
+            continue;
+        }
+        out.push_str(if line.starts_with("@@") { "@@" } else { line });
+        out.push('\n');
+    }
+    out
+}
+
 /// One line of a commit's tree that a [`grep_fixed_at`] needle matched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrepHit {

@@ -11,7 +11,7 @@ use std::sync::{Mutex, OnceLock};
 pub use super::contextual_packages::{
     ContextualPackageKind, ContextualPackageRef, ContextualPackagesConfig,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::models::{Preset, TerminalCommand};
@@ -33,8 +33,8 @@ pub struct MaterializationSettings {
 // (pure serde data, no upward dependency on config). Re-exported here so every
 // `project_settings::CheckCommand`-style path keeps resolving.
 pub use crate::models::{
-    CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector, CheckWhen, MainCadence,
-    PopulateConfig,
+    CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector, CheckTree, CheckWhen,
+    MainCadence, PopulateConfig,
 };
 
 /// Project settings as stored in YAML file.
@@ -81,11 +81,39 @@ pub struct ProjectSettingsFile {
     pub mcp_servers: Option<HashMap<String, cairn_packs::server_config::McpServerConfig>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contextual_packages: Option<ContextualPackagesConfig>,
+    /// Upstream tool pins whose version bumps may land through the `pinBump`
+    /// merge precondition, keyed by tool name. Read from the merge TARGET's
+    /// revision, never the PR's, so a bump cannot redefine its own gate. See
+    /// docs/checks.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_bumps: Option<BTreeMap<String, PinBumpSpec>>,
     /// How the store lands work: which registry files merge by structure
     /// rather than by lines. Read from the commit being landed onto, never from
     /// the branch being landed, so no branch can change the rules it lands by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landing: Option<LandingSettings>,
+}
+
+/// One upstream tool pin a `pinBump` merge may advance.
+///
+/// The pin file is a JSON object with a string `version` and an optional `skip`
+/// array of versions a bump must never select. Unknown keys are refused rather
+/// than ignored: a misspelled `frozen` would otherwise silently drop a guard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PinBumpSpec {
+    /// Repo-relative path of the pin file.
+    pub pin: String,
+    /// Top-level pin fields a bump must leave unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frozen: Vec<String>,
+    /// Configured checks that must have passed, with verified evidence, at the
+    /// PR head on every one of `platforms`.
+    pub checks: Vec<String>,
+    /// The platforms a bump must be proven on, each by its own verdict. Every
+    /// one must be in each required check's `verdictPlatforms`, which stays a
+    /// trust set: widening a check's trust never adds a platform a bump needs.
+    pub platforms: Vec<String>,
 }
 
 /// The `landing` section of `.cairn/config.yaml`.
@@ -181,6 +209,8 @@ struct LegacyProjectSettingsFile {
     contextual_packages: Option<ContextualPackagesConfig>,
     #[serde(default)]
     landing: Option<LandingSettings>,
+    #[serde(default)]
+    pin_bumps: Option<BTreeMap<String, PinBumpSpec>>,
 }
 
 /// Legacy terminal command with persistent field
@@ -426,6 +456,7 @@ pub fn parse_project_settings(content: &str) -> Result<(ProjectSettingsFile, boo
         mcp_servers: legacy.mcp_servers,
         contextual_packages: legacy.contextual_packages,
         landing: legacy.landing,
+        pin_bumps: legacy.pin_bumps,
     };
 
     if let Some(policy) = &mut settings.contextual_packages {
@@ -541,6 +572,7 @@ const MANAGED_TOP_LEVEL_KEYS: &[&str] = &[
     "mcpServers",
     "contextualPackages",
     "landing",
+    "pinBumps",
     // Legacy keys the load-path migration strips.
     "ciCommands",
     "copyFiles",
@@ -1179,6 +1211,39 @@ checks:
         let serialized = serde_yaml::to_string(&settings).unwrap();
         let reparsed: ProjectSettingsFile = serde_yaml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.checks, settings.checks);
+    }
+
+    #[test]
+    fn pin_bumps_parse_round_trip_and_refuse_unknown_keys() {
+        let yaml = r#"
+pinBumps:
+  codex:
+    pin: tools/codex-pin.json
+    frozen: [integration]
+    checks: [codex-pin, codex-contract]
+    platforms: [linux, macos]
+"#;
+        let (settings, legacy) = parse_project_settings(yaml).unwrap();
+        assert!(!legacy);
+        let bumps = settings.pin_bumps.as_ref().unwrap();
+        assert_eq!(
+            bumps.get("codex"),
+            Some(&PinBumpSpec {
+                pin: "tools/codex-pin.json".to_string(),
+                frozen: vec!["integration".to_string()],
+                checks: vec!["codex-pin".to_string(), "codex-contract".to_string()],
+                platforms: vec!["linux".to_string(), "macos".to_string()],
+            })
+        );
+        let serialized = serde_yaml::to_string(&settings).unwrap();
+        assert!(serialized.contains("pinBumps:"), "{serialized}");
+        let (reparsed, _) = parse_project_settings(&serialized).unwrap();
+        assert_eq!(reparsed.pin_bumps, settings.pin_bumps);
+
+        let misspelled =
+            "pinBumps:\n  codex:\n    pin: p.json\n    froze: [integration]\n    checks: [a]\n    platforms: [linux]\n";
+        let error = parse_project_settings(misspelled).unwrap_err();
+        assert!(error.contains("froze"), "{error}");
     }
 
     #[test]

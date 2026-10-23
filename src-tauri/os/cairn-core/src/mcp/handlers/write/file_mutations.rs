@@ -498,31 +498,120 @@ pub(crate) async fn record_agent_file_change(
     Ok(())
 }
 
+/// Upper bound on the Myers search's work (diagonals visited plus snake steps)
+/// in [`changed_line_counts`]. Myers is O((n+m)·D), so a mostly rewritten large
+/// file (a regenerated lockfile, a reformatted JSON blob) would still pin the
+/// runtime worker for seconds; past this budget the counts fall back to the
+/// trimmed middle's line counts. A few million interned-id comparisons is tens
+/// of milliseconds.
+const LINE_DIFF_WORK_BUDGET: usize = 8_000_000;
+
+/// Lines added and deleted between two versions of a file, as
+/// `(additions, deletions)`. These are display statistics on the recorded file
+/// change, so they are minimal (`m - LCS`, `n - LCS`) whenever that is cheap to
+/// compute, and an over-count bounded by the changed region when it is not.
 pub(crate) fn changed_line_counts(before: Option<&str>, after: Option<&str>) -> (i32, i32) {
+    let span = tracing::info_span!(
+        target: "profiler",
+        "changed_line_counts",
+        before_lines = tracing::field::Empty,
+        after_lines = tracing::field::Empty,
+        bounded = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+
     let before_lines = before
         .map(|content| content.lines().collect::<Vec<_>>())
         .unwrap_or_default();
     let after_lines = after
         .map(|content| content.lines().collect::<Vec<_>>())
         .unwrap_or_default();
+    span.record("before_lines", before_lines.len());
+    span.record("after_lines", after_lines.len());
 
-    let mut lcs_lengths = vec![vec![0usize; after_lines.len() + 1]; before_lines.len() + 1];
-    for (before_index, before_line) in before_lines.iter().enumerate() {
-        for (after_index, after_line) in after_lines.iter().enumerate() {
-            lcs_lengths[before_index + 1][after_index + 1] = if before_line == after_line {
-                lcs_lengths[before_index][after_index] + 1
+    let prefix = before_lines
+        .iter()
+        .zip(&after_lines)
+        .take_while(|(b, a)| b == a)
+        .count();
+    let before_rest = &before_lines[prefix..];
+    let after_rest = &after_lines[prefix..];
+    let suffix = before_rest
+        .iter()
+        .rev()
+        .zip(after_rest.iter().rev())
+        .take_while(|(b, a)| b == a)
+        .count();
+    let before_mid = &before_rest[..before_rest.len() - suffix];
+    let after_mid = &after_rest[..after_rest.len() - suffix];
+
+    let (additions, deletions) = if before_mid.is_empty() || after_mid.is_empty() {
+        (after_mid.len(), before_mid.len())
+    } else {
+        match myers_edit_distance(before_mid, after_mid, LINE_DIFF_WORK_BUDGET) {
+            Some(distance) => {
+                // D = n + m - 2·LCS for an insert/delete-only edit script.
+                let unchanged = (before_mid.len() + after_mid.len() - distance) / 2;
+                (after_mid.len() - unchanged, before_mid.len() - unchanged)
+            }
+            None => {
+                span.record("bounded", true);
+                (after_mid.len(), before_mid.len())
+            }
+        }
+    };
+    (additions as i32, deletions as i32)
+}
+
+/// Length of the shortest insert/delete edit script between `before` and
+/// `after` (Myers' greedy forward pass, keeping only the furthest-reaching
+/// frontier, so O(n+m) space), or `None` once the search has done `budget`
+/// units of work. Lines are interned to integer ids first so each snake step is
+/// one integer compare rather than a string compare.
+fn myers_edit_distance<'a>(before: &[&'a str], after: &[&'a str], budget: usize) -> Option<usize> {
+    let mut ids = std::collections::HashMap::<&'a str, u32>::new();
+    let mut intern = |lines: &[&'a str]| -> Vec<u32> {
+        lines
+            .iter()
+            .map(|&line| {
+                let next = ids.len() as u32;
+                *ids.entry(line).or_insert(next)
+            })
+            .collect()
+    };
+    let a = intern(before);
+    let b = intern(after);
+    let (n, m) = (a.len(), b.len());
+    let max = n + m;
+    // frontier[k + max] is the furthest x reached on diagonal k = x - y.
+    let mut frontier = vec![0usize; 2 * max + 2];
+    let mut work = 0usize;
+    for d in 0..=max {
+        let d = d as isize;
+        for k in (-d..=d).step_by(2) {
+            let idx = (k + max as isize) as usize;
+            let mut x = if k == -d || (k != d && frontier[idx - 1] < frontier[idx + 1]) {
+                frontier[idx + 1]
             } else {
-                lcs_lengths[before_index][after_index + 1]
-                    .max(lcs_lengths[before_index + 1][after_index])
+                frontier[idx - 1] + 1
             };
+            let mut y = (x as isize - k) as usize;
+            while x < n && y < m && a[x] == b[y] {
+                x += 1;
+                y += 1;
+                work += 1;
+            }
+            frontier[idx] = x;
+            if x >= n && y >= m {
+                return Some(d as usize);
+            }
+            work += 1;
+            if work > budget {
+                return None;
+            }
         }
     }
-
-    let unchanged = lcs_lengths[before_lines.len()][after_lines.len()];
-    (
-        after_lines.len().saturating_sub(unchanged) as i32,
-        before_lines.len().saturating_sub(unchanged) as i32,
-    )
+    Some(max)
 }
 
 /// A validated, ready-to-apply file change.
@@ -1918,5 +2007,73 @@ mod tests {
         let before = "keep\nremove\nold\n";
         let after = "keep\nadd\nnew\n";
         assert_eq!(changed_line_counts(Some(before), Some(after)), (2, 2));
+    }
+
+    #[test]
+    fn line_counts_identical_and_empty() {
+        assert_eq!(changed_line_counts(Some("a\nb\n"), Some("a\nb\n")), (0, 0));
+        assert_eq!(changed_line_counts(None, None), (0, 0));
+        assert_eq!(changed_line_counts(Some(""), Some("x\n")), (1, 0));
+    }
+
+    #[test]
+    fn line_counts_are_minimal_across_interleaved_edits() {
+        // LCS of the two is a,c,e,g (4): 7-4 deletions, 6-4 additions.
+        let before = "a\nb\nc\nd\ne\nf\ng\n";
+        let after = "a\nc\nx\ne\ny\ng\n";
+        assert_eq!(changed_line_counts(Some(before), Some(after)), (2, 3));
+        // A moved line is one deletion and one addition.
+        assert_eq!(
+            changed_line_counts(Some("1\n2\n3\n4\n"), Some("2\n3\n4\n1\n")),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn line_counts_trailing_newline_is_not_a_change() {
+        assert_eq!(changed_line_counts(Some("a\nb"), Some("a\nb\n")), (0, 0));
+    }
+
+    fn big_file(lines: usize, tag: &str) -> String {
+        (0..lines).map(|i| format!("{tag} line {i}\n")).collect()
+    }
+
+    #[test]
+    fn line_counts_one_line_change_in_a_huge_file_is_fast_and_exact() {
+        let before = big_file(50_000, "same");
+        let after = before.replacen("same line 25000\n", "edited line 25000\n", 1);
+        let started = std::time::Instant::now();
+        assert_eq!(changed_line_counts(Some(&before), Some(&after)), (1, 1));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn line_counts_scattered_edits_in_a_huge_file_stay_minimal() {
+        let before = big_file(50_000, "same");
+        let mut after = String::new();
+        for (i, line) in before.lines().enumerate() {
+            if i % 1_000 == 0 {
+                after.push_str("inserted\n");
+            }
+            if i % 5_000 != 0 {
+                after.push_str(line);
+                after.push('\n');
+            }
+        }
+        let started = std::time::Instant::now();
+        assert_eq!(changed_line_counts(Some(&before), Some(&after)), (50, 10));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn line_counts_full_rewrite_of_a_huge_file_is_bounded() {
+        let before = big_file(50_000, "old");
+        let after = big_file(50_000, "new");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            changed_line_counts(Some(&before), Some(&after)),
+            (50_000, 50_000)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

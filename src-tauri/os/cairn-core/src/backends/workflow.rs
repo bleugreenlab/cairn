@@ -202,10 +202,11 @@ pub(crate) async fn spawn_workflow_process(
         "await import(process.env.CAIRN_RUNTIME_ASSETS + \"/workflow/{}\")",
         entry.replace('"', "\\\"")
     );
-    // A workflow runtime is an agent process like any other, so its confinement
-    // is the run's fence dial and nothing else. Declaring `Confined` outright
-    // would confine a `fence: allow` workflow the moment the resident-process
-    // seam starts honoring the declaration.
+    // A workflow runtime is an agent process like any other, so its fence
+    // profile follows the run's fence dial and nothing else. Declaring
+    // `Confined` outright would confine a `fence: allow` workflow the moment the
+    // resident-process seam starts honoring the declaration. Unfenced, it still
+    // carries the operator credential boundary.
     let sandbox_mode =
         match crate::mcp::handlers::permission::resolve_fence_policy(orch, Some(&params.run_id))
             .await
@@ -213,7 +214,7 @@ pub(crate) async fn spawn_workflow_process(
             Some(fence) if crate::services::sandbox::sandbox_applies(fence) => {
                 ProcessSandboxMode::Confined
             }
-            _ => ProcessSandboxMode::Unconfined,
+            _ => ProcessSandboxMode::CredentialFloor,
         };
     let result = orch
         .fleet

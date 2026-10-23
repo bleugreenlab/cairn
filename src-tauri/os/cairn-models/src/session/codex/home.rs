@@ -173,6 +173,12 @@ image_generation = false
 # (codex `core-plugins/src/manager.rs`, maybe_start_plugin_startup_tasks_for_config).
 # MCP servers passed through `-c mcp_servers` are not plugins and still load.
 plugins = false
+
+# Disable Codex's own product analytics. Under a ChatGPT login it posts events
+# to chatgpt.com/backend-api/codex/analytics-events from every app-server
+# start; nothing in Cairn reads them.
+[analytics]
+enabled = false
 "#,
         model_catalog_toml = model_catalog_toml,
     )
@@ -350,6 +356,28 @@ mod tests {
                 .and_then(toml::Value::as_bool),
             Some(false),
             "config must set `shell_snapshot = false` under [features], got:\n{config}"
+        );
+    }
+
+    #[test]
+    fn test_codex_config_disables_analytics() {
+        // Codex posts analytics events to chatgpt.com at every app-server start
+        // under a ChatGPT login: egress no Cairn session needs.
+        let config = render_codex_config_toml("");
+        let parsed: toml::Table = toml::from_str(&config).expect("config is TOML");
+        assert_eq!(
+            parsed["analytics"]
+                .get("enabled")
+                .and_then(toml::Value::as_bool),
+            Some(false),
+            "config must set `enabled = false` under [analytics], got:\n{config}"
+        );
+        assert_eq!(
+            parsed["features"]
+                .get("plugins")
+                .and_then(toml::Value::as_bool),
+            Some(false),
+            "[analytics] must not swallow the [features] keys before it"
         );
     }
 

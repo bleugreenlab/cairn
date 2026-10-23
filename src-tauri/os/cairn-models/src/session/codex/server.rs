@@ -11,7 +11,7 @@ use serde_json::Value;
 use super::control::CodexControl;
 use super::params::{
     build_thread_fork_params, build_thread_resume_params, build_thread_start_params,
-    codex_approval_policy, codex_sandbox_mode, is_missing_rollout_error,
+    codex_approval_policy, codex_sandbox_mode,
 };
 use super::thread::{
     ensure_mcp_attached, reconcile_goal, resume_thread, verify_resumed_thread_binding,
@@ -22,6 +22,7 @@ use crate::interface::session::{
     ServerLaunch, SessionError, SessionEvents, SessionFacts, SessionHost, SessionProvider,
     SessionSpec, SessionStart,
 };
+use crate::wire::codex_app_server::errors::is_missing_rollout_error;
 
 /// Opens Codex threads.
 #[derive(Debug, Clone, Copy, Default)]

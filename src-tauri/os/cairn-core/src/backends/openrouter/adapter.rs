@@ -90,3 +90,49 @@ impl WireAdapter for OpenRouterAdapter {
         orch.context_window_for_context_tokens(OPENROUTER_BACKEND_KEY, Some(model))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::openai_compat::completion_body;
+    use crate::backends::{CompletionMessage, CompletionRequest, CompletionRole};
+    use crate::models::{OpenRouterRouting, RuntimeExtras};
+    use serde_json::json;
+
+    #[test]
+    fn a_completion_sends_effort_as_the_reasoning_object_beside_the_routing() {
+        let family = OpenRouterAdapter {
+            provider: build_provider_object(&OpenRouterRouting::default()),
+        }
+        .family(&Connection {
+            api_key: Some("key".to_string()),
+        })
+        .unwrap();
+        let request = CompletionRequest {
+            system: None,
+            messages: vec![CompletionMessage {
+                role: CompletionRole::User,
+                content: "hi".into(),
+            }],
+            model: "openai/gpt-6".into(),
+            project_id: None,
+            options: RuntimeExtras {
+                reasoning_effort: Some("low".to_string()),
+                ..Default::default()
+            },
+            output_schema: Some(json!({"type": "object"})),
+            timeout: std::time::Duration::from_secs(5),
+        };
+        let body = completion_body(&request, &family).unwrap();
+        assert_eq!(body["reasoning"], json!({"effort": "low"}));
+        assert!(body.get("reasoningEffort").is_none(), "{body}");
+        // The routing object always requires parameters, which is what keeps a
+        // schema-constrained completion on providers that honour the schema.
+        assert_eq!(body["provider"]["require_parameters"], json!(true));
+        assert_eq!(
+            body["response_format"]["json_schema"]["strict"],
+            json!(true)
+        );
+        assert_eq!(body["stream"], json!(false));
+    }
+}

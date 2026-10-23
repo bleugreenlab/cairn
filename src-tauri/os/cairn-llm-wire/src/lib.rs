@@ -1,7 +1,8 @@
 //! Cairn's model wires: the three HTTP protocol families (Anthropic Messages,
 //! OpenAI-compatible chat, OpenAI Responses) with their generation assembly and
 //! replay, and the two CLI stream wires (Claude stream-json and the Codex
-//! app-server's JSON-RPC notifications), plus the embedding wires (OpenAI's
+//! app-server's JSON-RPC notifications), the two decision wires (OpenAI's
+//! Decisions and System One), plus the embedding wires (OpenAI's
 //! `embeddings` and Cairn's gateway `/embed`).
 //!
 //! A leaf: it reaches no other workspace crate, so a host that only needs to
@@ -22,6 +23,7 @@ pub mod replay;
 pub mod schema_order;
 pub mod stream;
 mod stream_end;
+pub mod systemone;
 pub mod tool_defs;
 
 pub use replay::{MessageContent, MessageImage, ReplayEvent, ToolUseInfo};

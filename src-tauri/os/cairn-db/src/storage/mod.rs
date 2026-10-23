@@ -82,13 +82,13 @@ pub use runtime_admission::{
     persist_team_ordinary_lease, queue_team_ordinary_terminal, reap_expired_admissions,
     requeue_orphaned_admissions, retire_team_mirror, transition_admission,
     withdraw_queued_ordinary_admission, AdmissionRequest, AdmissionStatus, HostMemoryEnvelope,
-    LaneBudget, LaneOccupancy, LaneShortfall, LeaseDecision, NewAdmissionRequest,
+    LaneBudget, LaneOccupancy, LaneShortfall, LaunchOrigin, LeaseDecision, NewAdmissionRequest,
     OrdinaryAdmissionProjection, PreparedOrdinaryLaunch, PreparedRuntimeCall,
     PreparedRuntimeCapability, PreparedRuntimeClass, PreparedRuntimeHostKind,
     PreparedRuntimeHostRequirement, PreparedSessionStart, PreparedUserIdentity,
     QueuedOrdinaryLaunch, RecoverableTeamOrdinaryLaunch, RuntimeAdmissionReason,
     RuntimeAdmissionState, RuntimeHostIdentity, RuntimeResourceCapacity, RuntimeResourceClaim,
-    TeamOrdinaryAuthority, WithdrawnAdmission, DEFAULT_URGENT_BURST,
+    SpawnWindow, TeamOrdinaryAuthority, WithdrawnAdmission, DEFAULT_URGENT_BURST,
 };
 pub use search_index::{SearchIndex, SearchIndexHit};
 
@@ -99,8 +99,9 @@ pub use content_store::{ContentStore, ContentStoreFactory, TeamReplicaContext};
 pub use events::event_fixture;
 pub use events::{
     build_execution_pack, compress, count_commits_ahead, decompress, list_range_commits,
-    reconstruct_events, render_range_diff, render_range_file_diffs, NodeDiffFile, ObjectStore,
-    RangeCommit, ResolvePathError, CODEC_NONE, CODEC_ZSTD_V1,
+    reconstruct_events, reconstruct_events_reporting, render_range_diff, render_range_file_diffs,
+    NodeDiffFile, ObjectStore, RangeCommit, Reconstruction, ResolvePathError, CODEC_NONE,
+    CODEC_ZSTD_V1,
 };
 
 /// A freshly migrated, temp-backed test database. Exposed under `test-utils`

@@ -219,6 +219,13 @@ pub(crate) enum RunSpec {
         args: serde_json::Value,
         timeout: Option<u32>,
     },
+    /// A decision answered by a named model (`cairn://models/decide`),
+    /// executed on the host. `args` is the item's `payload.args_json`, parsed
+    /// into a decision request when the item runs.
+    Decide {
+        args: serde_json::Value,
+        timeout: Option<u32>,
+    },
     /// Inline `code` routed into a live stateful REPL session by slug, rather
     /// than a fresh process. Not a process exec — the code is written to the
     /// eval-server's persistent stdin and one framed response is awaited.

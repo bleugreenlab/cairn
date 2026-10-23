@@ -39,6 +39,7 @@
 //! identifier that can be compared across two sealed trees to attribute a break
 //! to a diff. The full shape is documented in `docs/checks.md`.
 
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -100,6 +101,12 @@ pub struct ParsedCheckResult {
     pub(crate) suite_failures: usize,
     /// Skipped / ignored / todo test count.
     pub(crate) skipped: usize,
+    /// Tests the rust-tests fast tier terminated at its per-test budget:
+    /// started, never finished. Neither passed nor failed, so they are outside
+    /// `tests_run()` and can never be counted as a pass. Nonzero only under
+    /// `selection: "fast"`.
+    #[serde(default)]
+    pub(crate) deferred: usize,
     /// The failing tests, in report order. This is the substrate future
     /// baseline/delta work compares across trees, so `name` is a stable
     /// identifier.
@@ -153,6 +160,78 @@ impl ParsedCheckResult {
     /// `N tests` / `no tests matched` rendering on this so a passing typecheck is
     /// never labelled with a bogus test count.
     pub(crate) fn is_test_runner(&self) -> bool {
+        self.verdict_facts().is_test_runner()
+    }
+
+    /// See [`VerdictFacts::is_incomplete_lint`].
+    pub(crate) fn is_incomplete_lint(&self) -> bool {
+        self.verdict_facts().is_incomplete_lint()
+    }
+
+    /// See [`VerdictFacts::tests_run`].
+    pub(crate) fn tests_run(&self) -> usize {
+        self.verdict_facts().tests_run()
+    }
+
+    /// The fields of this result that decide whether its green is verified.
+    pub(crate) fn verdict_facts(&self) -> VerdictFacts<'_> {
+        VerdictFacts {
+            parser: Cow::Borrowed(&self.parser),
+            selection: Cow::Borrowed(&self.selection),
+            complete: self.complete,
+            passed: self.passed,
+            failed: self.failed,
+            skipped: self.skipped,
+        }
+    }
+
+    /// Whether this is a fast-tier lane result: the change's related selection
+    /// run in full, then the rest of the workspace under a per-test budget. Its
+    /// verdict never speaks for the whole suite.
+    pub(crate) fn is_fast_tier(&self) -> bool {
+        self.selection == FAST_TIER_SELECTION
+    }
+
+    /// The one rendering of a fast-tier population, shared by every verdict
+    /// surface so a fast green can never read as a bare one: `fast tier: 8501
+    /// ran, 3596 deferred` (plus `, N skipped` when any were). `None` for any
+    /// other selection.
+    pub(crate) fn fast_tier_label(&self) -> Option<String> {
+        self.is_fast_tier()
+            .then(|| fast_tier_label(self.tests_run(), self.deferred, self.skipped))
+    }
+}
+
+/// Everything of a [`ParsedCheckResult`] that
+/// [`crate::execution::checks_status::verdict_evidence`] reads, and nothing else.
+///
+/// The per-test array is the bulk of a stored result (megabytes for a full
+/// rust-tests run) and has no bearing on the verdict, so a reader that needs
+/// only the verdict projects these fields out in SQL with
+/// [`VERDICT_FACTS_SQL`] instead of copying and parsing the whole document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerdictFacts<'a> {
+    pub(crate) parser: Cow<'a, str>,
+    pub(crate) selection: Cow<'a, str>,
+    pub(crate) complete: bool,
+    pub(crate) passed: usize,
+    pub(crate) failed: usize,
+    pub(crate) skipped: usize,
+}
+
+/// Projects `target_results_json` onto the [`VerdictFacts`] fields as one small
+/// JSON array, parsed once inside the database. Malformed JSON projects to
+/// NULL, which reads as no structured result exactly as a failed full parse
+/// does, instead of failing the whole query.
+pub(crate) const VERDICT_FACTS_SQL: &str = "CASE WHEN json_valid(target_results_json) \
+     THEN json_extract(target_results_json,'$.parser','$.selection','$.complete',\
+     '$.passed','$.failed','$.skipped') END";
+
+impl VerdictFacts<'_> {
+    /// Whether these facts came from a TEST RUNNER (`nextest`/`vitest`), whose
+    /// pass/fail counts denote real tests, rather than `tsc`, whose `failed` is a
+    /// type-error tally with no "test count" meaning.
+    pub(crate) fn is_test_runner(&self) -> bool {
         self.parser == "nextest" || self.parser == "vitest"
     }
 
@@ -167,11 +246,51 @@ impl ParsedCheckResult {
     }
 
     /// Tests the runner actually executed: passed + failed. Skipped/ignored tests
-    /// did not run, so they are excluded from the "was anything validated?" tally
-    /// that distinguishes a real green from a zero-selection green.
+    /// did not run, and deferred tests never reached a verdict, so both are
+    /// excluded from the "was anything validated?" tally that distinguishes a
+    /// real green from a zero-selection green.
     pub(crate) fn tests_run(&self) -> usize {
         self.passed + self.failed
     }
+}
+
+impl VerdictFacts<'static> {
+    /// Decodes a [`VERDICT_FACTS_SQL`] projection under the same rules
+    /// [`ParsedCheckResult`] deserializes with: `parser` and the three counts
+    /// are required (a document missing one has no structured result),
+    /// `selection` defaults to `unknown`, and `complete` to false.
+    pub(crate) fn from_projection(projection: &str) -> Option<Self> {
+        type Projection = (
+            Option<String>,
+            Option<String>,
+            Option<bool>,
+            Option<usize>,
+            Option<usize>,
+            Option<usize>,
+        );
+        let (parser, selection, complete, passed, failed, skipped): Projection =
+            serde_json::from_str(projection).ok()?;
+        Some(Self {
+            parser: Cow::Owned(parser?),
+            selection: Cow::Owned(selection.unwrap_or_else(unknown_selection)),
+            complete: complete.unwrap_or(false),
+            passed: passed?,
+            failed: failed?,
+            skipped: skipped?,
+        })
+    }
+}
+
+/// The `selection` a fast-tier lane result declares.
+pub(crate) const FAST_TIER_SELECTION: &str = "fast";
+
+/// `fast tier: N ran, D deferred[, S skipped]` — the label every surface uses.
+pub(crate) fn fast_tier_label(ran: usize, deferred: usize, skipped: usize) -> String {
+    let mut label = format!("fast tier: {ran} ran, {deferred} deferred");
+    if skipped > 0 {
+        label.push_str(&format!(", {skipped} skipped"));
+    }
+    label
 }
 
 /// One failing test / error site.
@@ -291,6 +410,12 @@ fn parse_nextest_artifact(value: &serde_json::Value) -> Option<ParsedCheckResult
     let passed = tests.iter().filter(|test| test.status == "passed").count();
     let failed = tests.iter().filter(|test| test.status == "failed").count();
     let skipped = tests.iter().filter(|test| test.status == "skipped").count();
+    // A deferred row is counted only as deferred. It is never folded into
+    // `passed` (it did not pass) nor `failed` (no assertion failed).
+    let deferred = tests
+        .iter()
+        .filter(|test| test.status == "deferred")
+        .count();
     let failures = tests
         .iter()
         .filter(|test| test.status == "failed")
@@ -323,6 +448,7 @@ fn parse_nextest_artifact(value: &serde_json::Value) -> Option<ParsedCheckResult
         failed,
         skipped,
         suite_failures: 0,
+        deferred,
         report: None,
         failures,
     })
@@ -369,6 +495,7 @@ fn parse_rust_lint_artifact(value: &serde_json::Value) -> Option<ParsedCheckResu
         failed: failures.len(),
         skipped: 0,
         suite_failures: 0,
+        deferred: 0,
         failures,
         report,
     })
@@ -410,6 +537,7 @@ fn parse_tsc(clean: &str) -> Option<ParsedCheckResult> {
         failed: failures.len(),
         skipped: 0,
         suite_failures: 0,
+        deferred: 0,
         report: None,
         failures,
     })
@@ -531,6 +659,7 @@ fn parse_vitest(clean: &str) -> Option<ParsedCheckResult> {
         failed,
         skipped,
         suite_failures,
+        deferred: 0,
         report: None,
         failures,
     })
@@ -657,6 +786,7 @@ fn parse_nextest(clean: &str) -> Option<ParsedCheckResult> {
         failed: grab(&COUNT_FAILED),
         skipped: grab(&COUNT_SKIPPED),
         suite_failures: 0,
+        deferred: 0,
         report: None,
         failures,
     })
@@ -753,6 +883,7 @@ fn parse_cargo_test(clean: &str) -> Option<ParsedCheckResult> {
         failed,
         skipped: ignored,
         suite_failures: 0,
+        deferred: 0,
         report: None,
         failures,
     })
@@ -1098,6 +1229,61 @@ test result: FAILED. 2 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; 
         );
     }
 
+    /// A fast-tier artifact, shaped as `scripts/test-rust-nextest.ts tiered`
+    /// writes it: one related test run in full, one budget-sized pass, one
+    /// genuine failure that happened before the budget, and two deferrals.
+    const FAST_TIER_ARTIFACT: &str = r#"{"schemaVersion":1,"parser":"nextest","complete":true,"selection":"fast","undeclaredSkips":0,"tests":[{"id":"c::c$changed::slow","status":"passed","durationMs":5200,"attempts":1,"retried":false,"flaky":false},{"id":"c::c$other::quick","status":"passed","durationMs":3,"attempts":1,"retried":false,"flaky":false},{"id":"c::c$other::breaks","status":"failed","durationMs":4,"attempts":1,"retried":false,"flaky":false,"failureMessage":"boom"},{"id":"c::c$other::slow_a","status":"deferred","durationMs":1001,"attempts":1,"retried":false,"flaky":false},{"id":"c::c$other::slow_b","status":"deferred","durationMs":1002,"attempts":1,"retried":false,"flaky":false}]}"#;
+
+    #[test]
+    fn a_deferred_test_is_never_counted_as_passed() {
+        let output = format!("{RESULT_ARTIFACT_JSON_MARKER}{FAST_TIER_ARTIFACT}\n");
+        let parsed = parse_check_output("bun run test:rust:tiered", &output).unwrap();
+        assert!(parsed.is_fast_tier());
+        assert!(
+            parsed.complete,
+            "a deferral is a terminal row; the stream was whole"
+        );
+        assert_eq!(
+            (
+                parsed.passed,
+                parsed.failed,
+                parsed.skipped,
+                parsed.deferred
+            ),
+            (2, 1, 0, 2)
+        );
+        assert_eq!(
+            parsed.tests_run(),
+            3,
+            "deferred tests never reached a verdict"
+        );
+        // A genuine failure before the budget is still the failure it was, and
+        // a deferral is never named as one.
+        let failing: Vec<_> = parsed.failures.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(failing, vec!["c::c$other::breaks"]);
+        assert_eq!(
+            parsed.fast_tier_label().as_deref(),
+            Some("fast tier: 3 ran, 2 deferred")
+        );
+    }
+
+    #[test]
+    fn only_a_fast_selection_carries_a_tier_label() {
+        for selection in ["full", "filtered", "empty", "unknown"] {
+            let json = FAST_TIER_ARTIFACT.replace(
+                "\"selection\":\"fast\"",
+                &format!("\"selection\":\"{selection}\""),
+            );
+            let output = format!("{RESULT_ARTIFACT_JSON_MARKER}{json}\n");
+            let parsed = parse_check_output("bun run test:rust", &output).unwrap();
+            assert_eq!(parsed.fast_tier_label(), None, "{selection}");
+        }
+        assert_eq!(
+            fast_tier_label(10, 0, 2),
+            "fast tier: 10 ran, 0 deferred, 2 skipped"
+        );
+    }
+
     #[test]
     fn parses_transferred_nextest_artifact_without_executor_filesystem_access() {
         let json = r#"{"schemaVersion":1,"parser":"nextest","complete":true,"selection":"filtered","undeclaredSkips":0,"tests":[{"id":"crate test::remote","status":"passed","attempts":1,"retried":false,"flaky":false}]}"#;
@@ -1386,6 +1572,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             failed: 8,
             skipped: 0,
             suite_failures: 0,
+            deferred: 0,
             report: None,
             failures: (0..8)
                 .map(|i| CheckFailure {
@@ -1413,6 +1600,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             failed: 0,
             skipped: 0,
             suite_failures: 0,
+            deferred: 0,
             report: None,
             failures: vec![],
         };
@@ -1433,6 +1621,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             failed: 1,
             skipped: 0,
             suite_failures: 0,
+            deferred: 0,
             report: None,
             failures: vec![CheckFailure {
                 name: "suite test".to_string(),
@@ -1454,6 +1643,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             failed: 1,
             skipped: 0,
             suite_failures: 0,
+            deferred: 0,
             report: None,
             failures: vec![CheckFailure {
                 name: "crate test::x".to_string(),

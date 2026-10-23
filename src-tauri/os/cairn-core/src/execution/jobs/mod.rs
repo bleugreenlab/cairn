@@ -44,7 +44,8 @@ mod persistence;
 mod private_lane;
 pub(crate) use private_lane::{
     describe_job_launch, describe_lane, describe_shortfall, private_lane_budgets,
-    promote_private_lanes_blocking, withdraw_orphaned_ordinary_admissions, PrivateLaneLedger,
+    promote_private_lanes_blocking, spawn_produced_first_output, spawn_reports_first_output,
+    withdraw_orphaned_ordinary_admissions, PrivateLaneLedger,
 };
 /// Drive queued private admission deterministically without a scheduler task.
 #[cfg(any(test, feature = "test-utils"))]
@@ -469,6 +470,9 @@ pub struct PreparedJob {
     pub turn_id: String,
     pub launch_event_id: String,
     pub start_reason: TurnStartReason,
+    /// Who this launch serves. An operator launch is admitted as urgent, ahead
+    /// of background work; see `ordinary_admission`.
+    pub origin: crate::storage::LaunchOrigin,
     /// Ownership of this job's launch, held from admission until the spawned
     /// process registers. The host layer must keep it alive across the spawn and
     /// drop it only once the process is registered or the start has failed;

@@ -292,14 +292,18 @@ fn items_are_borrowed_and_an_absent_item_reads_as_null() {
     let completed = json!({"method": "item/completed", "params": {}});
     assert_eq!(
         Notification::parse(&completed),
-        Notification::ItemCompleted { item: &Value::Null }
+        Notification::ItemCompleted {
+            turn_id: None,
+            item: &Value::Null
+        }
     );
-    let raw = json!({"method": "rawResponseItem/completed", "params": {"turnId": "turn-9", "item": item}});
+    let message = json!({"id": "msg-1", "type": "agentMessage", "text": "Done."});
+    let completed = json!({"method": "item/completed", "params": {"threadId": "thread-1", "turnId": "turn-9", "item": message}});
     assert_eq!(
-        Notification::parse(&raw),
-        Notification::RawResponseItemCompleted {
+        Notification::parse(&completed),
+        Notification::ItemCompleted {
             turn_id: Some("turn-9"),
-            item: &item
+            item: &message
         }
     );
 }
@@ -564,19 +568,6 @@ fn mcp_tool_call_items_read_their_result_or_their_error() {
         "result": {"content": [{"type": "text", "text": "bad input"}], "is_error": true}});
     let (text, is_error, _) = summarize_mcp_tool_call(&tool_error);
     assert_eq!((text.as_str(), is_error), ("bad input", true));
-}
-
-#[test]
-fn raw_response_messages_join_their_text_parts() {
-    let item = json!({"type": "message", "content": [{"type": "output_text", "text": "a"}, {"type": "output_text", "text": ""}, {"type": "output_text", "text": "b"}]});
-    assert_eq!(
-        extract_raw_response_message_text(&item),
-        Some("a\nb".to_string())
-    );
-    assert_eq!(
-        extract_raw_response_message_text(&json!({"type": "reasoning"})),
-        None
-    );
 }
 
 #[test]

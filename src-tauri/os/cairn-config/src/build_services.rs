@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 /// Roots where Cairn materializes builds whose helper processes may use a
 /// user-configured build service.
-const MANAGED_BUILD_ROOTS: [&str; 2] = ["{worktrees}", "{cairnHome}/build-slots"];
+const MANAGED_BUILD_ROOTS: [&str; 2] = ["{worktrees}", "{buildRoot}/build-slots"];
 
 /// One Cairn-supervised build-service daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -102,23 +102,31 @@ impl ReadyProbe {
 /// Template variables expanded in build-service config string values.
 ///
 /// `{worktree}` is per-spawn (client env injection) and absent at daemon-launch
-/// time; the other three are global. An unexpanded `{worktree}` is left literal
+/// time; the others are global. An unexpanded `{worktree}` is left literal
 /// when no per-spawn worktree is in scope.
 #[derive(Debug, Clone)]
 pub struct Templates {
     pub home: PathBuf,
+    /// Where the external build caches live: the home directory, or a build
+    /// volume's cache home (`CAIRN_CACHE_HOME` to the processes Cairn runs).
+    pub cache_home: PathBuf,
     pub cairn_home: PathBuf,
+    /// Where the runner's own executor keeps its cells: the Cairn home, or a
+    /// build volume configured apart from it.
+    pub build_root: PathBuf,
     pub worktrees: PathBuf,
     pub worktree: Option<PathBuf>,
 }
 
 impl Templates {
-    /// Expand `{home}`, `{cairnHome}`, `{worktrees}`, and (when in scope)
-    /// `{worktree}` in a string value.
+    /// Expand `{home}`, `{cacheHome}`, `{cairnHome}`, `{buildRoot}`,
+    /// `{worktrees}`, and (when in scope) `{worktree}` in a string value.
     pub fn expand(&self, s: &str) -> String {
         let mut out = s
             .replace("{home}", &self.home.to_string_lossy())
+            .replace("{cacheHome}", &self.cache_home.to_string_lossy())
             .replace("{cairnHome}", &self.cairn_home.to_string_lossy())
+            .replace("{buildRoot}", &self.build_root.to_string_lossy())
             .replace("{worktrees}", &self.worktrees.to_string_lossy());
         if let Some(wt) = &self.worktree {
             out = out.replace("{worktree}", &wt.to_string_lossy());
@@ -167,7 +175,9 @@ mod tests {
     fn templates() -> Templates {
         Templates {
             home: PathBuf::from("/home/u"),
+            cache_home: PathBuf::from("/Volumes/Builds/cairn/cache-home"),
             cairn_home: PathBuf::from("/home/u/.cairn"),
+            build_root: PathBuf::from("/Volumes/Builds/cairn"),
             worktrees: PathBuf::from("/home/u/.cairn/worktrees"),
             worktree: Some(PathBuf::from("/home/u/.cairn/worktrees/cairn-1")),
         }
@@ -225,6 +235,10 @@ env:
             t.expand("{worktrees}/**/target/**"),
             "/home/u/.cairn/worktrees/**/target/**"
         );
+        assert_eq!(
+            t.expand("{cacheHome}/.cache/sccache-cairn"),
+            "/Volumes/Builds/cairn/cache-home/.cache/sccache-cairn"
+        );
         assert_eq!(t.expand("{cairnHome}/sccache"), "/home/u/.cairn/sccache");
         assert_eq!(
             t.expand("{worktree}/target"),
@@ -253,6 +267,20 @@ env:
         ));
         assert!(builds_in_managed_root(
             &t,
+            Path::new("/Volumes/Builds/cairn/build-slots/cairn/slot-3")
+        ));
+        // With the build root on its own volume, the home's old inventory is
+        // nobody's cell any more.
+        assert!(!builds_in_managed_root(
+            &t,
+            Path::new("/home/u/.cairn/build-slots/cairn/slot-3")
+        ));
+        let home_layout = Templates {
+            build_root: PathBuf::from("/home/u/.cairn"),
+            ..templates()
+        };
+        assert!(builds_in_managed_root(
+            &home_layout,
             Path::new("/home/u/.cairn/build-slots/cairn/slot-3")
         ));
         // The developer's own checkout is the case the port split exists for: it

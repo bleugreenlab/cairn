@@ -340,13 +340,25 @@ pub fn install_pack(
 
 /// Verify and enumerate the complete commit/tree/blob closure through a primary
 /// ODB and zero or more alternate ODB directories.
+///
+/// `shallow` is the history boundary the closure stops at: commits whose
+/// parents the objects deliberately do not hold, as a shallow clone's `shallow`
+/// file records them. The walk runs in a throwaway repository that cannot see
+/// any repository's own `shallow` file, so the boundary must be passed in;
+/// without it a shallow source's never-fetched parent reads as a missing
+/// object. Anything missing on the near side of the boundary is still refused.
 pub fn verify_commit_closure(
     primary_objects_dir: &Path,
     alternate_objects_dirs: &[PathBuf],
+    shallow: &[String],
     commit: &str,
 ) -> Result<ClosureManifest, String> {
     validate_oid(commit)?;
+    validate_oids(shallow)?;
     let plumbing_repo = plumbing_repository()?;
+    if !shallow.is_empty() {
+        write_shallow_list(&plumbing_repo.path().join("shallow"), shallow)?;
+    }
     let env = odb_env(
         plumbing_repo.path(),
         primary_objects_dir,
@@ -379,6 +391,138 @@ pub fn verify_commit_closure(
         canonical_bytes,
         objects,
     })
+}
+
+/// The most boundary commits one transfer may declare. A `--depth` clone has
+/// one per branch tip it was cut at; this bound only refuses a degenerate list
+/// before it becomes an oversized header.
+pub const MAX_SHALLOW_BOUNDARY_COMMITS: usize = 512;
+
+/// The commits `repository` records in its `shallow` file, sorted. A complete
+/// repository has none. Works for bare and non-bare repositories alike.
+pub fn shallow_commits(repository: &Path) -> Result<Vec<String>, String> {
+    let listed = git(
+        repository,
+        &["rev-parse", "--git-path", "shallow"],
+        None,
+        &[],
+    )?;
+    let path = PathBuf::from(listed.trim());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        repository.join(path)
+    };
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("reading {}: {error}", path.display())),
+    };
+    let commits: BTreeSet<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let commits: Vec<String> = commits.into_iter().collect();
+    validate_oids(&commits)?;
+    Ok(commits)
+}
+
+/// The part of `repository`'s shallow boundary that the history of `commit`
+/// reaches: what a receiver of `commit`'s closure must also treat as shallow.
+/// Empty, without walking anything, for a complete repository.
+pub fn shallow_boundary(repository: &Path, commit: &str) -> Result<Vec<String>, String> {
+    validate_oid(commit)?;
+    let shallow = shallow_commits(repository)?;
+    if shallow.is_empty() {
+        return Ok(shallow);
+    }
+    // Run inside the repository, so Git honors the same boundary it reports.
+    let history = git(repository, &["rev-list", commit], None, &[])?;
+    let reached: BTreeSet<&str> = history.lines().map(str::trim).collect();
+    Ok(shallow
+        .into_iter()
+        .filter(|boundary| reached.contains(boundary.as_str()))
+        .collect())
+}
+
+/// Add `boundary` to `repository`'s `shallow` file, so every later walk of the
+/// repository stops where its objects deliberately stop. Entries already
+/// recorded are kept. Returns whether the file changed.
+pub fn extend_shallow_boundary(repository: &Path, boundary: &[String]) -> Result<bool, String> {
+    validate_oids(boundary)?;
+    if boundary.is_empty() {
+        return Ok(false);
+    }
+    let existing = shallow_commits(repository)?;
+    let mut merged: BTreeSet<String> = existing.iter().cloned().collect();
+    merged.extend(boundary.iter().cloned());
+    if merged.len() == existing.len() {
+        return Ok(false);
+    }
+    let listed = git(
+        repository,
+        &["rev-parse", "--git-path", "shallow"],
+        None,
+        &[],
+    )?;
+    let path = PathBuf::from(listed.trim());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        repository.join(path)
+    };
+    let merged: Vec<String> = merged.into_iter().collect();
+    write_shallow_list(&path, &merged)?;
+    Ok(true)
+}
+
+/// Encode a shallow boundary as one header value: space-separated commit IDs.
+pub fn encode_shallow_boundary(boundary: &[String]) -> Result<String, String> {
+    validate_oids(boundary)?;
+    if boundary.len() > MAX_SHALLOW_BOUNDARY_COMMITS {
+        return Err(format!(
+            "shallow boundary of {} commits exceeds the transfer limit of {MAX_SHALLOW_BOUNDARY_COMMITS}",
+            boundary.len()
+        ));
+    }
+    Ok(boundary.join(" "))
+}
+
+/// Parse a header value [`encode_shallow_boundary`] produced.
+pub fn parse_shallow_boundary(value: &str) -> Result<Vec<String>, String> {
+    let boundary: Vec<String> = value.split_whitespace().map(str::to_owned).collect();
+    if boundary.len() > MAX_SHALLOW_BOUNDARY_COMMITS {
+        return Err(format!(
+            "shallow boundary of {} commits exceeds the transfer limit of {MAX_SHALLOW_BOUNDARY_COMMITS}",
+            boundary.len()
+        ));
+    }
+    validate_oids(&boundary)?;
+    Ok(boundary)
+}
+
+/// Atomically replace a `shallow` file with `commits`, one per line.
+fn write_shallow_list(path: &Path, commits: &[String]) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| format!("shallow file {} has no parent", path.display()))?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".cairn-shallow-")
+        .tempfile_in(directory)
+        .map_err(|e| format!("staging shallow file: {e}"))?;
+    for commit in commits {
+        writeln!(staged, "{commit}").map_err(|e| format!("writing shallow file: {e}"))?;
+    }
+    staged
+        .as_file()
+        .sync_all()
+        .map_err(|e| format!("syncing shallow file: {e}"))?;
+    staged
+        .persist(path)
+        .map_err(|e| format!("publishing shallow file {}: {}", path.display(), e.error))?;
+    Ok(())
 }
 
 /// Return canonical sizes for object IDs resolved through primary plus alternates.
@@ -676,7 +820,7 @@ mod tests {
         assert!(!first.already_present);
         let second = install_pack(&target_objects, &validated).unwrap();
         assert!(second.already_present);
-        let closure = verify_commit_closure(&target_objects, &[], &tip).unwrap();
+        let closure = verify_commit_closure(&target_objects, &[], &[], &tip).unwrap();
         assert_eq!(closure.commit, tip);
         assert!(closure.objects.iter().any(|object| object.kind == "blob"));
 
@@ -736,11 +880,148 @@ mod tests {
         install_pack(&objects_dir(target.path()), &validated).unwrap();
         let alternate = objects_dir(source.path());
         let closure =
-            verify_commit_closure(&objects_dir(target.path()), &[alternate], &tip).unwrap();
+            verify_commit_closure(&objects_dir(target.path()), &[alternate], &[], &tip).unwrap();
         assert!(closure.object_count > validated.manifest.object_count);
 
         let empty = tempfile::tempdir().unwrap();
         fs::create_dir_all(empty.path().join("objects/pack")).unwrap();
-        assert!(verify_commit_closure(&empty.path().join("objects"), &[], &tip).is_err());
+        assert!(verify_commit_closure(&empty.path().join("objects"), &[], &[], &tip).is_err());
+    }
+
+    /// A three-commit upstream and a `--depth 1` clone of it: the clone holds
+    /// the tip and records it as shallow, and never fetched its parent.
+    fn shallow_clone() -> (tempfile::TempDir, PathBuf, String, String) {
+        let temp = tempfile::tempdir().unwrap();
+        let upstream = temp.path().join("upstream");
+        fs::create_dir_all(&upstream).unwrap();
+        init_repo(&upstream);
+        write_file(&upstream, "one", b"one");
+        commit_all(&upstream, "one");
+        write_file(&upstream, "two", b"two");
+        let parent = commit_all(&upstream, "two");
+        write_file(&upstream, "three", b"three");
+        let tip = commit_all(&upstream, "three");
+        let clone = temp.path().join("clone");
+        let url = format!("file://{}", upstream.display());
+        git(
+            temp.path(),
+            &["clone", "-q", "--depth", "1", &url, clone.to_str().unwrap()],
+        );
+        (temp, clone, tip, parent)
+    }
+
+    #[test]
+    fn closure_stops_at_a_shallow_source_boundary_and_not_before_it() {
+        let (_temp, clone, tip, parent) = shallow_clone();
+        let shallow = shallow_commits(&clone).unwrap();
+        assert_eq!(shallow, vec![tip.clone()]);
+
+        // Blind to the boundary, the walk crosses it into the parent the clone
+        // never fetched: the failure every resident batch of a shallow-cloned
+        // project hit.
+        let blind = verify_commit_closure(&objects_dir(&clone), &[], &[], &tip).unwrap_err();
+        assert_eq!(blind, format!("commit closure is missing object {parent}"));
+
+        let closure = verify_commit_closure(&objects_dir(&clone), &[], &shallow, &tip).unwrap();
+        assert!(closure.objects.iter().any(|object| object.oid == tip));
+        assert!(closure.objects.iter().all(|object| object.oid != parent));
+
+        // The boundary excuses history, not content: a blob the tip's own tree
+        // names is still required.
+        let blob = git(&clone, &["rev-parse", "HEAD:three"]).trim().to_owned();
+        let packed = tempfile::tempdir().unwrap();
+        let (pack, _) = build_reachable_pack(&clone, std::slice::from_ref(&tip), &[])
+            .unwrap()
+            .unwrap();
+        let validated = validate_pack(&pack, PackLimits::default()).unwrap();
+        let without_blob = packed.path().join("objects");
+        let blob_free: Vec<_> = validated
+            .manifest
+            .objects
+            .iter()
+            .filter(|object| object.oid != blob)
+            .map(|object| object.oid.clone())
+            .collect();
+        let (partial, _) =
+            build_pack_from_oids(&clone, &format!("{}\n", blob_free.join("\n"))).unwrap();
+        install_pack(
+            &without_blob,
+            &validate_pack(&partial, PackLimits::default()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_commit_closure(&without_blob, &[], &shallow, &tip).unwrap_err(),
+            format!("commit closure is missing object {blob}")
+        );
+    }
+
+    #[test]
+    fn a_complete_source_missing_an_object_is_still_refused() {
+        let source = tempfile::tempdir().unwrap();
+        init_repo(source.path());
+        write_file(source.path(), "base", b"base");
+        let base = commit_all(source.path(), "base");
+        write_file(source.path(), "tip", b"tip");
+        let tip = commit_all(source.path(), "tip");
+        assert!(shallow_commits(source.path()).unwrap().is_empty());
+        assert!(shallow_boundary(source.path(), &tip).unwrap().is_empty());
+
+        // Lose the parent from a repository that never declared a boundary.
+        let loose = objects_dir(source.path()).join(&base[..2]).join(&base[2..]);
+        fs::remove_file(loose).unwrap();
+        let shallow = shallow_commits(source.path()).unwrap();
+        assert_eq!(
+            verify_commit_closure(&objects_dir(source.path()), &[], &shallow, &tip).unwrap_err(),
+            format!("commit closure is missing object {base}")
+        );
+    }
+
+    #[test]
+    fn the_boundary_a_commit_reaches_is_carried_and_recorded_by_a_receiver() {
+        let (_temp, clone, tip, _parent) = shallow_clone();
+        write_file(&clone, "four", b"four");
+        let child = commit_all(&clone, "four");
+        assert_eq!(shallow_boundary(&clone, &child).unwrap(), vec![tip.clone()]);
+
+        // A receiver: an empty bare repository that is sent the child's
+        // closure, which stops at the clone's boundary.
+        let receiver = tempfile::tempdir().unwrap();
+        git(receiver.path(), &["init", "-q", "--bare"]);
+        let (pack, _) = build_reachable_pack(&clone, std::slice::from_ref(&child), &[])
+            .unwrap()
+            .unwrap();
+        install_pack(
+            &receiver.path().join("objects"),
+            &validate_pack(&pack, PackLimits::default()).unwrap(),
+        )
+        .unwrap();
+        let boundary = parse_shallow_boundary(
+            &encode_shallow_boundary(&shallow_boundary(&clone, &child).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(extend_shallow_boundary(receiver.path(), &boundary).unwrap());
+        assert!(!extend_shallow_boundary(receiver.path(), &boundary).unwrap());
+        assert_eq!(shallow_commits(receiver.path()).unwrap(), vec![tip]);
+
+        // Git itself now agrees in the receiver: the walk the repository's own
+        // tools make reports nothing missing.
+        let walked = git(
+            receiver.path(),
+            &["rev-list", "--objects", "--missing=print", &child],
+        );
+        assert!(
+            !walked.lines().any(|line| line.starts_with('?')),
+            "{walked}"
+        );
+    }
+
+    #[test]
+    fn shallow_boundary_encoding_rejects_malformed_and_oversized_lists() {
+        assert_eq!(parse_shallow_boundary("").unwrap(), Vec::<String>::new());
+        assert!(parse_shallow_boundary("not-an-oid").is_err());
+        assert!(parse_shallow_boundary(&"A".repeat(40)).is_err());
+        let oversized = vec!["a".repeat(40); MAX_SHALLOW_BOUNDARY_COMMITS + 1];
+        assert!(encode_shallow_boundary(&oversized).is_err());
+        assert!(parse_shallow_boundary(&oversized.join(" ")).is_err());
     }
 }

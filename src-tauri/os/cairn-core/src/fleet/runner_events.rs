@@ -77,6 +77,9 @@ pub enum RunnerEventKind {
     ExecutorDetached,
     ExecutorLinkReset,
     ExecutorSubstrateFailed,
+    /// A step of the rolling self-update of a build-skewed remote; the detail
+    /// names the phase and the build.
+    ExecutorSelfUpdate,
     ListenerRestaged,
     ListenerAckMismatch,
     TransportOutage,
@@ -84,7 +87,7 @@ pub enum RunnerEventKind {
 }
 
 impl RunnerEventKind {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::RunnerStarted,
         Self::RunnerHandoff,
         Self::RuntimeStall,
@@ -95,6 +98,7 @@ impl RunnerEventKind {
         Self::ExecutorDetached,
         Self::ExecutorLinkReset,
         Self::ExecutorSubstrateFailed,
+        Self::ExecutorSelfUpdate,
         Self::ListenerRestaged,
         Self::ListenerAckMismatch,
         Self::TransportOutage,
@@ -113,6 +117,7 @@ impl RunnerEventKind {
             Self::ExecutorDetached => "executor_detached",
             Self::ExecutorLinkReset => "executor_link_reset",
             Self::ExecutorSubstrateFailed => "executor_substrate_failed",
+            Self::ExecutorSelfUpdate => "executor_self_update",
             Self::ListenerRestaged => "listener_restaged",
             Self::ListenerAckMismatch => "listener_ack_mismatch",
             Self::TransportOutage => "transport_outage",
@@ -931,6 +936,7 @@ mod tests {
                 "executor_detached",
                 "executor_link_reset",
                 "executor_substrate_failed",
+                "executor_self_update",
                 "listener_restaged",
                 "listener_ack_mismatch",
                 "transport_outage",

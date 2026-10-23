@@ -38,6 +38,7 @@ fn carries(wire: Wire) -> Carries {
         | Wire::AnthropicMessages
         | Wire::OpenAiResponses
         | Wire::OpenAiDecisions
+        | Wire::SystemOne
         | Wire::ClaudeStreamJson
         | Wire::ElevenLabsStreamInput
         | Wire::OpenAiSpeech

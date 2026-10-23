@@ -3,7 +3,9 @@
 use crate::interface::complete::{
     Complete, CompletionCall, CompletionError, CompletionReply, CompletionWire, Delivery,
 };
-use crate::wire::{anthropic_messages, decisions, embeddings, openai_compat, openai_responses};
+use crate::wire::{
+    anthropic_messages, decisions, embeddings, openai_compat, openai_responses, systemone,
+};
 
 /// Sends each completion straight to its provider over the wire it names.
 #[derive(Debug, Clone, Copy, Default)]
@@ -48,12 +50,17 @@ impl Complete for HttpComplete {
                 decisions::http::post_decisions(endpoint, body, timeout)
                     .map(CompletionReply::Decisions)
             }
-            (CompletionWire::Decisions(endpoint), Delivery::Stream { .. }) => {
-                Err(CompletionError::InvalidRequest(format!(
-                    "{} answers a decision as one whole reply; a decision is never streamed",
-                    endpoint.provider_name
-                )))
+            (CompletionWire::SystemOne(endpoint), Delivery::Whole { timeout }) => {
+                systemone::http::post_systemone(endpoint, body, timeout)
+                    .map(CompletionReply::SystemOne)
             }
+            (
+                CompletionWire::Decisions(endpoint) | CompletionWire::SystemOne(endpoint),
+                Delivery::Stream { .. },
+            ) => Err(CompletionError::InvalidRequest(format!(
+                "{} answers a decision as one whole reply; a decision is never streamed",
+                endpoint.provider_name
+            ))),
             (CompletionWire::Embeddings(endpoint), Delivery::Whole { timeout }) => {
                 embeddings::openai::post_embeddings(endpoint, body, timeout)
                     .map(CompletionReply::Embeddings)

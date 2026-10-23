@@ -53,6 +53,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=TOKS_BUNDLE_DIR");
     println!("cargo:rerun-if-env-changed=CAIRN_ASSET_CACHE_DIR");
+    println!("cargo:rerun-if-env-changed=CAIRN_CACHE_HOME");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let Some(bundle) = bundle_for(
@@ -208,6 +209,14 @@ fn obtain(bundle: &Bundle, out_dir: &Path) -> Vec<u8> {
 fn cache_dir() -> Option<PathBuf> {
     if let Some(dir) = env::var_os("CAIRN_ASSET_CACHE_DIR") {
         return Some(PathBuf::from(dir));
+    }
+    // Cache home is where Cairn's build caches live (scripts/lib/cache-home.ts).
+    // One that is not a directory is a build volume that is not mounted, and the
+    // bundle must not be cached on the internal disk in its place.
+    if let Some(home) = env::var_os("CAIRN_CACHE_HOME").filter(|home| !home.is_empty()) {
+        let home = PathBuf::from(home);
+        assert!(home.is_dir(), "build volume absent: {}", home.display());
+        return Some(home.join(".cache").join("cairn-assets"));
     }
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))

@@ -19,6 +19,7 @@ mod reliability;
 pub(crate) mod repair;
 pub(crate) mod residency;
 mod resource_profiles;
+pub(crate) mod rollout;
 pub mod runner_events;
 pub(crate) mod service_placement;
 pub mod telemetry;
@@ -27,7 +28,9 @@ pub use cairn_config::fleet::*;
 
 use crate::mcp::handlers::run::{ResolvedRunBatch, RunSpec};
 use crate::orchestrator::Orchestrator;
+use cairn_common::executor_protocol::needs_build_volume;
 use cairn_common::executor_protocol::DiskHealthStatus;
+use cairn_common::executor_protocol::SandboxCapabilityEvidence;
 use cairn_common::executor_protocol::{
     aged_priority, CacheWarmthEvidence, CellAdmissionKind, CellCheckoutKind, CellCommandClass,
     CellResidency, ContentionEstimate, CpuAdmissionState, DeclineReason, DurationEstimate,
@@ -359,9 +362,11 @@ pub enum LinkStallCause {
     },
     /// Beats keep arriving on time; what they carry stopped being recomputed.
     TelemetryFrozen {
-        /// How long ago the executor last recomputed the facts its beats carry,
-        /// by its own stamp.
-        facts_age_ms: u64,
+        /// How long the executor's recompute stamp has gone unchanged, counted
+        /// in time this runner was awake. Not the stamp's wall-clock age: wall
+        /// time keeps running while the host sleeps, and a sleep is not a
+        /// freeze.
+        frozen_ms: u64,
     },
 }
 
@@ -378,8 +383,8 @@ impl LinkStallCause {
                 ),
                 None => format!("the link recorded nothing for {silence_ms}ms"),
             },
-            Self::TelemetryFrozen { facts_age_ms } => format!(
-                "heartbeats kept arriving but the facts they carry were last measured {facts_age_ms}ms ago"
+            Self::TelemetryFrozen { frozen_ms } => format!(
+                "heartbeats kept arriving but the facts they carry have not been recomputed for {frozen_ms}ms of runner-awake time"
             ),
         }
     }
@@ -396,9 +401,9 @@ impl LinkStallCause {
                 "silence_ms": silence_ms,
                 "pump_silence_ms": pump_silence_ms,
             }),
-            Self::TelemetryFrozen { facts_age_ms } => serde_json::json!({
+            Self::TelemetryFrozen { frozen_ms } => serde_json::json!({
                 "stall_kind": "telemetry_frozen",
-                "facts_age_ms": facts_age_ms,
+                "frozen_ms": frozen_ms,
             }),
         }
     }
@@ -449,6 +454,7 @@ impl Default for LinkStallBounds {
 struct CoalescedLeaderCompletionGuard {
     pool: Fleet,
     leader: RequestIdentity,
+    work_class: PlacementWorkClass,
     keys: Vec<CoalescingKey>,
     runner_context_id: Option<String>,
     armed: bool,
@@ -460,32 +466,71 @@ impl CoalescedLeaderCompletionGuard {
     }
 }
 
+/// Lock `mutex` even when a holder that panicked poisoned it.
+///
+/// For destructors that run during an unwind: a second panic there, on a lock
+/// the unwinding code held, aborts the whole process.
+fn lock_through_poison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The error line for a coalesced leader that ended without an outcome.
+///
+/// Two populations end this way and look nothing alike to the person reading
+/// the log: a leader whose task panicked, and one whose task was dropped
+/// unfinished, which is what a runtime shutting down does to every task on it.
+fn unfinished_leader_line(
+    leader: &RequestIdentity,
+    work_class: PlacementWorkClass,
+    machine: Option<&str>,
+    panicking: bool,
+) -> String {
+    let ending = if panicking {
+        "its task panicked; the panic is logged just before this line"
+    } else {
+        "its task was dropped unfinished, as a runtime shutting down drops the tasks on it"
+    };
+    let machine = machine.map_or_else(
+        || "no machine reported running it".to_string(),
+        |machine| format!("last reported running on {machine}"),
+    );
+    format!(
+        "coalesced {} leader {leader:?} ended without publishing a terminal outcome: {ending}; \
+         {machine}; its subscribers are told it vanished",
+        work_class.as_str()
+    )
+}
+
 impl Drop for CoalescedLeaderCompletionGuard {
     fn drop(&mut self) {
         if !self.armed {
             return;
         }
-        self.pool
-            .cancelled_leaders
-            .lock()
-            .unwrap()
-            .remove(&self.leader);
-        self.pool
-            .coalesced_leaders
-            .lock()
-            .unwrap()
-            .remove(&self.leader);
-        self.pool
-            .preparing_leaders
-            .lock()
-            .unwrap()
-            .remove(&self.leader);
+        lock_through_poison(&self.pool.cancelled_leaders).remove(&self.leader);
+        lock_through_poison(&self.pool.coalesced_leaders).remove(&self.leader);
+        lock_through_poison(&self.pool.preparing_leaders).remove(&self.leader);
         if let Some(id) = &self.runner_context_id {
-            self.pool.runner_contexts.lock().unwrap().remove(id);
+            lock_through_poison(&self.pool.runner_contexts).remove(id);
         }
+        // The leader's queue entry is withdrawn by its own guard, which drops
+        // first, so the binding is usually gone by now; the machine's last
+        // snapshot still names the request until it next reports.
+        let machine = self
+            .pool
+            .queue
+            .binding_of(&self.leader)
+            .and_then(|(executor_id, _)| self.pool.executor_public_name(&executor_id))
+            .or_else(|| self.pool.machine_last_running(&self.leader));
         log::error!(
-            "coalesced leader {:?} ended without publishing a terminal outcome",
-            self.leader
+            "{}",
+            unfinished_leader_line(
+                &self.leader,
+                self.work_class,
+                machine.as_deref(),
+                std::thread::panicking(),
+            )
         );
         for key in &self.keys {
             self.pool
@@ -1125,6 +1170,16 @@ pub struct Fleet {
     /// in-flight requests — which is what lets a generation ending decide the
     /// fate of both in a single pass. See [`queue`].
     queue: Arc<queue::ExecutionQueue>,
+    /// The runtime this fleet was built on, which outlives any one caller.
+    ///
+    /// A coalesced leader answers for everyone who joined its execution, so it
+    /// cannot run on the runtime of whichever caller happened to open it. That
+    /// caller may be a turn-end review wave on a current-thread runtime of its
+    /// own (`detach_onto_runtime`), and cancelling the wave drops that runtime
+    /// and every task on it, a leader included, mid-execution. Absent on a
+    /// fleet built off any runtime, which `Fleet::default()` is; its leaders
+    /// run on the caller's runtime.
+    host_runtime: Option<tokio::runtime::Handle>,
     /// Executions carried across a link gap that the reattached connection has
     /// not yet accounted for, with the generation that owes the accounting.
     ///
@@ -1221,6 +1276,15 @@ pub struct Fleet {
     recent_cached_completions:
         Arc<Mutex<VecDeque<cairn_common::executor_protocol::CellCompletion>>>,
     expected_executor_build_ids: Arc<Mutex<HashMap<String, String>>>,
+    /// The executor build this runner serves for each artifact target, as the
+    /// self-update driver last resolved it. A remote's expected build is the
+    /// one here for its target. Locked last wherever it is locked with
+    /// anything else.
+    executor_artifact_builds: Arc<Mutex<HashMap<String, rollout::ArtifactBuild>>>,
+    /// The rolling self-update of remotes whose build differs from what this
+    /// runner serves (see [`rollout`]). Locked alone or after `connections`,
+    /// never before it.
+    self_update: Arc<Mutex<rollout::Rollout>>,
     /// The placement decisions this runner most recently took, newest last.
     recent_placements: Arc<Mutex<VecDeque<PlacementDecision>>>,
     /// Which placement rejections have been logged, so an unchanged verdict
@@ -2043,6 +2107,7 @@ impl Fleet {
         }
         let pool = Self {
             residency_route_path: Arc::new(Some(path.clone())),
+            host_runtime: tokio::runtime::Handle::try_current().ok(),
             ..Self::default()
         };
         match load_residency_routes(&path) {
@@ -2471,6 +2536,10 @@ struct ExecutorConnectionState {
     /// so the placement gate reads one field on the candidate rather than
     /// reaching for fleet state it would have to lock separately.
     drained: bool,
+    /// Whether the self-update rollout is emptying this machine so it can be
+    /// replaced. Stamped by every rollout pass and on attach, for the reason
+    /// `drained` is, and cleared by the pass that ends its turn.
+    update_hold: bool,
     /// What an operator holds this machine to be for. Stamped from
     /// [`Fleet::machine_roles`] on attach and whenever the roles are
     /// re-adopted, for the same reason `drained` is.
@@ -3131,6 +3200,9 @@ impl Fleet {
             correlation_id: uuid::Uuid::new_v4().to_string(),
             enabled: drained,
         });
+        // A machine whose turn it is stays held across a link bounce; the pass
+        // that ends the turn is what releases it.
+        let update_hold = self.self_update.lock().unwrap().holds(&executor_id);
         let generation = {
             let mut generations = self.connection_generations.lock().unwrap();
             let generation = generations
@@ -3156,16 +3228,20 @@ impl Fleet {
             last_update,
             colocated,
             drained,
+            update_hold,
             // Stamped below, under the table lock.
             machine_role: MachineRole::General,
             preparation_refusals: HashMap::new(),
             link_clock: Arc::default(),
             link_path: None,
         };
+        // The facts a link opens with are judged from the moment it attached,
+        // so a link whose facts never change still has a freeze to measure.
+        connection.link_clock.facts_recomputed();
         // A refusal outlives the link only while the machine still advertises
         // the environment it was recorded against: a re-attach with the
         // toolchain present is the repair, identical evidence is not.
-        let replaced = {
+        let replaced_generation = {
             let mut connections = self.lock_connections();
             // A refusal outlives the link only while the machine still
             // advertises the environment it was recorded against: a re-attach
@@ -3185,13 +3261,38 @@ impl Fleet {
             connection.machine_role = self.machine_role(&executor_id);
             connections
                 .insert(executor_id.clone(), connection)
-                .is_some()
+                .map(|previous| previous.generation)
         };
-        if replaced {
-            self.fail_for_executor(
-                &executor_id,
-                "executor connection was replaced before returning a result",
-            );
+        // A colocated process was spawned by this runner's supervisor with a
+        // fresh nonce, so a replacement there is known to be a new process and
+        // the old one's work is gone.
+        //
+        // A remote dialling in over a connection the runner still holds says
+        // nothing of the kind. A runner that slept, or a path that went
+        // half-open, leaves the old socket registered because nothing closed
+        // it on this side, while the executor gave up on it, kept its cells
+        // running, and redialled. That is a link gap whose close the runner
+        // never saw, and it ends the old generation the way the close would
+        // have: its work is held, and the rebinding below carries it onto this
+        // connection for the first snapshot to account for. A restarted process
+        // lists none of the old attempts there, so this needs no process
+        // identity to tell the two apart.
+        if let Some(replaced_generation) = replaced_generation {
+            if colocated {
+                self.fail_for_executor(
+                    &executor_id,
+                    "executor connection was replaced before returning a result",
+                );
+            } else {
+                log::info!(
+                    "executor_id={executor_id} generation {generation} replaced generation {replaced_generation} without a close; holding its work for reconciliation"
+                );
+                self.end_link_generation(
+                    &executor_id,
+                    replaced_generation,
+                    &ExecutorDisconnectOrigin::PeerOrIo,
+                );
+            }
         }
         // After the insertion above and before this returns, which is the only
         // ordering that leaves no window. A rotation staged concurrently either
@@ -3355,70 +3456,80 @@ impl Fleet {
                     .unwrap()
                     .insert((executor_id.to_string(), generation), origin.clone());
             }
-            // Who ended the link decides what it says about the work. A runner
-            // that closed this connection is recycling the process behind it,
-            // so the work really is gone; a link that simply went away says
-            // nothing about a machine that is still running and still coming
-            // back. An executor that closed its own link named why, but the
-            // reconciliation against its next opening snapshot is still what
-            // says which of its work survived, so its work is held the same way.
-            //
-            // Either way, an entry that was only ever OFFERED goes back to the
-            // queue: nothing was running behind an offer, so nothing can be run
-            // twice by re-offering it, and an offer outliving its link is the
-            // stuck placement this whole design exists to make impossible.
-            //
-            // A runner closing links because it is itself stopping is a third
-            // case, and the one most easily misread: the machine was not lost
-            // and the work did not fail. Answering it as a closed connection is
-            // what charged a runner restart to the substrate.
-            let stopped_at = self.runner_stop.at();
-            let diagnostic = match stopped_at {
-                Some(at) => format!(
-                    "this runner began shutting down at {} before the request returned a result",
-                    describe_runner_stop(at)
-                ),
-                None => "executor connection closed before returning a result".to_string(),
-            };
-            let cause = match (&origin, stopped_at) {
-                (ExecutorDisconnectOrigin::RunnerInitiated, Some(stopped_at_unix_ms)) => {
-                    queue::GenerationEndCause::RunnerStopping { stopped_at_unix_ms }
-                }
-                (ExecutorDisconnectOrigin::RunnerInitiated, None) => {
-                    queue::GenerationEndCause::MachineGone
-                }
-                (
-                    ExecutorDisconnectOrigin::PeerOrIo
-                    | ExecutorDisconnectOrigin::ExecutorInitiated(_),
-                    _,
-                ) => queue::GenerationEndCause::LinkGap,
-            };
-            let sweep = self.queue.end_generation(
-                executor_id,
-                generation,
-                cause,
-                &diagnostic,
-                unix_time_ms(),
-            );
-            if !sweep.released_offers.is_empty() {
-                log::info!(
-                    "returned {} offered entr(ies) to the queue for executor_id={executor_id}: nothing had been claimed on them",
-                    sweep.released_offers.len()
-                );
-            }
-            match origin {
-                ExecutorDisconnectOrigin::RunnerInitiated => {
-                    self.fail_calls_for_executor(executor_id, &diagnostic);
-                }
-                ExecutorDisconnectOrigin::PeerOrIo
-                | ExecutorDisconnectOrigin::ExecutorInitiated(_) => {
-                    self.hold_executions_across_link_gap(executor_id, sweep.held_claims);
-                }
-            }
-            self.binding_changed.notify_waiters();
-            self.connection_ready.notify_waiters();
+            self.end_link_generation(executor_id, generation, &origin);
         }
         disconnected
+    }
+
+    /// End one connection generation's hold on the work bound to it, once that
+    /// generation is no longer the machine's link.
+    ///
+    /// Separate from the disconnect because a generation also ends when a
+    /// remote redials over a connection the runner never saw close. The machine
+    /// is not absent then, so the absence bookkeeping a disconnect does first
+    /// stays with the disconnect, and only what the work needs is done here.
+    fn end_link_generation(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        origin: &ExecutorDisconnectOrigin,
+    ) {
+        // Who ended the link decides what it says about the work. A runner
+        // that closed this connection is recycling the process behind it,
+        // so the work really is gone; a link that simply went away says
+        // nothing about a machine that is still running and still coming
+        // back. An executor that closed its own link named why, but the
+        // reconciliation against its next opening snapshot is still what
+        // says which of its work survived, so its work is held the same way.
+        //
+        // Either way, an entry that was only ever OFFERED goes back to the
+        // queue: nothing was running behind an offer, so nothing can be run
+        // twice by re-offering it, and an offer outliving its link is the
+        // stuck placement this whole design exists to make impossible.
+        //
+        // A runner closing links because it is itself stopping is a third
+        // case, and the one most easily misread: the machine was not lost
+        // and the work did not fail. Answering it as a closed connection is
+        // what charged a runner restart to the substrate.
+        let stopped_at = self.runner_stop.at();
+        let diagnostic = match stopped_at {
+            Some(at) => format!(
+                "this runner began shutting down at {} before the request returned a result",
+                describe_runner_stop(at)
+            ),
+            None => "executor connection closed before returning a result".to_string(),
+        };
+        let cause = match (origin, stopped_at) {
+            (ExecutorDisconnectOrigin::RunnerInitiated, Some(stopped_at_unix_ms)) => {
+                queue::GenerationEndCause::RunnerStopping { stopped_at_unix_ms }
+            }
+            (ExecutorDisconnectOrigin::RunnerInitiated, None) => {
+                queue::GenerationEndCause::MachineGone
+            }
+            (
+                ExecutorDisconnectOrigin::PeerOrIo | ExecutorDisconnectOrigin::ExecutorInitiated(_),
+                _,
+            ) => queue::GenerationEndCause::LinkGap,
+        };
+        let sweep =
+            self.queue
+                .end_generation(executor_id, generation, cause, &diagnostic, unix_time_ms());
+        if !sweep.released_offers.is_empty() {
+            log::info!(
+                "returned {} offered entr(ies) to the queue for executor_id={executor_id}: nothing had been claimed on them",
+                sweep.released_offers.len()
+            );
+        }
+        match origin {
+            ExecutorDisconnectOrigin::RunnerInitiated => {
+                self.fail_calls_for_executor(executor_id, &diagnostic);
+            }
+            ExecutorDisconnectOrigin::PeerOrIo | ExecutorDisconnectOrigin::ExecutorInitiated(_) => {
+                self.hold_executions_across_link_gap(executor_id, sweep.held_claims);
+            }
+        }
+        self.binding_changed.notify_waiters();
+        self.connection_ready.notify_waiters();
     }
 
     /// State where this runner's executor listener answers. Re-publishing sends
@@ -4251,7 +4362,7 @@ impl Fleet {
     /// failure.
     ///
     /// A fact freeze the executor explains is not remediated here at all; see
-    /// [`unexplained_facts_age_ms`].
+    /// [`unexplained_facts_frozen_ms`].
     pub fn assess_colocated_link(
         &self,
         now_unix_ms: u64,
@@ -4269,10 +4380,10 @@ impl Fleet {
                     entry
                         .link_clock
                         .reader_silence_ms(link_clock::monotonic_now_ns()),
-                    unexplained_facts_age_ms(entry, now_unix_ms),
+                    unexplained_facts_frozen_ms(entry, link_clock::monotonic_now_ns()),
                 )
             });
-        let Some((executor_id, generation, judgement, pump_silence_ms, facts_age_ms)) = observed
+        let Some((executor_id, generation, judgement, pump_silence_ms, frozen_ms)) = observed
         else {
             return LinkRemediation::Healthy;
         };
@@ -4292,11 +4403,11 @@ impl Fleet {
             link_clock::LinkJudgement::JudgeAbsent { .. } => return LinkRemediation::Healthy,
             link_clock::LinkJudgement::Fresh => {}
         }
-        match facts_age_ms {
-            Some(facts_age_ms) if facts_age_ms > bounds.telemetry_ms => LinkRemediation::Bounce {
+        match frozen_ms {
+            Some(frozen_ms) if frozen_ms > bounds.telemetry_ms => LinkRemediation::Bounce {
                 executor_id,
                 generation,
-                cause: LinkStallCause::TelemetryFrozen { facts_age_ms },
+                cause: LinkStallCause::TelemetryFrozen { frozen_ms },
             },
             _ => LinkRemediation::Healthy,
         }
@@ -4309,7 +4420,7 @@ impl Fleet {
     /// the generation is not attached, the link is silent past its own bound so
     /// silence remediation owns it, the executor publishes no recompute stamp
     /// at all, or it publishes one that is frozen *and says why* — see
-    /// [`unexplained_facts_age_ms`]. A clock that was never claimed is not a
+    /// [`unexplained_facts_frozen_ms`]. A clock that was never claimed is not a
     /// stalled clock, no machine may be bounced for a fact it never offered,
     /// and a machine reporting its own wedge has already done the thing the
     /// bounce exists to provoke.
@@ -4329,7 +4440,7 @@ impl Fleet {
         ) {
             return None;
         }
-        unexplained_facts_age_ms(entry, now_unix_ms)
+        unexplained_facts_frozen_ms(entry, link_clock::monotonic_now_ns())
     }
 
     /// Take the fleet's single telemetry-bounce turn, or decline.
@@ -4593,6 +4704,11 @@ impl Fleet {
         if entry.generation != generation || advertisement.identity != entry.identity {
             return false;
         }
+        if advertisement.liveness_observed_at_unix_ms
+            != entry.advertisement.liveness_observed_at_unix_ms
+        {
+            entry.link_clock.facts_recomputed();
+        }
         entry.advertisement = advertisement;
         entry.last_progress_unix_ms = unix_time_ms();
         update(entry);
@@ -4606,10 +4722,16 @@ impl Fleet {
         generation: u64,
         message: ExecutorMessage,
     ) -> bool {
-        if self
-            .lock_connections()
-            .get(executor_id)
-            .is_none_or(|entry| entry.generation != generation)
+        // Every frame on a retired link is superseded by what the current one
+        // says, except a result: it is the only record that a command ran, and
+        // the runner may already have read it off the old socket when a redial
+        // replaced that link and carried the claim forward. The `Result` arm
+        // judges it against the claim's binding instead.
+        if !matches!(message, ExecutorMessage::Result { .. })
+            && self
+                .lock_connections()
+                .get(executor_id)
+                .is_none_or(|entry| entry.generation != generation)
         {
             return false;
         }
@@ -4624,10 +4746,45 @@ impl Fleet {
                 }
                 let key = (request_id, attempt_id);
                 // The result has to come from the machine this entry is bound to,
-                // on the link it is bound on. Anything else is an answer about a
-                // binding that no longer exists.
-                if self.queue.binding_of(&key) != Some((executor_id.to_string(), generation)) {
-                    return false;
+                // on the link it is bound on or one the binding was carried
+                // forward to. A redial that replaces an unclosed link rebinds the
+                // claim before the old link's ingest has drained, so a result the
+                // runner already received there arrives stamped with the older
+                // generation; what identifies the execution is the machine it ran
+                // on, not the link that carried the order. Anything else is an
+                // answer about a binding that no longer exists, such as a
+                // colocated replacement whose work was already failed.
+                let binding = self.queue.binding_of(&key);
+                let bound_generation = match &binding {
+                    Some((bound, bound_generation))
+                        if bound == executor_id && *bound_generation >= generation =>
+                    {
+                        *bound_generation
+                    }
+                    _ => {
+                        let bound = match binding {
+                            Some((bound, bound_generation)) => {
+                                format!("it is bound to {bound} at generation {bound_generation}")
+                            }
+                            None => {
+                                "it is not bound to any machine (already settled, or never queued)"
+                                    .to_string()
+                            }
+                        };
+                        log::warn!(
+                            "discarded the result of request {} attempt {} from executor_id={executor_id} generation {generation}: {bound}",
+                            key.0,
+                            key.1,
+                        );
+                        return false;
+                    }
+                };
+                if bound_generation != generation {
+                    log::info!(
+                        "executor_id={executor_id} result of request {} attempt {} arrived on replaced generation {generation}; settling it against generation {bound_generation}, which carries the claim",
+                        key.0,
+                        key.1,
+                    );
                 }
                 let _ = self.settle_runner_contexts_for_request(&key.0, &key.1);
                 scrub_cell_outcome(&mut outcome);
@@ -4635,24 +4792,28 @@ impl Fleet {
                     let canonical = self
                         .lock_connections()
                         .get(executor_id)
-                        .filter(|connection| connection.generation == generation)
+                        .filter(|connection| connection.generation == bound_generation)
                         .map(|connection| {
                             (
                                 connection.identity.executor_id.clone(),
                                 connection.identity.device_id.clone(),
-                                connection.generation,
                             )
                         });
-                    let Some((canonical_id, device_id, canonical_generation)) = canonical else {
+                    let Some((canonical_id, device_id)) = canonical else {
+                        log::warn!(
+                            "discarded the result of request {} attempt {} from executor_id={executor_id} generation {generation}: generation {bound_generation}, which carries the claim, is no longer that machine's link",
+                            key.0,
+                            key.1,
+                        );
                         return false;
                     };
                     metadata.executor_id = canonical_id;
                     metadata.executor_device_id = device_id;
-                    metadata.executor_connection_generation = canonical_generation;
+                    metadata.executor_connection_generation = bound_generation;
                 }
                 self.queue.settle(
                     &key,
-                    Some((executor_id, generation)),
+                    Some((executor_id, bound_generation)),
                     queue::TerminalState::Completed,
                     outcome,
                     unix_time_ms(),
@@ -5858,7 +6019,7 @@ impl Fleet {
                     capabilities
                         .sandbox
                         .as_ref()
-                        .is_some_and(|evidence| evidence.nested_sandbox_write_available),
+                        .is_some_and(SandboxCapabilityEvidence::check_lane_can_nest),
                 )
             })
             .collect();
@@ -6073,9 +6234,143 @@ impl Fleet {
             .insert(executor_id.into(), build_id);
     }
 
+    /// Record the executor build this runner serves for `target`, or why it
+    /// has none. Written by the self-update driver, which resolves and hashes
+    /// the artifact off the fleet's locks.
+    pub fn record_executor_artifact_build(&self, target: &str, build: Result<String, String>) {
+        self.executor_artifact_builds.lock().unwrap().insert(
+            target.to_string(),
+            match build {
+                Ok(build_id) => rollout::ArtifactBuild::Resolved(build_id),
+                Err(reason) => rollout::ArtifactBuild::Unavailable(reason),
+            },
+        );
+    }
+
+    /// The artifact targets the attached remotes run, which are the ones the
+    /// self-update driver has to resolve.
+    pub fn remote_executor_targets(&self) -> std::collections::BTreeSet<&'static str> {
+        self.lock_connections()
+            .values()
+            .filter(|entry| !entry.colocated)
+            .filter_map(executor_artifact_target)
+            .collect()
+    }
+
+    /// One pass of the rolling self-update (see [`rollout`]): stamp the hold
+    /// placement reads, send the directive once the machine whose turn it is
+    /// has emptied, and journal what changed.
+    ///
+    /// Each lock is taken alone. The queue and the pending-residency map are
+    /// read between two acquisitions of the connection table rather than
+    /// under it, and the rollout decides between them, so no lock here is ever
+    /// held across another.
+    pub fn advance_self_update_rollout(&self, now_unix_ms: u64) {
+        let artifacts = self.executor_artifact_builds.lock().unwrap().clone();
+        let mut observed: Vec<(rollout::Candidate, ExecutorWork)> = self
+            .lock_connections()
+            .values()
+            .filter(|entry| !entry.colocated)
+            .map(|entry| (rollout_candidate(entry, now_unix_ms), executor_work(entry)))
+            .collect();
+        let mut pending_residency: HashMap<String, usize> = HashMap::new();
+        for pending in self.pending_residency.lock().unwrap().values() {
+            *pending_residency
+                .entry(pending.executor_id.clone())
+                .or_default() += 1;
+        }
+        for (candidate, work) in &mut observed {
+            let bound = self.queue.identities_bound_to(&candidate.executor_id).len();
+            let residency = pending_residency
+                .get(&candidate.executor_id)
+                .copied()
+                .unwrap_or(0);
+            candidate.in_flight = work.in_flight(bound, residency);
+        }
+        let candidates: Vec<rollout::Candidate> = observed
+            .into_iter()
+            .map(|(candidate, _)| candidate)
+            .collect();
+        let step = self
+            .self_update
+            .lock()
+            .unwrap()
+            .advance(&candidates, &artifacts, now_unix_ms);
+        let delivered = {
+            let mut connections = self.lock_connections();
+            for (executor_id, entry) in connections.iter_mut() {
+                entry.update_hold = step.hold.as_deref() == Some(executor_id.as_str());
+            }
+            step.direct.as_ref().map(|directive| {
+                connections
+                    .get(&directive.executor_id)
+                    .filter(|entry| entry.generation == directive.generation)
+                    .is_some_and(|entry| {
+                        entry
+                            .sender
+                            .send(ExecutorMessage::UpdateDirected {
+                                manifest_url:
+                                    cairn_common::executor_protocol::EXECUTOR_ARTIFACT_MANIFEST_PATH
+                                        .into(),
+                                build_id: directive.build_id.clone(),
+                            })
+                            .is_ok()
+                    })
+            })
+        };
+        if let (Some(directive), Some(false)) = (&step.direct, delivered) {
+            log::info!(
+                "self-update directive for executor_id={} did not reach generation {}; draining it again",
+                directive.executor_id,
+                directive.generation
+            );
+            self.self_update
+                .lock()
+                .unwrap()
+                .directive_undelivered(&directive.executor_id, now_unix_ms);
+        }
+        for transition in step.transitions {
+            log::info!(
+                "executor self-update {} executor_id={} build={}: {}",
+                transition.kind.as_str(),
+                transition.executor_id,
+                transition.build_id,
+                transition.cause
+            );
+            self.runner_events.record(
+                runner_events::RunnerEvent::new(runner_events::RunnerEventKind::ExecutorSelfUpdate)
+                    .executor(transition.executor_id)
+                    .cause(transition.cause)
+                    .detail(serde_json::json!({
+                        "phase": transition.kind.as_str(),
+                        "build": transition.build_id,
+                    })),
+            );
+        }
+    }
+
+    /// The build each attached executor should be running: the one the
+    /// supervisor launched for the colocated executor, and the one this runner
+    /// serves for each remote's target.
+    fn expected_build_ids(
+        &self,
+        connections: &HashMap<String, ExecutorConnectionState>,
+    ) -> HashMap<String, String> {
+        let mut expected = self.expected_executor_build_ids.lock().unwrap().clone();
+        let artifacts = self.executor_artifact_builds.lock().unwrap();
+        for (executor_id, entry) in connections.iter().filter(|(_, entry)| !entry.colocated) {
+            if let Some(rollout::ArtifactBuild::Resolved(build_id)) =
+                executor_artifact_target(entry).and_then(|target| artifacts.get(target))
+            {
+                expected.insert(executor_id.clone(), build_id.clone());
+            }
+        }
+        expected
+    }
+
     pub fn executor_health(&self, captured_at_unix_ms: u64) -> Vec<ExecutorHealthSnapshot> {
         let connections = self.lock_connections();
-        let expected_build_ids = self.expected_executor_build_ids.lock().unwrap();
+        let expected_build_ids = self.expected_build_ids(&connections);
         let mut values: Vec<_> = connections
             .values()
             .map(|entry| executor_health_snapshot(entry, captured_at_unix_ms, &expected_build_ids))
@@ -6099,7 +6394,9 @@ impl Fleet {
     pub fn inspect_executors(&self, captured_at_unix_ms: u64) -> Vec<ExecutorInspection> {
         let known_projects = self.known_project_requirements.lock().unwrap().clone();
         let connections = self.lock_connections();
-        let expected_build_ids = self.expected_executor_build_ids.lock().unwrap();
+        let expected_build_ids = self.expected_build_ids(&connections);
+        let artifacts = self.executor_artifact_builds.lock().unwrap().clone();
+        let self_update = self.self_update.lock().unwrap();
         let enrolled_remotes = self.enrolled_remotes.lock().unwrap();
         let mut values: Vec<_> = connections
             .values()
@@ -6111,6 +6408,11 @@ impl Fleet {
                 health: executor_health_snapshot(entry, captured_at_unix_ms, &expected_build_ids),
                 executor_build_id: entry.executor_build_id.clone(),
                 last_update: entry.last_update.clone(),
+                self_update: if entry.colocated {
+                    None
+                } else {
+                    self_update.status(&rollout_candidate(entry, captured_at_unix_ms), &artifacts)
+                },
                 occupancy: (*entry.snapshot).clone(),
                 slots: entry.health.slots.clone(),
                 captured_at_unix_ms,
@@ -6542,6 +6844,37 @@ impl Fleet {
     /// names. The key carries the leader, so a completion can only ever settle
     /// the execution its own leader opened, never a later one for the same
     /// content.
+    /// Run a coalesced leader to its terminal outcome on the runtime that hosts
+    /// this fleet, so that it ends only by settling, never because the caller
+    /// that opened it went away. See [`Fleet::host_runtime`].
+    fn spawn_leader(&self, leader: impl std::future::Future<Output = ()> + Send + 'static) {
+        match &self.host_runtime {
+            Some(runtime) => {
+                runtime.spawn(leader);
+            }
+            None => {
+                tokio::spawn(leader);
+            }
+        }
+    }
+
+    /// The public name of the machine whose last report showed `leader`
+    /// executing, if any machine's does.
+    fn machine_last_running(&self, leader: &RequestIdentity) -> Option<String> {
+        self.lock_connections()
+            .values()
+            .find(|entry| {
+                entry.snapshot.executing_requests.iter().any(|execution| {
+                    execution.request_id == leader.0 && execution.attempt_id == leader.1
+                })
+            })
+            .map(executor_public_name)
+    }
+
+    /// Deliver `settlement` to every subscriber of `key`.
+    ///
+    /// Reached from the leader's completion guard during an unwind, so its locks
+    /// recover from poison rather than panicking a second time.
     fn complete_coalesced_for_leader(
         &self,
         key: &CoalescingKey,
@@ -6549,7 +6882,7 @@ impl Fleet {
     ) -> bool {
         let settlement = settlement.into();
         let execution = {
-            let mut registry = self.in_flight.lock().unwrap();
+            let mut registry = lock_through_poison(&self.in_flight);
             let Some(execution) = registry.by_key.remove(key) else {
                 return false;
             };
@@ -6558,15 +6891,12 @@ impl Fleet {
             }
             execution
         };
-        let leader_still_active = self
-            .in_flight
-            .lock()
-            .unwrap()
+        let leader_still_active = lock_through_poison(&self.in_flight)
             .by_key
             .keys()
             .any(|candidate| candidate.leader == key.leader);
         if !leader_still_active {
-            self.coalesced_leaders.lock().unwrap().remove(&key.leader);
+            lock_through_poison(&self.coalesced_leaders).remove(&key.leader);
         }
         for (identity, subscriber) in execution.subscribers {
             let delivery = match &settlement {
@@ -8665,11 +8995,12 @@ impl Fleet {
             let completion_guard = CoalescedLeaderCompletionGuard {
                 pool: pool.clone(),
                 leader: (request.request_id.clone(), request.attempt_id.clone()),
+                work_class: request.placement_work_class,
                 keys: vec![key.clone()],
                 runner_context_id: None,
                 armed: true,
             };
-            tokio::spawn(async move {
+            self.spawn_leader(async move {
                 let mut completion_guard = completion_guard;
                 if !pool.in_flight.lock().unwrap().by_key.contains_key(&key) {
                     let identity = (request.request_id.clone(), request.attempt_id.clone());
@@ -8776,7 +9107,12 @@ impl Fleet {
     /// structurally red on every branch and says nothing about the tree
     /// (CAIRN-3124). Containment of what a batch may *publish* is a separate
     /// knob: [`MutationPolicy`] owns it, and review stays `PureVerdict`.
-    const CHECK_CADENCE_SANDBOX_MODE: ProcessSandboxMode = ProcessSandboxMode::Unconfined;
+    ///
+    /// What a check runs is still the branch's code, so on a machine holding an
+    /// operator credential the executor applies that boundary alone
+    /// (`BranchCode`); a suite there cannot exercise its own nested sandbox,
+    /// which is what the skip manifest's live tests record.
+    const CHECK_CADENCE_SANDBOX_MODE: ProcessSandboxMode = ProcessSandboxMode::BranchCode;
 
     /// The single `ProcessBatch` shape both check cadences submit, so the
     /// confinement and ordering contract has one home rather than one copy per
@@ -9033,11 +9369,12 @@ impl Fleet {
             let completion_guard = CoalescedLeaderCompletionGuard {
                 pool: pool.clone(),
                 leader: leader.clone(),
+                work_class: request.placement_work_class,
                 keys: keys.clone(),
                 runner_context_id: runner_context_id.clone(),
                 armed: true,
             };
-            tokio::spawn(async move {
+            self.spawn_leader(async move {
                 let mut completion_guard = completion_guard;
                 let mut request = request;
                 let (outcome, account) = match pool.prepare_execution(&orch, &mut request).await {
@@ -9164,10 +9501,11 @@ impl Fleet {
 
     /// The confinement a batch runs under.
     ///
-    /// The agent's fence dial is the only gate on whether a profile exists: an
-    /// `allow` agent's batch is unconfined wherever it runs, including in the
-    /// project's live checkout, and a batch with no resolvable run identity is
-    /// nobody's agent operation. The repository shape only picks which profile a
+    /// The agent's fence dial is the only gate on whether a fence profile
+    /// exists: an `allow` agent's batch has none wherever it runs, including in
+    /// the project's live checkout, and neither does a batch with no resolvable
+    /// run identity. Either way it is agent work and carries the operator
+    /// credential boundary. The repository shape only picks which profile a
     /// *fenced* batch gets — an externally owned live checkout stays readable
     /// with its writes kernel-denied, a cell confines writes to itself.
     fn batch_sandbox_mode(
@@ -9182,7 +9520,7 @@ impl Fleet {
                     ProcessSandboxMode::Confined
                 }
             }
-            _ => ProcessSandboxMode::Unconfined,
+            _ => ProcessSandboxMode::CredentialFloor,
         }
     }
 
@@ -9455,6 +9793,19 @@ impl Fleet {
             RunnerCallback::SandboxDenied {
                 command, denial, ..
             } => {
+                // An executor refuses its own operator credential denials
+                // without calling back; this catches a path only this runner
+                // knows is a Cairn home, before any branch could prompt for it.
+                if let cairn_common::executor_protocol::SandboxDenial::Path(path) = &denial {
+                    if let Some(refusal) = crate::authorization::protected::read_refusal(
+                        &orch.config_dir,
+                        std::path::Path::new(path),
+                    ) {
+                        return RunnerCallbackResult::Rejected {
+                            diagnostic: refusal.into(),
+                        };
+                    }
+                }
                 if context.live_checkout {
                     return RunnerCallbackResult::Rejected {
                         diagnostic: crate::mcp::handlers::run::READ_ONLY_CHECKOUT_DENIAL.into(),
@@ -11884,6 +12235,26 @@ fn candidate_rejection(
         // and must be allowed to finish so the drain can empty it. Selectors and
         // unpinned requests are new placement and remain refused.
         Some(PlacementRejectionReason::Drained)
+    } else if entry.update_hold && !pinned_here {
+        // The self-update rollout's hold, with a drain's exemption for the same
+        // reason: resident work has to finish for the machine to empty.
+        Some(PlacementRejectionReason::UpdatePending)
+    } else if let Some(volume) = entry
+        .health
+        .build_volume
+        .as_ref()
+        .filter(|volume| volume.is_absent())
+        .filter(|_| needs_build_volume(scope.repository))
+    {
+        // The machine says the volume it keeps cells on is not mounted. Like
+        // a drain this is filtered, not offered and failed: another machine
+        // taking the work records nothing against this one. Unlike a drain it
+        // binds a residency pin too, because the pinned cell is on that very
+        // volume; the work is refused at once with the reason rather than
+        // offered to a machine that can only decline it.
+        Some(PlacementRejectionReason::BuildVolumeAbsent {
+            path: volume.root.clone(),
+        })
     } else if scope
         .avoided_executor_ids
         .iter()
@@ -12183,6 +12554,8 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
         PlacementRejectionReason::OutrankedBy { .. } => "outrankedBy",
         PlacementRejectionReason::UntrustedVerdictPlatform { .. } => "untrustedVerdictPlatform",
         PlacementRejectionReason::Drained => "drained",
+        PlacementRejectionReason::UpdatePending => "updatePending",
+        PlacementRejectionReason::BuildVolumeAbsent { .. } => "buildVolumeAbsent",
         PlacementRejectionReason::RoleExcluded { .. } => "roleExcluded",
         PlacementRejectionReason::AvoidedInfrastructure => "avoidedInfrastructure",
         PlacementRejectionReason::Declined { reason, .. } => return format!("declined:{reason:?}"),
@@ -14314,13 +14687,97 @@ fn published_facts_age_ms(entry: &ExecutorConnectionState, now_unix_ms: u64) -> 
 /// the runner has not applied the newer one, not because the executor stopped
 /// recomputing. Bouncing on that would be the runner blaming the peer for its
 /// own backlog, which is the failure [`link_clock`] exists to prevent.
-fn unexplained_facts_age_ms(entry: &ExecutorConnectionState, now_unix_ms: u64) -> Option<u64> {
+///
+/// What it measures is how long the executor's recompute stamp has gone
+/// unchanged on the runner's awake clock, not the stamp's wall-clock age. The
+/// two agree on a host that stays awake. They part across a sleep: wall time
+/// runs on, and an executor whose refresh interval is counted in its own awake
+/// time correctly ships its pre-sleep facts in the first beats after the wake.
+/// Read as wall age, a fifteen-minute sleep was a fifteen-minute freeze, and
+/// the colocated executor was recycled on every wake. Placement keeps the wall
+/// age, because facts measured before a sleep really are old.
+fn unexplained_facts_frozen_ms(entry: &ExecutorConnectionState, now_ns: u64) -> Option<u64> {
     if entry.advertisement.facts_stale_refresh_blocked.is_some()
         || entry.link_clock.heartbeat_pending()
     {
         return None;
     }
-    published_facts_age_ms(entry, now_unix_ms)
+    entry.advertisement.liveness_observed_at_unix_ms?;
+    entry.link_clock.facts_frozen_ms(now_ns)
+}
+
+/// The published artifact target a machine runs, from what it advertises.
+fn executor_artifact_target(entry: &ExecutorConnectionState) -> Option<&'static str> {
+    let capabilities = &entry.advertisement.capabilities;
+    cairn_common::executor_protocol::RemotePlatform::from_os_arch(
+        &capabilities.os.to_ascii_lowercase(),
+        &capabilities.arch.to_ascii_lowercase(),
+    )
+    .map(cairn_common::executor_protocol::RemotePlatform::target)
+}
+
+/// A remote as the self-update rollout reads it. `in_flight` is filled in by
+/// the caller, which alone can read the runner's queue for it.
+fn rollout_candidate(entry: &ExecutorConnectionState, now_unix_ms: u64) -> rollout::Candidate {
+    rollout::Candidate {
+        executor_id: entry.identity.executor_id.clone(),
+        name: executor_public_name(entry),
+        generation: entry.generation,
+        target: executor_artifact_target(entry),
+        running_build: entry.executor_build_id.clone(),
+        last_update: entry.last_update.clone(),
+        in_flight: 0,
+        snapshots_received: entry.snapshots_received,
+        reachable: !entry.sender.is_closed()
+            && matches!(
+                judge_link(entry, now_unix_ms, EXECUTOR_PROGRESS_FRESHNESS_MS),
+                link_clock::LinkJudgement::Fresh
+            ),
+    }
+}
+
+/// What a machine's own snapshot says is in flight on it: everything an
+/// executor restart would end.
+struct ExecutorWork {
+    /// Attempts it was granted and has not finished, and commands waiting in
+    /// its admission.
+    commands: usize,
+    residency_operations: usize,
+    /// Resident processes starting or running in its cells.
+    resident_processes: usize,
+}
+
+impl ExecutorWork {
+    /// The machine's account joined to the runner's: work the queue binds to
+    /// it (offered or claimed) and residency acquisitions it is waiting on.
+    /// Each pair is two witnesses to the same work, so the larger stands
+    /// rather than the sum.
+    fn in_flight(&self, bound: usize, pending_residency: usize) -> u32 {
+        let total = self.commands.max(bound)
+            + self.residency_operations.max(pending_residency)
+            + self.resident_processes;
+        u32::try_from(total).unwrap_or(u32::MAX)
+    }
+}
+
+fn executor_work(entry: &ExecutorConnectionState) -> ExecutorWork {
+    let snapshot = &entry.snapshot;
+    ExecutorWork {
+        commands: snapshot.granted_attempts.len() + snapshot.queued_requests.len(),
+        residency_operations: snapshot.in_flight_residency_operations.len(),
+        resident_processes: snapshot
+            .cells
+            .iter()
+            .flat_map(|cell| cell.occupancy.processes.values())
+            .filter(|process| {
+                matches!(
+                    process.status,
+                    cairn_common::executor_protocol::ResidentProcessStatus::Starting
+                        | cairn_common::executor_protocol::ResidentProcessStatus::Running { .. }
+                )
+            })
+            .count(),
+    }
 }
 
 fn executor_health_snapshot(
@@ -14360,6 +14817,9 @@ fn executor_health_snapshot(
         evicted_cells: entry.health.evicted_cells.clone(),
         busy_declined_cells: entry.health.busy_declined_cells.clone(),
         stopped_commands: entry.health.stopped_commands.clone(),
+        repository_faults: entry.health.repository_faults.clone(),
+        quarantines: entry.health.quarantines.clone(),
+        build_volume: entry.health.build_volume.clone(),
         build_skew: expected_build_ids
             .get(&entry.identity.executor_id)
             .zip(entry.executor_build_id.as_ref())
@@ -14718,6 +15178,10 @@ fn containment_deficiency(
     }
 }
 
+/// Whether a macOS machine can take work that applies its own nested Seatbelt
+/// profile. Only a measurement taken on the check-lane path counts: one taken
+/// from the executor's own process is how a machine whose lanes all exited 71
+/// kept receiving them (cairn/5316).
 fn matches_sandbox_capability(
     capabilities: &ExecutorCapabilities,
     selector: &ExecutorSelector,
@@ -14727,7 +15191,27 @@ fn matches_sandbox_capability(
         || capabilities
             .sandbox
             .as_ref()
-            .is_some_and(|evidence| evidence.nested_sandbox_write_available)
+            .is_some_and(SandboxCapabilityEvidence::check_lane_can_nest)
+}
+
+/// The nested-Seatbelt fact as a refusal inventory states it.
+fn nested_sandbox_summary(evidence: &SandboxCapabilityEvidence) -> String {
+    let state = if evidence.nested_sandbox_write_context.is_none() {
+        "unverified (measured from the executor's own process, which no check lane runs in; refused until the executor updates)"
+    } else if evidence.nested_sandbox_write_available {
+        "available"
+    } else {
+        "unavailable"
+    };
+    format!(
+        "CAIRN_SANDBOXED={}, check-lane nested Seatbelt write={state} ({})",
+        if evidence.cairn_sandboxed_marker {
+            "set"
+        } else {
+            "unset"
+        },
+        evidence.nested_sandbox_write_detail
+    )
 }
 
 /// The fleet as a refusal has to describe it: every live machine by the name a
@@ -14801,11 +15285,20 @@ fn environment_identity(entry: &ExecutorConnectionState, repair_epoch: i64) -> S
         None => facts.push("prerequisites=unreported".to_string()),
     }
     match capabilities.sandbox.as_ref() {
+        // The context's fingerprint rather than its timestamp: a re-probe
+        // under the same inputs is not a repair, a moved outer profile is.
         Some(evidence) => facts.push(format!(
-            "sandbox={}|{}|{}",
+            "sandbox={}|{}|{}|{}",
             evidence.cairn_sandboxed_marker,
             evidence.nested_sandbox_write_available,
-            evidence.nested_sandbox_write_detail
+            evidence.nested_sandbox_write_detail,
+            evidence
+                .nested_sandbox_write_context
+                .as_ref()
+                .map_or("no-context", |context| context
+                    .fingerprint
+                    .as_deref()
+                    .unwrap_or("unfingerprinted"))
         )),
         None => facts.push("sandbox=unreported".to_string()),
     }
@@ -14825,22 +15318,7 @@ fn known_executor_inventory(connections: &HashMap<String, ExecutorConnectionStat
             };
             let sandbox = capabilities.sandbox.as_ref().map_or_else(
                 || "nested Seatbelt write capability not reported".to_string(),
-                |evidence| {
-                    format!(
-                        "CAIRN_SANDBOXED={}, nested Seatbelt write={} ({})",
-                        if evidence.cairn_sandboxed_marker {
-                            "set"
-                        } else {
-                            "unset"
-                        },
-                        if evidence.nested_sandbox_write_available {
-                            "available"
-                        } else {
-                            "unavailable"
-                        },
-                        evidence.nested_sandbox_write_detail
-                    )
-                },
+                nested_sandbox_summary,
             );
             // A role other than general is part of what the machine is, so a
             // reader of the inventory sees why it took nothing.
@@ -15029,23 +15507,35 @@ fn no_matching_executor_diagnostic(
         );
     }
 
+    let would_serve = |rejection: &&PlacementRejection| {
+        connections
+            .get(&rejection.executor_id)
+            .is_some_and(|entry| {
+                request
+                    .executor
+                    .as_ref()
+                    .filter(|selector| !selector.is_empty())
+                    .is_none_or(|selector| matches_selector(entry, selector))
+                    && serves_project(entry, &request.project_id)
+            })
+    };
     let drained_target = rejected.iter().find(|rejection| {
-        matches!(rejection.reason, PlacementRejectionReason::Drained)
-            && connections
-                .get(&rejection.executor_id)
-                .is_some_and(|entry| {
-                    request
-                        .executor
-                        .as_ref()
-                        .filter(|selector| !selector.is_empty())
-                        .is_none_or(|selector| matches_selector(entry, selector))
-                        && serves_project(entry, &request.project_id)
-                })
+        matches!(rejection.reason, PlacementRejectionReason::Drained) && would_serve(rejection)
     });
     if let Some(rejection) = drained_target {
         return format!(
             "{} is drained by an operator, so the runner is refusing new work there. Only an operator can clear the drain; read cairn://executors for live state.",
             rejection.executor_name
+        );
+    }
+    let updating_target = rejected.iter().find(|rejection| {
+        matches!(rejection.reason, PlacementRejectionReason::UpdatePending)
+            && would_serve(rejection)
+    });
+    if let Some(rejection) = updating_target {
+        return format!(
+            "{name} is being emptied for an executor update, so the runner is refusing new work there until it returns on the runner's build. This clears on its own; cairn://executors/{name} shows how far along it is.",
+            name = rejection.executor_name
         );
     }
 
@@ -15158,6 +15648,7 @@ fn serialize_process_batch(
             RunSpec::McpCall(_)
             | RunSpec::ExecutorAction(_)
             | RunSpec::ResponseCall { .. }
+            | RunSpec::Decide { .. }
             | RunSpec::ReplSend { .. } => {
                 return Err(format!(
                     "{header} is not process-backed and cannot use a build cell"
@@ -16366,6 +16857,328 @@ mod tests {
         assert!(pool.queue.len() == 0);
     }
 
+    /// Dial `executor_id` in as a remote, as the transport does on every Hello.
+    fn dial_remote(pool: &Fleet, executor_id: &str) -> u64 {
+        let (_, connection) = fleet_entry(executor_id, "linux", 0, &[]);
+        pool.attach_advertised_executor(
+            connection.advertisement,
+            connection.sender,
+            false,
+            None,
+            None,
+        )
+        .expect("attach")
+    }
+
+    /// The 10-19 specimen: the runner slept, each remote's kernel gave up on
+    /// its link and the executor redialled, and the runner, which never saw a
+    /// close, still held the old connection when the new one arrived. That is
+    /// a link gap whose close went unseen, and the work comes through it.
+    #[tokio::test]
+    async fn a_redial_that_replaces_an_unclosed_connection_holds_its_work() {
+        let pool = Fleet::default();
+        let first = dial_remote(&pool, "fedora");
+        let key = ("request".to_string(), "attempt".to_string());
+        let result_rx = claim_entry(&pool, &key, "fedora", first, None);
+        let offered = ("offered".to_string(), "attempt".to_string());
+        let (offered_entry, _offered_rx) = enqueue_entry(&pool, &offered, None);
+        assert!(pool
+            .queue
+            .offer(&offered_entry, "fedora", "fedora", first, unix_time_ms()));
+
+        let second = dial_remote(&pool, "fedora");
+        assert!(second > first);
+        assert!(
+            pool.queue.holds(&key),
+            "a replaced connection is not a dead process"
+        );
+        assert_eq!(
+            pool.queue.binding_of(&key),
+            Some(("fedora".to_string(), second)),
+            "the claim is carried onto the connection that replaced its own"
+        );
+        assert!(
+            matches!(
+                pool.queue.state_of(&offered_entry),
+                Some(queue::EntryState::Queued)
+            ),
+            "an entry that was only offered goes back to the queue"
+        );
+
+        pool.apply_executor_snapshot(
+            "fedora",
+            second,
+            FleetSnapshot {
+                granted_attempts: vec![cairn_common::executor_protocol::GrantedAttempt {
+                    request_id: key.0.clone(),
+                    attempt_id: key.1.clone(),
+                }],
+                ..FleetSnapshot::default()
+            },
+            ExecutorSubstrateReport::default(),
+        );
+        assert!(
+            pool.queue.holds(&key),
+            "work the machine says it still holds stays held"
+        );
+
+        let finished = CellOutcome::Cancelled {
+            request_id: key.0.clone(),
+            attempt_id: key.1.clone(),
+        };
+        pool.handle_executor_message(
+            "fedora",
+            second,
+            ExecutorMessage::Result {
+                request_id: key.0.clone(),
+                attempt_id: key.1.clone(),
+                outcome: finished.clone(),
+            },
+        );
+        assert_eq!(result_rx.await.unwrap(), finished);
+    }
+
+    /// The transport drains a closed link's ingest before it ends the
+    /// generation, so a result read off that socket is settled. A redial that
+    /// replaces an unclosed link cannot wait for that drain: the claim is
+    /// rebound first, and a result the runner already received on the old link
+    /// arrives stamped with the old generation. The executor no longer lists
+    /// the attempt as granted, so no second result is coming, and dropping
+    /// this one would leave the waiter to the end-to-end watchdog.
+    #[tokio::test]
+    async fn a_result_read_off_the_replaced_link_settles_the_rebound_claim() {
+        let pool = Fleet::default();
+        let first = dial_remote(&pool, "fedora");
+        let key = ("request".to_string(), "attempt".to_string());
+        let result_rx = claim_entry(&pool, &key, "fedora", first, None);
+
+        let second = dial_remote(&pool, "fedora");
+        assert_eq!(
+            pool.queue.binding_of(&key),
+            Some(("fedora".to_string(), second))
+        );
+
+        let ran_on_the_old_link = CellOutcome::Completed {
+            request_id: key.0.clone(),
+            attempt_id: key.1.clone(),
+            exit_code: Some(0),
+            output: "ran".into(),
+            timed_out: false,
+            metadata: CellExecutionMeta {
+                warmth: None,
+                cell_origin: None,
+                load_context: None,
+                executor_id: "fedora".into(),
+                executor_device_id: "device".into(),
+                executor_connection_generation: first,
+                cell_id: "cell".into(),
+                cell_epoch: 1,
+                started_at_unix_ms: 1,
+                finished_at_unix_ms: 2,
+                duration_ms: None,
+                peak_rss_bytes: None,
+                peak_physical_footprint_bytes: None,
+                cpu: None,
+                allocation: None,
+                disk_delta_bytes: None,
+                measurement_quality: None,
+                environment_fingerprint: String::new(),
+                verdict_platform: None,
+                verdict_arch: None,
+                verdict_environment_hash: None,
+                sandbox: None,
+                toolchain_fingerprint: None,
+                containment: None,
+                stop: None,
+            },
+            mutation_delta: None,
+            sandbox_denials: Vec::new(),
+            tracked_modifications: None,
+        };
+        pool.handle_executor_message(
+            "fedora",
+            first,
+            ExecutorMessage::Result {
+                request_id: key.0.clone(),
+                attempt_id: key.1.clone(),
+                outcome: ran_on_the_old_link,
+            },
+        );
+
+        match result_rx.await.unwrap() {
+            CellOutcome::Completed {
+                exit_code,
+                output,
+                metadata,
+                ..
+            } => {
+                assert_eq!(exit_code, Some(0));
+                assert_eq!(output, "ran");
+                assert_eq!(
+                    metadata.executor_connection_generation, second,
+                    "the result is recorded against the link that carries the claim"
+                );
+            }
+            other => panic!("the real result reaches the waiter, got {other:?}"),
+        }
+        assert!(!pool.queue.holds(&key));
+    }
+
+    /// Accepting a result from an older link is about the same machine's claim
+    /// carried forward, never about another machine's claim.
+    #[tokio::test]
+    async fn a_result_from_another_machine_does_not_settle_the_claim() {
+        let pool = Fleet::default();
+        let fedora = dial_remote(&pool, "fedora");
+        let bbs = dial_remote(&pool, "bbs");
+        let key = ("request".to_string(), "attempt".to_string());
+        let _result_rx = claim_entry(&pool, &key, "bbs", bbs, None);
+        let late = CellOutcome::Cancelled {
+            request_id: key.0.clone(),
+            attempt_id: key.1.clone(),
+        };
+        pool.handle_executor_message(
+            "fedora",
+            fedora,
+            ExecutorMessage::Result {
+                request_id: key.0.clone(),
+                attempt_id: key.1.clone(),
+                outcome: late,
+            },
+        );
+        assert_eq!(
+            pool.queue.binding_of(&key),
+            Some(("bbs".to_string(), bbs)),
+            "another machine's answer does not settle this claim"
+        );
+    }
+
+    /// The same redial from a process that restarted while the link was down.
+    /// Its opening snapshot lists none of the old work, and that is what
+    /// settles it, naming the generation that lost it.
+    #[tokio::test]
+    async fn a_replacing_redial_from_a_restarted_process_settles_its_work_on_the_first_snapshot() {
+        let pool = Fleet::default();
+        let first = dial_remote(&pool, "fedora");
+        let key = ("request".to_string(), "attempt".to_string());
+        let result_rx = claim_entry(&pool, &key, "fedora", first, None);
+
+        let second = dial_remote(&pool, "fedora");
+        pool.apply_executor_snapshot(
+            "fedora",
+            second,
+            FleetSnapshot::default(),
+            ExecutorSubstrateReport::default(),
+        );
+        let outcome = result_rx.await.unwrap();
+        assert!(
+            matches!(
+                &outcome,
+                CellOutcome::Unavailable {
+                    reason: CellUnavailableReason::ExecutorUnavailable,
+                    diagnostic,
+                } if diagnostic.contains("no longer running or queued")
+                    && diagnostic.contains(&format!("running at generation {first}"))
+                    && !diagnostic.contains("replaced before returning")
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    /// The old socket does close eventually, and by then it is not the
+    /// machine's link. Its close must not reach the work it handed on.
+    #[tokio::test]
+    async fn the_replaced_generations_late_close_leaves_the_rebound_work_alone() {
+        let pool = Fleet::default();
+        let first = dial_remote(&pool, "fedora");
+        let key = ("request".to_string(), "attempt".to_string());
+        let _result_rx = claim_entry(&pool, &key, "fedora", first, None);
+        let second = dial_remote(&pool, "fedora");
+
+        assert!(!pool.disconnect_advertised_executor("fedora", first));
+        assert!(pool.queue.holds(&key));
+        assert_eq!(
+            pool.queue.binding_of(&key),
+            Some(("fedora".to_string(), second))
+        );
+        assert_eq!(
+            pool.lock_connections().get("fedora").unwrap().generation,
+            second
+        );
+    }
+
+    /// The colocated machine is the one case where the runner knows a
+    /// replacement is a new process: its supervisor spawned it.
+    #[tokio::test]
+    async fn a_colocated_replace_still_fails_its_work() {
+        let pool = Fleet::default();
+        let (sender, _executor) = mpsc::unbounded_channel();
+        let generation = pool.attach_executor(sender);
+        let key = ("request".to_string(), "attempt".to_string());
+        let result_rx = claim_entry(&pool, &key, COLOCATED_EXECUTOR_ID, generation, None);
+
+        let (sender, _replacement) = mpsc::unbounded_channel();
+        pool.attach_executor(sender);
+        assert!(matches!(
+            result_rx.await.unwrap(),
+            CellOutcome::Unavailable {
+                reason: CellUnavailableReason::ExecutorUnavailable,
+                ref diagnostic,
+            } if diagnostic.contains("replaced before returning a result")
+        ));
+    }
+
+    /// Recycling the colocated executor is a fact about one machine. The
+    /// remotes keep their links and their work, and the listener every remote
+    /// dials is not restaged by it.
+    #[tokio::test]
+    async fn resetting_the_colocated_link_leaves_remote_links_untouched() {
+        let pool = Fleet::default();
+        let (sender, _executor) = mpsc::unbounded_channel();
+        let colocated = pool.attach_executor(sender);
+        let local_key = ("local".to_string(), "attempt".to_string());
+        let local_rx = claim_entry(&pool, &local_key, COLOCATED_EXECUTOR_ID, colocated, None);
+        let remotes: Vec<_> = ["fedora", "bbs"]
+            .into_iter()
+            .map(|id| {
+                let generation = dial_remote(&pool, id);
+                let key = (format!("{id}-request"), "attempt".to_string());
+                let rx = claim_entry(&pool, &key, id, generation, None);
+                (id, generation, key, rx)
+            })
+            .collect();
+        let mut listener = pool.subscribe_executor_listener();
+        listener.borrow_and_update();
+
+        let abandonment = pool.abandon_stalled_colocated_link(
+            COLOCATED_EXECUTOR_ID,
+            colocated,
+            LinkStallCause::TelemetryFrozen {
+                frozen_ms: EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS + 1,
+            },
+        );
+        assert!(abandonment.disconnected);
+        assert!(matches!(
+            local_rx.await.unwrap(),
+            CellOutcome::Unavailable { .. }
+        ));
+        for (id, generation, key, _rx) in &remotes {
+            assert_eq!(
+                pool.lock_connections().get(*id).unwrap().generation,
+                *generation
+            );
+            assert!(pool.queue.holds(key), "{id} keeps its claim");
+            assert_eq!(
+                pool.queue.binding_of(key),
+                Some((id.to_string(), *generation))
+            );
+        }
+        assert!(
+            !listener.has_changed().unwrap(),
+            "a colocated reset does not restage the listener"
+        );
+    }
+
     /// The runner's own shutdown answers a claim on its colocated machine at
     /// once, and says what happened: the runner stopped. Answering it as a
     /// closed connection is what recorded a restart as the machine's fault.
@@ -16998,12 +17811,56 @@ mod tests {
             "ordinary work remains placeable"
         );
 
-        capabilities.sandbox = Some(cairn_common::executor_protocol::SandboxCapabilityEvidence {
+        // An executor that measured from its own process, as every executor
+        // did before cairn/5316: its `available` is the claim a machine whose
+        // lanes all exited 71 kept making, so it places nothing.
+        let mut evidence = SandboxCapabilityEvidence {
             cairn_sandboxed_marker: false,
             nested_sandbox_write_available: true,
             nested_sandbox_write_detail: "live probe succeeded".into(),
-        });
+            nested_sandbox_write_context: None,
+        };
+        capabilities.sandbox = Some(evidence.clone());
+        assert!(!matches_sandbox_capability(&capabilities, &selector));
+        assert!(nested_sandbox_summary(&evidence).contains("unverified"));
+
+        let context = cairn_common::executor_protocol::NestedSandboxProbeContext {
+            launcher: cairn_common::executor_protocol::SandboxLauncherClass::Unconfined,
+            credential_floor_sha256: None,
+            outer_profile_sha256: None,
+            fingerprint: Some("f".into()),
+            measured_at_unix_ms: 1,
+        };
+        evidence.nested_sandbox_write_context = Some(context.clone());
+        capabilities.sandbox = Some(evidence.clone());
         assert!(matches_sandbox_capability(&capabilities, &selector));
+
+        // A check lane under the credential floor: measured, refused, and the
+        // inventory a refusal prints carries the kernel rule as the reason.
+        let floored = SandboxCapabilityEvidence {
+            cairn_sandboxed_marker: false,
+            nested_sandbox_write_available: false,
+            nested_sandbox_write_detail:
+                "outer profile inherited: a confined process cannot apply a second profile".into(),
+            nested_sandbox_write_context: Some(
+                cairn_common::executor_protocol::NestedSandboxProbeContext {
+                    credential_floor_sha256: Some("floor".into()),
+                    outer_profile_sha256: Some("outer".into()),
+                    ..context
+                },
+            ),
+        };
+        capabilities.sandbox = Some(floored.clone());
+        assert!(!matches_sandbox_capability(&capabilities, &selector));
+        let summary = nested_sandbox_summary(&floored);
+        assert!(
+            summary.contains("check-lane nested Seatbelt write=unavailable (outer profile inherited: a confined process cannot apply a second profile)"),
+            "{summary}"
+        );
+        assert!(
+            matches_sandbox_capability(&capabilities, &ExecutorSelector::default()),
+            "an incapable machine still takes work that does not need the capability"
+        );
     }
 
     /// Whole-machine demand is declared as saturation, because a submitter cannot
@@ -17389,10 +18246,7 @@ mod tests {
         pool.in_flight.lock().unwrap().open(
             CoalescingKey::new(result_identity(), leader.clone()),
             PlacementDemand::default(),
-            HashMap::from([
-                (own.clone(), subscriber()),
-                (joined.clone(), subscriber()),
-            ]),
+            HashMap::from([(own.clone(), subscriber()), (joined.clone(), subscriber())]),
         );
         (own, joined)
     }
@@ -18192,11 +19046,11 @@ mod tests {
     #[test]
     fn a_stall_cause_carries_its_measurements_as_fields() {
         let frozen = LinkStallCause::TelemetryFrozen {
-            facts_age_ms: 1_009_658,
+            frozen_ms: 1_009_658,
         }
         .detail();
         assert_eq!(frozen["stall_kind"], "telemetry_frozen");
-        assert_eq!(frozen["facts_age_ms"], 1_009_658);
+        assert_eq!(frozen["frozen_ms"], 1_009_658);
         let silent = LinkStallCause::Silence {
             silence_ms: 70_000,
             pump_silence_ms: None,
@@ -18208,13 +19062,15 @@ mod tests {
     }
 
     /// Put this connection's published facts that far in the past while leaving
-    /// the link itself beating normally: the CAIRN-4362 specimen shape.
+    /// the link itself beating normally: the CAIRN-4362 specimen shape. Both
+    /// clocks agree, as they do on a host that has not slept.
     fn facts_last_measured(pool: &Fleet, age_ms: u64) {
         let mut connections = pool.lock_connections();
         let entry = connections.get_mut(COLOCATED_EXECUTOR_ID).unwrap();
         entry.last_progress_unix_ms = unix_time_ms();
         entry.advertisement.liveness_observed_at_unix_ms =
             Some(unix_time_ms().saturating_sub(age_ms));
+        entry.link_clock.stage_facts_recomputed(age_ms);
     }
 
     /// The specimen this remediation exists for: three machines refused for
@@ -18441,6 +19297,101 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The 10-19 colocated resets: the runner and its executor slept together
+    /// for a quarter of an hour, and the first beats after the wake carried
+    /// facts whose wall-clock stamp was fifteen minutes old. The executor had
+    /// been awake for seconds of it. A freeze is counted in time somebody
+    /// could have recomputed, so the sleep is charged to nobody, while
+    /// placement still refuses the old facts.
+    #[test]
+    fn a_suspended_runner_does_not_charge_its_sleep_to_colocated_facts() {
+        let (pool, generation, ..) = colocated_link_with_executing_leader(0);
+        {
+            let mut connections = pool.lock_connections();
+            let entry = connections.get_mut(COLOCATED_EXECUTOR_ID).unwrap();
+            entry.last_progress_unix_ms = unix_time_ms();
+            entry.advertisement.liveness_observed_at_unix_ms =
+                Some(unix_time_ms().saturating_sub(900_000));
+            entry.link_clock.stage_facts_recomputed(10_000);
+        }
+
+        assert_eq!(
+            pool.assess_colocated_link(unix_time_ms(), LinkStallBounds::default()),
+            LinkRemediation::Healthy
+        );
+        let frozen = pool
+            .managed_telemetry_stall_ms(COLOCATED_EXECUTOR_ID, generation, unix_time_ms())
+            .expect("a link with a recompute stamp reports how long it has been frozen");
+        assert!((10_000..15_000).contains(&frozen), "{frozen}");
+        assert!(
+            pool.executor_health(unix_time_ms())
+                .remove(0)
+                .telemetry_stale,
+            "facts measured before a sleep are still old facts"
+        );
+
+        // Awake time with no recompute is a freeze, whatever the wall says.
+        pool.link_clock(COLOCATED_EXECUTOR_ID, generation)
+            .unwrap()
+            .stage_facts_recomputed(EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS + 1_000);
+        assert!(matches!(
+            pool.assess_colocated_link(unix_time_ms(), LinkStallBounds::default()),
+            LinkRemediation::Bounce {
+                cause: LinkStallCause::TelemetryFrozen { frozen_ms },
+                ..
+            } if frozen_ms > EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS
+        ));
+    }
+
+    /// What restarts the freeze is the executor's stamp moving, read off the
+    /// beat as ingest applies it. A beat that carries the same stamp again is
+    /// a beat, not a recompute.
+    #[test]
+    fn only_a_beat_whose_recompute_stamp_moved_restarts_the_freeze() {
+        let (pool, generation, ..) = colocated_link_with_executing_leader(0);
+        facts_last_measured(&pool, EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS + 1_000);
+        let beat = |liveness_observed_at_unix_ms: Option<u64>| {
+            let mut advertisement = pool
+                .lock_connections()
+                .get(COLOCATED_EXECUTOR_ID)
+                .unwrap()
+                .advertisement
+                .clone();
+            advertisement.observed_at_unix_ms = unix_time_ms();
+            advertisement.liveness_observed_at_unix_ms = liveness_observed_at_unix_ms;
+            assert!(pool.handle_executor_message(
+                COLOCATED_EXECUTOR_ID,
+                generation,
+                ExecutorMessage::Heartbeat {
+                    advertisement,
+                    health: ExecutorSubstrateReport::default(),
+                    last_update: None,
+                },
+            ));
+        };
+        let stamp = pool
+            .lock_connections()
+            .get(COLOCATED_EXECUTOR_ID)
+            .unwrap()
+            .advertisement
+            .liveness_observed_at_unix_ms;
+
+        beat(stamp);
+        assert!(matches!(
+            pool.assess_colocated_link(unix_time_ms(), LinkStallBounds::default()),
+            LinkRemediation::Bounce {
+                cause: LinkStallCause::TelemetryFrozen { .. },
+                ..
+            }
+        ));
+
+        beat(Some(unix_time_ms()));
+        assert_eq!(
+            pool.assess_colocated_link(unix_time_ms(), LinkStallBounds::default()),
+            LinkRemediation::Healthy
+        );
     }
 
     /// The wedge arrives on every attached machine inside one window, so the
@@ -18806,6 +19757,7 @@ mod tests {
         drop(CoalescedLeaderCompletionGuard {
             pool: pool.clone(),
             leader: leader.clone(),
+            work_class: PlacementWorkClass::ReviewChecks,
             keys: vec![key.clone()],
             runner_context_id: None,
             armed: true,
@@ -18821,6 +19773,88 @@ mod tests {
         assert!(!pool.coalesced_leaders.lock().unwrap().contains(&leader));
         assert!(!pool.cancelled_leaders.lock().unwrap().contains(&leader));
         assert!(!pool.preparing_leaders.lock().unwrap().contains_key(&leader));
+    }
+
+    /// A leader that panicked while holding the in-flight registry leaves it
+    /// poisoned. Its guard drops during that same unwind, and a second panic
+    /// there would abort the runner; instead its subscribers are still told
+    /// the leader vanished.
+    #[tokio::test]
+    async fn a_leader_that_panics_holding_the_registry_still_releases_its_subscribers() {
+        let pool = Fleet::default();
+        let leader = ("leader".to_string(), "attempt".to_string());
+        let key = CoalescingKey::new(result_identity(), leader.clone());
+        let (tx, rx) = oneshot::channel();
+        pool.in_flight.lock().unwrap().open(
+            key.clone(),
+            PlacementDemand::default(),
+            HashMap::from([(
+                leader.clone(),
+                CoalescedSubscriber {
+                    waiter: tx,
+                    priority: CellPriority::ReviewCheck,
+                    requesting_job_id: None,
+                },
+            )]),
+        );
+        let guard = CoalescedLeaderCompletionGuard {
+            pool: pool.clone(),
+            leader: leader.clone(),
+            work_class: PlacementWorkClass::ReviewChecks,
+            keys: vec![key.clone()],
+            runner_context_id: None,
+            armed: true,
+        };
+        let registry = pool.in_flight.clone();
+        let unwound = std::thread::spawn(move || {
+            let _guard = guard;
+            let _held = registry.lock().unwrap();
+            panic!("the leader panicked holding the registry");
+        })
+        .join();
+
+        assert!(unwound.is_err(), "the leader's thread panicked");
+        assert!(pool.in_flight.is_poisoned());
+        assert_eq!(
+            rx.await.unwrap().err(),
+            Some(CoalescedWaitError::LeaderVanished)
+        );
+        assert!(!lock_through_poison(&pool.in_flight)
+            .by_key
+            .contains_key(&key));
+    }
+
+    /// The two ways a leader ends without an outcome read differently, and
+    /// both name what the leader was doing and where.
+    #[test]
+    fn an_unfinished_leader_says_whether_it_panicked_or_was_dropped() {
+        let leader = ("fa11da35".to_string(), "3158a653".to_string());
+        let panicked = unfinished_leader_line(
+            &leader,
+            PlacementWorkClass::ReviewChecks,
+            Some("fedora"),
+            true,
+        );
+        let dropped =
+            unfinished_leader_line(&leader, PlacementWorkClass::ReviewChecks, None, false);
+
+        assert!(
+            panicked.contains("coalesced reviewChecks leader"),
+            "{panicked}"
+        );
+        assert!(panicked.contains("its task panicked"), "{panicked}");
+        assert!(
+            panicked.contains("last reported running on fedora"),
+            "{panicked}"
+        );
+        assert!(
+            dropped.contains("its task was dropped unfinished"),
+            "{dropped}"
+        );
+        assert!(
+            dropped.contains("no machine reported running it"),
+            "{dropped}"
+        );
     }
 
     #[tokio::test]
@@ -18852,6 +19886,7 @@ mod tests {
         let guard_a = CoalescedLeaderCompletionGuard {
             pool: pool.clone(),
             leader: leader_a,
+            work_class: PlacementWorkClass::ReviewChecks,
             keys: vec![key.clone()],
             runner_context_id: None,
             armed: true,
@@ -19103,13 +20138,14 @@ mod tests {
         for repository in [&live, &cell] {
             assert_eq!(
                 Fleet::batch_sandbox_mode(Some(Fence::Allow), repository),
-                ProcessSandboxMode::Unconfined,
-                "allow means no Cairn-applied policy, on every repository shape"
+                ProcessSandboxMode::CredentialFloor,
+                "allow means no fence profile, on every repository shape, and \
+                 never an agent batch that can read the operator credential"
             );
             assert_eq!(
                 Fleet::batch_sandbox_mode(None, repository),
-                ProcessSandboxMode::Unconfined,
-                "a batch with no run identity is nobody's agent operation"
+                ProcessSandboxMode::CredentialFloor,
+                "a batch with no run identity has no fence, but it is still agent work"
             );
         }
 
@@ -19145,7 +20181,12 @@ mod tests {
             None,
             Fleet::WRITE_CHECK_SILENCE_BOUND_MS,
         );
-        assert_eq!(batch.sandbox_mode, ProcessSandboxMode::Unconfined);
+        assert_eq!(
+            batch.sandbox_mode,
+            ProcessSandboxMode::BranchCode,
+            "no fence profile, and the operator credential boundary wherever there is a \
+             credential for the branch's code to read"
+        );
         assert!(batch.sequential, "checks run in deterministic plan order");
         assert!(
             !batch.stop_on_error,
@@ -19568,6 +20609,7 @@ mod tests {
             id.into(),
             ExecutorConnectionState {
                 drained: false,
+                update_hold: false,
                 machine_role: MachineRole::General,
                 identity: identity.clone(),
                 advertisement: ExecutorAdvertisement {
@@ -24098,6 +25140,125 @@ mod tests {
         assert_eq!(skew.executor_build_id, "running-build");
     }
 
+    /// A remote running a different build from the one the runner serves for
+    /// its target is refused new work, and directed over its own link only once
+    /// its work has drained and two snapshots since the hold say so.
+    #[test]
+    fn a_build_skewed_remote_is_held_then_directed_over_its_link_once_empty() {
+        use cairn_common::executor_protocol::SelfUpdatePhase;
+
+        let pool = Fleet::default();
+        let (executor_id, mut connection) = fleet_entry("bbs", "linux", 0, &[]);
+        let (sender, mut executor) = mpsc::unbounded_channel();
+        connection.sender = sender;
+        connection.executor_build_id = Some("build-0759".into());
+        connection.link_clock.stage(0, 0);
+        Arc::make_mut(&mut connection.snapshot).granted_attempts =
+            vec![cairn_common::executor_protocol::GrantedAttempt {
+                request_id: "r".into(),
+                attempt_id: "a".into(),
+            }];
+        pool.lock_connections()
+            .insert(executor_id.clone(), connection);
+        pool.record_executor_artifact_build("x86_64-unknown-linux-gnu", Ok("build-1329".into()));
+
+        pool.advance_self_update_rollout(NOW);
+        assert!(
+            pool.lock_connections()
+                .get(&executor_id)
+                .unwrap()
+                .update_hold
+        );
+        let inspected = pool.inspect_executors(NOW);
+        assert_eq!(
+            inspected[0].self_update.as_ref().unwrap().phase,
+            SelfUpdatePhase::Draining {
+                in_flight: 1,
+                since_unix_ms: NOW
+            }
+        );
+        assert_eq!(
+            inspected[0]
+                .health
+                .build_skew
+                .as_ref()
+                .unwrap()
+                .runner_build_id,
+            "build-1329",
+            "a remote's expected build is what the runner serves for its target"
+        );
+        assert!(
+            executor.try_recv().is_err(),
+            "nothing is directed while work is in flight"
+        );
+
+        {
+            let mut connections = pool.lock_connections();
+            let entry = connections.get_mut(&executor_id).unwrap();
+            Arc::make_mut(&mut entry.snapshot).granted_attempts.clear();
+            entry.snapshots_received += 2;
+            entry.link_clock.stage(0, 0);
+        }
+        pool.advance_self_update_rollout(NOW + 30_000);
+        let directed =
+            std::iter::from_fn(|| executor.try_recv().ok()).find_map(|message| match message {
+                ExecutorMessage::UpdateDirected {
+                    manifest_url,
+                    build_id,
+                } => Some((manifest_url, build_id)),
+                _ => None,
+            });
+        assert_eq!(
+            directed,
+            Some((
+                cairn_common::executor_protocol::EXECUTOR_ARTIFACT_MANIFEST_PATH.to_string(),
+                "build-1329".to_string()
+            ))
+        );
+        assert!(
+            pool.lock_connections()
+                .get(&executor_id)
+                .unwrap()
+                .update_hold,
+            "held until it returns on the new build"
+        );
+    }
+
+    #[test]
+    fn placement_passes_over_a_machine_emptied_for_its_update() {
+        let mut connections = HashMap::from([
+            fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]),
+            fleet_entry("bbs", "linux", 0, &[]),
+        ]);
+        connections
+            .get_mut(COLOCATED_EXECUTOR_ID)
+            .unwrap()
+            .colocated = true;
+        connections.get_mut("bbs").unwrap().update_hold = true;
+        let mut request = targeted_request("linux");
+        request.executor = Some(ExecutorSelector {
+            name: Some("bbs".into()),
+            ..ExecutorSelector::default()
+        });
+        let refusal = place(&connections, &request)
+            .expect_err("a machine being emptied for its update takes no new work");
+        assert!(
+            refusal.contains("bbs is being emptied for an executor update"),
+            "{refusal}"
+        );
+
+        connections.get_mut("bbs").unwrap().update_hold = false;
+        assert_eq!(
+            place(&connections, &request)
+                .unwrap()
+                .selected
+                .expect("the hold's end re-admits it")
+                .0
+                .executor_id,
+            "bbs"
+        );
+    }
+
     #[test]
     fn heartbeat_refreshes_live_executor_health_report() {
         let pool = Fleet::default();
@@ -24742,6 +25903,7 @@ mod tests {
             }),
         );
         cairn_common::executor_protocol::PersistentCellState {
+            observed_head: None,
             size_bytes: 0,
             warm_command_classes: Vec::new(),
             executor_id: String::new(),
@@ -24767,6 +25929,7 @@ mod tests {
                 ..residency
             }),
             occupancy: CellOccupancy::default(),
+            seeded_from: None,
         }
     }
 
@@ -28388,6 +29551,7 @@ mod tests {
         status: cairn_common::executor_protocol::ResidentProcessStatus,
     ) -> PersistentCellState {
         PersistentCellState {
+            observed_head: None,
             size_bytes: 0,
             warm_command_classes: Vec::new(),
             executor_id: String::new(),
@@ -28425,7 +29589,9 @@ mod tests {
                         reservation: None,
                     },
                 )]),
+                clone_source: None,
             },
+            seeded_from: None,
         }
     }
 
@@ -28663,6 +29829,7 @@ mod tests {
                 toolchain_fingerprint: None,
                 containment: None,
                 stop: None,
+                cell_origin: None,
             },
             mutation_delta: None,
             sandbox_denials: Vec::new(),
@@ -29520,6 +30687,7 @@ mod tests {
                 toolchain_fingerprint: None,
                 containment: None,
                 stop: None,
+                cell_origin: None,
             },
             mutation_delta: None,
             sandbox_denials: Vec::new(),
@@ -29669,6 +30837,165 @@ mod tests {
     #[tokio::test]
     async fn a_lane_declined_for_pressure_runs_after_the_next_heartbeat() {
         a_declined_cell_waits_for_posted_state_and_runs(DeclineReason::Pressure, true).await;
+    }
+
+    /// A shared execution belongs to everyone who joined it, not to the caller
+    /// that happened to open it.
+    ///
+    /// A turn-end review wave whose hook fired off any runtime runs on a
+    /// current-thread runtime of its own, so a leader it opens is spawned from
+    /// there. Cancelling the wave returns from that runtime's `block_on` and
+    /// drops the runtime, which ends every task still on it. A leader that ran
+    /// there died mid-execution with its completion guard armed, and every
+    /// consumer that had joined it was told the leader vanished while the
+    /// machine was still doing the work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shared_execution_outlives_the_runtime_of_the_wave_that_opened_it() {
+        use cairn_common::executor_protocol::ProcessBatchItemOutcome;
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (sender, mut executor) = mpsc::unbounded_channel();
+        let generation = orch.fleet.attach_executor(sender);
+        let check = |request_id: &str| {
+            let mut request = provenance_request();
+            request.request_id = request_id.into();
+            request.repository = RepositoryLocator::ScratchOnly {
+                owner_id: request.project_id.clone(),
+            };
+            request.wait_horizon_unix_ms = unix_time_ms() + 60_000;
+            let items = vec![PureVerdictBatchItem {
+                result_identity: result_identity(),
+                process: cache_batch_item(Vec::new()),
+            }];
+            (request, items)
+        };
+
+        let (cancel_wave, wave_cancelled) = oneshot::channel::<()>();
+        let wave_orch = orch.clone();
+        let (request, items) = check("wave");
+        let wave = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                tokio::select! {
+                    _ = wave_orch
+                        .fleet
+                        .submit_pure_verdict_batch(&wave_orch, request, items, None, None) => {
+                        panic!("the wave is cancelled before its check settles")
+                    }
+                    _ = wave_cancelled => {}
+                }
+            });
+            // The runtime drops here, as the wave's own does when it returns.
+        });
+        let Some(ExecutorMessage::Offer { entry_id, .. }) = next_work_frame(&mut executor).await
+        else {
+            panic!("the wave's check is offered");
+        };
+
+        let follower_orch = orch.clone();
+        let (request, items) = check("follower");
+        let follower = tokio::spawn(async move {
+            follower_orch
+                .fleet
+                .submit_pure_verdict_batch(&follower_orch, request, items, None, None)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !orch
+                .fleet
+                .in_flight
+                .lock()
+                .unwrap()
+                .by_key
+                .values()
+                .any(|execution| execution.subscribers.len() == 2)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the follower joins the wave's execution");
+
+        cancel_wave.send(()).unwrap();
+        tokio::task::spawn_blocking(move || wave.join())
+            .await
+            .unwrap()
+            .expect("the wave's thread ends cleanly");
+
+        orch.fleet.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::Claim { entry_id },
+        );
+        let granted = tokio::time::timeout(Duration::from_secs(10), next_work_frame(&mut executor))
+            .await
+            .ok()
+            .flatten();
+        let Some(ExecutorMessage::Granted { request, .. }) = granted else {
+            panic!("the shared check is still granted after the wave is gone; got {granted:?}");
+        };
+        let mut outcome = completed_for(&request, COLOCATED_EXECUTOR_ID, generation);
+        if let CellOutcome::Completed { output, .. } = &mut outcome {
+            *output = serde_json::to_string(&[ProcessBatchItemOutcome {
+                header: "item".into(),
+                body: "ok".into(),
+                succeeded: true,
+                suspended: false,
+                images: Vec::new(),
+                exit_code: Some(0),
+                timed_out: false,
+                started_at_unix_ms: 1,
+                finished_at_unix_ms: 2,
+                duration_ms: 1,
+                peak_rss_bytes: None,
+                cpu: None,
+                granted_units: None,
+                disk_delta_bytes: None,
+                sandbox_denials: Vec::new(),
+                tracked_modifications: None,
+                environment_fingerprint: String::new(),
+                verdict_platform: None,
+                verdict_arch: None,
+                toolchain_fingerprint: None,
+                verdict_environment_hash: None,
+                stop: None,
+            }])
+            .unwrap();
+        }
+        orch.fleet.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::Result {
+                request_id: request.request_id.clone(),
+                attempt_id: request.attempt_id.clone(),
+                outcome,
+            },
+        );
+
+        let delivered = tokio::time::timeout(Duration::from_secs(10), follower)
+            .await
+            .expect("the follower is answered")
+            .unwrap();
+        assert!(
+            matches!(
+                delivered.as_slice(),
+                [Ok(CoalescedCellOutcome {
+                    outcome: CellOutcome::Completed {
+                        exit_code: Some(0),
+                        ..
+                    },
+                    ..
+                })]
+            ),
+            "the follower receives the machine's answer, not a vanished leader: {:?}",
+            delivered
+                .iter()
+                .map(|delivery| delivery.as_ref().map(|delivered| &delivered.outcome))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Each batch item is classified from its own outcome when the batch comes
@@ -31036,6 +32363,66 @@ mod tests {
         let refusal = place(&connections, &request).expect_err("nothing can prepare it");
         assert!(refusal.contains("cannot leave"), "{refusal}");
         assert!(refusal.contains("requires bun"), "{refusal}");
+    }
+
+    /// A machine whose build volume is unplugged is filtered out of cell work
+    /// the way a drained one is: another machine takes the work and nothing
+    /// is recorded against this one. A pin to it is refused with the reason,
+    /// work that needs no cell is not its volume's to refuse, and a volume
+    /// that is present refuses nothing.
+    #[test]
+    fn an_absent_build_volume_filters_cell_work_and_only_cell_work() {
+        use cairn_common::executor_protocol::{BuildVolumeReport, BuildVolumeState};
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        local.colocated = true;
+        let report = |state| BuildVolumeReport {
+            root: "/Volumes/Builds/cairn".into(),
+            state,
+            since_unix_ms: NOW,
+            suspended_cells: Vec::new(),
+            readopted_cells: 0,
+        };
+        Arc::make_mut(&mut local.health).build_volume = Some(report(BuildVolumeState::Absent {
+            reason: "not mounted".into(),
+        }));
+        let request = spillable_request();
+        let absent = Some(PlacementRejectionReason::BuildVolumeAbsent {
+            path: "/Volumes/Builds/cairn".into(),
+        });
+        assert_eq!(
+            candidate_rejection(&local, PlacementScope::of(&request), NOW),
+            absent
+        );
+        let mut pinned = request.clone();
+        pinned.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
+        assert_eq!(
+            candidate_rejection(&local, PlacementScope::of(&pinned), NOW),
+            absent
+        );
+        let mut live = request.clone();
+        live.repository = live_checkout();
+        assert_ne!(
+            candidate_rejection(&local, PlacementScope::of(&live), NOW),
+            absent
+        );
+
+        let (remote_id, mut remote) = fleet_entry("bbs", "linux", 0, &[]);
+        measured(&mut remote, 0.1, 8_000_000_000, 8_000_000_000);
+        let connections = HashMap::from([(local_id.clone(), local.clone()), (remote_id, remote)]);
+        let draft = place(&connections, &request).expect("another machine takes it");
+        let (selected, _) = draft.selected.expect("placed");
+        assert_eq!(selected.executor_id, "bbs");
+        assert!(draft.rejected.iter().any(|rejection| matches!(
+            rejection.reason,
+            PlacementRejectionReason::BuildVolumeAbsent { .. }
+        )));
+
+        Arc::make_mut(&mut local.health).build_volume =
+            Some(report(BuildVolumeState::Present { mount_point: None }));
+        assert_ne!(
+            candidate_rejection(&local, PlacementScope::of(&request), NOW),
+            absent
+        );
     }
 
     /// Rust work is refused where the attach-time prerequisite verdict reads

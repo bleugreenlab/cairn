@@ -254,8 +254,12 @@ async fn finish_minted_post_seal(
         Some(job_id),
     );
     if let Some(context) = run_context.as_ref() {
-        crate::execution::checks::cancel_stale_review_on_branch_advance(orch, &context.job_id)
-            .await;
+        crate::execution::checks::cancel_stale_review_on_branch_advance(
+            orch,
+            &context.job_id,
+            crate::execution::checks::BranchAdvance::Commit,
+        )
+        .await;
     }
     let check_summary = crate::execution::checks::run_write_checks_after_seal(
         orch,
@@ -947,20 +951,22 @@ async fn handle_write_attempt(
     }
 
     // Logical namespace fence for explicit repository-host operations. Creating
-    // a project initializes an arbitrary `repoPath`, and attach-remote runs git on
-    // the project's live repository. They route through the same fence keyed on the target repo
+    // a project initializes an arbitrary `repoPath`, attach-remote runs git on
+    // the project's live repository, and export writes the project's record to
+    // a local directory. They route through the same fence keyed on the target
     // path. Pure-DB project writes (rename/hide, or a create with an empty
     // repoPath) return no crossing and skip this. Raised before any change
     // applies. Resolving the crossing for attach-remote needs a DB lookup, so
     // detection is async.
-    let mut project_crossing: Option<(usize, std::path::PathBuf)> = None;
+    let mut project_crossing = None;
     for (index, item) in payload.changes.iter().enumerate() {
-        if let Some(path) = project_write_crossing_path(orch, item).await {
-            project_crossing = Some((index, path));
+        if let Some(crossing) = project_write_crossing_path(orch, item).await {
+            project_crossing = Some((index, crossing));
             break;
         }
     }
-    if let Some((index, repo_path)) = project_crossing {
+    if let Some((index, crossing)) = project_crossing {
+        let repo_path = crossing.path;
         use crate::mcp::handlers::fence;
         use crate::models::Fence;
         let item = &payload.changes[index];
@@ -998,6 +1004,7 @@ async fn handle_write_attempt(
                 }
             }
             fence::RunFenceResolution::Unavailable(error) => return error,
+            fence::RunFenceResolution::Ambient if crossing.ambient_allowed => {}
             fence::RunFenceResolution::Ambient => return "permission context unavailable: creating a project or attaching a remote requires an authenticated run".to_string(),
         }
     }
@@ -2426,8 +2433,12 @@ async fn handle_write_attempt(
             // rather than competing with a dying suite. See
             // cancel_stale_review_on_branch_advance for the rationale and job-id scoping.
             if let Some(ctx) = run_context.as_ref() {
-                crate::execution::checks::cancel_stale_review_on_branch_advance(orch, &ctx.job_id)
-                    .await;
+                crate::execution::checks::cancel_stale_review_on_branch_advance(
+                    orch,
+                    &ctx.job_id,
+                    crate::execution::checks::BranchAdvance::Commit,
+                )
+                .await;
             }
             off_frame(|| {
                 crate::execution::checks::run_write_checks_after_seal(

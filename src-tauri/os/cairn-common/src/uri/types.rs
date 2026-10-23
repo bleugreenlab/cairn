@@ -175,6 +175,22 @@ pub enum CairnResource {
         project: String,
         revision: String,
     },
+    /// The diff between two revisions, served from the store with no checkout.
+    ProjectVcsDiff {
+        project: String,
+    },
+    /// How two revisions relate: fork point, containment, ahead and behind.
+    ProjectVcsAncestry {
+        project: String,
+    },
+    /// History over a revision range, optionally restricted to a path.
+    ProjectVcsLog {
+        project: String,
+    },
+    /// Line-by-line attribution of one file at a revision.
+    ProjectVcsBlame {
+        project: String,
+    },
     /// Every stored image minted in one scope, in ordinal order.
     ///
     /// The ordinal in an image address is a navigable index, not decoration:
@@ -908,6 +924,9 @@ pub enum CairnResource {
     Models,
     /// Providers, their discovered models, and how tiers bind to them.
     ModelsCatalog,
+    /// The `decide` verb's door: a `run` target that answers typed questions
+    /// with the model the caller names.
+    ModelsDecide,
     /// Every provider account, with its live usage windows and no secret.
     ModelsAccounts,
     /// One provider account by id.
@@ -973,6 +992,10 @@ impl CairnResource {
             Self::ProjectMap { .. } => ResourceKind::ProjectMap,
             Self::ProjectHome { .. } => ResourceKind::ProjectHome,
             Self::ProjectCheckResults { .. } => ResourceKind::ProjectCheckResults,
+            Self::ProjectVcsDiff { .. } => ResourceKind::ProjectVcsDiff,
+            Self::ProjectVcsAncestry { .. } => ResourceKind::ProjectVcsAncestry,
+            Self::ProjectVcsLog { .. } => ResourceKind::ProjectVcsLog,
+            Self::ProjectVcsBlame { .. } => ResourceKind::ProjectVcsBlame,
             Self::ProjectCheckObservation { .. } => ResourceKind::ProjectCheckObservation,
             Self::ProjectImage { .. } => ResourceKind::ProjectImage,
             Self::ProjectImages { .. } => ResourceKind::ProjectImages,
@@ -1049,6 +1072,7 @@ impl CairnResource {
             Self::Grant { .. } => ResourceKind::Grant,
             Self::Models => ResourceKind::Models,
             Self::ModelsCatalog => ResourceKind::ModelsCatalog,
+            Self::ModelsDecide => ResourceKind::ModelsDecide,
             Self::ModelsAccounts => ResourceKind::ModelsAccounts,
             Self::ModelsAccount { .. } => ResourceKind::ModelsAccount,
             Self::ModelsUsage => ResourceKind::ModelsUsage,

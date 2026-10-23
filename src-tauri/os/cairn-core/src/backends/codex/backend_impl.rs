@@ -566,7 +566,7 @@ impl AgentBackend for CodexBackend {
     ) -> Result<CompletionOutcome, CompletionError> {
         use crate::backends::one_shot::{
             instructions, map_one_shot_error, map_open_error, one_shot_timeout,
-            response_scratch_dir, runtime_extras,
+            response_scratch_dir,
         };
         use cairn_models::interface::session::ApprovalMode;
         use cairn_models::session::one_shot::await_one_shot;
@@ -591,7 +591,7 @@ impl AgentBackend for CodexBackend {
         let (server, _) =
             acquire_pooled_server(orch, codex_auth).map_err(CompletionError::Upstream)?;
         let scratch = response_scratch_dir()?;
-        let extras = runtime_extras(&request);
+        let extras = request.options.clone();
         let spec = SessionSpec {
             start: SessionStart::New {
                 session_id: uuid::Uuid::new_v4().to_string(),

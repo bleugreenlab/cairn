@@ -1,5 +1,5 @@
 //! Resolved session and backend capability values.
-use cairn_domain::Fence;
+use cairn_domain::{Fence, RuntimeExtras};
 use cairn_models::types::usage::MeteredUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -122,7 +122,10 @@ pub struct CompletionRequest {
     pub model: String,
     /// Project whose provider-account scope should govern backend routing.
     pub project_id: Option<String>,
-    pub extras: Value,
+    /// The caller's generation options (reasoning effort, service tier) as
+    /// typed knobs. Each backend maps them onto its own wire's spelling; they
+    /// are never copied into a request body as they are named here.
+    pub options: RuntimeExtras,
     pub output_schema: Option<Value>,
     pub timeout: Duration,
 }
@@ -297,7 +300,7 @@ mod tests {
                 .collect(),
             model: "m".to_string(),
             project_id: None,
-            extras: Value::Null,
+            options: RuntimeExtras::default(),
             output_schema: None,
             timeout: Duration::from_secs(1),
         }

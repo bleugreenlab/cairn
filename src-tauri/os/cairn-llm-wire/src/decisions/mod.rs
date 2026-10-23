@@ -1,10 +1,14 @@
 //! The Decisions wire: typed questions in, per-question answers out, one
 //! non-streamed POST to `{base}/decisions`.
 //!
-//! One wire, many API-key providers: OpenAI's Decisions API, the Vercel AI
-//! Gateway (which serves `openai/gpt-6-luna-decisions` and `typesafe-ai/jev`
-//! through it), and TypeSafe directly all take this request and return this
-//! reply. Nothing here branches on which one it is talking to; the URL and
+//! OpenAI's Decisions API speaks this wire: a `questions` array of
+//! `predicate | choice | score`, answered in question order, with a refusal
+//! variant carrying the declined question's name. TypeSafe and OpenRouter
+//! speak System One instead, which is its own wire ([`crate::systemone`]).
+//! The Vercel AI Gateway documents this shape for its OpenAI-compatible
+//! decisions route; whether the models it serves there from other vendors
+//! (`typesafe-ai/jev`) answer it faithfully has not been verified. Nothing
+//! here branches on which provider it is talking to; the URL and
 //! authentication arrive as a [`http::DecisionsEndpoint`].
 //!
 //! A decision generates nothing, so unlike the three turn families there is

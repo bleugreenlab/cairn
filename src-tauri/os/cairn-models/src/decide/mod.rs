@@ -4,18 +4,20 @@
 
 mod logprobs;
 mod native;
+mod systemone;
 #[cfg(test)]
 mod tests;
 
 use std::time::Duration;
 
 use cairn_domain::decision::{
-    question_problems, Decision, DecisionQuestion, MeasuredBy, QuestionKind,
+    input_usage, question_problems, Decision, DecisionQuestion, MeasuredBy, QuestionKind,
 };
 
 use crate::interface::complete::{Complete, CompletionCall};
 use crate::interface::decide::{DecideError, DecisionCall, DecisionRoute};
 use crate::wire::decisions::http::build_body;
+use crate::wire::systemone::http::build_body as systemone_body;
 
 /// Every question `method` cannot measure, as a sentence naming it. Empty
 /// means the method can ask them all. Checked before a recipe is admitted,
@@ -99,7 +101,36 @@ pub fn decide(complete: &dyn Complete, call: DecisionCall<'_>) -> Result<Decisio
                 provider: endpoint.backend_key.clone(),
                 model,
                 answers: native::answers(call.questions, reply)?,
-                input_tokens,
+                usage: input_usage(input_tokens, None),
+            })
+        }
+        DecisionRoute::SystemOne(endpoint) => {
+            let body = systemone_body(
+                call.model,
+                call.input.into(),
+                &native::wire_questions(call.questions),
+            );
+            let reply = complete
+                .complete(CompletionCall::whole(
+                    call.route.completion_wire(),
+                    body,
+                    call.timeout,
+                ))?
+                .into_systemone()?;
+            let usage = reply.usage.clone();
+            let model = reply
+                .model
+                .clone()
+                .filter(|model| !model.is_empty())
+                .unwrap_or_else(|| call.model.to_string());
+            Ok(Decision {
+                provider: endpoint.backend_key.clone(),
+                model,
+                answers: systemone::answers(call.questions, reply)?,
+                usage: input_usage(
+                    usage.as_ref().and_then(|usage| usage.input_tokens),
+                    usage.and_then(|usage| usage.cost),
+                ),
             })
         }
         DecisionRoute::Logprobs(endpoint) => {
@@ -141,7 +172,7 @@ pub fn decide(complete: &dyn Complete, call: DecisionCall<'_>) -> Result<Decisio
                 provider: endpoint.backend_key.clone(),
                 model: model.unwrap_or_else(|| call.model.to_string()),
                 answers,
-                input_tokens,
+                usage: input_usage(input_tokens, None),
             })
         }
     }

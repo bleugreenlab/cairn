@@ -746,7 +746,7 @@ async fn every_catalog_provider_launches_through_the_facet() {
                         }],
                         model,
                         project_id: None,
-                        extras: Value::Null,
+                        options: Default::default(),
                         output_schema: None,
                         timeout: Duration::from_secs(5),
                     },
@@ -855,7 +855,7 @@ fn one_shot_request(model: &str, output_schema: Option<Value>) -> CompletionRequ
         }],
         model: model.to_string(),
         project_id: None,
-        extras: Value::Null,
+        options: Default::default(),
         output_schema,
         timeout: Duration::from_secs(5),
     }
@@ -1177,7 +1177,7 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
     let jev_key = cairn_models::types::catalog::custom_key(&jev.id);
     orch.refresh_provider_model_catalog_blocking(&jev_key);
 
-    let offer = orch.decision_offer(None, &decision).unwrap();
+    let offer = orch.node_decision_offer(None, &decision).unwrap();
     assert_eq!(
         (
             offer.provider.as_str(),
@@ -1253,7 +1253,7 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
         ..decision.clone()
     };
     assert!(
-        orch.decision_offer(None, &pinned).is_err(),
+        orch.node_decision_offer(None, &pinned).is_err(),
         "the recorder refuses the probe"
     );
     assert_eq!(
@@ -1267,7 +1267,9 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
         "the logprobs probe rides the wire the offer declares"
     );
     assert_eq!(
-        orch.decision_offer(None, &decision).unwrap().measured_by(),
+        orch.node_decision_offer(None, &decision)
+            .unwrap()
+            .measured_by(),
         Some(MeasuredBy::Native),
         "unset prefers a native offer over a logprobs one"
     );

@@ -1283,6 +1283,8 @@ pub(crate) fn check_verdict_evidence(
 ///
 /// A reusable green over a `vitest related` selection is honest, and it is not
 /// "this check is green on this ref" — so `filtered` and `empty` are refused.
+/// So is `fast`: the rust-tests fast tier deferred every test that ran past its
+/// per-test budget, so its green never speaks for the whole suite.
 ///
 /// It is refusal by ASSERTION rather than a requirement that the row claim
 /// `full`, and the store is why. Only nextest reports a selection kind at all;
@@ -1304,7 +1306,7 @@ fn selection_is_narrowed(entry: &CheckResultCacheEntry) -> bool {
         .target_results_json
         .as_deref()
         .and_then(|json| serde_json::from_str::<ParsedCheckResult>(json).ok())
-        .is_some_and(|parsed| matches!(parsed.selection.as_str(), "filtered" | "empty"))
+        .is_some_and(|parsed| matches!(parsed.selection.as_str(), "filtered" | "empty" | "fast"))
 }
 
 /// Resolve the gated ref and compute the check identity a verdict on it must
@@ -1440,6 +1442,8 @@ pub(crate) mod test_support {
             id: id.to_string(),
             public_handle: format!("{id:0<24}"),
             infra_reset_scopes: Vec::new(),
+            selection: None,
+            deferred_count: 0,
             project_id: project_id.to_string(),
             commit_sha: "commit-gated".to_string(),
             defined_by_commit_sha: "commit-gated".to_string(),
@@ -2128,12 +2132,18 @@ mod tests {
         filtered.target_results_json = Some(parse_json("filtered"));
         record_fresh_check_observation(db.clone(), reseal(filtered)).unwrap();
 
+        // A fast-tier green: everything past the per-test budget was deferred.
+        let mut fast = observation("obs-fast", "input-fast");
+        fast.target_results_json = Some(parse_json("fast"));
+        record_fresh_check_observation(db.clone(), reseal(fast)).unwrap();
+
         for input in [
             "input-not-reusable",
             "input-failure-kind",
             "input-platform",
             "input-incomplete",
             "input-filtered",
+            "input-fast",
         ] {
             assert_eq!(
                 check_verdict_evidence(db.clone(), &coordinate(input), Some(&passed())).unwrap(),

@@ -109,6 +109,155 @@ fn sampling_is_forwarded_only_when_the_operator_configures_it() {
     assert_eq!(configured["top_k"], serde_json::json!(40));
 }
 
+/// What a response definition's one-shot completion sends a custom provider.
+mod completion {
+    use super::config;
+    use crate::backends::{CompletionMessage, CompletionRequest, CompletionRole};
+    use crate::credentials::{CustomModelPolicy, CustomSampling};
+    use crate::models::{Model, Preset, PresetOptionValue};
+    use cairn_models::interface::complete::{
+        Complete, CompletionCall, CompletionError, CompletionReply,
+    };
+    use serde_json::{json, Value};
+    use std::sync::Mutex;
+
+    /// Records the body it was asked to send and answers with an empty object.
+    struct Recorder(Mutex<Option<Value>>);
+
+    impl Complete for Recorder {
+        fn complete(&self, call: CompletionCall<'_>) -> Result<CompletionReply, CompletionError> {
+            *self.0.lock().unwrap() = Some(call.body);
+            Ok(CompletionReply::Chat(
+                serde_json::from_value(
+                    json!({"choices": [{"message": {"role": "assistant", "content": "{}"}}]}),
+                )
+                .unwrap(),
+            ))
+        }
+    }
+
+    /// The body a definition pinned to the provider sends, its `options` turned
+    /// into the request the way the responses path turns them.
+    fn sent(sampling: CustomSampling, options: &[(&str, &str)], schema: Option<Value>) -> Value {
+        let mut provider = config(
+            "Local",
+            "http://127.0.0.1:1/v1",
+            CustomModelPolicy::Discover,
+        );
+        provider.sampling = sampling;
+        let preset = Preset {
+            model: Model::new("dsv4-flash"),
+            options: options
+                .iter()
+                .map(|(key, value)| (key.to_string(), PresetOptionValue::Str(value.to_string())))
+                .collect(),
+        };
+        let recorder = Recorder(Mutex::new(None));
+        super::super::adapter::CustomAdapter::new(provider)
+            .complete(
+                &recorder,
+                CompletionRequest {
+                    system: None,
+                    messages: vec![CompletionMessage {
+                        role: CompletionRole::User,
+                        content: "label it".into(),
+                    }],
+                    model: preset.model.to_string(),
+                    project_id: None,
+                    options: preset.to_extras(),
+                    output_schema: schema,
+                    timeout: std::time::Duration::from_secs(5),
+                },
+            )
+            .unwrap();
+        recorder.0.into_inner().unwrap().expect("one request")
+    }
+
+    fn sampling() -> CustomSampling {
+        CustomSampling {
+            repetition_penalty: Some(1.1),
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            top_k: Some(40),
+        }
+    }
+
+    #[test]
+    fn a_definitions_effort_is_sent_as_reasoning_effort() {
+        let body = sent(
+            CustomSampling::default(),
+            &[("reasoningEffort", "high")],
+            None,
+        );
+        assert_eq!(body["reasoning_effort"], json!("high"));
+        // "none" is how a reasoning model is switched off, so it passes as written.
+        let off = sent(
+            CustomSampling::default(),
+            &[("reasoningEffort", "none")],
+            None,
+        );
+        assert_eq!(off["reasoning_effort"], json!("none"));
+        let unset = sent(CustomSampling::default(), &[], None);
+        assert!(unset.get("reasoning_effort").is_none(), "{unset}");
+    }
+
+    #[test]
+    fn no_option_reaches_the_body_under_its_own_camel_case_name() {
+        let body = sent(
+            sampling(),
+            &[
+                ("reasoningEffort", "high"),
+                ("serviceTier", "priority"),
+                ("fastMode", "true"),
+            ],
+            None,
+        );
+        let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
+        assert!(
+            keys.iter().all(|key| !key.chars().any(char::is_uppercase)),
+            "{keys:?}"
+        );
+    }
+
+    #[test]
+    fn a_completion_carries_the_providers_sampling_and_output_cap() {
+        let body = sent(sampling(), &[], None);
+        assert_eq!(body["repetition_penalty"], json!(1.1));
+        assert_eq!(body["temperature"], json!(0.7));
+        assert_eq!(body["top_p"], json!(0.9));
+        assert_eq!(body["top_k"], json!(40));
+        assert_eq!(body["max_tokens"], json!(32_768));
+        assert_eq!(body["stream"], json!(false));
+        assert!(body.get("stream_options").is_none(), "{body}");
+        assert!(body.get("tools").is_none(), "{body}");
+        let unset = sent(CustomSampling::default(), &[], None);
+        for key in ["repetition_penalty", "temperature", "top_p", "top_k"] {
+            assert!(unset.get(key).is_none(), "{key} must not acquire a default");
+        }
+    }
+
+    /// The call's effort and the provider's sampling are different knobs and
+    /// both ride; the schema is asked for natively whatever else is configured,
+    /// although the provider's session turns leave it off.
+    #[test]
+    fn the_calls_effort_the_providers_sampling_and_the_schema_all_ride() {
+        let schema = json!({"type": "object", "properties": {"label": {"type": "string"}}});
+        let body = sent(
+            sampling(),
+            &[("reasoningEffort", "low")],
+            Some(schema.clone()),
+        );
+        assert_eq!(body["reasoning_effort"], json!("low"));
+        assert_eq!(body["temperature"], json!(0.7));
+        assert_eq!(body["response_format"]["type"], json!("json_schema"));
+        assert_eq!(
+            body["response_format"]["json_schema"]["strict"],
+            json!(true)
+        );
+        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
+    }
+}
+
 #[test]
 fn every_agent_generation_has_a_bounded_output_budget() {
     let body = generation_body(CustomSampling::default(), 65_536);
@@ -436,7 +585,7 @@ fn a_custom_provider_receives_a_preset_schema_required_first() {
                 }],
                 model: "qwen".into(),
                 project_id: None,
-                extras: serde_json::Value::Null,
+                options: Default::default(),
                 output_schema: Some(schema),
                 timeout: std::time::Duration::from_secs(5),
             },
@@ -930,8 +1079,9 @@ mod golden {
         );
     }
 
-    /// The schema and effort are the caller's, and the owned loop sends
-    /// neither to a custom provider today.
+    /// The caller's effort rides in OpenAI's flat spelling beside the
+    /// operator's sampling. The schema does not: a strict JSON reply would
+    /// foreclose the turn's tool calls.
     #[tokio::test]
     async fn owned_turn_with_all_sampling_keys() {
         let mut provider = config("vLLM", "http://127.0.0.1:1/v1", CustomModelPolicy::Discover);
@@ -951,7 +1101,7 @@ mod golden {
         assert_golden(
             &bodies,
             &[
-                r#"{"max_tokens":32768,"messages":[{"content":"SYSTEM","role":"system"},{"content":"hi","role":"user"}],"model":"gemma-4-26b","repetition_penalty":1.1,"stream":true,"stream_options":{"include_usage":true},"temperature":0.7,"tool_choice":"auto","tools":["read","write","run"],"top_k":40,"top_p":0.9}"#,
+                r#"{"max_tokens":32768,"messages":[{"content":"SYSTEM","role":"system"},{"content":"hi","role":"user"}],"model":"gemma-4-26b","reasoning_effort":"high","repetition_penalty":1.1,"stream":true,"stream_options":{"include_usage":true},"temperature":0.7,"tool_choice":"auto","tools":["read","write","run"],"top_k":40,"top_p":0.9}"#,
             ],
         );
     }

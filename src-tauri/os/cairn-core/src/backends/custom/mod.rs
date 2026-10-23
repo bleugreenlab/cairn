@@ -318,6 +318,15 @@ impl AgentBackend for CustomBackend {
             .unwrap_or_default()
     }
 
+    fn decision_route(
+        &self,
+        orch: &Orchestrator,
+        project_id: Option<&str>,
+        _offer: &cairn_models::interface::SelectedOffer,
+    ) -> Result<DecisionRoute, String> {
+        self.config(orch, project_id)?.decision_route()
+    }
+
     fn response_completion_availability(
         &self,
         orch: &Orchestrator,

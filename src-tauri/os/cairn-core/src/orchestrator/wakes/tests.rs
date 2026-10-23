@@ -835,6 +835,7 @@ async fn checks_settled_wake_fires_once_for_its_own_node_then_is_consumed() {
         passed: Some(38),
         failed: Some(2),
         skipped: None,
+        deferred: None,
         parser: None,
         complete: None,
         selection: None,
@@ -844,6 +845,7 @@ async fn checks_settled_wake_fires_once_for_its_own_node_then_is_consumed() {
         failure_kind: None,
         suppressed_after: None,
         executor: None,
+        verified_on: None,
     }];
     let snapshot = ChecksSnapshot {
         settlement: classify(&statuses, HeadTurn::Idle, false),
@@ -909,6 +911,7 @@ fn a_verdictless_subscribe_time_reading_is_confirmed_rather_than_fired_on() {
         passed: None,
         failed: None,
         skipped: None,
+        deferred: None,
         parser: None,
         complete: None,
         selection: None,
@@ -918,6 +921,7 @@ fn a_verdictless_subscribe_time_reading_is_confirmed_rather_than_fired_on() {
         failure_kind: None,
         suppressed_after: None,
         executor: None,
+        verified_on: None,
     };
 
     // What a node caught between its turn completing and its wave arming looks
@@ -965,6 +969,7 @@ fn checks_settled_message_carries_verdict_tally_lanes_and_gaps() {
         passed: None,
         failed: None,
         skipped: None,
+        deferred: None,
         parser: None,
         complete: None,
         selection: None,
@@ -974,6 +979,7 @@ fn checks_settled_message_carries_verdict_tally_lanes_and_gaps() {
         failure_kind: None,
         suppressed_after: None,
         executor: None,
+        verified_on: None,
     };
     let statuses = vec![
         lane("rust-lint", NodeCheckState::Pending),

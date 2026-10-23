@@ -23,19 +23,27 @@
 //! workspace's own capability set may be rewritten without naming what is
 //! changing. `Fence::Allow` relaxes the first and must never answer the second.
 //!
-//! A second file is protected here for a closely related reason.
-//! `~/.cairn/operator_auth_secret` is the credential that distinguishes a real
-//! desktop operator answering an authority prompt from anything else on the
-//! machine that can open a loopback socket. Unlike the configuration document,
-//! it is protected against **reads** as well as writes, because reading it is
-//! the whole attack: an agent holding those bytes can approve its own
-//! escalation. And unlike an ordinary secret, a fence prompt is not an adequate
-//! guard for it — allowing a containment crossing is something an agent may do
-//! through its own `permissions` resource, so a merely deny-read credential
-//! would be one self-approved crossing away from disclosure. Both of its
-//! boundaries therefore refuse rather than prompt.
+//! A second file is protected here for a closely related reason. Every Cairn
+//! home's `operator_auth_secret` — `~/.cairn`'s, and each dev-instance home's —
+//! is the credential that distinguishes a real desktop operator answering an
+//! authority prompt from anything else on the machine that can open a loopback
+//! socket. Unlike the configuration document, it is protected against **reads**
+//! as well as writes, because reading it is the whole attack: an agent holding
+//! those bytes can approve its own escalation. And unlike an ordinary secret, a
+//! fence prompt is not an adequate guard for it — allowing a containment
+//! crossing is something an agent may do through its own `permissions`
+//! resource, so a merely deny-read credential would be one self-approved
+//! crossing away from disclosure. Both of its boundaries therefore refuse rather
+//! than prompt.
+//!
+//! The refusals here are defense in depth for the structured verbs. The
+//! boundary itself is enforced in the kernel at every agent spawn by
+//! `cairn_sandbox::operator_credential`, whose set of covered paths is the one
+//! these predicates consult, so a `read` is refused exactly where a shell is.
 
 use std::path::{Component, Path, PathBuf};
+
+use cairn_sandbox::OPERATOR_CREDENTIAL_REFUSAL;
 
 /// What an agent is told when it tries to write the configuration document
 /// directly. Names the surface that works, because a refusal an agent cannot
@@ -47,18 +55,6 @@ pub const BROKERED_ONLY_REFUSAL: &str = concat!(
     "which validate the change and name the authority it needs: `write cairn://settings` for ",
     "settings sections, and `write cairn://mcp` for MCP servers. This is not a containment ",
     "decision, so it is not affected by the filesystem fence."
-);
-
-/// What an agent is told when it tries to read or write the desktop operator
-/// credential. Says plainly that there is no version of this that succeeds, so
-/// it does not read as a transient failure worth retrying.
-pub const OPERATOR_CREDENTIAL_REFUSAL: &str = concat!(
-    "Denied: the desktop operator credential (~/.cairn/operator_auth_secret) is not readable or ",
-    "writable by an agent. It is the credential that lets the person at this machine approve an ",
-    "authority prompt, so an agent holding it could approve its own escalation. This is not a ",
-    "containment decision and it is not approvable: no fence answer, `allowAll`, or permission ",
-    "response makes this path reachable. An authority request is answered by the operator in the ",
-    "desktop app."
 );
 
 /// The workspace configuration document for this install.
@@ -163,12 +159,19 @@ pub fn is_workspace_settings_path(candidate: &Path, config_dir: &Path) -> bool {
     resolves_to(candidate, &workspace_settings_path(config_dir))
 }
 
-/// Whether `candidate` resolves to the desktop operator credential.
+/// Whether `candidate` resolves to a desktop operator credential: this
+/// install's, or any other Cairn home's on the machine, dev-instance homes
+/// included.
 ///
-/// Same identity comparison as [`is_workspace_settings_path`], and it inherits
-/// the same hard-link limit.
+/// The covered set is the kernel boundary's (`OperatorCredentialFloor`), with
+/// this install's own home added in case it lives outside the `~/.cairn*`
+/// family. Path resolution has the same hard-link limit as
+/// [`is_workspace_settings_path`], which matters less here: the kernel refuses
+/// an agent process the link itself.
 pub fn is_operator_credential_path(candidate: &Path, config_dir: &Path) -> bool {
-    resolves_to(candidate, &operator_credential_path(config_dir))
+    cairn_sandbox::OperatorCredentialFloor::for_this_machine()
+        .with_home(config_dir)
+        .names_credential(candidate)
 }
 
 /// Whether two paths name the same file, comparing resolved identity rather
@@ -448,6 +451,39 @@ mod tests {
             );
         }
         let _ = link;
+    }
+
+    #[test]
+    fn another_cairn_homes_operator_credential_is_refused_too() {
+        // The install's own home is one of many: a dev instance's credential
+        // approves that instance's escalations, and is reachable by the same
+        // shell. The home need not exist yet to be recognized.
+        let config = tempfile::tempdir().unwrap();
+        let os_home = cairn_common::paths::os_home_dir().expect("an OS home");
+        for home in [
+            ".cairn",
+            ".cairn-dev",
+            ".cairn-dev-agent-cairn-5099-builder-5",
+        ] {
+            let credential = os_home
+                .join(home)
+                .join(cairn_common::auth::OPERATOR_SECRET_FILE);
+            assert_eq!(
+                read_refusal(config.path(), &credential),
+                Some(OPERATOR_CREDENTIAL_REFUSAL),
+                "{} must be unreadable",
+                credential.display()
+            );
+            assert_eq!(
+                denied_path_refusal(config.path(), &credential),
+                Some(OPERATOR_CREDENTIAL_REFUSAL)
+            );
+        }
+        assert_eq!(
+            read_refusal(config.path(), &os_home.join(".cairn-dev/mcp_auth_secret")),
+            None,
+            "the MCP secret beside it stays readable"
+        );
     }
 
     #[test]

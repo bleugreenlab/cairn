@@ -21,7 +21,7 @@ pub(crate) const NODE_CONTRACT: ResourceContract =
         mutations: &[MutationSpec {
             mode: ChangeMode::Patch,
             required: &[NODE_ACTION],
-            optional: &[PR_METHOD],
+            optional: &[PR_METHOD, PR_PRECONDITION],
             label: "stop a running node or act on a pr action node",
             example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/EXEC/NODE\",mode:\"patch\",payload:{action:\"stop\"}}]})",
         }],
@@ -193,6 +193,7 @@ pub(crate) const NODE_ARTIFACT_CONTRACT: ResourceContract =
                     CONFIRMED,
                     PR_ACTION,
                     PR_METHOD,
+                    PR_PRECONDITION,
                 ],
                 label: "edit, confirm, or act on a PR artifact",
                 example: "field merge: write({changes:[{target:\"cairn:~/plan\",mode:\"patch\",payload:{content:\"...\"}}]}) | text replacement: write({changes:[{target:\"cairn:~/plan\",mode:\"patch\",payload:{old_string:\"old\",new_string:\"new\",field:\"content\"}}]}) | confirm a gated artifact: write({changes:[{target:\"cairn:~/plan\",mode:\"patch\",payload:{confirmed:true}}]}) | merge a PR artifact: write({changes:[{target:\"cairn:~/pr\",mode:\"patch\",payload:{action:\"merge\",method:\"squash\"}}]})",
@@ -258,8 +259,9 @@ pub(crate) const NODE_REBASE_CONTRACT: ResourceContract = ResourceContract {
             REBASE_DROP_INCOMING_REASON,
             CONTENDED_IDENTIFIER,
             DISCHARGE_REASON,
+            REBASE_FAST_FORWARD_BRANCH,
         ],
-        label: "replay this branch or discharge an incorrect identifier obligation",
+        label: "replay this branch, take origin's fast-forward of it or its base, or discharge an incorrect identifier obligation",
         example: "write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"replay\",resolution:\"take-committed-tip\"}}]})",
     }],
 };

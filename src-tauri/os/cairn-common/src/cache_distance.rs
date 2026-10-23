@@ -21,6 +21,11 @@ impl CacheDistance {
     pub fn rank(&self) -> u64 {
         (((self.crates_transitive as u64) << 32) | self.files as u64).min(u64::MAX - 1)
     }
+
+    /// `12 files / 3 crates`: what a warm tree still has to rebuild.
+    pub fn describe_short(&self) -> String {
+        format!("{} files / {} crates", self.files, self.crates)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

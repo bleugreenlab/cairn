@@ -296,6 +296,7 @@ async fn supervise_discord(orch: crate::orchestrator::Orchestrator) {
                     if let Err(error) = reconciler.reconcile_due(now).await {
                         log::warn!("Discord surface reconciliation failed: {error}");
                     }
+                    let card_sweep = Instant::now();
                     if let Err(error) = state_card::reconcile_discord_cards(
                         &db,
                         &surface_orch.db.local,
@@ -306,6 +307,10 @@ async fn supervise_discord(orch: crate::orchestrator::Orchestrator) {
                     {
                         log::warn!("Discord state-card reconciliation failed: {error}");
                     }
+                    log::debug!(
+                        "Discord state-card sweep took {:?}",
+                        card_sweep.elapsed()
+                    );
                 }
                 tokio::select! {
                     () = DISCORD_SURFACE_WAKE.get_or_init(tokio::sync::Notify::new).notified() => {},

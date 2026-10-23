@@ -1,7 +1,7 @@
 //! The facet's one door for HTTP model calls: a completion over one of the
-//! three turn families (Chat, Messages, Responses), the Decisions family, or
-//! one of the two embedding wires (OpenAI `embeddings`, Cairn's gateway
-//! `/embed`).
+//! three turn families (Chat, Messages, Responses), one of the two decision
+//! wires (OpenAI's Decisions, System One), or one of the two embedding wires
+//! (OpenAI `embeddings`, Cairn's gateway `/embed`).
 //!
 //! The seam sits at the request body on purpose. Bodies already differ per
 //! provider (OpenRouter's routing object, Ollama's host, custom sampling), and
@@ -27,6 +27,7 @@ use crate::wire::openai_compat::wire::ChatResponse;
 use crate::wire::openai_responses::http::ResponsesEndpoint;
 use crate::wire::openai_responses::wire::ResponsesResponse;
 use crate::wire::stream::StreamSink;
+use crate::wire::systemone::wire::SystemOneResponse;
 pub use crate::wire::CompletionError;
 
 /// Which protocol family a completion speaks, and the deployment it goes to.
@@ -35,8 +36,12 @@ pub enum CompletionWire<'a> {
     Chat(&'a Endpoint),
     Messages(&'a MessagesEndpoint),
     Responses(&'a ResponsesEndpoint),
-    /// Typed questions answered with probabilities; never streamed.
+    /// Typed questions answered with probabilities over OpenAI's Decisions
+    /// API; never streamed.
     Decisions(&'a DecisionsEndpoint),
+    /// Named questions answered with probabilities over System One; never
+    /// streamed.
+    SystemOne(&'a DecisionsEndpoint),
     /// Texts in, vectors out, over OpenAI's `embeddings`; never streamed.
     Embeddings(&'a EmbeddingsEndpoint),
     /// Texts in, vectors out, over Cairn's gateway `/embed`; never streamed.
@@ -50,7 +55,7 @@ impl CompletionWire<'_> {
             Self::Chat(endpoint) => &endpoint.backend_key,
             Self::Messages(endpoint) => &endpoint.backend_key,
             Self::Responses(endpoint) => &endpoint.backend_key,
-            Self::Decisions(endpoint) => &endpoint.backend_key,
+            Self::Decisions(endpoint) | Self::SystemOne(endpoint) => &endpoint.backend_key,
             Self::Embeddings(endpoint) => &endpoint.backend_key,
             Self::GatewayEmbed(endpoint) => &endpoint.backend_key,
         }
@@ -62,6 +67,7 @@ impl CompletionWire<'_> {
             Self::Messages(_) => "messages",
             Self::Responses(_) => "responses",
             Self::Decisions(_) => "decisions",
+            Self::SystemOne(_) => "systemone",
             Self::Embeddings(_) => "embeddings",
             Self::GatewayEmbed(_) => "gateway-embed",
         }
@@ -76,6 +82,7 @@ impl CompletionWire<'_> {
             Self::Messages(_) => Wire::AnthropicMessages,
             Self::Responses(_) => Wire::OpenAiResponses,
             Self::Decisions(_) => Wire::OpenAiDecisions,
+            Self::SystemOne(_) => Wire::SystemOne,
             Self::Embeddings(_) => Wire::OpenAiEmbeddings,
             Self::GatewayEmbed(_) => Wire::CairnEmbed,
         }
@@ -130,6 +137,7 @@ pub enum CompletionReply {
     Messages(MessagesResponse),
     Responses(ResponsesResponse),
     Decisions(DecisionsResponse),
+    SystemOne(SystemOneResponse),
     Embeddings(EmbeddingsResponse),
     GatewayEmbed(GatewayEmbedResponse),
 }
@@ -140,6 +148,7 @@ fn mismatched(expected: &str, reply: &CompletionReply) -> CompletionError {
         CompletionReply::Messages(_) => "messages",
         CompletionReply::Responses(_) => "responses",
         CompletionReply::Decisions(_) => "decisions",
+        CompletionReply::SystemOne(_) => "systemone",
         CompletionReply::Embeddings(_) => "embeddings",
         CompletionReply::GatewayEmbed(_) => "gateway-embed",
     };
@@ -172,6 +181,13 @@ impl CompletionReply {
         match self {
             Self::Decisions(response) => Ok(response),
             other => Err(mismatched("decisions", &other)),
+        }
+    }
+
+    pub fn into_systemone(self) -> Result<SystemOneResponse, CompletionError> {
+        match self {
+            Self::SystemOne(response) => Ok(response),
+            other => Err(mismatched("systemone", &other)),
         }
     }
 

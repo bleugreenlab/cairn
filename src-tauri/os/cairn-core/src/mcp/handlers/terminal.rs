@@ -7,10 +7,10 @@ use super::run::MAX_BUFFER_SIZE;
 use crate::services::{ensure_submitted_line, LeaseTerminalBinding, PtySession};
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::executor_protocol::{
-    CellOwnerRef, ProcessSandboxMode, ResidencyAcquireRequest, ResidencyFence, ResidencyOperation,
-    ResidencyResult, ResidentProcessEvent, ResidentProcessEventKind, ResidentProcessIoMode,
-    ResidentProcessKind, ResidentProcessSpec, ResidentProcessStatus, ResidentPtySize,
-    ResidentSandboxPolicy, RESIDENT_PROCESS_DEFAULT_SHELL, RESIDENT_PROCESS_SHELL_COMMAND_FLAG,
+    CellOwnerRef, ResidencyAcquireRequest, ResidencyFence, ResidencyOperation, ResidencyResult,
+    ResidentProcessEvent, ResidentProcessEventKind, ResidentProcessIoMode, ResidentProcessKind,
+    ResidentProcessSpec, ResidentProcessStatus, ResidentPtySize, ResidentSandboxPolicy,
+    RESIDENT_PROCESS_DEFAULT_SHELL, RESIDENT_PROCESS_SHELL_COMMAND_FLAG,
 };
 use cairn_common::ids;
 use cairn_common::uri::CairnResource;
@@ -2900,7 +2900,10 @@ async fn spawn_terminal_session(
     // this marker into its user's shell. Explicit shell configuration remains a
     // concrete program and is validated by that same spawn site.
     let program = shell.unwrap_or_else(|| RESIDENT_PROCESS_DEFAULT_SHELL.to_string());
-    let resolved_sandbox = super::run::build_run_sandbox_policy(
+    // A terminal is an agent's process whoever owns its row: a project terminal
+    // an agent created has no run identity to resolve a fence from, and it still
+    // carries the operator credential boundary.
+    let confinement = super::run::resolve_run_confinement(
         orch,
         &target.cwd,
         checkout_kind,
@@ -2909,32 +2912,31 @@ async fn spawn_terminal_session(
         (!command.is_empty()).then_some(command.as_str()),
     )
     .await;
-    let sandbox_mode = match (resolved_sandbox.is_some(), checkout_kind) {
-        (false, _) => ProcessSandboxMode::Unconfined,
-        (true, super::run::RunCheckout::AgentOwned) => ProcessSandboxMode::Confined,
-        (true, super::run::RunCheckout::ProjectLive) => ProcessSandboxMode::ReadOnlyCheckout,
-    };
-    let sandbox_policy = resolved_sandbox.map(|(policy, _)| {
-        // Shell-state grants are added after program resolution by the executor.
-        // Their paths derive from that machine's HOME and XDG environment, so
-        // materializing them here would repeat the same cross-machine bug as
-        // resolving the shell executable on the runner.
-        ResidentSandboxPolicy {
-            worktree: policy.worktree.to_string_lossy().into_owned(),
-            writable_extra: policy
-                .writable_extra
-                .into_iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect(),
-            deny_read: policy
-                .deny_read
-                .into_iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect(),
-            writable_regex: policy.writable_regex,
-            worktree_writable: policy.worktree_writable,
-        }
-    });
+    let sandbox_mode = confinement.sandbox_mode(checkout_kind);
+    let sandbox_policy = confinement
+        .fenced()
+        .map(|(policy, _)| policy.clone())
+        .map(|policy| {
+            // Shell-state grants are added after program resolution by the executor.
+            // Their paths derive from that machine's HOME and XDG environment, so
+            // materializing them here would repeat the same cross-machine bug as
+            // resolving the shell executable on the runner.
+            ResidentSandboxPolicy {
+                worktree: policy.worktree.to_string_lossy().into_owned(),
+                writable_extra: policy
+                    .writable_extra
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect(),
+                deny_read: policy
+                    .deny_read
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect(),
+                writable_regex: policy.writable_regex,
+                worktree_writable: policy.worktree_writable,
+            }
+        });
     // The mode decides which process the terminal's lifetime IS. A
     // lifetime-process terminal hands its command to the shell as the shell's
     // own argument, so the PTY dies exactly when the command finishes and the
@@ -3440,6 +3442,7 @@ mod terminal_finalize_tests {
     use crate::models::Fence;
     use crate::services::testing::{CapturingEmitter, TestServicesBuilder};
     use crate::storage::SearchIndex;
+    use cairn_common::executor_protocol::ProcessSandboxMode;
     use cairn_common::executor_protocol::{
         CellCheckoutKind, CellResidency, ExecutorMessage, ExecutorSubstrateReport, FleetSnapshot,
         OwnerDeathPolicy, PersistentCellLifecycle, PersistentCellState, RepositoryLocator,
@@ -4339,7 +4342,7 @@ mod terminal_finalize_tests {
         let process =
             spawn_and_capture_terminal_process(&orch, target, fence, "bun dev:instance").await;
 
-        assert_eq!(process.sandbox_mode, ProcessSandboxMode::Unconfined);
+        assert_eq!(process.sandbox_mode, ProcessSandboxMode::CredentialFloor);
         assert!(process.sandbox_policy.is_none());
     }
 
@@ -4402,12 +4405,13 @@ mod terminal_finalize_tests {
         assert!(!policy.worktree_writable);
     }
 
-    /// The dial is the whole gate, including on the project's live checkout: an
-    /// `allow` agent's terminal there gets no profile at all. The live checkout
-    /// used to be confined structurally, regardless of the dial, which is one of
-    /// the surfaces that made `allow` a lie (CAIRN-3227).
+    /// The dial is the whole gate on the fence, including on the project's live
+    /// checkout: an `allow` agent's terminal there gets no fence profile. The
+    /// live checkout used to be confined structurally, regardless of the dial,
+    /// which is one of the surfaces that made `allow` a lie (CAIRN-3227). The
+    /// operator credential boundary is not the dial's to lift.
     #[tokio::test(flavor = "multi_thread")]
-    async fn terminal_spawn_leaves_the_live_checkout_unconfined_under_allow() {
+    async fn terminal_spawn_leaves_the_live_checkout_unfenced_under_allow() {
         let db = crate::storage::migrated_test_db("term_policy_live_allow.db").await;
         let orch = test_orchestrator(db);
         seed(&orch.db.local).await;
@@ -4419,20 +4423,22 @@ mod terminal_finalize_tests {
 
         let process = spawn_and_capture_terminal_process(&orch, target, fence, "cargo test").await;
 
-        assert_eq!(process.sandbox_mode, ProcessSandboxMode::Unconfined);
+        assert_eq!(process.sandbox_mode, ProcessSandboxMode::CredentialFloor);
         assert!(
             process.sandbox_policy.is_none(),
-            "an allow agent's terminal must carry no policy anywhere"
+            "an allow agent's terminal must carry no fence policy anywhere"
         );
     }
 
-    /// A project terminal is the operator's own shell: no agent run stands behind
-    /// it, so there is no dial to consult and nothing of Cairn's to confine. The
-    /// seam reached for the read-only-checkout profile purely because the cwd was
-    /// the live checkout, which is how the operator's own fish came to run under
-    /// a cell profile (the CAIRN-3119 family).
+    /// A project terminal has no agent run behind it, so there is no dial to
+    /// consult and no fence profile. The seam once reached for the
+    /// read-only-checkout profile purely because the cwd was the live checkout
+    /// (the CAIRN-3119 family). It is still not Cairn's own process: an agent can
+    /// create one and read everything it prints, which is how an agent shell
+    /// read a dev instance's operator credential (cairn/5217), so it carries the
+    /// operator credential boundary.
     #[tokio::test(flavor = "multi_thread")]
-    async fn terminal_spawn_without_a_run_behind_it_is_never_confined() {
+    async fn terminal_spawn_without_a_run_behind_it_is_unfenced_but_floored() {
         let db = crate::storage::migrated_test_db("term_policy_no_run.db").await;
         let orch = test_orchestrator(db);
         seed(&orch.db.local).await;
@@ -4453,10 +4459,10 @@ mod terminal_finalize_tests {
         )
         .await;
 
-        assert_eq!(process.sandbox_mode, ProcessSandboxMode::Unconfined);
+        assert_eq!(process.sandbox_mode, ProcessSandboxMode::CredentialFloor);
         assert!(
             process.sandbox_policy.is_none(),
-            "a shell with no agent behind it must never be sandboxed"
+            "a shell with no agent behind it must never carry a fence profile"
         );
     }
 
@@ -4487,7 +4493,9 @@ mod terminal_finalize_tests {
         let process =
             spawn_and_capture_terminal_process(&orch, target, fence, "bun dev:instance").await;
 
-        assert_eq!(process.sandbox_mode, ProcessSandboxMode::Unconfined);
+        // Acceptance lifts the fence for the operator's own command; the
+        // operator credential is not part of what it lifts.
+        assert_eq!(process.sandbox_mode, ProcessSandboxMode::CredentialFloor);
         assert!(process.sandbox_policy.is_none());
     }
 
@@ -4606,6 +4614,7 @@ mod terminal_finalize_tests {
             events: Vec::new(),
         };
         PersistentCellState {
+            observed_head: None,
             size_bytes: 0,
             warm_command_classes: Vec::new(),
             executor_id: String::new(),
@@ -4643,7 +4652,9 @@ mod terminal_finalize_tests {
                         reservation: None,
                     },
                 )]),
+                clone_source: None,
             },
+            seeded_from: None,
         }
     }
 
@@ -6199,10 +6210,23 @@ mod terminal_finalize_tests {
 
         // The executor runs the process; the cached advertisement, taken before
         // the start and never refreshed, does not show it.
-        assert!(orch.fleet.snapshot().cells[0]
-            .occupancy
-            .processes
-            .contains_key(&session_id));
+        assert!(
+            executor
+                .cell
+                .lock()
+                .unwrap()
+                .occupancy
+                .processes
+                .contains_key(&session_id),
+            "the executor's own state holds the live terminal's process"
+        );
+        assert!(
+            !orch.fleet.snapshot().cells[0]
+                .occupancy
+                .processes
+                .contains_key(&session_id),
+            "the cached advertisement predates the start"
+        );
 
         let mut watch = ProcessLossWatch::default();
         for _ in 0..5 {

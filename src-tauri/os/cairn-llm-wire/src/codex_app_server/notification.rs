@@ -8,6 +8,19 @@ use super::items::extract_app_server_delta;
 /// stop working; the host answers with fresh ones or the turn waits.
 pub const AUTH_TOKENS_REFRESH_METHOD: &str = "account/chatgptAuthTokens/refresh";
 
+/// Every server request Cairn answers with a real handler rather than
+/// `-32601`. A request outside this list is one Cairn has never been taught,
+/// so the `codex-contract` suite fails a Codex that sends one.
+pub const SUPPORTED_SERVER_REQUESTS: &[&str] = &[
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/fileRead/requestApproval",
+    "item/mcpToolCall/requestApproval",
+    "item/permissions/requestApproval",
+    "mcpServer/elicitation/request",
+    AUTH_TOKENS_REFRESH_METHOD,
+];
+
 /// Stands in for a field the notification omitted, so a reader sees the same
 /// absence it would have seen through a JSON pointer.
 const ABSENT: &Value = &Value::Null;
@@ -23,7 +36,18 @@ pub enum ProviderTurnStatus<'a> {
     Other(&'a str),
 }
 
+/// The `turn/completed` status Codex reports for a turn that ended in an
+/// error (as opposed to `completed` or `interrupted`). Cairn terminalizes a
+/// capacity failure only on this exact status, so the contract suite asserts
+/// the real binary emits it.
+pub const TURN_STATUS_FAILED: &str = "failed";
+
 impl<'a> ProviderTurnStatus<'a> {
+    /// Whether this is Codex's [`TURN_STATUS_FAILED`] status.
+    pub fn is_failed(self) -> bool {
+        self.as_str() == TURN_STATUS_FAILED
+    }
+
     /// Read `turn.status` from a `turn/completed` notification.
     pub fn from_wire(status: &'a str) -> Self {
         match status {
@@ -77,10 +101,8 @@ pub enum Notification<'a> {
     ReasoningDelta { delta: Option<&'a str> },
     /// `item/started`.
     ItemStarted { item: &'a Value },
-    /// `item/completed`.
-    ItemCompleted { item: &'a Value },
-    /// `rawResponseItem/completed`.
-    RawResponseItemCompleted {
+    /// `item/completed`. The turn id is `params.turnId`.
+    ItemCompleted {
         turn_id: Option<&'a str>,
         item: &'a Value,
     },
@@ -146,9 +168,6 @@ impl<'a> Notification<'a> {
                 item: msg.pointer("/params/item").unwrap_or(ABSENT),
             },
             "item/completed" => Self::ItemCompleted {
-                item: msg.pointer("/params/item").unwrap_or(ABSENT),
-            },
-            "rawResponseItem/completed" => Self::RawResponseItemCompleted {
                 turn_id: notification_turn_id(msg),
                 item: msg.pointer("/params/item").unwrap_or(ABSENT),
             },

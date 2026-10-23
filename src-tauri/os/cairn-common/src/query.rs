@@ -108,6 +108,16 @@ const KNOWN_QUERY_KEYS: &[&str] = &[
     // and on one row, explain a thread's standing triggers against it.
     "source",
     "explain",
+    // Store-served source control (cairn://p/{project}/vcs/...): revision
+    // endpoints, single-commit diffs, the diff base mode, blame's revision and
+    // line window. `path`, `view`, `file`, `glob`, `limit`, `offset` and
+    // `format` are shared with other resources above.
+    "from",
+    "to",
+    "commit",
+    "base",
+    "rev",
+    "lines",
 ];
 
 /// Keys whose value is a free-text payload taken verbatim: the value is NOT

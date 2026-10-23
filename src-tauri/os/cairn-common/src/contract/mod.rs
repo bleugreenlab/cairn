@@ -29,6 +29,7 @@ mod specs;
 mod tasks;
 mod tenets;
 mod types;
+mod vcs;
 mod workspace;
 
 pub use specs::BROWSER_ACTIONS;
@@ -45,6 +46,18 @@ pub fn contract_for(kind: ResourceKind) -> Option<&'static ResourceContract> {
 /// dispatcher must reject the mutation.
 pub fn mutation_spec(kind: ResourceKind, mode: ChangeMode) -> Option<&'static MutationSpec> {
     contract_for(kind).and_then(|contract| contract.mutation(mode))
+}
+
+/// Every resource that is also a `run` target, with the named arguments it
+/// takes. Rendered into the kind's affordance actions and into `cairn://help`.
+/// `cairn-core`'s `every_run_target_resolves_to_its_own_spec` pins each entry
+/// to a run-dispatch arm, as `contract_mutations_all_have_dispatch_arms` pins
+/// mutations.
+pub const RUN_TARGETS: &[RunTargetSpec] = &[models::MODELS_DECIDE_RUN_TARGET];
+
+/// The run target `kind` is, if it is one.
+pub fn run_target_for(kind: ResourceKind) -> Option<&'static RunTargetSpec> {
+    RUN_TARGETS.iter().find(|target| target.kind == kind)
 }
 
 // ============================================================================
@@ -64,6 +77,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     globals::GRANT_CONTRACT,
     models::MODELS_CONTRACT,
     models::MODELS_CATALOG_CONTRACT,
+    models::MODELS_DECIDE_CONTRACT,
     models::MODELS_ACCOUNTS_CONTRACT,
     models::MODELS_ACCOUNT_CONTRACT,
     models::MODELS_USAGE_CONTRACT,
@@ -98,6 +112,10 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     projects::PROJECT_HOME_CONTRACT,
     projects::PROJECT_CHECK_RESULTS_CONTRACT,
     projects::PROJECT_CHECK_OBSERVATION_CONTRACT,
+    vcs::PROJECT_VCS_DIFF_CONTRACT,
+    vcs::PROJECT_VCS_ANCESTRY_CONTRACT,
+    vcs::PROJECT_VCS_LOG_CONTRACT,
+    vcs::PROJECT_VCS_BLAME_CONTRACT,
     projects::PROJECT_MESSAGES_CONTRACT,
     projects::PROJECT_TERMINAL_CONTRACT,
     projects::PROJECT_BROWSER_CONTRACT,
@@ -285,9 +303,10 @@ mod tests {
                 "role",
                 "desktopAutomation",
                 "repaired",
+                "buildRoot",
                 "expectedGeneration"
             ],
-            "host, identity, paths, tunnel, and project membership stay unwritable"
+            "host, identity, home, tunnel, and project membership stay unwritable; the one path a patch moves is the runner's own executor's build root, which is validated and marked and never moves the home or the machine authority"
         );
         assert!(mutation_spec(ResourceKind::Executor, ChangeMode::Delete).is_some());
 
@@ -348,6 +367,37 @@ mod tests {
             !generation.note().contains("draining"),
             "the fence must not claim draining: {generation:?}"
         );
+    }
+
+    /// A run target's example is what an agent copies: it must address the
+    /// target's own URI, as a `run` call, naming every required argument.
+    #[test]
+    fn every_run_target_example_is_a_run_of_its_own_uri_naming_its_required_keys() {
+        for target in RUN_TARGETS {
+            let contract = contract_for(target.kind).expect("a run target is a contract kind");
+            assert!(
+                target.example.starts_with("run(")
+                    && target
+                        .example
+                        .contains(&format!("target:\"{}\"", contract.uri_template)),
+                "{:?}: {}",
+                target.kind,
+                target.example
+            );
+            for key in target.required {
+                assert!(
+                    target.example.contains(&format!("{}:", key.key)),
+                    "{:?} example must name `{}`: {}",
+                    target.kind,
+                    key.key,
+                    target.example
+                );
+            }
+            assert_eq!(
+                RUN_TARGETS.iter().filter(|t| t.kind == target.kind).count(),
+                1
+            );
+        }
     }
 
     #[test]

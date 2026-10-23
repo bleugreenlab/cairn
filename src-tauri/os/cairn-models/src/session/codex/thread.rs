@@ -8,7 +8,7 @@ use crate::wire::codex_app_server::goal::{
     parse_response, GoalClearResponse, GoalResponse, GoalStatus,
 };
 
-use super::params::is_missing_rollout_error;
+use crate::wire::codex_app_server::errors::is_missing_rollout_error;
 
 pub fn verify_resumed_thread_binding(
     session_start: &SessionStart,

@@ -26,7 +26,8 @@
 //! and the resolvers that produce it live in `cairn-core`'s
 //! `execution::gates::vocabulary`.
 
-use cairn_db::turso::{params, Connection};
+use cairn_db::sql::{placeholders, IN_LIST_CHUNK};
+use cairn_db::turso::{params, Connection, Value};
 
 use crate::models::ExecutionGate;
 use crate::storage::{DbResult, RowExt};
@@ -96,32 +97,38 @@ pub async fn list_gates_conn(
     Ok(gates)
 }
 
+/// The gates of `n` executions, by execution then authored order.
+fn gates_for_executions_sql(n: usize) -> String {
+    format!(
+        "SELECT {GATE_COLUMNS} FROM execution_gates
+          WHERE execution_id IN ({})
+          ORDER BY execution_id, seq, id",
+        placeholders(n)
+    )
+}
+
 /// The gates of every execution in `execution_ids`, grouped by execution and
-/// in authored order within each. One query however many executions a list
-/// surface shows; an execution with no gates is simply absent from the map.
+/// in authored order within each. One query per [`IN_LIST_CHUNK`] executions;
+/// an execution with no gates is simply absent from the map.
 pub async fn list_gates_for_executions_conn(
     conn: &Connection,
     execution_ids: &[String],
 ) -> DbResult<std::collections::HashMap<String, Vec<ExecutionGate>>> {
     let mut grouped = std::collections::HashMap::<String, Vec<ExecutionGate>>::new();
-    if execution_ids.is_empty() {
-        return Ok(grouped);
-    }
-    let ids_json = serde_json::to_string(execution_ids).map_err(|error| {
-        crate::storage::DbError::internal(format!("failed to serialize execution ids: {error}"))
-    })?;
-    let sql = format!(
-        "SELECT {GATE_COLUMNS} FROM execution_gates
-          WHERE execution_id IN (SELECT value FROM json_each(?1))
-          ORDER BY execution_id, seq, id"
-    );
-    let mut rows = conn.query(&sql, params![ids_json]).await?;
-    while let Some(row) = rows.next().await? {
-        let gate = gate_from_row(&row)?;
-        grouped
-            .entry(gate.execution_id.clone())
-            .or_default()
-            .push(gate);
+    // A chunk boundary never splits one execution's gates: each id lands in
+    // exactly one chunk, so the per-execution order survives the split.
+    for chunk in execution_ids.chunks(IN_LIST_CHUNK) {
+        let bound: Vec<Value> = chunk.iter().map(|id| Value::Text(id.clone())).collect();
+        let mut rows = conn
+            .query(&gates_for_executions_sql(chunk.len()), bound)
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let gate = gate_from_row(&row)?;
+            grouped
+                .entry(gate.execution_id.clone())
+                .or_default()
+                .push(gate);
+        }
     }
     Ok(grouped)
 }
@@ -351,6 +358,60 @@ mod tests {
         .await
         .unwrap();
         db
+    }
+
+    /// Every surface that lists executions renders their gates through this
+    /// statement. Bound through `json_each` it could not seek; it must reach
+    /// `execution_gates` by execution id, never by scanning the table
+    /// (cairn/5206).
+    #[tokio::test]
+    async fn gates_for_executions_seek_by_execution() {
+        let db = seeded_db().await;
+        let sql = format!("EXPLAIN QUERY PLAN {}", gates_for_executions_sql(3));
+        let plan: Vec<String> = db
+            .read(move |conn| {
+                let sql = sql.clone();
+                Box::pin(async move {
+                    let bound = vec![Value::Text("e".into()); 3];
+                    let mut rows = conn.query(&sql, bound).await?;
+                    let mut plan = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        plan.push(row.text(3)?);
+                    }
+                    Ok(plan)
+                })
+            })
+            .await
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("idx_execution_gates_execution")),
+            "the gate read seeks idx_execution_gates_execution: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.starts_with("SCAN")),
+            "the gate read must not scan: {plan:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gates_for_many_executions_group_across_chunks() {
+        let db = seeded_db().await;
+        insert(&db, vec!["{\"a\":1}".into(), "{\"b\":2}".into()]).await;
+        // More ids than one bound list carries, with the gated one in the
+        // second chunk, so the read must span chunks and still group.
+        let mut ids: Vec<String> = (0..IN_LIST_CHUNK).map(|n| format!("absent-{n}")).collect();
+        ids.push("e".into());
+        let grouped = db
+            .read(move |conn| {
+                let ids = ids.clone();
+                Box::pin(async move { list_gates_for_executions_conn(conn, &ids).await })
+            })
+            .await
+            .unwrap();
+        assert_eq!(grouped.len(), 1);
+        let seqs: Vec<i64> = grouped["e"].iter().map(|gate| gate.seq).collect();
+        assert_eq!(seqs, vec![0, 1]);
     }
 
     async fn gates(db: &LocalDb) -> Vec<ExecutionGate> {

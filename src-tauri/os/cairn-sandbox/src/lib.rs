@@ -17,12 +17,27 @@
 //! `/usr/lib`, …), and **hard-denies reads** of a narrow sensitive denylist of
 //! external credential stores (see [`default_deny_read`], which deliberately
 //! does *not* deny Cairn's own `~/.cairn[-dev]`). See `docs/worktree-fence.md`.
+//!
+//! Separately from the fence, every agent spawn carries the operator credential
+//! boundary ([`operator_credential`]), including a spawn the fence leaves
+//! unconfined: no agent process may read a Cairn home's `operator_auth_secret`.
+//! Each seam states its [`Confinement`] so that choice is made explicitly.
 
 pub mod containment;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+mod nested;
+pub mod operator_credential;
+mod setuid_refusal;
+
+pub use nested::check_lane_nested_sandbox_evidence;
+pub use operator_credential::{
+    credential_denial, detect_credential_floor_denial, Confinement, MacosProfile,
+    OperatorCredentialFloor, OPERATOR_CREDENTIAL_REFUSAL,
+};
+pub use setuid_refusal::setuid_refusal_note;
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -41,28 +56,45 @@ pub fn current_process_is_confined() -> bool {
     false
 }
 
-/// Evidence that this process can launch a nested macOS Seatbelt profile and
+/// Evidence that a process can launch a nested macOS Seatbelt profile and
 /// perform a write which that profile explicitly permits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NestedSandboxWriteProbe {
     pub available: bool,
+    /// Whether the refusal was `sandbox_apply` itself (exit 71): the kernel
+    /// declining to apply a profile inside one, as opposed to a write the
+    /// nested profile should have permitted failing.
+    pub apply_refused: bool,
     pub detail: String,
 }
 
-/// Measure the kernel capability sandbox lifecycle tests actually need.
+/// Whether THIS process can apply a nested profile and write inside it: the
+/// question a test asks of the environment it is already running in.
+///
+/// An executor deciding whether its check lanes can do so asks a different
+/// question, because it spawns those lanes inside a profile of its own; see
+/// [`check_lane_nested_sandbox_evidence`].
 ///
 /// This deliberately does not consult `CAIRN_SANDBOXED`: that marker records a
 /// Cairn policy decision, while an inherited Seatbelt profile is kernel state.
 #[cfg(target_os = "macos")]
 pub fn probe_nested_sandbox_write() -> NestedSandboxWriteProbe {
     static PROBE: std::sync::OnceLock<NestedSandboxWriteProbe> = std::sync::OnceLock::new();
-    PROBE.get_or_init(macos::probe_nested_sandbox_write).clone()
+    PROBE
+        .get_or_init(|| macos::probe_nested_sandbox_write_under(&Confinement::Unconfined))
+        .clone()
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn probe_nested_sandbox_write() -> NestedSandboxWriteProbe {
+    nested_probe_not_applicable()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn nested_probe_not_applicable() -> NestedSandboxWriteProbe {
     NestedSandboxWriteProbe {
         available: false,
+        apply_refused: false,
         detail: format!("not applicable on {}", std::env::consts::OS),
     }
 }
@@ -383,7 +415,11 @@ pub fn enforcement_description() -> Option<String> {
     let policy = SandboxPolicy::for_run(Path::new("/cairn/containment/probe"), &[], Vec::new());
     #[cfg(target_os = "macos")]
     {
-        Some(macos::sbpl_profile(&policy))
+        let floor = OperatorCredentialFloor::new(
+            Some(std::path::PathBuf::from("/cairn/containment/home")),
+            [],
+        );
+        Some(macos::sbpl_profile(&policy, &floor))
     }
     #[cfg(target_os = "linux")]
     {
@@ -487,7 +523,12 @@ pub fn detect_denial(
 /// leading `: `. A bare lowercase phrase is deliberately not a signature: an
 /// Ask spawn is scanned even on a clean exit, and `rg 'permission denied'` or
 /// a test log's prose must not raise a crossing.
-fn has_denial_signature(output: &str) -> bool {
+pub fn has_denial_signature(output: &str) -> bool {
+    output.lines().any(line_has_denial_signature)
+}
+
+/// Whether one output line carries a permission-denial signature.
+pub(crate) fn line_has_denial_signature(line: &str) -> bool {
     const SIGS: [&str; 6] = [
         "Operation not permitted",
         "Permission denied",
@@ -496,10 +537,7 @@ fn has_denial_signature(output: &str) -> bool {
         ": operation not permitted",
         ": permission denied",
     ];
-    output
-        .lines()
-        .filter(|line| !is_selinux_creation_context_warning(line))
-        .any(|line| SIGS.iter().any(|s| line.contains(s)))
+    !is_selinux_creation_context_warning(line) && SIGS.iter().any(|s| line.contains(s))
 }
 
 /// Whether a line is the warning SELinux-aware GNU tools print when they cannot
@@ -710,6 +748,12 @@ fn temp_dirs() -> Vec<PathBuf> {
         }
     }
     dirs
+}
+
+/// Escape a string for an SBPL double-quoted literal.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn escape_sbpl(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn home_dir() -> Option<PathBuf> {

@@ -175,25 +175,26 @@ impl JjBackend {
         self.heal_conflicted_intermediates(worktree, &branch);
     }
 
-    /// After a successful seal, collapse a clean-tip / conflicted-intermediate
-    /// branch to one clean commit on its base so it is immediately pushable and
-    /// mergeable. This closes the between-advances gap that re-wedges an
-    /// integration branch: when a base advance bakes conflicts into a branch's
-    /// intermediate commits and the agent resolves the markers at the TIP and
-    /// re-seals, resealing `@` cannot clear the conflicted ancestors, so
-    /// [`crate::jj::push_store_bookmark`] silently refuses (jj won't push a conflicted
-    /// history) and origin's head goes stale until the next reconcile flatten
-    /// fires. Running the same guarded flatten the reconcile path uses, here at
-    /// reseal time, makes the resolve-and-reseal self-healing.
+    /// After a successful seal, heal a clean-tip / conflicted-intermediate branch
+    /// in place so it is immediately pushable and mergeable. This closes the
+    /// between-advances gap that re-wedges an integration branch: when a base
+    /// advance bakes conflicts into a branch's intermediate commits and the agent
+    /// resolves the markers at the TIP and re-seals, resealing `@` cannot clear the
+    /// conflicted ancestors, so [`crate::jj::push_store_bookmark`] silently refuses
+    /// (jj won't push a conflicted history) and origin's head goes stale until the
+    /// next reconcile heal fires. Running the same heal the reconcile path uses,
+    /// here at reseal time, makes the resolve-and-reseal self-healing, and like the
+    /// reconcile path it resolves each conflict-flagged commit where it stands
+    /// rather than collapsing the branch.
     ///
     /// Every step is BEST-EFFORT with logs — a heal failure must never fail a good
     /// seal. A `TipConflicted` branch is left untouched (the agent must resolve the
-    /// markers; a flatten preserves the tip tree and cannot clear it). The jj ops
-    /// run with the worktree as cwd: it is a workspace over the shared store, and
-    /// every op is `--ignore-working-copy` and addresses commits by id/revset, so
-    /// they mutate the shared graph exactly as the reconcile path's store-cwd ops
-    /// do. `advance_workspace_onto` then re-parents this workspace's `@` onto the
-    /// flattened commit (via `update-stale`).
+    /// markers first; the tip IS the resolution the heal carries). The jj ops run
+    /// with the worktree as cwd: it is a workspace over the shared store, and every
+    /// op is `--ignore-working-copy` and addresses commits by id/revset, so they
+    /// mutate the shared graph exactly as the reconcile path's store-cwd ops do.
+    /// The heal rebases this workspace's `@` along with the rest of the branch, so
+    /// the workspace is brought up to date afterwards.
     fn heal_conflicted_intermediates(&self, worktree: &Path, branch: &str) {
         let Some((base_branch, _base_rev)) = crate::jj::read_base_marker(worktree) else {
             return;
@@ -201,32 +202,28 @@ impl JjBackend {
         let Some(base_commit) = crate::jj::bookmark_commit(&self.jj, worktree, &base_branch) else {
             return;
         };
-        // Only a clean tip over conflicted intermediates is flatten-recoverable.
-        // Clean (nothing to do), TipConflicted (agent must resolve), and a probe
-        // error all fall through untouched.
+        // Only a clean tip over conflicted intermediates is healable. Clean
+        // (nothing to do), TipConflicted (agent must resolve), and a probe error
+        // all fall through untouched.
         if !matches!(
             crate::jj::flatten_state(&self.jj, worktree, &base_commit, branch),
             Ok(crate::jj::FlattenState::IntermediateOnly)
         ) {
             return;
         }
-        let desc = crate::jj::branch_description(&self.jj, worktree, branch);
-        let message = if desc.is_empty() {
-            format!("Flatten {branch} onto base (auto-recovery)")
-        } else {
-            desc
-        };
-        match crate::jj::flatten_branch_recovery(&self.jj, worktree, branch, &base_commit, &message)
-        {
-            Ok(recovered) => {
+        match crate::jj::heal_conflicted_ancestry(&self.jj, worktree, branch, &base_commit) {
+            Ok(heal) => {
                 log::info!(
-                    "reseal heal: flattened {branch} ({} conflicted intermediate(s) collapsed, {} rider(s) re-pointed)",
-                    recovered.collapsed_conflicted_commits,
-                    recovered.repointed_bookmarks.len(),
+                    "reseal heal: healed {branch} in place ({} conflict-flagged commit(s) resolved, {} emptied commit(s) dropped)",
+                    heal.healed.len(),
+                    heal.dropped.len(),
                 );
+                if let Err(e) = crate::jj::update_stale(&self.jj, worktree) {
+                    log::warn!("reseal heal: could not refresh {branch}'s workspace after the heal: {e}");
+                }
             }
             Err(e) => log::warn!(
-                "reseal heal: flatten of {branch} refused ({e}); leaving branch for the reconcile/merge-time recovery"
+                "reseal heal: heal of {branch} refused ({e}); leaving branch for the reconcile/merge-time recovery"
             ),
         }
     }
@@ -969,7 +966,7 @@ mod tests {
                 assert_eq!(&validated.manifest.pack_checksum, checksum);
                 cairn_codec::transfer::install_pack(objects, &validated).unwrap();
             }
-            cairn_codec::transfer::verify_commit_closure(objects, &[], tip).map(|_| ())
+            cairn_codec::transfer::verify_commit_closure(objects, &[], &[], tip).map(|_| ())
         }
 
         /// The first cloud-visible seal is self-contained: nothing is cataloged
@@ -1038,7 +1035,7 @@ mod tests {
             .unwrap();
             cairn_codec::transfer::install_pack(&partial_objects, &validated).unwrap();
             assert!(
-                cairn_codec::transfer::verify_commit_closure(&partial_objects, &[], &child)
+                cairn_codec::transfer::verify_commit_closure(&partial_objects, &[], &[], &child)
                     .is_err(),
                 "a range pack must not masquerade as a complete history"
             );
@@ -1808,8 +1805,9 @@ mod tests {
     }
 
     /// A resolve-and-reseal that leaves a CLEAN tip over conflicted INTERMEDIATE
-    /// commits is healed at reseal time: `push_after_seal` flattens the branch to
-    /// one clean commit on its base, re-parents `@`, and pushes it to origin — so a
+    /// commits is healed at reseal time: the resolution moves into the commit
+    /// that conflicted, the emptied resolving commit is dropped, `@` is brought
+    /// up to date, and the branch pushes to origin — so a
     /// coordinator's resolution immediately restores a pushable, mergeable branch
     /// instead of a silently-failing push whose origin head goes stale.
     #[test]
@@ -1900,7 +1898,27 @@ mod tests {
         assert_eq!(
             count_commits(&bin, &cfg, &ws, &range),
             1,
-            "the branch is flattened to one commit on its base"
+            "the builder's own commit survives; the resolving commit it absorbed is dropped"
+        );
+        let message = jj
+            .run(
+                &store,
+                &[
+                    "log",
+                    "-r",
+                    &format!("bookmarks(exact:{builder:?})"),
+                    "--no-graph",
+                    "-T",
+                    "description",
+                    "--ignore-working-copy",
+                ],
+                "healed description",
+            )
+            .unwrap();
+        assert!(
+            message.starts_with("builder edits shared\n")
+                && message.contains("Cairn conflict heal:"),
+            "the commit keeps its own message and says what the heal changed: {message}"
         );
         assert!(
             crate::jj::conflicted_commits(&jj, &ws, &range).is_empty(),

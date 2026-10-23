@@ -373,14 +373,16 @@ pub(crate) struct ChecksCoords {
 /// Accepts the canonical `.../checks` URI and the bare node/task URI it hangs
 /// off, because an agent that has a node URI in hand should not have to know
 /// which suffix this surface wants. `home` is the caller's own node URI, used to
-/// expand a `cairn:~/` reference; pass it already resolved.
+/// expand a deictic `cairn:~` / `cairn:@` reference; pass it already resolved.
 pub(crate) fn checks_coords(reference: &str, home: Option<&str>) -> Result<ChecksCoords, String> {
     use cairn_common::uri::{parse_uri, CairnResource};
 
     let reference = reference.trim();
-    let expanded = if let Some(rest) = reference.strip_prefix("cairn:~/") {
-        let home = home.ok_or("a cairn:~/ checks ref needs a resolvable home node")?;
-        format!("{}/{}", home.trim_end_matches('/'), rest)
+    let expanded = if crate::resources::mutations::is_home_relative_target(reference) {
+        let home = home.ok_or("a cairn:~ or cairn:@ checks ref needs a resolvable home node")?;
+        crate::resources::resolve_home_relative_against(home, reference).ok_or_else(|| {
+            format!("checks ref '{reference}' cannot be resolved against home '{home}'")
+        })?
     } else {
         reference.to_string()
     };
@@ -478,6 +480,7 @@ mod tests {
             passed: None,
             failed: None,
             skipped: None,
+            deferred: None,
             parser: None,
             complete: None,
             selection: None,
@@ -487,6 +490,7 @@ mod tests {
             failure_kind: None,
             suppressed_after: None,
             executor: None,
+            verified_on: None,
         }
     }
 
@@ -784,6 +788,12 @@ mod tests {
         let own = checks_coords("cairn:~/checks", Some(home)).unwrap();
         assert_eq!(own.canonical, format!("{home}/checks"));
 
+        // A project-relative ref names another node of the caller's project.
+        for reference in ["cairn:@/3427/1/builder/checks", "cairn:@3427/1/builder"] {
+            let coords = checks_coords(reference, Some(home)).expect(reference);
+            assert_eq!(coords.canonical, "cairn://p/cairn/3427/1/builder/checks");
+        }
+
         let task =
             checks_coords("cairn://p/cairn/3427/1/builder/task/review/checks", None).unwrap();
         assert_eq!(task.task_name.as_deref(), Some("review"));
@@ -796,6 +806,8 @@ mod tests {
         for reference in [
             "cairn://p/cairn/3427",
             "cairn:~/terminal/dev",
+            "cairn:@",
+            "cairn:@/terminal/dev",
             "rust-tests",
             "",
         ] {
@@ -806,8 +818,10 @@ mod tests {
                 "{reference}: {error}"
             );
         }
-        assert!(checks_coords("cairn:~/checks", None)
-            .unwrap_err()
-            .contains("home node"));
+        for reference in ["cairn:~/checks", "cairn:@/3427/1/builder/checks"] {
+            assert!(checks_coords(reference, None)
+                .unwrap_err()
+                .contains("home node"));
+        }
     }
 }

@@ -203,7 +203,7 @@ async fn isolated_executor_materializes_and_returns_delta_through_cloud_only() {
         fixture.state.repository.join(objects)
     };
     cairn_codec::transfer::install_pack(&objects, &validated).unwrap();
-    cairn_codec::transfer::verify_commit_closure(&objects, &[], &delta_commit).unwrap();
+    cairn_codec::transfer::verify_commit_closure(&objects, &[], &[], &delta_commit).unwrap();
     assert_eq!(
         git(
             &fixture.state.repository,
@@ -229,11 +229,13 @@ async fn catalog(
     // Production pack construction. Only the storage around it is simulated: a
     // second implementation of what a runner actually serves would let this
     // fixture stay green while the real route drifted.
-    let Ok(Some(built)) = build_local_reachable_pack(
+    let Some(built) = build_local_reachable_pack(
         &state.repository,
         &request.want_commit,
         &request.have_commits,
-    ) else {
+    )
+    .ok()
+    .and_then(|fetched| fetched.pack) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let index = cairn_codec::transfer::validate_pack(
@@ -447,10 +449,34 @@ fn init_repo(repo: &Path) -> String {
     git(repo, &["rev-parse", "HEAD"])
 }
 
+/// A runner repository that is a `--depth 1` clone of a three-commit upstream,
+/// the shape of a project checkout cloned shallow: its HEAD is recorded as
+/// shallow and HEAD's parent was never fetched.
+fn init_shallow_repo(repo: &Path) -> String {
+    let upstream = repo.with_file_name("shallow-upstream");
+    init_repo(&upstream);
+    for marker in ["second", "shallow-tip-marker"] {
+        std::fs::write(upstream.join("README.md"), format!("{marker}\n")).unwrap();
+        git(&upstream, &["commit", "-am", marker]);
+    }
+    let url = format!("file://{}", upstream.display());
+    git(
+        repo.parent().unwrap(),
+        &["clone", "-q", "--depth", "1", &url, repo.to_str().unwrap()],
+    );
+    git(repo, &["config", "user.email", "acceptance@example.com"]);
+    git(repo, &["config", "user.name", "Acceptance"]);
+    git(repo, &["rev-parse", "HEAD"])
+}
+
 async fn fixture() -> Fixture {
+    fixture_from(init_repo).await
+}
+
+async fn fixture_from(make_repository: fn(&Path) -> String) -> Fixture {
     let (temp, db) = common::migrated_db().await;
     let repository = temp.path().join("runner-repository");
-    let base = init_repo(&repository);
+    let base = make_repository(&repository);
     let db = Arc::new(db);
     let project_id = common::insert_project_with_repo(&db, "cas", &repository).await;
     let repository_id = "acceptance-repository".to_owned();
@@ -589,24 +615,25 @@ async fn fetch(
         Ok(built) => built,
         Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
     };
-    let Some(built) = built else {
-        return StatusCode::NO_CONTENT.into_response();
+    // Production response headers, for the same reason.
+    let headers = built.response_headers().unwrap();
+    let mut response = match built.pack {
+        None => StatusCode::NO_CONTENT.into_response(),
+        Some(_) if state.interrupt_fetch.swap(false, Ordering::SeqCst) => {
+            return (StatusCode::OK, Bytes::from_static(b"PACK interrupted")).into_response();
+        }
+        Some(pack) => {
+            state
+                .runner_object_bytes
+                .fetch_add(pack.pack.len(), Ordering::SeqCst);
+            Response::new(Body::from(pack.pack))
+        }
     };
-    if state.interrupt_fetch.swap(false, Ordering::SeqCst) {
-        return (StatusCode::OK, Bytes::from_static(b"PACK interrupted")).into_response();
+    for (name, value) in headers {
+        response
+            .headers_mut()
+            .insert(name, HeaderValue::from_str(&value).unwrap());
     }
-    state
-        .runner_object_bytes
-        .fetch_add(built.pack.len(), Ordering::SeqCst);
-    let mut response = Response::new(Body::from(built.pack.clone()));
-    response.headers_mut().insert(
-        "x-cairn-content-sha256",
-        HeaderValue::from_str(&content_sha256(&built.pack)).unwrap(),
-    );
-    response.headers_mut().insert(
-        "x-cairn-pack-checksum",
-        HeaderValue::from_str(&built.pack_checksum).unwrap(),
-    );
     response
 }
 
@@ -860,6 +887,105 @@ async fn an_unavailable_exact_head_refuses_structurally_without_running_anything
         published_packs.is_empty(),
         "an unresolvable head must leave no objects behind: {published_packs:?}"
     );
+}
+
+/// A project whose canonical repository is a shallow clone. Its history stops
+/// at the clone boundary by design, so the closure a managed executor proves,
+/// the repository it materializes, and the delta the runner imports back must
+/// all stop there too, while a genuinely incomplete closure is still refused
+/// (the codec's own tests hold that half).
+#[tokio::test]
+async fn a_shallow_source_materializes_runs_and_returns_its_delta() {
+    if common::skip_if_fenced("a_shallow_source_materializes_runs_and_returns_its_delta") {
+        return;
+    }
+    let fixture = fixture_from(init_shallow_repo).await;
+    let runner_repository = &fixture.state.repository;
+    let boundary = cairn_codec::transfer::shallow_commits(runner_repository).unwrap();
+    assert_eq!(boundary, vec![fixture.base.clone()]);
+
+    let outcome = submit(
+        &fixture,
+        request(
+            &fixture,
+            "shallow",
+            "cat README.md && printf shallow-change > shallow.txt",
+            MutationPolicy::AllowDelta,
+        ),
+    )
+    .await;
+    let (output, delta_commit, receipt) = match outcome {
+        CellOutcome::Completed {
+            output,
+            mutation_delta: Some(delta),
+            exit_code: Some(0),
+            ..
+        } => (
+            output,
+            delta.delta_commit,
+            delta.upload_receipt.expect("managed delta receipt"),
+        ),
+        other => panic!("a shallow source must materialize and run, got {other:?}"),
+    };
+    assert!(output.contains("shallow-tip-marker"), "{output}");
+    assert_eq!(fixture.state.fetches.load(Ordering::SeqCst), 1);
+    assert!(fixture.state.runner_object_bytes.load(Ordering::SeqCst) > 0);
+
+    // The residency repository is shallow at the source's boundary, so Git run
+    // there (worktrees, eviction's walk, delta construction) agrees with the
+    // closure the executor proved.
+    let sidecar = sidecar(&fixture);
+    let managed_repository = PathBuf::from(sidecar["repository"].as_str().unwrap());
+    assert_eq!(
+        cairn_codec::transfer::shallow_commits(&managed_repository).unwrap(),
+        boundary
+    );
+    let walked = git(
+        &managed_repository,
+        &["rev-list", "--objects", "--missing=print", &delta_commit],
+    );
+    assert!(
+        !walked.lines().any(|line| line.starts_with('?')),
+        "{walked}"
+    );
+    let cell = PathBuf::from(sidecar["path"].as_str().unwrap());
+    assert_eq!(git(&cell, &["rev-list", "--count", &fixture.base]), "1");
+
+    // The runner's commit barrier walks its own shallow store, and only the
+    // canonical repository's boundary lets that walk end.
+    let staged = fixture
+        .orch
+        .object_plane
+        .staged_delta(&receipt)
+        .expect("validated staged delta");
+    let pack = std::fs::read(staged.path).unwrap();
+    let validated =
+        cairn_codec::transfer::validate_pack(&pack, cairn_codec::transfer::PackLimits::default())
+            .unwrap();
+    let objects = runner_repository.join(git(
+        runner_repository,
+        &["rev-parse", "--git-path", "objects"],
+    ));
+    cairn_codec::transfer::install_pack(&objects, &validated).unwrap();
+    assert!(
+        cairn_codec::transfer::verify_commit_closure(&objects, &[], &[], &delta_commit).is_err()
+    );
+    cairn_codec::transfer::verify_commit_closure(&objects, &[], &boundary, &delta_commit).unwrap();
+
+    // A second run on the same commit is a warm hit: the recorded boundary
+    // completes the local proof without asking the runner again.
+    let warm = submit(
+        &fixture,
+        request(
+            &fixture,
+            "shallow-warm",
+            "printf warm-ok",
+            MutationPolicy::PureVerdict,
+        ),
+    )
+    .await;
+    assert_completed(&warm, "warm-ok");
+    assert_eq!(fixture.state.fetches.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

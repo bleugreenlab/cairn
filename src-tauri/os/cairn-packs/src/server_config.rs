@@ -268,6 +268,216 @@ pub fn fingerprint_mcp_config(
     }
 }
 
+/// Version of the catalog binding's canonical encoding. Bump when its field
+/// set, order, or interpretation changes; validators must reject other versions.
+pub const CATALOG_BINDING_VERSION: u32 = 1;
+
+const CATALOG_BINDING_DOMAIN: &str = "cairn.mcp.catalog-binding";
+
+/// Token-free identity of the context under which a catalog was fetched.
+///
+/// Ownership paths must already be canonicalized by the caller. The config
+/// identity must come from `fingerprint_mcp_config` over the authored config,
+/// with the requesting project's identity, server name, and "catalog" operation.
+/// Server-provided cacheScope is deliberately not authority-bearing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogBinding {
+    pub binding_version: u32,
+    /// "workspace" or "project:{canonical path}".
+    pub ownership_scope: String,
+    /// Authorization identity, separate from filesystem ownership.
+    pub project_id: Option<String>,
+    /// "user" or "pack:{id}".
+    pub owner: String,
+    pub config_identity: cairn_common::authorization::McpConfigFingerprint,
+    pub credential_key: String,
+    pub credential_context: CatalogCredentialContext,
+    pub protocol_version: String,
+    /// The operation being cached: "tools/list".
+    pub method: String,
+    pub authorization_revision: u32,
+}
+
+/// Stable credential witnesses, never credential values.
+///
+/// Static credentials and OAuth may coexist on one server. An absent witness
+/// means that credential kind is not used, NOT that its storage is unavailable.
+/// Callers must reject missing, unreadable, or updating required witnesses before
+/// constructing a binding; this pure encoder cannot establish credential state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogCredentialContext {
+    pub static_generation: Option<CredentialGeneration>,
+    pub oauth: CatalogOAuthState,
+}
+
+/// The OAuth state a catalog was fetched under.
+///
+/// Signed-out carries its tombstone generation rather than collapsing into
+/// "no OAuth": a sign-in and sign-out that both land during one fetch must leave
+/// the witness different, or the signed-in account's catalog would be recorded
+/// as anonymous.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CatalogOAuthState {
+    /// No OAuth credential has ever been stored under this key.
+    Never,
+    SignedOut(CredentialGeneration),
+    SignedIn(CatalogOAuthContext),
+}
+
+impl CatalogOAuthState {
+    pub fn signed_in(&self) -> Option<&CatalogOAuthContext> {
+        match self {
+            Self::SignedIn(context) => Some(context),
+            _ => None,
+        }
+    }
+
+    pub fn signed_in_mut(&mut self) -> Option<&mut CatalogOAuthContext> {
+        match self {
+            Self::SignedIn(context) => Some(context),
+            _ => None,
+        }
+    }
+}
+
+/// A credential witness that is never reused for a different credential.
+///
+/// Writers that share Cairn's credential mutation lock advance `counter`
+/// strictly, and keep it across sign-out, so no two committed credentials share
+/// one. `incarnation` is random and chosen whenever a witness has to be created
+/// from nothing, which is what keeps a witness deleted outside Cairn (a cleared
+/// keychain entry) from restarting at a counter an old catalog still carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialGeneration {
+    pub incarnation: String,
+    pub counter: u64,
+}
+
+/// Non-secret OAuth context projected by the credential store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogOAuthContext {
+    pub issuer: Option<String>,
+    pub resource: String,
+    pub client_id: String,
+    /// Granted scopes are encoded as a set, independent of order or duplicates.
+    pub scopes: Vec<String>,
+    pub generation: CredentialGeneration,
+}
+
+/// Compute a lowercase SHA-256 digest of the structured catalog binding.
+///
+/// This is encoding, not validation: callers must check the supported binding
+/// version, stable credential witnesses, protocol and authorization context.
+/// Persisted digests are only inspection copies and must be recomputed from the
+/// binding at verification time. No keychain, environment or filesystem is read.
+pub fn fingerprint_catalog_binding(binding: &CatalogBinding) -> String {
+    // Exhaustive destructures keep newly added identity fields from silently
+    // escaping the digest, including fields added to nested witness types.
+    let CatalogBinding {
+        binding_version,
+        ownership_scope,
+        project_id,
+        owner,
+        config_identity,
+        credential_key,
+        credential_context,
+        protocol_version,
+        method,
+        authorization_revision,
+    } = binding;
+    let cairn_common::authorization::McpConfigFingerprint {
+        algorithm,
+        encoding_version,
+        digest,
+    } = config_identity;
+    let CatalogCredentialContext {
+        static_generation,
+        oauth,
+    } = credential_context;
+
+    let mut encoder = CanonicalEncoder::new(CATALOG_BINDING_DOMAIN, CATALOG_BINDING_VERSION);
+    encoder.field("binding_version", &binding_version.to_string());
+    encoder.field("ownership_scope", ownership_scope);
+    match project_id {
+        None => encoder.field("project_id", "absent"),
+        Some(id) => {
+            encoder.field("project_id", "present");
+            encoder.field("project_id.value", id);
+        }
+    }
+    encoder.field("owner", owner);
+    encoder.field("config.algorithm", algorithm);
+    encoder.field("config.encoding_version", &encoding_version.to_string());
+    encoder.field("config.digest", digest);
+    encoder.field("credential_key", credential_key);
+    match static_generation {
+        None => encoder.field("credential.static", "absent"),
+        Some(generation) => {
+            encoder.field("credential.static", "present");
+            encode_generation(&mut encoder, "credential.static", generation);
+        }
+    }
+    match oauth {
+        CatalogOAuthState::Never => encoder.field("credential.oauth", "never"),
+        CatalogOAuthState::SignedOut(generation) => {
+            encoder.field("credential.oauth", "signed-out");
+            encode_generation(&mut encoder, "credential.oauth", generation);
+        }
+        CatalogOAuthState::SignedIn(oauth) => {
+            let CatalogOAuthContext {
+                issuer,
+                resource,
+                client_id,
+                scopes,
+                generation,
+            } = oauth;
+            encoder.field("credential.oauth", "present");
+            match issuer {
+                None => encoder.field("credential.oauth.issuer", "absent"),
+                Some(issuer) => {
+                    encoder.field("credential.oauth.issuer", "present");
+                    encoder.field("credential.oauth.issuer.value", issuer);
+                }
+            }
+            encoder.field("credential.oauth.resource", resource);
+            encoder.field("credential.oauth.client_id", client_id);
+            let scopes: Vec<String> = scopes
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            encoder.sequence("credential.oauth.scopes", &scopes);
+            encode_generation(&mut encoder, "credential.oauth", generation);
+        }
+    }
+    encoder.field("protocol_version", protocol_version);
+    encoder.field("method", method);
+    encoder.field(
+        "authorization_revision",
+        &authorization_revision.to_string(),
+    );
+    encoder.finish()
+}
+
+fn encode_generation(
+    encoder: &mut CanonicalEncoder,
+    prefix: &str,
+    generation: &CredentialGeneration,
+) {
+    let CredentialGeneration {
+        incarnation,
+        counter,
+    } = generation;
+    encoder.field(&format!("{prefix}.incarnation"), incarnation);
+    encoder.field(&format!("{prefix}.counter"), &counter.to_string());
+}
+
 fn default_transport() -> String {
     "stdio".to_string()
 }
@@ -646,5 +856,258 @@ mod fingerprint_secret_tests {
         );
         assert!(!printed.contains("npx"));
         assert!(printed.contains("sha256"));
+    }
+}
+
+#[cfg(test)]
+mod catalog_binding_tests {
+    use super::*;
+
+    fn generation(incarnation: &str, counter: u64) -> CredentialGeneration {
+        CredentialGeneration {
+            incarnation: incarnation.into(),
+            counter,
+        }
+    }
+
+    fn binding() -> CatalogBinding {
+        CatalogBinding {
+            binding_version: CATALOG_BINDING_VERSION,
+            ownership_scope: "project:/canonical/project".into(),
+            project_id: Some("project-id".into()),
+            owner: "pack:example".into(),
+            config_identity: cairn_common::authorization::McpConfigFingerprint {
+                algorithm: "sha256".into(),
+                encoding_version: MCP_CONFIG_FINGERPRINT_ENCODING_VERSION,
+                digest: "authored-config-digest".into(),
+            },
+            credential_key: "project:server".into(),
+            credential_context: CatalogCredentialContext {
+                static_generation: Some(generation("static-incarnation", 4)),
+                oauth: CatalogOAuthState::SignedIn(CatalogOAuthContext {
+                    issuer: Some("https://issuer.test".into()),
+                    resource: "https://server.test/mcp".into(),
+                    client_id: "client-id".into(),
+                    scopes: vec!["read".into(), "write".into()],
+                    generation: generation("oauth-incarnation", 8),
+                }),
+            },
+            protocol_version: "2025-06-18".into(),
+            method: "tools/list".into(),
+            authorization_revision: 2,
+        }
+    }
+
+    #[test]
+    fn every_bound_dimension_changes_the_digest() {
+        let original = fingerprint_catalog_binding(&binding());
+        macro_rules! changes {
+            ($field:ident $(.$nested:ident)*, $value:expr) => {{
+                let mut changed = binding();
+                changed.$field$(.$nested)* = $value;
+                assert_ne!(
+                    original,
+                    fingerprint_catalog_binding(&changed),
+                    stringify!($field$(.$nested)*)
+                );
+            }};
+        }
+        changes!(binding_version, CATALOG_BINDING_VERSION + 1);
+        changes!(ownership_scope, "workspace".into());
+        changes!(ownership_scope, "project:/other/project".into());
+        changes!(project_id, Some("other-project".into()));
+        changes!(project_id, None);
+        changes!(owner, "user".into());
+        changes!(owner, "pack:other".into());
+        changes!(config_identity.algorithm, "other-algorithm".into());
+        changes!(config_identity.encoding_version, 99);
+        changes!(config_identity.digest, "other-config-digest".into());
+        changes!(credential_key, "workspace:server".into());
+        changes!(credential_context.static_generation, None);
+        changes!(
+            credential_context.static_generation,
+            Some(generation("static-incarnation", 5))
+        );
+        changes!(
+            credential_context.static_generation,
+            Some(generation("static-incarnation", u64::MAX))
+        );
+        changes!(
+            credential_context.static_generation,
+            Some(generation("recreated-incarnation", 4))
+        );
+        changes!(credential_context.oauth, CatalogOAuthState::Never);
+        changes!(
+            credential_context.oauth,
+            CatalogOAuthState::SignedOut(generation("oauth-incarnation", 8))
+        );
+        changes!(protocol_version, "2024-11-05".into());
+        changes!(method, "resources/list".into());
+        changes!(authorization_revision, 3);
+
+        macro_rules! oauth_changes {
+            ($field:ident, $value:expr) => {{
+                let mut changed = binding();
+                changed
+                    .credential_context
+                    .oauth
+                    .signed_in_mut()
+                    .unwrap()
+                    .$field = $value;
+                assert_ne!(
+                    original,
+                    fingerprint_catalog_binding(&changed),
+                    stringify!($field)
+                );
+            }};
+        }
+        oauth_changes!(issuer, None);
+        oauth_changes!(issuer, Some("https://other-issuer.test".into()));
+        oauth_changes!(resource, "https://other-resource.test".into());
+        oauth_changes!(client_id, "other-client".into());
+        oauth_changes!(scopes, vec!["read".into()]);
+        oauth_changes!(scopes, vec!["read".into(), "write".into(), "admin".into()]);
+        oauth_changes!(generation, generation("oauth-incarnation", 9));
+        oauth_changes!(generation, generation("oauth-incarnation", u64::MAX));
+        oauth_changes!(generation, generation("recreated-incarnation", 8));
+    }
+
+    fn assert_distinct(first: &CatalogBinding, second: &CatalogBinding) {
+        assert_ne!(
+            fingerprint_catalog_binding(first),
+            fingerprint_catalog_binding(second)
+        );
+    }
+
+    #[test]
+    fn optional_values_do_not_collapse_absence_into_empty_or_zero() {
+        let mut absent = binding();
+        absent.project_id = None;
+        let mut empty = absent.clone();
+        empty.project_id = Some(String::new());
+        assert_distinct(&absent, &empty);
+
+        absent = binding();
+        absent.credential_context.static_generation = None;
+        empty = absent.clone();
+        empty.credential_context.static_generation = Some(generation("", 0));
+        assert_distinct(&absent, &empty);
+
+        absent = binding();
+        absent
+            .credential_context
+            .oauth
+            .signed_in_mut()
+            .unwrap()
+            .issuer = None;
+        empty = absent.clone();
+        empty
+            .credential_context
+            .oauth
+            .signed_in_mut()
+            .unwrap()
+            .issuer = Some(String::new());
+        assert_distinct(&absent, &empty);
+    }
+
+    #[test]
+    fn credential_kinds_cannot_alias_even_with_equal_generations() {
+        let mut none = binding();
+        none.credential_context = CatalogCredentialContext {
+            static_generation: None,
+            oauth: CatalogOAuthState::Never,
+        };
+        // Same incarnation and counter on both kinds: only the kind may differ.
+        let shared = generation("oauth-incarnation", 8);
+        let mut static_only = none.clone();
+        static_only.credential_context.static_generation = Some(shared.clone());
+        let mut oauth_only = none.clone();
+        oauth_only.credential_context.oauth = binding().credential_context.oauth;
+        let mut both = oauth_only.clone();
+        both.credential_context.static_generation = Some(shared);
+        // Signed out at the same generation is neither signed in nor never.
+        let mut signed_out = none.clone();
+        signed_out.credential_context.oauth =
+            CatalogOAuthState::SignedOut(generation("oauth-incarnation", 8));
+        let digests: BTreeSet<_> = [none, static_only, oauth_only, both, signed_out]
+            .iter()
+            .map(fingerprint_catalog_binding)
+            .collect();
+        assert_eq!(digests.len(), 5);
+    }
+
+    #[test]
+    fn encoding_is_deterministic_and_scope_sets_are_canonical() {
+        let original = binding();
+        let digest = fingerprint_catalog_binding(&original);
+        assert_eq!(digest.len(), 64);
+        assert!(digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        for _ in 0..16 {
+            let decoded: CatalogBinding =
+                serde_json::from_str(&serde_json::to_string(&original).unwrap()).unwrap();
+            assert_eq!(original, decoded);
+            assert_eq!(digest, fingerprint_catalog_binding(&decoded));
+        }
+        let mut reordered = original;
+        reordered
+            .credential_context
+            .oauth
+            .signed_in_mut()
+            .unwrap()
+            .scopes = vec!["write".into(), "read".into(), "read".into()];
+        assert_eq!(digest, fingerprint_catalog_binding(&reordered));
+    }
+
+    #[test]
+    fn field_and_sequence_boundaries_are_unambiguous() {
+        let mut first = binding();
+        first.ownership_scope = "a".into();
+        first.owner = "bc".into();
+        let mut second = first.clone();
+        second.ownership_scope = "ab".into();
+        second.owner = "c".into();
+        assert_distinct(&first, &second);
+        first
+            .credential_context
+            .oauth
+            .signed_in_mut()
+            .unwrap()
+            .scopes = vec!["readwrite".into()];
+        second = first.clone();
+        second
+            .credential_context
+            .oauth
+            .signed_in_mut()
+            .unwrap()
+            .scopes = vec!["read".into(), "write".into()];
+        assert_distinct(&first, &second);
+    }
+
+    #[test]
+    fn serialized_binding_rejects_unbound_or_secret_fields() {
+        for path in [
+            vec![],
+            vec!["credential_context"],
+            vec!["credential_context", "oauth", "signedIn"],
+            vec!["credential_context", "oauth", "signedIn", "generation"],
+            vec!["credential_context", "static_generation"],
+            vec!["config_identity"],
+        ] {
+            let mut value = serde_json::to_value(binding()).unwrap();
+            let mut object = &mut value;
+            for key in path {
+                object = &mut object[key];
+            }
+            object
+                .as_object_mut()
+                .unwrap()
+                .insert("access_token".into(), "not-allowed".into());
+            assert!(serde_json::from_value::<CatalogBinding>(value).is_err());
+        }
+        let mut value = serde_json::to_value(binding()).unwrap();
+        value["cacheScope"] = "public".into();
+        assert!(serde_json::from_value::<CatalogBinding>(value).is_err());
     }
 }

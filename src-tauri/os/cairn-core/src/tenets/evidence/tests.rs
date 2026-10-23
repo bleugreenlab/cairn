@@ -271,7 +271,7 @@ impl EvidenceDeps for Fake {
             provider: "custom:fake".into(),
             model: "fake-decider".into(),
             answers: fake_answers(&decision.questions, &verdicts),
-            input_tokens: None,
+            usage: Default::default(),
         })
     }
     fn nudge(&self, job_id: &str) {
@@ -1586,7 +1586,7 @@ async fn the_decision_asks_valid_questions_and_parses_by_name() {
             choice("tenet-3", "maybe"),
             choice("tenet-4", "supports"),
         ],
-        input_tokens: None,
+        usage: Default::default(),
     };
     let verdicts = judge::parse(&answered, &candidates);
     assert_eq!(verdicts.len(), 1, "{verdicts:?}");

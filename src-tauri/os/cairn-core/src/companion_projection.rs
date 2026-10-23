@@ -573,7 +573,8 @@ mod tests {
         let db = projection_db().await;
         db.execute_script("INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','w',1,1); INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','p','p','/tmp/p',1,1); INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',1,'issue','active',1,1); INSERT INTO executions(id,recipe_id,issue_id,project_id,seq,status,started_at) VALUES('e','build','i','p',1,'running',1);").await.unwrap();
         let baseline = read_companion_snapshot(db.clone()).await.unwrap();
-        db.execute_script("INSERT INTO jobs(id,project_id,execution_id,name,status,uri_segment,created_at,updated_at) VALUES('j','p','e','node','running','node',2,2); INSERT INTO check_result_cache(project_id,tree_hash,input_hash,check_name,exit_code,passed,output_tail,duration_ms,ran_at,job_id) VALUES('p','tree','input','focused',0,1,'',1,2,'j');").await.unwrap();
+        assert!(baseline.nodes.is_empty() && baseline.checks.is_empty());
+        db.execute_script("INSERT INTO jobs(id,project_id,execution_id,status,uri_segment,created_at,updated_at) VALUES('j','p','e','running','node',2,2); INSERT INTO check_result_cache(project_id,tree_hash,input_hash,check_name,exit_code,passed,output_tail,duration_ms,ran_at,job_id) VALUES('p','tree','input','focused',0,1,'',1,2,'j');").await.unwrap();
 
         let localized = refresh_companion_snapshot(db.clone(), &baseline, CompanionSections::GRAPH)
             .await
@@ -581,7 +582,12 @@ mod tests {
         let canonical = read_companion_snapshot(db).await.unwrap();
 
         assert_eq!(localized, canonical);
-        assert!(localized.checks.contains_key("j:focused"));
+        assert_eq!(localized.nodes["j"].name, "node");
+        let check = &localized.checks["j:focused"];
+        assert_eq!(
+            (check.node_id.as_str(), check.verdict.as_str()),
+            ("j", "passed")
+        );
     }
 
     #[tokio::test]

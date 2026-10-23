@@ -397,6 +397,8 @@ pub struct RecordedRequest {
     pub method: HttpMethod,
     pub url: String,
     pub headers: HeaderMap,
+    /// The JSON body of a POST, PUT, or PATCH; `None` for GET and DELETE.
+    pub body: Option<Value>,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -482,11 +484,13 @@ impl MockHttpClient {
         method: HttpMethod,
         url: &str,
         headers: HeaderMap,
+        body: Option<Value>,
     ) -> HttpResultFuture<'_> {
         self.requests.lock().unwrap().push(RecordedRequest {
             method,
             url: url.to_string(),
             headers,
+            body,
         });
         let result = self.find_response(url);
         Box::pin(async move { result })
@@ -503,23 +507,23 @@ impl Default for MockHttpClient {
 #[cfg(any(test, feature = "test-utils"))]
 impl HttpClient for MockHttpClient {
     fn get(&self, url: &str, headers: HeaderMap) -> HttpResultFuture<'_> {
-        self.response_future(HttpMethod::Get, url, headers)
+        self.response_future(HttpMethod::Get, url, headers, None)
     }
 
-    fn post(&self, url: &str, _body: Value, headers: HeaderMap) -> HttpResultFuture<'_> {
-        self.response_future(HttpMethod::Post, url, headers)
+    fn post(&self, url: &str, body: Value, headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.response_future(HttpMethod::Post, url, headers, Some(body))
     }
 
-    fn put(&self, url: &str, _body: Value, headers: HeaderMap) -> HttpResultFuture<'_> {
-        self.response_future(HttpMethod::Put, url, headers)
+    fn put(&self, url: &str, body: Value, headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.response_future(HttpMethod::Put, url, headers, Some(body))
     }
 
-    fn patch(&self, url: &str, _body: Value, headers: HeaderMap) -> HttpResultFuture<'_> {
-        self.response_future(HttpMethod::Patch, url, headers)
+    fn patch(&self, url: &str, body: Value, headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.response_future(HttpMethod::Patch, url, headers, Some(body))
     }
 
     fn delete(&self, url: &str, headers: HeaderMap) -> HttpResultFuture<'_> {
-        self.response_future(HttpMethod::Delete, url, headers)
+        self.response_future(HttpMethod::Delete, url, headers, None)
     }
 }
 

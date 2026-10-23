@@ -133,7 +133,8 @@ fn insert_fleet(
 /// earlier, so letting it write roles would let a stale snapshot undo a role an
 /// operator set in between, on disk and, at the next start, in placement. Roles
 /// change only through [`mutate_fleet`], which reads, writes and publishes them
-/// as one step.
+/// as one step. The colocated build root is held the same way: only the
+/// build-root command, which validates the path and writes its marker, sets it.
 pub fn set_fleet(
     config_dir: &std::path::Path,
     config: &crate::fleet::FleetConfig,
@@ -145,8 +146,13 @@ pub fn set_fleet(
             .and_then(|slots| slots.get("machineRoles"))
             .and_then(|roles| serde_yaml::from_value(roles.clone()).ok())
             .unwrap_or_default();
+        let held_build_root = root
+            .get(BUILD_SLOTS_KEY)
+            .and_then(|slots| slots.get("colocatedBuildRoot"))
+            .and_then(|build_root| serde_yaml::from_value(build_root.clone()).ok());
         let mut next = config.clone();
         next.carry_machine_roles(held_roles);
+        next.colocated_build_root = held_build_root;
         insert_fleet(root, &next)
     })
 }
@@ -213,6 +219,12 @@ pub struct SettingsFile {
     /// Absent: the catalog's best decision offer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     decision_model: Option<String>,
+    /// The image model a request naming none is drawn by. Absent: refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_model: Option<String>,
+    /// The speech model a request naming none is spoken by. Absent: refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speech_model: Option<String>,
 
     /// External MCP servers reachable through the `cairn://mcp/...` gateway.
     /// Keyed by server name. Project config overlays this set.
@@ -600,10 +612,9 @@ impl SettingsFile {
                     .map(str::to_string)
                     .collect(),
             },
-            decision_model: self
-                .decision_model
-                .clone()
-                .filter(|model| !model.trim().is_empty()),
+            decision_model: non_blank(&self.decision_model),
+            image_model: non_blank(&self.image_model),
+            speech_model: non_blank(&self.speech_model),
             system_prompt: String::new(), // Deprecated, always empty
             max_thinking_tokens,
             merge_type: self.merge_type.clone().unwrap_or(MergeType::Squash),
@@ -665,6 +676,8 @@ impl SettingsFile {
             backends: Some(settings.backends.clone()),
             enabled_providers: Some(settings.enabled_providers.clone()),
             decision_model: settings.decision_model.clone(),
+            image_model: settings.image_model.clone(),
+            speech_model: settings.speech_model.clone(),
             mcp_servers: None,
             default_model: None,
             preferred_models: None,
@@ -1050,6 +1063,17 @@ pub fn set_inference(
     })
 }
 
+/// The directory the runner's own executor keeps its cell inventory in: under
+/// the configured build root when there is one, else under the home. Read from
+/// settings, so it is the root the next runner start uses; the build root a
+/// running executor reports is on its executor page.
+pub fn colocated_cell_inventory(config_dir: &std::path::Path) -> PathBuf {
+    load_fleet(config_dir)
+        .colocated_build_root
+        .map_or_else(|| config_dir.to_path_buf(), |root| root.path)
+        .join(cairn_common::runtime::BUILD_SLOTS_DIR)
+}
+
 /// Resolve the template variables for build-service config expansion.
 ///
 /// `{worktrees}` is always `~/.cairn/worktrees` (the canonical worktree root),
@@ -1061,7 +1085,14 @@ pub fn build_service_templates(
 ) -> crate::build_services::Templates {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let worktrees = home.join(".cairn").join("worktrees");
+    // The build root the runner's executor was started with, which is the one
+    // configured now: a change takes effect for both at the next runner start.
+    let build_root = load_fleet(config_dir).colocated_build_root;
     crate::build_services::Templates {
+        cache_home: build_root
+            .as_ref()
+            .map_or_else(|| home.clone(), |root| root.cache_home()),
+        build_root: build_root.map_or_else(|| config_dir.to_path_buf(), |root| root.path),
         home,
         cairn_home: config_dir.to_path_buf(),
         worktrees,
@@ -1107,6 +1138,8 @@ const SETTINGS_DTO_KEYS: &[&str] = &[
     "backends",
     "enabledProviders",
     "decisionModel",
+    "imageModel",
+    "speechModel",
     // Removed DTO keys remain here so the next save deletes stale YAML.
     "branchPrefix",
     "maxThinkingTokens",
@@ -1337,6 +1370,18 @@ fn validate_enabled_providers(
     Ok(())
 }
 
+/// A stored model default, with a blank value read as unset.
+fn non_blank(model: &Option<String>) -> Option<String> {
+    model.clone().filter(|model| !model.trim().is_empty())
+}
+
+/// A model default as written: trimmed, and blank means unset.
+fn trimmed_model(value: Option<String>) -> Option<String> {
+    value
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+}
+
 fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
     if let Some(value) = input.tier_defaults {
         current.tier_defaults = value;
@@ -1353,9 +1398,13 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
         current.enabled_providers = cairn_models_types::catalog::in_catalog_order(value);
     }
     if let Some(value) = input.decision_model {
-        current.decision_model = value
-            .map(|model| model.trim().to_string())
-            .filter(|model| !model.is_empty());
+        current.decision_model = trimmed_model(value);
+    }
+    if let Some(value) = input.image_model {
+        current.image_model = trimmed_model(value);
+    }
+    if let Some(value) = input.speech_model {
+        current.speech_model = trimmed_model(value);
     }
     if let Some(value) = input.max_thinking_tokens {
         current.max_thinking_tokens = value;
@@ -1959,6 +2008,44 @@ externalReplies: disabled
             serde_json::from_value(serde_json::json!({ "decisionModel": "  " })).unwrap(),
         );
         assert_eq!(current.decision_model, None);
+    }
+
+    #[test]
+    fn image_and_speech_models_are_set_cleared_and_omitted_when_unset() {
+        let empty = serde_yaml::to_string(&SettingsFile::from_settings(&test_settings())).unwrap();
+        assert!(
+            !empty.contains("imageModel") && !empty.contains("speechModel"),
+            "{empty}"
+        );
+
+        let mut current = test_settings();
+        apply_settings_update(
+            &mut current,
+            serde_json::from_value(serde_json::json!({
+                "imageModel": " codex/gpt-image-2 ",
+                "speechModel": "local-tts",
+            }))
+            .unwrap(),
+        );
+        assert_eq!(current.image_model.as_deref(), Some("codex/gpt-image-2"));
+        let yaml = serde_yaml::to_string(&SettingsFile::from_settings(&current)).unwrap();
+        let parsed: SettingsFile = serde_yaml::from_str(&yaml).unwrap();
+        let reloaded = parsed.to_settings();
+        assert_eq!(reloaded.image_model.as_deref(), Some("codex/gpt-image-2"));
+        assert_eq!(reloaded.speech_model.as_deref(), Some("local-tts"));
+
+        // Each is cleared on its own, by null or blank.
+        apply_settings_update(
+            &mut current,
+            serde_json::from_value(serde_json::json!({ "imageModel": null })).unwrap(),
+        );
+        assert_eq!(current.image_model, None);
+        assert_eq!(current.speech_model.as_deref(), Some("local-tts"));
+        apply_settings_update(
+            &mut current,
+            serde_json::from_value(serde_json::json!({ "speechModel": "  " })).unwrap(),
+        );
+        assert_eq!(current.speech_model, None);
     }
 
     #[test]

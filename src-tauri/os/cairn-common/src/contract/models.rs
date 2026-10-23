@@ -86,6 +86,39 @@ const MODELS_SIGN_IN_CODE: KeySpec = KeySpec::new(
     "with submit_code: the code#state string Claude's sign-in page shows on its manual path",
 );
 
+const MODELS_DECIDE_MODEL: KeySpec = KeySpec::new(
+    "model",
+    KeyType::Str,
+    "the model to decide with: a catalog id, native id, alias, or provider/tier, as cairn://models/catalog?serves=decide lists them; never chosen for you",
+);
+
+const MODELS_DECIDE_INPUT: KeySpec =
+    KeySpec::new("input", KeyType::Str, "the state the questions judge");
+
+const MODELS_DECIDE_QUESTIONS: KeySpec = KeySpec::new(
+    "questions",
+    KeyType::Array,
+    "[{name, instructions, type}] — type choice (with options:[{value, description?}], 1-255) | predicate (yes or no) | score (with levels:[{label, description?}], 2-10, lowest first); names unique, letters, digits, _ and -",
+);
+
+const MODELS_DECIDE_PROVIDER: KeySpec = KeySpec::new(
+    "provider",
+    KeyType::Str,
+    "KEY — only this provider's offers of `model`, e.g. custom:<account id>",
+);
+
+pub(crate) const MODELS_DECIDE_RUN_TARGET: RunTargetSpec = RunTargetSpec {
+    kind: ResourceKind::ModelsDecide,
+    label: "answer typed questions with a named model",
+    required: &[
+        MODELS_DECIDE_MODEL,
+        MODELS_DECIDE_INPUT,
+        MODELS_DECIDE_QUESTIONS,
+    ],
+    optional: &[MODELS_DECIDE_PROVIDER],
+    example: r#"run({commands:[{target:"cairn://models/decide",payload:{args_json:{model:"MODEL",input:"...",questions:[{name:"q",type:"predicate",instructions:"..."}]}}}]})"#,
+};
+
 pub(crate) const MODELS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Models,
     uri_template: "cairn://models",
@@ -94,6 +127,7 @@ pub(crate) const MODELS_CONTRACT: ResourceContract = ResourceContract {
     read_projections: NO_PROJECTIONS,
     related: &[
         RelatedSpec { label: "providers, models, and tier bindings", kind: ResourceKind::ModelsCatalog, actions: false },
+        RelatedSpec { label: "answer typed questions with a named model (a run target)", kind: ResourceKind::ModelsDecide, actions: false },
         RelatedSpec { label: "accounts and their usage windows; sign in and re-measure", kind: ResourceKind::ModelsAccounts, actions: false },
         RelatedSpec { label: "pooled capacity per provider", kind: ResourceKind::ModelsUsage, actions: false },
         RelatedSpec { label: "live model sessions", kind: ResourceKind::ModelsSessions, actions: false },
@@ -114,6 +148,17 @@ pub(crate) const MODELS_CATALOG_CONTRACT: ResourceContract = ResourceContract {
         ProjectionSpec { key: "serves", values: "complete | session | decide | image | embed — only the models (in either view) that serve that verb; an image offer also says what it can draw (count, references, aspect ratios or sizes, mask), and an embed offer its width, which widths it can return, how it tells documents from queries, and its batch limits" },
     ],
     related: &[RelatedSpec { label: "accounts behind each provider", kind: ResourceKind::ModelsAccounts, actions: false }],
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const MODELS_DECIDE_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ModelsDecide,
+    uri_template: "cairn://models/decide",
+    name: "Decide",
+    description: "The decide verb's door, invoked with `run`, not written. Give it a model, the input to judge, and typed questions (choice, predicate, score); it answers each question in order with the model's probability over every answer, how that was measured (`native` from a Decisions model, `logprobs` from a chat model's next-token distribution), and a refusal where the model declined. It returns the decision as the verb produced it, with no thresholds applied, plus the offer that answered and the call's latency. It never chooses a model: an absent one, one that serves no decisions, or one that cannot measure these questions is refused, naming the offers that do serve decide, and nothing else is asked instead. An unconfirmed logprobs offer is probed once first, exactly as a recipe's decision node is. Each provider request is bounded at 30 seconds and a probe at 15; the item's own `timeout` releases the caller sooner, and the call it abandons ends within those bounds. Reading it lists the offers that serve decide now.",
+    read_projections: NO_PROJECTIONS,
+    related: &[RelatedSpec { label: "every offer that serves decide", kind: ResourceKind::ModelsCatalog, actions: false }],
     cross_actions: NO_CROSS_ACTIONS,
     mutations: NO_MUTATIONS,
 };

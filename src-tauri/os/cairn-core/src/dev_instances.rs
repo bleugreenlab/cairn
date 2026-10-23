@@ -1594,6 +1594,7 @@ mod tests {
             PersistentCellState, ResidencyPhase,
         };
         PersistentCellState {
+            observed_head: None,
             size_bytes: 0,
             warm_command_classes: Vec::new(),
             executor_id: "executor-a".into(),
@@ -1640,6 +1641,7 @@ mod tests {
                 events: Vec::new(),
             }),
             occupancy: CellOccupancy::default(),
+            seeded_from: None,
         }
     }
 

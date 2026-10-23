@@ -22,8 +22,10 @@ pub mod contended_identifiers;
 pub mod custom_providers;
 mod decide;
 mod subscription_periods;
-pub(crate) use decide::DecisionFailure;
-pub(crate) mod default_branch_sync;
+#[cfg(test)]
+pub(crate) use decide::tests as decide_fixtures;
+pub(crate) use decide::{DecideRequest, DecisionFailure};
+pub(crate) mod base_branch_sync;
 mod embed;
 pub use decide::DecisionDiagnostic;
 pub mod device_presence;
@@ -34,6 +36,7 @@ pub mod identity;
 pub mod inference;
 pub(crate) mod landing;
 pub mod lifecycle;
+pub mod model_defaults;
 pub mod models;
 pub mod object_plane;
 pub mod parent_wake;
@@ -181,6 +184,23 @@ impl TurnEndCancelReason {
 
 const NOT_CANCELLED: u8 = u8::MAX;
 
+/// The jj an orchestrator drives when its host names none.
+///
+/// The runtime always names the bundled sidecar, so outside tests this is only a
+/// bare `jj` for PATH. A test build defaults to the sidecar the suites provision
+/// and gate on (`cairn_vcs::jj::testing::provisioned_jj`): a fixture that builds
+/// its store with that sidecar and then publishes through this orchestrator must
+/// drive the same binary, or the outcome depends on whether the machine happens
+/// to have its own jj on PATH. `JjEnv::resolve` still honours `CAIRN_JJ_BIN`
+/// ahead of this path, so a suite that pins a private copy keeps it.
+fn default_jj_binary_path() -> String {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(sidecar) = cairn_vcs::jj::testing::provisioned_jj() {
+        return sidecar.to_string_lossy().into_owned();
+    }
+    "jj".to_string()
+}
+
 impl OrchestratorBuilder {
     pub(crate) fn new(db: Arc<DbState>, services: Arc<Services>, config_dir: PathBuf) -> Self {
         let process_state = Arc::new(AgentProcessState::default());
@@ -247,7 +267,7 @@ impl OrchestratorBuilder {
             subscriptions: Arc::new(cairn_models::subscription::Unsubscribed),
             models_runtime: None,
             mcp_binary_path: "cairn-cmd".to_string(),
-            jj_binary_path: "jj".to_string(),
+            jj_binary_path: default_jj_binary_path(),
             config_dir,
             schema_dir: None,
             mcp_callback_port: 0,
@@ -579,7 +599,7 @@ impl OrchestratorBuilder {
             job_launch_claims: Arc::new(Mutex::new(HashMap::new())),
             jj_store_locks: Arc::new(Mutex::new(HashMap::new())),
             jj_store_lock_metrics: Arc::new(Mutex::new(HashMap::new())),
-            default_branch_sync: Arc::default(),
+            base_branch_sync: Arc::default(),
             build_service_children: Arc::new(Mutex::new(HashMap::new())),
             build_service_reconcile: Arc::new(Mutex::new(())),
             build_service_runtime: Arc::new(Mutex::new(HashMap::new())),
@@ -782,9 +802,21 @@ struct TurnEndCancelInner {
     status: Mutex<Option<TurnEndCheckRuntimeStatus>>,
 }
 
+/// The immutable facts a running review wave planned with, published once its
+/// planning finishes. They are everything the live `/checks` projection reads,
+/// so a poll while the wave runs does no VCS or config work of its own.
 #[derive(Clone)]
 pub(crate) struct TurnEndCheckRuntimeStatus {
     pub tree_hash: String,
+    /// The branch head the wave pinned, and the fork point it measured the
+    /// head's change from. A base replay that keeps the branch's patch does not
+    /// withdraw the wave, so the node's head can move past this commit while the
+    /// wave still runs; the status poll names it on the lanes the wave answers.
+    pub sealed_commit: String,
+    pub base: String,
+    /// The checks contract `sealed_commit` declares, which the wave planned
+    /// with.
+    pub checks: Arc<HashMap<String, crate::config::project_settings::CheckCommand>>,
     pub applicable_names: HashSet<String>,
     /// Every configured check's input hash at `tree_hash`: the key the wave
     /// reuses and records under, so the status poll reads lanes by it too.
@@ -845,12 +877,18 @@ impl TurnEndCancel {
     pub(crate) fn set_runtime_status(
         &self,
         tree_hash: String,
+        sealed_commit: String,
+        base: String,
+        checks: Arc<HashMap<String, crate::config::project_settings::CheckCommand>>,
         applicable_names: HashSet<String>,
         input_hashes: HashMap<String, String>,
     ) {
         if let Ok(mut status) = self.inner.status.lock() {
             *status = Some(TurnEndCheckRuntimeStatus {
                 tree_hash,
+                sealed_commit,
+                base,
+                checks,
                 applicable_names,
                 input_hashes,
                 request_ids: HashMap::new(),
@@ -1279,11 +1317,11 @@ pub struct Orchestrator {
     jj_store_locks: Arc<Mutex<HashMap<String, Arc<store_lock::PriorityLock>>>>,
     jj_store_lock_metrics: Arc<Mutex<HashMap<String, JjStoreLockMetrics>>>,
 
-    /// What this process knows about each project's default branch on origin,
-    /// the single-flight sync toward it, and the per-repository fetch locks.
-    /// See `orchestrator::default_branch_sync`.
-    pub(crate) default_branch_sync:
-        Arc<crate::orchestrator::default_branch_sync::DefaultBranchSyncRegistry>,
+    /// What this process knows about origin's copy of each project's base
+    /// branches (the default branch and every tracked integration branch), the
+    /// single-flight sync toward each, and the per-repository fetch locks.
+    /// See `orchestrator::base_branch_sync`.
+    pub(crate) base_branch_sync: Arc<crate::orchestrator::base_branch_sync::BaseBranchSyncRegistry>,
 
     /// Launcher handles for supervised Managed Build Service daemons, keyed by
     /// service name. The default sccache daemon runs in the FOREGROUND as Cairn's
@@ -1400,6 +1438,32 @@ impl Orchestrator {
             }
         }
     }
+    /// Run async `task` in the background on the runtime this orchestrator was
+    /// built on, regardless of the caller's thread, so whatever it spawns in turn
+    /// outlives the caller. Off any runtime it gets a thread and a runtime of
+    /// its own.
+    pub(crate) fn spawn_detached(
+        &self,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        match &self.runtime {
+            Some(runtime) => {
+                runtime.spawn(task);
+            }
+            None => {
+                std::thread::spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime.block_on(task),
+                        Err(error) => log::error!("detached task: no runtime: {error}"),
+                    }
+                });
+            }
+        }
+    }
+
     /// Queue a persisted fallback era for its one-way generated-summary upgrade.
     /// Returns false when startup has not wired the worker or its bounded queue
     /// is full; persistence remains authoritative and the startup sweep retries it.
@@ -2467,7 +2531,7 @@ impl Orchestrator {
 
     /// Reconcile in-flight default-branch workspaces once at startup for remote
     /// advances that landed while the app was closed. Live advances reach the
-    /// store through `default_branch_sync`: the GitHub `push` webhook, Cairn's
+    /// store through `base_branch_sync`: the GitHub `push` webhook, Cairn's
     /// own merge path, and a polling floor that `spawn_default_advance_reconcile`
     /// starts after this catch-up, which bounds the lag when the relay is absent.
     ///
@@ -2504,7 +2568,7 @@ impl Orchestrator {
             .await;
             crate::execution::checks_main::spawn_heartbeat(&orch);
             orch.spawn_reconcile_intent_sweep();
-            crate::orchestrator::default_branch_sync::spawn_default_branch_poll(&orch);
+            crate::orchestrator::base_branch_sync::spawn_base_branch_poll(&orch);
         });
     }
 
@@ -3293,8 +3357,8 @@ impl Orchestrator {
     /// Rediscover every provider's models, then tell clients the catalog moved.
     ///
     /// The announcement belongs here rather than at any one entry point. A full
-    /// refresh runs on several schedules — an immediate startup pass, a gated
-    /// startup pass, and the account paths that change credentials — and every
+    /// refresh runs on several schedules — the startup pass, the account paths
+    /// that change credentials, and a managed-Codex version swap — and every
     /// one of them leaves clients holding a catalog they fetched before
     /// discovery finished. A scoped single-backend refresh deliberately stays
     /// silent: it hands the new entry straight back to the caller that asked.
@@ -3315,14 +3379,6 @@ impl Orchestrator {
             "config-changed",
             serde_json::json!({"entity_type": "model_catalog"}),
         );
-    }
-
-    pub async fn run_model_catalog_refresh(&self) {
-        let orch = self.clone();
-        if let Err(error) = tokio::task::spawn_blocking(move || orch.refresh_model_catalog()).await
-        {
-            log::warn!("model catalog refresh task failed: {error}");
-        }
     }
 
     pub async fn run_provider_model_catalog_refresh(
@@ -3390,6 +3446,33 @@ mod tests {
         Arc::new(DbState::new(Arc::new(local), search))
     }
 
+    /// Fixtures gate on the provisioned sidecar and then publish through the
+    /// orchestrator. With a bare `jj` default those were two binaries: on a
+    /// machine with no PATH install every such test failed `jj git init
+    /// --git-repo: No such file or directory`, and on one with an install it
+    /// passed, so the verdict described the machine's PATH rather than the tree.
+    #[tokio::test]
+    async fn a_default_test_orchestrator_drives_the_provisioned_jj() {
+        let services = Arc::new(TestServicesBuilder::new().build());
+        let orch = OrchestratorBuilder::new(
+            test_db().await,
+            services,
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+        match cairn_vcs::jj::testing::provisioned_jj() {
+            Some(sidecar) => assert_eq!(
+                std::path::Path::new(&orch.jj_binary_path),
+                sidecar.as_path(),
+                "a test orchestrator must drive the build slot's provisioned jj, not PATH's"
+            ),
+            None => assert_eq!(
+                orch.jj_binary_path, "jj",
+                "with no provisioned sidecar, PATH is the documented fallback"
+            ),
+        }
+    }
+
     /// A snapshot shaped like a healthy remote: every reading its platform can
     /// take, taken.
     fn healthy_non_macos_executor() -> cairn_common::executor_protocol::ExecutorHealthSnapshot {
@@ -3407,6 +3490,7 @@ mod tests {
             display_name: "bglab-win".into(),
         };
         ExecutorHealthSnapshot {
+            build_volume: None,
             identity: identity.clone(),
             public_name: "bglab-win".into(),
             colocated: false,
@@ -3445,6 +3529,8 @@ mod tests {
                 ..DiskHealth::default()
             },
             machine: MachineTelemetry {
+                build_volume: None,
+                build_disk_accounting: None,
                 cpu: Measurement::measured(
                     10,
                     CpuPressure {
@@ -3500,6 +3586,8 @@ mod tests {
             command_processes: Default::default(),
             evicted_cells: Vec::new(),
             busy_declined_cells: Vec::new(),
+            repository_faults: Vec::new(),
+            quarantines: None,
             build_skew: None,
             stopped_commands: Vec::new(),
         }

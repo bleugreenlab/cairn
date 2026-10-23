@@ -233,19 +233,27 @@ fn validate_project_checkout(path: &Path, config_dir: &Path) -> Result<(), Cairn
     let config = config_dir
         .canonicalize()
         .unwrap_or_else(|_| config_dir.to_path_buf());
-    if canonical.starts_with(config.join("scratch"))
-        || canonical.starts_with(config.join("build-slots"))
-        || canonical.starts_with(config.join("executions"))
-        || canonical
-            .components()
-            .any(|component| matches!(component, Component::Normal(name) if name == "build-slots"))
-    {
+    if is_disposable_execution_storage(&canonical, &config) {
         return Err(CairnError::Internal(format!(
             "registered project checkout points into disposable execution storage: {}",
             canonical.display()
         )));
     }
     Ok(())
+}
+
+/// Whether a canonical path lies in storage Cairn reclaims: this install's
+/// scratch, build slots, or executions, or any executor's `build-slots` tree.
+/// Executor homes are configurable, so the last arm matches the directory name
+/// anywhere rather than a known root. That includes a cell's own scratch, which
+/// is where every writable path of a test run on a remote cell lives.
+fn is_disposable_execution_storage(canonical: &Path, config: &Path) -> bool {
+    canonical.starts_with(config.join("scratch"))
+        || canonical.starts_with(config.join("build-slots"))
+        || canonical.starts_with(config.join("executions"))
+        || canonical
+            .components()
+            .any(|component| matches!(component, Component::Normal(name) if name == "build-slots"))
 }
 
 /// Make the selected folder a self-contained project repository with a usable HEAD.
@@ -1632,8 +1640,12 @@ mod tests {
 
     #[test]
     fn project_checkout_validation_rejects_disposable_and_missing_paths() {
-        let home = std::env::var_os("HOME").expect("tests require a home directory");
-        let root = tempfile::tempdir_in(home).unwrap();
+        // The filesystem arms run against real directories. Acceptance and each
+        // storage rule are asserted on synthetic paths instead: on a remote cell
+        // every writable directory (HOME and TMPDIR included) sits inside the
+        // cell's `build-slots` scratch, so no real temp root there is a
+        // legitimate checkout.
+        let root = tempdir().unwrap();
         let config = root.path().join(".cairn");
         let scratch = config.join("scratch/job/repo");
         let build_slot = root.path().join("build-slots/slot/repo");
@@ -1643,7 +1655,28 @@ mod tests {
         assert!(validate_project_checkout(&scratch, &config).is_err());
         assert!(validate_project_checkout(&build_slot, &config).is_err());
         assert!(validate_project_checkout(&root.path().join("missing"), &config).is_err());
-        assert!(validate_project_checkout(root.path(), &config).is_ok());
+        assert!(validate_project_checkout(Path::new("relative/repo"), &config).is_err());
+
+        let base = std::env::temp_dir()
+            .ancestors()
+            .last()
+            .unwrap()
+            .to_path_buf();
+        let config = base.join("users/dev/.cairn");
+        let disposable = |path: PathBuf| is_disposable_execution_storage(&path, &config);
+        assert!(!disposable(base.join("users/dev/code/repo")));
+        assert!(!disposable(config.join("projects/repo")));
+        assert!(disposable(config.join("scratch/job/repo")));
+        assert!(disposable(config.join("build-slots/slot/repo")));
+        assert!(disposable(config.join("executions/run/repo")));
+        // A build root configured on another volume keeps its cells under its own
+        // `build-slots`, which the name arm covers wherever the volume is mounted.
+        assert!(disposable(
+            base.join("Volumes/Builds/cairn/build-slots/cairn/slot-1/repo")
+        ));
+        assert!(disposable(base.join(
+            "users/dev/.cairn-exec/build-slots/cairn/.authority/slot-1/scratch/repo"
+        )));
     }
 
     #[tokio::test]

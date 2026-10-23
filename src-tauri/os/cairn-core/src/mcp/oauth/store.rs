@@ -11,11 +11,33 @@
 //! Access/refresh tokens and any client secret are secret and live only here,
 //! never in `settings.yaml`. The non-secret `client_id`/`scopes` may also live
 //! in the settings `oauth` block; this store is the source of truth at runtime.
+//!
+//! ## Credential witness
+//!
+//! The keychain value wraps the record with a [`CredentialGeneration`] that
+//! advances on **every** save, including a pure token refresh: the record
+//! carries no subject identifier, so an unchanged issuer, resource, client and
+//! scope set cannot rule out a changed authorization context behind a new token.
+//! The generation commits in the same keychain write as the credential, so a
+//! crash cannot separate them. Every write runs under
+//! [`crate::config::credential_witness`]'s mutation lock, which is what makes
+//! the increment unique rather than merely atomic. Sign-out leaves a tombstone
+//! holding the generation rather than deleting the entry, so signing in again
+//! continues the sequence instead of restarting it. A token refresh happens
+//! outside the lock (it awaits the network) and commits only if the stored value
+//! is still exactly the one it started from, so a refresh that finishes after a
+//! sign-out or a new sign-in is discarded rather than resurrecting old tokens.
+//!
+//! [`witness`] is the only projection of this store that cache validation may
+//! see. It carries issuer, resource, client, scopes and generation, and has no
+//! field that could hold a token or client secret.
 
+use cairn_packs::server_config::{CatalogOAuthContext, CredentialGeneration};
 use keyring::{Entry, Error};
 use serde::{Deserialize, Serialize};
 
 use super::{refresh_access_token, TokenSet, EXPIRY_SKEW_SECS};
+use crate::config::credential_witness::{self, CredentialMutationGuard};
 
 /// Short-lived authorization state stored in the same keychain namespace as
 /// tokens so a deep-link callback can safely complete a later process turn.
@@ -172,39 +194,217 @@ fn entry(server: &str) -> Result<Entry, String> {
     Entry::new(&service(), server).map_err(|e| format!("Failed to open keychain entry: {e}"))
 }
 
-/// Load the stored OAuth record for `server`, if one exists.
-pub fn load(server: &str) -> Option<StoredAuth> {
-    let raw = match entry(server).ok()?.get_password() {
-        Ok(value) => value,
-        Err(Error::NoEntry) => return None,
-        Err(e) => {
-            log::warn!("Failed to read OAuth tokens for {server} from keychain: {e}");
-            return None;
-        }
+/// The keychain value. Untagged so records written before witnesses existed
+/// still read; the envelope shapes refuse unknown fields so neither can be
+/// mistaken for the other.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredEntry {
+    Tombstone(Tombstone),
+    Witnessed(WitnessedAuth),
+    Legacy(StoredAuth),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Tombstone {
+    tombstone: CredentialGeneration,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WitnessedAuth {
+    auth: StoredAuth,
+    generation: CredentialGeneration,
+}
+
+/// What the keychain holds for one key, and the exact text it held.
+enum Current {
+    Absent,
+    Tombstone(CredentialGeneration),
+    Witnessed(StoredAuth, CredentialGeneration),
+    /// Written before witnesses existed: usable, but not a witness.
+    Legacy(StoredAuth),
+    Corrupt,
+    Unavailable(String),
+}
+
+fn read_current(server: &str) -> (Current, Option<String>) {
+    let raw = match entry(server).and_then(|entry| {
+        entry.get_password().map(Some).or_else(|e| match e {
+            Error::NoEntry => Ok(None),
+            e => Err(format!(
+                "Failed to read OAuth tokens for {server} from keychain: {e}"
+            )),
+        })
+    }) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return (Current::Absent, None),
+        Err(e) => return (Current::Unavailable(e), None),
     };
-    match serde_json::from_str(&raw) {
-        Ok(auth) => Some(auth),
-        Err(e) => {
-            log::warn!("Stored OAuth record for {server} is corrupt: {e}");
-            None
+    let current = match serde_json::from_str::<StoredEntry>(&raw) {
+        Ok(StoredEntry::Tombstone(Tombstone { tombstone })) => Current::Tombstone(tombstone),
+        Ok(StoredEntry::Witnessed(WitnessedAuth { auth, generation })) => {
+            Current::Witnessed(auth, generation)
         }
+        Ok(StoredEntry::Legacy(auth)) => Current::Legacy(auth),
+        Err(_) => Current::Corrupt,
+    };
+    (current, Some(raw))
+}
+
+/// The generation the next write must carry: strictly after the current one,
+/// or a fresh incarnation when there is no readable history to continue.
+fn next_generation(server: &str, current: &Current) -> Result<CredentialGeneration, String> {
+    match current {
+        Current::Tombstone(generation) | Current::Witnessed(_, generation) => {
+            Ok(CredentialGeneration {
+                incarnation: generation.incarnation.clone(),
+                counter: generation.counter.checked_add(1).ok_or_else(|| {
+                    format!("OAuth credential generation for `{server}` is exhausted")
+                })?,
+            })
+        }
+        Current::Absent | Current::Legacy(_) | Current::Corrupt => Ok(CredentialGeneration {
+            incarnation: credential_witness::new_incarnation(),
+            counter: 0,
+        }),
+        Current::Unavailable(e) => Err(e.clone()),
     }
 }
 
-/// Store (or replace) the OAuth record for `server`.
-pub fn save(server: &str, auth: &StoredAuth) -> Result<(), String> {
-    let blob = serde_json::to_string(auth)
+fn write_entry(
+    _guard: &CredentialMutationGuard,
+    server: &str,
+    value: &StoredEntry,
+) -> Result<(), String> {
+    let blob = serde_json::to_string(value)
         .map_err(|e| format!("Failed to serialize OAuth record: {e}"))?;
     entry(server)?
         .set_password(&blob)
         .map_err(|e| format!("Failed to store OAuth tokens in keychain: {e}"))
 }
 
-/// Remove the stored OAuth record for `server`. Succeeds when none exists.
+fn write_auth(
+    guard: &CredentialMutationGuard,
+    server: &str,
+    current: &Current,
+    auth: &StoredAuth,
+) -> Result<(), String> {
+    let generation = next_generation(server, current)?;
+    write_entry(
+        guard,
+        server,
+        &StoredEntry::Witnessed(WitnessedAuth {
+            auth: auth.clone(),
+            generation,
+        }),
+    )
+}
+
+/// Load the stored OAuth record for `server`, if one exists.
+pub fn load(server: &str) -> Option<StoredAuth> {
+    match read_current(server).0 {
+        Current::Witnessed(auth, _) | Current::Legacy(auth) => Some(auth),
+        Current::Absent | Current::Tombstone(_) => None,
+        Current::Corrupt => {
+            log::warn!("Stored OAuth record for {server} is corrupt");
+            None
+        }
+        Current::Unavailable(e) => {
+            log::warn!("{e}");
+            None
+        }
+    }
+}
+
+/// Store (or replace) the OAuth record for `server`, advancing its generation.
+pub fn save(server: &str, auth: &StoredAuth) -> Result<(), String> {
+    let guard = credential_witness::acquire()?;
+    let (current, _) = read_current(server);
+    write_auth(&guard, server, &current, auth)
+}
+
+/// Sign `server` out. The tokens go; the generation history stays behind as a
+/// tombstone. Succeeds when nothing is signed in.
 pub fn delete(server: &str) -> Result<(), String> {
-    match entry(server)?.delete_credential() {
-        Ok(()) | Err(Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("Failed to delete OAuth tokens from keychain: {e}")),
+    let guard = credential_witness::acquire()?;
+    let (current, _) = read_current(server);
+    match current {
+        Current::Absent | Current::Tombstone(_) => Ok(()),
+        Current::Unavailable(e) => Err(e),
+        _ => {
+            let tombstone = next_generation(server, &current)?;
+            write_entry(
+                &guard,
+                server,
+                &StoredEntry::Tombstone(Tombstone { tombstone }),
+            )
+        }
+    }
+}
+
+/// Change the stored record in place under the lock, so the read-modify-write
+/// cannot interleave with a sign-out or a new sign-in. A record that is gone
+/// stays gone.
+fn update(server: &str, change: impl FnOnce(&mut StoredAuth)) -> Result<(), String> {
+    let guard = credential_witness::acquire()?;
+    let (current, _) = read_current(server);
+    let mut auth = match &current {
+        Current::Witnessed(auth, _) | Current::Legacy(auth) => auth.clone(),
+        Current::Absent | Current::Tombstone(_) | Current::Corrupt => return Ok(()),
+        Current::Unavailable(e) => return Err(e.clone()),
+    };
+    change(&mut auth);
+    write_auth(&guard, server, &current, &auth)
+}
+
+/// Commit a refreshed record only if the stored value is still byte-for-byte
+/// the one the refresh started from. `Ok(false)` means it was superseded.
+fn commit_refresh(server: &str, started_from: &str, auth: &StoredAuth) -> Result<bool, String> {
+    let guard = credential_witness::acquire()?;
+    let (current, raw) = read_current(server);
+    if raw.as_deref() != Some(started_from) {
+        return Ok(false);
+    }
+    write_auth(&guard, server, &current, auth)?;
+    Ok(true)
+}
+
+/// The OAuth credential witness for `server`, as cache validation may see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OAuthWitness {
+    /// No OAuth credential has ever been stored under this key.
+    Never,
+    /// Signed out; the tombstone's generation, which a sign-in and sign-out
+    /// during one fetch would have advanced.
+    SignedOut(CredentialGeneration),
+    /// Signed in, with this token-free context and generation.
+    SignedIn(CatalogOAuthContext),
+    /// Signed in with a record written before witnesses existed. Usable for a
+    /// connection, never for caching; its next refresh or sign-in witnesses it.
+    Unwitnessed,
+    /// The keychain could not be read or the record is corrupt. Fail closed.
+    Unavailable(String),
+}
+
+/// Project the token-free witness for `server`. Never refreshes, never prompts.
+pub fn witness(server: &str) -> OAuthWitness {
+    match read_current(server).0 {
+        Current::Absent => OAuthWitness::Never,
+        Current::Tombstone(generation) => OAuthWitness::SignedOut(generation),
+        Current::Witnessed(auth, generation) => OAuthWitness::SignedIn(CatalogOAuthContext {
+            issuer: auth.issuer,
+            resource: auth.resource,
+            client_id: auth.client_id,
+            scopes: auth.scopes,
+            generation,
+        }),
+        Current::Legacy(_) => OAuthWitness::Unwitnessed,
+        Current::Corrupt => {
+            OAuthWitness::Unavailable(format!("Stored OAuth record for {server} is corrupt"))
+        }
+        Current::Unavailable(e) => OAuthWitness::Unavailable(e),
     }
 }
 
@@ -230,7 +430,7 @@ pub fn record_scope_step_up(server: &str, required: &[String]) {
     if required.is_empty() {
         return;
     }
-    if let Some(mut auth) = load(server) {
+    let result = update(server, |auth| {
         let mut union = auth.scopes.clone();
         for scope in required {
             if !union.contains(scope) {
@@ -241,7 +441,9 @@ pub fn record_scope_step_up(server: &str, required: &[String]) {
             .into_iter()
             .filter(|s| !auth.scopes.contains(s))
             .collect();
-        let _ = save(server, &auth);
+    });
+    if let Err(e) = result {
+        log::warn!("Failed to record OAuth scope step-up for {server}: {e}");
     }
 }
 
@@ -249,9 +451,8 @@ pub fn record_scope_step_up(server: &str, required: &[String]) {
 /// expiry so the next [`get_valid_access_token`] forces a refresh. Used by the
 /// gateway after a `401` to recover from a server-side revocation.
 pub fn force_expire(server: &str) {
-    if let Some(mut auth) = load(server) {
-        auth.expires_at = Some(0);
-        let _ = save(server, &auth);
+    if let Err(e) = update(server, |auth| auth.expires_at = Some(0)) {
+        log::warn!("Failed to expire OAuth tokens for {server}: {e}");
     }
 }
 
@@ -261,10 +462,15 @@ pub fn force_expire(server: &str) {
 /// refresh is impossible/failed — the gateway then surfaces "authorization
 /// required".
 pub async fn get_valid_access_token(server: &str) -> Option<String> {
-    let mut auth = load(server)?;
+    let (current, raw) = read_current(server);
+    let mut auth = match current {
+        Current::Witnessed(auth, _) | Current::Legacy(auth) => auth,
+        _ => return None,
+    };
     if !auth.is_expired() {
         return Some(auth.access_token);
     }
+    let started_from = raw?;
     let refresh_token = auth.refresh_token.clone()?;
     match refresh_access_token(
         &auth.token_endpoint,
@@ -278,11 +484,24 @@ pub async fn get_valid_access_token(server: &str) -> Option<String> {
     {
         Ok(tokens) => {
             auth.apply_tokens(tokens);
-            let access = auth.access_token.clone();
-            if let Err(e) = save(server, &auth) {
-                log::warn!("Failed to persist refreshed OAuth tokens for {server}: {e}");
+            match commit_refresh(server, &started_from, &auth) {
+                Ok(true) => Some(auth.access_token),
+                // Signed out or replaced while the refresh was in flight. The
+                // refreshed tokens belong to the old credential and are dropped;
+                // whatever is stored now is what the user chose.
+                Ok(false) => {
+                    log::info!("Discarded a superseded OAuth refresh for {server}");
+                    load(server)
+                        .filter(|current| !current.is_expired())
+                        .map(|current| current.access_token)
+                }
+                // An unpersisted token would authenticate a connection under a
+                // generation that never advanced, so it is not used either.
+                Err(e) => {
+                    log::warn!("Failed to persist refreshed OAuth tokens for {server}: {e}");
+                    None
+                }
             }
-            Some(access)
         }
         Err(e) => {
             log::warn!("OAuth token refresh for {server} failed: {e}");
@@ -471,5 +690,186 @@ mod tests {
     async fn missing_server_yields_none() {
         mock_keychain::install();
         assert!(get_valid_access_token("store-absent").await.is_none());
+    }
+
+    fn signed_in(server: &str) -> CatalogOAuthContext {
+        match witness(server) {
+            OAuthWitness::SignedIn(context) => context,
+            other => panic!("expected a signed-in witness, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_save_advances_the_generation_even_with_identical_context() {
+        mock_keychain::install();
+        let server = "witness-refresh-identical";
+        save(server, &sample("token-1")).unwrap();
+        let first = signed_in(server);
+        // A pure token refresh: issuer, resource, client and scopes unchanged.
+        save(server, &sample("token-2")).unwrap();
+        let second = signed_in(server);
+        assert_eq!(
+            (
+                &first.issuer,
+                &first.resource,
+                &first.client_id,
+                &first.scopes
+            ),
+            (
+                &second.issuer,
+                &second.resource,
+                &second.client_id,
+                &second.scopes
+            )
+        );
+        assert_eq!(first.generation.incarnation, second.generation.incarnation);
+        assert_eq!(second.generation.counter, first.generation.counter + 1);
+        force_expire(server);
+        assert_eq!(
+            signed_in(server).generation.counter,
+            second.generation.counter + 1
+        );
+        record_scope_step_up(server, &["admin".to_string()]);
+        assert_eq!(
+            signed_in(server).generation.counter,
+            second.generation.counter + 2
+        );
+    }
+
+    #[test]
+    fn sign_out_keeps_history_so_signing_in_again_never_reuses_a_generation() {
+        mock_keychain::install();
+        let server = "witness-sign-out";
+        assert_eq!(witness(server), OAuthWitness::Never);
+        save(server, &sample("account-a")).unwrap();
+        let a = signed_in(server);
+        delete(server).unwrap();
+        let OAuthWitness::SignedOut(tombstone) = witness(server) else {
+            panic!("sign-out must keep its generation in the witness");
+        };
+        assert!(tombstone.counter > a.generation.counter);
+        assert!(load(server).is_none());
+        assert_eq!(status(server).state, "needs_auth");
+        // Signing out twice changes nothing; force-expire and step-up cannot
+        // resurrect a signed-out record.
+        delete(server).unwrap();
+        force_expire(server);
+        record_scope_step_up(server, &["admin".to_string()]);
+        assert_eq!(witness(server), OAuthWitness::SignedOut(tombstone.clone()));
+        // A sign-in and sign-out leaves a different signed-out witness, never
+        // the one it started from.
+        save(server, &sample("account-b")).unwrap();
+        delete(server).unwrap();
+        assert!(matches!(witness(server), OAuthWitness::SignedOut(after) if after != tombstone));
+        save(server, &sample("account-a")).unwrap();
+        let again = signed_in(server);
+        assert_eq!(again.generation.incarnation, a.generation.incarnation);
+        assert!(again.generation.counter > a.generation.counter + 1);
+    }
+
+    #[test]
+    fn concurrent_saves_publish_distinct_generations() {
+        mock_keychain::install();
+        let server = "witness-concurrent-saves";
+        save(server, &sample("seed")).unwrap();
+        let seed = signed_in(server).generation.counter;
+        let writers: Vec<_> = (0..8)
+            .map(|writer| {
+                std::thread::spawn(move || {
+                    for round in 0..10 {
+                        save(server, &sample(&format!("{writer}-{round}"))).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(signed_in(server).generation.counter, seed + 80);
+    }
+
+    #[test]
+    fn a_refresh_that_finishes_after_a_new_sign_in_is_discarded() {
+        mock_keychain::install();
+        let server = "witness-stale-refresh";
+        save(server, &sample("account-a")).unwrap();
+        let (_, started_from) = read_current(server);
+        let started_from = started_from.unwrap();
+        // The user signs in as B while A's refresh is in flight.
+        save(server, &sample("account-b")).unwrap();
+        let b = signed_in(server);
+        let mut refreshed = sample("account-a");
+        refreshed.access_token = "account-a-refreshed".into();
+        assert!(!commit_refresh(server, &started_from, &refreshed).unwrap());
+        assert_eq!(load(server).unwrap().access_token, "account-b");
+        assert_eq!(signed_in(server), b);
+        // Likewise after a sign-out: the refresh must not sign A back in.
+        let (_, started_from) = read_current(server);
+        delete(server).unwrap();
+        assert!(!commit_refresh(server, &started_from.unwrap(), &refreshed).unwrap());
+        assert!(matches!(witness(server), OAuthWitness::SignedOut(_)));
+    }
+
+    #[test]
+    fn an_unchanged_refresh_commits_with_a_new_generation() {
+        mock_keychain::install();
+        let server = "witness-fresh-refresh";
+        save(server, &sample("token")).unwrap();
+        let before = signed_in(server);
+        let (_, started_from) = read_current(server);
+        assert!(
+            commit_refresh(server, &started_from.unwrap(), &sample("token-refreshed")).unwrap()
+        );
+        assert_eq!(load(server).unwrap().access_token, "token-refreshed");
+        assert_eq!(
+            signed_in(server).generation.counter,
+            before.generation.counter + 1
+        );
+    }
+
+    #[test]
+    fn legacy_records_stay_usable_but_are_not_witnesses() {
+        mock_keychain::install();
+        let server = "witness-legacy";
+        let legacy = sample("legacy-token");
+        entry(server)
+            .unwrap()
+            .set_password(&serde_json::to_string(&legacy).unwrap())
+            .unwrap();
+        assert_eq!(load(server), Some(legacy.clone()));
+        assert_eq!(witness(server), OAuthWitness::Unwitnessed);
+        save(server, &legacy).unwrap();
+        assert!(matches!(witness(server), OAuthWitness::SignedIn(_)));
+    }
+
+    #[test]
+    fn a_corrupt_record_is_no_witness_and_sign_out_starts_a_new_incarnation() {
+        mock_keychain::install();
+        let server = "witness-corrupt-oauth";
+        save(server, &sample("token")).unwrap();
+        let original = signed_in(server);
+        entry(server).unwrap().set_password("{corrupt").unwrap();
+        assert!(matches!(witness(server), OAuthWitness::Unavailable(_)));
+        assert!(load(server).is_none());
+        delete(server).unwrap();
+        save(server, &sample("token")).unwrap();
+        assert_ne!(
+            signed_in(server).generation.incarnation,
+            original.generation.incarnation
+        );
+    }
+
+    #[test]
+    fn the_witness_projection_carries_no_token_material() {
+        mock_keychain::install();
+        let server = "witness-token-free";
+        let mut auth = sample("access-Zx91Qw82");
+        auth.client_secret = Some("client-secret-Ab12".into());
+        auth.refresh_token = Some("refresh-Cd34".into());
+        save(server, &auth).unwrap();
+        let projected = serde_json::to_string(&signed_in(server)).unwrap();
+        for secret in ["access-Zx91Qw82", "client-secret-Ab12", "refresh-Cd34"] {
+            assert!(!projected.contains(secret));
+        }
     }
 }

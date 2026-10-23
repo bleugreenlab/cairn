@@ -1201,6 +1201,7 @@ async fn handle_merge_pr(
             "recipe-merge-action",
             action_run.id.clone(),
         )),
+        None,
     )
     .await?;
     Ok(Some(serde_json::json!({ "merged": true })))

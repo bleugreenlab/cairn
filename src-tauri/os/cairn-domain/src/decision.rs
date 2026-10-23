@@ -25,6 +25,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
+use cairn_models_types::usage::{BillingUnit, Charge, Measure, Meter, MeteredUsage};
 use serde::{Deserialize, Serialize};
 
 /// The most options a `choice` question may offer (the industry cap).
@@ -437,23 +438,92 @@ pub fn predicate_confidence(probability_yes: f64) -> f64 {
 }
 
 /// What one `decide` call answered: the answers in question order, the model
-/// that gave them, and the input it was billed for (decisions generate no
-/// output tokens). This is the record a consumer keeps.
+/// that gave them, and what the call consumed. This is the record a consumer
+/// keeps.
+///
+/// It serializes as `inputTokens` and `cost` beside the answers, the shape
+/// consumers already read, rather than as the usage it holds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(into = "DecisionRecord", from = "DecisionRecord")]
 pub struct Decision {
     /// The provider that answered, as its backend key.
     pub provider: String,
     /// The model that answered, as the provider reported it.
     pub model: String,
     pub answers: Vec<DecisionAnswer>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_tokens: Option<i64>,
+    /// The input it was billed for (decisions generate no output), and what
+    /// the provider said the call cost when it said (OpenRouter's
+    /// `usage.cost`); never estimated.
+    pub usage: MeteredUsage,
 }
 
 impl Decision {
     pub fn answer(&self, name: &str) -> Option<&DecisionAnswer> {
         self.answers.iter().find(|answer| answer.name() == name)
+    }
+
+    /// The input tokens the call was billed for, when reported.
+    pub fn input_tokens(&self) -> Option<i64> {
+        self.usage
+            .quantity(Charge::Input, BillingUnit::Tokens)
+            .map(|tokens| i64::try_from(tokens).unwrap_or(i64::MAX))
+    }
+
+    /// What the provider said the call cost, in USD, when it said.
+    pub fn cost_usd(&self) -> Option<f64> {
+        self.usage.cost_usd
+    }
+}
+
+/// A decision's usage: input tokens on the input meter, when reported, and
+/// the provider's stated cost.
+pub fn input_usage(input_tokens: Option<i64>, cost_usd: Option<f64>) -> MeteredUsage {
+    MeteredUsage {
+        measures: input_tokens
+            .and_then(|tokens| u64::try_from(tokens).ok())
+            .map(|quantity| Measure {
+                meter: Meter::tokens(Charge::Input),
+                quantity,
+            })
+            .into_iter()
+            .collect(),
+        cost_usd,
+    }
+}
+
+/// [`Decision`] as it is serialized.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DecisionRecord {
+    provider: String,
+    model: String,
+    answers: Vec<DecisionAnswer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cost: Option<f64>,
+}
+
+impl From<Decision> for DecisionRecord {
+    fn from(decision: Decision) -> Self {
+        Self {
+            input_tokens: decision.input_tokens(),
+            cost: decision.cost_usd(),
+            provider: decision.provider,
+            model: decision.model,
+            answers: decision.answers,
+        }
+    }
+}
+
+impl From<DecisionRecord> for Decision {
+    fn from(record: DecisionRecord) -> Self {
+        Self {
+            provider: record.provider,
+            model: record.model,
+            answers: record.answers,
+            usage: input_usage(record.input_tokens, record.cost),
+        }
     }
 }
 
@@ -867,10 +937,21 @@ mod tests {
             provider: "custom:acc_1".into(),
             model: "jev".into(),
             answers: vec![choice("yes", Some(0.9), MeasuredBy::Native)],
-            input_tokens: Some(96),
+            usage: input_usage(Some(96), Some(0.000004)),
         };
+        assert_eq!(decision.input_tokens(), Some(96));
+        assert_eq!(decision.cost_usd(), Some(0.000004));
         let value = serde_json::to_value(&decision).unwrap();
         assert_eq!(value["inputTokens"], json!(96));
+        assert_eq!(value["cost"], json!(0.000004));
+        assert!(value.get("usage").is_none(), "{value}");
+        // A record kept before cost was reported reads back with none.
+        let older: Decision = serde_json::from_value(json!({
+            "provider": "custom:acc_1", "model": "jev", "answers": [], "inputTokens": 40
+        }))
+        .unwrap();
+        assert_eq!(older.input_tokens(), Some(40));
+        assert_eq!(older.cost_usd(), None);
         assert_eq!(value["answers"][0]["measuredBy"], json!("native"));
         let back: Decision = serde_json::from_value(value).unwrap();
         assert_eq!(

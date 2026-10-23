@@ -15,6 +15,7 @@ use cairn_models::types::catalog::{
     custom_account_id, DiscoveredModel, Modalities, Modality, ModelPricing, ProviderCategory,
     ProviderDescriptor, ServedVerb, Verb, VerbKind, Wire,
 };
+use cairn_models::types::embedding::CAIRN_GATEWAY_KEY;
 use cairn_models::types::pool::{
     ProviderPoolAccountResets, ProviderPoolAccountState, ProviderPoolConstraintReach,
     ProviderPoolSegmentState, ProviderPoolSnapshot,
@@ -34,6 +35,10 @@ const INDEX: &[(&str, &str)] = &[
     (
         "cairn://models/catalog",
         "installed providers, what model discovery found on each, and how tiers bind to them",
+    ),
+    (
+        "cairn://models/decide",
+        "answer typed questions with a named model: a run target, not a write",
     ),
     (
         "cairn://models/accounts",
@@ -292,12 +297,24 @@ fn model_line(model: &DiscoveredModel) -> String {
     line
 }
 
+/// What a provider that holds no account stands on, when it is one: Cairn's
+/// gateway runs on this device's Cairn token and is listed only while one
+/// exists.
+fn accountless(provider: &ProviderDescriptor) -> Option<&'static str> {
+    (provider.key == CAIRN_GATEWAY_KEY).then_some("this device's Cairn token")
+}
+
 /// Whether `account` (serialized [`AccountInfo`]) belongs on `provider`'s
-/// tab: a custom provider owns exactly its own account, every other provider
-/// owns the accounts of its credential provider.
+/// tab: a custom provider owns exactly its own account, Cairn's gateway owns
+/// none (its descriptor shares the custom credential provider, but no custom
+/// endpoint's key is ever its credential), and every other provider owns the
+/// accounts of its credential provider.
 ///
 /// [`AccountInfo`]: cairn_models::accounts::AccountInfo
 fn account_serves(account: &Value, provider: &ProviderDescriptor) -> bool {
+    if accountless(provider).is_some() {
+        return false;
+    }
     match custom_account_id(&provider.key) {
         Some(id) => account["id"].as_str() == Some(id),
         None => account["apiProvider"].as_str() == Some(provider.api_provider.as_str()),
@@ -336,6 +353,43 @@ pub(crate) fn render_index() -> String {
     for (uri, what) in INDEX {
         let _ = writeln!(out, "- `{uri}` — {what}");
     }
+    out
+}
+
+/// The decide door: what it takes, and every offer that could answer through
+/// it now.
+pub(crate) fn render_decide(facet: &dyn Models) -> String {
+    let mut out = String::from(
+        "# Decide\n\nInvoke with `run`, not `write`: `run({commands:[{target:\"cairn://models/decide\", payload:{args_json:{model, input, questions, provider?}}}]})`. Each question is answered in order with the model's probability over every answer and how it was measured; a declined question comes back as a refusal. The model is never chosen for you.\n\n",
+    );
+    let catalog = match facet.catalog(&ModelScope::workspace()) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let _ = writeln!(out, "Could not read the catalog: {error}");
+            return out;
+        }
+    };
+    let offers = catalog.offers_serving(VerbKind::Decide);
+    if offers.is_empty() {
+        let _ = writeln!(
+            out,
+            "Nothing in this workspace serves decide yet. {}",
+            cairn_models::interface::fixes(VerbKind::Decide)
+        );
+        return out;
+    }
+    out.push_str("## Offers that serve decide\n\n");
+    for offer in offers {
+        let measured = offer
+            .measured_by()
+            .map_or("nothing", |method| method.as_str());
+        let _ = writeln!(
+            out,
+            "- `{}` on `{}` — measured by {measured}, over `{}`",
+            offer.model, offer.provider, offer.served.wire
+        );
+    }
+    out.push_str("\nA logprobs offer not yet seen to answer is asked one probe question before its first decision. Each offer in full: `cairn://models/catalog?serves=decide`.\n");
     out
 }
 
@@ -432,7 +486,9 @@ fn render_providers(
             .iter()
             .filter(|account| account_serves(account, descriptor))
             .count();
-        if configured == 0 {
+        if let Some(credential) = accountless(descriptor) {
+            let _ = writeln!(out, "Configured: {credential}");
+        } else if configured == 0 {
             let _ = writeln!(out, "Needs setup: {}", descriptor.setup_requirement);
         } else {
             let _ = writeln!(
@@ -787,7 +843,9 @@ pub(crate) fn render_accounts(
         }
         shown += 1;
         let _ = writeln!(out, "\n## {}", heading(&provider.descriptor));
-        if mine.is_empty() {
+        if let Some(credential) = accountless(&provider.descriptor) {
+            let _ = writeln!(out, "No account of its own: it runs on {credential}.");
+        } else if mine.is_empty() {
             let _ = writeln!(out, "No account. {}", provider.descriptor.setup_requirement);
         }
         for index in mine {
@@ -1181,6 +1239,7 @@ mod tests {
         "cairn://models/catalog?view=models",
         "cairn://models/catalog?installed=all",
         "cairn://models/catalog?provider=claude",
+        "cairn://models/decide",
         "cairn://models/accounts",
         "cairn://models/accounts?provider=claude",
         "cairn://models/usage",
@@ -1213,6 +1272,54 @@ mod tests {
                 .map(|account| format!("cairn://models/accounts/{}", account.id)),
         );
         uris
+    }
+
+    #[test]
+    fn the_gateway_owns_no_account_beside_an_installed_custom_endpoint() {
+        use cairn_models::types::catalog::{cairn_gateway_descriptor, unknown_descriptor};
+        let custom = serde_json::json!({ "id": "acc_local", "apiProvider": "custom" });
+        assert!(!super::account_serves(&custom, &cairn_gateway_descriptor()));
+        assert!(super::account_serves(
+            &custom,
+            &unknown_descriptor("custom:acc_local")
+        ));
+        assert!(!super::account_serves(
+            &custom,
+            &unknown_descriptor("custom:acc_other")
+        ));
+        assert_eq!(
+            super::accountless(&cairn_gateway_descriptor()),
+            Some("this device's Cairn token")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_decide_page_lists_the_offers_that_serve_decide_now() {
+        let (orch, server, key) = crate::orchestrator::decide_fixtures::workspace_with_server(
+            crate::credentials::CustomProtocol::OpenAiChatCompletions,
+            None,
+            "qwen3",
+            Vec::new(),
+        )
+        .await;
+        let page = read(&orch, "cairn://models/decide").await;
+        assert!(
+            page.contains(&format!("`qwen3` on `{key}` — measured by logprobs")),
+            "{page}"
+        );
+        assert!(page.contains("Invoke with `run`"), "{page}");
+        assert!(
+            page.contains("run({commands:[{target:\"cairn://models/decide\""),
+            "the affordance carries the invocation: {page}"
+        );
+        assert_eq!(server.calls(), 0, "a read asks nothing");
+
+        let bare = crate::orchestrator::models::tests::bare_orchestrator().await;
+        let nothing = read(&bare, "cairn://models/decide").await;
+        assert!(
+            nothing.contains("Nothing in this workspace serves decide yet"),
+            "{nothing}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

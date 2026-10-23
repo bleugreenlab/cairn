@@ -122,9 +122,41 @@ pub struct LinkClock {
     ingest_since_ns: AtomicU64,
     heartbeats_received: AtomicU64,
     heartbeats_applied: AtomicU64,
+    facts_recomputed_ns: AtomicU64,
 }
 
 impl LinkClock {
+    /// The facts on record for this link were recomputed by the executor:
+    /// its recompute stamp changed, or the link attached with the facts it
+    /// opened with.
+    ///
+    /// Kept on this clock rather than read off the executor's wall-clock
+    /// stamp because the question it answers is how long the facts have gone
+    /// without moving while anyone could have moved them. Wall time keeps
+    /// running while the host sleeps, so a runner that slept fifteen minutes
+    /// with its colocated executor beside it read their first beats after
+    /// the wake as fifteen minutes of frozen facts, and recycled a healthy
+    /// executor for it.
+    pub fn facts_recomputed(&self) {
+        self.facts_recomputed_ns
+            .store(monotonic_now_ns(), Ordering::Relaxed);
+    }
+
+    /// How long, in time this runner was awake, the facts on record have gone
+    /// without being recomputed, or `None` before any were recorded.
+    pub fn facts_frozen_ms(&self, now_ns: u64) -> Option<u64> {
+        stamped(self.facts_recomputed_ns.load(Ordering::Relaxed))
+            .map(|at| now_ns.saturating_sub(at) / NANOS_PER_MS)
+    }
+
+    /// Stage a link whose facts were last recomputed `ago_ms` of awake time
+    /// ago, for tests of the frozen-facts judgement's consumers.
+    #[cfg(test)]
+    pub(crate) fn stage_facts_recomputed(&self, ago_ms: u64) {
+        let at = monotonic_now_ns() - ago_ms * NANOS_PER_MS;
+        self.facts_recomputed_ns.store(at, Ordering::Relaxed);
+    }
+
     /// The reader received a heartbeat. Returns its sequence number, which
     /// ingest hands back to [`Self::heartbeat_applied`] once it is in.
     pub fn heartbeat_received(&self) -> u64 {
@@ -370,6 +402,17 @@ mod tests {
             clock.judge(MS, 90_000, BOUND_MS),
             LinkJudgement::PeerSilent { silence_ms: 90_000 }
         );
+    }
+
+    #[test]
+    fn facts_are_frozen_only_from_their_last_recompute() {
+        let clock = LinkClock::default();
+        assert_eq!(clock.facts_frozen_ms(monotonic_now_ns()), None);
+        clock.stage_facts_recomputed(10_000);
+        let frozen = clock.facts_frozen_ms(monotonic_now_ns()).unwrap();
+        assert!((10_000..11_000).contains(&frozen), "{frozen}");
+        clock.facts_recomputed();
+        assert!(clock.facts_frozen_ms(monotonic_now_ns()).unwrap() < 1_000);
     }
 
     #[test]

@@ -25,7 +25,7 @@ pub(crate) const POSTS_CONTRACT: ResourceContract = ResourceContract {
 
 pub(crate) const POST_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Post,
-    uri_template: "cairn://posts/{integer}",
+    uri_template: "cairn://posts/{post_id}",
     name: "Post",
     description: "One immutable post and its creation-ordered comments; comment authorship is captured from the authenticated run, never supplied",
     read_projections: &[ProjectionSpec { key: "format", values: "json for a lossless persisted-field projection" }],
@@ -42,7 +42,7 @@ pub(crate) const POST_CONTRACT: ResourceContract = ResourceContract {
 
 pub(crate) const POST_COMMENT_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::PostComment,
-    uri_template: "cairn://posts/{integer}/comments/{integer}",
+    uri_template: "cairn://posts/{post_id}/comments/{comment_id}",
     name: "Post comment",
     description:
         "One comment, under the header of the post it answers; append to the post itself to reply",

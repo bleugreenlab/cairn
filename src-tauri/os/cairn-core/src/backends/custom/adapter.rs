@@ -74,11 +74,12 @@ impl CustomAdapter {
             .require_turns()
             .map_err(CompletionError::InvalidRequest)?;
         let requested_model = request.model.clone();
-        let body = completion_body(&request)?;
+        let family = self.chat_family();
+        let body = completion_body(&request, &family)?;
         let started = Instant::now();
         let response = llm
             .complete(CompletionCall::whole(
-                CompletionWire::Chat(&self.endpoint),
+                CompletionWire::Chat(&family.endpoint),
                 body,
                 request.timeout,
             ))
@@ -105,6 +106,31 @@ impl CustomAdapter {
             latency_ms: started.elapsed().as_millis() as u64,
             account_id: None,
         })
+    }
+
+    /// The chat family every generation for this provider is built from, an
+    /// agent turn and a one-shot completion alike, so the operator's sampling
+    /// and the caller's effort reach the server by one rule.
+    fn chat_family(&self) -> ChatFamily {
+        ChatFamily {
+            endpoint: self.endpoint.clone(),
+            dialect: ChatDialect {
+                // A single tool-loop generation must stay small enough to
+                // complete promptly on operator-hosted models. Without an
+                // explicit cap, OpenAI-compatible servers commonly generate up
+                // to the model's remaining context, turning a degenerate
+                // response into tens of minutes of apparent session silence.
+                max_tokens: Some(self.config.max_output_tokens),
+                include_usage: true,
+                // OpenAI's flat `reasoning_effort`, the spelling the servers
+                // operators run (vLLM, Ollama) map onto a reasoning model's
+                // chat template, `"none"` included, so a caller can switch
+                // reasoning off as well as set its level.
+                reasoning: ChatReasoning::Effort,
+                response_format: false,
+            },
+            extras: sampling_extras(&self.config.sampling),
+        }
     }
 }
 
@@ -137,21 +163,7 @@ impl WireAdapter for CustomAdapter {
     }
 
     fn family(&self, _: &Connection) -> Result<ChatFamily, String> {
-        Ok(ChatFamily {
-            endpoint: self.endpoint.clone(),
-            dialect: ChatDialect {
-                // A single tool-loop generation must stay small enough to
-                // complete promptly on operator-hosted models. Without an
-                // explicit cap, OpenAI-compatible servers commonly generate up
-                // to the model's remaining context, turning a degenerate
-                // response into tens of minutes of apparent session silence.
-                max_tokens: Some(self.config.max_output_tokens),
-                include_usage: true,
-                reasoning: ChatReasoning::Omit,
-                response_format: false,
-            },
-            extras: sampling_extras(&self.config.sampling),
-        })
+        Ok(self.chat_family())
     }
 
     fn build_conversation(

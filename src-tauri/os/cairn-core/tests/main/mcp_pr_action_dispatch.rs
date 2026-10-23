@@ -254,6 +254,138 @@ async fn pr_node_merge_resolves_through_parent_job() {
     );
 }
 
+/// Seed a thread whose branch 1 is the builder job's PR.
+async fn insert_thread_branch(db: &LocalDb, project_id: &str) {
+    db.execute(
+        "INSERT INTO threads (id, project_id, name, created_at, updated_at)
+         VALUES ('thread-pin', ?1, 'pin-thread', 1, 1)",
+        params![project_id],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO thread_branches (id, thread_id, number, stage, git_ref, job_id, created_at, moved_at)
+         VALUES ('branch-pin', 'thread-pin', 1, 'pr-open', 'feature', 'job-builder', 1, 1)",
+        (),
+    )
+    .await
+    .unwrap();
+}
+
+const MERGE_SURFACES: [&str; 3] = [
+    "cairn://p/pra/1/1/builder/pr",
+    "cairn://p/pra/1/1/pr",
+    "cairn://p/pra/pin-thread/branches/1",
+];
+
+/// Every merge surface hands `precondition:"pinBump"` to the merge, and the
+/// merge evaluates it: this fixture has no jj store, so the gate refuses with
+/// its own condition instead of attempting the GitHub merge.
+#[tokio::test]
+async fn pin_bump_precondition_passes_through_every_merge_surface() {
+    let (temp, db, project_id, issue_id) = pr_action_node_fixture().await;
+    insert_merge_request(&db, &project_id, &issue_id).await;
+    insert_pr_action_run(&db, &project_id, &issue_id).await;
+    insert_thread_branch(&db, &project_id).await;
+    let orch = orchestrator(&temp, db.clone());
+
+    for target in MERGE_SURFACES {
+        let preview = change_target(
+            &orch,
+            target,
+            json!({ "action": "merge", "precondition": "pinBump" }),
+            true,
+        )
+        .await;
+        assert!(
+            preview.contains("precondition=pinBump"),
+            "{target}: the preview names the gate: {preview}"
+        );
+
+        let result = change_target(
+            &orch,
+            target,
+            json!({ "action": "merge", "precondition": "pinBump" }),
+            false,
+        )
+        .await;
+        assert!(
+            result.contains("as a pin bump: could not read the source branch head"),
+            "{target}: the merge evaluated the precondition: {result}"
+        );
+    }
+    assert_eq!(
+        common::query_i64(
+            &db,
+            "SELECT COUNT(*) FROM merge_attempt_events
+              WHERE merge_request_id = 'mr-1' AND sequence = 1 AND state = 'violation'
+                AND detail LIKE 'pinBump: %'"
+        )
+        .await
+        .unwrap(),
+        3,
+        "each refused attempt journals its violation"
+    );
+    assert_eq!(
+        db.query_text("SELECT status FROM merge_requests WHERE id = 'mr-1'", ())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("open")
+    );
+}
+
+/// A misspelled or mistyped precondition is refused, never ignored: ignoring it
+/// would land the merge without the gate its caller asked for.
+#[tokio::test]
+async fn unknown_or_non_string_precondition_is_refused_on_every_merge_surface() {
+    let (temp, db, project_id, issue_id) = pr_action_node_fixture().await;
+    insert_merge_request(&db, &project_id, &issue_id).await;
+    insert_pr_action_run(&db, &project_id, &issue_id).await;
+    insert_thread_branch(&db, &project_id).await;
+    let orch = orchestrator(&temp, db.clone());
+
+    for target in MERGE_SURFACES {
+        for (precondition, expected) in [
+            // The reply is JSON, so the quotes inside the refusal are escaped.
+            (json!("pinbump"), "unknown merge precondition"),
+            (json!(1), "payload.precondition must be the string"),
+        ] {
+            for preview in [true, false] {
+                let result = change_target(
+                    &orch,
+                    target,
+                    json!({ "action": "merge", "precondition": precondition }),
+                    preview,
+                )
+                .await;
+                assert!(
+                    result.contains(expected) && !result.contains("Would merge"),
+                    "{target} {precondition}: {result}"
+                );
+            }
+        }
+        let close = change_target(
+            &orch,
+            target,
+            json!({ "action": "close", "precondition": "pinBump" }),
+            true,
+        )
+        .await;
+        assert!(
+            close.contains("only accepted with action='merge'"),
+            "{target}: {close}"
+        );
+    }
+    assert_eq!(
+        common::query_i64(&db, "SELECT COUNT(*) FROM merge_attempt_events")
+            .await
+            .unwrap(),
+        0,
+        "a refused payload never reaches the merge"
+    );
+}
+
 #[tokio::test]
 async fn unknown_action_is_rejected() {
     let (temp, db, project_id, issue_id) = pr_action_node_fixture().await;

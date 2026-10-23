@@ -1173,6 +1173,44 @@ fn task_checks_uri_parses_and_round_trips() {
 }
 
 #[test]
+fn project_vcs_family_parses_each_operation_and_rejects_others() {
+    for (op, resource) in [
+        (
+            "diff",
+            CairnResource::ProjectVcsDiff {
+                project: "cairn".to_string(),
+            },
+        ),
+        (
+            "ancestry",
+            CairnResource::ProjectVcsAncestry {
+                project: "cairn".to_string(),
+            },
+        ),
+        (
+            "log",
+            CairnResource::ProjectVcsLog {
+                project: "cairn".to_string(),
+            },
+        ),
+        (
+            "blame",
+            CairnResource::ProjectVcsBlame {
+                project: "cairn".to_string(),
+            },
+        ),
+    ] {
+        let uri = format!("cairn://p/cairn/vcs/{op}");
+        assert_eq!(parse_uri(&uri), Some(resource.clone()));
+        assert_eq!(resource.to_uri(), uri);
+        assert_eq!(resource.project(), Some("cairn"));
+        assert_eq!(resource.issue_number(), None);
+    }
+    assert_eq!(parse_uri("cairn://p/cairn/vcs/tree"), None);
+    assert!(crate::thread_name::validate_thread_name("vcs").is_err());
+}
+
+#[test]
 fn project_check_results_uri_parses_and_round_trips() {
     let uri = "cairn://p/cairn/check-results/main";
     let resource = CairnResource::ProjectCheckResults {

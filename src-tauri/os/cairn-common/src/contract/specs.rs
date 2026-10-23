@@ -55,6 +55,11 @@ pub(crate) const REBASE_RESOLUTION: KeySpec = KeySpec::new(
     KeyType::Str,
     "take-committed-tip — explicitly use the branch's committed tip content for the session's conflicting paths",
 );
+pub(crate) const REBASE_FAST_FORWARD_BRANCH: KeySpec = KeySpec::new(
+    "branch",
+    KeyType::Str,
+    "fast-forward-from-origin only: `base` takes origin's copy of the branch this node is cut from instead of the node's own",
+);
 pub(crate) const REBASE_DROP_INCOMING_REASON: KeySpec = KeySpec::new(
     "drop_incoming_reason",
     KeyType::Str,
@@ -280,6 +285,11 @@ pub(crate) const PR_METHOD: KeySpec = KeySpec::new(
     KeyType::Str,
     "merge method for action:merge (default squash)",
 );
+pub(crate) const PR_PRECONDITION: KeySpec = KeySpec::new(
+    "precondition",
+    KeyType::Str,
+    "pinBump — action:merge only: land only if the change is exactly an upstream tool-pin bump the base revision's `pinBumps` config describes, verified by its required checks on every required platform at this head (see docs/checks.md); any other value is refused",
+);
 pub(crate) const NODE_ACTION: KeySpec = KeySpec::new(
     "action",
     KeyType::Str,
@@ -296,7 +306,7 @@ pub(crate) const ATTACHMENT_ACTION: KeySpec = KeySpec::new(
 pub(crate) const REBASE_ACTION: KeySpec = KeySpec::new(
     "action",
     KeyType::Str,
-    "replay — replay onto the base; discharge-contended-identifier — explicitly release an incorrect durable identifier obligation",
+    "replay — replay onto the base; discharge-contended-identifier — explicitly release an incorrect durable identifier obligation; fast-forward-from-origin — take origin's copy of the branch (or of its base, with branch:\"base\") now, only when it is a pure fast-forward",
 );
 pub(crate) const REBASE_FINGERPRINT: KeySpec = KeySpec::new(
     "fingerprint",
@@ -559,6 +569,13 @@ pub(crate) const MCP_OAUTH: KeySpec = KeySpec::new(
     KeyType::Object,
     "non-secret OAuth block only: {clientId?, scopes?}; tokens and client secrets live in the keychain and are never set here",
 );
+/// Dedicated to the MCP server member: an operation on the calling run's
+/// connection, never a registry edit, so it shares nothing with the config keys.
+pub(crate) const MCP_ACTION: KeySpec = KeySpec::new(
+    "action",
+    KeyType::Str,
+    "restart — drop the calling run's pooled connection to this server (stopping its stdio process) so the next call reconnects; for a server that is alive but not answering. Edits no configuration",
+);
 pub(crate) const MCP_SCOPE: KeySpec = KeySpec::new(
     "scope",
     KeyType::Str,
@@ -640,6 +657,11 @@ pub(crate) const EXECUTOR_ROLE: KeySpec = KeySpec::new(
     "role",
     KeyType::Str,
     "buildsOnly | general | inferenceOnly: what this machine is for; omitted means general (or, re-enrolling, the role it holds). Durable runner-side state like draining: unfenced, works on an unreachable machine, and the machine is never told. inferenceOnly is never offered any batch class",
+);
+pub(crate) const EXECUTOR_BUILD_ROOT: KeySpec = KeySpec::new(
+    "buildRoot",
+    KeyType::Str,
+    "local only: an existing directory on another volume where the runner's own executor keeps its cells, managed objects, dependency catalog and build caches; null restores the home. Written while the volume is mounted (it gets a marker), and takes effect at the next runner start. While the volume is unplugged the machine stays attached and declines work that needs a cell, and it adopts its cells again when the volume returns",
 );
 pub(crate) const EXECUTOR_EXPECTED_GENERATION: KeySpec = KeySpec::with_aliases(
     "expectedGeneration",
@@ -828,6 +850,16 @@ pub(crate) const SETTINGS_DECISION_MODEL: KeySpec = KeySpec::new(
     KeyType::Str,
     "model or tier a decision node naming none is answered by; null returns it to the catalog's choice",
 );
+pub(crate) const SETTINGS_IMAGE_MODEL: KeySpec = KeySpec::new(
+    "imageModel",
+    KeyType::Str,
+    "image model a request naming none is drawn by; null clears it, and such a request is then refused",
+);
+pub(crate) const SETTINGS_SPEECH_MODEL: KeySpec = KeySpec::new(
+    "speechModel",
+    KeyType::Str,
+    "speech model a request naming none is spoken by; null clears it, and such a request is then refused",
+);
 pub(crate) const SETTINGS_MERGE_TYPE: KeySpec =
     KeySpec::new("mergeType", KeyType::Str, "squash|merge|rebase");
 pub(crate) const SETTINGS_MEMORY_REVIEW_ENABLED: KeySpec = KeySpec::new(
@@ -987,6 +1019,16 @@ pub(crate) const PROJECT_REMOTE_URL: KeySpec = KeySpec::with_aliases(
     &["remote_url"],
     KeyType::Str,
     "attach this git remote as origin",
+);
+pub(crate) const PROJECT_ACTION: KeySpec = KeySpec::new(
+    "action",
+    KeyType::Str,
+    "export (requires path): write every row the project owns to a self-contained local archive, archived transcript events reconstructed to plain content; runs against a live project from one snapshot",
+);
+pub(crate) const PROJECT_EXPORT_PATH: KeySpec = KeySpec::new(
+    "path",
+    KeyType::Str,
+    "absolute local directory for action:export, new or empty; receives manifest.json (written last) and tables/<table>.jsonl",
 );
 pub(crate) const PROJECT_REF_STORE_PRUNE: KeySpec = KeySpec::with_aliases(
     "refStorePrune",

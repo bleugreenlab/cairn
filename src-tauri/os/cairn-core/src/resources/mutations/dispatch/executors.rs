@@ -36,6 +36,18 @@ struct ConfigureRequest {
     repaired: Option<bool>,
     #[serde(alias = "expected_generation")]
     expected_generation: Option<u64>,
+    /// Where the runner's own executor keeps its cells: a directory on another
+    /// volume, or `null` for the home. Absent leaves it as it is.
+    #[serde(alias = "build_root", default, deserialize_with = "present_or_null")]
+    build_root: Option<Option<String>>,
+}
+
+/// Tell an absent key (`None`) from an explicit `null` (`Some(None)`).
+fn present_or_null<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <Option<String> as serde::Deserialize>::deserialize(deserializer).map(Some)
 }
 
 #[derive(serde::Deserialize)]
@@ -181,7 +193,7 @@ pub(super) async fn dispatch(
                     build_failure(
                         index,
                         item,
-                        format!("invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, role (buildsOnly, general, or inferenceOnly), desktopAutomation, repaired, and expectedGeneration."),
+                        format!("invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, role (buildsOnly, general, or inferenceOnly), desktopAutomation, repaired, buildRoot, and expectedGeneration."),
                     )
                 })?;
             if request.new_name.is_none()
@@ -190,11 +202,12 @@ pub(super) async fn dispatch(
                 && request.role.is_none()
                 && request.desktop_automation.is_none()
                 && request.repaired.is_none()
+                && request.build_root.is_none()
             {
                 return Err(build_failure(
                     index,
                     item,
-                    "a patch changes newName, runtimePolicy, draining, role, desktopAutomation, or repaired; none was supplied",
+                    "a patch changes newName, runtimePolicy, draining, role, desktopAutomation, repaired, or buildRoot; none was supplied",
                 ));
             }
             // Resolve first, so an unknown machine is refused identically whether
@@ -247,6 +260,16 @@ pub(super) async fn dispatch(
                         "declare {name} repaired, re-arming every check suppressed on its environment"
                     ));
                 }
+                if let Some(build_root) = &request.build_root {
+                    planned.push(match build_root {
+                        Some(root) => {
+                            format!("move {name}'s build root to {root} from the next runner start")
+                        }
+                        None => format!(
+                            "move {name}'s build root back to its home from the next runner start"
+                        ),
+                    });
+                }
                 format!("Would {}", planned.join(", "))
             } else {
                 let mut applied = Vec::new();
@@ -297,6 +320,12 @@ pub(super) async fn dispatch(
                 if let Some(role) = request.role {
                     let outcome = management::set_machine_role(orch, name, role)
                         .map_err(|error| build_failure(index, item, error))?;
+                    applied.push(outcome.summary());
+                }
+                if let Some(build_root) = &request.build_root {
+                    let outcome =
+                        management::set_colocated_build_root(orch, name, build_root.as_deref())
+                            .map_err(|error| build_failure(index, item, error))?;
                     applied.push(outcome.summary());
                 }
                 if request.repaired == Some(true) {

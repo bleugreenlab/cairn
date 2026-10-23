@@ -141,6 +141,22 @@ macro_rules! private_prepared_ordinary_launches {
     };
 }
 
+/// cairn/5205: whether a prepared ordinary launch serves an operator or
+/// background work, the fact its admission priority is derived from.
+macro_rules! private_prepared_ordinary_launch_origin {
+    () => {
+        migration!("0278_prepared_ordinary_launch_origin")
+    };
+}
+
+/// cairn/5286: rebuilds the execution-queue journal so its decline-reason CHECK
+/// admits `build_volume_absent`. Private for the same reason as the table.
+macro_rules! private_execution_queue_build_volume_absent {
+    () => {
+        migration!("0280_execution_queue_build_volume_absent")
+    };
+}
+
 /// Runner-local recovery journal for the exact remote authority generation held
 /// by a team ordinary process and any terminal action still owed to Postgres.
 macro_rules! private_team_ordinary_admission_authority {
@@ -281,6 +297,31 @@ macro_rules! shared_tail_sibling_job_lookup_indexes {
 macro_rules! shared_tail_job_artifact_inputs {
     () => {
         migration!("0275_job_artifact_inputs")
+    };
+}
+
+/// cairn/5141: the fast tier's deferred per-test outcome, added beside the
+/// CHECK-constrained `check_test_results` rather than by rebuilding it, plus the
+/// observation's tier and deferred tally. Additive on tables both lineages carry.
+macro_rules! shared_tail_check_deferred_tests {
+    () => {
+        migration!("0276_check_deferred_tests")
+    };
+}
+
+/// cairn/5206: the gate census seeks an execution's gates and its supersession
+/// record by execution id instead of scanning, on tables both lineages carry.
+macro_rules! shared_tail_execution_gates_execution_index {
+    () => {
+        migration!("0277_index_execution_gates_execution")
+    };
+}
+
+/// cairn/5304: drop the `check_test_outcomes` view, which Turso could answer
+/// only by materializing every test row; readers filter the union per arm.
+macro_rules! shared_tail_drop_check_test_outcomes_view {
+    () => {
+        migration!("0279_drop_check_test_outcomes_view")
     };
 }
 
@@ -1527,6 +1568,9 @@ macro_rules! team_lineage {
             shared_tail_tenet_statements!(),
             shared_tail_check_observation_platform_relabels!(),
             shared_tail_job_artifact_inputs!(),
+            shared_tail_check_deferred_tests!(),
+            shared_tail_execution_gates_execution_index!(),
+            shared_tail_drop_check_test_outcomes_view!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1806,6 +1850,11 @@ macro_rules! private_lineage {
             private_subscription_periods!(),
             private_runner_events!(),
             shared_tail_job_artifact_inputs!(),
+            shared_tail_check_deferred_tests!(),
+            private_prepared_ordinary_launch_origin!(),
+            shared_tail_execution_gates_execution_index!(),
+            shared_tail_drop_check_test_outcomes_view!(),
+            private_execution_queue_build_volume_absent!(),
         ]
     };
 }
@@ -2139,6 +2188,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("check_result_observations", TableScope::ProjectScoped),
     ("check_observation_relabels", TableScope::ProjectScoped),
     ("check_test_results", TableScope::ProjectScoped),
+    ("check_deferred_tests", TableScope::ProjectScoped),
     ("checkpoint_command_cache", TableScope::ProjectScoped),
     ("checkpoint_runs", TableScope::ProjectScoped),
     ("pr_publish_attempts", TableScope::ProjectScoped),
@@ -2733,6 +2783,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "check_observation_relabels",
         id_columns: &["observation_id", "project_id"],
+    },
+    RekeyTableManifest {
+        table: "check_deferred_tests",
+        id_columns: &["observation_id"],
     },
     RekeyTableManifest {
         table: "checkpoint_command_cache",
@@ -3652,6 +3706,11 @@ mod tests {
                 "subscription_periods",
                 "runner_events",
                 "job_artifact_inputs",
+                "check_deferred_tests",
+                "prepared_ordinary_launch_origin",
+                "index_execution_gates_execution",
+                "drop_check_test_outcomes_view",
+                "execution_queue_build_volume_absent",
             ],
         );
     }
@@ -7182,6 +7241,10 @@ mod tests {
                 "tenet_statements",
                 "check_observation_platform_relabels",
                 "job_artifact_inputs",
+                // cairn/5141: the fast tier's deferred per-test outcome.
+                "check_deferred_tests",
+                "index_execution_gates_execution",
+                "drop_check_test_outcomes_view",
             ],
         );
         assert_eq!(

@@ -1429,7 +1429,7 @@ pub(crate) async fn produce_file_segment(
         // another one.
         if branch.is_some() {
             revision_label = Some(
-                crate::orchestrator::default_branch_sync::revision_label(
+                crate::orchestrator::base_branch_sync::revision_label(
                     orch,
                     &resolution.project_id,
                     &resolution.rev,

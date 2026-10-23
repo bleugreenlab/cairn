@@ -1,6 +1,7 @@
 //! Codex model discovery: the installed CLI's live `model/list`, and the
 //! model cache a session's hardened catalog is built from.
 
+use crate::interface::session::Secret;
 use crate::types::catalog::{DiscoveredModel, DiscoveredReasoningEffort};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -81,7 +82,7 @@ struct CodexModelListResult {
 struct CodexModelListEntry {
     id: String,
     model: String,
-    #[allow(dead_code)]
+    #[serde(default)]
     display_name: String,
     description: Option<String>,
     #[serde(default)]
@@ -104,11 +105,12 @@ struct CodexReasoningEffortEntry {
 
 /// Ask the Codex CLI at `codex_path` for its models. A cache Codex writes
 /// while answering is published into `codex_home` for
-/// [`super::home::write_codex_config`] to harden.
+/// [`super::home::write_codex_config`] to harden. `login` is the
+/// `account/login/start` params, and is exposed only into that request.
 pub fn discover_codex_models(
     codex_path: &str,
     codex_home: &Path,
-    login_params: Option<Value>,
+    login: Option<&Secret<Value>>,
     extra_env: &HashMap<String, String>,
 ) -> Result<Vec<DiscoveredModel>, String> {
     // Discovery needs the installed runtime's live catalog, not the hardened
@@ -179,14 +181,14 @@ pub fn discover_codex_models(
             "params": {}
         }),
     )?;
-    if let Some(login_params) = login_params {
+    if let Some(login) = login {
         send_message(
             &mut stdin,
             &json!({
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "account/login/start",
-                "params": login_params
+                "params": login.expose()
             }),
         )?;
         // model/list sent before the login lands answers from the CLI's
@@ -293,12 +295,16 @@ fn finish_model_discovery(
         std::fs::copy(&discovered_cache, codex_home.join("models_cache.json"))
             .map_err(|error| format!("Failed to publish Codex model cache: {error}"))?;
     }
-    let mut models: Vec<DiscoveredModel> = result
+    let models = result
         .data
         .into_iter()
         .map(|model| DiscoveredModel {
             id: model.id,
-            display_name: model.model.clone(),
+            display_name: if model.display_name.trim().is_empty() {
+                model.model.clone()
+            } else {
+                model.display_name
+            },
             model: model.model,
             description: model.description,
             hidden: model.hidden,
@@ -323,7 +329,6 @@ fn finish_model_discovery(
             tokenizer: None,
         })
         .collect();
-    merge_fallback_models(&mut models);
     Ok(models)
 }
 
@@ -344,10 +349,10 @@ fn finish_model_discovery(
 pub fn refresh_codex_model_cache(
     codex_path: &str,
     codex_home: &Path,
-    login_params: Option<Value>,
+    login: Option<&Secret<Value>>,
     extra_env: &HashMap<String, String>,
 ) -> Result<(), String> {
-    let discovery = discover_codex_models(codex_path, codex_home, login_params, extra_env);
+    let discovery = discover_codex_models(codex_path, codex_home, login, extra_env);
     let published_cache_exists = codex_home.join("models_cache.json").exists();
     resolve_cache_refresh(discovery, published_cache_exists)
 }
@@ -373,114 +378,52 @@ fn resolve_cache_refresh(
     }
 }
 
-fn reasoning_effort(name: &str, description: &str) -> DiscoveredReasoningEffort {
-    DiscoveredReasoningEffort {
-        reasoning_effort: name.to_string(),
-        description: Some(description.to_string()),
-    }
-}
-
-fn fallback_model(
-    slug: &str,
-    default_effort: &str,
-    supported_reasoning_efforts: Vec<DiscoveredReasoningEffort>,
-) -> DiscoveredModel {
-    DiscoveredModel {
-        id: slug.to_string(),
-        model: slug.to_string(),
-        display_name: slug.to_string(),
-        description: None,
-        hidden: false,
-        // Never claim the default flag: Codex's own `model/list` owns which
-        // model is default, and Cairn pins the tier presets independently.
-        is_default: false,
-        default_reasoning_effort: Some(default_effort.to_string()),
-        supported_reasoning_efforts,
-        context_window: Some(372_000),
-        canonical_slug: None,
-        serving_account_ids: Vec::new(),
-        pricing: None,
-        supported_parameters: Vec::new(),
-        router: false,
-        modalities: None,
-        serves: None,
-        tokenizer: None,
-    }
-}
-
-/// Codex model slugs Cairn knows are selectable (they run via `codex -m <slug>`)
-/// but that the pinned `codex` CLI's `model/list` does not yet enumerate.
-/// Metadata mirrors Codex's own
-/// `models-manager/models.json`. Deduped against discovery by slug, so once the
-/// CLI reports them natively its entry wins and these are dropped.
-fn fallback_codex_models() -> Vec<DiscoveredModel> {
-    let base = || {
-        vec![
-            reasoning_effort("low", "Fast responses with lighter reasoning"),
-            reasoning_effort(
-                "medium",
-                "Balances speed and reasoning depth for everyday tasks",
-            ),
-            reasoning_effort("high", "Greater reasoning depth for complex problems"),
-            reasoning_effort("xhigh", "Extra high reasoning depth for complex problems"),
-            reasoning_effort("max", "Maximum reasoning depth for the hardest problems"),
-        ]
-    };
-    let with_ultra = || {
-        let mut efforts = base();
-        efforts.push(reasoning_effort(
-            "ultra",
-            "Maximum reasoning with automatic task delegation",
-        ));
-        efforts
-    };
-    vec![
-        DiscoveredModel {
-            // Codex's session window differs from the public API window.
-            context_window: Some(272_000),
-            ..fallback_model("gpt-6-astra", "medium", with_ultra())
-        },
-        fallback_model("gpt-5.6-sol", "low", with_ultra()),
-        fallback_model("gpt-5.6-terra", "medium", with_ultra()),
-        fallback_model("gpt-5.6-luna", "medium", base()),
-    ]
-}
-
-/// Prepend known-selectable Codex models the CLI hasn't enumerated yet, skipping
-/// any slug already present so a native discovery of the same model wins.
-fn merge_fallback_models(discovered: &mut Vec<DiscoveredModel>) {
-    let present: std::collections::HashSet<String> =
-        discovered.iter().map(|m| m.model.clone()).collect();
-    let mut missing: Vec<DiscoveredModel> = fallback_codex_models()
-        .into_iter()
-        .filter(|m| !present.contains(&m.model))
-        .collect();
-    if missing.is_empty() {
-        return;
-    }
-    missing.append(discovered);
-    *discovered = missing;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The installed CLI can answer model/list without writing
+    /// models_cache.json into its isolated discovery home. Its models are
+    /// still offered, but no session catalog is published, so a session start
+    /// with none published before refuses rather than hardening nothing.
     #[test]
-    fn model_list_without_cache_still_offers_astra() {
+    fn cacheless_model_list_publishes_no_session_catalog() {
         let home = tempfile::tempdir().unwrap();
         let published = home.path().join("published");
-        // The installed CLI successfully answers model/list but does not
-        // necessarily write models_cache.json into its isolated discovery home.
-        let result = serde_json::from_value(json!({"data": []})).unwrap();
+        let result = serde_json::from_value(json!({"data": [{
+            "id": "gpt-6-astra", "model": "gpt-6-astra", "displayName": "GPT-6-Astra"
+        }]}))
+        .unwrap();
         let models = finish_model_discovery(result, home.path(), &published).unwrap();
-        let astra = models
-            .iter()
-            .find(|model| model.model == "gpt-6-astra")
-            .unwrap();
-        assert!(!astra.hidden);
+        assert_eq!(models.len(), 1);
         assert!(!published.join("models_cache.json").exists());
-        assert!(resolve_cache_refresh(Ok(models), false).is_err());
+        let error = resolve_cache_refresh(Ok(models), false).unwrap_err();
+        assert!(error.contains("no published session catalog exists"));
+    }
+
+    /// The picker reads like Codex's own: the CLI's display name, or the slug
+    /// when the CLI names none.
+    #[test]
+    fn discovery_carries_the_cli_display_name() {
+        let home = tempfile::tempdir().unwrap();
+        let result = serde_json::from_value(json!({"data": [
+            {"id": "gpt-6-astra", "model": "gpt-6-astra", "displayName": "GPT-6-Astra"},
+            {"id": "gpt-5.5", "model": "gpt-5.5", "displayName": ""},
+            {"id": "gpt-6-luna", "model": "gpt-6-luna"}
+        ]}))
+        .unwrap();
+        let models = finish_model_discovery(result, home.path(), home.path()).unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| (model.model.as_str(), model.display_name.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("gpt-6-astra", "GPT-6-Astra"),
+                ("gpt-5.5", "gpt-5.5"),
+                ("gpt-6-luna", "gpt-6-luna")
+            ]
+        );
     }
 
     #[test]
@@ -576,11 +519,11 @@ done
         let env = HashMap::from([("FAKE_STDERR".to_string(), "flood".to_string())]);
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let login = json!({"type": "scriptedLogin"});
+            let login = Secret::new(json!({"type": "scriptedLogin"}));
             let _ = done.send(refresh_codex_model_cache(
                 &codex,
                 home.path(),
-                Some(login),
+                Some(&login),
                 &env,
             ));
         });
@@ -630,7 +573,8 @@ done
         let codex = scripted_app_server(bin.path());
         let home = tempfile::tempdir().unwrap();
         let env = HashMap::from([("FAKE_LOGIN".to_string(), "reject".to_string())]);
-        let error = discover_codex_models(&codex, home.path(), Some(json!({})), &env).unwrap_err();
+        let login = Secret::new(json!({}));
+        let error = discover_codex_models(&codex, home.path(), Some(&login), &env).unwrap_err();
         assert!(error.contains("invalid tokens"), "{error}");
     }
 
@@ -652,73 +596,9 @@ done
     }
 
     #[test]
-    fn fallback_covers_known_selectable_models() {
-        let models = fallback_codex_models();
-        let slugs: Vec<&str> = models.iter().map(|m| m.model.as_str()).collect();
-        assert_eq!(
-            slugs,
-            [
-                "gpt-6-astra",
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-5.6-luna"
-            ]
-        );
-        assert_eq!(
-            models[0].default_reasoning_effort.as_deref(),
-            Some("medium")
-        );
-        assert_eq!(models[0].context_window, Some(272_000));
-        assert_eq!(
-            models[0]
-                .supported_reasoning_efforts
-                .iter()
-                .map(|effort| effort.reasoning_effort.as_str())
-                .collect::<Vec<_>>(),
-            ["low", "medium", "high", "xhigh", "max", "ultra"]
-        );
-
-        // Every fallback is visible and carries selectable reasoning efforts, so
-        // the effort control renders (an empty list hides it in the UI).
-        for model in &models {
-            assert!(!model.hidden);
-            assert!(!model.is_default);
-            assert!(!model.supported_reasoning_efforts.is_empty());
-        }
-
-        // Astra/sol/terra expose `ultra`; luna does not (matches models.json).
-        let has_ultra = |m: &DiscoveredModel| {
-            m.supported_reasoning_efforts
-                .iter()
-                .any(|e| e.reasoning_effort == "ultra")
-        };
-        assert!(has_ultra(&models[0]));
-        assert!(has_ultra(&models[1]));
-        assert!(has_ultra(&models[2]));
-        assert!(!has_ultra(&models[3]));
-    }
-
-    #[test]
-    fn merge_prepends_all_when_discovery_lacks_them() {
-        let mut discovered = vec![fallback_model("gpt-5.5", "high", vec![])];
-        merge_fallback_models(&mut discovered);
-        let slugs: Vec<&str> = discovered.iter().map(|m| m.model.as_str()).collect();
-        assert_eq!(
-            slugs,
-            [
-                "gpt-6-astra",
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-5.6-luna",
-                "gpt-5.5"
-            ]
-        );
-    }
-
-    #[test]
     fn cache_refresh_succeeds_when_discovery_succeeds() {
         // A successful refresh can start a session only with a published cache.
-        let ok = || Ok(vec![fallback_model("gpt-5.6-sol", "low", vec![])]);
+        let ok = || Ok(Vec::new());
         assert!(resolve_cache_refresh(ok(), true).is_ok());
         let error = resolve_cache_refresh(ok(), false).unwrap_err();
         assert!(error.contains("no published session catalog exists"));
@@ -745,35 +625,5 @@ done
         // discovery error must still surface — there is nothing to harden.
         let result = resolve_cache_refresh(Err("model/list unavailable".to_string()), false);
         assert_eq!(result, Err("model/list unavailable".to_string()));
-    }
-
-    #[test]
-    fn merge_skips_slugs_discovery_already_reports() {
-        // Once the CLI enumerates Astra, discovery's entry is authoritative
-        // and the fallback for that slug is dropped (no duplicate).
-        let mut native = fallback_model("gpt-6-astra", "high", vec![]);
-        native.context_window = Some(1_050_000);
-        native.is_default = true;
-        let mut discovered = vec![native];
-        merge_fallback_models(&mut discovered);
-        let slugs: Vec<&str> = discovered.iter().map(|m| m.model.as_str()).collect();
-        assert_eq!(
-            slugs,
-            [
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-5.6-luna",
-                "gpt-6-astra"
-            ]
-        );
-        assert_eq!(slugs.iter().filter(|s| **s == "gpt-6-astra").count(), 1);
-        let astra = discovered.last().unwrap();
-        assert_eq!(astra.default_reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(astra.context_window, Some(1_050_000));
-        assert!(astra.is_default);
-        assert!(astra.supported_reasoning_efforts.is_empty());
-        let once = serde_json::to_value(&discovered).unwrap();
-        merge_fallback_models(&mut discovered);
-        assert_eq!(serde_json::to_value(&discovered).unwrap(), once);
     }
 }

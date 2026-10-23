@@ -1,6 +1,5 @@
-//! OpenRouter's endpoint and provider-routing object, and the
-//! structured-output constraint its one-shot completions carry. Its headers
-//! are the facet's (`cairn_models::openrouter`), shared with the image verb.
+//! OpenRouter's endpoint and provider-routing object. Its headers are the
+//! facet's (`cairn_models::openrouter`), shared with the image verb.
 
 use crate::models::{OpenRouterRouting, OpenRouterSort};
 use serde_json::{json, Value};
@@ -27,76 +26,8 @@ pub(super) fn build_provider_object(routing: &OpenRouterRouting) -> Value {
     provider
 }
 
-/// Inject the native structured-output constraint into an OpenRouter request
-/// body for a schema-constrained call (CAIRN-2505). The `response_format`
-/// json_schema half is shared with every OpenAI-compatible provider; what is
-/// OpenRouter's alone is `provider.require_parameters`, which routes ONLY to
-/// providers that honor the schema, so a routed provider can't silently drop it.
-/// Cairn's server-side validation of the stored artifact makes a schema
-/// violation a loud failure; it cannot see an optional field a constrained
-/// decoder foreclosed, which is what the shared wire's required-first property
-/// order (`cairn_models::wire::schema_order`) exists to prevent. A model
-/// with no schema-capable provider then fails the request loudly (an HTTP error
-/// naming the model), which is the intended behavior.
-pub(super) fn apply_output_schema(body: &mut Value, schema: Option<&Value>) {
-    crate::backends::openai_compat::http::apply_output_schema(body, schema);
-    if schema.is_none() {
-        return;
-    }
-    match body.get_mut("provider").and_then(Value::as_object_mut) {
-        Some(obj) => {
-            obj.insert("require_parameters".to_string(), json!(true));
-        }
-        None => {
-            body["provider"] = json!({ "require_parameters": true });
-        }
-    }
-}
-
 /// The headers Cairn's OpenRouter requests carry: the facet's, attributed to
 /// Cairn.
 pub(super) fn openrouter_headers(api_key: &str) -> Vec<(String, String)> {
     cairn_models::openrouter::headers(api_key, &cairn_models::openrouter::Attribution::cairn())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::apply_output_schema;
-    use serde_json::json;
-
-    #[test]
-    fn no_schema_leaves_body_unconstrained() {
-        let mut body = json!({ "model": "m", "provider": { "sort": "throughput" } });
-        apply_output_schema(&mut body, None);
-        assert!(body.get("response_format").is_none());
-        // The existing provider object is untouched.
-        assert!(body["provider"].get("require_parameters").is_none());
-    }
-
-    #[test]
-    fn schema_sets_response_format_and_require_parameters() {
-        let schema = json!({
-            "type": "object",
-            "required": ["answer"],
-            "properties": {"answer": {"type": "string"}}
-        });
-        let mut body = json!({ "model": "m", "provider": { "sort": "throughput" } });
-        apply_output_schema(&mut body, Some(&schema));
-
-        assert_eq!(body["response_format"]["type"], "json_schema");
-        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
-        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
-        // require_parameters is merged into the existing provider object, not
-        // clobbering its routing prefs.
-        assert_eq!(body["provider"]["require_parameters"], true);
-        assert_eq!(body["provider"]["sort"], "throughput");
-    }
-
-    #[test]
-    fn schema_creates_provider_object_when_absent() {
-        let schema = json!({ "type": "object" });
-        let mut body = json!({ "model": "m" });
-        apply_output_schema(&mut body, Some(&schema));
-        assert_eq!(body["provider"]["require_parameters"], true);
-    }
 }

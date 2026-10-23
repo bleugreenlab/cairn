@@ -59,7 +59,8 @@ pub async fn invoke_definition(
     // catalog check (`validate_runnable_model`) is for authoring: a built-in's
     // exact pin need not be one the discovery catalog lists. A refusal is
     // journaled like any other failure, so history shows why it never ran.
-    let attempt = complete_definition(orch, definition, args, project_id, project_path).await?;
+    let attempt =
+        complete_definition(orch, definition, args, project_id, project_path, None, None).await?;
     let now = chrono::Utc::now().timestamp_millis();
     let args_json = serde_json::to_string(args).ok();
     let scope_key = project_id
@@ -394,6 +395,172 @@ pub struct ResponseOutcome {
     pub cost: Option<f64>,
 }
 
+/// A caller's bound on a whole model call, and what decided it.
+///
+/// A definition's `timeout` bounds each provider request. A caller that must
+/// itself answer within some window (a `run` item executes on the host and
+/// cannot suspend) bounds the whole call as well. When that bound is what ends
+/// the call, the failure says so with the numbers, so neither the definition
+/// nor the model is blamed for a limit neither of them set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvocationBound {
+    pub limit: Duration,
+    /// Present when a cap above the caller set `limit`, rather than the
+    /// caller's own ask.
+    pub cap: Option<BoundCap>,
+}
+
+/// A limit above the caller that overrode what it asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundCap {
+    /// What the cap is called where the reader meets it.
+    pub name: &'static str,
+    /// What the caller asked for: more than the cap, or `None` for nothing.
+    pub requested: Option<Duration>,
+    /// Why the cap holds, for a reader deciding whether to retry.
+    pub why: &'static str,
+}
+
+impl InvocationBound {
+    /// "timed out at ...": the bound, what set it, and each timeout the reader
+    /// might have expected to govern instead.
+    pub fn describe(&self, declared: Option<Duration>) -> String {
+        let limit = seconds(self.limit);
+        let mut context = Vec::new();
+        let mut text = match &self.cap {
+            Some(cap) => {
+                context.push(cap.requested.map_or_else(
+                    || "no timeout was requested".to_string(),
+                    |requested| format!("requested {}", seconds(requested)),
+                ));
+                format!("timed out at the {limit} {}", cap.name)
+            }
+            None => format!("timed out at the {limit} bound its caller requested"),
+        };
+        if let Some(declared) = declared {
+            context.push(format!("the definition declares {}", seconds(declared)));
+        }
+        if !context.is_empty() {
+            text.push_str(&format!(" ({})", context.join("; ")));
+        }
+        text.push('.');
+        if let Some(cap) = &self.cap {
+            text.push(' ');
+            text.push_str(cap.why);
+        }
+        text
+    }
+}
+
+fn seconds(duration: Duration) -> String {
+    if duration.subsec_millis() == 0 {
+        format!("{} s", duration.as_secs())
+    } else {
+        format!("{:.1} s", duration.as_secs_f64())
+    }
+}
+
+impl InvocationBound {
+    /// What the caller itself asked for: the ask a cap overrode, or the limit
+    /// when no cap did.
+    fn requested(&self) -> Option<Duration> {
+        match &self.cap {
+            Some(cap) => cap.requested,
+            None => Some(self.limit),
+        }
+    }
+}
+
+/// Why a caller ended its invocation before the invocation ended itself.
+///
+/// An [`InvocationBound`] is fixed when the call starts. Some callers only
+/// learn mid-call that the answer is no longer wanted, or that they can no
+/// longer carry it, and interrupt instead. Either way the invocation ends as
+/// an outcome and is journaled as one. The provider request it abandons is
+/// detached on its blocking thread, which cannot be cancelled, and ends
+/// within its own timeout: the definition's, or what remained of the bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Interruption {
+    /// Nobody is waiting for the answer any more. The reason is journaled.
+    Cancelled(String),
+    /// A window above the caller closed before the call's own bound did. The
+    /// call ends exactly as if this cap had been its bound, so its failure
+    /// reads like any other bound's and names what the caller had asked for.
+    Capped {
+        limit: Duration,
+        name: &'static str,
+        why: &'static str,
+    },
+}
+
+impl Interruption {
+    fn into_error(self, bound: Option<&InvocationBound>, declared: Duration) -> ResponseError {
+        match self {
+            Self::Cancelled(reason) => ResponseError::Cancelled(reason),
+            Self::Capped { limit, name, why } => ResponseError::OutlivedBound {
+                bound: InvocationBound {
+                    limit,
+                    cap: Some(BoundCap {
+                        name,
+                        requested: bound.and_then(InvocationBound::requested),
+                        why,
+                    }),
+                },
+                declared,
+            },
+        }
+    }
+}
+
+/// The sending half of an interruption: fires once, for every invocation
+/// holding one of its [`InvocationInterrupt`]s. A second interruption is
+/// ignored, so the first reason is the one every invocation journals.
+pub struct Interrupter(tokio::sync::watch::Sender<Option<Interruption>>);
+
+/// The receiving half an invocation watches. Cloned into each invocation of
+/// one caller; an interrupter dropped without firing never fires.
+#[derive(Clone)]
+pub struct InvocationInterrupt(tokio::sync::watch::Receiver<Option<Interruption>>);
+
+pub fn interruption() -> (Interrupter, InvocationInterrupt) {
+    let (sender, receiver) = tokio::sync::watch::channel(None);
+    (Interrupter(sender), InvocationInterrupt(receiver))
+}
+
+impl Interrupter {
+    pub fn interrupt(&self, interruption: Interruption) {
+        self.0.send_if_modified(|current| {
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(interruption);
+            true
+        });
+    }
+}
+
+impl InvocationInterrupt {
+    /// The interruption, once one has fired.
+    pub fn fired(&self) -> Option<Interruption> {
+        self.0.borrow().clone()
+    }
+
+    async fn wait(&mut self) -> Interruption {
+        // The read guard is released before any further await, which keeps
+        // this future `Send`.
+        let fired = self
+            .0
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|fired| fired.clone());
+        match fired {
+            Some(interruption) => interruption,
+            None => std::future::pending().await,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ResponseError {
     #[error("unknown response '{0}'")]
@@ -406,6 +573,16 @@ pub enum ResponseError {
     BackendUnavailable(String),
     #[error("response timed out")]
     Timeout,
+    /// The caller's bound on the whole call ran out before the definition's
+    /// own timeout did.
+    #[error("response {}", .bound.describe(Some(.declared.to_owned())))]
+    OutlivedBound {
+        bound: InvocationBound,
+        declared: Duration,
+    },
+    /// Its caller interrupted it because nobody is waiting for the answer.
+    #[error("response cancelled: {0}")]
+    Cancelled(String),
     #[error("response output violated its contract: {0}")]
     ContractViolation(String),
     #[error("response failed: {0}")]
@@ -491,6 +668,87 @@ struct CompletionAttempt {
     model: Model,
     backend: String,
     result: Result<ResponseTestOutcome, ResponseError>,
+    /// The provider request still running after its caller was released.
+    /// Releasing the caller always ends the attempt in an error.
+    detached: Option<DetachedRequest>,
+}
+
+/// Why a caller stopped waiting for its provider request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Release {
+    /// Interrupted: nobody is waiting for the answer any more.
+    Cancelled,
+    /// Interrupted: a window above the caller closed.
+    Capped,
+    /// The caller's own bound ran out.
+    Bound,
+}
+
+impl Release {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Capped => "capped",
+            Self::Bound => "bound",
+        }
+    }
+}
+
+impl Interruption {
+    fn release(&self) -> Release {
+        match self {
+            Self::Cancelled(_) => Release::Cancelled,
+            Self::Capped { .. } => Release::Capped,
+        }
+    }
+}
+
+type CompletionJoin = tokio::task::JoinHandle<(
+    Result<crate::backends::CompletionOutcome, ResponseError>,
+    std::time::Instant,
+)>;
+
+/// A provider request its caller stopped waiting for, which runs on its
+/// blocking thread until it returns or its own timeout fires.
+struct DetachedRequest {
+    /// Resolves to the request's outcome and the instant it returned.
+    task: CompletionJoin,
+    released_at: std::time::Instant,
+    release: Release,
+    backend: String,
+    model: String,
+    /// The request's own timeout: the definition's, or what remained of the
+    /// bound when it was sent, whichever was shorter.
+    held_to: Duration,
+}
+
+impl DetachedRequest {
+    /// Log one line when the request returns: how long it kept the provider
+    /// busy after its caller left, and how it ended. The journal records the
+    /// release but never sees this end.
+    fn watch(self, response_id: &str, journal_id: Option<&str>) {
+        let response_id = response_id.to_owned();
+        let journal_id = journal_id.unwrap_or("none").to_owned();
+        tokio::spawn(async move {
+            let (ended, returned_at) = match self.task.await {
+                Ok((Ok(_), returned_at)) => ("result", returned_at),
+                Ok((Err(ResponseError::Timeout), returned_at)) => ("timeout", returned_at),
+                Ok((Err(_), returned_at)) => ("error", returned_at),
+                // A panicked request stamped no instant of its own.
+                Err(_) => ("error", std::time::Instant::now()),
+            };
+            log::info!(
+                "detached response request returned response_id={response_id} journal_id={journal_id} backend={} model={} reason={} tail_ms={} ended={ended} timeout_ms={}",
+                self.backend,
+                self.model,
+                self.release.as_str(),
+                returned_at
+                    .saturating_duration_since(self.released_at)
+                    .as_millis(),
+                self.held_to.as_millis(),
+            );
+        });
+    }
 }
 
 /// Complete a supplied response definition without loading or persisting config,
@@ -505,18 +763,26 @@ pub async fn test_definition(
     definition.validate().map_err(ResponseError::Upstream)?;
     validate_runnable_model(orch, definition, project_id, project_path)
         .map_err(ResponseError::BackendUnavailable)?;
-    complete_definition(orch, definition, args, project_id, project_path)
+    complete_definition(orch, definition, args, project_id, project_path, None, None)
         .await?
         .result
 }
 
 /// Invoke one named, tool-free model completion. Named invocations journal their
 /// outcome after running through the same one-shot pipeline used by draft tests.
+///
+/// `bound` is the caller's limit on the whole call. It is enforced here rather
+/// than around this future, because a call cut off from outside never reaches
+/// its journal write: running out of `bound` is an outcome like any other, and
+/// is recorded as one. `interrupt` ends the call early on the caller's say-so
+/// and is journaled the same way.
 pub async fn invoke(
     orch: &Orchestrator,
     id: &str,
     args: &Value,
     caller: ResponseCaller,
+    bound: Option<&InvocationBound>,
+    interrupt: Option<&InvocationInterrupt>,
 ) -> Result<ResponseOutcome, ResponseError> {
     let (caller_kind, caller_label, caller_run_id, project_id, project_path) = caller.fields();
     let file = crate::config::responses::get_response(&orch.config_dir, id, project_path)
@@ -539,8 +805,16 @@ pub async fn invoke(
         .as_ref()
         .map(|id| format!("project:{id}"))
         .unwrap_or_else(|| "workspace".into());
-    let attempt =
-        complete_definition(orch, &file.definition, args, project_id, project_path).await?;
+    let attempt = complete_definition(
+        orch,
+        &file.definition,
+        args,
+        project_id,
+        project_path,
+        bound,
+        interrupt,
+    )
+    .await?;
     let now = chrono::Utc::now().timestamp_millis();
     let args_json = serde_json::to_string(args).ok();
 
@@ -585,7 +859,7 @@ pub async fn invoke(
             })
         }
         Err(error) => {
-            crate::storage::insert_response_invocation(
+            let journaled = crate::storage::insert_response_invocation(
                 &orch.db.local,
                 NewResponseInvocation {
                     response_id: id.to_string(),
@@ -609,8 +883,11 @@ pub async fn invoke(
                     account_id: None,
                 },
             )
-            .await
-            .map_err(|storage_error| {
+            .await;
+            if let Some(detached) = attempt.detached {
+                detached.watch(id, journaled.as_ref().ok().map(|row| row.id.as_str()));
+            }
+            journaled.map_err(|storage_error| {
                 ResponseError::Upstream(format!(
                     "{error}; additionally failed to persist response history: {storage_error}"
                 ))
@@ -626,13 +903,31 @@ async fn complete_definition(
     args: &Value,
     project_id: Option<&str>,
     project_path: Option<&std::path::Path>,
+    bound: Option<&InvocationBound>,
+    interrupt: Option<&InvocationInterrupt>,
 ) -> Result<CompletionAttempt, ResponseError> {
+    #[cfg(test)]
+    if let Some(executor) = test_completion::executor_for(&orch.config_dir) {
+        return complete_definition_with_executor(
+            orch,
+            definition,
+            args,
+            project_id,
+            project_path,
+            bound,
+            interrupt,
+            executor,
+        )
+        .await;
+    }
     complete_definition_with_executor(
         orch,
         definition,
         args,
         project_id,
         project_path,
+        bound,
+        interrupt,
         Arc::new(|backend_name, request, orch| {
             // Run-time eligibility, in order: the workspace has the provider
             // installed, an account can serve it, and (at the launch door) the
@@ -674,14 +969,25 @@ type CompletionExecutor = Arc<
         + Sync,
 >;
 
+#[allow(clippy::too_many_arguments)]
 async fn complete_definition_with_executor(
     orch: &Orchestrator,
     definition: &ResponseDefinition,
     args: &Value,
     project_id: Option<&str>,
     project_path: Option<&std::path::Path>,
+    bound: Option<&InvocationBound>,
+    interrupt: Option<&InvocationInterrupt>,
     executor: CompletionExecutor,
 ) -> Result<CompletionAttempt, ResponseError> {
+    let deadline = bound.map(|bound| (tokio::time::Instant::now() + bound.limit, bound));
+    let mut interrupt = interrupt.cloned();
+    let interrupted =
+        |interruption: Interruption| interruption.into_error(bound, definition.timeout);
+    let outlived = |bound: &InvocationBound| ResponseError::OutlivedBound {
+        bound: bound.clone(),
+        declared: definition.timeout,
+    };
     let rendered = definition.render(args).map_err(classify_render_error)?;
     let (model, extras, backend_name) = if let Some(model) = &definition.model {
         let preset = Preset {
@@ -712,6 +1018,7 @@ async fn complete_definition_with_executor(
                     result: Err(ResponseError::BackendUnavailable(format!(
                         "no enabled provider serves the '{tier}' tier ({error})"
                     ))),
+                    detached: None,
                 })
             }
         }
@@ -743,23 +1050,79 @@ async fn complete_definition_with_executor(
         messages,
         model: model.to_string(),
         project_id: project_id.map(str::to_string),
-        extras: serde_json::to_value(extras).unwrap_or(Value::Null),
+        options: extras,
         output_schema: output_schema.clone(),
         timeout: definition.timeout,
     };
     let mut terminal_error = None;
     let mut accepted = None;
+    let mut detached = None;
     for attempt in 0..=1 {
-        let request_for_attempt = request.clone();
+        if let Some(interruption) = interrupt.as_ref().and_then(InvocationInterrupt::fired) {
+            terminal_error = Some(interrupted(interruption));
+            break;
+        }
+        let mut request_for_attempt = request.clone();
+        // A request handed to a blocking thread cannot be cancelled, so each one
+        // is held to what remains of the caller's bound: abandoned at the
+        // deadline, it ends on its own soon after instead of running out the
+        // definition's full timeout.
+        let mut shortened_by_bound = false;
+        if let Some((deadline, _)) = deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining < request_for_attempt.timeout {
+                request_for_attempt.timeout = remaining;
+                shortened_by_bound = true;
+            }
+        }
         let backend_for_attempt = backend_name.clone();
         let orch_for_attempt = orch.clone();
         let executor_for_attempt = executor.clone();
-        let completion = match tokio::task::spawn_blocking(move || {
-            executor_for_attempt(backend_for_attempt, request_for_attempt, &orch_for_attempt)
-        })
-        .await
-        {
-            Ok(completion) => completion,
+        let held_to = request_for_attempt.timeout;
+        // The request stamps when it returned, so a detached one's tail is
+        // measured from its own end, not from whenever it is next awaited.
+        let mut task = tokio::task::spawn_blocking(move || {
+            let completion =
+                executor_for_attempt(backend_for_attempt, request_for_attempt, &orch_for_attempt);
+            (completion, std::time::Instant::now())
+        });
+        // Whichever ends the call first: the request, the caller's bound, or
+        // the caller interrupting. A request that lands at the same instant
+        // wins, because its answer is already paid for.
+        let ended_early = async {
+            tokio::select! {
+                () = async {
+                    match deadline {
+                        Some((deadline, _)) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => (Release::Bound, outlived(deadline.expect("a deadline fired").1)),
+                interruption = async {
+                    match interrupt.as_mut() {
+                        Some(interrupt) => interrupt.wait().await,
+                        None => std::future::pending().await,
+                    }
+                } => (interruption.release(), interrupted(interruption)),
+            }
+        };
+        let joined = tokio::select! {
+            biased;
+            joined = &mut task => joined,
+            (release, error) = ended_early => {
+                detached = Some(DetachedRequest {
+                    task,
+                    released_at: std::time::Instant::now(),
+                    release,
+                    backend: backend_name.clone(),
+                    model: model.to_string(),
+                    held_to,
+                });
+                terminal_error = Some(error);
+                break;
+            }
+        };
+        let completion = match joined {
+            Ok((completion, _)) => completion,
             Err(error) => {
                 terminal_error = Some(ResponseError::Upstream(format!(
                     "completion task failed: {error}"
@@ -805,6 +1168,12 @@ async fn complete_definition_with_executor(
                     Err(error) => terminal_error = Some(ResponseError::ContractViolation(error)),
                 }
             }
+            // The provider's timeout fired, but it was the bound's, not the
+            // definition's: name the bound, exactly as if its timer had won.
+            Err(ResponseError::Timeout) if shortened_by_bound => {
+                terminal_error = deadline.map(|(_, bound)| outlived(bound));
+                break;
+            }
             Err(error) => {
                 terminal_error = Some(error);
                 break;
@@ -819,6 +1188,7 @@ async fn complete_definition_with_executor(
             terminal_error
                 .unwrap_or_else(|| ResponseError::Upstream("completion produced no result".into()))
         }),
+        detached,
     })
 }
 
@@ -916,6 +1286,12 @@ fn default_timeout() -> Duration {
     Duration::from_secs(15)
 }
 
+/// The longest timeout a definition may declare: the ceiling on one `run`
+/// batch, which a response item can suspend all the way up to. Past it the
+/// definition would promise `run` a bound the batch ceiling cuts first.
+pub const MAX_RESPONSE_TIMEOUT: Duration =
+    Duration::from_millis(cairn_common::run_contract::RUN_BATCH_CEILING_MS as u64);
+
 mod duration_seconds {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
@@ -965,6 +1341,15 @@ impl ResponseDefinition {
         }
         if self.model.is_none() && self.backend.is_some() {
             return Err("Response 'backend' is only valid with an exact 'model' pin".into());
+        }
+        if self.timeout > MAX_RESPONSE_TIMEOUT {
+            return Err(format!(
+                "Response timeout {}s is past the {}s ceiling on a single `run` batch ({} hours), which no call of it from `run` could reach; declare at most {}s",
+                self.timeout.as_secs(),
+                MAX_RESPONSE_TIMEOUT.as_secs(),
+                cairn_common::run_contract::RUN_BATCH_CEILING_HOURS,
+                MAX_RESPONSE_TIMEOUT.as_secs()
+            ));
         }
 
         let mut declared = HashSet::new();
@@ -1150,6 +1535,32 @@ fn render_value(value: &Value) -> String {
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| value.to_string())
+}
+
+/// A stand-in provider for tests that drive [`invoke`] from outside this
+/// module, keyed by the orchestrator's config directory so concurrent tests
+/// cannot answer for each other. Keyed rather than task-local because callers
+/// such as a suspended `run` batch invoke from a task of their own.
+#[cfg(test)]
+pub(crate) mod test_completion {
+    use super::CompletionExecutor;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    static EXECUTORS: LazyLock<Mutex<HashMap<PathBuf, CompletionExecutor>>> =
+        LazyLock::new(Default::default);
+
+    pub(crate) fn install(config_dir: &Path, executor: CompletionExecutor) {
+        EXECUTORS
+            .lock()
+            .unwrap()
+            .insert(config_dir.to_path_buf(), executor);
+    }
+
+    pub(super) fn executor_for(config_dir: &Path) -> Option<CompletionExecutor> {
+        EXECUTORS.lock().unwrap().get(config_dir).cloned()
+    }
 }
 
 #[cfg(test)]
@@ -1564,6 +1975,8 @@ mod tests {
             &json!({"subject": "reply"}),
             None,
             None,
+            None,
+            None,
             Arc::new(move |backend, request, _orch| {
                 *captured_for_backend.lock().unwrap() = Some((backend, request));
                 Ok(CompletionOutcome {
@@ -1579,6 +1992,10 @@ mod tests {
         .await
         .unwrap();
 
+        assert!(
+            attempt.detached.is_none(),
+            "an answered caller detaches nothing"
+        );
         let outcome = attempt.result.unwrap();
         assert_eq!(outcome.text, r#"{"answer":"done"}"#);
         assert_eq!(outcome.parsed, Some(json!({"answer": "done"})));
@@ -1613,6 +2030,336 @@ mod tests {
         );
     }
 
+    fn pinned(timeout_secs: u64) -> ResponseDefinition {
+        parse_definition(&format!(
+            "---\nname: Pinned\ndescription: pinned response\nmodel: test-model\nbackend: openrouter\ntimeout: {timeout_secs}s\n---\nAnswer"
+        ))
+        .unwrap()
+    }
+
+    /// The caller's bound releases it while the provider is still working, as
+    /// an attempt (so `invoke` journals it), and the request it abandoned was
+    /// held to the bound rather than to the definition's longer timeout.
+    #[tokio::test]
+    async fn a_callers_bound_ends_the_attempt_and_shortens_the_abandoned_request() {
+        let orch = test_orchestrator().await;
+        let sent_timeout = Arc::new(Mutex::new(None));
+        let sent_for_backend = sent_timeout.clone();
+        let bound = InvocationBound {
+            limit: Duration::from_millis(200),
+            cap: None,
+        };
+        let started = std::time::Instant::now();
+        let attempt = complete_definition_with_executor(
+            &orch,
+            &pinned(300),
+            &json!({}),
+            None,
+            None,
+            Some(&bound),
+            None,
+            Arc::new(move |_, request, _| {
+                *sent_for_backend.lock().unwrap() = Some(request.timeout);
+                std::thread::sleep(Duration::from_secs(2));
+                Err(ResponseError::Timeout)
+            }),
+        )
+        .await
+        .expect("a bound that runs out is an attempt, so invoke journals it");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(attempt.model.as_str(), "test-model");
+        assert_eq!(attempt.rendered, "Answer");
+        assert_eq!(
+            attempt.result,
+            Err(ResponseError::OutlivedBound {
+                bound,
+                declared: Duration::from_secs(300),
+            })
+        );
+        let sent = sent_timeout.lock().unwrap().expect("the request was sent");
+        assert!(sent <= Duration::from_millis(200), "{sent:?}");
+        let detached = attempt.detached.expect("the abandoned request is detached");
+        assert_eq!(detached.release, Release::Bound);
+        assert_eq!(detached.held_to, sent);
+    }
+
+    /// A definition may declare up to the run-batch ceiling, which a `run`
+    /// call reaches by suspending; one past it is refused where it is written
+    /// (both write paths parse through here), naming the ceiling.
+    #[test]
+    fn a_definition_timeout_past_the_run_batch_ceiling_is_refused() {
+        let ceiling = MAX_RESPONSE_TIMEOUT.as_secs();
+        assert_eq!(ceiling, 6 * 60 * 60);
+        assert_eq!(pinned(ceiling).timeout, MAX_RESPONSE_TIMEOUT);
+        let error = parse_definition(&format!(
+            "---\nname: Pinned\ndescription: pinned response\nmodel: test-model\nbackend: openrouter\ntimeout: {}s\n---\nAnswer",
+            ceiling + 1
+        ))
+        .unwrap_err();
+        assert!(
+            error.starts_with("Response timeout 21601s is past the 21600s ceiling"),
+            "{error}"
+        );
+    }
+
+    /// An interruption releases the caller while the provider is still working,
+    /// as an attempt, so `invoke` journals it. A cancellation names its reason;
+    /// a cap reads like any bound and carries the caller's own ask.
+    #[tokio::test]
+    async fn an_interruption_ends_the_attempt_with_its_cause() {
+        let orch = test_orchestrator().await;
+        let bound = InvocationBound {
+            limit: Duration::from_secs(600),
+            cap: None,
+        };
+        let (interrupter, interrupt) = interruption();
+        let (definition, args) = (pinned(300), json!({}));
+        let started = std::time::Instant::now();
+        let (attempt, ()) = tokio::join!(
+            complete_definition_with_executor(
+                &orch,
+                &definition,
+                &args,
+                None,
+                None,
+                Some(&bound),
+                Some(&interrupt),
+                Arc::new(|_, _, _| {
+                    std::thread::sleep(Duration::from_secs(2));
+                    Err(ResponseError::Timeout)
+                }),
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                interrupter.interrupt(Interruption::Cancelled("stopped".into()));
+                interrupter.interrupt(Interruption::Cancelled("second".into()));
+            }
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        let attempt = attempt.unwrap();
+        assert_eq!(
+            attempt.result,
+            Err(ResponseError::Cancelled("stopped".into())),
+            "the first interruption is the one journaled"
+        );
+        assert_eq!(
+            attempt.detached.map(|detached| detached.release),
+            Some(Release::Cancelled)
+        );
+
+        let (interrupter, interrupt) = interruption();
+        interrupter.interrupt(Interruption::Capped {
+            limit: Duration::from_secs(120),
+            name: "host-item cap",
+            why: "Why.",
+        });
+        let capped = complete_definition_with_executor(
+            &orch,
+            &pinned(300),
+            &json!({}),
+            None,
+            None,
+            Some(&bound),
+            Some(&interrupt),
+            Arc::new(|_, _, _| panic!("an interrupted call starts no request")),
+        )
+        .await
+        .unwrap();
+        assert!(
+            capped.detached.is_none(),
+            "no request was started to detach"
+        );
+        assert_eq!(
+            capped.result.unwrap_err().to_string(),
+            "response timed out at the 120 s host-item cap (requested 600 s; the definition declares 300 s). Why."
+        );
+    }
+
+    /// A request that outlives its released caller logs one line when it
+    /// finally returns, naming the invocation's journal row, why the caller
+    /// left, and how long the provider stayed busy after. A request that
+    /// answers its caller logs nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_detached_request_logs_its_tail_once_it_returns() {
+        const TARGET: &str = "cairn_core::responses";
+        crate::test_support::capture_log(TARGET);
+        let orch = test_orchestrator().await;
+        let responses = orch.config_dir.join("responses");
+        std::fs::create_dir_all(&responses).unwrap();
+        for (id, prompt) in [("tail-answered", "Answer"), ("tail-detached", "Detach")] {
+            std::fs::write(
+                responses.join(format!("{id}.md")),
+                format!("---\nname: Tail\ndescription: tail\nmodel: test-model\nbackend: openrouter\ntimeout: 300s\n---\n{prompt}"),
+            )
+            .unwrap();
+        }
+        // The detached request returns only when the test opens the gate,
+        // well after its caller was released.
+        let (open_gate, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        test_completion::install(
+            &orch.config_dir,
+            Arc::new(move |_, request: CompletionRequest, _| {
+                if request.messages.last().unwrap().content == "Detach" {
+                    gate.lock().unwrap().recv().unwrap();
+                }
+                Ok(CompletionOutcome {
+                    text: "answer".into(),
+                    parsed: None,
+                    model: "test-model".into(),
+                    usage: Default::default(),
+                    latency_ms: 1,
+                    account_id: None,
+                })
+            }),
+        );
+        let caller = || ResponseCaller::Internal {
+            label: "test".into(),
+        };
+        let lines_for = |id: &str| {
+            let marker = format!(" response_id={id} ");
+            crate::test_support::captured_log(TARGET)
+                .into_iter()
+                .filter(|line| line.contains(&marker))
+                .collect::<Vec<_>>()
+        };
+
+        invoke(&orch, "tail-answered", &json!({}), caller(), None, None)
+            .await
+            .expect("the normal path answers its caller");
+
+        let bound = InvocationBound {
+            limit: Duration::from_secs(60),
+            cap: None,
+        };
+        let (interrupter, interrupt) = interruption();
+        let args = json!({});
+        let (released, ()) = tokio::join!(
+            invoke(
+                &orch,
+                "tail-detached",
+                &args,
+                caller(),
+                Some(&bound),
+                Some(&interrupt),
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                interrupter.interrupt(Interruption::Cancelled("stopped".into()));
+            }
+        );
+        assert_eq!(released, Err(ResponseError::Cancelled("stopped".into())));
+        assert!(
+            lines_for("tail-detached").is_empty(),
+            "nothing logs until the detached request returns"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        open_gate.send(()).unwrap();
+
+        let waited = std::time::Instant::now();
+        let line = loop {
+            if let Some(line) = lines_for("tail-detached").pop() {
+                break line;
+            }
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "the detached request never logged its return"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(lines_for("tail-detached").len(), 1, "exactly one line");
+        let journal = crate::storage::list_response_invocations(
+            &orch.db.local,
+            "workspace",
+            "tail-detached",
+            10,
+        )
+        .await
+        .unwrap();
+        let field = |key: &str| {
+            line.split(' ')
+                .find_map(|pair| pair.strip_prefix(&format!("{key}=")))
+                .unwrap_or_else(|| panic!("no {key} in {line}"))
+                .to_string()
+        };
+        assert!(
+            line.starts_with("detached response request returned "),
+            "{line}"
+        );
+        assert_eq!(field("journal_id"), journal[0].id);
+        assert_eq!(field("backend"), "openrouter");
+        assert_eq!(field("model"), "test-model");
+        assert_eq!(field("reason"), "cancelled");
+        assert_eq!(field("ended"), "result");
+        // Held to what remained of the 60 s bound, not the definition's 300 s.
+        let timeout_ms: u64 = field("timeout_ms").parse().unwrap();
+        assert!((55_000..=60_000).contains(&timeout_ms), "{line}");
+        let tail_ms: u64 = field("tail_ms").parse().unwrap();
+        assert!(
+            tail_ms >= 150,
+            "the tail runs from release to return: {line}"
+        );
+
+        assert!(
+            lines_for("tail-answered").is_empty(),
+            "a request that answered its caller logs nothing"
+        );
+    }
+
+    /// A provider timeout that fires because the bound shortened the request
+    /// is the bound's doing, and is named as such; one the definition's own
+    /// timeout governed stays a plain timeout.
+    #[tokio::test]
+    async fn a_provider_timeout_is_attributed_to_whichever_bound_set_it() {
+        let orch = test_orchestrator().await;
+        let bound = InvocationBound {
+            limit: Duration::from_secs(60),
+            cap: None,
+        };
+        let timed_out: CompletionExecutor = Arc::new(|_, _, _| Err(ResponseError::Timeout));
+
+        let shortened = complete_definition_with_executor(
+            &orch,
+            &pinned(300),
+            &json!({}),
+            None,
+            None,
+            Some(&bound),
+            None,
+            timed_out.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&shortened.result, Err(ResponseError::OutlivedBound { .. })),
+            "{:?}",
+            shortened.result
+        );
+
+        let declared = complete_definition_with_executor(
+            &orch,
+            &pinned(15),
+            &json!({}),
+            None,
+            None,
+            Some(&bound),
+            None,
+            timed_out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(declared.result, Err(ResponseError::Timeout));
+    }
+
     #[tokio::test]
     async fn an_unresolvable_tier_is_a_journalable_refusal() {
         let orch = test_orchestrator().await;
@@ -1622,6 +2369,8 @@ mod tests {
             &orch,
             &definition,
             &json!({"required": "value"}),
+            None,
+            None,
             None,
             None,
             Arc::new(|_, _, _| panic!("an unresolved tier must not reach a backend")),

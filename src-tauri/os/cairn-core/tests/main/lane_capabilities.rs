@@ -129,10 +129,18 @@ fn tursodb() -> Capability {
     }
 }
 
-/// jj gates roughly 65 tests in `cairn-core`'s jj module, none of which record a
-/// skip — so its absence would be invisible everywhere except here.
+/// jj gates a few hundred tests across the workspace through the `jj_bin()`
+/// guards, each of which records a `jj-unavailable` skip the runner fails as
+/// undeclared. That covers only the tests a run selects; this is the one named
+/// red that says why. Required on the same terms as the sync server: a machine
+/// that genuinely cannot get jj declares so for the run with
+/// `CAIRN_JJ_TESTS_OPTIONAL=1`, which also declares the guards' skips.
+///
+/// Probed with `resolve_jj`, never the recording guard: this test FAILS on a
+/// missing jj, and a skip recorded under its name would let the runner rewrite
+/// that failure as a skip.
 fn jj() -> Capability {
-    let bin = common::jj_bin();
+    let bin = common::resolve_jj();
     let version = bin.as_ref().and_then(|bin| {
         Command::new(bin)
             .arg("--version")
@@ -142,7 +150,7 @@ fn jj() -> Capability {
     });
     Capability {
         name: "jj",
-        required: true,
+        required: std::env::var_os(cairn_vcs::jj::testing::JJ_TESTS_OPTIONAL_ENV).is_none(),
         present: bin.is_some(),
         detail: match (bin, version) {
             (Some(bin), Some(version)) => format!("{version} at {bin}"),

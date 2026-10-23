@@ -209,14 +209,16 @@ fn build_service_spawn_config(
         .expanded_state_dir(templates)
         .unwrap_or_else(|| templates.cairn_home.clone());
 
-    let sandbox = if sandbox::is_available() {
-        Some(SandboxPolicy::for_service(
+    // A build service is Cairn's own daemon, but it runs compilers over agent
+    // code, so its profile also closes with the operator credential boundary.
+    let confinement = if sandbox::is_available() {
+        sandbox::Confinement::Fenced(SandboxPolicy::for_service(
             &state_dir,
             &write_globs,
             deny_read,
         ))
     } else {
-        None
+        sandbox::Confinement::Unconfined
     };
     let mut config = SpawnConfig::new(program)
         .args(args.iter().cloned())
@@ -227,7 +229,7 @@ fn build_service_spawn_config(
         // working directory. The persistent state directory already exists
         // before launch.
         .cwd(&state_dir.to_string_lossy())
-        .sandbox(sandbox);
+        .confinement(confinement);
     // A daemon manages its own lifetime; don't hold its stdio pipes open.
     config.capture_stdout = false;
     config.capture_stderr = false;
@@ -291,9 +293,7 @@ fn command_probe_ok(cmd: &[String]) -> bool {
     let Some((prog, args)) = cmd.split_first() else {
         return false;
     };
-    crate::env::command(prog)
-        .args(args)
-        .output()
+    cairn_platform::process::observed_output(crate::env::command(prog).args(args))
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -667,10 +667,13 @@ impl ListenerProcessControl for OsListenerProcessControl {
             .map(|addr| addr.port().to_string())
             .ok_or_else(|| format!("TCP address '{addr}' resolved to no endpoints"))?;
         let endpoints: Vec<String> = resolved.iter().map(ToString::to_string).collect();
-        let output = crate::env::command("lsof")
-            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpn"])
-            .output()
-            .map_err(|e| format!("inspect listener on {addr}: {e}"))?;
+        let output = cairn_platform::process::observed_output(crate::env::command("lsof").args([
+            "-nP",
+            &format!("-iTCP:{port}"),
+            "-sTCP:LISTEN",
+            "-Fpn",
+        ]))
+        .map_err(|e| format!("inspect listener on {addr}: {e}"))?;
         if !output.status.success() && output.stdout.is_empty() {
             return Ok(None);
         }
@@ -770,10 +773,14 @@ fn process_environ(pid: u32) -> Result<HashMap<String, String>, String> {
 /// fails OPEN, acting only on what it can positively confirm.
 #[cfg(not(target_os = "linux"))]
 fn process_environ(pid: u32) -> Result<HashMap<String, String>, String> {
-    let output = crate::env::command("ps")
-        .args(["eww", "-p", &pid.to_string(), "-o", "command="])
-        .output()
-        .map_err(|e| format!("read environment for listener pid {pid}: {e}"))?;
+    let output = cairn_platform::process::observed_output(crate::env::command("ps").args([
+        "eww",
+        "-p",
+        &pid.to_string(),
+        "-o",
+        "command=",
+    ]))
+    .map_err(|e| format!("read environment for listener pid {pid}: {e}"))?;
     if !output.status.success() {
         return Err(format!(
             "read environment for listener pid {pid}: ps failed"
@@ -1091,10 +1098,13 @@ fn process_executable(pid: u32) -> Result<PathBuf, String> {
 
 #[cfg(not(target_os = "linux"))]
 fn process_executable(pid: u32) -> Result<PathBuf, String> {
-    let output = crate::env::command("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-        .map_err(|e| format!("resolve executable for listener pid {pid}: {e}"))?;
+    let output = cairn_platform::process::observed_output(crate::env::command("ps").args([
+        "-p",
+        &pid.to_string(),
+        "-o",
+        "comm=",
+    ]))
+    .map_err(|e| format!("resolve executable for listener pid {pid}: {e}"))?;
     if !output.status.success() {
         return Err(format!(
             "resolve executable for listener pid {pid}: ps failed"
@@ -2888,7 +2898,9 @@ mod tests {
     fn templates() -> Templates {
         Templates {
             home: PathBuf::from("/home/u"),
+            cache_home: PathBuf::from("/home/u"),
             cairn_home: PathBuf::from("/home/u/.cairn"),
+            build_root: PathBuf::from("/home/u/.cairn"),
             worktrees: PathBuf::from("/home/u/.cairn/worktrees"),
             worktree: None,
         }
@@ -3171,7 +3183,7 @@ mod tests {
                     && cfg.args.is_empty()
                     && cfg.env.get("SCCACHE_START_SERVER").map(String::as_str) == Some("1")
                     && cfg.env.get("SCCACHE_SERVER_PORT").map(String::as_str) == Some("4227")
-                    && cfg.sandbox.is_some()
+                    && cfg.confinement.is_fenced()
             })
             .returning(|_| Ok(Box::new(MockChildProcess::with_stdout(7, vec![]))));
 
@@ -3185,7 +3197,9 @@ mod tests {
     fn templates_in(root: &Path) -> Templates {
         Templates {
             home: root.to_path_buf(),
+            cache_home: root.to_path_buf(),
             cairn_home: root.join(".cairn"),
+            build_root: root.join(".cairn"),
             worktrees: root.join(".cairn").join("worktrees"),
             worktree: None,
         }
@@ -4524,11 +4538,17 @@ Max cache size                       50 GiB
     /// Settings naming one compile-cache service whose launch program is an
     /// absolute path, which [`service_on_path`] reads as installed without
     /// consulting PATH.
+    ///
+    /// The state directory is pinned inside `config_dir` because the
+    /// machine-wide reconcile lock lives beside it. Without one,
+    /// [`machine_lock_path`] falls back to the real user home, where the lock
+    /// is shared with a running Cairn and with every other test process.
     fn write_sccache_settings(config_dir: &Path, enabled: bool) {
+        let state_dir = config_dir.join("sccache-state").display().to_string();
         std::fs::write(
             crate::config::settings::get_settings_path(config_dir),
             format!(
-                "buildServices:\n  sccache:\n    enabled: {enabled}\n    start:\n      - /opt/sccache\n"
+                "buildServices:\n  sccache:\n    enabled: {enabled}\n    stateDir: {state_dir:?}\n    start:\n      - /opt/sccache\n"
             ),
         )
         .unwrap();
@@ -4637,7 +4657,14 @@ Max cache size                       50 GiB
         );
 
         // The same settings, once reconciliation has actually looked at them.
+        // Publication precedes every early return, so holding the reconcile
+        // lock stops this pass right after it publishes. Unheld, whether the
+        // pass goes on to launch the service depends on the host's sandbox,
+        // whether this process is itself confined, and who holds the
+        // machine-wide lock, none of which this test is about.
+        let reconciling = orch.build_service_reconcile.lock().unwrap();
         orch.ensure_build_services_ready();
+        drop(reconciling);
         assert_eq!(
             orch.compile_cache_health().map(|health| health.service),
             Some("sccache".to_string())

@@ -354,15 +354,32 @@ pub async fn list_quarantined(db: &LocalDb) -> DbResult<Vec<QuarantinedRecord>> 
 /// excludes them from redaction: they are Cairn-minted or protocol-fixed, and
 /// blanking one turns a withheld event into a broken transcript.
 pub fn withhold_quarantined(events: &mut [crate::models::Event]) {
+    withhold_each(events, |_, _| {});
+}
+
+/// [`withhold_quarantined`], also naming the incident that withheld each event:
+/// index-aligned with `events`, `None` where the event is served as stored.
+/// Both answers come from one snapshot of the set, so a caller that labels what
+/// it was handed can never label an event the substitution skipped.
+pub fn withhold_quarantined_reporting(events: &mut [crate::models::Event]) -> Vec<Option<String>> {
+    let mut withheld = vec![None; events.len()];
+    withhold_each(events, |index, incident| {
+        withheld[index] = Some(incident.to_string())
+    });
+    withheld
+}
+
+fn withhold_each(events: &mut [crate::models::Event], mut on_withheld: impl FnMut(usize, &str)) {
     let set = quarantine().snapshot();
     if set.is_empty() {
         return;
     }
-    for event in events.iter_mut() {
+    for (index, event) in events.iter_mut().enumerate() {
         let Some(incident) = set.withheld_by(TRANSCRIPT_EVENT_SINK, &event.id) else {
             continue;
         };
         event.data = withheld_event_data(&event.data, incident);
+        on_withheld(index, incident);
     }
 }
 

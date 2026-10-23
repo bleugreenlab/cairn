@@ -273,16 +273,32 @@ impl EventEmitter for ProjectionInvalidatingEmitter {
     }
 }
 
-/// A computation's outcome is `Option`: `None` means "could not be computed",
-/// which is never published and never cached, so a transient failure does not
-/// pin an absent projection until the next unrelated invalidation.
-type Cell<V> = tokio::sync::OnceCell<Option<V>>;
+/// What one flight produced, and the moment it finished.
+///
+/// `value` is `None` when the projection could not be computed, which is never
+/// published and never cached, so a transient failure does not pin an absent
+/// projection until the next unrelated invalidation.
+///
+/// `at` is recorded inside the flight, before the cell becomes visible, so any
+/// reader that can see a settled cell sees exactly when it settled. It is the
+/// one answer to "how old is what is published" for every freshness rule here.
+struct Settled<V> {
+    value: Option<V>,
+    at: Instant,
+}
 
-/// Explicit requests admitted within this interval are one operator burst. The
-/// deadline is cache-owned rather than scheduler-owned, so independently
-/// scheduled request handlers agree on the same boundary even if a fast
-/// computation publishes before all of them enter the cache.
-const EXPLICIT_REFRESH_ADMISSION: Duration = Duration::from_millis(25);
+type Cell<V> = tokio::sync::OnceCell<Settled<V>>;
+
+/// What a read accepts as current.
+#[derive(Clone, Copy, Debug)]
+enum Freshness {
+    /// Whatever is published at the current generation.
+    Published,
+    /// Anything that had not yet settled when the demand was made.
+    Replace { demanded_at: Instant },
+    /// What is published, if it was published no longer ago than this.
+    Within(Duration),
+}
 
 /// Observable behavior of one cache, for tests and for before/after reporting.
 #[cfg(test)]
@@ -301,16 +317,10 @@ pub(crate) struct GenerationCacheCounters {
 struct GenerationCacheState<V> {
     generations: HashMap<String, u64>,
     cells: HashMap<(String, u64), Arc<Cell<V>>>,
-    explicit_refresh_admission_until: HashMap<String, Instant>,
     /// Keys whose inputs have moved but whose published value is still being
     /// served, with the reason the first deferred invalidation gave. Present
     /// only for a cache built [`GenerationCache::with_coalescing`].
     deferred: HashMap<String, &'static str>,
-    /// When the value at each key's current generation was published. The
-    /// coalescing floor is measured from here rather than from the first
-    /// deferred invalidation, so an unbroken write stream cannot push the
-    /// rebuild further and further out.
-    published_at: HashMap<String, Instant>,
 }
 
 impl<V> Default for GenerationCacheState<V> {
@@ -318,10 +328,30 @@ impl<V> Default for GenerationCacheState<V> {
         Self {
             generations: HashMap::new(),
             cells: HashMap::new(),
-            explicit_refresh_admission_until: HashMap::new(),
             deferred: HashMap::new(),
-            published_at: HashMap::new(),
         }
+    }
+}
+
+impl<V> GenerationCacheState<V> {
+    fn current_generation(&self, key: &str) -> u64 {
+        self.generations.get(key).copied().unwrap_or_default()
+    }
+
+    /// What the flight at `generation` settled to, or `None` while it is still
+    /// in flight or was never started.
+    fn settled(&self, key: &str, generation: u64) -> Option<&Settled<V>> {
+        self.cells.get(&(key.to_string(), generation))?.get()
+    }
+
+    /// When the value at a key's current generation was published, or `None`
+    /// when nothing is. The coalescing floor is measured from here rather than
+    /// from the first deferred invalidation, so an unbroken write stream cannot
+    /// push the rebuild further and further out.
+    fn published_at(&self, key: &str) -> Option<Instant> {
+        self.settled(key, self.current_generation(key))
+            .filter(|settled| settled.value.is_some())
+            .map(|settled| settled.at)
     }
 }
 
@@ -378,13 +408,10 @@ impl<V: Clone> GenerationCache<V> {
     /// which such a caller must read as "cannot tell" rather than as "empty".
     pub(crate) fn published(&self, key: &str) -> Option<V> {
         let state = self.state.lock().ok()?;
-        let generation = state.generations.get(key).copied().unwrap_or_default();
         state
-            .cells
-            .get(&(key.to_string(), generation))?
-            .get()
-            .cloned()
-            .flatten()
+            .settled(key, state.current_generation(key))?
+            .value
+            .clone()
     }
 
     #[cfg(test)]
@@ -420,12 +447,9 @@ impl<V: Clone> GenerationCache<V> {
         *generation = generation.wrapping_add(1);
         let generation = *generation;
         state.cells.retain(|(cached_key, _), _| cached_key != key);
-        state.explicit_refresh_admission_until.remove(key);
-        // The new generation has nothing published and nothing outstanding
-        // against it. Leaving either behind would let the next reader either
-        // skip a rebuild it owes or measure a floor from a value that is gone.
+        // The new generation has nothing outstanding against it. Leaving a
+        // deferral behind would let the next reader skip a rebuild it owes.
         state.deferred.remove(key);
-        state.published_at.remove(key);
         log::debug!("{label} cache invalidated key={key} generation={generation} reason={reason}");
         generation
     }
@@ -451,12 +475,7 @@ impl<V: Clone> GenerationCache<V> {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        let generation = state.generations.get(key).copied().unwrap_or_default();
-        let has_published = state
-            .cells
-            .get(&(key.to_string(), generation))
-            .is_some_and(|cell| cell.get().is_some_and(Option::is_some));
-        if !has_published {
+        if state.published_at(key).is_none() {
             Self::advance_locked(&mut state, self.label, key, reason);
             return;
         }
@@ -474,8 +493,7 @@ impl<V: Clone> GenerationCache<V> {
         let floor = self.coalesce_floor?;
         let reason = *state.deferred.get(key)?;
         let due = state
-            .published_at
-            .get(key)
+            .published_at(key)
             .is_none_or(|published| published.elapsed() >= floor);
         if !due {
             return None;
@@ -513,17 +531,13 @@ impl<V: Clone> GenerationCache<V> {
         let Ok(mut state) = self.state.lock() else {
             return false;
         };
-        let generation = state.generations.get(key).copied().unwrap_or_default();
-        let published = state
-            .cells
-            .get(&(key.to_string(), generation))
-            .and_then(|cell| cell.get())
-            .cloned()
-            .flatten();
-        let Some(published) = published else {
+        let Some(published) = state
+            .settled(key, state.current_generation(key))
+            .and_then(|settled| settled.value.as_ref())
+        else {
             return false;
         };
-        if !stale(&published) {
+        if !stale(published) {
             return false;
         }
         Self::advance_locked(&mut state, self.label, key, reason);
@@ -564,27 +578,67 @@ impl<V: Clone> GenerationCache<V> {
         F: Fn() -> Fut,
         Fut: Future<Output = Option<V>>,
     {
-        self.get_or_compute_inner(key, false, compute).await
+        self.get_or_compute_inner(key, Freshness::Published, compute)
+            .await
     }
 
-    /// Replace a settled value and reserve its replacement flight atomically.
+    /// Read a value no older than `max_age`, computing it once per window across
+    /// all concurrent readers.
     ///
-    /// Explicit refresh is a demand, not a durable invalidation. The generation
-    /// advance and the new single-flight cell therefore have to be installed
-    /// under one lock: otherwise a concurrent caller can observe the empty gap
-    /// between them and make an independent refresh decision.
-    pub(crate) async fn refresh_or_compute<F, Fut>(&self, key: &str, compute: F) -> Option<V>
+    /// For a projection whose inputs move continuously while nothing announces
+    /// each move: a live check wave's lanes and output tails. Every reader past
+    /// the window finds the published value expired, so the first of them
+    /// advances the generation under the state lock and the rest join the
+    /// flight it opened; readers inside the window are hits. Invalidations still
+    /// advance the generation at once, and a computation that spans one is
+    /// retried rather than published, exactly as for [`Self::get_or_compute`].
+    pub(crate) async fn get_or_compute_within<F, Fut>(
+        &self,
+        key: &str,
+        max_age: Duration,
+        compute: F,
+    ) -> Option<V>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Option<V>>,
     {
-        self.get_or_compute_inner(key, true, compute).await
+        self.get_or_compute_inner(key, Freshness::Within(max_age), compute)
+            .await
+    }
+
+    /// A value that had not yet settled when the demand was made: replace
+    /// whatever had, and join or consume whatever had not.
+    ///
+    /// Explicit refresh is a demand, not a durable invalidation. Its answer is
+    /// decided by `demanded_at`, the moment the demand was made, which the
+    /// caller takes where the demand arrives rather than where it reaches this
+    /// cache. That is what makes a burst cost one refresh on any host: every
+    /// member was demanded before the replacement settled, so a member the
+    /// scheduler carries here only after the replacement has published still
+    /// consumes it instead of starting another. A demand made after the
+    /// replacement settled is a new demand and gets a new computation.
+    ///
+    /// The generation advance and the new single-flight cell are installed
+    /// under one lock, so concurrent members cannot observe the gap between
+    /// them and each decide independently that the replacement is theirs.
+    pub(crate) async fn refresh_or_compute<F, Fut>(
+        &self,
+        key: &str,
+        demanded_at: Instant,
+        compute: F,
+    ) -> Option<V>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Option<V>>,
+    {
+        self.get_or_compute_inner(key, Freshness::Replace { demanded_at }, compute)
+            .await
     }
 
     async fn get_or_compute_inner<F, Fut>(
         &self,
         key: &str,
-        mut replace_published: bool,
+        mut freshness: Freshness,
         compute: F,
     ) -> Option<V>
     where
@@ -602,36 +656,37 @@ impl<V: Clone> GenerationCache<V> {
                 if let Some(settled) = self.settle_deferred_locked(&mut state, key) {
                     generation = settled;
                 }
-                if replace_published {
-                    let now = Instant::now();
-                    let admission_open = state
-                        .explicit_refresh_admission_until
-                        .get(key)
-                        .is_some_and(|deadline| now < *deadline);
-                    let cell_key = (key.to_string(), generation);
-                    let published = state
-                        .cells
-                        .get(&cell_key)
-                        .is_some_and(|cell| cell.get().is_some());
-                    if !admission_open {
-                        if published {
-                            generation = Self::advance_locked(
-                                &mut state,
-                                self.label,
-                                key,
-                                "explicit-refresh",
-                            );
-                        }
-                        // A cold explicit miss owns the same burst boundary as a
-                        // replacement. Otherwise a peer arriving just after the
-                        // fast cold computation publishes would compute again.
-                        state
-                            .explicit_refresh_admission_until
-                            .insert(key.to_string(), now + EXPLICIT_REFRESH_ADMISSION);
+                if let Freshness::Within(max_age) = freshness {
+                    let published = state.settled(key, generation).is_some();
+                    let expired = state
+                        .published_at(key)
+                        .is_none_or(|published_at| published_at.elapsed() >= max_age);
+                    // Deciding and advancing under one lock is what makes a
+                    // burst of expired readers cost one computation: after the
+                    // first advances, the new generation has nothing published
+                    // and the rest join its flight. A retry after an
+                    // invalidation finds nothing published either, so it joins
+                    // rather than advancing again.
+                    if published && expired {
+                        generation =
+                            Self::advance_locked(&mut state, self.label, key, "live-refresh");
+                    }
+                }
+                if let Freshness::Replace { demanded_at } = freshness {
+                    // Only an outcome that had already settled when the demand
+                    // was made is one it asks to replace. A flight still running,
+                    // or one that settled since, already answers it, however
+                    // long this caller took to be scheduled here.
+                    let settled_before_demand = state
+                        .settled(key, generation)
+                        .is_some_and(|settled| settled.at < demanded_at);
+                    if settled_before_demand {
+                        generation =
+                            Self::advance_locked(&mut state, self.label, key, "explicit-refresh");
                     }
                     // An invalidation-during-compute retry must join the generation
                     // created by that invalidation, not advance it as another demand.
-                    replace_published = false;
+                    freshness = Freshness::Published;
                 }
                 let cell_key = (key.to_string(), generation);
                 let state_kind = state.cells.get(&cell_key).map_or("miss", |cell| {
@@ -659,7 +714,17 @@ impl<V: Clone> GenerationCache<V> {
             );
 
             let started = Instant::now();
-            let value = cell.get_or_init(&compute).await.clone();
+            let value = cell
+                .get_or_init(|| async {
+                    let value = compute().await;
+                    Settled {
+                        value,
+                        at: Instant::now(),
+                    }
+                })
+                .await
+                .value
+                .clone();
             if state_kind == "miss" {
                 log::info!(
                     "{} computed key={key} generation={generation} duration_ms={}",
@@ -670,17 +735,12 @@ impl<V: Clone> GenerationCache<V> {
 
             let current = self.generation(key);
             if current == generation {
-                if let Ok(mut state) = self.state.lock() {
-                    if value.is_none() {
-                        // A failed computation is not a fact about the
-                        // projection. Drop the cell so the next reader retries
-                        // instead of inheriting this reader's transient error.
+                if value.is_none() {
+                    // A failed computation is not a fact about the projection.
+                    // Drop the cell so the next reader retries instead of
+                    // inheriting this reader's transient error.
+                    if let Ok(mut state) = self.state.lock() {
                         state.cells.remove(&(key.to_string(), generation));
-                    } else if state_kind == "miss" {
-                        // The floor the next deferred invalidation waits out is
-                        // measured from here: the moment this value became the
-                        // one being served.
-                        state.published_at.insert(key.to_string(), Instant::now());
                     }
                 }
                 return value;
@@ -837,6 +897,7 @@ mod tests {
         let computations = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(Barrier::new(16));
 
+        let demanded_at = Instant::now();
         let mut readers = Vec::new();
         for _ in 0..16 {
             let cache = cache.clone();
@@ -845,7 +906,7 @@ mod tests {
             readers.push(tokio::spawn(async move {
                 barrier.wait().await;
                 cache
-                    .refresh_or_compute("k", || {
+                    .refresh_or_compute("k", demanded_at, || {
                         computations.fetch_add(1, Ordering::SeqCst);
                         async { Some(1u64) }
                     })
@@ -859,7 +920,7 @@ mod tests {
         assert_eq!(
             computations.load(Ordering::SeqCst),
             1,
-            "one cold explicit burst must reserve one admission generation"
+            "one cold explicit burst must compute once"
         );
         let counters = cache.counters();
         assert_eq!(counters.misses, 1);
@@ -886,6 +947,7 @@ mod tests {
             .unwrap();
         let warm_generation = cache.generation("k");
 
+        let demanded_at = Instant::now();
         let barrier = Arc::new(Barrier::new(16));
         let mut readers = Vec::new();
         for _ in 0..16 {
@@ -898,7 +960,7 @@ mod tests {
                 // value and reserve its replacement flight atomically, or join
                 // the flight already producing a fresh one.
                 cache
-                    .refresh_or_compute("k", || {
+                    .refresh_or_compute("k", demanded_at, || {
                         let computations = computations.clone();
                         async move {
                             computations.fetch_add(1, Ordering::SeqCst);
@@ -925,10 +987,137 @@ mod tests {
         );
     }
 
-    /// Admission is bounded: a later operator action is a new demand rather than
-    /// being pinned forever to the previous explicit refresh.
+    /// N observers polling a live projection at once share one computation per
+    /// window, inside the window every read is a hit, and past it one reader
+    /// recomputes for all of them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_reads_compute_once_per_window() {
+        let cache: Arc<GenerationCache<u64>> = Arc::new(GenerationCache::new("test"));
+        let computations = Arc::new(AtomicUsize::new(0));
+        let window = Duration::from_millis(200);
+        let burst = move |cache: Arc<GenerationCache<u64>>, computations: Arc<AtomicUsize>| async move {
+            let barrier = Arc::new(Barrier::new(16));
+            let mut readers = Vec::new();
+            for _ in 0..16 {
+                let cache = cache.clone();
+                let computations = computations.clone();
+                let barrier = barrier.clone();
+                readers.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    cache
+                        .get_or_compute_within("k", window, || {
+                            let computations = computations.clone();
+                            async move {
+                                let n = computations.fetch_add(1, Ordering::SeqCst);
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                                Some(n as u64)
+                            }
+                        })
+                        .await
+                }));
+            }
+            let mut values = Vec::new();
+            for reader in readers {
+                values.push(reader.await.unwrap());
+            }
+            values
+        };
+
+        let first = burst(cache.clone(), computations.clone()).await;
+        assert!(first.iter().all(|value| *value == Some(0)));
+        assert_eq!(
+            computations.load(Ordering::SeqCst),
+            1,
+            "one computation for the burst"
+        );
+
+        let inside = burst(cache.clone(), computations.clone()).await;
+        assert!(
+            inside.iter().all(|value| *value == Some(0)),
+            "inside the window: hits"
+        );
+        assert_eq!(computations.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(window + Duration::from_millis(20)).await;
+        let after = burst(cache.clone(), computations.clone()).await;
+        assert!(
+            after.iter().all(|value| *value == Some(1)),
+            "past the window: fresh"
+        );
+        assert_eq!(
+            computations.load(Ordering::SeqCst),
+            2,
+            "an expired window costs one recomputation, not one per observer"
+        );
+    }
+
+    /// A live read obeys the generation fence: an invalidation during its
+    /// flight is retried at the new generation rather than published, and an
+    /// invalidation between reads is served at once rather than waiting out
+    /// the window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_reads_honor_invalidation() {
+        let cache: Arc<GenerationCache<u64>> = Arc::new(GenerationCache::new("test"));
+        let value = Arc::new(AtomicU64::new(1));
+        let entered = Arc::new(Barrier::new(2));
+        let window = Duration::from_secs(60);
+
+        let reader = {
+            let cache = cache.clone();
+            let value = value.clone();
+            let entered = entered.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_compute_within("k", window, || {
+                        let value = value.clone();
+                        let entered = entered.clone();
+                        async move {
+                            let observed = value.load(Ordering::SeqCst);
+                            if observed == 1 {
+                                entered.wait().await;
+                                tokio::time::sleep(Duration::from_millis(30)).await;
+                            }
+                            Some(observed)
+                        }
+                    })
+                    .await
+            })
+        };
+        entered.wait().await;
+        value.store(2, Ordering::SeqCst);
+        cache.invalidate("k", "test");
+        assert_eq!(
+            reader.await.unwrap(),
+            Some(2),
+            "the stale flight is not published"
+        );
+        assert_eq!(cache.counters().invalidated_during_compute, 1);
+
+        value.store(3, Ordering::SeqCst);
+        cache.invalidate("k", "settlement");
+        let read = cache
+            .get_or_compute_within("k", window, || {
+                let value = value.clone();
+                async move { Some(value.load(Ordering::SeqCst)) }
+            })
+            .await;
+        assert_eq!(
+            read,
+            Some(3),
+            "an invalidation does not wait out the window"
+        );
+    }
+
+    /// Whether an explicit demand computes is decided by when it was made, not by
+    /// when it reached the cache.
+    ///
+    /// The late member is the shape that failed on loaded hosts: one task of a
+    /// burst parked behind the worker running the refresh, polled only after the
+    /// refresh had published. It consumes that refresh however long it waited.
+    /// A demand made after the refresh settled is a new operator action and
+    /// starts a distinct refresh rather than being pinned to the previous one.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_refresh_after_the_admission_window_recomputes() {
+    async fn a_demand_is_answered_by_whatever_settled_after_it_was_made() {
         let cache: GenerationCache<u64> = GenerationCache::new("test");
         let computations = AtomicUsize::new(0);
 
@@ -937,25 +1126,28 @@ mod tests {
             .await
             .unwrap();
         let refresh = || async {
-            computations.fetch_add(1, Ordering::SeqCst);
-            Some(2u64)
+            let earlier = computations.fetch_add(1, Ordering::SeqCst) as u64;
+            Some(2 + earlier)
         };
 
-        assert_eq!(cache.refresh_or_compute("k", refresh).await, Some(2));
-        assert_eq!(cache.refresh_or_compute("k", refresh).await, Some(2));
+        let burst = Instant::now();
+        assert_eq!(cache.refresh_or_compute("k", burst, refresh).await, Some(2));
+        // Longer than the scheduling delay a burst member sees on a loaded host.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
-            computations.load(Ordering::SeqCst),
-            1,
-            "demands inside one admission window coalesce"
+            cache.refresh_or_compute("k", burst, refresh).await,
+            Some(2),
+            "a late member of the burst consumes the burst's refresh"
         );
+        assert_eq!(computations.load(Ordering::SeqCst), 1);
 
-        tokio::time::sleep(EXPLICIT_REFRESH_ADMISSION + Duration::from_millis(5)).await;
-        assert_eq!(cache.refresh_or_compute("k", refresh).await, Some(2));
+        let later = Instant::now();
         assert_eq!(
-            computations.load(Ordering::SeqCst),
-            2,
-            "a later operator action starts a distinct refresh"
+            cache.refresh_or_compute("k", later, refresh).await,
+            Some(3),
+            "a demand made after the refresh settled starts a distinct refresh"
         );
+        assert_eq!(computations.load(Ordering::SeqCst), 2);
     }
 
     /// The same at a freshness rollover, where every mounted reader observes the

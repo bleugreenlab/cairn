@@ -1,6 +1,9 @@
+use std::collections::{HashMap, HashSet};
+
 use cairn_db::turso::{params, Row};
 use sha2::{Digest, Sha256};
 
+use crate::execution::check_parsers::{VerdictFacts, VERDICT_FACTS_SQL};
 use crate::storage::{DbResult, LocalDb, RowExt};
 
 pub const CARD_RENDER_VERSION: u8 = 1;
@@ -9,11 +12,8 @@ pub use cairn_channels::state_card::{
     AgentCardState, AgentPhase, CheckState, CheckVerdict, PullRequestState, TodoProgress,
 };
 
-fn card_check_verdict(
-    passed: bool,
-    parsed: Option<&crate::execution::check_parsers::ParsedCheckResult>,
-) -> CheckVerdict {
-    match crate::execution::checks_status::check_state_from_evidence(passed, parsed) {
+fn card_check_verdict(passed: bool, parsed: Option<&VerdictFacts<'_>>) -> CheckVerdict {
+    match crate::execution::checks_status::check_state_from_facts(passed, parsed) {
         crate::execution::checks_status::NodeCheckState::Passed => CheckVerdict::Passed,
         crate::execution::checks_status::NodeCheckState::Unverified => CheckVerdict::Unverified,
         _ => CheckVerdict::Failed,
@@ -27,12 +27,21 @@ pub fn fingerprint(state: &AgentCardState) -> Result<String, serde_json::Error> 
     Ok(format!("{:x}", digest.finalize()))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Job ids this thread derived card state for, in order.
+    static DERIVED_JOBS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Derive a card from current project-database truth without touching a worktree or VCS.
 pub async fn derive_agent_state(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Option<AgentCardState>, String> {
+    #[cfg(test)]
+    DERIVED_JOBS.with(|jobs| jobs.borrow_mut().push(job_id.to_string()));
     let job_id = job_id.to_string();
+    let checks_sql = format!("SELECT check_name, passed, {VERDICT_FACTS_SQL} FROM check_result_cache c WHERE job_id=?1 AND NOT EXISTS (SELECT 1 FROM check_result_cache n WHERE n.job_id=c.job_id AND n.check_name=c.check_name AND (n.ran_at>c.ran_at OR (n.ran_at=c.ran_at AND n.tree_hash>c.tree_hash) OR (n.ran_at=c.ran_at AND n.tree_hash=c.tree_hash AND n.input_hash>c.input_hash))) ORDER BY check_name");
     db.read(|conn| Box::pin(async move {
         let Some(base) = conn.query("SELECT node_name, status, started_at, completed_at,
              (SELECT COUNT(*) FROM todos WHERE job_id=j.id),
@@ -54,14 +63,13 @@ pub async fn derive_agent_state(
             _ => AgentPhase::Running,
         };
         let pull_request = conn.query("SELECT github_pr_number, COALESCE(github_state,status), COALESCE(additions,0), COALESCE(deletions,0), github_review FROM merge_requests WHERE job_id=?1 ORDER BY updated_at DESC LIMIT 1", params![job_id.as_str()]).await?.next().await?.map(|r| -> DbResult<_> { Ok(PullRequestState { number:r.opt_i64(0)?.unwrap_or(0), status:r.text(1)?, additions:r.i64(2)?, deletions:r.i64(3)?, review_status:r.opt_text(4)? }) }).transpose()?;
-        let mut rows = conn.query("SELECT check_name, passed, target_results_json FROM check_result_cache c WHERE job_id=?1 AND NOT EXISTS (SELECT 1 FROM check_result_cache n WHERE n.job_id=c.job_id AND n.check_name=c.check_name AND (n.ran_at>c.ran_at OR (n.ran_at=c.ran_at AND n.tree_hash>c.tree_hash) OR (n.ran_at=c.ran_at AND n.tree_hash=c.tree_hash AND n.input_hash>c.input_hash))) ORDER BY check_name", params![job_id.as_str()]).await?;
+        let mut rows = conn.query(&checks_sql, params![job_id.as_str()]).await?;
         let mut checks = Vec::new();
         while let Some(row) = rows.next().await? {
-            let parsed = row.opt_text(2)?.and_then(|json| {
-                serde_json::from_str::<crate::execution::check_parsers::ParsedCheckResult>(&json)
-                    .ok()
-            });
-            let verdict = card_check_verdict(row.i64(1)? != 0, parsed.as_ref());
+            let facts = row
+                .opt_text(2)?
+                .and_then(|projection| VerdictFacts::from_projection(&projection));
+            let verdict = card_check_verdict(row.i64(1)? != 0, facts.as_ref());
             checks.push(CheckState { name: row.text(0)?, verdict });
         }
         Ok(Some(AgentCardState { subject_uri, agent_name: base.opt_text(0)?.unwrap_or_else(|| "agent".into()), phase, started_at: base.opt_i64(2)?.unwrap_or(0), completed_at: base.opt_i64(3)?, active_todo: base.opt_text(6)?, todos: TodoProgress { total: base.i64(4)? as u32, completed: base.i64(5)? as u32 }, pull_request, checks }))
@@ -246,6 +254,26 @@ pub async fn mark_failure(
     db.execute("UPDATE channel_state_card SET attempts=attempts+1,status=CASE WHEN attempts+1>=?6 THEN 'failed' ELSE status END,next_attempt_at=?5,last_error=?4,updated_at=?7 WHERE provider=?1 AND conversation=?2 AND subject_uri=?3",params![provider,conversation,subject_uri,error,next_attempt_at,MAX_ATTEMPTS,now]).await.map(|n|n==1).map_err(|e|e.to_string())
 }
 
+/// The jobs that already have a card, keyed by conversation.
+async fn carded_jobs(
+    db: &LocalDb,
+    provider: &str,
+) -> Result<HashMap<String, HashSet<String>>, String> {
+    let rows = db
+        .query_all(
+            "SELECT conversation, job_id FROM channel_state_card WHERE provider=?1",
+            params![provider],
+            |row| Ok((row.text(0)?, row.text(1)?)),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut carded: HashMap<String, HashSet<String>> = HashMap::new();
+    for (conversation, job_id) in rows {
+        carded.entry(conversation).or_default().insert(job_id);
+    }
+    Ok(carded)
+}
+
 const RECONCILE_BATCH: i64 = 50;
 /// A card's budget for posting and editing. Pinning is deliberately outside it:
 /// a pin is decoration, and a card that cannot be pinned must still be able to
@@ -260,6 +288,10 @@ pub async fn reconcile_discord_cards(
     provider: &dyn super::ChannelProvider,
     now: i64,
 ) -> Result<(), String> {
+    // Discovery only creates cards, and `ensure` ignores one that exists, so a
+    // job that already has a card in a conversation has nothing to discover
+    // there; keeping its card current is the due pass's work.
+    let carded = carded_jobs(ledger_db, "discord").await?;
     for binding in super::ledger::list_active_bindings(ledger_db)
         .await?
         .into_iter()
@@ -282,7 +314,11 @@ pub async fn reconcile_discord_cards(
             )
             .await
             .map_err(|error| error.to_string())?;
+        let already_carded = carded.get(&binding.conversation);
         for job_id in job_ids {
+            if already_carded.is_some_and(|jobs| jobs.contains(&job_id)) {
+                continue;
+            }
             let Some(state) = derive_agent_state(project_db, &job_id).await? else {
                 continue;
             };
@@ -454,12 +490,13 @@ mod tests {
             passed: 0,
             failed: 0,
             suite_failures: 0,
+            deferred: 0,
             report: None,
             skipped: 0,
             failures: vec![],
         };
         assert_eq!(
-            card_check_verdict(true, Some(&empty)),
+            card_check_verdict(true, Some(&empty.verdict_facts())),
             CheckVerdict::Unverified
         );
     }
@@ -802,5 +839,234 @@ mod tests {
         );
         card.conversation = "discord:123";
         assert!(ensure(&db, &card).await.is_err());
+    }
+
+    fn take_derived_jobs() -> Vec<String> {
+        DERIVED_JOBS.with(|jobs| std::mem::take(&mut *jobs.borrow_mut()))
+    }
+
+    #[tokio::test]
+    async fn discovery_derives_only_for_jobs_without_a_card() {
+        let db = seeded_reconcile_db("state-card-discovery-skip.db").await;
+        // Three more bound issues whose finished jobs already have cards, each
+        // with a check row a derivation would have read.
+        let mut script = String::new();
+        for n in 8..11 {
+            script.push_str(&format!(
+                "INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i{n}','p',{n},'Card','active',1,1);
+                 INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES('e{n}','build','i{n}','p','completed',1,1);
+                 INSERT INTO jobs(id,execution_id,issue_id,project_id,status,uri_segment,node_name,started_at,completed_at,created_at,updated_at) VALUES('j{n}','e{n}','i{n}','p','complete','builder','Builder',1,2,1,1);
+                 INSERT INTO check_result_cache(project_id,tree_hash,input_hash,check_name,exit_code,passed,output_tail,duration_ms,ran_at,job_id,target_results_json) VALUES('p','t{n}','in{n}','typecheck',0,1,'',1,1,'j{n}','{{\"parser\":\"tsc\",\"passed\":0,\"failed\":0,\"skipped\":0,\"failures\":[]}}');
+                 INSERT INTO channel_conversation_binding(provider,conversation,target_uri,binding_kind,message_classes,followed_at,selected_at) VALUES('discord','discord:1/{n}','cairn://p/cairn/{n}','structural',7,1,1);
+                 INSERT INTO channel_state_card(provider,conversation,subject_uri,target_uri,project_key,job_id,status,created_at,updated_at) VALUES('discord','discord:1/{n}','cairn://p/cairn/{n}/1/builder','cairn://p/cairn/{n}','cairn','j{n}','settled',1,1);"
+            ));
+        }
+        db.execute_script(&script).await.unwrap();
+        let provider = RecordingProvider::default();
+        take_derived_jobs();
+
+        reconcile_discord_cards(&db, &db, &provider, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            take_derived_jobs(),
+            ["j", "j"],
+            "only the uncarded job is derived: once to create its card, once by the due pass that posts it"
+        );
+        let cards = db
+            .query_all(
+                "SELECT job_id FROM channel_state_card ORDER BY job_id",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cards, ["j", "j10", "j8", "j9"]);
+        assert_eq!(*provider.posts.lock().unwrap(), 1);
+
+        reconcile_discord_cards(&db, &db, &provider, 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            take_derived_jobs(),
+            ["j"],
+            "once carded, a live job is derived only by the due pass"
+        );
+    }
+
+    /// The card reads verdict fields projected in SQL; the board reads the full
+    /// parse. Both must classify every shape of result identically.
+    #[tokio::test]
+    async fn projected_verdict_facts_classify_like_the_full_parse() {
+        use crate::execution::check_parsers::{CheckTestResult, ParsedCheckResult};
+        use crate::execution::checks_status::{
+            verdict_evidence, verdict_evidence_from_facts, UnverifiedReason, VerdictEvidence,
+        };
+
+        let result = |parser: &str, selection: &str, complete: bool, passed: usize, skipped| {
+            let parsed = ParsedCheckResult {
+                schema_version: 1,
+                complete,
+                selection: selection.into(),
+                tests: (0..passed)
+                    .map(|i| CheckTestResult {
+                        id: format!("cairn-core::module::tests::test_number_{i}"),
+                        status: "passed".into(),
+                        duration_ms: Some(12),
+                        attempts: 1,
+                        retried: false,
+                        flaky: false,
+                        failure_message: None,
+                        skip_reason: None,
+                        skip_declaration: None,
+                        skip_declaration_source: None,
+                    })
+                    .collect(),
+                undeclared_skips: 0,
+                parser: parser.into(),
+                passed,
+                failed: 0,
+                suite_failures: 0,
+                deferred: 0,
+                report: None,
+                skipped,
+                failures: vec![],
+            };
+            Some(serde_json::to_string(&parsed).unwrap())
+        };
+        let raw = |json: &str| Some(json.to_string());
+        let unverified = VerdictEvidence::Unverified;
+        let cases = [
+            (
+                "a-verified",
+                true,
+                result("nextest", "full", true, 2_000, 0),
+                VerdictEvidence::Verified,
+            ),
+            (
+                "b-empty-selection",
+                true,
+                result("nextest", "empty", true, 0, 0),
+                unverified(UnverifiedReason::EmptySelection),
+            ),
+            (
+                "c-all-skipped",
+                true,
+                result("nextest", "full", true, 0, 4),
+                unverified(UnverifiedReason::AllSkipped(4)),
+            ),
+            (
+                "d-incomplete-enumeration",
+                true,
+                result("vitest", "full", false, 3, 0),
+                unverified(UnverifiedReason::IncompleteEnumeration),
+            ),
+            (
+                "e-no-tests-ran",
+                true,
+                result("nextest", "full", true, 0, 0),
+                unverified(UnverifiedReason::NoTestsRan),
+            ),
+            (
+                "f-incomplete-lint",
+                true,
+                result("rust-lint", "unknown", false, 0, 0),
+                unverified(UnverifiedReason::IncompleteLint),
+            ),
+            (
+                "g-typecheck",
+                true,
+                result("tsc", "unknown", false, 0, 0),
+                VerdictEvidence::Verified,
+            ),
+            (
+                "h-failed-exit",
+                false,
+                result("nextest", "full", true, 5, 0),
+                VerdictEvidence::Failed,
+            ),
+            (
+                "i-serde-defaults",
+                true,
+                raw(r#"{"parser":"nextest","passed":2,"failed":0,"skipped":0,"failures":[]}"#),
+                unverified(UnverifiedReason::IncompleteEnumeration),
+            ),
+            (
+                "j-missing-count",
+                true,
+                raw(r#"{"parser":"nextest","passed":2,"failed":0,"failures":[]}"#),
+                unverified(UnverifiedReason::NoStructuredResult),
+            ),
+            (
+                "k-malformed",
+                true,
+                raw("{not json"),
+                unverified(UnverifiedReason::NoStructuredResult),
+            ),
+            (
+                "l-absent",
+                true,
+                None,
+                unverified(UnverifiedReason::NoStructuredResult),
+            ),
+        ];
+
+        let db = seeded_reconcile_db("state-card-verdict-projection.db").await;
+        for (name, passed, json, _) in &cases {
+            db.execute(
+                "INSERT INTO check_result_cache(project_id,tree_hash,input_hash,check_name,exit_code,passed,output_tail,duration_ms,ran_at,job_id,target_results_json) VALUES('p','tree',?1,?1,?2,?3,'',1,1,'j',?4)",
+                params![*name, i64::from(!*passed), i64::from(*passed), json.clone()],
+            )
+            .await
+            .unwrap();
+        }
+
+        for (name, passed, json, expected) in &cases {
+            let full = json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<ParsedCheckResult>(json).ok());
+            assert_eq!(
+                verdict_evidence(*passed, full.as_ref()),
+                *expected,
+                "{name}: full parse"
+            );
+            let projection = db
+                .query_one(
+                    format!(
+                        "SELECT {VERDICT_FACTS_SQL} FROM check_result_cache WHERE check_name=?1"
+                    ),
+                    params![*name],
+                    |row| row.opt_text(0),
+                )
+                .await
+                .unwrap();
+            let facts = projection
+                .as_deref()
+                .and_then(VerdictFacts::from_projection);
+            assert_eq!(
+                verdict_evidence_from_facts(*passed, facts.as_ref()),
+                *expected,
+                "{name}: projection {projection:?}"
+            );
+        }
+
+        let card = derive_agent_state(&db, "j").await.unwrap().unwrap();
+        let card_checks: Vec<_> = card
+            .checks
+            .iter()
+            .map(|check| (check.name.as_str(), check.verdict))
+            .collect();
+        let expected: Vec<_> = cases
+            .iter()
+            .map(|(name, _, _, evidence)| {
+                let verdict = match evidence {
+                    VerdictEvidence::Failed => CheckVerdict::Failed,
+                    VerdictEvidence::Verified => CheckVerdict::Passed,
+                    VerdictEvidence::Unverified(_) => CheckVerdict::Unverified,
+                };
+                (*name, verdict)
+            })
+            .collect();
+        assert_eq!(card_checks, expected);
     }
 }

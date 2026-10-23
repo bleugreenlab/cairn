@@ -33,6 +33,8 @@ The complete per-resource reference lives at `cairn://help`, and every resource 
 
 `read` is the complete way to fetch and search content. Per-target filters ride in each URI's query string: `?glob=`, `?grep=`, `?search=`, line windows, and resource-specific projections.
 
+Search and read project files with `read` and its filters, not with `rg`, `grep`, `find`, `cat`, `head`, or `sed` inside `run`. `read` answers from the project store with no machine to schedule, while a `run` batch generally waits for an executor holding your checkout, which on a busy fleet takes minutes. Reach for `run` only when you need a real process: a build, a test, `git`, a script.
+
 Multi-target reads combine files and resources in one call:
 
     read({paths:[
@@ -166,7 +168,7 @@ When the suite you are landing into is not already green, a failure is only your
 
     run({commands:[{command:"bun run test src/parser.test.ts"}], branch:"main"})
 
-It takes the same refs `read`'s `?branch=` does, and is verdict-only: tracked files the batch writes are discarded, it cannot be combined with `commit_msg`, and an MCP-tool or REPL batch executes on the host and is rejected.
+It takes the same refs `read`'s `?branch=` does, and is verdict-only: tracked files the batch writes are discarded, it cannot be combined with `commit_msg`, and an MCP-tool or REPL batch executes on the host and is rejected. Before spending a branch run on a base comparison, read the ledger — `cairn:@/check-results/<base>?suite=S&environment=current` — and for diffs, fork points, history, and blame read `cairn:@/vcs/{diff,ancestry,log,blame}`, which answer from the store with no checkout.
 
 ### Interpreters
 

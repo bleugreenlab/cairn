@@ -245,6 +245,15 @@ pub(crate) fn classify_unavailable(
         // it may have run, so presenting it again could run it twice; the
         // caller is told the outcome is unknown instead.
         CellUnavailableReason::ClaimedAttemptSilent { .. } => PlacementVerdict::Structural,
+        // The machine keeps its cells on a volume that is not mounted. It
+        // comes back when someone plugs the drive in, which is not a wait any
+        // agent can sit through: like a drain, work free to move is filtered
+        // onto other machines before it is offered, and work pinned here is
+        // told why at once.
+        CellUnavailableReason::BuildVolumeAbsent { .. } => PlacementVerdict::Structural,
+        // The work ran, partly, and its tree went away under it. Presenting it
+        // again would run it twice; the caller is told what happened instead.
+        CellUnavailableReason::BuildVolumeLost { .. } => PlacementVerdict::Structural,
     }
 }
 
@@ -370,7 +379,9 @@ mod tests {
             | CellUnavailableReason::ObjectInfrastructure(_)
             | CellUnavailableReason::HomeCannotHold { .. }
             | CellUnavailableReason::RunnerStopping { .. }
-            | CellUnavailableReason::ClaimedAttemptSilent { .. } => {}
+            | CellUnavailableReason::ClaimedAttemptSilent { .. }
+            | CellUnavailableReason::BuildVolumeAbsent { .. }
+            | CellUnavailableReason::BuildVolumeLost { .. } => {}
         }
         let waits = [
             deadline(Some(ExecutorSubstrateState::CapacityBusy)),
@@ -419,6 +430,12 @@ mod tests {
                     cairn_common::executor_protocol::ClaimedAttemptAccount::Executing,
                 ),
                 final_account: cairn_common::executor_protocol::ClaimedAttemptAccount::LinkDown,
+            },
+            CellUnavailableReason::BuildVolumeAbsent {
+                path: "/Volumes/Builds/cairn".into(),
+            },
+            CellUnavailableReason::BuildVolumeLost {
+                path: "/Volumes/Builds/cairn".into(),
             },
         ];
         for reason in waits {

@@ -42,26 +42,31 @@ pub(crate) struct BlobCacheDiagnostics {
     pub resident_bytes: usize,
 }
 
-struct BlobCacheInner {
+struct ByteLruInner {
     entries: HashMap<String, Arc<[u8]>>,
     order: VecDeque<String>,
     resident_bytes: usize,
 }
 
-struct BlobCache {
+/// A byte-bounded least-recently-used map from string keys to immutable bytes.
+///
+/// Every key must name content that can never change (an object id, or an
+/// answer keyed by resolved commit ids), so entries are only ever evicted for
+/// space, never invalidated.
+pub(crate) struct ByteLru {
     capacity: usize,
-    inner: Mutex<BlobCacheInner>,
+    inner: Mutex<ByteLruInner>,
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
     oversize_rejections: AtomicU64,
 }
 
-impl BlobCache {
-    fn new(capacity: usize) -> Self {
+impl ByteLru {
+    pub(crate) fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            inner: Mutex::new(BlobCacheInner {
+            inner: Mutex::new(ByteLruInner {
                 entries: HashMap::new(),
                 order: VecDeque::new(),
                 resident_bytes: 0,
@@ -70,6 +75,74 @@ impl BlobCache {
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             oversize_rejections: AtomicU64::new(0),
+        }
+    }
+
+    /// The cached bytes for `key`, refreshing its recency. Counts a hit or a
+    /// miss.
+    pub(crate) fn get(&self, key: &str) -> Option<Arc<[u8]>> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(bytes) = inner.entries.get(key).cloned() else {
+            drop(inner);
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        if let Some(position) = inner.order.iter().position(|entry| entry == key) {
+            inner.order.remove(position);
+        }
+        inner.order.push_back(key.to_string());
+        Some(bytes)
+    }
+
+    /// Cache `bytes` under `key`, evicting the least recently used entries to
+    /// make room, and return what the cache now holds for `key` (an entry a
+    /// racing insert landed first wins). Bytes larger than the whole capacity
+    /// are returned uncached.
+    pub(crate) fn insert(&self, key: &str, bytes: Arc<[u8]>) -> Arc<[u8]> {
+        if bytes.len() > self.capacity {
+            self.oversize_rejections.fetch_add(1, Ordering::Relaxed);
+            return bytes;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(existing) = inner.entries.get(key).cloned() {
+            return existing;
+        }
+        while inner.resident_bytes + bytes.len() > self.capacity {
+            let Some(oldest) = inner.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = inner.entries.remove(&oldest) {
+                inner.resident_bytes -= evicted.len();
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        inner.resident_bytes += bytes.len();
+        inner.order.push_back(key.to_string());
+        inner.entries.insert(key.to_string(), bytes.clone());
+        bytes
+    }
+
+    pub(crate) fn diagnostics(&self) -> BlobCacheDiagnostics {
+        BlobCacheDiagnostics {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            oversize_rejections: self.oversize_rejections.load(Ordering::Relaxed),
+            resident_bytes: self.inner.lock().unwrap().resident_bytes,
+        }
+    }
+}
+
+/// Blob bytes by object id, read through on a miss.
+struct BlobCache {
+    lru: ByteLru,
+}
+
+impl BlobCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            lru: ByteLru::new(capacity),
         }
     }
 
@@ -85,14 +158,7 @@ impl BlobCache {
         if Instant::now() >= limits.deadline {
             return Err(ObjectReadError::DeadlineExceeded);
         }
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(bytes) = inner.entries.get(sha).cloned() {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            if let Some(position) = inner.order.iter().position(|entry| entry == sha) {
-                inner.order.remove(position);
-            }
-            inner.order.push_back(sha.to_string());
-            drop(inner);
+        if let Some(bytes) = self.lru.get(sha) {
             if bytes.len() > limits.max_blob_bytes {
                 return Err(ObjectReadError::BlobLimitExceeded {
                     size: bytes.len(),
@@ -101,42 +167,12 @@ impl BlobCache {
             }
             return Ok(bytes);
         }
-        drop(inner);
-
-        self.misses.fetch_add(1, Ordering::Relaxed);
         let bytes: Arc<[u8]> = store.blob(sha, limits)?.into();
-        if bytes.len() > self.capacity {
-            self.oversize_rejections.fetch_add(1, Ordering::Relaxed);
-            return Ok(bytes);
-        }
-
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(existing) = inner.entries.get(sha).cloned() {
-            return Ok(existing);
-        }
-        while inner.resident_bytes + bytes.len() > self.capacity {
-            let Some(oldest) = inner.order.pop_front() else {
-                break;
-            };
-            if let Some(evicted) = inner.entries.remove(&oldest) {
-                inner.resident_bytes -= evicted.len();
-                self.evictions.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        inner.resident_bytes += bytes.len();
-        inner.order.push_back(sha.to_string());
-        inner.entries.insert(sha.to_string(), bytes.clone());
-        Ok(bytes)
+        Ok(self.lru.insert(sha, bytes))
     }
 
     fn diagnostics(&self) -> BlobCacheDiagnostics {
-        BlobCacheDiagnostics {
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-            evictions: self.evictions.load(Ordering::Relaxed),
-            oversize_rejections: self.oversize_rejections.load(Ordering::Relaxed),
-            resident_bytes: self.inner.lock().unwrap().resident_bytes,
-        }
+        self.lru.diagnostics()
     }
 }
 

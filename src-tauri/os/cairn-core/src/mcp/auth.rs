@@ -536,6 +536,11 @@ mod tests {
             "src-tauri/os/cairn-core/src/mcp/mod.rs",
             // Names the path so agent reads and writes of it are refused.
             "src-tauri/os/cairn-core/src/authorization/protected.rs",
+            // The kernel boundary: names the file only to refuse it to every
+            // agent spawn, and its probe plants a throwaway credential of its
+            // own to measure that refusal. Neither reads a real credential.
+            "src-tauri/os/cairn-sandbox/src/operator_credential.rs",
+            "src-tauri/os/cairn-sandbox/src/containment.rs",
             // Hosts: the runner materializes it, the hosted server carries an
             // (never-matching) validator so both reach the same authorization.
             "src-tauri/cairn-orch/src/main.rs",

@@ -21,24 +21,43 @@ pub struct GraphFileChange {
     pub deletions: i32,
 }
 
-/// Changed files between two immutable logical coordinates. Unlike
-/// [`node_changed_files`], this never consults the workspace `@` commit.
+/// The files `head` changed since it last shared history with `base`, between
+/// two immutable logical coordinates. Unlike [`node_changed_files`], this never
+/// consults the workspace `@` commit.
+///
+/// This is a diff between two trees, from `fork_point(base | head)` to `head`,
+/// and never a diff over the revset `base..head`. jj refuses to diff a revset
+/// with gaps in it, and a branch that merged its base in rather than being
+/// rebased onto it has exactly that shape: its fork point is the merged base
+/// commit, and the branch's own commits behind the merge do not descend from
+/// it. For every range jj would accept, including a `base` that has moved past
+/// the fork, the tree diff gives the same answer as the range diff did.
+///
+/// The error carries jj's own message, so a caller that cannot proceed can say
+/// why.
 pub fn logical_changed_files(
     jj: &JjEnv,
     repository: &Path,
     base: &str,
     head: &str,
-) -> Option<Vec<GraphFileChange>> {
+) -> Result<Vec<GraphFileChange>, String> {
     if !is_jj_dir(repository) {
-        return None;
+        return Err(format!("`{}` is not a jj repository", repository.display()));
     }
-    let revset = format!("{base}..{head}");
+    let from = format!("fork_point(({base}) | ({head}))");
     jj.run(
         repository,
-        &["diff", "--ignore-working-copy", "--git", "-r", &revset],
+        &[
+            "diff",
+            "--ignore-working-copy",
+            "--git",
+            "--from",
+            &from,
+            "--to",
+            head,
+        ],
         "jj diff --git (logical range)",
     )
-    .ok()
     .map(|patch| parse_git_diff(&patch))
 }
 

@@ -296,6 +296,113 @@ pub const fn batch_filesystem_edge(mode: PolicyMode) -> EdgeId {
     }
 }
 
+/// Attempt to read a Cairn home's operator credential the way an unfenced agent
+/// spawn would, and report whether it could.
+///
+/// The planted home sits directly in `$HOME` under a `.cairn` name, which is
+/// where every real Cairn home on the machine lives, and the spawn goes through
+/// exactly [`crate::Confinement::CredentialFloor`]'s wrapping, because a probe
+/// that confined itself some other way would measure its own harness. The
+/// positive control is an ordinary file beside the credential: a seam that
+/// cannot read anything there measured nothing.
+#[cfg(unix)]
+pub fn probe_operator_credential_read() -> Result<ProbeWitness, String> {
+    const CONTROL: &str = "cairn-containment-control";
+    const CREDENTIAL: &str = "cairn-containment-credential";
+
+    let home = crate::home_dir()
+        .ok_or_else(|| "no home directory to plant a Cairn home in".to_string())?;
+    let probe_home = home.join(format!(
+        ".cairn-containment-probe-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir(&probe_home).map_err(|e| format!("create the probe home: {e}"))?;
+    let control = probe_home.join("control");
+    let credential = probe_home.join(cairn_common::auth::OPERATOR_SECRET_FILE);
+    let planted = std::fs::write(&control, CONTROL)
+        .and_then(|()| std::fs::write(&credential, CREDENTIAL))
+        .map_err(|e| format!("plant the probe credential: {e}"));
+    let output = planted.and_then(|()| {
+        let script = format!(
+            "cat {} 2>/dev/null; cat {} 2>/dev/null; exit 0",
+            shell_quote(&control),
+            shell_quote(&credential)
+        );
+        let confinement = crate::Confinement::CredentialFloor;
+        let (program, args) = confinement.wrap_argv("/bin/sh", &["-c".to_string(), script]);
+        let mut command = std::process::Command::new(&program);
+        command.args(&args);
+        confinement.install_pre_exec(&mut command);
+        command
+            .output()
+            .map_err(|e| format!("spawn the operator credential probe: {e}"))
+    });
+    // The probe home is removed by this unconfined process whatever happened.
+    let _ = std::fs::remove_dir_all(&probe_home);
+    let stdout = String::from_utf8_lossy(&output?.stdout).into_owned();
+
+    let positive_control_passed = stdout.contains(CONTROL);
+    let crossing_permitted = stdout.contains(CREDENTIAL);
+    let detail = match (positive_control_passed, crossing_permitted) {
+        (true, false) => "an agent spawn read an ordinary file in a Cairn home and was refused that home's operator_auth_secret".to_string(),
+        (true, true) => format!(
+            "an agent spawn read a Cairn home's operator_auth_secret: {} cannot enforce the operator credential boundary, so any agent process on this machine can approve its own escalation with a credential it finds here",
+            std::env::consts::OS
+        ),
+        (false, _) => "the ordinary file beside the planted credential could not be read, so this probe could not exercise the seam".to_string(),
+    };
+    Ok(ProbeWitness {
+        edge: EdgeId::OperatorCredentialRead,
+        effect: EffectClass::Read,
+        positive_control_passed,
+        crossing_permitted,
+        detail,
+    })
+}
+
+#[cfg(not(unix))]
+pub fn probe_operator_credential_read() -> Result<ProbeWitness, String> {
+    Err(format!(
+        "no probe implements the operator credential boundary on {}, and no sandbox primitive enforces it there",
+        std::env::consts::OS
+    ))
+}
+
+/// The operator credential edge as this machine can currently report it.
+pub fn observe_operator_credential_read(
+    build_id: &str,
+    boot: &str,
+    platform: Option<RemotePlatform>,
+) -> EdgeDisposition {
+    let edge = EdgeId::OperatorCredentialRead;
+    let Some(platform) = platform else {
+        return EdgeDisposition::Unmeasured {
+            reason: "this machine is not one of the published executor platforms, so its measurements have no closed platform identity to bind to".into(),
+        };
+    };
+    let Some(invalidation_fingerprint) = fingerprint(edge, build_id, boot) else {
+        return EdgeDisposition::Unmeasured {
+            reason: "this machine cannot currently read every input that could widen the operator credential boundary, so no positive disposition is constructible".into(),
+        };
+    };
+    let witness = match probe_operator_credential_read() {
+        Ok(witness) => witness,
+        Err(reason) => return EdgeDisposition::Unmeasured { reason },
+    };
+    let definition = edge.definition();
+    witness.into_disposition(PositiveScope {
+        executor_build_id: build_id.to_string(),
+        boot_generation: boot.to_string(),
+        platform,
+        process_class: definition.key.process_class,
+        carrier: definition.key.carrier,
+        policy_mode: definition.key.policy_mode,
+        probe_version: ProbeVersion::V1,
+        claim_revision: definition.claim_revision,
+        invalidation_fingerprint,
+    })
+}
+
 #[cfg(unix)]
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
@@ -398,6 +505,9 @@ fn probe_evidence(
                         platform,
                         PolicyMode::Unconfined,
                     ),
+                    EdgeId::OperatorCredentialRead => {
+                        observe_operator_credential_read(build_id, boot, platform)
+                    }
                     other => EdgeDisposition::Unmeasured {
                         reason: format!(
                             "no probe attempts the {other:?} seam yet; see docs/security/executor-containment.md for the boundary that owns it"
@@ -477,6 +587,52 @@ mod tests {
             assert!(
                 matches!(disposition, EdgeDisposition::Unmeasured { .. }),
                 "a failed control produced {disposition:?}"
+            );
+        }
+    }
+
+    /// The operator credential edge says what this platform can actually do:
+    /// refused where Seatbelt runs, measured as readable where nothing can
+    /// refuse it, and never claimed refused on a seam the probe could not use.
+    #[cfg(unix)]
+    #[test]
+    fn the_operator_credential_probe_reports_what_this_platform_enforces() {
+        let witness = match probe_operator_credential_read() {
+            Ok(witness) => witness,
+            // A fenced test process cannot plant a home in `$HOME` at all. The
+            // executor that measures this in production is never fenced.
+            Err(reason) if reason.starts_with("create the probe home") => {
+                eprintln!("skipping: this process cannot write its own home: {reason}");
+                return;
+            }
+            Err(reason) => panic!("the probe runs on unix: {reason}"),
+        };
+        if !witness.positive_control_passed {
+            // Only a macOS process already inside a sandbox, which cannot apply
+            // another, fails the control; elsewhere the seam always works.
+            if !cfg!(target_os = "macos") {
+                panic!("the seam's control failed off macOS: {}", witness.detail);
+            }
+            assert!(
+                crate::current_process_is_confined(),
+                "an unconfined process must be able to exercise the seam: {}",
+                witness.detail
+            );
+            return;
+        }
+        assert_eq!(
+            witness.crossing_permitted,
+            !cfg!(target_os = "macos"),
+            "{}",
+            witness.detail
+        );
+        let disposition = witness.into_disposition(scope());
+        if cfg!(target_os = "macos") {
+            assert!(matches!(disposition, EdgeDisposition::Refused { .. }));
+        } else {
+            assert!(
+                matches!(disposition, EdgeDisposition::Ambient { .. }),
+                "a platform that cannot enforce the boundary must say so: {disposition:?}"
             );
         }
     }

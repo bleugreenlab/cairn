@@ -56,27 +56,30 @@ pub(crate) fn verbs(spec: &AffordanceSpec) -> Vec<String> {
     spec.actions.iter().map(|a| verb_slug(&a.label)).collect()
 }
 
-/// The shortest readable spelling that selects exactly this action.
+/// A single word that selects exactly this action, when one is shorter than
+/// its canonical slug.
 ///
-/// Help must only advertise a shorthand the dispatcher will accept. Builtins
-/// are excluded because colon dispatch resolves them before resource actions.
-pub(crate) fn preferred_verb(
+/// This is a convenience beside the slug, never a replacement for it: which
+/// word is unambiguous depends on the resource's other actions, so the same
+/// action can have a different shorthand, or none, wherever it appears. Help
+/// must only advertise a shorthand the dispatcher will accept, and builtins are
+/// excluded because colon dispatch resolves them before resource actions.
+pub(crate) fn shorthand(
     spec: &AffordanceSpec,
     action: &ActionSpec,
     builtins: &[&str],
-) -> String {
-    alias_words(&action.label)
-        .into_iter()
-        .find(|alias| {
-            !builtins.contains(&alias.as_str())
-                && spec
-                    .actions
-                    .iter()
-                    .filter(|candidate| alias_words(&candidate.label).contains(alias))
-                    .count()
-                    == 1
-        })
-        .unwrap_or_else(|| verb_slug(&action.label))
+) -> Option<String> {
+    let slug = verb_slug(&action.label);
+    alias_words(&action.label).into_iter().find(|alias| {
+        *alias != slug
+            && !builtins.contains(&alias.as_str())
+            && spec
+                .actions
+                .iter()
+                .filter(|candidate| alias_words(&candidate.label).contains(alias))
+                .count()
+                == 1
+    })
 }
 
 /// Resolve a typed verb against the actions the current resource advertises.
@@ -501,9 +504,9 @@ mod tests {
     }
 
     #[test]
-    fn help_prefers_the_leading_safe_alias_over_an_internal_label() {
+    fn a_long_label_offers_its_leading_safe_word_as_shorthand() {
         let action = action(
-            "patch project rename hide attach remote",
+            "patch project (rename / hide / attach remote / ref-store prune)",
             "patch",
             Vec::new(),
             Vec::new(),
@@ -515,8 +518,37 @@ mod tests {
             filters: Vec::new(),
             actions: vec![action],
         };
-        assert_eq!(preferred_verb(&spec, &spec.actions[0], &["help"]), "patch");
+        assert_eq!(
+            shorthand(&spec, &spec.actions[0], &["help"]).as_deref(),
+            Some("patch")
+        );
         assert_eq!(resolve_verb(&spec, "patch").unwrap(), &spec.actions[0]);
+    }
+
+    #[test]
+    fn shorthand_skips_shared_words_and_builtins_and_never_restates_the_slug() {
+        let spec = issue_spec();
+        // `append` is shared with `append message`, so `comment` is the word.
+        assert_eq!(
+            shorthand(&spec, &spec.actions[1], &[]).as_deref(),
+            Some("comment")
+        );
+        // A word a builtin claims first would never reach the action.
+        let feed = action("read feed page", "patch", Vec::new(), Vec::new());
+        let spec = AffordanceSpec {
+            actions: vec![feed],
+            ..issue_spec()
+        };
+        assert_eq!(
+            shorthand(&spec, &spec.actions[0], &["read"]).as_deref(),
+            Some("feed")
+        );
+        // A one-word label is already as short as it gets.
+        let spec = AffordanceSpec {
+            actions: vec![action("comment", "append", Vec::new(), Vec::new())],
+            ..issue_spec()
+        };
+        assert_eq!(shorthand(&spec, &spec.actions[0], &[]), None);
     }
 
     #[test]

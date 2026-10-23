@@ -645,7 +645,7 @@ fn each_familys_one_shot_usage_journals_as_its_golden() {
             }],
             model: model.into(),
             project_id: None,
-            extras: serde_json::Value::Null,
+            options: Default::default(),
             output_schema: None,
             timeout: std::time::Duration::from_secs(5),
         }
@@ -790,4 +790,126 @@ fn shipped_go_models_carry_their_pinned_tokenizers() {
     assert_eq!(family("kimi-k3").as_deref(), Some("kimi-k3"));
     assert_eq!(family("glm-5.2").as_deref(), Some("glm-5"));
     assert_eq!(family("grok-4.5"), None);
+}
+
+/// A one-shot carries the caller's effort in each family's own spelling, and
+/// never under the option's camelCase name.
+#[test]
+fn a_one_shot_maps_the_effort_onto_each_familys_own_knob() {
+    use super::{complete_chat, complete_messages, complete_responses};
+    use crate::backends::openai_responses::wire::{ResponseEnvelope, ResponsesResponse};
+    use crate::backends::{CompletionMessage, CompletionRequest, CompletionRole};
+    use crate::models::RuntimeExtras;
+    use cairn_models::interface::complete::{
+        Complete, CompletionCall, CompletionError, CompletionReply,
+    };
+    use std::sync::Mutex;
+
+    struct Recorder {
+        reply: Mutex<Option<CompletionReply>>,
+        body: Mutex<Option<serde_json::Value>>,
+    }
+    impl Complete for Recorder {
+        fn complete(&self, call: CompletionCall<'_>) -> Result<CompletionReply, CompletionError> {
+            *self.body.lock().unwrap() = Some(call.body);
+            Ok(self.reply.lock().unwrap().take().expect("one request"))
+        }
+    }
+    fn recorder(reply: CompletionReply) -> Recorder {
+        Recorder {
+            reply: Mutex::new(Some(reply)),
+            body: Mutex::new(None),
+        }
+    }
+    fn sent(recorder: Recorder) -> serde_json::Value {
+        recorder.body.into_inner().unwrap().expect("one request")
+    }
+    fn request(model: &str) -> CompletionRequest {
+        CompletionRequest {
+            system: Some("Be brief.".into()),
+            messages: vec![
+                CompletionMessage {
+                    role: CompletionRole::User,
+                    content: "example".into(),
+                },
+                CompletionMessage {
+                    role: CompletionRole::Assistant,
+                    content: "answer".into(),
+                },
+                CompletionMessage {
+                    role: CompletionRole::User,
+                    content: "hi".into(),
+                },
+            ],
+            model: model.into(),
+            project_id: None,
+            options: RuntimeExtras {
+                reasoning_effort: Some("high".to_string()),
+                service_tier: Some("priority".to_string()),
+                ..Default::default()
+            },
+            output_schema: None,
+            timeout: std::time::Duration::from_secs(5),
+        }
+    }
+    let started = std::time::Instant::now();
+    let no_camel_case = |body: &serde_json::Value| {
+        assert!(body.get("reasoningEffort").is_none(), "{body}");
+        assert!(body.get("serviceTier").is_none(), "{body}");
+    };
+
+    let chat = recorder(CompletionReply::Chat(
+        serde_json::from_value(
+            json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}),
+        )
+        .unwrap(),
+    ));
+    complete_chat(&chat, "key", request("glm-5.2"), started).unwrap();
+    let body = sent(chat);
+    no_camel_case(&body);
+    assert_eq!(body["reasoning_effort"], json!("high"));
+    assert_eq!(body["stream"], json!(false));
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "example"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "hi"},
+        ])
+    );
+
+    let messages = recorder(CompletionReply::Messages(
+        serde_json::from_value(json!({"content": [{"type": "text", "text": "ok"}]})).unwrap(),
+    ));
+    complete_messages(&messages, "key", request("minimax-m3"), started).unwrap();
+    let body = sent(messages);
+    no_camel_case(&body);
+    // Messages takes a thinking budget, not an effort word, and none is invented.
+    assert!(body.get("thinking").is_none(), "{body}");
+    assert_eq!(body["system"][0]["text"], json!("Be brief."));
+    assert_eq!(body["messages"][1]["role"], json!("assistant"));
+    assert_eq!(body["messages"][1]["content"][0]["text"], json!("answer"));
+    assert_eq!(body["stream"], json!(false));
+
+    let envelope: ResponseEnvelope = serde_json::from_value(json!({
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "ok"}]
+        }]
+    }))
+    .unwrap();
+    let responses = recorder(CompletionReply::Responses(
+        ResponsesResponse::from_envelope(envelope),
+    ));
+    complete_responses(&responses, "key", request("grok-4.5"), started).unwrap();
+    let body = sent(responses);
+    no_camel_case(&body);
+    assert_eq!(body["reasoning"], json!({"effort": "high"}));
+    assert_eq!(body["instructions"], json!("Be brief."));
+    assert_eq!(body["input"][0]["content"][0]["type"], json!("input_text"));
+    assert_eq!(body["input"][1]["content"][0]["type"], json!("output_text"));
+    assert_eq!(body["stream"], json!(false));
 }

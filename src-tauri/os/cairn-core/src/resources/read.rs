@@ -1442,7 +1442,9 @@ pub(crate) async fn produce_cairn_resource(
     // materialized body rejects `glob`/`type`.
     let allow_glob = matches!(
         resource,
-        CairnResource::Changed { .. } | CairnResource::NodeDiff { .. }
+        CairnResource::Changed { .. }
+            | CairnResource::NodeDiff { .. }
+            | CairnResource::ProjectVcsDiff { .. }
     );
     match crate::mcp::handlers::search::body_grep_payload(&split.params, allow_glob) {
         Err(error) => return RenderedResource::line(error, affordance, None, None),
@@ -1642,7 +1644,12 @@ pub(crate) async fn produce_cairn_resource(
     ) && find_query_value(&split.params, "format")
         == Some("json");
     let is_raw_line_resource = is_structured_raw_transcript || raw_artifact;
-    let body_params = if renderer_owns_params || is_browser_resource {
+    // Record pagers: `offset`/`limit` page records (commits), not rendered
+    // lines, so both reach the renderer and the view does not re-window.
+    let renderer_pages_records = matches!(resource, CairnResource::ProjectVcsLog { .. });
+    let body_params = if renderer_pages_records {
+        strip_params(&split.params, &["char_offset"])
+    } else if renderer_owns_params || is_browser_resource {
         strip_params(&split.params, &["offset"])
     } else if is_raw_line_resource {
         strip_params(&split.params, &["offset", "limit", "char_offset"])
@@ -1664,8 +1671,12 @@ pub(crate) async fn produce_cairn_resource(
     RenderedResource::line(
         content,
         affordance,
-        view_offset,
-        if renderer_owns_params {
+        if renderer_pages_records {
+            None
+        } else {
+            view_offset
+        },
+        if renderer_owns_params || renderer_pages_records {
             None
         } else {
             view_limit
@@ -1910,6 +1921,12 @@ async fn render_resource_body(
             None => crate::resources::models::render_index(),
         },
         CairnResource::ModelsCatalog => crate::resources::models::render_catalog(orch, &params),
+        CairnResource::ModelsDecide => {
+            match reject_query_params("cairn://models/decide", &params) {
+                Some(error) => error,
+                None => crate::resources::models::render_decide(orch),
+            }
+        }
         CairnResource::ModelsAccounts => crate::resources::models::render_accounts(
             orch,
             &params,
@@ -2068,6 +2085,20 @@ async fn render_resource_body(
                         (None, _) => {
                             let mut rendered = crate::resources::executors::render_executor(executor);
                             if executor.colocated {
+                                let configured =
+                                    crate::config::settings::load_fleet(&orch.config_dir)
+                                        .colocated_build_root
+                                        .map(|root| root.path);
+                                rendered.push_str(
+                                    &crate::resources::executors::render_pending_build_root(
+                                        configured.as_deref(),
+                                        executor
+                                            .health
+                                            .build_volume
+                                            .as_ref()
+                                            .map(|report| report.root.as_str()),
+                                    ),
+                                );
                                 rendered.push_str(
                                     &crate::resources::executors::render_colocated_supervision(
                                         orch.fleet.colocated_substrate().as_ref(),
@@ -2232,6 +2263,25 @@ async fn render_resource_body(
         }
         CairnResource::ProjectCheckResults { project, revision } => {
             read_project_check_results(orch, request, &project, &revision, &params).await
+        }
+        CairnResource::ProjectVcsDiff { project } => {
+            super::vcs::read_vcs(orch, request, &project, super::vcs::VcsOp::Diff, &params).await
+        }
+        CairnResource::ProjectVcsAncestry { project } => {
+            super::vcs::read_vcs(
+                orch,
+                request,
+                &project,
+                super::vcs::VcsOp::Ancestry,
+                &params,
+            )
+            .await
+        }
+        CairnResource::ProjectVcsLog { project } => {
+            super::vcs::read_vcs(orch, request, &project, super::vcs::VcsOp::Log, &params).await
+        }
+        CairnResource::ProjectVcsBlame { project } => {
+            super::vcs::read_vcs(orch, request, &project, super::vcs::VcsOp::Blame, &params).await
         }
         CairnResource::ProjectCheckObservation { project, handle } => {
             if let Some(error) = reject_query_params("check observation", &params) {
@@ -3364,6 +3414,18 @@ mod tests {
     }
 
     #[test]
+    fn project_help_advertises_export_action() {
+        let block = render_help(&db_params("kind=project"));
+        assert!(block.contains("export (requires path)"), "{block}");
+        assert!(
+            block.contains("`path`") || block.contains("path("),
+            "{block}"
+        );
+        let help = crate::system_prompt::cairn_help();
+        assert!(help.contains("export (requires path)"), "{help}");
+    }
+
+    #[test]
     fn help_unknown_kind_errors_clearly() {
         let err = render_help(&db_params("kind=not-a-kind"));
         assert!(err.contains("Unknown resource-kind slug"), "{err}");
@@ -4153,8 +4215,10 @@ line2', X'0001020AFF', 2.5),
         assert!(raw.affordance.is_none());
         assert!(!raw.content.contains("## actions"));
 
-        // The ruling the arc carried reads back exactly from its tenet: the
-        // escaped quote and newline, and the nested provenance object.
+        // The ruling the arc carried reads back exactly from its tenet: its text
+        // is the tenet's one statement, escaped quote and newline intact; an
+        // accepted ruling is an approved yes; and the nested provenance object
+        // survives under the legacy record.
         let stored: serde_json::Value = serde_json::from_str(stored_arc).unwrap();
         let ruling = &stored["rulings"][0];
         let tenet = produce_cairn_resource(
@@ -4167,8 +4231,10 @@ line2', X'0001020AFF', 2.5),
         let tenet: serde_json::Value = serde_json::from_str(&tenet.content)
             .unwrap_or_else(|error| panic!("{error}: {}", tenet.content));
         assert_eq!(tenet["slug"], ruling["slug"]);
-        assert_eq!(tenet["question"], "Say \"yes\"\nthen proceed");
-        assert_eq!(tenet["text"], ruling["text"]);
+        assert_eq!(tenet["statement"], "Say \"yes\"\nthen proceed");
+        assert_eq!(tenet["statement"], ruling["text"]);
+        assert_eq!(tenet["status"], "approved");
+        assert_eq!(tenet["verdict"], "yes");
         assert_eq!(tenet["legacy"]["rationale"], ruling["rationale"]);
         assert_eq!(tenet["legacy"]["provenance"], ruling["provenance"]);
 

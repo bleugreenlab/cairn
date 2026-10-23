@@ -9,6 +9,13 @@ use std::time::Duration;
 
 use super::private_lane::WORKSPACE;
 const OWNER: &str = "ordinary-session-promoter";
+
+/// The lease owner this boot's promoter stamps on private rows. The boot id
+/// lets startup recovery tell this boot's live leases from orphans of an
+/// earlier one, as the watchdog ledger's `runner_boot_id` does.
+fn private_lease_owner(orch: &Orchestrator) -> String {
+    format!("{OWNER}@{}", orch.boot_at)
+}
 const PRIVATE_LEASE_SECONDS: i64 = 300;
 const PRIVATE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 const PRIVATE_HEARTBEAT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -238,7 +245,10 @@ impl OrdinaryLease {
     }
     fn owner(&self) -> Result<String, String> {
         match self {
-            Self::Private(_) => Ok(OWNER.into()),
+            Self::Private(request) => request
+                .lease_owner
+                .clone()
+                .ok_or_else(|| "private ordinary lease has no owner".into()),
             Self::Team { request, .. } => request
                 .lease_owner
                 .clone()
@@ -268,7 +278,17 @@ fn enqueue_request_from_snapshot(
         runtime_class: runtime_class.into(),
         resource_claim: serde_json::to_value(&launch.runtime_capability.claim)
             .expect("persisted runtime claim is serializable"),
-        priority: crate::runtime_admission::AdmissionPriority::Ordinary,
+        priority: team_priority(launch.origin),
+    }
+}
+
+fn team_priority(
+    origin: crate::storage::LaunchOrigin,
+) -> crate::runtime_admission::AdmissionPriority {
+    if origin.is_urgent() {
+        crate::runtime_admission::AdmissionPriority::Urgent
+    } else {
+        crate::runtime_admission::AdmissionPriority::Ordinary
     }
 }
 
@@ -357,10 +377,22 @@ fn backend_for(prepared: &PreparedJob) -> std::sync::Arc<dyn crate::backends::Ag
 /// Requeued rows whose run is already terminal are withdrawn before promotion:
 /// a run whose row was `active` had a process that died with the predecessor,
 /// and the boot reconcile settled it, so its row must not spend a lease.
+///
+/// Leases this boot already took are exempt. Watchdog recovery runs earlier in
+/// startup and enqueues successors that the promoter leases and starts at
+/// once, and transport readiness can admit operator launches before this step
+/// too; requeueing those would orphan a live process from its row and fail
+/// its start with "lease was replaced".
 pub(crate) async fn recover_on_startup(orch: &Orchestrator) {
     let now = chrono::Utc::now().timestamp();
-    if let Err(error) =
-        crate::storage::requeue_orphaned_admissions(&orch.db.local, WORKSPACE, now).await
+    let current_owner = private_lease_owner(orch);
+    if let Err(error) = crate::storage::requeue_orphaned_admissions(
+        &orch.db.local,
+        WORKSPACE,
+        Some(&current_owner),
+        now,
+    )
+    .await
     {
         log::warn!("ordinary admission recovery could not reclaim leases: {error}");
     }
@@ -520,6 +552,7 @@ pub(super) fn enqueue_or_start(
                 name: identity.name.clone(),
             }
         }),
+        origin: prepared.origin,
         created_at: now,
     };
     // The prepared turn belongs to its run from here on, so every run-scoped
@@ -550,6 +583,7 @@ pub(super) fn enqueue_or_start(
         let lane = capability.lane.0.clone();
         let claim = capability.claim.clone();
         let run_id = prepared.run_id.clone();
+        let origin = prepared.origin;
         let queue_workspace = team_id
             .as_ref()
             .map(|id| format!("team:{id}"))
@@ -568,7 +602,9 @@ pub(super) fn enqueue_or_start(
                         logical_stream_units: claim.logical_stream_units,
                         estimated_memory_bytes: claim.estimated_memory_bytes,
                     },
-                    urgent: false,
+                    // An operator waiting on this launch goes ahead of background
+                    // work; the urgent burst bound keeps ordinary work moving.
+                    urgent: origin.is_urgent(),
                     now,
                 },
                 snapshot,
@@ -605,7 +641,7 @@ pub(super) fn enqueue_or_start(
                 runtime_class: runtime_class.into(),
                 resource_claim: serde_json::to_value(&capability.claim)
                     .map_err(|e| e.to_string())?,
-                priority: crate::runtime_admission::AdmissionPriority::Ordinary,
+                priority: team_priority(prepared.origin),
             },
         );
     } else {
@@ -778,11 +814,20 @@ pub(crate) fn promote_private_lane(orch: &Orchestrator, lane: &str) {
 /// Drain every queued launch the lane can admit right now. Each pass measures
 /// the budget afresh (see `private_lane`), records the decision for the
 /// surfaces that display it, and when the head is blocked with nothing mid-spawn
-/// asks the warm GC for room on its behalf.
+/// asks the warm GC for room on its behalf. Inside the boot horizon it also
+/// leases against the boot ramp's warm-up window.
 pub(super) fn promote_private_lane_blocking(orch: &Orchestrator, lane: &str) -> Result<(), String> {
+    let owner = private_lease_owner(orch);
     loop {
         let db = orch.db.local.clone();
         let lane_owned = lane.to_string();
+        let owner = owner.clone();
+        // While the ramp is on, the window read, the lease it decides, and the
+        // warming registration below are one critical section across passes;
+        // the start itself runs outside it.
+        let ramp_admission = super::private_lane::boot_ramp_active(orch)
+            .then(|| orch.private_lanes.lock_ramp_admission());
+        let spawn_window = super::private_lane::boot_ramp_window(orch);
         let budget = super::private_lane::private_lane_budget(orch);
         let now = chrono::Utc::now().timestamp();
         let decision = run_db(async move {
@@ -790,11 +835,12 @@ pub(super) fn promote_private_lane_blocking(orch: &Orchestrator, lane: &str) -> 
                 &db,
                 WORKSPACE,
                 &lane_owned,
-                OWNER,
+                &owner,
                 now,
                 now + PRIVATE_LEASE_SECONDS,
                 budget.capacity(),
                 budget.memory,
+                spawn_window,
             )
             .await
             .map_err(|error| error.to_string())
@@ -809,12 +855,19 @@ pub(super) fn promote_private_lane_blocking(orch: &Orchestrator, lane: &str) -> 
                 return Ok(());
             }
             crate::storage::LeaseDecision::Blocked {
+                head_request_id,
                 shortfall,
                 in_flight_requests,
-                ..
             } => {
                 orch.private_lanes
                     .record(lane, budget, Some(shortfall.clone()));
+                // A ramp hold waits for a warming spawn to speak. Evicting a warm
+                // process frees memory, not a warm-up slot, and the release that
+                // frees one promotes again.
+                if matches!(shortfall, crate::storage::LaneShortfall::Ramp { .. }) {
+                    super::private_lane::note_ramp_hold(orch, &head_request_id);
+                    return Ok(());
+                }
                 // A spawn in flight is about to change what the probe reads and
                 // will re-trigger promotion when it settles; evicting now would
                 // decide against a measurement that is already stale.
@@ -843,7 +896,18 @@ pub(super) fn promote_private_lane_blocking(orch: &Orchestrator, lane: &str) -> 
             continue;
         };
         let request_id = lease.request_id.clone();
-        if let Err(error) = start_leased(orch, OrdinaryLease::Private(lease), snapshot) {
+        let run_id = snapshot.run_id.clone();
+        let warms = spawn_window.is_some() && lease.resource_claim.spawns_dedicated_process();
+        if warms {
+            orch.private_lanes
+                .begin_warming(&run_id, lane, &request_id, lease.urgent);
+        }
+        drop(ramp_admission);
+        let started = start_leased(orch, OrdinaryLease::Private(lease), snapshot);
+        if warms {
+            super::private_lane::settle_warming_start(orch, &run_id, &started);
+        }
+        if let Err(error) = started {
             // start_leased has already closed this generation and failed its
             // job; the next queued launch still deserves the freed slot.
             log::warn!("ordinary admission {request_id} failed to start: {error}");
@@ -1360,6 +1424,7 @@ fn transition(
     }
     let db = orch.db.local.clone();
     let id = lease.request_id().to_string();
+    let owner = lease.owner()?;
     let generation = lease.generation();
     let from = from.to_string();
     let to = to.to_string();
@@ -1367,7 +1432,7 @@ fn transition(
         crate::storage::transition_admission(
             &db,
             &id,
-            OWNER,
+            &owner,
             generation,
             &from,
             &to,
@@ -1410,6 +1475,7 @@ fn finish(
     }
     let db = orch.db.local.clone();
     let key = lease.launch_key().to_string();
+    let owner = lease.owner()?;
     let generation = lease.generation();
     let state = state.to_string();
     let detail = detail.map(str::to_string);
@@ -1418,7 +1484,7 @@ fn finish(
             &db,
             WORKSPACE,
             &key,
-            OWNER,
+            &owner,
             generation,
             &state,
             detail.as_deref(),
@@ -2557,6 +2623,7 @@ mod tests {
             turn_id: "t".into(),
             launch_event_id: "ev".into(),
             start_reason: crate::models::TurnStartReason::FollowUp,
+            origin: crate::storage::LaunchOrigin::Background,
             launch_claim: Some(orch.claim_job_launch("j", "cold")),
         };
         let identity = || {
@@ -2707,6 +2774,7 @@ mod tests {
                 turn_id: "t".into(),
                 launch_event_id: "ev".into(),
                 start_reason: crate::models::TurnStartReason::FollowUp,
+                origin: crate::storage::LaunchOrigin::Background,
                 launch_claim: Some(enqueuer.claim_job_launch("j", "cold")),
             };
             let identity = crate::identity::UserIdentity {
@@ -2795,7 +2863,7 @@ mod tests {
             request_id: "req".into(), job_id: "j".into(), run_id: "cold".into(), session_id: "s".into(), turn_id: "t".into(), execution_id: "e".into(), launch_event_id: "ev".into(), prompt: "queued hello".into(), reason: crate::models::TurnStartReason::FollowUp,
             session_start: crate::storage::PreparedSessionStart::New { session_id: "s".into() }, model: String::new(), agent_config: serde_json::Value::Null, output_schema: None,
             runtime_capability: serde_json::from_value(serde_json::json!({"class":"dedicated_process","lane":"lane","host_requirement":{"requirement":"resident_on","host_kind":"runner"},"claim":{"resident_process_units":1,"server_instance_key":null,"logical_stream_units":1,"estimated_memory_bytes":null},"supports_warm_reuse":true})).unwrap(),
-            provider_account_id: None, identity_override: None, created_at: 1,
+            provider_account_id: None, identity_override: None, origin: crate::storage::LaunchOrigin::Background, created_at: 1,
         };
         (orch, request, snapshot)
     }
@@ -2835,6 +2903,87 @@ mod tests {
             );
             assert_eq!(orch.process_state.has_process("cold"), Some(true));
         }
+    }
+
+    /// A launch this boot leased before startup recovery reaches the admission
+    /// step (a watchdog successor, an early operator send) keeps its lease: its
+    /// start completes, its row stays the live process's, and recovery does
+    /// not hand the row to a second start.
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_recovery_spares_a_launch_this_boot_already_leased() {
+        let (orch, _, snapshot) = lifecycle_fixture("ordinary-startup-boot-fence.db").await;
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = starts.clone();
+        let _backend = crate::orchestrator::session::install_orchestrator_test_session_backend(
+            &orch,
+            move || Box::new(CountingBackend(counted.clone())),
+        );
+        crate::storage::persist_prepared_ordinary_launch(&orch.db.local, snapshot.clone())
+            .await
+            .unwrap();
+        orch.db.local.execute(
+            "UPDATE runtime_admission_requests SET state='queued', lease_owner=NULL, lease_expires_at=NULL WHERE request_id='req'",
+            (),
+        ).await.unwrap();
+        let owner = super::private_lease_owner(&orch);
+        let now = chrono::Utc::now().timestamp();
+        let lease = match crate::storage::lease_next_admission_within(
+            &orch.db.local,
+            "private-runtime",
+            "lane",
+            &owner,
+            now,
+            now + 300,
+            crate::storage::RuntimeResourceCapacity {
+                resident_process_units: u32::MAX,
+                logical_stream_units: u32::MAX,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        {
+            crate::storage::LeaseDecision::Leased(lease) => lease,
+            other => panic!("expected a lease, got {other:?}"),
+        };
+
+        // Recovery runs between this boot's lease and its start.
+        super::recover_on_startup(&orch).await;
+        assert_eq!(
+            request_state(&orch, "req").await,
+            ("leased".to_string(), None),
+            "this boot's lease is not requeued"
+        );
+        assert!(
+            super::start_leased(&orch, super::OrdinaryLease::Private(lease), snapshot).unwrap()
+        );
+
+        // Recovery after the start leaves the live process's row alone too.
+        super::recover_on_startup(&orch).await;
+        let request = crate::storage::get_admission_request(&orch.db.local, "req")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.state, "active");
+        assert_eq!(request.lease_owner.as_deref(), Some(owner.as_str()));
+        assert_eq!(request.lease_generation, 2);
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(orch.process_state.has_process("cold"), Some(true));
+        let status = text(&orch, "SELECT status FROM runs WHERE id='cold'").await;
+        assert_ne!(status, "crashed");
+        let replaced: i64 = orch
+            .db
+            .local
+            .query_opt(
+                "SELECT COUNT(*) FROM events WHERE data LIKE '%lease was replaced%'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replaced, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3348,6 +3497,384 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(turn_state, "failed");
+    }
+
+    /// Registers like [`CountingBackend`] and, as Claude's reader does, tells the
+    /// boot ramp that its process will report first output.
+    struct ClaudeLikeBackend(Arc<std::sync::atomic::AtomicUsize>, std::time::Duration);
+
+    impl AgentBackend for ClaudeLikeBackend {
+        fn name(&self) -> &str {
+            "Claude"
+        }
+        fn is_available(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
+            Ok(Vec::new())
+        }
+        fn serves(
+            &self,
+            _: &crate::orchestrator::Orchestrator,
+            _: Option<&str>,
+        ) -> Vec<cairn_models::types::catalog::ServedVerb> {
+            Vec::new()
+        }
+        fn resolve_tools(&self, _: &[String], _: &[String]) -> ResolvedTools {
+            ResolvedTools {
+                allowed: Vec::new(),
+                disallowed: Vec::new(),
+            }
+        }
+        fn start_session(
+            &self,
+            config: SessionConfig,
+            orch: &Orchestrator,
+            _admitted: crate::backends::Admitted,
+        ) -> Result<(), String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(self.1);
+            let run_id = config.run_id;
+            crate::execution::jobs::spawn_reports_first_output(orch, &run_id);
+            orch.process_state
+                .register_process(
+                    run_id.clone(),
+                    crate::agent_process::process::RunHandle::test_handle(
+                        Some(config.session_start.session_id()),
+                        None,
+                    ),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        }
+        fn supports_resume(&self) -> bool {
+            true
+        }
+        fn supports_warm_processes(&self) -> bool {
+            true
+        }
+    }
+
+    fn install_claude_like(
+        orch: &Orchestrator,
+    ) -> (Arc<std::sync::atomic::AtomicUsize>, impl Sized) {
+        install_slow_claude_like(orch, std::time::Duration::ZERO)
+    }
+
+    /// [`install_claude_like`] with each start taking `delay`, so concurrent
+    /// promotion passes overlap.
+    fn install_slow_claude_like(
+        orch: &Orchestrator,
+        delay: std::time::Duration,
+    ) -> (Arc<std::sync::atomic::AtomicUsize>, impl Sized) {
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = starts.clone();
+        let backend = crate::orchestrator::session::install_orchestrator_test_session_backend(
+            orch,
+            move || Box::new(ClaudeLikeBackend(counted.clone(), delay)),
+        );
+        (starts, backend)
+    }
+
+    /// A restart's enqueue burst fires one promotion pass per launch. However
+    /// those passes overlap, they share one window: no first output arrives
+    /// here, so exactly four background spawns may ever start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_promotion_passes_never_lease_past_the_boot_ramp_window() {
+        let orch = ramp_fixture("boot-ramp-concurrent.db", 10).await;
+        let (starts, _backend) =
+            install_slow_claude_like(&orch, std::time::Duration::from_millis(50));
+        let passes: Vec<_> = (0..10)
+            .map(|_| {
+                let orch = orch.clone();
+                tokio::task::spawn_blocking(move || {
+                    super::promote_private_lane_blocking(&orch, "lane")
+                })
+            })
+            .collect();
+        for pass in passes {
+            pass.await.unwrap().unwrap();
+        }
+        assert_eq!(started(&starts), 4);
+        assert_eq!(orch.private_lanes.warming_runs().len(), 4);
+        assert_eq!(
+            text(
+                &orch,
+                "SELECT CAST(COUNT(*) AS TEXT) FROM runtime_admission_requests WHERE state IN ('leased','starting','active')"
+            )
+            .await,
+            "4"
+        );
+    }
+
+    /// `launches` background launches queued inside this boot's ramp horizon,
+    /// with the fixture's own request removed (it holds enqueue sequence 1).
+    async fn ramp_fixture(name: &str, launches: u32) -> Orchestrator {
+        let (mut orch, _, snapshot) = lifecycle_fixture(name).await;
+        orch.boot_at = chrono::Utc::now().timestamp();
+        orch.db
+            .local
+            .execute(
+                "DELETE FROM runtime_admission_requests WHERE request_id='req'",
+                (),
+            )
+            .await
+            .unwrap();
+        for n in 1..=launches {
+            queue_launch(&orch, &snapshot, n, "starting").await;
+        }
+        orch
+    }
+
+    fn started(starts: &std::sync::atomic::AtomicUsize) -> usize {
+        starts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_boot_ramp_keeps_four_spawns_warming_and_first_output_admits_the_next() {
+        let orch = ramp_fixture("boot-ramp-window.db", 6).await;
+        let (starts, _backend) = install_claude_like(&orch);
+
+        super::promote_private_lane_blocking(&orch, "lane").unwrap();
+        assert_eq!(started(&starts), 4);
+        for n in 5..=6 {
+            assert_eq!(request_state(&orch, &format!("req{n}")).await.0, "queued");
+        }
+        // Held launches stay durably queued, which the reaper reads as a launch
+        // in flight rather than a run to settle.
+        let pending = crate::storage::pending_launch_run_ids(&orch.db.local)
+            .await
+            .unwrap();
+        assert!(
+            pending.contains("r5") && pending.contains("r6"),
+            "{pending:?}"
+        );
+        crate::runs::reap::reap_stale_runs(&orch);
+        assert_eq!(
+            text(&orch, "SELECT status FROM runs WHERE id='r5'").await,
+            "starting"
+        );
+        assert_eq!(
+            text(&orch, "SELECT status FROM runs WHERE id='r6'").await,
+            "starting"
+        );
+
+        // A spawn past its first output no longer occupies the window, and its
+        // slot goes to the next background launch.
+        crate::execution::jobs::spawn_produced_first_output(&orch, "r1");
+        assert!(!orch.private_lanes.warming_runs().contains("r1"));
+        promote_until_started(&orch, "r5").await;
+        assert_eq!(started(&starts), 5);
+        assert_eq!(request_state(&orch, "req6").await.0, "queued");
+        assert_eq!(
+            orch.private_lanes.warming_runs(),
+            ["r2", "r3", "r4", "r5"]
+                .map(String::from)
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_start_releases_its_boot_ramp_slot() {
+        let orch = ramp_fixture("boot-ramp-start-failure.db", 6).await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE prepared_ordinary_launches SET agent_config_json='\"not an agent config\"' WHERE request_id='req1'",
+                (),
+            )
+            .await
+            .unwrap();
+        let (starts, _backend) = install_claude_like(&orch);
+
+        super::promote_private_lane_blocking(&orch, "lane").unwrap();
+        assert_eq!(request_state(&orch, "req1").await.0, "failed");
+        assert_eq!(started(&starts), 4, "r2 through r5 take the window");
+        assert_eq!(orch.process_state.has_process("r5"), Some(true));
+        assert_eq!(request_state(&orch, "req6").await.0, "queued");
+        assert!(!orch.private_lanes.warming_runs().contains("r1"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_spawn_silent_past_the_warming_timeout_releases_its_slot() {
+        let orch = ramp_fixture("boot-ramp-timeout.db", 5).await;
+        let (starts, _backend) = install_claude_like(&orch);
+
+        super::promote_private_lane_blocking(&orch, "lane").unwrap();
+        assert_eq!(started(&starts), 4);
+        orch.private_lanes
+            .backdate_warming("r1", super::super::private_lane::BOOT_RAMP_WARMING_TIMEOUT);
+        super::promote_private_lane_blocking(&orch, "lane").unwrap();
+        assert_eq!(started(&starts), 5);
+        assert!(!orch.private_lanes.warming_runs().contains("r1"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_urgent_launch_starts_while_the_boot_ramp_is_full() {
+        let (mut orch, _, snapshot) = lifecycle_fixture("boot-ramp-urgent.db").await;
+        orch.boot_at = chrono::Utc::now().timestamp();
+        orch.db
+            .local
+            .execute(
+                "DELETE FROM runtime_admission_requests WHERE request_id='req'",
+                (),
+            )
+            .await
+            .unwrap();
+        for n in 1..=5 {
+            queue_launch(&orch, &snapshot, n, "starting").await;
+        }
+        let (starts, _backend) = install_claude_like(&orch);
+        super::promote_private_lane_blocking(&orch, "lane").unwrap();
+        assert_eq!(started(&starts), 4);
+
+        queue_launch(&orch, &snapshot, 6, "starting").await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE runtime_admission_requests SET priority=1 WHERE request_id='req6'",
+                (),
+            )
+            .await
+            .unwrap();
+        super::promote_private_lane_blocking(&orch, "lane").unwrap();
+        assert_eq!(orch.process_state.has_process("r6"), Some(true));
+        assert_eq!(request_state(&orch, "req5").await.0, "queued");
+        assert_eq!(
+            orch.private_lanes.warming_runs().len(),
+            5,
+            "an urgent spawn still counts as warming"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn past_the_boot_horizon_no_spawn_window_applies() {
+        let mut orch = ramp_fixture("boot-ramp-past-horizon.db", 6).await;
+        orch.boot_at = 0;
+        let (starts, _backend) = install_claude_like(&orch);
+        super::promote_private_lane_blocking(&orch, "lane").unwrap();
+        assert_eq!(started(&starts), 6);
+        assert!(orch.private_lanes.warming_runs().is_empty());
+    }
+
+    /// A watchdog recovery whose successor the ramp holds is not recovered a
+    /// second time. A periodic reconcile long after the claim may re-claim the
+    /// lease, but it finds the predecessor no longer the job's current target
+    /// and closes it without a successor of its own; the held successor stays
+    /// queued (its `starting` run also keeps the stranded-job sweep off it) and
+    /// starts exactly once when a slot frees.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_ramp_held_watchdog_successor_is_not_recovered_again_while_it_waits() {
+        let (mut orch, _, snapshot) = lifecycle_fixture("boot-ramp-watchdog-successor.db").await;
+        orch.boot_at = chrono::Utc::now().timestamp();
+        let (starts, _backend) = install_claude_like(&orch);
+        crate::storage::persist_prepared_ordinary_launch(&orch.db.local, snapshot)
+            .await
+            .unwrap();
+        orch.db.local.execute_script(
+            "UPDATE runtime_admission_requests SET state='queued', lease_owner=NULL, lease_expires_at=NULL WHERE request_id='req';
+             INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,lease_expires_at,created_at,updated_at) VALUES
+                ('warm-1','private-runtime','lane','ordinary:warm-1','{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}',0,2,'active','ordinary-session-promoter',1,9999999999,1,1),
+                ('warm-2','private-runtime','lane','ordinary:warm-2','{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}',0,3,'active','ordinary-session-promoter',1,9999999999,1,1),
+                ('warm-3','private-runtime','lane','ordinary:warm-3','{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}',0,4,'active','ordinary-session-promoter',1,9999999999,1,1),
+                ('warm-4','private-runtime','lane','ordinary:warm-4','{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}',0,5,'active','ordinary-session-promoter',1,9999999999,1,1);
+             INSERT INTO sessions(id,job_id,backend,status,sequence,created_at,updated_at)
+               VALUES('predecessor-session','j','claude','open',2,1,1);
+             INSERT INTO runs(id,project_id,issue_id,job_id,session_id,status,created_at,updated_at)
+               VALUES('predecessor','p','i','j','predecessor-session','live',1,1);
+             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at)
+               VALUES('predecessor-turn','predecessor-session','predecessor','j',1,'running','initial',1,1);",
+        ).await.unwrap();
+        for n in 1..=4 {
+            orch.private_lanes.begin_warming(
+                &format!("warm-run-{n}"),
+                "lane",
+                &format!("warm-{n}"),
+                false,
+            );
+        }
+        let identity = crate::runs::watchdog_ledger::WatchdogIdentity {
+            run_id: "predecessor".into(),
+            session_id: "predecessor-session".into(),
+            provider_turn_id: "provider-turn".into(),
+            generation: "generation".into(),
+        };
+        crate::runs::watchdog_ledger::arm_watchdog(
+            &orch.db.local,
+            crate::runs::watchdog_ledger::NewWatchdogLease {
+                identity: identity.clone(),
+                runner_boot_id: "boot".into(),
+                phase: crate::runs::watchdog_ledger::WatchdogPhase::ProviderProgress,
+                phase_deadline_at: 2,
+                now: 1,
+            },
+            "provider silence".into(),
+        )
+        .await
+        .unwrap();
+        assert!(crate::runs::watchdog_ledger::claim_watchdog_recovery(
+            &orch.db.local,
+            &identity,
+            3,
+        )
+        .await
+        .unwrap());
+        assert!(
+            crate::runs::watchdog_ledger::record_pending_recovery_successor(
+                &orch.db.local,
+                &identity,
+                3,
+                "cold",
+                "t",
+            )
+            .await
+            .unwrap()
+        );
+
+        super::promote_private_lane_blocking(&orch, "lane").unwrap();
+        assert_eq!(started(&starts), 0);
+        assert_eq!(request_state(&orch, "req").await.0, "queued");
+
+        let report = crate::runs::watchdog_reconciler::reconcile_watchdog_leases(
+            &orch.db.local,
+            crate::runs::watchdog_reconciler::ReconcileScope::Periodic,
+            chrono::Utc::now().timestamp() + 3_600,
+            crate::runs::watchdog_reconciler::DEFAULT_HEARTBEAT_GRACE_SECS,
+            &orch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.recovery_failed, 0, "{report:?}");
+        assert_eq!(started(&starts), 0);
+        assert_eq!(
+            text(
+                &orch,
+                "SELECT CAST(COUNT(*) AS TEXT) FROM runs WHERE job_id='j'"
+            )
+            .await,
+            "2",
+            "no second successor run"
+        );
+        assert_eq!(request_state(&orch, "req").await.0, "queued");
+
+        orch.private_lanes
+            .release_warming("warm-run-1", "first_output");
+        promote_until_started(&orch, "cold").await;
+        assert_eq!(started(&starts), 1);
+        let lease = crate::runs::watchdog_ledger::get_watchdog_lease(
+            &orch.db.local,
+            "predecessor",
+            "predecessor-session",
+            "provider-turn",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            lease.state,
+            crate::runs::watchdog_ledger::WatchdogLeaseState::Terminalized
+        );
     }
 
     #[test]

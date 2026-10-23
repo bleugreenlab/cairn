@@ -1116,6 +1116,7 @@ pub(crate) mod tests {
             version: version.to_string(),
             tag: format!("rust-v{version}"),
             reason: "test".to_string(),
+            skip: Vec::new(),
             packages: BTreeMap::from([(
                 target().to_string(),
                 CodexPackage {

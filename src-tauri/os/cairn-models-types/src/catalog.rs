@@ -501,6 +501,37 @@ impl Modalities {
     }
 }
 
+/// The `architecture` object a model listing entry may carry, in the shape
+/// OpenRouter defined and OpenAI-compatible servers adopt:
+/// `{"input_modalities": [...], "output_modalities": [...]}`. Either side may
+/// be absent; an absent side was not reported, which is not the same as an
+/// empty one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ListedArchitecture {
+    #[serde(default)]
+    pub input_modalities: Option<Vec<Modality>>,
+    #[serde(default)]
+    pub output_modalities: Option<Vec<Modality>>,
+}
+
+impl ListedArchitecture {
+    /// What the listing said the model takes and gives, when it said either.
+    pub fn modalities(&self) -> Option<Modalities> {
+        if self.input_modalities.is_none() && self.output_modalities.is_none() {
+            return None;
+        }
+        Some(Modalities {
+            input: self.input_modalities.clone().unwrap_or_default(),
+            output: self.output_modalities.clone().unwrap_or_default(),
+        })
+    }
+
+    /// Whether the reported outputs are embeddings and nothing else.
+    pub fn embeds_only(&self) -> bool {
+        self.output_modalities.as_deref() == Some(&[Modality::Embeddings])
+    }
+}
+
 impl fmt::Display for Modalities {
     /// `text+image → text`, the shape a model picker or catalog line shows.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -532,10 +563,15 @@ pub enum Wire {
     /// OpenAI `responses`.
     #[serde(rename = "openai-responses")]
     OpenAiResponses,
-    /// A native decisions endpoint that answers a choice with its own
-    /// probabilities.
+    /// OpenAI's Decisions API (`POST /decisions`): a native decision model
+    /// answering an array of questions with its own probabilities.
     #[serde(rename = "openai-decisions")]
     OpenAiDecisions,
+    /// System One: TypeSafe's `/v1/systemone` and OpenRouter's
+    /// `/api/alpha/decisions`, a native decision model answering questions
+    /// keyed by name with its own probabilities.
+    #[serde(rename = "systemone")]
+    SystemOne,
     /// The Claude CLI's stream-json protocol.
     #[serde(rename = "claude-stream-json")]
     ClaudeStreamJson,
@@ -571,6 +607,7 @@ impl Wire {
             Self::AnthropicMessages => "anthropic-messages",
             Self::OpenAiResponses => "openai-responses",
             Self::OpenAiDecisions => "openai-decisions",
+            Self::SystemOne => "systemone",
             Self::ClaudeStreamJson => "claude-stream-json",
             Self::CodexAppServer => "codex-app-server",
             Self::OpenAiEmbeddings => "openai-embeddings",
@@ -1051,6 +1088,7 @@ mod tests {
             Wire::AnthropicMessages,
             Wire::OpenAiResponses,
             Wire::OpenAiDecisions,
+            Wire::SystemOne,
             Wire::ClaudeStreamJson,
             Wire::CodexAppServer,
             Wire::OpenAiEmbeddings,

@@ -221,6 +221,7 @@ pub fn create_child_task(
             turn_id,
             launch_event_id,
             start_reason: TurnStartReason::Initial,
+            origin: crate::storage::LaunchOrigin::Background,
             launch_claim: None,
         },
         None,

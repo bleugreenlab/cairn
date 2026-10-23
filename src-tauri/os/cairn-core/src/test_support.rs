@@ -52,6 +52,79 @@ pub(crate) fn captured_log(target: &str) -> Vec<String> {
         .collect()
 }
 
+/// The frozen snapshot of a shipping recipe — a Builder agent node that writes
+/// `create-pr`, then the PR node — as an issue execution carries it.
+///
+/// Every production insert into `executions` freezes a snapshot, and the
+/// advancement recompute and downstream-input resolution load it, so a fixture
+/// execution without one is a row the product cannot reach. The PR node keeps
+/// the topology derivation reading the builder as shipping work rather than a
+/// standing (long-running) node.
+pub(crate) fn shipping_execution_snapshot_json(issue_id: &str, project_id: &str) -> String {
+    use crate::models::{
+        AgentNodeConfig, ConfirmPolicy, ExecutionSnapshot, NodePosition, RecipeNode,
+        RecipeNodeType, RecipeSnapshot, RecipeTrigger, SchemaConfig, TriggerContext, TriggerType,
+    };
+    let node = |id: &str, name: &str, node_type, agent_config| RecipeNode {
+        id: id.to_string(),
+        node_type,
+        name: name.to_string(),
+        position: NodePosition { x: 0.0, y: 0.0 },
+        parent_id: None,
+        trigger_config: None,
+        agent_config,
+        action_config: None,
+        checkpoint_config: None,
+        artifact_config: None,
+        condition_config: None,
+        decision_config: None,
+        context_config: None,
+    };
+    let builder = node(
+        "builder",
+        "Builder",
+        RecipeNodeType::Agent,
+        Some(AgentNodeConfig {
+            agent_config_id: Some("builder".to_string()),
+            output_schema: Some(SchemaConfig {
+                name: "create-pr".to_string(),
+                schema: None,
+                confirm_policy: ConfirmPolicy::Auto,
+                tool_name: None,
+                description: None,
+            }),
+            git_config: None,
+        }),
+    );
+    let pr = node("pr", "PR", RecipeNodeType::Pr, None);
+    serde_json::to_string(&ExecutionSnapshot {
+        continuity: Default::default(),
+        branch_target: Default::default(),
+        model_routing: None,
+        recipe: RecipeSnapshot {
+            id: "recipe".to_string(),
+            name: "Recipe".to_string(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            nodes: vec![builder, pr],
+            edges: vec![],
+        },
+        agents: std::collections::HashMap::new(),
+        skills: std::collections::HashMap::new(),
+        trigger_context: TriggerContext {
+            issue_id: Some(issue_id.to_string()),
+            project_id: project_id.to_string(),
+            trigger_type: TriggerType::Manual,
+            event_payload: None,
+            initiated_via: None,
+        },
+        presets: None,
+        delegated_packets: vec![],
+        created_at: 1,
+    })
+    .unwrap()
+}
+
 pub(crate) struct ThreadFixture {
     pub project_id: &'static str,
     pub thread_id: &'static str,

@@ -36,13 +36,31 @@ pub(super) async fn dispatch(
                 .ok_or_else(|| build_failure(index, item, "mode=patch requires payload"))?;
             let action = payload_non_empty_str(payload, "action", &[])
                 .ok_or_else(|| build_failure(index, item, "payload.action is required"))?;
-            if action != "replay" && action != "discharge-contended-identifier" {
+            if !matches!(
+                action,
+                "replay" | "discharge-contended-identifier" | "fast-forward-from-origin"
+            ) {
                 return Err(build_failure(
                     index,
                     item,
                     format!(
-                        "payload.action must be 'replay' or 'discharge-contended-identifier', got '{action}'"
+                        "payload.action must be 'replay', 'fast-forward-from-origin' or 'discharge-contended-identifier', got '{action}'"
                     ),
+                ));
+            }
+            let fast_forward_branch = payload_non_empty_str(payload, "branch", &[]);
+            if fast_forward_branch.is_some() && action != "fast-forward-from-origin" {
+                return Err(build_failure(
+                    index,
+                    item,
+                    "payload.branch applies only to fast-forward-from-origin",
+                ));
+            }
+            if fast_forward_branch.is_some_and(|value| value != "base") {
+                return Err(build_failure(
+                    index,
+                    item,
+                    "payload.branch must be 'base' when provided: fast-forward-from-origin acts on this node's branch, or with branch:'base' on the branch it is cut from",
                 ));
             }
             let identifier = payload_non_empty_str(payload, "identifier", &[]);
@@ -104,7 +122,32 @@ pub(super) async fn dispatch(
                     )
                 })?;
 
-            if action == "discharge-contended-identifier" {
+            if action == "fast-forward-from-origin" {
+                let target = if fast_forward_branch.is_some() {
+                    crate::resources::node_base_branch(orch, &conn, &job.id, &branch)
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?
+                } else {
+                    branch.clone()
+                };
+                if dry_run {
+                    format!("Would take origin's copy of `{target}` if it is a pure fast-forward")
+                } else {
+                    let project_id = crate::mcp::handlers::run_context::project_id_by_key(
+                        &orch.db.local,
+                        project,
+                    )
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+                    crate::orchestrator::base_branch_sync::fast_forward_now(
+                        orch,
+                        &project_id,
+                        &target,
+                    )
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?
+                }
+            } else if action == "discharge-contended-identifier" {
                 let identifier = identifier.expect("validated above");
                 let reason = discharge_reason.expect("validated above");
                 if dry_run {

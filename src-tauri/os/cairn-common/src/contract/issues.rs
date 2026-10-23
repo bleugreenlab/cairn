@@ -131,6 +131,7 @@ pub(crate) const THREAD_BRANCH_CONTRACT: ResourceContract = ResourceContract {
             KeySpec::new("stage", KeyType::Str, "abandoned only"),
             KeySpec::new("action", KeyType::Str, "merge|close — act on this branch's create-pr artifact"),
             KeySpec::new("method", KeyType::Str, "merge method for action:merge (default squash)"),
+            PR_PRECONDITION,
         ],
         label: "patch or act on thread branch PR",
         example: "write({changes:[{target:\"cairn:~/branches/1\",mode:\"patch\",payload:{action:\"merge\",method:\"squash\"}}]})",

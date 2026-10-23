@@ -929,6 +929,137 @@ fn git_capture(git_dir: &Path, args: &[&str], context: &str) -> Result<String, S
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Remote bookmarks one `jj bookmark untrack` names at a time, so the command
+/// line stays far below any platform's argument limit.
+const UNTRACK_CHUNK: usize = 200;
+
+/// What retiring finished branches' remote-tracking refs changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetiredTrackingRefs {
+    /// The operation the store was at before the retirement wrote anything:
+    /// restoring it brings the remote bookmarks back. Empty when nothing was
+    /// retired.
+    pub operation_before: String,
+    /// Each `refs/remotes/<remote>/<branch>` deleted, with the object it held,
+    /// which is what re-creating it takes. The `<branch>@<remote>` remote
+    /// bookmark went with it.
+    pub refs: Vec<RefTarget>,
+    /// Finished branches whose tracking ref stays because a leftover
+    /// `<ref>.lock` blocks every update of it.
+    pub locked: u64,
+}
+
+/// Remove the remote-tracking ref `refs/remotes/<remote>/<branch>`, and with it
+/// the `<branch>@<remote>` remote bookmark, for each branch in `finished`.
+///
+/// A remote bookmark anchors its whole history in the store's view, and
+/// nothing else removes one: the store fetches one branch at a time and never
+/// prunes, so a tracking ref outlives the branch the remote deleted after its
+/// merge. Which branches are finished is the caller's decision, made from its
+/// own records. It must never be read off the remote's advertisement, which can
+/// lag this store's own push, so a branch missing from it may be one the store
+/// has just published.
+///
+/// A local bookmark of the same name stays exactly where it is. jj's import
+/// carries a deleted remote ref through to the local bookmark tracking it: a
+/// local bookmark still at the remote's commit is deleted with it, and one that
+/// moved on becomes a conflict between the move and the deletion. Each tracked
+/// remote bookmark is therefore untracked first, and the import then drops only
+/// the remote bookmark. Each ref deletion names the object the ref held when
+/// listed, so a ref a push moved since fails the deletion instead of being
+/// lost. The caller holds the store lock.
+pub fn retire_remote_tracking_refs(
+    jj: &super::JjEnv,
+    store: &Path,
+    remote: &str,
+    finished: &[String],
+) -> Result<RetiredTrackingRefs, String> {
+    let mut retired = RetiredTrackingRefs::default();
+    if finished.is_empty() {
+        return Ok(retired);
+    }
+    let git_dir = store_git_dir(store)
+        .ok_or_else(|| format!("{} has no git repository behind it", store.display()))?;
+    let prefix = format!("refs/remotes/{remote}/");
+    let finished: HashSet<&str> = finished.iter().map(String::as_str).collect();
+    let mut lingering = Vec::new();
+    for target in list_refs(&git_dir, &prefix)? {
+        if !target
+            .name
+            .strip_prefix(&prefix)
+            .is_some_and(|branch| finished.contains(branch))
+        {
+            continue;
+        }
+        if git_dir.join(format!("{}.lock", target.name)).exists() {
+            retired.locked += 1;
+        } else {
+            lingering.push(target);
+        }
+    }
+    if lingering.is_empty() {
+        return Ok(retired);
+    }
+
+    retired.operation_before = super::operation_id(jj, store)?;
+    let tracked = tracked_remote_bookmarks(jj, store, remote)?;
+    let untrack: Vec<String> = lingering
+        .iter()
+        .map(|target| &target.name[prefix.len()..])
+        .filter(|branch| tracked.contains(*branch))
+        .map(|branch| format!("exact:{branch:?}"))
+        .collect();
+    let remote_flag = format!("--remote={remote}");
+    for chunk in untrack.chunks(UNTRACK_CHUNK) {
+        let mut args = vec!["bookmark", "untrack"];
+        args.extend(chunk.iter().map(String::as_str));
+        args.extend([remote_flag.as_str(), "--ignore-working-copy"]);
+        super::run_store_rewrite(jj, store, &args, "jj bookmark untrack (finished branches)")?;
+    }
+
+    retire_refs(PackedRefs::JjStore(store), &git_dir, &lingering)?;
+    super::import_git(jj, store)?;
+
+    let remaining: HashSet<String> = list_refs(&git_dir, &prefix)?
+        .into_iter()
+        .map(|target| target.name)
+        .collect();
+    for target in lingering {
+        if remaining.contains(&target.name) {
+            retired.locked += 1;
+        } else {
+            retired.refs.push(target);
+        }
+    }
+    Ok(retired)
+}
+
+/// Every `<branch>@<remote>` the store tracks, by branch name.
+fn tracked_remote_bookmarks(
+    jj: &super::JjEnv,
+    store: &Path,
+    remote: &str,
+) -> Result<HashSet<String>, String> {
+    Ok(jj
+        .run(
+            store,
+            &[
+                "bookmark",
+                "list",
+                "--all-remotes",
+                "--ignore-working-copy",
+                "-T",
+                &format!("if(remote == {remote:?} && tracked, name ++ \"\\n\", \"\")"),
+            ],
+            "jj bookmark list (tracked remote bookmarks)",
+        )?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
 /// What one sweep of a store's view changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoreViewSweep {

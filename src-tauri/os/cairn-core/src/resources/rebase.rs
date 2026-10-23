@@ -162,7 +162,11 @@ pub(super) async fn read_node_rebase(
     // Read before anything else on the page: while the name is conflicted, no
     // replay can run, so everything below it describes a branch that cannot
     // move until this is settled.
-    let name_section = conflicted_name_section(orch, &conn, &job.id, &branch).await;
+    let name_section = format!(
+        "{}{}",
+        own_origin_section(orch, &conn, &job.id, &branch).await,
+        conflicted_name_section(orch, &conn, &job.id, &branch).await
+    );
     let session = match load_active_session(&db, &branch).await {
         Ok(Some(session)) => session,
         Ok(None) => {
@@ -288,6 +292,12 @@ async fn render_closed_session(
             standing.superseded_note(),
             replay_next_action(&standing.base_branch),
         ),
+        Ok(standing) if standing.origin_drift.is_some() => format!(
+            "\nThe branch carries its base's tip as the store holds it, but the store's copy of \
+             the base is behind origin.\n{}{}",
+            standing.origin_note(),
+            standing.superseded_note()
+        ),
         Ok(standing) => format!(
             "\nNothing needs doing here: the branch carries its base's current tip. A later base \
              advance that cannot replay cleanly opens a fresh session at this same \
@@ -331,9 +341,29 @@ struct BaseStanding {
     /// that name no longer exists in the store.
     superseded: Option<String>,
     source: BaseSource,
+    /// Present when the store's copy of the base is known not to contain
+    /// origin's: "carries the base" is then only true of a stale copy.
+    origin_drift: Option<crate::orchestrator::base_branch_sync::OriginDrift>,
 }
 
 impl BaseStanding {
+    /// Said whenever the base the standing is measured against is behind
+    /// origin, because every "carries" and "nothing to do" on the page is then
+    /// an answer about a tip origin has moved past.
+    fn origin_note(&self) -> String {
+        let Some(drift) = &self.origin_drift else {
+            return String::new();
+        };
+        format!(
+            "\n> ⚠️ **`{base}`@`{dest}` is STALE.** {why}. Once the store takes origin's copy, which \
+             it does on its own within a minute when the copy is a pure fast-forward, this branch \
+             is replayed onto it. To have it taken now:\n\n```\nwrite({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",payload:{{action:\"fast-forward-from-origin\",branch:\"base\"}}}}]}})\n```\n",
+            base = self.base_branch,
+            dest = self.destination.get(..8).unwrap_or(&self.destination),
+            why = capitalized(&drift.describe(chrono::Utc::now())),
+        )
+    }
+
     /// Said out loud whenever the branch named here is NOT the one the job
     /// recorded. Silently measuring against a different base would make every
     /// other number on the page unreadable.
@@ -375,6 +405,18 @@ async fn load_base_standing(
     let resolved =
         resolve_base(&jj, &store, branch, &candidates).map_err(|error| error.to_string())?;
     let carries_base = crate::jj::branch_carries_commit(&jj, &store, branch, &resolved.commit);
+    let origin_drift = match load_project_id(conn, job_id).await {
+        Some(project_id) => {
+            crate::orchestrator::base_branch_sync::known_drift(
+                orch,
+                &project_id,
+                &store,
+                &resolved.branch,
+            )
+            .await
+        }
+        None => None,
+    };
     Ok(BaseStanding {
         base_branch: resolved.branch,
         destination: resolved.commit,
@@ -382,7 +424,74 @@ async fn load_base_standing(
         carries_base,
         superseded: resolved.superseded,
         source: resolved.source,
+        origin_drift,
     })
+}
+
+/// The base branch a node's branch is measured against and replayed onto, as
+/// this page resolves it.
+pub(crate) async fn node_base_branch(
+    orch: &Orchestrator,
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    branch: &str,
+) -> Result<String, String> {
+    load_base_standing(orch, conn, job_id, branch)
+        .await
+        .map(|standing| standing.base_branch)
+}
+
+async fn load_project_id(conn: &cairn_db::turso::Connection, job_id: &str) -> Option<String> {
+    let mut rows = conn
+        .query(
+            "SELECT project_id FROM jobs WHERE id = ?1 LIMIT 1",
+            (job_id,),
+        )
+        .await
+        .ok()?;
+    rows.next()
+        .await
+        .ok()?
+        .and_then(|row| row.opt_text(0).ok().flatten())
+}
+
+fn capitalized(sentence: &str) -> String {
+    let mut chars = sentence.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// The page's section for a node whose OWN branch the store knows to be behind
+/// origin, or nothing. Most often the parent of an issue whose child's pull
+/// request was merged into the parent's branch in GitHub's UI.
+async fn own_origin_section(
+    orch: &Orchestrator,
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    branch: &str,
+) -> String {
+    let (Some(project_id), Ok(repo_path)) = (
+        load_project_id(conn, job_id).await,
+        load_repo_path(conn, job_id).await,
+    ) else {
+        return String::new();
+    };
+    let store = crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(&repo_path));
+    let Some(drift) =
+        crate::orchestrator::base_branch_sync::known_drift(orch, &project_id, &store, branch).await
+    else {
+        return String::new();
+    };
+    format!(
+        "# Behind origin\n\n{}. The store owns this branch and takes origin's copy only when it is \
+         a pure fast-forward, which it does on its own within a minute; this asks for it \
+         now:\n\n```\nwrite({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",payload:{{action:\"fast-forward-from-origin\"}}}}]}})\n```\n\nIf origin's copy has diverged from the store's, the request says so and moves nothing, and \
+         publishing the branch is refused until the two agree: combining them is a decision for \
+         this branch's owner, never a force-push.\n\n",
+        capitalized(&drift.describe(chrono::Utc::now()))
+    )
 }
 
 /// What happened to the advance onto the base's current head, for a branch
@@ -765,7 +874,8 @@ async fn render_no_session(
             )
         }
     };
-    let superseded = standing.superseded_note();
+    let superseded = format!("{}{}", standing.superseded_note(), standing.origin_note());
+    let stale_base = standing.origin_drift.is_some();
     let advance = if standing.carries_base {
         String::new()
     } else {
@@ -778,6 +888,13 @@ async fn render_no_session(
         ..
     } = standing;
 
+    if carries_base && stale_base {
+        return format!(
+            "# Rebase session\n\nNo conflict resolution session for `{branch}`. The branch carries \
+             `{base_branch}` at `{destination}`, but that is the store's copy, and origin's has \
+             moved past it.\n{superseded}"
+        );
+    }
     if carries_base {
         return format!(
             "# Rebase session\n\nNo conflict resolution session for `{branch}`, and none is \
@@ -1821,7 +1938,35 @@ mod tests {
             carries_base: false,
             superseded: superseded.map(str::to_string),
             source: BaseSource::PullRequestTarget,
+            origin_drift: None,
         }
+    }
+
+    /// cairn/5038: a child that "already carries" its parent's integration
+    /// branch carries only the store's copy, and the page must not let that read
+    /// as current while origin's copy is known to be ahead.
+    #[test]
+    fn a_base_behind_origin_is_named_stale_with_both_commits_and_the_way_on() {
+        let mut stale = standing(None);
+        stale.base_branch = "agent/tm-190-builder-0".into();
+        stale.destination = "95cfaf8212dc22c7cad7e1ea6d23729aba68c3e3".into();
+        stale.origin_drift = Some(crate::orchestrator::base_branch_sync::OriginDrift {
+            branch: "agent/tm-190-builder-0".into(),
+            local: Some("95cfaf8212dc22c7cad7e1ea6d23729aba68c3e3".into()),
+            remote: "d9e277c784f6b4ab2b1d8019fcba39ecd556c851".into(),
+            state: Default::default(),
+        });
+        let note = stale.origin_note();
+        assert!(
+            note.contains("`agent/tm-190-builder-0`@`95cfaf82` is STALE"),
+            "{note}"
+        );
+        assert!(note.contains("origin's is at `d9e277c7`"), "{note}");
+        assert!(
+            note.contains(r#"action:"fast-forward-from-origin",branch:"base""#),
+            "{note}"
+        );
+        assert!(standing(None).origin_note().is_empty());
     }
 
     /// Measuring a branch against a base it never recorded is only honest if the

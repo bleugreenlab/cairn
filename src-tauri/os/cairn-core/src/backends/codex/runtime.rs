@@ -417,6 +417,43 @@ pub(crate) fn observe_and_interrupt_for_test(
     }
 }
 
+const UNSUPPORTED_REQUEST: &str = "Unsupported request";
+
+/// How Cairn answers one Codex server request. Every method in
+/// `SUPPORTED_SERVER_REQUESTS` except the token refresh (which the session
+/// runtime answers before a request reaches here) routes to a handler; anything
+/// else is refused with `-32601`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerRequestRoute {
+    Approval {
+        kind: &'static str,
+        command_execution: bool,
+    },
+    DeclineNativeFileChange,
+    McpElicitation,
+    Unsupported(&'static str),
+}
+
+fn route_server_request(method: &str) -> ServerRequestRoute {
+    let approval = |kind, command_execution| ServerRequestRoute::Approval {
+        kind,
+        command_execution,
+    };
+    match method {
+        "item/commandExecution/requestApproval" => approval("codex/command_execution", true),
+        "item/fileChange/requestApproval" => ServerRequestRoute::DeclineNativeFileChange,
+        "item/fileRead/requestApproval" => approval("codex/file_read", false),
+        "item/mcpToolCall/requestApproval" => approval("codex/mcp_tool_call", false),
+        "item/permissions/requestApproval" => approval("codex/permissions", false),
+        "mcpServer/elicitation/request" => ServerRequestRoute::McpElicitation,
+        "item/tool/call" => ServerRequestRoute::Unsupported("Dynamic tool calls are not supported"),
+        "item/tool/requestUserInput" | "tool/requestUserInput" => {
+            ServerRequestRoute::Unsupported("Interactive prompts are not supported")
+        }
+        _ => ServerRequestRoute::Unsupported(UNSUPPORTED_REQUEST),
+    }
+}
+
 struct CodexReaderHost {
     session: super::super::transcript_host::SessionTranscriptHost,
     client: Option<Arc<AppServerClient>>,
@@ -460,71 +497,43 @@ impl CodexHost for CodexReaderHost {
         let orch = &self.session.orch;
         let run_db = self.session.run_db.clone();
         let run_id = self.session.run_id.as_str();
-        match method {
-            Some("item/commandExecution/requestApproval") => handle_codex_approval_request(
+        let Some(method) = method else {
+            return Ok(());
+        };
+        let params = || msg.get("params").cloned().unwrap_or(Value::Null);
+        match route_server_request(method) {
+            ServerRequestRoute::Approval {
+                kind,
+                command_execution,
+            } => handle_codex_approval_request(
                 orch,
                 &run_db,
                 run_id,
-                "codex/command_execution",
-                msg.get("params").cloned().unwrap_or(Value::Null),
+                kind,
+                params(),
                 client.as_ref(),
                 id_value,
-                true,
+                command_execution,
             ),
-            Some("item/fileChange/requestApproval") => {
+            ServerRequestRoute::DeclineNativeFileChange => {
                 decline_codex_native_file_change(client.as_ref(), id_value)
             }
-            Some("item/fileRead/requestApproval") => handle_codex_approval_request(
+            ServerRequestRoute::McpElicitation => handle_codex_mcp_server_elicitation_request(
                 orch,
                 &run_db,
                 run_id,
-                "codex/file_read",
-                msg.get("params").cloned().unwrap_or(Value::Null),
-                client.as_ref(),
-                id_value,
-                false,
-            ),
-            Some("item/mcpToolCall/requestApproval") => handle_codex_approval_request(
-                orch,
-                &run_db,
-                run_id,
-                "codex/mcp_tool_call",
-                msg.get("params").cloned().unwrap_or(Value::Null),
-                client.as_ref(),
-                id_value,
-                false,
-            ),
-            Some("item/permissions/requestApproval") => handle_codex_approval_request(
-                orch,
-                &run_db,
-                run_id,
-                "codex/permissions",
-                msg.get("params").cloned().unwrap_or(Value::Null),
-                client.as_ref(),
-                id_value,
-                false,
-            ),
-            Some("mcpServer/elicitation/request") => handle_codex_mcp_server_elicitation_request(
-                orch,
-                &run_db,
-                run_id,
-                msg.get("params").cloned().unwrap_or(Value::Null),
+                params(),
                 client.as_ref(),
                 id_value,
             ),
-            Some("item/tool/call") => {
-                log::debug!("Codex requested dynamic tool call — declining");
-                client.respond_error(id_value, -32601, "Dynamic tool calls are not supported")
+            ServerRequestRoute::Unsupported(reason) => {
+                if reason == UNSUPPORTED_REQUEST {
+                    log::warn!("Unhandled Codex server request: {}", method);
+                } else {
+                    log::debug!("Codex sent {method}: declining");
+                }
+                client.respond_error(id_value, -32601, reason)
             }
-            Some("item/tool/requestUserInput") | Some("tool/requestUserInput") => {
-                log::debug!("Codex requested interactive input — declining");
-                client.respond_error(id_value, -32601, "Interactive prompts are not supported")
-            }
-            Some(other) => {
-                log::warn!("Unhandled Codex server request: {}", other);
-                client.respond_error(id_value, -32601, "Unsupported request")
-            }
-            None => Ok(()),
         }
     }
     fn refresh_tokens(&self, id_value: &Value) -> Result<(), String> {
@@ -762,6 +771,52 @@ impl CodexHost for CodexReaderHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_models::wire::codex_app_server::{
+        Notification, AUTH_TOKENS_REFRESH_METHOD, SUPPORTED_SERVER_REQUESTS,
+    };
+
+    #[test]
+    fn every_supported_server_request_routes_to_a_real_handler() {
+        for method in SUPPORTED_SERVER_REQUESTS {
+            if *method == AUTH_TOKENS_REFRESH_METHOD {
+                let msg = json!({"id": 7, "method": method, "params": {}});
+                assert!(
+                    matches!(
+                        Notification::parse(&msg),
+                        Notification::AuthTokensRefreshRequest { .. }
+                    ),
+                    "{method} must reach the session runtime's token handler"
+                );
+                continue;
+            }
+            assert!(
+                !matches!(
+                    route_server_request(method),
+                    ServerRequestRoute::Unsupported(_)
+                ),
+                "{method} is listed as supported but is declined with -32601"
+            );
+        }
+    }
+
+    #[test]
+    fn unlisted_server_requests_are_refused_as_unsupported() {
+        for method in [
+            "item/tool/call",
+            "tool/requestUserInput",
+            "brand/new/request",
+        ] {
+            assert!(!SUPPORTED_SERVER_REQUESTS.contains(&method));
+            assert!(matches!(
+                route_server_request(method),
+                ServerRequestRoute::Unsupported(_)
+            ));
+        }
+        assert_eq!(
+            route_server_request("brand/new/request"),
+            ServerRequestRoute::Unsupported(UNSUPPORTED_REQUEST)
+        );
+    }
     use crate::agent_process::process::RunHandle;
     use crate::db::DbState;
     use crate::orchestrator::OrchestratorBuilder;
@@ -883,9 +938,19 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn third_message_only_goal_turn_denies_raced_fourth_and_explicitly_rearms() {
-        let db = Arc::new(crate::storage::migrated_test_db("scripted-repeat-boundary").await);
+    /// A job-backed Codex session whose provider turns enter Cairn as goal
+    /// turns, over a warm control scripted to answer the goal pauses and turn
+    /// interrupts a safety pause issues.
+    struct GoalLoopRun {
+        db: Arc<LocalDb>,
+        orch: Orchestrator,
+        client: Arc<AppServerClient>,
+        requests: Arc<Mutex<Vec<Value>>>,
+        provider_turn: Arc<Mutex<Option<String>>>,
+    }
+
+    async fn goal_loop_run(name: &str) -> GoalLoopRun {
+        let db = Arc::new(crate::storage::migrated_test_db(name).await);
         db.execute_script(
             "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
              INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
@@ -962,60 +1027,245 @@ mod tests {
             .unwrap()
             .register("r".to_string(), handle);
         orch.process_state.set_current_turn_id("r", Some("t0"));
-
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let specimen = [
-            "Blocked pending recovery of the recipe's existing independent-review node",
-            "The review-orchestration blocker remains unchanged",
-            "No recovery event has arrived...",
-        ];
-        for (provider_turn_id, text) in ["p1", "p2", "p3"].into_iter().zip(specimen) {
-            tx.send(json!({
-                "method":"turn/started",
-                "params":{"turn":{"id":provider_turn_id,"status":"inProgress"}}
-            }))
-            .unwrap();
-            tx.send(json!({
-                "method":"rawResponseItem/completed",
-                "params":{
-                    "turnId":provider_turn_id,
-                    "item":{"type":"message","role":"assistant","content":[
-                        {"type":"output_text","text":text}
-                    ]}
-                }
-            }))
-            .unwrap();
-            tx.send(json!({
-                "method":"turn/completed",
-                "params":{"turn":{"id":provider_turn_id,"status":"completed"}}
-            }))
-            .unwrap();
-        }
-        tx.send(json!({
-            "method":"turn/started",
-            "params":{"turn":{"id":"p4","status":"inProgress"}}
-        }))
-        .unwrap();
-        drop(tx);
-
-        let emitter = orch.services.emitter.clone();
-        CodexBackend::reader_thread_app_server(
-            &orch,
-            &emitter,
-            "r",
-            Some("s".to_string()),
-            rx,
+        GoalLoopRun {
+            db,
+            orch,
             client,
+            requests,
             provider_turn,
-            None,
-            "codex".to_string(),
-            db.clone(),
-            None,
+        }
+    }
+
+    impl GoalLoopRun {
+        /// Run the session's real reader loop over `notifications` to the end.
+        fn read(&self, notifications: Vec<Value>) {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            for notification in notifications {
+                tx.send(notification).unwrap();
+            }
+            drop(tx);
+            CodexBackend::reader_thread_app_server(
+                &self.orch,
+                &self.orch.services.emitter,
+                "r",
+                Some("s".to_string()),
+                rx,
+                self.client.clone(),
+                self.provider_turn.clone(),
+                None,
+                "codex".to_string(),
+                self.db.clone(),
+                None,
+            );
+        }
+
+        /// Every final-output observation's data, in transcript order.
+        async fn observations(&self) -> Vec<Value> {
+            self.db
+                .read(|conn| {
+                    Box::pin(async move {
+                        let mut rows = conn
+                            .query(
+                                "SELECT data FROM events
+                                  WHERE event_type='system:codex_final_output_observed'
+                                  ORDER BY sequence",
+                                (),
+                            )
+                            .await?;
+                        let mut observations = Vec::new();
+                        while let Some(row) = rows.next().await? {
+                            observations.push(serde_json::from_str(&row.text(0)?).unwrap());
+                        }
+                        Ok(observations)
+                    })
+                })
+                .await
+                .unwrap()
+        }
+
+        async fn breaker_trigger(&self) -> Option<String> {
+            self.db
+                .query_opt_text(
+                    "SELECT json_extract(data,'$.trigger') FROM events
+                      WHERE event_type='system:codex_repeat_circuit_breaker'",
+                    (),
+                )
+                .await
+                .unwrap()
+        }
+    }
+
+    // The notifications below are the shapes the pinned Codex app-server sends a
+    // connection that never opted into `experimentalRawEvents`: there is no
+    // `rawResponseItem/*`, so a turn's final text arrives only on its completed
+    // `agentMessage` item.
+
+    fn turn_started(provider_turn_id: &str) -> Value {
+        json!({"method":"turn/started","params":{
+            "threadId":"native-thread",
+            "turn":{"id":provider_turn_id,"status":"inProgress"}
+        }})
+    }
+
+    fn turn_completed(provider_turn_id: &str) -> Value {
+        json!({"method":"turn/completed","params":{
+            "threadId":"native-thread",
+            "turn":{"id":provider_turn_id,"status":"completed"}
+        }})
+    }
+
+    fn agent_message(provider_turn_id: &str, text: &str, streamed: bool) -> Vec<Value> {
+        let item_id = format!("msg-{provider_turn_id}");
+        let mut notifications = vec![json!({"method":"item/started","params":{
+            "threadId":"native-thread",
+            "turnId":provider_turn_id,
+            "item":{"id":item_id,"type":"agentMessage","text":""}
+        }})];
+        if streamed {
+            notifications.push(json!({"method":"item/agentMessage/delta","params":{
+                "threadId":"native-thread",
+                "turnId":provider_turn_id,
+                "itemId":item_id,
+                "delta":text
+            }}));
+        }
+        notifications.push(json!({"method":"item/completed","params":{
+            "threadId":"native-thread",
+            "turnId":provider_turn_id,
+            "item":{"id":item_id,"type":"agentMessage","text":text}
+        }}));
+        notifications
+    }
+
+    fn command(provider_turn_id: &str) -> Vec<Value> {
+        let item_id = format!("cmd-{provider_turn_id}");
+        vec![
+            json!({"method":"item/started","params":{
+                "threadId":"native-thread",
+                "turnId":provider_turn_id,
+                "item":{"id":item_id,"type":"commandExecution","command":["git","status"],"cwd":"/tmp/p"}
+            }}),
+            json!({"method":"item/completed","params":{
+                "threadId":"native-thread",
+                "turnId":provider_turn_id,
+                "item":{"id":item_id,"type":"commandExecution","aggregatedOutput":"clean\n","exitCode":0,"status":"completed"}
+            }}),
+        ]
+    }
+
+    fn message_only_turn(provider_turn_id: &str, text: &str, streamed: bool) -> Vec<Value> {
+        let mut notifications = vec![turn_started(provider_turn_id)];
+        notifications.extend(agent_message(provider_turn_id, text, streamed));
+        notifications.push(turn_completed(provider_turn_id));
+        notifications
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn identical_agent_messages_trip_the_repeat_breaker_through_the_reader() {
+        let run = goal_loop_run("reader-identical-final-outputs").await;
+        run.read(
+            ["p1", "p2", "p3"]
+                .into_iter()
+                .flat_map(|turn| message_only_turn(turn, "Complete.", false))
+                .collect(),
         );
 
+        let observations = run.observations().await;
+        assert_eq!(observations.len(), 3, "{observations:?}");
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation["repeatCount"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "every turn's agent message is counted as its final output"
+        );
+        assert_eq!(
+            event_count(&run.db, "system:codex_repeat_circuit_breaker").await,
+            1
+        );
+        assert!(run.breaker_trigger().await.is_some());
+        assert_eq!(
+            event_count(&run.db, "assistant").await,
+            3,
+            "a message repeating the previous turn's still reaches the transcript"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_result_between_identical_agent_messages_restarts_the_window() {
+        let run = goal_loop_run("reader-tool-boundary").await;
+        let mut notifications = message_only_turn("p1", "Complete.", false);
+        notifications.push(turn_started("p2"));
+        notifications.extend(command("p2"));
+        notifications.extend(agent_message("p2", "Complete.", false));
+        notifications.push(turn_completed("p2"));
+        notifications.extend(message_only_turn("p3", "Complete.", false));
+        run.read(notifications);
+
+        assert_eq!(event_count(&run.db, "tool_result").await, 1);
+        let observations = run.observations().await;
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| (
+                    observation["repeatCount"].as_u64().unwrap(),
+                    observation["messageOnlyGoalCount"].as_u64().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (1, 1), (2, 2)],
+            "the tool result resets both windows: {observations:?}"
+        );
+        assert_eq!(
+            event_count(&run.db, "system:codex_repeat_circuit_breaker").await,
+            0
+        );
+        assert_eq!(run.breaker_trigger().await, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn third_message_only_goal_turn_denies_raced_fourth_and_explicitly_rearms() {
+        let run = goal_loop_run("scripted-repeat-boundary").await;
+        // cairn://p/cairn/4734/1/builder: alternating near-identical outputs, so
+        // only the message-only goal-turn trigger can catch the loop.
+        let specimen = [
+            "Implementation is complete and under review. No further builder action is pending.",
+            "Implementation remains complete and under review; no builder work is pending.",
+            "Implementation is complete and under review. No further builder action is pending.",
+        ];
+        let mut notifications: Vec<Value> = ["p1", "p2", "p3"]
+            .into_iter()
+            .zip(specimen)
+            .flat_map(|(turn, text)| message_only_turn(turn, text, true))
+            .collect();
+        notifications.push(turn_started("p4"));
+        run.read(notifications);
+        let (db, orch, requests) = (run.db.clone(), run.orch.clone(), run.requests.clone());
+
+        assert_eq!(
+            event_count(&db, "system:codex_goal_turn_started").await,
+            3,
+            "the raced fourth turn is refused before it becomes a goal turn"
+        );
+        let observations = run.observations().await;
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| (
+                    observation["repeatCount"].as_u64().unwrap(),
+                    observation["messageOnlyGoalCount"].as_u64().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (1, 2), (1, 3)],
+            "{observations:?}"
+        );
         assert_eq!(
             event_count(&db, "system:codex_repeat_circuit_breaker").await,
             1
+        );
+        assert_eq!(
+            run.breaker_trigger().await.as_deref(),
+            Some("three_consecutive_message_only_goal_turns")
         );
         assert_eq!(event_count(&db, "system:notice").await, 1);
         assert_eq!(

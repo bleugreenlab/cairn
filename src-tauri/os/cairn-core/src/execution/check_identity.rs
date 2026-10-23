@@ -10,8 +10,11 @@ const CONTENT_IDENTITY_VERSION: &str = "check-content-v1";
 /// Runtime declarations used by the Rust self-skip ledger. Their values change
 /// whether a self-skip is authorized, so Rust checks include them even when the
 /// project does not repeat them in configuration.
-pub const RUST_SKIP_LEDGER_ENVIRONMENT: &[&str] =
-    &["CAIRN_SYNC_TESTS_OPTIONAL", "CAIRN_TEST_SYNC_URL"];
+pub const RUST_SKIP_LEDGER_ENVIRONMENT: &[&str] = &[
+    "CAIRN_JJ_TESTS_OPTIONAL",
+    "CAIRN_SYNC_TESTS_OPTIONAL",
+    "CAIRN_TEST_SYNC_URL",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckContentIdentity {
@@ -156,6 +159,13 @@ pub(crate) fn content_identity(
         field(&mut hasher, "full-command");
         field(&mut hasher, full_command);
     }
+    // An impact-slice verdict was produced from the slice, not a checkout, so
+    // it may not answer for the same check run in a cell (or the reverse).
+    // Trailing and only for `impact`, so every `tree: full` key is unchanged.
+    if !check.tree.is_full() {
+        field(&mut hasher, "tree");
+        field(&mut hasher, check.tree.as_str());
+    }
 
     CheckContentIdentity {
         fingerprint: digest(hasher),
@@ -298,6 +308,7 @@ mod tests {
         assert_eq!(
             verdict_environment_names(&check),
             vec![
+                "CAIRN_JJ_TESTS_OPTIONAL",
                 "CAIRN_SYNC_TESTS_OPTIONAL",
                 "CAIRN_TEST_SYNC_URL",
                 "CUSTOM_FLAG"
@@ -305,6 +316,23 @@ mod tests {
         );
         let non_rust = command("command: bunx tsc --noEmit\n");
         assert!(verdict_environment_names(&non_rust).is_empty());
+    }
+
+    /// `tree:` enters the key only when it says `impact`: a `tree: full` key is
+    /// the key every existing check already has, and a slice verdict cannot
+    /// answer for the same check run in a cell.
+    #[test]
+    fn tree_impact_changes_the_key_and_tree_full_does_not() {
+        let selector = crate::execution::inputs::InputSelector::from_globs(&["a/**".to_string()]);
+        let entries = vec![("a/x".to_string(), "1".repeat(40))];
+        let identity = |yaml: &str| {
+            content_identity(&command(yaml), &selector, Some(&entries), "tree").fingerprint
+        };
+        let implicit = identity("command: bun run x\nimpact: [a/**]\n");
+        let full = identity("command: bun run x\nimpact: [a/**]\ntree: full\n");
+        let impact = identity("command: bun run x\nimpact: [a/**]\ntree: impact\n");
+        assert_eq!(implicit, full);
+        assert_ne!(implicit, impact);
     }
 
     #[test]

@@ -1765,6 +1765,7 @@ mod tests {
             toolchain_fingerprint: None,
             containment: None,
             stop: None,
+            cell_origin: None,
         };
         let (left, right) = tokio::join!(
             update_profile(
@@ -1842,6 +1843,7 @@ mod tests {
             toolchain_fingerprint: None,
             containment: None,
             stop: None,
+            cell_origin: None,
         };
 
         observe_completed(
@@ -2180,6 +2182,7 @@ mod tests {
             toolchain_fingerprint: None,
             containment: None,
             stop: None,
+            cell_origin: None,
         }
     }
 

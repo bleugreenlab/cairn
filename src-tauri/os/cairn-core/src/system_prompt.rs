@@ -21,7 +21,7 @@ const VERSION_CONTROL_MARKER: &str = "<!--TIER:VERSION_CONTROL-->\n";
 /// Version-control contract for virtual agent residence.
 const VERSION_CONTROL_AUTHORING: &str = include_str!("agent_process/version_control_authoring.md");
 
-use cairn_common::contract::{KeySpec, KeyType, RESOURCE_CONTRACTS};
+use cairn_common::contract::{contract_for, KeySpec, KeyType, RESOURCE_CONTRACTS, RUN_TARGETS};
 
 fn format_keys(specs: &[KeySpec]) -> String {
     specs
@@ -73,6 +73,33 @@ fn resource_mutation_reference() -> String {
                 out.push_str(&format!("    e.g. {}\n", spec.example));
             }
         }
+    }
+    out.push_str(&resource_run_reference());
+    out
+}
+
+/// The resources `run` invokes rather than `write` mutates, each with the
+/// named arguments its `payload.args_json` takes.
+fn resource_run_reference() -> String {
+    let mut out = String::from(
+        "\n## Run Targets\n\n\
+         `run` invokes these resources as host items, passing named arguments in \
+         `payload.args_json`. Keys are typed; [optional].\n\n",
+    );
+    for target in RUN_TARGETS {
+        let Some(contract) = contract_for(target.kind) else {
+            continue;
+        };
+        out.push_str(&format!(
+            "- `{}` — {}\n  - run: {}",
+            contract.uri_template,
+            target.label,
+            format_keys(target.required)
+        ));
+        if !target.optional.is_empty() {
+            out.push_str(&format!(" [{}]", format_keys(target.optional)));
+        }
+        out.push_str(&format!("\n    e.g. {}\n", target.example));
     }
     out
 }
@@ -271,6 +298,21 @@ mod tests {
         assert!(!authoring.contains(VERSION_CONTROL_MARKER));
         assert!(!authoring.contains("<!--"));
         assert_eq!(authoring.matches("## Version Control").count(), 1);
+    }
+
+    #[test]
+    fn help_lists_every_run_target_with_its_invocation() {
+        let help = cairn_help();
+        let runs = help
+            .split_once("## Run Targets")
+            .expect("help has a run-target section")
+            .1;
+        for target in RUN_TARGETS {
+            let contract = cairn_common::contract::contract_for(target.kind).unwrap();
+            assert!(runs.contains(contract.uri_template), "{runs}");
+            assert!(runs.contains(target.example), "{runs}");
+        }
+        assert!(runs.contains("cairn://models/decide"));
     }
 
     #[test]

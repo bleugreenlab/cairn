@@ -26,6 +26,10 @@ impl CairnResource {
             | ProjectMap { project, .. }
             | ProjectHome { project, .. }
             | ProjectCheckResults { project, .. }
+            | ProjectVcsDiff { project }
+            | ProjectVcsAncestry { project }
+            | ProjectVcsLog { project }
+            | ProjectVcsBlame { project }
             | Issue { project, .. }
             | ProjectThreads { project, .. }
             | Thread { project, .. }
@@ -360,6 +364,7 @@ impl CairnResource {
             | Self::Grant { .. }
             | Self::Models
             | Self::ModelsCatalog
+            | Self::ModelsDecide
             | Self::ModelsAccounts
             | Self::ModelsAccount { .. }
             | Self::ModelsUsage
@@ -387,6 +392,10 @@ impl CairnResource {
             | Self::ProjectAttachments { .. }
             | Self::ProjectCheckResults { .. }
             | Self::ProjectCheckObservation { .. }
+            | Self::ProjectVcsDiff { .. }
+            | Self::ProjectVcsAncestry { .. }
+            | Self::ProjectVcsLog { .. }
+            | Self::ProjectVcsBlame { .. }
             | Self::ProjectResponses { .. }
             | Self::ProjectResponse { .. }
             | Self::ProjectResponseHistory { .. }
@@ -412,6 +421,10 @@ impl CairnResource {
             | Self::ProjectHome { project }
             | Self::ProjectCheckResults { project, .. }
             | Self::ProjectCheckObservation { project, .. }
+            | Self::ProjectVcsDiff { project }
+            | Self::ProjectVcsAncestry { project }
+            | Self::ProjectVcsLog { project }
+            | Self::ProjectVcsBlame { project }
             | Self::Issue { project, .. }
             | Self::ProjectThreads { project, .. }
             | Self::Thread { project, .. }
@@ -541,6 +554,7 @@ impl CairnResource {
             | Self::Grant { .. }
             | Self::Models
             | Self::ModelsCatalog
+            | Self::ModelsDecide
             | Self::ModelsAccounts
             | Self::ModelsAccount { .. }
             | Self::ModelsUsage
@@ -631,6 +645,10 @@ impl CairnResource {
             | Self::ProjectMap { .. }
             | Self::ProjectHome { .. }
             | Self::ProjectCheckResults { .. }
+            | Self::ProjectVcsDiff { .. }
+            | Self::ProjectVcsAncestry { .. }
+            | Self::ProjectVcsLog { .. }
+            | Self::ProjectVcsBlame { .. }
             | Self::ProjectMessages { .. }
             | Self::ProjectTerminal { .. }
             | Self::ProjectBrowser { .. }
@@ -698,6 +716,7 @@ impl CairnResource {
             | Self::Grant { .. }
             | Self::Models
             | Self::ModelsCatalog
+            | Self::ModelsDecide
             | Self::ModelsAccounts
             | Self::ModelsAccount { .. }
             | Self::ModelsUsage

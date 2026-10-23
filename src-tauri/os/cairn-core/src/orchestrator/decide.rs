@@ -8,11 +8,13 @@
 //! async runtime. Which providers serve `decide` at all, and over which wire,
 //! is each backend's own declaration (`AgentBackend::serves`).
 //!
-//! Only custom providers can answer a decision today: one speaking the
-//! Decisions protocol natively, one speaking OpenAI chat from its logprobs.
-//! Every shipped provider (the subscriptions, OpenRouter, OpenCode) reports
-//! none, so a workspace with only those refuses with the fixes rather than
-//! asking a chat model to report its own probabilities.
+//! Where an offer is reached is its backend's answer
+//! (`AgentBackend::decision_route`), from the wire the offer declares: a
+//! custom provider's Decisions or OpenAI-chat endpoint, or OpenRouter's
+//! System One endpoint for the decision models its listing reports. The
+//! subscriptions and OpenCode serve no `decide`, so a workspace with only
+//! those refuses with the fixes rather than asking a chat model to report its
+//! own probabilities.
 //!
 //! A chat provider's protocol says only that logprobs *might* be served. So a
 //! logprobs offer is admitted (at save, import, validation, and launch) only
@@ -25,14 +27,17 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::models::decision::{Decision, DecisionNode, MeasuredBy};
+use crate::models::decision::{
+    question_problems, Decision, DecisionNode, DecisionQuestion, MeasuredBy,
+};
 use crate::models::RecipeNode;
 use cairn_models::interface::decide::{DecisionCall, DecisionRoute};
-use cairn_models::interface::{ModelScope, Models, OfferQuery, SelectedOffer, Unable};
-use cairn_models::types::catalog::{self, VerbKind};
+use cairn_models::interface::{
+    Catalog, ModelScope, Models, NoOffer, OfferQuery, SelectedOffer, Unable,
+};
+use cairn_models::types::catalog::{VerbKind, Wire};
 
 use super::Orchestrator;
-use crate::backends::custom::CustomProviderConfig;
 
 /// Bounds each provider request. A native decision answers in under a second
 /// and a single logprobs token barely longer; this leaves room for a cold
@@ -41,6 +46,9 @@ const DECISION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bounds the capability probe, which can run inside a save or a launch.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How many offers a refusal names as the ones that do serve `decide`.
+const ALTERNATIVES_NAMED: usize = 3;
 
 /// How long an observation stands. A server reconfigured to serve logprobs,
 /// or a model swapped behind an id, is seen afresh after this.
@@ -117,10 +125,11 @@ pub struct DecisionDiagnostic {
 /// about it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DecisionFailure {
-    /// Nothing in scope can answer these questions: no offer serves `decide`,
-    /// the one selected cannot measure them, or none could be confirmed. Only
-    /// a configuration change fixes it, so retrying is pointless. The text
-    /// names the fixes.
+    /// Nothing in scope can answer these questions as asked: no offer serves
+    /// `decide`, the one selected cannot measure them, none could be
+    /// confirmed, or the request itself cannot be asked (no model named,
+    /// malformed questions). Only a configuration or request change fixes it,
+    /// so retrying is pointless. The text names the fixes.
     Unanswerable(String),
     /// An offer that can answer was found and something went wrong reaching
     /// it: the catalog read, the route, a probe that could not tell, or the
@@ -152,15 +161,15 @@ fn decision_query<'a>(
     }
 }
 
-/// Why `offer` cannot ask `decision`'s questions, when it cannot.
-fn unmeasurable_by(offer: &SelectedOffer, decision: &DecisionNode) -> Option<String> {
+/// Why `offer` cannot ask `questions`, when it cannot.
+fn unmeasurable_by(offer: &SelectedOffer, questions: &[DecisionQuestion]) -> Option<String> {
     let Some(method) = offer.measured_by() else {
         return Some(format!(
             "{} on {} serves decisions over {}, which measures none",
             offer.model, offer.provider, offer.served.wire
         ));
     };
-    let unmeasurable = cairn_models::decide::unmeasurable(&decision.questions, method);
+    let unmeasurable = cairn_models::decide::unmeasurable(questions, method);
     (!unmeasurable.is_empty()).then(|| {
         format!(
             "{} on {} measures decisions by {}, which cannot ask this: {}",
@@ -172,10 +181,112 @@ fn unmeasurable_by(offer: &SelectedOffer, decision: &DecisionNode) -> Option<Str
     })
 }
 
+/// The offers that could answer `questions` instead, named `provider/model`:
+/// at most [`ALTERNATIVES_NAMED`], then how many more. Every offer serving
+/// `decide` in scope, whatever provider the request narrowed to, less any
+/// that cannot measure these questions. Empty when there are none.
+fn alternatives(catalog: &Catalog, questions: &[DecisionQuestion]) -> String {
+    let able: Vec<String> = catalog
+        .offers_serving(VerbKind::Decide)
+        .into_iter()
+        .filter(|offer| unmeasurable_by(offer, questions).is_none())
+        .map(|offer| format!("{}/{}", offer.provider, offer.model))
+        .collect();
+    let mut named = able
+        .iter()
+        .take(ALTERNATIVES_NAMED)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if able.len() > ALTERNATIVES_NAMED {
+        named.push_str(&format!(" and {} more", able.len() - ALTERNATIVES_NAMED));
+    }
+    named
+}
+
+/// The offer `query` selects for `questions` from `catalog`, or the refusal.
+///
+/// The one gate every decision passes, before anything is probed: the
+/// catalog's selector, then whether the offer can measure these questions.
+/// When a model was named and refused, the refusal ends by naming the offers
+/// that do serve `decide`, so the fix is in the text.
+fn select(
+    catalog: &Catalog,
+    query: OfferQuery<'_>,
+    questions: &[DecisionQuestion],
+) -> Result<SelectedOffer, String> {
+    let named = query
+        .requested
+        .is_some_and(|requested| !requested.trim().is_empty());
+    let offer = catalog.offer_for(query).map_err(|mut refusal| {
+        let alternatives = alternatives(catalog, questions);
+        if named && !alternatives.is_empty() {
+            let suffix = format!("offers that serve decide: {alternatives}");
+            refusal.detail = Some(match refusal.detail.take() {
+                Some(detail) => format!("{detail}; {suffix}"),
+                None => suffix,
+            });
+        }
+        refusal.to_string()
+    })?;
+    match unmeasurable_by(&offer, questions) {
+        None => Ok(offer),
+        Some(refusal) => {
+            let alternatives = alternatives(catalog, questions);
+            Err(if named && !alternatives.is_empty() {
+                format!("{refusal} Offers that serve decide: {alternatives}.")
+            } else {
+                refusal
+            })
+        }
+    }
+}
+
+/// A decision asked through `run cairn://models/decide`: the questions, the
+/// state they judge, and the model that must answer them. Nothing here is
+/// chosen for the caller: no workspace default, no best offer.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DecideRequest {
+    /// A catalog id, native id, alias, or `provider/tier`, as any verb's
+    /// selector reads it. Optional only so its absence is refused by name.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Only this provider's offers of `model`.
+    #[serde(default)]
+    pub provider: Option<String>,
+    pub input: String,
+    pub questions: Vec<DecisionQuestion>,
+}
+
+/// The offer that answered a named decision.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OfferView {
+    pub provider: String,
+    /// The id the provider was sent.
+    pub model: String,
+    pub measured_by: MeasuredBy,
+    pub wire: Wire,
+}
+
+/// What the decide door returns: the facet's [`Decision`] unchanged (its
+/// answers, refusals, and usage), with the offer that answered and how long
+/// the whole call took, a first-time probe included.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DecideOutcome {
+    #[serde(flatten)]
+    pub decision: Decision,
+    pub offer: OfferView,
+    pub latency_ms: u64,
+}
+
 impl Orchestrator {
-    /// The offer `decision` would be answered by in `project_id`'s scope,
-    /// confirmed able to measure its questions, or the refusal naming the
-    /// fixes.
+    /// The offer `query` selects for `questions` in `project_id`'s scope,
+    /// confirmed able to measure them, or the refusal naming the fixes. Only
+    /// offers of what `query` asked for are walked: one recorded unable is
+    /// refused, never replaced by another model.
     ///
     /// May ask an unconfirmed logprobs offer one probe question, so it
     /// blocks for up to [`PROBE_TIMEOUT`]; the probe runs on its own thread,
@@ -183,24 +294,19 @@ impl Orchestrator {
     pub(crate) fn decision_offer(
         &self,
         project_id: Option<&str>,
-        decision: &DecisionNode,
+        query: OfferQuery<'_>,
+        questions: &[DecisionQuestion],
     ) -> Result<SelectedOffer, DecisionFailure> {
         let scope = ModelScope {
             project_id: project_id.map(str::to_string),
         };
-        let workspace_default = self.get_settings().decision_model;
         // Each pass either returns or records one more offer as unable, which
         // the next catalog read no longer offers, so the walk ends; the bound
         // only guards against an observation expiring mid-walk.
         for _ in 0..32 {
-            let offer = self
-                .catalog(&scope)
-                .map_err(DecisionFailure::Failed)?
-                .offer_for(decision_query(decision, workspace_default.as_deref()))
-                .map_err(|refusal| DecisionFailure::Unanswerable(refusal.to_string()))?;
-            if let Some(refusal) = unmeasurable_by(&offer, decision) {
-                return Err(DecisionFailure::Unanswerable(refusal));
-            }
+            let catalog = self.catalog(&scope).map_err(DecisionFailure::Failed)?;
+            let offer =
+                select(&catalog, query, questions).map_err(DecisionFailure::Unanswerable)?;
             if self
                 .confirm_offer(project_id, &offer)
                 .map_err(DecisionFailure::Failed)?
@@ -211,6 +317,21 @@ impl Orchestrator {
         Err(DecisionFailure::Unanswerable(
             "no decision-capable offer could be confirmed".to_string(),
         ))
+    }
+
+    /// The offer a recipe's decision node would be answered by: the model it
+    /// names, else the workspace's `decisionModel`, else the best offer.
+    pub(crate) fn node_decision_offer(
+        &self,
+        project_id: Option<&str>,
+        decision: &DecisionNode,
+    ) -> Result<SelectedOffer, DecisionFailure> {
+        let workspace_default = self.get_settings().decision_model;
+        self.decision_offer(
+            project_id,
+            decision_query(decision, workspace_default.as_deref()),
+            &decision.questions,
+        )
     }
 
     /// Whether `offer` can answer decisions: a native offer by its protocol,
@@ -254,15 +375,14 @@ impl Orchestrator {
         }
     }
 
-    /// The deployment `offer` is measured on.
+    /// The deployment `offer` is measured on, as its backend reaches it.
     fn decision_route(
         &self,
         project_id: Option<&str>,
         offer: &SelectedOffer,
     ) -> Result<DecisionRoute, String> {
-        let account_id = catalog::custom_account_id(&offer.provider)
-            .ok_or_else(|| format!("{} cannot answer a decision", offer.provider))?;
-        CustomProviderConfig::resolve(self, account_id, project_id)?.decision_route()
+        crate::backends::backend_for_name(Some(&offer.provider))
+            .decision_route(self, project_id, offer)
     }
 
     /// Where each decision node in `nodes` stands in `project_id`'s scope,
@@ -298,15 +418,14 @@ impl Orchestrator {
                         ))
                     }
                 };
-                let offer = match catalog
-                    .offer_for(decision_query(decision, workspace_default.as_deref()))
-                {
+                let offer = match select(
+                    catalog,
+                    decision_query(decision, workspace_default.as_deref()),
+                    &decision.questions,
+                ) {
                     Ok(offer) => offer,
                     Err(refusal) => return Some(report(true, format!("can't be answered: {refusal}"))),
                 };
-                if let Some(refusal) = unmeasurable_by(&offer, decision) {
-                    return Some(report(true, format!("can't be answered: {refusal}")));
-                }
                 (offer.measured_by() == Some(MeasuredBy::Logprobs)
                     && self.decision_observations.get(&offer).is_none())
                 .then(|| {
@@ -333,7 +452,7 @@ impl Orchestrator {
             .iter()
             .filter_map(|node| {
                 let decision = node.decision_config.as_ref()?;
-                self.decision_offer(project_id, decision)
+                self.node_decision_offer(project_id, decision)
                     .err()
                     .map(|refusal| {
                         format!("Decision node '{}' can't be answered: {refusal}", node.name)
@@ -370,19 +489,133 @@ impl Orchestrator {
         let project_id = project_id.map(str::to_string);
         let decision = decision.clone();
         tokio::task::spawn_blocking(move || {
-            orch.decide_blocking(project_id.as_deref(), &decision, &input)
+            let workspace_default = orch.get_settings().decision_model;
+            orch.decide_blocking(
+                project_id.as_deref(),
+                decision_query(&decision, workspace_default.as_deref()),
+                &decision.questions,
+                &input,
+            )
+            .map(|(decision, _)| decision)
         })
         .await
         .map_err(|error| DecisionFailure::Failed(format!("the decision task failed: {error}")))?
     }
 
+    /// Answer `request`'s questions with the model it names, and only that
+    /// model: the door behind `run cairn://models/decide`. Selection, the
+    /// one-time probe, and what the call reveals about the offer are the
+    /// recipe path's own; the answers come back raw, with no thresholds.
+    ///
+    /// The facet's decide is one whole request per provider call and takes no
+    /// cancel token. Dropping this future releases the caller at once; the
+    /// blocking worker then detaches and ends within its own bounds, a
+    /// [`PROBE_TIMEOUT`] probe and a [`DECISION_TIMEOUT`] per provider request.
+    pub(crate) async fn decide_named(
+        &self,
+        project_id: Option<&str>,
+        request: DecideRequest,
+    ) -> Result<DecideOutcome, DecisionFailure> {
+        let started = Instant::now();
+        let orch = self.clone();
+        let project_id = project_id.map(str::to_string);
+        let (decision, offer) = tokio::task::spawn_blocking(move || {
+            orch.decide_named_blocking(project_id.as_deref(), &request)
+        })
+        .await
+        .map_err(|error| DecisionFailure::Failed(format!("the decision task failed: {error}")))??;
+        // `select` admits only an offer that measures, so this always holds.
+        let measured_by = offer.measured_by().ok_or_else(|| {
+            DecisionFailure::Failed(format!(
+                "{} on {} answered over {}, which measures nothing",
+                offer.model, offer.provider, offer.served.wire
+            ))
+        })?;
+        Ok(DecideOutcome {
+            decision,
+            offer: OfferView {
+                measured_by,
+                wire: offer.served.wire,
+                provider: offer.provider,
+                model: offer.model,
+            },
+            latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })
+    }
+
+    fn decide_named_blocking(
+        &self,
+        project_id: Option<&str>,
+        request: &DecideRequest,
+    ) -> Result<(Decision, SelectedOffer), DecisionFailure> {
+        let named = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let Some(model) = named(&request.model) else {
+            return Err(DecisionFailure::Unanswerable(
+                self.unnamed_model_refusal(project_id, &request.questions)?,
+            ));
+        };
+        let problems = question_problems(&request.questions);
+        if !problems.is_empty() {
+            return Err(DecisionFailure::Unanswerable(format!(
+                "These questions can't be asked: {}.",
+                problems.join("; ")
+            )));
+        }
+        let provider = named(&request.provider);
+        self.decide_blocking(
+            project_id,
+            OfferQuery {
+                requested: Some(&model),
+                provider: provider.as_deref(),
+                ..OfferQuery::new(VerbKind::Decide)
+            },
+            &request.questions,
+            &request.input,
+        )
+    }
+
+    /// The refusal for a named decision that names no model, with the offers
+    /// it could have named.
+    fn unnamed_model_refusal(
+        &self,
+        project_id: Option<&str>,
+        questions: &[DecisionQuestion],
+    ) -> Result<String, DecisionFailure> {
+        let catalog = self
+            .catalog(&ModelScope {
+                project_id: project_id.map(str::to_string),
+            })
+            .map_err(DecisionFailure::Failed)?;
+        let lead = "Name the model to decide with (a catalog id, or `model` with `provider`): this door never chooses one";
+        let alternatives = alternatives(&catalog, questions);
+        Ok(if alternatives.is_empty() {
+            let nothing = NoOffer {
+                verb: VerbKind::Decide,
+                requested: None,
+                detail: None,
+            };
+            format!("{lead}. {nothing}")
+        } else {
+            format!("{lead}; offers that serve decide: {alternatives}.")
+        })
+    }
+
+    /// Select, confirm, and ask: the one path every decision takes, so what a
+    /// call reveals about its offer is recorded whoever asked.
     fn decide_blocking(
         &self,
         project_id: Option<&str>,
-        decision: &DecisionNode,
+        query: OfferQuery<'_>,
+        questions: &[DecisionQuestion],
         input: &str,
-    ) -> Result<Decision, DecisionFailure> {
-        let offer = self.decision_offer(project_id, decision)?;
+    ) -> Result<(Decision, SelectedOffer), DecisionFailure> {
+        let offer = self.decision_offer(project_id, query, questions)?;
         let route = self
             .decision_route(project_id, &offer)
             .map_err(DecisionFailure::Failed)?;
@@ -392,7 +625,7 @@ impl Orchestrator {
                 route: &route,
                 model: &offer.model,
                 input,
-                questions: &decision.questions,
+                questions,
                 timeout: DECISION_TIMEOUT,
             },
         );
@@ -409,52 +642,75 @@ impl Orchestrator {
             }
             Ok(_) => {}
         }
-        result.map_err(|error| DecisionFailure::Failed(error.to_string()))
+        result
+            .map(|decision| (decision, offer))
+            .map_err(|error| DecisionFailure::Failed(error.to_string()))
     }
 }
 
+/// The scripted provider these tests ask, shared with the run handler's tests
+/// of the decide door.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use cairn_models::interface::complete::{
-        Complete, CompletionCall, CompletionError, CompletionReply,
+        Complete, CompletionCall, CompletionError, CompletionReply, CompletionWire,
     };
     use cairn_models::interface::{ModelScope, Models};
     use cairn_models::types::catalog::VerbKind;
     use serde_json::{json, Value};
 
+    pub(crate) use super::DecideOutcome;
+    use super::{DecideRequest, DecisionFailure, OfferView};
     use crate::credentials::{CustomModelPolicy, CustomProtocol, CustomSampling, ProviderAuth};
-    use crate::models::{CreateRecipe, Recipe, RecipeFile, UpdateRecipe};
+    use crate::models::decision::{DecisionAnswer, MeasuredBy};
+    use crate::models::{CreateRecipe, Recipe, RecipeFile, UpdateRecipe, UpdateSettings};
     use crate::orchestrator::models::ModelRuntime;
     use crate::orchestrator::Orchestrator;
+    use cairn_models::types::catalog::Wire;
 
-    /// A chat server that answers from a script and counts what it was asked.
+    /// A server that answers from a script and counts what it was asked.
     #[derive(Default)]
-    struct Scripted {
+    pub(crate) struct Scripted {
         replies: Mutex<VecDeque<Value>>,
         calls: Mutex<usize>,
+        /// How long each reply takes, when it should not be at once.
+        delay: Mutex<Option<Duration>>,
     }
 
     impl Scripted {
-        fn calls(&self) -> usize {
+        pub(crate) fn calls(&self) -> usize {
             *self.calls.lock().unwrap()
+        }
+
+        /// Hold every reply for `delay`, as a hung provider would.
+        pub(crate) fn hold_each_reply(&self, delay: Duration) {
+            *self.delay.lock().unwrap() = Some(delay);
         }
     }
 
     impl Complete for Scripted {
-        fn complete(&self, _call: CompletionCall<'_>) -> Result<CompletionReply, CompletionError> {
+        fn complete(&self, call: CompletionCall<'_>) -> Result<CompletionReply, CompletionError> {
             *self.calls.lock().unwrap() += 1;
+            let delay = *self.delay.lock().unwrap();
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
             let reply = self
                 .replies
                 .lock()
                 .unwrap()
                 .pop_front()
                 .expect("a request the script did not expect");
-            Ok(CompletionReply::Chat(
-                serde_json::from_value(reply).unwrap(),
-            ))
+            Ok(match call.wire {
+                CompletionWire::Decisions(_) => {
+                    CompletionReply::Decisions(serde_json::from_value(reply).unwrap())
+                }
+                _ => CompletionReply::Chat(serde_json::from_value(reply).unwrap()),
+            })
         }
     }
 
@@ -464,7 +720,7 @@ mod tests {
     }
 
     /// What a chat server that serves logprobs answers.
-    fn with_logprobs() -> Value {
+    pub(crate) fn with_logprobs() -> Value {
         json!({"model": "qwen3", "choices": [{
             "message": {"role": "assistant", "content": "Yes"},
             "logprobs": {"content": [{"token": "Yes", "logprob": -0.1, "top_logprobs": [
@@ -476,6 +732,25 @@ mod tests {
     /// A bare workspace whose one provider is a custom chat server serving
     /// `qwen3`, answering from `replies`.
     async fn workspace_with_chat_server(replies: Vec<Value>) -> (Orchestrator, Arc<Scripted>) {
+        let (orch, scripted, _) = workspace_with_server(
+            CustomProtocol::OpenAiChatCompletions,
+            None,
+            "qwen3",
+            replies,
+        )
+        .await;
+        (orch, scripted)
+    }
+
+    /// A bare workspace whose one provider is a custom server speaking
+    /// `protocol` and serving `model`, answering from `replies`, with that
+    /// provider's backend key.
+    pub(crate) async fn workspace_with_server(
+        protocol: CustomProtocol,
+        api_key: Option<&str>,
+        model: &str,
+        replies: Vec<Value>,
+    ) -> (Orchestrator, Arc<Scripted>, String) {
         let mut orch = crate::orchestrator::models::tests::bare_orchestrator().await;
         let scripted = Arc::new(Scripted {
             replies: Mutex::new(replies.into()),
@@ -490,11 +765,11 @@ mod tests {
                 "Sparks".into(),
                 ProviderAuth::custom_endpoint(
                     "http://sparks.invalid/v1",
-                    CustomProtocol::OpenAiChatCompletions,
-                    None,
+                    protocol,
+                    api_key,
                     &[],
                     CustomModelPolicy::Explicit {
-                        ids: vec!["qwen3".into()],
+                        ids: vec![model.into()],
                     },
                     CustomSampling::default(),
                     1,
@@ -503,10 +778,412 @@ mod tests {
                 None,
             )
             .unwrap();
-        orch.refresh_provider_model_catalog_blocking(&cairn_models::types::catalog::custom_key(
-            &account.id,
-        ));
-        (orch, scripted)
+        let key = cairn_models::types::catalog::custom_key(&account.id);
+        orch.refresh_provider_model_catalog_blocking(&key);
+        (orch, scripted, key)
+    }
+
+    /// What a chat server that serves logprobs answers to a two-option
+    /// choice, offered as `A` and `B`: mostly the second.
+    pub(crate) fn choosing_b() -> Value {
+        json!({"model": "qwen3", "choices": [{
+            "message": {"role": "assistant", "content": "B"},
+            "logprobs": {"content": [{"token": "B", "logprob": 0.86_f64.ln(), "top_logprobs": [
+                {"token": "B", "logprob": 0.86_f64.ln()}, {"token": "A", "logprob": 0.14_f64.ln()}
+            ]}]}
+        }]})
+    }
+
+    fn named_request(model: Option<&str>, questions: Value) -> DecideRequest {
+        serde_json::from_value(json!({
+            "model": model,
+            "input": "The checkout page times out for every customer.",
+            "questions": questions,
+        }))
+        .unwrap()
+    }
+
+    fn scale() -> Value {
+        json!([{"name": "scale", "type": "choice", "instructions": "How large is this issue?",
+                "options": [{"value": "small"}, {"value": "large"}]}])
+    }
+
+    fn unanswerable(failure: DecisionFailure) -> String {
+        match failure {
+            DecisionFailure::Unanswerable(text) => text,
+            DecisionFailure::Failed(text) => panic!("expected a refusal, got a failure: {text}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_door_returns_the_full_distribution_and_the_offer_that_answered() {
+        let (orch, server, key) = workspace_with_server(
+            CustomProtocol::OpenAiChatCompletions,
+            None,
+            "qwen3",
+            vec![with_logprobs(), choosing_b(), choosing_b()],
+        )
+        .await;
+
+        let outcome = orch
+            .decide_named(None, named_request(Some("qwen3"), scale()))
+            .await
+            .unwrap();
+        assert_eq!(server.calls(), 2, "one probe, then the question");
+        assert_eq!(
+            outcome.offer,
+            OfferView {
+                provider: key.clone(),
+                model: "qwen3".into(),
+                measured_by: MeasuredBy::Logprobs,
+                wire: Wire::OpenAiChatCompletions,
+            }
+        );
+        let DecisionAnswer::Choice {
+            pick,
+            confidence,
+            probabilities,
+            measured_by,
+            ..
+        } = &outcome.decision.answers[0]
+        else {
+            panic!("expected a choice: {:?}", outcome.decision.answers);
+        };
+        assert_eq!(pick, "large");
+        assert_eq!(*measured_by, MeasuredBy::Logprobs);
+        assert!(confidence.is_some());
+        assert_eq!(
+            probabilities
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            ["small", "large"]
+        );
+        assert!((probabilities[1].probability - 0.86).abs() < 1e-9);
+
+        let body = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(body["provider"], key.as_str());
+        assert_eq!(body["answers"][0]["measuredBy"], "logprobs");
+        assert_eq!(body["offer"]["wire"], "openai-chat");
+        assert!(body["latencyMs"].is_u64(), "{body}");
+
+        orch.decide_named(None, named_request(Some("qwen3"), scale()))
+            .await
+            .unwrap();
+        assert_eq!(server.calls(), 3, "what the probe saw stands");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_question_comes_back_as_a_refusal_in_its_position() {
+        let (orch, server, _) = workspace_with_server(
+            CustomProtocol::Decisions,
+            Some("gateway-key"),
+            "typesafe-ai/jev",
+            vec![json!({
+                "model": "typesafe-ai/jev",
+                "answers": [
+                    {"type": "refusal", "name": "damaged"},
+                    {"type": "choice", "name": "queue", "choice": "billing"}
+                ],
+                "usage": {"input_tokens": 40, "output_tokens": 0}
+            })],
+        )
+        .await;
+        let request = named_request(
+            Some("typesafe-ai/jev"),
+            json!([
+                {"name": "damaged", "type": "predicate", "instructions": "Is it damaged?"},
+                {"name": "queue", "type": "choice", "instructions": "Which queue?",
+                 "options": [{"value": "billing"}, {"value": "shipping"}]}
+            ]),
+        );
+
+        let outcome = orch.decide_named(None, request).await.unwrap();
+        assert_eq!(server.calls(), 1, "a native offer is never probed");
+        let body = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(
+            body["answers"][0],
+            json!({"type": "refusal", "name": "damaged", "measuredBy": "native"})
+        );
+        assert_eq!(body["answers"][1]["pick"], "billing");
+        assert_eq!(body["inputTokens"], 40);
+        assert_eq!(body["offer"]["measuredBy"], "native");
+        let back: DecideOutcome = serde_json::from_value(body).unwrap();
+        assert!(back.decision.answers[0].is_refusal());
+        assert_eq!(back, outcome);
+    }
+
+    /// Records where each System One request went and answers OpenRouter's
+    /// documented reply.
+    #[derive(Default)]
+    struct OpenRouterDecisions {
+        sent: Mutex<Vec<(String, Vec<(String, String)>, Value)>>,
+    }
+
+    impl Complete for OpenRouterDecisions {
+        fn complete(&self, call: CompletionCall<'_>) -> Result<CompletionReply, CompletionError> {
+            let CompletionWire::SystemOne(endpoint) = call.wire else {
+                panic!("expected System One, got {}", call.wire.family());
+            };
+            self.sent.lock().unwrap().push((
+                endpoint.url.clone(),
+                endpoint.headers.clone(),
+                call.body,
+            ));
+            Ok(CompletionReply::SystemOne(
+                serde_json::from_value(json!({
+                    "answers": {
+                        "is_bug": {"noul": 0.96, "type": "noul"},
+                        "team": {"choice": "payments", "confidence": 0.75, "type": "choice",
+                                 "probabilities": {"account": 0, "frontend": 0.16, "payments": 0.84}},
+                        "urgency": {"confidence": 0.99, "score": 1.99, "type": "score",
+                                    "legend": {"0": "later", "1": "this week", "2": "now"},
+                                    "probabilities": {"0": 0, "1": 0.01, "2": 0.99}}
+                    },
+                    "id": "gen-dec-1789738314-X5e5eKGQdvR9rblyX250",
+                    "model": "typesafe/jev-1.14-20261014",
+                    "provider": "TypeSafe",
+                    "usage": {"cost": 0.000019992, "input_tokens": 476, "output_tokens": 70}
+                }))
+                .unwrap(),
+            ))
+        }
+    }
+
+    /// OpenRouter's decision models reach `decide` through what discovery
+    /// declared: selected by id, sent over System One to the Decisions API on
+    /// the workspace key, answered with typed answers, and listed with their
+    /// price on every surface that shows decision offers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_openrouter_decision_model_is_selected_by_id_and_answers_over_system_one() {
+        let mut orch = crate::orchestrator::models::tests::bare_orchestrator().await;
+        let recorder = Arc::new(OpenRouterDecisions::default());
+        orch.models_runtime = ModelRuntime {
+            complete: recorder.clone(),
+            ..orch.models_runtime.clone()
+        };
+        let mut enabled = orch.enabled_providers();
+        enabled.push("openrouter".to_string());
+        orch.update_settings(UpdateSettings {
+            enabled_providers: Some(enabled),
+            ..Default::default()
+        })
+        .unwrap();
+        orch.add_account(
+            crate::credentials::ApiProvider::OpenRouter,
+            "OpenRouter".into(),
+            ProviderAuth::ApiKey {
+                value: "sk-or-test".into(),
+            },
+            None,
+        )
+        .unwrap();
+        orch.seed_model_catalog_for_test(cairn_models::types::catalog::ProviderModelCatalog {
+            backend: "openrouter".into(),
+            models: crate::backends::openrouter::decode_decision_models(include_str!(
+                "../backends/openrouter/testdata/decisions_models.json"
+            ))
+            .unwrap(),
+            options: Vec::new(),
+            refreshed_at: Some(1_790_000_000),
+            error: None,
+        });
+
+        let request = named_request(
+            Some("openrouter/typesafe/jev-1.14"),
+            json!([
+                {"name": "is_bug", "type": "predicate", "instructions": "Is this a defect?"},
+                {"name": "team", "type": "choice", "instructions": "Which team?",
+                 "options": [{"value": "account"}, {"value": "frontend"}, {"value": "payments"}]},
+                {"name": "urgency", "type": "score", "instructions": "How urgent?",
+                 "levels": [{"label": "later"}, {"label": "this week"}, {"label": "now"}]}
+            ]),
+        );
+        let outcome = orch.decide_named(None, request).await.unwrap();
+        assert_eq!(
+            outcome.offer,
+            OfferView {
+                provider: "openrouter".into(),
+                model: "typesafe/jev-1.14".into(),
+                measured_by: MeasuredBy::Native,
+                wire: Wire::SystemOne,
+            }
+        );
+        let body = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(body["cost"], json!(0.000019992));
+        assert_eq!(body["inputTokens"], 476);
+        assert_eq!(body["model"], "typesafe/jev-1.14-20261014");
+        assert_eq!(body["offer"]["wire"], "systemone");
+        let picks: Vec<_> = outcome
+            .decision
+            .answers
+            .iter()
+            .map(|answer| (answer.pick().unwrap(), answer.confidence().is_some()))
+            .collect();
+        assert_eq!(
+            picks,
+            vec![("yes", true), ("payments", true), ("now", true)]
+        );
+
+        let sent = recorder.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "a native offer is never probed");
+        let (url, headers, sent_body) = &sent[0];
+        assert_eq!(url, "https://openrouter.ai/api/alpha/decisions");
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("authorization")
+                && value == "Bearer sk-or-test"));
+        assert_eq!(sent_body["model"], "typesafe/jev-1.14");
+        assert_eq!(sent_body["questions"]["is_bug"]["type"], "noul");
+
+        let request = crate::mcp::types::McpCallbackRequest {
+            thread_id: None,
+            cwd: "/tmp".to_string(),
+            run_id: None,
+            tool: "read".to_string(),
+            payload: json!({}),
+            tool_use_id: None,
+        };
+        let read = |uri: &'static str| {
+            let orch = orch.clone();
+            let request = request.clone();
+            async move { crate::resources::read_cairn_resource(&orch, &request, uri).await }
+        };
+        let page = read("cairn://models/decide").await;
+        assert!(
+            page.contains("`typesafe/jev-1.14` on `openrouter` — measured by native"),
+            "{page}"
+        );
+        let catalog = read("cairn://models/catalog?provider=openrouter&serves=decide").await;
+        assert!(catalog.contains("typesafe/jev-1.14"), "{catalog}");
+        assert!(catalog.contains("~typesafe/jev-latest"), "{catalog}");
+        assert!(catalog.contains("in $0.042/M"), "{catalog}");
+        assert!(catalog.contains("in $0.1/M"), "{catalog}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_model_that_cannot_decide_is_refused_naming_the_offers_that_can() {
+        let (orch, server, key) = workspace_with_chat_server_keyed().await;
+        orch.update_settings(UpdateSettings {
+            enabled_providers: Some(vec!["claude".to_string(), key.clone()]),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let refused = unanswerable(
+            orch.decide_named(None, named_request(Some("opus"), scale()))
+                .await
+                .unwrap_err(),
+        );
+        assert!(refused.contains("cannot answer decisions"), "{refused}");
+        assert!(
+            refused.contains(&format!("offers that serve decide: {key}/qwen3")),
+            "{refused}"
+        );
+        assert_eq!(server.calls(), 0, "nothing was asked of any provider");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_door_never_chooses_a_model() {
+        let (orch, server, key) = workspace_with_chat_server_keyed().await;
+        // A workspace default exists, and the door still does not use it.
+        orch.update_settings(UpdateSettings {
+            decision_model: Some(Some("qwen3".into())),
+            ..Default::default()
+        })
+        .unwrap();
+
+        for model in [None, Some(""), Some("   ")] {
+            let refused = unanswerable(
+                orch.decide_named(None, named_request(model, scale()))
+                    .await
+                    .unwrap_err(),
+            );
+            assert!(refused.contains("never chooses one"), "{refused}");
+            assert!(
+                refused.contains(&format!("offers that serve decide: {key}/qwen3")),
+                "{refused}"
+            );
+        }
+        assert_eq!(server.calls(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_model_is_refused_and_never_answered_by_another() {
+        let (orch, server, key) = workspace_with_chat_server_keyed().await;
+        let refused = unanswerable(
+            orch.decide_named(None, named_request(Some("not-served"), scale()))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            refused.contains("no installed provider offers 'not-served'"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains(&format!("offers that serve decide: {key}/qwen3")),
+            "{refused}"
+        );
+        assert_eq!(server.calls(), 0);
+
+        // Narrowing to a provider that does not offer the model is the same
+        // refusal, not a fallback to the one that does.
+        let mut request = named_request(Some("qwen3"), scale());
+        request.provider = Some("claude".into());
+        let refused = unanswerable(orch.decide_named(None, request).await.unwrap_err());
+        assert!(refused.contains("'qwen3'"), "{refused}");
+        assert_eq!(server.calls(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_requests_are_refused_before_anything_is_asked() {
+        let (orch, server, _) = workspace_with_chat_server_keyed().await;
+        let refused = unanswerable(
+            orch.decide_named(None, named_request(Some("qwen3"), json!([])))
+                .await
+                .unwrap_err(),
+        );
+        assert!(refused.contains("at least one question"), "{refused}");
+        assert!(serde_json::from_value::<DecideRequest>(json!({
+            "model": "qwen3", "input": "x", "questions": [], "thresholds": {}
+        }))
+        .is_err());
+        assert_eq!(server.calls(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recipe_node_naming_an_unserved_model_is_told_what_does_serve() {
+        let (orch, server, key) = workspace_with_chat_server_keyed().await;
+        let options = ["yes".to_string(), "no".to_string()];
+        let recipe = decision_recipe_naming(&options, Some("not-served"));
+        let refused = orch
+            .refuse_unanswerable_decisions(&recipe.nodes, None)
+            .unwrap_err();
+        assert!(refused.contains("'not-served'"), "{refused}");
+        assert!(
+            refused.contains(&format!("offers that serve decide: {key}/qwen3")),
+            "{refused}"
+        );
+        let [report] = orch
+            .decision_diagnostics(&recipe.nodes, None)
+            .try_into()
+            .unwrap();
+        assert!(
+            report.message.contains("offers that serve decide"),
+            "the load-time report and the gate say the same thing: {}",
+            report.message
+        );
+        assert_eq!(server.calls(), 0);
+    }
+
+    async fn workspace_with_chat_server_keyed() -> (Orchestrator, Arc<Scripted>, String) {
+        workspace_with_server(
+            CustomProtocol::OpenAiChatCompletions,
+            None,
+            "qwen3",
+            Vec::new(),
+        )
+        .await
     }
 
     fn decision_recipe(options: &[String]) -> Recipe {

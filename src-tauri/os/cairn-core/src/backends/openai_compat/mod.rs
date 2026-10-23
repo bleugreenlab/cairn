@@ -5,16 +5,30 @@ pub(crate) mod conversation;
 pub(crate) mod http;
 pub(crate) use cairn_models::wire::openai_compat::wire;
 
-use crate::backends::{CompletionError, CompletionRequest, CompletionRole};
-use serde_json::{json, Value};
+use crate::backends::{completion_generation, CompletionError, CompletionRequest, CompletionRole};
+use cairn_models::turn::ChatFamily;
+use serde_json::Value;
+use wire::{ChatContent, ChatMessage};
 
-/// The request body for a one-shot, tool-free chat completion.
+/// The request body for a one-shot, tool-free chat completion on `family`.
 ///
+/// Built by the wire's [`http::build_body`] from the provider's own family, the
+/// same builder and the same provider data as a session turn. So the caller's
+/// reasoning effort reaches the provider in that provider's spelling, and the
+/// keys the provider adds to every body (a custom server's sampling,
+/// OpenRouter's routing object) ride on a completion exactly as on a turn.
 /// Deliberately toolless: a completion is a single call that returns text, not
 /// a turn loop, so offering tools would advertise a capability nothing here can
-/// service. Shared by every provider on this wire rather than reimplemented per
-/// adapter, so a schema-constrained call means the same thing on all of them.
-pub(crate) fn completion_body(request: &CompletionRequest) -> Result<Value, CompletionError> {
+/// service.
+///
+/// The one place a completion departs from its provider's session dialect is
+/// the output schema, which it always asks for natively. A session may leave
+/// `response_format` off because a strict JSON reply would foreclose its tool
+/// calls; a completion has no tools, and the schema is its whole contract.
+pub(crate) fn completion_body(
+    request: &CompletionRequest,
+    family: &ChatFamily,
+) -> Result<Value, CompletionError> {
     if request.messages.is_empty() {
         return Err(CompletionError::InvalidRequest(
             "at least one message is required".to_string(),
@@ -22,29 +36,29 @@ pub(crate) fn completion_body(request: &CompletionRequest) -> Result<Value, Comp
     }
     let mut messages = Vec::with_capacity(request.messages.len() + 1);
     if let Some(system) = &request.system {
-        messages.push(json!({"role": "system", "content": system}));
+        messages.push(ChatMessage::system(system.clone()));
     }
-    messages.extend(request.messages.iter().map(|message| {
-        let role = match message.role {
-            CompletionRole::User => "user",
-            CompletionRole::Assistant => "assistant",
-        };
-        json!({"role": role, "content": message.content})
+    messages.extend(request.messages.iter().map(|message| match message.role {
+        CompletionRole::User => ChatMessage::user(message.content.clone()),
+        CompletionRole::Assistant => ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(ChatContent::Text(message.content.clone())),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_details: None,
+            reasoning: None,
+        },
     }));
-    let mut body = json!({
-        "model": request.model,
-        "messages": messages,
-        "stream": false,
-    });
-    if let Some(extras) = request.extras.as_object() {
-        body.as_object_mut()
-            .expect("completion body is an object")
-            .extend(extras.clone());
-    } else if !request.extras.is_null() {
-        return Err(CompletionError::InvalidRequest(
-            "extras must be an object or null".to_string(),
-        ));
-    }
-    http::apply_output_schema(&mut body, request.output_schema.as_ref());
-    Ok(body)
+    let dialect = http::ChatDialect {
+        response_format: true,
+        ..family.dialect
+    };
+    Ok(http::build_body(
+        &dialect,
+        &request.model,
+        &messages,
+        &completion_generation(request),
+        &family.extras,
+        false,
+    ))
 }

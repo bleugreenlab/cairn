@@ -1404,6 +1404,123 @@ pub fn set_machine_role(
     })
 }
 
+/// Move the runner's own executor's build root to `path`, a directory on another
+/// volume, or back to the home with `None`.
+///
+/// Only the colocated executor has one: a remote keeps all of its state under
+/// the home its declaration names. The directory must already exist, because
+/// the build root is never created in place of a volume that is not mounted.
+/// Its marker is written now, while the volume is here, or adopted when one is
+/// already there, so a root the operator moves between machines keeps its
+/// identity. The setting is read when the runner starts, which is when it takes
+/// effect: a predecessor's held cells are never looked for under a root it did
+/// not use.
+pub fn set_colocated_build_root(
+    orch: &Orchestrator,
+    reference: &str,
+    path: Option<&str>,
+) -> Result<BuildRootOutcome, String> {
+    let executor_id = resolve_executor_reference(orch, reference)?;
+    let name = public_name(orch, &executor_id);
+    if executor_id != crate::fleet::COLOCATED_EXECUTOR_ID {
+        return Err(format!(
+            "{name} is a remote machine. A build root moves the runner's own executor's cells (`local`); a remote keeps all of its state under the home its declaration names, so move its cairnHome instead"
+        ));
+    }
+    let declaration = path
+        .map(|path| prepare_build_root(std::path::Path::new(path), &orch.config_dir))
+        .transpose()?;
+    mutate_fleet(orch, |config| {
+        config.colocated_build_root = declaration.clone();
+        Ok(())
+    })?;
+    Ok(BuildRootOutcome {
+        name,
+        build_root: declaration.map(|declaration| declaration.path),
+    })
+}
+
+/// Validate a build root and give it its marker.
+pub(crate) fn prepare_build_root(
+    path: &std::path::Path,
+    home: &std::path::Path,
+) -> Result<cairn_common::executor_paths::BuildRootDeclaration, String> {
+    use cairn_common::executor_paths::{
+        read_build_root_marker, write_build_root_marker, BuildRootDeclaration, BUILD_ROOT_MARKER,
+    };
+    if !path.is_absolute() {
+        return Err(format!(
+            "buildRoot must be an absolute path; {} is not",
+            path.display()
+        ));
+    }
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        format!(
+            "buildRoot {} cannot be used: {error}. Mount the volume and create the directory first; Cairn never creates a build root in place of a volume that is not there",
+            path.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(format!("buildRoot {} is not a directory", path.display()));
+    }
+    let root = std::fs::canonicalize(path)
+        .map_err(|error| format!("buildRoot {} cannot be resolved: {error}", path.display()))?;
+    let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    if root.starts_with(&home) {
+        return Err(format!(
+            "buildRoot {} is inside the Cairn home {}; it must be a directory apart from it, normally on another volume. To keep cells in the home, set buildRoot to null",
+            root.display(),
+            home.display()
+        ));
+    }
+    if home.starts_with(&root) {
+        return Err(format!(
+            "buildRoot {} contains the Cairn home {}; choose a directory beside it, not above it",
+            root.display(),
+            home.display()
+        ));
+    }
+    let id = match read_build_root_marker(&root) {
+        Ok(id) if !id.is_empty() => id,
+        _ => {
+            let id = uuid::Uuid::new_v4().to_string();
+            write_build_root_marker(&root, &id).map_err(|error| {
+                format!(
+                    "buildRoot {} is not writable: could not write {BUILD_ROOT_MARKER}: {error}",
+                    root.display()
+                )
+            })?;
+            id
+        }
+    };
+    Ok(BuildRootDeclaration { path: root, id })
+}
+
+/// What a build-root write recorded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildRootOutcome {
+    pub name: String,
+    /// The configured root, or `None` for the home.
+    pub build_root: Option<std::path::PathBuf>,
+}
+
+impl BuildRootOutcome {
+    pub fn summary(&self) -> String {
+        match &self.build_root {
+            Some(root) => format!(
+                "{} will keep its cells, managed objects, dependency catalog and build caches under {} from the next runner start; until then it uses the build root it started with. While that volume is unplugged the machine stays attached and takes no work that needs a cell, and its cells are adopted again when it returns",
+                self.name,
+                root.display()
+            ),
+            None => format!(
+                "{} will keep its cells under its home again from the next runner start",
+                self.name
+            ),
+        }
+    }
+}
+
 /// Change the fleet settings as one serialized step: read the current block,
 /// apply `mutate`, write it, and have placement adopt the roles it now holds
 /// before any other fleet write can run.
@@ -2157,5 +2274,41 @@ mod tests {
         );
         assert!(summary.contains("3 resident process"), "{summary}");
         assert!(ExecutorOccupancy::default().is_empty());
+    }
+
+    /// A build root is a mounted directory apart from the home. One that is
+    /// not there, or that sits inside or above the home, is refused with what
+    /// to do; a marker already on the volume is adopted, so the same drive
+    /// keeps its identity, and otherwise one is written.
+    #[test]
+    fn a_build_root_is_validated_and_marked() {
+        use cairn_common::executor_paths::{read_build_root_marker, write_build_root_marker};
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home").join(".cairn");
+        std::fs::create_dir_all(&home).unwrap();
+        let volume = temp.path().join("Volumes").join("Builds");
+
+        let missing = super::prepare_build_root(&volume, &home).unwrap_err();
+        assert!(missing.contains("Mount the volume"), "{missing}");
+        assert!(!volume.exists(), "nothing is created in a volume's place");
+        let relative =
+            super::prepare_build_root(std::path::Path::new("Builds"), &home).unwrap_err();
+        assert!(relative.contains("absolute"), "{relative}");
+        let inside = home.join("elsewhere");
+        std::fs::create_dir_all(&inside).unwrap();
+        let refused = super::prepare_build_root(&inside, &home).unwrap_err();
+        assert!(refused.contains("inside the Cairn home"), "{refused}");
+        let above = super::prepare_build_root(temp.path(), &home).unwrap_err();
+        assert!(above.contains("contains the Cairn home"), "{above}");
+
+        std::fs::create_dir_all(&volume).unwrap();
+        let fresh = super::prepare_build_root(&volume, &home).unwrap();
+        assert_eq!(read_build_root_marker(&volume).unwrap(), fresh.id);
+        assert!(!fresh.id.is_empty());
+
+        write_build_root_marker(&volume, "this-drive").unwrap();
+        let adopted = super::prepare_build_root(&volume, &home).unwrap();
+        assert_eq!(adopted.id, "this-drive");
+        assert_eq!(adopted.path, std::fs::canonicalize(&volume).unwrap());
     }
 }

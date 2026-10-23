@@ -150,23 +150,60 @@ pub async fn resolve_catalog_chain(
     Ok(chain)
 }
 
+/// What a runner answers an executor's object fetch with.
+pub struct RunnerFetch {
+    /// The objects the executor lacks; `None` when its haves already cover the
+    /// wanted commit.
+    pub pack: Option<ValidatedObjectPack>,
+    /// The source repository's shallow commits that the wanted commit's
+    /// history reaches. The pack deliberately stops there, so the executor
+    /// must prove the closure against, and record, the same boundary.
+    pub shallow_boundary: Vec<String>,
+}
+
+impl RunnerFetch {
+    /// The response headers carrying this answer's pack identity and shallow
+    /// boundary. Fails only for a boundary too wide to transfer.
+    pub fn response_headers(&self) -> Result<Vec<(&'static str, String)>, String> {
+        let mut headers = Vec::new();
+        if let Some(pack) = &self.pack {
+            headers.push(("x-cairn-content-sha256", content_sha256(&pack.pack)));
+            headers.push(("x-cairn-pack-checksum", pack.pack_checksum.clone()));
+        }
+        if !self.shallow_boundary.is_empty() {
+            headers.push((
+                cairn_common::executor_protocol::OBJECT_SHALLOW_BOUNDARY_HEADER,
+                cairn_codec::transfer::encode_shallow_boundary(&self.shallow_boundary)?,
+            ));
+        }
+        Ok(headers)
+    }
+}
+
 /// Read-only runner-local pack construction. Call without the project-store lock.
 pub fn build_local_reachable_pack(
     repository: &Path,
     want_commit: &str,
     have_commits: &[String],
-) -> Result<Option<ValidatedObjectPack>, String> {
+) -> Result<RunnerFetch, String> {
     let wants = [want_commit.to_owned()];
+    let shallow_boundary = cairn_codec::transfer::shallow_boundary(repository, want_commit)?;
     let Some((pack, builder_index)) =
         cairn_codec::transfer::build_reachable_pack(repository, &wants, have_commits)?
     else {
-        return Ok(None);
+        return Ok(RunnerFetch {
+            pack: None,
+            shallow_boundary,
+        });
     };
     let validated = validate_pack_bytes(pack)?;
     if validated.index != builder_index {
         return Err("reachable pack builder index disagrees with independent validation".into());
     }
-    Ok(Some(validated))
+    Ok(RunnerFetch {
+        pack: Some(validated),
+        shallow_boundary,
+    })
 }
 
 #[derive(Clone, Debug)]

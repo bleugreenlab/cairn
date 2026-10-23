@@ -922,23 +922,27 @@ async fn run_turn_end_checks_inner(
         .map_err(|e| e.to_string())?;
 
     // 4. Compute changed files between immutable logical coordinates.
+    let wave_base = base.clone();
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let changed_jj = jj.clone();
     let changed_repo = logical_repository.clone();
     let changed_head = sealed_commit.clone();
-    let Some(changed) = tokio::task::spawn_blocking(move || {
+    let changed = match tokio::task::spawn_blocking(move || {
         logical_changed_files(&changed_jj, &changed_repo, &base, &changed_head)
     })
     .await
     .map_err(|error| format!("turn-end changed-file task failed: {error}"))?
-    else {
-        log::debug!(
-            "turn-end checks for job {}: changed-file set unresolvable; nothing to run",
-            short_id(job_id)
-        );
-        return Ok(TurnEndDisposition::Skipped(
-            "changed-file set is unresolvable",
-        ));
+    {
+        Ok(changed) => changed,
+        Err(error) => {
+            log::warn!(
+                "turn-end checks for job {}: changed-file set unresolvable; nothing to run: {error}",
+                short_id(job_id)
+            );
+            return Ok(TurnEndDisposition::Skipped(
+                "changed-file set is unresolvable",
+            ));
+        }
     };
     if changed.is_empty() {
         log::debug!(
@@ -1042,7 +1046,14 @@ async fn run_turn_end_checks_inner(
     // Publish the immutable facts the 1 Hz status poll needs. They remain valid
     // until the single-flight slot is released because this suite is pinned to
     // the sealed tree.
-    cancel.set_runtime_status(tree_hash.clone(), applicable_names, input_hashes.clone());
+    cancel.set_runtime_status(
+        tree_hash.clone(),
+        sealed_commit.clone(),
+        wave_base,
+        std::sync::Arc::new(checks.clone()),
+        applicable_names,
+        input_hashes.clone(),
+    );
 
     // 7. Loop-break gate: drop any plan whose INPUT hash (the content of just
     // that check's impact-matched files) is infrastructure-suppressed; every
@@ -1067,27 +1078,15 @@ async fn run_turn_end_checks_inner(
         .iter()
         .map(|plan| plan.name.clone())
         .zip(
-            crate::execution::checks::plan_infra_scopes(
-                Some(orch),
-                crate::execution::checks::InfraScopeInputs {
-                    project_id: &cache_project_id,
-                    job_id: &cache_job_id,
-                    commit_sha: &cache_commit,
-                    repository: &coords.repository_path,
-                    mutation_policy: crate::fleet::MutationPolicy::PureVerdict,
-                    work_class: crate::fleet::PlacementWorkClass::ReviewChecks,
-                },
+            review_infra_scopes(
+                orch,
+                &cache_project_id,
+                &cache_job_id,
+                &cache_commit,
+                &coords.repository_path,
                 &plans
                     .iter()
-                    .map(|plan| crate::execution::checks::CheckPlacementQuestion {
-                        selector: cache_checks
-                            .get(&plan.name)
-                            .and_then(|check| check.executor.clone()),
-                        verdict_platforms: cache_checks
-                            .get(&plan.name)
-                            .map(crate::execution::check_identity::verdict_platforms)
-                            .unwrap_or_default(),
-                    })
+                    .map(|plan| review_check_placement_question(cache_checks.get(&plan.name)))
                     .collect::<Vec<_>>(),
             )
             .await,
@@ -1259,29 +1258,15 @@ async fn run_turn_end_checks_inner(
     // and the runner that stores what comes back. A turn-end wave is where a
     // check with an unsatisfiable selector lives, so the fleet counter here is
     // what stops `executor-windows-check` re-arming on every commit.
-    let infra_scopes = crate::execution::checks::plan_infra_scopes(
-        Some(orch),
-        crate::execution::checks::InfraScopeInputs {
-            project_id: &coords.project_id,
-            job_id,
-            commit_sha: &sealed_commit,
-            repository: &coords.repository_path,
-            mutation_policy: crate::fleet::MutationPolicy::PureVerdict,
-            work_class: crate::fleet::PlacementWorkClass::ReviewChecks,
-        },
+    let infra_scopes = review_infra_scopes(
+        orch,
+        &coords.project_id,
+        job_id,
+        &sealed_commit,
+        &coords.repository_path,
         &to_run
             .iter()
-            .map(
-                |(plan, _)| crate::execution::checks::CheckPlacementQuestion {
-                    selector: checks
-                        .get(&plan.name)
-                        .and_then(|check| check.executor.clone()),
-                    verdict_platforms: checks
-                        .get(&plan.name)
-                        .map(crate::execution::check_identity::verdict_platforms)
-                        .unwrap_or_default(),
-                },
-            )
+            .map(|(plan, _)| review_check_placement_question(checks.get(&plan.name)))
             .collect::<Vec<_>>(),
     )
     .await;
@@ -1590,6 +1575,46 @@ fn normalized_salient(value: &str) -> Option<String> {
 /// re-arm to keep nominating. Submission refuses it as not placeable instead.
 /// The bounded rows themselves are left exactly as they are: they are still the
 /// record of what happened, and still bound the lane if a machine returns.
+#[allow(clippy::too_many_arguments)]
+/// The placement question a review-cadence check asks. It also names the fleet
+/// counter that bounds the check, so every site that reads or charges that
+/// counter for a review check has to ask it identically.
+pub(crate) fn review_check_placement_question(
+    check: Option<&crate::config::project_settings::CheckCommand>,
+) -> crate::execution::checks::CheckPlacementQuestion {
+    crate::execution::checks::CheckPlacementQuestion {
+        selector: check.and_then(|check| check.executor.clone()),
+        verdict_platforms: check
+            .map(crate::execution::check_identity::verdict_platforms)
+            .unwrap_or_default(),
+    }
+}
+
+/// The suppression scope sets a review wave for `job_id` at `commit` reads and
+/// charges, one per placement question, in order.
+pub(crate) async fn review_infra_scopes(
+    orch: &Orchestrator,
+    project_id: &str,
+    job_id: &str,
+    commit: &str,
+    repository: &str,
+    questions: &[crate::execution::checks::CheckPlacementQuestion],
+) -> Vec<crate::execution::cache::InfraScopes> {
+    crate::execution::checks::plan_infra_scopes(
+        Some(orch),
+        crate::execution::checks::InfraScopeInputs {
+            project_id,
+            job_id,
+            commit_sha: commit,
+            repository,
+            mutation_policy: crate::fleet::MutationPolicy::PureVerdict,
+            work_class: crate::fleet::PlacementWorkClass::ReviewChecks,
+        },
+        questions,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hold_back_suppressed(
     db: &std::sync::Arc<LocalDb>,
@@ -2065,6 +2090,7 @@ mod tests {
 
     fn cell_held_by(holder: ResidencyHolder, phase: ResidencyPhase) -> PersistentCellState {
         PersistentCellState {
+            observed_head: None,
             size_bytes: 0,
             warm_command_classes: Vec::new(),
             executor_id: "executor".into(),
@@ -2108,6 +2134,7 @@ mod tests {
                 events: Vec::new(),
             }),
             occupancy: CellOccupancy::default(),
+            seeded_from: None,
         }
     }
 
@@ -2457,6 +2484,7 @@ mod tests {
             passed: None,
             failed: None,
             skipped: None,
+            deferred: None,
             parser: None,
             complete: None,
             selection: None,
@@ -2466,6 +2494,7 @@ mod tests {
             failure_kind: None,
             suppressed_after: None,
             executor: None,
+            verified_on: None,
         }
     }
 

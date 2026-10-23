@@ -52,8 +52,8 @@ pub use workspace::{
 
 // Project types
 pub use project::{
-    CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector, CheckWhen, CreateProject,
-    HumanBaseMergePolicy, HumanBaseMergePolicyError, HumanBaseMergePolicyReadState,
+    CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector, CheckTree, CheckWhen,
+    CreateProject, HumanBaseMergePolicy, HumanBaseMergePolicyError, HumanBaseMergePolicyReadState,
     HumanBaseMergePolicyState, MainCadence, MoveProject, PopulateConfig, Project,
     ProjectRemoteStatus, TerminalCommand, UpdateProject,
 };

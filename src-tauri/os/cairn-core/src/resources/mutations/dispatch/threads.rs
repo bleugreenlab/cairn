@@ -222,8 +222,16 @@ pub(super) async fn dispatch(
                     "payload.method requires action='merge'",
                 ));
             }
+            let precondition = crate::pr_data::actions::parse_merge_precondition(
+                payload.get("precondition"),
+                action.unwrap_or_default(),
+            )
+            .map_err(|error| build_failure(index, item, error))?;
             if dry_run {
-                format!("Would patch thread branch {project}/{thread}/{number}")
+                let gate = precondition
+                    .map(|_| " (precondition=pinBump)")
+                    .unwrap_or_default();
+                format!("Would patch thread branch {project}/{thread}/{number}{gate}")
             } else {
                 let (db, project_id) = project_id(orch, project)
                     .await
@@ -259,6 +267,7 @@ pub(super) async fn dispatch(
                                 .and_then(serde_json::Value::as_str)
                                 .map(str::to_string),
                             attribution,
+                            precondition,
                         )
                         .await
                     } else {

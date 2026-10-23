@@ -251,6 +251,15 @@ pub struct FleetConfig {
     /// in-memory copy is rebuilt from it whenever it is written or loaded.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub machine_roles: BTreeMap<String, MachineRole>,
+    /// Where the runner's own executor keeps its cells, managed objects,
+    /// dependency catalog and external caches, when that is a volume apart
+    /// from the home: an external drive the machine may be undocked from.
+    /// Absent keeps them under the home. Set only through the build-root
+    /// command, which validates the path and writes the marker, never through
+    /// a whole-block settings write; read at runner start, so a change takes
+    /// effect when the runner next starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colocated_build_root: Option<cairn_common::executor_paths::BuildRootDeclaration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -855,6 +864,7 @@ impl Default for FleetConfig {
             executor_listener: None,
             drained_machines: BTreeSet::new(),
             machine_roles: BTreeMap::new(),
+            colocated_build_root: None,
         }
     }
 }

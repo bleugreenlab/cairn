@@ -12,6 +12,17 @@
 //! older CLI runs the alias on an older, dearer model, which this underprices.
 //! Truly unrecognized models return `None` and are reported as unpriced.
 //!
+//! GPT tiers are OpenAI's Standard-processing list prices from
+//! <https://developers.openai.com/api/docs/pricing>. A temporary promotion is
+//! not a list price: that page shows GPT-5.6 Sol at a promotional rate (through
+//! at least 2026-11-21), so its tier keeps the $5 / $30 launch price from
+//! <https://openai.com/index/gpt-5-6/>. GPT-5.6 Terra and Luna take the page's
+//! current rate, below their launch prices, because the page does not mark it
+//! as promotional. Most GPT-5.4-and-later models bill a request over 272k input
+//! tokens at a long-context tier (2x input, 1.5x output); as with Haiku 5.5's
+//! tier below, request length is gone by the time rows are rolled up, so every
+//! GPT request is priced at the short-context tier.
+//!
 //! For Claude agent sessions this table is the only cost source: they never
 //! record `events.cost_usd`, because a subscription's per-turn cost figure is
 //! notional. Only a one-shot completion on an API-key account records the CLI's
@@ -27,14 +38,17 @@
 //! at its own tier needs the rollup to keep long-prompt components apart
 //! (cairn/5218).
 //!
-//! `cache_write` is the 5-minute cache-write rate. Codex cost ignores cache
-//! entirely (its `input` already subsumes cache), so the cache fields are unused
-//! for codex tiers.
+//! `cache_write` is Claude's 5-minute cache-write rate, and OpenAI's published
+//! cache-write rate for GPT tiers. Codex usage is normalized into disjoint
+//! uncached input and cache reads (`cairn-llm-wire`'s `codex_app_server::usage`)
+//! but carries no cache writes, so a GPT tier's `cache_write` is unused for
+//! Codex sessions: tokens OpenAI bills as cache writes (1.25x input from
+//! GPT-5.6 on) are priced here at the plain input rate.
 
 use cairn_models_types::catalog::claude_generation;
 
 /// Date the price table was last reviewed against public list prices.
-pub(crate) const PRICE_SOURCE_DATE: &str = "2026-10-19";
+pub(crate) const PRICE_SOURCE_DATE: &str = "2026-10-20";
 
 /// Per-million-token USD prices for one model tier.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -67,10 +81,14 @@ const SONNET_4: ModelPrice = ModelPrice::new(3.0, 0.30, 3.75, 15.0); // Sonnet 4
 const HAIKU_5_5: ModelPrice = ModelPrice::new(0.10, 0.01, 0.125, 0.50);
 const HAIKU_4_5: ModelPrice = ModelPrice::new(1.0, 0.10, 1.25, 5.0); // Haiku 4.5
 
-// GPT-5 / Codex tiers.
+// GPT / Codex tiers.
+const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 1.0, 12.50, 50.0);
+const GPT_6_1_SOL: ModelPrice = ModelPrice::new(2.0, 0.10, 2.50, 10.0);
+const GPT_6_SOL: ModelPrice = ModelPrice::new(2.0, 0.20, 2.50, 10.0);
+const GPT_6_LUNA: ModelPrice = ModelPrice::new(0.10, 0.01, 0.125, 0.50);
 const GPT_5_6_SOL: ModelPrice = ModelPrice::new(5.0, 0.50, 6.25, 30.0);
-const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.50, 0.25, 3.125, 15.0);
-const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(1.0, 0.10, 1.25, 6.0);
+const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.0, 0.20, 2.50, 12.0);
+const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(0.20, 0.02, 0.25, 1.20);
 const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 0.50, 5.0, 30.0);
 const GPT_5_4: ModelPrice = ModelPrice::new(2.50, 0.25, 2.50, 15.0);
 const GPT_5_4_MINI: ModelPrice = ModelPrice::new(0.75, 0.075, 0.75, 4.50);
@@ -104,7 +122,19 @@ fn price_for(model: Option<&str>) -> Option<ModelPrice> {
         })
     } else if model.contains("gpt") || model.contains("codex") {
         Some(
-            if model.contains("5.6-luna") || model.contains("5-6-luna") {
+            // `gpt-6.1-*` also contains `gpt-6`, so the point release goes first.
+            if model.contains("gpt-6.1") || model.contains("gpt-6-1") {
+                // Sol is the only 6.1 model.
+                GPT_6_1_SOL
+            } else if model.contains("gpt-6") {
+                if model.contains("-astra") {
+                    GPT_6_ASTRA
+                } else if model.contains("-luna") {
+                    GPT_6_LUNA
+                } else {
+                    GPT_6_SOL
+                }
+            } else if model.contains("5.6-luna") || model.contains("5-6-luna") {
                 GPT_5_6_LUNA
             } else if model.contains("5.6-terra") || model.contains("5-6-terra") {
                 GPT_5_6_TERRA
@@ -235,6 +265,28 @@ mod tests {
         assert_eq!(price_for(Some("gpt-5.4-mini")), Some(GPT_5_4_MINI));
         assert_eq!(price_for(Some("gpt-5")), Some(GPT_5_4));
         assert_eq!(price_for(Some("gpt-5-codex")), Some(GPT_5_4));
+    }
+
+    #[test]
+    fn gpt_six_family_is_priced_by_size() {
+        assert_eq!(price_for(Some("gpt-6.1-sol")), Some(GPT_6_1_SOL));
+        assert_eq!(price_for(Some("gpt-6-astra")), Some(GPT_6_ASTRA));
+        assert_eq!(price_for(Some("gpt-6-sol")), Some(GPT_6_SOL));
+        assert_eq!(price_for(Some("gpt-6-luna")), Some(GPT_6_LUNA));
+        // None of them falls through to the bare-`gpt` default.
+        for model in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+            assert_ne!(price_for(Some(model)), Some(GPT_5_4), "{model}");
+        }
+    }
+
+    /// `gpt-6.1-sol` contains `gpt-6`; it must not take GPT-6 Sol's dearer
+    /// cached-input rate, which is the only field where the two differ.
+    #[test]
+    fn gpt_six_one_is_not_classified_as_gpt_six() {
+        assert_ne!(GPT_6_1_SOL, GPT_6_SOL);
+        assert_ne!(price_for(Some("gpt-6.1-sol")), Some(GPT_6_SOL));
+        assert_eq!(price_for(Some("gpt-6-1-sol")), Some(GPT_6_1_SOL));
+        assert_eq!(price_for(Some("gpt-6.1")), Some(GPT_6_1_SOL));
     }
 
     #[test]

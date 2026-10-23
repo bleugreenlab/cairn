@@ -32,6 +32,9 @@ socket2 = { version = "0.6", features = ["all"] }
 # Scrubbing borrows each needle rather than owning it, so scanning never makes
 # a second, un-zeroized copy of a registered credential.
 memchr = "2"
+# Per-file copy-on-write clones (FICLONE, clonefile, ReFS block cloning) for
+# `cow::clone_tree`, strictly: its `reflink` never falls back to a byte copy.
+reflink-copy = "0.1.30"
 thiserror = "2"
 zeroize = "1"
 

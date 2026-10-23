@@ -336,6 +336,39 @@ pub struct CheckCommand {
     /// docs/checks.md, "Main cadence".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub main_cadence: Option<MainCadence>,
+
+    /// What the check's command sees. `full` (the default) runs it in a cell at
+    /// a checkout of the commit under test. `impact` runs it on the runner, with
+    /// no cell and no placement, in a scratch directory holding exactly the
+    /// files the check's `impact` globs select at that commit: the same entries
+    /// its cache key hashes, so the check can see only what its verdict is keyed
+    /// on. See docs/checks.md, "Checks that need no tree".
+    #[serde(default, skip_serializing_if = "CheckTree::is_full")]
+    pub tree: CheckTree,
+}
+
+/// A check's `tree:` declaration.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckTree {
+    /// A full checkout in a cell.
+    #[default]
+    Full,
+    /// Only the `impact`-selected files, on the runner.
+    Impact,
+}
+
+impl CheckTree {
+    pub fn is_full(&self) -> bool {
+        *self == CheckTree::Full
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckTree::Full => "full",
+            CheckTree::Impact => "impact",
+        }
+    }
 }
 
 /// A check's `mainCadence:` declaration.

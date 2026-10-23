@@ -76,6 +76,13 @@ pub const EXECUTOR_ARTIFACT_MANIFEST_PATH: &str = "/api/executor/artifact/manife
 /// to the runner, which serves the bytes itself.
 pub const EXECUTOR_CLI_SELECTION_PATH: &str = "/api/executor/artifact/cli";
 
+/// The response header on a runner object fetch that names the source
+/// repository's shallow boundary reached by the wanted commit's history, as
+/// space-separated commit IDs. The pack stops at those commits by design, so the
+/// executor proves the closure against them and records them in its managed
+/// repository's `shallow` file. Absent for a complete source.
+pub const OBJECT_SHALLOW_BOUNDARY_HEADER: &str = "x-cairn-shallow-boundary";
+
 /// The workspace crate the `cairn` CLI is published as, in a manifest's
 /// `sidecars`.
 pub const CLI_SIDECAR_CRATE: &str = "cairn-cmd";
@@ -191,7 +198,13 @@ impl RemotePlatform {
     /// nothing to bind to and reports no measurements at all rather than
     /// inventing a name that no placement rule knows how to compare.
     pub fn current() -> Option<Self> {
-        match (std::env::consts::OS, std::env::consts::ARCH) {
+        Self::from_os_arch(std::env::consts::OS, std::env::consts::ARCH)
+    }
+
+    /// The published platform an executor advertising `os`/`arch` runs, in
+    /// the vocabulary `std::env::consts` and [`ExecutorCapabilities`] share.
+    pub fn from_os_arch(os: &str, arch: &str) -> Option<Self> {
+        match (os, arch) {
             ("linux", "x86_64") => Some(Self::LinuxX86_64),
             ("linux", "aarch64") => Some(Self::LinuxArm64),
             ("windows", "x86_64") => Some(Self::WindowsX86_64),
@@ -571,9 +584,72 @@ pub const fn executor_cpu_budget(logical_cores: usize, colocated: bool) -> u32 {
 pub struct SandboxCapabilityEvidence {
     /// Whether Cairn attached a policy to this executor process.
     pub cairn_sandboxed_marker: bool,
-    /// A live behavioral measurement, not an inference from the marker.
+    /// A live behavioral measurement, not an inference from the marker: a
+    /// command wrapped exactly as this machine wraps a check lane's commands
+    /// applied a nested Seatbelt profile and wrote inside its allowance.
     pub nested_sandbox_write_available: bool,
     pub nested_sandbox_write_detail: String,
+    /// The launch and confinement context that measurement holds for.
+    ///
+    /// Absent from an executor that predates it. Such an executor applied the
+    /// nested profile from its own process, a context no check lane runs in,
+    /// so its `available` says nothing about a lane: it is how a machine
+    /// advertised itself capable while every lane there exited 71 at
+    /// `sandbox_apply` (cairn/5316).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_sandbox_write_context: Option<NestedSandboxProbeContext>,
+}
+
+impl SandboxCapabilityEvidence {
+    /// Whether a check lane on this machine can apply a nested Seatbelt
+    /// profile, on evidence that names the context it was measured in.
+    pub fn check_lane_can_nest(&self) -> bool {
+        self.nested_sandbox_write_available && self.nested_sandbox_write_context.is_some()
+    }
+}
+
+/// What a nested-Seatbelt measurement was taken under: every input that
+/// decides whether a check lane's command may apply a profile of its own.
+///
+/// The kernel rule is that a process under any Seatbelt profile cannot apply
+/// another, so the answer turns on whether anything confines the lane's
+/// command before it starts: a profile the executor itself inherited, and the
+/// profile the executor wraps the lane in. Policy text alone cannot decide it,
+/// because a service-launched executor and a confined descendant can generate
+/// identical profiles and get opposite answers, so the launcher is an input
+/// too.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedSandboxProbeContext {
+    pub launcher: SandboxLauncherClass,
+    /// SHA-256 of the operator credential floor's rules when this machine's
+    /// check lanes carry it (it holds an operator credential); absent when
+    /// they do not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_floor_sha256: Option<String>,
+    /// SHA-256 of the whole outer profile a check-lane command is wrapped in;
+    /// absent when lane commands are spawned with nothing applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outer_profile_sha256: Option<String>,
+    /// SHA-256 over every input above, which is what lets a later pass reuse
+    /// this measurement instead of probing again. Absent when an input could
+    /// not be read, in which case the executor re-probes on every pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    pub measured_at_unix_ms: u64,
+}
+
+/// Whether the executor process itself already runs under a Seatbelt profile.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SandboxLauncherClass {
+    /// No inherited profile: launched by the service manager or another
+    /// unconfined parent.
+    Unconfined,
+    /// An inherited profile, so nothing the executor spawns can apply one.
+    ConfinedDescendant,
+    /// The executor could not tell, so its measurement is never reused.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -697,11 +773,17 @@ pub enum PolicyMode {
 impl PolicyMode {
     /// The containment mode a requested process sandbox mode runs under, so a
     /// caller cannot pair a batch with evidence about a different policy.
+    ///
+    /// The credential floor confines no write, so its filesystem seam is the
+    /// unconfined one; what it does refuse is measured by its own edge,
+    /// [`EdgeId::OperatorCredentialRead`].
     pub const fn of(mode: ProcessSandboxMode) -> Self {
         match mode {
             ProcessSandboxMode::Confined => Self::Confined,
             ProcessSandboxMode::ReadOnlyCheckout => Self::ReadOnlyCheckout,
-            ProcessSandboxMode::Unconfined => Self::Unconfined,
+            ProcessSandboxMode::Unconfined
+            | ProcessSandboxMode::CredentialFloor
+            | ProcessSandboxMode::BranchCode => Self::Unconfined,
         }
     }
 }
@@ -764,9 +846,10 @@ pub enum EdgeId {
     ExecutorArtifactPull,
     RunnerArtifactReleaseFetch,
     ExecutionQueueOffer,
+    OperatorCredentialRead,
 }
 impl EdgeId {
-    pub const COUNT: usize = 55;
+    pub const COUNT: usize = 56;
     pub const fn definition(self) -> &'static EdgeDefinition {
         &CONTAINMENT_EDGE_DEFINITIONS[self as usize]
     }
@@ -2285,6 +2368,36 @@ pub const CONTAINMENT_EDGE_DEFINITIONS: [EdgeDefinition; EdgeId::COUNT] = [
         claim_revision: 1,
         supported_probe_versions: PROBE_VERSIONS,
     },
+    // An agent process reading a Cairn home's desktop operator credential on the
+    // machine it runs on. Every agent spawn is meant to be refused this whatever
+    // its fence says, so the edge is not keyed by a policy mode. Its evidence is
+    // an attempted read of a planted credential through the same wrapping an
+    // unfenced agent spawn gets: macOS Seatbelt refuses it, while Linux landlock
+    // cannot refuse one file in a readable tree and Windows applies no profile,
+    // so those machines measure the read succeeding rather than claim it fails.
+    EdgeDefinition {
+        id: EdgeId::OperatorCredentialRead,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Filesystem,
+            process_class: ProcessClass::BatchSpawn,
+            effect: EffectClass::Read,
+            policy_mode: PolicyMode::NotApplicable,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::SandboxProfile,
+        scoping: EdgeScoping::Machine,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Machine,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
 ];
 // CONTAINMENT_INVENTORY_END
 
@@ -2348,6 +2461,7 @@ pub const CONTAINMENT_EDGE_IDS: [EdgeId; EdgeId::COUNT] = [
     EdgeId::ExecutorArtifactPull,
     EdgeId::RunnerArtifactReleaseFetch,
     EdgeId::ExecutionQueueOffer,
+    EdgeId::OperatorCredentialRead,
 ];
 const _: () = assert!(CONTAINMENT_EDGE_IDS.len() == EdgeId::COUNT);
 
@@ -4657,6 +4771,21 @@ pub struct LearnedResourceEstimate {
 /// OOM ranking. What a runner gets wrong talking to an older executor: nothing
 /// it did not already get wrong, since the handshake admits only equal versions.
 ///
+/// cairn/5193 lets an executor on any copy-on-write volume (XFS with reflink,
+/// btrfs, APFS) seed a new cell by cloning a sibling's tree and use the
+/// dependency catalog off macOS, without a bump. Every field it adds is a
+/// serde-defaulted optional that an older peer reads as a gap:
+/// `CellExecutionMeta::cell_origin` (where the cell a command ran in came
+/// from), `CellOccupancy::clone_source` (a bounded fence on a resident cell
+/// being cloned between its holder's commands), and
+/// `PersistentCellState::seeded_from`. The enums they carry (`CellSeed`,
+/// `CellProvenance`) are new types inside those new fields, not new variants
+/// of an enum an older peer already decodes. What a runner gets wrong talking
+/// to an older executor: nothing; it reads no origin and renders the result
+/// line and the executor page as it always did. An older runner ignores the
+/// fields, and the clone-source hold is enforced by the executor that sets it,
+/// so nothing on the runner's side depends on reading it.
+///
 /// Version 153 (cairn/5178) makes [`ExecutorSubstrateReport::predicted_relief_ms`]
 /// honour the runner's occupancy contract. An older executor forecasts the
 /// drain from only the occupants that carry a learned duration they have not
@@ -4688,7 +4817,228 @@ pub struct LearnedResourceEstimate {
 /// already exist. What a runner gets wrong talking to an older executor:
 /// nothing; the older executor receives one more ordinary request when two
 /// placement demands disagree, and runs it as it runs any other.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 153;
+///
+/// cairn/5228 does not move the number. It adds a host-executed run item, a
+/// decision asked through `cairn://models/decide`, which the runner-only
+/// `fleet/mod.rs` refuses to turn into a build-cell process exactly as it
+/// already refuses a Response or MCP item. The refusal happens before
+/// anything is framed, so no frame gains, loses, or reinterprets a field, and
+/// a runner talking to an older executor gets nothing wrong: that executor is
+/// never sent a decide item at all.
+///
+/// Version 154 (cairn/5217) adds [`ProcessSandboxMode::CredentialFloor`], the
+/// mode a runner now sends for agent work its fence leaves unconfined,
+/// [`ProcessSandboxMode::BranchCode`] for checks, and the containment edge
+/// [`EdgeId::OperatorCredentialRead`]. All are new enum variants a 153 peer
+/// cannot decode. The version also has to move for safety
+/// rather than shape: a 153 executor reads `Unconfined` as "apply nothing",
+/// which is exactly the agent shell that read a dev instance's operator
+/// credential, so a runner must never send agent work to one.
+///
+/// Still 154 (cairn/5078): a cell checkout's HEAD is protected, repaired and
+/// reported. [`PersistentCellState::observed_head`] and [`ObservedCellHead`]
+/// are one defaulted, optional field on the cell records executors already
+/// post. Nothing decodes those records with `deny_unknown_fields`, so a runner
+/// older than this ignores the field and renders the recorded commit as it
+/// always has, and a newer runner reading an older executor finds the field
+/// absent and labels the recorded commit as a record. Everything else lives in
+/// the executor alone: the managed object cache pins each worktree's HEAD and
+/// index, and every ref under `refs/cairn/`, against eviction and no longer
+/// takes a warm-cell lease, a claim that trips over a fault in the shared
+/// repository quarantines no slot, removes any Cairn ref naming a missing
+/// object, and otherwise answers the existing
+/// `ObjectInfrastructure(IntegrityFailure)` refusal, which every runner at this
+/// version already treats as structural and places elsewhere, a held cell
+/// whose HEAD left the store is repaired in place onto its holder's refresh
+/// target instead of being refused and later torn down, provisioning never
+/// discards a held cell, and the cell identity file is read for identity only.
+/// No message changes, and the refusal text a holder may receive arrives
+/// through the diagnostic string it already carries. What a runner gets wrong
+/// talking to an older executor: nothing it would decode differently. That
+/// executor can still lose a refreshed checkout's commit to eviction until it
+/// runs a build carrying this.
+///
+/// cairn/4901 does not move the number. An executor now publishes only each
+/// running command attempt's leader identity in a cell's
+/// `occupancy.commandOwnership`. The descendants it discovers stay in the
+/// cell's persisted state file, which is where adoption, the drain pass and a
+/// colocated executor's retirement already read them, and `occupancy.draining`
+/// is still sent whole. On macOS the executor also sheds, while a command runs,
+/// recorded descendants that a direct read finds gone, as Linux already did
+/// against its census. Discovering or shedding a descendant no longer publishes
+/// a snapshot of its own, and a spawn publishes once rather than twice. No
+/// frame, field or cadence contract changes: `processes` was already a
+/// defaulted list, nothing in the runner reads descendant identities from a
+/// snapshot, and every cell reads as occupied exactly as before. The per-reason
+/// publish counts and the snapshot composition line are the executor's own
+/// log and never cross the link. What a runner gets wrong talking to an older
+/// executor: nothing; it is sent the longer list it already ignores.
+///
+/// cairn/5189 moves where an executor's derived state lives behind
+/// `executor_paths::ExecutorPaths`, without a bump. With nothing configured
+/// every path is the one it was, and no frame, field or value changes: the
+/// layout is the executor's own business. Adoption now rebases a cell found
+/// under a different build root than its records name and repairs its worktree
+/// links, a project cell-root migration repairs those links before it prunes
+/// worktree registrations, and managed repositories record their alternate
+/// relative to the primary object database. All three are disk state one
+/// executor reads back, never wire. The
+/// runner's retirement walks cells through the same layout, which for every
+/// runner today is the default. What a runner gets wrong talking to an older
+/// executor: nothing, because nothing it reads has changed.
+///
+/// cairn/5283 does not move the number. It restores one parameter name in
+/// the executor's dependency-catalog preparation that a merge had split, so
+/// the executor compiles again; the catalog root it is handed and uses is the
+/// one it always was. What a runner gets wrong talking to an older executor:
+/// nothing, because no frame, field or value changes.
+///
+/// cairn/5176 does not move the number. A macOS executor now ends a command a
+/// previous generation left running in a cell it adopts. It used to signal
+/// that command by numeric pid, which macOS refuses, so the cell stayed
+/// quarantined with its command alive; it now settles the attempt's tree
+/// through the process groups its recorded members anchor, as the command's
+/// own teardown always has. That lives entirely in the executor's adoption of
+/// its own cell state: the abandoned attempt is absent from the first snapshot
+/// exactly as it is on Linux, and the cell is advertised as any adopted cell
+/// is. What a runner gets wrong talking to an older executor: nothing it would
+/// decode differently; that executor keeps such a cell quarantined and its
+/// command running until it runs a build carrying this.
+///
+/// cairn/5186 does not move the number. Four runner-side judgements change,
+/// none of them in a frame. A remote that redials while its previous
+/// connection is still registered now ends that generation as a link gap in
+/// the runner-only `fleet/mod.rs` (its claims held and rebound, then settled
+/// against the new session's opening snapshot exactly as after a closed
+/// socket) instead of failing them. A `Result` that arrives on the replaced
+/// link settles the claim it was carried to, judged by the claim's binding
+/// rather than by which link is current. The colocated frozen-facts watchdog
+/// measures how long `liveness_observed_at_unix_ms` has gone unchanged on the
+/// runner's awake clock rather than subtracting it from wall time, so a
+/// runner's sleep is no longer charged to its executor. And the transport
+/// route sorts a `ListenerAccepted` with no rotation pending apart from a real
+/// mismatch when it logs. Every field is read as before and nothing new is
+/// sent. A runner talking to an older executor gets nothing wrong: the older
+/// executor already lists the work it still holds in `grantedAttempts` and
+/// already republishes its recompute stamp, which is all these read.
+///
+/// cairn/5267 does not move the number. It gives the shared startup-maintenance
+/// gate an optional deadline and makes `poll` report which path admitted an
+/// operation. The gate is process-local admission policy: nothing about it is
+/// serialized, and the executor constructs its own gate without a deadline, so
+/// its storage pass is admitted exactly as before. What a runner gets wrong
+/// talking to an older executor: nothing; no frame, field or value changes.
+///
+/// cairn/5297 does not move the number. The completions in a snapshot's
+/// `recentCompletions` now carry `actuals` without `containment` or
+/// `sandbox` (see `CellExecutionMeta::for_snapshot_history`). Both are
+/// per-process facts the executor already advertises once in its
+/// capabilities, and their copies were most of every snapshot frame. Both
+/// fields were already optional and defaulted, so an older runner decodes the
+/// shorter completion it is sent. The `Result` frame's metadata, where
+/// per-command containment evidence is consumed, still carries both. What a
+/// runner gets wrong talking to an older executor: nothing, because no runner
+/// path reads either field from a snapshot completion and the older
+/// executor's copies are bytes it ignores.
+///
+/// Version 155 (cairn/5292) makes managed residency work for a project whose
+/// canonical repository is a shallow clone. The runner's object fetch now
+/// answers with [`OBJECT_SHALLOW_BOUNDARY_HEADER`], the source's shallow
+/// commits that the wanted commit's history reaches, on a pack and on a
+/// covered (`204`) answer alike. The executor proves the closure against that
+/// boundary and records it in its managed repository's `shallow` file, so its
+/// worktrees, eviction walk and delta-pack construction stop where the objects
+/// deliberately stop. No frame changes shape and the header is absent for a
+/// complete source, so nothing changes for one. What a runner gets wrong
+/// talking to an older executor: that executor ignores the header and refuses
+/// every resident batch of a shallow-cloned project with `commit closure is
+/// missing object` naming the boundary's never-fetched parent, as it already
+/// does. The number moves as a rollout trigger, as 137 and 153 did: without it
+/// no attached machine would run the executor that reads the boundary.
+///
+/// cairn/5291 does not move the number. [`ExecutorSubstrateReport`] and
+/// [`ExecutorHealthSnapshot`] gain two defaulted fields,
+/// `repositoryFaults` ([`RepositoryFaultReport`]) and `quarantines`
+/// ([`QuarantineCensus`]), which a runner only renders. An older runner
+/// ignores them, and a newer runner reading an older executor finds them absent
+/// and renders nothing, which is what that executor can say. The rest lives in
+/// the executor alone: the storage sweep now audits every shared repository's
+/// `refs/cairn/` for refs naming missing objects and deletes them, as a claim
+/// that trips over one already did, and counts the quarantine records on disk
+/// by cause. No frame, refusal, or placement input changes. What a runner gets
+/// wrong talking to an older executor: nothing; the page omits two sections
+/// that executor cannot fill.
+///
+/// Version 156 (cairn/5311) adds [`ExecutorMessage::UpdateDirected`], which a
+/// runner sends on a live link to a resident executor whose build differs from
+/// the artifact the runner serves for its target, once the runner has emptied
+/// the machine of work. Until now only a refused `Hello` made a remote fetch a
+/// new binary, so an executor fix merged without a protocol bump never reached
+/// the fleet. The directive reuses the incompatible-protocol path's manifest,
+/// download, verification and swap; it differs only in that a failure before
+/// the swap leaves the running build in place and reconnecting, because that
+/// build still speaks the protocol. Runner-side, an executor being emptied for
+/// an update is refused new placement with
+/// [`PlacementRejectionReason::UpdatePending`], and
+/// [`ExecutorInspection::self_update`] says where the machine stands. What a
+/// runner gets wrong talking to an older executor: nothing, since it is
+/// refused at `Hello` as before, and that refusal is what installs a build
+/// that reads the directive. The number moves for the new frame and, as for
+/// 155, as the rollout trigger that delivers it.
+///
+/// Version 157 (cairn/5286, cairn/5189's second half) lets the colocated
+/// executor keep its build root on a detachable volume and says, on the wire,
+/// when that volume is gone. It adds [`ExecutorSubstrateReport::build_volume`]
+/// ([`BuildVolumeReport`]), the per-volume readings
+/// [`MachineTelemetry::build_volume`] and
+/// [`MachineTelemetry::build_disk_accounting`], the gap
+/// [`MeasurementGap::BuildVolumeAbsent`], the decline
+/// [`DeclineReason::BuildVolumeAbsent`], the refusals
+/// [`CellUnavailableReason::BuildVolumeAbsent`] and
+/// [`CellUnavailableReason::BuildVolumeLost`], the liveness phase
+/// [`LivenessRefreshPhase::BuildVolume`], and the runner-side filter
+/// [`PlacementRejectionReason::BuildVolumeAbsent`]. Every one is a new enum
+/// variant or a field whose absence a 156 peer would misread, so it is a
+/// version rather than a silent addition: a 156 runner cannot decode a decline,
+/// an outcome, or a measurement that names an absent volume, and would read a
+/// machine that has stopped taking cell work as an ordinary one. What a 157
+/// runner gets wrong talking to an older executor: nothing; an older executor
+/// has no build root apart from its home, posts no `buildVolume`, and is never
+/// filtered for it.
+///
+/// cairn/5288 does not move the number. The runner-only `fleet/mod.rs` now runs
+/// each coalesced leader on the runtime the fleet was built on rather than on
+/// the runtime of the caller that opened it, so cancelling a turn-end review
+/// wave no longer drops a leader mid-execution, and the leader's completion
+/// guard says whether a leader that did end without an outcome panicked or was
+/// dropped. The leader sends and reads exactly what it did; it simply survives
+/// to read the `Result`. What a runner gets wrong talking to an older executor:
+/// nothing; no frame, field or value changes.
+///
+/// cairn/5316 does not move the number. [`SandboxCapabilityEvidence`] gains
+/// one defaulted field, `nestedSandboxWriteContext`
+/// ([`NestedSandboxProbeContext`]), and its measurement moves from the
+/// executor's own process to a command wrapped as a check lane's is, re-probed
+/// whenever the context's fingerprint moves. A runner now places
+/// `requiresMacosNestedSandboxWrite` work only on evidence carrying that
+/// context. Mixed versions do disagree about a placement outcome here, which
+/// would ordinarily call for a version, but the disagreement resolves
+/// fail-closed: a runner talking to an older executor refuses it such work,
+/// naming the missing context, and places nothing on the older `available`,
+/// which is the claim this change exists to retire. Since 156 the fleet rolls
+/// onto the runner's build by build hash (`UpdateDirected`), not by protocol
+/// refusal, so that executor is updated without a bump. A field whose absence
+/// read fail-open would need one. An older runner ignores the field and keeps
+/// reading the boolean, which is now honest.
+///
+/// cairn/5287 does not move the number. When a macOS executor's Seatbelt
+/// profile refuses a command the setuid `/bin/ps` or `/usr/bin/top`, the
+/// executor appends a diagnostic paragraph to that item's result body, after
+/// its unchanged output and exit code. The body is a string the runner already
+/// relays verbatim, and the exit status and every other field are untouched.
+/// What a runner gets wrong talking to an older executor: nothing; it relays a
+/// body without the paragraph.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 157;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -5731,6 +6081,10 @@ pub struct VerifiedWarmRoot {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum LivenessRefreshPhase {
+    /// Probing whether the build root's volume is here, and acting on a change:
+    /// suspending the cells on a volume that went away, or adopting them back
+    /// from one that returned. Bounded per probe; a return's adoption is not.
+    BuildVolume,
     /// Reclaiming residencies whose holders stopped answering. Takes pool state
     /// and the per-holder residency operation locks.
     ExpireResidencies,
@@ -5748,7 +6102,8 @@ pub enum LivenessRefreshPhase {
 
 impl LivenessRefreshPhase {
     /// The phases in the order one pass runs them.
-    pub const ORDER: [Self; 6] = [
+    pub const ORDER: [Self; 7] = [
+        Self::BuildVolume,
         Self::ExpireResidencies,
         Self::EvictIdleManifests,
         Self::Snapshot,
@@ -5761,6 +6116,7 @@ impl LivenessRefreshPhase {
     /// reads.
     pub fn label(self) -> &'static str {
         match self {
+            Self::BuildVolume => "probing the build volume",
             Self::ExpireResidencies => "expiring residencies",
             Self::EvictIdleManifests => "evicting idle manifests",
             Self::Snapshot => "reading pool state",
@@ -6337,6 +6693,12 @@ pub enum DeclineReason {
     /// long. Kept apart from `Capacity` because a hold that never clears is a
     /// leak, and under that label it read as a machine that was merely full.
     ProjectProvisioning,
+    /// This work needs a cell, and the volume this machine keeps its cells on
+    /// is not mounted (see [`BuildVolumeReport`]). The detail is
+    /// [`build_volume_absent_detail`]. Nothing on the machine relieves it: the
+    /// decline holds until the machine posts the volume present again, and
+    /// work free to move belongs on another machine meanwhile.
+    BuildVolumeAbsent,
 }
 
 /// Why a disk refusal will or will not clear on its own.
@@ -6756,6 +7118,10 @@ pub struct CellExecutionMeta {
     /// out of every warmth-keyed profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warmth: Option<ExecutionWarmth>,
+    /// Where the cell this command ran in came from: its seed on the cell's
+    /// first occupancy, its reuse distance after that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_origin: Option<CellOrigin>,
     /// The machine load observed immediately before this command started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_context: Option<ExecutionLoadContext>,
@@ -6961,6 +7327,24 @@ impl CellExecutionMeta {
         });
         meta.stop = item.stop.clone();
         meta
+    }
+
+    /// This command's metadata as it rides in an executor's snapshot history
+    /// ([`CellCompletion::actuals`]): the command's own measurements, without
+    /// the facts about the machine that ran it.
+    ///
+    /// `containment` and `sandbox` are measured once per executor process and
+    /// advertised once in [`ExecutorCapabilities`]. The snapshot republishes
+    /// its whole completion history on every frame, so a copy of the
+    /// machine's containment matrix in each completion was most of every frame.
+    /// The per-item result keeps both fields, because that result is the
+    /// verdict's provenance record and the snapshot history is not.
+    pub fn for_snapshot_history(&self) -> Self {
+        Self {
+            containment: None,
+            sandbox: None,
+            ..self.clone()
+        }
     }
 }
 
@@ -7482,6 +7866,22 @@ pub enum CellUnavailableReason {
         /// What the runner read when it stopped waiting.
         final_account: ClaimedAttemptAccount,
     },
+    /// This work needs a cell, and the volume the machine keeps its cells on
+    /// is not mounted. Nothing of the work ran. A fact about the machine, not
+    /// the work: another machine can take it, and this one can again once the
+    /// volume returns, with no operator step on either side.
+    BuildVolumeAbsent {
+        path: String,
+    },
+    /// The volume holding this work's cell went away while the work ran, or
+    /// came back from such an absence before it finished. Whatever the command
+    /// reported is not a verdict, because the files it was reading may have
+    /// vanished under it; its exit code is deliberately not carried. The cell
+    /// is suspended, not torn down, and is adopted again when the volume
+    /// returns.
+    BuildVolumeLost {
+        path: String,
+    },
 }
 
 /// What the machine holding a claimed attempt says about it, read by the runner
@@ -7993,6 +8393,33 @@ pub struct CellOccupancy {
     pub draining: Option<DrainingCommandOwnership>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub processes: std::collections::BTreeMap<String, ResidentProcess>,
+    /// Another cell is being cloned from this one's tree, between its holder's
+    /// commands.
+    ///
+    /// Occupancy for the same reason `draining` is: every gate written in
+    /// terms of [`Self::is_empty`] (target reclaim, retirement, cell
+    /// selection) refuses the source while the clone reads it. The holder's
+    /// own next command and resident process starts wait for the hold to be
+    /// released or to pass its deadline, never longer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone_source: Option<CloneSourceHold>,
+}
+
+/// A bounded fence on a cell whose tree is the source of a copy-on-write clone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CloneSourceHold {
+    /// The new cell being seeded from this one.
+    pub target_cell_id: String,
+    /// The hold lapses here whether or not anything released it, so a crash
+    /// mid-clone cannot strand the holder.
+    pub deadline_unix_ms: u64,
+}
+
+impl CloneSourceHold {
+    pub fn is_active(&self, now_unix_ms: u64) -> bool {
+        now_unix_ms < self.deadline_unix_ms
+    }
 }
 
 impl CellOccupancy {
@@ -8001,6 +8428,15 @@ impl CellOccupancy {
             && self.command_ownership.is_none()
             && self.draining.is_none()
             && self.processes.is_empty()
+            && self.clone_source.is_none()
+    }
+
+    /// The deadline of a clone-source hold still in force at `now_unix_ms`.
+    pub fn active_clone_source_deadline(&self, now_unix_ms: u64) -> Option<u64> {
+        self.clone_source
+            .as_ref()
+            .filter(|hold| hold.is_active(now_unix_ms))
+            .map(|hold| hold.deadline_unix_ms)
     }
 
     pub fn live_processes(&self) -> impl Iterator<Item = (&String, &ResidentProcess)> {
@@ -8215,6 +8651,156 @@ pub struct PersistentCellState {
     /// adoption across an executor restart. Zero means unmeasured, not empty.
     #[serde(default)]
     pub size_bytes: u64,
+    /// What git last said this checkout stands on, as opposed to
+    /// `last_sealed_commit`, which is what the executor recorded moving it
+    /// to. Absent from executors that predate the observation and for cells
+    /// not yet looked at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_head: Option<ObservedCellHead>,
+    /// Where this checkout's tree came from when it was created: a
+    /// copy-on-write clone of a sibling cell, the dependency catalog, or
+    /// nothing. Persisted so the cell's first result and the executor page can
+    /// name it after the fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeded_from: Option<CellSeed>,
+}
+
+/// How a new cell's tree was seeded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum CellSeed {
+    /// Cloned by copy-on-write from a sibling cell's tree, build products
+    /// included.
+    Clone {
+        source_cell_id: String,
+        /// The residency holding the source when it was cloned between that
+        /// holder's commands; absent for an idle source.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_holder: Option<String>,
+        /// The source's actual `HEAD` at the clone.
+        source_commit: String,
+        /// From the source's `HEAD` to the commit the clone was made for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        distance: Option<crate::cache_distance::CacheDistance>,
+        cloned_at_unix_ms: u64,
+        clone_ms: u64,
+    },
+    /// The dependency catalog was materialized into an otherwise empty target.
+    Catalog { generation: String },
+    /// No clone source and no catalog: built from nothing.
+    Cold,
+}
+
+impl CellSeed {
+    /// `cloned from cell 3 (held by cairn/5105; warm: 12 files / 3 crates from
+    /// 659e638)`, `seeded from the dependency catalog`, or `(cold: no clone
+    /// source)`, so every surface names an origin the same way.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Clone {
+                source_cell_id,
+                source_holder,
+                source_commit,
+                distance,
+                ..
+            } => {
+                let held = source_holder
+                    .as_deref()
+                    .map(|holder| format!("held by {holder}; "))
+                    .unwrap_or_default();
+                format!(
+                    "cloned from cell {} ({held}warm: {} from {})",
+                    cell_label(source_cell_id),
+                    distance.as_ref().map_or_else(
+                        || "distance unmeasured".to_string(),
+                        crate::cache_distance::CacheDistance::describe_short
+                    ),
+                    short_commit_label(source_commit)
+                )
+            }
+            Self::Catalog { .. } => "seeded from the dependency catalog".into(),
+            Self::Cold => "(cold: no clone source)".into(),
+        }
+    }
+}
+
+/// Where the cell that ran a command came from, as of that command.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CellOrigin {
+    #[serde(rename = "slotId")]
+    pub cell_id: String,
+    pub provenance: CellProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmth: Option<ExecutionWarmth>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum CellProvenance {
+    /// The cell's first occupancy: how its tree was seeded.
+    Seeded { seed: CellSeed },
+    /// A cell that had run before, and how far its tree was from this
+    /// command's commit when it was claimed.
+    Reused {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        distance: Option<crate::cache_distance::CacheDistance>,
+    },
+}
+
+impl CellOrigin {
+    /// `cell 7 cloned from cell 3 (...)`, `cell 7 seeded from the dependency
+    /// catalog`, `cell 7 (cold: no clone source)`, `cell 3 (warm: 0 files / 0
+    /// crates)`.
+    pub fn describe(&self) -> String {
+        let cell = cell_label(&self.cell_id);
+        match &self.provenance {
+            CellProvenance::Seeded { seed } => format!("cell {cell} {}", seed.describe()),
+            CellProvenance::Reused {
+                distance: Some(distance),
+            } => format!("cell {cell} (warm: {})", distance.describe_short()),
+            CellProvenance::Reused { distance: None } => {
+                format!("cell {cell} (reused; distance unmeasured)")
+            }
+        }
+    }
+}
+
+/// A cell's number as people say it: `slot-7` is cell 7.
+fn cell_label(cell_id: &str) -> &str {
+    cell_id.strip_prefix("slot-").unwrap_or(cell_id)
+}
+
+fn short_commit_label(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
+}
+
+/// One reading of a cell checkout's HEAD.
+///
+/// The recorded commit is bookkeeping and can drift from the tree, and a
+/// commit the checkout does stand on can leave the object store under it. Both
+/// read as a healthy slot on the record alone, so the executor reports what
+/// the checkout itself resolves to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservedCellHead {
+    /// The object id HEAD names, when HEAD is readable at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// Whether that id resolves to a commit in the checkout's object store.
+    pub resolvable: bool,
+    pub observed_at_unix_ms: u64,
+    /// Why it does not resolve, when it does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 impl PersistentCellState {
@@ -8665,6 +9251,8 @@ pub enum MeasurementGap {
     /// No attempt has completed yet. This is the state a freshly started
     /// executor is honestly in, and it is what a defaulted measurement means.
     NotSampled,
+    /// The reading is of the build volume, and that volume is not mounted.
+    BuildVolumeAbsent,
 }
 
 impl MeasurementGap {
@@ -8677,6 +9265,7 @@ impl MeasurementGap {
             Self::SamplingFailed => "sampling failed",
             Self::PermissionDenied => "permission denied",
             Self::NotSampled => "not sampled yet",
+            Self::BuildVolumeAbsent => "the build volume is not mounted",
         }
     }
 }
@@ -9375,9 +9964,22 @@ impl ExecutorRetainedState {
 pub struct MachineTelemetry {
     pub cpu: Measurement<CpuPressure>,
     pub memory: Measurement<MachineMemory>,
+    /// The volume the executor's home is on: its database, its machine
+    /// authority, and, unless a build root is configured, its cells.
     pub volume: Measurement<MachineVolume>,
+    /// What Cairn holds on the home's volume.
     pub disk_accounting: Measurement<DiskAccounting>,
     pub process: ProcessTelemetry,
+    /// The volume the build root is on, when the build root is configured
+    /// apart from the home. `None` when it is the home, which is then the only
+    /// volume and `volume` is its reading. While the build volume is absent
+    /// this is a [`MeasurementGap::BuildVolumeAbsent`] gap, never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_volume: Option<Measurement<MachineVolume>>,
+    /// What Cairn holds under that build root, accounted against its own
+    /// volume. Present exactly when `build_volume` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_disk_accounting: Option<Measurement<DiskAccounting>>,
 }
 
 /// The stable name of a machine reading, used wherever a gap has to be reported
@@ -10449,6 +11051,60 @@ pub struct BuildSkew {
     pub executor_build_id: String,
 }
 
+/// Where a resident executor stands against the executor build its runner
+/// serves for the machine's target, and what the runner is doing about a
+/// difference.
+///
+/// A protocol mismatch never reaches this: it is refused at `Hello` and the
+/// executor repairs it at once. This is the scheduled path, for a build that
+/// speaks the protocol but is not the one the runner would install.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfUpdateStatus {
+    /// The artifact target the runner compares this machine against.
+    pub target: String,
+    /// The build the runner serves for `target`, when it resolved one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_build_id: Option<String>,
+    pub phase: SelfUpdatePhase,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SelfUpdatePhase {
+    /// Running the build the runner serves.
+    Current,
+    /// The runner could not resolve an artifact for this target, so it has
+    /// nothing to compare the machine against.
+    ArtifactUnavailable { reason: String },
+    /// Running a different build and waiting its turn: the fleet updates one
+    /// machine at a time, so a bad artifact strands one machine rather than
+    /// all of them. `behind` names the machine whose turn it is.
+    Waiting {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        behind: Option<String>,
+    },
+    /// This machine's turn. The runner refuses it new work and directs the
+    /// update once nothing is in flight here.
+    Draining { in_flight: u32, since_unix_ms: u64 },
+    /// Directed to update; the runner is waiting for it to return on the new
+    /// build.
+    Directed { at_unix_ms: u64 },
+    /// It did not empty within the drain budget, so it takes work again and
+    /// its turn comes back after `until_unix_ms`.
+    Deferred { until_unix_ms: u64 },
+    /// An update to this build failed in the fleet, so the runner directs no
+    /// machine to it. A different artifact resumes the rollout.
+    Halted { cause: String },
+    /// This machine did not act on a directive to this build. Other machines
+    /// still update; this one is retried when the artifact changes.
+    Excluded { cause: String },
+}
+
 /// Everything a machine continuously posts about itself, so the runner can
 /// route from state the machine asserted rather than from a forecast the runner
 /// computed about it.
@@ -10521,6 +11177,170 @@ pub struct ExecutorSubstrateReport {
     /// by nothing but a restart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stopped_commands: Vec<StoppedCommandReport>,
+    /// Shared repositories this executor currently holds to be faulty, one
+    /// entry per repository.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repository_faults: Vec<RepositoryFaultReport>,
+    /// The quarantines on disk, by cause, as the last storage sweep counted
+    /// them. `None` until a sweep has counted, and from a peer that predates
+    /// the census.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantines: Option<QuarantineCensus>,
+    /// The build root this executor keeps its cells under, and whether its
+    /// volume is mounted. `None` when the build root is the home, which is
+    /// always present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_volume: Option<BuildVolumeReport>,
+}
+
+/// A fault in a repository every slot of a project shares, as this executor
+/// last met it.
+///
+/// One repository is one fact. A claim that trips over it has learned nothing
+/// about the slot it was preparing, so the fault is the machine's to report,
+/// never a quarantine charged to that slot. Cleared by the next claim that
+/// succeeds against the repository, and, when the storage sweep's ref audit
+/// recorded it, by an audit that finds the repository clean.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryFaultReport {
+    pub repository: String,
+    /// The fault, verbatim, so the report and the executor's log line cannot
+    /// tell different stories.
+    pub fault: String,
+    /// The slot whose claim tripped over it. `None` when the storage sweep's
+    /// audit of the repository's refs found it.
+    #[serde(rename = "slotId", default, skip_serializing_if = "Option::is_none")]
+    pub cell_id: Option<String>,
+    pub observed_at_unix_ms: u64,
+}
+
+/// How many distinct causes a [`QuarantineCensus`] lists. The rest are
+/// still counted in [`QuarantineCensus::records`].
+pub const QUARANTINE_CENSUS_CAUSES: usize = 12;
+
+/// The quarantined slots a machine still holds on disk, counted by why each was
+/// quarantined.
+///
+/// Read from the quarantine records themselves (each quarantined authority
+/// keeps the slot's state file and its `quarantineReason`), so it survives a
+/// restart and counts what the forensic window has not yet reclaimed. A cause
+/// that quarantines hundreds of slots a day reads here as one line with a
+/// large count, which no per-slot listing can show.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuarantineCensus {
+    pub counted_at_unix_ms: u64,
+    /// Quarantine records counted, listed cause or not.
+    pub records: u64,
+    /// Quarantined slot trees on disk. A tree and its record are retired
+    /// separately, so the two counts can differ by the few in between.
+    pub trees: u64,
+    /// Most frequent first, at most [`QUARANTINE_CENSUS_CAUSES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub causes: Vec<QuarantineCauseReport>,
+}
+
+/// One cause in a [`QuarantineCensus`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuarantineCauseReport {
+    /// The reason with its identifiers (slot numbers, object ids, process ids,
+    /// timestamps) elided, so one cause that struck many slots counts once.
+    pub cause: String,
+    pub count: u64,
+    pub newest_at_unix_ms: u64,
+    #[serde(rename = "newestSlotId")]
+    pub newest_cell_id: String,
+    #[serde(default)]
+    pub newest_project_id: String,
+    /// The newest such quarantine's reason, verbatim.
+    pub newest_reason: String,
+}
+
+/// A build root on a volume of its own, and whether that volume is here.
+///
+/// The executor keeps everything that grows with builds under its build root:
+/// cells, the managed object cache, the dependency catalog, and the external
+/// build caches. When that root is on a detachable volume, the volume being
+/// unplugged is an ordinary, named state of the machine rather than a fault:
+/// the executor stays attached, takes no work that needs a cell, creates
+/// nothing in place of the missing volume, and takes its cells back when the
+/// volume returns.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildVolumeReport {
+    /// The configured build root, as the executor was started with it.
+    pub root: String,
+    pub state: BuildVolumeState,
+    /// When the volume entered its current state, as this executor saw it.
+    pub since_unix_ms: u64,
+    /// Cells this executor held on the volume when it went away. They are
+    /// suspended, not torn down: nothing touches them until the volume
+    /// returns, when they are adopted again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suspended_cells: Vec<SuspendedCellReport>,
+    /// How many held cells the last return of the volume adopted again.
+    #[serde(default)]
+    pub readopted_cells: usize,
+}
+
+impl BuildVolumeReport {
+    pub fn is_absent(&self) -> bool {
+        matches!(self.state, BuildVolumeState::Absent { .. })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum BuildVolumeState {
+    /// The build root is reachable and carries this executor's marker.
+    /// `mount_point` is the volume it is on, when the platform can say.
+    Present {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mount_point: Option<String>,
+    },
+    /// The build root is not reachable as this executor's: the volume is not
+    /// mounted, the directory is an empty mount point, a different volume is
+    /// mounted there, or the volume stopped answering.
+    Absent { reason: String },
+}
+
+/// A cell held on the build volume when it went away.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SuspendedCellReport {
+    pub project_id: String,
+    #[serde(rename = "slotId")]
+    pub cell_id: String,
+    /// The residency holder whose environment it is, as its storage key, or
+    /// empty for an idle cell.
+    #[serde(default)]
+    pub holder: String,
+}
+
+/// The words a decline or a refusal uses for an absent build volume, so every
+/// surface spells it the same way.
+pub fn build_volume_absent_detail(root: &str) -> String {
+    format!("buildVolumeAbsent({root})")
+}
+
+/// Whether this work needs the build volume: whether it runs in a cell.
+///
+/// A colocated repository and managed objects are both materialized into cells,
+/// which live under the build root. An existing checkout is an externally owned
+/// tree and scratch-only work runs in the machine authority's scratch, both on
+/// the home's volume, so they keep running while the build volume is absent.
+/// One answer for the executor's admission and the runner's placement filter.
+pub fn needs_build_volume(repository: &RepositoryLocator) -> bool {
+    matches!(
+        repository,
+        RepositoryLocator::ColocatedPath { .. } | RepositoryLocator::ManagedObjects { .. }
+    )
 }
 
 /// What a machine has committed, counted by the machine.
@@ -10716,8 +11536,16 @@ pub struct ExecutorHealthSnapshot {
     pub busy_declined_cells: Vec<BusyDeclinedCellReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stopped_commands: Vec<StoppedCommandReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repository_faults: Vec<RepositoryFaultReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantines: Option<QuarantineCensus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_skew: Option<BuildSkew>,
+    /// The build root the machine posts, when it keeps one apart from its
+    /// home. See [`BuildVolumeReport`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_volume: Option<BuildVolumeReport>,
 }
 
 /// One executor as an agent inspects it: its public address, everything the
@@ -10758,6 +11586,12 @@ pub struct ExecutorInspection {
     /// durable on the machine and refreshed by both Hello and Heartbeat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_update: Option<UpdateReport>,
+    /// How this machine's build compares with the one the runner serves for
+    /// its target, and where the runner's rolling update stands. `None` for
+    /// the colocated executor, whose binary the runner itself launches, and
+    /// for a machine whose build or target the runner has not yet compared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_update: Option<SelfUpdateStatus>,
     /// This executor's own cells, queued work, and running work.
     pub occupancy: FleetSnapshot,
     /// The machine's own projection of its slots, which carries what the last
@@ -12380,6 +13214,15 @@ pub enum PlacementRejectionReason {
     /// because a drain is the runner's own fact and holds whether or not the
     /// machine is in any condition to answer.
     Drained,
+    /// The runner is emptying this machine so it can replace its executor with
+    /// the build the runner serves for it. Clears on its own once the update
+    /// lands, fails, or is deferred. Work already resident here is exempt, as
+    /// for a drain.
+    UpdatePending,
+    /// This work needs a cell, and the machine has posted that the volume it
+    /// keeps cells on is not mounted. Filtered rather than offered, the way a
+    /// drain is: another machine taking the work records no failure here.
+    BuildVolumeAbsent { path: String },
     /// An operator gave this machine a role that does not accept this class of
     /// work. Permanent until an operator changes the role, so it is reported
     /// ahead of anything that could clear on its own, a drain included.
@@ -12520,6 +13363,13 @@ impl PlacementRejectionReason {
                 trusted.join(", ")
             ),
             Self::Drained => "drained by an operator; refusing new work".into(),
+            Self::UpdatePending => {
+                "being emptied for an executor update; refusing new work".into()
+            }
+            Self::BuildVolumeAbsent { path } => format!(
+                "{}: the volume this machine keeps its cells on is not mounted; it takes no work that needs a cell until it returns",
+                build_volume_absent_detail(path)
+            ),
             Self::RoleExcluded { role, work_class } => format!(
                 "is {}; this request is {}",
                 role.label(),
@@ -13214,12 +14064,25 @@ pub struct ExecutorConfig {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ProcessSandboxMode {
+    /// Cairn's own process: a dev-instance runtime or a service. Nothing
+    /// applied.
     #[default]
     Unconfined,
     Confined,
     /// The externally owned checkout stays readable but is never writable,
     /// including after a fence grant. Temp and toolchain cache roots remain writable.
     ReadOnlyCheckout,
+    /// Agent work the fence leaves unconfined. The executor applies only the
+    /// operator credential boundary (`cairn_sandbox::operator_credential`), which
+    /// every agent spawn carries whatever its fence says; `Confined` and
+    /// `ReadOnlyCheckout` carry it inside their profiles.
+    CredentialFloor,
+    /// Branch code Cairn runs as its own verification: a check cadence or a
+    /// project-declared check. The executor applies the operator credential
+    /// boundary when its machine holds an operator credential, and nothing
+    /// otherwise, so a suite that starts its own sandbox keeps working where
+    /// there is no credential to protect.
+    BranchCode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -13607,6 +14470,21 @@ pub enum ExecutorMessage {
         received: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         manifest_url: Option<String>,
+    },
+    /// Runner → resident executor, on a live link: the executor build this
+    /// runner serves for the machine's target is not the one it is running,
+    /// and the runner holds the machine empty of work so it can be replaced
+    /// now.
+    ///
+    /// Unlike [`Self::ProtocolIncompatible`], the running build is still
+    /// usable, so an update that fails before the swap leaves it running and
+    /// reconnecting with the failure in its `last_update`. `manifest_url` is a
+    /// path on the runner's artifact plane, resolved against the endpoint the
+    /// executor dialed, exactly as for an incompatible protocol. `build_id` is
+    /// the build the runner expects it to come back on.
+    UpdateDirected {
+        manifest_url: String,
+        build_id: String,
     },
     RuntimePolicyRequest {
         correlation_id: String,
@@ -14532,6 +15410,7 @@ mod tests {
                     reservation: None,
                 },
             )]),
+            clone_source: None,
         };
         let value = serde_json::to_value(&occupancy).unwrap();
         assert!(
@@ -14696,6 +15575,7 @@ mod tests {
                     ownership: None,
                 }),
             )]),
+            clone_source: None,
         };
         assert_eq!(occupancy.resident_reservation().concurrency_units, 1);
 
@@ -15575,6 +16455,7 @@ mod tests {
                 command_ownership: None,
                 draining: None,
                 processes,
+                clone_source: None,
             },
             ..template.clone()
         }
@@ -15617,6 +16498,7 @@ mod tests {
                 command_ownership: None,
                 draining: None,
                 processes,
+                clone_source: None,
             },
             ..template.clone()
         }
@@ -15873,6 +16755,8 @@ mod tests {
             ),
         };
         let machine = MachineTelemetry {
+            build_volume: None,
+            build_disk_accounting: None,
             cpu: Measurement::measured(
                 40,
                 CpuPressure {
@@ -16137,6 +17021,12 @@ mod tests {
             }),
         );
         let cell = PersistentCellState {
+            observed_head: Some(ObservedCellHead {
+                commit: Some("847f2d1d00000000000000000000000000000000".into()),
+                resolvable: false,
+                observed_at_unix_ms: 1_700_000_000_000,
+                failure: Some("verify cell HEAD commit: fatal: Needed a single revision".into()),
+            }),
             size_bytes: 4_294_967_296,
             warm_command_classes: Vec::new(),
             executor_id: "executor-a".into(),
@@ -16163,7 +17053,9 @@ mod tests {
                 command_ownership: None,
                 draining: None,
                 processes,
+                clone_source: None,
             },
+            seeded_from: None,
         };
         // Two more residencies, both dev instances: one launched against an
         // agent branch, which the row names by the work it belongs to, and one
@@ -16298,6 +17190,7 @@ mod tests {
                 },
             ],
             executors: vec![ExecutorHealthSnapshot {
+                build_volume: None,
                 identity: sample_advertisement().identity,
                 public_name: "local".into(),
                 colocated: true,
@@ -16338,6 +17231,8 @@ mod tests {
                 command_processes: CommandProcessHealth::default(),
                 evicted_cells: Vec::new(),
                 busy_declined_cells: Vec::new(),
+                repository_faults: Vec::new(),
+                quarantines: None,
                 build_skew: Some(BuildSkew {
                     runner_build_id: "runner".into(),
                     executor_build_id: "executor".into(),
@@ -16443,6 +17338,7 @@ mod tests {
                         sandbox: None,
                         containment: None,
                         stop: None,
+                        cell_origin: None,
                     }),
                     cached: false,
                     subscriber_count: 1,
@@ -17199,6 +18095,8 @@ mod tests {
     #[test]
     fn diagnostic_gaps_are_visible_but_are_not_placement_gaps() {
         let windows_shaped = MachineTelemetry {
+            build_volume: None,
+            build_disk_accounting: None,
             cpu: Measurement::measured(
                 1,
                 CpuPressure {
@@ -17746,6 +18644,7 @@ mod tests {
                 sandbox: None,
                 containment: None,
                 stop: None,
+                cell_origin: None,
             },
             mutation_delta: Some(Box::new(MutationDelta {
                 base_commit: "b".into(),

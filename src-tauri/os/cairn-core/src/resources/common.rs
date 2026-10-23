@@ -383,6 +383,20 @@ pub(super) fn affordance_spec_for_kind(
             }
         }
     }
+    // A resource invoked rather than written advertises its `run` call beside
+    // its writes; `mode: "run"` tells a consumer it is not a `write` mode.
+    if let Some(run) = cairn_common::contract::run_target_for(kind) {
+        actions.push(ActionSpec {
+            label: run.label.to_string(),
+            mode: "run".to_string(),
+            uri_template: contract.uri_template.to_string(),
+            uri: current.and_then(|resource| bind_uri_template(resource, contract.uri_template)),
+            required: run.required.iter().map(key_info).collect(),
+            optional: run.optional.iter().map(key_info).collect(),
+            example: run.example.to_string(),
+            guidance: None,
+        });
+    }
     Some(AffordanceSpec {
         kind: kind.slug().to_string(),
         name: contract.name.to_string(),
@@ -1682,6 +1696,37 @@ mod tests {
         let catalog = affordance_for_kind(ResourceKind::ModelsCatalog);
         assert!(catalog.contains("installed"), "{catalog}");
         assert!(catalog.contains("view"), "{catalog}");
+    }
+
+    /// The decide door is invoked, not written: its one action is a `run`,
+    /// and the models index links to it.
+    #[test]
+    fn affordance_for_models_decide_advertises_its_run_invocation() {
+        let decide = affordance_for_kind(ResourceKind::ModelsDecide);
+        assert!(decide.contains("### actions"), "{decide}");
+        assert!(
+            decide.contains("run({commands:[{target:\"cairn://models/decide\""),
+            "{decide}"
+        );
+        assert_eq!(
+            decide.matches("\n- [").count(),
+            2,
+            "one link, one action: {decide}"
+        );
+        let spec = affordance_spec_for_kind(ResourceKind::ModelsDecide, None).unwrap();
+        assert_eq!(spec.actions.len(), 1);
+        assert_eq!(spec.actions[0].mode, "run");
+        assert_eq!(
+            spec.actions[0]
+                .required
+                .iter()
+                .map(|key| key.key.as_str())
+                .collect::<Vec<_>>(),
+            ["model", "input", "questions"]
+        );
+
+        let index = affordance_for_kind(ResourceKind::Models);
+        assert!(index.contains("(cairn://models/decide)"), "{index}");
     }
 
     /// Every `cairn://inference` page is read-only, and the index offers its

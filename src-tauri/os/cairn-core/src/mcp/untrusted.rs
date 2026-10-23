@@ -18,6 +18,15 @@
 //! is installed, so an unwrapped gateway is not reachable rather than merely
 //! discouraged.
 //!
+//! # Exfiltration, not prompt injection
+//!
+//! Credential redaction mitigates exfiltration; it does not make server-authored
+//! prose safe to treat as instructions. Tool names, descriptions, schemas and
+//! initialize instructions remain untrusted even after sanitization. They must
+//! never enter a trusted prompt segment. The orientation renderer in
+//! `mcp::handlers::mcp_resources` accepts local configuration only; catalog
+//! discovery belongs in untrusted MCP resource read results.
+//!
 //! # Exact, not structural
 //!
 //! Sanitization here is [`SanitizeMode::ExactOnly`]: registered credentials and
@@ -62,8 +71,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::mcp::gateway::{
-    McpCallOutcome, McpGateway, McpResourceDef, McpTaskOutcome, McpToolCallResult, McpToolCatalog,
-    PlacedFacade,
+    McpCallOutcome, McpConnectionStatus, McpGateway, McpResourceDef, McpTaskOutcome,
+    McpToolCallResult, McpToolCatalog, PlacedFacade,
 };
 use crate::security::{BrokeredMcpConfig, Crossing, DetectionReport, Sanitizer};
 
@@ -265,6 +274,23 @@ impl McpGateway for UntrustedGateway {
         Ok(catalog)
     }
 
+    async fn list_tools_fresh(
+        &self,
+        server: &str,
+        config: &BrokeredMcpConfig,
+    ) -> Result<McpToolCatalog, String> {
+        let mut catalog = scrub_error(
+            "a tools/list error",
+            self.inner.list_tools_fresh(server, config).await,
+        )?;
+        scrub_catalog(&mut catalog);
+        Ok(catalog)
+    }
+
+    fn catalog_capture_protocols(&self) -> Vec<String> {
+        self.inner.catalog_capture_protocols()
+    }
+
     async fn list_resources(
         &self,
         session_key: &str,
@@ -389,6 +415,23 @@ impl McpGateway for UntrustedGateway {
         )
     }
 
+    fn connection_status(&self, session_key: &str, server: &str) -> Option<McpConnectionStatus> {
+        let mut status = self.inner.connection_status(session_key, server)?;
+        if let Some(exit) = status.last_exit.as_mut() {
+            // A server's stderr is its own output and as likely as a tool
+            // result to echo the credentials it was launched with.
+            scrub_text("a server's exit status", &mut exit.status);
+            for line in &mut exit.stderr_tail {
+                scrub_text("a server's stderr", line);
+            }
+        }
+        Some(status)
+    }
+
+    async fn restart_connection(&self, session_key: &str, server: &str) -> Result<bool, String> {
+        self.inner.restart_connection(session_key, server).await
+    }
+
     async fn close_session(&self, session_key: &str) {
         self.inner.close_session(session_key).await
     }
@@ -448,6 +491,7 @@ mod tests {
             _: &BrokeredMcpConfig,
         ) -> Result<McpToolCatalog, String> {
             Ok(McpToolCatalog {
+                protocol_version: None,
                 tools: vec![McpToolDef {
                     name: "search".to_string(),
                     description: Some(serialized_echo()),

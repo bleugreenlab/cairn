@@ -32,6 +32,7 @@ pub const RESERVED_PROJECT_SEGMENTS: &[&str] = &[
     "tenets",
     "terminal",
     "threads",
+    "vcs",
     "wakes",
     "workflows",
 ];

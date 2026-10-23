@@ -21,7 +21,11 @@ fn embedded_preset_schema(schema_name: &str) -> Option<&'static str> {
     }
 }
 
-/// List of preset schema names
+/// List of preset schema names.
+///
+/// `preset-schema-names.json` at the crate root publishes this list to the
+/// frontend, which offers it as the run dialog's preset choices; a test below
+/// holds the two equal.
 pub const PRESET_SCHEMAS: &[&str] = &[
     "document",
     "plan",
@@ -138,5 +142,21 @@ mod tests {
                 .unwrap_or_else(|| panic!("preset `{name}` declares no properties"));
             assert!(!fields.is_empty(), "preset `{name}` declares no fields");
         }
+    }
+
+    #[test]
+    fn the_published_preset_names_are_exactly_the_list() {
+        // The frontend imports this file rather than reading Rust source, so a
+        // crate move, a visibility change, or a reformat cannot desynchronise the
+        // two sides; only the list itself can, and this is where that is caught.
+        let published: Vec<String> =
+            serde_json::from_str(include_str!("../preset-schema-names.json"))
+                .expect("preset-schema-names.json is a JSON array of strings");
+        let expected = serde_json::to_string_pretty(PRESET_SCHEMAS).unwrap();
+        assert_eq!(
+            published, PRESET_SCHEMAS,
+            "src-tauri/os/cairn-workflow/preset-schema-names.json must list PRESET_SCHEMAS \
+             in order; write it as:\n{expected}"
+        );
     }
 }

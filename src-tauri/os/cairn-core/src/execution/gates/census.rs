@@ -20,7 +20,8 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use cairn_common::identity::PrincipalRef;
-use cairn_db::turso::{params, Connection};
+use cairn_db::sql::{placeholders, IN_LIST_CHUNK};
+use cairn_db::turso::{Connection, Value as SqlValue};
 use serde_json::Value;
 
 use super::vocabulary::{GateOutcome, GateVocabulary};
@@ -29,7 +30,7 @@ use crate::models::{
     ReleaseOverride,
 };
 use crate::routes::{FactRegistry, TriggerClause};
-use crate::storage::{DbError, DbResult, RowExt};
+use crate::storage::{DbResult, RowExt};
 use cairn_workflow::gates::store::list_gates_for_executions_conn;
 
 /// The shared fact registry, whose gate half is the vocabulary every census
@@ -249,9 +250,8 @@ fn principal_label(value: &Value) -> String {
     }
 }
 
-fn ids_json(ids: &[String]) -> DbResult<String> {
-    serde_json::to_string(ids)
-        .map_err(|error| DbError::internal(format!("failed to serialize ids: {error}")))
+fn bound_ids(ids: &[String]) -> Vec<SqlValue> {
+    ids.iter().map(|id| SqlValue::Text(id.clone())).collect()
 }
 
 /// Every fact a census reads about one execution, beyond its gates. A filter
@@ -290,9 +290,18 @@ struct CensusRow {
     wont_start: Option<String>,
 }
 
-async fn census_rows(conn: &Connection, filter: &str, bound: &str) -> DbResult<Vec<CensusRow>> {
-    let sql = format!("{CENSUS_ROW_SQL}{filter} ORDER BY e.issue_id, e.seq, e.id");
-    let mut rows = conn.query(&sql, params![bound]).await?;
+/// [`CENSUS_ROW_SQL`] over `filter`, a predicate on `e` (and optionally
+/// `i`/`p`), in issue then execution order.
+fn census_rows_sql(filter: &str) -> String {
+    format!("{CENSUS_ROW_SQL}{filter} ORDER BY e.issue_id, e.seq, e.id")
+}
+
+async fn census_rows(
+    conn: &Connection,
+    sql: &str,
+    bound: Vec<SqlValue>,
+) -> DbResult<Vec<CensusRow>> {
+    let mut rows = conn.query(sql, bound).await?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().await? {
         let wont_start = if row.i64(5)? != 0 {
@@ -342,48 +351,65 @@ async fn render_rows(
         .collect())
 }
 
+/// The census rows of `n` listed executions that can have a census: gated, or
+/// released by hand.
+fn executions_census_sql(n: usize) -> String {
+    census_rows_sql(&format!(
+        "e.id IN ({})
+           AND (e.release_override_json IS NOT NULL
+                OR EXISTS (SELECT 1 FROM execution_gates g WHERE g.execution_id = e.id))",
+        placeholders(n)
+    ))
+}
+
 /// The census of each execution in `execution_ids` that has one. Two queries
-/// regardless of how many executions a list shows.
+/// per [`IN_LIST_CHUNK`] executions, however many a list shows.
 pub async fn census_for_executions_conn(
     conn: &Connection,
     execution_ids: &[String],
 ) -> DbResult<HashMap<String, ExecutionGateCensus>> {
-    if execution_ids.is_empty() {
-        return Ok(HashMap::new());
+    let mut out = HashMap::new();
+    for chunk in execution_ids.chunks(IN_LIST_CHUNK) {
+        let rows = census_rows(conn, &executions_census_sql(chunk.len()), bound_ids(chunk)).await?;
+        out.extend(
+            render_rows(conn, rows)
+                .await?
+                .into_iter()
+                .map(|(row, census)| (row.id, census)),
+        );
     }
-    let rows = census_rows(
-        conn,
-        "e.id IN (SELECT value FROM json_each(?1))
-           AND (e.release_override_json IS NOT NULL
-                OR EXISTS (SELECT 1 FROM execution_gates g WHERE g.execution_id = e.id))",
-        &ids_json(execution_ids)?,
-    )
-    .await?;
-    Ok(render_rows(conn, rows)
-        .await?
-        .into_iter()
-        .map(|(row, census)| (row.id, census))
-        .collect())
+    Ok(out)
 }
 
-/// Gated, unreleased executions selected by `filter` (a SQL predicate over
-/// `e`, bound to `?1`), in issue then execution order, paired with their issue
-/// id. Both kinds come back — those waiting to start (`census.held`) and those
-/// that never will (`census.wont_start`) — for the caller to list apart.
+/// The census statement for gated, unreleased executions selected by `filter`,
+/// a SQL predicate over `e`.
+fn gated_unreleased_rows_sql(filter: &str) -> String {
+    census_rows_sql(&format!(
+        "{filter} AND e.issue_id IS NOT NULL AND {}",
+        cairn_db::gated_unreleased_sql!()
+    ))
+}
+
+/// The gated, unreleased executions on `n` issues.
+fn issues_gated_sql(n: usize) -> String {
+    gated_unreleased_rows_sql(&format!("e.issue_id IN ({})", placeholders(n)))
+}
+
+/// Gated, unreleased executions selected by `sql` (built by
+/// [`gated_unreleased_rows_sql`]) over `bound`, in issue then execution order,
+/// paired with their issue id. Both kinds come back — those waiting to start
+/// (`census.held`) and those that never will (`census.wont_start`) — for the
+/// caller to list apart.
 ///
 /// This reads facts rather than `status = 'held'`: the status projection
 /// derives `held` for both kinds (see `cairn_workflow::transitions::outcome`),
 /// and only the shared predicate tells them apart.
-async fn gated_unreleased_where(
+async fn gated_unreleased_rows(
     conn: &Connection,
-    filter: &str,
-    bound: &str,
+    sql: &str,
+    bound: Vec<SqlValue>,
 ) -> DbResult<Vec<(String, HeldExecution)>> {
-    let filter = format!(
-        "{filter} AND e.issue_id IS NOT NULL AND {}",
-        cairn_db::gated_unreleased_sql!()
-    );
-    let rows = census_rows(conn, &filter, bound).await?;
+    let rows = census_rows(conn, sql, bound).await?;
     Ok(render_rows(conn, rows)
         .await?
         .into_iter()
@@ -430,17 +456,14 @@ pub async fn gated_executions_for_issues_conn(
     issue_ids: &[String],
 ) -> DbResult<HashMap<String, IssueGatedExecutions>> {
     let mut grouped = HashMap::<String, IssueGatedExecutions>::new();
-    if issue_ids.is_empty() {
-        return Ok(grouped);
-    }
-    let gated = gated_unreleased_where(
-        conn,
-        "e.issue_id IN (SELECT value FROM json_each(?1))",
-        &ids_json(issue_ids)?,
-    )
-    .await?;
-    for (issue_id, execution) in gated {
-        grouped.entry(issue_id).or_default().push(execution);
+    // Each issue lands in exactly one chunk, so its executions keep their seq
+    // order across the split.
+    for chunk in issue_ids.chunks(IN_LIST_CHUNK) {
+        let gated =
+            gated_unreleased_rows(conn, &issues_gated_sql(chunk.len()), bound_ids(chunk)).await?;
+        for (issue_id, execution) in gated {
+            grouped.entry(issue_id).or_default().push(execution);
+        }
     }
     Ok(grouped)
 }
@@ -463,26 +486,31 @@ pub async fn held_executions_for_project_conn(
     conn: &Connection,
     project_id: &str,
 ) -> DbResult<Vec<ProjectHeldExecution>> {
-    let held = gated_unreleased_where(
+    let held = gated_unreleased_rows(
         conn,
-        "e.issue_id IN (SELECT id FROM issues
-                         WHERE project_id = ?1 AND status NOT IN ('merged', 'closed'))",
-        project_id,
+        &gated_unreleased_rows_sql(
+            "e.issue_id IN (SELECT id FROM issues
+                             WHERE project_id = ?1 AND status NOT IN ('merged', 'closed'))",
+        ),
+        vec![SqlValue::Text(project_id.to_string())],
     )
     .await?;
     if held.is_empty() {
         return Ok(Vec::new());
     }
-    let issue_ids: Vec<String> = held.iter().map(|(issue_id, _)| issue_id.clone()).collect();
-    let mut rows = conn
-        .query(
-            "SELECT id, number, title FROM issues WHERE id IN (SELECT value FROM json_each(?1))",
-            params![ids_json(&issue_ids)?],
-        )
-        .await?;
+    let mut issue_ids: Vec<String> = held.iter().map(|(issue_id, _)| issue_id.clone()).collect();
+    issue_ids.sort();
+    issue_ids.dedup();
     let mut issues = HashMap::<String, (i64, String)>::new();
-    while let Some(row) = rows.next().await? {
-        issues.insert(row.text(0)?, (row.i64(1)?, row.text(2)?));
+    for chunk in issue_ids.chunks(IN_LIST_CHUNK) {
+        let sql = format!(
+            "SELECT id, number, title FROM issues WHERE id IN ({})",
+            placeholders(chunk.len())
+        );
+        let mut rows = conn.query(&sql, bound_ids(chunk)).await?;
+        while let Some(row) = rows.next().await? {
+            issues.insert(row.text(0)?, (row.i64(1)?, row.text(2)?));
+        }
     }
     let mut out: Vec<ProjectHeldExecution> = held
         .into_iter()
@@ -609,6 +637,73 @@ mod tests {
             "an ungated execution has no census"
         );
         assert_eq!(census["e-held"].summary, HELD_SUMMARY);
+    }
+
+    /// The plan of `sql` with `n` bound ids, one node per line.
+    async fn query_plan(db: &LocalDb, sql: String, n: usize) -> Vec<String> {
+        db.read(move |conn| {
+            let sql = format!("EXPLAIN QUERY PLAN {sql}");
+            Box::pin(async move {
+                let bound = vec![SqlValue::Text("x".into()); n];
+                let mut rows = conn.query(&sql, bound).await?;
+                let mut plan = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    plan.push(row.text(3)?);
+                }
+                Ok(plan)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The issue route hydrates the issue's gated executions and every listed
+    /// execution's census through these two statements. With the ids bound as
+    /// one `json_each` array the planner could not seek and scanned the whole
+    /// executions table: 5.4 s and 2.7 s on a production database of 5.5k
+    /// executions (cairn/5206). Every table they reach, the gate EXISTS
+    /// probes and the supersession subquery included, must be a seek.
+    #[tokio::test]
+    async fn census_statements_never_scan() {
+        let db = crate::storage::migrated_test_db("gate-census-plan.db").await;
+        for (label, sql, driving_index) in [
+            ("issues", issues_gated_sql(3), "idx_executions_issue_seq"),
+            ("executions", executions_census_sql(3), "(id=?)"),
+        ] {
+            let plan = query_plan(&db, sql, 3).await;
+            assert!(
+                plan.iter()
+                    .any(|line| line.starts_with("SEARCH e ") && line.contains(driving_index)),
+                "{label}: executions are reached by {driving_index}: {plan:#?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("idx_execution_gates_execution")),
+                "{label}: the gate probes seek by execution: {plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|line| line.starts_with("SCAN")),
+                "{label}: no table in the census is scanned: {plan:#?}"
+            );
+        }
+    }
+
+    /// More issues than one bound list carries: the held execution in the
+    /// second chunk is still found and grouped under its issue.
+    #[tokio::test]
+    async fn gated_executions_span_chunks() {
+        let db = issue_with_two_executions().await;
+        let mut ids: Vec<String> = (0..IN_LIST_CHUNK).map(|n| format!("absent-{n}")).collect();
+        ids.push("i".to_string());
+        let gated = db
+            .read(move |conn| {
+                let ids = ids.clone();
+                Box::pin(async move { gated_executions_for_issues_conn(conn, &ids).await })
+            })
+            .await
+            .unwrap();
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated["i"].held[0].execution_id, "e-held");
     }
 
     /// Every surface reads its gated executions through these two: the issue

@@ -17,8 +17,8 @@
 //!
 //! Questions and answers are `cairn_domain::decision` types; the facet defines
 //! no mirror of them. What it adds is how an answer is measured: natively over
-//! the Decisions wire, or from a chat model's next-token logprobs over a closed
-//! label set. A chat model asked to report its own probabilities is not a
+//! one of the two decision wires (OpenAI's Decisions, System One), or from a
+//! chat model's next-token logprobs over a closed label set. A chat model asked to report its own probabilities is not a
 //! route: the number would not be a measurement.
 //!
 //! [`Complete`]: super::complete::Complete
@@ -37,8 +37,10 @@ use crate::wire::openai_compat::http::Endpoint;
 /// How a decision is measured, and the deployment that measures it.
 #[derive(Debug, Clone)]
 pub enum DecisionRoute {
-    /// A decision model over the Decisions wire.
+    /// A decision model over OpenAI's Decisions wire.
     Native(DecisionsEndpoint),
+    /// A decision model over System One (TypeSafe, OpenRouter).
+    SystemOne(DecisionsEndpoint),
     /// A chat-completions endpoint that serves next-token logprobs.
     Logprobs(Endpoint),
 }
@@ -48,6 +50,7 @@ impl DecisionRoute {
     pub fn completion_wire(&self) -> CompletionWire<'_> {
         match self {
             Self::Native(endpoint) => CompletionWire::Decisions(endpoint),
+            Self::SystemOne(endpoint) => CompletionWire::SystemOne(endpoint),
             Self::Logprobs(endpoint) => CompletionWire::Chat(endpoint),
         }
     }
@@ -61,14 +64,14 @@ impl DecisionRoute {
 
     pub fn backend_key(&self) -> &str {
         match self {
-            Self::Native(endpoint) => &endpoint.backend_key,
+            Self::Native(endpoint) | Self::SystemOne(endpoint) => &endpoint.backend_key,
             Self::Logprobs(endpoint) => &endpoint.backend_key,
         }
     }
 
     pub fn provider_name(&self) -> &str {
         match self {
-            Self::Native(endpoint) => &endpoint.provider_name,
+            Self::Native(endpoint) | Self::SystemOne(endpoint) => &endpoint.provider_name,
             Self::Logprobs(endpoint) => &endpoint.provider_name,
         }
     }
@@ -78,7 +81,7 @@ impl DecisionRoute {
 /// cannot measure one.
 pub fn measured_by(wire: Wire) -> Option<MeasuredBy> {
     match wire {
-        Wire::OpenAiDecisions => Some(MeasuredBy::Native),
+        Wire::OpenAiDecisions | Wire::SystemOne => Some(MeasuredBy::Native),
         Wire::OpenAiChatCompletions => Some(MeasuredBy::Logprobs),
         Wire::AnthropicMessages
         | Wire::OpenAiResponses
@@ -108,11 +111,11 @@ pub struct DecisionCall<'a> {
 /// The fixes every no-offer refusal of a decision names.
 pub const DECISION_FIXES: &str =
     "A decision is answered by a decision model or by a local model's \
-logprobs, never by a chat model reporting its own probabilities. To fix it, add a custom provider \
-in Settings → Providers: either a Decisions API key (OpenAI at https://api.openai.com/v1, the \
-Vercel AI Gateway at https://ai-gateway.vercel.sh/v1, or TypeSafe Jev) with the protocol set to \
-Decisions, or an OpenAI-compatible server that returns logprobs (for example vLLM) with the \
-protocol set to OpenAI chat.";
+logprobs, never by a chat model reporting its own probabilities. To fix it, add an OpenRouter API \
+key in Settings → Providers (its decision models, such as TypeSafe's Jev, answer over System \
+One), or add a custom provider there: either an OpenAI Decisions API key (https://api.openai.com/v1) \
+with the protocol set to Decisions, or an OpenAI-compatible server that returns logprobs (for \
+example vLLM) with the protocol set to OpenAI chat.";
 
 /// Why a decision produced no answers. A refused question is not an error:
 /// it is an answer ([`cairn_domain::decision::DecisionAnswer::Refusal`]).

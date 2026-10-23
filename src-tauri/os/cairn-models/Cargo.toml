@@ -41,3 +41,12 @@ tempfile = "3"
 
 [features]
 test-utils = ["cairn-platform/test-utils"]
+# The real-binary Codex contract suite (tests/codex_contract). Only
+# `bun run codex:contract` enables it, so no ordinary test, lint, or
+# full-suite run builds or selects the target.
+codex-contract = []
+
+[[test]]
+name = "codex_contract"
+path = "tests/codex_contract/main.rs"
+required-features = ["codex-contract"]

@@ -68,6 +68,13 @@ pub(crate) fn is_workspace_mcp_mutation(item: &ChangeItem) -> bool {
     ) {
         return false;
     }
+    // A connection action changes no configuration, so it is no authority
+    // boundary. It cannot smuggle one in either: an action payload is
+    // dispatched only as an action, and one carrying any config field is
+    // refused before anything happens.
+    if item.mode == ChangeMode::Patch && is_connection_action(item.payload.as_ref()) {
+        return false;
+    }
     if !matches!(parse_uri(&item.target), Some(CairnResource::Mcp { .. })) {
         return false;
     }
@@ -460,19 +467,25 @@ async fn remove_server(
     scope: McpWriteScope,
     name: &str,
 ) -> Result<(), String> {
+    // The catalog withdrawal is part of the removal, not cleanup after it: it
+    // is what refuses a capture still in flight, so its failure fails the
+    // removal and leaves the server registered for a retry.
     match scope {
         McpWriteScope::Workspace => {
-            delete_workspace_mcp_server(&orch.config_dir, name)?;
-            let _ = mcp_tools::remove_server(&orch.config_dir, ToolScope::Workspace, name);
+            mcp_tools::withdraw_and_unregister(&orch.config_dir, ToolScope::Workspace, name, || {
+                delete_workspace_mcp_server(&orch.config_dir, name)
+            })
         }
         McpWriteScope::Project => {
             let project_path = resolve_project_path(orch, request).await?;
-            delete_project_mcp_server(&project_path, name)?;
-            let _ =
-                mcp_tools::remove_server(&orch.config_dir, ToolScope::Project(&project_path), name);
+            mcp_tools::withdraw_and_unregister(
+                &orch.config_dir,
+                ToolScope::Project(&project_path),
+                name,
+                || delete_project_mcp_server(&project_path, name),
+            )
         }
     }
-    Ok(())
 }
 
 /// `write cairn://mcp` create — add a new server to the registry.
@@ -556,6 +569,65 @@ pub(super) async fn apply_mcp_patch(
     ))
 }
 
+/// Whether a `cairn://mcp/<server>` patch is a connection action rather than a
+/// registry edit. Detection, authority, and dispatch all ask this one question.
+pub(crate) fn is_connection_action(payload: Option<&serde_json::Value>) -> bool {
+    payload.is_some_and(|payload| payload.get("action").is_some())
+}
+
+/// `write cairn://mcp/<server>` patch with `action` — an operation on the
+/// calling run's pooled connection, not on the registry.
+pub(super) async fn apply_mcp_action(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    payload: &serde_json::Value,
+    server: &str,
+    dry_run: bool,
+) -> Result<String, String> {
+    match payload.get("action").and_then(serde_json::Value::as_str) {
+        Some("restart") => {}
+        Some(other) => {
+            return Err(format!(
+                "unknown action '{other}'; cairn://mcp/<server> accepts action:\"restart\""
+            ))
+        }
+        None => return Err("payload.action must be a string".to_string()),
+    }
+    if let Some(extra) = payload
+        .as_object()
+        .and_then(|fields| fields.keys().find(|key| key.as_str() != "action"))
+    {
+        return Err(format!(
+            "action:\"restart\" takes no other fields (got '{extra}'); edit the server with a separate patch"
+        ));
+    }
+    let caller = crate::mcp::handlers::mcp_resources::McpCaller::resolve(orch, request).await;
+    let (session_key, connection) = caller.connection_key(&orch.config_dir, server)?;
+    if dry_run {
+        return Ok(format!(
+            "Would restart this run's connection to MCP server '{server}'"
+        ));
+    }
+    let gateway = orch
+        .mcp_gateway()
+        .ok_or_else(|| "MCP gateway is not available in this host".to_string())?;
+    Ok(
+        if gateway
+            .restart_connection(&session_key, &connection)
+            .await?
+        {
+            format!(
+                "Restarted this run's connection to MCP server '{server}': the pooled connection \
+                 was dropped, and the next call reconnects"
+            )
+        } else {
+            format!(
+                "This run held no connection to MCP server '{server}'; its next call opens a fresh one"
+            )
+        },
+    )
+}
+
 /// `write cairn://mcp/<server>` delete — remove one server and purge its
 /// captured tool list. `${VAR}`-referenced secrets live in the keychain, not the
 /// config, so nothing secret is stored to purge here.
@@ -610,6 +682,242 @@ mod tests {
             mode,
             payload: Some(payload),
         }
+    }
+
+    async fn test_orchestrator(config_dir: &std::path::Path) -> Orchestrator {
+        use crate::db::DbState;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::{LocalDb, SearchIndex};
+        use std::sync::Arc;
+        let local = LocalDb::open_migrated_for_test(config_dir.join("mcp.db"))
+            .await
+            .unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
+        Orchestrator::builder(
+            Arc::new(DbState::new(Arc::new(local), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            config_dir.to_path_buf(),
+        )
+        .build()
+    }
+
+    /// The agent's delete through its real removal step: a withdrawal that
+    /// cannot be recorded must fail the delete and leave it retryable, and a
+    /// capture that began before the eventual removal must stay refused after
+    /// an identical definition is re-added.
+    #[tokio::test]
+    async fn a_failed_catalog_withdrawal_fails_the_delete_and_stays_retryable() {
+        use crate::config::mcp_tools::{
+            record_catalog, withdrawal_epoch, CatalogCapture, CatalogContext, CatalogOrigin,
+        };
+        crate::config::secrets::mock_keychain::install();
+        let temp = tempfile::TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let config_dir = orch.config_dir.clone();
+        let config = stdio("plain-tool", &[]);
+        mcp_servers::upsert_workspace_mcp_server(&config_dir, "plain", &config).unwrap();
+        let request = McpCallbackRequest::default();
+
+        // An unreadable catalog store makes the withdrawal fail.
+        let store = config_dir.join("mcp_tools.json");
+        std::fs::write(&store, b"{corrupt").unwrap();
+        let error = remove_server(&orch, &request, McpWriteScope::Workspace, "plain")
+            .await
+            .unwrap_err();
+        assert!(error.contains("MCP tool store"), "{error}");
+        assert!(
+            mcp_servers::load_workspace_mcp_servers(&config_dir).contains_key("plain"),
+            "a failed withdrawal must leave the server registered so the delete can be retried"
+        );
+
+        // A capture starts now and reads the withdrawal count.
+        std::fs::remove_file(&store).unwrap();
+        let in_flight = withdrawal_epoch(&config_dir, ToolScope::Workspace, "plain").unwrap();
+
+        // The retry succeeds, then an identical definition is re-added.
+        remove_server(&orch, &request, McpWriteScope::Workspace, "plain")
+            .await
+            .unwrap();
+        assert!(!mcp_servers::load_workspace_mcp_servers(&config_dir).contains_key("plain"));
+        assert!(withdrawal_epoch(&config_dir, ToolScope::Workspace, "plain").unwrap() > in_flight);
+        mcp_servers::upsert_workspace_mcp_server(&config_dir, "plain", &config).unwrap();
+
+        // The capture that began before the removal cannot publish.
+        let context = CatalogContext {
+            ownership_scope: ToolScope::Workspace.identity(),
+            project_id: None,
+            owner: "user".into(),
+            config_identity: mcp_servers::fingerprint_mcp_config(
+                crate::authorization::WORKSPACE_ID,
+                None,
+                "plain",
+                "catalog",
+                Some(&config),
+            ),
+            credential_key: "plain".into(),
+            credential_context: cairn_packs::server_config::CatalogCredentialContext {
+                static_generation: None,
+                oauth: cairn_packs::server_config::CatalogOAuthState::Never,
+            },
+        };
+        let binding = context.binding("2025-11-25");
+        let catalog = crate::mcp::gateway::McpToolCatalog {
+            protocol_version: Some("2025-11-25".into()),
+            ..Default::default()
+        };
+        let published = record_catalog(
+            &crate::config::credential_witness::acquire().unwrap(),
+            &config_dir,
+            ToolScope::Workspace,
+            "plain",
+            &catalog,
+            CatalogCapture {
+                before: &binding,
+                after: &binding,
+                origin: CatalogOrigin {
+                    server: "plain".into(),
+                    ownership_scope: binding.ownership_scope.clone(),
+                    owner: "user".into(),
+                    transport: "stdio".into(),
+                    endpoint: "plain-tool".into(),
+                    protocol_version: "2025-11-25".into(),
+                },
+                fetched_at_ms: 1,
+                withdrawal_epoch: in_flight,
+            },
+        );
+        assert!(published.unwrap_err().contains("removed"));
+    }
+
+    /// Records which pooled connection a restart named.
+    #[derive(Default)]
+    struct RestartRecorder {
+        restarted: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mcp::gateway::McpGateway for RestartRecorder {
+        async fn list_tools(
+            &self,
+            _: &str,
+            _: &str,
+            _: &crate::security::BrokeredMcpConfig,
+        ) -> Result<crate::mcp::gateway::McpToolCatalog, String> {
+            unreachable!("a restart lists nothing")
+        }
+        async fn list_resources(
+            &self,
+            _: &str,
+            _: &str,
+            _: &crate::security::BrokeredMcpConfig,
+        ) -> Result<Vec<crate::mcp::gateway::McpResourceDef>, String> {
+            unreachable!("a restart lists nothing")
+        }
+        async fn read_resource(
+            &self,
+            _: &str,
+            _: &str,
+            _: &crate::security::BrokeredMcpConfig,
+            _: &str,
+        ) -> Result<String, String> {
+            unreachable!("a restart reads nothing")
+        }
+        async fn restart_connection(
+            &self,
+            session_key: &str,
+            server: &str,
+        ) -> Result<bool, String> {
+            let mut restarted = self.restarted.lock().unwrap();
+            restarted.push((session_key.into(), server.into()));
+            Ok(restarted.len() == 1)
+        }
+        async fn close_session(&self, _: &str) {}
+    }
+
+    #[tokio::test]
+    async fn restart_drops_the_calling_runs_connection_and_edits_nothing() {
+        crate::config::secrets::mock_keychain::install();
+        let temp = tempfile::TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let config = stdio("plain-tool", &[]);
+        mcp_servers::upsert_workspace_mcp_server(&orch.config_dir, "plain", &config).unwrap();
+        let settings = std::fs::read(orch.config_dir.join("settings.yaml")).unwrap();
+        let recorder = std::sync::Arc::new(RestartRecorder::default());
+        orch.set_mcp_gateway(recorder.clone())
+            .map_err(|_| "gateway already set")
+            .unwrap();
+        // No run context: pooled under the request's cwd, as a tool call is.
+        let request = McpCallbackRequest {
+            cwd: "/work".into(),
+            ..Default::default()
+        };
+        let restart = serde_json::json!({"action": "restart"});
+
+        let dry = apply_mcp_action(&orch, &request, &restart, "plain", true)
+            .await
+            .unwrap();
+        assert!(dry.starts_with("Would restart"), "{dry}");
+        assert!(recorder.restarted.lock().unwrap().is_empty());
+
+        let done = apply_mcp_action(&orch, &request, &restart, "plain", false)
+            .await
+            .unwrap();
+        assert!(
+            done.starts_with("Restarted this run's connection"),
+            "{done}"
+        );
+        let again = apply_mcp_action(&orch, &request, &restart, "plain", false)
+            .await
+            .unwrap();
+        assert!(again.contains("held no connection"), "{again}");
+        assert_eq!(
+            *recorder.restarted.lock().unwrap(),
+            [
+                ("/work".to_string(), "plain".to_string()),
+                ("/work".to_string(), "plain".to_string())
+            ]
+        );
+        assert_eq!(
+            std::fs::read(orch.config_dir.join("settings.yaml")).unwrap(),
+            settings,
+            "a restart edits no configuration"
+        );
+
+        for (payload, expected) in [
+            (
+                serde_json::json!({"action": "reboot"}),
+                "unknown action 'reboot'",
+            ),
+            (
+                serde_json::json!({"action": "restart", "command": "evil"}),
+                "takes no other fields",
+            ),
+        ] {
+            let error = apply_mcp_action(&orch, &request, &payload, "plain", false)
+                .await
+                .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+        let error = apply_mcp_action(&orch, &request, &restart, "absent", false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("Unknown MCP server 'absent'"), "{error}");
+        assert_eq!(recorder.restarted.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_restart_is_not_a_registry_authority_boundary() {
+        assert!(!is_workspace_mcp_mutation(&item(
+            "cairn://mcp/playwright",
+            ChangeMode::Patch,
+            serde_json::json!({"action": "restart"})
+        )));
+        // An ordinary patch still is.
+        assert!(is_workspace_mcp_mutation(&item(
+            "cairn://mcp/playwright",
+            ChangeMode::Patch,
+            serde_json::json!({"enabled": false})
+        )));
     }
 
     #[test]

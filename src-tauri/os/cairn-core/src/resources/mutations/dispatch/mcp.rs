@@ -1,6 +1,8 @@
 //! External MCP server registry mutation dispatch, relocated from dispatch.rs.
 
-use super::super::mcp::{apply_mcp_create, apply_mcp_delete, apply_mcp_patch};
+use super::super::mcp::{
+    apply_mcp_action, apply_mcp_create, apply_mcp_delete, apply_mcp_patch, is_connection_action,
+};
 use super::super::{build_failure, ResourceMutationResult};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
@@ -45,9 +47,12 @@ pub(super) async fn dispatch(
                 .payload
                 .as_ref()
                 .ok_or_else(|| build_failure(index, item, "mode=patch requires payload"))?;
-            apply_mcp_patch(orch, request, payload, server, dry_run)
-                .await
-                .map_err(|error| build_failure(index, item, error))?
+            if is_connection_action(Some(payload)) {
+                apply_mcp_action(orch, request, payload, server, dry_run).await
+            } else {
+                apply_mcp_patch(orch, request, payload, server, dry_run).await
+            }
+            .map_err(|error| build_failure(index, item, error))?
         }
         (
             CairnResource::Mcp {

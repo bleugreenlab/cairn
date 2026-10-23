@@ -1782,10 +1782,18 @@ async fn change_default_non_atomic_failures_are_reported_with_blocking_appends()
     let result = handle_write(&orch, &request).await;
     let report = parse_report(result.split("\n\n").next().unwrap());
 
+    // The request carries no run, so the task append spawns nothing: that is
+    // the append's own failure, reported beside the resource failure.
     assert_eq!(report["applied"].as_array().unwrap().len(), 0);
-    assert_eq!(failure_count(&report), 1, "{report:?}");
+    assert_eq!(failure_count(&report), 2, "{report:?}");
     assert_eq!(report["failures"][0]["index"], 0);
     assert!(result.contains("No project found with key 'missing'"));
+    assert_eq!(report["failures"][1]["index"], 1);
+    assert!(report["failures"][1]["error"]
+        .as_str()
+        .unwrap()
+        .contains("authenticated agent request is missing its run ID"));
+    assert!(report.get("blocking").is_none(), "{report:?}");
 }
 
 #[tokio::test]

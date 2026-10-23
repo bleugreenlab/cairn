@@ -514,7 +514,7 @@ fn drain(client: &AppServerClient, watch: Receiver<Value>, route: ThreadRoute, t
             }
         };
         match Notification::parse(&message) {
-            Notification::ItemCompleted { item } => {
+            Notification::ItemCompleted { item, .. } => {
                 if let Some(saved) =
                     ImageGenerationItem::parse(item).and_then(|image| image.saved_path)
                 {

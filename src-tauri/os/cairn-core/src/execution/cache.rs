@@ -4,9 +4,33 @@
 //! re-executing expensive operations.
 
 use crate::orchestrator::Orchestrator;
-use crate::storage::{LocalDb, RowExt};
-use cairn_db::turso::params;
+use crate::storage::{DbResult, LocalDb, RowExt};
+use cairn_db::turso::{params, Connection, Value};
 use std::sync::Arc;
+
+/// The PRIMARY KEY index of `check_result_cache`: `(project_id, check_name,
+/// input_hash, environment_fingerprint, result_schema_version)`.
+///
+/// Lookups by `(project, check, input hash)` name it explicitly. Turso keeps
+/// no table statistics, and without them it plans those lookups through a
+/// secondary index that leads with `project_id` alone, walking every row the
+/// project has: 355 ms per check against 2 ms through the key, measured on a
+/// production database of 80k rows (cairn/5206). SQLite names a table's first
+/// automatic index this way, and `check_lookups_seek_the_primary_key` fails if
+/// the schema ever stops providing it.
+pub(crate) const CHECK_RESULT_CACHE_KEY_INDEX: &str = "sqlite_autoindex_check_result_cache_1";
+
+/// The partial unique index `(project_id, public_handle) WHERE public_handle IS
+/// NOT NULL` on `check_result_observations`: the one path to the observation a
+/// permalink handle names.
+///
+/// Turso substitutes a partial index only when the WHERE clause restates its
+/// predicate; it does not infer `public_handle IS NOT NULL` from
+/// `public_handle = ?`. Without the restated clause the lookup plans through
+/// `project_id` alone and walks every observation the project has, and naming
+/// the index without it is refused outright ("no query solution").
+/// `observation_lookups_seek_their_index` pins the plan.
+const CHECK_OBSERVATION_HANDLE_INDEX: &str = "idx_check_result_observations_public_handle";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowFamily {
@@ -25,6 +49,12 @@ impl RowFamily {
     fn predicate(self, column: &str) -> String {
         format!("{column} = '{}'", self.as_str())
     }
+}
+
+/// The SQL predicate selecting verdict rows (as opposed to infrastructure
+/// suppression rows) of `check_result_cache` under `column`.
+pub(crate) fn verdict_row_predicate(column: &str) -> String {
+    RowFamily::Verdict.predicate(column)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -64,71 +94,145 @@ pub(crate) struct CheckResultIdentity {
 ///
 /// One input hash can hold several verdicts for one check, one per environment
 /// that ran it, so the newest row wins and the caller gets one row per check
-/// name. Each lookup is a point read on the table's primary key.
-pub(crate) fn list_check_results_for_inputs(
-    db: Arc<LocalDb>,
+/// name. Each lookup seeks the table's primary key, named explicitly through
+/// [`CHECK_RESULT_CACHE_KEY_INDEX`]. It reads on a connection the caller
+/// already holds, so a projection's lookups share one transaction.
+pub(crate) async fn list_check_results_for_inputs_conn(
+    conn: &Connection,
     project_id: &str,
     head: HeadVerdictKeys<'_>,
-) -> Result<Vec<CheckResultCacheEntry>, String> {
-    let project_id = project_id.to_string();
-    let tree_hash = head.tree_hash.to_string();
+) -> DbResult<Vec<CheckResultCacheEntry>> {
     let scope = infra_suppression_scope(head.job_id, head.commit_sha);
-    let mut lanes: Vec<(String, String)> = head
-        .input_hashes
-        .iter()
-        .map(|(name, hash)| (name.clone(), hash.clone()))
-        .collect();
+    let mut lanes: Vec<(&String, &String)> = head.input_hashes.iter().collect();
     lanes.sort();
-    run_checkpoint_cache_db(async move {
-        db.read(|conn| {
-            let project_id = project_id.clone();
-            let tree_hash = tree_hash.clone();
-            let scope = scope.clone();
-            let lanes = lanes.clone();
-            Box::pin(async move {
-                let sql = format!(
-                    "SELECT r.project_id, r.tree_hash, r.input_hash, r.check_name, r.exit_code,
-                            r.passed, r.output_tail, r.duration_ms, r.ran_at, r.target_results_json,
-                            r.job_id, r.cached, r.failure_kind, r.executor_id, r.executor_device_id,
-                            r.executor_connection_generation, r.executor_slot_id, r.executor_lease_epoch,
-                            r.executor_started_at_unix_ms, r.executor_finished_at_unix_ms,
-                            r.toolchain_fingerprint, r.infra_failure_streak, r.defined_by_commit_sha
-                       FROM check_result_cache r
-                      WHERE r.project_id = ?1 AND r.check_name = ?2 AND r.input_hash = ?3
-                        AND (({} AND r.tree_hash = ?4)
-                             OR ({} AND r.environment_fingerprint = ?5))
-                      ORDER BY r.ran_at DESC, r.rowid DESC
-                      LIMIT 1",
-                    RowFamily::Verdict.predicate("r.row_family"),
-                    RowFamily::InfraSuppression.predicate("r.row_family"),
-                );
-                let mut out = Vec::new();
-                for (check_name, input_hash) in &lanes {
-                    let mut rows = conn
-                        .query(
-                            &sql,
-                            params![
-                                project_id.as_str(),
-                                check_name.as_str(),
-                                input_hash.as_str(),
-                                tree_hash.as_str(),
-                                scope.as_str()
-                            ],
-                        )
-                        .await?;
-                    if let Some(row) = rows.next().await? {
-                        out.push(row_to_check_result(&row)?);
-                    }
-                }
-                Ok::<_, crate::storage::DbError>(out)
-            })
-        })
-        .await
-        .map_err(|e| format!("Failed to list head-scoped check result rows: {e}"))
-    })
+    let sql = head_rows_sql();
+    let mut out = Vec::new();
+    for (check_name, input_hash) in lanes {
+        let mut rows = conn
+            .query(
+                &sql,
+                params![
+                    project_id,
+                    check_name.as_str(),
+                    input_hash.as_str(),
+                    head.tree_hash,
+                    scope.as_str()
+                ],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            out.push(row_to_check_result(&row)?);
+        }
+    }
+    Ok(out)
 }
 
-/// Everything [`list_check_results_for_inputs`] needs to know about one head.
+/// `?first, ?first+1, …` for `n` numbered placeholders.
+fn numbered_placeholders(first: usize, n: usize) -> String {
+    (0..n)
+        .map(|index| format!("?{}", first + index))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A passing verdict row for one `(check, input hash)` lane, in any
+/// environment; the caller filters by environment.
+fn passing_row_sql() -> String {
+    format!(
+        "SELECT project_id, tree_hash, input_hash, check_name, exit_code,
+                passed, output_tail, duration_ms, ran_at, target_results_json,
+                job_id, cached, failure_kind, executor_id, executor_device_id,
+                executor_connection_generation, executor_slot_id, executor_lease_epoch,
+                executor_started_at_unix_ms, executor_finished_at_unix_ms,
+                toolchain_fingerprint, infra_failure_streak,
+                defined_by_commit_sha
+           FROM check_result_cache INDEXED BY {CHECK_RESULT_CACHE_KEY_INDEX}
+          WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
+            AND {} AND passed = 1 AND failure_kind IS NULL",
+        RowFamily::Verdict.predicate("row_family"),
+    )
+}
+
+/// The infrastructure rows of one lane under `scopes` scope strings.
+fn infra_rows_sql(scopes: usize) -> String {
+    format!(
+        "SELECT project_id, tree_hash, input_hash, check_name, exit_code,
+                passed, output_tail, duration_ms, ran_at, target_results_json,
+                job_id, cached, failure_kind, executor_id, executor_device_id,
+                executor_connection_generation, executor_slot_id, executor_lease_epoch,
+                executor_started_at_unix_ms, executor_finished_at_unix_ms,
+                toolchain_fingerprint, infra_failure_streak, defined_by_commit_sha,
+                environment_fingerprint
+           FROM check_result_cache INDEXED BY {CHECK_RESULT_CACHE_KEY_INDEX}
+          WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
+            AND {} AND environment_fingerprint IN ({})",
+        RowFamily::InfraSuppression.predicate("row_family"),
+        numbered_placeholders(4, scopes),
+    )
+}
+
+/// Latch one infrastructure scope's escalation once its streak reaches the
+/// bound.
+fn claim_escalation_sql() -> String {
+    format!(
+        "UPDATE check_result_cache INDEXED BY {CHECK_RESULT_CACHE_KEY_INDEX}
+            SET infra_escalated_at = ?5
+          WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
+            AND {} AND environment_fingerprint = ?6
+            AND infra_failure_streak >= ?4
+            AND infra_escalated_at IS NULL",
+        RowFamily::InfraSuppression.predicate("row_family"),
+    )
+}
+
+/// Charge one more observed failure to `scopes` scopes still under the bound.
+fn charge_streak_sql(scopes: usize) -> String {
+    format!(
+        "UPDATE check_result_cache INDEXED BY {CHECK_RESULT_CACHE_KEY_INDEX}
+            SET infra_failure_streak = infra_failure_streak + 1
+          WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
+            AND {} AND environment_fingerprint IN ({})
+            AND infra_failure_streak >= 1
+            AND infra_failure_streak < ?4",
+        RowFamily::InfraSuppression.predicate("row_family"),
+        numbered_placeholders(5, scopes),
+    )
+}
+
+/// Clear the streak and escalation of `scopes` scopes after a real verdict.
+fn reset_streak_sql(scopes: usize) -> String {
+    format!(
+        "UPDATE check_result_cache INDEXED BY {CHECK_RESULT_CACHE_KEY_INDEX}
+            SET infra_failure_streak = 0, infra_escalated_at = NULL
+          WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
+            AND environment_fingerprint IN ({})
+            AND {}",
+        numbered_placeholders(4, scopes),
+        RowFamily::InfraSuppression.predicate("row_family"),
+    )
+}
+
+/// The newest own-evaluation row for one `(check, input hash)` lane of a head.
+fn head_rows_sql() -> String {
+    format!(
+        "SELECT r.project_id, r.tree_hash, r.input_hash, r.check_name, r.exit_code,
+                r.passed, r.output_tail, r.duration_ms, r.ran_at, r.target_results_json,
+                r.job_id, r.cached, r.failure_kind, r.executor_id, r.executor_device_id,
+                r.executor_connection_generation, r.executor_slot_id, r.executor_lease_epoch,
+                r.executor_started_at_unix_ms, r.executor_finished_at_unix_ms,
+                r.toolchain_fingerprint, r.infra_failure_streak, r.defined_by_commit_sha
+           FROM check_result_cache r INDEXED BY {CHECK_RESULT_CACHE_KEY_INDEX}
+          WHERE r.project_id = ?1 AND r.check_name = ?2 AND r.input_hash = ?3
+            AND (({} AND r.tree_hash = ?4)
+                 OR ({} AND r.environment_fingerprint = ?5))
+          ORDER BY r.ran_at DESC, r.rowid DESC
+          LIMIT 1",
+        RowFamily::Verdict.predicate("r.row_family"),
+        RowFamily::InfraSuppression.predicate("r.row_family"),
+    )
+}
+
+/// Everything [`list_check_results_for_inputs_conn`] needs to know about one head.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HeadVerdictKeys<'a> {
     /// The head's sealed tree. Rows written at it are this head's own evaluations.
@@ -139,6 +243,38 @@ pub(crate) struct HeadVerdictKeys<'a> {
     /// The head scope infrastructure rows are bound to.
     pub job_id: &'a str,
     pub commit_sha: &'a str,
+}
+
+/// [`HeadVerdictKeys`] holding its own copies, for a read whose future must own
+/// what it reads by.
+#[derive(Clone, Debug)]
+pub(crate) struct OwnedHeadVerdictKeys {
+    pub tree_hash: String,
+    pub input_hashes: std::collections::HashMap<String, String>,
+    pub job_id: String,
+    pub commit_sha: String,
+}
+
+impl OwnedHeadVerdictKeys {
+    pub(crate) fn keys(&self) -> HeadVerdictKeys<'_> {
+        HeadVerdictKeys {
+            tree_hash: &self.tree_hash,
+            input_hashes: &self.input_hashes,
+            job_id: &self.job_id,
+            commit_sha: &self.commit_sha,
+        }
+    }
+}
+
+impl From<HeadVerdictKeys<'_>> for OwnedHeadVerdictKeys {
+    fn from(head: HeadVerdictKeys<'_>) -> Self {
+        Self {
+            tree_hash: head.tree_hash.to_string(),
+            input_hashes: head.input_hashes.clone(),
+            job_id: head.job_id.to_string(),
+            commit_sha: head.commit_sha.to_string(),
+        }
+    }
 }
 
 impl CheckResultIdentity {
@@ -240,21 +376,7 @@ pub(crate) fn get_check_result(
             let check_name = check_name.clone();
             let input_hash = input_hash.clone();
             Box::pin(async move {
-                let sql = format!(
-                    "
-                    SELECT project_id, tree_hash, input_hash, check_name, exit_code,
-                           passed, output_tail, duration_ms, ran_at, target_results_json,
-                           job_id, cached, failure_kind, executor_id, executor_device_id,
-                           executor_connection_generation, executor_slot_id, executor_lease_epoch,
-                           executor_started_at_unix_ms, executor_finished_at_unix_ms,
-                           toolchain_fingerprint, infra_failure_streak,
-                           defined_by_commit_sha
-                    FROM check_result_cache
-                    WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-                      AND {} AND passed = 1 AND failure_kind IS NULL
-                    ",
-                    RowFamily::Verdict.predicate("row_family"),
-                );
+                let sql = passing_row_sql();
                 let mut rows = conn
                     .query(
                         &sql,
@@ -292,92 +414,160 @@ pub(crate) struct ReusableCheckLookup<'a> {
     pub result_schema_version: i64,
 }
 
+impl ReusableCheckLookup<'_> {
+    /// Whether any row could satisfy this lookup. An empty trust set, executor
+    /// list, or identity admits nothing, so the read is skipped.
+    fn is_answerable(&self) -> bool {
+        !(self.verdict_platforms.is_empty()
+            || self.executor_ids.is_some_and(<[String]>::is_empty)
+            || self.implementation_identity.is_empty()
+            || self.verdict_environment_hash.is_empty()
+            || self.result_schema_version <= 0)
+    }
+}
+
+/// [`ReusableCheckLookup`] holding its own copies, for a read whose future must
+/// own what it reads by.
+struct OwnedReusableCheckLookup {
+    project_id: String,
+    check_name: String,
+    input_hash: String,
+    verdict_platforms: Vec<String>,
+    executor_ids: Option<Vec<String>>,
+    implementation_identity: String,
+    verdict_environment_hash: String,
+    result_schema_version: i64,
+}
+
+impl OwnedReusableCheckLookup {
+    fn new(lookup: &ReusableCheckLookup<'_>) -> Self {
+        Self {
+            project_id: lookup.project_id.to_string(),
+            check_name: lookup.check_name.to_string(),
+            input_hash: lookup.input_hash.to_string(),
+            verdict_platforms: lookup.verdict_platforms.to_vec(),
+            executor_ids: lookup.executor_ids.map(<[String]>::to_vec),
+            implementation_identity: lookup.implementation_identity.to_string(),
+            verdict_environment_hash: lookup.verdict_environment_hash.to_string(),
+            result_schema_version: lookup.result_schema_version,
+        }
+    }
+
+    fn lookup(&self) -> ReusableCheckLookup<'_> {
+        ReusableCheckLookup {
+            project_id: &self.project_id,
+            check_name: &self.check_name,
+            input_hash: &self.input_hash,
+            verdict_platforms: &self.verdict_platforms,
+            executor_ids: self.executor_ids.as_deref(),
+            implementation_identity: &self.implementation_identity,
+            verdict_environment_hash: &self.verdict_environment_hash,
+            result_schema_version: self.result_schema_version,
+        }
+    }
+}
+
 pub(crate) fn get_reusable_check_result(
     db: Arc<LocalDb>,
     lookup: ReusableCheckLookup<'_>,
 ) -> Result<Option<ReusableCheckResult>, String> {
-    let ReusableCheckLookup {
-        project_id,
-        check_name,
-        input_hash,
-        verdict_platforms,
-        executor_ids,
-        implementation_identity,
-        verdict_environment_hash,
-        result_schema_version,
-    } = lookup;
-    if verdict_platforms.is_empty()
-        || executor_ids.is_some_and(<[String]>::is_empty)
-        || implementation_identity.is_empty()
-        || verdict_environment_hash.is_empty()
-        || result_schema_version <= 0
-    {
+    if !lookup.is_answerable() {
         return Ok(None);
     }
-    let keys = (
-        project_id.to_string(),
-        check_name.to_string(),
-        input_hash.to_string(),
-        verdict_platforms.to_vec(),
-        implementation_identity.to_string(),
-        verdict_environment_hash.to_string(),
-        executor_ids.map(<[String]>::to_vec),
-    );
+    let owned = OwnedReusableCheckLookup::new(&lookup);
     run_checkpoint_cache_db(async move {
-        db.read(|conn| {
-            let keys = keys.clone();
-            Box::pin(async move {
-                let placeholders = (0..keys.3.len()).map(|i| format!("?{}", i + 7))
-                    .collect::<Vec<_>>().join(",");
-                let executor_predicate = match &keys.6 {
-                    Some(ids) => format!(
-                        "AND o.executor_id IN ({})",
-                        (0..ids.len())
-                            .map(|i| format!("?{}", i + 7 + keys.3.len()))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    ),
-                    None => String::new(),
-                };
-                let sql = format!(
-                    "SELECT c.project_id,c.tree_hash,c.input_hash,c.check_name,c.exit_code,
-                            c.passed,c.output_tail,c.duration_ms,c.ran_at,c.target_results_json,
-                            c.job_id,c.cached,c.failure_kind,c.executor_id,c.executor_device_id,
-                            c.executor_connection_generation,c.executor_slot_id,c.executor_lease_epoch,
-                            c.executor_started_at_unix_ms,c.executor_finished_at_unix_ms,
-                            c.toolchain_fingerprint,c.infra_failure_streak,c.defined_by_commit_sha,
-                            c.source_observation_id,o.environment_fingerprint
-                       FROM check_result_cache c
-                       JOIN check_result_observations o ON o.id=c.source_observation_id
-                      WHERE c.project_id=?1 AND c.check_name=?2 AND c.input_hash=?3
-                        AND c.result_schema_version=?4 AND o.runner_build_id=?5
-                        AND o.verdict_environment_hash=?6
-                        AND o.verdict_platform IN ({placeholders})
-                        {executor_predicate}
-                        AND {} AND c.failure_kind IS NULL AND o.reusable=1
-                        AND o.complete=1 AND o.failure_kind IS NULL
-                        AND o.verdict IN ('passed','failed')
-                        AND c.defined_by_commit_sha IS NOT NULL
-                        AND o.defined_by_commit_sha IS NOT NULL
-                      ORDER BY o.ran_at DESC, o.rowid DESC LIMIT 1",
-                    RowFamily::Verdict.predicate("c.row_family"),
-                );
-                let mut values: Vec<cairn_db::turso::Value> = vec![
-                    keys.0.into(), keys.1.into(), keys.2.into(),
-                    result_schema_version.into(), keys.4.into(), keys.5.into(),
-                ];
-                values.extend(keys.3.into_iter().map(Into::into));
-                values.extend(keys.6.into_iter().flatten().map(Into::into));
-                let mut rows = conn.query(&sql, values).await?;
-                let Some(row) = rows.next().await? else { return Ok(None); };
-                Ok(Some(ReusableCheckResult {
-                    entry: row_to_check_result(&row)?,
-                    source_observation_id: row.text(23)?,
-                    environment_fingerprint: row.text(24)?,
-                }))
-            })
-        }).await.map_err(|e| format!("Failed to load reusable check result: {e}"))
+        db.read(move |conn| {
+            Box::pin(async move { get_reusable_check_result_conn(conn, owned.lookup()).await })
+        })
+        .await
+        .map_err(|e| format!("Failed to load reusable check result: {e}"))
     })
+}
+
+/// The newest reusable verdict for one lane, admitted by `platforms` trusted
+/// verdict platforms and, when `executors` is set, only that many machines.
+fn reusable_check_result_sql(platforms: usize, executors: Option<usize>) -> String {
+    let placeholders = (0..platforms)
+        .map(|i| format!("?{}", i + 7))
+        .collect::<Vec<_>>()
+        .join(",");
+    let executor_predicate = match executors {
+        Some(executors) => format!(
+            "AND o.executor_id IN ({})",
+            (0..executors)
+                .map(|i| format!("?{}", i + 7 + platforms))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        None => String::new(),
+    };
+    format!(
+        "SELECT c.project_id,c.tree_hash,c.input_hash,c.check_name,c.exit_code,
+                c.passed,c.output_tail,c.duration_ms,c.ran_at,c.target_results_json,
+                c.job_id,c.cached,c.failure_kind,c.executor_id,c.executor_device_id,
+                c.executor_connection_generation,c.executor_slot_id,c.executor_lease_epoch,
+                c.executor_started_at_unix_ms,c.executor_finished_at_unix_ms,
+                c.toolchain_fingerprint,c.infra_failure_streak,c.defined_by_commit_sha,
+                c.source_observation_id,o.environment_fingerprint
+           FROM check_result_cache c INDEXED BY {CHECK_RESULT_CACHE_KEY_INDEX}
+           JOIN check_result_observations o ON o.id=c.source_observation_id
+          WHERE c.project_id=?1 AND c.check_name=?2 AND c.input_hash=?3
+            AND c.result_schema_version=?4 AND o.runner_build_id=?5
+            AND o.verdict_environment_hash=?6
+            AND o.verdict_platform IN ({placeholders})
+            {executor_predicate}
+            AND {} AND c.failure_kind IS NULL AND o.reusable=1
+            AND o.complete=1 AND o.failure_kind IS NULL
+            AND o.verdict IN ('passed','failed')
+            AND c.defined_by_commit_sha IS NOT NULL
+            AND o.defined_by_commit_sha IS NOT NULL
+          ORDER BY o.ran_at DESC, o.rowid DESC LIMIT 1",
+        RowFamily::Verdict.predicate("c.row_family"),
+    )
+}
+
+/// [`get_reusable_check_result`] on a connection the caller already holds.
+pub(crate) async fn get_reusable_check_result_conn(
+    conn: &Connection,
+    lookup: ReusableCheckLookup<'_>,
+) -> DbResult<Option<ReusableCheckResult>> {
+    if !lookup.is_answerable() {
+        return Ok(None);
+    }
+    let sql = reusable_check_result_sql(
+        lookup.verdict_platforms.len(),
+        lookup.executor_ids.map(<[String]>::len),
+    );
+    let mut values: Vec<Value> = vec![
+        Value::Text(lookup.project_id.to_string()),
+        Value::Text(lookup.check_name.to_string()),
+        Value::Text(lookup.input_hash.to_string()),
+        Value::Integer(lookup.result_schema_version),
+        Value::Text(lookup.implementation_identity.to_string()),
+        Value::Text(lookup.verdict_environment_hash.to_string()),
+    ];
+    values.extend(
+        lookup
+            .verdict_platforms
+            .iter()
+            .map(|platform| Value::Text(platform.clone())),
+    );
+    values.extend(
+        lookup
+            .executor_ids
+            .into_iter()
+            .flatten()
+            .map(|executor| Value::Text(executor.clone())),
+    );
+    let mut rows = conn.query(&sql, values).await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    Ok(Some(ReusableCheckResult {
+        entry: row_to_check_result(&row)?,
+        source_observation_id: row.text(23)?,
+        environment_fingerprint: row.text(24)?,
+    }))
 }
 
 /// Consecutive OBSERVED infrastructure failures one
@@ -441,8 +631,12 @@ pub(crate) fn infra_env_scope(digest: &str) -> String {
 /// moves when a machine that changes the answer to "is there anywhere to run
 /// this at all?" attaches, detaches, or changes what it advertises.
 pub(crate) fn infra_fleet_scope(digest: &str) -> String {
-    format!("infra:fleet:{digest}")
+    format!("{INFRA_FLEET_SCOPE_PREFIX}{digest}")
 }
+
+/// Every fleet-domain scope begins with this, so a store-wide sweep can tell a
+/// fleet counter from the others without knowing any digest.
+pub(crate) const INFRA_FLEET_SCOPE_PREFIX: &str = "infra:fleet:";
 
 /// Which repair makes a suppressed check worth attempting again.
 ///
@@ -682,23 +876,7 @@ async fn read_infra_scope_rows(
     if scopes.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = (0..scopes.len())
-        .map(|index| format!("?{}", index + 4))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT project_id, tree_hash, input_hash, check_name, exit_code,
-                passed, output_tail, duration_ms, ran_at, target_results_json,
-                job_id, cached, failure_kind, executor_id, executor_device_id,
-                executor_connection_generation, executor_slot_id, executor_lease_epoch,
-                executor_started_at_unix_ms, executor_finished_at_unix_ms,
-                toolchain_fingerprint, infra_failure_streak, defined_by_commit_sha,
-                environment_fingerprint
-           FROM check_result_cache
-          WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-            AND {} AND environment_fingerprint IN ({placeholders})",
-        RowFamily::InfraSuppression.predicate("row_family"),
-    );
+    let sql = infra_rows_sql(scopes.len());
     let mut values: Vec<cairn_db::turso::Value> = vec![
         project_id.to_string().into(),
         check_name.to_string().into(),
@@ -938,14 +1116,7 @@ pub(crate) fn claim_infra_escalation(
             let input_hash = input_hash.clone();
             let scope = scope.clone();
             Box::pin(async move {
-                let sql = format!(
-                    "UPDATE check_result_cache SET infra_escalated_at = ?5
-                         WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-                           AND {} AND environment_fingerprint = ?6
-                           AND infra_failure_streak >= ?4
-                           AND infra_escalated_at IS NULL",
-                    RowFamily::InfraSuppression.predicate("row_family"),
-                );
+                let sql = claim_escalation_sql();
                 let changed = conn
                     .execute(
                         &sql,
@@ -1049,19 +1220,7 @@ pub(crate) fn claim_check_execution(
                     .map(str::to_string)
                     .collect();
                 if !chargeable.is_empty() {
-                    let placeholders = (0..chargeable.len())
-                        .map(|index| format!("?{}", index + 5))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let update_sql = format!(
-                        "UPDATE check_result_cache
-                                SET infra_failure_streak = infra_failure_streak + 1
-                              WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-                                AND {} AND environment_fingerprint IN ({placeholders})
-                                AND infra_failure_streak >= 1
-                                AND infra_failure_streak < ?4",
-                        RowFamily::InfraSuppression.predicate("row_family"),
-                    );
+                    let update_sql = charge_streak_sql(chargeable.len());
                     let mut values: Vec<cairn_db::turso::Value> = vec![
                         project_id.clone().into(),
                         check_name.clone().into(),
@@ -1438,6 +1597,53 @@ pub(crate) fn list_check_results_for_job(
     run_checkpoint_cache_db(async move { latest_check_results_for_job(&db, &job_id).await })
 }
 
+/// The commit `job_id`'s own evaluation of `row` was recorded against: the
+/// newest observation of that check, inputs, and tree that this job produced.
+/// `None` when the job has no such observation (the row was reused from
+/// elsewhere, or predates observations).
+pub(crate) fn observed_commit_for_job(
+    db: Arc<LocalDb>,
+    job_id: &str,
+    row: &CheckResultCacheEntry,
+) -> Result<Option<String>, String> {
+    let keys = (
+        row.project_id.clone(),
+        row.check_name.clone(),
+        row.input_hash.clone(),
+        row.tree_hash.clone(),
+        job_id.to_string(),
+    );
+    run_checkpoint_cache_db(async move {
+        db.read(|conn| {
+            let keys = keys.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT commit_sha FROM check_result_observations
+                          WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
+                            AND tree_hash = ?4 AND job_id = ?5
+                          ORDER BY ran_at DESC
+                          LIMIT 1",
+                        params![
+                            keys.0.as_str(),
+                            keys.1.as_str(),
+                            keys.2.as_str(),
+                            keys.3.as_str(),
+                            keys.4.as_str()
+                        ],
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok::<_, crate::storage::DbError>(Some(row.text(0)?)),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to read the commit a job's verdict was observed on: {e}"))
+    })
+}
+
 /// The most recent cached result per check name for one job — one indexed query,
 /// no worktree and no VCS. Cheap enough to render inside resume assembly, which
 /// is why the attention wake body reads verdicts through here rather than through
@@ -1723,6 +1929,13 @@ pub(crate) struct FreshCheckObservationWrite {
     pub toolchain_fingerprint: Option<String>,
     pub output_tail: String,
     pub target_results_json: Option<String>,
+    /// The population `tests` describes, as the producer's structured result
+    /// declared it (`full`, `filtered`, `empty`, `fast`, `unknown`); `None` when
+    /// the run produced no parse.
+    pub selection: Option<String>,
+    /// Tests the fast tier terminated at its per-test budget. Each one is also a
+    /// `deferred` row in `tests`, persisted to `check_deferred_tests`.
+    pub deferred_count: i64,
     pub tests: Vec<CheckTestResultRow>,
     /// The suppression scopes this verdict is evidence ABOUT, and the only ones
     /// a genuine verdict clears. A pass on one machine says nothing about a
@@ -1793,9 +2006,61 @@ pub(crate) struct CheckResultObservationProjection {
     pub verdict_platform: Option<String>,
     pub verdict_arch: Option<String>,
     pub output_tail: String,
+    /// The tier of the source observation; `None` on rows recorded before the
+    /// column existed.
+    pub selection: Option<String>,
+    pub deferred_count: i64,
     pub tests: Vec<CheckTestResultRow>,
     pub test_total: usize,
     pub test_offset: usize,
+}
+
+/// Every per-test outcome of one observation, read through the
+/// `check_test_outcomes` view: `check_test_results` (passed, failed, skipped)
+/// united with `check_deferred_tests` (deferred). Readers name the view rather
+/// than either table, so a deferred test is never invisible and never a pass.
+const OBSERVATION_TEST_COLUMNS: &str =
+    "test_id,status,duration_ms,attempt_count,failure_excerpt,skip_reason,declaration_source,flaky";
+
+/// One observation's per-test outcomes, its id bound as `?1`: the result rows
+/// united with the deferred tests as `status = 'deferred'`. Every per-test
+/// reader selects from this, never from either table alone, so a deferred test
+/// is visible as itself and no reader can count one as passed.
+///
+/// The id filter sits inside each arm because Turso pushes no predicate into a
+/// compound select. Filtered from outside, the union first materializes every
+/// test row of every observation: 16 s for one observation's tests against
+/// 75 ms through each table's key, on a production database of 3.3M test rows
+/// (cairn/5304). `observation_lookups_seek_their_index` pins the plan.
+const OBSERVATION_TEST_OUTCOMES: &str =
+    "(SELECT test_id,status,duration_ms,attempt_count,failure_excerpt,skip_reason,
+             declaration_source,flaky
+        FROM check_test_results WHERE observation_id=?1
+      UNION ALL
+      SELECT test_id,'deferred',duration_ms,attempt_count,NULL,NULL,NULL,0
+        FROM check_deferred_tests WHERE observation_id=?1) outcomes";
+
+/// The per-test filter of a paged read: `?2` an exact status and `?3` a test-id
+/// substring, each ignored when NULL.
+const OBSERVATION_TEST_FILTER: &str =
+    "(?2 IS NULL OR status=?2) AND (?3 IS NULL OR instr(test_id,?3)>0)";
+
+/// An observation's whole test manifest, in test order.
+fn observation_tests_sql() -> String {
+    format!("SELECT {OBSERVATION_TEST_COLUMNS} FROM {OBSERVATION_TEST_OUTCOMES} ORDER BY test_id")
+}
+
+fn observation_test_count_sql() -> String {
+    format!("SELECT COUNT(*) FROM {OBSERVATION_TEST_OUTCOMES} WHERE {OBSERVATION_TEST_FILTER}")
+}
+
+/// One page of the filtered manifest: `?4` rows from offset `?5`.
+fn observation_test_page_sql() -> String {
+    format!(
+        "SELECT {OBSERVATION_TEST_COLUMNS} FROM {OBSERVATION_TEST_OUTCOMES}
+          WHERE {OBSERVATION_TEST_FILTER}
+          ORDER BY test_id ASC LIMIT ?4 OFFSET ?5"
+    )
 }
 
 /// Atomically persist an immutable fresh observation, its test manifest, commit
@@ -1822,6 +2087,8 @@ pub(crate) fn record_fresh_check_observation(
                     "verdictPlatform": observation.verdict_platform,
                     "verdictArch": observation.verdict_arch,
                     "verdictEnvironmentHash": observation.verdict_environment_hash,
+                    "selection": observation.selection,
+                    "deferredCount": observation.deferred_count,
                 })
                 .to_string();
                 let mut existing = conn
@@ -1842,7 +2109,9 @@ pub(crate) fn record_fresh_check_observation(
                            AND public_handle IS json_extract(?31,'$.publicHandle')
                            AND verdict_platform IS json_extract(?31,'$.verdictPlatform')
                            AND verdict_arch IS json_extract(?31,'$.verdictArch')
-                           AND verdict_environment_hash IS json_extract(?31,'$.verdictEnvironmentHash')",
+                           AND verdict_environment_hash IS json_extract(?31,'$.verdictEnvironmentHash')
+                           AND selection IS json_extract(?31,'$.selection')
+                           AND deferred_count = json_extract(?31,'$.deferredCount')",
                         params![observation.id.as_str(), observation.project_id.as_str(),
                             observation.commit_sha.as_str(), observation.tree_hash.as_str(),
                             observation.check_name.as_str(), observation.input_hash.as_str(),
@@ -1873,8 +2142,7 @@ pub(crate) fn record_fresh_check_observation(
                         )));
                     }
                     let mut tests = conn.query(
-                        "SELECT test_id,status,duration_ms,attempt_count,failure_excerpt,skip_reason,declaration_source,flaky
-                           FROM check_test_results WHERE observation_id=?1 ORDER BY test_id",
+                        observation_tests_sql(),
                         params![observation.id.as_str()],
                     ).await?;
                     let mut stored = Vec::new();
@@ -1907,14 +2175,16 @@ pub(crate) fn record_fresh_check_observation(
                         executor_lease_epoch, executor_started_at_unix_ms,
                         executor_finished_at_unix_ms, runner_build_id, toolchain_fingerprint,
                         output_tail, defined_by_commit_sha, public_handle, verdict_platform,
-                        verdict_arch, verdict_environment_hash
+                        verdict_arch, verdict_environment_hash, selection, deferred_count
                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
                               ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,
                               json_extract(?31,'$.definedByCommitSha'),
                               json_extract(?31,'$.publicHandle'),
                               json_extract(?31,'$.verdictPlatform'),
                               json_extract(?31,'$.verdictArch'),
-                              json_extract(?31,'$.verdictEnvironmentHash'))
+                              json_extract(?31,'$.verdictEnvironmentHash'),
+                              json_extract(?31,'$.selection'),
+                              json_extract(?31,'$.deferredCount'))
                        ON CONFLICT(id) DO NOTHING",
                     Vec::<cairn_db::turso::Value>::from([
                         observation.id.as_str().into(), observation.project_id.as_str().into(),
@@ -1936,6 +2206,19 @@ pub(crate) fn record_fresh_check_observation(
                     ]),
                 ).await?;
                 for test in &observation.tests {
+                    // `check_test_results.status` cannot hold `deferred`, and must
+                    // not: a deferral is not a test result. It has its own table.
+                    if test.status == "deferred" {
+                        conn.execute(
+                            "INSERT INTO check_deferred_tests (
+                                observation_id, test_id, duration_ms, attempt_count
+                             ) VALUES (?1,?2,?3,?4)
+                             ON CONFLICT(observation_id, test_id) DO NOTHING",
+                            params![observation.id.as_str(), test.test_id.as_str(),
+                                test.duration_ms, test.attempt_count],
+                        ).await?;
+                        continue;
+                    }
                     conn.execute(
                         "INSERT INTO check_test_results (
                             observation_id, test_id, status, duration_ms, attempt_count,
@@ -2043,18 +2326,7 @@ pub(crate) fn record_fresh_check_observation(
                     .and_then(crate::execution::checks::CheckFailureKind::from_stored)
                     .is_some_and(crate::execution::checks::CheckFailureKind::is_infrastructure);
                 if !infrastructure && !observation.infra_reset_scopes.is_empty() {
-                    let placeholders = (0..observation.infra_reset_scopes.len())
-                        .map(|index| format!("?{}", index + 4))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let reset_sql = format!(
-                        "UPDATE check_result_cache
-                            SET infra_failure_streak = 0, infra_escalated_at = NULL
-                          WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-                            AND environment_fingerprint IN ({placeholders})
-                            AND {}",
-                        RowFamily::InfraSuppression.predicate("row_family"),
-                    );
+                    let reset_sql = reset_streak_sql(observation.infra_reset_scopes.len());
                     let mut values: Vec<cairn_db::turso::Value> = vec![
                         observation.project_id.clone().into(),
                         observation.check_name.clone().into(),
@@ -2159,7 +2431,7 @@ pub(crate) fn get_check_result_observation(
                             o.executor_lease_epoch,o.executor_started_at_unix_ms,
                             o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
                             o.output_tail,a.defined_by_commit_sha,o.defined_by_commit_sha,
-                            o.verdict_platform,o.verdict_arch
+                            o.verdict_platform,o.verdict_arch,o.selection,o.deferred_count
                        FROM check_result_commit_aliases a
                        JOIN check_result_observations o ON o.id=a.source_observation_id
                       WHERE a.project_id=?1 AND a.commit_sha=?2 AND a.check_name=?3
@@ -2190,22 +2462,17 @@ pub(crate) fn get_check_result_observation(
                     executor_finished_at_unix_ms: row.opt_i64(30)?, runner_build_id: row.opt_text(31)?,
                     toolchain_fingerprint: row.opt_text(32)?,
                     verdict_platform: row.opt_text(36)?, verdict_arch: row.opt_text(37)?,
-                    output_tail: row.text(33)?, tests: Vec::new(),
+                    output_tail: row.text(33)?,
+                    selection: row.opt_text(38)?, deferred_count: row.i64(39)?, tests: Vec::new(),
                     test_total: 0, test_offset: offset,
                 };
                 let mut totals = conn.query(
-                    "SELECT COUNT(*) FROM check_test_results
-                      WHERE observation_id=?1 AND (?2 IS NULL OR status=?2)
-                        AND (?3 IS NULL OR instr(test_id,?3)>0)",
+                    observation_test_count_sql(),
                     params![observation_id.as_str(), keys.4.as_deref(), keys.5.as_deref()]
                 ).await?;
                 projection.test_total = totals.next().await?.expect("COUNT always returns a row").i64(0)? as usize;
                 let mut tests = conn.query(
-                    "SELECT test_id,status,duration_ms,attempt_count,failure_excerpt,skip_reason,
-                            declaration_source,flaky FROM check_test_results
-                      WHERE observation_id=?1 AND (?2 IS NULL OR status=?2)
-                        AND (?3 IS NULL OR instr(test_id,?3)>0)
-                      ORDER BY test_id ASC LIMIT ?4 OFFSET ?5",
+                    observation_test_page_sql(),
                     params![observation_id.as_str(), keys.4.as_deref(), keys.5.as_deref(), limit as i64, offset as i64]
                 ).await?;
                 while let Some(test) = tests.next().await? {
@@ -2222,8 +2489,25 @@ pub(crate) fn get_check_result_observation(
     })
 }
 
-/// Load one immutable observation by its internal key. Public callers decode an
-/// opaque permalink handle before crossing this boundary; the UUID never renders.
+/// The observation a permalink handle names, within one project.
+fn observation_by_handle_sql() -> String {
+    format!(
+        "SELECT o.id,o.project_id,o.commit_sha,o.tree_hash,o.check_name,o.input_hash,
+                o.environment_fingerprint,o.exit_code,o.verdict,o.failure_kind,o.complete,
+                o.reusable,o.non_reusable_reason,o.parser_version,o.result_schema_version,
+                o.ran_at,o.duration_ms,o.job_id,o.run_id,o.cadence,o.executor_id,
+                o.executor_device_id,o.executor_connection_generation,o.executor_slot_id,
+                o.executor_lease_epoch,o.executor_started_at_unix_ms,
+                o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
+                o.output_tail,o.defined_by_commit_sha,o.verdict_platform,o.verdict_arch,
+                o.selection,o.deferred_count
+           FROM check_result_observations o INDEXED BY {CHECK_OBSERVATION_HANDLE_INDEX}
+          WHERE o.project_id=?1 AND o.public_handle=?2 AND o.public_handle IS NOT NULL"
+    )
+}
+
+/// Load one immutable observation by the opaque public handle its permalink
+/// carries; the internal UUID never renders.
 pub(crate) fn get_check_result_observation_by_handle(
     db: Arc<LocalDb>,
     project_id: &str,
@@ -2234,84 +2518,102 @@ pub(crate) fn get_check_result_observation_by_handle(
         db.read(|conn| {
             let keys = keys.clone();
             Box::pin(async move {
-                let mut rows = conn.query(
-                    "SELECT o.id,o.project_id,o.commit_sha,o.tree_hash,o.check_name,o.input_hash,
-                            o.environment_fingerprint,o.exit_code,o.verdict,o.failure_kind,o.complete,
-                            o.reusable,o.non_reusable_reason,o.parser_version,o.result_schema_version,
-                            o.ran_at,o.duration_ms,o.job_id,o.run_id,o.cadence,o.executor_id,
-                            o.executor_device_id,o.executor_connection_generation,o.executor_slot_id,
-                            o.executor_lease_epoch,o.executor_started_at_unix_ms,
-                            o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
-                            o.output_tail,o.defined_by_commit_sha,o.verdict_platform,o.verdict_arch
-                       FROM check_result_observations o
-                      WHERE o.project_id=?1 AND o.public_handle=?2",
-                    params![keys.0.as_str(), keys.1.as_str()],
-                ).await?;
-                let Some(row) = rows.next().await? else { return Ok(None); };
+                let mut rows = conn
+                    .query(
+                        observation_by_handle_sql(),
+                        params![keys.0.as_str(), keys.1.as_str()],
+                    )
+                    .await?;
+                let Some(row) = rows.next().await? else {
+                    return Ok(None);
+                };
                 let id = row.text(0)?;
                 let mut projection = CheckResultObservationProjection {
                     disposition: "fresh".into(),
                     defined_by_commit_sha: row.opt_text(30)?,
                     source_defined_by_commit_sha: row.opt_text(30)?,
-                    evaluated_tree_hash: row.text(3)?, evaluated_input_hash: row.text(5)?,
-                    evaluated_at: row.i64(15)?, observation_id: id.clone(), project_id: row.text(1)?,
-                    source_commit_sha: row.text(2)?, source_tree_hash: row.text(3)?,
-                    check_name: row.text(4)?, source_input_hash: row.text(5)?,
-                    environment_fingerprint: row.text(6)?, exit_code: row.i64(7)? as i32,
-                    verdict: row.text(8)?, failure_kind: row.opt_text(9)?, complete: row.i64(10)? != 0,
-                    reusable: row.i64(11)? != 0, non_reusable_reason: row.opt_text(12)?,
-                    parser_version: row.i64(13)?, result_schema_version: row.i64(14)?,
-                    ran_at: row.i64(15)?, duration_ms: row.i64(16)?, job_id: row.opt_text(17)?,
-                    run_id: row.opt_text(18)?, cadence: row.text(19)?, executor_id: row.opt_text(20)?,
-                    executor_device_id: row.opt_text(21)?, executor_connection_generation: row.opt_i64(22)?,
-                    executor_cell_id: row.opt_text(23)?, executor_lease_epoch: row.opt_i64(24)?,
-                    executor_started_at_unix_ms: row.opt_i64(25)?, executor_finished_at_unix_ms: row.opt_i64(26)?,
-                    runner_build_id: row.opt_text(27)?, toolchain_fingerprint: row.opt_text(28)?,
-                    verdict_platform: row.opt_text(31)?, verdict_arch: row.opt_text(32)?,
-                    output_tail: row.text(29)?, tests: Vec::new(), test_total: 0, test_offset: 0,
+                    evaluated_tree_hash: row.text(3)?,
+                    evaluated_input_hash: row.text(5)?,
+                    evaluated_at: row.i64(15)?,
+                    observation_id: id.clone(),
+                    project_id: row.text(1)?,
+                    source_commit_sha: row.text(2)?,
+                    source_tree_hash: row.text(3)?,
+                    check_name: row.text(4)?,
+                    source_input_hash: row.text(5)?,
+                    environment_fingerprint: row.text(6)?,
+                    exit_code: row.i64(7)? as i32,
+                    verdict: row.text(8)?,
+                    failure_kind: row.opt_text(9)?,
+                    complete: row.i64(10)? != 0,
+                    reusable: row.i64(11)? != 0,
+                    non_reusable_reason: row.opt_text(12)?,
+                    parser_version: row.i64(13)?,
+                    result_schema_version: row.i64(14)?,
+                    ran_at: row.i64(15)?,
+                    duration_ms: row.i64(16)?,
+                    job_id: row.opt_text(17)?,
+                    run_id: row.opt_text(18)?,
+                    cadence: row.text(19)?,
+                    executor_id: row.opt_text(20)?,
+                    executor_device_id: row.opt_text(21)?,
+                    executor_connection_generation: row.opt_i64(22)?,
+                    executor_cell_id: row.opt_text(23)?,
+                    executor_lease_epoch: row.opt_i64(24)?,
+                    executor_started_at_unix_ms: row.opt_i64(25)?,
+                    executor_finished_at_unix_ms: row.opt_i64(26)?,
+                    runner_build_id: row.opt_text(27)?,
+                    toolchain_fingerprint: row.opt_text(28)?,
+                    verdict_platform: row.opt_text(31)?,
+                    verdict_arch: row.opt_text(32)?,
+                    output_tail: row.text(29)?,
+                    selection: row.opt_text(33)?,
+                    deferred_count: row.i64(34)?,
+                    tests: Vec::new(),
+                    test_total: 0,
+                    test_offset: 0,
                 };
-                let mut tests = conn.query(
-                    "SELECT test_id,status,duration_ms,attempt_count,failure_excerpt,skip_reason,
-                            declaration_source,flaky FROM check_test_results
-                      WHERE observation_id=?1 ORDER BY test_id ASC",
-                    params![id.as_str()],
-                ).await?;
+                let mut tests = conn
+                    .query(observation_tests_sql(), params![id.as_str()])
+                    .await?;
                 while let Some(test) = tests.next().await? {
                     projection.tests.push(CheckTestResultRow {
-                        test_id: test.text(0)?, status: test.text(1)?, duration_ms: test.opt_i64(2)?,
-                        attempt_count: test.opt_i64(3)?, failure_excerpt: test.opt_text(4)?,
-                        skip_reason: test.opt_text(5)?, declaration_source: test.opt_text(6)?,
+                        test_id: test.text(0)?,
+                        status: test.text(1)?,
+                        duration_ms: test.opt_i64(2)?,
+                        attempt_count: test.opt_i64(3)?,
+                        failure_excerpt: test.opt_text(4)?,
+                        skip_reason: test.opt_text(5)?,
+                        declaration_source: test.opt_text(6)?,
                         flaky: test.i64(7)? != 0,
                     });
                 }
                 projection.test_total = projection.tests.len();
                 Ok(Some(projection))
             })
-        }).await.map_err(|e| format!("Failed to load check observation: {e}"))
+        })
+        .await
+        .map_err(|e| format!("Failed to load check observation: {e}"))
     })
 }
 
-pub(crate) fn get_check_observation_public_handle(
-    db: Arc<LocalDb>,
+/// The public handle a verdict citation names, read on a connection the caller
+/// already holds.
+pub(crate) async fn get_check_observation_public_handle_conn(
+    conn: &Connection,
     project_id: &str,
     observation_id: &str,
-) -> Result<Option<String>, String> {
-    let keys = (project_id.to_string(), observation_id.to_string());
-    run_checkpoint_cache_db(async move {
-        db.read(|conn| {
-            let keys = keys.clone();
-            Box::pin(async move {
-                let mut rows = conn.query(
-                    "SELECT public_handle FROM check_result_observations WHERE project_id=?1 AND id=?2",
-                    params![keys.0.as_str(), keys.1.as_str()],
-                ).await?;
-                match rows.next().await? {
-                    Some(row) => Ok(row.opt_text(0)?),
-                    None => Ok(None),
-                }
-            })
-        }).await.map_err(|e| format!("Failed to load check observation handle: {e}"))
-    })
+) -> DbResult<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT public_handle FROM check_result_observations WHERE project_id=?1 AND id=?2",
+            params![project_id, observation_id],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(row.opt_text(0)?),
+        None => Ok(None),
+    }
 }
 
 /// The machine an observation was produced on and the platform its verdict
@@ -2618,7 +2920,11 @@ pub fn get_checkpoint_cache_result_impl(
     }))
 }
 
-fn run_checkpoint_cache_db<T>(
+/// Run a cache read from synchronous code: on a thread of its own when called
+/// from inside a runtime, which a nested `block_on` would panic in. One call is
+/// one thread and one current-thread runtime, so a caller with several reads
+/// makes them all inside a single call rather than one call each.
+pub(crate) fn run_checkpoint_cache_db<T>(
     future: impl std::future::Future<Output = Result<T, String>> + Send + 'static,
 ) -> Result<T, String>
 where
@@ -2644,6 +2950,106 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every statement that addresses one `(project, check, input hash)` lane of
+    /// `check_result_cache`. Left to the planner, the two `/checks` lookups
+    /// reached the table through an index on `project_id` alone and walked the
+    /// project's whole history per check: 355 ms and 41 ms against 2 ms each
+    /// through the key, roughly ten seconds of every poll on a 27-check project
+    /// (cairn/5206). The engine's own lane reads and infrastructure-streak
+    /// writes carry the identical predicate. Turso keeps no statistics, so an
+    /// empty schema plans exactly as production does.
+    #[tokio::test]
+    async fn check_lookups_seek_the_primary_key() {
+        let db = crate::storage::migrated_test_db("check-lookup-plan.db").await;
+        for (label, sql, binds) in [
+            ("head rows", head_rows_sql(), 5),
+            ("reusable verdict", reusable_check_result_sql(2, Some(1)), 9),
+            ("passing row", passing_row_sql(), 3),
+            ("infra rows", infra_rows_sql(2), 5),
+            ("claim escalation", claim_escalation_sql(), 6),
+            ("charge streak", charge_streak_sql(2), 6),
+            ("reset streak", reset_streak_sql(2), 5),
+        ] {
+            let plan = query_plan(&db, sql, binds).await;
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains(CHECK_RESULT_CACHE_KEY_INDEX)
+                        && line.contains("project_id=? AND check_name=? AND input_hash=?")),
+                "{label}: seeks the key on all three lane columns: {plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|line| line.starts_with("SCAN")),
+                "{label}: scans nothing: {plan:#?}"
+            );
+        }
+    }
+
+    /// Every statement that reads one observation or its test manifest. The
+    /// handle lookup reached the observation through `project_id` alone,
+    /// walking every observation of the project, and each per-test read
+    /// filtered the outcomes union from outside, which Turso answers by
+    /// materializing every test row in the database first: 16 s per read on
+    /// 3.3M rows against 75 ms through each table's key (cairn/5304).
+    #[tokio::test]
+    async fn observation_lookups_seek_their_index() {
+        let db = crate::storage::migrated_test_db("observation-lookup-plan.db").await;
+        let handle = query_plan(&db, observation_by_handle_sql(), 2).await;
+        assert!(
+            handle
+                .iter()
+                .any(|line| line.contains(CHECK_OBSERVATION_HANDLE_INDEX)
+                    && line.contains("project_id=? AND public_handle=?")),
+            "by handle: seeks the handle index on both columns: {handle:#?}"
+        );
+        assert!(
+            !handle.iter().any(|line| line.starts_with("SCAN")),
+            "by handle: scans nothing: {handle:#?}"
+        );
+
+        for (label, sql, binds) in [
+            ("manifest", observation_tests_sql(), 1),
+            ("test count", observation_test_count_sql(), 3),
+            ("test page", observation_test_page_sql(), 5),
+        ] {
+            let plan = query_plan(&db, sql, binds).await;
+            for table in ["check_test_results", "check_deferred_tests"] {
+                assert!(
+                    plan.iter()
+                        .any(|line| line.starts_with(&format!("SEARCH {table} "))
+                            && line.contains("observation_id=?")),
+                    "{label}: seeks {table} by observation: {plan:#?}"
+                );
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|line| line.starts_with(&format!("SCAN {table}"))),
+                    "{label}: never walks {table}: {plan:#?}"
+                );
+            }
+        }
+    }
+
+    /// The detail column of `EXPLAIN QUERY PLAN` for `sql`, with each of its
+    /// `binds` parameters bound to a placeholder.
+    async fn query_plan(db: &LocalDb, sql: String, binds: usize) -> Vec<String> {
+        db.read(move |conn| {
+            let sql = sql.clone();
+            Box::pin(async move {
+                let bound = vec![Value::Text("x".into()); binds];
+                let mut rows = conn
+                    .query(&format!("EXPLAIN QUERY PLAN {sql}"), bound)
+                    .await?;
+                let mut plan = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    plan.push(row.text(3)?);
+                }
+                Ok(plan)
+            })
+        })
+        .await
+        .unwrap()
+    }
 
     /// A passing write. The middle argument seeds both `tree_hash` and
     /// `input_hash` to the same value so tests that don't care about the
@@ -2690,6 +3096,8 @@ mod tests {
             id: id.to_string(),
             public_handle: format!("{id:0<24}"),
             infra_reset_scopes: Vec::new(),
+            selection: None,
+            deferred_count: 0,
             project_id: "project-a".to_string(),
             commit_sha: commit.to_string(),
             defined_by_commit_sha: commit.to_string(),
@@ -2753,6 +3161,93 @@ mod tests {
         let error = record_fresh_check_observation(db, write)
             .expect_err("mixed sealed and loose coordinates must not become reusable evidence");
         assert!(error.contains("sealed check coordinate"), "{error}");
+    }
+
+    /// A fast-tier observation persists its deferrals beside, never inside,
+    /// `check_test_results`: no query over that table can count one as passed,
+    /// every reader sees it through `check_test_outcomes`, and the observation
+    /// row carries the tier and the tally.
+    #[tokio::test]
+    async fn a_fast_tier_observation_keeps_its_deferrals_out_of_test_results() {
+        let db = cache_db().await;
+        let mut write = observation("obs-fast", "commit-fast", "env-fast");
+        write.selection = Some("fast".to_string());
+        write.deferred_count = 1;
+        write.tests.push(CheckTestResultRow {
+            test_id: "crate::slow".to_string(),
+            status: "deferred".to_string(),
+            duration_ms: Some(1_001),
+            attempt_count: Some(1),
+            failure_excerpt: None,
+            skip_reason: None,
+            declaration_source: None,
+            flaky: false,
+        });
+        record_fresh_check_observation(db.clone(), write.clone()).unwrap();
+        // Re-recording the identical observation is idempotent: the manifest
+        // comparison reads deferrals back through the outcomes union too.
+        record_fresh_check_observation(db.clone(), write.clone()).unwrap();
+
+        let in_results = db
+            .query_opt_i64(
+                "SELECT COUNT(*) FROM check_test_results WHERE observation_id='obs-fast' AND test_id='crate::slow'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(in_results, Some(0), "a deferral is not a test result");
+        let passed = db
+            .query_opt_i64(
+                "SELECT COUNT(*) FROM check_test_results WHERE observation_id='obs-fast' AND status='passed'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(passed, Some(1));
+
+        let by_handle =
+            get_check_result_observation_by_handle(db.clone(), "project-a", &write.public_handle)
+                .unwrap()
+                .expect("the observation is citable by its handle");
+        assert_eq!(by_handle.selection.as_deref(), Some("fast"));
+        assert_eq!(by_handle.deferred_count, 1);
+        let statuses: Vec<_> = by_handle
+            .tests
+            .iter()
+            .map(|t| (t.test_id.as_str(), t.status.as_str()))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![("crate::passes", "passed"), ("crate::slow", "deferred")]
+        );
+
+        let deferred_page = get_check_result_observation(
+            db.clone(),
+            "project-a",
+            "commit-fast",
+            "rust",
+            "env-fast",
+            1,
+            Some("deferred"),
+            None,
+            10,
+            0,
+        )
+        .unwrap()
+        .expect("the commit coordinate resolves");
+        assert_eq!(deferred_page.test_total, 1);
+        assert_eq!(deferred_page.tests[0].test_id, "crate::slow");
+
+        // One terminal outcome per test: the schema refuses a result row for a
+        // test the observation already deferred.
+        let error = db
+            .execute_script(
+                "INSERT INTO check_test_results(observation_id, test_id, status, flaky)
+                 VALUES ('obs-fast', 'crate::slow', 'passed', 0);",
+            )
+            .await
+            .expect_err("a deferred test cannot also pass");
+        assert!(error.to_string().contains("deferred"), "{error}");
     }
 
     /// One project with three jobs: an issue-owned job that owns a branch, a
@@ -3590,16 +4085,21 @@ mod tests {
             .iter()
             .map(|(name, hash)| (name.to_string(), hash.to_string()))
             .collect();
-        list_check_results_for_inputs(
-            db,
-            "project-a",
-            HeadVerdictKeys {
-                tree_hash,
-                input_hashes: &input_hashes,
-                job_id,
-                commit_sha,
-            },
-        )
+        let head = OwnedHeadVerdictKeys {
+            tree_hash: tree_hash.to_string(),
+            input_hashes,
+            job_id: job_id.to_string(),
+            commit_sha: commit_sha.to_string(),
+        };
+        run_checkpoint_cache_db(async move {
+            db.read(move |conn| {
+                Box::pin(async move {
+                    list_check_results_for_inputs_conn(conn, "project-a", head.keys()).await
+                })
+            })
+            .await
+            .map_err(|error| error.to_string())
+        })
         .unwrap()
     }
 

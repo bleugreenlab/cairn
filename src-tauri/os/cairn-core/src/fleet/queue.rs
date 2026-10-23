@@ -1323,6 +1323,7 @@ fn decline_reason_key(reason: DeclineReason) -> String {
         DeclineReason::Constraint => "constraint",
         DeclineReason::Unknown => "unknown",
         DeclineReason::ProjectProvisioning => "project_provisioning",
+        DeclineReason::BuildVolumeAbsent => "build_volume_absent",
     }
     .to_string()
 }

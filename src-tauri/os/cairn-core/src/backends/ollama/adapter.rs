@@ -47,11 +47,12 @@ impl OllamaAdapter {
         request: CompletionRequest,
     ) -> Result<CompletionOutcome, CompletionError> {
         let requested_model = request.model.clone();
-        let body = completion_body(&request)?;
+        let family = self.chat_family();
+        let body = completion_body(&request, &family)?;
         let started = Instant::now();
         let response = llm
             .complete(CompletionCall::whole(
-                CompletionWire::Chat(&self.endpoint),
+                CompletionWire::Chat(&family.endpoint),
                 body,
                 request.timeout,
             ))
@@ -77,6 +78,20 @@ impl OllamaAdapter {
             account_id: None,
         })
     }
+
+    /// The chat family an agent turn and a one-shot completion are both built
+    /// from.
+    fn chat_family(&self) -> ChatFamily {
+        ChatFamily {
+            endpoint: self.endpoint.clone(),
+            dialect: ChatDialect {
+                reasoning: ChatReasoning::Omit,
+                response_format: false,
+                ..ChatDialect::default()
+            },
+            extras: Map::new(),
+        }
+    }
 }
 
 use crate::backends::openai_compat::completion_body;
@@ -99,15 +114,7 @@ impl WireAdapter for OllamaAdapter {
         Ok(Connection { api_key: None })
     }
     fn family(&self, _: &Connection) -> Result<ChatFamily, String> {
-        Ok(ChatFamily {
-            endpoint: self.endpoint.clone(),
-            dialect: ChatDialect {
-                reasoning: ChatReasoning::Omit,
-                response_format: false,
-                ..ChatDialect::default()
-            },
-            extras: Map::new(),
-        })
+        Ok(self.chat_family())
     }
     fn build_conversation(
         &self,
@@ -147,9 +154,21 @@ mod tests {
             ],
             model: "qwen:test".into(),
             project_id: None,
-            extras: json!({"temperature": 0.2}),
+            options: Default::default(),
             output_schema: None,
             timeout: Duration::from_secs(1),
+        }
+    }
+
+    fn adapter() -> OllamaAdapter {
+        OllamaAdapter {
+            account_id: None,
+            endpoint: Endpoint {
+                provider_name: OLLAMA_BACKEND_NAME.to_string(),
+                backend_key: OLLAMA_BACKEND_KEY.to_string(),
+                chat_url: "http://127.0.0.1:1/v1/chat/completions".to_string(),
+                headers: vec![("content-type".into(), "application/json".into())],
+            },
         }
     }
 
@@ -215,17 +234,21 @@ mod tests {
     }
 
     #[test]
-    fn completion_body_is_tool_free_and_preserves_messages_and_options() {
+    fn completion_body_is_tool_free_and_preserves_messages_and_schema() {
         let mut request = request();
         request.output_schema = Some(json!({
             "type": "object",
             "properties": {"answer": {"type": "string"}},
             "required": ["answer"]
         }));
-        let body = completion_body(&request).unwrap();
+        request.options.reasoning_effort = Some("high".to_string());
+        let body = completion_body(&request, &adapter().chat_family()).unwrap();
         assert_eq!(body["model"], "qwen:test");
         assert_eq!(body["stream"], false);
-        assert_eq!(body["temperature"], 0.2);
+        // Ollama's dialect sends no effort, on a turn or a completion, and the
+        // option's own name never reaches the body.
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoningEffort").is_none());
         assert_eq!(
             body["messages"][0],
             json!({"role": "system", "content": "Be concise"})
@@ -292,13 +315,7 @@ mod tests {
         let mut empty = request();
         empty.messages.clear();
         assert!(matches!(
-            completion_body(&empty),
-            Err(CompletionError::InvalidRequest(_))
-        ));
-        let mut bad_extras = request();
-        bad_extras.extras = json!("not an object");
-        assert!(matches!(
-            completion_body(&bad_extras),
+            completion_body(&empty, &adapter().chat_family()),
             Err(CompletionError::InvalidRequest(_))
         ));
     }

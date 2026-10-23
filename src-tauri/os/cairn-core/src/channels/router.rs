@@ -5,6 +5,7 @@ use std::{
 };
 
 use cairn_common::uri::{parse_uri, CairnResource};
+use cairn_db::sql::placeholders;
 use cairn_db::turso::{params, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -4140,11 +4141,6 @@ fn review_subject(content_ref: &str) -> Option<(String, i32)> {
     let parsed = parse_uri(content_ref)?;
     let project = parsed.project().map(cairn_common::uri::canonical_project)?;
     Some((project, parsed.issue_number()?))
-}
-
-/// `?, ?, ?` for an `IN (...)` list of `n` bound values.
-fn placeholders(n: usize) -> String {
-    (0..n).map(|_| "?").collect::<Vec<_>>().join(", ")
 }
 
 /// The statement behind [`load_review_issue_titles`], built for a given batch

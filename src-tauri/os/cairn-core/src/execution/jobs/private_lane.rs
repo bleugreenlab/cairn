@@ -31,12 +31,39 @@
 //! relevant warm process holding a unit in the lane under an explicit ceiling.
 //! The evicted process's release re-triggers promotion, and an evicted park
 //! resumes later through the same queue.
+//!
+//! ## Boot ramp
+//!
+//! A restart resumes every session the old process was serving at once: the
+//! watchdog reconcile and the owned-wait reconcile each hand the queue a wave of
+//! launches within seconds, and memory, the only brake above, has room for all
+//! of them. What the host cannot absorb is their warm-up. A Claude process is
+//! expensive between its spawn and its first output (that interval grew from
+//! under a second to 12-22 s in a 20-resume wave), and enough of them at once
+//! convoys the runtime every UI command waits on.
+//!
+//! So for [`BOOT_RAMP_HORIZON`] after boot the promoter keeps at most
+//! [`BOOT_RAMP_WINDOW`] spawns warming. A spawn warms from its lease until its
+//! process's first output, its launch ending (its admission row leaving
+//! `leased`/`starting`/`active`), or [`BOOT_RAMP_WARMING_TIMEOUT`]; a backend
+//! that does not report first output stops warming once its process registers.
+//! Each release promotes again, so the window refills at the pace warm-up
+//! actually takes rather than on a clock. Launches the window holds stay
+//! durably `queued`, which is what the reaper and every surface already read.
+//!
+//! This is a warm-up window, not a resident-session cap. It never counts a
+//! process past its first output, it ends with the horizon, and memory remains
+//! the only bound on how many sessions are resident. Urgent work (an operator
+//! waiting on the launch) is never held, though it counts as warming. The
+//! window and horizon are constants: a knob an operator had to set to recover
+//! from a convoy would be situational state.
 
 use super::{run_db, run_db_borrowed};
 use crate::agent_process::gc::SpawnRoom;
 use crate::orchestrator::Orchestrator;
+use crate::resume_timing::ResumeTimingEvent;
 use crate::storage::{
-    HostMemoryEnvelope, LaneBudget, LaneShortfall, RowExt, RuntimeResourceCapacity,
+    HostMemoryEnvelope, LaneBudget, LaneShortfall, RowExt, RuntimeResourceCapacity, SpawnWindow,
 };
 use cairn_session::agent_process::gc::{memory_reserve, DEFAULT_SPAWN_RSS};
 use std::collections::{HashMap, HashSet};
@@ -50,6 +77,14 @@ pub(crate) const WORKSPACE: &str = "private-runtime";
 /// one; without this a second pass would evict again for the same shortfall.
 /// Matches the process sweep interval, which re-measures and retries.
 const MEMORY_EVICTION_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// How long after boot the promoter bounds spawn warm-up. See the module doc.
+pub(crate) const BOOT_RAMP_HORIZON: Duration = Duration::from_secs(10 * 60);
+/// How many spawns may be warming at once while the boot ramp is on.
+pub(crate) const BOOT_RAMP_WINDOW: u32 = 4;
+/// A spawn with no output this long after its lease stops counting as warming,
+/// so one wedged process cannot hold the window shut.
+pub(crate) const BOOT_RAMP_WARMING_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// What one promotion pass admitted against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,15 +135,185 @@ struct LaneDecision {
     shortfall: Option<LaneShortfall>,
 }
 
+/// One spawn the boot ramp counts as warming.
+struct WarmingSpawn {
+    lane: String,
+    request_id: String,
+    leased_at: Instant,
+    /// Its backend reports the process's first output (Claude's reader does).
+    /// Otherwise the spawn stops warming once its process registers.
+    reports_first_output: bool,
+}
+
+/// This boot's warm-up window. In memory only: the ramp is per boot, and a
+/// restart starts a new one.
+#[derive(Default)]
+struct BootRamp {
+    /// Keyed by run id.
+    warming: HashMap<String, WarmingSpawn>,
+    /// Queue heads the ramp held, with when it first held each.
+    held_since: HashMap<String, Instant>,
+    held: u64,
+    longest_hold: Duration,
+    ended: bool,
+}
+
 /// The last decision each private lane's promoter made. Surfaces read this
 /// rather than probing, so what they display is what was decided.
 #[derive(Default)]
 pub struct PrivateLaneLedger {
     decisions: Mutex<HashMap<String, LaneDecision>>,
     memory_evictions: Mutex<HashMap<String, Instant>>,
+    boot_ramp: Mutex<BootRamp>,
+    /// Serializes, across every pass on every private lane, a ramp pass's
+    /// window read, the lease it decides, and the warming registration that
+    /// lease implies. Without it, concurrent passes (a restart's enqueue burst
+    /// fires one each) all read the same count and lease past the window.
+    ramp_admission: Mutex<()>,
 }
 
 impl PrivateLaneLedger {
+    /// Hold the ramp's admission critical section. The caller drops it before
+    /// starting the leased launch, so a slow spawn never serializes the lane.
+    pub(crate) fn lock_ramp_admission(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.ramp_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn ramp(&self) -> Option<std::sync::MutexGuard<'_, BootRamp>> {
+        self.boot_ramp.lock().ok()
+    }
+
+    /// The window as it stands: how many spawns are warming against how many
+    /// may.
+    pub(crate) fn spawn_window(&self) -> SpawnWindow {
+        SpawnWindow {
+            warming: self.ramp().map_or(0, |ramp| ramp.warming.len() as u64),
+            window: BOOT_RAMP_WINDOW,
+        }
+    }
+
+    /// Count `run_id`'s spawn as warming from its lease.
+    pub(crate) fn begin_warming(&self, run_id: &str, lane: &str, request_id: &str, urgent: bool) {
+        let Some(mut ramp) = self.ramp() else {
+            return;
+        };
+        let now = Instant::now();
+        if let Some(since) = ramp.held_since.remove(request_id) {
+            ramp.held += 1;
+            ramp.longest_hold = ramp.longest_hold.max(now.duration_since(since));
+        }
+        ramp.warming.insert(
+            run_id.to_string(),
+            WarmingSpawn {
+                lane: lane.to_string(),
+                request_id: request_id.to_string(),
+                leased_at: now,
+                reports_first_output: false,
+            },
+        );
+        let warming = ramp.warming.len();
+        drop(ramp);
+        let mut event = ResumeTimingEvent::new("boot_ramp_lease");
+        event.run_id = Some(run_id);
+        event.count = Some(warming);
+        event.mode = Some(if urgent { "urgent" } else { "ordinary" });
+        event.emit();
+    }
+
+    /// `run_id`'s backend will report its process's first output, so it keeps
+    /// warming past registration until it does.
+    pub(crate) fn expect_first_output(&self, run_id: &str) {
+        if let Some(spawn) = self
+            .ramp()
+            .as_mut()
+            .and_then(|ramp| ramp.warming.get_mut(run_id))
+        {
+            spawn.reports_first_output = true;
+        }
+    }
+
+    /// Stop counting `run_id` as warming, recording why (`first_output`,
+    /// `active`, `ended` or `timeout`). Returns its lane, for the caller to
+    /// promote what the freed slot admits, or `None` if it was not warming.
+    pub(crate) fn release_warming(&self, run_id: &str, mode: &str) -> Option<String> {
+        let spawn = self.ramp()?.warming.remove(run_id)?;
+        let mut event = ResumeTimingEvent::new("boot_ramp_release").elapsed(spawn.leased_at);
+        event.run_id = Some(run_id);
+        event.mode = Some(mode);
+        event.emit();
+        Some(spawn.lane)
+    }
+
+    /// Its process registered: a spawn whose backend reports no first output
+    /// has nothing further to wait for.
+    fn release_unless_awaiting_output(&self, run_id: &str) {
+        let awaiting = self.ramp().is_some_and(|ramp| {
+            ramp.warming
+                .get(run_id)
+                .is_some_and(|spawn| spawn.reports_first_output)
+        });
+        if !awaiting {
+            self.release_warming(run_id, "active");
+        }
+    }
+
+    fn note_ramp_hold(&self, request_id: &str) {
+        if let Some(mut ramp) = self.ramp() {
+            ramp.held_since
+                .entry(request_id.to_string())
+                .or_insert_with(Instant::now);
+        }
+    }
+
+    /// Warming spawns as `(run_id, request_id, leased_at)`.
+    fn warming_spawns(&self) -> Vec<(String, String, Instant)> {
+        self.ramp().map_or_else(Vec::new, |ramp| {
+            ramp.warming
+                .iter()
+                .map(|(run, spawn)| (run.clone(), spawn.request_id.clone(), spawn.leased_at))
+                .collect()
+        })
+    }
+
+    /// Close the ramp once, logging what it did.
+    fn end_boot_ramp(&self) {
+        let Some(mut ramp) = self.ramp() else {
+            return;
+        };
+        if ramp.ended {
+            return;
+        }
+        ramp.ended = true;
+        let still_warming = ramp.warming.len();
+        ramp.warming.clear();
+        ramp.held_since.clear();
+        log::info!(
+            "boot ramp ended: it held {} background launch(es), the longest for {}s; {still_warming} spawn(s) were still warming",
+            ramp.held,
+            ramp.longest_hold.as_secs()
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn warming_runs(&self) -> HashSet<String> {
+        self.ramp()
+            .map(|ramp| ramp.warming.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backdate_warming(&self, run_id: &str, by: Duration) {
+        if let Some(spawn) = self
+            .ramp()
+            .as_mut()
+            .and_then(|ramp| ramp.warming.get_mut(run_id))
+        {
+            spawn.leased_at = spawn.leased_at.checked_sub(by).expect("backdated instant");
+        }
+    }
+
     pub(crate) fn record(
         &self,
         lane: &str,
@@ -140,6 +345,88 @@ impl PrivateLaneLedger {
     }
 }
 
+/// Whether this boot is still inside its ramp horizon.
+pub(crate) fn boot_ramp_active(orch: &Orchestrator) -> bool {
+    chrono::Utc::now().timestamp()
+        < orch
+            .boot_at
+            .saturating_add(BOOT_RAMP_HORIZON.as_secs() as i64)
+}
+
+/// The spawn window this promotion pass leases against, or `None` once the
+/// boot ramp is over. Spawns that stopped warming without saying so (their
+/// launch ended, or they timed out) are released first, so the window reads
+/// only spawns that are still warming.
+pub(super) fn boot_ramp_window(orch: &Orchestrator) -> Option<SpawnWindow> {
+    if !boot_ramp_active(orch) {
+        orch.private_lanes.end_boot_ramp();
+        return None;
+    }
+    let now = Instant::now();
+    for (run_id, request_id, leased_at) in orch.private_lanes.warming_spawns() {
+        if now.duration_since(leased_at) >= BOOT_RAMP_WARMING_TIMEOUT {
+            log::warn!(
+                "boot ramp: run {run_id} produced no output {}s after its lease; it no longer counts as warming",
+                now.duration_since(leased_at).as_secs()
+            );
+            orch.private_lanes.release_warming(&run_id, "timeout");
+            continue;
+        }
+        // An unreadable row proves nothing; the timeout still bounds it.
+        let launch_live = run_db({
+            let db = orch.db.local.clone();
+            async move {
+                crate::storage::get_admission_request(&db, &request_id)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        })
+        .map(|request| {
+            request.is_some_and(|request| {
+                matches!(request.state.as_str(), "leased" | "starting" | "active")
+            })
+        });
+        if launch_live == Ok(false) {
+            orch.private_lanes.release_warming(&run_id, "ended");
+        }
+    }
+    Some(orch.private_lanes.spawn_window())
+}
+
+/// Settle a warming spawn once its start returns: its slot frees at once if
+/// the start left no process that will report first output.
+pub(super) fn settle_warming_start(
+    orch: &Orchestrator,
+    run_id: &str,
+    started: &Result<bool, String>,
+) {
+    match started {
+        Ok(true) => orch.private_lanes.release_unless_awaiting_output(run_id),
+        Ok(false) | Err(_) => {
+            orch.private_lanes.release_warming(run_id, "ended");
+        }
+    }
+}
+
+/// Record that the ramp is holding `head_request_id`, for the end-of-ramp log.
+pub(super) fn note_ramp_hold(orch: &Orchestrator, head_request_id: &str) {
+    orch.private_lanes.note_ramp_hold(head_request_id);
+}
+
+/// `run_id`'s backend reports its process's first output; the ramp keeps it
+/// warming until then.
+pub(crate) fn spawn_reports_first_output(orch: &Orchestrator, run_id: &str) {
+    orch.private_lanes.expect_first_output(run_id);
+}
+
+/// `run_id`'s process produced its first output: it is no longer warming, and
+/// its slot admits the next background launch.
+pub(crate) fn spawn_produced_first_output(orch: &Orchestrator, run_id: &str) {
+    if let Some(lane) = orch.private_lanes.release_warming(run_id, "first_output") {
+        super::ordinary_admission::promote_private_lane(orch, &lane);
+    }
+}
+
 /// Ask the warm GC for room on behalf of a blocked queue head. The caller has
 /// established that nothing in the lane is mid-spawn.
 pub(super) fn make_room_for_head(orch: &Orchestrator, lane: &str, shortfall: &LaneShortfall) {
@@ -168,7 +455,8 @@ pub(super) fn make_room_for_head(orch: &Orchestrator, lane: &str, shortfall: &La
             };
             orch.evict_one_warm_unit(&holders).into_iter().collect()
         }
-        LaneShortfall::Streams { .. } => Vec::new(),
+        // Evicting frees memory or a unit, never a warm-up slot.
+        LaneShortfall::Streams { .. } | LaneShortfall::Ramp { .. } => Vec::new(),
     };
     if !evicted.is_empty() {
         log::info!(
@@ -206,6 +494,8 @@ pub(crate) async fn private_lane_budgets(
 ) -> crate::storage::DbResult<Vec<LaneBudget>> {
     let occupancy = crate::storage::lane_occupancy(&orch.db.local, WORKSPACE).await?;
     let current_ceiling = orch.get_settings().private_dedicated_process_capacity;
+    // Warm-up is one host's, so every lane reports the same window.
+    let boot_ramp = boot_ramp_active(orch).then(|| orch.private_lanes.spawn_window());
     // Memory is one host, so every lane's headroom nets out spawns in flight on
     // all of them, as the lease does.
     let host_in_flight = occupancy
@@ -239,6 +529,7 @@ pub(crate) async fn private_lane_budgets(
                 lane: lane.lane,
                 active_units: lane.active_units,
                 queued: lane.queued,
+                boot_ramp,
             }
         })
         .collect())
@@ -259,6 +550,12 @@ pub(crate) fn describe_lane(budget: &LaneBudget, now: i64) -> String {
         Some(ceiling) => format!(", operator ceiling {ceiling}"),
         None => ", no unit ceiling".to_string(),
     });
+    if let Some(ramp) = budget.boot_ramp {
+        line.push_str(&format!(
+            ", boot ramp: {} of {} warming",
+            ramp.warming, ramp.window
+        ));
+    }
     match (budget.memory, budget.headroom_bytes(), budget.measured_at) {
         (Some(memory), Some(headroom), _) => {
             line.push_str(&format!(
@@ -311,6 +608,9 @@ pub(crate) fn describe_shortfall(shortfall: &LaneShortfall) -> String {
         LaneShortfall::Streams { active, ceiling } => {
             format!("the stream ceiling of {ceiling} is full ({active} active)")
         }
+        LaneShortfall::Ramp { warming, window } => format!(
+            "the boot ramp starts background launches only while fewer than {window} spawns are warming up ({warming} are)"
+        ),
     }
 }
 
@@ -522,7 +822,30 @@ mod tests {
             measured_at: Some(100),
             per_process_bytes: GIB,
             shortfall,
+            boot_ramp: None,
         }
+    }
+
+    #[test]
+    fn a_lane_line_names_the_boot_ramp_while_it_holds_background_launches() {
+        let mut ramped = budget(
+            None,
+            Some(LaneShortfall::Ramp {
+                warming: 4,
+                window: 4,
+            }),
+        );
+        ramped.boot_ramp = Some(SpawnWindow {
+            warming: 4,
+            window: 4,
+        });
+        assert!(
+            describe_lane(&ramped, 112).contains(", no unit ceiling, boot ramp: 4 of 4 warming;")
+        );
+        assert_eq!(
+            describe_shortfall(ramped.shortfall.as_ref().unwrap()),
+            "the boot ramp starts background launches only while fewer than 4 spawns are warming up (4 are)"
+        );
     }
 
     #[test]

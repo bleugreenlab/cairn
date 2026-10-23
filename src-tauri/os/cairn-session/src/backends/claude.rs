@@ -45,6 +45,9 @@ pub trait ClaudeHost: Send + Sync {
     /// Stop the process through host-owned admission release policy.
     fn stop_process(&self);
     fn startup_rejected(&self, message: &str);
+    /// The process wrote its first stdout line: its spawn has finished warming
+    /// up. Called once, from the reader, and must not block it.
+    fn first_output(&self);
     fn initialized(&self);
     fn capture_output(&self, output: serde_json::Value);
     fn rate_limit(&self, snapshot: ProviderUsageSnapshot, info: Option<&RateLimitInfo>) -> bool;
@@ -1328,6 +1331,7 @@ impl ClaudeRuntime {
                         event.bytes = Some(l.len());
                         event.emit();
                         first_stdout_logged = true;
+                        host.host.first_output();
                     }
                     if !l.contains("\"type\":\"stream_event\"") {
                         log::trace!(
@@ -2693,6 +2697,7 @@ mod depletion_order_tests {
         fn credential_acknowledged(&self, _generation: u64) {}
         fn error(&self, _message: &str) {}
         fn startup_rejected(&self, _message: &str) {}
+        fn first_output(&self) {}
         fn initialized(&self) {}
         fn capture_output(&self, _output: serde_json::Value) {}
         fn rate_limit(

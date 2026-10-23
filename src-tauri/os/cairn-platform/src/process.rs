@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -93,6 +93,24 @@ pub fn observed_spawn(command: &mut Command) -> std::io::Result<Child> {
         );
     }
     result
+}
+
+/// `command.output()`, with the spawn accounted as [`observed_spawn`] accounts
+/// it. As `output` does, it captures stdout and stderr and gives the child a
+/// null stdin.
+pub fn observed_output(command: &mut Command) -> std::io::Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    observed_spawn(command)?.wait_with_output()
+}
+
+/// `command.status()`, with the spawn accounted as [`observed_spawn`] accounts
+/// it. The child inherits whatever stdio the command was given, as with
+/// `status`.
+pub fn observed_status(command: &mut Command) -> std::io::Result<ExitStatus> {
+    observed_spawn(command)?.wait()
 }
 
 fn spawn_pipe_reader<R: Read + Send + 'static>(
@@ -193,6 +211,35 @@ pub fn bounded_command_output(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// The accounted forms answer exactly as `output` and `status` do, and
+    /// the spawn is recorded in the ledger stall lines read.
+    #[test]
+    fn observed_output_and_status_answer_as_std_does_and_are_accounted() {
+        let output =
+            observed_output(Command::new("sh").args(["-c", "echo out; echo err >&2; exit 3"]))
+                .unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
+        assert!(
+            spawn_stats().longest_recent.is_some(),
+            "the spawn is in the recent-spawn record"
+        );
+
+        let status = observed_status(Command::new("sh").args(["-c", "exit 0"])).unwrap();
+        assert!(status.success());
+        let refused = observed_output(&mut Command::new("/nonexistent/cairn-test-binary"));
+        assert!(
+            refused.is_err(),
+            "a spawn that fails is an error, as with std"
+        );
+        assert_eq!(
+            spawn_stats().in_flight,
+            0,
+            "nothing is left in flight once a spawn returns, failed or not"
+        );
+    }
 
     /// The child leads its own process group, so the timeout's `kill(-pid)`
     /// reaches everything it started, and a timed-out child is still reaped.

@@ -613,9 +613,16 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
         }
         (None, _) => String::new(),
     };
+    // A fast-tier verdict names its population on the verdict line itself, so a
+    // green there never reads as a whole-suite one.
+    let tier = result
+        .get("tier")
+        .and_then(serde_json::Value::as_str)
+        .map(|tier| format!(" · {tier}"))
+        .unwrap_or_default();
     Ok((
         format!(
-            "{cache}\n{suite} {} on {short_commit} ({disposition}){machine} · {observation}{reuse}",
+            "{cache}\n{suite} {} on {short_commit} ({disposition}){machine}{tier} · {observation}{reuse}",
             if passed { "✓" } else { "✗" }
         ),
         passed,
@@ -1392,6 +1399,35 @@ mod tests {
         assert!(
             rendered.contains("⚠ rust-tests has no verdict for the placement you asked for on f69ed3b1ed36 (unmet) · fedora (linux) · cairn://p/cairn/check-observations/h — this verdict was produced on fedora for linux, but this request counts only verdicts for macos."),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn check_run_response_names_a_fast_tier_population_on_the_verdict_line() {
+        let (summary, passed) = render_check_run_response(
+            &serde_json::json!({
+                "ok": true,
+                "result": {
+                    "checkName": "rust-tests",
+                    "commitSha": "1234567890abcdef",
+                    "disposition": "fresh",
+                    "passed": true,
+                    "verified": true,
+                    "reusable": true,
+                    "tier": "fast tier: 8501 ran, 3596 deferred",
+                    "observationRef": "cairn://p/CAIRN/check-observations/h",
+                    "ranAt": "t"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(passed);
+        assert!(
+            summary.contains(
+                "rust-tests ✓ on 1234567890ab (fresh) · fast tier: 8501 ran, 3596 deferred · "
+            ),
+            "{summary}"
         );
     }
 

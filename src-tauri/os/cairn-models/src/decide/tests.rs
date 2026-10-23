@@ -16,6 +16,7 @@ use crate::wire::decisions::http::DecisionsEndpoint;
 use crate::wire::decisions::wire::DecisionsResponse;
 use crate::wire::openai_compat::http::Endpoint;
 use crate::wire::openai_compat::wire::ChatResponse;
+use crate::wire::systemone::wire::SystemOneResponse;
 
 /// A `Complete` that answers from a script and records every request.
 #[derive(Default)]
@@ -63,6 +64,19 @@ fn native_route() -> DecisionRoute {
         url: "http://gateway/v1/decisions".into(),
         headers: vec![],
     })
+}
+
+fn systemone_route() -> DecisionRoute {
+    DecisionRoute::SystemOne(DecisionsEndpoint {
+        provider_name: "OpenRouter".into(),
+        backend_key: "openrouter".into(),
+        url: "https://openrouter.ai/api/alpha/decisions".into(),
+        headers: vec![],
+    })
+}
+
+fn systemone_reply(value: Value) -> CompletionReply {
+    CompletionReply::SystemOne(serde_json::from_value::<SystemOneResponse>(value).unwrap())
 }
 
 fn logprobs_route() -> DecisionRoute {
@@ -158,7 +172,7 @@ fn native_answers_keep_their_probabilities_and_say_how_they_were_measured() {
 
     assert_eq!(decision.provider, "custom:acc_gateway");
     assert_eq!(decision.model, "openai/gpt-6-luna-decisions");
-    assert_eq!(decision.input_tokens, Some(96));
+    assert_eq!(decision.input_tokens(), Some(96));
     assert!(decision
         .answers
         .iter()
@@ -181,6 +195,218 @@ fn native_answers_keep_their_probabilities_and_say_how_they_were_measured() {
         "billing"
     );
     assert_eq!(requests[0].1["questions"][2]["levels"][2]["label"], "high");
+}
+
+/// OpenRouter's documented reply, verbatim, to the questions it answers:
+/// each answer found by name, in question order, its probabilities in option
+/// and level order, its confidence as reported, and the call's cost kept.
+#[test]
+fn systemone_answers_are_matched_by_name_and_keep_confidence_and_cost() {
+    let complete = Scripted::answering(vec![systemone_reply(json!({
+      "answers": {
+        "is_bug": { "noul": 0.96, "type": "noul" },
+        "team": {
+          "choice": "payments",
+          "confidence": 0.75,
+          "probabilities": { "account": 0, "frontend": 0.16, "payments": 0.84 },
+          "type": "choice"
+        },
+        "urgency": {
+          "confidence": 0.99,
+          "legend": {
+            "0": "Can wait for the next release",
+            "1": "Should be fixed this week",
+            "2": "Blocking revenue right now"
+          },
+          "probabilities": { "0": 0, "1": 0.01, "2": 0.99 },
+          "score": 1.99,
+          "type": "score"
+        }
+      },
+      "id": "gen-dec-1789738314-X5e5eKGQdvR9rblyX250",
+      "model": "typesafe/jev-1.13-20260917",
+      "provider": "TypeSafe",
+      "usage": { "cost": 0.000019992, "input_tokens": 476, "output_tokens": 70 }
+    }))]);
+    let route = systemone_route();
+    // Asked in an order the reply's map does not keep.
+    let questions = [
+        score("urgency", &["later", "this week", "now"]),
+        choice("team", &["payments", "frontend", "account"]),
+        predicate("is_bug"),
+    ];
+    let decision = decide(&complete, call(&route, &questions)).unwrap();
+
+    assert_eq!(decision.provider, "openrouter");
+    assert_eq!(decision.model, "typesafe/jev-1.13-20260917");
+    assert_eq!(decision.input_tokens(), Some(476));
+    assert_eq!(decision.cost_usd(), Some(0.000019992));
+    assert!(decision
+        .answers
+        .iter()
+        .all(|answer| answer.measured_by() == MeasuredBy::Native));
+    let names: Vec<&str> = decision.answers.iter().map(DecisionAnswer::name).collect();
+    assert_eq!(names, vec!["urgency", "team", "is_bug"]);
+
+    let DecisionAnswer::Score {
+        score,
+        pick,
+        probabilities,
+        ..
+    } = &decision.answers[0]
+    else {
+        panic!("expected a score: {:?}", decision.answers[0]);
+    };
+    assert_eq!((*score, pick.as_str()), (1.99, "now"));
+    assert_eq!(
+        probabilities
+            .iter()
+            .map(|entry| (entry.value.as_str(), entry.probability))
+            .collect::<Vec<_>>(),
+        vec![("later", 0.0), ("this week", 0.01), ("now", 0.99)]
+    );
+    assert_eq!(decision.answers[0].confidence(), Some(0.99));
+
+    let DecisionAnswer::Choice { probabilities, .. } = &decision.answers[1] else {
+        panic!("expected a choice: {:?}", decision.answers[1]);
+    };
+    assert_eq!(decision.answers[1].pick(), Some("payments"));
+    assert_eq!(decision.answers[1].confidence(), Some(0.75));
+    let order: Vec<&str> = probabilities
+        .iter()
+        .map(|entry| entry.value.as_str())
+        .collect();
+    assert_eq!(order, vec!["payments", "frontend", "account"]);
+
+    assert_eq!(
+        decision.answers[2],
+        DecisionAnswer::Predicate {
+            name: "is_bug".into(),
+            measured_by: MeasuredBy::Native,
+            probability_yes: 0.96,
+        }
+    );
+
+    let requests = complete.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].0, "systemone");
+    let body = &requests[0].1;
+    assert_eq!(body["model"], "m");
+    assert_eq!(body["state"], "The package arrived broken.");
+    assert_eq!(body["questions"]["is_bug"]["type"], "noul");
+    assert_eq!(
+        body["questions"]["team"]["criteria"],
+        json!({"payments": null, "frontend": null, "account": null})
+    );
+    assert_eq!(
+        body["questions"]["urgency"]["criteria"],
+        json!(["later", "this week", "now"])
+    );
+}
+
+/// TypeSafe's own endpoint reports no cost and no confidence on a choice
+/// that leaves it out: neither is invented, though confidence is computed
+/// from the probabilities when they are there.
+#[test]
+fn systemone_without_cost_or_confidence_reports_none_and_computes_confidence() {
+    let complete = Scripted::answering(vec![systemone_reply(json!({
+        "model": "jev-1.13.0",
+        "answers": {
+            "tone": {"type": "choice", "choice": "frustrated",
+                     "probabilities": {"frustrated": 0.84, "angry": 0.16, "calm": 0.0}},
+            "severity": {"type": "score", "score": 1.43,
+                         "probabilities": {"0": 0.0, "1": 0.57, "2": 0.43}}
+        },
+        "usage": {"input_tokens": 589, "output_tokens": 212}
+    }))]);
+    let route = systemone_route();
+    let questions = [
+        choice("tone", &["calm", "frustrated", "angry"]),
+        score("severity", &["cosmetic", "workaround", "blocking"]),
+    ];
+    let decision = decide(&complete, call(&route, &questions)).unwrap();
+    assert_eq!(decision.cost_usd(), None);
+    assert_eq!(decision.input_tokens(), Some(589));
+    // TypeSafe's documented confidence for this distribution is 0.76.
+    let confidence = decision.answers[0].confidence().unwrap();
+    assert!((confidence - 0.76).abs() < 1e-9, "{confidence}");
+    assert_eq!(decision.answers[1].pick(), Some("workaround"));
+    assert!(decision.answers[1].confidence().is_some());
+}
+
+/// System One shows no refusal. A question left unanswered, or answered in a
+/// shape the wire does not recognise, is a refusal with its reason: never a
+/// pick, never a probability of 0. Its siblings answer normally.
+#[test]
+fn a_systemone_answer_missing_or_unrecognised_is_a_refusal_with_its_reason() {
+    let complete = Scripted::answering(vec![systemone_reply(json!({
+        "model": "typesafe/jev-1.14",
+        "answers": {
+            "declined": {"type": "refusal", "reason": "unsafe"},
+            "broken": {"type": "noul"},
+            "fine": {"type": "noul", "noul": 0.2}
+        },
+        "usage": {"input_tokens": 40}
+    }))]);
+    let route = systemone_route();
+    let questions = [
+        predicate("declined"),
+        predicate("broken"),
+        choice("missing", &["a", "b"]),
+        predicate("fine"),
+    ];
+    let decision = decide(&complete, call(&route, &questions)).unwrap();
+    for refused in &decision.answers[..3] {
+        assert!(refused.is_refusal(), "{refused:?}");
+        assert_eq!(refused.pick(), None);
+        assert_eq!(refused.confidence(), None);
+        assert_eq!(refused.measured_by(), MeasuredBy::Native);
+    }
+    let reason = |index: usize| match &decision.answers[index] {
+        DecisionAnswer::Refusal { reason, .. } => reason.clone().unwrap(),
+        other => panic!("expected a refusal: {other:?}"),
+    };
+    assert!(reason(0).contains(r#""reason":"unsafe""#), "{}", reason(0));
+    assert!(
+        reason(1).contains("no shape Cairn recognises"),
+        "{}",
+        reason(1)
+    );
+    assert_eq!(reason(2), "no answer came back for it");
+    assert_eq!(decision.answers[3].pick(), Some("no"));
+}
+
+#[test]
+fn a_systemone_reply_that_does_not_fit_its_questions_is_an_invalid_reply() {
+    let route = systemone_route();
+    let questions = [choice("queue", &["billing", "shipping"])];
+    let refused = |reply: Value| {
+        let complete = Scripted::answering(vec![systemone_reply(reply)]);
+        decide(&complete, call(&route, &questions))
+            .unwrap_err()
+            .to_string()
+    };
+    let error = refused(json!({"answers": {"queue": {"type": "noul", "noul": 0.4}}}));
+    assert!(error.contains("is a choice question"), "{error}");
+    let error = refused(json!({"answers": {"queue": {"type": "choice", "choice": "legal"}}}));
+    assert!(error.contains("not one of its options"), "{error}");
+    let error = refused(
+        json!({"answers": {"queue": {"type": "choice", "choice": "billing",
+        "probabilities": {"billing": 0.6, "legal": 0.4}}}}),
+    );
+    assert!(error.contains("'legal'"), "{error}");
+    let error = refused(json!({"answers": {
+        "queue": {"type": "choice", "choice": "billing"},
+        "other": {"type": "noul", "noul": 0.5}
+    }}));
+    assert!(error.contains("'other', which was not asked"), "{error}");
+
+    let questions = [score("urgency", &["low", "high"])];
+    let complete = Scripted::answering(vec![systemone_reply(json!({"answers": {
+        "urgency": {"type": "score", "score": 1.0, "probabilities": {"0": 0.0, "2": 1.0}}
+    }}))]);
+    let error = decide(&complete, call(&route, &questions)).unwrap_err();
+    assert!(error.to_string().contains("level '2'"), "{error}");
 }
 
 /// The decoder pin: a refused question is a refusal in its position, never a
@@ -262,7 +488,7 @@ fn logprobs_answers_renormalize_the_label_mass_of_a_vllm_reply() {
 
     assert_eq!(decision.provider, "custom:acc_sparks");
     assert_eq!(decision.model, "gemma4-26b");
-    assert_eq!(decision.input_tokens, Some(87));
+    assert_eq!(decision.input_tokens(), Some(87));
     let DecisionAnswer::Choice {
         measured_by,
         pick,
@@ -329,7 +555,7 @@ fn logprobs_measure_predicates_and_scores_one_request_per_question() {
     ];
     let decision = decide(&complete, call(&route, &questions)).unwrap();
     assert_eq!(complete.requests().len(), 2);
-    assert_eq!(decision.input_tokens, Some(20));
+    assert_eq!(decision.input_tokens(), Some(20));
 
     let DecisionAnswer::Predicate {
         probability_yes,
@@ -570,7 +796,10 @@ fn malformed_questions_are_refused_before_any_request() {
 fn the_routes_name_their_method_and_family() {
     use cairn_models_types::catalog::Wire;
     assert_eq!(native_route().measured_by(), MeasuredBy::Native);
+    assert_eq!(systemone_route().measured_by(), MeasuredBy::Native);
     assert_eq!(logprobs_route().measured_by(), MeasuredBy::Logprobs);
+    assert_eq!(systemone_route().completion_wire().wire(), Wire::SystemOne);
+    assert_eq!(systemone_route().completion_wire().family(), "systemone");
     assert_eq!(
         native_route().completion_wire().wire(),
         Wire::OpenAiDecisions

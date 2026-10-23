@@ -93,12 +93,87 @@ pub async fn reconstruct_events(db: &LocalDb, events: Vec<Event>) -> Vec<Event> 
     if !events.iter().any(is_archived) {
         return withheld(events);
     }
-    // Two phases so the `ObjectStore` (which holds a non-Send `Rc`) is never
-    // alive across an await: gather all coordinates and pack bytes via async DB
-    // reads under one read connection first, then build the layered stores and
-    // reconstruct synchronously.
-    let run_ids = gitcoord_run_ids(&events);
-    let hashes = blobbed_hashes(&events);
+    let coords = load_coords(db, &events).await;
+    withheld(finish(coords, events))
+}
+
+/// What reconstruction made of one event: whether the `data` it now carries is
+/// the content an agent saw, and if not, why not.
+///
+/// The read path never needs this — a transcript renders a degraded stub the
+/// same way it renders content — but a consumer that hands events onward as a
+/// record (the project export) must be able to say which rows are not, rather
+/// than guess from the text: a stub prefix also appears verbatim in any
+/// transcript that read this file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reconstruction {
+    /// Stored `full`: `data` is the recorded content, untouched.
+    Stored,
+    /// Archived, and restored completely from its compressed form, its
+    /// content-addressed blobs, or its git coordinate.
+    Restored,
+    /// Archived, and at least one part of it could not be resolved (a dropped
+    /// pack, a commit or blob the store no longer has): `data` carries the rest,
+    /// with each unresolvable part replaced by a [`STUB_PREFIX`] stub.
+    Degraded,
+    /// Archived, but the stored form itself could not be decoded (an invalid
+    /// column shape, corrupt compression, a stub that is not JSON): `data` is
+    /// still the stored form, not content.
+    Undecodable,
+    /// Withheld by the disclosure quarantine: `data` is the withholding notice,
+    /// and the stored form must not be served either.
+    Withheld,
+}
+
+impl Reconstruction {
+    /// Whether `data` is anything less than the complete content an agent saw.
+    pub fn is_unresolved(self) -> bool {
+        matches!(self, Reconstruction::Degraded | Reconstruction::Undecodable)
+    }
+}
+
+/// [`reconstruct_events`], also reporting what reconstruction made of each
+/// event (index-aligned with the input). Same reader, same quarantine gate, run
+/// last; the only difference is that the outcome each shape handler already
+/// knows is returned instead of dropped.
+pub async fn reconstruct_events_reporting(
+    db: &LocalDb,
+    events: Vec<Event>,
+) -> Vec<(Event, Reconstruction)> {
+    let reported = if events.iter().any(is_archived) {
+        let coords = load_coords(db, &events).await;
+        finish_reporting(coords, events)
+    } else {
+        events
+            .into_iter()
+            .map(|event| (event, Reconstruction::Stored))
+            .collect()
+    };
+    let (mut events, outcomes): (Vec<Event>, Vec<Reconstruction>) = reported.into_iter().unzip();
+    // The quarantine gate runs last here exactly as in `withheld`, for the same
+    // reason: reconstruction regenerates `data` and would overwrite a stub laid
+    // down before it.
+    let withheld = crate::storage::quarantine::withhold_quarantined_reporting(&mut events);
+    events
+        .into_iter()
+        .zip(outcomes)
+        .zip(withheld)
+        .map(|((event, outcome), incident)| match incident {
+            Some(_) => (event, Reconstruction::Withheld),
+            None => (event, outcome),
+        })
+        .collect()
+}
+
+/// Gather every coordinate, pack, and blob a batch's archived events need.
+///
+/// Two phases so the `ObjectStore` (which holds a non-Send `Rc`) is never
+/// alive across an await: gather all coordinates and pack bytes via async DB
+/// reads under one read connection first, then build the layered stores and
+/// reconstruct synchronously.
+async fn load_coords(db: &LocalDb, events: &[Event]) -> Coords {
+    let run_ids = gitcoord_run_ids(events);
+    let hashes = blobbed_hashes(events);
     // A team replica carries a content store; the private DB returns `None`. When
     // present, an offloaded pack/blob whose bytes are absent locally is fetched
     // from the shared per-team store (the store read-through caches into the
@@ -106,25 +181,23 @@ pub async fn reconstruct_events(db: &LocalDb, events: Vec<Event>) -> Vec<Event> 
     // in this async phase, before the non-Send `ObjectStore` is built.
     let store = db.team_id().map(|_| db.content_store().clone());
     let private_route_db = db.private_route_db().cloned();
-    let coords = db
-        .read(move |conn| {
-            let private_route_db = private_route_db.clone();
-            Box::pin(async move {
-                DbResult::Ok(
-                    Coords::load(
-                        conn,
-                        &run_ids,
-                        &hashes,
-                        store.as_deref(),
-                        private_route_db.as_deref(),
-                    )
-                    .await,
+    db.read(move |conn| {
+        let private_route_db = private_route_db.clone();
+        Box::pin(async move {
+            DbResult::Ok(
+                Coords::load(
+                    conn,
+                    &run_ids,
+                    &hashes,
+                    store.as_deref(),
+                    private_route_db.as_deref(),
                 )
-            })
+                .await,
+            )
         })
-        .await
-        .unwrap_or_default();
-    withheld(finish(coords, events))
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Connection-scoped reconstruction for callers that already hold a read
@@ -172,6 +245,22 @@ fn finish(coords: Coords, mut events: Vec<Event>) -> Vec<Event> {
         }
     }
     events
+}
+
+/// [`finish`], keeping each event's outcome.
+fn finish_reporting(coords: Coords, events: Vec<Event>) -> Vec<(Event, Reconstruction)> {
+    let ctx = coords.into_ctx();
+    events
+        .into_iter()
+        .map(|mut event| {
+            let outcome = if is_archived(&event) {
+                reconstruct_one(&mut event, &ctx)
+            } else {
+                Reconstruction::Stored
+            };
+            (event, outcome)
+        })
+        .collect()
 }
 
 fn is_archived(event: &Event) -> bool {
@@ -486,7 +575,7 @@ async fn load_blob_local(conn: &turso::Connection, hash: &str) -> Option<Vec<u8>
     row.opt_blob(0).ok()?
 }
 
-fn reconstruct_one(event: &mut Event, ctx: &ReconstructCtx) {
+fn reconstruct_one(event: &mut Event, ctx: &ReconstructCtx) -> Reconstruction {
     let shape = match decode(&columns_of(event)) {
         Ok(shape) => shape,
         Err(error) => {
@@ -494,11 +583,11 @@ fn reconstruct_one(event: &mut Event, ctx: &ReconstructCtx) {
                 "archived event {} has invalid column shape: {error}",
                 event.id
             );
-            return;
+            return Reconstruction::Undecodable;
         }
     };
     match shape {
-        ArchivedShape::Full { .. } => {}
+        ArchivedShape::Full { .. } => Reconstruction::Stored,
         ArchivedShape::Zstd { .. } => reconstruct_zstd(event),
         ArchivedShape::GitcoordRead { commit, .. } => {
             reconstruct_gitcoord_read(event, &commit, ctx.store_for(&event.run_id))
@@ -534,20 +623,21 @@ fn blobbed_marker(data: &str) -> Option<String> {
 /// hash into `archival_blobs`, or an inlined dynamic span), concatenate in order
 /// into the full prompt, and put it back under `content`. A segment whose blob is
 /// missing degrades to a labeled stub in place, so the rest still reconstructs.
-fn reconstruct_system_prompt(event: &mut Event, blobs: &HashMap<String, String>) {
+fn reconstruct_system_prompt(event: &mut Event, blobs: &HashMap<String, String>) -> Reconstruction {
     let mut value: Value = match serde_json::from_str(&event.data) {
         Ok(value) => value,
         Err(error) => {
             log::warn!("system prompt {} data is not json: {error}", event.id);
-            return;
+            return Reconstruction::Undecodable;
         }
     };
     let Some(segments) = value.get("segments").and_then(|s| s.as_array()) else {
         log::warn!("system prompt {} has no segments", event.id);
-        return;
+        return Reconstruction::Undecodable;
     };
 
     let mut full = String::new();
+    let mut outcome = Reconstruction::Restored;
     for seg in segments {
         if let Some(inline) = seg.get("inline").and_then(|v| v.as_str()) {
             full.push_str(inline);
@@ -560,6 +650,7 @@ fn reconstruct_system_prompt(event: &mut Event, blobs: &HashMap<String, String>)
                         .and_then(|v| v.as_str())
                         .unwrap_or("segment");
                     full.push_str(&stub(hash, kind));
+                    outcome = Reconstruction::Degraded;
                 }
             }
         }
@@ -571,12 +662,16 @@ fn reconstruct_system_prompt(event: &mut Event, blobs: &HashMap<String, String>)
         map.remove("segments");
     }
     match serde_json::to_string(&value) {
-        Ok(serialized) => event.data = serialized,
+        Ok(serialized) => {
+            event.data = serialized;
+            outcome
+        }
         Err(error) => {
             log::warn!(
                 "system prompt {} could not be re-serialized: {error}",
                 event.id
-            )
+            );
+            Reconstruction::Undecodable
         }
     }
 }
@@ -585,9 +680,27 @@ fn reconstruct_system_prompt(event: &mut Event, blobs: &HashMap<String, String>)
 /// plus the inlined varying fields. A missing skeleton blob (or any structural
 /// failure) degrades to a labeled stub so the transcript stays valid JSON; the
 /// rest of the row still reconstructs when only the tool-set blob is missing.
-fn reconstruct_system_init(event: &mut Event, blobs: &HashMap<String, String>) {
+fn reconstruct_system_init(event: &mut Event, blobs: &HashMap<String, String>) -> Reconstruction {
+    // `reassemble_system_init` substitutes a stub array for a missing tool-set
+    // blob and still succeeds, so whether it did is read off the stub up front.
+    let toolset_missing = serde_json::from_str::<Value>(&event.data)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("toolset")
+                .and_then(|hash| hash.as_str())
+                .map(|hash| !blobs.contains_key(hash))
+        })
+        .unwrap_or(false);
     match reassemble_system_init(&event.data, blobs) {
-        Some(data) => event.data = data,
+        Some(data) => {
+            event.data = data;
+            if toolset_missing {
+                Reconstruction::Degraded
+            } else {
+                Reconstruction::Restored
+            }
+        }
         None => {
             let hash = serde_json::from_str::<Value>(&event.data)
                 .ok()
@@ -603,6 +716,7 @@ fn reconstruct_system_init(event: &mut Event, blobs: &HashMap<String, String>) {
                 "content": stub(&hash, "skeleton"),
             })
             .to_string();
+            Reconstruction::Degraded
         }
     }
 }
@@ -664,33 +778,46 @@ fn columns_of(event: &Event) -> EventColumns {
     }
 }
 
-fn reconstruct_zstd(event: &mut Event) {
+fn reconstruct_zstd(event: &mut Event) -> Reconstruction {
     let codec = event.codec.as_deref().unwrap_or(CODEC_NONE);
     let Some(blob) = event.data_blob.as_deref() else {
         log::warn!("zstd archived event {} has no data_blob", event.id);
-        return;
+        return Reconstruction::Undecodable;
     };
     match decompress(codec, blob) {
         Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(text) => event.data = text,
-            Err(error) => log::warn!(
-                "zstd archived event {} data_blob is not valid utf-8: {error}",
-                event.id
-            ),
+            Ok(text) => {
+                event.data = text;
+                Reconstruction::Restored
+            }
+            Err(error) => {
+                log::warn!(
+                    "zstd archived event {} data_blob is not valid utf-8: {error}",
+                    event.id
+                );
+                Reconstruction::Undecodable
+            }
         },
-        Err(error) => log::warn!(
-            "failed to decompress zstd archived event {}: {error}",
-            event.id
-        ),
+        Err(error) => {
+            log::warn!(
+                "failed to decompress zstd archived event {}: {error}",
+                event.id
+            );
+            Reconstruction::Undecodable
+        }
     }
 }
 
-fn reconstruct_gitcoord_read(event: &mut Event, commit_hex: &str, store: Option<&ObjectStore>) {
+fn reconstruct_gitcoord_read(
+    event: &mut Event,
+    commit_hex: &str,
+    store: Option<&ObjectStore>,
+) -> Reconstruction {
     let mut data: Value = match serde_json::from_str(&event.data) {
         Ok(value) => value,
         Err(error) => {
             log::warn!("gitcoord read {} data is not json: {error}", event.id);
-            return;
+            return Reconstruction::Undecodable;
         }
     };
 
@@ -705,11 +832,11 @@ fn reconstruct_gitcoord_read(event: &mut Event, commit_hex: &str, store: Option<
                 .collect::<Vec<_>>()
         });
 
-    let rendered = match paths {
-        Some(paths) => reconstruct_read(commit_hex, &paths, store),
+    let (rendered, resolved) = match paths {
+        Some(paths) => reconstruct_read_resolving(commit_hex, &paths, store),
         None => {
             log::warn!("gitcoord read {} has no tool_input.paths", event.id);
-            stub(commit_hex, "<read>")
+            (stub(commit_hex, "<read>"), false)
         }
     };
 
@@ -737,11 +864,25 @@ fn reconstruct_gitcoord_read(event: &mut Event, commit_hex: &str, store: Option<
         map.insert("toolResult".to_string(), Value::String(rendered));
     }
     match serde_json::to_string(&data) {
-        Ok(serialized) => event.data = serialized,
-        Err(error) => log::warn!(
-            "gitcoord read {} could not be re-serialized: {error}",
-            event.id
-        ),
+        Ok(serialized) => {
+            event.data = serialized;
+            resolved_outcome(resolved)
+        }
+        Err(error) => {
+            log::warn!(
+                "gitcoord read {} could not be re-serialized: {error}",
+                event.id
+            );
+            Reconstruction::Undecodable
+        }
+    }
+}
+
+fn resolved_outcome(resolved: bool) -> Reconstruction {
+    if resolved {
+        Reconstruction::Restored
+    } else {
+        Reconstruction::Degraded
     }
 }
 
@@ -750,23 +891,27 @@ fn reconstruct_gitcoord_read(event: &mut Event, commit_hex: &str, store: Option<
 /// composed result into `toolResult`. `content_render_sha` is the drift tripwire
 /// over the full original bytes (skipped when a section degraded to a stub, which
 /// legitimately differs).
-fn reconstruct_hybrid_read(event: &mut Event, commit_hex: &str, store: Option<&ObjectStore>) {
+fn reconstruct_hybrid_read(
+    event: &mut Event,
+    commit_hex: &str,
+    store: Option<&ObjectStore>,
+) -> Reconstruction {
     let codec = event.codec.as_deref().unwrap_or(CODEC_NONE);
     let Some(blob) = event.data_blob.as_deref() else {
         log::warn!("hybrid read {} has no data_blob", event.id);
-        return;
+        return Reconstruction::Undecodable;
     };
     let skeleton = match decompress(codec, blob) {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(text) => text,
             Err(error) => {
                 log::warn!("hybrid read {} skeleton is not utf-8: {error}", event.id);
-                return;
+                return Reconstruction::Undecodable;
             }
         },
         Err(error) => {
             log::warn!("failed to decompress hybrid read {}: {error}", event.id);
-            return;
+            return Reconstruction::Undecodable;
         }
     };
 
@@ -774,7 +919,7 @@ fn reconstruct_hybrid_read(event: &mut Event, commit_hex: &str, store: Option<&O
         Ok(value) => value,
         Err(error) => {
             log::warn!("hybrid read {} data is not json: {error}", event.id);
-            return;
+            return Reconstruction::Undecodable;
         }
     };
 
@@ -800,7 +945,8 @@ fn reconstruct_hybrid_read(event: &mut Event, commit_hex: &str, store: Option<&O
         })
         .unwrap_or_default();
 
-    let rendered = splice_hybrid_skeleton(&skeleton, commit_hex, &paths, &sections, store);
+    let (rendered, resolved) =
+        splice_hybrid_skeleton_resolving(&skeleton, commit_hex, &paths, &sections, store);
 
     // Same drift tripwire as the pure-file read: a mismatch means the live and
     // archival read composition diverged since archival. A degraded (stub) section
@@ -824,11 +970,17 @@ fn reconstruct_hybrid_read(event: &mut Event, commit_hex: &str, store: Option<&O
         map.remove("sections");
     }
     match serde_json::to_string(&data) {
-        Ok(serialized) => event.data = serialized,
-        Err(error) => log::warn!(
-            "hybrid read {} could not be re-serialized: {error}",
-            event.id
-        ),
+        Ok(serialized) => {
+            event.data = serialized;
+            resolved_outcome(resolved)
+        }
+        Err(error) => {
+            log::warn!(
+                "hybrid read {} could not be re-serialized: {error}",
+                event.id
+            );
+            Reconstruction::Undecodable
+        }
     }
 }
 
@@ -836,10 +988,15 @@ fn reconstruct_hybrid_read(event: &mut Event, commit_hex: &str, store: Option<&O
 /// regenerate the committed diff, and re-inject each file's section into its
 /// `changes[*].payload`. Presentation-equivalence, not byte-identity: the
 /// reconstructed payload is the committed change, not the original anchors.
-fn reconstruct_gitcoord_write(event: &mut Event, commit_hex: &str, store: Option<&ObjectStore>) {
+fn reconstruct_gitcoord_write(
+    event: &mut Event,
+    commit_hex: &str,
+    store: Option<&ObjectStore>,
+) -> Reconstruction {
     let codec = event.codec.as_deref().unwrap_or(CODEC_NONE);
     let Some(blob) = event.data_blob.as_deref() else {
-        return;
+        log::warn!("gitcoord write {} has no data_blob", event.id);
+        return Reconstruction::Undecodable;
     };
     let remainder = match decompress(codec, blob) {
         Ok(bytes) => match String::from_utf8(bytes) {
@@ -849,34 +1006,41 @@ fn reconstruct_gitcoord_write(event: &mut Event, commit_hex: &str, store: Option
                     "gitcoord write {} remainder is not utf-8: {error}",
                     event.id
                 );
-                return;
+                return Reconstruction::Undecodable;
             }
         },
         Err(error) => {
             log::warn!("failed to decompress gitcoord write {}: {error}", event.id);
-            return;
+            return Reconstruction::Undecodable;
         }
     };
     let mut value: Value = match serde_json::from_str(&remainder) {
         Ok(value) => value,
         Err(error) => {
             log::warn!("gitcoord write {} remainder is not json: {error}", event.id);
-            return;
+            return Reconstruction::Undecodable;
         }
     };
 
     let sections = commit_diff_sections(commit_hex, store);
+    let mut stubbed = false;
     if let Some(tool_uses) = value.get_mut("toolUses").and_then(|v| v.as_array_mut()) {
         for tool in tool_uses {
-            inject_change_diffs(tool, commit_hex, &sections);
+            stubbed |= inject_change_diffs(tool, commit_hex, &sections);
         }
     }
     match serde_json::to_string(&value) {
-        Ok(serialized) => event.data = serialized,
-        Err(error) => log::warn!(
-            "gitcoord write {} could not be re-serialized: {error}",
-            event.id
-        ),
+        Ok(serialized) => {
+            event.data = serialized;
+            resolved_outcome(!stubbed)
+        }
+        Err(error) => {
+            log::warn!(
+                "gitcoord write {} could not be re-serialized: {error}",
+                event.id
+            );
+            Reconstruction::Undecodable
+        }
     }
 }
 
@@ -909,19 +1073,21 @@ pub fn commit_diff_paths(commit_hex: &str, store: &ObjectStore) -> Option<HashSe
 /// a `unified_patch` envelope, a failed item) is left as stored, and a file
 /// absent from the diff stays payload-free; when the coordinate is wholly
 /// unresolvable, each payload-free file change gets a labeled stub instead.
+/// Returns whether any change got a stub.
 fn inject_change_diffs(
     tool: &mut Value,
     commit_hex: &str,
     sections: &Option<HashMap<String, String>>,
-) {
+) -> bool {
     let Some(changes) = tool
         .get_mut("input")
         .and_then(|v| v.as_object_mut())
         .and_then(|input| input.get_mut("changes"))
         .and_then(|v| v.as_array_mut())
     else {
-        return;
+        return false;
     };
+    let mut stubbed = false;
     for change in changes {
         let Some(obj) = change.as_object_mut() else {
             continue;
@@ -944,13 +1110,17 @@ fn inject_change_diffs(
                 Some(section) => section.clone(),
                 None => continue,
             },
-            None => stub(commit_hex, &path),
+            None => {
+                stubbed = true;
+                stub(commit_hex, &path)
+            }
         };
         obj.insert(
             "payload".to_string(),
             serde_json::json!({ "diff": diff_text }),
         );
     }
+    stubbed
 }
 
 /// Split a unified diff into per-file sections keyed by their `b/<path>`. Each
@@ -995,12 +1165,31 @@ fn split_diff_by_path(diff: &str) -> HashMap<String, String> {
 /// `STUB_PREFIX` guard in [`reconstruct_gitcoord_read`] explicitly exempts it from
 /// the recorded-render SHA comparison (as does the equivalent hybrid-read guard).
 pub fn reconstruct_read(commit_hex: &str, paths: &[String], store: Option<&ObjectStore>) -> String {
+    reconstruct_read_resolving(commit_hex, paths, store).0
+}
+
+/// [`reconstruct_read`], also reporting whether every target resolved.
+fn reconstruct_read_resolving(
+    commit_hex: &str,
+    paths: &[String],
+    store: Option<&ObjectStore>,
+) -> (String, bool) {
     let renderer = crate::storage::render::archived_file_renderer();
+    let mut resolved = true;
     let segments: Vec<ReadSegment> = paths
         .iter()
-        .map(|target| build_archived_segment(commit_hex, target, store, renderer))
+        .map(
+            |target| match build_archived_segment(commit_hex, target, store, renderer) {
+                Ok(segment) => segment,
+                Err(stub) => {
+                    resolved = false;
+                    *stub
+                }
+            },
+        )
         .collect();
-    crate::storage::render::assemble_legacy_chars(segments, &LEGACY_CHAR_METER).text
+    let text = crate::storage::render::assemble_legacy_chars(segments, &LEGACY_CHAR_METER).text;
+    (text, resolved)
 }
 
 /// Render one archived file target's standalone section text — the exact bytes it
@@ -1013,9 +1202,24 @@ pub fn render_archived_file_section(
     target: &str,
     store: Option<&ObjectStore>,
 ) -> String {
+    render_archived_file_section_resolving(commit_hex, target, store).0
+}
+
+/// [`render_archived_file_section`], also reporting whether the target resolved.
+fn render_archived_file_section_resolving(
+    commit_hex: &str,
+    target: &str,
+    store: Option<&ObjectStore>,
+) -> (String, bool) {
     let renderer = crate::storage::render::archived_file_renderer();
-    let seg = build_archived_segment(commit_hex, target, store, renderer);
-    crate::storage::render::render_section_text(seg, &LEGACY_CHAR_METER)
+    let (seg, resolved) = match build_archived_segment(commit_hex, target, store, renderer) {
+        Ok(segment) => (segment, true),
+        Err(stub) => (*stub, false),
+    };
+    (
+        crate::storage::render::render_section_text(seg, &LEGACY_CHAR_METER),
+        resolved,
+    )
 }
 
 /// The NUL-delimited placeholder a hybrid-read skeleton carries in place of an
@@ -1038,15 +1242,32 @@ pub fn splice_hybrid_skeleton(
     sections: &[usize],
     store: Option<&ObjectStore>,
 ) -> String {
+    splice_hybrid_skeleton_resolving(skeleton, commit_hex, paths, sections, store).0
+}
+
+/// [`splice_hybrid_skeleton`], also reporting whether every excised section
+/// resolved. A section index with no target is a placeholder left unfilled, so
+/// it counts as unresolved too.
+fn splice_hybrid_skeleton_resolving(
+    skeleton: &str,
+    commit_hex: &str,
+    paths: &[String],
+    sections: &[usize],
+    store: Option<&ObjectStore>,
+) -> (String, bool) {
     let mut out = skeleton.to_string();
+    let mut resolved = true;
     for &index in sections {
         let Some(target) = paths.get(index) else {
+            resolved = false;
             continue;
         };
-        let section = render_archived_file_section(commit_hex, target, store);
+        let (section, section_resolved) =
+            render_archived_file_section_resolving(commit_hex, target, store);
+        resolved &= section_resolved;
         out = out.replace(&section_placeholder(index), &section);
     }
-    out
+    (out, resolved)
 }
 
 /// Build the [`ReadSegment`] for one archived read target from its blob, or an
@@ -1055,25 +1276,32 @@ pub fn splice_hybrid_skeleton(
 /// layer's byte renderers) guarantees the segment is identical to the one the
 /// live read built from the same bytes; when no renderer is registered the
 /// target degrades to the same coordinate stub as an unresolvable one.
+///
+/// `Err` carries that stub segment, so a caller that only renders treats both
+/// arms alike and one that reports can tell them apart.
 fn build_archived_segment(
     commit_hex: &str,
     target: &str,
     store: Option<&ObjectStore>,
     renderer: Option<&dyn ArchivedFileRenderer>,
-) -> ReadSegment {
-    let stub_segment =
-        |label: &str| crate::storage::render::error_segment(target, stub(commit_hex, label));
+) -> Result<ReadSegment, Box<ReadSegment>> {
+    let stub_segment = |label: &str| {
+        Box::new(crate::storage::render::error_segment(
+            target,
+            stub(commit_hex, label),
+        ))
+    };
     let Some(store) = store else {
-        return stub_segment(target);
+        return Err(stub_segment(target));
     };
     let Some(path) = repo_relative_path(target) else {
-        return stub_segment(target);
+        return Err(stub_segment(target));
     };
     match store.resolve_path_at_commit(commit_hex, &path) {
-        Ok(bytes) => render_archived_bytes(renderer, target, &bytes, || stub_segment(&path)),
+        Ok(bytes) => render_archived_bytes(renderer, target, &bytes, || *stub_segment(&path)),
         Err(error) => {
             warn_unresolvable_once(commit_hex, &path, &error);
-            stub_segment(&path)
+            Err(stub_segment(&path))
         }
     }
 }
@@ -1088,16 +1316,16 @@ fn render_archived_bytes(
     target: &str,
     bytes: &[u8],
     stub: impl Fn() -> ReadSegment,
-) -> ReadSegment {
+) -> Result<ReadSegment, Box<ReadSegment>> {
     match renderer {
         Some(renderer) => match renderer.produce_archived_file_segment(target, bytes) {
-            Ok(segment) => segment,
+            Ok(segment) => Ok(segment),
             Err(error) => {
                 log::warn!("archived read render failed for {target}: {error}");
-                stub()
+                Err(Box::new(stub()))
             }
         },
-        None => stub(),
+        None => Err(Box::new(stub())),
     }
 }
 
@@ -1256,13 +1484,144 @@ mod tests {
         assert_eq!(combined, expected);
     }
 
+    fn outcomes(reported: &[(Event, Reconstruction)]) -> Vec<Reconstruction> {
+        reported.iter().map(|(_, outcome)| *outcome).collect()
+    }
+
+    #[tokio::test]
+    async fn reporting_names_plain_and_restored_rows() {
+        let db = migrated_db().await;
+        let original = "{\"eventType\":\"user\",\"content\":\"hello archived world\"}";
+        let blob = compress(original.as_bytes()).unwrap();
+        let events = vec![
+            make_event(
+                "p1",
+                "user",
+                "{\"content\":\"plain\"}",
+                None,
+                None,
+                None,
+                None,
+            ),
+            make_event(
+                "z1",
+                "user",
+                "{\"_archived\":true}",
+                Some("zstd"),
+                None,
+                Some(blob),
+                Some(CODEC_ZSTD_V1),
+            ),
+        ];
+        let reported = reconstruct_events_reporting(&db, events).await;
+        assert_eq!(
+            outcomes(&reported),
+            [Reconstruction::Stored, Reconstruction::Restored]
+        );
+        assert_eq!(reported[1].0.data, original);
+    }
+
+    /// A coordinate the store cannot resolve is reported, not left to be
+    /// inferred from the stub text: that text is also what a transcript that
+    /// read this very file contains.
+    #[tokio::test]
+    async fn reporting_names_an_unresolvable_coordinate_degraded() {
+        let fx = build_fixture();
+        let db = migrated_db().await;
+        seed_chain(
+            &db,
+            fx.origin.to_str().unwrap(),
+            Some((fx.pack.clone(), fx.idx.clone())),
+        )
+        .await;
+
+        let bogus = "0".repeat(40);
+        let reported =
+            reconstruct_events_reporting(&db, vec![read_event(&bogus, &["file:a.txt"])]).await;
+        assert_eq!(outcomes(&reported), [Reconstruction::Degraded]);
+        assert!(reported[0].1.is_unresolved());
+        assert!(tool_result(&reported[0].0).contains(STUB_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn reporting_names_a_missing_prompt_segment_degraded() {
+        let db = migrated_db().await;
+        let stub_data = serde_json::json!({
+            "eventType": "system",
+            "archived": "system_prompt",
+            "segments": [{"inline": "head "}, {"hash": "f".repeat(64), "kind": "skills"}],
+        })
+        .to_string();
+        let event = make_event(
+            "sp1",
+            "system",
+            &stub_data,
+            Some("gitcoord"),
+            None,
+            None,
+            None,
+        );
+        let reported = reconstruct_events_reporting(&db, vec![event]).await;
+        assert_eq!(outcomes(&reported), [Reconstruction::Degraded]);
+        let value: Value = serde_json::from_str(&reported[0].0.data).unwrap();
+        assert!(value["content"].as_str().unwrap().starts_with("head "));
+    }
+
+    #[tokio::test]
+    async fn reporting_names_a_corrupt_blob_undecodable_and_keeps_the_stored_form() {
+        let db = migrated_db().await;
+        let event = make_event(
+            "bad-zstd",
+            "user",
+            "{\"_archived\":true}",
+            Some("zstd"),
+            None,
+            Some(b"not a zstd frame".to_vec()),
+            Some(CODEC_ZSTD_V1),
+        );
+        let reported = reconstruct_events_reporting(&db, vec![event]).await;
+        assert_eq!(outcomes(&reported), [Reconstruction::Undecodable]);
+        assert_eq!(reported[0].0.data, "{\"_archived\":true}");
+    }
+
+    /// The quarantine gate still runs last on the reporting path, so an archived
+    /// credential-bearing row comes back withheld rather than restored.
+    #[tokio::test]
+    async fn reporting_names_a_quarantined_row_withheld_after_restoring_it() {
+        use crate::storage::quarantine::{quarantine, QuarantineSet, TRANSCRIPT_EVENT_SINK};
+        let db = migrated_db().await;
+        let blob = compress(b"{\"content\":\"sk-secret\"}").unwrap();
+        let event = make_event(
+            "reporting-withheld-event",
+            "user",
+            "{\"_archived\":true}",
+            Some("zstd"),
+            None,
+            Some(blob),
+            Some(CODEC_ZSTD_V1),
+        );
+        let source = std::path::Path::new("reporting-withheld-test-source");
+        quarantine().install_for(
+            source,
+            QuarantineSet::from_entries([(
+                TRANSCRIPT_EVENT_SINK.to_string(),
+                "reporting-withheld-event".to_string(),
+                "incident-1".to_string(),
+            )]),
+        );
+        let reported = reconstruct_events_reporting(&db, vec![event]).await;
+        quarantine().install_for(source, QuarantineSet::default());
+        assert_eq!(outcomes(&reported), [Reconstruction::Withheld]);
+        assert!(!reported[0].0.data.contains("sk-secret"));
+    }
+
     /// The trait-fallback branch: with no renderer registered, archived file bytes
     /// degrade to the injected stub. Pure — no DB, no global, no mcp dependency.
     #[test]
     fn render_archived_bytes_without_renderer_degrades_to_stub() {
         let stub =
             || crate::storage::render::error_segment("file:a.txt", stub("deadbeef", "file:a.txt"));
-        let segment = render_archived_bytes(None, "file:a.txt", b"ignored", stub);
+        let segment = render_archived_bytes(None, "file:a.txt", b"ignored", stub).unwrap_err();
         assert!(segment.body.contains(STUB_PREFIX));
     }
 }

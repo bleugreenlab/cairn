@@ -75,15 +75,15 @@ pub trait GitClient: Send + Sync {
     /// backwards onto a commit its own store had already moved past.
     fn fetch_origin_branch(&self, repo: &Path, branch: &str) -> Result<(), String>;
 
-    /// Ask `remote` where its `branch` points without fetching anything:
-    /// `git ls-remote <remote> refs/heads/<branch>`. `Ok(None)` means the
-    /// remote answered and has no such branch.
-    fn ls_remote_branch(
+    /// Ask `remote` where each of `branches` points without fetching anything,
+    /// in one round-trip: `git ls-remote <remote> refs/heads/<branch>...`. A
+    /// branch the remote answered for but does not have is absent from the map.
+    fn ls_remote_branches(
         &self,
         repo: &Path,
         remote: &str,
-        branch: &str,
-    ) -> Result<Option<String>, String>;
+        branches: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, String>;
 
     /// Clone a remote repository into the target directory.
     fn clone(&self, remote_url: &str, target_dir: &Path) -> Result<(), String>;
@@ -145,14 +145,22 @@ pub trait GitClient: Send + Sync {
     fn checkout_ours(&self, repo: &Path, paths: Vec<String>) -> Result<(), String>;
 }
 
-/// The object id `ls-remote` reported for exactly `refname`. A pattern-matched
-/// `ls-remote` can also list refs that merely end in the same path
-/// (`refs/heads/x/main`), so only the exact name counts.
-fn parse_ls_remote_tip(stdout: &str, refname: &str) -> Option<String> {
-    stdout.lines().find_map(|line| {
-        let (sha, name) = line.split_once('\t')?;
-        (name.trim() == refname && !sha.trim().is_empty()).then(|| sha.trim().to_string())
-    })
+/// The object id `ls-remote` reported for each of `branches`, by exact name. A
+/// pattern-matched `ls-remote` also lists refs that merely end in the same path
+/// (`refs/heads/x/main`), so only the exact `refs/heads/<branch>` counts.
+fn parse_ls_remote_tips(
+    stdout: &str,
+    branches: &[String],
+) -> std::collections::HashMap<String, String> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (sha, name) = line.split_once('\t')?;
+            let branch = name.trim().strip_prefix("refs/heads/")?;
+            (branches.iter().any(|wanted| wanted == branch) && !sha.trim().is_empty())
+                .then(|| (branch.to_string(), sha.trim().to_string()))
+        })
+        .collect()
 }
 
 /// Production git client using the git CLI.
@@ -492,29 +500,38 @@ impl GitClient for RealGitClient {
         }
     }
 
-    fn ls_remote_branch(
+    fn ls_remote_branches(
         &self,
         repo: &Path,
         remote: &str,
-        branch: &str,
-    ) -> Result<Option<String>, String> {
-        let refname = format!("refs/heads/{branch}");
+        branches: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        if branches.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let refnames: Vec<String> = branches
+            .iter()
+            .map(|branch| format!("refs/heads/{branch}"))
+            .collect();
         let output = crate::process::bounded_command_output(
             self.git_command()
-                .args(["ls-remote", remote, &refname])
+                .arg("ls-remote")
+                .arg(remote)
+                .args(&refnames)
                 .current_dir(repo),
             crate::process::NETWORK_TIMEOUT,
             "git ls-remote",
         )?;
         if !output.status.success() {
             return Err(format!(
-                "git ls-remote {remote} {refname} failed: {}",
+                "git ls-remote {remote} {} failed: {}",
+                refnames.join(" "),
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        Ok(parse_ls_remote_tip(
+        Ok(parse_ls_remote_tips(
             &String::from_utf8_lossy(&output.stdout),
-            &refname,
+            branches,
         ))
     }
 
@@ -688,13 +705,18 @@ mod tests {
     }
 
     #[test]
-    fn ls_remote_tip_matches_only_the_exact_ref() {
-        let stdout = "aaa\trefs/heads/team/main\nbbb\trefs/heads/main\n";
+    fn ls_remote_tips_match_only_the_exact_refs() {
+        let stdout =
+            "aaa\trefs/heads/team/main\nbbb\trefs/heads/main\nccc\trefs/heads/agent/p-1-builder-0\n";
+        let wanted = ["main".to_string(), "agent/p-1-builder-0".to_string()];
+        let tips = parse_ls_remote_tips(stdout, &wanted);
+        assert_eq!(tips.len(), 2);
+        assert_eq!(tips.get("main").map(String::as_str), Some("bbb"));
         assert_eq!(
-            parse_ls_remote_tip(stdout, "refs/heads/main").as_deref(),
-            Some("bbb")
+            tips.get("agent/p-1-builder-0").map(String::as_str),
+            Some("ccc")
         );
-        assert_eq!(parse_ls_remote_tip("", "refs/heads/main"), None);
+        assert!(parse_ls_remote_tips("", &wanted).is_empty());
     }
 
     #[test]
@@ -714,14 +736,15 @@ mod tests {
             .unwrap();
 
         let tip = git.rev_parse(&origin, vec!["HEAD".to_string()]).unwrap();
-        assert_eq!(
-            git.ls_remote_branch(&local, "origin", "main").unwrap(),
-            Some(tip)
-        );
-        assert_eq!(
-            git.ls_remote_branch(&local, "origin", "absent").unwrap(),
-            None
-        );
+        let tips = git
+            .ls_remote_branches(
+                &local,
+                "origin",
+                &["main".to_string(), "absent".to_string()],
+            )
+            .unwrap();
+        assert_eq!(tips.get("main"), Some(&tip));
+        assert!(!tips.contains_key("absent"));
         assert!(
             !git.remote_branch_exists(&local, "main").unwrap(),
             "ls-remote must not write a remote-tracking ref"

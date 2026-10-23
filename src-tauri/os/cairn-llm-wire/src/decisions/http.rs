@@ -8,14 +8,16 @@ use serde_json::{json, Value};
 use super::wire::{DecisionsResponse, WireQuestion};
 use crate::{upstream_error_detail, CompletionError};
 
-/// Where a Decisions deployment lives and how it authenticates.
+/// Where a decision deployment lives and how it authenticates, whichever of
+/// the two decision wires it speaks (this one, or [`crate::systemone`]): both
+/// are one whole JSON POST to one URL.
 #[derive(Clone)]
 pub struct DecisionsEndpoint {
     /// What to call this provider in an error a user will read.
     pub provider_name: String,
     /// The backend key usage is attributed to.
     pub backend_key: String,
-    /// The full `/decisions` URL.
+    /// The full URL a decision is posted to.
     pub url: String,
     pub headers: Vec<(String, String)>,
 }
@@ -68,6 +70,16 @@ pub fn post_decisions(
     body: Value,
     timeout: Duration,
 ) -> Result<DecisionsResponse, CompletionError> {
+    read(&post_whole(endpoint, body, timeout)?)
+}
+
+/// One decision POST, either wire's: the reply body on success, the
+/// provider's own sentence on an HTTP failure.
+pub(crate) fn post_whole(
+    endpoint: &DecisionsEndpoint,
+    body: Value,
+    timeout: Duration,
+) -> Result<String, CompletionError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
         .build()
@@ -103,7 +115,7 @@ pub fn post_decisions(
             upstream_error_detail(&text)
         )));
     }
-    read(&text)
+    Ok(text)
 }
 
 /// Decode a Decisions reply body.

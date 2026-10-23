@@ -91,7 +91,11 @@ mod tests {
 
     /// The declaration decides the store, and the store is what decides whether
     /// the value is ever treated as a credential.
+    // These tests share `store-matlab`'s entries in the process-wide test
+    // keychain, so one test's stored value would otherwise race another's
+    // "nothing stored" assertion.
     #[test]
+    #[serial_test::serial(store_matlab_keychain)]
     fn a_supplied_value_lands_in_the_namespace_its_declaration_names() {
         crate::config::secrets::mock_keychain::install();
         let ws = tempfile::tempdir().unwrap();
@@ -140,10 +144,13 @@ mod tests {
     /// yet, and the declaration has to mean the same thing before and after it
     /// appears.
     #[test]
+    #[serial_test::serial(store_matlab_keychain)]
     fn a_path_variable_refuses_anything_that_is_not_a_path() {
         crate::config::secrets::mock_keychain::install();
         let ws = tempfile::tempdir().unwrap();
         install_pack(ws.path(), "matlab", MATLAB_PACK);
+        // Start from nothing stored, whatever an earlier test left behind.
+        crate::config::secrets::delete_config_value("store-matlab", "STORE_MATLAB_BIN").unwrap();
 
         let error = store_pack_mcp_value(
             ws.path(),
@@ -189,6 +196,7 @@ mod tests {
     /// Re-supplying a variable must not leave the previous answer behind in the
     /// other namespace, where the secret-first read order would resurrect it.
     #[test]
+    #[serial_test::serial(store_matlab_keychain)]
     fn re_supplying_a_variable_clears_the_other_namespace() {
         crate::config::secrets::mock_keychain::install();
         let ws = tempfile::tempdir().unwrap();

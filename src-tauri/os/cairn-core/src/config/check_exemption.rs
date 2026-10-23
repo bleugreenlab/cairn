@@ -297,6 +297,7 @@ mod tests {
             verdict_platforms: None,
             fixes: false,
             main_cadence: None,
+            tree: Default::default(),
         }
     }
 

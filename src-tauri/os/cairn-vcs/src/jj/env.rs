@@ -661,7 +661,7 @@ fn origin_tracking_refs(
         .collect())
 }
 
-fn git_is_ancestor(checkout: &Path, ancestor: &str, descendant: &str) -> bool {
+pub(crate) fn git_is_ancestor(checkout: &Path, ancestor: &str, descendant: &str) -> bool {
     cairn_platform::env::git()
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
         .current_dir(checkout)
@@ -698,6 +698,75 @@ pub fn fetch_remote_branch_via_git(
     Ok(())
 }
 
+/// Where a fetch of origin's copy of a store-owned branch waits until the store
+/// has judged it. Under `refs/cairn/`, which compaction already treats as a pin,
+/// so the observed commit's objects survive the judgement. Its lifecycle is one
+/// fetch-and-judge: [`crate::jj::fast_forward_branch_from_origin`] deletes it
+/// whatever it answers, and a fetch that finds no such branch on origin deletes
+/// any leftover. An observation is never a cache.
+pub fn origin_observation_ref(branch: &str) -> String {
+    format!("refs/cairn/origin-observed/{branch}")
+}
+
+/// Fetch origin's `branch` into [`origin_observation_ref`] and answer the commit
+/// it names, or `Ok(None)` when origin has no such branch.
+///
+/// Never into `refs/remotes/origin/<branch>`. For a branch the store owns, that
+/// tracking ref is what every import reads, and an import merges any move of it
+/// into the local bookmark: a copy origin diverged from would turn the branch
+/// into a conflicted name on the next import anyone ran. Parked here, nothing
+/// imports it until [`crate::jj::fast_forward_branch_from_origin`] has decided
+/// that it is a pure fast-forward.
+///
+/// Network I/O with no jj involvement, so callers run it outside the store lock
+/// and inside the repository's fetch lock.
+pub fn fetch_origin_observation(store_dir: &Path, branch: &str) -> Result<Option<String>, String> {
+    let checkout = super::export::resolve_backing_checkout(store_dir).ok_or_else(|| {
+        format!(
+            "git fetch origin branch `{branch}`: no backing checkout resolved for {}",
+            store_dir.display()
+        )
+    })?;
+    let observation = origin_observation_ref(branch);
+    let refspec = format!("+refs/heads/{branch}:{observation}");
+    // An empty `--refmap` matters as much as the refspec: without it git also
+    // makes its "opportunistic" update of `refs/remotes/origin/<branch>` from
+    // the configured fetch mapping, which is precisely the write this avoids.
+    let output = bounded_command_output(
+        cairn_platform::env::git()
+            .args(["fetch", "--no-tags", "--refmap=", "origin", &refspec])
+            .current_dir(&checkout),
+        JJ_NETWORK_TIMEOUT,
+        "git fetch origin",
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("couldn't find remote ref") {
+            let _ = cairn_platform::env::git()
+                .args(["update-ref", "-d", &observation])
+                .current_dir(&checkout)
+                .output();
+            return Ok(None);
+        }
+        return Err(format!(
+            "git fetch origin branch `{branch}`: {}",
+            stderr.trim()
+        ));
+    }
+    let resolved = cairn_platform::env::git()
+        .args(["rev-parse", "--verify", "--quiet", &observation])
+        .current_dir(&checkout)
+        .output()
+        .map_err(|error| format!("read {observation}: {error}"))?;
+    let commit = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
+    if !resolved.status.success() || commit.is_empty() {
+        return Err(format!(
+            "git fetch origin branch `{branch}` succeeded but {observation} does not resolve"
+        ));
+    }
+    Ok(Some(commit))
+}
+
 /// Fetch one branch of a remote into the shared store, advancing its
 /// remote-tracking bookmark (`<branch>@<remote>`) to the remote's current tip.
 /// Used to bring an externally-advanced target branch into the store, so a
@@ -708,6 +777,15 @@ pub fn fetch_remote_branch_via_git(
 /// abandons commits the remote no longer advertises. A whole-remote fetch that
 /// received an advertisement lagging one of this store's own pushes would walk
 /// that agent branch backwards and hide its newest commits.
+///
+/// For the same reason no fetch of this store passes `--prune`, and nothing
+/// runs `git remote prune` against it. A prune deletes every tracking ref the
+/// advertisement leaves out, so a lagging one takes the tracking ref of a branch
+/// the store has just pushed, and the next import then deletes that branch's
+/// local bookmark, or conflicts it if it moved. Tracking refs of finished
+/// branches are retired by the ref-store maintenance instead, keyed on Cairn's
+/// own records of the branch and never on the remote's advertisement
+/// (`retire_remote_tracking_refs`; cairn/5235).
 pub fn fetch_remote_branch(
     jj: &JjEnv,
     store_dir: &Path,

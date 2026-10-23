@@ -48,8 +48,22 @@ pub(crate) async fn publish_managed_branch(
     store: &Path,
     branch: &str,
 ) -> Result<(), String> {
+    crate::orchestrator::base_branch_sync::refuse_if_behind_origin(orch, store, branch).await?;
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    match crate::jj::publish_branch_to_origin(&jj, store, branch).await {
+    push_managed_branch(orch, &jj, store, branch).await?;
+    if let Some(tip) = crate::jj::bookmark_commit(&jj, store, branch) {
+        crate::orchestrator::base_branch_sync::record_publication(orch, store, branch, &tip).await;
+    }
+    Ok(())
+}
+
+async fn push_managed_branch(
+    orch: &Orchestrator,
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    branch: &str,
+) -> Result<(), String> {
+    match crate::jj::publish_branch_to_origin(jj, store, branch).await {
         Ok(()) => return Ok(()),
         Err(crate::jj::StoreBookmarkPushError::Failed(error)) => return Err(error),
         Err(crate::jj::StoreBookmarkPushError::StaleRemote(error)) => {
@@ -62,7 +76,7 @@ pub(crate) async fn publish_managed_branch(
 
     let fetch_store = store.to_path_buf();
     let fetch_branch = branch.to_string();
-    crate::orchestrator::default_branch_sync::with_fetch_lock(orch, store, || {
+    crate::orchestrator::base_branch_sync::with_fetch_lock(orch, store, || {
         tokio::task::spawn_blocking(move || {
             crate::jj::fetch_remote_branch_via_git(&fetch_store, "origin", &fetch_branch)
         })
@@ -79,10 +93,10 @@ pub(crate) async fn publish_managed_branch(
             )
             .await;
         let _phase = guard.phase(format!("import and converge branch={branch}"));
-        crate::jj::converge_managed_branch_after_remote_rewrite(&jj, store, branch)?;
+        crate::jj::converge_managed_branch_after_remote_rewrite(jj, store, branch)?;
     }
 
-    crate::jj::publish_branch_to_origin(&jj, store, branch)
+    crate::jj::publish_branch_to_origin(jj, store, branch)
         .await
         .map_err(|error| format!("stale publication retry failed: {error}"))
 }
@@ -369,6 +383,32 @@ fn branch_fork_point(
     crate::jj::revset_commit(jj, store, &format!("heads(::{pre_tip} & ::{dest})"))
 }
 
+/// Whether replaying a branch from `before` to `after` onto `dest` kept the
+/// branch's own change: its diff from its fork point is the same at both tips.
+/// An unreadable comparison answers no, so doubt withdraws a running wave
+/// exactly as every base advance did before the comparison existed.
+fn replay_kept_patch(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    before: Option<&String>,
+    after: Option<&String>,
+    dest: &str,
+) -> bool {
+    let (Some(before), Some(after)) = (before, after) else {
+        return false;
+    };
+    match (
+        crate::jj::own_patch_against(jj, store, before, dest),
+        crate::jj::own_patch_against(jj, store, after, dest),
+    ) {
+        (Ok(before), Ok(after)) => before.patch == after.patch,
+        (Err(error), _) | (_, Err(error)) => {
+            log::warn!("replayed patch comparison {before} -> {after} unreadable: {error}");
+            false
+        }
+    }
+}
+
 fn lineage_stems_at(
     jj: &crate::jj::JjEnv,
     store: &Path,
@@ -399,7 +439,9 @@ fn registered_changes(
     tip: &str,
 ) -> Result<BTreeSet<String>, String> {
     crate::jj::logical_changed_files(jj, store, fork, tip)
-        .ok_or_else(|| format!("could not read logical changes from `{fork}` to `{tip}`"))
+        .map_err(|error| {
+            format!("could not read logical changes from `{fork}` to `{tip}`: {error}")
+        })
         .map(|changes| {
             changes
                 .into_iter()
@@ -408,6 +450,31 @@ fn registered_changes(
                 .filter(|path| crate::orchestrator::contended_identifiers::path_is_registered(path))
                 .collect()
         })
+}
+
+/// Why the contended-identifier preflight stopped a replay before the graph
+/// moved. The two causes call for opposite handling, so they stay apart until
+/// the diagnostic is composed.
+#[derive(Debug)]
+enum PreflightFailure {
+    /// The branch graph could not be read the way the preflight needs. The same
+    /// tip and base fail the same way every time, so this is reported to the
+    /// branch's agent and quarantined rather than retried.
+    Graph(String),
+    /// Obligation bookkeeping could not be loaded or stored: the runner's own
+    /// state, retried and withheld from the agent.
+    Persistence(String),
+}
+
+impl PreflightFailure {
+    fn diagnostic(self) -> String {
+        match self {
+            Self::Graph(error) => format!("{} {error}", crate::jj::CONTENDED_PREFLIGHT_REFUSAL),
+            Self::Persistence(error) => format!(
+                "contended identifier obligations could not persist before graph mutation: {error}"
+            ),
+        }
+    }
 }
 
 /// Capture monotonic contributions before the rebase can absorb their evidence.
@@ -426,13 +493,15 @@ async fn persist_pre_rebase_obligations(
     baseline: &ReplayBaseline,
     pre_tip: &str,
     base: &str,
-) -> Result<BTreeSet<String>, String> {
+) -> Result<BTreeSet<String>, PreflightFailure> {
     use crate::orchestrator::contended_identifiers as contended;
 
-    let changes = registered_changes(jj, store, &baseline.fork, pre_tip)?;
+    let changes =
+        registered_changes(jj, store, &baseline.fork, pre_tip).map_err(PreflightFailure::Graph)?;
     let stored: BTreeMap<String, contended::Obligation> =
         contended::load_obligations(db, project_id, store, bookmark)
-            .await?
+            .await
+            .map_err(PreflightFailure::Persistence)?
             .into_iter()
             .map(|obligation| (obligation.identifier.clone(), obligation))
             .collect();
@@ -454,7 +523,8 @@ async fn persist_pre_rebase_obligations(
             pre_tip,
             base,
             previous.map(|obligation| obligation.delta),
-        )?;
+        )
+        .map_err(PreflightFailure::Graph)?;
         if evidence.resolved.delta > 0 {
             contended::upsert_obligation(
                 db,
@@ -469,7 +539,8 @@ async fn persist_pre_rebase_obligations(
                 None,
                 constant.evidence.keeps_floor(),
             )
-            .await?;
+            .await
+            .map_err(PreflightFailure::Persistence)?;
         }
     }
     Ok(changes)
@@ -1142,7 +1213,10 @@ impl InflightRunBatch {
     }
 }
 
-/// The batch named by one `agent_waits` row, if the row is a run batch.
+/// The batch named by one `agent_waits` row, if the row is a run batch that
+/// can write to its branch. A host batch (a long response item) holds no
+/// working tree and cannot commit, so it never holds the boundary: deferring
+/// a rebase for minutes behind a model call would protect nothing.
 fn run_batch_from_wait(
     job_id: String,
     condition_json: &str,
@@ -1152,6 +1226,7 @@ fn run_batch_from_wait(
         Ok(crate::mcp::handlers::durable_suspend::Condition::RunBatch {
             request_id,
             label,
+            host: false,
             ..
         }) => Some(InflightRunBatch {
             job_id,
@@ -1871,11 +1946,11 @@ async fn reconcile_jj_downstream(
         let repo = Path::new(repo_path);
         if project_has_origin(orch, repo) {
             let ctx = format!("merged job {}", merged_job.id);
-            let record = crate::orchestrator::default_branch_sync::FetchRecord {
+            let record = crate::orchestrator::base_branch_sync::FetchRecord {
                 project_id: &merged_job.project_id,
-                source: crate::orchestrator::default_branch_sync::Source::Fetch,
+                source: crate::orchestrator::base_branch_sync::Source::Fetch,
             };
-            match crate::orchestrator::default_branch_sync::fetch_origin_serialized(
+            match crate::orchestrator::base_branch_sync::fetch_origin_serialized(
                 orch,
                 repo,
                 base_branch,
@@ -2068,7 +2143,7 @@ async fn reconcile_store_default_bookmark(
 /// conflicted, a passive ride-along note when clean; the before/after commit-id
 /// guard in `reconcile_base_advance` gates both).
 ///
-/// Reached only through `default_branch_sync::sync`, which single-flights it per
+/// Reached only through `base_branch_sync::sync`, which single-flights it per
 /// project. Its triggers are the GitHub `push` webhook, the default-branch poll
 /// floor, and Cairn's own GitHub merge path; startup catch-up has its own
 /// before/after variant below.
@@ -2115,13 +2190,13 @@ pub(crate) async fn reconcile_default_advance(
     // refs before entering the jj critical section. Git object writes are
     // content-addressed and additive; jj observes the fetched refs only when the
     // locked import below runs, preserving the store's single-writer discipline.
-    crate::orchestrator::default_branch_sync::fetch_origin_serialized(
+    crate::orchestrator::base_branch_sync::fetch_origin_serialized(
         orch,
         repo_path_path,
         default_branch,
-        Some(crate::orchestrator::default_branch_sync::FetchRecord {
+        Some(crate::orchestrator::base_branch_sync::FetchRecord {
             project_id,
-            source: crate::orchestrator::default_branch_sync::Source::Fetch,
+            source: crate::orchestrator::base_branch_sync::Source::Fetch,
         }),
     )
     .await?;
@@ -2188,6 +2263,194 @@ pub(crate) async fn reconcile_default_advance(
     .and(bookmark)
 }
 
+/// Bring an advance made on origin to a STORE-OWNED base branch (an issue
+/// parent's integration branch) into the store, and reconcile everything
+/// downstream of it: the jobs whose own branch it is, and every live child cut
+/// from it, which is replayed onto the new tip through the ordinary base-advance
+/// path exactly as a Cairn-driven merge into the branch would replay it.
+///
+/// The store owns this branch, so origin's copy is taken only when it is a
+/// pure fast-forward ([`crate::jj::fast_forward_branch_from_origin`]): a pull
+/// request into the branch merged in GitHub's UI, GitHub's "update branch".
+/// Anything else is reported, to the sync state and to the branch's own jobs,
+/// and moves nothing.
+///
+/// Reached only through `base_branch_sync::sync`, which single-flights it per
+/// branch. Returns `Err` when the store did not take origin's copy, so reads
+/// and publication can say why the store is behind.
+pub(crate) async fn reconcile_base_branch_advance(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+) -> Result<(), String> {
+    let db = owning_db_for_project(&orch.db, project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(repo_path) = load_project_repo_path(&db, project_id).await? else {
+        return Ok(());
+    };
+    let repo = Path::new(&repo_path);
+    if !project_has_origin(orch, repo) {
+        return Ok(());
+    }
+    let record = crate::orchestrator::base_branch_sync::FetchRecord {
+        project_id,
+        source: crate::orchestrator::base_branch_sync::Source::Fetch,
+    };
+    let Some(observed) =
+        crate::orchestrator::base_branch_sync::fetch_origin_observation_serialized(
+            orch, repo, branch, record,
+        )
+        .await?
+    else {
+        log::debug!("origin holds no `{branch}` for project {project_id}; nothing to take");
+        return Ok(());
+    };
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, repo);
+    let outcome = {
+        let guard = orch
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Background,
+                format!("origin fast-forward of {branch}"),
+            )
+            .await;
+        let _phase = guard.phase("fast-forward from origin");
+        crate::jj::ensure_store_initialized(&jj, &store, repo).and_then(|()| {
+            crate::jj::fast_forward_branch_from_origin(&jj, &store, branch, &observed)
+        })?
+    };
+    match outcome {
+        crate::jj::OriginFastForward::Current { .. } | crate::jj::OriginFastForward::NoBookmark => {
+            Ok(())
+        }
+        crate::jj::OriginFastForward::Superseded { local, remote } => {
+            log::debug!(
+                "origin's `{branch}` ({remote}) is the store's own publication, since rewritten \
+                 to {local}; its next publication replaces it"
+            );
+            Ok(())
+        }
+        crate::jj::OriginFastForward::Diverged { local, remote } => {
+            let reason = format!(
+                "origin's `{branch}` ({remote}) and the store's ({local}) each hold commits the \
+                 other lacks, so it is not a fast-forward and the store did not take it"
+            );
+            notify_on_branch_jobs(
+                orch,
+                &db,
+                project_id,
+                branch,
+                &build_origin_divergence_note(branch, &local, &remote),
+                DeliveryUrgency::Steer,
+                &format!("origin-divergence:{project_id}:{branch}:{local}:{remote}"),
+            )
+            .await;
+            Err(reason)
+        }
+        crate::jj::OriginFastForward::Advanced { from, to } => {
+            {
+                let guard = orch
+                    .acquire_jj_store_lock(
+                        &store,
+                        crate::orchestrator::StoreLockClass::Background,
+                        format!("on-branch advance from origin on {branch}"),
+                    )
+                    .await;
+                let _phase = guard.phase("on-branch coordinate advance");
+                refresh_advanced_branch_cells(orch, &db, project_id, branch, &repo_path).await;
+            }
+            notify_on_branch_jobs(
+                orch,
+                &db,
+                project_id,
+                branch,
+                &build_origin_fast_forward_note(branch, &from, &to),
+                DeliveryUrgency::Passive,
+                &format!("origin-fast-forward:{project_id}:{branch}:{to}"),
+            )
+            .await;
+            let siblings = load_sibling_jobs(&db, project_id, branch, EXCLUDE_NONE).await?;
+            if siblings.is_empty() {
+                log::debug!("origin advance of {branch}: no live work cut from it to replay");
+                return Ok(());
+            }
+            let notes = BaseAdvanceNotes {
+                conflict: build_external_advance_conflict_note(branch),
+                clean: build_external_advance_clean_note(branch),
+                incoming: IncomingIdentity {
+                    base_branch: branch.to_string(),
+                    ..IncomingIdentity::default()
+                },
+            };
+            reconcile_base_advance(
+                orch,
+                &db,
+                project_id,
+                &format!("origin advance of {branch}"),
+                &repo_path,
+                branch,
+                branch,
+                siblings,
+                notes,
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+}
+
+/// Tell every live job whose own branch is `branch` something about it, once
+/// per `key`.
+async fn notify_on_branch_jobs(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    project_id: &str,
+    branch: &str,
+    note: &str,
+    urgency: DeliveryUrgency,
+    key: &str,
+) {
+    let jobs = match load_on_branch_jobs(db, project_id, branch).await {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            log::warn!("could not load the jobs on `{branch}` to notify: {error}");
+            return;
+        }
+    };
+    for job in jobs {
+        let Some(run_id) = latest_run_for_job(db, &job.id) else {
+            continue;
+        };
+        if let Err(error) =
+            queue_system_direct_once(orch, &run_id, note, urgency, &format!("{key}:{run_id}"))
+        {
+            log::warn!("could not notify job {} about `{branch}`: {error}", job.id);
+        }
+    }
+}
+
+fn build_origin_fast_forward_note(branch: &str, from: &str, to: &str) -> String {
+    format!(
+        "[Branch update] Your branch `{branch}` advanced on origin outside Cairn (a pull request \
+         into it merged in GitHub, or a push), from `{from}` to `{to}`. The store fast-forwarded \
+         to it, so your reads, runs and next publication carry it, and work cut from your branch \
+         is being replayed onto it. Nothing to do."
+    )
+}
+
+fn build_origin_divergence_note(branch: &str, local: &str, remote: &str) -> String {
+    format!(
+        "⛔ [Branch update] Origin's `{branch}` is at `{remote}`, which the store's `{local}` \
+         does not contain, and it does not contain the store's either: each side holds commits \
+         the other lacks. The store will not move your branch sideways, so it stays at \
+         `{local}`, and publishing it is refused until the two agree. Read `cairn:~/rebase` for \
+         both commits; combining them is a decision for you or your thread, not something to \
+         force-push."
+    )
+}
+
 /// One-time startup catch-up for remote default-branch advances that landed while
 /// Cairn was closed. This is intentionally not a sweep: no-remote projects are
 /// skipped because nothing outside Cairn can advance them, and remote projects
@@ -2246,13 +2509,13 @@ async fn reconcile_startup_remote_default_advance(
         crate::jj::revset_commit(&jj, &store, &remote_default)
     };
 
-    if let Err(error) = crate::orchestrator::default_branch_sync::fetch_origin_serialized(
+    if let Err(error) = crate::orchestrator::base_branch_sync::fetch_origin_serialized(
         orch,
         repo_path,
         &project.default_branch,
-        Some(crate::orchestrator::default_branch_sync::FetchRecord {
+        Some(crate::orchestrator::base_branch_sync::FetchRecord {
             project_id: &project.id,
-            source: crate::orchestrator::default_branch_sync::Source::Startup,
+            source: crate::orchestrator::base_branch_sync::Source::Startup,
         }),
     )
     .await
@@ -3725,9 +3988,7 @@ async fn execute_reconcile_claim(
                         contended_context = Some((baseline, pre_tip, changes));
                         None
                     }
-                    Err(error) => Some(format!(
-                        "contended identifier preflight refused before graph mutation: {error}"
-                    )),
+                    Err(failure) => Some(failure.diagnostic()),
                 }
             }
             _ => Some(
@@ -4033,17 +4294,35 @@ async fn execute_reconcile_claim(
                     .find(|sibling| sibling.branch.as_deref() == Some(branch.as_str()))
                 {
                     orch.invalidate_node_check_status(&sibling.id, "base-or-fork-point-advance");
-                    // A wave still verifying the pre-advance tree answers a
-                    // question nobody can ask any more. Cancelling it hands the
-                    // slot to `finish_superseded_turn_end_checks`, which arms
-                    // one for the new tree, so a second advance supersedes a
-                    // parked wave instead of queueing behind it. A sibling with
-                    // no wave in flight is untouched: dormant branches are
-                    // armed lazily, when someone waits on their checks.
-                    orch.cancel_turn_end_checks(
-                        &sibling.id,
-                        crate::orchestrator::TurnEndCancelReason::BranchAdvanced,
-                    );
+                    // A replay that kept the branch's own patch leaves its
+                    // running wave verifying the change the branch still
+                    // claims, so the wave finishes and records against the head
+                    // it ran on. A replay that altered the patch (a conflict, a
+                    // structural merge, an edit inside a hunk's context) leaves
+                    // the wave answering a question nobody can ask any more:
+                    // cancelling it hands the slot to
+                    // `finish_superseded_turn_end_checks`, which arms one for
+                    // the new tree. A sibling with no wave in flight is
+                    // untouched, and pays for no comparison: dormant branches
+                    // are armed lazily, when someone waits on their checks.
+                    if orch.turn_end_checks_in_flight(&sibling.id) {
+                        let patch_unchanged =
+                            guard.blocking_phase("replayed patch comparison", || {
+                                replay_kept_patch(
+                                    &jj,
+                                    &store,
+                                    before.get(branch),
+                                    after.get(branch),
+                                    &pinned_dest,
+                                )
+                            });
+                        crate::execution::checks::cancel_stale_review_on_branch_advance(
+                            orch,
+                            &sibling.id,
+                            crate::execution::checks::BranchAdvance::BaseReplay { patch_unchanged },
+                        )
+                        .await;
+                    }
                 }
             }
             item_report
@@ -5172,6 +5451,7 @@ where
             let guidance = match failure_kind {
                 "immutable_commit" => "jj refused to rewrite some of this branch's commits. The diagnostic above says why when Cairn could tell: if they are already on the default branch, the work landed and the PR and issue can close; if origin holds them under a remote bookmark this store does not track, nothing landed and that copy needs reconciling, so report the diagnostic.",
                 "missing_bookmark" => "This branch no longer exists and needs to be re-created; report the diagnostic above.",
+                crate::jj::CONTENDED_PREFLIGHT => "Cairn could not read this branch's change the way its migration and protocol-number check needs, so it moved nothing. A retry reads the same commits and fails the same way, so this is Cairn's to fix: report the diagnostic above.",
                 _ => "Report the diagnostic above.",
             };
             format!(
@@ -5728,6 +6008,57 @@ async fn load_sibling_jobs(
                 });
             }
             Ok(siblings)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// The non-default branches of a project the base-branch sync tracks against
+/// origin: every branch live work is cut from, and every branch that work was
+/// ever cut from while the job owning it is still live.
+///
+/// The second half is not redundant. Once its children have merged, a parent's
+/// integration branch has no live child, and it is exactly then that an
+/// operator's UI merge of the last child leaves the store's copy behind origin
+/// while the parent itself goes on to publish, open its own pull request and
+/// cut its next child from it.
+pub(crate) async fn load_tracked_base_branches(
+    db: &LocalDb,
+    project_id: &str,
+    default_branch: &str,
+) -> Result<Vec<String>, String> {
+    let sql = format!(
+        "SELECT j.base_branch FROM jobs j
+          WHERE j.project_id = ?1 AND j.base_branch IS NOT NULL
+            AND j.base_branch NOT IN ('', ?2) AND {LIVE_JOB_PREDICATE}
+         UNION
+         SELECT j.branch FROM jobs j
+          WHERE j.project_id = ?1
+            AND j.branch IN (
+              SELECT b.base_branch FROM jobs b
+               WHERE b.project_id = ?1 AND b.base_branch IS NOT NULL
+                 AND b.base_branch NOT IN ('', ?2)
+            )
+            AND {LIVE_JOB_PREDICATE}"
+    );
+    let project_id = project_id.to_string();
+    let default_branch = default_branch.to_string();
+    db.read(|conn| {
+        let sql = sql.clone();
+        let project_id = project_id.clone();
+        let default_branch = default_branch.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(&sql, params![project_id.as_str(), default_branch.as_str()])
+                .await?;
+            let mut branches = Vec::new();
+            while let Some(row) = rows.next().await? {
+                branches.push(row.text(0)?);
+            }
+            branches.sort();
+            branches.dedup();
+            Ok(branches)
         })
     })
     .await
@@ -6696,6 +7027,20 @@ mod tests {
         assert!(
             inflight_run_batch(&db, &clear).await.unwrap().is_none(),
             "a run batch on one branch must not defer its clear sibling"
+        );
+    }
+
+    /// A host batch parks on a run-batch row too, but it holds no tree and
+    /// cannot commit, so it must not hold its branch at the boundary. A row
+    /// written before the marker existed reads as a tree batch and still holds.
+    #[test]
+    fn a_host_run_batch_does_not_hold_the_branch() {
+        let host = r#"{"kind":"run_batch","request_id":"r","commits":false,"host":true}"#;
+        assert_eq!(run_batch_from_wait("job".into(), host, 1), None);
+        let legacy = r#"{"kind":"run_batch","request_id":"r","commits":false}"#;
+        assert_eq!(
+            run_batch_from_wait("job".into(), legacy, 1).map(|batch| batch.request_id),
+            Some("r".to_string())
         );
     }
 
@@ -9887,6 +10232,170 @@ mod real_store_collision_tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    /// The agg/267 shape: a branch that merged its base in instead of being
+    /// rebased. Its fork with the next base is the merged base commit, and the
+    /// branch's own commit behind the merge does not descend from it, so a
+    /// revset diff over `fork..tip` has a gap jj refuses, and the preflight once
+    /// failed on it forever as a transient. Measured as a tree diff, the
+    /// preflight reads the branch's own registered change and the replay goes
+    /// through.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_tip_that_merged_its_base_passes_the_preflight_and_replays() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let fx = fixture(&bin);
+        let db = obligation_db("merged-tip-preflight.db").await;
+        let branch = "agent/merged-tip";
+        let branch_ws = fx.workspaces.path().join("merged-tip");
+        let main_ws = main_line(&fx);
+        crate::jj::add_workspace(&fx.jj, &fx.store, &branch_ws, branch, "main", None).unwrap();
+        let path = branch_ws.join(PROTOCOL);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{text}pub const BRANCH_ONLY: u32 = 1;\n")).unwrap();
+        crate::jj::seal(&fx.jj, &branch_ws, "edit the protocol file elsewhere", None).unwrap();
+        let own = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+
+        let merged_base = bump_with_heading(&fx, &main_ws, 11);
+        set_main(&fx, &merged_base);
+        fx.jj
+            .run(
+                &fx.store,
+                &[
+                    "new",
+                    "--no-edit",
+                    "--ignore-working-copy",
+                    &own,
+                    &merged_base,
+                    "-m",
+                    "Merge main into the branch",
+                ],
+                "merge the base into the branch",
+            )
+            .unwrap();
+        let merge = crate::jj::revset_commit(
+            &fx.jj,
+            &fx.store,
+            &format!("children({own}) & children({merged_base})"),
+        )
+        .expect("the merge commit resolves");
+        fx.jj
+            .run(
+                &fx.store,
+                &[
+                    "bookmark",
+                    "set",
+                    branch,
+                    "-r",
+                    &merge,
+                    "--ignore-working-copy",
+                ],
+                "point the branch at its merge",
+            )
+            .unwrap();
+
+        let base = bump_with_heading(&fx, &main_ws, 12);
+        set_main(&fx, &base);
+
+        let pre_tip = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+        assert_eq!(pre_tip, merge);
+        let fork = branch_fork_point(&fx.jj, &fx.store, &pre_tip, &base).unwrap();
+        assert_eq!(
+            fork, merged_base,
+            "the fork is the base commit the branch merged"
+        );
+        let gapped = fx
+            .jj
+            .run(
+                &fx.store,
+                &[
+                    "diff",
+                    "--ignore-working-copy",
+                    "--git",
+                    "-r",
+                    &format!("{fork}..{pre_tip}"),
+                ],
+                "range diff over the merged tip",
+            )
+            .expect_err("jj refuses the gapped range, or this fixture no longer reproduces it");
+        assert!(gapped.contains("gaps"), "{gapped}");
+
+        let changes = persist_pre_rebase_obligations(
+            &fx.jj,
+            &db,
+            "p",
+            &fx.store,
+            branch,
+            &ReplayBaseline::fork_only(&fork),
+            &pre_tip,
+            &base,
+        )
+        .await
+        .expect("the preflight reads a merged tip");
+        assert_eq!(
+            changes,
+            BTreeSet::from([PROTOCOL.to_string()]),
+            "the branch's own registered edit, and nothing the merged base brought"
+        );
+
+        assert_eq!(
+            crate::jj::rebase_branch_onto(&fx.jj, &fx.store, branch, "main").unwrap(),
+            crate::jj::RebaseOutcome::Rebased
+        );
+        let rebased = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+        let plan = plan_post_rebase_resolution(
+            &fx.jj,
+            &fx.store,
+            &ReplayBaseline::fork_only(&fork),
+            &pre_tip,
+            &base,
+            &rebased,
+            &changes,
+            &[],
+        )
+        .unwrap();
+        assert!(plan.is_empty(), "{plan:?}");
+        assert_eq!(protocol_value(&fx, &rebased), 12);
+        assert!(text_at(&fx, &rebased, PROTOCOL).contains("BRANCH_ONLY"));
+    }
+
+    /// A graph read the preflight cannot complete is the branch's to report,
+    /// not a transient: it is classified permanent and its diagnostic quotes
+    /// jj. Bookkeeping it cannot persist is the runner's, and stays retryable.
+    #[test]
+    fn preflight_failures_are_classified_by_their_cause() {
+        let graph = PreflightFailure::Graph(
+            "could not read logical changes from `a` to `b`: jj diff --git (logical range) \
+             failed: Error: Revision `a` doesn't exist"
+                .into(),
+        )
+        .diagnostic();
+        assert!(graph.contains("doesn't exist"), "{graph}");
+        assert_eq!(
+            crate::jj::reconcile_failure_kind(&graph),
+            crate::jj::CONTENDED_PREFLIGHT
+        );
+        assert!(!reconcile_has_transient_failures(&[
+            crate::jj::ReconcileFailure {
+                branch: "agent/x".into(),
+                error: graph,
+            }
+        ]));
+
+        let persistence = PreflightFailure::Persistence("database is locked".into()).diagnostic();
+        assert_eq!(
+            crate::jj::reconcile_failure_kind(&persistence),
+            "persistence"
+        );
+        assert!(reconcile_has_transient_failures(&[
+            crate::jj::ReconcileFailure {
+                branch: "agent/x".into(),
+                error: persistence,
+            }
+        ]));
     }
 
     /// A tip an earlier advance already inflated — base + 18, no paragraph —

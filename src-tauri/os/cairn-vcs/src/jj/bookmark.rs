@@ -446,6 +446,194 @@ pub fn reconcile_tracked_bookmark(
     })
 }
 
+/// Where a store-owned branch stands against the copy of it origin was just
+/// observed to hold, after [`fast_forward_branch_from_origin`] acted on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OriginFastForward {
+    /// The store's bookmark already contains origin's copy: they are equal, or
+    /// the store holds work origin has not been sent yet.
+    Current { local: String },
+    /// Origin's copy strictly descended from the store's bookmark, which now
+    /// points at it.
+    Advanced { from: String, to: String },
+    /// Origin still holds this store's own earlier publication of the branch,
+    /// which the store has since rewritten (a base-advance replay): see
+    /// [`origin_copy_is_superseded`]. Nothing was moved; the branch's next
+    /// publication replaces origin's copy, leased on it.
+    Superseded { local: String, remote: String },
+    /// Each side holds commits the other lacks. Nothing was moved.
+    Diverged { local: String, remote: String },
+    /// The store has no bookmark of that name to advance.
+    NoBookmark,
+}
+
+/// Take origin's copy of a STORE-OWNED branch (an agent or integration branch)
+/// when, and only when, it is a pure fast-forward of the store's bookmark.
+///
+/// The store is the authority for these branches, so this is deliberately not
+/// [`reconcile_tracked_bookmark`]: nothing here ever moves a bookmark backwards
+/// or sideways. What it covers is the one way origin legitimately gets ahead of
+/// the store, which is a merge or push made outside Cairn (a pull request into
+/// the branch merged in GitHub's UI, GitHub's "update branch"). That leaves
+/// origin holding the store's tip plus more, and until the store takes it every
+/// child cut from the branch, every replay onto it and every publication of it
+/// works from the old tip.
+///
+/// `observed` is what [`fetch_origin_observation`] just parked. Only once it is
+/// known to descend from the bookmark is it promoted into
+/// `refs/remotes/origin/<branch>` and imported, so no import, this one or
+/// anyone's, ever sees a diverged copy as the remote's state and merges it into a
+/// conflicted name. The bookmark is then set explicitly, because a copy the store
+/// never tracked is imported without moving it, and the advance is exported and
+/// verified.
+///
+/// The observation ref is deleted once this answers, whatever the answer or
+/// error: its lifecycle is one fetch-and-judge. The observed commit is named in
+/// the answer, and its objects stay readable by id until git's own prune.
+///
+/// The caller MUST hold the per-store lock.
+pub fn fast_forward_branch_from_origin(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    observed: &str,
+) -> Result<OriginFastForward, String> {
+    let checkout = super::export::resolve_backing_checkout(store).ok_or_else(|| {
+        format!(
+            "fast-forward `{branch}` from origin: no backing checkout resolved for {}",
+            store.display()
+        )
+    })?;
+    let answer = judge_and_take_origin_copy(jj, store, &checkout, branch, observed);
+    let _ = cairn_platform::env::git()
+        .args(["update-ref", "-d", &origin_observation_ref(branch)])
+        .current_dir(&checkout)
+        .output();
+    answer
+}
+
+fn judge_and_take_origin_copy(
+    jj: &JjEnv,
+    store: &Path,
+    checkout: &Path,
+    branch: &str,
+    observed: &str,
+) -> Result<OriginFastForward, String> {
+    if bookmark_name_is_conflicted(jj, store, branch)? {
+        return Err(format!(
+            "`{branch}`'s name is conflicted in the store, so there is no single tip to \
+             fast-forward; settle it on the branch's rebase page first"
+        ));
+    }
+    let Some(local) = bookmark_commit_checked(jj, store, branch)? else {
+        return Ok(OriginFastForward::NoBookmark);
+    };
+    if local == observed || git_is_ancestor(checkout, observed, &local) {
+        return Ok(OriginFastForward::Current { local });
+    }
+    if !git_is_ancestor(checkout, &local, observed) {
+        let remote = observed.to_string();
+        return Ok(
+            match origin_copy_is_superseded(jj, store, branch, &local, observed) {
+                Ok(true) => OriginFastForward::Superseded { local, remote },
+                Ok(false) => OriginFastForward::Diverged { local, remote },
+                Err(error) => {
+                    log::debug!(
+                        "fast-forward `{branch}` from origin: could not tell whether origin's \
+                         {observed} is the store's own replaced publication, so it is treated as \
+                         diverged: {error}"
+                    );
+                    OriginFastForward::Diverged { local, remote }
+                }
+            },
+        );
+    }
+
+    let tracking = format!("refs/remotes/origin/{branch}");
+    with_packed_refs_patience(
+        PackedRefs::Checkout(checkout),
+        "promote origin observation",
+        || {
+            let output = cairn_platform::env::git()
+                .args(["update-ref", &tracking, observed])
+                .current_dir(checkout)
+                .output()
+                .map_err(|error| format!("git update-ref {tracking}: {error}"))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "git update-ref {tracking}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ))
+            }
+        },
+    )?;
+    import_git(jj, store)?;
+    if bookmark_commit_checked(jj, store, branch)?.as_deref() != Some(observed) {
+        set_bookmark_at(jj, store, branch, observed)?;
+    }
+    // A copy imported untracked would refuse the branch's next push.
+    if let Err(error) = track_bookmark(jj, store, branch) {
+        log::debug!("fast-forward `{branch}` from origin: track (continuing): {error}");
+    }
+    export_bookmark_advance(jj, store, true, branch, "fast-forward from origin")?;
+    log::info!("store bookmark `{branch}` fast-forwarded from {local} to origin's {observed}");
+    Ok(OriginFastForward::Advanced {
+        from: local,
+        to: observed.to_string(),
+    })
+}
+
+/// Whether origin's copy of a store-owned `branch`, at `remote`, is this store's
+/// own earlier publication of it, replaced since by a rewrite of the bookmark
+/// now at `local`: the shape a base-advance replay leaves until its push lands.
+///
+/// The store does not contain origin's tip then, yet origin holds nothing the
+/// store never had, and the sideways move is exactly what publishing is for.
+/// Two facts jj recorded itself establish it, with no patch-equivalence guess:
+///
+/// - `remote` is the target of the TRACKED `<branch>@origin`, which is what this
+///   store last pushed there or took from there. It is also the commit jj's
+///   push leases against, so the publication moves origin only while origin
+///   still holds exactly it.
+/// - every commit `remote` holds that `local` lacks is hidden, meaning this
+///   store itself rewrote or abandoned it. A commit made outside Cairn and
+///   imported into `<branch>@origin` (stale-publication recovery fetches there)
+///   is visible, so origin's copy is never superseded while it holds one.
+///
+/// Pure read; the caller need not hold the store lock.
+pub fn origin_copy_is_superseded(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    local: &str,
+    remote: &str,
+) -> Result<bool, String> {
+    let tracked = revset_commit_checked(
+        jj,
+        store,
+        &format!("tracked_remote_bookmarks(exact:{branch:?}, remote=exact:\"origin\")"),
+    )?;
+    if !tracked.is_some_and(|tracked| tracked.eq_ignore_ascii_case(remote)) {
+        return Ok(false);
+    }
+    let visible = jj.run(
+        store,
+        &[
+            "log",
+            "-r",
+            &format!("::{remote} ~ ::{local}"),
+            "--no-graph",
+            "-T",
+            "if(hidden, \"\", commit_id ++ \"\\n\")",
+            "--ignore-working-copy",
+        ],
+        "jj log origin-only commits the store has not replaced",
+    )?;
+    Ok(visible.trim().is_empty())
+}
+
 /// Outcome of converging a store-authoritative managed branch after origin was
 /// rewritten. The caller must have fetched origin and must hold the store lock.
 #[derive(Debug, Clone, PartialEq, Eq)]

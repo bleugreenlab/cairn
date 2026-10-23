@@ -44,6 +44,8 @@ pub(crate) const PREF_KEYS: &[&str] = &[
     "backends",
     "enabledProviders",
     "decisionModel",
+    "imageModel",
+    "speechModel",
     "openrouterRouting",
     "routeCallsViaOpenRouter",
     "privateDedicatedProcessCapacity",

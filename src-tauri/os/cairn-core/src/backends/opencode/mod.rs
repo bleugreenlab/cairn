@@ -168,35 +168,15 @@ fn model_wire(orch: &Orchestrator, model: &str, verb: VerbKind) -> Result<Wire, 
     }
 }
 
-/// Merge a caller's `extras` object into a request body.
-fn apply_extras(
-    body: &mut serde_json::Value,
-    extras: &serde_json::Value,
-) -> Result<(), CompletionError> {
-    if let Some(extras) = extras.as_object() {
-        body.as_object_mut()
-            .expect("completion body is an object")
-            .extend(extras.clone());
-        return Ok(());
-    }
-    if extras.is_null() {
-        return Ok(());
-    }
-    Err(CompletionError::InvalidRequest(
-        "extras must be an object or null".to_string(),
-    ))
-}
-
 use cairn_models::interface::complete::{
     Complete, CompletionCall, CompletionReply, CompletionWire,
 };
+use cairn_models::wire::MessageContent;
 
-fn completion_role(role: &CompletionRole) -> &'static str {
-    match role {
-        CompletionRole::User => "user",
-        CompletionRole::Assistant => "assistant",
-    }
-}
+// Each family's one-shot body is built by that family's wire builder, as its
+// session turns are, so the caller's options are mapped by the same rule: an
+// effort becomes `reasoning_effort` on chat and `reasoning.effort` on
+// Responses, and is not translated into a thinking budget on Messages.
 
 fn complete_chat(
     llm: &dyn Complete,
@@ -204,28 +184,12 @@ fn complete_chat(
     request: CompletionRequest,
     started: std::time::Instant,
 ) -> Result<CompletionOutcome, CompletionError> {
-    use crate::backends::openai_compat::http::apply_output_schema;
-    use serde_json::json;
-
-    let requested_model = request.model.clone();
-    let mut messages = Vec::with_capacity(request.messages.len() + 1);
-    if let Some(system) = &request.system {
-        messages.push(json!({"role": "system", "content": system}));
-    }
-    messages.extend(request.messages.iter().map(
-        |message| json!({"role": completion_role(&message.role), "content": message.content}),
-    ));
-    let mut body = json!({
-        "model": requested_model,
-        "messages": messages,
-        "stream": false,
-    });
-    apply_extras(&mut body, &request.extras)?;
-    apply_output_schema(&mut body, request.output_schema.as_ref());
+    let family = adapter::chat_family(api_key);
+    let body = crate::backends::openai_compat::completion_body(&request, &family)?;
 
     let response = llm
         .complete(CompletionCall::whole(
-            CompletionWire::Chat(&http::endpoint(api_key)),
+            CompletionWire::Chat(&family.endpoint),
             body,
             request.timeout,
         ))
@@ -264,25 +228,29 @@ fn complete_messages(
     request: CompletionRequest,
     started: std::time::Instant,
 ) -> Result<CompletionOutcome, CompletionError> {
-    use crate::backends::anthropic_messages::wire::ContentBlock;
-    use serde_json::json;
+    use crate::backends::anthropic_messages::wire::{ContentBlock, MessagesMessage};
 
     let endpoint = http::messages_endpoint(api_key);
-    let messages: Vec<serde_json::Value> = request
-        .messages
-        .iter()
-        .map(|message| json!({"role": completion_role(&message.role), "content": message.content}))
-        .collect();
-    let mut body = json!({
-        "model": request.model,
-        "max_tokens": endpoint.max_output_tokens,
-        "messages": messages,
-        "stream": false,
-    });
+    let mut messages = Vec::with_capacity(request.messages.len() + 1);
     if let Some(system) = &request.system {
-        body["system"] = json!(system);
+        messages.push(MessagesMessage::system(system.clone()));
     }
-    apply_extras(&mut body, &request.extras)?;
+    messages.extend(request.messages.iter().map(|message| match message.role {
+        CompletionRole::User => {
+            MessagesMessage::user_content(&MessageContent::text(message.content.clone()))
+        }
+        CompletionRole::Assistant => MessagesMessage::assistant(vec![ContentBlock::Text {
+            text: message.content.clone(),
+        }]),
+    }));
+    let body = crate::backends::anthropic_messages::http::build_body(
+        &endpoint,
+        &request.model,
+        &messages,
+        &crate::backends::completion_generation(&request),
+        &serde_json::Map::new(),
+        false,
+    );
 
     let response = llm
         .complete(CompletionCall::whole(
@@ -326,37 +294,30 @@ fn complete_responses(
     request: CompletionRequest,
     started: std::time::Instant,
 ) -> Result<CompletionOutcome, CompletionError> {
-    use crate::backends::openai_responses::http::apply_output_schema;
-    use crate::backends::openai_responses::wire::{ContentPart, ResponsesItem};
-    use serde_json::json;
+    use crate::backends::openai_responses::wire::{ContentPart, ResponsesItem, ResponsesTurn};
+    use cairn_models::wire::openai_responses::conversation::user_item;
 
-    let input: Vec<serde_json::Value> = request
-        .messages
-        .iter()
-        .map(|message| {
-            // The input and output text spellings are distinct on this protocol
-            // and are not interchangeable.
-            let part_type = match message.role {
-                CompletionRole::User => "input_text",
-                CompletionRole::Assistant => "output_text",
-            };
-            json!({
-                "type": "message",
-                "role": completion_role(&message.role),
-                "content": [{"type": part_type, "text": message.content}],
-            })
-        })
-        .collect();
-    let mut body = json!({
-        "model": request.model,
-        "input": input,
-        "stream": false,
-    });
+    let mut turns = Vec::with_capacity(request.messages.len() + 1);
     if let Some(system) = &request.system {
-        body["instructions"] = json!(system);
+        turns.push(ResponsesTurn::one(ResponsesItem::Instructions {
+            text: system.clone(),
+        }));
     }
-    apply_extras(&mut body, &request.extras)?;
-    apply_output_schema(&mut body, request.output_schema.as_ref());
+    // The input and output text spellings are distinct on this protocol and
+    // are not interchangeable, which is what the two constructors keep apart.
+    turns.extend(request.messages.iter().map(|message| {
+        ResponsesTurn::one(match message.role {
+            CompletionRole::User => user_item(&MessageContent::text(message.content.clone())),
+            CompletionRole::Assistant => ResponsesItem::assistant_text(message.content.clone()),
+        })
+    }));
+    let body = crate::backends::openai_responses::http::build_body(
+        &request.model,
+        &turns,
+        &crate::backends::completion_generation(&request),
+        &serde_json::Map::new(),
+        false,
+    );
 
     let response = llm
         .complete(CompletionCall::whole(

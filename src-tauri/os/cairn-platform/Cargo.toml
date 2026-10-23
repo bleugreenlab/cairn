@@ -18,7 +18,6 @@ libc = "0.2"
 reflink-copy = "0.1.30"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
-uuid = { version = "1", features = ["v4"] }
 mockall = { version = "0.13", optional = true }
 
 [dev-dependencies]

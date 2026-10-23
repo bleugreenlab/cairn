@@ -1,0 +1,12 @@
+-- Drop check_test_outcomes, the union of check_test_results and
+-- check_deferred_tests that 0276_check_deferred_tests added for per-test
+-- readers (cairn/5304).
+--
+-- Turso pushes no predicate into a compound select, so every
+-- `WHERE observation_id = ?` read of the view materialized every test row of
+-- every observation before filtering: 16 s per read on a production database
+-- of 3.3M test rows, against 75 ms with the filter inside each arm. The union
+-- now lives once, filtered per arm, as
+-- execution::cache::OBSERVATION_TEST_OUTCOMES, and a view nothing reads would
+-- only invite the next reader back onto the slow path.
+DROP VIEW IF EXISTS check_test_outcomes;

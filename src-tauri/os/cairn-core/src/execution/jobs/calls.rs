@@ -701,6 +701,7 @@ pub(crate) async fn fail_orphaned_calls_on_startup(orch: &Orchestrator) {
     if let Err(error) = crate::storage::requeue_orphaned_admissions(
         &orch.db.local,
         "local-runtime",
+        None,
         chrono::Utc::now().timestamp(),
     )
     .await

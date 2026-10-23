@@ -76,6 +76,52 @@ async fn journal_policy_gate_event(
     Ok(event_id)
 }
 
+/// A gate a caller asks the merge to prove before landing. A precondition only
+/// ever adds a refusal; it never relaxes another gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergePrecondition {
+    /// The change is exactly an upstream tool-pin bump the base revision's
+    /// `pinBumps` config describes, verified at the head being landed.
+    PinBump,
+}
+
+impl std::str::FromStr for MergePrecondition {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pinBump" => Ok(Self::PinBump),
+            other => Err(format!(
+                "unknown merge precondition {other:?}; the only precondition is \"pinBump\""
+            )),
+        }
+    }
+}
+
+/// Read `payload.precondition` for a PR action. Absent is `None`; anything
+/// present must be exactly the string `"pinBump"` on a merge, because a
+/// misspelled or mistyped precondition that was silently ignored would land
+/// the merge without the gate its caller asked for.
+pub fn parse_merge_precondition(
+    precondition: Option<&serde_json::Value>,
+    action: &str,
+) -> Result<Option<MergePrecondition>, String> {
+    let Some(value) = precondition else {
+        return Ok(None);
+    };
+    if action != "merge" {
+        return Err("payload.precondition is only accepted with action='merge'".to_string());
+    }
+    let Some(text) = value.as_str() else {
+        return Err(format!(
+            "payload.precondition must be the string \"pinBump\", not {value}"
+        ));
+    };
+    text.parse()
+        .map(Some)
+        .map_err(|error| format!("payload.precondition: {error}"))
+}
+
 struct MergeAttemptJournal<'a> {
     attempt_id: &'a str,
     project_id: &'a str,
@@ -90,11 +136,22 @@ async fn journal_merge_attempt_outcome(
     db: &LocalDb,
     attempt: MergeAttemptJournal<'_>,
     result: &Result<String, String>,
+    success_detail: Option<&str>,
 ) -> Result<(), String> {
     let (state, detail) = match result {
-        Ok(_) => ("succeeded", None),
+        Ok(_) => ("succeeded", success_detail),
         Err(error) => ("failed", Some(error.as_str())),
     };
+    journal_merge_attempt_terminal(db, attempt, state, detail).await
+}
+
+/// Append the attempt's terminal event (sequence 1).
+async fn journal_merge_attempt_terminal(
+    db: &LocalDb,
+    attempt: MergeAttemptJournal<'_>,
+    state: &str,
+    detail: Option<&str>,
+) -> Result<(), String> {
     db.execute(
         "INSERT INTO merge_attempt_events (
             event_id, attempt_id, sequence, project_id, merge_request_id, job_id,
@@ -550,6 +607,7 @@ fn map_github_merge_error(source_branch: &str, target_branch: &str, error: Strin
 /// and best-effort — origin is already authoritative, the GitHub `push` webhook
 /// and the local sweep also perform this work, and the before/after commit-id
 /// guards in `base_advance` make the double-fire a no-op.
+#[allow(clippy::too_many_arguments)]
 async fn merge_remote_pr_via_github(
     orch: &Orchestrator,
     db: Arc<LocalDb>,
@@ -558,6 +616,7 @@ async fn merge_remote_pr_via_github(
     merge_method: Option<String>,
     merge_started: std::time::Instant,
     attribution: Option<super::PrResolutionAttribution>,
+    expected_head_sha: Option<&str>,
 ) -> Result<String, String> {
     let repo_path = merge_context.mr.repo_path.clone();
     let source_branch = merge_context.source_branch.clone();
@@ -597,17 +656,26 @@ async fn merge_remote_pr_via_github(
 
     // FAIL-CLOSED: on any failure, surface it and mark/advance NOTHING locally.
     let github_started = std::time::Instant::now();
-    let merge_commit = api::merge_pr(http, &auth, &owner, &repo, pr_number, &method)
-        .await
-        .map_err(|e| map_github_merge_error(&source_branch, &target_branch, e))?;
+    let merge_commit = api::merge_pr(
+        http,
+        &auth,
+        &owner,
+        &repo,
+        pr_number,
+        &method,
+        expected_head_sha,
+    )
+    .await
+    .map_err(|e| map_github_merge_error(&source_branch, &target_branch, e))?;
     // Origin moved the moment GitHub answered. Record it before anything else
     // so a default-branch read between now and the store import says it is
     // behind instead of passing the pre-merge tree off as current.
     if let Some(merge_commit) = merge_commit.as_deref() {
-        orch.default_branch_sync.record_tip(
+        orch.base_branch_sync.record_tip(
             &merge_context.project_id,
+            &target_branch,
             merge_commit,
-            crate::orchestrator::default_branch_sync::Source::Merge,
+            crate::orchestrator::base_branch_sync::Source::Merge,
         );
     }
     log::info!(
@@ -648,7 +716,7 @@ async fn merge_remote_pr_via_github(
         // the advanced `<base>@origin` tip. The `push` webhook for this same
         // merge lands on the same single-flight sync, which waits for this one
         // rather than racing it; failures are recorded where reads report them.
-        crate::orchestrator::default_branch_sync::sync(
+        crate::orchestrator::base_branch_sync::sync(
             &orch_clone,
             &reconcile_ctx.project_id,
             &target_branch,
@@ -685,6 +753,7 @@ pub async fn merge_pr_for_job(
     job_id: &str,
     merge_method: Option<String>,
     attribution: Option<super::PrResolutionAttribution>,
+    precondition: Option<MergePrecondition>,
 ) -> Result<String, String> {
     let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
         .await
@@ -697,7 +766,7 @@ pub async fn merge_pr_for_job(
     )
     .await;
     barrier.refuse_merge()?;
-    merge_pr_for_job_past_barrier(orch, job_id, merge_method, attribution)
+    merge_pr_for_job_past_barrier(orch, job_id, merge_method, attribution, precondition)
         .await
         .map(|reply| barrier.prefix(reply))
         .map_err(|error| barrier.prefix(error))
@@ -708,6 +777,7 @@ async fn merge_pr_for_job_past_barrier(
     job_id: &str,
     merge_method: Option<String>,
     attribution: Option<super::PrResolutionAttribution>,
+    precondition: Option<MergePrecondition>,
 ) -> Result<String, String> {
     // Route to the owning database (team replica or private DB). The merge
     // request, its issue, and the producing job for a team execution all live in
@@ -777,6 +847,53 @@ async fn merge_pr_for_job_past_barrier(
         detail,
     )
     .await?;
+
+    // Evaluated ahead of the ordinary policy refusal so a pin bump that cannot
+    // land names its own condition rather than the generic policy message.
+    let pin_bump = match precondition {
+        None => None,
+        Some(MergePrecondition::PinBump) => {
+            let inputs = super::pin_bump::collect_inputs(
+                orch,
+                &db,
+                &merge_context,
+                &resolved_default,
+                policy,
+            )
+            .await;
+            match super::pin_bump::evaluate(&inputs) {
+                Ok(evidence) => Some(evidence),
+                Err(refusal) => {
+                    journal_merge_attempt_terminal(
+                        &db,
+                        MergeAttemptJournal {
+                            attempt_id: &attempt_id,
+                            project_id: &merge_context.project_id,
+                            merge_request_id: &merge_context.mr.mr_id,
+                            job_id,
+                            target_ref: &merge_context.target_branch,
+                            source_ref: &merge_context.source_branch,
+                            policy_json: &stored_policy,
+                        },
+                        "violation",
+                        Some(&format!("pinBump: {refusal}")),
+                    )
+                    .await?;
+                    return Err(format!(
+                        "Refusing to merge `{}` as a pin bump: {refusal}",
+                        merge_context.source_branch
+                    ));
+                }
+            }
+        }
+    };
+    // The landing is bound to the commit the bump was verified at: GitHub is
+    // told the expected head, and the local fold re-reads the source under the
+    // store lock.
+    let verified_head = pin_bump
+        .as_ref()
+        .map(|evidence| evidence.head_commit.clone());
+    let pin_bump_detail = pin_bump.as_ref().map(ToString::to_string);
     policy_result?;
 
     let outstanding = crate::orchestrator::contended_identifiers::outstanding_obligation_labels(
@@ -903,6 +1020,7 @@ async fn merge_pr_for_job_past_barrier(
             merge_method,
             merge_started,
             attribution,
+            verified_head.as_deref(),
         )
         .await;
     }
@@ -929,6 +1047,21 @@ async fn merge_pr_for_job_past_barrier(
                 format!("merge fold for {}", merge_context.source_branch),
             )
             .await;
+        if let Some(verified_head) = verified_head.as_deref() {
+            let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+            let current = crate::jj::bookmark_commit_checked(
+                &jj,
+                &merge_store,
+                &merge_context.source_branch,
+            )?;
+            if current.as_deref() != Some(verified_head) {
+                return Err(format!(
+                    "Refusing to merge `{source}` as a pin bump: the branch moved from the verified head {verified_head} to {current} before the fold; merge again so the new head is verified.",
+                    source = merge_context.source_branch,
+                    current = current.as_deref().unwrap_or("nothing"),
+                ));
+            }
+        }
         store_merge_child(orch, &merge_context, &method).await?
     } else {
         const MAX_VERIFY_ATTEMPTS: usize = 8;
@@ -1079,6 +1212,7 @@ async fn merge_pr_for_job_past_barrier(
             policy_json: &stored_policy,
         },
         &merge_result,
+        pin_bump_detail.as_deref(),
     )
     .await?;
     merge_result
@@ -1186,6 +1320,7 @@ mod tests {
                     policy_json: policy,
                 },
                 &result,
+                None,
             )
             .await
             .unwrap();

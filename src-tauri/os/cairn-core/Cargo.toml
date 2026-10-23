@@ -168,7 +168,7 @@ cairn-db = { path = "../cairn-db", features = ["test-utils"] }
 
 [features]
 internal-api = []
-test-utils = ["cairn-models/test-utils", "cairn-attention/test-utils", "cairn-workflow/test-utils", "cairn-session/test-utils", "cairn-platform/test-utils", "dep:mockall", "internal-api", "cairn-db/test-utils"]
+test-utils = ["cairn-models/test-utils", "cairn-attention/test-utils", "cairn-workflow/test-utils", "cairn-session/test-utils", "cairn-platform/test-utils", "cairn-vcs/test-utils", "dep:mockall", "internal-api", "cairn-db/test-utils"]
 
 [[example]]
 name = "compute_vibe_axes"
@@ -192,6 +192,10 @@ required-features = ["internal-api"]
 
 [[example]]
 name = "vacuum_reclaim"
+required-features = ["internal-api"]
+
+[[example]]
+name = "export_project"
 required-features = ["internal-api"]
 
 [[example]]

@@ -185,7 +185,7 @@ pub(crate) async fn member(
             )
         },
     );
-    let mut out=format!("# Response {} — {}\n\n{}\n\n- {}\n- timeout: {}s\n- variables: {}\n- output: `{}`\n- few-shot examples: {}\n- history: [{}]({})\n\n## prompt\n\n{}\n\n## recent history\n\n",id,d.name,d.description,selection,d.timeout.as_secs(),variables,output,d.examples.len(),h,h,d.template);
+    let mut out=format!("# Response {} — {}\n\n{}\n\n- {}\n- timeout: {}\n- variables: {}\n- output: `{}`\n- few-shot examples: {}\n- history: [{}]({})\n\n## prompt\n\n{}\n\n## recent history\n\n",id,d.name,d.description,selection,format!("{}s",d.timeout.as_secs()),variables,output,d.examples.len(),h,h,d.template);
     let scope_key = history_scope(
         o,
         if x.is_project_scoped {

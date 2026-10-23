@@ -812,19 +812,20 @@ pub(super) async fn seed_running_node(orch: &Orchestrator) -> (i32, String, Stri
         .unwrap()
         .unwrap();
 
+    let snapshot = crate::test_support::shipping_execution_snapshot_json(&issue_id, &project_id);
     exec_sql(
         orch,
         format!(
-            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq) \
-                 VALUES ('exec-stop', 'recipe', '{issue_id}', '{project_id}', 'running', 1, 1)"
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) \
+                 VALUES ('exec-stop', 'recipe', '{issue_id}', '{project_id}', 'running', 1, 1, '{snapshot}')"
         ),
     )
     .await;
     exec_sql(
             orch,
             format!(
-                "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, branch) \
-                 VALUES ('job-stop', 'exec-stop', '{issue_id}', '{project_id}', 'Builder', 'running', 1, 1, 'builder', 'agent/builder')"
+                "INSERT INTO jobs(id, execution_id, recipe_node_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, branch) \
+                 VALUES ('job-stop', 'exec-stop', 'builder', '{issue_id}', '{project_id}', 'Builder', 'running', 1, 1, 'builder', 'agent/builder')"
             ),
         )
         .await;

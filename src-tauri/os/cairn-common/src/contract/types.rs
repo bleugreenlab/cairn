@@ -70,6 +70,10 @@ pub enum ResourceKind {
     ProjectHome,
     ProjectCheckResults,
     ProjectCheckObservation,
+    ProjectVcsDiff,
+    ProjectVcsAncestry,
+    ProjectVcsLog,
+    ProjectVcsBlame,
     ProjectImages,
     ProjectImage,
     ProjectAttachments,
@@ -145,6 +149,7 @@ pub enum ResourceKind {
     Grant,
     Models,
     ModelsCatalog,
+    ModelsDecide,
     ModelsAccounts,
     ModelsAccount,
     ModelsUsage,
@@ -234,6 +239,10 @@ impl ResourceKind {
         ResourceKind::ProjectHome,
         ResourceKind::ProjectCheckResults,
         ResourceKind::ProjectCheckObservation,
+        ResourceKind::ProjectVcsDiff,
+        ResourceKind::ProjectVcsAncestry,
+        ResourceKind::ProjectVcsLog,
+        ResourceKind::ProjectVcsBlame,
         ResourceKind::ProjectImages,
         ResourceKind::ProjectImage,
         ResourceKind::ProjectAttachments,
@@ -309,6 +318,7 @@ impl ResourceKind {
         ResourceKind::Grant,
         ResourceKind::Models,
         ResourceKind::ModelsCatalog,
+        ResourceKind::ModelsDecide,
         ResourceKind::ModelsAccounts,
         ResourceKind::ModelsAccount,
         ResourceKind::ModelsUsage,
@@ -539,31 +549,37 @@ pub struct MutationSpec {
     pub example: &'static str,
 }
 
+/// ``required `a(str)`; optional `b(bool)` ``, or `None` when nothing is
+/// enumerated.
+fn accepted_keys_display(required: &[KeySpec], optional: &[KeySpec]) -> Option<String> {
+    fn keys(specs: &[KeySpec]) -> String {
+        specs
+            .iter()
+            .map(|k| format!("`{}`", k.display()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !required.is_empty() {
+        parts.push(format!("required {}", keys(required)));
+    }
+    if !optional.is_empty() {
+        parts.push(format!("optional {}", keys(optional)));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
+}
+
 impl MutationSpec {
     /// ``required `a(str)`; optional `b(bool)` `` — the accepted-key list shared
     /// by the read-side affordance block and the write-side unknown-key
     /// rejection, so what a resource advertises and what it enforces cannot
     /// drift. `None` when the mutation enumerates no keys at all.
     pub fn accepted_keys_display(&self) -> Option<String> {
-        fn keys(specs: &[KeySpec]) -> String {
-            specs
-                .iter()
-                .map(|k| format!("`{}`", k.display()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
-        let mut parts: Vec<String> = Vec::new();
-        if !self.required.is_empty() {
-            parts.push(format!("required {}", keys(self.required)));
-        }
-        if !self.optional.is_empty() {
-            parts.push(format!("optional {}", keys(self.optional)));
-        }
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join("; "))
-        }
+        accepted_keys_display(self.required, self.optional)
     }
 
     /// True when `key` is the canonical name or a declared alias of any key this
@@ -573,6 +589,31 @@ impl MutationSpec {
             .iter()
             .chain(self.optional.iter())
             .any(|spec| spec.key == key || spec.aliases.contains(&key))
+    }
+}
+
+/// A resource that is invoked rather than written: a host-executed `run`
+/// target, called as `run({commands:[{target, payload:{args_json}}]})`. Its
+/// keys are the named arguments `args_json` carries.
+///
+/// Kept beside [`ResourceContract`] rather than in it because `mutations` are
+/// `write` modes; this is the one place a contract kind says it is also a
+/// `run` target, so affordances and help can advertise it.
+#[derive(Debug, Clone, Copy)]
+pub struct RunTargetSpec {
+    pub kind: ResourceKind,
+    /// Short human label ("answer typed questions").
+    pub label: &'static str,
+    pub required: &'static [KeySpec],
+    pub optional: &'static [KeySpec],
+    /// One-line, ready-to-copy `run` call.
+    pub example: &'static str,
+}
+
+impl RunTargetSpec {
+    /// The accepted-argument list, in the same form a mutation's renders.
+    pub fn accepted_keys_display(&self) -> Option<String> {
+        accepted_keys_display(self.required, self.optional)
     }
 }
 

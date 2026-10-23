@@ -2,7 +2,7 @@
 //! proxying and checkpoint-result caching.
 
 use super::output::{strip_streamable_tail, OutputTail};
-use super::sandbox_policy::build_run_sandbox_policy;
+use super::sandbox_policy::{resolve_run_confinement, RunConfinement};
 use super::types::{ItemOutcome, McpCallSpec, RunCompletePayload, RunOutputPayload, RunSpec};
 use crate::config::mcp_servers::McpServerConfigExt;
 use crate::mcp::gateway::{McpCallOutcome, McpResourceDef};
@@ -28,6 +28,12 @@ struct ExecOutput {
     timed_out: bool,
     /// A kernel sandbox denial detected after execution (drives the fence).
     denial: Option<sandbox::SandboxDenial>,
+    /// Whether the operator credential boundary refused the command, which is
+    /// answered with its own refusal and never adjudicated.
+    credential_refused: bool,
+    /// Why the spawn's macOS profile refused it `ps` or `top`, appended after
+    /// its output (see `sandbox::setuid_refusal_note`).
+    setuid_refusal: Option<String>,
 }
 
 /// The verbs a cached probe positively proves a machine has, if it proves any.
@@ -157,6 +163,59 @@ fn strip_dev_instance_routing_env(mut config: SpawnConfig) -> SpawnConfig {
     config
 }
 
+/// Answer a `cairn://models/decide` item in the caller's project scope (the
+/// workspace's, outside a run), bounded by the item's timeout under the
+/// host-item cap.
+///
+/// The facet's decide takes no cancel token, so a timeout releases the
+/// caller at once and the abandoned provider call ends within its own bounds.
+/// Decisions keep no invocation journal, so there is no row to write for one.
+pub(super) async fn run_decide(
+    orch: &Orchestrator,
+    run_context: Option<&RunContext>,
+    header: String,
+    args: serde_json::Value,
+    timeout: Option<u32>,
+) -> ItemOutcome {
+    let request: crate::orchestrator::DecideRequest = match serde_json::from_value(args) {
+        Ok(request) => request,
+        Err(error) => {
+            return ItemOutcome::failed(
+                header,
+                format!(
+                    "cairn://models/decide takes {{model, input, questions, provider?}} in payload.args_json: {error}. Read cairn://models/decide for the shape."
+                ),
+            )
+        }
+    };
+    let bound = super::host_item_bound(timeout);
+    let project_id = run_context.map(|context| context.project_id.as_str());
+    match tokio::time::timeout(bound.limit, orch.decide_named(project_id, request)).await {
+        Err(_) => ItemOutcome::failed(
+            header,
+            format!(
+                "Decision {} The provider call it abandoned ends on its own within 30 s per request (15 s for a first-time probe).",
+                bound.describe(None)
+            ),
+        ),
+        Ok(Err(failure)) => ItemOutcome::failed(header, failure.to_string()),
+        Ok(Ok(outcome)) => ItemOutcome {
+            header: format!(
+                "cairn://models/decide [{} · {} · {:.1}s]",
+                outcome.offer.provider,
+                outcome.offer.model,
+                outcome.latency_ms as f64 / 1000.0
+            ),
+            body: serde_json::to_string_pretty(&outcome)
+                .unwrap_or_else(|error| format!("the decision could not be rendered: {error}")),
+            succeeded: true,
+            suspended: false,
+            images: Vec::new(),
+            tracked_modifications: None,
+        },
+    }
+}
+
 /// Run a single resolved item: execute it, format its body, and (for shell
 /// items only) cache checkpoint results and auto-push on `git commit`.
 #[allow(clippy::too_many_arguments)]
@@ -168,6 +227,7 @@ pub(crate) async fn run_one(
     run_context: Option<&RunContext>,
     header: String,
     spec: Result<RunSpec, String>,
+    interrupt: Option<&crate::responses::InvocationInterrupt>,
 ) -> ItemOutcome {
     let spec = match spec {
         Ok(spec) => spec,
@@ -220,6 +280,9 @@ pub(crate) async fn run_one(
         }
         RunSpec::ExecutorAction(spec) => {
             return run_executor_action(orch, header, *spec).await;
+        }
+        RunSpec::Decide { args, timeout } => {
+            return run_decide(orch, run_context, header, args, timeout).await;
         }
         RunSpec::ResponseCall {
             response_id,
@@ -291,18 +354,21 @@ pub(crate) async fn run_one(
                     }
                 },
             );
-            let invocation = crate::responses::invoke(orch, &response_id, &args, caller);
-            return match tokio::time::timeout(
-                Duration::from_millis(
-                    super::clamp_host_item_timeout_ms(timeout)
-                        .unwrap_or(super::MAX_HOST_ITEM_TIMEOUT_MS) as u64,
-                ),
-                invocation,
+            // The bound and any interruption are enforced inside the
+            // invocation, never around it: a call cut off from outside would
+            // skip its journal row.
+            let bound = super::response_item_bound(timeout);
+            return match crate::responses::invoke(
+                orch,
+                &response_id,
+                &args,
+                caller,
+                Some(&bound),
+                interrupt,
             )
             .await
             {
-                Err(_) => ItemOutcome::failed(header, "Response invocation timed out"),
-                Ok(Ok(outcome)) => {
+                Ok(outcome) => {
                     let invocation = project_key.as_deref().map_or_else(
                         || format!("cairn://responses/{response_id}/history/{}", outcome.seq),
                         |project| {
@@ -333,7 +399,7 @@ pub(crate) async fn run_one(
                         tracked_modifications: None,
                     }
                 }
-                Ok(Err(error)) => ItemOutcome::failed(header, error.to_string()),
+                Err(error) => ItemOutcome::failed(header, error.to_string()),
             };
         }
         RunSpec::Script {
@@ -382,8 +448,21 @@ pub(crate) async fn run_one(
     // Denial-driven namespace fence: if the kernel sandbox blocked this command,
     // adjudicate the crossing under the agent's escape policy. On allow we
     // re-execute escalated (sandbox off) so the now-granted crossing proceeds.
+    if exec.credential_refused {
+        return ItemOutcome::failed(header, sandbox::OPERATOR_CREDENTIAL_REFUSAL);
+    }
     if let Some(denial) = exec.denial.take() {
         use crate::mcp::handlers::fence;
+        // The operator credential boundary is answered before anything else: it
+        // is never a fence crossing, and in the live checkout it is not the
+        // read-only-checkout refusal either.
+        if let sandbox::SandboxDenial::Path { path, .. } = &denial {
+            if let Some(refusal) =
+                crate::authorization::protected::read_refusal(&orch.config_dir, path)
+            {
+                return ItemOutcome::failed(header, refusal);
+            }
+        }
         // The live checkout is read-only and non-negotiable: an ambient checkout cwd
         // routes a denial to a clear explanation, never a fence prompt. There is
         // no run context to adjudicate and nothing the user can grant — changes
@@ -852,13 +931,17 @@ fn format_exec_body(exec: &ExecOutput, timeout_ms: u32) -> String {
             result.push_str(&format!("Exit code: {}", code));
         }
     }
+    if let Some(note) = &exec.setuid_refusal {
+        result.push_str("\n\n");
+        result.push_str(note);
+    }
     result
 }
 
 /// Build the agent-facing spawn config for work the host spawns itself: env
 /// injection (MCP callback, PATH shim, uv cache, worktree VCS env, git
 /// identity, per-job scratch `TMPDIR`, the `cairn:~` home URI) plus the
-/// optional OS sandbox. Every value here may name a path on this machine,
+/// spawn's confinement. Every value here may name a path on this machine,
 /// which is exactly why nothing placed on a cell may use it.
 ///
 /// A batch, terminal, or REPL placed onto a cell does NOT pass through here:
@@ -876,7 +959,7 @@ pub(crate) async fn build_agent_spawn_config(
     run_context: Option<&RunContext>,
     program: &str,
     args: &[String],
-    sandbox_policy: Option<sandbox::SandboxPolicy>,
+    confinement: sandbox::Confinement,
 ) -> SpawnConfig {
     // Inject the MCP callback env so an in-run `cairn read|change ...` shell
     // invocation can authenticate and forward to this same app (the basis for
@@ -931,7 +1014,7 @@ pub(crate) async fn build_agent_spawn_config(
                 "CAIRN_HOME",
                 &cairn_common::paths::cairn_home().to_string_lossy(),
             )
-            .sandbox(sandbox_policy),
+            .confinement(confinement),
     ));
     // Make bare `git`/`jj` behave correctly inside a jj-only worktree: managed
     // `JJ_CONFIG`/editor so a bare `jj` commit is pushable, and a
@@ -1008,18 +1091,17 @@ async fn execute_process(
     let tool_use_id = tool_use_id.to_string();
     let inline_command_id = Uuid::new_v4().to_string();
 
-    // Build the OS filesystem sandbox for this spawn (None for fence allow, no
-    // run context, an already-granted command, or platforms without a sandbox
-    // primitive). `sandbox_enabled` is false on an escalated
-    // re-execution after a fence grant.
+    // Decide this spawn's confinement. `sandbox_enabled` is false on an
+    // escalated re-execution after a fence grant: the grant lifted the fence,
+    // and the spawn keeps the operator credential boundary all the same.
     // Host execution only ever runs in the agent's jj residence or the project's
     // live checkout, so the path tells the truth here.
     let checkout_kind = super::sandbox_policy::RunCheckout::infer(cwd);
-    let sandbox = if sandbox_enabled {
+    let run_confinement = if sandbox_enabled {
         // Grant key: the shell command for shell items, else the program for
         // skill scripts — so a command-scoped session grant generalizes to
         // scripts too (the only crossing kind Linux produces).
-        build_run_sandbox_policy(
+        resolve_run_confinement(
             orch,
             cwd,
             checkout_kind,
@@ -1029,8 +1111,9 @@ async fn execute_process(
         )
         .await
     } else {
-        None
+        RunConfinement::CredentialFloor
     };
+    let fence_mode = run_confinement.fenced().map(|(_, fence)| fence);
     // Ask agents get a synthetic command-scoped macOS fallback when path recovery
     // misses; Deny agents preserve their raw fail-fast output. Ambient live-checkout
     // runs also enable fallback detection regardless of fence: the
@@ -1039,14 +1122,16 @@ async fn execute_process(
     // routes such a denial to the hard read-only-checkout message, never a fence
     // prompt — a live checkout is non-grantable, so enabling detection cannot
     // synthesize a grant.
-    let command_scoped_fallback = checkout_kind.is_project_live()
-        || matches!(sandbox.as_ref().map(|(_, fence)| *fence), Some(Fence::Ask));
-    let sandbox_policy = sandbox.map(|(policy, _)| policy);
-    let sandboxed = sandbox_policy.is_some();
+    let command_scoped_fallback =
+        checkout_kind.is_project_live() || matches!(fence_mode, Some(Fence::Ask));
+    let sandboxed = fence_mode.is_some();
+    let confinement = run_confinement.into_confinement();
+    let floored = matches!(confinement, sandbox::Confinement::CredentialFloor);
     let spawn_started = std::time::SystemTime::now();
+    let applied_confinement = confinement.clone();
 
     let mut spawn_config =
-        build_agent_spawn_config(orch, cwd, run_context, program, args, sandbox_policy).await;
+        build_agent_spawn_config(orch, cwd, run_context, program, args, confinement).await;
 
     // Capture stdin only when the spec carries a payload to feed (today only
     // `uv run -`, which has no inline-source flag, so its script arrives on
@@ -1181,7 +1266,7 @@ async fn execute_process(
         // promotable run batches are executor-routed; checks and the remaining
         // host-only classes retain the killed-at-budget contract.
         let denial = if let Some(_ctx) = run_context {
-            if sandboxed {
+            if sandboxed || floored {
                 let partial = {
                     let o = captured(&stdout_content);
                     let e = captured(&stderr_content);
@@ -1192,12 +1277,14 @@ async fn execute_process(
                         (true, true) => String::new(),
                     }
                 };
-                sandbox::detect_denial(
+                classify_host_denial(
+                    sandboxed,
                     None,
                     &partial,
                     child_pid,
                     spawn_started,
                     command_scoped_fallback,
+                    cwd,
                 )
             } else {
                 None
@@ -1205,6 +1292,7 @@ async fn execute_process(
         } else {
             None
         };
+        let (denial, credential_refused) = split_host_denial(denial);
         if let Ok(mut child) = child.lock() {
             let _ = child.kill();
         }
@@ -1236,6 +1324,8 @@ async fn execute_process(
             exit_code: None,
             timed_out: true,
             denial,
+            credential_refused,
+            setuid_refusal: None,
         });
     }
 
@@ -1267,7 +1357,7 @@ async fn execute_process(
     let stderr_str = captured(&stderr_content);
 
     // Detect a kernel sandbox denial so the caller can drive the worktree fence.
-    let denial = if sandboxed {
+    let denial = if sandboxed || floored {
         let mut combined = match (stdout_str.is_empty(), stderr_str.is_empty()) {
             (false, false) => format!("{stdout_str}\n{stderr_str}"),
             (false, true) => stdout_str.clone(),
@@ -1282,16 +1372,24 @@ async fn execute_process(
         if ssh_crossing && exit_code != Some(0) {
             combined.push_str("\nPermission denied while reading SSH credentials");
         }
-        sandbox::detect_denial(
+        classify_host_denial(
+            sandboxed,
             exit_code,
             &combined,
             child_pid,
             spawn_started,
             command_scoped_fallback,
+            cwd,
         )
     } else {
         None
     };
+    let (denial, credential_refused) = split_host_denial(denial);
+    let setuid_refusal = sandbox::setuid_refusal_note(
+        &applied_confinement,
+        exit_code,
+        &format!("{stdout_str}\n{stderr_str}"),
+    );
 
     Ok(ExecOutput {
         stdout: stdout_str,
@@ -1299,7 +1397,51 @@ async fn execute_process(
         exit_code,
         timed_out: false,
         denial,
+        credential_refused,
+        setuid_refusal,
     })
+}
+
+/// What refused a host spawn: the operator credential boundary, or an
+/// ordinary fence denial.
+enum HostDenial {
+    OperatorCredential,
+    Fence(sandbox::SandboxDenial),
+}
+
+/// Classify a host spawn's denial by what it was refused.
+///
+/// A credential read is recognized from the attempted path (the kernel log's,
+/// or any path the output names, resolved through symlinks), so it is the
+/// boundary's refusal even when the log lookup misses. A spawn carrying only
+/// the floor reports nothing else: the floor refuses nothing else.
+fn classify_host_denial(
+    fenced: bool,
+    exit_code: Option<i32>,
+    output: &str,
+    pid: Option<u32>,
+    since: std::time::SystemTime,
+    command_scoped_fallback: bool,
+    cwd: &str,
+) -> Option<HostDenial> {
+    let cwd = Some(std::path::Path::new(cwd));
+    if !fenced {
+        return sandbox::detect_credential_floor_denial(exit_code, output, pid, since, cwd)
+            .map(|_| HostDenial::OperatorCredential);
+    }
+    let detected = sandbox::detect_denial(exit_code, output, pid, since, command_scoped_fallback)?;
+    if sandbox::credential_denial(output, cwd, Some(&detected)).is_some() {
+        return Some(HostDenial::OperatorCredential);
+    }
+    Some(HostDenial::Fence(detected))
+}
+
+fn split_host_denial(denial: Option<HostDenial>) -> (Option<sandbox::SandboxDenial>, bool) {
+    match denial {
+        Some(HostDenial::OperatorCredential) => (None, true),
+        Some(HostDenial::Fence(denial)) => (Some(denial), false),
+        None => (None, false),
+    }
 }
 
 /// Read back what a pipe reader captured.
@@ -1572,6 +1714,25 @@ async fn get_job_checkpoint_command(db: &LocalDb, job_id: &str) -> Option<String
 mod tests {
     use super::*;
 
+    /// The floor's setuid explanation is appended, never substituted: the
+    /// command's stderr and its exit status reach the agent exactly as before.
+    #[test]
+    fn a_setuid_refusal_note_follows_the_untouched_output_and_exit_code() {
+        let exec = ExecOutput {
+            stdout: String::new(),
+            stderr: "/bin/bash: /bin/ps: Operation not permitted".into(),
+            exit_code: Some(126),
+            timed_out: false,
+            denial: None,
+            credential_refused: false,
+            setuid_refusal: Some("Cairn: the floor refused `/bin/ps`.".into()),
+        };
+        assert_eq!(
+            format_exec_body(&exec, 1_000),
+            "stderr:\n/bin/bash: /bin/ps: Operation not permitted\n\nExit code: 126\n\nCairn: the floor refused `/bin/ps`."
+        );
+    }
+
     #[tokio::test]
     async fn host_spawn_home_uses_the_team_run_database() {
         use crate::db::DbState;
@@ -1623,7 +1784,7 @@ mod tests {
             Some(&ctx),
             "bash",
             &[],
-            None,
+            sandbox::Confinement::CredentialFloor,
         )
         .await;
         assert_eq!(

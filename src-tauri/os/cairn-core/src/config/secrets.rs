@@ -21,9 +21,28 @@
 //! `"{server}/{var}"` for workspace servers and
 //! `"project/{project_path}/{server}/{var}"` for project servers, so a same-named
 //! project server can authenticate to a different tenant/workspace.
+//!
+//! ## Credential witness
+//!
+//! Every mutation of a credential key's values (secrets and non-credential
+//! configuration values alike, since both feed `${VAR}` expansion) advances a
+//! witness kept in its own keychain service, so cached MCP catalogs can be bound
+//! to the exact credential state they were fetched under. A key's values live in
+//! many keychain entries and no single write can change them atomically, so the
+//! witness is a seqlock held under [`super::credential_witness`]'s mutation lock:
+//! `Stable(n)` becomes `Updating(n + 1)`, the values change, and `Stable(n + 2)`
+//! publishes them. A mutation that fails or dies part way leaves `Updating`,
+//! which no reader may cache under and no ordinary mutation may clear. Only an
+//! explicit user reconcile ([`reconcile_static_witness`]) does, by starting a
+//! newer generation. Deleting values never deletes the witness: its history is
+//! what keeps a deleted-then-recreated credential from reusing a generation.
 
+use cairn_packs::server_config::CredentialGeneration;
 use keyring::{Entry, Error};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+use super::credential_witness::{self, CredentialMutationGuard};
 
 /// Build the keychain service name for the current dev/prod mode.
 fn service() -> String {
@@ -89,9 +108,11 @@ fn config_entry(server: &str, var: &str) -> Result<Entry, String> {
 /// configuration, always, on every read, forever. See
 /// [`crate::security::broker`].
 pub fn set_config_value(server: &str, var: &str, value: &str) -> Result<(), String> {
-    config_entry(server, var)?
-        .set_password(value)
-        .map_err(|e| format!("Failed to store value in keychain: {e}"))
+    mutate_values(server, || {
+        config_entry(server, var)?
+            .set_password(value)
+            .map_err(|e| format!("Failed to store value in keychain: {e}"))
+    })
 }
 
 /// Read the non-credential value for `var` referenced by `server`, if stored.
@@ -108,17 +129,21 @@ pub fn get_config_value(server: &str, var: &str) -> Option<String> {
 
 /// Remove the stored non-credential value for `var` referenced by `server`.
 pub fn delete_config_value(server: &str, var: &str) -> Result<(), String> {
-    match config_entry(server, var)?.delete_credential() {
-        Ok(()) | Err(Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("Failed to delete value from keychain: {e}")),
-    }
+    mutate_values(server, || {
+        match config_entry(server, var)?.delete_credential() {
+            Ok(()) | Err(Error::NoEntry) => Ok(()),
+            Err(e) => Err(format!("Failed to delete value from keychain: {e}")),
+        }
+    })
 }
 
 /// Store (or replace) the secret value for `var` referenced by `server`.
 pub fn set_secret(server: &str, var: &str, value: &str) -> Result<(), String> {
-    entry(server, var)?
-        .set_password(value)
-        .map_err(|e| format!("Failed to store secret in keychain: {e}"))
+    mutate_values(server, || {
+        entry(server, var)?
+            .set_password(value)
+            .map_err(|e| format!("Failed to store secret in keychain: {e}"))
+    })
 }
 
 /// Read the secret value for `var` referenced by `server`, if one is stored.
@@ -145,10 +170,246 @@ pub fn has_secret(server: &str, var: &str) -> bool {
 /// Remove the stored secret for `var` referenced by `server`. Succeeds when no
 /// secret exists, so callers can purge unconditionally.
 pub fn delete_secret(server: &str, var: &str) -> Result<(), String> {
-    match entry(server, var)?.delete_credential() {
+    mutate_values(server, || match entry(server, var)?.delete_credential() {
         Ok(()) | Err(Error::NoEntry) => Ok(()),
         Err(e) => Err(format!("Failed to delete secret from keychain: {e}")),
+    })
+}
+
+/// Whether `var` resolves from a witnessed Cairn store rather than from the
+/// process environment. Environment values are not covered by the witness, so a
+/// server depending on one is never cached.
+pub fn has_witnessed_value(server: &str, var: &str) -> bool {
+    get_secret(server, var).is_some() || get_config_value(server, var).is_some()
+}
+
+fn witness_service() -> String {
+    format!(
+        "computer.cairn.mcp-witness.{}",
+        cairn_common::paths::env_str()
+    )
+}
+
+fn witness_entry(server: &str) -> Result<Entry, String> {
+    Entry::new(&witness_service(), server)
+        .map_err(|e| format!("Failed to open keychain witness entry: {e}"))
+}
+
+const WITNESS_RECORD_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum WitnessState {
+    Stable,
+    Updating,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WitnessRecord {
+    v: u32,
+    incarnation: String,
+    counter: u64,
+    state: WitnessState,
+}
+
+impl WitnessRecord {
+    fn generation(&self) -> CredentialGeneration {
+        CredentialGeneration {
+            incarnation: self.incarnation.clone(),
+            counter: self.counter,
+        }
     }
+}
+
+/// What a reader may conclude about the static values behind a credential key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaticWitness {
+    /// No witness has been written yet: a new key, or values stored before
+    /// witnesses existed. Establish one under the lock before relying on it.
+    Absent,
+    /// No mutation is in progress; catalogs may bind to this generation.
+    Stable(CredentialGeneration),
+    /// A mutation began and did not commit, or is committing now. Nothing may be
+    /// cached, and only an explicit reconcile clears it.
+    Updating(CredentialGeneration),
+    /// The keychain could not be read, or the witness is corrupt. Fail closed.
+    Unavailable(String),
+}
+
+enum RawWitness {
+    Absent,
+    Record(WitnessRecord),
+    Corrupt,
+    Unavailable(String),
+}
+
+fn read_witness(server: &str) -> RawWitness {
+    let raw = match witness_entry(server).and_then(|entry| {
+        entry.get_password().map(Some).or_else(|e| match e {
+            Error::NoEntry => Ok(None),
+            e => Err(format!("Failed to read MCP credential witness: {e}")),
+        })
+    }) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return RawWitness::Absent,
+        Err(e) => return RawWitness::Unavailable(e),
+    };
+    match serde_json::from_str::<WitnessRecord>(&raw) {
+        Ok(record) if record.v == WITNESS_RECORD_VERSION && !record.incarnation.is_empty() => {
+            RawWitness::Record(record)
+        }
+        _ => RawWitness::Corrupt,
+    }
+}
+
+fn write_witness(
+    _guard: &CredentialMutationGuard,
+    server: &str,
+    record: &WitnessRecord,
+) -> Result<(), String> {
+    let blob = serde_json::to_string(record)
+        .map_err(|e| format!("Failed to serialize MCP credential witness: {e}"))?;
+    witness_entry(server)?
+        .set_password(&blob)
+        .map_err(|e| format!("Failed to store MCP credential witness: {e}"))
+}
+
+/// The current witness for `server`'s static values, without taking the lock.
+/// A single keychain read is atomic, which is all a reader needs.
+pub fn static_witness(server: &str) -> StaticWitness {
+    match read_witness(server) {
+        RawWitness::Absent => StaticWitness::Absent,
+        RawWitness::Record(record) => match record.state {
+            WitnessState::Stable => StaticWitness::Stable(record.generation()),
+            WitnessState::Updating => StaticWitness::Updating(record.generation()),
+        },
+        RawWitness::Corrupt => StaticWitness::Unavailable(
+            "MCP credential witness is unreadable; reconcile it in Settings".to_string(),
+        ),
+        RawWitness::Unavailable(e) => StaticWitness::Unavailable(e),
+    }
+}
+
+/// The current witness, creating a stable one under the lock if none exists.
+///
+/// Creating one changes no value; it only begins witnessing them. The fresh
+/// incarnation means no catalog recorded under an earlier, since-deleted
+/// witness can ever match it.
+pub fn establish_static_witness(server: &str) -> StaticWitness {
+    match static_witness(server) {
+        StaticWitness::Absent => {}
+        witness => return witness,
+    }
+    let guard = match credential_witness::acquire() {
+        Ok(guard) => guard,
+        Err(e) => return StaticWitness::Unavailable(e),
+    };
+    if let RawWitness::Absent = read_witness(server) {
+        let record = WitnessRecord {
+            v: WITNESS_RECORD_VERSION,
+            incarnation: credential_witness::new_incarnation(),
+            counter: 0,
+            state: WitnessState::Stable,
+        };
+        if let Err(e) = write_witness(&guard, server, &record) {
+            return StaticWitness::Unavailable(e);
+        }
+    }
+    drop(guard);
+    static_witness(server)
+}
+
+fn exhausted(server: &str) -> String {
+    format!("MCP credential generation for `{server}` is exhausted")
+}
+
+/// Change `server`'s values under the witness protocol. A failure after the
+/// witness reads `Updating` leaves it there: the values may have changed.
+fn mutate_values(server: &str, change: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    let guard = credential_witness::acquire()?;
+    let base = match read_witness(server) {
+        RawWitness::Absent => WitnessRecord {
+            v: WITNESS_RECORD_VERSION,
+            incarnation: credential_witness::new_incarnation(),
+            counter: 0,
+            state: WitnessState::Stable,
+        },
+        RawWitness::Record(record) if record.state == WitnessState::Stable => record,
+        RawWitness::Record(_) => {
+            return Err(format!(
+                "MCP credentials for `{server}` were left mid-update by an interrupted change. \
+                 Reconcile them in Settings before changing them again."
+            ))
+        }
+        RawWitness::Corrupt => {
+            return Err(format!(
+                "MCP credential witness for `{server}` is unreadable. Reconcile it in Settings."
+            ))
+        }
+        RawWitness::Unavailable(e) => return Err(e),
+    };
+    let updating = base
+        .counter
+        .checked_add(1)
+        .ok_or_else(|| exhausted(server))?;
+    let stable = updating.checked_add(1).ok_or_else(|| exhausted(server))?;
+    write_witness(
+        &guard,
+        server,
+        &WitnessRecord {
+            counter: updating,
+            state: WitnessState::Updating,
+            ..base.clone()
+        },
+    )?;
+    change()?;
+    write_witness(
+        &guard,
+        server,
+        &WitnessRecord {
+            counter: stable,
+            state: WitnessState::Stable,
+            ..base
+        },
+    )
+}
+
+/// Leave `server`'s witness as a crashed mutation would: `Updating`.
+#[cfg(test)]
+pub(crate) fn interrupt_mutation_for_test(server: &str) {
+    assert!(mutate_values(server, || Err("interrupted".into())).is_err());
+}
+
+/// The explicit user reconcile: accept the values currently stored for
+/// `server` as its credentials, and publish a generation newer than any
+/// catalog could be bound to.
+///
+/// This is the only path out of `Updating`. Nothing calls it automatically: a
+/// refetch cannot tell whether an interrupted change left the values as the
+/// user intended, only the user can. An unreadable witness is replaced with a
+/// fresh incarnation, which is equally unmatched by any recorded catalog.
+pub fn reconcile_static_witness(server: &str) -> Result<CredentialGeneration, String> {
+    let guard = credential_witness::acquire()?;
+    let next = match read_witness(server) {
+        RawWitness::Record(record) => WitnessRecord {
+            counter: record
+                .counter
+                .checked_add(1)
+                .ok_or_else(|| exhausted(server))?,
+            state: WitnessState::Stable,
+            ..record
+        },
+        RawWitness::Absent | RawWitness::Corrupt => WitnessRecord {
+            v: WITNESS_RECORD_VERSION,
+            incarnation: credential_witness::new_incarnation(),
+            counter: 0,
+            state: WitnessState::Stable,
+        },
+        RawWitness::Unavailable(e) => return Err(e),
+    };
+    write_witness(&guard, server, &next)?;
+    Ok(next.generation())
 }
 
 // A persistent in-memory keychain backend for tests, shared across the whole
@@ -273,6 +534,144 @@ mod tests {
         set_secret("server-b", "KEY", "b-value").unwrap();
         assert_eq!(get_secret("server-a", "KEY").as_deref(), Some("a-value"));
         assert_eq!(get_secret("server-b", "KEY").as_deref(), Some("b-value"));
+    }
+
+    fn stable(server: &str) -> CredentialGeneration {
+        match static_witness(server) {
+            StaticWitness::Stable(generation) => generation,
+            other => panic!("expected a stable witness, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_mutation_advances_a_stable_witness_and_deletion_keeps_history() {
+        use_mock_keychain();
+        let server = "witness-history";
+        assert_eq!(static_witness(server), StaticWitness::Absent);
+        set_secret(server, "TOKEN", "account-a").unwrap();
+        let first = stable(server);
+        delete_secret(server, "TOKEN").unwrap();
+        let deleted = stable(server);
+        set_secret(server, "TOKEN", "account-a").unwrap();
+        let recreated = stable(server);
+        set_config_value(server, "BIN", "/opt/tool").unwrap();
+        let configured = stable(server);
+        // Same values as `first`, yet never the same witness: delete/recreate
+        // cannot bring an old catalog's generation back.
+        for generation in [&deleted, &recreated, &configured] {
+            assert_eq!(generation.incarnation, first.incarnation);
+        }
+        assert!(first.counter < deleted.counter);
+        assert!(deleted.counter < recreated.counter);
+        assert!(recreated.counter < configured.counter);
+    }
+
+    #[test]
+    fn concurrent_writers_never_publish_the_same_generation() {
+        use_mock_keychain();
+        let server = "witness-concurrent";
+        let writers: Vec<_> = (0..8)
+            .map(|writer| {
+                std::thread::spawn(move || {
+                    for round in 0..10 {
+                        set_secret(server, "TOKEN", &format!("{writer}-{round}")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        // Each of the 80 mutations advanced by exactly two from the value it
+        // read under the lock. A lost or duplicated increment would come up short.
+        assert_eq!(stable(server).counter, 160);
+    }
+
+    #[test]
+    fn an_interrupted_mutation_stays_updating_until_explicitly_reconciled() {
+        use_mock_keychain();
+        let server = "witness-interrupted";
+        set_secret(server, "TOKEN", "before").unwrap();
+        let before = stable(server);
+        assert!(mutate_values(server, || Err("keychain write failed".into())).is_err());
+        let StaticWitness::Updating(stuck) = static_witness(server) else {
+            panic!("an interrupted mutation must leave the witness updating");
+        };
+        // Ordinary mutations and witness establishment cannot clear it.
+        assert!(set_secret(server, "TOKEN", "after").is_err());
+        assert!(delete_secret(server, "TOKEN").is_err());
+        assert_eq!(
+            establish_static_witness(server),
+            StaticWitness::Updating(stuck.clone())
+        );
+        let reconciled = reconcile_static_witness(server).unwrap();
+        assert_eq!(stable(server), reconciled);
+        assert!(reconciled.counter > stuck.counter && stuck.counter > before.counter);
+        set_secret(server, "TOKEN", "after").unwrap();
+        assert!(stable(server).counter > reconciled.counter);
+    }
+
+    #[test]
+    fn a_witness_recreated_outside_cairn_starts_a_new_incarnation() {
+        use_mock_keychain();
+        let server = "witness-external-delete";
+        set_secret(server, "TOKEN", "value").unwrap();
+        let original = stable(server);
+        witness_entry(server).unwrap().delete_credential().unwrap();
+        assert_eq!(static_witness(server), StaticWitness::Absent);
+        let StaticWitness::Stable(established) = establish_static_witness(server) else {
+            panic!("establishing an absent witness must yield a stable one");
+        };
+        assert_ne!(established.incarnation, original.incarnation);
+        // Establishing an existing witness changes nothing.
+        assert_eq!(
+            establish_static_witness(server),
+            StaticWitness::Stable(established)
+        );
+    }
+
+    #[test]
+    fn a_corrupt_witness_fails_closed_until_reconciled() {
+        use_mock_keychain();
+        let server = "witness-corrupt";
+        witness_entry(server)
+            .unwrap()
+            .set_password("{not json")
+            .unwrap();
+        assert!(matches!(
+            static_witness(server),
+            StaticWitness::Unavailable(_)
+        ));
+        assert!(matches!(
+            establish_static_witness(server),
+            StaticWitness::Unavailable(_)
+        ));
+        assert!(set_secret(server, "TOKEN", "value").is_err());
+        let reconciled = reconcile_static_witness(server).unwrap();
+        assert_eq!(stable(server), reconciled);
+    }
+
+    #[test]
+    fn exhausted_generations_refuse_rather_than_wrap() {
+        use_mock_keychain();
+        let server = "witness-exhausted";
+        let guard = credential_witness::acquire().unwrap();
+        write_witness(
+            &guard,
+            server,
+            &WitnessRecord {
+                v: WITNESS_RECORD_VERSION,
+                incarnation: "near-end".into(),
+                counter: u64::MAX - 1,
+                state: WitnessState::Stable,
+            },
+        )
+        .unwrap();
+        drop(guard);
+        assert!(set_secret(server, "TOKEN", "value").is_err());
+        // Refused before anything was written: still stable, value untouched.
+        assert_eq!(stable(server).counter, u64::MAX - 1);
+        assert_eq!(get_secret(server, "TOKEN"), None);
     }
 
     #[test]

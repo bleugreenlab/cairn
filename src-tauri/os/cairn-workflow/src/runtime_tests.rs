@@ -309,7 +309,7 @@ fn decided(answer: DecisionAnswer) -> Decision {
         provider: "decisions".into(),
         model: "typesafe-ai/jev".into(),
         answers: vec![answer],
-        input_tokens: Some(12),
+        usage: cairn_domain::decision::input_usage(Some(12), None),
     }
 }
 

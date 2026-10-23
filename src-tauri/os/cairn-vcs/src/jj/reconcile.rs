@@ -86,27 +86,6 @@ fn branch_footprint(
     Ok(footprint)
 }
 
-/// The full description of a bookmark's tip over the store, trimmed, or empty when
-/// the bookmark does not resolve. A reconcile-time flatten preserves the branch's
-/// own seal message (not a PR title) by passing this as the squash description.
-pub fn branch_description(jj: &JjEnv, store: &Path, branch: &str) -> String {
-    jj.run(
-        store,
-        &[
-            "log",
-            "-r",
-            &format!("bookmarks(exact:{branch:?})"),
-            "--no-graph",
-            "-T",
-            "description",
-            "--ignore-working-copy",
-        ],
-        "branch description",
-    )
-    .map(|s| s.trim().to_string())
-    .unwrap_or_default()
-}
-
 /// Reset `branch` back to `tip` (a deliberate sideways/backwards move) and
 /// re-export the ref to git. Used to UNDO a [`squash_branch_onto`] when a
 /// post-squash guard in [`flatten_branch_recovery`] refuses the result: the squash
@@ -272,14 +251,16 @@ pub struct FlattenReport {
     pub repointed_bookmarks: Vec<String>,
 }
 
-/// Guarded flatten recovery for a clean-tip / conflicted-intermediate branch.
+/// Guarded collapse of a branch to ONE commit on `dest_commit` whose tree equals
+/// its clean rebased tip, for the default-branch squash landing.
 ///
-/// A base advance that re-applies a whole lineage onto a new base can bake
-/// conflicts into intermediate commits while a later commit resolves them, so the
-/// NET tip is clean but jj still refuses to push/fold the branch (its history
-/// contains conflicted commits). This collapses the branch to ONE commit on
-/// `dest_commit` whose tree equals the clean rebased tip — clearing the conflicted
-/// history while preserving the exact net tree — behind two guards:
+/// That landing is the one place a collapse is the intended shape: the branch
+/// lands as one commit under its PR title whatever its history. Everywhere else
+/// a clean-tip / conflicted-intermediate branch is healed in place by
+/// [`heal_conflicted_ancestry`], because collapsing it there erases published
+/// history under a message that describes only the tip. The collapse discards
+/// any conflicted intermediates while preserving the exact net tree, behind two
+/// guards:
 ///
 /// - **Pre-guard:** the branch tip must genuinely descend from `dest_commit`.
 ///   Otherwise the squash would re-parent a stale tree onto dest and revert dest's
@@ -297,8 +278,8 @@ pub struct FlattenReport {
 ///
 /// The caller MUST hold the per-store lock (like [`collapse_divergent_bookmark`])
 /// so the flatten cannot itself fork the op log. `message` becomes the flattened
-/// commit's description (a PR title at a default landing, the branch's own seal
-/// message at a reconcile).
+/// commit's description, and must describe the whole branch (the PR title), never
+/// the tip commit's own message.
 pub fn flatten_branch_recovery(
     jj: &JjEnv,
     store: &Path,
@@ -639,7 +620,7 @@ pub(crate) fn publish_reconciled_bookmark(
 #[derive(Clone, Copy)]
 struct ReconcilePublication {
     clean: bool,
-    flattened: bool,
+    healed: bool,
 }
 
 /// Where a branch this pass rebased stood immediately before the rebase, so a
@@ -649,19 +630,17 @@ pub(crate) struct RebaseRollback {
     pub(crate) pre_tip: Option<String>,
 }
 
-/// Whether a flatten refusal came from one of its guards — a positive finding
-/// that this tree must not be folded — rather than from jj failing to run. The
-/// prefixes are the ones [`flatten_branch_recovery`] writes for its guards; the
-/// squash's verified export refusing a tree that carries conflict scaffolding is
+/// Whether a heal refusal came from one of its guards — a positive finding that
+/// this history cannot be healed exactly — rather than from jj failing to run.
+/// The prefix is the one [`heal_conflicted_ancestry`] writes for its guards; the
+/// heal's verified export refusing a tree that carries conflict scaffolding is
 /// the same kind of finding, reached through the export guard.
-fn flatten_refusal_is_guard(error: &str) -> bool {
-    error.starts_with("flatten guard:")
-        || error.starts_with("flatten footprint guard:")
-        || is_conflict_scaffolding_export_refusal(error)
+fn heal_refusal_is_guard(error: &str) -> bool {
+    error.starts_with(ANCESTRY_HEAL_GUARD) || is_conflict_scaffolding_export_refusal(error)
 }
 
 /// Undo this pass's rebase of a branch whose conflicted history could not be
-/// flattened, and say truthfully why.
+/// healed, and say truthfully why.
 ///
 /// Left in place, the branch would sit on a rebased tip with conflict-flagged
 /// ancestors under a `conflicted` label that names no path, and nothing would
@@ -669,7 +648,10 @@ fn flatten_refusal_is_guard(error: &str) -> bool {
 /// recorded as a conflict with coordinates captured before the rollback erases
 /// them. Anything else is jj failing to act — a store lock, a transient process
 /// error — and is recorded as a failure, which the durable worker retries.
-pub(crate) fn roll_back_refused_flatten(
+///
+/// The rollback is what keeps an agent's committed resolution intact: the
+/// branch returns to the tip the agent committed, never to a collapsed copy.
+pub(crate) fn roll_back_refused_heal(
     jj: &JjEnv,
     store: &Path,
     branch: &str,
@@ -678,7 +660,7 @@ pub(crate) fn roll_back_refused_flatten(
     refusal: String,
     report: &mut ReconcileReport,
 ) {
-    let diagnostic = flatten_refusal_is_guard(&refusal).then(|| {
+    let diagnostic = heal_refusal_is_guard(&refusal).then(|| {
         let paths: Vec<String> =
             conflicted_commits(jj, store, &format!("({dest})..bookmarks(exact:{branch:?})"))
                 .into_iter()
@@ -690,7 +672,7 @@ pub(crate) fn roll_back_refused_flatten(
     });
     if let Err(error) = restore_operation(jj, store, &rollback.pre_op) {
         log::error!(
-            "jj reconcile: flatten of {branch} was refused ({refusal}) and the rebase could not be \
+            "jj reconcile: heal of {branch} was refused ({refusal}) and the rebase could not be \
              rolled back to {}: {error}",
             rollback.pre_op
         );
@@ -698,9 +680,9 @@ pub(crate) fn roll_back_refused_flatten(
             report,
             branch,
             rollback_incomplete(&format!(
-                "flatten of the rebased branch was refused ({refusal}), and rolling the rebase \
-                 back to operation {} also failed: {error}. The branch may sit on conflict-flagged \
-                 history; do not publish it.",
+                "healing the rebased branch's conflict-flagged history was refused ({refusal}), \
+                 and rolling the rebase back to operation {} also failed: {error}. The branch may \
+                 sit on conflict-flagged history; do not publish it.",
                 rollback.pre_op
             )),
         );
@@ -711,13 +693,13 @@ pub(crate) fn roll_back_refused_flatten(
         store,
         true,
         branch,
-        "jj git export (refused flatten rolled back)",
+        "jj git export (refused heal rolled back)",
     ) {
         record_failure(
             report,
             branch,
             rollback_incomplete(&format!(
-                "flatten refused ({refusal}); the store was rolled back, but exporting the \
+                "heal refused ({refusal}); the store was rolled back, but exporting the \
                  restored branch failed, so git may still name the rebased tip: {error}"
             )),
         );
@@ -726,22 +708,22 @@ pub(crate) fn roll_back_refused_flatten(
     match diagnostic {
         Some(diagnostic) => {
             log::warn!(
-                "jj reconcile: flatten of {branch} refused by guard ({refusal}); rebase rolled \
+                "jj reconcile: heal of {branch} refused by guard ({refusal}); rebase rolled \
                  back and recorded as a conflict"
             );
             record_conflict(report, branch, diagnostic);
         }
         None => {
             log::warn!(
-                "jj reconcile: flatten of {branch} could not run ({refusal}); rebase rolled back \
+                "jj reconcile: heal of {branch} could not run ({refusal}); rebase rolled back \
                  and left for retry"
             );
             record_failure(
                 report,
                 branch,
                 format!(
-                    "the rebased branch carries conflict-flagged history that must be flattened, \
-                     and the flatten could not run: {refusal}. The rebase was rolled back, so the \
+                    "the rebased branch carries conflict-flagged history that must be healed, \
+                     and the heal could not run: {refusal}. The rebase was rolled back, so the \
                      branch is unchanged; it is retried."
                 ),
             );
@@ -749,38 +731,40 @@ pub(crate) fn roll_back_refused_flatten(
     }
 }
 
-/// Record a flatten refused for a branch that already sat on its dest before
+/// Record a heal refused for a branch that already sat on its dest before
 /// this pass, so there is no rebase of this pass's to roll back.
 ///
 /// A guard refusal is a finding about the tree, and the agent is interrupted
 /// rather than the branch silently wedged. Anything else is jj failing to act
 /// — above all a lost `packed-refs.lock` — and is a retried failure, never a
 /// content conflict: there is nothing in the tree for the agent to resolve.
-pub(crate) fn record_unmoved_flatten_refusal(
+pub(crate) fn record_unmoved_heal_refusal(
     report: &mut ReconcileReport,
     branch: &str,
     refusal: String,
 ) {
     if refusal.contains(ROLLBACK_INCOMPLETE) {
-        log::error!("jj reconcile: flatten of {branch} failed and was not fully undone: {refusal}");
+        log::error!("jj reconcile: heal of {branch} failed and was not fully undone: {refusal}");
         record_failure(
             report,
             branch,
-            format!("the flatten of this branch's conflict-flagged history failed: {refusal}"),
+            format!("healing this branch's conflict-flagged history failed: {refusal}"),
         );
         return;
     }
-    if flatten_refusal_is_guard(&refusal) {
-        log::warn!("jj reconcile: flatten of {branch} refused by guard ({refusal}); classifying conflicted");
+    if heal_refusal_is_guard(&refusal) {
+        log::warn!(
+            "jj reconcile: heal of {branch} refused by guard ({refusal}); classifying conflicted"
+        );
         report.conflicted.push(branch.to_string());
         return;
     }
-    log::warn!("jj reconcile: flatten of {branch} could not run ({refusal}); left for retry");
+    log::warn!("jj reconcile: heal of {branch} could not run ({refusal}); left for retry");
     record_failure(
         report,
         branch,
         format!(
-            "the branch carries conflict-flagged history that must be flattened, and the flatten \
+            "the branch carries conflict-flagged history that must be healed, and the heal \
              could not run: {refusal}. Nothing was rebased this pass, so the branch is unchanged; \
              it is retried."
         ),
@@ -789,15 +773,15 @@ pub(crate) fn record_unmoved_flatten_refusal(
 
 /// Classify one sibling that is already positioned on `dest_commit` (either it was
 /// just rebased there, or it already descended from it) into the reconcile report,
-/// applying proactive flatten recovery for the clean-tip / conflicted-intermediate
-/// case. `dest_commit` is `None` only when the reconcile dest was unresolvable, in
+/// healing the clean-tip / conflicted-intermediate case in place with
+/// [`heal_conflicted_ancestry`]. `dest_commit` is `None` only when the reconcile dest was unresolvable, in
 /// which case this falls back to the bare tip-conflict check (liveness over
 /// strictness). `publication.clean` advances a cleanly-rebased sibling's PR head
 /// when an `origin` remote is configured. A local-only project has nothing to publish and
 /// remains clean; failure to reach a configured origin is reported as blocking so
-/// the PR head cannot silently remain stale. A FLATTENED sibling always attempts
-/// publication because its commit id changed. The caller holds the per-store lock,
-/// so the flatten cannot fork.
+/// the PR head cannot silently remain stale. A HEALED sibling always attempts
+/// publication because its commit ids changed. The caller holds the per-store lock,
+/// so the heal cannot fork.
 fn classify_reconciled_sibling(
     jj: &JjEnv,
     store: &Path,
@@ -852,44 +836,41 @@ fn classify_reconciled_sibling(
         Some(FlattenState::TipConflicted) => report.conflicted.push(branch.to_string()),
         // Clean tip, conflicted intermediates: heal it in place so the branch stays
         // pushable/mergeable at all times (no silent seal-push failure, no
-        // misleading "clean" note while the merge is actually blocked).
+        // misleading "clean" note while the merge is actually blocked). The heal
+        // resolves each conflict-flagged commit where it stands; it never
+        // collapses the branch, so an integration branch keeps every commit it
+        // carries, child-PR landings included.
         Some(FlattenState::IntermediateOnly) => {
             let dest = dest_commit.expect("IntermediateOnly implies a concrete dest");
-            let desc = branch_description(jj, store, branch);
-            let message = if desc.is_empty() {
-                format!("Flatten {branch} onto base (auto-recovery)")
-            } else {
-                desc
-            };
-            match flatten_branch_recovery(jj, store, branch, dest, &message) {
-                Ok(recovered) => {
-                    // The flatten rewrote the commit id, so the PR head must move
-                    // even when a plain clean rebase would have been skipped.
-                    if publication.flattened {
+            match heal_conflicted_ancestry(jj, store, branch, dest) {
+                Ok(heal) => {
+                    // The heal rewrote commit ids, so the PR head must move even
+                    // when a plain clean rebase would have been skipped.
+                    if publication.healed {
                         if let Err(e) = publish_reconciled_bookmark(
                             jj,
                             store,
                             branch,
                             discover_origin_presence(jj, store),
                         ) {
-                            log::warn!("jj reconcile: push flattened sibling {branch} failed: {e}");
+                            log::warn!("jj reconcile: push healed sibling {branch} failed: {e}");
                             record_failure(report, branch, e.to_string());
                             return;
                         }
                     }
                     log::info!(
-                        "jj reconcile: flattened {branch} ({} conflicted intermediate(s) collapsed, {} twin(s) abandoned)",
-                        recovered.collapsed_conflicted_commits,
-                        recovered.abandoned_twins.len()
+                        "jj reconcile: healed {branch} in place ({} conflict-flagged commit(s) resolved, {} emptied commit(s) dropped)",
+                        heal.healed.len(),
+                        heal.dropped.len()
                     );
                     report.rebased_clean.push(branch.to_string());
                 }
                 Err(e) => match rollback {
                     // This pass moved the branch, so it puts it back.
                     Some(rollback) => {
-                        roll_back_refused_flatten(jj, store, branch, dest, rollback, e, report)
+                        roll_back_refused_heal(jj, store, branch, dest, rollback, e, report)
                     }
-                    None => record_unmoved_flatten_refusal(report, branch, e),
+                    None => record_unmoved_heal_refusal(report, branch, e),
                 },
             }
         }
@@ -905,12 +886,27 @@ fn classify_reconciled_sibling(
 /// so recording it as terminal was the exact shape this system must not have —
 /// runner-owned state failing into a dead end no agent can reach. It is retried
 /// instead, and the next base advance repairs the bookmark on its way through.
+///
+/// [`CONTENDED_PREFLIGHT`] is permanent for the tip it failed on: the preflight
+/// reads only the branch graph, so the same tip and base fail the same way
+/// every time, and retrying them forever only hides the refusal behind a
+/// "retried automatically" status.
 pub fn reconcile_failure_is_permanent(kind: &str) -> bool {
     matches!(
         kind,
-        "immutable_commit" | "ambiguous_divergence" | "missing_bookmark"
+        "immutable_commit" | "ambiguous_divergence" | "missing_bookmark" | CONTENDED_PREFLIGHT
     )
 }
+
+/// The prefix of a contended-identifier preflight refusal: the branch graph
+/// could not be read the way the preflight needs, so nothing was moved. The
+/// base-advance worker composes the diagnostic with it, and
+/// [`reconcile_failure_kind`] classifies by it.
+pub const CONTENDED_PREFLIGHT_REFUSAL: &str =
+    "contended identifier preflight refused before graph mutation:";
+
+/// The failure kind of a [`CONTENDED_PREFLIGHT_REFUSAL`].
+pub const CONTENDED_PREFLIGHT: &str = "contended_preflight";
 
 ///
 /// A lost `packed-refs.lock` is checked first, because the lock error's own
@@ -930,6 +926,12 @@ pub fn reconcile_failure_kind(error: &str) -> &'static str {
     }
     if error.contains(CONTENTION_DIAGNOSIS) || packed_refs_lock_error(error) {
         return REF_LOCK_CONTENTION;
+    }
+    // Ahead of the keyword arms, because a preflight diagnostic quotes jj and
+    // the revisions it read, either of which can carry their words. A read
+    // that timed out is load, not the branch, and stays retryable.
+    if error.contains(CONTENDED_PREFLIGHT_REFUSAL) && !error.contains(" timed out after ") {
+        return CONTENDED_PREFLIGHT;
     }
     let error = error.to_ascii_lowercase();
     if error.contains("immutable") {
@@ -1019,8 +1021,11 @@ pub fn ref_lock_deferral(error: &str) -> Option<String> {
 ///
 /// `RebasedOverConflictedAncestry` deliberately continues to classification: that
 /// is the clean-tip / conflicted-intermediate shape, and
-/// [`classify_reconciled_sibling`] heals it with the guarded flatten, which is
-/// the whole reason the branch had to be moved onto its dest first.
+/// [`classify_reconciled_sibling`] heals it in place, which is the whole reason
+/// the branch had to be moved onto its dest first. A take-committed-tip replay
+/// produces exactly this shape on any branch with more than one commit: the
+/// carry resolves the tip, and the commit where the conflict first arose stays
+/// flagged below it.
 fn rebase_sibling(
     jj: &JjEnv,
     store: &Path,
@@ -1245,7 +1250,7 @@ fn reconcile_one_sibling(
         dest_commit,
         ReconcilePublication {
             clean: push_clean && publish,
-            flattened: publish,
+            healed: publish,
         },
         rollback.as_ref(),
         report,

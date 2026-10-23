@@ -20,6 +20,16 @@ pub struct RuntimeResourceClaim {
     pub estimated_memory_bytes: Option<u64>,
 }
 
+impl RuntimeResourceClaim {
+    /// Whether leasing this claim spawns a process of its own, which is what
+    /// the boot ramp's warm-up window bounds and counts. A stream on a
+    /// multiplexed server rides that server's process instead, so the ramp
+    /// neither holds nor counts it.
+    pub fn spawns_dedicated_process(&self) -> bool {
+        self.resident_process_units > 0 && self.server_instance_key.is_none()
+    }
+}
+
 /// Idempotently records an ordinary admission request and its immutable launch
 /// identity in one transaction. A queued ordinary request is authoritative only
 /// when its prepared launch can be reconstructed after a crash.
@@ -78,8 +88,8 @@ pub async fn enqueue_prepared_ordinary_launch(
                 new.request_id
             };
             conn.execute(
-                "INSERT OR IGNORE INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-                params![request_id.clone(),launch.job_id,launch.run_id,launch.session_id,launch.turn_id,launch.execution_id,launch.launch_event_id,launch.prompt,reason,session_start,launch.model,agent_config,output_schema,capability,launch.provider_account_id,identity_override,launch.created_at],
+                "INSERT OR IGNORE INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                params![request_id.clone(),launch.job_id,launch.run_id,launch.session_id,launch.turn_id,launch.execution_id,launch.launch_event_id,launch.prompt,reason,session_start,launch.model,agent_config,output_schema,capability,launch.provider_account_id,identity_override,launch.created_at,launch.origin.as_str()],
             ).await?;
             let mut prepared = conn.query(
                 "SELECT 1 FROM prepared_ordinary_launches WHERE request_id=?1",
@@ -331,6 +341,40 @@ pub struct PreparedRuntimeCapability {
     pub supports_warm_reuse: bool,
 }
 
+/// Who asked for an ordinary launch. An operator launch serves content an
+/// operator authored (or an operator's own start) and is admitted as urgent,
+/// ahead of background work: resumes, wakes, recoveries, delegated children.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchOrigin {
+    Operator,
+    Background,
+}
+
+impl LaunchOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Background => "background",
+        }
+    }
+
+    fn parse(value: &str) -> DbResult<Self> {
+        match value {
+            "operator" => Ok(Self::Operator),
+            "background" => Ok(Self::Background),
+            other => Err(DbError::internal(format!(
+                "invalid ordinary launch origin: {other}"
+            ))),
+        }
+    }
+
+    /// Whether admission leases this launch ahead of ordinary work.
+    pub fn is_urgent(self) -> bool {
+        self == Self::Operator
+    }
+}
+
 /// Immutable inputs required to reconstruct an ordinary session launch after restart.
 /// The prompt remains canonical in `launch_event_id`; provider credentials are resolved
 /// from `provider_account_id` only when the request is promoted.
@@ -356,6 +400,7 @@ pub struct PreparedOrdinaryLaunch {
     /// Request-scoped human identity metadata. Authentication material is never
     /// represented by this type and is resolved again by the launch host.
     pub identity_override: Option<PreparedUserIdentity>,
+    pub origin: LaunchOrigin,
     pub created_at: i64,
 }
 
@@ -396,8 +441,8 @@ pub async fn persist_prepared_ordinary_launch(
         .map(|identity| encode_json(identity, "ordinary launch identity"))
         .transpose()?;
     db.execute(
-        "INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-        params![launch.request_id,launch.job_id,launch.run_id,launch.session_id,launch.turn_id,launch.execution_id,launch.launch_event_id,launch.prompt,reason,session_start,launch.model,agent_config,output_schema,capability,launch.provider_account_id,identity_override,launch.created_at],
+        "INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+        params![launch.request_id,launch.job_id,launch.run_id,launch.session_id,launch.turn_id,launch.execution_id,launch.launch_event_id,launch.prompt,reason,session_start,launch.model,agent_config,output_schema,capability,launch.provider_account_id,identity_override,launch.created_at,launch.origin.as_str()],
     ).await?;
     Ok(())
 }
@@ -407,7 +452,7 @@ pub async fn get_prepared_ordinary_launch(
     request_id: &str,
 ) -> DbResult<Option<PreparedOrdinaryLaunch>> {
     db.query_opt(
-        "SELECT request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at FROM prepared_ordinary_launches WHERE request_id=?1",
+        "SELECT request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin FROM prepared_ordinary_launches WHERE request_id=?1",
         (request_id.to_string(),),
         |row| {
             let reason = format!("\"{}\"", row.text(8)?);
@@ -422,6 +467,7 @@ pub async fn get_prepared_ordinary_launch(
                 provider_account_id: row.opt_text(14)?,
                 identity_override: row.opt_text(15)?.map(|value| decode_json(&value, "ordinary launch identity")).transpose()?,
                 created_at: row.i64(16)?,
+                origin: LaunchOrigin::parse(&row.text(17)?)?,
             })
         },
     ).await
@@ -430,15 +476,34 @@ pub async fn get_prepared_ordinary_launch(
 /// Requeue leases owned by a runner process which is being reconstructed after
 /// restart. The old process and heartbeat tasks are gone, so retaining an
 /// apparently unexpired generation would make recovery timing-dependent.
-pub async fn requeue_orphaned_admissions(db: &LocalDb, workspace: &str, now: i64) -> DbResult<u64> {
+///
+/// `current_owner` names the leases this boot has already taken: startup work
+/// that runs before recovery (watchdog successors, launches raced in by early
+/// transport readiness) leases under it, and its processes and heartbeats are
+/// alive. Those rows are left alone. A NULL owner, or any other owner, belongs
+/// to an earlier boot and is requeued. `None` requeues every live lease.
+pub async fn requeue_orphaned_admissions(
+    db: &LocalDb,
+    workspace: &str,
+    current_owner: Option<&str>,
+    now: i64,
+) -> DbResult<u64> {
     let workspace = workspace.to_string();
+    let current_owner = current_owner.map(str::to_string);
     db.write(move |conn| {
         let workspace = workspace.clone();
+        let current_owner = current_owner.clone();
         Box::pin(async move {
-            Ok(conn.execute(
-                "UPDATE runtime_admission_requests SET state='queued',lease_owner=NULL,lease_expires_at=NULL,updated_at=?2 WHERE workspace_key=?1 AND state IN ('leased','starting','active')",
-                params![workspace, now],
-            ).await?)
+            Ok(match current_owner {
+                Some(owner) => conn.execute(
+                    "UPDATE runtime_admission_requests SET state='queued',lease_owner=NULL,lease_expires_at=NULL,updated_at=?2 WHERE workspace_key=?1 AND state IN ('leased','starting','active') AND (lease_owner IS NULL OR lease_owner<>?3)",
+                    params![workspace, now, owner],
+                ).await?,
+                None => conn.execute(
+                    "UPDATE runtime_admission_requests SET state='queued',lease_owner=NULL,lease_expires_at=NULL,updated_at=?2 WHERE workspace_key=?1 AND state IN ('leased','starting','active')",
+                    params![workspace, now],
+                ).await?,
+            })
         })
     }).await
 }
@@ -754,7 +819,7 @@ pub async fn lease_next_admission_with_capacity(
 ) -> DbResult<Option<AdmissionRequest>> {
     Ok(
         match lease_next_admission_within(
-            db, workspace, lane, owner, now, expires_at, capacity, None,
+            db, workspace, lane, owner, now, expires_at, capacity, None, None,
         )
         .await?
         {
@@ -810,6 +875,28 @@ pub enum LaneShortfall {
     /// The lane's logical stream ceiling is full.
     #[serde(rename_all = "camelCase")]
     Streams { active: u64, ceiling: u32 },
+    /// The boot ramp's warm-up window is full: `warming` spawns are between
+    /// lease and first output, and background work waits for one to finish.
+    #[serde(rename_all = "camelCase")]
+    Ramp { warming: u64, window: u32 },
+}
+
+/// The boot ramp's warm-up window, passed by a promoter that bounds how many
+/// spawns may be between lease and first output at once. Only a background
+/// (non-urgent) request that spawns a dedicated process
+/// ([`RuntimeResourceClaim::spawns_dedicated_process`]) waits on a full window.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpawnWindow {
+    /// Spawns warming now, urgent ones included.
+    pub warming: u64,
+    pub window: u32,
+}
+
+impl SpawnWindow {
+    pub fn is_full(&self) -> bool {
+        self.warming >= u64::from(self.window)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -845,6 +932,11 @@ fn adds_resident_process(claim: &RuntimeResourceClaim, resident_servers: &HashSe
 /// admits on memory: the unit ceilings and the warm GC's own fallback still
 /// apply. Memory admission is FIFO: once the head is blocked on memory, no later
 /// process-claiming request may pass it, so a large head cannot be starved.
+///
+/// A full `spawn_window` passes over background requests that would spawn a
+/// dedicated process; urgent ones and streams on a multiplexed server still
+/// lease.
+/// `None` applies no window.
 #[allow(clippy::too_many_arguments)]
 pub async fn lease_next_admission_within(
     db: &LocalDb,
@@ -855,6 +947,7 @@ pub async fn lease_next_admission_within(
     expires_at: i64,
     capacity: RuntimeResourceCapacity,
     memory: Option<HostMemoryEnvelope>,
+    spawn_window: Option<SpawnWindow>,
 ) -> DbResult<LeaseDecision> {
     let (workspace, lane, owner) = (workspace.to_string(), lane.to_string(), owner.to_string());
     enum Outcome {
@@ -926,6 +1019,15 @@ pub async fn lease_next_admission_within(
             } else {
                 0
             };
+            let urgent = row.i64(1)? != 0;
+            if let Some(window) = spawn_window.filter(SpawnWindow::is_full) {
+                if !urgent && candidate.spawns_dedicated_process() {
+                    if head.is_none() {
+                        head = Some((id, LaneShortfall::Ramp { warming: window.warming, window: window.window }));
+                    }
+                    continue;
+                }
+            }
             let shortfall = if active_process_units + candidate_process_units > u64::from(capacity.resident_process_units) {
                 Some(LaneShortfall::Units { active: active_process_units, ceiling: capacity.resident_process_units })
             } else if active_stream_units + u64::from(candidate.logical_stream_units) > u64::from(capacity.logical_stream_units) {
@@ -947,7 +1049,7 @@ pub async fn lease_next_admission_within(
             };
             match shortfall {
                 None => {
-                    selected = Some((id, row.i64(1)? != 0));
+                    selected = Some((id, urgent));
                     break;
                 }
                 Some(shortfall) => {
@@ -1080,6 +1182,8 @@ pub struct LaneBudget {
     pub per_process_bytes: u64,
     /// Why the queue head is waiting, as of the last promotion pass.
     pub shortfall: Option<LaneShortfall>,
+    /// The boot ramp's warm-up window while the ramp is on.
+    pub boot_ramp: Option<SpawnWindow>,
 }
 
 impl LaneBudget {
@@ -1278,6 +1382,7 @@ async fn prepared_ordinary_launch_round_trips_and_is_immutable() {
             supports_warm_reuse: true,
         },
         provider_account_id: Some("account-1".into()),
+        origin: LaunchOrigin::Operator,
         identity_override: Some(PreparedUserIdentity {
             user_id: "user-1".into(),
             email: "user@example.com".into(),
@@ -1416,6 +1521,7 @@ async fn prepared_ordinary_launch_round_trips_and_is_immutable() {
         measured_at: None,
         per_process_bytes: 1024,
         shortfall: None,
+        boot_ramp: None,
     }];
     // Terminal requests are history, not queue activity.
     assert!(ordinary_admission_projections(&db, 12, &capacity)
@@ -1730,7 +1836,12 @@ mod tests {
         .await
         .unwrap());
 
-        assert_eq!(requeue_orphaned_admissions(&db, "w", 4).await.unwrap(), 1);
+        assert_eq!(
+            requeue_orphaned_admissions(&db, "w", None, 4)
+                .await
+                .unwrap(),
+            1
+        );
         let replacement = lease_next_admission(&db, "w", "process", "new", 5, 20_000)
             .await
             .unwrap()
@@ -1741,6 +1852,57 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn startup_requeue_spares_this_boots_leases_and_reclaims_earlier_ones() {
+        let db = crate::storage::migrated_test_db("admission-restart-boot-fence.db").await;
+        for (n, id) in ["current", "earlier", "legacy", "ownerless"]
+            .iter()
+            .enumerate()
+        {
+            enqueue_admission_request(&db, request(id, false, n as i64))
+                .await
+                .unwrap();
+        }
+        db.execute_script(
+            "UPDATE runtime_admission_requests SET state='active',lease_generation=1,lease_expires_at=99999 WHERE workspace_key='w';
+             UPDATE runtime_admission_requests SET lease_owner='promoter@200' WHERE request_id='current';
+             UPDATE runtime_admission_requests SET state='leased',lease_owner='promoter@100' WHERE request_id='earlier';
+             UPDATE runtime_admission_requests SET state='starting',lease_owner='promoter' WHERE request_id='legacy';
+             UPDATE runtime_admission_requests SET lease_owner=NULL WHERE request_id='ownerless';",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            requeue_orphaned_admissions(&db, "w", Some("promoter@200"), 5)
+                .await
+                .unwrap(),
+            3
+        );
+        let current = get_admission_request(&db, "current")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (current.state.as_str(), current.lease_owner.as_deref()),
+            ("active", Some("promoter@200"))
+        );
+        assert!(
+            heartbeat_admission(&db, "current", "promoter@200", 1, 6, 30_000)
+                .await
+                .unwrap(),
+            "this boot's lease keeps its generation and heartbeat"
+        );
+        for id in ["earlier", "legacy", "ownerless"] {
+            let row = get_admission_request(&db, id).await.unwrap().unwrap();
+            assert_eq!(
+                (row.state.as_str(), row.lease_owner.as_deref()),
+                ("queued", None),
+                "{id} belongs to an earlier boot"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1925,7 +2087,12 @@ mod tests {
         .await
         .unwrap());
 
-        assert_eq!(requeue_orphaned_admissions(&db, "w", 5).await.unwrap(), 1);
+        assert_eq!(
+            requeue_orphaned_admissions(&db, "w", None, 5)
+                .await
+                .unwrap(),
+            1
+        );
         let replacement = lease_next_admission(&db, "w", "process", "new-host", 6, 30_000)
             .await
             .unwrap()
@@ -1978,9 +2145,94 @@ mod tests {
         capacity: RuntimeResourceCapacity,
         memory: Option<HostMemoryEnvelope>,
     ) -> LeaseDecision {
-        lease_next_admission_within(db, "w", "process", "runner", 10, 300, capacity, memory)
+        lease_next_admission_within(
+            db, "w", "process", "runner", 10, 300, capacity, memory, None,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn lease_ramped(db: &LocalDb, warming: u64) -> LeaseDecision {
+        lease_next_admission_within(
+            db,
+            "w",
+            "process",
+            "runner",
+            10,
+            300,
+            unbounded(),
+            None,
+            Some(SpawnWindow { warming, window: 4 }),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn leased_id(decision: LeaseDecision) -> String {
+        match decision {
+            LeaseDecision::Leased(request) => request.request_id,
+            other => panic!("expected a lease, got {other:?}"),
+        }
+    }
+
+    /// A full window passes over background spawns, reports the hold as the
+    /// ramp's, and still leases urgent work.
+    #[tokio::test]
+    async fn a_full_spawn_window_holds_background_spawns_and_leases_urgent_ones() {
+        let db = crate::storage::migrated_test_db("admission-ramp-full.db").await;
+        enqueue_admission_request(&db, request("background", false, 1))
             .await
-            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lease_ramped(&db, 4).await,
+            LeaseDecision::Blocked {
+                head_request_id: "background".into(),
+                shortfall: LaneShortfall::Ramp {
+                    warming: 4,
+                    window: 4
+                },
+                in_flight_requests: 0,
+            }
+        );
+        assert_eq!(state_of(&db, "background").await, "queued");
+
+        enqueue_admission_request(&db, request("operator", true, 2))
+            .await
+            .unwrap();
+        assert_eq!(leased_id(lease_ramped(&db, 5).await), "operator");
+        assert_eq!(state_of(&db, "background").await, "queued");
+    }
+
+    #[tokio::test]
+    async fn below_the_spawn_window_admission_stays_fifo() {
+        let db = crate::storage::migrated_test_db("admission-ramp-below.db").await;
+        for (n, id) in ["first", "second"].iter().enumerate() {
+            enqueue_admission_request(&db, request(id, false, n as i64))
+                .await
+                .unwrap();
+        }
+        assert_eq!(leased_id(lease_ramped(&db, 3).await), "first");
+        assert_eq!(leased_id(lease_ramped(&db, 3).await), "second");
+    }
+
+    /// A stream on a server already resident adds no process, so it has nothing
+    /// to warm up and the window does not hold it.
+    #[tokio::test]
+    async fn a_full_spawn_window_does_not_hold_a_request_that_adds_no_process() {
+        let db = crate::storage::migrated_test_db("admission-ramp-no-process.db").await;
+        enqueue_admission_request(&db, claimed_request("server", false, 1, 1, Some("srv"), 1))
+            .await
+            .unwrap();
+        enqueue_admission_request(&db, claimed_request("stream", false, 2, 1, Some("srv"), 1))
+            .await
+            .unwrap();
+        db.execute(
+            "UPDATE runtime_admission_requests SET state='active' WHERE request_id='server'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(leased_id(lease_ramped(&db, 4).await), "stream");
     }
 
     async fn state_of(db: &LocalDb, id: &str) -> String {
@@ -2380,6 +2632,7 @@ mod tests {
             measured_at: Some(1),
             per_process_bytes: 450 * MIB,
             shortfall: None,
+            boot_ramp: None,
         };
         assert_eq!(budget.resident_process_units(), 9 + 26);
         assert_eq!(

@@ -293,6 +293,15 @@ pub struct Settings {
     /// decision offer.
     #[serde(default)]
     pub decision_model: Option<String>,
+    /// The image model a request naming none is drawn by. Doors take an
+    /// explicit model, so a caller's omission resolves here first; `None`
+    /// refuses such a request rather than letting the catalog choose.
+    #[serde(default)]
+    pub image_model: Option<String>,
+    /// The speech model a request naming none is spoken by, resolved the
+    /// same way as `image_model`.
+    #[serde(default)]
+    pub speech_model: Option<String>,
 
     pub system_prompt: String,
     pub max_thinking_tokens: Option<i32>,
@@ -377,6 +386,12 @@ pub struct UpdateSettings {
     /// to the catalog.
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub decision_model: Option<Option<String>>,
+    /// Set the workspace image default; `null` or blank clears it.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub image_model: Option<Option<String>>,
+    /// Set the workspace speech default; `null` or blank clears it.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub speech_model: Option<Option<String>>,
 
     /// Deprecated - system_prompt is no longer used
     #[allow(dead_code)]

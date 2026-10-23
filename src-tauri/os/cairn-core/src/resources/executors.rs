@@ -684,6 +684,92 @@ pub(crate) fn render_update_report(
     out
 }
 
+/// The running build beside the one the runner would have it run: the
+/// supervisor's launch for the colocated executor, the served artifact for a
+/// remote's target.
+fn render_build(executor: &ExecutorInspection) -> String {
+    let target = executor
+        .self_update
+        .as_ref()
+        .map(|status| status.target.as_str());
+    match (
+        &executor.executor_build_id,
+        &executor.health.build_skew,
+        target,
+    ) {
+        (_, Some(skew), Some(target)) => format!(
+            "{} — SKEWED from {}, the build the runner serves for {target}",
+            skew.executor_build_id, skew.runner_build_id
+        ),
+        (_, Some(skew), None) => format!(
+            "{} — SKEWED from the runner's deployed {}",
+            skew.executor_build_id, skew.runner_build_id
+        ),
+        (Some(build), None, Some(target))
+            if executor
+                .self_update
+                .as_ref()
+                .and_then(|status| status.runner_build_id.as_ref())
+                == Some(build) =>
+        {
+            format!("{build}, the build the runner serves for {target}")
+        }
+        (Some(build), None, _) => build.clone(),
+        (None, None, _) => "not reported".to_string(),
+    }
+}
+
+/// Where the rolling self-update stands for this machine, in the words an
+/// operator asking "is the fleet running the fix" needs.
+fn render_self_update(
+    status: &cairn_common::executor_protocol::SelfUpdateStatus,
+    captured_at_unix_ms: u64,
+) -> String {
+    use cairn_common::executor_protocol::SelfUpdatePhase;
+    let served = status.runner_build_id.as_deref().unwrap_or("its build");
+    match &status.phase {
+        SelfUpdatePhase::Current => "current".to_string(),
+        SelfUpdatePhase::ArtifactUnavailable { reason } => format!(
+            "not compared: the runner has no {} executor to serve ({reason})",
+            status.target
+        ),
+        SelfUpdatePhase::Waiting { behind: Some(name) } => format!(
+            "update pending: waiting for {name} to finish updating, since the fleet updates one machine at a time"
+        ),
+        SelfUpdatePhase::Waiting { behind: None } => {
+            "update pending: next in line".to_string()
+        }
+        SelfUpdatePhase::Draining {
+            in_flight: 0,
+            since_unix_ms,
+        } => format!(
+            "update pending: empty, confirming nothing new arrived before the restart (new work refused since {})",
+            age(captured_at_unix_ms.saturating_sub(*since_unix_ms))
+        ),
+        SelfUpdatePhase::Draining {
+            in_flight,
+            since_unix_ms,
+        } => format!(
+            "update pending: finishing {in_flight} in flight; new work goes elsewhere (since {})",
+            age(captured_at_unix_ms.saturating_sub(*since_unix_ms))
+        ),
+        SelfUpdatePhase::Directed { at_unix_ms } => format!(
+            "updating: directed to install {served} {}; waiting for it to return on that build",
+            age(captured_at_unix_ms.saturating_sub(*at_unix_ms))
+        ),
+        SelfUpdatePhase::Deferred { until_unix_ms } => format!(
+            "update deferred: it did not empty in time, so it takes work again and is asked again in {}",
+            duration_ms(until_unix_ms.saturating_sub(captured_at_unix_ms))
+        ),
+        SelfUpdatePhase::Halted { cause } => {
+            format!("update halted for {served}: {cause}")
+        }
+        SelfUpdatePhase::Excluded { cause } => {
+            format!("update skipped on this machine for {served}: {cause}")
+        }
+    }
+}
+
 /// Render one machine's compact operational status.
 pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     let health = &executor.health;
@@ -717,6 +803,11 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     out.push_str(&render_build_prerequisites(capabilities));
     out.push_str(&render_project_eligibility(&executor.project_eligibility));
     out.push_str(&render_containment(capabilities, executor.colocated));
+    out.push_str(&render_nested_sandbox(
+        capabilities,
+        health.advertisement.observed_at_unix_ms,
+        health.heartbeat_age_ms,
+    ));
     out.push_str(&format!(
         "- Projects served: {}\n\n",
         list_or(&capabilities.projects_served, "every project")
@@ -813,17 +904,13 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             "no"
         }
     ));
-    out.push_str(&format!(
-        "- Build: {}\n",
-        match (&executor.executor_build_id, &health.build_skew) {
-            (_, Some(skew)) => format!(
-                "{} — SKEWED from the runner's deployed {}",
-                skew.executor_build_id, skew.runner_build_id
-            ),
-            (Some(build), None) => build.clone(),
-            (None, None) => "not reported".to_string(),
-        }
-    ));
+    out.push_str(&format!("- Build: {}\n", render_build(executor)));
+    if let Some(status) = &executor.self_update {
+        out.push_str(&format!(
+            "- Self-update: {}\n",
+            render_self_update(status, executor.captured_at_unix_ms)
+        ));
+    }
     out.push_str(&format!(
         "- CLI build: {}\n",
         render_cli_build(capabilities)
@@ -1144,6 +1231,14 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             ));
         }
     }
+    out.push_str(&render_repository_faults(
+        &health.repository_faults,
+        executor.captured_at_unix_ms,
+    ));
+    out.push_str(&render_quarantine_census(
+        health.quarantines.as_ref(),
+        executor.captured_at_unix_ms,
+    ));
     out.push_str(&render_stopped_commands(
         &health.stopped_commands,
         &capabilities.os,
@@ -1193,11 +1288,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         out.push_str("No cached slot state.\n");
     }
     for cell in &occupancy.cells {
-        let head = cell
-            .last_sealed_commit
-            .as_deref()
-            .map(short_commit)
-            .unwrap_or_else(|| "unmeasured".into());
+        let head = render_cell_head(cell);
         let lifecycle = serde_json::to_value(&cell.lifecycle)
             .ok()
             .and_then(|value| value.as_str().map(str::to_string))
@@ -1233,6 +1324,9 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         ));
         if let Some(reason) = &cell.quarantine_reason {
             out.push_str(&format!("  - Quarantine: {}\n", reason.replace('\n', " ")));
+        }
+        if let Some(seed) = &cell.seeded_from {
+            out.push_str(&format!("  - Seeded: {}\n", seed.describe()));
         }
     }
     out.push('\n');
@@ -1406,16 +1500,123 @@ fn render_storage(executor: &ExecutorInspection) -> String {
     } else {
         " (thresholds not reported by this executor)".to_string()
     };
-    out.push_str(&format!(
-        "- Volume: {} — {:?}{thresholds}\n",
-        reading(&machine.volume, captured, |volume| format!(
+    let free_of = |volume: &cairn_common::executor_protocol::MachineVolume| {
+        format!(
             "{} free of {}",
             bytes(volume.free_bytes),
             bytes(volume.total_bytes)
-        )),
-        disk.status,
-    ));
-    match machine.disk_accounting.value() {
+        )
+    };
+    // While a build root apart from the home is here, the verdict and its
+    // thresholds are that volume's: cells grow there. The home keeps its own
+    // floor, which every admission still needs.
+    let build_present = health
+        .build_volume
+        .as_ref()
+        .is_some_and(|report| !report.is_absent());
+    if let Some(report) = &health.build_volume {
+        out.push_str(&build_root_line(
+            report,
+            machine.build_volume.as_ref(),
+            captured,
+            &format!("{:?}{thresholds}", disk.status),
+        ));
+        if let (true, Some(accounting), Some(volume)) = (
+            build_present,
+            &machine.build_disk_accounting,
+            &machine.build_volume,
+        ) {
+            render_holdings(
+                &mut out,
+                "on the build volume",
+                accounting,
+                volume,
+                captured,
+            );
+        }
+    }
+    if build_present {
+        out.push_str(&format!(
+            "- Volume: {} — the home: the runner, its database and the machine authority; every admission still needs its {} floor\n",
+            reading(&machine.volume, captured, free_of),
+            bytes(disk.watermark_bytes),
+        ));
+    } else {
+        out.push_str(&format!(
+            "- Volume: {} — {:?}{thresholds}\n",
+            reading(&machine.volume, captured, free_of),
+            disk.status,
+        ));
+    }
+    render_holdings(
+        &mut out,
+        "",
+        &machine.disk_accounting,
+        &machine.volume,
+        captured,
+    );
+    out
+}
+
+/// The build root, its volume, and whether it is here, in words.
+fn build_root_line(
+    report: &cairn_common::executor_protocol::BuildVolumeReport,
+    volume: Option<&Measurement<cairn_common::executor_protocol::MachineVolume>>,
+    captured: u64,
+    verdict: &str,
+) -> String {
+    use cairn_common::executor_protocol::BuildVolumeState;
+    let since = age(captured.saturating_sub(report.since_unix_ms));
+    match &report.state {
+        BuildVolumeState::Present { mount_point } => {
+            let free = volume.map_or_else(
+                || "free space not reported".to_string(),
+                |volume| {
+                    reading(volume, captured, |volume| {
+                        format!(
+                            "{} free of {}",
+                            bytes(volume.free_bytes),
+                            bytes(volume.total_bytes)
+                        )
+                    })
+                },
+            );
+            let returned = if report.readopted_cells > 0 {
+                format!(
+                    "; {} held cells adopted again when it last returned",
+                    report.readopted_cells
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "- Build root: {} — present on volume {}: {free} — {verdict}{returned}\n",
+                report.root,
+                mount_point.as_deref().unwrap_or("(mount point not reported)"),
+            )
+        }
+        BuildVolumeState::Absent { reason } => format!(
+            "- Build root: {} — ABSENT for {since}: {reason}; this machine accepts no work that needs a cell until it returns; {} cells suspended\n",
+            report.root,
+            report.suspended_cells.len(),
+        ),
+    }
+}
+
+/// What Cairn holds on one volume, and what that volume holds outside it.
+fn render_holdings(
+    out: &mut String,
+    on: &str,
+    accounting_reading: &Measurement<cairn_common::executor_protocol::DiskAccounting>,
+    volume_reading: &Measurement<cairn_common::executor_protocol::MachineVolume>,
+    captured: u64,
+) {
+    let on = if on.is_empty() {
+        String::new()
+    } else {
+        format!(" {on}")
+    };
+    match accounting_reading.value() {
         Some(accounting) => {
             let categories = &accounting.categories;
             let other_top = if accounting.other_top.is_empty() {
@@ -1440,9 +1641,9 @@ fn render_storage(executor: &ExecutorInspection) -> String {
                 String::new()
             };
             out.push_str(&format!(
-                "- Cairn holds {} (logical bytes, accounting {}): live cells {} · external caches {} · quarantines {} · managed objects {} · warm caches {} · other {}{other_top}{retired_homes}\n",
+                "- Cairn holds{on} {} (logical bytes, accounting {}): live cells {} · external caches {} · quarantines {} · managed objects {} · warm caches {} · other {}{other_top}{retired_homes}\n",
                 bytes(accounting.used_bytes),
-                age(captured.saturating_sub(machine.disk_accounting.measured_at_unix_ms)),
+                age(captured.saturating_sub(accounting_reading.measured_at_unix_ms)),
                 bytes(categories.live_cells_bytes),
                 bytes(categories.external_managed_caches_bytes),
                 bytes(categories.quarantines_bytes),
@@ -1471,7 +1672,7 @@ fn render_storage(executor: &ExecutorInspection) -> String {
                     out.push_str(&format!("  - and {unlisted} more not listed\n"));
                 }
             }
-            if let Some(volume) = machine.volume.value() {
+            if let Some(volume) = volume_reading.value() {
                 // Unaccounted, never "not Cairn's": the walk covers what
                 // Cairn manages, and Cairn's processes write outside it too.
                 // A full volume whose remainder read as someone else's was
@@ -1492,11 +1693,27 @@ fn render_storage(executor: &ExecutorInspection) -> String {
             }
         }
         None => out.push_str(&format!(
-            "- Cairn holds: {}\n",
-            reading(&machine.disk_accounting, captured, |_| String::new())
+            "- Cairn holds{on}: {}\n",
+            reading(accounting_reading, captured, |_| String::new())
         )),
     }
-    out
+}
+
+/// A build-root change the runner holds but its executor has not started with
+/// yet, or nothing when the two agree. Only the colocated machine has one.
+pub(crate) fn render_pending_build_root(
+    configured: Option<&std::path::Path>,
+    in_effect: Option<&str>,
+) -> String {
+    let configured = configured.map(|path| path.to_string_lossy().into_owned());
+    if configured.as_deref() == in_effect {
+        return String::new();
+    }
+    format!(
+        "- Build root change pending: configured {}, in effect {} until the runner restarts\n",
+        configured.as_deref().unwrap_or("the home"),
+        in_effect.unwrap_or("the home"),
+    )
 }
 
 /// One retired executor home: a named component with its bytes, never folded
@@ -1846,6 +2063,7 @@ fn decline_reason_word(reason: DeclineReason) -> &'static str {
         DeclineReason::Constraint => "constraint",
         DeclineReason::Unknown => "unstated",
         DeclineReason::ProjectProvisioning => "project provisioning hold",
+        DeclineReason::BuildVolumeAbsent => "build volume absent",
     }
 }
 
@@ -2654,7 +2872,7 @@ fn group_thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::new();
     for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(digit);
@@ -2913,6 +3131,41 @@ fn render_cache_distance(
 
 /// Public keys come from cached owner metadata or the project-scoped slot path,
 /// never from an opaque project UUID or an executor-local absolute path.
+/// A cell's head as its checkout reports it, with the executor's own record
+/// beside it whenever the two disagree.
+///
+/// The record alone is what this page used to show, and it read as a healthy
+/// slot while the checkout's HEAD had left the object store. An executor that
+/// predates the observation, or has not yet looked, gets its record labelled as
+/// one.
+fn render_cell_head(cell: &cairn_common::executor_protocol::PersistentCellState) -> String {
+    let recorded = cell.last_sealed_commit.as_deref();
+    let Some(observed) = &cell.observed_head else {
+        return recorded.map_or_else(
+            || "unmeasured".into(),
+            |commit| format!("{} (recorded)", short_commit(commit)),
+        );
+    };
+    let named = observed
+        .commit
+        .as_deref()
+        .map_or_else(|| "unreadable".into(), short_commit);
+    if !observed.resolvable {
+        let failure = observed
+            .failure
+            .as_deref()
+            .and_then(|failure| failure.lines().find(|line| !line.trim().is_empty()))
+            .unwrap_or("does not resolve");
+        return format!("{named} UNRESOLVABLE: {}", failure.trim());
+    }
+    match recorded {
+        Some(commit) if observed.commit.as_deref() != Some(commit) => {
+            format!("{named} (recorded {})", short_commit(commit))
+        }
+        _ => named,
+    }
+}
+
 fn slot_project_name(cell: &cairn_common::executor_protocol::PersistentCellState) -> String {
     if let Some(key) = cell
         .occupancy
@@ -3212,6 +3465,70 @@ fn refresh_duration(ms: u64) -> String {
     }
 }
 
+/// A fault in a repository every slot of a project shares. Only when there
+/// are any. It is the machine's fact, never a slot's, so it has a section of
+/// its own rather than a Quarantine line under some slot that happened to meet
+/// it first.
+fn render_repository_faults(
+    faults: &[cairn_common::executor_protocol::RepositoryFaultReport],
+    captured_at_unix_ms: u64,
+) -> String {
+    if faults.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n## Shared repository faults\n");
+    for fault in faults {
+        let met = match &fault.cell_id {
+            Some(cell_id) => format!("met by a claim on {cell_id}"),
+            None => "found by the storage sweep's ref audit".to_string(),
+        };
+        out.push_str(&format!(
+            "- `{}` ({met}, {}): {}. Every claim against this repository fails until it is repaired, and none quarantines a slot; refs under `refs/cairn/` the executor repairs itself, so what stands here is someone else's to fix.\n",
+            fault.repository,
+            age(captured_at_unix_ms.saturating_sub(fault.observed_at_unix_ms)),
+            fault.fault,
+        ));
+    }
+    out
+}
+
+/// The quarantines on disk by cause. A slot quarantined out of the pool leaves
+/// every per-slot listing on this page, so without this a machine holding
+/// hundreds of them, all from one cause, rendered nothing at all.
+fn render_quarantine_census(
+    census: Option<&cairn_common::executor_protocol::QuarantineCensus>,
+    captured_at_unix_ms: u64,
+) -> String {
+    let Some(census) = census.filter(|census| census.records > 0 || census.trees > 0) else {
+        return String::new();
+    };
+    let mut out = String::from("\n## Quarantines by cause\n");
+    out.push_str(&format!(
+        "- {} quarantine records on disk ({} quarantined trees), counted {}; each is held for the forensic window, then reclaimed\n",
+        census.records,
+        census.trees,
+        age(captured_at_unix_ms.saturating_sub(census.counted_at_unix_ms)),
+    ));
+    for cause in &census.causes {
+        out.push_str(&format!(
+            "- {} × {}: newest {} ({}): {}\n",
+            cause.count,
+            cause.cause,
+            age(captured_at_unix_ms.saturating_sub(cause.newest_at_unix_ms)),
+            cause.newest_cell_id,
+            cause.newest_reason,
+        ));
+    }
+    let listed = census.causes.iter().map(|cause| cause.count).sum::<u64>();
+    if listed < census.records {
+        out.push_str(&format!(
+            "- {} more under causes not listed\n",
+            census.records - listed
+        ));
+    }
+    out
+}
+
 fn age(ms: u64) -> String {
     if ms < 1_000 {
         return format!("{ms}ms ago");
@@ -3458,6 +3775,81 @@ fn render_containment(capabilities: &ExecutorCapabilities, colocated: bool) -> S
     out
 }
 
+/// Whether a macOS machine's check lanes can apply a nested Seatbelt profile,
+/// with the context that answer holds for.
+///
+/// Placement selects `requiresMacosNestedSandboxWrite` work on exactly this,
+/// so the page shows all of it: the result and its reason, the launcher, the
+/// credential floor and outer profile it was measured under, and the
+/// fingerprint whose movement re-runs the probe. A machine advertised capable
+/// while its lanes were refused, with nothing on this page to say so, is how
+/// cairn/5316 went unseen.
+///
+/// The age is reckoned on the executor's clock, from the beat that carried the
+/// measurement, so a skewed runner clock cannot make it read fresh.
+fn render_nested_sandbox(
+    capabilities: &ExecutorCapabilities,
+    beat_observed_at_unix_ms: u64,
+    heartbeat_age_ms: u64,
+) -> String {
+    use cairn_common::executor_protocol::SandboxLauncherClass;
+    if !capabilities.os.eq_ignore_ascii_case("macos") {
+        return String::new();
+    }
+    let Some(evidence) = &capabilities.sandbox else {
+        return "- Nested Seatbelt (check lanes): not reported by this executor, so it takes no work that requires it\n".to_string();
+    };
+    let Some(context) = &evidence.nested_sandbox_write_context else {
+        return format!(
+            "- Nested Seatbelt (check lanes): unverified — this executor measured from its own process, which no check lane runs in, so it takes no work that requires it until it updates (it reported {}: {})\n",
+            if evidence.nested_sandbox_write_available {
+                "available"
+            } else {
+                "unavailable"
+            },
+            evidence.nested_sandbox_write_detail
+        );
+    };
+    let short = |digest: &str| digest.chars().take(12).collect::<String>();
+    let mut out = format!(
+        "- Nested Seatbelt (check lanes): {} — {}\n",
+        if evidence.nested_sandbox_write_available {
+            "available"
+        } else {
+            "UNAVAILABLE"
+        },
+        evidence.nested_sandbox_write_detail
+    );
+    out.push_str(&format!(
+        "  - Measured {}: launcher {}; credential floor {}; outer profile {}\n",
+        age(beat_observed_at_unix_ms
+            .saturating_sub(context.measured_at_unix_ms)
+            .saturating_add(heartbeat_age_ms)),
+        match context.launcher {
+            SandboxLauncherClass::Unconfined => "unconfined (no inherited profile)",
+            SandboxLauncherClass::ConfinedDescendant =>
+                "confined descendant (the executor itself runs under an inherited profile)",
+            SandboxLauncherClass::Unknown => "unknown (sandbox-exec did not launch)",
+        },
+        context.credential_floor_sha256.as_deref().map_or_else(
+            || "not carried by check lanes".to_string(),
+            |digest| format!("carried by check lanes, rules sha256 {}", short(digest))
+        ),
+        context.outer_profile_sha256.as_deref().map_or_else(
+            || "none applied".to_string(),
+            |digest| format!("sha256 {}", short(digest))
+        ),
+    ));
+    out.push_str(&match &context.fingerprint {
+        Some(fingerprint) => format!(
+            "  - Fingerprint {}: the probe re-runs whenever it moves\n",
+            short(fingerprint)
+        ),
+        None => "  - No fingerprint: an input could not be read, so the probe re-runs on every refresh rather than reuse this\n".to_string(),
+    });
+    out
+}
+
 fn describe_disposition(disposition: &cairn_common::executor_protocol::EdgeDisposition) -> String {
     use cairn_common::executor_protocol::EdgeDisposition;
     match disposition {
@@ -3637,6 +4029,83 @@ mod storage_section_tests {
     }
 
     /// A total short by an unknown amount cannot support a subtraction.
+    #[test]
+    fn the_storage_section_names_the_build_root_present_absent_and_pending() {
+        use cairn_common::executor_protocol::{
+            BuildVolumeReport, BuildVolumeState, Measurement, SuspendedCellReport,
+        };
+        const TIB: u64 = 1024 * GIB;
+        let mut executor = tight_local();
+        let at = executor.captured_at_unix_ms;
+        executor.health.build_volume = Some(BuildVolumeReport {
+            root: "/Volumes/Builds/cairn".into(),
+            state: BuildVolumeState::Present {
+                mount_point: Some("/Volumes/Builds".into()),
+            },
+            since_unix_ms: at,
+            suspended_cells: Vec::new(),
+            readopted_cells: 2,
+        });
+        executor.health.machine.build_volume = Some(Measurement::measured(
+            at,
+            MachineVolume {
+                total_bytes: 36 * TIB / 10,
+                free_bytes: 32 * TIB / 10,
+            },
+        ));
+        let present = render_executor(&executor);
+        for expected in [
+            "- Build root: /Volumes/Builds/cairn — present on volume /Volumes/Builds: 3.2 TiB free of 3.6 TiB",
+            "2 held cells adopted again when it last returned",
+            "— the home: the runner, its database and the machine authority; every admission still needs its 2.0 GiB floor",
+        ] {
+            assert!(present.contains(expected), "{expected}\n{present}");
+        }
+
+        executor.health.build_volume = Some(BuildVolumeReport {
+            root: "/Volumes/Builds/cairn".into(),
+            state: BuildVolumeState::Absent {
+                reason: "the build volume is not mounted (marker not found)".into(),
+            },
+            since_unix_ms: at,
+            suspended_cells: (0..7)
+                .map(|index| SuspendedCellReport {
+                    project_id: "p".into(),
+                    cell_id: format!("slot-{index}"),
+                    holder: String::new(),
+                })
+                .collect(),
+            readopted_cells: 0,
+        });
+        executor.health.machine.build_volume = None;
+        let absent = render_executor(&executor);
+        assert!(
+            absent.contains("- Build root: /Volumes/Builds/cairn — ABSENT for "),
+            "{absent}"
+        );
+        assert!(
+            absent.contains("the build volume is not mounted (marker not found); this machine accepts no work that needs a cell until it returns; 7 cells suspended"),
+            "{absent}"
+        );
+        // While it is absent the home's volume carries the verdict again.
+        assert!(absent.contains("- Volume: "), "{absent}");
+
+        assert_eq!(
+            super::render_pending_build_root(
+                Some(std::path::Path::new("/Volumes/Builds/cairn")),
+                None
+            ),
+            "- Build root change pending: configured /Volumes/Builds/cairn, in effect the home until the runner restarts\n"
+        );
+        assert_eq!(
+            super::render_pending_build_root(
+                Some(std::path::Path::new("/Volumes/Builds/cairn")),
+                Some("/Volumes/Builds/cairn")
+            ),
+            ""
+        );
+    }
+
     #[test]
     fn partial_accounting_suppresses_the_not_cairns_inference() {
         let mut executor = tight_local();
@@ -4501,12 +4970,53 @@ mod tests {
     }
 
     #[test]
+    fn pool_slot_head_is_what_the_checkout_resolves_not_what_the_cell_recorded() {
+        use cairn_common::executor_protocol::ObservedCellHead;
+        let observed = |commit: &str, resolvable: bool, failure: Option<&str>| {
+            let mut cell = cached_slot();
+            cell.observed_head = Some(ObservedCellHead {
+                commit: Some(commit.into()),
+                resolvable,
+                observed_at_unix_ms: CAPTURED_AT,
+                failure: failure.map(str::to_string),
+            });
+            cell
+        };
+
+        assert_eq!(
+            render_cell_head(&observed("abcdef1234567890", true, None)),
+            "abcdef12"
+        );
+        assert_eq!(
+            render_cell_head(&observed("847f2d1d00000000", true, None)),
+            "847f2d1d (recorded abcdef12)"
+        );
+        assert_eq!(
+            render_cell_head(&observed(
+                "847f2d1d00000000",
+                false,
+                Some("verify cell HEAD commit: fatal: Needed a single revision\n"),
+            )),
+            "847f2d1d UNRESOLVABLE: verify cell HEAD commit: fatal: Needed a single revision"
+        );
+        let mut executor = inspection("local", true);
+        executor.occupancy.cells = vec![observed("847f2d1d00000000", false, None)];
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "slot-1: project CAIRN, head 847f2d1d UNRESOLVABLE: does not resolve, idle"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn pool_slot_rendering_shows_project_head_lifecycle_size_age_and_distance_without_private_identity(
     ) {
         let mut executor = inspection("local", true);
         executor.occupancy.cells = vec![cached_slot()];
         let rendered = render_executor(&executor);
-        assert!(rendered.contains("slot-1: project CAIRN, head abcdef12, idle, ~2.0 KiB estimate, last used 2m ago; last distance: unmeasured"), "{rendered}");
+        assert!(rendered.contains("slot-1: project CAIRN, head abcdef12 (recorded), idle, ~2.0 KiB estimate, last used 2m ago; last distance: unmeasured"), "{rendered}");
         for private in [
             "project-private-uuid",
             "executor-private-uuid",
@@ -4641,6 +5151,69 @@ mod tests {
         assert!(rendered.contains("every envelope is refused"), "{rendered}");
     }
 
+    /// The nested-Seatbelt answer placement uses is on the machine page with
+    /// its reason and the context it holds for, and an executor that measured
+    /// from its own process reads as unverified rather than capable.
+    #[test]
+    fn the_machine_page_shows_the_check_lane_nested_seatbelt_answer() {
+        use cairn_common::executor_protocol::{
+            NestedSandboxProbeContext, SandboxCapabilityEvidence, SandboxLauncherClass,
+        };
+        let mut executor = inspection("local", true);
+        executor.health.advertisement.capabilities.os = "macos".into();
+        executor.health.advertisement.observed_at_unix_ms = 1_000_000;
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("- Nested Seatbelt (check lanes): not reported by this executor"),
+            "{rendered}"
+        );
+
+        let mut evidence = SandboxCapabilityEvidence {
+            cairn_sandboxed_marker: false,
+            nested_sandbox_write_available: true,
+            nested_sandbox_write_detail:
+                "an in-bounds temp write succeeded under a nested Seatbelt profile".into(),
+            nested_sandbox_write_context: None,
+        };
+        executor.health.advertisement.capabilities.sandbox = Some(evidence.clone());
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("- Nested Seatbelt (check lanes): unverified — this executor measured from its own process"),
+            "{rendered}"
+        );
+
+        evidence.nested_sandbox_write_available = false;
+        evidence.nested_sandbox_write_detail = "outer profile inherited: a confined process cannot apply a second profile (this machine holds an operator credential, so its check-lane commands run under the operator credential floor)".into();
+        evidence.nested_sandbox_write_context = Some(NestedSandboxProbeContext {
+            launcher: SandboxLauncherClass::Unconfined,
+            credential_floor_sha256: Some("ab".repeat(32)),
+            outer_profile_sha256: Some("cd".repeat(32)),
+            fingerprint: Some("ef".repeat(32)),
+            measured_at_unix_ms: 1_000_000 - 116_000,
+        });
+        executor.health.advertisement.capabilities.sandbox = Some(evidence);
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("- Nested Seatbelt (check lanes): UNAVAILABLE — outer profile inherited: a confined process cannot apply a second profile"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  - Measured 2m ago: launcher unconfined (no inherited profile); credential floor carried by check lanes, rules sha256 abababababab; outer profile sha256 cdcdcdcdcdcd\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("  - Fingerprint efefefefefef: the probe re-runs whenever it moves\n"),
+            "{rendered}"
+        );
+
+        executor.health.advertisement.capabilities.os = "linux".into();
+        assert!(
+            !render_executor(&executor).contains("Nested Seatbelt"),
+            "the capability only gates macOS placement, so other machines omit it"
+        );
+    }
+
     pub(super) fn inspection(name: &str, colocated: bool) -> ExecutorInspection {
         let identity = ExecutorIdentity {
             device_id: "device-9f3c1a".into(),
@@ -4653,6 +5226,7 @@ mod tests {
             recent_placements: Vec::new(),
             colocated,
             health: ExecutorHealthSnapshot {
+                build_volume: None,
                 identity: identity.clone(),
                 public_name: name.into(),
                 colocated,
@@ -4697,11 +5271,14 @@ mod tests {
                 command_processes: Default::default(),
                 evicted_cells: Vec::new(),
                 busy_declined_cells: Vec::new(),
+                repository_faults: Vec::new(),
+                quarantines: None,
                 build_skew: None,
                 stopped_commands: Vec::new(),
             },
             executor_build_id: Some("build-abc".into()),
             last_update: None,
+            self_update: None,
             occupancy: FleetSnapshot::default(),
             slots: Vec::new(),
             captured_at_unix_ms: CAPTURED_AT,
@@ -6783,6 +7360,72 @@ mod tests {
         );
     }
 
+    /// bbs held 561 quarantines from one dangling ref and its page said
+    /// nothing. The census renders them as one cause with its count and its
+    /// newest instance, and the repository fault as the machine's, naming the
+    /// slot that met it.
+    #[test]
+    fn quarantines_render_by_cause_and_a_repository_fault_as_the_machines() {
+        use cairn_common::executor_protocol::{
+            QuarantineCauseReport, QuarantineCensus, RepositoryFaultReport,
+        };
+        let mut executor = inspection("bbs", false);
+        let rendered = render_executor(&executor);
+        assert!(!rendered.contains("## Quarantines by cause"), "{rendered}");
+        assert!(
+            !rendered.contains("## Shared repository faults"),
+            "{rendered}"
+        );
+
+        // Late enough that "an hour before the capture" is a time.
+        executor.captured_at_unix_ms = 10 * 3_600_000;
+        let at = executor.captured_at_unix_ms;
+        let reason =
+            "switch idle pool slot: fatal: bad object refs/cairn/rescued/slot-100/1792385741831";
+        executor.health.quarantines = Some(QuarantineCensus {
+            counted_at_unix_ms: at - 120_000,
+            records: 300,
+            trees: 298,
+            causes: vec![QuarantineCauseReport {
+                cause: "switch idle pool slot: fatal: bad object refs/cairn/rescued/slot-…/…"
+                    .into(),
+                count: 288,
+                newest_at_unix_ms: at - 3_600_000,
+                newest_cell_id: "slot-595".into(),
+                newest_project_id: "cairn".into(),
+                newest_reason: reason.into(),
+            }],
+        });
+        executor.health.repository_faults = vec![RepositoryFaultReport {
+            repository: "/home/bleu/.cairn-exec/managed-objects/e2e0/repository.git".into(),
+            fault: "shared repository is faulty: 1 refs name objects it does not hold (refs/heads/foreign -> 0001)".into(),
+            cell_id: Some("slot-601".into()),
+            observed_at_unix_ms: at - 60_000,
+        }];
+        let rendered = render_executor(&executor);
+        for expected in [
+            "## Quarantines by cause",
+            "- 300 quarantine records on disk (298 quarantined trees), counted 2m ago",
+            "- 288 × switch idle pool slot: fatal: bad object refs/cairn/rescued/slot-…/…: newest 1h ago (slot-595)",
+            "- 12 more under causes not listed",
+            "## Shared repository faults",
+            "(met by a claim on slot-601, 1m ago)",
+            "refs/heads/foreign",
+            "none quarantines a slot",
+        ] {
+            assert!(rendered.contains(expected), "missing {expected:?}:\n{rendered}");
+        }
+
+        // An older executor sends neither field, and the page says nothing.
+        let mut report = serde_json::to_value(&executor.health).unwrap();
+        let object = report.as_object_mut().unwrap();
+        object.remove("quarantines");
+        object.remove("repositoryFaults");
+        let decoded: cairn_common::executor_protocol::ExecutorHealthSnapshot =
+            serde_json::from_value(report).unwrap();
+        assert!(decoded.quarantines.is_none() && decoded.repository_faults.is_empty());
+    }
+
     /// A slot claims keep declining is still in the pool, so the page says so
     /// plainly, with the lock, its age, and its holder, or the diagnostic when
     /// no lock was named.
@@ -7188,6 +7831,77 @@ mod tests {
         assert!(rendered.contains("SKEWED"), "{rendered}");
         assert!(rendered.contains("build-old"), "{rendered}");
         assert!(rendered.contains("build-new"), "{rendered}");
+    }
+
+    fn self_updating(
+        phase: cairn_common::executor_protocol::SelfUpdatePhase,
+    ) -> ExecutorInspection {
+        let mut executor = inspection("bbs", false);
+        executor.executor_build_id = Some("build-0759".into());
+        executor.self_update = Some(cairn_common::executor_protocol::SelfUpdateStatus {
+            target: "x86_64-unknown-linux-gnu".into(),
+            runner_build_id: Some("build-1329".into()),
+            phase,
+        });
+        executor
+    }
+
+    /// "Is the fleet running the fix" is answered on the page, by the build
+    /// the runner serves beside the one the machine runs, and by where the
+    /// rolling update stands.
+    #[test]
+    fn the_page_names_the_served_build_and_the_rollout_state() {
+        use cairn_common::executor_protocol::SelfUpdatePhase;
+
+        let mut pending = self_updating(SelfUpdatePhase::Draining {
+            in_flight: 3,
+            since_unix_ms: CAPTURED_AT - 90_000,
+        });
+        pending.health.build_skew = Some(cairn_common::executor_protocol::BuildSkew {
+            runner_build_id: "build-1329".into(),
+            executor_build_id: "build-0759".into(),
+        });
+        let rendered = render_executor(&pending);
+        assert!(
+            rendered.contains("- Build: build-0759 — SKEWED from build-1329, the build the runner serves for x86_64-unknown-linux-gnu"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- Self-update: update pending: finishing 3 in flight"),
+            "{rendered}"
+        );
+
+        let mut current = self_updating(SelfUpdatePhase::Current);
+        current.executor_build_id = Some("build-1329".into());
+        let rendered = render_executor(&current);
+        assert!(
+            rendered.contains(
+                "- Build: build-1329, the build the runner serves for x86_64-unknown-linux-gnu"
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains("- Self-update: current\n"), "{rendered}");
+
+        let rendered = render_executor(&self_updating(SelfUpdatePhase::Waiting {
+            behind: Some("fedora".into()),
+        }));
+        assert!(
+            rendered.contains("waiting for fedora to finish updating"),
+            "{rendered}"
+        );
+
+        let rendered = render_executor(&self_updating(SelfUpdatePhase::Halted {
+            cause: "bgsrv-mac's update to build-1329 failed: rollback deadline".into(),
+        }));
+        assert!(
+            rendered.contains("- Self-update: update halted for build-1329: bgsrv-mac's update"),
+            "{rendered}"
+        );
+
+        // The colocated executor's binary is the runner's own; it carries no
+        // rollout line.
+        let rendered = render_executor(&inspection("local", true));
+        assert!(!rendered.contains("Self-update"), "{rendered}");
     }
 }
 

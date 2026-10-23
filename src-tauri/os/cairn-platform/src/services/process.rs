@@ -14,6 +14,8 @@ use std::os::unix::process::CommandExt;
 #[cfg(any(test, feature = "test-utils"))]
 use mockall::automock;
 
+use cairn_sandbox::Confinement;
+#[cfg(test)]
 use cairn_sandbox::SandboxPolicy;
 
 /// Configuration for spawning a process.
@@ -26,9 +28,9 @@ pub struct SpawnConfig {
     pub capture_stdout: bool,
     pub capture_stderr: bool,
     capture_stdin: bool,
-    /// OS-level filesystem confinement to apply to this spawn. `None` = run
-    /// unconfined (trusted agent, no run context, or platform without support).
-    pub sandbox: Option<SandboxPolicy>,
+    /// What this spawn is wrapped in. Defaults to `Unconfined`, Cairn's own
+    /// process; an agent spawn states `CredentialFloor` or `Fenced`.
+    pub confinement: Confinement,
     /// Environment variables to explicitly REMOVE from the inherited process env
     /// before spawn. Applied after the `env` overlay in `build_command`, so a
     /// removal is unconditional (it wins over both inheritance and the overlay).
@@ -48,14 +50,14 @@ impl SpawnConfig {
             capture_stdout: true,
             capture_stderr: true,
             capture_stdin: false,
-            sandbox: None,
+            confinement: Confinement::Unconfined,
             env_remove: Vec::new(),
         }
     }
 
-    /// Apply an OS-level filesystem sandbox to this spawn.
-    pub fn sandbox(mut self, policy: Option<SandboxPolicy>) -> Self {
-        self.sandbox = policy;
+    /// Say what this spawn is wrapped in.
+    pub fn confinement(mut self, confinement: Confinement) -> Self {
+        self.confinement = confinement;
         self
     }
 
@@ -190,10 +192,7 @@ pub struct RealProcessSpawner;
 /// landlock `pre_exec` hook is installed. The cwd and env are applied after so
 /// they take effect inside the wrapped invocation.
 fn build_command(config: &SpawnConfig) -> std::process::Command {
-    let (program, args) = match &config.sandbox {
-        Some(policy) => cairn_sandbox::wrap_argv(&config.program, &config.args, policy),
-        None => (config.program.clone(), config.args.clone()),
-    };
+    let (program, args) = config.confinement.wrap_argv(&config.program, &config.args);
 
     // Resolve against the PATH the child will actually carry, so an overlay
     // PATH (the agent shell's, with the Cairn bin dir first) picks the same
@@ -221,7 +220,7 @@ fn build_command(config: &SpawnConfig) -> std::process::Command {
         cmd.env_remove(key);
     }
 
-    if config.sandbox.is_some() {
+    if config.confinement.is_fenced() {
         // Mark fenced spawns so client tooling (e.g. the rustc cache wrapper)
         // never auto-starts a daemon that would inherit this confinement. Which
         // daemon a spawn may USE is a separate question, answered by the
@@ -230,9 +229,7 @@ fn build_command(config: &SpawnConfig) -> std::process::Command {
         cmd.env("CAIRN_SANDBOXED", "1");
     }
 
-    if let Some(policy) = &config.sandbox {
-        cairn_sandbox::install_pre_exec(&mut cmd, policy);
-    }
+    config.confinement.install_pre_exec(&mut cmd);
 
     cmd
 }
@@ -268,8 +265,7 @@ impl ProcessSpawner for RealProcessSpawner {
     fn run(&self, config: SpawnConfig) -> Result<CommandOutput, String> {
         let mut cmd = build_command(&config);
 
-        let output = cmd
-            .output()
+        let output = crate::process::observed_output(&mut cmd)
             .map_err(|e| format!("Failed to run command: {}", e))?;
 
         Ok(CommandOutput {
@@ -576,7 +572,7 @@ mod tests {
         };
         let cfg = SpawnConfig::new("/bin/bash")
             .args(["-c".to_string(), format!("echo x > {}", escape.display())])
-            .sandbox(Some(policy));
+            .confinement(Confinement::Fenced(policy));
         let out = RealProcessSpawner.run(cfg).unwrap();
         assert!(!out.success, "out-of-worktree write must be denied");
         assert!(!escape.exists(), "escape file must not be created");
@@ -603,7 +599,7 @@ mod tests {
         };
         let cfg = SpawnConfig::new("echo")
             .env("SCCACHE_SERVER_PORT", "4226")
-            .sandbox(Some(policy));
+            .confinement(Confinement::Fenced(policy));
         let confined = envs(&build_command(&cfg));
         assert_eq!(
             confined.get("CAIRN_SANDBOXED").map(String::as_str),

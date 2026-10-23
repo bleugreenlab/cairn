@@ -8,9 +8,10 @@ use std::collections::{HashMap, HashSet};
 use crate::config::slugify_resource_segment;
 use crate::db_records::{db_job_from_row, DbJob, JOB_COLUMNS};
 use crate::error::CairnError;
-use crate::models::{ExecutionSnapshot, Job, RecipeNode, Turn};
+use crate::models::{ExecutionSnapshot, Job, RecipeNode, RecipeSnapshot, Turn};
 use crate::storage::{DbError, LocalDb, RowExt};
-use cairn_db::turso::params;
+use cairn_db::sql::{placeholders, IN_LIST_CHUNK};
+use cairn_db::turso::{params, Connection, Value};
 use serde::Serialize;
 
 #[derive(Debug, Clone)]
@@ -319,83 +320,183 @@ pub(crate) async fn node_uri_segment_for_job(db: &LocalDb, job_id: &str) -> Opti
         .filter(|segment| !segment.is_empty())
 }
 
-#[derive(Serialize)]
+/// The tabs a job's view offers, and the one it opens on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JobTabs {
     available_tabs: Vec<String>,
     initial_tab: String,
+}
+
+impl JobTabs {
+    /// The tab rule. An artifact that feeds a single downstream action is
+    /// surfaced on that action's node rather than here, so such a job shows
+    /// chat alone, as does a job with no artifact. A running job opens on chat;
+    /// a settled one opens on its artifact when it shows one.
+    fn for_job(status: &str, has_artifact: bool, has_downstream_action: bool) -> Self {
+        let available_tabs = if has_downstream_action || !has_artifact {
+            vec!["chat".to_string()]
+        } else {
+            vec!["chat".to_string(), "artifact".to_string()]
+        };
+        let initial_tab = if status != "running" && available_tabs.len() > 1 {
+            "artifact"
+        } else {
+            "chat"
+        };
+        Self {
+            available_tabs,
+            initial_tab: initial_tab.to_string(),
+        }
+    }
+}
+
+/// What a job's DTO carries beyond its own row: its tabs and its execution's
+/// seq.
+struct JobView {
+    tabs: JobTabs,
+    exec_seq: Option<i32>,
+}
+
+/// Every fact the tab rule and the exec seq need for `n` jobs, in one
+/// statement.
+///
+/// It must never select `executions.snapshot`. A snapshot runs to hundreds of
+/// kilobytes, and reading it on every job of an issue cost seconds per job
+/// under load (cairn/5206); only the jobs with an artifact consult the recipe
+/// graph, through [`recipe_graphs_sql`].
+fn job_view_rows_sql(n: usize) -> String {
+    format!(
+        "SELECT j.id, j.status, j.recipe_node_id, j.execution_id, e.seq,
+                CASE WHEN EXISTS (SELECT 1 FROM artifacts a WHERE a.job_id = j.id)
+                     THEN 1 ELSE 0 END
+           FROM jobs j
+           LEFT JOIN executions e ON e.id = j.execution_id
+          WHERE j.id IN ({})",
+        placeholders(n)
+    )
+}
+
+/// The recipe graph of `n` executions, extracted in SQL. The graph averages a
+/// few kilobytes of a snapshot that averages well over a hundred, so the rest
+/// of the snapshot is neither returned nor parsed.
+fn recipe_graphs_sql(n: usize) -> String {
+    format!(
+        "SELECT id, json_extract(snapshot, '$.recipe')
+           FROM executions
+          WHERE id IN ({}) AND snapshot IS NOT NULL",
+        placeholders(n)
+    )
+}
+
+struct JobViewRow {
+    id: String,
+    status: String,
+    recipe_node_id: Option<String>,
+    execution_id: Option<String>,
+    exec_seq: Option<i32>,
+    has_artifact: bool,
+}
+
+/// The tabs and exec seq of each of `job_ids` that exists, in a fixed number
+/// of statements however many jobs an issue has: one per [`IN_LIST_CHUNK`]
+/// jobs, then one recipe-graph read per execution that one of them needs.
+async fn job_views_conn(
+    conn: &Connection,
+    job_ids: &[String],
+) -> Result<HashMap<String, JobView>, DbError> {
+    let mut job_rows = Vec::with_capacity(job_ids.len());
+    for chunk in job_ids.chunks(IN_LIST_CHUNK) {
+        let mut rows = conn
+            .query(&job_view_rows_sql(chunk.len()), bound_text(chunk))
+            .await?;
+        while let Some(row) = rows.next().await? {
+            job_rows.push(JobViewRow {
+                id: row.text(0)?,
+                status: row.text(1)?,
+                recipe_node_id: row.opt_text(2)?,
+                execution_id: row.opt_text(3)?,
+                exec_seq: row.opt_i64(4)?.map(|seq| seq as i32),
+                has_artifact: row.i64(5)? != 0,
+            });
+        }
+    }
+
+    // Only a job with an artifact can have that artifact surfaced on a
+    // downstream action, so only its execution's graph is read, once however
+    // many of the execution's jobs need it.
+    let mut graph_execution_ids: Vec<String> = job_rows
+        .iter()
+        .filter(|row| row.has_artifact && row.recipe_node_id.is_some())
+        .filter_map(|row| row.execution_id.clone())
+        .collect();
+    graph_execution_ids.sort();
+    graph_execution_ids.dedup();
+    let mut graphs = HashMap::<String, RecipeSnapshot>::new();
+    for chunk in graph_execution_ids.chunks(IN_LIST_CHUNK) {
+        let mut rows = conn
+            .query(&recipe_graphs_sql(chunk.len()), bound_text(chunk))
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let execution_id = row.text(0)?;
+            // A graph that does not parse reads as feeding no action, so the
+            // job keeps its own artifact tab.
+            if let Some(graph) = row
+                .opt_text(1)?
+                .and_then(|json| serde_json::from_str::<RecipeSnapshot>(&json).ok())
+            {
+                graphs.insert(execution_id, graph);
+            }
+        }
+    }
+
+    Ok(job_rows
+        .into_iter()
+        .map(|row| {
+            let graph = row.execution_id.as_ref().and_then(|id| graphs.get(id));
+            let has_downstream_action = match (row.recipe_node_id.as_deref(), graph) {
+                (Some(node_id), Some(graph)) if row.has_artifact => {
+                    has_single_downstream_action(graph, node_id)
+                }
+                _ => false,
+            };
+            let view = JobView {
+                tabs: JobTabs::for_job(&row.status, row.has_artifact, has_downstream_action),
+                exec_seq: row.exec_seq,
+            };
+            (row.id, view)
+        })
+        .collect())
+}
+
+fn bound_text(values: &[String]) -> Vec<Value> {
+    values
+        .iter()
+        .map(|value| Value::Text(value.clone()))
+        .collect()
+}
+
+async fn job_views(
+    db: &LocalDb,
+    job_ids: &[String],
+) -> Result<HashMap<String, JobView>, CairnError> {
+    let job_ids = job_ids.to_vec();
+    db.read(|conn| {
+        let job_ids = job_ids.clone();
+        Box::pin(async move { job_views_conn(conn, &job_ids).await })
+    })
+    .await
+    .map_err(CairnError::from)
 }
 
 pub async fn compute_tabs_for_jobs(
     db: &LocalDb,
     job_ids: &[String],
 ) -> Result<HashMap<String, JobTabs>, CairnError> {
-    let job_ids = job_ids.to_vec();
-    db.read(|conn| {
-        let job_ids = job_ids.clone();
-        Box::pin(async move {
-            let mut result = HashMap::new();
-
-            for job_id in job_ids {
-                let mut job_rows = conn
-                    .query(
-                        "SELECT j.status, j.recipe_node_id, e.snapshot
-                         FROM jobs j
-                         LEFT JOIN executions e ON j.execution_id = e.id
-                         WHERE j.id = ?1",
-                        params![job_id.as_str()],
-                    )
-                    .await?;
-                let Some(row) = job_rows.next().await? else {
-                    continue;
-                };
-                let status = row.text(0)?;
-                let recipe_node_id = row.opt_text(1)?;
-                let snapshot = row.opt_text(2)?;
-                drop(job_rows);
-
-                let mut artifact_rows = conn
-                    .query(
-                        "SELECT 1 FROM artifacts WHERE job_id = ?1 LIMIT 1",
-                        params![job_id.as_str()],
-                    )
-                    .await?;
-                let has_artifact = artifact_rows.next().await?.is_some();
-                drop(artifact_rows);
-
-                let has_downstream_action = match (recipe_node_id.as_deref(), snapshot.as_deref()) {
-                    (Some(node_id), Some(snapshot)) => {
-                        has_single_downstream_action(snapshot, node_id).unwrap_or(false)
-                    }
-                    _ => false,
-                };
-
-                let available_tabs = if has_downstream_action || !has_artifact {
-                    vec!["chat".to_string()]
-                } else {
-                    vec!["chat".to_string(), "artifact".to_string()]
-                };
-                let initial_tab = if status == "running" {
-                    "chat".to_string()
-                } else if available_tabs.iter().any(|tab| tab == "artifact") {
-                    "artifact".to_string()
-                } else {
-                    "chat".to_string()
-                };
-
-                result.insert(
-                    job_id,
-                    JobTabs {
-                        available_tabs,
-                        initial_tab,
-                    },
-                );
-            }
-
-            Ok(result)
-        })
-    })
-    .await
-    .map_err(CairnError::from)
+    Ok(job_views(db, job_ids)
+        .await?
+        .into_iter()
+        .map(|(id, view)| (id, view.tabs))
+        .collect())
 }
 
 pub async fn get_job(db: &LocalDb, job_id: &str) -> Result<Job, CairnError> {
@@ -476,25 +577,25 @@ async fn list_jobs_by_predicate(
         .await?;
 
     let ids: Vec<String> = db_jobs.iter().map(|job| job.id.clone()).collect();
-    let tabs = compute_tabs_for_jobs(db, &ids).await?;
-    let exec_seqs = exec_seqs_for_jobs(db, &db_jobs).await?;
+    let mut views = job_views(db, &ids).await?;
 
     db_jobs
         .into_iter()
         .map(|db_job| {
             let id = db_job.id.clone();
-            let execution_id = db_job.execution_id.clone();
             let mut job = Job::try_from(db_job).map_err(CairnError::Internal)?;
-            if let Some(job_tabs) = tabs.get(&id) {
-                job.available_tabs = job_tabs.available_tabs.clone();
-                job.initial_tab = job_tabs.initial_tab.clone();
-            }
-            if let Some(execution_id) = execution_id {
-                job.exec_seq = exec_seqs.get(&execution_id).copied();
+            if let Some(view) = views.remove(&id) {
+                apply_view(&mut job, view);
             }
             Ok(job)
         })
         .collect()
+}
+
+fn apply_view(job: &mut Job, view: JobView) {
+    job.available_tabs = view.tabs.available_tabs;
+    job.initial_tab = view.tabs.initial_tab;
+    job.exec_seq = view.exec_seq;
 }
 
 async fn load_job_by_predicate(
@@ -516,47 +617,13 @@ async fn load_job_by_predicate(
 }
 
 async fn apply_tabs_and_exec_seq(db: &LocalDb, job: &mut Job) -> Result<(), CairnError> {
-    let tabs = compute_tabs_for_jobs(db, std::slice::from_ref(&job.id)).await?;
-    if let Some(job_tabs) = tabs.get(&job.id) {
-        job.available_tabs = job_tabs.available_tabs.clone();
-        job.initial_tab = job_tabs.initial_tab.clone();
-    }
-    if let Some(execution_id) = job.execution_id.as_deref() {
-        job.exec_seq = exec_seq_for_execution(db, execution_id).await?;
+    if let Some(view) = job_views(db, std::slice::from_ref(&job.id))
+        .await?
+        .remove(&job.id)
+    {
+        apply_view(job, view);
     }
     Ok(())
-}
-
-async fn exec_seq_for_execution(
-    db: &LocalDb,
-    execution_id: &str,
-) -> Result<Option<i32>, CairnError> {
-    let execution_id = execution_id.to_string();
-    db.query_opt(
-        "SELECT seq FROM executions WHERE id = ?1",
-        params![execution_id.as_str()],
-        |row| row.opt_i64(0).map(|seq| seq.map(|value| value as i32)),
-    )
-    .await
-    .map(Option::flatten)
-    .map_err(CairnError::from)
-}
-
-async fn exec_seqs_for_jobs(
-    db: &LocalDb,
-    jobs: &[DbJob],
-) -> Result<HashMap<String, i32>, CairnError> {
-    let execution_ids: HashSet<String> = jobs
-        .iter()
-        .filter_map(|job| job.execution_id.clone())
-        .collect();
-    let mut result = HashMap::new();
-    for execution_id in execution_ids {
-        if let Some(seq) = exec_seq_for_execution(db, &execution_id).await? {
-            result.insert(execution_id, seq);
-        }
-    }
-    Ok(result)
 }
 
 // ============================================================================
@@ -1618,16 +1685,14 @@ fn node_name_from_snapshot(snapshot_json: &str, node_id: &str) -> Option<String>
     find_node_in_snapshot(&snapshot, node_id).map(|node| node.name.clone())
 }
 
-fn has_single_downstream_action(snapshot_json: &str, node_id: &str) -> Result<bool, CairnError> {
-    let snapshot: ExecutionSnapshot = serde_json::from_str(snapshot_json)?;
-    let node_map: HashMap<&str, &RecipeNode> = snapshot
-        .recipe
+/// Whether `node_id`'s only context edge feeds an action node.
+fn has_single_downstream_action(recipe: &RecipeSnapshot, node_id: &str) -> bool {
+    let node_map: HashMap<&str, &RecipeNode> = recipe
         .nodes
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect();
-    let target_node_ids: Vec<&str> = snapshot
-        .recipe
+    let target_node_ids: Vec<&str> = recipe
         .edges
         .iter()
         .filter(|edge| edge.edge_type.to_string() == "context" && edge.source_node_id == node_id)
@@ -1635,13 +1700,13 @@ fn has_single_downstream_action(snapshot_json: &str, node_id: &str) -> Result<bo
         .collect();
 
     if target_node_ids.len() != 1 {
-        return Ok(false);
+        return false;
     }
 
-    Ok(node_map
+    node_map
         .get(target_node_ids[0])
         .map(|node| node.node_type.to_string() == "action")
-        .unwrap_or(false))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1649,7 +1714,7 @@ mod tests {
     use super::{
         derive_node_activity, home_uri_for_job, issue_status_indicators, list_jobs_for_thread,
         mark_thread_viewed, node_status_indicators, published_thread_status_indicators,
-        thread_activity_rows, thread_unread_counts, thread_unread_rows_sql, NodeActivity,
+        thread_activity_rows, thread_unread_counts, thread_unread_rows_sql, JobTabs, NodeActivity,
         NodeStatusScope, ISSUE_STATUS_JOB_ROWS_SQL, ISSUE_STATUS_PR_ROWS_SQL,
         THREAD_STATUS_ROWS_SQL, UNREAD_COUNT_CAP,
     };
@@ -1739,6 +1804,146 @@ mod tests {
             .await
             .unwrap();
         db
+    }
+
+    #[test]
+    fn the_tab_rule() {
+        let tabs = |status, has_artifact, downstream| {
+            let tabs = JobTabs::for_job(status, has_artifact, downstream);
+            (tabs.available_tabs.join(","), tabs.initial_tab)
+        };
+        let chat = || ("chat".to_string(), "chat".to_string());
+        assert_eq!(tabs("complete", false, false), chat(), "no artifact");
+        assert_eq!(
+            tabs("complete", true, true),
+            chat(),
+            "an artifact feeding one action shows on that action"
+        );
+        assert_eq!(
+            tabs("complete", true, false),
+            ("chat,artifact".to_string(), "artifact".to_string())
+        );
+        assert_eq!(
+            tabs("running", true, false),
+            ("chat,artifact".to_string(), "chat".to_string()),
+            "a running job opens on chat"
+        );
+    }
+
+    /// A recipe where `builder` feeds `ship`, an action, through its only
+    /// context edge, and `planner` feeds `builder`, an agent.
+    const TAB_SNAPSHOT: &str = r#"{
+        "recipe": {
+            "id": "r", "name": "Recipe", "description": null, "trigger": "manual",
+            "nodes": [
+                {"id": "planner", "nodeType": "agent", "name": "Planner", "position": {"x": 0.0, "y": 0.0}},
+                {"id": "builder", "nodeType": "agent", "name": "Builder", "position": {"x": 1.0, "y": 0.0}},
+                {"id": "ship", "nodeType": "action", "name": "Ship", "position": {"x": 2.0, "y": 0.0}}
+            ],
+            "edges": [
+                {"id": "e1", "edgeType": "context", "sourceNodeId": "planner", "sourceHandle": "plan", "targetNodeId": "builder", "targetHandle": "plan"},
+                {"id": "e2", "edgeType": "context", "sourceNodeId": "builder", "sourceHandle": "out", "targetNodeId": "ship", "targetHandle": "in"}
+            ]
+        },
+        "agents": {}, "skills": {},
+        "triggerContext": {"issueId": "i", "projectId": "p", "triggerType": "manual"},
+        "createdAt": 1
+    }"#;
+
+    /// Several jobs of one issue sharing one execution, the shape every issue
+    /// route reads: one statement covers them all, the shared graph is read
+    /// once, and each job gets its own tabs and the execution's seq.
+    #[tokio::test]
+    async fn jobs_sharing_an_execution_get_their_tabs_and_seq_together() {
+        let db = test_db().await;
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p', 'default', 'P', 'p', '/tmp/p', 1, 1);
+             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+               VALUES('i', 'p', 1, 'I', 'active', 'active', 'none', 1, 1);",
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, snapshot, started_at, seq)
+             VALUES('e', 'r', 'i', 'p', 'running', ?1, 1, 7)",
+            params![TAB_SNAPSHOT],
+        )
+        .await
+        .unwrap();
+        db.execute_script(
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, recipe_node_id)
+               VALUES('j-plan', 'e', 'i', 'p', 'Planner', 'complete', 1, 1, 'planner');
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, recipe_node_id)
+               VALUES('j-build', 'e', 'i', 'p', 'Builder', 'complete', 2, 2, 'builder');
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, recipe_node_id)
+               VALUES('j-ship', 'e', 'i', 'p', 'Ship', 'running', 3, 3, 'ship');
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at)
+               VALUES('j-loose', NULL, 'i', 'p', 'Loose', 'complete', 4, 4);
+             INSERT INTO artifacts(id, job_id, artifact_type, data, created_at, updated_at)
+               VALUES('a-plan', 'j-plan', 'plan', '{}', 1, 1);
+             INSERT INTO artifacts(id, job_id, artifact_type, data, created_at, updated_at)
+               VALUES('a-build', 'j-build', 'create-pr', '{}', 2, 2);
+             INSERT INTO artifacts(id, job_id, artifact_type, data, created_at, updated_at)
+               VALUES('a-loose', 'j-loose', 'plan', '{}', 4, 4);",
+        )
+        .await
+        .unwrap();
+
+        let views = super::job_views(
+            &db,
+            &[
+                "j-plan".into(),
+                "j-build".into(),
+                "j-ship".into(),
+                "j-loose".into(),
+                "j-missing".into(),
+            ],
+        )
+        .await
+        .unwrap();
+        let tabs = |id: &str| {
+            let view = &views[id];
+            (
+                view.tabs.available_tabs.join(","),
+                view.tabs.initial_tab.clone(),
+                view.exec_seq,
+            )
+        };
+        assert_eq!(
+            tabs("j-plan"),
+            ("chat,artifact".into(), "artifact".into(), Some(7)),
+            "its artifact feeds an agent, so it shows here"
+        );
+        assert_eq!(
+            tabs("j-build"),
+            ("chat".into(), "chat".into(), Some(7)),
+            "its artifact feeds one action, so it shows there"
+        );
+        assert_eq!(tabs("j-ship"), ("chat".into(), "chat".into(), Some(7)));
+        assert_eq!(
+            tabs("j-loose"),
+            ("chat,artifact".into(), "artifact".into(), None),
+            "a job outside any execution has no seq and no graph"
+        );
+        assert!(!views.contains_key("j-missing"));
+
+        let job = super::get_job(&db, "j-build").await.unwrap();
+        assert_eq!(job.available_tabs, vec!["chat".to_string()]);
+        assert_eq!(job.exec_seq, Some(7));
+        let listed = super::list_jobs_for_issue(&db, "i").await.unwrap();
+        assert_eq!(listed.len(), 4);
+        assert!(listed
+            .iter()
+            .all(|job| job.id == "j-loose" || job.exec_seq == Some(7)));
+    }
+
+    /// The job statement must never read the snapshot column; the recipe graph
+    /// is extracted in SQL for the executions that need it.
+    #[test]
+    fn the_job_statement_never_reads_the_snapshot() {
+        assert!(!super::job_view_rows_sql(3).contains("snapshot"));
+        assert!(super::recipe_graphs_sql(1).contains("json_extract(snapshot, '$.recipe')"));
     }
 
     #[tokio::test]

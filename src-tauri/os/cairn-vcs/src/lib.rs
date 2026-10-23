@@ -7,6 +7,7 @@
 
 pub mod checkout;
 pub mod git;
+pub mod history;
 pub mod jj;
 pub mod parse_gate;
 
@@ -905,23 +906,8 @@ async fn merge_base_inner(
     let repo = load_repo_at_head(repository_path).await?;
     let left_id = resolve_symbol_at(&repo, left)?;
     let right_id = resolve_symbol_at(&repo, right)?;
-    let mut bases = repo
-        .index()
-        .common_ancestors(
-            std::slice::from_ref(&left_id),
-            std::slice::from_ref(&right_id),
-        )
-        .map_err(|error| CoordinateResolutionError::Repository(error.to_string()))?;
-    // jj's virtual root commit is the ancestor of every commit in the index, so
-    // genuinely unrelated histories "share" it. It is not a real Git object and
-    // cannot be diffed against; treat it as no fork point at all rather than
-    // handing a caller a coordinate that resolves nowhere.
-    let root = repo.store().root_commit_id().clone();
-    bases.retain(|id| *id != root);
-    bases.sort_by_key(|id| id.hex());
-    let base = bases
-        .into_iter()
-        .next()
+    let base = best_common_ancestor(&repo, &left_id, &right_id)
+        .map_err(CoordinateResolutionError::Repository)?
         .ok_or_else(|| CoordinateResolutionError::Absent {
             coordinate: format!("{right}...{left}"),
             diagnostic: "the two coordinates share no common ancestor".to_string(),
@@ -931,6 +917,31 @@ async fn merge_base_inner(
         right: right_id.hex(),
         base: base.hex(),
     })
+}
+
+/// The one fork-point rule every merge-base answer in this crate shares: the
+/// best common ancestor with the lowest hex id, or `None` when the two commits
+/// share only jj's virtual root.
+///
+/// Both ids must already be in the index; `common_ancestors` does not guard
+/// against an unknown id.
+pub(crate) fn best_common_ancestor(
+    repo: &ReadonlyRepo,
+    left: &CommitId,
+    right: &CommitId,
+) -> Result<Option<CommitId>, String> {
+    let mut bases = repo
+        .index()
+        .common_ancestors(std::slice::from_ref(left), std::slice::from_ref(right))
+        .map_err(|error| error.to_string())?;
+    // jj's virtual root commit is the ancestor of every commit in the index, so
+    // genuinely unrelated histories "share" it. It is not a real Git object and
+    // cannot be diffed against; treat it as no fork point at all rather than
+    // handing a caller a coordinate that resolves nowhere.
+    let root = repo.store().root_commit_id().clone();
+    bases.retain(|id| *id != root);
+    bases.sort_by_key(|id| id.hex());
+    Ok(bases.into_iter().next())
 }
 
 #[cfg(test)]

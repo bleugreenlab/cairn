@@ -44,9 +44,9 @@ async fn sweep_channel_surfaces(conn: &Connection, project_key: &str) -> Result<
 }
 
 #[derive(Debug, Clone)]
-struct KeyAddressedSpec {
-    table: &'static str,
-    sweep_where_sql: &'static str,
+pub(super) struct KeyAddressedSpec {
+    pub(super) table: &'static str,
+    pub(super) sweep_where_sql: &'static str,
 }
 
 /// Channel and Discord ledger rows that name a project by key, or by a
@@ -61,7 +61,7 @@ struct KeyAddressedSpec {
 /// its route from `self.local`.
 ///
 /// Each predicate binds `?1` to the canonical lowercase project key.
-const CHANNEL_KEY_ADDRESSED: &[KeyAddressedSpec] = &[
+pub(super) const CHANNEL_KEY_ADDRESSED: &[KeyAddressedSpec] = &[
     KeyAddressedSpec {
         table: "channel_state_card",
         sweep_where_sql: "project_key = ?1",
@@ -166,7 +166,7 @@ pub type MoveProjectResult<T> = Result<T, MoveProjectError>;
 /// manifest stays one table list with two consumers instead of becoming a second
 /// list that can drift out of agreement with the schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TableLineage {
+pub(super) enum TableLineage {
     /// Lives in whichever database owns the project row: the private database
     /// for a local project, the team replica for a team project.
     Shared,
@@ -176,7 +176,7 @@ enum TableLineage {
     Private,
 }
 
-fn table_lineage(table: &str) -> Result<TableLineage, DbError> {
+pub(super) fn table_lineage(table: &str) -> Result<TableLineage, DbError> {
     TABLE_SCOPES
         .iter()
         .find(|(name, _)| *name == table)
@@ -206,28 +206,31 @@ fn table_lineage(table: &str) -> Result<TableLineage, DbError> {
 /// bound into the delete. Naming the id set — rather than writing the subquery
 /// out — is what lets one predicate serve both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum OwnerSet {
+pub(super) enum OwnerSet {
     Threads,
     Jobs,
     Runs,
+    Sessions,
     Prompts,
     PermissionRequests,
 }
 
 impl OwnerSet {
-    const ALL: [OwnerSet; 5] = [
+    pub(super) const ALL: [OwnerSet; 6] = [
         OwnerSet::Threads,
         OwnerSet::Jobs,
         OwnerSet::Runs,
+        OwnerSet::Sessions,
         OwnerSet::Prompts,
         OwnerSet::PermissionRequests,
     ];
 
-    const fn table(self) -> &'static str {
+    pub(super) const fn table(self) -> &'static str {
         match self {
             OwnerSet::Threads => "threads",
             OwnerSet::Jobs => "jobs",
             OwnerSet::Runs => "runs",
+            OwnerSet::Sessions => "sessions",
             OwnerSet::Prompts => "prompts",
             OwnerSet::PermissionRequests => "permission_requests",
         }
@@ -236,7 +239,7 @@ impl OwnerSet {
     /// The manifest's own answer to "which of this table's rows belong to the
     /// project". Reusing the shared entry's predicate keeps the id sets and the
     /// shared sweep from ever disagreeing about what the project owns.
-    fn select_ids_sql(self) -> String {
+    pub(super) fn select_ids_sql(self) -> String {
         let spec = COPY_ORDER
             .iter()
             .find(|spec| spec.table == self.table())
@@ -254,7 +257,7 @@ const IDS_MARKER: &str = "{ids}";
 
 /// One OR'd term of a private entry's sweep predicate.
 #[derive(Debug, Clone, Copy)]
-struct OwnerClause {
+pub(super) struct OwnerClause {
     /// The id set this term addresses rows through, or `None` for a term that
     /// names the project directly and binds `?1`.
     owner: Option<OwnerSet>,
@@ -264,7 +267,7 @@ struct OwnerClause {
 
 /// How an entry selects the rows a project owns.
 #[derive(Debug, Clone, Copy)]
-enum SweepPredicate {
+pub(super) enum SweepPredicate {
     /// Binds `?1` = the project id and may subquery any table that lives in the
     /// same database as the entry itself.
     Direct(&'static str),
@@ -276,9 +279,9 @@ enum SweepPredicate {
 }
 
 #[derive(Debug, Clone)]
-struct TableCopySpec {
-    table: &'static str,
-    sweep: SweepPredicate,
+pub(super) struct TableCopySpec {
+    pub(super) table: &'static str,
+    pub(super) sweep: SweepPredicate,
     copy_where_sql: Option<&'static str>,
 }
 
@@ -290,11 +293,13 @@ struct DeferredReferenceUpdate {
     value: String,
 }
 
-// One ownership manifest serves both move-to-team and project deletion. Entries
-// are parent-before-child so copy can walk forward and deletion can walk in
+// One ownership manifest serves move-to-team, project deletion, and project
+// export (`super::export`, which reads each entry's sweep predicate as the
+// answer to "which of this table's rows does the project own"). Entries are
+// parent-before-child so copy can walk forward and deletion can walk in
 // reverse. Private-only tables have no copy predicate; mixed-scope tables may
 // copy a narrower replicated subset while sweeping every locally owned row.
-const COPY_ORDER: &[TableCopySpec] = &[
+pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("projects", "id = ?1"),
     delete_only("labels", "1 = 0"),
     spec("action_configs", "project_id = ?1"),
@@ -355,7 +360,12 @@ const COPY_ORDER: &[TableCopySpec] = &[
     // prompt or permission request and are swept through that owner.
     owned("channel_ask_resolution", &[owner(OwnerSet::Prompts, "action_ref IN {ids}"), owner(OwnerSet::PermissionRequests, "action_ref IN {ids}")]),
     owned("channel_ask_action", &[owner(OwnerSet::Prompts, "action_ref IN {ids}"), owner(OwnerSet::PermissionRequests, "action_ref IN {ids}")]),
-    spec("tool_invocations", "run_id IN (SELECT id FROM runs WHERE project_id = ?1) OR event_id IN (SELECT id FROM events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?1))"),
+    // `run_id` alone: both writers (the per-event seam and the run backfill in
+    // cairn-analytics) take it from the event's own run, so an `event_id`
+    // branch selects nothing more. It is not free to keep: Turso tests `IN
+    // (subquery)` membership by scanning the list, and the project's event ids
+    // are a list of hundreds of thousands checked once per invocation row.
+    spec("tool_invocations", "run_id IN (SELECT id FROM runs WHERE project_id = ?1)"),
     spec("tool_invocation_runs", "run_id IN (SELECT id FROM runs WHERE project_id = ?1)"),
     spec("token_rollup", "project_id = ?1 OR run_id IN (SELECT id FROM runs WHERE project_id = ?1) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("token_rollup_runs", "run_id IN (SELECT id FROM runs WHERE project_id = ?1)"),
@@ -390,6 +400,7 @@ const COPY_ORDER: &[TableCopySpec] = &[
     delete_only("check_result_observations", "project_id = ?1"),
     delete_only("check_test_results", "observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_observation_relabels", "project_id = ?1 OR observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
+    delete_only("check_deferred_tests", "observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_result_commit_aliases", "project_id = ?1 OR source_observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_result_cache", "project_id = ?1 OR source_observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("codemap_cache", "project_id = ?1"),
@@ -404,7 +415,7 @@ const COPY_ORDER: &[TableCopySpec] = &[
     delete_only("contended_identifier_obligations", "project_id = ?1"),
 ];
 
-const fn spec(table: &'static str, where_sql: &'static str) -> TableCopySpec {
+pub(super) const fn spec(table: &'static str, where_sql: &'static str) -> TableCopySpec {
     TableCopySpec {
         table,
         sweep: SweepPredicate::Direct(where_sql),
@@ -412,7 +423,10 @@ const fn spec(table: &'static str, where_sql: &'static str) -> TableCopySpec {
     }
 }
 
-const fn delete_only(table: &'static str, sweep_where_sql: &'static str) -> TableCopySpec {
+pub(super) const fn delete_only(
+    table: &'static str,
+    sweep_where_sql: &'static str,
+) -> TableCopySpec {
     TableCopySpec {
         table,
         sweep: SweepPredicate::Direct(sweep_where_sql),
@@ -422,7 +436,7 @@ const fn delete_only(table: &'static str, sweep_where_sql: &'static str) -> Tabl
 
 /// A private-lineage entry whose rows are addressed through shared-lineage id
 /// sets. Never copied: nothing in the private lineage is replicated.
-const fn owned(table: &'static str, clauses: &'static [OwnerClause]) -> TableCopySpec {
+pub(super) const fn owned(table: &'static str, clauses: &'static [OwnerClause]) -> TableCopySpec {
     TableCopySpec {
         table,
         sweep: SweepPredicate::Owned(clauses),
@@ -430,11 +444,16 @@ const fn owned(table: &'static str, clauses: &'static [OwnerClause]) -> TableCop
     }
 }
 
-const fn owner(set: OwnerSet, sql: &'static str) -> OwnerClause {
+pub(super) const fn owner(set: OwnerSet, sql: &'static str) -> OwnerClause {
     OwnerClause {
         owner: Some(set),
         sql,
     }
+}
+
+/// An owned entry's term that names the project directly, binding `?1`.
+pub(super) const fn direct(sql: &'static str) -> OwnerClause {
+    OwnerClause { owner: None, sql }
 }
 
 const fn split_scope(
@@ -450,53 +469,56 @@ const fn split_scope(
 }
 
 impl TableCopySpec {
-    fn lineage(&self) -> Result<TableLineage, DbError> {
+    pub(super) fn lineage(&self) -> Result<TableLineage, DbError> {
         table_lineage(self.table)
     }
 
     /// The `DELETE`s this private entry issues against the per-install database.
-    ///
-    /// One statement when the id sets are readable as subqueries; one statement
-    /// per clause per chunk of bound ids when they are not. Both expansions come
-    /// from the same clause list, so what the two paths delete cannot diverge.
     fn private_statements(
+        &self,
+        project_id: &str,
+        owner_ids: &OwnerIds,
+    ) -> Result<Vec<(String, Vec<Value>)>, DbError> {
+        Ok(self
+            .private_predicates(project_id, owner_ids)?
+            .into_iter()
+            .map(|(predicate, params)| {
+                (
+                    format!("DELETE FROM {} WHERE {predicate}", self.table),
+                    params,
+                )
+            })
+            .collect())
+    }
+
+    /// The `WHERE` predicates, with their bound values, that select this private
+    /// entry's project-owned rows in the per-install database.
+    ///
+    /// One predicate when the id sets are readable as subqueries; one predicate
+    /// per clause per chunk of bound ids when they are not, in which case a row
+    /// matching two clauses is selected by both. Both expansions come from the
+    /// same clause list, so what deletion and export address cannot diverge.
+    pub(super) fn private_predicates(
         &self,
         project_id: &str,
         owner_ids: &OwnerIds,
     ) -> Result<Vec<(String, Vec<Value>)>, DbError> {
         let project_bind = || vec![Value::Text(project_id.to_string())];
         let sets = match owner_ids {
-            OwnerIds::SameDatabase => {
-                return Ok(vec![(
-                    format!(
-                        "DELETE FROM {} WHERE {}",
-                        self.table,
-                        self.local_where_sql()
-                    ),
-                    project_bind(),
-                )])
-            }
+            OwnerIds::SameDatabase => return Ok(vec![(self.local_where_sql(), project_bind())]),
             OwnerIds::Materialized(sets) => sets,
         };
         let clauses = match self.sweep {
             // A private entry that names the project directly, or reaches its
             // rows only through other private tables, needs no translation: the
             // rows it subqueries are in this same database.
-            SweepPredicate::Direct(sql) => {
-                return Ok(vec![(
-                    format!("DELETE FROM {} WHERE {sql}", self.table),
-                    project_bind(),
-                )])
-            }
+            SweepPredicate::Direct(sql) => return Ok(vec![(sql.to_string(), project_bind())]),
             SweepPredicate::Owned(clauses) => clauses,
         };
         let mut statements = Vec::new();
         for clause in clauses {
             let Some(set) = clause.owner else {
-                statements.push((
-                    format!("DELETE FROM {} WHERE {}", self.table, clause.sql),
-                    project_bind(),
-                ));
+                statements.push((clause.sql.to_string(), project_bind()));
                 continue;
             };
             let ids = sets.get(&set).ok_or_else(|| {
@@ -512,11 +534,7 @@ impl TableCopySpec {
                     .collect::<Vec<_>>()
                     .join(", ");
                 statements.push((
-                    format!(
-                        "DELETE FROM {} WHERE {}",
-                        self.table,
-                        clause.sql.replace(IDS_MARKER, &format!("({placeholders})"))
-                    ),
+                    clause.sql.replace(IDS_MARKER, &format!("({placeholders})")),
                     chunk.iter().cloned().map(Value::Text).collect(),
                 ));
             }
@@ -526,7 +544,7 @@ impl TableCopySpec {
 
     /// The predicate to use when this entry's rows and every id set it addresses
     /// them through are in the same database.
-    fn local_where_sql(&self) -> String {
+    pub(super) fn local_where_sql(&self) -> String {
         match self.sweep {
             SweepPredicate::Direct(sql) => sql.to_string(),
             SweepPredicate::Owned(clauses) => clauses
@@ -1156,7 +1174,7 @@ async fn materialize_owner_ids(db: &LocalDb, project_id: &str) -> Result<OwnerId
 
 /// Where the sweep reads owner id sets from.
 #[derive(Debug, Clone)]
-enum OwnerIds {
+pub(super) enum OwnerIds {
     /// Both lineages are one database: address owned rows by subquery.
     SameDatabase,
     /// The shared lineage is a different database: its ids were read up front
@@ -1244,7 +1262,7 @@ async fn sweep_shared_half(conn: &Connection, project_id: &str) -> Result<(), Db
 }
 
 #[cfg(all(test, feature = "test-utils"))]
-mod tests {
+pub(super) mod tests {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -1273,7 +1291,10 @@ mod tests {
         }
     }
 
-    async fn migrated_db(name: &str, migrations: Vec<crate::storage::Migration>) -> LocalDb {
+    pub(in crate::projects) async fn migrated_db(
+        name: &str,
+        migrations: Vec<crate::storage::Migration>,
+    ) -> LocalDb {
         let temp = tempdir().unwrap();
         let path = temp.keep().join(name);
         let db = LocalDb::open(path).await.unwrap();
@@ -1427,7 +1448,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn seed_complete_project_graph(db: &LocalDb) {
+    pub(in crate::projects) async fn seed_complete_project_graph(db: &LocalDb) {
         db.execute_batch(
             r#"
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws-delete', 'Delete', 1, 1);
@@ -1463,6 +1484,8 @@ mod tests {
               VALUES ('observation-delete', 'project-delete', 'commit', 'tree', 'check', 'input', 'env', 0, 'passed', 1, 1, 1, 1, 1, 1, 'write', 'ok');
             INSERT INTO check_test_results(observation_id, test_id, status, flaky)
               VALUES ('observation-delete', 'test', 'passed', 0);
+            INSERT INTO check_deferred_tests(observation_id, test_id, duration_ms)
+              VALUES ('observation-delete', 'slow-test', 1001);
             INSERT INTO check_result_commit_aliases(project_id, commit_sha, check_name, environment_fingerprint, result_schema_version, source_observation_id, tree_hash, input_hash, disposition, evaluated_at)
               VALUES ('project-delete', 'commit', 'check', 'env', 1, 'observation-delete', 'tree', 'input', 'fresh', 1);
             INSERT INTO check_result_cache(project_id, tree_hash, input_hash, check_name, source_observation_id, exit_code, passed, output_tail, duration_ms, ran_at)
@@ -1547,6 +1570,7 @@ mod tests {
         }
         for table in [
             "check_test_results",
+            "check_deferred_tests",
             "codex_watchdog_leases",
             "codex_watchdog_lifecycle",
             "comments",

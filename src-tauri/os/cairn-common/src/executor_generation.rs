@@ -9,17 +9,13 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::executor_paths::{machine_authority_dir, ExecutorPaths};
 use crate::executor_protocol::{ExecutorGenerationHolder, PersistentCellState};
 use crate::kernel_lock::{read_lock_holder, try_lock_exclusive, unix_time_ms};
 
 /// Where the generation lock lives in a Cairn home.
 pub fn executor_generation_lock_path(cairn_home: &Path) -> PathBuf {
-    executor_authority_dir(cairn_home).join("cairn-executor-generation.lock")
-}
-
-/// The directory holding the executor's home-wide authority files.
-pub fn executor_authority_dir(cairn_home: &Path) -> PathBuf {
-    cairn_home.join("build-slots").join(".authority")
+    machine_authority_dir(cairn_home).join("cairn-executor-generation.lock")
 }
 
 /// Which live process holds this Cairn home's executor generation, without
@@ -71,20 +67,11 @@ pub const CELL_STATE_FILE_NAME: &str = "cairn-build-slot-state.json";
 /// The kernel lock an executor holds on each cell it manages.
 pub const CELL_LOCK_FILE_NAME: &str = "cairn-build-slot.lock";
 
-/// Every build cell authority directory in a Cairn home: the home-wide ones and
-/// each project's.
-pub fn cell_authority_dirs(cairn_home: &Path) -> Vec<PathBuf> {
-    let root = cairn_home.join("build-slots");
-    let mut roots = vec![root.join(".authority")];
-    if let Ok(projects) = std::fs::read_dir(&root) {
-        roots.extend(
-            projects
-                .flatten()
-                .filter(|entry| entry.path().is_dir() && entry.file_name() != ".authority")
-                .map(|entry| entry.path().join(".authority")),
-        );
-    }
-    roots
+/// Every build cell authority directory an executor's layout holds: the
+/// machine-wide ones and each project's.
+pub fn cell_authority_dirs(paths: &ExecutorPaths) -> Vec<PathBuf> {
+    paths
+        .cell_authority_roots()
         .into_iter()
         .filter_map(|root| std::fs::read_dir(root).ok())
         .flat_map(|entries| entries.flatten().map(|entry| entry.path()))
@@ -94,8 +81,8 @@ pub fn cell_authority_dirs(cairn_home: &Path) -> Vec<PathBuf> {
 
 /// Cell authorities whose kernel lock some live process still holds. Probed
 /// without keeping any: each attempt is released at once.
-pub fn held_cell_authorities(cairn_home: &Path) -> Vec<PathBuf> {
-    cell_authority_dirs(cairn_home)
+pub fn held_cell_authorities(paths: &ExecutorPaths) -> Vec<PathBuf> {
+    cell_authority_dirs(paths)
         .into_iter()
         .filter(|authority| {
             std::fs::OpenOptions::new()
@@ -273,7 +260,7 @@ pub fn cell_workload(
     workload
 }
 
-/// The workload recorded across a Cairn home, and the cells whose record could
+/// The workload recorded across an executor's cells, and the cells whose record could
 /// not be read.
 #[derive(Debug, Default)]
 pub struct RecordedWorkload {
@@ -283,7 +270,7 @@ pub struct RecordedWorkload {
     pub unreadable: Vec<(PathBuf, String)>,
 }
 
-/// Every live-recorded workload process in a Cairn home, read from the cell
+/// Every live-recorded workload process in an executor's cells, read from the cell
 /// state the executor persists.
 ///
 /// Executors launch resident processes and command batches into process groups
@@ -292,9 +279,9 @@ pub struct RecordedWorkload {
 /// that launched them finds them: by the identities that executor recorded,
 /// each of which still has to be checked against the kernel before anything
 /// acts on it.
-pub fn recorded_workload(cairn_home: &Path) -> RecordedWorkload {
+pub fn recorded_workload(paths: &ExecutorPaths) -> RecordedWorkload {
     let mut workload = RecordedWorkload::default();
-    for authority in cell_authority_dirs(cairn_home) {
+    for authority in cell_authority_dirs(paths) {
         match read_cell_state(&authority) {
             CellStateRead::Absent => {}
             CellStateRead::Unreadable(error) => workload.unreadable.push((authority, error)),
@@ -421,7 +408,7 @@ mod tests {
     #[test]
     fn the_recorded_workload_is_every_verifiable_identity_in_the_cell() {
         let (home, authority) = home_with(&fixture("active"));
-        let workload = recorded_workload(home.path());
+        let workload = recorded_workload(&ExecutorPaths::new(home.path()));
         assert!(workload.unreadable.is_empty(), "{:?}", workload.unreadable);
         let mut found: Vec<_> = workload
             .processes
@@ -453,7 +440,7 @@ mod tests {
     #[test]
     fn a_cell_an_older_executor_wrote_is_still_read() {
         let (home, _) = home_with(&fixture("running"));
-        let workload = recorded_workload(home.path());
+        let workload = recorded_workload(&ExecutorPaths::new(home.path()));
         assert!(workload.unreadable.is_empty(), "{:?}", workload.unreadable);
         assert_eq!(workload.processes.len(), 4);
     }
@@ -476,7 +463,7 @@ mod tests {
                 "parent": {"kind": "leader"},
             }));
         let (home, _) = home_with(&state);
-        let workload = recorded_workload(home.path());
+        let workload = recorded_workload(&ExecutorPaths::new(home.path()));
         assert!(workload.unreadable.is_empty(), "{:?}", workload.unreadable);
         let pids: Vec<_> = workload
             .processes
@@ -497,7 +484,7 @@ mod tests {
     fn an_undecodable_cell_is_reported_unknown_not_empty() {
         let (home, authority) = home_with(&fixture("active"));
         std::fs::write(authority.join(CELL_STATE_FILE_NAME), b"{\"lifecycle\":").unwrap();
-        let workload = recorded_workload(home.path());
+        let workload = recorded_workload(&ExecutorPaths::new(home.path()));
         assert!(workload.processes.is_empty());
         assert_eq!(workload.unreadable.len(), 1);
         assert_eq!(workload.unreadable[0].0, authority);

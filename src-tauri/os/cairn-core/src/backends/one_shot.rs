@@ -73,11 +73,6 @@ pub(crate) fn instructions(request: &CompletionRequest) -> String {
         .unwrap_or_else(|| TOOL_FREE_INSTRUCTIONS.to_string())
 }
 
-/// The preset options a response carries, as a session would read them.
-pub(crate) fn runtime_extras(request: &CompletionRequest) -> crate::models::RuntimeExtras {
-    serde_json::from_value(request.extras.clone()).unwrap_or_default()
-}
-
 pub(crate) fn map_open_error(error: SessionError) -> CompletionError {
     CompletionError::Upstream(error.to_string())
 }
@@ -102,7 +97,7 @@ mod tests {
             messages: Vec::new(),
             model: "m".into(),
             project_id: None,
-            extras: serde_json::Value::Null,
+            options: Default::default(),
             output_schema: None,
             timeout: Duration::from_secs(secs),
         };

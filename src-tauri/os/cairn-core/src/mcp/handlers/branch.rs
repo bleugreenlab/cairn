@@ -371,6 +371,38 @@ pub(crate) async fn resolve_current_for_read(
     })
 }
 
+/// The calling run's project and the branch its job's work merges into
+/// (`jobs.base_branch`: the parent issue's branch for a stacked child), or
+/// `None` when the job records none and so merges into the project default.
+/// The same coordinate node `/diff` measures a branch against.
+pub(crate) async fn current_base_branch(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+) -> Result<(String, Option<String>), String> {
+    let (run, db) = super::run_context::lookup_run_routed(&orch.db, request).await?;
+    let job_id = run.job_id.clone();
+    let base = db
+        .read(move |conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT base_branch FROM jobs WHERE id = ?1 LIMIT 1",
+                        params![job_id],
+                    )
+                    .await?;
+                Ok::<_, crate::storage::DbError>(match rows.next().await? {
+                    Some(row) => row.opt_text(0)?,
+                    None => None,
+                })
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .filter(|base| !base.trim().is_empty());
+    Ok((run.project_id, base))
+}
+
 /// Map a failure to resolve the run's OWN coordinate.
 ///
 /// When that coordinate is the branch this job minted and it is simply absent,
@@ -663,22 +695,67 @@ pub(crate) async fn resolve_for_read(
     branch: &str,
 ) -> Result<BranchResolution, String> {
     let (project, rev) = match resolve_node_uri(orch, branch).await? {
-        Some(job) => {
-            let rev = job
-                .branch
-                .ok_or_else(|| format!("Node URI '{branch}' has no recorded branch"))?;
-            (project_context_by_id(orch, &job.project_id).await?, rev)
-        }
+        Some(job) => node_read_target(orch, branch, job).await?,
         None => {
             let project = project_context_for_request(orch, request).await?;
-            let rev = if branch.trim() == "main" {
-                project.default_branch.clone()
-            } else {
-                branch.trim().to_string()
-            };
+            let rev = raw_read_rev(branch, &project);
             (project, rev)
         }
     };
+    resolve_read_in_project(orch, project, rev, branch).await
+}
+
+/// [`resolve_for_read`] for a surface addressed by project URI: a raw ref
+/// resolves in `project_id` whoever asks (a read with no run, such as the
+/// desktop's own, included), and a node URI must name a node of that project.
+pub(crate) async fn resolve_for_project_read(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+) -> Result<BranchResolution, String> {
+    let (project, rev) = match resolve_node_uri(orch, branch).await? {
+        Some(job) => node_read_target(orch, branch, job).await?,
+        None => {
+            let project = project_context_by_id(orch, project_id).await?;
+            let rev = raw_read_rev(branch, &project);
+            (project, rev)
+        }
+    };
+    if project.project_id != project_id {
+        return Err(format!(
+            "'{branch}' names a node in a different project; refusing to substitute its branch"
+        ));
+    }
+    resolve_read_in_project(orch, project, rev, branch).await
+}
+
+async fn node_read_target(
+    orch: &Orchestrator,
+    branch: &str,
+    job: JobBranchContext,
+) -> Result<(ProjectBranchContext, String), String> {
+    let rev = job
+        .branch
+        .ok_or_else(|| format!("Node URI '{branch}' has no recorded branch"))?;
+    Ok((project_context_by_id(orch, &job.project_id).await?, rev))
+}
+
+/// A raw ref as the store resolves it: `main` is the project's default branch
+/// whatever that is named; anything else is passed through.
+fn raw_read_rev(branch: &str, project: &ProjectBranchContext) -> String {
+    if branch.trim() == "main" {
+        project.default_branch.clone()
+    } else {
+        branch.trim().to_string()
+    }
+}
+
+async fn resolve_read_in_project(
+    orch: &Orchestrator,
+    project: ProjectBranchContext,
+    rev: String,
+    branch: &str,
+) -> Result<BranchResolution, String> {
     let project_path = project
         .project_path
         .ok_or_else(|| format!("project '{}' has no local repository", project.project_id))?;

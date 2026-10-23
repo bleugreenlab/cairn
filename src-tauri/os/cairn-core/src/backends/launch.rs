@@ -202,7 +202,7 @@ mod tests {
             }],
             model: model.to_string(),
             project_id: None,
-            extras: serde_json::Value::Null,
+            options: Default::default(),
             output_schema: None,
             timeout: std::time::Duration::from_secs(5),
         }

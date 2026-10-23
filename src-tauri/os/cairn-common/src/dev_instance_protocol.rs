@@ -481,6 +481,7 @@ mod tests {
                 sandbox: None,
                 containment: None,
                 stop: None,
+                cell_origin: None,
             },
             mutation_delta: None,
             sandbox_denials: vec![],

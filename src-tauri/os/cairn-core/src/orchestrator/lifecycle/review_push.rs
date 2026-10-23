@@ -734,6 +734,16 @@ pub async fn rearm_one_bounded_failed_review(orch: &Orchestrator) -> bool {
 /// dispatches at most one wave per tick.
 pub(super) const DORMANT_INFRA_RETRY_COOLDOWN_SECONDS: i64 = 5 * 60;
 
+/// Zero the cooled counters a dormant wave is bounded by, so the wave it is
+/// about to receive may execute.
+///
+/// Fleet-domain counters are never released here. Time cannot repair "no
+/// machine the fleet has can take this"; the one repair that can (a matching
+/// machine attaching, enrolling, or changing what it advertises) moves the
+/// fleet's capability identity, which mints a fresh scope at zero on its own.
+/// Releasing a fleet counter on a timer only bought three more executions of a
+/// lane that had nowhere to run, every cooldown, for as long as the fleet
+/// stayed as it was (cairn/4983).
 pub(super) async fn release_cooled_infrastructure_suppression(
     orch: &Orchestrator,
     job_id: &str,
@@ -747,11 +757,13 @@ pub(super) async fn release_cooled_infrastructure_suppression(
           WHERE job_id = ?1
             AND failure_kind IN ('capacity', 'infrastructure')
             AND infra_failure_streak >= ?2
-            AND ran_at <= (unixepoch() - ?3) * 1000",
+            AND ran_at <= (unixepoch() - ?3) * 1000
+            AND environment_fingerprint NOT LIKE ?4",
         (
             job_id,
             crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
             DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,
+            format!("{}%", crate::execution::cache::INFRA_FLEET_SCOPE_PREFIX),
         ),
     )
     .await
@@ -763,6 +775,7 @@ pub(super) async fn release_cooled_infrastructure_suppression(
 pub(super) struct BoundedRearmCandidate {
     pub(super) job_id: String,
     pub(super) tree_hash: String,
+    pub(super) input_hash: String,
     pub(super) ran_at: i64,
     pub(super) check_name: String,
     pub(super) failure_kind: String,
@@ -869,7 +882,7 @@ pub(super) const BOUNDED_REARM_CANDIDATES_SQL: &str = "WITH live_job AS (
                       latest AS (
                         SELECT lj.job_id AS job_id, lj.issue_id AS issue_id,
                                lj.branch AS branch, c.tree_hash AS tree_hash,
-                               c.check_name AS check_name,
+                               c.input_hash AS input_hash, c.check_name AS check_name,
                                c.ran_at AS ran_at, c.failure_kind AS failure_kind,
                                c.infra_failure_streak AS infra_failure_streak,
                                ROW_NUMBER() OVER (
@@ -879,7 +892,7 @@ pub(super) const BOUNDED_REARM_CANDIDATES_SQL: &str = "WITH live_job AS (
                           FROM live_job lj
                          CROSS JOIN check_result_cache c ON c.job_id = lj.job_id
                       )
-                      SELECT job_id, tree_hash, ran_at, check_name, failure_kind
+                      SELECT job_id, tree_hash, input_hash, ran_at, check_name, failure_kind
                         FROM latest
                        WHERE recency = 1
                          AND failure_kind IN ('capacity', 'infrastructure', 'not_placeable')
@@ -933,9 +946,10 @@ async fn bounded_rearm_candidates_in_db(
                 candidates.push(BoundedRearmCandidate {
                     job_id: row.text(0)?,
                     tree_hash: row.text(1)?,
-                    ran_at: row.i64(2)?,
-                    check_name: row.text(3)?,
-                    failure_kind: row.text(4)?,
+                    input_hash: row.text(2)?,
+                    ran_at: row.i64(3)?,
+                    check_name: row.text(4)?,
+                    failure_kind: row.text(5)?,
                 });
             }
             Ok::<_, DbError>(candidates)
@@ -946,14 +960,17 @@ async fn bounded_rearm_candidates_in_db(
 }
 
 /// Whether a dormant candidate is worth a wave now: its row still describes the
-/// branch's current tree, and, for a lane recorded as not placeable, a machine
-/// that could take it has since attached or enrolled.
+/// branch's current tree, and the wave it would receive could execute the check.
 ///
-/// The second half is the recovery edge for not-placeable lanes. Nothing about
-/// a machine attaching schedules a wave for a PR whose agent has gone quiet, so
-/// this cadence asks the fleet on its behalf, using the check's definition at
-/// that same commit. Until the answer changes the candidate is passed over,
-/// which costs a config read and no wave.
+/// For a lane recorded as not placeable, that means a machine that could take
+/// it has since attached or enrolled. For a substrate failure, it means the
+/// release this cadence performs would leave the check unsuppressed, asked the
+/// way the wave itself asks it (see [`rearm_would_free`]).
+///
+/// Both are recovery edges. Nothing about a machine attaching schedules a wave
+/// for a PR whose agent has gone quiet, so this cadence asks the fleet on its
+/// behalf, using the check's definition at that same commit. Until the answer
+/// changes the candidate is passed over, which costs a config read and no wave.
 pub(super) async fn bounded_candidate_is_due(
     orch: &Orchestrator,
     candidate: &BoundedRearmCandidate,
@@ -998,29 +1015,93 @@ pub(super) async fn bounded_candidate_is_due(
     if current_tree != candidate.tree_hash {
         return Ok(false);
     }
-    if candidate.failure_kind != crate::execution::checks::CheckFailureKind::NotPlaceable.as_str() {
-        return Ok(true);
-    }
     // Read from the project repository, as the turn-end wave reads it: the
     // managed store is not a git object database of its own.
-    let Some(loaded) =
-        crate::execution::checks::load_checks_contract_at_commit(&repo_root, &sealed_commit).await
-    else {
-        return Ok(false);
-    };
-    // A check the commit no longer declares has nothing for a wave to run.
-    Ok(loaded
-        .contract
-        .checks
-        .get(&candidate.check_name)
-        .is_some_and(|check| {
+    let loaded =
+        crate::execution::checks::load_checks_contract_at_commit(&repo_root, &sealed_commit).await;
+    let check = loaded
+        .as_ref()
+        .and_then(|loaded| loaded.contract.checks.get(&candidate.check_name));
+    if candidate.failure_kind == crate::execution::checks::CheckFailureKind::NotPlaceable.as_str() {
+        // A check the commit no longer declares has nothing for a wave to run.
+        return Ok(check.is_some_and(|check| {
             orch.fleet
                 .unplaceable_reason(
                     check.executor.as_ref(),
                     &crate::execution::check_identity::verdict_platforms(check),
                 )
                 .is_none()
-        }))
+        }));
+    }
+    // Without a definition there is no placement question, so no fleet or
+    // machine counter can be named; the head counter the SQL already cooled is
+    // the only one left, and the wave decides the rest.
+    let Some(check) = check else {
+        return Ok(true);
+    };
+    let scopes = crate::execution::checks_turn_end::review_infra_scopes(
+        orch,
+        &coords.project_id,
+        &candidate.job_id,
+        &sealed_commit,
+        &coords.repository_path,
+        &[crate::execution::checks_turn_end::review_check_placement_question(Some(check))],
+    )
+    .await
+    .pop()
+    .expect("one scope set per placement question");
+    let bounded = {
+        let project_id = coords.project_id.clone();
+        let check_name = candidate.check_name.clone();
+        let input_hash = candidate.input_hash.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::execution::cache::get_suppressed_check_result(
+                db,
+                &project_id,
+                &check_name,
+                &input_hash,
+                &scopes,
+            )
+        })
+        .await
+        .map_err(|error| format!("bounded re-arm suppression read task failed: {error}"))??
+    };
+    Ok(rearm_would_free(
+        bounded.as_ref(),
+        chrono::Utc::now().timestamp_millis(),
+    ))
+}
+
+/// Whether [`release_cooled_infrastructure_suppression`] would leave a check
+/// free to execute, given the suppression the wave would read for it now.
+///
+/// This is the question the re-arm has to answer from the bounding rows rather
+/// than from the job's newest row. A suppressed wave re-stamps a head-scoped
+/// row at streak zero (see `record_suppressed_check`), and that row becomes the
+/// newest one, so the candidate statement's `streak < bound` arm nominates the
+/// job on every tick while the counter that actually bounds it sits in another
+/// scope. Re-arming on that basis spends a wave every tick to re-stamp the same
+/// refusal.
+///
+/// A fleet-domain bound is never freed by the release, so it is never due; it
+/// becomes due when the fleet's capability identity moves and the bounding
+/// scope is no longer the one the wave reads. Any other bound is freed only
+/// once every row bounding it has cooled.
+pub(super) fn rearm_would_free(
+    bounded: Option<&crate::execution::cache::SuppressedCheck>,
+    now_unix_ms: i64,
+) -> bool {
+    let Some(bounded) = bounded else {
+        return true;
+    };
+    if bounded.domain == crate::execution::cache::InfraRepairDomain::Fleet {
+        return false;
+    }
+    let cooled_at = now_unix_ms - DORMANT_INFRA_RETRY_COOLDOWN_SECONDS * 1000;
+    bounded
+        .scopes
+        .iter()
+        .all(|scope| scope.entry.ran_at <= cooled_at)
 }
 
 /// Jobs eligible for the startup review-checks re-arm, as `(job_id, issue_id)`:

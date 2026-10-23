@@ -112,7 +112,6 @@ fn a_recorded_codex_turn_classifies_in_order_and_ends_exactly_once() {
             Notification::ReasoningDelta { .. } => "ReasoningDelta",
             Notification::ItemStarted { .. } => "ItemStarted",
             Notification::ItemCompleted { .. } => "ItemCompleted",
-            Notification::RawResponseItemCompleted { .. } => "RawResponseItemCompleted",
             Notification::TurnCompleted { .. } => "TurnCompleted",
             Notification::TurnAborted { .. } => "TurnAborted",
             Notification::Error { .. } => "Error",

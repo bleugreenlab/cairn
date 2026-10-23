@@ -18,8 +18,10 @@ pub const MCP_SECRET_FILE: &str = "mcp_auth_secret";
 ///
 /// This one is a capability: presenting it to `/api/invoke` is what lets an
 /// answer to an authority prompt mint an authority grant. It is never placed in
-/// an agent's environment, and `cairn_core::authorization::protected` refuses
-/// agent reads and writes of the file itself.
+/// an agent's environment. On macOS, agent shells are refused the file in every
+/// Cairn home by the kernel (`cairn_sandbox::operator_credential`, which also
+/// lists what it does not yet cover and how Linux and Windows report it), and
+/// `cairn_core::authorization::protected` refuses it to the structured verbs.
 pub const OPERATOR_SECRET_FILE: &str = "operator_auth_secret";
 
 /// The HTTP header the desktop operator credential is presented in.
@@ -141,8 +143,8 @@ pub fn load_local_mcp_token() -> Option<String> {
 /// shell, forwarding a permission answer to its own runner, and
 /// `cairn-orch peer-credentials`, which prints it for the operator to paste into
 /// a desktop on another machine. Both read the file with the caller's own
-/// permissions, so a confined agent that runs the CLI learns nothing its
-/// sandbox did not already grant it. Nothing in an agent's process tree calls
+/// permissions; where the operator credential boundary is enforced, an agent
+/// shell that runs the CLI is refused the file like any other read. Nothing in an agent's process tree calls
 /// this, and adding a caller that runs inside one would defeat the boundary the
 /// credential exists to draw.
 pub fn load_operator_token_from(home: &std::path::Path) -> Option<String> {

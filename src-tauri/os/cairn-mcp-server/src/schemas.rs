@@ -357,9 +357,12 @@ pub struct RunItemInput {
     /// Setting it terminates this item at the bound, its result block reporting
     /// the timeout with whatever output it produced. Omitting it lets a shell,
     /// code, or skill-script item run to completion, bounded only by the 6-hour
-    /// ceiling on a single batch (a larger value is clamped to it). An MCP-tool
-    /// or REPL item executes on the host and is capped at the 120-second
-    /// synchronous window.
+    /// ceiling on a single batch (a larger value is clamped to it). A response
+    /// item runs to this bound, or to its definition's own timeout when it is
+    /// omitted, up to the same ceiling, because its batch suspends; one called
+    /// from @cairn/sdk inside a shell or script item cannot suspend and ends at
+    /// 120 seconds. An MCP-tool, REPL, or decide item executes on the host and
+    /// is capped at the 120-second synchronous window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u32>,
     /// A `cairn://skills/<id>/scripts/<name>` target. Mutually exclusive with `command` and `code`.
