@@ -55,13 +55,15 @@ pub(crate) use common::{
     pointer_affordance_block, resolve_home_relative_against, resolve_home_relative_resource_uri,
 };
 pub(crate) use node::{
-    render_reseed_digest, reseed_verbatim_baseline_bytes, resolve_node_or_task_job_id,
+    reseed_verbatim_baseline_bytes, resolve_node_or_task_job_id,
     resolve_node_or_task_job_id_for_read,
 };
 pub(crate) use read::run_condition_sql;
 pub(crate) use read::{produce_cairn_resource, read_cairn_resource};
 pub(crate) use rebase::node_base_branch;
-pub(crate) use thread_seed::{compose_thread_seed_with_policy, SeedPolicy, ThreadSeed};
+pub(crate) use thread_seed::{
+    compose_node_seed, compose_thread_seed_with_policy, seed_tokens, SeedPolicy, ThreadSeed,
+};
 /// The one interpretation of a thread sub-path, shared by the read dispatcher,
 /// the write dispatcher, and anything that resolves a thread-addressed resource.
 pub(crate) use threads::delegate_thread_descendant;

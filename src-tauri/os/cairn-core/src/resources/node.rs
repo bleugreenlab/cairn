@@ -1886,11 +1886,7 @@ pub(super) async fn read_node_chat(
     .await
 }
 
-/// Canonical `/chat` digest render for an already-resolved job.
-///
-/// Both the node-chat read resolver and the cold-resume reseed path
-/// (CAIRN-2534) route through this, so the digest is produced by exactly one
-/// code path rather than re-rendered through a parallel one. `base_uri`/`meta`
+/// Canonical `/chat` digest render for an already-resolved job. `base_uri`/`meta`
 /// are caller-built (the cosmetic header line plus truncation drill-down link
 /// scaffolding).
 async fn render_job_chat_digest(
@@ -1920,51 +1916,6 @@ async fn render_job_chat_digest(
         crate::clock::host(),
         opts,
     )
-}
-
-/// Render the cold-resume seed digest for a job (CAIRN-2534): its `/chat`
-/// transcript at full reseed fidelity (`messages=full` + `diffs=true`) in
-/// chronological order, framed as the reconstructed prior context.
-///
-/// Reached from the reseed gate in `continue_job_impl`, which holds only the
-/// job — not the node's project/number/exec coordinates. Those are cosmetic
-/// here: under `unabridged` no truncation drill-down links are emitted, so a
-/// best-effort base_uri/meta suffices while the digest *body* stays exact.
-/// Returns the "No runs found" sentinel when the job has no transcript, and an
-/// error when the database cannot be opened, so a connection failure never
-/// becomes seed content.
-pub(crate) async fn render_reseed_digest(
-    db: &LocalDb,
-    job: &crate::db_records::DbJob,
-) -> Result<String, String> {
-    let conn = connect_for_read(db).await?;
-    let label = job
-        .node_name
-        .as_deref()
-        .or(job.uri_segment.as_deref())
-        .unwrap_or("session");
-    let base_uri = build_node_chat_uri(&job.project_id, 0, 0, label);
-    let meta = DigestMeta {
-        label,
-        project: &job.project_id,
-        coordinate: DigestCoordinate::Unaddressed,
-        status: &job.status,
-    };
-    Ok(render_job_chat_digest(
-        db,
-        &conn,
-        &job.id,
-        &base_uri,
-        &meta,
-        &DigestOptions {
-            latest: false,
-            turn_offset: None,
-            turn_limit: None,
-            unabridged: true,
-            inline_diffs: true,
-        },
-    )
-    .await)
 }
 
 /// What this job's transcript weighs verbatim: the baseline a cold native resume

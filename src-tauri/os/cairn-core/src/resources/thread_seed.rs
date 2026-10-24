@@ -1,10 +1,13 @@
-//! Composing the seed a thread session resumes from (CAIRN-3388).
+//! Composing the seed a rebuilt session resumes from: a thread's (CAIRN-3388)
+//! and, at the end of this module, any other node's.
 //!
-//! An ordinary issue reseeds from its whole transcript at full fidelity, which
-//! is right for work with an objective and an ending. A thread has neither, so
-//! the same digest gets more expensive every week while carrying less of what
-//! matters. This composer bounds every generated part of a rebuilt seed while
-//! leaving the authored arc verbatim and budget-exempt. It renders, in order:
+//! A full-fidelity digest of the whole transcript gets more expensive with every
+//! turn while carrying less of what matters, and a session seeded with one near
+//! its window's trigger rotates again before it has done anything. So every
+//! seed is held to one token budget (`seed_budget_tokens`, measured by
+//! [`seed_tokens`]). The thread composer bounds every generated part of a
+//! rebuilt seed while leaving the authored arc verbatim and budget-exempt. It
+//! renders, in order:
 //!
 //! 1. the authored arc;
 //! 2. a live, bounded children census;
@@ -65,7 +68,7 @@ impl Default for SeedPolicy {
     }
 }
 
-fn seed_tokens(text: &str) -> usize {
+pub(crate) fn seed_tokens(text: &str) -> usize {
     // One deterministic family makes the configured bound stable even when the
     // consuming model changes. Precision across model tokenizers is not the goal.
     count(text, Family::V5) as usize
@@ -216,7 +219,13 @@ pub(crate) async fn compose_thread_seed_with_policy(
         .collect();
 
     let blocks = group_turn_blocks(&events);
-    let plan = plan_chapters(&blocks, &marks, &open_children, &prior_entries);
+    let plan = plan_chapters(
+        &blocks,
+        &marks,
+        &open_children,
+        &prior_entries,
+        blocks.len().saturating_sub(RECENCY_FLOOR_TURNS),
+    );
 
     let new_entries: Vec<TocEntry> = plan
         .chapters
@@ -490,7 +499,8 @@ struct ChapterPlan {
     chapters: Vec<Chapter>,
 }
 
-/// Decide, per turn, whether it is dropped into a chapter or kept verbatim.
+/// Decide, per turn below `recency_start`, whether it is dropped into a chapter
+/// or kept verbatim. Turns from `recency_start` on are never chaptered.
 ///
 /// Classification is per turn rather than per contiguous range on purpose: two
 /// children worked in the same stretch of conversation interleave, and treating
@@ -501,8 +511,8 @@ fn plan_chapters(
     marks: &[ChildMark],
     open_children: &[String],
     prior_entries: &[TocEntry],
+    recency_start: usize,
 ) -> ChapterPlan {
-    let recency_start = blocks.len().saturating_sub(RECENCY_FLOOR_TURNS);
     let already_compacted = |index: usize| {
         prior_entries
             .iter()
@@ -620,31 +630,34 @@ fn build_entry(
 /// contents and "Turn 5" in the verbatim section describe one numbering. A
 /// subset-relative label would tell a thread its oldest kept turn is turn 1.
 fn render_gap_markers(selected: &[usize], total: usize, chat_uri: &str) -> String {
+    // A set, because a node's history can run to thousands of turns and this is
+    // measured once per candidate selection.
+    let selected: HashSet<usize> = selected.iter().copied().collect();
     let mut out = String::new();
     let mut start = None;
     for index in 0..total {
         if selected.contains(&index) {
             if let Some(gap_start) = start.take() {
-                out.push_str(&format!(
-                    "_Turns {}–{} omitted → `{chat_uri}?offset={gap_start}&limit={}`._\n\n",
-                    gap_start + 1,
-                    index,
-                    index - gap_start
-                ));
+                out.push_str(&omitted_range_marker(gap_start, index, chat_uri));
             }
         } else if start.is_none() {
             start = Some(index);
         }
     }
     if let Some(gap_start) = start {
-        out.push_str(&format!(
-            "_Turns {}–{} omitted → `{chat_uri}?offset={gap_start}&limit={}`._\n\n",
-            gap_start + 1,
-            total,
-            total - gap_start
-        ));
+        out.push_str(&omitted_range_marker(gap_start, total, chat_uri));
     }
     out
+}
+
+/// The one line that stands for the turns `start..end` (block indices, end
+/// exclusive) and says where to read them in full.
+fn omitted_range_marker(start: usize, end: usize, chat_uri: &str) -> String {
+    format!(
+        "_Turns {}–{end} omitted → `{chat_uri}?offset={start}&limit={}`._\n\n",
+        start + 1,
+        end - start
+    )
 }
 
 fn recent_section_tokens(
@@ -746,7 +759,13 @@ fn degrade_to_budget(
     );
     let framing =
         seed_tokens(branches) + seed_tokens(&census) + seed_tokens(store) + seed_tokens(&eras);
-    let recent = bounded_recent(blocks, budget.saturating_sub(framing), chat_uri, meta);
+    let recent = bounded_recent(
+        blocks,
+        budget.saturating_sub(framing),
+        chat_uri,
+        meta,
+        RECENCY_FLOOR_TURNS,
+    );
 
     let body = format!("{branches}{census}{store}{eras}{}", recent.section);
     if seed_tokens(&body) <= budget {
@@ -759,7 +778,7 @@ fn degrade_to_budget(
     // A budget smaller than the framing that introduces it. The census and the
     // eras each have an address of their own and the turn does not, so the turn
     // takes what is left and the cut makes that literally true.
-    let recent = bounded_recent(blocks, budget, chat_uri, meta);
+    let recent = bounded_recent(blocks, budget, chat_uri, meta, RECENCY_FLOOR_TURNS);
     let mut body = recent.section;
     if seed_tokens(&body) > budget {
         body.truncate(seed_cut(&body, budget));
@@ -953,18 +972,21 @@ struct BoundedRecent {
     selected: Vec<usize>,
 }
 
-/// The newest turns that fit `budget`, never fewer than one.
+/// The newest turns that fit `budget`, at most `max_turns` and never fewer than
+/// one.
 ///
-/// The recency floor is a ceiling here. Degradation happens because something
-/// did not fit, so this takes newest-first and stops at the first turn that
-/// would not — and when even the newest turn is bigger than the budget, keeps
-/// its head and says where the rest of it is. An over-budget seed and an empty
-/// one are both worse than a turn a thread can see was cut.
+/// A degrading thread seed passes its recency floor as the ceiling; a node seed
+/// passes no ceiling, because its verbatim window is all the history it carries.
+/// Either way this takes newest-first and stops at the first turn that would not
+/// fit — and when even the newest turn is bigger than the budget, keeps its head
+/// and says where the rest of it is. An over-budget seed and an empty one are
+/// both worse than a turn an agent can see was cut.
 fn bounded_recent(
     blocks: &[TurnBlock<'_>],
     budget: usize,
     chat_uri: &str,
     meta: &DigestMeta<'_>,
+    max_turns: usize,
 ) -> BoundedRecent {
     let Some(newest) = blocks.len().checked_sub(1) else {
         return BoundedRecent {
@@ -974,7 +996,7 @@ fn bounded_recent(
     };
 
     let mut selected = vec![newest];
-    for index in (blocks.len().saturating_sub(RECENCY_FLOOR_TURNS)..newest).rev() {
+    for index in (blocks.len().saturating_sub(max_turns)..newest).rev() {
         let mut trial = selected.clone();
         trial.push(index);
         trial.sort_unstable();
@@ -2179,6 +2201,261 @@ async fn load_children(
     }
 
     Ok(children)
+}
+
+// ── Non-thread seeds ───────────────────────────────────────────────────────────
+
+/// Framing for the pointers. The plan state lives in these documents and not in
+/// the seed, so the seed says so rather than letting a turn below stand in for it.
+const WORKING_DOCUMENTS_NOTICE: &str =
+    "_Your plan state lives in these, not in this seed. Re-read them before acting._";
+
+const EARLIER_TURNS_NOTICE: &str = "_One line per stretch of conversation, each starting where a message reached you, with the address that reads it in full. Read a range only when it bears on what you are doing now: re-reading costs more than it saves unless the range is load-bearing._";
+
+/// The share of a node seed's budget, in percent, the table of contents may
+/// claim from the verbatim window once the whole history no longer fits. The
+/// newest turns are the one part of a seed no address carries as cheaply, so
+/// they keep the rest.
+const NODE_TOC_SHARE: usize = 25;
+
+/// Compose the seed a non-thread node's rebuilt session starts from: pointers to
+/// its working documents, a table of contents of the turns that did not fit, and
+/// the newest turns verbatim, all within `budget_tokens` as [`seed_tokens`]
+/// measures it.
+///
+/// An issue's node has an objective and an ending, but one that lives long — a
+/// coordinator running for days — accumulates history exactly as a thread does,
+/// and a seed that carries all of it opens the next session as full as the one
+/// it replaced. A node has no arc, eras, or children, and nothing here persists:
+/// every composition reads the transcript afresh, so the table of contents is
+/// derived each time rather than carried between generations.
+///
+/// `Ok(None)` when no transcript rows could be loaded. That is not evidence of an
+/// empty history, so the caller settles it with a direct count.
+pub(crate) async fn compose_node_seed(
+    db: &LocalDb,
+    job: &crate::db_records::DbJob,
+    budget_tokens: usize,
+) -> Result<Option<String>, String> {
+    let conn = connect_for_read(db).await?;
+    let events = load_job_events_ordered(
+        &conn,
+        &job.id,
+        db.team_id().map(|_| db.content_store().as_ref()),
+        db.private_route_db().map(|db| db.as_ref()),
+    )
+    .await;
+    if events.is_empty() {
+        return Ok(None);
+    }
+
+    let coordinates = node_coordinates(&conn, &job.id).await;
+    let fallback_label = job
+        .node_name
+        .as_deref()
+        .or(job.uri_segment.as_deref())
+        .unwrap_or("session");
+    let (home, meta) = match coordinates.as_ref() {
+        Some(coordinates) => (
+            coordinates.base_uri.clone(),
+            DigestMeta {
+                label: &coordinates.label,
+                project: &coordinates.project_key,
+                coordinate: coordinates.digest_coordinate(),
+                status: &coordinates.status,
+            },
+        ),
+        // Every node that can run resolves a home URI, so this is a job Cairn
+        // cannot address canonically. Its agent can still reach its own
+        // documents and transcript relative to itself.
+        None => (
+            "cairn:~".to_string(),
+            DigestMeta {
+                label: fallback_label,
+                project: &job.project_id,
+                coordinate: DigestCoordinate::Unaddressed,
+                status: &job.status,
+            },
+        ),
+    };
+    let chat_uri = format!("{home}/chat");
+    let artifacts = artifact_names(&conn, &job.id)
+        .await
+        .map_err(|error| format!("Failed to list this node's artifacts: {error}"))?;
+    let documents = render_working_documents(coordinates.as_ref(), &home, &artifacts);
+    let blocks = group_turn_blocks(&events);
+    Ok(Some(compose_node_body(
+        budget_tokens,
+        &documents,
+        &blocks,
+        &chat_uri,
+        &meta,
+    )))
+}
+
+/// The documents, pointers, and turns of a node seed, fitted to `budget`.
+fn compose_node_body(
+    budget: usize,
+    documents: &str,
+    blocks: &[TurnBlock<'_>],
+    chat_uri: &str,
+    meta: &DigestMeta<'_>,
+) -> String {
+    let available = budget.saturating_sub(seed_tokens(documents));
+    // A history that fits whole needs no table of contents, and holding a share
+    // open for one would drop turns to protect space nothing uses.
+    let whole = bounded_recent(blocks, available, chat_uri, meta, usize::MAX);
+    let (recent, toc) = if whole.selected.first() == Some(&0) {
+        (whole, String::new())
+    } else {
+        let recent = bounded_recent(
+            blocks,
+            available - available * NODE_TOC_SHARE / 100,
+            chat_uri,
+            meta,
+            usize::MAX,
+        );
+        let toc = earlier_turns(
+            blocks,
+            recent_start(&recent, blocks.len()),
+            chat_uri,
+            available.saturating_sub(seed_tokens(&recent.section)),
+        );
+        (recent, toc)
+    };
+    let body = format!("{documents}{toc}{}", recent.section);
+    if seed_tokens(&body) <= budget {
+        return body;
+    }
+
+    // Sections measured apart do not quite sum to the whole, and pointers past
+    // the budget leave nothing to apportion. The table of contents collapses to
+    // the one line that addresses all of it, and a tokenizer cut is the last
+    // boundary, so no input shape produces an over-budget seed.
+    let toc = earlier_turns(blocks, recent_start(&recent, blocks.len()), chat_uri, 0);
+    let mut body = format!("{documents}{toc}{}", recent.section);
+    if seed_tokens(&body) > budget {
+        body.truncate(seed_cut(&body, budget));
+    }
+    body
+}
+
+fn recent_start(recent: &BoundedRecent, total: usize) -> usize {
+    recent.selected.first().copied().unwrap_or(total)
+}
+
+/// The table of contents for turns `0..end`, fitted to `budget`.
+///
+/// The chapters are the thread planner's, with nothing marked and nothing open,
+/// so every turn below `end` lands in exactly one stretch bounded where a message
+/// reached the agent. The newest stretches render one line each; everything older
+/// collapses into the single marker that addresses it.
+fn earlier_turns(blocks: &[TurnBlock<'_>], end: usize, chat_uri: &str, budget: usize) -> String {
+    if end == 0 {
+        return String::new();
+    }
+    let entries: Vec<TocEntry> = plan_chapters(blocks, &[], &[], &[], end)
+        .chapters
+        .iter()
+        .map(|chapter| build_entry(chapter, blocks, &[], chat_uri))
+        .collect();
+
+    // The most entries that fit, found by binary search over the measured
+    // section, as the collapsed census is. Only a measured candidate is accepted.
+    let (mut low, mut high) = (0usize, entries.len());
+    let mut best = 0usize;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        if seed_tokens(&render_earlier_turns(&entries, mid, end, chat_uri)) <= budget {
+            best = mid;
+            low = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    render_earlier_turns(&entries, best, end, chat_uri)
+}
+
+/// The newest `take` of `entries`, after one marker for every turn older than
+/// them. `entries` cover `0..end` contiguously.
+fn render_earlier_turns(entries: &[TocEntry], take: usize, end: usize, chat_uri: &str) -> String {
+    let mut out = String::from("## Earlier turns\n\n");
+    out.push_str(EARLIER_TURNS_NOTICE);
+    out.push_str("\n\n");
+    let kept = &entries[entries.len() - take..];
+    let collapsed_end = kept
+        .first()
+        .map_or(end, |entry| entry.start_block.max(0) as usize);
+    if collapsed_end > 0 {
+        out.push_str(&omitted_range_marker(0, collapsed_end, chat_uri));
+    }
+    for entry in kept {
+        let (start, last) = (entry.start_block + 1, entry.end_block + 1);
+        let range = if start == last {
+            format!("Turn {start}")
+        } else {
+            format!("Turns {start}–{last}")
+        };
+        out.push_str(&format!(
+            "- {range}: {} → `{}`\n",
+            entry.overview, entry.content_uri
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// Where the node's own working documents are: the issue (or thread) it serves,
+/// its todos, and every artifact it has written.
+fn render_working_documents(
+    coordinates: Option<&NodeCoordinates>,
+    home: &str,
+    artifacts: &[String],
+) -> String {
+    let mut out = String::from("## Working documents\n\n");
+    out.push_str(WORKING_DOCUMENTS_NOTICE);
+    out.push_str("\n\n");
+    if let Some(coordinates) = coordinates {
+        match coordinates.thread_name.as_deref() {
+            Some(name) => out.push_str(&format!(
+                "- Thread: `{}`\n",
+                cairn_common::uri::build_thread_uri(&coordinates.project_key, name)
+            )),
+            None if coordinates.number > 0 => out.push_str(&format!(
+                "- Issue: `{}`\n",
+                cairn_common::uri::build_issue_uri(&coordinates.project_key, coordinates.number)
+            )),
+            None => {}
+        }
+    }
+    out.push_str(&format!("- Todos: `{home}/todos`\n"));
+    for name in artifacts {
+        out.push_str(&format!("- Artifact `{name}`: `{home}/{name}`\n"));
+    }
+    out.push('\n');
+    out
+}
+
+async fn artifact_names(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> Result<Vec<String>, String> {
+    let mut rows = conn
+        .query(
+            "SELECT DISTINCT output_name FROM artifacts
+             WHERE job_id = ?1 AND output_name IS NOT NULL AND output_name != ''
+             ORDER BY output_name",
+            params![job_id],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut names = Vec::new();
+    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        names.push(row.text(0).map_err(|error| error.to_string())?);
+    }
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -3689,5 +3966,206 @@ mod tests {
         );
         assert!(rendered.contains("- **#3** (approved"), "own fits in full");
         assert!(!rendered.contains("### Related tenets"), "{rendered}");
+    }
+
+    // ── Non-thread seeds ──
+
+    const NODE_JOB: &str = "job-node";
+    const NODE_HOME: &str = "cairn://p/prj/7/1/coordinator";
+
+    /// A coordinator on issue 7 with a `plan` artifact and `turns` turns, each a
+    /// user message and an assistant reply of `body` repeated. The newest
+    /// assistant reply carries `NEWEST_TURN_MARKER`.
+    async fn node_fixture(name: &str, turns: i64, body: &str, addressed: bool) -> LocalDb {
+        let db = migrated_test_db(name).await;
+        let issue = if addressed { "'i-node'" } else { "NULL" };
+        db.execute_script(&format!(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p','default','P','prj','/tmp/p',1,1);
+             INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at)
+               VALUES ('i-node','p',7,'Coordinate the port','active','none',1,1);
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('e-node','recipe','i-node','p','running',1,1);
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, current_session_id, created_at, updated_at)
+               VALUES ('job-node','e-node',{issue},'p','running','coordinator','coordinator','sess-n',1,1);
+             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+               VALUES ('sess-n','job-node','claude','open',1,1,1);
+             INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
+               VALUES ('run-n','job-node','i-node','running',1,1);
+             INSERT INTO artifacts(id, job_id, artifact_type, schema_version, data, version, output_name, created_at, updated_at, confirmed)
+               VALUES ('a-plan','job-node','plan',1,'{{}}',1,'plan',1,1,1);"
+        ))
+        .await
+        .unwrap();
+        for sequence in 1..=turns {
+            let turn_id = format!("turn-{sequence}");
+            let assistant = if sequence == turns {
+                format!("NEWEST_TURN_MARKER {body}")
+            } else {
+                format!("Reply {sequence}. {body}")
+            };
+            db.execute(
+                "INSERT INTO turns(id, session_id, run_id, job_id, sequence, created_at, updated_at)
+                 VALUES (?1,'sess-n','run-n','job-node',?2,?2,?2)",
+                params![turn_id.as_str(), sequence],
+            )
+            .await
+            .unwrap();
+            for (offset, kind, content) in [
+                (
+                    0,
+                    "user",
+                    format!("Step {sequence}: carry on with the port. {body}"),
+                ),
+                (1, "assistant", assistant),
+            ] {
+                db.execute(
+                    "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at, turn_id)
+                     VALUES (?1,'run-n',?2,?2,?3,?4,?2,?5)",
+                    params![
+                        format!("ev-{sequence}-{kind}"),
+                        sequence * 10 + offset,
+                        kind,
+                        serde_json::json!({ "content": content }).to_string(),
+                        turn_id.as_str()
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+        }
+        db
+    }
+
+    async fn node_job(db: &LocalDb) -> crate::db_records::DbJob {
+        db.read(|conn| {
+            Box::pin(async move {
+                crate::execution::jobs::load_job_conn(conn, NODE_JOB)
+                    .await
+                    .map(Option::unwrap)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn node_seed(db: &LocalDb, budget: usize) -> String {
+        compose_node_seed(db, &node_job(db).await, budget)
+            .await
+            .unwrap()
+            .expect("the node has a transcript")
+    }
+
+    /// The whole history rendered at reseed fidelity, as the retired
+    /// full-history digest carried it.
+    async fn whole_history_tokens(db: &LocalDb) -> usize {
+        let conn = connect_for_read(db).await.unwrap();
+        let events = load_job_events_ordered(&conn, NODE_JOB, None, None).await;
+        let blocks = group_turn_blocks(&events);
+        let all: Vec<usize> = (0..blocks.len()).collect();
+        let meta = DigestMeta {
+            label: "coordinator",
+            project: "prj",
+            coordinate: DigestCoordinate::Unaddressed,
+            status: "running",
+        };
+        seed_tokens(&render_blocks(&blocks, &all, "chat", &meta))
+    }
+
+    #[tokio::test]
+    async fn a_node_seed_far_beyond_its_budget_keeps_its_newest_turns_a_toc_and_its_documents() {
+        let db = node_fixture(
+            "node-seed-bounded.db",
+            200,
+            &"analysis of the parser module and its callers ".repeat(30),
+            true,
+        )
+        .await;
+        let budget = SeedPolicy::default().budget_tokens;
+        assert!(
+            whole_history_tokens(&db).await > 10 * budget,
+            "the fixture must dwarf the budget for the bound to mean anything"
+        );
+
+        let seed = node_seed(&db, budget).await;
+
+        assert!(
+            seed_tokens(&seed) <= budget,
+            "{} tokens against a {budget}-token budget",
+            seed_tokens(&seed)
+        );
+        // Working documents, as canonical addresses the agent can re-read.
+        for pointer in [
+            "- Issue: `cairn://p/prj/7`".to_string(),
+            format!("- Todos: `{NODE_HOME}/todos`"),
+            format!("- Artifact `plan`: `{NODE_HOME}/plan`"),
+        ] {
+            assert!(seed.contains(&pointer), "missing {pointer}: {seed}");
+        }
+        // The newest turn verbatim, and none of the oldest.
+        assert!(seed.contains("## Turn 200 ·"), "{seed}");
+        assert!(seed.contains("NEWEST_TURN_MARKER"), "{seed}");
+        assert!(!seed.contains("## Turn 1 ·"), "{seed}");
+        // A table of contents addressing older turns by chat offset: the newest
+        // of them one line each, the rest behind the one marker that reaches it.
+        let toc = &seed[seed.find("## Earlier turns").expect("a table of contents")
+            ..seed.find("## Recent").expect("a verbatim window")];
+        assert!(
+            toc.contains(&format!("`{NODE_HOME}/chat?offset=0&limit=")),
+            "{toc}"
+        );
+        assert!(toc.contains(": Step "), "an entry names its turn: {toc}");
+        assert!(
+            toc.lines()
+                .filter(|line| line.starts_with("- Turn"))
+                .count()
+                > 3
+        );
+        // Sections in the order the header promises.
+        let order = ["## Working documents", "## Earlier turns", "## Recent"]
+            .map(|heading| seed.find(heading).unwrap());
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[tokio::test]
+    async fn a_node_history_that_fits_is_carried_whole_without_a_toc() {
+        let db = node_fixture("node-seed-whole.db", 5, "short reply", true).await;
+        let seed = node_seed(&db, SeedPolicy::default().budget_tokens).await;
+        for turn in 1..=5 {
+            assert!(seed.contains(&format!("## Turn {turn} ·")), "{seed}");
+        }
+        assert!(!seed.contains("## Earlier turns"), "{seed}");
+        assert!(!seed.contains("omitted"), "{seed}");
+    }
+
+    #[tokio::test]
+    async fn a_node_seed_holds_a_budget_smaller_than_its_own_framing() {
+        let db = node_fixture("node-seed-tiny.db", 40, &"long reply ".repeat(200), true).await;
+        for budget in [40, 300, 1_500] {
+            let seed = node_seed(&db, budget).await;
+            assert!(
+                seed_tokens(&seed) <= budget,
+                "{} tokens against {budget}: {seed}",
+                seed_tokens(&seed)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unaddressable_node_points_at_itself_relatively() {
+        let db = node_fixture("node-seed-relative.db", 60, &"reply ".repeat(300), false).await;
+        let seed = node_seed(&db, 4_000).await;
+        assert!(seed.contains("- Todos: `cairn:~/todos`"), "{seed}");
+        assert!(seed.contains("`cairn:~/chat?offset=0&limit="), "{seed}");
+        assert!(!seed.contains("- Issue:"), "{seed}");
+    }
+
+    #[tokio::test]
+    async fn a_node_with_no_transcript_composes_nothing() {
+        let db = node_fixture("node-seed-empty.db", 0, "", true).await;
+        assert!(compose_node_seed(&db, &node_job(&db).await, 12_000)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

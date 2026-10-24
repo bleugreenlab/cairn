@@ -1875,8 +1875,7 @@ impl DigestPreview {
 /// action runs and then throws the seed away, so the size an operator reads in
 /// the tab menu cannot describe anything other than what pressing the action
 /// would create. Both paths are previewable — a thread's compacted seed and an
-/// ordinary node's full-fidelity digest — because composition is read-only on
-/// both.
+/// ordinary node's budgeted seed — because composition is read-only on both.
 pub fn preview_job_digest(orch: &Orchestrator, job_id: &str) -> Result<DigestPreview, String> {
     let owning_db = run_db({
         let dbs = orch.db.clone();
@@ -4108,8 +4107,9 @@ fn assemble_resume_prompt(
 /// of this context nothing can regenerate.
 const THREAD_SEED_HEADER: &str = "This thread's session was rebuilt so it stays cheap to run indefinitely. Below: the arc you authored, a table of contents for history that has been compacted away, and the most recent turns verbatim. Every compacted chapter names what it was and where to read it in full — read one only when it bears on what you are doing now, because re-reading costs more than it saves unless the range is genuinely load-bearing. Re-read any file whose content still matters, and keep `cairn:~/arc` current: decisions, the paths you rejected and why, and the open questions are the only things here that cannot be rebuilt from the transcript.";
 
-/// Header that leads the reseed seed prompt, framing the digest that follows.
-const RESEED_SEED_HEADER: &str = "The prior events in this session are summarized below because the underlying agent session was reconstructed after a period of inactivity (tool-result bodies were elided). Re-read any files whose content is still relevant, and re-read your working documents (todos/plan/board) for the current plan state before acting.";
+/// Header that leads a non-thread node's seed, framing the three sections that
+/// follow.
+const RESEED_SEED_HEADER: &str = "Your underlying agent session was rebuilt, so your prior context is reconstructed below rather than carried whole: pointers to your working documents, a table of contents of earlier turns with the address that reads each in full, and your most recent turns verbatim (tool-result bodies elided). Re-read your working documents (todos/plan/board) for the current plan state before acting, re-read any file whose content still matters, and read an earlier range only when it bears on what you are doing now.";
 
 /// What a cold native resume makes the provider recreate, in bytes.
 ///
@@ -4129,11 +4129,11 @@ fn verbatim_prefix_bytes(owning_db: &Arc<LocalDb>, job_id: &str) -> Option<i64> 
     .flatten()
 }
 
-/// The seed content delivered and stored on a reseed: the header framing the
-/// digest, then the digest itself (`header + digest`). The trigger is appended
-/// separately at delivery and stored as its own verbatim `user` event.
-fn build_reseed_seed_content(digest: &str) -> String {
-    format!("{RESEED_SEED_HEADER}\n\n{digest}")
+/// The seed content delivered and stored on a non-thread reseed: the header,
+/// then the composed body (`header + body`). The trigger is appended separately
+/// at delivery and stored as its own verbatim `user` event.
+fn build_reseed_seed_content(composed: &str) -> String {
+    format!("{RESEED_SEED_HEADER}\n\n{composed}")
 }
 
 /// The seed content delivered and stored when a thread compacts. Same shape as
@@ -4164,7 +4164,7 @@ fn apply_reseed_seed(prompt: String, reseed: Option<&ReseedOutcome>) -> String {
 }
 
 /// A successful automatic rebuild: the fresh session that was rotated in, and
-/// the seed (header + prior-session digest) to deliver and store.
+/// the seed (header + composed body) to deliver and store.
 struct ReseedOutcome {
     new_session_id: String,
     seed_content: String,
@@ -4307,35 +4307,73 @@ fn attempt_session_reseed(
     // may occupy before it gives something up — so an ordinary node reads the
     // same setting a thread does rather than carrying a second knob that would
     // drift from it.
-    match reseed_step(
-        occupancy,
-        orch.get_settings().thread_compact_threshold,
-        prefix_cache,
-    ) {
+    let threshold = orch.get_settings().thread_compact_threshold;
+    match reseed_step(occupancy, threshold, prefix_cache) {
         ReseedStep::Resume => return ReseedDecision::NativeResume(None),
         ReseedStep::PriceColdRebuild => {}
         ReseedStep::RebuildForWindow => {
-            let Ok(outcome) = force_session_reseed(
+            // `reseed_step` rebuilds for the window only on a reading, so a
+            // rebuild always has one to report.
+            let (used, window) = occupancy.unwrap_or_default();
+            let composed = match compose_forced_reseed(orch, owning_db, job, session) {
+                Ok(composed) => composed,
+                Err(error) => {
+                    log::warn!(
+                        "Window-pressure seed composition failed for job {}; resuming natively: {error}",
+                        &job.id[..job.id.len().min(8)]
+                    );
+                    return ReseedDecision::NativeResume(None);
+                }
+            };
+
+            // A successor that opens at or above the trigger rotates again on its
+            // first call, and so does its successor, forever. Rotating would only
+            // spend the conversation to buy the next rotation, so it is refused
+            // here, loudly. The seed budget makes this unreachable at default
+            // settings; this is what keeps a budget too large for its window from
+            // looping.
+            let seed_tokens = crate::resources::seed_tokens(composed.framed()) as i64;
+            if window_pressure_reached(Some((seed_tokens, window)), threshold) {
+                refuse_window_rotation(
+                    orch,
+                    owning_db,
+                    job,
+                    session,
+                    seed_tokens,
+                    (used, window),
+                    threshold,
+                );
+                return ReseedDecision::NativeResume(None);
+            }
+
+            let outcome = match apply_composed_reseed(
                 orch,
                 owning_db,
                 job,
                 session,
-                target_backend,
-                RotationReason::Reseed,
-                None,
-            ) else {
-                return ReseedDecision::NativeResume(None);
+                composed,
+                Rotation {
+                    reason: RotationReason::Reseed,
+                    target_backend,
+                    boundary: None,
+                },
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    log::warn!(
+                        "Window-pressure reseed failed for job {}; resuming natively: {error}",
+                        &job.id[..job.id.len().min(8)]
+                    );
+                    return ReseedDecision::NativeResume(None);
+                }
             };
-
-            // `reseed_step` rebuilds for the window only on a reading, so a
-            // rebuild always has one to report.
-            let (used, window) = occupancy.unwrap_or_default();
             log::info!(
-            "Window-pressure reseed for job {}: rotated session {} -> {} ({used}/{window} tokens)",
-            &job.id[..job.id.len().min(8)],
-            &session.id[..session.id.len().min(8)],
-            &outcome.new_session_id[..outcome.new_session_id.len().min(8)],
-        );
+                "Window-pressure reseed for job {}: rotated session {} -> {} \
+                 ({used}/{window} tokens, seed {seed_tokens} tokens)",
+                &job.id[..job.id.len().min(8)],
+                &session.id[..session.id.len().min(8)],
+                &outcome.new_session_id[..outcome.new_session_id.len().min(8)],
+            );
             // Window pressure, not economics: no cache reading participated, so the
             // boundary records none.
             return ReseedDecision::Rebuilt(outcome, None);
@@ -4345,8 +4383,9 @@ fn attempt_session_reseed(
     // Past the horizon the two continuations differ only in what they send, so
     // both sides are measured before either is chosen. The baseline is what
     // native resume makes the provider recreate; the seed is what the rebuild
-    // would send instead. Composing at all costs a transcript render, which is
-    // why nothing above this line pays for it.
+    // would send instead — the budgeted seed, framed, the very string rotation
+    // delivers below. Composing at all costs a transcript read, which is why
+    // nothing above this line pays for it.
     let Some(prefix_bytes) = verbatim_prefix_bytes(owning_db, &job.id) else {
         return ReseedDecision::NativeResume(None);
     };
@@ -4408,6 +4447,77 @@ fn attempt_session_reseed(
     }
 }
 
+/// Record, in the log and on the session's transcript, a window-pressure
+/// rotation refused because its seed would not relieve the pressure.
+fn refuse_window_rotation(
+    orch: &Orchestrator,
+    owning_db: &Arc<LocalDb>,
+    job: &DbJob,
+    session: &Session,
+    seed_tokens: i64,
+    (used, window): (i64, i64),
+    threshold: f64,
+) {
+    log::warn!(
+        "Refused a window-pressure rotation for job {} (session {}): its seed measures \
+         {seed_tokens} tokens, at or above {threshold} of the {window}-token window \
+         ({used} used), so the successor would rotate again on its first call. \
+         The seed budget (seed_budget_tokens) is too large for this window.",
+        &job.id[..job.id.len().min(8)],
+        &session.id[..session.id.len().min(8)],
+    );
+    let content = format!(
+        "This session was not rebuilt for window pressure. Its rebuilt seed would measure \
+         {seed_tokens} tokens, at or above {:.0}% of the {window}-token window, so the new \
+         session would start full and rotate again on its first call. It continues on its \
+         existing conversation. The seed budget (`seed_budget_tokens`) is too large for \
+         this model's window.",
+        threshold * 100.0
+    );
+    let raw = serde_json::json!({
+        "kind": "window_rotation_refused",
+        "seedTokens": seed_tokens,
+        "windowTokens": window,
+        "usedTokens": used,
+        "threshold": threshold,
+    });
+    let Some(run_id) = latest_run_for_session(owning_db, &session.id) else {
+        log::warn!(
+            "Session {} has no run to record its refused window rotation on",
+            &session.id[..session.id.len().min(8)]
+        );
+        return;
+    };
+    if let Err(error) = crate::messages::transcript::insert_system_message_sync(
+        orch,
+        &run_id,
+        Some(&session.id),
+        None,
+        &content,
+        raw,
+    ) {
+        log::warn!(
+            "Could not record the refused window rotation on session {}: {error}",
+            &session.id[..session.id.len().min(8)]
+        );
+    }
+}
+
+fn latest_run_for_session(owning_db: &Arc<LocalDb>, session_id: &str) -> Option<String> {
+    let db = owning_db.clone();
+    let session_id = session_id.to_string();
+    run_db(async move {
+        db.query_opt_text(
+            "SELECT id FROM runs WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 1",
+            (session_id,),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    })
+    .ok()
+    .flatten()
+}
+
 /// A forced reseed's seed, composed but not yet applied.
 ///
 /// This is the whole read-only half of [`force_session_reseed`]: everything up to
@@ -4421,8 +4531,8 @@ enum ComposedReseed {
         seed: Box<crate::resources::ThreadSeed>,
         framed: String,
     },
-    /// An ordinary node reseeds from its whole transcript at full fidelity.
-    Digest { framed: String },
+    /// Any other node reseeds from its budgeted node seed.
+    Node { framed: String },
 }
 
 impl ComposedReseed {
@@ -4430,7 +4540,7 @@ impl ComposedReseed {
     /// header first, then the composed body.
     fn framed(&self) -> &str {
         match self {
-            ComposedReseed::Thread { framed, .. } | ComposedReseed::Digest { framed } => framed,
+            ComposedReseed::Thread { framed, .. } | ComposedReseed::Node { framed } => framed,
         }
     }
 }
@@ -4488,22 +4598,25 @@ fn compose_forced_reseed(
         });
     }
 
-    let digest = {
+    // The same budget a thread seed is held to: one budget answers how large a
+    // rebuilt session may start, whatever kind of node it is.
+    let budget = seed_policy_for_job(orch, owning_db, job).budget_tokens;
+    let composed = {
         let db = owning_db.clone();
         let job = job.clone();
-        run_db(async move { crate::resources::render_reseed_digest(&db, &job).await })
+        run_db(async move { crate::resources::compose_node_seed(&db, &job, budget).await })
             .map_err(ComposeRefusal::Failed)?
     };
-    if digest.trim().is_empty() || digest == "No runs found for this node." {
-        // The renderer drops rows it cannot read, so an empty rendering is not
+    let Some(composed) = composed.filter(|body| !body.trim().is_empty()) else {
+        // The loader drops rows it cannot read, so an empty load is not
         // evidence of an empty history. Only a direct count of the job's event
         // rows can say there is nothing to carry; anything else fails closed.
         return Err(empty_digest_refusal(job_event_rows_exist(
             owning_db, &job.id,
         )));
-    }
-    Ok(ComposedReseed::Digest {
-        framed: build_reseed_seed_content(&digest),
+    };
+    Ok(ComposedReseed::Node {
+        framed: build_reseed_seed_content(&composed),
     })
 }
 
@@ -4560,7 +4673,7 @@ fn force_session_reseed(
 }
 
 /// Apply an already-composed forced reseed: compact a thread, or rotate an
-/// ordinary node onto its digest.
+/// ordinary node onto its node seed.
 fn apply_composed_reseed(
     orch: &Orchestrator,
     owning_db: &Arc<LocalDb>,
@@ -4589,7 +4702,7 @@ fn apply_composed_reseed(
             },
             rotation,
         ),
-        ComposedReseed::Digest { framed } => {
+        ComposedReseed::Node { framed } => {
             rotate_with_seed(orch, owning_db, job, session, framed, rotation)
         }
     }
@@ -4627,7 +4740,7 @@ struct UnconfirmedStartRotation {
 }
 
 /// Replace a session whose provider was launched under its id but never
-/// confirmed it. A thread gets its thread seed and any other node its digest,
+/// confirmed it. A thread gets its thread seed and any other node its node seed,
 /// as a forced reseed would. A node with no transcript rotates without a seed:
 /// the provider holds no conversation worth carrying, and the successor's fresh
 /// launch assembles its first prompt exactly as a retry would have, under a new
@@ -4813,6 +4926,19 @@ fn compose_thread_seed_blocking(
     let db = owning_db.clone();
     let job_id = job.id.clone();
     let now = orch.services.clock.now();
+    let policy = seed_policy_for_job(orch, owning_db, job);
+    run_db(async move {
+        crate::resources::compose_thread_seed_with_policy(&db, &job_id, now, policy).await
+    })
+}
+
+/// The seed policy `job`'s rebuilt session is composed under: its agent
+/// snapshot's override where it carries one, the workspace setting otherwise.
+fn seed_policy_for_job(
+    orch: &Orchestrator,
+    owning_db: &Arc<LocalDb>,
+    job: &DbJob,
+) -> crate::resources::SeedPolicy {
     let settings = orch.get_settings();
     let snapshot_policy = match (job.execution_id.clone(), job.agent_config_id.clone()) {
         (Some(execution_id), Some(agent_config_id)) => run_db({
@@ -4828,7 +4954,7 @@ fn compose_thread_seed_blocking(
         .flatten(),
         _ => None,
     };
-    let policy = crate::resources::SeedPolicy {
+    crate::resources::SeedPolicy {
         budget_tokens: snapshot_policy
             .and_then(|(budget, _)| (budget > 0).then_some(budget))
             .unwrap_or(settings.seed_budget_tokens)
@@ -4837,10 +4963,7 @@ fn compose_thread_seed_blocking(
             .and_then(|(_, eras)| (eras >= 0).then_some(eras))
             .unwrap_or(settings.seed_eras)
             .max(0) as usize,
-    };
-    run_db(async move {
-        crate::resources::compose_thread_seed_with_policy(&db, &job_id, now, policy).await
-    })
+    }
 }
 
 /// Compose a thread's seed, decide whether this continuation compacts, and apply
@@ -7351,6 +7474,271 @@ mod tests {
         assert_eq!(raw["cacheState"], "cold");
         assert_eq!(raw["reseedSkipped"], "insufficient_savings");
         assert_eq!(raw["savingsThreshold"], 0.5);
+    }
+
+    /// A coordinator on issue 7 whose `turns` turns each weigh about 1,300
+    /// tokens, on a Claude session `s1` with run `r1`. The newest reply carries
+    /// `NEWEST_TURN_MARKER`.
+    async fn long_running_node(
+        name: &str,
+        turns: i64,
+    ) -> (Orchestrator, Arc<crate::storage::LocalDb>) {
+        let orch = test_orchestrator(migrated_test_db(name).await);
+        let db = orch.db.local.clone();
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at)
+               VALUES('i','p',7,'Port the parser','active','none',1,1);
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES('e','recipe','i','p','running',1,1);
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, node_name, uri_segment,
+                              current_session_id, model, created_at, updated_at)
+               VALUES('j','e','i','p','blocked','coordinator','coordinator','s1','opus',1,1);
+             INSERT INTO sessions(id, job_id, backend, backend_id, status, sequence, created_at, updated_at)
+               VALUES('s1','j','claude','native-thread-1','open',1,1,1);
+             INSERT INTO runs(id, job_id, issue_id, session_id, status, created_at, updated_at)
+               VALUES('r1','j','i','s1','exited',1,1);",
+        )
+        .await
+        .unwrap();
+        let body = "analysis of the parser module and its callers ".repeat(60);
+        for sequence in 1..=turns {
+            let turn_id = format!("t{sequence}");
+            db.execute(
+                "INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
+                 VALUES (?1,'s1','r1','j',?2,'complete','follow_up',?2,?2)",
+                params![turn_id.as_str(), sequence],
+            )
+            .await
+            .unwrap();
+            let reply = if sequence == turns {
+                format!("NEWEST_TURN_MARKER {body}")
+            } else {
+                format!("Reply {sequence}. {body}")
+            };
+            for (offset, kind, content) in [
+                (0, "user", format!("Step {sequence}: carry on. {body}")),
+                (1, "assistant", reply),
+            ] {
+                db.execute(
+                    "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at, turn_id)
+                     VALUES (?1,'r1','s1',?2,?2,?3,?4,?2,?5)",
+                    params![
+                        format!("e{sequence}-{kind}"),
+                        sequence * 10 + offset,
+                        kind,
+                        serde_json::json!({ "content": content }).to_string(),
+                        turn_id.as_str()
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+        }
+        (orch, db)
+    }
+
+    fn occupancy_of(session_id: &str, used: i64, window: i64) -> crate::models::ContextTokenState {
+        crate::models::ContextTokenState {
+            run_id: "r1".to_string(),
+            session_id: Some(session_id.to_string()),
+            backend: "claude".to_string(),
+            model: Some("opus".to_string()),
+            used_tokens: used,
+            context_window: Some(window),
+            auto_compact_limit: None,
+            reasoning_tokens: None,
+            last_output_tokens: None,
+            captured_at: 1,
+        }
+    }
+
+    async fn session_count(db: &Arc<crate::storage::LocalDb>) -> i64 {
+        use crate::storage::RowExt;
+        db.query_one(
+            "SELECT COUNT(*) FROM sessions WHERE job_id = 'j'",
+            (),
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// What the header adds on top of the budgeted body. The body itself is
+    /// held to the budget; the header is fixed framing outside it.
+    const SEED_FRAMING_ALLOWANCE: usize = 200;
+
+    /// Tenet 1256. A node whose history renders at roughly twice its window
+    /// rotates under window pressure once: the successor opens on a seed within
+    /// the seed budget, and its next continuation, at that seed's occupancy,
+    /// resumes natively instead of rotating again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_long_running_node_rotates_once_under_window_pressure_onto_a_budgeted_seed() {
+        use crate::sessions::queries::get as get_session;
+
+        let (orch, db) = long_running_node("node-window-rotates-once", 150).await;
+        let window = 100_000;
+        let history_bytes = super::verbatim_prefix_bytes(&db, "j").unwrap();
+        assert!(
+            history_bytes / 4 > window,
+            "the history must outweigh the window: {history_bytes} bytes"
+        );
+        orch.store_context_token_snapshot(occupancy_of("s1", 90_000, window));
+        let job = super::load_job(db.clone(), "j".to_string(), "window pressure")
+            .await
+            .unwrap();
+        let session = get_session(&db, "s1").await.unwrap();
+
+        let ReseedDecision::Rebuilt(outcome, decision) = super::attempt_session_reseed(
+            &orch,
+            &db,
+            &job,
+            &session,
+            0,
+            Some("claude"),
+            PrefixCacheState::Warm,
+        ) else {
+            panic!("a node at 90% of its window must rotate");
+        };
+        assert!(decision.is_none(), "{decision:?}");
+
+        let budget = orch.get_settings().seed_budget_tokens as usize;
+        let seed_tokens = crate::resources::seed_tokens(&outcome.seed_content);
+        assert!(
+            seed_tokens <= budget + SEED_FRAMING_ALLOWANCE,
+            "the successor's seed measures {seed_tokens} tokens against a {budget}-token budget"
+        );
+        let seed = &outcome.seed_content;
+        assert!(seed.starts_with(RESEED_SEED_HEADER));
+        assert!(seed.contains("NEWEST_TURN_MARKER"), "{seed}");
+        assert!(seed.contains("## Turn 150 ·"), "{seed}");
+        assert!(
+            seed.contains("`cairn://p/p/7/1/coordinator/chat?offset=0&limit="),
+            "{seed}"
+        );
+        assert!(seed.contains("- Issue: `cairn://p/p/7`"), "{seed}");
+        assert!(
+            seed.contains("- Todos: `cairn://p/p/7/1/coordinator/todos`"),
+            "{seed}"
+        );
+        assert_eq!(session_count(&db).await, 2);
+
+        // The successor's first request weighs its seed plus a system prompt.
+        // That is nowhere near the trigger, so it continues natively.
+        let successor = get_session(&db, &outcome.new_session_id).await.unwrap();
+        orch.store_context_token_snapshot(occupancy_of(
+            &successor.id,
+            seed_tokens as i64 + 20_000,
+            window,
+        ));
+        let job = super::load_job(db.clone(), "j".to_string(), "after rotation")
+            .await
+            .unwrap();
+        assert!(matches!(
+            super::attempt_session_reseed(
+                &orch,
+                &db,
+                &job,
+                &successor,
+                0,
+                Some("claude"),
+                PrefixCacheState::Warm,
+            ),
+            ReseedDecision::NativeResume(None)
+        ));
+        assert_eq!(session_count(&db).await, 2, "the successor rotated again");
+    }
+
+    /// A window rotation whose seed would open the successor at or above the
+    /// trigger only buys the next rotation, so it is refused: no rotation, the
+    /// session untouched, and a visible record naming both sizes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_window_rotation_that_would_not_relieve_pressure_is_refused() {
+        use crate::sessions::queries::get as get_session;
+
+        let (orch, db) = long_running_node("node-window-refused", 40).await;
+        // A window far smaller than the seed budget: the misconfiguration the
+        // guard exists for.
+        let window = 5_000;
+        orch.store_context_token_snapshot(occupancy_of("s1", 4_500, window));
+        let job = super::load_job(db.clone(), "j".to_string(), "refused rotation")
+            .await
+            .unwrap();
+        let session = get_session(&db, "s1").await.unwrap();
+
+        assert!(matches!(
+            super::attempt_session_reseed(
+                &orch,
+                &db,
+                &job,
+                &session,
+                0,
+                Some("claude"),
+                PrefixCacheState::Warm,
+            ),
+            ReseedDecision::NativeResume(None)
+        ));
+
+        assert_eq!(session_count(&db).await, 1);
+        let after = get_session(&db, "s1").await.unwrap();
+        assert_eq!(after.backend_id.as_deref(), Some("native-thread-1"));
+        assert_eq!(
+            db.query_opt_text("SELECT current_session_id FROM jobs WHERE id = 'j'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("s1")
+        );
+        let record = db
+            .query_opt_text(
+                "SELECT data FROM events WHERE session_id = 's1' AND event_type = 'system:message'",
+                (),
+            )
+            .await
+            .unwrap()
+            .expect("the refusal is recorded on the session");
+        assert!(record.contains("window_rotation_refused"), "{record}");
+        assert!(record.contains("\"windowTokens\":5000"), "{record}");
+        assert!(record.contains("\"seedTokens\":"), "{record}");
+        assert!(record.contains("5000-token window"), "{record}");
+    }
+
+    /// The cold-cache price compares the seed actually delivered: the budgeted
+    /// one. A long history therefore pays, and the seed rotated in is the one
+    /// that was priced.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cold_rebuild_is_priced_on_the_budgeted_seed_it_delivers() {
+        use crate::sessions::queries::get as get_session;
+
+        let (orch, db) = long_running_node("node-cold-budgeted", 150).await;
+        let job = super::load_job(db.clone(), "j".to_string(), "cold rebuild")
+            .await
+            .unwrap();
+        let session = get_session(&db, "s1").await.unwrap();
+        let expected = match super::compose_forced_reseed(&orch, &db, &job, &session) {
+            Ok(composed) => composed.framed().to_string(),
+            Err(error) => panic!("composition failed: {error}"),
+        };
+
+        let ReseedDecision::Rebuilt(outcome, Some(decision)) = super::attempt_session_reseed(
+            &orch,
+            &db,
+            &job,
+            &session,
+            0,
+            Some("claude"),
+            PrefixCacheState::Cold,
+        ) else {
+            panic!("a budgeted seed must pay against a long cold prefix");
+        };
+        assert_eq!(decision.decision, "digest_reseed");
+        assert_eq!(outcome.seed_content, expected);
+        assert!(
+            crate::resources::seed_tokens(&outcome.seed_content)
+                <= orch.get_settings().seed_budget_tokens as usize + SEED_FRAMING_ALLOWANCE
+        );
     }
 
     /// A thread whose window is running out compacts for capacity, and records

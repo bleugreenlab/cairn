@@ -627,6 +627,101 @@ async fn idle_compact_is_the_ordinary_reseed() {
     );
 }
 
+/// Tenet 1256: Compact on a long-running node seeds the successor within the
+/// seed budget, not with the node's whole history. Before it, a coordinator
+/// whose history neared its window was compacted onto a session already full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_of_a_long_history_seeds_a_budgeted_session() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    let db = orch.db.local.clone();
+    seed_job(&db, "claude", "complete").await;
+    db.execute("UPDATE runs SET status = 'exited' WHERE id = 'run-1'", ())
+        .await
+        .unwrap();
+    // Two hundred more completed turns of about 1,300 tokens each: a history of
+    // roughly a quarter million tokens, twenty times the default budget.
+    let body = "analysis of the parser module and its callers ".repeat(60);
+    for sequence in 2..=201_i64 {
+        let turn_id = format!("turn-{sequence}");
+        db.execute(
+            "INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, start_reason,
+                                created_at, updated_at)
+             VALUES (?1, 'session-1', 'run-1', 'job-1', ?2, 'complete', 'follow_up', ?2, ?2)",
+            params![turn_id.as_str(), sequence],
+        )
+        .await
+        .unwrap();
+        let reply = if sequence == 201 {
+            format!("NEWEST_TURN_MARKER {body}")
+        } else {
+            format!("Reply {sequence}. {body}")
+        };
+        for (offset, kind, content) in [
+            (0, "user", format!("Step {sequence}: carry on. {body}")),
+            (1, "assistant", reply),
+        ] {
+            db.execute(
+                "INSERT INTO events (id, run_id, session_id, sequence, timestamp, event_type, data,
+                                     created_at, turn_id)
+                 VALUES (?1, 'run-1', 'session-1', ?2, ?2, ?3, ?4, ?2, ?5)",
+                params![
+                    format!("event-{sequence}-{kind}"),
+                    sequence * 10 + offset,
+                    kind,
+                    serde_json::json!({ "type": kind, "content": content }).to_string(),
+                    turn_id.as_str()
+                ],
+            )
+            .await
+            .unwrap();
+        }
+    }
+    db.execute(
+        "UPDATE jobs SET current_turn_id = 'turn-201' WHERE id = 'job-1'",
+        (),
+    )
+    .await
+    .unwrap();
+
+    match compact_job(&orch, "job-1", None, ColdCompact::Unconfirmed).expect("an idle job compacts")
+    {
+        CompactResult::Compacted(_) => {}
+        CompactResult::ConfirmationRequired(counts) => {
+            panic!("an idle job asked for confirmation: {counts:?}")
+        }
+    }
+
+    let history: i64 = count(
+        &db,
+        "SELECT SUM(LENGTH(data)) FROM events WHERE session_id = 'session-1'",
+    )
+    .await;
+    let seed = text(
+        &db,
+        "SELECT e.data FROM events e JOIN jobs j ON j.current_session_id = e.session_id
+          WHERE j.id = 'job-1' AND e.event_type = 'user:seed'",
+    )
+    .await
+    .expect("the successor opens from a seed");
+    // The default budget is 12,000 tokens. At a generous five bytes a token plus
+    // the header and the event's own JSON, a budgeted seed stays under 80 KB;
+    // the history it replaces is over a megabyte.
+    assert!(
+        history > 1_000_000,
+        "the fixture history is only {history} bytes"
+    );
+    assert!(
+        seed.len() < 80_000,
+        "a Compact seeded {} bytes from a {history}-byte history",
+        seed.len()
+    );
+    assert!(seed.contains("NEWEST_TURN_MARKER"), "{seed}");
+    assert!(seed.contains("## Working documents"), "{seed}");
+    assert!(seed.contains("## Earlier turns"), "{seed}");
+    assert!(seed.contains("/chat?offset=0&limit="), "{seed}");
+    assert!(seed.contains("/todos`"), "{seed}");
+}
+
 /// Without the operator's consent, a Compact that finds live work tears
 /// nothing down: it reports the work for the operator to confirm against.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
