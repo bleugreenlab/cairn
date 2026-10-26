@@ -157,6 +157,15 @@ macro_rules! private_execution_queue_build_volume_absent {
     };
 }
 
+/// cairn/4482: purpose items granted to a machine and not yet confirmed dead,
+/// so a runner restart cannot forget work a remote machine is still running.
+/// Describes this installation's own fleet only.
+macro_rules! private_purpose_debts {
+    () => {
+        migration!("0282_purpose_debts")
+    };
+}
+
 /// Runner-local recovery journal for the exact remote authority generation held
 /// by a team ordinary process and any terminal action still owed to Postgres.
 macro_rules! private_team_ordinary_admission_authority {
@@ -1866,6 +1875,7 @@ macro_rules! private_lineage {
             shared_tail_drop_check_test_outcomes_view!(),
             private_execution_queue_build_volume_absent!(),
             shared_tail_job_goal_intent!(),
+            private_purpose_debts!(),
         ]
     };
 }
@@ -2419,6 +2429,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // this installation's own fleet.
     (
         "executor_preparation_refusals",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // Work this runner granted to one of its own machines and has not yet seen
+    // end. Names executor identities that mean nothing on another install.
+    (
+        "purpose_debts",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     // A routed batch's commit awaiting republication onto its branch. Names
@@ -3723,6 +3739,7 @@ mod tests {
                 "drop_check_test_outcomes_view",
                 "execution_queue_build_volume_absent",
                 "job_goal_intent",
+                "purpose_debts",
             ],
         );
     }

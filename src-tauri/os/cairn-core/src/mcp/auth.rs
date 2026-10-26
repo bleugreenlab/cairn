@@ -561,6 +561,10 @@ mod tests {
             // response, log, config file, or spawned process environment.
             "src-tauri/src/commands/attachments.rs",
             "src-tauri/src/commands/voice.rs",
+            // The purpose-overlap proxy: main-webview only, local runner only,
+            // forwards its arguments and returns the runner's payload, like
+            // `permission.rs`.
+            "src-tauri/src/commands/fleet.rs",
             // Test fixtures, which mint their own throwaway credentials.
             "src-tauri/cairn-orch/tests/transport.rs",
             "src-tauri/cairn-transport/src/routes/invoke/tests.rs",

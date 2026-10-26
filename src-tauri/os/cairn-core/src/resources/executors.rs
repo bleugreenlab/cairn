@@ -32,6 +32,45 @@ use cairn_common::executor_protocol::{
     StorageReclaimRung, StorageRungReclaim, StorageWithheld, StorageWithheldReason,
 };
 
+/// Questions held back from their next answer because an earlier answer may
+/// still be running, or nothing when none are.
+///
+/// The collection lists every one, including those that never reached a
+/// machine; a machine's own page lists the ones it holds. Read-only on purpose:
+/// the only escape is an operator naming the overlap in the app, because this
+/// resource's writes arrive with no person behind them.
+pub(crate) fn render_blocked_questions(
+    blocked: &[crate::fleet::BlockedQuestion],
+    journal_error: Option<&str>,
+) -> String {
+    if blocked.is_empty() && journal_error.is_none() {
+        return String::new();
+    }
+    let mut out = format!("## Blocked questions ({})\n\n", blocked.len());
+    if !blocked.is_empty() {
+        out.push_str(
+            "Each question below will not dispatch its next answer while an earlier one may still be running. Each settles on the evidence named, never on a timer or a restart. Only an operator can authorize the overlap instead, from the fleet view in the app.\n\n",
+        );
+    }
+    for question in blocked {
+        out.push_str(&format!("### {}\n", question.question));
+        out.push_str(&format!(
+            "- Item: request {} attempt {}, retired {} ago {}\n",
+            question.request_id, question.attempt_id, question.retired_ago, question.phase
+        ));
+        out.push_str(&format!("- Machine: {}\n", question.placement));
+        out.push_str(&format!("- Cause: {}\n", question.cause));
+        out.push_str(&format!("- Confirmation: {}\n", question.confirmation));
+        out.push_str(&format!("- Settles when: {}\n\n", question.settles_when));
+    }
+    if let Some(error) = journal_error {
+        out.push_str(&format!(
+            "Debts are not durable right now ({error}): a runner restart would forget them.\n\n"
+        ));
+    }
+    out
+}
+
 /// This runner's own private agent-session lanes. Kept at collection scope
 /// because sessions run on the runner, not on any executor; rendered from the
 /// promoter's last recorded decision, never a fresh probe.
@@ -4750,6 +4789,67 @@ fn plural(count: usize, one: &str, many: &str) -> String {
         format!("{count} {one}")
     } else {
         format!("{count} {many}")
+    }
+}
+
+#[cfg(test)]
+mod blocked_question_tests {
+    use super::render_blocked_questions;
+    use crate::fleet::purpose::{
+        Confirmation, DebtPlacement, DebtRowState, ItemPhase, PurposeDebtRow, PurposeKey,
+        RetirementCause,
+    };
+
+    /// Every debt is listed on the collection, including one that never
+    /// reached a machine, and a debt a restart reloaded says so. A machine's
+    /// own page lists only what that machine holds.
+    #[test]
+    fn blocked_questions_name_unplaced_and_reloaded_debts() {
+        let fleet = crate::fleet::Fleet::default();
+        let unplaced = PurposeKey::main_cadence("p", "rust-tests", "linux");
+        fleet.admit_purpose_for_test(&unplaced, &("queued".into(), "q".into()), 10);
+        fleet.admit_purpose_for_test(&unplaced, &("newer".into(), "n".into()), 20);
+        let reloaded = PurposeKey::main_cadence("p", "rust-tests", "macos");
+        fleet.reload_purpose_debts_for_test(
+            vec![PurposeDebtRow {
+                key: reloaded.clone(),
+                request: ("stranded".into(), "s".into()),
+                state: DebtRowState::Live,
+                phase: ItemPhase::Dispatched,
+                placement: DebtPlacement {
+                    executor_id: "remote-mac".into(),
+                    generation: 4,
+                    dispatched_at_unix_ms: 5,
+                    awaiting_post_boot_account: false,
+                },
+                cause: None::<RetirementCause>,
+                confirmation: None::<Confirmation>,
+                retired_at_unix_ms: None,
+            }],
+            1_000,
+        );
+
+        let all = render_blocked_questions(&fleet.blocked_questions(None, 2_000), None);
+        assert!(all.contains("## Blocked questions (2)"), "{all}");
+        assert!(all.contains(&format!("### {unplaced}")), "{all}");
+        assert!(
+            all.contains("- Machine: never placed on a machine"),
+            "{all}"
+        );
+        assert!(all.contains(&format!("### {reloaded}")), "{all}");
+        assert!(all.contains("- Machine: on remote-mac"), "{all}");
+        assert!(all.contains("runner restarted at"), "{all}");
+        assert!(all.contains("authorize the overlap"), "{all}");
+
+        let one =
+            render_blocked_questions(&fleet.blocked_questions(Some("remote-mac"), 2_000), None);
+        assert!(one.contains("## Blocked questions (1)"), "{one}");
+        assert!(!one.contains("never placed"), "{one}");
+        assert_eq!(
+            render_blocked_questions(&fleet.blocked_questions(Some("elsewhere"), 2_000), None),
+            "",
+            "a machine holding no debt renders nothing"
+        );
     }
 }
 

@@ -42,10 +42,45 @@
 //! the coalescing registry's `subscribers`, which already tracks it per
 //! execution for every check Cairn runs; a second copy here would be one more
 //! thing to keep true.
+//!
+//! # What settles a debt
+//!
+//! A debt is cleared by evidence the runner already holds that the work is no
+//! longer running, and by nothing else. There are four kinds, and each has one
+//! entry point here:
+//!
+//! - the attempt's own terminal outcome, or a runner decision that proves
+//!   nothing ran ([`PurposeRegistry::finish`]);
+//! - the bound machine's own account of its work, read from its snapshots
+//!   ([`PurposeRegistry::settle_on_machine`],
+//!   [`PurposeRegistry::post_boot_account`]);
+//! - the bound machine being gone by the runner's authority
+//!   ([`PurposeRegistry::settle_on_machine`]);
+//! - an operator naming the exact overlap they authorize
+//!   ([`PurposeRegistry::authorize_overlap`]).
+//!
+//! A timer, a watchdog that gave up, a leader task that vanished, and a runner
+//! restart are not on that list. Each leaves the debt in place as
+//! [`Confirmation::Unconfirmed`] with its reason named
+//! ([`PurposeRegistry::end_unconfirmed`]), because the work may still be
+//! running on a machine the runner cannot currently hear.
+//!
+//! # Why dispatched items are persisted
+//!
+//! A runner restart forgets an in-memory debt, but the remote machine running
+//! the work does not restart with it. So every item that reached
+//! [`ItemPhase::Dispatched`] is journaled ([`DebtChange`]) from the grant until
+//! it settles, and on boot every journaled row comes back as an unconfirmed
+//! debt. Items that never reached a machine are not journaled: the restart
+//! itself ends runner-owned work.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use super::RequestIdentity;
+use crate::storage::{LocalDb, RowExt};
 
 /// The question a dispatched work item answers.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -61,6 +96,15 @@ impl PurposeKey {
     /// earlier process left behind.
     pub(crate) fn main_cadence(project_id: &str, check: &str, platform: &str) -> Self {
         Self(format!("main-cadence:{project_id}:{check}:{platform}"))
+    }
+
+    /// A key as it was written to the debt journal, or as an operator named it.
+    pub(crate) fn from_persisted(key: String) -> Self {
+        Self(key)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -86,12 +130,152 @@ pub(crate) enum ItemPhase {
     Dispatched,
 }
 
+impl ItemPhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Dispatched => "dispatched",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "preparing" => Some(Self::Preparing),
+            "dispatched" => Some(Self::Dispatched),
+            _ => None,
+        }
+    }
+
+    /// When, in an item's life, it was retired.
+    pub(crate) fn describe_retirement(self) -> &'static str {
+        match self {
+            Self::Preparing => "before it reached a machine",
+            Self::Dispatched => "after it was granted to a machine",
+        }
+    }
+}
+
+/// A unix-millisecond instant as an operator reads it.
+pub(crate) fn stamp(unix_ms: u64) -> String {
+    crate::clock::stamp_millis_with_seconds(unix_ms as i64)
+        .unwrap_or_else(|| format!("unix ms {unix_ms}"))
+}
+
+/// The machine an item was granted to, recorded at the grant.
+///
+/// Captured then rather than looked up later because the queue forgets a
+/// binding once its entry is answered, and a debt whose work outlived its
+/// entry (a watchdog that gave up, a runner restart) still has to name the
+/// machine that may be running it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DebtPlacement {
+    pub(crate) executor_id: String,
+    pub(crate) generation: u64,
+    pub(crate) dispatched_at_unix_ms: u64,
+    /// Set on a debt reloaded at boot until that machine's first snapshot in
+    /// this process has been read against it. Generations restart at boot, so
+    /// the recorded one cannot be compared with a live connection's until that
+    /// account rebases it.
+    pub(crate) awaiting_post_boot_account: bool,
+}
+
+/// Why an item stopped being its question's live answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub(crate) enum RetirementCause {
+    /// A newer answer to the same question took the key.
+    Displaced { by: RequestIdentity },
+    /// Someone asked for this work to stop and nothing replaced it.
+    Retracted,
+    /// Nothing displaced it: its attempt ended on the runner's side without
+    /// the machine saying it had stopped.
+    Unanswered,
+    /// It was the live answer when the runner last stopped, and the runner
+    /// came back to find it still owed.
+    Reloaded,
+}
+
+impl RetirementCause {
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Displaced { by } => {
+                format!("displaced by request {} attempt {}", by.0, by.1)
+            }
+            Self::Retracted => "retracted with nothing replacing it".into(),
+            Self::Unanswered => {
+                "nothing displaced it; its attempt ended without the machine answering".into()
+            }
+            Self::Reloaded => "it was the live answer when the runner last stopped".into(),
+        }
+    }
+}
+
+/// Why the runner can no longer expect this debt's own terminal outcome.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub(crate) enum UnconfirmedReason {
+    /// The runner stopped waiting on a grant it had delivered.
+    GrantAbandoned { detail: String },
+    /// The task waiting on the attempt panicked or was dropped.
+    LeaderVanished,
+    /// The runner restarted while the attempt was on a machine.
+    RunnerRestarted { at_unix_ms: u64 },
+}
+
+impl UnconfirmedReason {
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::GrantAbandoned { detail } => format!("grant abandoned by the runner: {detail}"),
+            Self::LeaderVanished => "leader task vanished".into(),
+            Self::RunnerRestarted { at_unix_ms } => {
+                format!("runner restarted at {}", stamp(*at_unix_ms))
+            }
+        }
+    }
+}
+
+/// Whether a debt's own terminal outcome is still on its way.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub(crate) enum Confirmation {
+    /// Something is still waiting on the attempt, and its answer will settle
+    /// the debt.
+    Awaiting,
+    /// Nothing is waiting on the attempt any more. Only machine evidence or an
+    /// operator settles it now.
+    Unconfirmed {
+        since_unix_ms: u64,
+        reason: UnconfirmedReason,
+    },
+}
+
+impl Confirmation {
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Awaiting => "awaiting its own terminal outcome".into(),
+            Self::Unconfirmed {
+                reason: reason @ UnconfirmedReason::RunnerRestarted { .. },
+                ..
+            } => format!("unconfirmed: {}", reason.describe()),
+            Self::Unconfirmed {
+                since_unix_ms,
+                reason,
+            } => format!(
+                "unconfirmed since {}: {}",
+                stamp(*since_unix_ms),
+                reason.describe()
+            ),
+        }
+    }
+}
+
 /// One live answer to one question.
 #[derive(Clone, Debug)]
 struct LiveItem {
     request: RequestIdentity,
     phase: ItemPhase,
     armed_at_unix_ms: u64,
+    placement: Option<DebtPlacement>,
 }
 
 /// An item told to stop, whose death has not yet been observed.
@@ -105,7 +289,108 @@ struct LiveItem {
 #[derive(Clone, Debug)]
 struct RetiringItem {
     request: RequestIdentity,
+    phase: ItemPhase,
+    placement: Option<DebtPlacement>,
+    cause: RetirementCause,
+    confirmation: Confirmation,
     retired_at_unix_ms: u64,
+}
+
+impl RetiringItem {
+    fn from_live(
+        live: LiveItem,
+        cause: RetirementCause,
+        confirmation: Confirmation,
+        at_unix_ms: u64,
+    ) -> Self {
+        Self {
+            request: live.request,
+            phase: live.phase,
+            placement: live.placement,
+            cause,
+            confirmation,
+            retired_at_unix_ms: at_unix_ms,
+        }
+    }
+
+    fn view(&self, key: &PurposeKey) -> PurposeDebtView {
+        PurposeDebtView {
+            key: key.clone(),
+            request: self.request.clone(),
+            phase: self.phase,
+            placement: self.placement.clone(),
+            cause: self.cause.clone(),
+            confirmation: self.confirmation.clone(),
+            retired_at_unix_ms: self.retired_at_unix_ms,
+        }
+    }
+}
+
+/// One outstanding debt, as the refusal, the executors page, and the operator
+/// escape describe it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PurposeDebtView {
+    pub(crate) key: PurposeKey,
+    pub(crate) request: RequestIdentity,
+    pub(crate) phase: ItemPhase,
+    /// `None` for an item that was never granted to a machine.
+    pub(crate) placement: Option<DebtPlacement>,
+    pub(crate) cause: RetirementCause,
+    pub(crate) confirmation: Confirmation,
+    pub(crate) retired_at_unix_ms: u64,
+}
+
+/// Whether a journaled item was the live answer or a debt when last written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DebtRowState {
+    Live,
+    Retiring,
+}
+
+impl DebtRowState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Retiring => "retiring",
+        }
+    }
+}
+
+/// The durable form of one item that reached a machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PurposeDebtRow {
+    pub(crate) key: PurposeKey,
+    pub(crate) request: RequestIdentity,
+    pub(crate) state: DebtRowState,
+    pub(crate) phase: ItemPhase,
+    pub(crate) placement: DebtPlacement,
+    /// Absent while the item is still the live answer.
+    pub(crate) cause: Option<RetirementCause>,
+    pub(crate) confirmation: Option<Confirmation>,
+    pub(crate) retired_at_unix_ms: Option<u64>,
+}
+
+/// One change to the durable set of placed items, in the order the registry
+/// made it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DebtChange {
+    Upsert(PurposeDebtRow),
+    Delete {
+        key: PurposeKey,
+        request: RequestIdentity,
+    },
+}
+
+/// What the first account of one machine read against the debts reloaded for
+/// it in this process said about them. That is its first snapshot after the
+/// reload finished, which is never earlier than its first snapshot after boot.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PostBootAccount {
+    /// Absent from the account, so not running: settled.
+    pub(crate) settled: Vec<PurposeDebtView>,
+    /// Still listed by the machine. The caller owes each a `Cancel`, and the
+    /// debt stays until the machine says it ended.
+    pub(crate) still_running: Vec<RequestIdentity>,
 }
 
 /// Everything a question currently owns: its live answer, if it has one, and
@@ -147,9 +432,113 @@ pub(crate) enum Admission {
 #[derive(Default)]
 pub(crate) struct PurposeRegistry {
     items: HashMap<PurposeKey, PurposeState>,
+    /// Where changes to placed items are sent to be made durable. Absent on a
+    /// registry with no store, which is every bare `Fleet::default()`.
+    journal: Option<mpsc::UnboundedSender<DebtChange>>,
+    /// Machines the runner lost while a boot reload was still reading the
+    /// journal: `Some` from [`Self::expect_reload`] until [`Self::reload`]. A
+    /// reloaded row naming one of them settles as it arrives, because the
+    /// evidence that settles it landed before the row did.
+    lost_before_reload: Option<HashSet<String>>,
 }
 
 impl PurposeRegistry {
+    /// Note that journaled rows are about to be read back, so machines lost
+    /// before they arrive are remembered against them.
+    pub(crate) fn expect_reload(&mut self) {
+        self.lost_before_reload = Some(HashSet::new());
+    }
+
+    /// Settle every debt bound to `executor_id`, because the runner knows that
+    /// machine's work is gone, including any debt for it still to be reloaded.
+    pub(crate) fn machine_lost(&mut self, executor_id: &str) -> Vec<PurposeDebtView> {
+        if let Some(lost) = self.lost_before_reload.as_mut() {
+            lost.insert(executor_id.to_string());
+        }
+        self.settle_on_machine(executor_id, |_, _| true)
+    }
+
+    /// Install the durable sink. Every later change to an item that reached a
+    /// machine is sent there, in the order it was made.
+    pub(crate) fn attach_journal(&mut self, journal: mpsc::UnboundedSender<DebtChange>) {
+        self.journal = Some(journal);
+    }
+
+    /// Whether `request` currently holds a placement anywhere in the registry.
+    fn placed(&self, request: &RequestIdentity) -> bool {
+        self.items.values().any(|state| {
+            state
+                .live
+                .as_ref()
+                .is_some_and(|live| &live.request == request && live.placement.is_some())
+                || state
+                    .retiring
+                    .iter()
+                    .any(|item| &item.request == request && item.placement.is_some())
+        })
+    }
+
+    /// Send the durable form of `request` under `key` as it now stands: its
+    /// row if it is placed, or its deletion if it was placed before this
+    /// change and is not now.
+    fn journal_item(&self, key: &PurposeKey, request: &RequestIdentity, was_placed: bool) {
+        let Some(journal) = &self.journal else {
+            return;
+        };
+        let row = self.items.get(key).and_then(|state| {
+            if let Some(live) = state.live.as_ref().filter(|live| &live.request == request) {
+                return live.placement.clone().map(|placement| PurposeDebtRow {
+                    key: key.clone(),
+                    request: request.clone(),
+                    state: DebtRowState::Live,
+                    phase: live.phase,
+                    placement,
+                    cause: None,
+                    confirmation: None,
+                    retired_at_unix_ms: None,
+                });
+            }
+            state
+                .retiring
+                .iter()
+                .find(|item| &item.request == request)
+                .and_then(|item| {
+                    item.placement.clone().map(|placement| PurposeDebtRow {
+                        key: key.clone(),
+                        request: request.clone(),
+                        state: DebtRowState::Retiring,
+                        phase: item.phase,
+                        placement,
+                        cause: Some(item.cause.clone()),
+                        confirmation: Some(item.confirmation.clone()),
+                        retired_at_unix_ms: Some(item.retired_at_unix_ms),
+                    })
+                })
+        });
+        let change = match row {
+            Some(row) => DebtChange::Upsert(row),
+            None if was_placed => DebtChange::Delete {
+                key: key.clone(),
+                request: request.clone(),
+            },
+            None => return,
+        };
+        let _ = journal.send(change);
+    }
+
+    fn journal_removed(&self, key: &PurposeKey, request: &RequestIdentity) {
+        if let Some(journal) = &self.journal {
+            let _ = journal.send(DebtChange::Delete {
+                key: key.clone(),
+                request: request.clone(),
+            });
+        }
+    }
+
+    fn prune(&mut self) {
+        self.items.retain(|_, state| !state.is_vacant());
+    }
+
     /// Admit `request` as the live answer to `key`, displacing any older one.
     ///
     /// The whole transition happens here, under the caller's single lock: the
@@ -168,12 +557,13 @@ impl PurposeRegistry {
         request: RequestIdentity,
         armed_at_unix_ms: u64,
     ) -> Admission {
-        let state = self.items.entry(key).or_default();
+        let state = self.items.entry(key.clone()).or_default();
         let Some(existing) = state.live.as_mut() else {
             state.live = Some(LiveItem {
                 request,
                 phase: ItemPhase::Preparing,
                 armed_at_unix_ms,
+                placement: None,
             });
             return Admission::Admitted;
         };
@@ -188,20 +578,28 @@ impl PurposeRegistry {
                 holder: existing.request.clone(),
             };
         }
-        let retire = existing.request.clone();
-        let phase = existing.phase;
+        let displaced = state
+            .live
+            .replace(LiveItem {
+                request: request.clone(),
+                phase: ItemPhase::Preparing,
+                armed_at_unix_ms,
+                placement: None,
+            })
+            .expect("the live item was just read");
+        let retire = displaced.request.clone();
+        let phase = displaced.phase;
+        let was_placed = displaced.placement.is_some();
         // The displaced item becomes this question's debt rather than leaving
         // it. Until its death is observed the key is not free, and the caller
         // that just won the key may not dispatch.
-        state.retiring.push(RetiringItem {
-            request: retire.clone(),
-            retired_at_unix_ms: armed_at_unix_ms,
-        });
-        state.live = Some(LiveItem {
-            request,
-            phase: ItemPhase::Preparing,
+        state.retiring.push(RetiringItem::from_live(
+            displaced,
+            RetirementCause::Displaced { by: request },
+            Confirmation::Awaiting,
             armed_at_unix_ms,
-        });
+        ));
+        self.journal_item(&key, &retire, was_placed);
         Admission::Replaced { retire, phase }
     }
 
@@ -211,7 +609,22 @@ impl PurposeRegistry {
     /// newer answer is taking its place. The key stays occupied by the debt, so
     /// a fresh arrival still waits for the death rather than starting beside it.
     pub(crate) fn retire(&mut self, request: &RequestIdentity, at_unix_ms: u64) -> bool {
-        let Some(state) = self.items.values_mut().find(|state| {
+        self.retire_live(
+            request,
+            RetirementCause::Retracted,
+            Confirmation::Awaiting,
+            at_unix_ms,
+        )
+    }
+
+    fn retire_live(
+        &mut self,
+        request: &RequestIdentity,
+        cause: RetirementCause,
+        confirmation: Confirmation,
+        at_unix_ms: u64,
+    ) -> bool {
+        let Some((key, state)) = self.items.iter_mut().find(|(_, state)| {
             state
                 .live
                 .as_ref()
@@ -219,12 +632,49 @@ impl PurposeRegistry {
         }) else {
             return false;
         };
-        state.live = None;
+        let key = key.clone();
+        let live = state.live.take().expect("the live item was just matched");
+        let was_placed = live.placement.is_some();
+        state.retiring.push(RetiringItem::from_live(
+            live,
+            cause,
+            confirmation,
+            at_unix_ms,
+        ));
+        self.journal_item(&key, request, was_placed);
+        true
+    }
+
+    /// Record a debt on `key` for an execution this question joined rather
+    /// than led, because retiring the question's own item retired that
+    /// execution too. Its leader's terminal outcome clears it through
+    /// [`Self::finish`], like any other debt.
+    pub(crate) fn owe_for_joined(
+        &mut self,
+        key: &PurposeKey,
+        joined: RequestIdentity,
+        placement: Option<DebtPlacement>,
+        cause: RetirementCause,
+        at_unix_ms: u64,
+    ) {
+        let state = self.items.entry(key.clone()).or_default();
+        if state.retiring.iter().any(|item| item.request == joined) {
+            return;
+        }
+        let phase = if placement.is_some() {
+            ItemPhase::Dispatched
+        } else {
+            ItemPhase::Preparing
+        };
         state.retiring.push(RetiringItem {
-            request: request.clone(),
+            request: joined.clone(),
+            phase,
+            placement,
+            cause,
+            confirmation: Confirmation::Awaiting,
             retired_at_unix_ms: at_unix_ms,
         });
-        true
+        self.journal_item(key, &joined, false);
     }
 
     /// Whether `request` is still the live answer to `key`.
@@ -251,35 +701,136 @@ impl PurposeRegistry {
             .unwrap_or(0)
     }
 
-    /// The oldest outstanding retirement for `key`, for reporting a wait that
-    /// has gone on long enough to be worth naming.
-    pub(crate) fn oldest_pending_retirement(
-        &self,
-        key: &PurposeKey,
-    ) -> Option<(RequestIdentity, u64)> {
-        self.items
-            .get(key)?
-            .retiring
-            .iter()
-            .min_by_key(|item| item.retired_at_unix_ms)
-            .map(|item| (item.request.clone(), item.retired_at_unix_ms))
+    /// Every outstanding debt on `key`, oldest first.
+    pub(crate) fn debts_for(&self, key: &PurposeKey) -> Vec<PurposeDebtView> {
+        let mut debts: Vec<_> = self
+            .items
+            .get(key)
+            .map(|state| state.retiring.iter().map(|item| item.view(key)).collect())
+            .unwrap_or_default();
+        debts.sort_by_key(|debt| debt.retired_at_unix_ms);
+        debts
     }
 
-    /// Record that the live item for `request` reached `phase`.
-    ///
-    /// Fenced by request identity, so a transition reported by an item that has
-    /// already been replaced cannot move the item that replaced it.
-    pub(crate) fn advance(&mut self, request: &RequestIdentity, phase: ItemPhase) -> bool {
-        let Some(item) = self
+    /// Every outstanding debt on every question, ordered by question and then
+    /// by age.
+    pub(crate) fn debts(&self) -> Vec<PurposeDebtView> {
+        let mut debts: Vec<_> = self
             .items
-            .values_mut()
-            .filter_map(|state| state.live.as_mut())
-            .find(|item| &item.request == request)
-        else {
-            return false;
+            .iter()
+            .flat_map(|(key, state)| state.retiring.iter().map(move |item| item.view(key)))
+            .collect();
+        debts.sort_by(|left, right| {
+            (&left.key, left.retired_at_unix_ms).cmp(&(&right.key, right.retired_at_unix_ms))
+        });
+        debts
+    }
+
+    /// Record that `request` was granted to a machine.
+    ///
+    /// From here a runner that forgets the item would leave work running that
+    /// nothing owes a death, so this is where the item becomes durable. The
+    /// item may already be a debt: retirement can land between the last
+    /// pre-grant check and the grant itself, and the debt must then name the
+    /// machine it went to as much as a live item would.
+    pub(crate) fn dispatched(
+        &mut self,
+        request: &RequestIdentity,
+        executor_id: &str,
+        generation: u64,
+        at_unix_ms: u64,
+    ) -> bool {
+        let placement = DebtPlacement {
+            executor_id: executor_id.to_string(),
+            generation,
+            dispatched_at_unix_ms: at_unix_ms,
+            awaiting_post_boot_account: false,
         };
-        item.phase = phase;
-        true
+        let mut touched = Vec::new();
+        for (key, state) in &mut self.items {
+            if let Some(live) = state.live.as_mut().filter(|live| &live.request == request) {
+                live.phase = ItemPhase::Dispatched;
+                live.placement = Some(placement.clone());
+                touched.push(key.clone());
+            }
+            for item in state
+                .retiring
+                .iter_mut()
+                .filter(|item| &item.request == request)
+            {
+                item.phase = ItemPhase::Dispatched;
+                item.placement = Some(placement.clone());
+                touched.push(key.clone());
+            }
+        }
+        for key in &touched {
+            self.journal_item(key, request, false);
+        }
+        !touched.is_empty()
+    }
+
+    /// The attempt for `request` ended on the runner's side without proof that
+    /// nothing is running.
+    ///
+    /// An item that never reached a machine has nothing running anywhere, so
+    /// this is [`Self::finish`] for it. One that did keeps (or becomes) a debt,
+    /// marked unconfirmed with `reason`: a watchdog giving up and a task
+    /// vanishing are facts about this runner, not about the machine. A live
+    /// item nobody displaced becomes a debt here too, because its work may
+    /// still be running and the next answer must not start beside it.
+    pub(crate) fn end_unconfirmed(
+        &mut self,
+        request: &RequestIdentity,
+        reason: UnconfirmedReason,
+        at_unix_ms: u64,
+    ) -> bool {
+        let unconfirmed = Confirmation::Unconfirmed {
+            since_unix_ms: at_unix_ms,
+            reason,
+        };
+        let mut touched = Vec::new();
+        for (key, state) in &mut self.items {
+            if state
+                .live
+                .as_ref()
+                .is_some_and(|live| &live.request == request)
+            {
+                let live = state.live.take().expect("the live item was just matched");
+                let was_placed = live.placement.is_some();
+                if was_placed {
+                    state.retiring.push(RetiringItem::from_live(
+                        live,
+                        RetirementCause::Unanswered,
+                        unconfirmed.clone(),
+                        at_unix_ms,
+                    ));
+                }
+                touched.push((key.clone(), was_placed));
+                continue;
+            }
+            let mut was_placed = false;
+            let mut matched = false;
+            state.retiring.retain_mut(|item| {
+                if &item.request != request {
+                    return true;
+                }
+                matched = true;
+                if item.placement.is_none() {
+                    return false;
+                }
+                was_placed = true;
+                item.confirmation = unconfirmed.clone();
+                true
+            });
+            if matched {
+                touched.push((key.clone(), was_placed));
+            }
+        }
+        for (key, was_placed) in &touched {
+            self.journal_item(key, request, *was_placed);
+        }
+        self.prune();
+        !touched.is_empty()
     }
 
     /// Release the key an item held, because it finished or was retired.
@@ -294,8 +845,10 @@ impl PurposeRegistry {
     /// displaced item clears its own debt here, which is what releases whichever
     /// successor is waiting on it.
     pub(crate) fn finish(&mut self, request: &RequestIdentity) -> bool {
-        let mut cleared = false;
-        self.items.retain(|_, state| {
+        let was_placed = self.placed(request);
+        let mut cleared_keys = Vec::new();
+        for (key, state) in &mut self.items {
+            let mut cleared = false;
             if state
                 .live
                 .as_ref()
@@ -307,9 +860,228 @@ impl PurposeRegistry {
             let before = state.retiring.len();
             state.retiring.retain(|item| &item.request != request);
             cleared |= state.retiring.len() != before;
-            !state.is_vacant()
-        });
-        cleared
+            if cleared {
+                cleared_keys.push(key.clone());
+            }
+        }
+        if was_placed {
+            for key in &cleared_keys {
+                self.journal_removed(key, request);
+            }
+        }
+        self.prune();
+        !cleared_keys.is_empty()
+    }
+
+    /// Settle the debts bound to `executor_id` that `evidence` accepts, and
+    /// report which.
+    ///
+    /// The entry point for what a machine says, or what the runner knows, about
+    /// that machine as a whole: its own account of its work, or its being gone
+    /// by the runner's authority. The caller decides which placements its
+    /// evidence covers; a debt that names no machine is never touched here.
+    pub(crate) fn settle_on_machine(
+        &mut self,
+        executor_id: &str,
+        evidence: impl Fn(&RequestIdentity, &DebtPlacement) -> bool,
+    ) -> Vec<PurposeDebtView> {
+        let mut settled = Vec::new();
+        for (key, state) in &mut self.items {
+            state.retiring.retain(|item| {
+                let covered = item.placement.as_ref().is_some_and(|placement| {
+                    placement.executor_id == executor_id && evidence(&item.request, placement)
+                });
+                if covered {
+                    settled.push(item.view(key));
+                }
+                !covered
+            });
+        }
+        for debt in &settled {
+            self.journal_removed(&debt.key, &debt.request);
+        }
+        self.prune();
+        settled
+    }
+
+    /// Read one machine's first account in this process against the debts
+    /// reloaded for it at boot.
+    ///
+    /// A debt the account does not list (as granted, executing, or queued) is
+    /// not running there and settles. One it still lists is running, so the
+    /// caller sends it `Cancel`; the debt stays, rebased onto `generation`, so
+    /// the machine's later accounts can settle it the way they settle any
+    /// other debt on a live connection.
+    pub(crate) fn post_boot_account(
+        &mut self,
+        executor_id: &str,
+        generation: u64,
+        lists: impl Fn(&RequestIdentity) -> bool,
+    ) -> PostBootAccount {
+        let mut account = PostBootAccount::default();
+        let mut rebased = Vec::new();
+        for (key, state) in &mut self.items {
+            state.retiring.retain_mut(|item| {
+                let Some(placement) = item.placement.as_mut().filter(|placement| {
+                    placement.executor_id == executor_id && placement.awaiting_post_boot_account
+                }) else {
+                    return true;
+                };
+                if lists(&item.request) {
+                    placement.awaiting_post_boot_account = false;
+                    placement.generation = generation;
+                    account.still_running.push(item.request.clone());
+                    rebased.push((key.clone(), item.request.clone()));
+                    true
+                } else {
+                    account.settled.push(item.view(key));
+                    false
+                }
+            });
+        }
+        for debt in &account.settled {
+            self.journal_removed(&debt.key, &debt.request);
+        }
+        for (key, request) in &rebased {
+            self.journal_item(key, request, true);
+        }
+        self.prune();
+        account
+    }
+
+    /// Settle the one debt an operator named, because they authorized the
+    /// overlap it was preventing.
+    ///
+    /// Exact by construction: the question, the item, and the machine must
+    /// all match one outstanding debt (`executor_id` is `None` only for a debt
+    /// that was never placed). Anything looser would be a generic override,
+    /// and a refusal lists what does exist so the operator can name it.
+    pub(crate) fn authorize_overlap(
+        &mut self,
+        key: &PurposeKey,
+        request: &RequestIdentity,
+        executor_id: Option<&str>,
+    ) -> Result<PurposeDebtView, String> {
+        let outstanding = self.debts_for(key);
+        let matches = |debt: &PurposeDebtView| {
+            &debt.request == request
+                && debt
+                    .placement
+                    .as_ref()
+                    .map(|placement| placement.executor_id.as_str())
+                    == executor_id
+        };
+        let Some(debt) = outstanding.iter().find(|debt| matches(debt)).cloned() else {
+            let listed = if outstanding.is_empty() {
+                "it owes none".to_string()
+            } else {
+                outstanding
+                    .iter()
+                    .map(|debt| {
+                        format!(
+                            "request {} attempt {} on {}",
+                            debt.request.0,
+                            debt.request.1,
+                            debt.placement
+                                .as_ref()
+                                .map_or("no machine", |placement| placement.executor_id.as_str())
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            return Err(format!(
+                "purpose {key} owes no debt for request {} attempt {} on {}; its outstanding debts: {listed}",
+                request.0,
+                request.1,
+                executor_id.unwrap_or("no machine"),
+            ));
+        };
+        if let Some(state) = self.items.get_mut(key) {
+            state.retiring.retain(|item| &item.request != request);
+        }
+        if debt.placement.is_some() {
+            self.journal_removed(key, request);
+        }
+        self.prune();
+        Ok(debt)
+    }
+
+    /// Adopt the journaled items a previous runner process left, at boot.
+    ///
+    /// Every row comes back as a debt, whatever it was when written: a live
+    /// item and a displaced one were both on a machine when that process
+    /// stopped, and neither has a waiter in this one to hear its outcome. Each
+    /// is unconfirmed because of the restart, and awaits the machine's first
+    /// account read against it in this process.
+    ///
+    /// A row naming a machine lost since [`Self::expect_reload`] is settled
+    /// instead, and returned.
+    pub(crate) fn reload(
+        &mut self,
+        rows: Vec<PurposeDebtRow>,
+        boot_unix_ms: u64,
+    ) -> Vec<PurposeDebtView> {
+        let lost = self.lost_before_reload.take().unwrap_or_default();
+        let mut settled = Vec::new();
+        for row in rows {
+            let key = row.key;
+            if self.items.get(&key).is_some_and(|state| {
+                state
+                    .retiring
+                    .iter()
+                    .any(|item| item.request == row.request)
+            }) {
+                continue;
+            }
+            let item = RetiringItem {
+                request: row.request,
+                phase: row.phase,
+                placement: Some(DebtPlacement {
+                    awaiting_post_boot_account: true,
+                    ..row.placement
+                }),
+                cause: match row.state {
+                    DebtRowState::Live => RetirementCause::Reloaded,
+                    DebtRowState::Retiring => row.cause.unwrap_or(RetirementCause::Reloaded),
+                },
+                confirmation: Confirmation::Unconfirmed {
+                    since_unix_ms: boot_unix_ms,
+                    reason: UnconfirmedReason::RunnerRestarted {
+                        at_unix_ms: boot_unix_ms,
+                    },
+                },
+                retired_at_unix_ms: row.retired_at_unix_ms.unwrap_or(boot_unix_ms),
+            };
+            if item
+                .placement
+                .as_ref()
+                .is_some_and(|placement| lost.contains(&placement.executor_id))
+            {
+                self.journal_removed(&key, &item.request);
+                settled.push(item.view(&key));
+                continue;
+            }
+            self.items.entry(key).or_default().retiring.push(item);
+        }
+        settled
+    }
+
+    /// The machines that hold debts reloaded at boot and not yet read against
+    /// an account from this process.
+    #[cfg(test)]
+    fn machines_awaiting_post_boot_account(&self) -> Vec<String> {
+        let mut machines: Vec<String> = self
+            .items
+            .values()
+            .flat_map(|state| state.retiring.iter())
+            .filter_map(|item| item.placement.as_ref())
+            .filter(|placement| placement.awaiting_post_boot_account)
+            .map(|placement| placement.executor_id.clone())
+            .collect();
+        machines.sort();
+        machines.dedup();
+        machines
     }
 
     #[cfg(test)]
@@ -324,6 +1096,135 @@ impl PurposeRegistry {
     fn len(&self) -> usize {
         self.items.len()
     }
+}
+
+// ---------------------------------------------------------------------------
+// The durable journal of placed items.
+// ---------------------------------------------------------------------------
+
+/// Every journaled row, for the boot reload.
+pub(crate) async fn load_rows(db: &LocalDb) -> Result<Vec<PurposeDebtRow>, String> {
+    let rows = db
+        .query_all(
+            "SELECT purpose_key, request_id, attempt_id, state, phase, executor_id, generation,
+                    dispatched_at, cause_json, confirmation_json, retired_at
+               FROM purpose_debts",
+            (),
+            |row| {
+                Ok((
+                    row.text(0)?,
+                    row.text(1)?,
+                    row.text(2)?,
+                    row.text(3)?,
+                    row.text(4)?,
+                    row.text(5)?,
+                    row.i64(6)?,
+                    row.i64(7)?,
+                    row.opt_text(8)?,
+                    row.opt_text(9)?,
+                    row.opt_i64(10)?,
+                ))
+            },
+        )
+        .await
+        .map_err(|error| format!("load purpose debts: {error}"))?;
+    let mut parsed = Vec::with_capacity(rows.len());
+    for (
+        key,
+        request_id,
+        attempt_id,
+        state,
+        phase,
+        executor_id,
+        generation,
+        dispatched_at,
+        cause,
+        confirmation,
+        retired_at,
+    ) in rows
+    {
+        // A row this build cannot read is still a machine that may be running
+        // something, so it reloads with the parts that did parse rather than
+        // being dropped.
+        let state = if state == "live" {
+            DebtRowState::Live
+        } else {
+            DebtRowState::Retiring
+        };
+        parsed.push(PurposeDebtRow {
+            key: PurposeKey::from_persisted(key),
+            request: (request_id, attempt_id),
+            state,
+            phase: ItemPhase::parse(&phase).unwrap_or(ItemPhase::Dispatched),
+            placement: DebtPlacement {
+                executor_id,
+                generation: u64::try_from(generation).unwrap_or_default(),
+                dispatched_at_unix_ms: u64::try_from(dispatched_at).unwrap_or_default(),
+                awaiting_post_boot_account: false,
+            },
+            cause: cause.and_then(|cause| serde_json::from_str(&cause).ok()),
+            confirmation: confirmation
+                .and_then(|confirmation| serde_json::from_str(&confirmation).ok()),
+            retired_at_unix_ms: retired_at.and_then(|at| u64::try_from(at).ok()),
+        });
+    }
+    Ok(parsed)
+}
+
+/// Apply one batch of changes, in order, as one transaction.
+pub(crate) async fn apply_changes(
+    db: &LocalDb,
+    changes: Vec<DebtChange>,
+    now_unix_ms: u64,
+) -> Result<(), String> {
+    db.write(move |conn| {
+        let changes = changes.clone();
+        Box::pin(async move {
+            for change in &changes {
+                match change {
+                    DebtChange::Upsert(row) => {
+                        conn.execute(
+                            "INSERT OR REPLACE INTO purpose_debts(
+                                 purpose_key, request_id, attempt_id, state, phase, executor_id,
+                                 generation, dispatched_at, cause_json, confirmation_json,
+                                 retired_at, updated_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                            (
+                                row.key.as_str(),
+                                row.request.0.as_str(),
+                                row.request.1.as_str(),
+                                row.state.as_str(),
+                                row.phase.as_str(),
+                                row.placement.executor_id.as_str(),
+                                row.placement.generation as i64,
+                                row.placement.dispatched_at_unix_ms as i64,
+                                row.cause
+                                    .as_ref()
+                                    .and_then(|cause| serde_json::to_string(cause).ok()),
+                                row.confirmation.as_ref().and_then(|confirmation| {
+                                    serde_json::to_string(confirmation).ok()
+                                }),
+                                row.retired_at_unix_ms.map(|at| at as i64),
+                                now_unix_ms as i64,
+                            ),
+                        )
+                        .await?;
+                    }
+                    DebtChange::Delete { key, request } => {
+                        conn.execute(
+                            "DELETE FROM purpose_debts
+                              WHERE purpose_key = ?1 AND request_id = ?2 AND attempt_id = ?3",
+                            (key.as_str(), request.0.as_str(), request.1.as_str()),
+                        )
+                        .await?;
+                    }
+                }
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| format!("purpose debt journal write failed: {error}"))
 }
 
 #[cfg(test)]
@@ -366,7 +1267,9 @@ mod tests {
             let mut registry = PurposeRegistry::default();
             let key = PurposeKey::main_cadence("project", "rust-tests", "linux");
             registry.admit(key.clone(), request("old"), 10);
-            assert!(registry.advance(&request("old"), phase));
+            if phase == ItemPhase::Dispatched {
+                assert!(registry.dispatched(&request("old"), "machine", 1, 12));
+            }
 
             assert_eq!(
                 registry.admit(key, request("new"), 20),
@@ -465,10 +1368,10 @@ mod tests {
             1,
             "the displaced item is owed a death, not assumed dead"
         );
-        assert_eq!(
-            registry.oldest_pending_retirement(&key),
-            Some((request("tip-x"), 20))
-        );
+        let debts = registry.debts_for(&key);
+        assert_eq!(debts.len(), 1);
+        assert_eq!(debts[0].request, request("tip-x"));
+        assert_eq!(debts[0].retired_at_unix_ms, 20);
 
         registry.finish(&request("tip-x"));
         assert_eq!(registry.pending_retirements(&key), 0);
@@ -553,6 +1456,436 @@ mod tests {
             Admission::Admitted
         );
         assert_eq!(registry.len(), 2);
+    }
+
+    fn key() -> PurposeKey {
+        PurposeKey::main_cadence("project", "rust-tests", "linux")
+    }
+
+    fn journaled() -> (PurposeRegistry, mpsc::UnboundedReceiver<DebtChange>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut registry = PurposeRegistry::default();
+        registry.attach_journal(sender);
+        (registry, receiver)
+    }
+
+    fn drain(receiver: &mut mpsc::UnboundedReceiver<DebtChange>) -> Vec<DebtChange> {
+        let mut changes = Vec::new();
+        while let Ok(change) = receiver.try_recv() {
+            changes.push(change);
+        }
+        changes
+    }
+
+    /// A debt has to be able to say what blocks the question: where the item
+    /// had got to, which machine has it, and why it is no longer the answer.
+    #[test]
+    fn a_debt_records_its_phase_its_machine_and_what_displaced_it() {
+        let mut registry = PurposeRegistry::default();
+        registry.admit(key(), request("old"), 10);
+        registry.dispatched(&request("old"), "machine-a", 3, 11);
+        registry.admit(key(), request("new"), 20);
+
+        let debts = registry.debts_for(&key());
+        assert_eq!(debts.len(), 1);
+        let debt = &debts[0];
+        assert_eq!(debt.phase, ItemPhase::Dispatched);
+        let placement = debt.placement.as_ref().expect("the debt names its machine");
+        assert_eq!(placement.executor_id, "machine-a");
+        assert_eq!(placement.generation, 3);
+        assert_eq!(
+            debt.cause,
+            RetirementCause::Displaced { by: request("new") }
+        );
+        assert_eq!(debt.confirmation, Confirmation::Awaiting);
+
+        registry.admit(key(), request("newer"), 30);
+        registry.retire(&request("newer"), 31);
+        let retracted = registry
+            .debts_for(&key())
+            .into_iter()
+            .find(|debt| debt.request == request("newer"))
+            .unwrap();
+        assert_eq!(retracted.phase, ItemPhase::Preparing);
+        assert_eq!(retracted.placement, None);
+        assert_eq!(retracted.cause, RetirementCause::Retracted);
+    }
+
+    /// Retirement landing between the last pre-grant check and the grant
+    /// still leaves a debt that names where the grant went.
+    #[test]
+    fn a_grant_to_an_already_retired_item_is_recorded_on_its_debt() {
+        let mut registry = PurposeRegistry::default();
+        registry.admit(key(), request("old"), 10);
+        registry.admit(key(), request("new"), 20);
+        assert!(registry.dispatched(&request("old"), "machine-a", 1, 21));
+        assert_eq!(
+            registry.debts_for(&key())[0]
+                .placement
+                .as_ref()
+                .map(|placement| placement.executor_id.as_str()),
+            Some("machine-a")
+        );
+    }
+
+    /// An attempt the runner gave up on proves nothing about a machine it was
+    /// never sent to, and nothing either way about one it was.
+    #[test]
+    fn ending_unconfirmed_clears_an_unplaced_item_and_keeps_a_placed_one() {
+        let mut registry = PurposeRegistry::default();
+        registry.admit(key(), request("old"), 10);
+        registry.admit(key(), request("new"), 20);
+        assert!(registry.end_unconfirmed(&request("old"), UnconfirmedReason::LeaderVanished, 25));
+        assert_eq!(
+            registry.pending_retirements(&key()),
+            0,
+            "nothing was running for an item that never reached a machine"
+        );
+
+        registry.dispatched(&request("new"), "machine-a", 2, 26);
+        registry.admit(key(), request("newest"), 30);
+        registry.end_unconfirmed(
+            &request("new"),
+            UnconfirmedReason::GrantAbandoned {
+                detail: "silent".into(),
+            },
+            31,
+        );
+        let debts = registry.debts_for(&key());
+        assert_eq!(debts.len(), 1);
+        assert_eq!(
+            debts[0].confirmation,
+            Confirmation::Unconfirmed {
+                since_unix_ms: 31,
+                reason: UnconfirmedReason::GrantAbandoned {
+                    detail: "silent".into()
+                },
+            }
+        );
+    }
+
+    /// A live answer whose attempt the runner abandoned is not finished just
+    /// because nobody displaced it. Its work may still be running, and the
+    /// next answer to arrive must wait for it.
+    #[test]
+    fn an_abandoned_live_answer_becomes_a_debt() {
+        let mut registry = PurposeRegistry::default();
+        registry.admit(key(), request("only"), 10);
+        registry.dispatched(&request("only"), "machine-a", 1, 11);
+        registry.end_unconfirmed(&request("only"), UnconfirmedReason::LeaderVanished, 20);
+
+        assert_eq!(registry.live(&key()), None);
+        let debts = registry.debts_for(&key());
+        assert_eq!(debts.len(), 1);
+        assert_eq!(debts[0].cause, RetirementCause::Unanswered);
+        assert_eq!(
+            registry.admit(key(), request("next"), 30),
+            Admission::Admitted
+        );
+        assert_eq!(registry.pending_retirements(&key()), 1);
+    }
+
+    /// Evidence about one machine settles only the debts that machine holds.
+    #[test]
+    fn machine_evidence_settles_only_that_machines_debts() {
+        let mut registry = PurposeRegistry::default();
+        let other = PurposeKey::main_cadence("project", "rust-tests", "macos");
+        registry.admit(key(), request("a"), 10);
+        registry.dispatched(&request("a"), "machine-a", 1, 11);
+        registry.admit(key(), request("a2"), 20);
+        registry.admit(other.clone(), request("b"), 10);
+        registry.dispatched(&request("b"), "machine-b", 1, 11);
+        registry.admit(other.clone(), request("b2"), 20);
+        registry.admit(key(), request("a3"), 30);
+
+        let settled = registry.settle_on_machine("machine-a", |_, _| true);
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].request, request("a"));
+        assert_eq!(
+            registry.pending_retirements(&key()),
+            1,
+            "the never-placed debt is not this machine's to settle"
+        );
+        assert_eq!(registry.pending_retirements(&other), 1);
+    }
+
+    /// The escape is exact. Naming the wrong item or the wrong machine is
+    /// refused with what is actually owed, never treated as a generic
+    /// override.
+    #[test]
+    fn authorizing_an_overlap_requires_the_exact_item_and_machine() {
+        let mut registry = PurposeRegistry::default();
+        registry.admit(key(), request("old"), 10);
+        registry.dispatched(&request("old"), "machine-a", 1, 11);
+        registry.admit(key(), request("new"), 20);
+
+        let wrong_machine = registry
+            .authorize_overlap(&key(), &request("old"), Some("machine-b"))
+            .unwrap_err();
+        assert!(
+            wrong_machine.contains("old-attempt on machine-a"),
+            "{wrong_machine}"
+        );
+        assert!(registry
+            .authorize_overlap(&key(), &request("other"), Some("machine-a"))
+            .is_err());
+        assert!(registry
+            .authorize_overlap(&key(), &request("old"), None)
+            .is_err());
+        assert_eq!(registry.pending_retirements(&key()), 1);
+
+        let settled = registry
+            .authorize_overlap(&key(), &request("old"), Some("machine-a"))
+            .unwrap();
+        assert_eq!(settled.request, request("old"));
+        assert_eq!(registry.pending_retirements(&key()), 0);
+    }
+
+    /// Only items that reached a machine are journaled: from the grant until
+    /// whatever settles them. Runner-owned work ends with the runner and
+    /// needs no row.
+    #[test]
+    fn the_journal_follows_placed_items_from_the_grant_to_settlement() {
+        let (mut registry, mut journal) = journaled();
+        registry.admit(key(), request("unplaced"), 5);
+        registry.finish(&request("unplaced"));
+        assert_eq!(drain(&mut journal), Vec::new());
+
+        registry.admit(key(), request("old"), 10);
+        assert_eq!(drain(&mut journal), Vec::new());
+        registry.dispatched(&request("old"), "machine-a", 1, 11);
+        let changes = drain(&mut journal);
+        assert!(
+            matches!(&changes[..], [DebtChange::Upsert(row)] if row.state == DebtRowState::Live),
+            "{changes:?}"
+        );
+        registry.admit(key(), request("new"), 20);
+        let changes = drain(&mut journal);
+        assert!(
+            matches!(&changes[..], [DebtChange::Upsert(row)]
+                if row.state == DebtRowState::Retiring
+                    && row.cause == Some(RetirementCause::Displaced { by: request("new") })),
+            "{changes:?}"
+        );
+        registry.finish(&request("old"));
+        assert_eq!(
+            drain(&mut journal),
+            vec![DebtChange::Delete {
+                key: key(),
+                request: request("old")
+            }]
+        );
+
+        for settle in 0..3 {
+            let item = request(&format!("settled-{settle}"));
+            registry.admit(key(), item.clone(), 100 + settle);
+            registry.dispatched(&item, "machine-a", 1, 100 + settle);
+            registry.end_unconfirmed(&item, UnconfirmedReason::LeaderVanished, 100 + settle);
+            drain(&mut journal);
+            match settle {
+                0 => {
+                    registry.settle_on_machine("machine-a", |_, _| true);
+                }
+                1 => {
+                    registry
+                        .authorize_overlap(&key(), &item, Some("machine-a"))
+                        .unwrap();
+                }
+                _ => {
+                    registry.finish(&item);
+                }
+            }
+            assert_eq!(
+                drain(&mut journal),
+                vec![DebtChange::Delete {
+                    key: key(),
+                    request: item
+                }]
+            );
+        }
+        // `request("new")` was displaced before it was placed: nothing to journal.
+        registry.finish(&request("new"));
+        assert_eq!(drain(&mut journal), Vec::new());
+    }
+
+    fn rows_of(changes: Vec<DebtChange>) -> Vec<PurposeDebtRow> {
+        let mut rows: Vec<PurposeDebtRow> = Vec::new();
+        for change in changes {
+            match change {
+                DebtChange::Upsert(row) => {
+                    rows.retain(|held| held.request != row.request);
+                    rows.push(row);
+                }
+                DebtChange::Delete { request, .. } => rows.retain(|held| held.request != request),
+            }
+        }
+        rows
+    }
+
+    /// A runner restart does not end work on a remote machine, so it must not
+    /// end the debt either. The reloaded debt names its machine and the
+    /// restart, blocks the question, and is settled only by that machine's
+    /// account from the new process.
+    #[test]
+    fn a_restart_reloads_a_dispatched_debt_that_only_the_machine_can_settle() {
+        let (mut before, mut journal) = journaled();
+        before.admit(key(), request("gone"), 10);
+        before.dispatched(&request("gone"), "machine-a", 7, 11);
+        before.admit(key(), request("running"), 20);
+        before.dispatched(&request("running"), "machine-a", 7, 21);
+        let rows = rows_of(drain(&mut journal));
+        drop(before);
+        assert_eq!(rows.len(), 2);
+
+        let mut after = PurposeRegistry::default();
+        after.reload(rows, 1_000);
+        let debts = after.debts_for(&key());
+        assert_eq!(debts.len(), 2);
+        for debt in &debts {
+            assert_eq!(
+                debt.confirmation,
+                Confirmation::Unconfirmed {
+                    since_unix_ms: 1_000,
+                    reason: UnconfirmedReason::RunnerRestarted { at_unix_ms: 1_000 },
+                }
+            );
+            assert_eq!(
+                debt.placement.as_ref().unwrap().executor_id,
+                "machine-a",
+                "a reloaded debt still names its machine"
+            );
+        }
+        assert_eq!(
+            debts
+                .iter()
+                .find(|debt| debt.request == request("running"))
+                .unwrap()
+                .cause,
+            RetirementCause::Reloaded
+        );
+        assert_eq!(
+            after.admit(key(), request("successor"), 2_000),
+            Admission::Admitted
+        );
+        assert_eq!(
+            after.pending_retirements(&key()),
+            2,
+            "the question is still owed"
+        );
+        assert_eq!(
+            after.machines_awaiting_post_boot_account(),
+            vec!["machine-a".to_string()]
+        );
+
+        // Generation 1 of a new process: the number means nothing against the
+        // recorded 7, and the account is what matters.
+        let account = after.post_boot_account("machine-a", 1, |item| item == &request("running"));
+        assert_eq!(account.settled.len(), 1);
+        assert_eq!(account.settled[0].request, request("gone"));
+        assert_eq!(account.still_running, vec![request("running")]);
+        assert_eq!(after.pending_retirements(&key()), 1);
+        assert!(after.machines_awaiting_post_boot_account().is_empty());
+
+        // The survivor was rebased onto this process's connection, so the
+        // machine's later word about it is ordinary evidence.
+        let settled = after.settle_on_machine("machine-a", |item, placement| {
+            item == &request("running") && placement.generation == 1
+        });
+        assert_eq!(settled.len(), 1);
+        assert_eq!(after.pending_retirements(&key()), 0);
+    }
+
+    /// A machine lost while the journal is still being read is evidence for
+    /// the rows that name it, even though they arrive after it. Once the
+    /// reload is done, nothing more is remembered.
+    #[test]
+    fn a_machine_lost_during_the_reload_settles_the_rows_that_name_it() {
+        let (mut registry, mut journal) = journaled();
+        registry.expect_reload();
+        assert!(registry.machine_lost("machine-a").is_empty());
+        let row = |id: &str, machine: &str| PurposeDebtRow {
+            key: key(),
+            request: request(id),
+            state: DebtRowState::Live,
+            phase: ItemPhase::Dispatched,
+            placement: DebtPlacement {
+                executor_id: machine.into(),
+                generation: 3,
+                dispatched_at_unix_ms: 5,
+                awaiting_post_boot_account: false,
+            },
+            cause: None,
+            confirmation: None,
+            retired_at_unix_ms: None,
+        };
+
+        let settled = registry.reload(
+            vec![row("gone", "machine-a"), row("owed", "machine-b")],
+            1_000,
+        );
+
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].request, request("gone"));
+        let debts = registry.debts_for(&key());
+        assert_eq!(debts.len(), 1);
+        assert_eq!(debts[0].request, request("owed"));
+        assert!(drain(&mut journal).iter().any(|change| matches!(
+            change,
+            DebtChange::Delete { request: deleted, .. } if *deleted == request("gone")
+        )));
+        registry.machine_lost("machine-c");
+        assert!(registry.lost_before_reload.is_none());
+    }
+
+    /// What the registry journals is what a restart reads back: upserts and
+    /// deletes land in order, and the reload sees exactly the outstanding
+    /// rows, with their causes and confirmations intact.
+    #[tokio::test]
+    async fn the_journal_round_trips_through_the_database() {
+        let db = crate::storage::migrated_test_db("purpose_debt_journal.db").await;
+        let (mut registry, mut journal) = journaled();
+        registry.admit(key(), request("settled"), 10);
+        registry.dispatched(&request("settled"), "machine-a", 1, 11);
+        registry.admit(key(), request("owed"), 20);
+        registry.dispatched(&request("owed"), "machine-b", 4, 21);
+        registry.admit(key(), request("live"), 30);
+        registry.finish(&request("settled"));
+        registry.end_unconfirmed(
+            &request("owed"),
+            UnconfirmedReason::GrantAbandoned {
+                detail: "silent".into(),
+            },
+            32,
+        );
+        apply_changes(&db, drain(&mut journal), 40).await.unwrap();
+
+        let rows = load_rows(&db).await.unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.request, request("owed"));
+        assert_eq!(row.state, DebtRowState::Retiring);
+        assert_eq!(row.phase, ItemPhase::Dispatched);
+        assert_eq!(row.placement.executor_id, "machine-b");
+        assert_eq!(row.placement.generation, 4);
+        assert_eq!(
+            row.cause,
+            Some(RetirementCause::Displaced {
+                by: request("live")
+            })
+        );
+        assert_eq!(
+            row.confirmation,
+            Some(Confirmation::Unconfirmed {
+                since_unix_ms: 32,
+                reason: UnconfirmedReason::GrantAbandoned {
+                    detail: "silent".into()
+                },
+            })
+        );
+
+        let mut reloaded = PurposeRegistry::default();
+        reloaded.reload(rows, 1_000);
+        assert_eq!(reloaded.pending_retirements(&key()), 1);
     }
 
     /// The key names the question. If a revision ever leaks into it, every tip

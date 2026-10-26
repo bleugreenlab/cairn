@@ -532,10 +532,94 @@ impl Drop for CoalescedLeaderCompletionGuard {
                 std::thread::panicking(),
             )
         );
+        // A leader that ended without an outcome proves nothing about the
+        // machine it may have been granted to. Before a grant its question
+        // owes nothing; after one, the debt stays, unconfirmed, naming that
+        // machine.
+        if lock_through_poison(&self.pool.purposes).end_unconfirmed(
+            &self.leader,
+            purpose::UnconfirmedReason::LeaderVanished,
+            unix_time_ms(),
+        ) {
+            self.pool.purpose_quiesced.notify_waiters();
+        }
         for key in &self.keys {
             self.pool
                 .complete_coalesced_for_leader(key, LeaderSettlement::Vanished);
         }
+    }
+}
+
+/// Releases a purpose item whose caller stopped before a leader of its own took
+/// it over, or whose only stake was in executions other leaders opened.
+///
+/// Such an item never reached a machine itself, so its end is its caller's end:
+/// there is nothing running to wait for. Without this, a caller dropped at the
+/// purpose gate, or a joiner whose subscriptions ended, would leave its
+/// question held by an answer nothing will ever finish.
+struct PurposeAdmissionGuard {
+    pool: Fleet,
+    item: RequestIdentity,
+    armed: bool,
+}
+
+impl Drop for PurposeAdmissionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        lock_through_poison(&self.pool.purpose_joiners).remove(&self.item);
+        lock_through_poison(&self.pool.cancelled_leaders).remove(&self.item);
+        if lock_through_poison(&self.pool.purposes).finish(&self.item) {
+            self.pool.purpose_quiesced.notify_waiters();
+        }
+    }
+}
+
+/// One question held back from its next answer because an earlier answer may
+/// still be running: the operator's view of a purpose debt.
+///
+/// The identifiers are carried so the app can name the exact overlap when an
+/// operator authorizes it; everything else is already in an operator's words.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedQuestion {
+    pub question: String,
+    pub request_id: String,
+    pub attempt_id: String,
+    /// When, in the item's life, it was retired.
+    pub phase: String,
+    /// `None` for an item that was never placed on a machine.
+    pub executor_id: Option<String>,
+    /// That machine's public name.
+    pub machine: Option<String>,
+    /// The machine and connection generation, or "never placed on a machine".
+    pub placement: String,
+    pub retired_at_unix_ms: u64,
+    pub retired_ago: String,
+    pub cause: String,
+    pub confirmation: String,
+    /// Nothing is waiting on the attempt any more; only machine evidence or an
+    /// operator settles it.
+    pub unconfirmed: bool,
+    pub settles_when: String,
+}
+
+/// Whether the purpose debts a previous runner process left have been read
+/// back. Purpose admission waits on it.
+///
+/// Loaded from the start on a fleet with no store, which is every bare
+/// `Fleet::default()`.
+#[derive(Clone)]
+struct PurposeDebtsLoaded(Arc<tokio::sync::watch::Sender<bool>>);
+
+/// Each purpose item that only joined executions other leaders opened, with
+/// the question it answers and the subscriber identities it waits under.
+type PurposeJoiners = HashMap<RequestIdentity, (purpose::PurposeKey, Vec<RequestIdentity>)>;
+
+impl Default for PurposeDebtsLoaded {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::watch::channel(true).0))
     }
 }
 
@@ -1112,16 +1196,17 @@ pub enum DrainApplication {
     HeldWithoutMachine { reason: String },
 }
 
-/// How long a successor waits for a displaced predecessor to confirm death
-/// before dispatching anyway.
+/// How long a successor waits for a displaced predecessor's debt to settle
+/// before it is refused.
 ///
-/// An escape hatch, not a schedule. An ordinary retirement resolves in the time
-/// a message takes to cross the link plus the time the item takes to reach its
-/// next phase transition. This budget exists so that a predecessor which can
-/// never report — its machine gone, its link severed beyond the watchdog's
-/// reach — cannot silently stop a project from ever being attested again.
-/// Reaching it is worth a log line, because at that point the guarantee has
-/// genuinely lapsed and the overlap it prevents may be real.
+/// A bound on one caller's wait, not on the debt. An ordinary retirement
+/// resolves in the time a message takes to cross the link plus the time the
+/// item takes to reach its next phase transition. Reaching the budget settles
+/// nothing: the successor is refused with a diagnostic naming every
+/// outstanding debt, the debt keeps blocking its question, and only evidence
+/// that the displaced work stopped (or an operator naming the overlap) clears
+/// it. Dispatching anyway would knowingly create the overlap this gate exists
+/// to prevent.
 const RETIREMENT_CONFIRMATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Debug)]
@@ -1255,9 +1340,23 @@ pub struct Fleet {
     /// makes duplicate answers unrepresentable rather than merely suppressed;
     /// see [`purpose`].
     purposes: Arc<Mutex<purpose::PurposeRegistry>>,
-    /// Woken whenever a terminal outcome clears a purpose debt, so a successor
-    /// waiting on its predecessor's death learns of it rather than polling.
+    /// Woken whenever a purpose debt settles, so a successor waiting on its
+    /// predecessor's death, and a cadence waiting to re-arm, learn of it
+    /// rather than polling.
     purpose_quiesced: Arc<tokio::sync::Notify>,
+    /// Woken whenever an item is retired, so work this runner still holds
+    /// before any grant (being placed, queued, offered) ends at once instead
+    /// of when some machine happens to claim it.
+    retirements: Arc<tokio::sync::Notify>,
+    /// Purpose items whose every check joined an execution another leader
+    /// opened: the question each answers and the subscriber identities it
+    /// waits under. Retiring one detaches those.
+    purpose_joiners: Arc<Mutex<PurposeJoiners>>,
+    /// Whether the debts a previous runner process journaled have been read
+    /// back; purpose admission waits on it.
+    purpose_debts_loaded: PurposeDebtsLoaded,
+    /// The last failure to make a purpose debt change durable.
+    purpose_debt_journal_error: Arc<Mutex<Option<String>>>,
     cancelled_leaders: Arc<Mutex<HashSet<RequestIdentity>>>,
     /// Why each request Cairn sent `Cancel` for was cancelled, until its
     /// outcome returns and takes the cause with it.
@@ -2132,6 +2231,108 @@ impl Fleet {
         queue::spawn_queue_journal(db, runner_incarnation, self.queue.clone());
     }
 
+    /// Give purpose debts a durable journal, and read back what a previous
+    /// runner process left owed.
+    ///
+    /// Every purpose item granted to a machine is journaled until evidence
+    /// settles it, because a remote machine keeps running work through a
+    /// runner restart. The rows reload as unconfirmed debts before any purpose
+    /// item is admitted: admission waits for the reload, so nothing dispatches
+    /// beside a debt this process has not read yet.
+    ///
+    /// Connections are accepted while the read runs, which leaves two windows,
+    /// both closed. A machine the runner loses during the read is remembered,
+    /// and the rows naming it settle as they load. A snapshot that arrives
+    /// during the read finds nothing reloaded to account for, so the reloaded
+    /// debts are read against that machine's next snapshot instead, which is
+    /// equally an account from after the granting process stopped. A failed read is reported
+    /// and admission proceeds, because blocking every attestation forever on an
+    /// unreadable table would be worse than the overlap it might permit.
+    pub(crate) fn attach_purpose_debt_journal(&self, db: Arc<crate::storage::LocalDb>) {
+        let (sender, mut changes) = mpsc::unbounded_channel();
+        self.purposes.lock().unwrap().attach_journal(sender);
+        self.purpose_debts_loaded.0.send_replace(false);
+        self.purposes.lock().unwrap().expect_reload();
+        let boot_unix_ms = unix_time_ms();
+        // Weak on purpose: the registry owns the journal's sender, so a task
+        // that held it would keep its own channel, and the database, open for
+        // as long as the process lived.
+        let registry = Arc::downgrade(&self.purposes);
+        let errors = Arc::downgrade(&self.purpose_debt_journal_error);
+        let loaded = self.purpose_debts_loaded.clone();
+        let failed_loaded = loaded.clone();
+        let failed_errors = errors.clone();
+        crate::orchestrator::lifecycle::detach_onto_runtime(
+            async move {
+                match purpose::load_rows(&db).await {
+                    Ok(rows) => {
+                        if !rows.is_empty() {
+                            log::warn!(
+                                "reloaded {} purpose debt(s) a previous runner process left on machines; each blocks its question until that machine accounts for it",
+                                rows.len()
+                            );
+                        }
+                        if let Some(registry) = registry.upgrade() {
+                            let settled = registry.lock().unwrap().reload(rows, boot_unix_ms);
+                            for debt in settled {
+                                log::info!(
+                                    "purpose {} debt for request {} attempt {} settled as it reloaded: its machine was lost while the journal was being read",
+                                    debt.key,
+                                    debt.request.0,
+                                    debt.request.1,
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("{error}");
+                        if let Some(registry) = registry.upgrade() {
+                            registry.lock().unwrap().reload(Vec::new(), boot_unix_ms);
+                        }
+                        if let Some(errors) = errors.upgrade() {
+                            *errors.lock().unwrap() = Some(error);
+                        }
+                    }
+                }
+                loaded.0.send_replace(true);
+                while let Some(first) = changes.recv().await {
+                    let mut batch = vec![first];
+                    while let Ok(next) = changes.try_recv() {
+                        batch.push(next);
+                    }
+                    if let Err(error) = purpose::apply_changes(&db, batch, unix_time_ms()).await {
+                        // The registry stays authoritative in this process;
+                        // what is lost is the next process's memory of it.
+                        log::warn!("{error}");
+                        if let Some(errors) = errors.upgrade() {
+                            *errors.lock().unwrap() = Some(error);
+                        }
+                    }
+                }
+            },
+            move || {
+                failed_loaded.0.send_replace(true);
+                let error =
+                    "purpose debt journal could not start; debts stay in memory only".to_string();
+                log::error!("{error}");
+                if let Some(errors) = failed_errors.upgrade() {
+                    *errors.lock().unwrap() = Some(error);
+                }
+            },
+        );
+    }
+
+    /// Resolves once debts journaled by a previous runner process are back.
+    async fn await_purpose_debts_loaded(&self) {
+        let mut loaded = self.purpose_debts_loaded.0.subscribe();
+        let _ = loaded.wait_for(|loaded| *loaded).await;
+    }
+
+    /// The last failure to make a purpose debt change durable, if any.
+    pub(crate) fn purpose_debt_journal_error(&self) -> Option<String> {
+        self.purpose_debt_journal_error.lock().unwrap().clone()
+    }
+
     /// Give this runner's lifecycle facts a durable journal, opening it with
     /// the `runner_started` row that marks where this process's connection
     /// generations begin. Attach it before the queue journal, so that row is
@@ -2890,7 +3091,7 @@ enum PurposeGate {
     Displaced,
     /// The debt did not clear within the budget.
     Owed {
-        outstanding: Option<(RequestIdentity, u64)>,
+        outstanding: Vec<purpose::PurposeDebtView>,
     },
 }
 
@@ -3511,6 +3712,7 @@ impl Fleet {
                 _,
             ) => queue::GenerationEndCause::LinkGap,
         };
+        let machine_gone = matches!(cause, queue::GenerationEndCause::MachineGone);
         let sweep =
             self.queue
                 .end_generation(executor_id, generation, cause, &diagnostic, unix_time_ms());
@@ -3527,6 +3729,17 @@ impl Fleet {
             ExecutorDisconnectOrigin::PeerOrIo | ExecutorDisconnectOrigin::ExecutorInitiated(_) => {
                 self.hold_executions_across_link_gap(executor_id, sweep.held_claims);
             }
+        }
+        // The runner ending this link on its own authority is the same
+        // judgement the queue makes when it answers the link's claims as
+        // `MachineGone`, and it covers the attempts nobody waits on any more.
+        // A link that went away is not that judgement, and neither is this
+        // runner shutting down: the machine keeps running through both.
+        if machine_gone {
+            self.settle_purpose_debts_for_lost_machine(
+                executor_id,
+                "the runner ended this machine's link on its own authority",
+            );
         }
         self.binding_changed.notify_waiters();
         self.connection_ready.notify_waiters();
@@ -5068,6 +5281,20 @@ impl Fleet {
         health: ExecutorSubstrateReport,
     ) -> bool {
         self.reconcile_held_executions(executor_id, generation, &snapshot);
+        // Read before the snapshot is stored, which is what counts it.
+        let first_of_connection = self
+            .lock_connections()
+            .get(executor_id)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| entry.snapshots_received == 0);
+        if let Some(first_of_connection) = first_of_connection {
+            self.settle_purpose_debts_from_account(
+                executor_id,
+                generation,
+                first_of_connection,
+                &snapshot,
+            );
+        }
         // New posted state is what makes reconsidering a machine that declined
         // meaningful, but only state that bears on the reason it gave: a
         // snapshot whose free-disk figure moved says nothing new about a CPU
@@ -6799,45 +7026,26 @@ impl Fleet {
             };
         }
         let owner = self.queue.attempt_binding_of(request_id);
-        let Some((attempt_id, executor_id, generation)) = owner else {
+        let Some((attempt_id, _, _)) = owner else {
             return CancelOutcome::Unknown;
         };
-        let identity = (request_id.to_string(), attempt_id.clone());
+        let identity = (request_id.to_string(), attempt_id);
         self.purposes
             .lock()
             .unwrap()
             .retire(&identity, unix_time_ms());
-        self.cancel_causes
-            .lock()
-            .unwrap()
-            .record(identity.clone(), CancelCause::OperatorRetracted);
-        // Delivery is what this can honestly claim. An executor built from this
-        // tree binds the request identity when it CLAIMS an offer, on its
-        // message loop and before anything is spawned, so a Cancel naming it is
-        // found whatever phase it has reached. The window a retirement could
-        // once fall through — between a machine handling a dispatch and its task
-        // starting — is closed by that ordering rather than tolerated: binding
-        // at the claim happens strictly before the grant that starts the work.
-        if self
-            .send_to(
-                &executor_id,
-                generation,
-                ExecutorMessage::Cancel {
-                    request_id: request_id.into(),
-                    attempt_id,
-                },
-            )
-            .is_ok()
-        {
-            // The honest word is "stopping". A delivered instruction is not a
-            // stopped process, and the row stays until the machine reports the
-            // terminal outcome — which is also what releases this question for
-            // its next answer. Reporting "retired" here would be the same
-            // mistake the registry used to make, told to the operator instead.
-            CancelOutcome::Stopping
-        } else {
-            CancelOutcome::Unknown
-        }
+        // An executor built from this tree binds the request identity when it
+        // CLAIMS an offer, on its message loop and before anything is spawned,
+        // so a Cancel naming it is found whatever phase it has reached.
+        //
+        // The honest word is "stopping" whether or not the Cancel could be
+        // delivered. A delivered instruction is not a stopped process, and an
+        // undelivered one leaves the work's question owing a death this click
+        // just recorded; either way the row stays until evidence says the work
+        // ended. Reporting "unknown" over a debt the runner now holds would
+        // hide the one thing the operator needs to know.
+        self.retire_item(&identity, CancelCause::OperatorRetracted);
+        CancelOutcome::Stopping
     }
 
     /// Deliver a leader's settlement to everyone waiting on the execution `key`
@@ -6912,31 +7120,8 @@ impl Fleet {
         true
     }
 
-    /// Terminate a work item the chokepoint has displaced or released.
-    ///
-    /// Retirement is recorded before it is delivered, because the item may not
-    /// be on the wire yet: an item still being placed is stopped by the record
-    /// alone, at the pre-submit gate in [`Fleet::execute_prepared`], and never
-    /// reaches an executor. An item already dispatched is told, and an executor
-    /// built from this tree observes that at every phase transition it has left,
-    /// because it binds the request identity when the `Submit` is received. An
-    /// executor older than that binding can still lose a retirement that lands
-    /// in the instant between handling a `Submit` and its task starting; the
-    /// reasoning for tolerating that rather than moving the protocol version is
-    /// recorded at `Fleet::bind_request_identity` in the executor crate.
-    ///
-    /// The last clause of "terminated means dead" — that the item's process
-    /// tree is reaped and its checkout quiescent before the cell is reused — is
-    /// deliberately not enforced here, because it is already enforced where the
-    /// tree actually is. The executor takes one `TreeQuiescent` proof for the
-    /// length of a batch hold and every reset on the cancellation path consumes
-    /// it, so a retirement delivered from here cannot reach a tree reset that
-    /// skipped the reaper: the type system on the far side refuses to compile
-    /// one. This path composes with that gate rather than duplicating it, and
-    /// duplicating it would be worse than redundant — a second liveness opinion
-    /// formed a network hop away from the processes it describes is exactly the
-    /// stale copy of a remote truth this design exists to abolish.
-    /// Wait until this question owes no unconfirmed deaths.
+    /// Wait until this question owes no outstanding debts, or until this
+    /// caller's budget is spent.
     ///
     /// The gate that separates "one holder is recorded" from "one work item
     /// exists". Winning a purpose key establishes which answer is newest; it
@@ -6946,12 +7131,14 @@ impl Fleet {
     /// registry that showed a single item throughout would have made that
     /// overlap harder to see rather than impossible.
     ///
-    /// The predecessor's own terminal outcome is the only evidence accepted
-    /// here, because it is the only one that is downstream of the work actually
-    /// stopping. The executor's quiescence proof guards reuse of the
-    /// predecessor's own tree; it says nothing about a successor placed on a
-    /// different cell or a different machine, which is exactly the overlap this
-    /// gate exists to prevent.
+    /// What settles a debt is evidence that the displaced work is no longer
+    /// running: its own terminal outcome, its machine's own account of its
+    /// work, that machine being gone by this runner's authority, or an operator
+    /// naming the exact overlap (see [`purpose`]). The executor's quiescence
+    /// proof guards reuse of the predecessor's own tree; it says nothing about
+    /// a successor placed on a different cell or a different machine, which is
+    /// exactly the overlap this gate exists to prevent. The budget bounds only
+    /// this caller's wait: spending it settles nothing.
     async fn await_purpose_quiescent(
         &self,
         key: &purpose::PurposeKey,
@@ -6964,7 +7151,7 @@ impl Fleet {
             // waiter never hears, and the successor would sit out the whole
             // budget for a predecessor that had already died.
             let quiesced = self.purpose_quiesced.notified();
-            let outstanding = {
+            {
                 let mut registry = self.purposes.lock().unwrap();
                 // Have I been displaced while waiting here? A burst of merges
                 // makes this ordinary: this item took the question from its
@@ -6989,15 +7176,48 @@ impl Fleet {
                 if registry.pending_retirements(key) == 0 {
                     return PurposeGate::Clear;
                 }
-                registry.oldest_pending_retirement(key)
-            };
+            }
             if tokio::time::timeout_at(deadline, quiesced).await.is_err() {
+                let outstanding = self.purposes.lock().unwrap().debts_for(key);
+                if outstanding.is_empty() {
+                    continue;
+                }
                 return PurposeGate::Owed { outstanding };
             }
         }
     }
 
-    fn retire_dispatched_item(&self, request: &RequestIdentity) {
+    /// Terminate a work item the chokepoint has displaced or released.
+    ///
+    /// The one retirement path: displacement by a newer answer, an operator's
+    /// retraction, and the retirement of a purpose item that only joined
+    /// another leader's execution all come through here. The registry has
+    /// already recorded the debt; this ends the work behind it.
+    ///
+    /// What ending it takes depends on where the work is, and the retirement is
+    /// recorded before anything is delivered because the item may not be on the
+    /// wire yet. Work this runner still holds (being prepared, queued, offered)
+    /// is ended by the runner itself: the retirement wakes the placement loop in
+    /// [`Fleet::execute_entry`], which withdraws the entry and answers
+    /// `Cancelled`, and that answer is the attempt's own terminal outcome. It
+    /// must not wait for a machine to claim the work first: a check's wait
+    /// horizon is unbounded, and the only machine that could claim it may
+    /// never come. Work already granted is told with `Cancel`, and an executor
+    /// built from this tree observes that at every phase transition it has
+    /// left, because it binds the request identity when it claims the offer.
+    ///
+    /// The last clause of "terminated means dead" — that the item's process
+    /// tree is reaped and its checkout quiescent before the cell is reused — is
+    /// deliberately not enforced here, because it is already enforced where the
+    /// tree actually is. The executor takes one `TreeQuiescent` proof for the
+    /// length of a batch hold and every reset on the cancellation path consumes
+    /// it, so a retirement delivered from here cannot reach a tree reset that
+    /// skipped the reaper: the type system on the far side refuses to compile
+    /// one. This path composes with that gate rather than duplicating it, and
+    /// duplicating it would be worse than redundant — a second liveness opinion
+    /// formed a network hop away from the processes it describes is exactly the
+    /// stale copy of a remote truth this design exists to abolish.
+    fn retire_item(&self, request: &RequestIdentity, cause: CancelCause) {
         self.cancelled_leaders
             .lock()
             .unwrap()
@@ -7005,9 +7225,10 @@ impl Fleet {
         self.cancel_causes
             .lock()
             .unwrap()
-            .record(request.clone(), CancelCause::Superseded);
-        let owner = self.queue.binding_of(request);
-        if let Some((executor_id, generation)) = owner {
+            .record(request.clone(), cause);
+        self.retirements.notify_waiters();
+        self.detach_purpose_joiner(request, cause);
+        if let Some((executor_id, generation)) = self.queue.binding_of(request) {
             let _ = self.send_to(
                 &executor_id,
                 generation,
@@ -7017,6 +7238,400 @@ impl Fleet {
                 },
             );
         }
+    }
+
+    /// Resolves once `key` has been retired, taking the retirement.
+    async fn retired(&self, key: &RequestIdentity) {
+        loop {
+            let notified = self.retirements.notified();
+            if self.cancelled_leaders.lock().unwrap().remove(key) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// End a retired purpose item's subscriptions to executions other leaders
+    /// opened.
+    ///
+    /// The item has no leader of its own, so its subscriptions ending is its
+    /// end. An execution it was the last subscriber to is retired by that, and
+    /// may already be on a machine; the question then owes that execution's
+    /// death in the item's place.
+    fn detach_purpose_joiner(&self, request: &RequestIdentity, cause: CancelCause) {
+        let Some((key, subscribers)) = self.purpose_joiners.lock().unwrap().remove(request) else {
+            return;
+        };
+        let retirement = self
+            .purposes
+            .lock()
+            .unwrap()
+            .debts_for(&key)
+            .into_iter()
+            .find(|debt| &debt.request == request)
+            .map(|debt| debt.cause)
+            .unwrap_or(purpose::RetirementCause::Retracted);
+        for subscriber in subscribers {
+            if let Detachment::Retired { leader: joined } =
+                self.detach_coalesced_subscriber(&subscriber, Some(cause))
+            {
+                let placement =
+                    self.queue
+                        .claimed_binding_of(&joined)
+                        .map(|(executor_id, generation)| purpose::DebtPlacement {
+                            executor_id,
+                            generation,
+                            // The queue keeps no grant time for the joined
+                            // execution; this is when the question took on
+                            // its debt.
+                            dispatched_at_unix_ms: unix_time_ms(),
+                            awaiting_post_boot_account: false,
+                        });
+                self.purposes.lock().unwrap().owe_for_joined(
+                    &key,
+                    joined,
+                    placement,
+                    retirement.clone(),
+                    unix_time_ms(),
+                );
+            }
+        }
+    }
+
+    /// Record how a leader's attempt ended against its question.
+    ///
+    /// The terminal outcome is what actually retires an item, and this is
+    /// where it lands. Fenced by identity inside the registry, so a displaced
+    /// item clears only its own debt and never the entry its replacement now
+    /// holds; the wakeup then releases whichever successor was waiting on this
+    /// death. A grant the runner stopped waiting on is not an outcome: the
+    /// work may still be running on that machine, so the debt stays,
+    /// unconfirmed, until the machine's own word or its loss settles it.
+    fn settle_leader_purpose(&self, leader: &RequestIdentity, abandoned_grant: Option<String>) {
+        let changed = {
+            let mut registry = self.purposes.lock().unwrap();
+            match abandoned_grant {
+                Some(detail) => registry.end_unconfirmed(
+                    leader,
+                    purpose::UnconfirmedReason::GrantAbandoned { detail },
+                    unix_time_ms(),
+                ),
+                None => registry.finish(leader),
+            }
+        };
+        if changed {
+            self.purpose_quiesced.notify_waiters();
+        }
+    }
+
+    /// Log and announce debts that `evidence` settled.
+    fn note_purpose_settlements(&self, settled: &[purpose::PurposeDebtView], evidence: &str) {
+        if settled.is_empty() {
+            return;
+        }
+        for debt in settled {
+            log::info!(
+                "purpose {} debt for request {} attempt {} {} settled: {evidence}",
+                debt.key,
+                debt.request.0,
+                debt.request.1,
+                self.purpose_debt_machine(debt),
+            );
+        }
+        self.purpose_quiesced.notify_waiters();
+    }
+
+    /// Settle every debt bound to `executor_id`, because the runner knows that
+    /// machine's work is gone.
+    fn settle_purpose_debts_for_lost_machine(&self, executor_id: &str, evidence: &str) {
+        let settled = self.purposes.lock().unwrap().machine_lost(executor_id);
+        self.note_purpose_settlements(&settled, evidence);
+    }
+
+    /// Read one snapshot as the machine's own account of the debts it holds.
+    ///
+    /// Three things in it are evidence. An attempt it names among its recent
+    /// completions has ended. The first snapshot of a connection newer than
+    /// the one a debt was granted on is the machine's statement of what
+    /// survived, so a debt it does not list is not running. And the first
+    /// snapshot read against a debt reloaded at boot is the same statement for
+    /// a connection this process never saw the grant on. A later snapshot from
+    /// the grant's own connection that merely omits an attempt is not
+    /// evidence: it can cross the grant in flight.
+    fn settle_purpose_debts_from_account(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        first_of_connection: bool,
+        snapshot: &FleetSnapshot,
+    ) {
+        let identify =
+            |request_id: &String, attempt_id: &String| (request_id.clone(), attempt_id.clone());
+        let listed: HashSet<RequestIdentity> = snapshot
+            .granted_attempts
+            .iter()
+            .map(|attempt| identify(&attempt.request_id, &attempt.attempt_id))
+            .chain(
+                snapshot
+                    .executing_requests
+                    .iter()
+                    .map(|request| identify(&request.request_id, &request.attempt_id)),
+            )
+            .chain(
+                snapshot
+                    .queued_requests
+                    .iter()
+                    .map(|request| identify(&request.request_id, &request.attempt_id)),
+            )
+            .collect();
+        let completed: HashSet<RequestIdentity> = snapshot
+            .recent_completions
+            .iter()
+            .map(|completion| identify(&completion.request_id, &completion.attempt_id))
+            .collect();
+        let (post_boot, completions, superseded) = {
+            let mut registry = self.purposes.lock().unwrap();
+            let post_boot = registry.post_boot_account(executor_id, generation, |request| {
+                listed.contains(request) && !completed.contains(request)
+            });
+            let completions =
+                registry.settle_on_machine(executor_id, |request, _| completed.contains(request));
+            let superseded = if first_of_connection {
+                registry.settle_on_machine(executor_id, |request, placement| {
+                    !placement.awaiting_post_boot_account
+                        && placement.generation < generation
+                        && !listed.contains(request)
+                })
+            } else {
+                Vec::new()
+            };
+            (post_boot, completions, superseded)
+        };
+        self.note_purpose_settlements(
+            &post_boot.settled,
+            &format!(
+                "the machine's first report since this runner started (connection generation {generation}) does not list it"
+            ),
+        );
+        self.note_purpose_settlements(&completions, "the machine reported the attempt ended");
+        self.note_purpose_settlements(
+            &superseded,
+            &format!(
+                "the first report of the machine's newer connection (generation {generation}) does not list it"
+            ),
+        );
+        for request in post_boot.still_running {
+            log::warn!(
+                "request {} attempt {} is still running on {} although the runner that granted it restarted; cancelling it, and its question stays owed until the machine reports it ended",
+                request.0,
+                request.1,
+                self.executor_name_for_text(executor_id),
+            );
+            let _ = self.send_to(
+                executor_id,
+                generation,
+                ExecutorMessage::Cancel {
+                    request_id: request.0,
+                    attempt_id: request.1,
+                },
+            );
+        }
+    }
+
+    /// The machine a debt names, in the words an operator reads.
+    pub(crate) fn purpose_debt_machine(&self, debt: &purpose::PurposeDebtView) -> String {
+        match &debt.placement {
+            None => "never placed on a machine".to_string(),
+            Some(placement) if placement.awaiting_post_boot_account => format!(
+                "on {} (granted on connection generation {} of the runner process before the restart)",
+                self.executor_name_for_text(&placement.executor_id),
+                placement.generation
+            ),
+            Some(placement) => format!(
+                "on {} (connection generation {})",
+                self.executor_name_for_text(&placement.executor_id),
+                placement.generation
+            ),
+        }
+    }
+
+    /// What would settle a debt, so the person reading a refusal knows what
+    /// they are waiting for and what they could do instead.
+    pub(crate) fn purpose_debt_settles_when(&self, debt: &purpose::PurposeDebtView) -> String {
+        let Some(placement) = &debt.placement else {
+            return "this runner ends its own attempt, which it does as soon as the retirement reaches it".to_string();
+        };
+        let machine = self.executor_name_for_text(&placement.executor_id);
+        let escape = "or an operator authorizes the overlap from the app";
+        if placement.awaiting_post_boot_account {
+            return format!(
+                "{machine} next reports without it or reports it ended, or {machine} is removed; {escape}"
+            );
+        }
+        let own = match debt.confirmation {
+            purpose::Confirmation::Awaiting => "its own terminal outcome arrives, ",
+            purpose::Confirmation::Unconfirmed { .. } => "",
+        };
+        format!(
+            "{own}{machine} reports it ended or its next connection does not list it, or {machine} is removed or its process recycled; {escape}"
+        )
+    }
+
+    /// One outstanding debt, whole, as a refusal names it.
+    pub(crate) fn describe_purpose_debt(
+        &self,
+        debt: &purpose::PurposeDebtView,
+        now_unix_ms: u64,
+    ) -> String {
+        format!(
+            "request {} attempt {}, retired {} ago {}, {}; {}; {}; settles when {}",
+            debt.request.0,
+            debt.request.1,
+            compact_duration(now_unix_ms.saturating_sub(debt.retired_at_unix_ms)),
+            debt.phase.describe_retirement(),
+            self.purpose_debt_machine(debt),
+            debt.cause.describe(),
+            debt.confirmation.describe(),
+            self.purpose_debt_settles_when(debt),
+        )
+    }
+
+    fn purpose_refusal_diagnostic(
+        &self,
+        key: &purpose::PurposeKey,
+        outstanding: &[purpose::PurposeDebtView],
+    ) -> String {
+        let now = unix_time_ms();
+        let owed = outstanding
+            .iter()
+            .map(|debt| self.describe_purpose_debt(debt, now))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!(
+            "purpose {key} still owes a confirmed death after {}s; refusing to dispatch a second answer to one question. Outstanding: {owed}",
+            RETIREMENT_CONFIRMATION_BUDGET.as_secs()
+        )
+    }
+
+    /// Resolves once `key` owes nothing.
+    ///
+    /// A wake, not a settlement, and deliberately without a timeout: it is how
+    /// a refused cadence lane learns it may run again, and it waits for as long
+    /// as the evidence takes.
+    pub(crate) async fn purpose_debt_cleared(&self, key: &purpose::PurposeKey) {
+        loop {
+            let quiesced = self.purpose_quiesced.notified();
+            if self.purposes.lock().unwrap().pending_retirements(key) == 0 {
+                return;
+            }
+            quiesced.await;
+        }
+    }
+
+    /// Whether `key` owes anything right now.
+    pub(crate) fn purpose_owes(&self, key: &purpose::PurposeKey) -> bool {
+        self.purposes.lock().unwrap().pending_retirements(key) > 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_purpose_for_test(
+        &self,
+        key: &purpose::PurposeKey,
+        request: &RequestIdentity,
+        armed_at_unix_ms: u64,
+    ) {
+        self.purposes
+            .lock()
+            .unwrap()
+            .admit(key.clone(), request.clone(), armed_at_unix_ms);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reload_purpose_debts_for_test(
+        &self,
+        rows: Vec<purpose::PurposeDebtRow>,
+        boot_unix_ms: u64,
+    ) {
+        self.purposes.lock().unwrap().reload(rows, boot_unix_ms);
+    }
+
+    /// A terminal outcome for `request`, as its leader would record it.
+    #[cfg(test)]
+    pub(crate) fn finish_purpose_for_test(&self, request: &RequestIdentity) {
+        self.settle_leader_purpose(request, None);
+    }
+
+    /// Every outstanding purpose debt, for rendering.
+    pub(crate) fn purpose_debts(&self) -> Vec<purpose::PurposeDebtView> {
+        self.purposes.lock().unwrap().debts()
+    }
+
+    /// Every question blocked by a debt, as the executors page and the app
+    /// show it; `executor_id` narrows to the debts one machine holds.
+    pub fn blocked_questions(
+        &self,
+        executor_id: Option<&str>,
+        now_unix_ms: u64,
+    ) -> Vec<BlockedQuestion> {
+        self.purpose_debts()
+            .into_iter()
+            .filter(|debt| {
+                executor_id.is_none_or(|executor_id| {
+                    debt.placement
+                        .as_ref()
+                        .is_some_and(|placement| placement.executor_id == executor_id)
+                })
+            })
+            .map(|debt| BlockedQuestion {
+                question: debt.key.to_string(),
+                request_id: debt.request.0.clone(),
+                attempt_id: debt.request.1.clone(),
+                phase: debt.phase.describe_retirement().to_string(),
+                executor_id: debt
+                    .placement
+                    .as_ref()
+                    .map(|placement| placement.executor_id.clone()),
+                machine: debt
+                    .placement
+                    .as_ref()
+                    .map(|placement| self.executor_name_for_text(&placement.executor_id)),
+                placement: self.purpose_debt_machine(&debt),
+                retired_at_unix_ms: debt.retired_at_unix_ms,
+                retired_ago: compact_duration(now_unix_ms.saturating_sub(debt.retired_at_unix_ms)),
+                cause: debt.cause.describe(),
+                confirmation: debt.confirmation.describe(),
+                unconfirmed: matches!(debt.confirmation, purpose::Confirmation::Unconfirmed { .. }),
+                settles_when: self.purpose_debt_settles_when(&debt),
+            })
+            .collect()
+    }
+
+    /// Settle the one debt an operator named, because they are authorizing the
+    /// overlap it was preventing.
+    ///
+    /// Reached only from the operator-gated invoke surface, which is the one
+    /// place a request carries a person. `operator` names them in the audit
+    /// line.
+    pub(crate) fn authorize_purpose_overlap(
+        &self,
+        key: &purpose::PurposeKey,
+        request: &RequestIdentity,
+        executor_id: Option<&str>,
+        operator: &str,
+    ) -> Result<purpose::PurposeDebtView, String> {
+        let settled = self
+            .purposes
+            .lock()
+            .unwrap()
+            .authorize_overlap(key, request, executor_id)?;
+        log::warn!(
+            "operator {operator} authorized an overlap on purpose {key}: a second answer may run beside request {} attempt {} {}",
+            request.0,
+            request.1,
+            self.purpose_debt_machine(&settled),
+        );
+        self.purpose_quiesced.notify_waiters();
+        Ok(settled)
     }
 
     /// Release one subscriber's interest in a coalesced execution.
@@ -7074,6 +7689,9 @@ impl Fleet {
         let Some(leader) = leader_to_cancel else {
             return Detachment::Released { remaining };
         };
+        // A leader nobody waits on any more ends now if it was never granted,
+        // rather than whenever a machine happens to claim it.
+        self.retirements.notify_waiters();
         // The execution stays coalescible until its terminal outcome, so a
         // follower can still join it after this. Recorded against the leader,
         // the cause reaches that follower with the cancelled outcome.
@@ -9015,6 +9633,10 @@ impl Fleet {
                     .await;
                 pool.cancelled_leaders.lock().unwrap().remove(&leader);
                 pool.coalesced_leaders.lock().unwrap().remove(&leader);
+                // This leader names no question of its own, but a purpose item
+                // that joined it may have left the question owing this
+                // execution's death.
+                pool.settle_leader_purpose(&leader, executed.abandoned_grant.clone());
                 pool.complete_coalesced_for_leader(
                     &key,
                     LeaderSettlement::Settled {
@@ -9225,7 +9847,12 @@ impl Fleet {
         // predecessor's terminal outcome before dispatching, because retirement
         // is something the displaced work does rather than something the record
         // says about it.
+        let mut admission_guard = None;
         if let Some(key) = &purpose {
+            // Not before the debts a previous runner process left are back:
+            // admitting first could dispatch beside one this process has not
+            // read yet.
+            self.await_purpose_debts_loaded().await;
             let admission =
                 self.purposes
                     .lock()
@@ -9237,7 +9864,7 @@ impl Fleet {
                     log::info!(
                         "purpose {key} moves to {leader:?}, retiring {retire:?} from {phase:?}"
                     );
-                    self.retire_dispatched_item(&retire);
+                    self.retire_item(&retire, CancelCause::Superseded);
                 }
                 purpose::Admission::Superseded { holder } => {
                     // Newest-wins is decided here rather than by which item
@@ -9253,6 +9880,11 @@ impl Fleet {
                     return refused;
                 }
             }
+            admission_guard = Some(PurposeAdmissionGuard {
+                pool: self.clone(),
+                item: leader.clone(),
+                armed: true,
+            });
             // Nothing below this line may run while a displaced answer to the
             // same question is still alive somewhere in the fleet.
             match self.await_purpose_quiescent(key, &leader).await {
@@ -9275,11 +9907,7 @@ impl Fleet {
                     // cadence, and leaves the operator a red they can act on;
                     // a silent second attestation leaves them the symptom that
                     // opened this issue.
-                    let diagnostic = format!(
-                        "purpose {key} still owes a confirmed death after {}s (outstanding \
-                         {outstanding:?}); refusing to dispatch a second answer to one question",
-                        RETIREMENT_CONFIRMATION_BUDGET.as_secs()
-                    );
+                    let diagnostic = self.purpose_refusal_diagnostic(key, &outstanding);
                     log::warn!("{diagnostic}");
                     self.purposes.lock().unwrap().finish(&leader);
                     self.purpose_quiesced.notify_waiters();
@@ -9322,6 +9950,26 @@ impl Fleet {
                     newly_claimed.push(item);
                 }
                 receivers.push((public_identity, rx));
+            }
+        }
+        // An item whose every check joined an execution another leader opened
+        // has no leader of its own. Its subscriptions are its stake in the
+        // fleet, so retiring it has to end them, and their ending is its end.
+        if let (true, Some(key)) = (newly_claimed.is_empty(), &purpose) {
+            self.purpose_joiners.lock().unwrap().insert(
+                leader.clone(),
+                (
+                    key.clone(),
+                    receivers
+                        .iter()
+                        .map(|(identity, _)| identity.clone())
+                        .collect(),
+                ),
+            );
+            // Displaced between the gate and this registration: the
+            // retirement found nothing to detach, so do it here.
+            if !self.purposes.lock().unwrap().is_live_holder(key, &leader) {
+                self.detach_purpose_joiner(&leader, CancelCause::Superseded);
             }
         }
         if !newly_claimed.is_empty() {
@@ -9374,23 +10022,29 @@ impl Fleet {
                 runner_context_id: runner_context_id.clone(),
                 armed: true,
             };
+            // From here the leader's own terminal path, or its completion
+            // guard, answers for this item's question.
+            if let Some(guard) = admission_guard.as_mut() {
+                guard.armed = false;
+            }
             self.spawn_leader(async move {
                 let mut completion_guard = completion_guard;
                 let mut request = request;
-                let (outcome, account) = match pool.prepare_execution(&orch, &mut request).await {
-                    Ok(prepared) => {
-                        if let Some(preparing) =
-                            pool.preparing_leaders.lock().unwrap().get_mut(&leader)
-                        {
-                            preparing.last_progress_unix_ms = unix_time_ms();
+                let (outcome, account, abandoned_grant) =
+                    match pool.prepare_execution(&orch, &mut request).await {
+                        Ok(prepared) => {
+                            if let Some(preparing) =
+                                pool.preparing_leaders.lock().unwrap().get_mut(&leader)
+                            {
+                                preparing.last_progress_unix_ms = unix_time_ms();
+                            }
+                            let executed = pool
+                                .execute_prepared_accounted(request, Some(batch), prepared)
+                                .await;
+                            (executed.outcome, executed.account, executed.abandoned_grant)
                         }
-                        let executed = pool
-                            .execute_prepared_accounted(request, Some(batch), prepared)
-                            .await;
-                        (executed.outcome, executed.account)
-                    }
-                    Err(outcome) => (outcome, CellAccount::default()),
-                };
+                        Err(outcome) => (outcome, CellAccount::default(), None),
+                    };
                 let settled = |outcome: CellOutcome| LeaderSettlement::Settled {
                     outcome,
                     account: account.clone(),
@@ -9405,13 +10059,7 @@ impl Fleet {
                     pool.settle_runner_context(&id);
                 }
                 pool.cancelled_leaders.lock().unwrap().remove(&leader);
-                // The terminal outcome is what actually retires an item, and
-                // this is where it lands. Fenced by identity inside the
-                // registry, so a displaced item clears only its own debt and
-                // never the entry its replacement now holds; the wakeup then
-                // releases whichever successor was waiting on this death.
-                pool.purposes.lock().unwrap().finish(&leader);
-                pool.purpose_quiesced.notify_waiters();
+                pool.settle_leader_purpose(&leader, abandoned_grant);
                 match &outcome {
                     CellOutcome::Completed {
                         output,
@@ -9491,12 +10139,16 @@ impl Fleet {
                 completion_guard.disarm();
             });
         }
-        futures_util::future::join_all(
+        let outcomes = futures_util::future::join_all(
             receivers
                 .into_iter()
                 .map(|(identity, rx)| self.await_coalesced(identity, wait_horizon_unix_ms, rx)),
         )
-        .await
+        .await;
+        // Still armed only for an item that led nothing: its subscriptions
+        // have ended, and with them its stake in the fleet.
+        drop(admission_guard);
+        outcomes
     }
 
     /// The confinement a batch runs under.
@@ -10126,6 +10778,16 @@ impl Fleet {
         if let Some(stopped_at) = self.runner_stop.at() {
             return self.stopped_outcome(stopped_at, &key, None).into();
         }
+        // Retired while it was still being prepared: nothing is queued yet,
+        // so ending it is the runner's own act and needs no machine.
+        if self.cancelled_leaders.lock().unwrap().remove(&key) {
+            self.preparing_leaders.lock().unwrap().remove(&key);
+            return CellOutcome::Cancelled {
+                request_id: key.0,
+                attempt_id: key.1,
+            }
+            .into();
+        }
         let batch_profile_identities = plan.batch_identities.clone();
         let profile_identity = request.command_resource_identity.clone();
         // One entry stands for this work from here until it settles. Placement
@@ -10171,6 +10833,23 @@ impl Fleet {
                 stopped_at = self.runner_stop.stopped() => {
                     guard.cause = Some(WithdrawalCause::RunnerStopped(stopped_at));
                     return self.stopped_outcome(stopped_at, &key, None).into();
+                }
+                // Retired while waiting for a machine. Nothing was granted, so
+                // the runner ends it here rather than waiting for a claim that
+                // may never come; that `Cancelled` is the attempt's own end.
+                () = self.retired(&key) => {
+                    self.queue.withdraw(
+                        &key,
+                        "withdrawn: retired before any machine claimed it".into(),
+                        unix_time_ms(),
+                    );
+                    self.binding_changed.notify_waiters();
+                    guard.disarm();
+                    return CellOutcome::Cancelled {
+                        request_id: key.0.clone(),
+                        attempt_id: key.1.clone(),
+                    }
+                    .into();
                 }
                 selection = self.select_executor(
                     &request,
@@ -10228,6 +10907,23 @@ impl Fleet {
                 stopped_at = self.runner_stop.stopped() => {
                     guard.cause = Some(WithdrawalCause::RunnerStopped(stopped_at));
                     return self.stopped_outcome(stopped_at, &key, None).into();
+                }
+                // Retired with an offer out. The machine may claim it as this
+                // runs, so it is told the grant is never coming.
+                () = self.retired(&key) => {
+                    self.queue.withdraw(
+                        &key,
+                        "withdrawn: retired while offered, before any grant".into(),
+                        unix_time_ms(),
+                    );
+                    self.binding_changed.notify_waiters();
+                    guard.disarm();
+                    withdraw_claim(&selected, &entry_id);
+                    return CellOutcome::Cancelled {
+                        request_id: key.0.clone(),
+                        attempt_id: key.1.clone(),
+                    }
+                    .into();
                 }
                 answer = self.offer_once(
                     &entry_id,
@@ -10338,10 +11034,12 @@ impl Fleet {
             .is_ok();
         if sent {
             guard.granted_to = Some(selected.executor_id.clone());
-            self.purposes
-                .lock()
-                .unwrap()
-                .advance(&key, purpose::ItemPhase::Dispatched);
+            self.purposes.lock().unwrap().dispatched(
+                &key,
+                &selected.executor_id,
+                selected.generation,
+                granted_at_unix_ms,
+            );
         }
         // Retirement can still land in the instant between the gate above and
         // this send, so the delivered form remains.
@@ -10393,20 +11091,42 @@ impl Fleet {
                 placement.generation = generation;
             }
         }
-        let (outcome, ended_by_runner) = match waited {
-            Ok(ClaimedWait::Answered(outcome)) => (*outcome, false),
+        // Whether the runner, rather than the machine, ended this wait, and why.
+        // The work may still be running when it did, so the item's question
+        // keeps owing its death (see `Fleet::settle_leader_purpose`).
+        let (outcome, ended_by_runner, abandoned_grant) = match waited {
+            Ok(ClaimedWait::Answered(outcome)) => {
+                // A runner shutting down answers its own claims, and that
+                // answer says nothing about the machine, which keeps running.
+                let abandoned = match &*outcome {
+                    CellOutcome::Unavailable {
+                        reason: CellUnavailableReason::RunnerStopping { stopped_at_unix_ms },
+                        ..
+                    } => Some(format!(
+                        "this runner began shutting down at {}",
+                        describe_runner_stop(*stopped_at_unix_ms)
+                    )),
+                    _ => None,
+                };
+                (*outcome, false, abandoned)
+            }
             Ok(ClaimedWait::ChannelClosed) => (
                 executor_unavailable(format!(
                     "executor {} (generation {}): result channel closed",
                     placement.executor_id, placement.generation
                 )),
                 false,
+                Some("its result channel closed before the machine answered".to_string()),
             ),
             Err(stopped_at) => {
                 guard.cause = Some(WithdrawalCause::RunnerStopped(stopped_at));
                 (
                     self.stopped_outcome(stopped_at, &key, Some(&selected.executor_id)),
                     true,
+                    Some(format!(
+                        "this runner began shutting down at {}",
+                        describe_runner_stop(stopped_at)
+                    )),
                 )
             }
             Ok(ClaimedWait::Silent(silence)) => {
@@ -10422,7 +11142,11 @@ impl Fleet {
                 guard.cause = Some(WithdrawalCause::ClaimedAttemptSilent(compact_duration(
                     silence.quiet_ms,
                 )));
-                (silence.outcome(&key, executor_name), true)
+                let abandoned = format!(
+                    "{executor_name} gave no account of it for {}",
+                    compact_duration(silence.quiet_ms)
+                );
+                (silence.outcome(&key, executor_name), true, Some(abandoned))
             }
         };
         if !selected.colocated {
@@ -10468,6 +11192,7 @@ impl Fleet {
             return ExecutedRequest {
                 outcome,
                 grant_without_result,
+                abandoned_grant,
                 above_ceiling: claimed_above_ceiling,
                 account: CellAccount {
                     cancel_cause: None,
@@ -10558,6 +11283,7 @@ impl Fleet {
         ExecutedRequest {
             outcome,
             grant_without_result,
+            abandoned_grant,
             above_ceiling: claimed_above_ceiling,
             account: CellAccount {
                 cancel_cause: None,
@@ -11451,12 +12177,13 @@ impl Fleet {
     /// died part-way through writing objects that a different node was then
     /// wedged without.
     ///
-    /// Held work is bounded from three directions, none of them a clock that
-    /// only knows how long something has been quiet: the reattached connection
+    /// Held work is bounded from three directions: the reattached connection
     /// accounts for it against its first snapshot
     /// ([`Fleet::reconcile_held_executions`]), the runner abandons it as soon as
-    /// it knows the process is gone ([`Fleet::abandon_held_executions`]), and
-    /// each submitter's own silence watchdog remains underneath.
+    /// the machine's enrollment is gone ([`Fleet::abandon_held_executions`]),
+    /// and each submitter's own silence watchdog remains underneath. Only the
+    /// first two are evidence; the watchdog ends a submitter's wait, and the
+    /// purpose debt behind it stays until evidence arrives.
     fn hold_executions_across_link_gap(
         &self,
         executor_id: &str,
@@ -11592,11 +12319,15 @@ impl Fleet {
         self.binding_changed.notify_waiters();
     }
 
-    /// Give up on work held across a gap, because the process running it is
-    /// gone.
+    /// Give up on everything a machine holds, because its enrollment is gone.
     ///
-    /// Only the runner's own supervisor knows this: it is what kills a remote
-    /// process group, and what watches the carrier that process lives under.
+    /// Called when an operator removes an enrolled remote or revokes its
+    /// enrollment ([`management::enrollment_revoked`]), whether or not it is
+    /// attached: a detached machine's held work has no live connection to
+    /// end, and nothing else would ever answer it. Both revoke the machine's
+    /// credential, so no result it might still produce can be accepted, and
+    /// that is what makes its work gone by this runner's authority. Its
+    /// purpose debts settle with it.
     pub fn abandon_held_executions(&self, executor_id: &str, diagnostic: &str) {
         self.unreconciled_executions
             .lock()
@@ -11620,6 +12351,10 @@ impl Fleet {
     fn fail_executions_for_executor(&self, executor_id: &str, diagnostic: &str) {
         self.queue
             .fail_claims_for(executor_id, diagnostic, unix_time_ms());
+        // The same decision settles the debts this machine holds, including
+        // those whose attempts nothing waits on any more and the ones a
+        // previous runner process left.
+        self.settle_purpose_debts_for_lost_machine(executor_id, diagnostic);
         self.binding_changed.notify_waiters();
     }
 
@@ -15939,6 +16674,11 @@ pub(crate) struct GrantWithoutResult {
 pub(crate) struct ExecutedRequest {
     pub(crate) outcome: CellOutcome,
     pub(crate) grant_without_result: Option<GrantWithoutResult>,
+    /// Why the runner stopped waiting on a grant it had delivered without the
+    /// machine answering: a silent machine, a closed result channel, or this
+    /// runner shutting down. The work may still be running, so this is never
+    /// evidence that it ended.
+    pub(crate) abandoned_grant: Option<String>,
     /// Set when a machine claimed this work above its memory ceiling, because
     /// no usable machine could hold it.
     pub(crate) above_ceiling: Option<AboveMemoryCeiling>,
@@ -15952,6 +16692,7 @@ impl From<CellOutcome> for ExecutedRequest {
         Self {
             outcome,
             grant_without_result: None,
+            abandoned_grant: None,
             above_ceiling: None,
             account: CellAccount::default(),
         }
@@ -16517,7 +17258,7 @@ mod tests {
         };
         assert_eq!(retire, older);
 
-        fleet.retire_dispatched_item(&retire);
+        fleet.retire_item(&retire, CancelCause::Superseded);
         assert!(
             fleet.cancelled_leaders.lock().unwrap().contains(&older),
             "a retirement must be recorded even with no executor to deliver it to"
@@ -16557,6 +17298,501 @@ mod tests {
             !fleet.cancelled_leaders.lock().unwrap().contains(&newer),
             "refusing a stale arrival must not retire the live item it lost to"
         );
+    }
+
+    fn debt_key() -> purpose::PurposeKey {
+        purpose::PurposeKey::main_cadence("project", "rust-tests", "linux")
+    }
+
+    /// An unconfirmed debt on `executor_id`: granted there, then abandoned by
+    /// the runner without the machine answering.
+    fn unconfirmed_debt_on(
+        fleet: &Fleet,
+        id: &str,
+        executor_id: &str,
+        generation: u64,
+        at: u64,
+    ) -> RequestIdentity {
+        let item: RequestIdentity = (id.into(), format!("{id}-attempt"));
+        let mut registry = fleet.purposes.lock().unwrap();
+        registry.admit(debt_key(), item.clone(), at);
+        registry.dispatched(&item, executor_id, generation, at);
+        registry.end_unconfirmed(&item, purpose::UnconfirmedReason::LeaderVanished, at);
+        item
+    }
+
+    fn completion_of(item: &RequestIdentity) -> cairn_common::executor_protocol::CellCompletion {
+        cairn_common::executor_protocol::CellCompletion {
+            executor_id: String::new(),
+            request_id: item.0.clone(),
+            attempt_id: item.1.clone(),
+            owner: None,
+            command_class: cairn_common::executor_protocol::CellCommandClass::classify("true"),
+            command: "true".into(),
+            priority: CellPriority::ReviewCheck,
+            queued_at_unix_ms: 0,
+            started_at_unix_ms: None,
+            finished_at_unix_ms: 0,
+            duration_ms: 0,
+            verdict: cairn_common::executor_protocol::CellCompletionVerdict::Cancelled,
+            failure_output_tail: None,
+            transcript_event_uri: None,
+            resource_reservation: None,
+            learned_estimate: None,
+            actuals: None,
+            cached: false,
+            subscriber_count: 1,
+            served_at_unix_ms: 0,
+        }
+    }
+
+    /// The cairn/4482 specimen. Work retired before any machine claimed it is
+    /// the runner's to end, and it ends now: waiting for a claim that may
+    /// never come is what left a question owing a death for hours. The
+    /// `Cancelled` it ends with is its own terminal outcome, so its successor
+    /// is free.
+    #[tokio::test]
+    async fn retiring_offered_work_before_its_grant_ends_it_and_tells_the_machine() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let request = provenance_request();
+        let old: RequestIdentity = (request.request_id.clone(), request.attempt_id.clone());
+        let newer: RequestIdentity = ("successor".into(), "successor-attempt".into());
+        orch.fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(debt_key(), old.clone(), 10);
+        let (_generation, submitting, mut machine, offered) = offered_and_held(&orch).await;
+
+        let admission = orch
+            .fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(debt_key(), newer.clone(), 20);
+        assert!(matches!(admission, purpose::Admission::Replaced { .. }));
+        orch.fleet.retire_item(&old, CancelCause::Superseded);
+
+        let executed = tokio::time::timeout(Duration::from_secs(5), submitting)
+            .await
+            .expect("retired work the runner holds ends without any machine's help")
+            .unwrap();
+        assert!(
+            matches!(executed.outcome, CellOutcome::Cancelled { .. }),
+            "{:?}",
+            executed.outcome
+        );
+        assert!(executed.abandoned_grant.is_none(), "nothing was granted");
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), machine.recv()).await {
+                Ok(Some(ExecutorMessage::Lost { entry_id })) => {
+                    assert_eq!(entry_id, offered);
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                other => panic!("the machine holding the offer was never told: {other:?}"),
+            }
+        }
+        assert_eq!(orch.fleet.queue.len(), 0);
+
+        orch.fleet
+            .settle_leader_purpose(&old, executed.abandoned_grant);
+        let gate = tokio::time::timeout(
+            Duration::from_secs(5),
+            orch.fleet.await_purpose_quiescent(&debt_key(), &newer),
+        )
+        .await
+        .expect("the successor is not held for a death that already happened");
+        assert!(matches!(gate, PurposeGate::Clear));
+    }
+
+    /// The specimen itself: the only machine that could serve a lane declined
+    /// it, so the lane waits in placement for that machine's next posted state,
+    /// which may never come. Retiring it ends it there, at once, with no
+    /// offer outstanding to withdraw, and its question owes nothing.
+    #[tokio::test]
+    async fn retiring_work_no_machine_will_claim_ends_it_at_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let request = provenance_request();
+        let old: RequestIdentity = (request.request_id.clone(), request.attempt_id.clone());
+        orch.fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(debt_key(), old.clone(), 10);
+        let (generation, submitting, mut machine, offered) = offered_and_held(&orch).await;
+        orch.fleet.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::Decline {
+                entry_id: offered.clone(),
+                reason: DeclineReason::Pressure,
+                detail: Some("no room for it".into()),
+                disk: None,
+            },
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), next_work_frame(&mut machine))
+                .await
+                .is_err(),
+            "a declined lane waits for the machine's next posted state"
+        );
+        assert!(orch.fleet.queue.state_of(&offered).is_some());
+        assert!(!submitting.is_finished(), "the lane waits for a machine");
+
+        orch.fleet.retire_item(&old, CancelCause::Superseded);
+
+        let executed = tokio::time::timeout(Duration::from_secs(5), submitting)
+            .await
+            .expect("retired work no machine can claim ends without one")
+            .unwrap();
+        assert!(
+            matches!(executed.outcome, CellOutcome::Cancelled { .. }),
+            "{:?}",
+            executed.outcome
+        );
+        assert!(executed.abandoned_grant.is_none(), "nothing was granted");
+        assert_eq!(orch.fleet.queue.len(), 0);
+        while let Ok(frame) = machine.try_recv() {
+            assert!(
+                !matches!(frame, ExecutorMessage::Lost { .. }),
+                "a declined offer is not outstanding, so nothing is withdrawn from the machine"
+            );
+        }
+        orch.fleet
+            .settle_leader_purpose(&old, executed.abandoned_grant);
+        assert!(!orch.fleet.purpose_owes(&debt_key()));
+    }
+
+    /// Work retired while it is still being prepared is never queued at all.
+    #[tokio::test]
+    async fn work_retired_before_it_is_queued_never_enters_the_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let request = provenance_request();
+        let old: RequestIdentity = (request.request_id.clone(), request.attempt_id.clone());
+        orch.fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(debt_key(), old.clone(), 10);
+        orch.fleet.retire_item(&old, CancelCause::Superseded);
+
+        let executed =
+            tokio::time::timeout(Duration::from_secs(5), scratch_submission(&orch).await)
+                .await
+                .expect("work retired before queueing ends at once")
+                .unwrap();
+        assert!(
+            matches!(executed.outcome, CellOutcome::Cancelled { .. }),
+            "{:?}",
+            executed.outcome
+        );
+        assert_eq!(orch.fleet.queue.len(), 0);
+        assert!(!orch.fleet.cancelled_leaders.lock().unwrap().contains(&old));
+    }
+
+    /// Revoking a machine's enrollment is the same evidence as removing it,
+    /// attached or not. A detached machine has no link to end, and its debts
+    /// would otherwise wait for a snapshot it can never send.
+    #[tokio::test]
+    async fn revoking_a_detached_machines_enrollment_settles_its_debts() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        unconfirmed_debt_on(&orch.fleet, "held", "detached-remote", 2, 10);
+        unconfirmed_debt_on(&orch.fleet, "elsewhere", "other-remote", 1, 20);
+
+        management::enrollment_revoked(&orch, "detached-remote", "device-1");
+
+        let left = orch.fleet.purpose_debts();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(
+            left[0].placement.as_ref().unwrap().executor_id,
+            "other-remote",
+            "revoking one machine settles only its debts"
+        );
+    }
+
+    /// A runner that stops waiting on a grant has learned nothing about the
+    /// machine. The question keeps owing the death, named against that
+    /// machine, until the machine itself says the attempt ended. A later
+    /// report from the same connection that merely omits the attempt is not
+    /// that statement.
+    #[tokio::test]
+    async fn a_grant_the_runner_gave_up_on_leaves_its_question_owed() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let request = provenance_request();
+        let item: RequestIdentity = (request.request_id.clone(), request.attempt_id.clone());
+        orch.fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(debt_key(), item.clone(), 10);
+        let (generation, submitting, _machine) = granted_and_held(&orch).await;
+
+        let executed = settled(submitting).await;
+        assert!(
+            executed.abandoned_grant.is_some(),
+            "the silence watchdog ended the wait, not the machine"
+        );
+        orch.fleet
+            .settle_leader_purpose(&item, executed.abandoned_grant);
+        let debts = orch.fleet.purpose_debts();
+        assert_eq!(debts.len(), 1);
+        assert_eq!(
+            debts[0].placement.as_ref().map(|p| p.executor_id.as_str()),
+            Some(COLOCATED_EXECUTOR_ID)
+        );
+        assert!(
+            matches!(
+                &debts[0].confirmation,
+                purpose::Confirmation::Unconfirmed {
+                    reason: purpose::UnconfirmedReason::GrantAbandoned { .. },
+                    ..
+                }
+            ),
+            "{:?}",
+            debts[0].confirmation
+        );
+
+        for _ in 0..2 {
+            orch.fleet.apply_executor_snapshot(
+                COLOCATED_EXECUTOR_ID,
+                generation,
+                FleetSnapshot::default(),
+                ExecutorSubstrateReport::default(),
+            );
+        }
+        assert!(
+            orch.fleet.purpose_owes(&debt_key()),
+            "a report from the grant's own connection can cross the grant in flight"
+        );
+
+        let mut ended = FleetSnapshot::default();
+        ended.recent_completions.push(completion_of(&item));
+        orch.fleet.apply_executor_snapshot(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ended,
+            ExecutorSubstrateReport::default(),
+        );
+        assert!(!orch.fleet.purpose_owes(&debt_key()));
+    }
+
+    /// Each kind of machine evidence settles an unconfirmed debt, and the two
+    /// things that look like evidence and are not leave it standing.
+    #[test]
+    fn machine_evidence_settles_an_unconfirmed_debt_and_nothing_else_does() {
+        let fleet = Fleet::default();
+        let owes = |fleet: &Fleet| {
+            fleet
+                .purposes
+                .lock()
+                .unwrap()
+                .pending_retirements(&debt_key())
+        };
+
+        unconfirmed_debt_on(&fleet, "a", "remote-x", 3, 10);
+        fleet.settle_purpose_debts_from_account("remote-x", 3, false, &FleetSnapshot::default());
+        fleet.settle_purpose_debts_from_account("remote-x", 3, true, &FleetSnapshot::default());
+        assert_eq!(
+            owes(&fleet),
+            1,
+            "the grant's own connection proves nothing by omission"
+        );
+        fleet.settle_purpose_debts_from_account("remote-x", 4, false, &FleetSnapshot::default());
+        assert_eq!(
+            owes(&fleet),
+            1,
+            "only a newer connection's first report is an account"
+        );
+        fleet.settle_purpose_debts_from_account("remote-x", 4, true, &FleetSnapshot::default());
+        assert_eq!(
+            owes(&fleet),
+            0,
+            "a newer connection that does not list it settles it"
+        );
+
+        let b = unconfirmed_debt_on(&fleet, "b", "remote-x", 4, 20);
+        let mut listing = FleetSnapshot::default();
+        listing.recent_completions.push(completion_of(&b));
+        fleet.settle_purpose_debts_from_account("remote-x", 4, false, &listing);
+        assert_eq!(owes(&fleet), 0, "the machine said it ended");
+
+        unconfirmed_debt_on(&fleet, "c", "remote-x", 5, 30);
+        fleet.end_link_generation("remote-x", 5, &ExecutorDisconnectOrigin::PeerOrIo);
+        assert_eq!(
+            owes(&fleet),
+            1,
+            "a link that went away is not a machine that did"
+        );
+        fleet.end_link_generation("remote-x", 5, &ExecutorDisconnectOrigin::RunnerInitiated);
+        assert_eq!(owes(&fleet), 0, "the runner recycled the machine's process");
+
+        unconfirmed_debt_on(&fleet, "d", "remote-x", 6, 40);
+        unconfirmed_debt_on(&fleet, "e", "remote-y", 1, 50);
+        fleet.abandon_held_executions("remote-x", "remote-x was removed");
+        assert_eq!(
+            owes(&fleet),
+            1,
+            "removing one machine settles only its debts"
+        );
+    }
+
+    /// A leader that vanishes before its grant owed nothing; one that vanishes
+    /// after leaves its question owing, named against the machine.
+    #[test]
+    fn a_vanished_leader_settles_before_a_grant_and_leaves_its_debt_after() {
+        let fleet = Fleet::default();
+        let guard = |leader: &RequestIdentity| CoalescedLeaderCompletionGuard {
+            pool: fleet.clone(),
+            leader: leader.clone(),
+            work_class: provenance_request().placement_work_class,
+            keys: Vec::new(),
+            runner_context_id: None,
+            armed: true,
+        };
+        let before: RequestIdentity = ("before".into(), "a".into());
+        fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(debt_key(), before.clone(), 10);
+        drop(guard(&before));
+        assert!(fleet.purpose_debts().is_empty());
+        assert!(!fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .is_live_holder(&debt_key(), &before));
+
+        let after: RequestIdentity = ("after".into(), "a".into());
+        {
+            let mut registry = fleet.purposes.lock().unwrap();
+            registry.admit(debt_key(), after.clone(), 20);
+            registry.dispatched(&after, "remote-x", 2, 21);
+        }
+        drop(guard(&after));
+        let debts = fleet.purpose_debts();
+        assert_eq!(debts.len(), 1);
+        assert_eq!(
+            debts[0].confirmation,
+            purpose::Confirmation::Unconfirmed {
+                since_unix_ms: debts[0].retired_at_unix_ms,
+                reason: purpose::UnconfirmedReason::LeaderVanished,
+            }
+        );
+    }
+
+    /// A purpose item that only joined another leader's execution has no
+    /// leader of its own to settle it. Retiring it ends its subscription, and
+    /// with it the item; the execution it was the last to want then becomes
+    /// the question's debt, cleared by that execution's own leader.
+    #[tokio::test]
+    async fn a_retired_joiner_ends_its_subscription_and_owes_the_execution_it_retired() {
+        let fleet = Fleet::default();
+        let joiner: RequestIdentity = ("joiner".into(), "joiner-attempt".into());
+        let joined_leader: RequestIdentity = ("other".into(), "other-attempt".into());
+        let subscription: RequestIdentity =
+            ("joiner:check-0".into(), "joiner-attempt:check-0".into());
+        let (waiter, delivered) = oneshot::channel();
+        fleet.in_flight.lock().unwrap().open(
+            CoalescingKey::new(result_identity(), joined_leader.clone()),
+            PlacementDemand::default(),
+            HashMap::from([(
+                subscription.clone(),
+                CoalescedSubscriber {
+                    waiter,
+                    priority: CellPriority::ReviewCheck,
+                    requesting_job_id: None,
+                },
+            )]),
+        );
+        fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(debt_key(), joiner.clone(), 10);
+        let admission_guard = PurposeAdmissionGuard {
+            pool: fleet.clone(),
+            item: joiner.clone(),
+            armed: true,
+        };
+        fleet
+            .purpose_joiners
+            .lock()
+            .unwrap()
+            .insert(joiner.clone(), (debt_key(), vec![subscription]));
+
+        let successor: RequestIdentity = ("successor".into(), "successor-attempt".into());
+        fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(debt_key(), successor, 20);
+        fleet.retire_item(&joiner, CancelCause::Superseded);
+        assert!(
+            matches!(
+                delivered.await,
+                Ok(Err(CoalescedWaitError::Cancelled(CancelCause::Superseded)))
+            ),
+            "the joiner's own wait ends at once"
+        );
+        drop(admission_guard);
+
+        let debts = fleet.purpose_debts();
+        assert_eq!(
+            debts.iter().map(|debt| &debt.request).collect::<Vec<_>>(),
+            vec![&joined_leader],
+            "the joiner settled; the execution it retired is owed in its place"
+        );
+        fleet.settle_leader_purpose(&joined_leader, None);
+        assert!(fleet.purpose_debts().is_empty());
+    }
+
+    /// The refusal is the operator's only view of a blocked question, so it
+    /// names the machine, where the item had got to, and a restart.
+    #[test]
+    fn the_refusal_names_the_machine_the_phase_and_a_restart() {
+        let fleet = Fleet::default();
+        fleet.purposes.lock().unwrap().reload(
+            vec![purpose::PurposeDebtRow {
+                key: debt_key(),
+                request: ("stranded".into(), "stranded-attempt".into()),
+                state: purpose::DebtRowState::Retiring,
+                phase: purpose::ItemPhase::Dispatched,
+                placement: purpose::DebtPlacement {
+                    executor_id: "remote-x".into(),
+                    generation: 7,
+                    dispatched_at_unix_ms: 1_000,
+                    awaiting_post_boot_account: false,
+                },
+                cause: Some(purpose::RetirementCause::Displaced {
+                    by: ("newer".into(), "newer-attempt".into()),
+                }),
+                confirmation: Some(purpose::Confirmation::Awaiting),
+                retired_at_unix_ms: Some(2_000),
+            }],
+            3_000,
+        );
+        let diagnostic = fleet.purpose_refusal_diagnostic(&debt_key(), &fleet.purpose_debts());
+        for expected in [
+            "request stranded attempt stranded-attempt",
+            "on remote-x",
+            "generation 7",
+            "after it was granted to a machine",
+            "displaced by request newer",
+            "runner restarted at",
+            "authorizes the overlap",
+        ] {
+            assert!(
+                diagnostic.contains(expected),
+                "missing {expected:?}: {diagnostic}"
+            );
+        }
     }
 
     use crate::db::DbState;
@@ -26710,6 +27946,22 @@ mod tests {
             std::sync::atomic::Ordering::Relaxed,
         );
 
+        let submitting = scratch_submission(orch).await;
+        let offered = loop {
+            match tokio::time::timeout(Duration::from_secs(30), machine.recv()).await {
+                Ok(Some(ExecutorMessage::Offer { entry_id, .. })) => break entry_id,
+                Ok(Some(_)) => continue,
+                other => panic!("the runner never offered the work: {other:?}"),
+            }
+        };
+        (generation, submitting, machine, offered)
+    }
+
+    /// Submit a scratch-only batch pinned to the colocated executor, as a
+    /// leader would, without waiting for its outcome.
+    async fn scratch_submission(
+        orch: &Arc<Orchestrator>,
+    ) -> tokio::task::JoinHandle<ExecutedRequest> {
         let mut request = provenance_request();
         request.repository = RepositoryLocator::ScratchOnly {
             owner_id: request.project_id.clone(),
@@ -26732,23 +27984,12 @@ mod tests {
             .prepare_execution(orch, &mut request)
             .await
             .expect("a scratch request prepares");
-
-        let submitting = {
-            let orch = orch.clone();
-            tokio::spawn(async move {
-                orch.fleet
-                    .execute_prepared_accounted(request, Some(batch), prepared)
-                    .await
-            })
-        };
-        let offered = loop {
-            match tokio::time::timeout(Duration::from_secs(30), machine.recv()).await {
-                Ok(Some(ExecutorMessage::Offer { entry_id, .. })) => break entry_id,
-                Ok(Some(_)) => continue,
-                other => panic!("the runner never offered the work: {other:?}"),
-            }
-        };
-        (generation, submitting, machine, offered)
+        let orch = orch.clone();
+        tokio::spawn(async move {
+            orch.fleet
+                .execute_prepared_accounted(request, Some(batch), prepared)
+                .await
+        })
     }
 
     async fn settled(submitting: tokio::task::JoinHandle<ExecutedRequest>) -> ExecutedRequest {

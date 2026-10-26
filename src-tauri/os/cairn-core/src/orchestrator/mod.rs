@@ -519,6 +519,10 @@ impl OrchestratorBuilder {
         // Machines that could not prepare a project's cells stay excluded for
         // that project across a runner restart, until their evidence changes.
         fleet.attach_preparation_store(self.db.local.clone());
+        // Work granted to a machine before a restart is still running there.
+        // Its debts reload before any purpose item is admitted, so nothing
+        // dispatches beside one.
+        fleet.attach_purpose_debt_journal(self.db.local.clone());
         let models_runtime = self.models_runtime.unwrap_or_else(|| {
             models::ModelRuntime::local(self.services.process.clone(), self.process_state.clone())
         });

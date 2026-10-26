@@ -1404,6 +1404,89 @@ pub fn set_machine_role(
     })
 }
 
+/// The overlap an operator authorizes: one question, one displaced item, and
+/// the machine it may still be running on (absent only for an item that was
+/// never placed).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthorizeOverlapRequest {
+    pub purpose: String,
+    pub request_id: String,
+    pub attempt_id: String,
+    #[serde(default)]
+    pub executor: Option<String>,
+}
+
+/// What an authorized overlap settled.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlapAuthorized {
+    pub question: String,
+    pub request_id: String,
+    pub attempt_id: String,
+    pub placement: String,
+}
+
+/// Act on an executor enrollment that has just been revoked.
+///
+/// A revoked credential can never report again, so everything the machine
+/// holds is gone by this runner's authority whether or not it is attached. An
+/// attached machine is shut down over its link; a detached one has no link to
+/// end, and without the abandonment below its held claims, and the purpose
+/// debts behind them, would wait for a snapshot that can never come.
+pub fn enrollment_revoked(orch: &Orchestrator, executor_id: &str, device_id: &str) {
+    if let Some(generation) = orch.fleet.managed_generation(executor_id, device_id) {
+        orch.object_plane.revoke(executor_id, generation);
+        orch.fleet.shutdown_advertised_executor(
+            executor_id,
+            device_id,
+            generation,
+            "this machine's enrollment was revoked",
+        );
+    }
+    orch.fleet.abandon_held_executions(
+        executor_id,
+        "this machine's enrollment was revoked, so nothing it might still be running can report",
+    );
+}
+
+/// Every question held back by a purpose debt, for the app.
+pub fn purpose_debts(orch: &Orchestrator) -> Vec<crate::fleet::BlockedQuestion> {
+    orch.fleet.blocked_questions(None, unix_time_ms())
+}
+
+/// Settle the one purpose debt an operator named, so a second answer to its
+/// question may run beside the displaced one.
+///
+/// This is the only escape from a debt no evidence has settled, and it is
+/// exact: question, item, and machine must all name one outstanding debt.
+/// Reached only from the operator-gated invoke surface; the `cairn://executors`
+/// resource has no person behind its writes and offers no equivalent.
+pub fn authorize_purpose_overlap(
+    orch: &Orchestrator,
+    request: AuthorizeOverlapRequest,
+    operator: &str,
+) -> Result<OverlapAuthorized, String> {
+    // The machine may be one that has since been removed, which no name
+    // resolves any more; the debt still names it by identity.
+    let executor_id = request.executor.as_deref().map(|reference| {
+        resolve_executor_reference(orch, reference).unwrap_or_else(|_| reference.to_string())
+    });
+    let key = crate::fleet::purpose::PurposeKey::from_persisted(request.purpose);
+    let settled = orch.fleet.authorize_purpose_overlap(
+        &key,
+        &(request.request_id, request.attempt_id),
+        executor_id.as_deref(),
+        operator,
+    )?;
+    Ok(OverlapAuthorized {
+        question: settled.key.to_string(),
+        request_id: settled.request.0.clone(),
+        attempt_id: settled.request.1.clone(),
+        placement: orch.fleet.purpose_debt_machine(&settled),
+    })
+}
+
 /// Move the runner's own executor's build root to `path`, a directory on another
 /// volume, or back to the home with `None`.
 ///

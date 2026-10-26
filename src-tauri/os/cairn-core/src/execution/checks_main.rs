@@ -31,7 +31,7 @@
 //! the hosts as movement. Only when the executor has no complete row does the
 //! platform's newest row stand in, and the message says so (see [`Comparison`]).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,6 +82,10 @@ pub(crate) enum Trigger {
     Heartbeat,
     /// The launch-time repair edge.
     Startup,
+    /// A lane refused because its question owed a displaced answer's death,
+    /// and that debt has now settled. Without this a settled debt would leave
+    /// main unobserved until the next merge or heartbeat.
+    DebtSettled,
     /// An observed advance of the default branch.
     Merge,
 }
@@ -94,9 +98,24 @@ struct CadencePass {
 
 /// The per-project cadence slot: one pass in flight, at most one queued.
 #[derive(Default)]
-pub(crate) struct CadenceSlots(HashMap<String, CadencePass>);
+pub(crate) struct CadenceSlots(
+    HashMap<String, CadencePass>,
+    /// Questions a refused lane is waiting on to settle, so a lane refused by
+    /// every pass against one debt gets one waiter, not one per pass.
+    HashSet<crate::fleet::purpose::PurposeKey>,
+);
 
 impl CadenceSlots {
+    /// Claim the one waiter for `key`'s settlement. `false` when one is
+    /// already waiting.
+    fn watch_debt(&mut self, key: &crate::fleet::purpose::PurposeKey) -> bool {
+        self.1.insert(key.clone())
+    }
+
+    fn debt_settled(&mut self, key: &crate::fleet::purpose::PurposeKey) {
+        self.1.remove(key);
+    }
+
     /// Ask for a pass. Returns `true` when the caller must start one; otherwise
     /// the request was folded into the single queued successor.
     fn request(&mut self, project_id: &str, branch: &str, trigger: Trigger, now: i64) -> bool {
@@ -411,6 +430,9 @@ async fn run_lane(
             }
         }
         LaneAttempt::Verdict(verdict) => {
+            if matches!(verdict, CadenceVerdict::Death { .. }) {
+                rearm_on_debt_settlement(orch, context, lane);
+            }
             report_lane(
                 orch,
                 &db,
@@ -424,6 +446,41 @@ async fn run_lane(
             .await;
         }
     }
+}
+
+/// If this lane died because its question still owes a displaced answer's
+/// death, arm the project again the moment that debt settles.
+///
+/// The wait has no bound of its own: it lasts as long as the evidence takes,
+/// and settling is the only thing that ends it. One waiter per question, so a
+/// lane refused by many passes against one debt is re-armed once.
+fn rearm_on_debt_settlement(orch: &Orchestrator, context: &PassContext<'_>, lane: &CadenceLane) {
+    let key = crate::fleet::purpose::PurposeKey::main_cadence(
+        context.project_id,
+        &lane.check,
+        &lane.platform,
+    );
+    if !orch.fleet.purpose_owes(&key) || !orch.main_cadence.lock().unwrap().watch_debt(&key) {
+        return;
+    }
+    let orch = orch.clone();
+    let project_id = context.project_id.to_string();
+    let repo_path = context.repo_path.to_string();
+    let default_branch = context.default_branch.to_string();
+    tokio::spawn(async move {
+        orch.fleet.purpose_debt_cleared(&key).await;
+        orch.main_cadence.lock().unwrap().debt_settled(&key);
+        log::info!(
+            "purpose {key} owes nothing now; re-arming the main cadence for project {project_id}"
+        );
+        spawn(
+            &orch,
+            project_id,
+            repo_path,
+            default_branch,
+            Trigger::DebtSettled,
+        );
+    });
 }
 
 async fn attempt_lane(
@@ -1895,6 +1952,58 @@ mod tests {
             slots.request("q", "trunk", Trigger::Merge, 8),
             "projects are independent"
         );
+    }
+
+    /// A settled debt outranks the routine re-arms, so a pass queued behind it
+    /// is not reported as a heartbeat, and yields only to a merge.
+    #[test]
+    fn a_settled_debt_ranks_above_routine_rearms_and_below_a_merge() {
+        assert!(Trigger::DebtSettled > Trigger::Heartbeat);
+        assert!(Trigger::DebtSettled > Trigger::Startup);
+        assert!(Trigger::DebtSettled < Trigger::Merge);
+        let mut slots = CadenceSlots::default();
+        assert!(slots.request("p", "main", Trigger::Startup, 1));
+        assert!(!slots.request("p", "main", Trigger::Heartbeat, 2));
+        assert!(!slots.request("p", "main", Trigger::DebtSettled, 3));
+        assert_eq!(slots.finish("p", 4), Some(Trigger::DebtSettled));
+    }
+
+    /// One debt, one waiter, however many passes it refuses.
+    #[test]
+    fn a_blocked_question_gets_exactly_one_waiter() {
+        let key = crate::fleet::purpose::PurposeKey::main_cadence("p", "rust-tests", "linux");
+        let mut slots = CadenceSlots::default();
+        assert!(slots.watch_debt(&key));
+        assert!(!slots.watch_debt(&key));
+        slots.debt_settled(&key);
+        assert!(slots.watch_debt(&key), "a later debt gets its own waiter");
+    }
+
+    /// The waiter wakes when the question's last debt settles, and not before.
+    #[tokio::test]
+    async fn the_debt_waiter_wakes_only_when_the_question_owes_nothing() {
+        let fleet = crate::fleet::Fleet::default();
+        let key = crate::fleet::purpose::PurposeKey::main_cadence("p", "rust-tests", "linux");
+        let old = ("old".to_string(), "old-attempt".to_string());
+        fleet.admit_purpose_for_test(&key, &old, 10);
+        fleet.admit_purpose_for_test(&key, &("new".into(), "new-attempt".into()), 20);
+        assert!(fleet.purpose_owes(&key));
+        let mut cleared = {
+            let fleet = fleet.clone();
+            let key = key.clone();
+            tokio::spawn(async move { fleet.purpose_debt_cleared(&key).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut cleared)
+                .await
+                .is_err(),
+            "an owed question does not wake its waiter"
+        );
+        fleet.finish_purpose_for_test(&old);
+        tokio::time::timeout(Duration::from_secs(5), cleared)
+            .await
+            .expect("settlement wakes the waiter")
+            .unwrap();
     }
 
     #[test]

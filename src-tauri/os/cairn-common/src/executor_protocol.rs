@@ -5047,6 +5047,16 @@ pub struct LearnedResourceEstimate {
 /// an older executor: nothing it would decode differently; that executor keeps
 /// classifying the label, and so prepares no catalog for a run batch, until
 /// the update directive brings it a build carrying this.
+///
+/// cairn/4482 does not move the number. The runner now settles purpose debt
+/// from evidence it already receives (an executor's snapshots, its own
+/// generation ends) and persists debts for work it granted. Retirement of work
+/// that was never granted now withdraws the queue entry and, if it was offered,
+/// sends the `Lost` an abandoned claim already received. A debt reloaded after
+/// a runner restart whose work a machine still lists is sent the ordinary
+/// `Cancel`. No message or field changes. What a runner gets wrong talking to
+/// an older executor: nothing; that executor receives `Lost` and `Cancel` in
+/// the situations it already handles them.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 157;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.

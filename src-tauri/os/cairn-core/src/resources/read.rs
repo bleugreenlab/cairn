@@ -1975,6 +1975,10 @@ async fn render_resource_body(
                         captured_at,
                         warming_up,
                     );
+                    rendered.push_str(&crate::resources::executors::render_blocked_questions(
+                        &orch.fleet.blocked_questions(None, captured_at),
+                        orch.fleet.purpose_debt_journal_error().as_deref(),
+                    ));
                     rendered.push_str(&crate::resources::executors::render_colocated_supervision(
                         orch.fleet.colocated_substrate().as_ref(),
                         &orch.fleet.colocated_supervision(),
@@ -2084,6 +2088,13 @@ async fn render_resource_body(
                     Some(executor) => match (view, request_id) {
                         (None, _) => {
                             let mut rendered = crate::resources::executors::render_executor(executor);
+                            rendered.push_str(&crate::resources::executors::render_blocked_questions(
+                                &orch.fleet.blocked_questions(
+                                    Some(&executor.health.identity.executor_id),
+                                    captured_at,
+                                ),
+                                None,
+                            ));
                             if executor.colocated {
                                 let configured =
                                     crate::config::settings::load_fleet(&orch.config_dir)
@@ -2160,7 +2171,16 @@ async fn render_resource_body(
                             crate::resources::executors::render_attach_log(remote, captured_at)
                         }
                         Some(_) if view.is_some() => format!("Placement history is unavailable for executor `{name}` because it is enrolled but not attached. Read cairn://executors/{name} for its link status."),
-                        Some(remote) => crate::resources::executors::render_enrolled_remote(remote, captured_at),
+                        // A detached machine is the likeliest holder of a
+                        // blocked question, so its page names them.
+                        Some(remote) => {
+                            let mut rendered = crate::resources::executors::render_enrolled_remote(remote, captured_at);
+                            rendered.push_str(&crate::resources::executors::render_blocked_questions(
+                                &orch.fleet.blocked_questions(Some(&remote.executor_id), captured_at),
+                                None,
+                            ));
+                            rendered
+                        }
                         // An enrollment in flight has reserved this name and is
                         // minutes from holding a machine. Answering "unknown"
                         // for that window would make a working enrollment look
