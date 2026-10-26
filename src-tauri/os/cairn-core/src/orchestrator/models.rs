@@ -501,9 +501,14 @@ pub(crate) mod tests {
     }
 
     /// [`bare_orchestrator`] with `subscriptions` installed.
+    ///
+    /// Pins the process's scratch root first: a response or a Codex server this
+    /// orchestrator starts provisions its working directory there, which must
+    /// not be the machine's real Cairn scratch on any entry point.
     pub(crate) async fn bare_orchestrator_with(
         subscriptions: Arc<dyn cairn_models::subscription::Subscriptions>,
     ) -> Orchestrator {
+        cairn_common::scratch::testing::pin_private_root();
         let root = tempfile::tempdir().unwrap().keep();
         let config_dir = root.join("config");
         std::fs::create_dir_all(&config_dir).unwrap();

@@ -65,6 +65,9 @@ struct Recorder {
     /// The notification stream of the last app-server started, which a
     /// tool-free Codex turn answers on.
     server_notifications: Mutex<Option<Sender<Value>>>,
+    /// The working directory of every tool-free one-shot and every Codex
+    /// app-server started, which Cairn provisions under its scratch root.
+    scratch_cwds: Mutex<Vec<String>>,
 }
 
 impl Recorder {
@@ -292,6 +295,7 @@ impl SessionProvider for RecordingClaude {
             );
             assert!(claude.hook_settings.is_none());
             self.0.record("claude:tool_free");
+            self.0.scratch_cwds.lock().unwrap().push(spec.cwd.clone());
             if spec.secrets.names().any(|name| name == "CLAUDE_CONFIG_DIR") {
                 self.0.record("claude:managed_home");
             }
@@ -355,6 +359,7 @@ impl SessionProvider for RecordingCodex {
                 "a Codex one-shot runs on the pool"
             );
             self.0.record("codex:tool_free");
+            self.0.scratch_cwds.lock().unwrap().push(spec.cwd.clone());
             return Ok(LaunchedSession {
                 control: Box::new(ScriptedCodexTurn {
                     recorder: self.0.clone(),
@@ -397,6 +402,11 @@ impl CodexSessionProvider for RecordingCodex {
         launch: ServerLaunch<'_>,
     ) -> Result<Arc<AppServerClient>, SessionError> {
         self.0.record("codex:start_server");
+        self.0
+            .scratch_cwds
+            .lock()
+            .unwrap()
+            .push(launch.cwd.to_string());
         if launch
             .login
             .is_some_and(|login| login.expose()["apiKey"] == CODEX_KEY)
@@ -1091,6 +1101,30 @@ async fn claude_and_codex_serve_responses_through_the_facet() {
         row.account_id
     );
     assert_eq!(session_rows(&orch).await, 0);
+
+    // Every working directory was provisioned in the fixture's private scratch
+    // root, and none in the machine's own response scratch, whatever
+    // `CAIRN_HOME` this process inherited.
+    let pinned = cairn_common::scratch::scratch_root();
+    let machine_responses = cairn_common::paths::cairn_home()
+        .join("scratch")
+        .join(".responses");
+    let cwds = recorder.scratch_cwds.lock().unwrap().clone();
+    assert!(!cwds.is_empty(), "no one-shot recorded a working directory");
+    for cwd in &cwds {
+        let cwd = std::path::Path::new(cwd);
+        assert!(
+            cwd.starts_with(&pinned),
+            "{} is outside {}",
+            cwd.display(),
+            pinned.display()
+        );
+        assert!(
+            !cwd.starts_with(&machine_responses),
+            "{} is in the machine's response scratch",
+            cwd.display()
+        );
+    }
 
     recorder.release();
 }

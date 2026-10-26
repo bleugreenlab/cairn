@@ -29,8 +29,59 @@ const SCRATCH_ROOT_DIR: &str = "scratch";
 ///
 /// This root sits outside the platform temp dirs the fence grants wholesale, so
 /// `cairn_sandbox::default_writable_extra` grants it by name.
+///
+/// A test process that has called [`testing::pin_private_root`] gets that
+/// private root instead.
 pub fn scratch_root() -> PathBuf {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(root) = testing::PINNED_ROOT.get() {
+        return root.clone();
+    }
     crate::paths::cairn_home().join(SCRATCH_ROOT_DIR)
+}
+
+/// A scratch root a test process owns, so code that provisions scratch under
+/// test never writes into the machine's real Cairn home.
+///
+/// Without it, [`scratch_root`] is wherever `CAIRN_HOME` points. The Rust test
+/// runner seals that to a per-run directory, but any other entry point (a bare
+/// `cargo test` or `cargo nextest` from a shell) resolves the real
+/// `~/.cairn/scratch`: the test then writes machine-global state, and passes or
+/// fails on whether the shell may write there rather than on the code.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod testing {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    pub(super) static PINNED_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+    /// Pin this process's scratch root to a fresh directory under the platform
+    /// temp root, and return it.
+    ///
+    /// The pin is process-wide and set once: every later call returns the same
+    /// root, so fixtures may call it freely, and tests sharing one process (plain
+    /// `cargo test`) agree on a single root rather than racing to replace it. A
+    /// test that reads [`super::scratch_root`] before the first pin in its
+    /// process sees the unpinned root, so a fixture pins before it builds
+    /// anything that provisions scratch. The directory keeps the
+    /// `<home>/scratch` shape and outlives the process, like the fixtures'
+    /// other kept temp dirs.
+    pub fn pin_private_root() -> PathBuf {
+        PINNED_ROOT
+            .get_or_init(|| {
+                let root = std::env::temp_dir()
+                    .join(format!("cairn-test-home-{}", uuid::Uuid::new_v4()))
+                    .join(super::SCRATCH_ROOT_DIR);
+                std::fs::create_dir_all(&root).unwrap_or_else(|error| {
+                    panic!(
+                        "could not create test scratch root {}: {error}",
+                        root.display()
+                    )
+                });
+                root
+            })
+            .clone()
+    }
 }
 
 /// Directory name of an installed JavaScript dependency tree — the same in a
@@ -193,6 +244,27 @@ fn remove_link(link: &Path) -> std::io::Result<()> {
 /// depending on how either platform classifies its own link kind.
 #[cfg(test)]
 mod tests {
+    /// A pinned root is the one [`super::scratch_root`] answers with, it is the
+    /// process's own temp space rather than the Cairn home's scratch root, and
+    /// pinning again keeps it.
+    #[test]
+    fn a_pinned_scratch_root_is_private_to_the_process() {
+        let pinned = super::testing::pin_private_root();
+        assert_eq!(super::scratch_root(), pinned);
+        assert!(pinned.is_dir(), "{}", pinned.display());
+        assert!(pinned.ends_with(super::SCRATCH_ROOT_DIR));
+        assert!(
+            pinned.starts_with(std::env::temp_dir()),
+            "{}",
+            pinned.display()
+        );
+        assert_ne!(
+            pinned,
+            crate::paths::cairn_home().join(super::SCRATCH_ROOT_DIR)
+        );
+        assert_eq!(super::testing::pin_private_root(), pinned);
+    }
+
     use super::*;
     use std::path::PathBuf;
 

@@ -147,6 +147,7 @@ keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "a
 libc = "0.2"
 
 [dev-dependencies]
+cairn-common = { path = "../cairn-common", features = ["test-utils"] }
 cairn-config = { path = "../cairn-config", features = ["test-utils"] }
 cairn-vcs = { path = "../cairn-vcs", features = ["test-utils"] }
 cairn-platform = { path = "../cairn-platform", features = ["test-utils"] }
