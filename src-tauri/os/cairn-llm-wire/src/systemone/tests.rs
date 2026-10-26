@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -374,36 +374,72 @@ fn serve_once(
     let (sender, received) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut raw = Vec::new();
-        let mut chunk = [0u8; 8192];
-        let request = loop {
-            let read = stream.read(&mut chunk).unwrap();
-            raw.extend_from_slice(&chunk[..read]);
-            let text = String::from_utf8_lossy(&raw).to_string();
-            let Some(head_end) = text.find("\r\n\r\n") else {
-                continue;
-            };
-            let length = text[..head_end]
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().ok())
-                        .flatten()
-                })
-                .unwrap_or(0);
-            if raw.len() >= head_end + 4 + length || read == 0 {
-                break text;
-            }
-        };
-        let _ = write!(
-            stream,
-            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
-            reply.len()
-        );
+        let request = read_request(&mut stream);
+        respond(&mut stream, status, reply);
         let _ = sender.send(request);
     });
     (format!("http://{address}/api/alpha/decisions"), received)
+}
+
+/// Serve `script`'s replies in order, one per request, and a 500 to any
+/// request past its end. Each request's JSON body is sent before its reply,
+/// so every body is on the receiver by the time the call returns.
+fn serve_script(script: Vec<(&'static str, String)>) -> (String, std::sync::mpsc::Receiver<Value>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sender, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for index in 0.. {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let request = read_request(&mut stream);
+            let body = serde_json::from_str(&request[request.find("\r\n\r\n").unwrap() + 4..])
+                .unwrap_or(Value::Null);
+            if sender.send(body).is_err() {
+                return;
+            }
+            let (status, reply) = script.get(index).cloned().unwrap_or((
+                "500 Internal Server Error",
+                r#"{"error":{"message":"an unscripted request"}}"#.into(),
+            ));
+            respond(&mut stream, status, &reply);
+        }
+    });
+    (format!("http://{address}/api/alpha/decisions"), received)
+}
+
+fn read_request(stream: &mut TcpStream) -> String {
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = stream.read(&mut chunk).unwrap();
+        raw.extend_from_slice(&chunk[..read]);
+        let text = String::from_utf8_lossy(&raw).to_string();
+        let Some(head_end) = text.find("\r\n\r\n") else {
+            continue;
+        };
+        let length = text[..head_end]
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        if raw.len() >= head_end + 4 + length || read == 0 {
+            break text;
+        }
+    }
+}
+
+fn respond(stream: &mut TcpStream, status: &str, reply: &str) {
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+        reply.len()
+    );
 }
 
 fn endpoint(url: String) -> DecisionsEndpoint {
@@ -465,5 +501,227 @@ fn a_provider_error_carries_its_own_sentence() {
             "OpenRouter decision returned HTTP 402: Insufficient credits. Add more using https://openrouter.ai/credits"
                 .into()
         )
+    );
+}
+
+fn predicates(names: &[&str]) -> Value {
+    build_body(
+        "openai/gpt-6-luna-decisions",
+        json!("state"),
+        &names
+            .iter()
+            .map(|name| WireQuestion::Predicate {
+                name: name.to_string(),
+                instructions: format!("{name}?"),
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// OpenRouter's whole-request failure when its OpenAI model declines `name`.
+fn refusing(name: &str) -> (&'static str, String) {
+    refusing_as("OpenAI", name)
+}
+
+fn refusing_as(upstream: &str, name: &str) -> (&'static str, String) {
+    (
+        "502 Bad Gateway",
+        json!({"error": {
+            "code": 502,
+            "message": format!("{upstream} refused to answer question \"{name}\"")
+        }})
+        .to_string(),
+    )
+}
+
+fn answering(names: &[&str], input_tokens: i64, cost: f64) -> (&'static str, String) {
+    let answers: serde_json::Map<String, Value> = names
+        .iter()
+        .map(|name| (name.to_string(), json!({"type": "noul", "noul": 0.7})))
+        .collect();
+    (
+        "200 OK",
+        json!({
+            "model": "openai/gpt-6-luna-decisions-20261001",
+            "answers": answers,
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0, "cost": cost}
+        })
+        .to_string(),
+    )
+}
+
+fn asked(body: &Value) -> Vec<String> {
+    body["questions"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect()
+}
+
+fn refused(reason: &str) -> SystemOneAnswer {
+    SystemOneAnswer::Refused {
+        reason: reason.into(),
+    }
+}
+
+/// A whole-request 502 naming one question is that question's refusal: the
+/// rest are asked again without it, and the reply answers all three.
+#[test]
+fn a_refused_question_is_dropped_and_the_rest_asked_again() {
+    let (status, mut refusal) = refusing("b");
+    // Should a refusal body ever report usage, it is counted too.
+    let mut parsed: Value = serde_json::from_str(&refusal).unwrap();
+    parsed["usage"] = json!({"input_tokens": 100, "cost": 0.25});
+    refusal = parsed.to_string();
+    let (url, requests) = serve_script(vec![(status, refusal), answering(&["a", "c"], 40, 0.5)]);
+    let reply = post_systemone(
+        &endpoint(url),
+        predicates(&["a", "b", "c"]),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let requests: Vec<Value> = requests.try_iter().collect();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(asked(&requests[0]), ["a", "b", "c"]);
+    assert_eq!(asked(&requests[1]), ["a", "c"]);
+    assert_eq!(requests[1]["model"], requests[0]["model"]);
+    assert_eq!(requests[1]["state"], requests[0]["state"]);
+    assert_eq!(reply.answers["a"], SystemOneAnswer::Noul { noul: 0.7 });
+    assert_eq!(reply.answers["c"], SystemOneAnswer::Noul { noul: 0.7 });
+    assert_eq!(
+        reply.answers["b"],
+        refused("OpenAI refused to answer question \"b\"")
+    );
+    assert_eq!(
+        reply.model.as_deref(),
+        Some("openai/gpt-6-luna-decisions-20261001")
+    );
+    assert_eq!(
+        reply.usage,
+        Some(SystemOneUsage {
+            input_tokens: Some(140),
+            output_tokens: Some(0),
+            cost: Some(0.75),
+        })
+    );
+}
+
+/// The match starts at `refused to answer question`, so an upstream other
+/// than OpenAI naming itself is read the same way.
+#[test]
+fn two_refusals_are_both_spliced_and_the_third_post_answers() {
+    let (url, requests) = serve_script(vec![
+        refusing("b"),
+        refusing_as("Anthropic", "c"),
+        answering(&["a", "d"], 30, 0.1),
+    ]);
+    let reply = post_systemone(
+        &endpoint(url),
+        predicates(&["a", "b", "c", "d"]),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let requests: Vec<Value> = requests.try_iter().collect();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(asked(&requests[1]), ["a", "c", "d"]);
+    assert_eq!(asked(&requests[2]), ["a", "d"]);
+    assert_eq!(
+        reply.answers.keys().collect::<Vec<_>>(),
+        ["a", "b", "c", "d"]
+    );
+    assert_eq!(
+        reply.answers["b"],
+        refused("OpenAI refused to answer question \"b\"")
+    );
+    assert_eq!(
+        reply.answers["c"],
+        refused("Anthropic refused to answer question \"c\"")
+    );
+}
+
+/// A model that keeps refusing fails the call loudly, naming every refused
+/// question, rather than costing a round trip per question.
+#[test]
+fn a_fourth_refusal_fails_the_call_naming_every_refused_question() {
+    let (url, requests) = serve_script(vec![
+        refusing("a"),
+        refusing("b"),
+        refusing("c"),
+        refusing("d"),
+        answering(&["e"], 1, 0.0),
+    ]);
+    let error = post_systemone(
+        &endpoint(url),
+        predicates(&["a", "b", "c", "d", "e"]),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert_eq!(requests.try_iter().count(), 4);
+    assert_eq!(
+        error,
+        CompletionError::Upstream(
+            r#"OpenRouter refused 4 questions in one decision, more than the 3 a call asks around: "a", "b", "c", "d""#
+                .into()
+        )
+    );
+}
+
+/// A refusal naming a question that was not asked is not one to act on.
+#[test]
+fn a_refusal_naming_a_question_not_asked_is_an_ordinary_upstream_error() {
+    let (url, requests) = serve_script(vec![refusing("z"), answering(&["a"], 1, 0.0)]);
+    let error =
+        post_systemone(&endpoint(url), predicates(&["a"]), Duration::from_secs(5)).unwrap_err();
+    assert_eq!(requests.try_iter().count(), 1);
+    assert_eq!(
+        error,
+        CompletionError::Upstream(
+            r#"OpenRouter decision returned HTTP 502: OpenAI refused to answer question "z""#
+                .into()
+        )
+    );
+}
+
+#[test]
+fn a_502_that_is_not_a_refusal_is_an_ordinary_upstream_error() {
+    let (url, requests) = serve_script(vec![
+        (
+            "502 Bad Gateway",
+            r#"{"error":{"code":502,"message":"Upstream provider unavailable for question \"a\""}}"#
+                .into(),
+        ),
+        answering(&["a"], 1, 0.0),
+    ]);
+    let error =
+        post_systemone(&endpoint(url), predicates(&["a"]), Duration::from_secs(5)).unwrap_err();
+    assert_eq!(requests.try_iter().count(), 1);
+    assert_eq!(
+        error,
+        CompletionError::Upstream(
+            r#"OpenRouter decision returned HTTP 502: Upstream provider unavailable for question "a""#
+                .into()
+        )
+    );
+}
+
+/// Refusing the only question left leaves nothing to ask: no empty request
+/// is posted, and the reply carries only the refusal.
+#[test]
+fn refusing_the_last_question_posts_nothing_more() {
+    let (url, requests) = serve_script(vec![refusing("a"), answering(&[], 1, 0.0)]);
+    let reply = post_systemone(&endpoint(url), predicates(&["a"]), Duration::from_secs(5)).unwrap();
+    assert_eq!(requests.try_iter().count(), 1);
+    assert_eq!(
+        reply,
+        SystemOneResponse {
+            model: None,
+            answers: [(
+                "a".to_string(),
+                refused("OpenAI refused to answer question \"a\"")
+            )]
+            .into(),
+            usage: None,
+        }
     );
 }

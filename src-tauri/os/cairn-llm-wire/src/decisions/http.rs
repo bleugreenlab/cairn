@@ -70,16 +70,39 @@ pub fn post_decisions(
     body: Value,
     timeout: Duration,
 ) -> Result<DecisionsResponse, CompletionError> {
-    read(&post_whole(endpoint, body, timeout)?)
+    read(&post_whole(endpoint, &body, timeout)?.into_body(endpoint)?)
 }
 
-/// One decision POST, either wire's: the reply body on success, the
-/// provider's own sentence on an HTTP failure.
+/// What one decision POST got back, whatever its HTTP status, so a wire can
+/// read a failure's body before it becomes an error.
+pub(crate) struct WholeReply {
+    pub status: reqwest::StatusCode,
+    pub text: String,
+}
+
+impl WholeReply {
+    /// The reply body on success; otherwise the provider's own sentence, as
+    /// an upstream error.
+    pub(crate) fn into_body(self, endpoint: &DecisionsEndpoint) -> Result<String, CompletionError> {
+        if self.status.is_success() {
+            return Ok(self.text);
+        }
+        Err(CompletionError::Upstream(format!(
+            "{} decision returned HTTP {}: {}",
+            endpoint.provider_name,
+            self.status.as_u16(),
+            upstream_error_detail(&self.text)
+        )))
+    }
+}
+
+/// One decision POST, either wire's. Only a request that never got a reply
+/// is an error here; an HTTP failure comes back as its status and body.
 pub(crate) fn post_whole(
     endpoint: &DecisionsEndpoint,
-    body: Value,
+    body: &Value,
     timeout: Duration,
-) -> Result<String, CompletionError> {
+) -> Result<WholeReply, CompletionError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
         .build()
@@ -91,7 +114,7 @@ pub(crate) fn post_whole(
                 .header_map()
                 .map_err(CompletionError::InvalidRequest)?,
         )
-        .json(&body)
+        .json(body)
         .send()
         .map_err(|error| {
             if error.is_timeout() {
@@ -107,15 +130,7 @@ pub(crate) fn post_whole(
     let text = response
         .text()
         .map_err(|error| CompletionError::InvalidResponse(error.to_string()))?;
-    if !status.is_success() {
-        return Err(CompletionError::Upstream(format!(
-            "{} decision returned HTTP {}: {}",
-            endpoint.provider_name,
-            status.as_u16(),
-            upstream_error_detail(&text)
-        )));
-    }
-    Ok(text)
+    Ok(WholeReply { status, text })
 }
 
 /// Decode a Decisions reply body.

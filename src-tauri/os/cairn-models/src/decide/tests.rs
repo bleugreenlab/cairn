@@ -16,7 +16,7 @@ use crate::wire::decisions::http::DecisionsEndpoint;
 use crate::wire::decisions::wire::DecisionsResponse;
 use crate::wire::openai_compat::http::Endpoint;
 use crate::wire::openai_compat::wire::ChatResponse;
-use crate::wire::systemone::wire::SystemOneResponse;
+use crate::wire::systemone::wire::{SystemOneAnswer, SystemOneResponse};
 
 /// A `Complete` that answers from a script and records every request.
 #[derive(Default)]
@@ -374,6 +374,41 @@ fn a_systemone_answer_missing_or_unrecognised_is_a_refusal_with_its_reason() {
     );
     assert_eq!(reason(2), "no answer came back for it");
     assert_eq!(decision.answers[3].pick(), Some("no"));
+}
+
+/// A question the gateway refused out of band is a refusal whose reason is
+/// the gateway's own sentence.
+#[test]
+fn a_systemone_question_the_gateway_refused_is_a_refusal_with_its_sentence() {
+    let complete = Scripted::answering(vec![CompletionReply::SystemOne(SystemOneResponse {
+        model: Some("openai/gpt-6-luna-decisions".into()),
+        answers: [
+            (
+                "declined".to_string(),
+                SystemOneAnswer::Refused {
+                    reason: r#"OpenAI refused to answer question "declined""#.into(),
+                },
+            ),
+            ("fine".to_string(), SystemOneAnswer::Noul { noul: 0.8 }),
+        ]
+        .into(),
+        usage: None,
+    })]);
+    let route = systemone_route();
+    let questions = [predicate("declined"), predicate("fine")];
+    let decision = decide(&complete, call(&route, &questions)).unwrap();
+    let declined = &decision.answers[0];
+    assert!(declined.is_refusal(), "{declined:?}");
+    assert_eq!(declined.pick(), None);
+    assert_eq!(
+        declined,
+        &DecisionAnswer::Refusal {
+            name: "declined".into(),
+            measured_by: MeasuredBy::Native,
+            reason: Some(r#"OpenAI refused to answer question "declined""#.into()),
+        }
+    );
+    assert_eq!(decision.answers[1].pick(), Some("yes"));
 }
 
 #[test]

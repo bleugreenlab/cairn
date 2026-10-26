@@ -53,6 +53,10 @@ pub enum SystemOneAnswer {
     /// missing a field. Kept verbatim so it can be reported, and never read as
     /// an answer.
     Unrecognised(Value),
+    /// A question the gateway refused out of band, by failing the request
+    /// that asked it, with the gateway's sentence saying so. Never decoded
+    /// from a reply: [`super::http::post_systemone`] splices it in.
+    Refused { reason: String },
 }
 
 #[derive(Deserialize)]

@@ -18,12 +18,22 @@
 //! # Refusals
 //!
 //! Neither reference shows a refusal: every answer is a `noul`, `choice`,
-//! `score` or `box`. So a refusal on this wire is whatever is not an answer
-//! of a shape Cairn recognises. An answer with an unknown `type` or a missing
-//! field decodes as [`wire::SystemOneAnswer::Unrecognised`], carrying the
-//! JSON as it came, and the facet reads it (and a question with no answer
-//! under its name at all) as a refusal: never a pick, never a probability
-//! of 0.
+//! `score` or `box`. A refusal arrives in one of two shapes.
+//!
+//! In band, which no provider has been seen to send: whatever is not an
+//! answer of a shape Cairn recognises. An answer with an unknown `type` or a
+//! missing field decodes as [`wire::SystemOneAnswer::Unrecognised`], carrying
+//! the JSON as it came, and the facet reads it (and a question with no
+//! answer under its name at all) as a refusal.
+//!
+//! Out of band, as OpenRouter does when an OpenAI decision model declines
+//! one question: the whole request fails (HTTP 502) with a message reading
+//! `OpenAI refused to answer question "<name>"`, and every other answer in it
+//! is lost. [`http::post_systemone`] asks the remaining questions again
+//! without that one and splices a [`wire::SystemOneAnswer::Refused`] carrying
+//! the gateway's sentence under its name, up to a bound per call.
+//!
+//! Either way a refusal is never a pick and never a probability of 0.
 
 pub mod http;
 pub mod wire;

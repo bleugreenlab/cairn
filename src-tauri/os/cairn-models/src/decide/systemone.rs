@@ -1,9 +1,10 @@
 //! The System One route: its named answers back onto Cairn's answer type.
 //!
 //! The answers are a map keyed by question name, so each question is matched
-//! by name, not position. System One shows no refusal, so a question with no
-//! answer under its name, or one answered in a shape the wire does not
-//! recognise, is a refusal with the reason stated: never a pick. An answer of
+//! by name, not position. A question the gateway refused (the wire's
+//! `Refused`, carrying the gateway's sentence), one with no answer under its
+//! name, or one answered in a shape the wire does not recognise, is a refusal
+//! with the reason stated: never a pick. An answer of
 //! the wrong kind, a pick or probability outside the question's options, or
 //! an answer to a question that was not asked is an invalid reply rather than
 //! something to coerce.
@@ -64,6 +65,7 @@ fn answer(
         return Ok(refusal(question, "no answer came back for it".to_string()));
     };
     match (&question.kind, answer) {
+        (_, SystemOneAnswer::Refused { reason }) => Ok(refusal(question, reason)),
         (_, SystemOneAnswer::Unrecognised(value)) => Ok(refusal(
             question,
             format!("it was answered in no shape Cairn recognises: {value}"),
