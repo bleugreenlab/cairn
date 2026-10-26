@@ -2262,7 +2262,10 @@ impl Fleet {
         let loaded = self.purpose_debts_loaded.clone();
         let failed_loaded = loaded.clone();
         let failed_errors = errors.clone();
-        crate::orchestrator::lifecycle::detach_onto_runtime(
+        // The task spawns nothing, so a runtime of its own is enough when the
+        // caller has none.
+        crate::orchestrator::spawn_onto(
+            tokio::runtime::Handle::try_current().ok().as_ref(),
             async move {
                 match purpose::load_rows(&db).await {
                     Ok(rows) => {
