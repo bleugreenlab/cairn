@@ -715,25 +715,27 @@ async fn load_turn_texts(
     let events = load_turn_events(db, &turn_ids).await?;
 
     let (ids, events): (Vec<String>, Vec<crate::models::Event>) = events.into_iter().unzip();
-    let events = crate::storage::reconstruct_events(db, events).await;
+    let events = crate::storage::reconstruct_events_reporting(db, events).await;
 
     let mut parts: HashMap<String, Vec<String>> = HashMap::new();
     let mut uncertain: HashMap<String, bool> = HashMap::new();
-    for (turn_id, event) in ids.into_iter().zip(events) {
+    for (turn_id, (event, outcome)) in ids.into_iter().zip(events) {
         let text = extract_embeddable_text(&event.data)
             .map(|text| text.trim().to_string())
             .filter(|text| !text.is_empty());
         match text {
             Some(text) => parts.entry(turn_id).or_default().push(text),
-            // An archived event yielding nothing is ambiguous: either it holds
-            // no prose, or its reconstruction failed and the prose is still out
-            // there. `reconstruct_events` rewrites `data` in place and leaves
-            // `storage_mode` set either way, so the two are indistinguishable
-            // here — which is exactly why this is recorded as doubt rather than
-            // resolved as absence.
+            // An archived event yielding nothing is in doubt only when its
+            // stored form would not decode. The archived shapes a content event
+            // takes (`zstd`, and a `gitcoord` write) keep their prose in the
+            // compressed remainder, so decoding it settles the question: a
+            // restored tool call with no prose has none. A write `Degraded` by
+            // an unresolvable commit lost only its regenerated diff, never its
+            // prose. Counting every archived event as doubt instead left
+            // tool-call-only turns deferred and retried forever.
             None => {
                 let entry = uncertain.entry(turn_id).or_insert(false);
-                *entry |= event.storage_mode.is_some();
+                *entry |= outcome == crate::storage::Reconstruction::Undecodable;
             }
         }
     }
@@ -762,8 +764,9 @@ async fn load_turn_texts(
 /// A turn's embeddable text, and whether its absence can be trusted.
 struct TurnProse {
     text: String,
-    /// The turn yielded no text AND held an archived event, so "no prose" may
-    /// really be "could not reconstruct". Never tombstone on this.
+    /// The turn yielded no text AND held an archived event whose stored form
+    /// would not decode, so "no prose" may really be "could not read". Never
+    /// tombstone on this.
     uncertain: bool,
 }
 
@@ -1596,6 +1599,70 @@ mod tests {
         assert_eq!(retryable[0].turn_id, "turn-archived");
         // And not a vector: a deferral is an unsettled answer, not a hit.
         assert!(load_vectors(&db, None).await.unwrap().is_empty());
+    }
+
+    /// Archive one event of `turn_id` as a real `zstd` row: the original `data`
+    /// compressed into `data_blob`, a label stub left inline.
+    async fn archive_as_zstd(db: &LocalDb, event_id: &str, original: &str) {
+        let blob = crate::storage::compress(original.as_bytes()).unwrap();
+        db.execute(
+            "UPDATE events SET storage_mode = 'zstd', codec = 'zstd_v1', data_blob = ?1,
+                               data = '{\"archived\":\"zstd\"}'
+              WHERE id = ?2",
+            params![Value::Blob(blob), event_id],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_archived_turn_that_restores_without_prose_is_settled_not_deferred() {
+        let db = migrated_db().await;
+        seed_project(&db).await;
+        // A turn of pure tool calls, archived cleanly. Its blob decodes, so
+        // "no prose" is an answer, not doubt; deferring it would rotate it
+        // through every reconcile forever without ever embedding anything.
+        seed_turn(&db, "turn-tools", "complete", 100, &[("assistant", "")]).await;
+        archive_as_zstd(
+            &db,
+            "turn-tools-event-0",
+            r#"{"eventType":"assistant","toolUses":[{"id":"t1","name":"mcp__cairn__read","input":{"paths":["file:a.rs"]}}]}"#,
+        )
+        .await;
+
+        let summary = embed_pending(&db, &tokened_client(), Scope::All, 10)
+            .await
+            .unwrap()
+            .expect("the pass itself succeeds");
+        assert_eq!(summary.tombstoned, 1);
+        assert_eq!(summary.deferred, 0);
+        let retryable = load_pending_turns(&db, retry_from(None), 10).await.unwrap();
+        assert!(retryable.is_empty(), "nothing left to retry");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn archived_prose_is_restored_into_the_turn_text() {
+        let db = migrated_db().await;
+        seed_project(&db).await;
+        seed_turn(&db, "turn-prose", "complete", 100, &[("assistant", "")]).await;
+        archive_as_zstd(
+            &db,
+            "turn-prose-event-0",
+            r#"{"eventType":"assistant","content":"the cache key now carries the filter"}"#,
+        )
+        .await;
+
+        let turn = PendingTurn {
+            turn_id: "turn-prose".to_string(),
+            session_id: "session-turn-prose".to_string(),
+            job_id: None,
+            project_id: Some("project-1".to_string()),
+            sequence: 1,
+        };
+        let prose = load_turn_texts(&db, &[turn]).await.unwrap();
+        let found = &prose["turn-prose"];
+        assert_eq!(found.text, "the cache key now carries the filter");
+        assert!(!found.uncertain);
     }
 
     #[tokio::test(flavor = "current_thread")]

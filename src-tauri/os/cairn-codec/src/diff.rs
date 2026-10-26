@@ -8,13 +8,16 @@
 //! `diff --git` envelope, abbreviated `index` lines, `--- / +++` headers, and
 //! context-grouped `@@` hunks.
 //!
-//! The line differ is an LCS with git's deletion-first tie-break and difflib-style
-//! context grouping (3 lines, hunks merged when their context windows touch). For
-//! the unambiguous edits an agent write batch produces — added files, deleted
-//! files, and localized in-file edits — this reproduces git's hunks exactly,
-//! verified against shelled `git show` in tests.
+//! The line differ is a linear-space Myers alignment that, like git's xdiff,
+//! marks changed lines per side and emits each change block's deletions before
+//! its insertions, with difflib-style context grouping (3 lines, hunks merged
+//! when their context windows touch). For the unambiguous edits an agent write
+//! batch produces — added files, deleted files, and localized in-file edits —
+//! this reproduces git's hunks exactly, verified against shelled `git show` in
+//! tests. Memory is O(n+m) per file, and a work budget bounds the time on a file
+//! that changed nearly everywhere (see [`ALIGN_WORK_BUDGET`]).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use gix_hash::{oid, ObjectId};
 use gix_object::{CommitRefIter, Kind as ObjectKind, TreeRefIter};
@@ -109,6 +112,16 @@ enum ChangeKind {
     Add,
     Delete,
     Modify,
+}
+
+impl ChangeKind {
+    fn status(&self) -> &'static str {
+        match self {
+            ChangeKind::Add => "added",
+            ChangeKind::Delete => "removed",
+            ChangeKind::Modify => "modified",
+        }
+    }
 }
 
 struct FileChange {
@@ -212,23 +225,55 @@ fn range_changes(
     Ok(changes)
 }
 
+/// One changed path of a [`RangePatch`]: its status and `+`/`-` line counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeFileSummary {
+    pub path: String,
+    pub status: String,
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+/// A range's unified diff together with its per-file summary, rendered in one
+/// pass so each file's lines are aligned once.
+#[derive(Debug, Clone, Default)]
+pub struct RangePatch {
+    pub patch: String,
+    pub files: Vec<RangeFileSummary>,
+}
+
 /// Render the unified diff of `tip_oid`'s tree against `base_oid`'s tree,
 /// equivalent to `git diff <base_oid> <tip_oid>` (two-dot). When `base_oid` is
 /// the recorded fork point this equals git's three-dot `<base>...<tip>`, so a
 /// cumulative branch diff matches.
-pub fn render_range_diff(
+///
+/// Only paths `include` accepts are rendered, and an excluded path's blobs are
+/// never read: the tree walk is cheap, while aligning a large file is not, so a
+/// caller that wants one file of a wide range must say so here rather than
+/// filtering the finished patch.
+pub fn render_range_patch(
     store: &ObjectStore,
     base_hex: &str,
     tip_hex: &str,
-) -> Result<String, String> {
+    include: &dyn Fn(&str) -> bool,
+) -> Result<RangePatch, String> {
     let base_oid =
         ObjectId::from_hex(base_hex.as_bytes()).map_err(|e| format!("invalid base sha: {e}"))?;
     let tip_oid =
         ObjectId::from_hex(tip_hex.as_bytes()).map_err(|e| format!("invalid tip sha: {e}"))?;
     let changes = range_changes(store, &base_oid, &tip_oid)?;
-    let mut out = String::new();
-    for change in &changes {
-        out.push_str(&render_file_change(store, change)?);
+    let mut out = RangePatch::default();
+    for change in changes.iter().filter(|change| include(&change.path)) {
+        let hunks = change_hunks(store, change)?;
+        let (additions, deletions) = count_changes(&hunks);
+        out.patch.push_str(&file_envelope(change));
+        out.patch.push_str(&hunks);
+        out.files.push(RangeFileSummary {
+            path: change.path.clone(),
+            status: change.kind.status().to_string(),
+            additions,
+            deletions,
+        });
     }
     Ok(out)
 }
@@ -287,25 +332,12 @@ pub fn count_commits_ahead(store: &ObjectStore, base_hex: &str, tip_hex: &str) -
 }
 
 fn render_node_diff_file(store: &ObjectStore, change: &FileChange) -> Result<NodeDiffFile, String> {
-    let old_bytes = match &change.old {
-        Some((_, oid)) => blob_bytes(store, oid)?,
-        None => Vec::new(),
-    };
-    let new_bytes = match &change.new {
-        Some((_, oid)) => blob_bytes(store, oid)?,
-        None => Vec::new(),
-    };
-    let patch = unified_hunks(&old_bytes, &new_bytes);
+    let patch = change_hunks(store, change)?;
     let (additions, deletions) = count_changes(&patch);
-    let status = match change.kind {
-        ChangeKind::Add => "added",
-        ChangeKind::Delete => "removed",
-        ChangeKind::Modify => "modified",
-    };
     Ok(NodeDiffFile {
         path: change.path.clone(),
         previous_path: None,
-        status: status.to_string(),
+        status: change.kind.status().to_string(),
         additions,
         deletions,
         patch,
@@ -468,6 +500,13 @@ fn blob_bytes(store: &ObjectStore, oid: &ObjectId) -> Result<Vec<u8>, String> {
 }
 
 fn render_file_change(store: &ObjectStore, change: &FileChange) -> Result<String, String> {
+    let mut out = file_envelope(change);
+    out.push_str(&change_hunks(store, change)?);
+    Ok(out)
+}
+
+/// A change's unified hunks (from its first `@@`), aligned once.
+fn change_hunks(store: &ObjectStore, change: &FileChange) -> Result<String, String> {
     let old_bytes = match &change.old {
         Some((_, oid)) => blob_bytes(store, oid)?,
         None => Vec::new(),
@@ -476,6 +515,11 @@ fn render_file_change(store: &ObjectStore, change: &FileChange) -> Result<String
         Some((_, oid)) => blob_bytes(store, oid)?,
         None => Vec::new(),
     };
+    Ok(unified_hunks(&old_bytes, &new_bytes))
+}
+
+/// A change's `diff --git` envelope through its `+++` line.
+fn file_envelope(change: &FileChange) -> String {
     let old_hex = change
         .old
         .as_ref()
@@ -521,8 +565,7 @@ fn render_file_change(store: &ObjectStore, change: &FileChange) -> Result<String
     };
     out.push_str(&format!("--- {a_label}\n"));
     out.push_str(&format!("+++ {b_label}\n"));
-    out.push_str(&unified_hunks(&old_bytes, &new_bytes));
-    Ok(out)
+    out
 }
 
 /// One aligned diff step over interned line indices.
@@ -546,42 +589,209 @@ fn split_lines(text: &str) -> (Vec<&str>, bool) {
     (lines, ends_with_newline)
 }
 
-/// LCS alignment with git's deletion-first tie-break.
-fn lcs_ops(a: &[&str], b: &[&str]) -> Vec<Op> {
-    let n = a.len();
-    let m = b.len();
-    let mut dp = vec![vec![0u32; m + 1]; n + 1];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            dp[i][j] = if a[i] == b[j] {
-                dp[i + 1][j + 1] + 1
-            } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
+/// Work one file's alignment may spend, in snake steps plus diagonal visits,
+/// before the regions still unaligned are reported as wholly replaced.
+///
+/// Myers runs in O((n+m)·D) time for D differing lines, so the memory bound
+/// alone does not bound a file that changed almost everywhere (a regenerated
+/// lockfile or JSON dump): D approaches n and the time is quadratic again. A
+/// few-edit change to a 100k-line file costs a few million units; past the
+/// budget the result is still a correct diff, only no longer minimal.
+const ALIGN_WORK_BUDGET: u64 = 16_000_000;
+
+/// Align two line sequences into an edit script.
+///
+/// Linear-space Myers (divide and conquer on the middle snake) over interned
+/// line ids, so memory is O(n+m) however large the file: a full LCS table is
+/// 4·n·m bytes, which is 66 GB for a 128k-line file edited in place. Like
+/// git's xdiff it marks which lines of each side changed and then reads the
+/// script off the marks, so each change block emits its deletions before its
+/// insertions.
+fn align_ops(a: &[&str], b: &[&str]) -> Vec<Op> {
+    let (a, b) = intern_lines(a, b);
+    let mut changed_a = vec![false; a.len()];
+    let mut changed_b = vec![false; b.len()];
+    let mut budget = ALIGN_WORK_BUDGET;
+    mark_changes(&a, &b, &mut changed_a, &mut changed_b, &mut budget);
+    ops_from_marks(&changed_a, &changed_b)
+}
+
+/// Map each distinct line to a small integer so comparisons are word-sized.
+fn intern_lines<'t>(a: &[&'t str], b: &[&'t str]) -> (Vec<u32>, Vec<u32>) {
+    let mut ids: HashMap<&'t str, u32> = HashMap::with_capacity(a.len() + b.len());
+    let mut intern = |line: &'t str| -> u32 {
+        let next = ids.len() as u32;
+        *ids.entry(line).or_insert(next)
+    };
+    let a_ids: Vec<u32> = a.iter().map(|line| intern(line)).collect();
+    let b_ids: Vec<u32> = b.iter().map(|line| intern(line)).collect();
+    (a_ids, b_ids)
+}
+
+/// Mark the lines of `a` and `b` that a shortest edit script deletes or
+/// inserts. `changed_a`/`changed_b` are index-aligned with `a`/`b`.
+fn mark_changes(
+    a: &[u32],
+    b: &[u32],
+    changed_a: &mut [bool],
+    changed_b: &mut [bool],
+    budget: &mut u64,
+) {
+    let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let (a, b) = (&a[prefix..], &b[prefix..]);
+    let suffix = a
+        .iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let (a, b) = (&a[..a.len() - suffix], &b[..b.len() - suffix]);
+    let changed_a = &mut changed_a[prefix..prefix + a.len()];
+    let changed_b = &mut changed_b[prefix..prefix + b.len()];
+    if a.is_empty() || b.is_empty() {
+        changed_a.fill(true);
+        changed_b.fill(true);
+        return;
+    }
+    match middle_snake(a, b, budget) {
+        // A split at either corner would recurse on the whole region; the
+        // theory rules it out once the ends are trimmed, and the guard keeps a
+        // bug from becoming unbounded recursion.
+        Some((x, y)) if (x, y) != (0, 0) && (x, y) != (a.len(), b.len()) => {
+            let (head_a, tail_a) = changed_a.split_at_mut(x);
+            let (head_b, tail_b) = changed_b.split_at_mut(y);
+            mark_changes(&a[..x], &b[..y], head_a, head_b, budget);
+            mark_changes(&a[x..], &b[y..], tail_a, tail_b, budget);
+        }
+        _ => {
+            changed_a.fill(true);
+            changed_b.fill(true);
         }
     }
-    let mut ops = Vec::new();
+}
+
+/// Find a point `(x, y)` on a shortest edit path from `(0, 0)` to
+/// `(a.len(), b.len())`, searching forward and backward at once until the two
+/// frontiers overlap (Myers 1986, section 4b). Returns `None` when the work
+/// budget runs out first.
+fn middle_snake(a: &[u32], b: &[u32], budget: &mut u64) -> Option<(usize, usize)> {
+    let (n, m) = (a.len() as isize, b.len() as isize);
+    let max_d = (n + m + 1) / 2;
+    let offset = max_d;
+    let width = (2 * max_d + 2) as usize;
+    // Furthest x reached on each diagonal k = x - y, forward from the start and
+    // backward from the end (the backward array counts x from the far edge).
+    let mut forward = vec![-1isize; width];
+    let mut backward = vec![-1isize; width];
+    forward[(offset + 1) as usize] = 0;
+    backward[(offset + 1) as usize] = 0;
+    let delta = n - m;
+    // With an odd delta the frontiers can first overlap on a forward step,
+    // with an even one on a backward step.
+    let overlap_forward = delta % 2 != 0;
+    let (mut k1_start, mut k1_end, mut k2_start, mut k2_end) = (0isize, 0isize, 0isize, 0isize);
+
+    for d in 0..max_d {
+        if *budget == 0 {
+            return None;
+        }
+        let mut k1 = -d + k1_start;
+        while k1 <= d - k1_end {
+            let at = (offset + k1) as usize;
+            let mut x1 = if k1 == -d || (k1 != d && forward[at - 1] < forward[at + 1]) {
+                forward[at + 1]
+            } else {
+                forward[at - 1] + 1
+            };
+            let mut y1 = x1 - k1;
+            let start = x1;
+            while x1 < n && y1 < m && a[x1 as usize] == b[y1 as usize] {
+                x1 += 1;
+                y1 += 1;
+            }
+            *budget = budget.saturating_sub(1 + (x1 - start) as u64);
+            forward[at] = x1;
+            if x1 > n {
+                k1_end += 2;
+            } else if y1 > m {
+                k1_start += 2;
+            } else if overlap_forward {
+                let other = offset + delta - k1;
+                if other >= 0 && (other as usize) < width && backward[other as usize] != -1 {
+                    let x2 = n - backward[other as usize];
+                    if x1 >= x2 {
+                        return Some((x1 as usize, y1 as usize));
+                    }
+                }
+            }
+            k1 += 2;
+        }
+
+        let mut k2 = -d + k2_start;
+        while k2 <= d - k2_end {
+            let at = (offset + k2) as usize;
+            let mut x2 = if k2 == -d || (k2 != d && backward[at - 1] < backward[at + 1]) {
+                backward[at + 1]
+            } else {
+                backward[at - 1] + 1
+            };
+            let mut y2 = x2 - k2;
+            let start = x2;
+            while x2 < n && y2 < m && a[(n - x2 - 1) as usize] == b[(m - y2 - 1) as usize] {
+                x2 += 1;
+                y2 += 1;
+            }
+            *budget = budget.saturating_sub(1 + (x2 - start) as u64);
+            backward[at] = x2;
+            if x2 > n {
+                k2_end += 2;
+            } else if y2 > m {
+                k2_start += 2;
+            } else if !overlap_forward {
+                let other = offset + delta - k2;
+                if other >= 0 && (other as usize) < width && forward[other as usize] != -1 {
+                    let x1 = forward[other as usize];
+                    let y1 = offset + x1 - other;
+                    if x1 >= n - x2 {
+                        return Some((x1 as usize, y1 as usize));
+                    }
+                }
+            }
+            k2 += 2;
+        }
+    }
+    None
+}
+
+/// Read an edit script off per-side change marks: kept lines pair up in order,
+/// and each block of changes emits its deletions, then its insertions.
+fn ops_from_marks(changed_a: &[bool], changed_b: &[bool]) -> Vec<Op> {
+    let (n, m) = (changed_a.len(), changed_b.len());
+    let mut ops = Vec::with_capacity(n.max(m));
     let (mut i, mut j) = (0usize, 0usize);
-    while i < n && j < m {
-        if a[i] == b[j] {
+    while i < n || j < m {
+        if i < n && j < m && !changed_a[i] && !changed_b[j] {
             ops.push(Op::Equal(i, j));
             i += 1;
             j += 1;
-        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            continue;
+        }
+        let before = (i, j);
+        while i < n && changed_a[i] {
             ops.push(Op::Del(i));
             i += 1;
-        } else {
+        }
+        while j < m && changed_b[j] {
             ops.push(Op::Ins(j));
             j += 1;
         }
-    }
-    while i < n {
-        ops.push(Op::Del(i));
-        i += 1;
-    }
-    while j < m {
-        ops.push(Op::Ins(j));
-        j += 1;
+        if (i, j) == before {
+            // Kept lines left on one side only: marks no alignment produces.
+            // Close the remainder out as replaced rather than loop.
+            ops.extend((i..n).map(Op::Del));
+            ops.extend((j..m).map(Op::Ins));
+            break;
+        }
     }
     ops
 }
@@ -592,7 +802,7 @@ fn unified_hunks(old: &[u8], new: &[u8]) -> String {
     let (old_lines, old_nl) = split_lines(&old_text);
     let (new_lines, new_nl) = split_lines(&new_text);
 
-    let ops = lcs_ops(&old_lines, &new_lines);
+    let ops = align_ops(&old_lines, &new_lines);
     let change_positions: Vec<usize> = ops
         .iter()
         .enumerate()
@@ -705,7 +915,7 @@ mod tests {
     /// add / modify / delete, then assert the object-store range renderer matches
     /// shelled `git diff <base> <tip>` byte-for-byte.
     #[test]
-    fn render_range_diff_matches_git_diff() {
+    fn render_range_patch_matches_git_diff() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path();
         init_repo(dir);
@@ -724,9 +934,37 @@ mod tests {
         let tip = commit_all(dir, "remove");
 
         let store = ObjectStore::new(Path::new(dir), None).unwrap();
-        let rendered = render_range_diff(&store, &base, &tip).unwrap();
+        let rendered = render_range_patch(&store, &base, &tip, &|_| true).unwrap();
         let expected = git(dir, &["diff", "--no-color", &base, &tip]);
-        assert_eq!(rendered, expected);
+        assert_eq!(rendered.patch, expected);
+        let summary: Vec<(&str, &str, u32, u32)> = rendered
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.path.as_str(),
+                    file.status.as_str(),
+                    file.additions,
+                    file.deletions,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("edit.txt", "modified", 2, 1),
+                ("gone.txt", "removed", 0, 1),
+                ("nested/new.txt", "added", 2, 0),
+            ]
+        );
+
+        // A filter renders only what it names; the rest is never aligned.
+        let one = render_range_patch(&store, &base, &tip, &|path| path == "edit.txt").unwrap();
+        assert_eq!(one.files.len(), 1);
+        assert_eq!(
+            one.patch,
+            git(dir, &["diff", "--no-color", &base, &tip, "--", "edit.txt"])
+        );
     }
 
     /// The structured variant carries the same per-file content as the string
@@ -767,6 +1005,170 @@ mod tests {
         assert_eq!(gone.status, "removed");
         assert_eq!((gone.additions, gone.deletions), (0, 1));
     }
+    /// LCS length by the full quadratic table: the reference the alignment's
+    /// minimality is checked against, on inputs small enough to afford it.
+    fn reference_lcs_len(a: &[&str], b: &[&str]) -> usize {
+        let mut table = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+        for i in (0..a.len()).rev() {
+            for j in (0..b.len()).rev() {
+                table[i][j] = if a[i] == b[j] {
+                    table[i + 1][j + 1] + 1
+                } else {
+                    table[i + 1][j].max(table[i][j + 1])
+                };
+            }
+        }
+        table[0][0]
+    }
+
+    /// Every random pair aligns into a script that consumes both sides in
+    /// order, pairs only equal lines, keeps as many lines as an LCS (so it is a
+    /// shortest script), and emits each change block's deletions first.
+    #[test]
+    fn alignment_is_consistent_and_minimal() {
+        const ALPHABET: [&str; 4] = ["a", "b", "c", "d"];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound) as usize
+        };
+        for _ in 0..3_000 {
+            let a: Vec<&str> = (0..next(40)).map(|_| ALPHABET[next(4)]).collect();
+            let b: Vec<&str> = (0..next(40)).map(|_| ALPHABET[next(4)]).collect();
+            let ops = align_ops(&a, &b);
+
+            let (mut i, mut j, mut kept) = (0usize, 0usize, 0usize);
+            let mut previous_was_insert = false;
+            for op in &ops {
+                match *op {
+                    Op::Equal(oi, ni) => {
+                        assert_eq!((oi, ni), (i, j), "script skips lines: {a:?} -> {b:?}");
+                        assert_eq!(a[oi], b[ni], "pairs unequal lines: {a:?} -> {b:?}");
+                        i += 1;
+                        j += 1;
+                        kept += 1;
+                        previous_was_insert = false;
+                    }
+                    Op::Del(oi) => {
+                        assert_eq!(oi, i, "deletes out of order: {a:?} -> {b:?}");
+                        assert!(
+                            !previous_was_insert,
+                            "insertion before deletion in one block: {a:?} -> {b:?}"
+                        );
+                        i += 1;
+                    }
+                    Op::Ins(ni) => {
+                        assert_eq!(ni, j, "inserts out of order: {a:?} -> {b:?}");
+                        j += 1;
+                        previous_was_insert = true;
+                    }
+                }
+            }
+            assert_eq!(
+                (i, j),
+                (a.len(), b.len()),
+                "script stops short: {a:?} -> {b:?}"
+            );
+            assert_eq!(
+                kept,
+                reference_lcs_len(&a, &b),
+                "not minimal: {a:?} -> {b:?}"
+            );
+        }
+    }
+
+    fn numbered_lines(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("    \"entry-{index}\": {},", index * 7))
+            .collect()
+    }
+
+    fn file_text(lines: &[String]) -> Vec<u8> {
+        let mut text = lines.join("\n");
+        text.push('\n');
+        text.into_bytes()
+    }
+
+    /// Scattered replacements, an inserted block, and a deleted block in a
+    /// file large enough that the old table cost gigabytes still render
+    /// byte-for-byte as git renders them.
+    #[test]
+    fn scattered_edits_in_a_large_file_match_git_diff() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        init_repo(dir);
+        let old = numbered_lines(30_000);
+        write_file(dir, "data.json", &file_text(&old));
+        let base = commit_all(dir, "base");
+
+        let mut new = old.clone();
+        new[3] = "    \"entry-3\": \"replaced\",".to_string();
+        new[12_000] = "    \"entry-12000\": null,".to_string();
+        new.drain(20_000..20_005);
+        for (offset, line) in ["    \"inserted-a\": 1,", "    \"inserted-b\": 2,"]
+            .into_iter()
+            .enumerate()
+        {
+            new.insert(25_000 + offset, line.to_string());
+        }
+        let last = new.len() - 1;
+        new[last] = "    \"entry-last\": 0".to_string();
+        write_file(dir, "data.json", &file_text(&new));
+        let tip = commit_all(dir, "edit");
+
+        let store = ObjectStore::new(Path::new(dir), None).unwrap();
+        let rendered = render_range_patch(&store, &base, &tip, &|_| true).unwrap();
+        let expected = git(dir, &["diff", "--no-color", &base, &tip]);
+        assert_eq!(rendered.patch, expected);
+        assert_eq!(
+            (rendered.files[0].additions, rendered.files[0].deletions),
+            (5, 8)
+        );
+    }
+
+    /// The production case: a 128k-line file edited in a few places, whose
+    /// full LCS table was 66 GB and 16 billion compares. Linear-space
+    /// alignment finishes it well inside the bound even in a debug build.
+    #[test]
+    fn a_large_file_with_few_edits_aligns_quickly() {
+        let old = numbered_lines(128_000);
+        let mut new = old.clone();
+        new[10] = "    \"entry-10\": -1,".to_string();
+        new[64_000] = "    \"entry-64000\": -1,".to_string();
+        new.insert(127_000, "    \"added\": true,".to_string());
+
+        let started = std::time::Instant::now();
+        let hunks = unified_hunks(&file_text(&old), &file_text(&new));
+        let elapsed = started.elapsed();
+        assert_eq!(count_changes(&hunks), (3, 2));
+        assert_eq!(hunks.matches("@@ -").count(), 3, "one hunk per edit");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?}"
+        );
+    }
+
+    /// A file that changed on every line drives Myers toward its quadratic
+    /// worst case; the work budget reports it as replaced wholesale instead.
+    #[test]
+    fn a_file_rewritten_everywhere_stays_within_the_work_budget() {
+        let old = numbered_lines(50_000);
+        let new: Vec<String> = (0..50_000)
+            .map(|index| format!("rewritten {index}"))
+            .collect();
+
+        let started = std::time::Instant::now();
+        let hunks = unified_hunks(&file_text(&old), &file_text(&new));
+        let elapsed = started.elapsed();
+        assert_eq!(count_changes(&hunks), (50_000, 50_000));
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?}"
+        );
+    }
+
     #[test]
     fn list_range_commits_returns_oldest_first_with_metadata() {
         let temp = tempfile::tempdir().unwrap();

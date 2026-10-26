@@ -283,7 +283,6 @@ impl FacetEmbedder {
     pub fn new(source: Arc<dyn EmbedSource>, gate: Arc<EmbedGate>) -> Self {
         Self { source, gate }
     }
-
 }
 
 /// Record how a request went on the gate, log any change of state, and turn

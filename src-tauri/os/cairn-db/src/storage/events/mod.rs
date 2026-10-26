@@ -38,8 +38,8 @@ pub mod reconstruct_fixture;
 pub use cairn_codec::codec::{compress, decompress, CODEC_NONE, CODEC_ZSTD_V1};
 pub use cairn_codec::diff;
 pub use cairn_codec::diff::{
-    count_commits_ahead, list_range_commits, render_range_diff, render_range_file_diffs,
-    NodeDiffFile, RangeCommit,
+    count_commits_ahead, list_range_commits, render_range_file_diffs, render_range_patch,
+    NodeDiffFile, RangeCommit, RangeFileSummary, RangePatch,
 };
 pub use cairn_codec::objects::{ObjectStore, ResolvePathError};
 pub use cairn_codec::packfile::build_execution_pack;

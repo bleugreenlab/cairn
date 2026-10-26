@@ -13,8 +13,7 @@ use super::files::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{
-    count_commits_ahead, list_range_commits, render_range_diff, render_range_file_diffs,
-    ObjectStore, RowExt,
+    count_commits_ahead, list_range_commits, render_range_patch, ObjectStore, RangePatch, RowExt,
 };
 
 const FINDING_CAP: usize = 100;
@@ -403,13 +402,15 @@ pub(super) struct RangeDiff {
     pub rows: Vec<FileChangeRow>,
 }
 
+/// The patch and per-file rows of `base..tip`, for the paths `include` accepts.
 pub(super) fn diff_data_between(
     store: &ObjectStore,
     base: &str,
     tip: &str,
+    include: &dyn Fn(&str) -> bool,
 ) -> Result<RangeDiff, String> {
-    let patch = render_range_diff(store, base, tip)?;
-    let rows = render_range_file_diffs(store, base, tip)?
+    let RangePatch { patch, files } = render_range_patch(store, base, tip, include)?;
+    let rows = files
         .into_iter()
         .map(|file| {
             (
@@ -417,7 +418,7 @@ pub(super) fn diff_data_between(
                 file.status,
                 Some(file.additions as i32),
                 Some(file.deletions as i32),
-                file.previous_path,
+                None,
             )
         })
         .collect();
@@ -444,7 +445,7 @@ async fn load_live_data(orch: &Orchestrator, coords: &DiffCoords) -> Option<Diff
     };
     let (base, tip, base_head) = (range.base, range.tip, range.target_head);
     let store = ObjectStore::new(repo, None).ok()?;
-    let RangeDiff { patch, rows } = diff_data_between(&store, &base, &tip).ok()?;
+    let RangeDiff { patch, rows } = diff_data_between(&store, &base, &tip, &|_| true).ok()?;
     let commits = list_range_commits(&store, &base, &tip)
         .unwrap_or_default()
         .into_iter()
@@ -515,7 +516,7 @@ async fn load_archived_data(
     let content_source =
         archived_content_source(&coords.repo_path, &tip, &pack, retain_content_source);
     let store = ObjectStore::new(Path::new(&coords.repo_path), pack).ok()?;
-    let RangeDiff { patch, rows } = diff_data_between(&store, &base, &tip).ok()?;
+    let RangeDiff { patch, rows } = diff_data_between(&store, &base, &tip, &|_| true).ok()?;
     let commits = list_range_commits(&store, &base, &tip)
         .unwrap_or_default()
         .into_iter()

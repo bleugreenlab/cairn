@@ -2,6 +2,9 @@ use super::*;
 use cairn_common::query::parse_query_params;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+impl StoreAnswer for String {}
 
 fn query(op: VcsOp, raw: &str) -> Result<VcsQuery, String> {
     let params = if raw.is_empty() {
@@ -63,34 +66,142 @@ fn log_and_blame_validate_their_windows() {
 /// key differs and the answer is recomputed.
 #[tokio::test]
 async fn a_repeat_read_is_served_from_the_cache_and_a_moved_ref_misses() {
-    let computed = AtomicUsize::new(0);
+    let computed = Arc::new(AtomicUsize::new(0));
     let compute = |value: &'static str| {
-        let computed = &computed;
+        let computed = computed.clone();
         async move {
             computed.fetch_add(1, Ordering::SeqCst);
             Ok::<_, String>(value.to_string())
         }
     };
     let key = format!("test|{}|aaaa|bbbb", uuid::Uuid::new_v4());
-    assert_eq!(cached(&key, compute("first")).await.unwrap(), "first");
-    assert_eq!(cached(&key, compute("second")).await.unwrap(), "first");
+    assert_eq!(
+        cached("diff", &key, compute("first")).await.unwrap(),
+        "first"
+    );
+    assert_eq!(
+        cached("diff", &key, compute("second")).await.unwrap(),
+        "first"
+    );
     assert_eq!(computed.load(Ordering::SeqCst), 1);
 
     let moved = key.replace("bbbb", "cccc");
-    assert_eq!(cached(&moved, compute("moved")).await.unwrap(), "moved");
+    assert_eq!(
+        cached("diff", &moved, compute("moved")).await.unwrap(),
+        "moved"
+    );
     assert_eq!(computed.load(Ordering::SeqCst), 2);
 
     let failing = format!("test|{}|fail", uuid::Uuid::new_v4());
     assert!(
-        cached::<String, _>(&failing, async { Err("boom".to_string()) })
+        cached::<String, _>("diff", &failing, async { Err("boom".to_string()) })
             .await
             .is_err()
     );
     assert_eq!(
-        cached(&failing, compute("retried")).await.unwrap(),
+        cached("diff", &failing, compute("retried")).await.unwrap(),
         "retried",
         "a failed answer is not cached"
     );
+}
+
+/// A computation that counts its runs and takes `duration` to answer.
+fn slow(
+    computed: &Arc<AtomicUsize>,
+    duration: Duration,
+) -> impl Future<Output = Result<String, String>> + Send + 'static {
+    let computed = computed.clone();
+    async move {
+        computed.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(duration).await;
+        Ok("answer".to_string())
+    }
+}
+
+/// Two reads of one key while it computes share the computation: identical
+/// expensive work is never stacked.
+#[tokio::test]
+async fn concurrent_reads_of_one_key_share_one_computation() {
+    let computed = Arc::new(AtomicUsize::new(0));
+    let key = format!("test|{}|flight", uuid::Uuid::new_v4());
+    let (first, second) = tokio::join!(
+        cached("diff", &key, slow(&computed, Duration::from_millis(100))),
+        cached("diff", &key, slow(&computed, Duration::from_millis(100))),
+    );
+    assert_eq!(first.unwrap(), "answer");
+    assert_eq!(second.unwrap(), "answer");
+    assert_eq!(computed.load(Ordering::SeqCst), 1);
+}
+
+/// A read that times out is told so, but its computation keeps running and
+/// caches its answer; the retry joins the flight while it runs and is served
+/// from the cache once it lands, without ever computing again.
+#[tokio::test]
+async fn a_timed_out_read_leaves_its_computation_to_answer_the_retry() {
+    let computed = Arc::new(AtomicUsize::new(0));
+    let key = format!("test|{}|orphan", uuid::Uuid::new_v4());
+    let limit = Duration::from_millis(20);
+
+    let error = cached_within::<String, _>(
+        limit,
+        "diff",
+        &key,
+        slow(&computed, Duration::from_millis(200)),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("did not finish"), "{error}");
+
+    // The retry arrives mid-flight and joins it rather than starting another.
+    let joined = cached_within(
+        Duration::from_secs(5),
+        "diff",
+        &key,
+        slow(&computed, Duration::from_millis(200)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(joined, "answer");
+
+    // And a later read is a cache hit.
+    let again = cached_within(
+        limit,
+        "diff",
+        &key,
+        slow(&computed, Duration::from_millis(200)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again, "answer");
+    assert_eq!(computed.load(Ordering::SeqCst), 1);
+}
+
+/// An abandoned computation still lands: with no reader waiting at all, its
+/// answer is cached when it completes.
+#[tokio::test]
+async fn an_abandoned_computation_caches_its_answer_when_it_lands() {
+    let computed = Arc::new(AtomicUsize::new(0));
+    let key = format!("test|{}|abandoned", uuid::Uuid::new_v4());
+    let limit = Duration::from_millis(10);
+    assert!(cached_within::<String, _>(
+        limit,
+        "diff",
+        &key,
+        slow(&computed, Duration::from_millis(60))
+    )
+    .await
+    .is_err());
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        lock_flights().get(&key).is_none(),
+        "the flight left the table"
+    );
+    let served = cached_within(limit, "diff", &key, slow(&computed, Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert_eq!(served, "answer");
+    assert_eq!(computed.load(Ordering::SeqCst), 1);
 }
 
 fn endpoint(rev: &str, commit: &str) -> Endpoint {

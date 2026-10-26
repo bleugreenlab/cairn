@@ -100,9 +100,9 @@ pub use content_store::{ContentStore, ContentStoreFactory, TeamReplicaContext};
 pub use events::event_fixture;
 pub use events::{
     build_execution_pack, compress, count_commits_ahead, decompress, list_range_commits,
-    reconstruct_events, reconstruct_events_reporting, render_range_diff, render_range_file_diffs,
-    NodeDiffFile, ObjectStore, RangeCommit, Reconstruction, ResolvePathError, CODEC_NONE,
-    CODEC_ZSTD_V1,
+    reconstruct_events, reconstruct_events_reporting, render_range_file_diffs, render_range_patch,
+    NodeDiffFile, ObjectStore, RangeCommit, RangeFileSummary, RangePatch, Reconstruction,
+    ResolvePathError, CODEC_NONE, CODEC_ZSTD_V1,
 };
 
 /// A freshly migrated, temp-backed test database. Exposed under `test-utils`

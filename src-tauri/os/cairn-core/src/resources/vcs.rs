@@ -12,9 +12,13 @@
 //! resolves to a new id and misses. Revision labels (age, STALE) are not part of
 //! the cached answer; they are rendered fresh on every read.
 
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
+
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 
 use cairn_codec::diff::render_commit_diff;
 use cairn_codec::objects::ObjectStore;
@@ -23,6 +27,7 @@ use cairn_vcs::history::{self, HistoryError};
 use globset::GlobBuilder;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use super::diff::{diff_data_between, escape_table, filter_patch, short, RangeDiff};
 use super::files::{dedupe_file_changes_by_path, push_file_change_table, FileChangeRow};
@@ -377,53 +382,184 @@ pub(super) async fn read_vcs(
     result.unwrap_or_else(|error| error)
 }
 
-/// Serve `key` from the answer cache, or compute it and cache what it returns.
-/// An answer that fails is not cached, so a timeout or transient store error is
-/// retried by the next read.
-async fn cached<T, Fut>(key: &str, compute: Fut) -> Result<T, String>
-where
-    T: Serialize + DeserializeOwned,
-    Fut: Future<Output = Result<T, String>>,
-{
-    if let Some(bytes) = answer_cache().get(key) {
-        if let Ok(answer) = serde_json::from_slice(&bytes) {
-            return Ok(answer);
-        }
-    }
-    let answer = compute.await?;
-    if let Ok(bytes) = serde_json::to_vec(&answer) {
-        answer_cache().insert(key, bytes.into());
-    }
-    Ok(answer)
+/// A computation in progress for one answer key, shared by every read that
+/// asks the same question while it runs.
+type Flight = Shared<BoxFuture<'static, Result<Arc<[u8]>, String>>>;
+
+fn flights() -> &'static Mutex<HashMap<String, Flight>> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<String, Flight>>> = OnceLock::new();
+    FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn timed_out(what: &str) -> String {
+fn lock_flights() -> MutexGuard<'static, HashMap<String, Flight>> {
+    flights().lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Serve `key` from the answer cache, or from the one computation answering it.
+///
+/// At most one computation per key is ever live. A read that arrives while one
+/// runs joins it rather than starting another, and the query limit bounds only
+/// how long a READER waits: a computation that outlives it keeps running,
+/// caches its answer when it completes, and so serves the retry that always
+/// follows a timeout. Cancelling it instead would make every retry pay the
+/// full cost again and never converge on a large input, while starting a fresh
+/// one per read stacked identical multi-gigabyte computations. What bounds an
+/// orphaned computation is its own work budget, not the reader's patience.
+///
+/// An answer that fails is not cached, so a transient store error is retried
+/// by the next read.
+async fn cached<T, Fut>(what: &'static str, key: &str, compute: Fut) -> Result<T, String>
+where
+    T: StoreAnswer,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    cached_within(QUERY_LIMIT, what, key, compute).await
+}
+
+async fn cached_within<T, Fut>(
+    limit: Duration,
+    what: &'static str,
+    key: &str,
+    compute: Fut,
+) -> Result<T, String>
+where
+    T: StoreAnswer,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    // One record per read, saying how it was served: from the cache, by
+    // joining a computation already in flight, or by launching one. Read with
+    // `vcs_compute`, a retry after a timeout shows as a `launched` read that
+    // timed out, a `joined` or `cache` read, and a single computation.
+    let span = tracing::info_span!(
+        target: "profiler",
+        "vcs_answer",
+        op = what,
+        key = key,
+        served = tracing::field::Empty,
+        timed_out = tracing::field::Empty,
+    );
+    if let Some(answer) = cached_answer(key) {
+        span.record("served", "cache");
+        return Ok(answer);
+    }
+    let (flight, served) = {
+        let mut flights = lock_flights();
+        // A flight caches its answer before it leaves the table, so checking
+        // again under the lock closes the window in which one finished between
+        // the miss above and taking the lock.
+        if let Some(answer) = cached_answer(key) {
+            span.record("served", "cache");
+            return Ok(answer);
+        }
+        match flights.entry(key.to_string()) {
+            Entry::Occupied(entry) => (entry.get().clone(), "joined"),
+            Entry::Vacant(entry) => (
+                entry.insert(launch(what, key.to_string(), compute)).clone(),
+                "launched",
+            ),
+        }
+    };
+    span.record("served", served);
+    let outcome = tokio::time::timeout(limit, flight)
+        .instrument(span.clone())
+        .await;
+    span.record("timed_out", outcome.is_err());
+    match outcome {
+        Err(_) => Err(timed_out(what, limit)),
+        Ok(Err(error)) => Err(error),
+        Ok(Ok(bytes)) => serde_json::from_slice(&bytes)
+            .map_err(|error| format!("The {what} answer could not be decoded: {error}")),
+    }
+}
+
+/// What [`cached`] stores and serves: a serializable answer that can say how
+/// many files it covers, so the computation's profiler record carries its size.
+trait StoreAnswer: Serialize + DeserializeOwned + Send + 'static {
+    fn files(&self) -> Option<usize> {
+        None
+    }
+}
+
+fn cached_answer<T: DeserializeOwned>(key: &str) -> Option<T> {
+    let bytes = answer_cache().get(key)?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Start the one computation for `key` as its own task, so it runs to
+/// completion whether or not any reader is still waiting.
+fn launch<T, Fut>(what: &'static str, key: String, compute: Fut) -> Flight
+where
+    T: StoreAnswer,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    // One record per computation, spanning it whole even after every reader
+    // has stopped waiting.
+    let span = tracing::info_span!(
+        target: "profiler",
+        "vcs_compute",
+        op = what,
+        key = key.as_str(),
+        files = tracing::field::Empty,
+    );
+    let recorded = span.clone();
+    let task = tokio::spawn(
+        async move {
+            // Leaves the table however the task ends, a panic included, so a
+            // key can never be stranded behind a flight that will not land.
+            let _landing = Landing(key.clone());
+            let answer = compute.await?;
+            if let Some(files) = answer.files() {
+                recorded.record("files", files);
+            }
+            let bytes = serde_json::to_vec(&answer)
+                .map_err(|error| format!("The answer could not be encoded: {error}"))?;
+            answer_cache().insert(&key, bytes.clone().into());
+            Ok(Arc::<[u8]>::from(bytes))
+        }
+        .instrument(span),
+    );
+    async move {
+        task.await
+            .map_err(|error| format!("The store task failed: {error}"))?
+    }
+    .boxed()
+    .shared()
+}
+
+struct Landing(String);
+
+impl Drop for Landing {
+    fn drop(&mut self) {
+        lock_flights().remove(&self.0);
+    }
+}
+
+fn timed_out(what: &str, limit: Duration) -> String {
     format!(
         "The {what} did not finish within {}s, the store read limit, so no partial answer is \
          served. Narrow the range or the path and read again.",
-        QUERY_LIMIT.as_secs()
+        limit.as_secs()
     )
 }
 
 fn history_error(what: &str, error: HistoryError) -> String {
     match error {
-        HistoryError::TimedOut { .. } => timed_out(what),
+        HistoryError::TimedOut { .. } => timed_out(what, QUERY_LIMIT),
         other => format!("Unable to compute the {what}: {other}"),
     }
 }
 
-/// Run a synchronous object-store computation on the blocking pool under the
-/// query limit. Work that outlives the limit finishes in the background and is
-/// dropped; the caller has already been told no answer is served.
+/// Run a synchronous object-store computation on the blocking pool. It is not
+/// timed here: [`cached`] applies the query limit to the reader's wait, so the
+/// work finishes, is cached, and answers the retry.
 async fn blocking<T, F>(what: &'static str, compute: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, String> + Send + 'static,
 {
-    match tokio::time::timeout(QUERY_LIMIT, tokio::task::spawn_blocking(compute)).await {
-        Err(_) => Err(timed_out(what)),
-        Ok(Err(error)) => Err(format!("The {what} task failed: {error}")),
-        Ok(Ok(result)) => result,
+    match tokio::task::spawn_blocking(compute).await {
+        Err(error) => Err(format!("The {what} task failed: {error}")),
+        Ok(result) => result,
     }
 }
 
@@ -438,6 +574,12 @@ struct DiffAnswer {
     tip: String,
     rows: Vec<FileChangeRow>,
     patch: String,
+}
+
+impl StoreAnswer for DiffAnswer {
+    fn files(&self) -> Option<usize> {
+        Some(self.rows.len())
+    }
 }
 
 async fn read_diff(
@@ -469,6 +611,7 @@ async fn read_diff(
             let key = format!("diff-commit|{project_id}|{tip}");
             Some(
                 cached(
+                    "diff",
                     &key,
                     blocking("diff", move || {
                         let store = ObjectStore::new(&objects, None)?;
@@ -552,13 +695,26 @@ async fn read_diff(
 
     let mode = query.base;
     let key = format!(
-        "diff|{project_id}|{}|{from_id}|{to_id}",
+        "diff|{project_id}|{}|{from_id}|{to_id}|file={}|glob={}",
         match mode {
             DiffBase::Fork => "fork",
             DiffBase::From => "from",
-        }
+        },
+        query.file.as_deref().unwrap_or(""),
+        query.glob.as_deref().unwrap_or(""),
     );
-    let answer = cached(&key, async move {
+    // Narrowing happens before any file is aligned: a range can touch thousands
+    // of files, and diffing them all to keep one is what made a one-file read of
+    // a wide range outlive the query limit.
+    let include = {
+        let file = query.file.clone();
+        let glob = glob.clone();
+        move |path: &str| {
+            file.as_deref().is_none_or(|file| file == path)
+                && glob.as_ref().is_none_or(|glob| glob.is_match(path))
+        }
+    };
+    let answer = cached("diff", &key, async move {
         let base = match mode {
             DiffBase::From => from_id.clone(),
             DiffBase::Fork => {
@@ -575,7 +731,7 @@ async fn read_diff(
         };
         blocking("diff", move || {
             let store = ObjectStore::new(&objects, None)?;
-            let RangeDiff { patch, rows } = diff_data_between(&store, &base, &to_id)?;
+            let RangeDiff { patch, rows } = diff_data_between(&store, &base, &to_id, &include)?;
             Ok(DiffAnswer {
                 base,
                 tip: to_id,
@@ -625,6 +781,9 @@ fn render_diff(
         .as_ref()
         .map(|answer| dedupe_file_changes_by_path(&answer.rows))
         .unwrap_or_default();
+    if let Some(file) = query.file.as_deref() {
+        rows.retain(|row| row.0 == file || row.4.as_deref() == Some(file));
+    }
     if let Some(glob) = glob {
         rows.retain(|row| {
             glob.is_match(&row.0) || row.4.as_deref().is_some_and(|path| glob.is_match(path))
@@ -763,6 +922,8 @@ struct LogAnswer {
     offset: usize,
 }
 
+impl StoreAnswer for LogAnswer {}
+
 async fn log_page(
     project_id: &str,
     resolution: &BranchResolution,
@@ -785,7 +946,7 @@ async fn log_page(
         limit,
         offset,
     };
-    cached(&key, async move {
+    cached("log", &key, async move {
         let page = history::log(&store, query, QUERY_LIMIT)
             .await
             .map_err(|error| history_error("log", error))?;
@@ -928,6 +1089,8 @@ struct AncestryAnswer {
     behind_capped: bool,
 }
 
+impl StoreAnswer for AncestryAnswer {}
+
 fn capped(count: usize, capped: bool) -> String {
     if capped {
         format!("≥{count}")
@@ -948,7 +1111,7 @@ async fn read_ancestry(
     let store = to.resolution.repository_path.clone();
     let (from_id, to_id) = (from.commit().to_string(), to.commit().to_string());
     let key = format!("ancestry|{project_id}|{from_id}|{to_id}");
-    let answer = cached(&key, async move {
+    let answer = cached("ancestry", &key, async move {
         let ancestry = history::ancestry(&store, &from_id, &to_id, COUNT_CAP, QUERY_LIMIT)
             .await
             .map_err(|error| history_error("ancestry", error))?;
@@ -1018,6 +1181,8 @@ struct BlameAnswer {
     commits: std::collections::BTreeMap<String, LogEntry>,
 }
 
+impl StoreAnswer for BlameAnswer {}
+
 async fn read_blame(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -1031,7 +1196,7 @@ async fn read_blame(
     let commit = rev.commit().to_string();
     let key = format!("blame|{project_id}|{commit}|{path}");
     let blame_path = path.clone();
-    let answer = cached(&key, async move {
+    let answer = cached("blame", &key, async move {
         let annotation =
             history::annotate(&store, &commit, &blame_path, BLAME_MAX_BYTES, QUERY_LIMIT)
                 .await
