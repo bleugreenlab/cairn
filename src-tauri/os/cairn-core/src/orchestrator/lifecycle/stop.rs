@@ -833,6 +833,34 @@ fn is_workflow_child_run(orch: &Orchestrator, run_id: &str) -> bool {
         == Some("workflow")
 }
 
+/// The operator pressed Stop on a run. A user interrupt suppresses autonomous
+/// successors, so the job's goal is turned off before the turn is interrupted
+/// and stays off until the operator turns it back on. Internal stops (an
+/// interrupting message, a model switch, closing an issue) go through
+/// [`stop_session`] and leave the operator's choice alone.
+pub fn operator_stop_run(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
+    if let Some(job_id) = job_id_for_run(orch, run_id) {
+        crate::execution::jobs::record_goal_intent(
+            orch,
+            &job_id,
+            crate::execution::jobs::GoalIntent::Off,
+        )?;
+    }
+    stop_session(orch, run_id)
+}
+
+/// The operator pressed Stop on a job. See [`operator_stop_run`].
+pub fn operator_stop_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
+    if job_exists(orch, job_id)? {
+        crate::execution::jobs::record_goal_intent(
+            orch,
+            job_id,
+            crate::execution::jobs::GoalIntent::Off,
+        )?;
+    }
+    stop_job(orch, job_id)
+}
+
 /// Stop a running backend session, cascading to child runs
 pub fn stop_session(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
     // First, collect child runs to stop
@@ -1020,7 +1048,9 @@ fn cancel_open_input_and_live_turns_for_job(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StopReason {
     /// Operator Stop and cascade cancellation reap inline commands and hard-kill
-    /// if interrupt delivery fails. The native goal remains operator-held.
+    /// if interrupt delivery fails. The native goal is paused as interrupted;
+    /// whether it continues once the job runs again is the job's goal intent,
+    /// which the operator Stop entrypoints turn off.
     OperatorStop,
     /// A system-owned park preserves inline siblings and warm state even when
     /// interrupt delivery fails. Only this condition may release its pause.
@@ -1030,7 +1060,7 @@ pub(crate) enum StopReason {
 impl StopReason {
     fn pause_intent(&self) -> PauseIntent {
         PauseIntent::Stake(match self {
-            Self::OperatorStop => GoalPause::OperatorHold,
+            Self::OperatorStop => GoalPause::Interrupted,
             Self::Park(owner) => GoalPause::Owned(owner.clone()),
         })
     }

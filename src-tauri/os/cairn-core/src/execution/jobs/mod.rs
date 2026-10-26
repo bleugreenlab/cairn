@@ -37,6 +37,7 @@ use std::sync::Arc;
 mod calls;
 mod child_tasks;
 mod config_loading;
+mod goal_intent;
 mod inputs;
 mod lifecycle;
 mod ordinary_admission;
@@ -74,6 +75,8 @@ pub use calls::restart_call;
 // `cairn_core::internal::...` through the Orchestrator method.
 pub(crate) use calls::fail_orphaned_calls_on_startup;
 pub use child_tasks::create_child_task;
+pub(crate) use goal_intent::{goal_intent_for_job, goal_intent_for_run, record_goal_intent};
+pub use goal_intent::{job_goal_state, set_job_goal_intent, GoalDisplay, GoalIntent, JobGoalState};
 pub(crate) use inputs::{
     find_downstream_artifact_schema_conn, find_downstream_artifact_schema_with_snapshot_conn,
     is_long_running_node_conn, node_ships_a_pr_conn, resolve_ctx_self_schemas_conn,
@@ -86,8 +89,6 @@ pub(crate) use lifecycle::{
 // The branch-mode coordinate decision. Production reaches it only through
 // `prepare_job`; the delegation edge's regression imports it to run the mode it
 // emits all the way to the commit a delegated task starts from.
-#[cfg(test)]
-pub(crate) use lifecycle::goal_pause_notice;
 pub use lifecycle::{
     compose_launch_inputs, continue_job_impl, continue_job_or_enqueue, on_job_complete_impl,
     prepare_job, preview_job_digest, resume_job_from_digest, DigestPreview, ResumeContext,
@@ -107,9 +108,6 @@ pub(crate) use persistence::load_job_conn;
 pub(crate) use slash_commands::resolve_skill_slash_command;
 pub(crate) use snapshots::queued_user_transcript_event;
 pub(crate) use turns::{admit_codex_goal_turn, CodexGoalTurnAdmission};
-pub(crate) use turns::{
-    codex_repeat_breaker_armed, observe_codex_final_output, rearm_codex_repeat_breaker,
-};
 // Delegation reaches the host-execution invariant here: a job that arrives at
 // delegation with no execution gets one carrying its OWN agent, not an empty
 // agents map.

@@ -5,7 +5,6 @@ use cairn_models::types::usage::ProviderUsageSnapshot;
 pub enum GoalTurnAdmission {
     Admitted,
     Deferred { predecessor_turn_id: String },
-    SafetyPaused,
 }
 
 pub trait CodexHost: Send + Sync {
@@ -21,16 +20,9 @@ pub trait CodexHost: Send + Sync {
     /// token, so it stays with the host.
     fn refresh_tokens(&self, id: &Value) -> Result<(), String>;
     fn capture_output(&self, output: Value);
-    fn observe_final_output(
-        &self,
-        cairn_turn_id: &str,
-        provider_turn_id: &str,
-        text: &str,
-    ) -> Option<TranscriptEvent>;
     fn account_usage(&self, snapshot: ProviderUsageSnapshot);
     fn context_snapshot(&self, snapshot: ContextTokenState);
     fn admit_goal_turn(&self, provider_turn_id: &str) -> Result<Option<GoalTurnAdmission>, String>;
-    fn defer_goal_turn(&self, provider_turn_id: &str) -> Result<(), String>;
     fn interrupt(&self) -> Result<(), String>;
     fn artifact_handoff(&self);
     fn watchdog_arm_failed(&self) -> Result<(), String>;
@@ -761,9 +753,6 @@ impl CodexRuntime {
         let mut streaming_state: Option<StreamingState> = None;
         let mut usage_accumulator = CodexTurnUsageAccumulator::default();
         let mut last_agent_message_text: Option<String> = None;
-        // The last agent message of each provider turn: its final output, which
-        // the repeated-output safety pause observes when the turn completes.
-        let mut final_output_by_turn: HashMap<String, String> = HashMap::new();
         let mut pending_tool_ids: HashSet<String> = HashSet::new();
         let mut tool_output_chars: HashMap<String, i32> = HashMap::new();
         let mut terminal_tool_suspended = false;
@@ -856,18 +845,6 @@ impl CodexRuntime {
                                         "Deferring Codex native goal turn {turn_id} behind non-terminal Cairn turn {predecessor_turn_id}"
                                     );
                                     claim_deferred_goal_turn(&mut deferred_goal_turns, turn_id);
-                                    continue;
-                                }
-                                Ok(Some(GoalTurnAdmission::SafetyPaused)) => {
-                                    log::warn!(
-                                        "Rejecting raced Codex goal turn {turn_id}: repeated-output safety pause is still armed"
-                                    );
-                                    claim_deferred_goal_turn(&mut deferred_goal_turns, turn_id);
-                                    if let Err(error) = host.host.defer_goal_turn(turn_id) {
-                                        log::error!(
-                                            "Failed to interrupt safety-paused Codex goal turn {turn_id}: {error}"
-                                        );
-                                    }
                                     continue;
                                 }
                                 Ok(_) => {}
@@ -1084,7 +1061,7 @@ impl CodexRuntime {
                         }
                     }
                 }
-                Notification::ItemCompleted { turn_id, item } => {
+                Notification::ItemCompleted { item, .. } => {
                     if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
                         match item_type {
                             "agentMessage" => {
@@ -1096,14 +1073,6 @@ impl CodexRuntime {
                                 }
                                 if let Some(text) = item.pointer("/text").and_then(|v| v.as_str()) {
                                     recorded_item_after_tool_result = true;
-                                    if !ephemeral {
-                                        if let Some(provider_turn_id) =
-                                            turn_id_or_cached(turn_id, &current_turn_id)
-                                        {
-                                            final_output_by_turn
-                                                .insert(provider_turn_id, text.to_string());
-                                        }
-                                    }
                                     finalize_agent_message(
                                         host,
                                         &run_db,
@@ -1197,31 +1166,6 @@ impl CodexRuntime {
                 }
                 Notification::TurnCompleted { turn_id, status } => {
                     let completed_provider_turn_id = turn_id_or_cached(turn_id, &current_turn_id);
-                    let mut repeat_safety_pause = false;
-                    if status == ProviderTurnStatus::Completed && !ephemeral {
-                        if let (Some(session_id), Some(provider_turn_id), Some(cairn_turn_id)) = (
-                            session_id.as_deref(),
-                            completed_provider_turn_id.as_deref(),
-                            host.process_state.get_current_turn_id(run_id),
-                        ) {
-                            if let Some(text) = final_output_by_turn.remove(provider_turn_id) {
-                                if let Some(notice) = host.host.observe_final_output(
-                                    &cairn_turn_id,
-                                    provider_turn_id,
-                                    &text,
-                                ) {
-                                    repeat_safety_pause = true;
-                                    store_event(host, run_id, Some(session_id), &notice);
-                                    if let Err(error) = host.host.defer_goal_turn(provider_turn_id)
-                                    {
-                                        log::error!("Failed to pause repeated-output Codex turn {provider_turn_id}: {error}");
-                                    }
-                                }
-                            }
-                        }
-                    } else if let Some(provider_turn_id) = completed_provider_turn_id.as_deref() {
-                        final_output_by_turn.remove(provider_turn_id);
-                    }
                     clear_provider_turn_if_current(
                         completed_provider_turn_id.as_deref(),
                         &current_turn_id,
@@ -1307,7 +1251,6 @@ impl CodexRuntime {
                             ephemeral,
                         ),
                         CodexTurnContext {
-                            repeat_safety_pause,
                             failure_disposition,
                         },
                     );
@@ -1368,7 +1311,6 @@ impl CodexRuntime {
                             ephemeral,
                         ),
                         CodexTurnContext {
-                            repeat_safety_pause: false,
                             failure_disposition: TurnFailureDisposition::Unhandled,
                         },
                     );
@@ -1453,7 +1395,6 @@ impl CodexRuntime {
                                 ephemeral,
                             ),
                             CodexTurnContext {
-                                repeat_safety_pause: false,
                                 failure_disposition: TurnFailureDisposition::DiagnosticRecorded,
                             },
                         );

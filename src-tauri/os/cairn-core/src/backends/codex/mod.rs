@@ -33,14 +33,86 @@ type ScriptedStdinFixture = (
 use cairn_models::wire::codex_app_server::goal;
 
 use crate::agent_process::process::{GoalPause, GoalPauseClaim, PauseIntent};
-use crate::execution::jobs::{GoalReactivation, GoalReconciliation, JobRunnable};
+use crate::execution::jobs::{GoalIntent, GoalReactivation, GoalReconciliation, JobRunnable};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum GoalPauseCause {
     Paused(GoalPause),
+    /// The operator turned the job's goal off.
+    OperatorOff,
     /// The provider reports Paused and Cairn holds no typed claim.
     Unattributed,
     Complete,
+}
+
+/// What a live Codex thread's goal looks like right now: the provider's status
+/// and Cairn's claim on why it is paused.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct GoalObservation {
+    pub status: goal::GoalStatus,
+    pub claim: Option<GoalPause>,
+}
+
+/// Read a live thread's goal and claim without changing either. `None` when the
+/// session is not a Codex app-server thread or its thread carries no goal.
+pub(crate) fn inspect_app_server_goal(
+    stdin: &mut dyn crate::agent_process::process::SessionControl,
+    claim: &GoalPauseClaim,
+) -> Result<Option<GoalObservation>, String> {
+    let Some(app_stdin) = stdin
+        .as_any_mut()
+        .downcast_mut::<cairn_models::session::codex::CodexControl>()
+    else {
+        return Ok(None);
+    };
+    Ok(app_stdin.get_goal()?.map(|goal| GoalObservation {
+        status: goal.status,
+        claim: claim.inspect(),
+    }))
+}
+
+/// The operator's goal intent outlives every process: a job whose goal is
+/// turned off opens its thread paused, before its first turn can end and let
+/// Codex continue on its own.
+pub(crate) fn apply_goal_intent_at_launch(
+    orch: &crate::orchestrator::Orchestrator,
+    run_id: &str,
+    native_goal: &cairn_models::interface::session::NativeGoal,
+    control: &mut dyn crate::agent_process::process::SessionControl,
+) -> Result<(), String> {
+    if matches!(
+        native_goal,
+        cairn_models::interface::session::NativeGoal::Objective(_)
+    ) && crate::execution::jobs::goal_intent_for_run(orch, run_id)? == GoalIntent::Off
+    {
+        pause_goal_before_first_turn(control)?;
+    }
+    Ok(())
+}
+
+/// Pause a freshly opened thread's goal before its first turn starts. The pause
+/// needs no claim: the durable intent is what keeps every release path from
+/// lifting it.
+fn pause_goal_before_first_turn(
+    control: &mut dyn crate::agent_process::process::SessionControl,
+) -> Result<(), String> {
+    let Some(app_stdin) = control
+        .as_any_mut()
+        .downcast_mut::<cairn_models::session::codex::CodexControl>()
+    else {
+        return Ok(());
+    };
+    match app_stdin.get_goal()? {
+        Some(goal)
+            if !matches!(
+                goal.status,
+                goal::GoalStatus::Paused | goal::GoalStatus::Complete
+            ) =>
+        {
+            set_goal_status(app_stdin, goal::GoalStatus::Paused)
+        }
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -55,13 +127,19 @@ pub(crate) enum GoalReactivationResult {
     Active,
 }
 
-/// The provider owns status; Cairn owns the authorization to lift a pause.
+/// The provider owns status; Cairn owns the authorization to lift a pause, and
+/// the operator's durable intent decides whether any lift is allowed at all.
 /// Callers hold stdin and the process-scoped claim throughout this operation.
+///
+/// A delivered message never changes the intent, so with the goal turned off
+/// this keeps (or makes) the goal paused whatever arrived: the message still
+/// runs its own turn, and the goal just does not continue past it.
 pub(crate) fn reactivate_app_server_goal(
     stdin: &mut dyn crate::agent_process::process::SessionControl,
     claim: &mut GoalPauseClaim,
     trigger: Option<&GoalReactivation>,
     runnable: JobRunnable,
+    intent: GoalIntent,
 ) -> Result<GoalReactivationResult, String> {
     let Some(app_stdin) = stdin
         .as_any_mut()
@@ -77,24 +155,32 @@ pub(crate) fn reactivate_app_server_goal(
             cause: GoalPauseCause::Complete,
         });
     }
+    if intent == GoalIntent::Off {
+        if let Some(GoalReactivation::OwnedConditionResolved(owner)) = trigger {
+            claim.consume(owner);
+        }
+        if goal.status != goal::GoalStatus::Paused {
+            set_goal_status(app_stdin, goal::GoalStatus::Paused)?;
+        }
+        return Ok(GoalReactivationResult::StillPaused {
+            cause: GoalPauseCause::OperatorOff,
+        });
+    }
     if goal.status != goal::GoalStatus::Paused {
         return Ok(GoalReactivationResult::Active);
     }
     let activation = || set_goal_status(app_stdin, goal::GoalStatus::Active);
     let lifted = match (claim.inspect(), trigger) {
-        (Some(GoalPause::OperatorHold), Some(GoalReactivation::Operator { kind, id }))
-            if matches!(*kind, "operator_message" | "explicit_resume") =>
-        {
-            claim
-                .release_operator_hold(activation)?
-                .then(|| (*kind, id.clone()))
-        }
         (Some(GoalPause::Owned(_)), Some(GoalReactivation::OwnedConditionResolved(owner))) => claim
             .release(owner, activation)?
             .then(|| (owner.kind(), Some(owner.id().to_string()))),
-        (None | Some(GoalPause::JobState(_)), _) if runnable == JobRunnable::Attested => claim
-            .release_unowned(activation)?
-            .then_some(("job_runnable", None)),
+        (None | Some(GoalPause::JobState(_) | GoalPause::Interrupted), _)
+            if runnable == JobRunnable::Attested =>
+        {
+            claim
+                .release_unowned(activation)?
+                .then_some(("job_runnable", None))
+        }
         _ => None,
     };
     if let Some((kind, id)) = lifted {
@@ -134,9 +220,6 @@ pub(crate) fn scripted_owned_goal_stdin_for_test(
     );
     (Box::new(stdin), requests, current_turn_id)
 }
-
-#[cfg(test)]
-pub(crate) use runtime::observe_and_interrupt_for_test;
 
 #[cfg(test)]
 pub(crate) fn scripted_durable_wait_stdin_for_test(
@@ -610,9 +693,11 @@ pub(crate) fn reconcile_app_server_goal(
     stdin: &mut dyn crate::agent_process::process::SessionControl,
     claim: &mut GoalPauseClaim,
     reconciliation: GoalReconciliation,
+    intent: GoalIntent,
 ) -> Result<(), String> {
     if reconciliation == GoalReconciliation::Active {
-        return reactivate_app_server_goal(stdin, claim, None, JobRunnable::Attested).map(|_| ());
+        return reactivate_app_server_goal(stdin, claim, None, JobRunnable::Attested, intent)
+            .map(|_| ());
     }
     let Some(app_stdin) = stdin
         .as_any_mut()
@@ -684,8 +769,9 @@ pub(crate) fn pause_app_server_goal_for_durable_wait(
     }) {
         if let Err(error) = set_goal_status(app_stdin, goal::GoalStatus::Paused) {
             if let Err(rollback_error) = restore_nonterminal_goal_status(app_stdin, status) {
-                // An uncertain provider write must not leave an autonomously liftable claim.
-                claim.stake(PauseIntent::Stake(GoalPause::OperatorHold));
+                // An uncertain provider write must not leave a wait claim that
+                // nothing will ever resolve; only the job's next admission lifts this.
+                claim.stake(PauseIntent::Stake(GoalPause::Interrupted));
                 return Err(format!(
                     "{error}; native goal rollback also failed: {rollback_error}"
                 ));
@@ -884,6 +970,7 @@ mod goal_status_tests {
                 stdin.as_mut(),
                 &mut GoalPauseClaim::default(),
                 GoalReconciliation::Active,
+                GoalIntent::On,
             )
             .unwrap_or_else(|error| panic!("{wake} status steer failed: {error}"));
             send_app_server_user_message(stdin.as_mut(), content)
@@ -910,6 +997,7 @@ mod goal_status_tests {
             stdin.as_mut(),
             &mut GoalPauseClaim::default(),
             GoalReconciliation::Active,
+            GoalIntent::On,
         )
         .expect_err("a goal that exists but refuses the write is a real failure");
         assert!(
@@ -935,7 +1023,8 @@ mod goal_status_tests {
                     stdin.as_mut(),
                     &mut GoalPauseClaim::default(),
                     None,
-                    JobRunnable::Unknown
+                    JobRunnable::Unknown,
+                    GoalIntent::On,
                 )
                 .unwrap(),
                 GoalReactivationResult::StillPaused { .. }
@@ -954,50 +1043,112 @@ mod goal_status_tests {
     }
 
     #[test]
-    fn explicit_attention_reactivates_paused_but_not_complete_goal() {
-        for (status, expected_methods, reactivated) in [
-            ("paused", vec!["thread/goal/get", "thread/goal/set"], true),
-            ("complete", vec!["thread/goal/get"], false),
-        ] {
-            let mut responses = vec![serde_json::json!({ "result": { "goal": {
+    fn admission_lifts_an_interrupted_goal_only_while_the_operator_has_it_on() {
+        let goal = |status: &str, updated_at: i64| {
+            serde_json::json!({ "result": { "goal": {
                 "threadId": "thread-1", "objective": "assigned work", "status": status,
                 "tokenBudget": null, "tokensUsed": 0, "timeUsedSeconds": 0,
-                "createdAt": 1, "updatedAt": 2
-            } } })];
-            if reactivated {
-                responses.push(serde_json::json!({ "result": { "goal": {
-                    "threadId": "thread-1", "objective": "assigned work", "status": "active",
-                    "tokenBudget": null, "tokensUsed": 0, "timeUsedSeconds": 0,
-                    "createdAt": 1, "updatedAt": 3
-                } } }));
-            }
+                "createdAt": 1, "updatedAt": updated_at
+            } } })
+        };
+        for (status, intent, responses, expected_methods, reactivated) in [
+            (
+                "paused",
+                GoalIntent::On,
+                vec![goal("paused", 2), goal("active", 3)],
+                vec!["thread/goal/get", "thread/goal/set"],
+                true,
+            ),
+            (
+                "complete",
+                GoalIntent::On,
+                vec![goal("complete", 2)],
+                vec!["thread/goal/get"],
+                false,
+            ),
+            (
+                "paused",
+                GoalIntent::Off,
+                vec![goal("paused", 2)],
+                vec!["thread/goal/get"],
+                false,
+            ),
+        ] {
             let (mut stdin, requests) = scripted_stdin(responses);
             let mut claim = GoalPauseClaim::default();
-            claim.stake(PauseIntent::Stake(GoalPause::OperatorHold));
+            claim.stake(PauseIntent::Stake(GoalPause::Interrupted));
+            let result = reactivate_app_server_goal(
+                stdin.as_mut(),
+                &mut claim,
+                Some(&GoalReactivation::Operator {
+                    kind: "explicit_resume",
+                    id: None,
+                }),
+                JobRunnable::Attested,
+                intent,
+            )
+            .unwrap();
             assert_eq!(
-                matches!(
-                    reactivate_app_server_goal(
-                        stdin.as_mut(),
-                        &mut claim,
-                        Some(&GoalReactivation::Operator {
-                            kind: "explicit_resume",
-                            id: None
-                        }),
-                        JobRunnable::Unknown,
-                    )
-                    .unwrap(),
-                    GoalReactivationResult::Lifted { .. }
-                ),
-                reactivated
+                matches!(result, GoalReactivationResult::Lifted { .. }),
+                reactivated,
+                "{status} {intent:?}: {result:?}"
             );
+            if intent == GoalIntent::Off {
+                assert_eq!(
+                    result,
+                    GoalReactivationResult::StillPaused {
+                        cause: GoalPauseCause::OperatorOff
+                    }
+                );
+            }
             let methods: Vec<_> = requests
                 .lock()
                 .unwrap()
                 .iter()
                 .map(|request| request["method"].as_str().unwrap().to_string())
                 .collect();
-            assert_eq!(methods, expected_methods);
+            assert_eq!(methods, expected_methods, "{status} {intent:?}");
         }
+    }
+
+    /// With the goal turned off, a delivery pauses a goal that is somehow still
+    /// active, and a resolved wait spends its claim instead of activating, so
+    /// turning the goal back on later does not wait on it forever.
+    #[test]
+    fn operator_off_pauses_an_active_goal_and_spends_a_resolved_wait() {
+        let goal = |status: &str| {
+            serde_json::json!({ "result": { "goal": {
+                "threadId": "thread-1", "objective": "assigned work", "status": status,
+                "tokenBudget": null, "tokensUsed": 0, "timeUsedSeconds": 0,
+                "createdAt": 1, "updatedAt": 2
+            } } })
+        };
+        let (mut stdin, requests) = scripted_stdin(vec![goal("active"), goal("paused")]);
+        let owner = crate::agent_process::process::GoalPauseOwner::DurableWait {
+            wait_id: "wait-1".into(),
+        };
+        let mut claim = GoalPauseClaim::default();
+        claim.stake(PauseIntent::Stake(GoalPause::Owned(owner.clone())));
+
+        let result = reactivate_app_server_goal(
+            stdin.as_mut(),
+            &mut claim,
+            Some(&GoalReactivation::OwnedConditionResolved(owner)),
+            JobRunnable::Attested,
+            GoalIntent::Off,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            GoalReactivationResult::StillPaused {
+                cause: GoalPauseCause::OperatorOff
+            }
+        );
+        assert_eq!(claim.inspect(), None, "the resolved wait is spent");
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent[1]["method"], "thread/goal/set");
+        assert_eq!(sent[1]["params"]["status"], "paused");
     }
 
     #[test]
@@ -1013,6 +1164,7 @@ mod goal_status_tests {
             stdin.as_mut(),
             &mut GoalPauseClaim::default(),
             GoalReconciliation::Paused(crate::agent_process::process::JobPauseState::Blocked),
+            GoalIntent::On,
         )
         .expect_err("an unapplied pause must not expose a suspension marker");
         assert!(error.contains("was not acknowledged"), "{error}");
@@ -1054,7 +1206,7 @@ mod goal_status_tests {
     }
 
     #[test]
-    fn user_interrupt_pauses_goal_before_idle_and_explicit_message_reactivates_same_thread() {
+    fn user_interrupt_pauses_goal_before_idle_and_admission_reactivates_same_thread() {
         let goal = |status: &str| {
             serde_json::json!({
                 "result": { "goal": {
@@ -1093,7 +1245,7 @@ mod goal_status_tests {
         assert!(pause_goal_and_interrupt_app_server_turn(
             stdin.as_mut(),
             &mut claim,
-            PauseIntent::Stake(GoalPause::OperatorHold)
+            PauseIntent::Stake(GoalPause::Interrupted)
         )
         .unwrap());
         {
@@ -1117,11 +1269,9 @@ mod goal_status_tests {
         reactivate_app_server_goal(
             stdin.as_mut(),
             &mut claim,
-            Some(&GoalReactivation::Operator {
-                kind: "explicit_resume",
-                id: None,
-            }),
-            JobRunnable::Unknown,
+            None,
+            JobRunnable::Attested,
+            GoalIntent::On,
         )
         .unwrap();
         send_app_server_user_message(stdin.as_mut(), "continue after my interrupt").unwrap();

@@ -29,8 +29,16 @@ where
     control.with_control(f)
 }
 
-pub(crate) use super::codex::{GoalPauseCause, GoalReactivationResult};
-use crate::execution::jobs::{GoalReactivation, GoalReconciliation, JobRunnable};
+pub(crate) use super::codex::{GoalObservation, GoalPauseCause, GoalReactivationResult};
+use crate::agent_process::process::{GoalPause, JobPauseState};
+use crate::execution::jobs::{GoalIntent, GoalReactivation, GoalReconciliation, JobRunnable};
+
+/// A missing process (or one with no writable control) has no provider goal to
+/// act on; callers treat it as nothing to do rather than a failure.
+fn no_live_session(error: &str) -> bool {
+    error.starts_with("Process not found:")
+        || error == crate::agent_process::process::NO_SESSION_CONTROL
+}
 
 /// Pause a native Codex goal before a durable suspension is published.
 /// Non-Codex backends have no provider-owned continuation to fence.
@@ -46,12 +54,7 @@ pub(crate) fn pause_goal_for_durable_wait(
         // fence. In-process tool loops and runs whose process entry has already
         // gone still need Cairn's durable wait just as they did before Codex
         // gained native goals.
-        Err(error)
-            if error.starts_with("Process not found:")
-                || error == crate::agent_process::process::NO_SESSION_CONTROL =>
-        {
-            Ok(None)
-        }
+        Err(error) if no_live_session(&error) => Ok(None),
         result => result,
     }
 }
@@ -123,36 +126,67 @@ pub(crate) fn send_user_message(
     })
 }
 
-/// Inspect the live status and consume only the matching authorized claim.
+/// Inspect the live status and consume only the matching authorized claim,
+/// within what the operator's goal intent allows.
 pub(crate) fn reactivate_goal(
     process_state: &AgentProcessState,
     run_id: &str,
     trigger: Option<&GoalReactivation>,
     runnable: JobRunnable,
+    intent: GoalIntent,
 ) -> Result<GoalReactivationResult, String> {
     with_session_control(process_state, run_id, |stdin, claim| {
-        super::codex::reactivate_app_server_goal(stdin, claim, trigger, runnable)
+        super::codex::reactivate_app_server_goal(stdin, claim, trigger, runnable, intent)
     })
 }
 
-/// Only the explicit operator rearm path may remove a tripped safety brake.
-pub(crate) fn rearm_goal_safety_brake(
+/// Apply a change of the operator's goal intent to a live session: Off pauses
+/// the goal now; On reactivates it when the job is runnable. A job that is not
+/// runnable has its state staked as the pause's cause, so the goal reads as
+/// waiting on the job rather than as an unattributed pause. `None` when the job
+/// has no live session to apply it to.
+pub(crate) fn apply_goal_intent(
     process_state: &AgentProcessState,
     run_id: &str,
-) -> Result<(), String> {
-    with_session_control(process_state, run_id, |_stdin, claim| {
-        claim.rearm_safety_brake();
-        Ok(())
-    })
+    intent: GoalIntent,
+    runnable: JobRunnable,
+    job_pause: Option<JobPauseState>,
+) -> Result<Option<GoalReactivationResult>, String> {
+    match with_session_control(process_state, run_id, |stdin, claim| {
+        if let Some(state) = job_pause {
+            claim.stake(crate::agent_process::process::PauseIntent::Stake(
+                GoalPause::JobState(state),
+            ));
+        }
+        super::codex::reactivate_app_server_goal(stdin, claim, None, runnable, intent)
+    }) {
+        Err(error) if no_live_session(&error) => Ok(None),
+        result => result.map(Some),
+    }
+}
+
+/// Read a live session's goal status and pause claim, changing nothing. `None`
+/// when there is no live session, it is not a Codex thread, or it has no goal.
+pub(crate) fn inspect_goal(
+    process_state: &AgentProcessState,
+    run_id: &str,
+) -> Result<Option<GoalObservation>, String> {
+    match with_session_control(process_state, run_id, |stdin, claim| {
+        super::codex::inspect_app_server_goal(stdin, claim)
+    }) {
+        Err(error) if no_live_session(&error) => Ok(None),
+        result => result,
+    }
 }
 
 pub(crate) fn reconcile_goal(
     process_state: &AgentProcessState,
     run_id: &str,
     reconciliation: GoalReconciliation,
+    intent: GoalIntent,
 ) -> Result<(), String> {
     with_session_control(process_state, run_id, |stdin, claim| {
-        super::codex::reconcile_app_server_goal(stdin, claim, reconciliation)
+        super::codex::reconcile_app_server_goal(stdin, claim, reconciliation, intent)
     })
 }
 

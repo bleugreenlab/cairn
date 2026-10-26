@@ -438,11 +438,16 @@ pub fn recover_provider_watchdog(
                 if !recovery_claim_is_owned(db.clone(), identity, claimed_at)? {
                     return Ok(ProviderWatchdogRecovery::LostClaim);
                 }
-                match crate::backends::stdin::reactivate_goal(
-                    &orch.process_state,
-                    &identity.run_id,
-                    None,
-                    crate::execution::jobs::JobRunnable::Unknown,
+                match crate::execution::jobs::goal_intent_for_run(orch, &identity.run_id).and_then(
+                    |intent| {
+                        crate::backends::stdin::reactivate_goal(
+                            &orch.process_state,
+                            &identity.run_id,
+                            None,
+                            crate::execution::jobs::JobRunnable::Unknown,
+                            intent,
+                        )
+                    },
                 ) {
                     Err(error) => {
                         let reason = "post_tool_goal_reactivation_failed";

@@ -473,6 +473,12 @@ impl AgentBackend for CodexBackend {
         );
 
         let mut control = launched.control;
+        super::apply_goal_intent_at_launch(
+            orch,
+            &config.run_id,
+            &native_goal(&config),
+            control.as_mut(),
+        )?;
         control.open_turn(&config.message_content.with_text(config.prompt.clone()))?;
 
         // Transition run to Running AFTER successful spawn (sets started_at accurately)

@@ -87,7 +87,8 @@ pub(crate) async fn insert_attention_push_events(
     }
 }
 
-/// Record the attention or durable owner that lifted a native Codex goal pause.
+/// Record what lifted a native Codex goal pause: the job's admission or the
+/// durable condition that owned it.
 pub(crate) fn insert_goal_reactivated_sync(
     orch: &Orchestrator,
     run_id: &str,
@@ -109,10 +110,7 @@ pub(crate) fn insert_goal_reactivated_sync(
         "type": "system",
         "subtype": "codex_goal_reactivated",
         "trigger": {"kind": trigger_kind, "id": trigger_id},
-        "owner_kind": match trigger_kind {
-            "operator_message" | "explicit_resume" => "operator_hold",
-            other => other,
-        }
+        "owner_kind": trigger_kind,
     })
     .to_string();
     insert_system_event_sync(

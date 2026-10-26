@@ -122,24 +122,6 @@ impl GoalReactivation {
     }
 }
 
-pub(crate) fn goal_pause_notice(cause: &crate::backends::stdin::GoalPauseCause) -> String {
-    use crate::agent_process::process::GoalPause;
-    use crate::backends::stdin::GoalPauseCause;
-    match cause {
-        GoalPauseCause::Unattributed => "[Goal state: paused, and Cairn cannot attribute this pause to a known cause. It lifts when this job is admitted to run again.]".to_string(),
-        GoalPauseCause::Paused(GoalPause::JobState(state)) => format!(
-            "[Goal state: paused because this job is {} and not runnable. It lifts when the job is admitted to run again; this delivery does not force that.]", state.label()),
-        GoalPauseCause::Complete => "[Goal state: complete. This delivery does not restart the goal.]".to_string(),
-        GoalPauseCause::Paused(GoalPause::OperatorHold) => "[Goal state: paused by an operator Stop. Autonomous continuation stays off until the operator resumes; this delivery does not lift it.]".to_string(),
-        GoalPauseCause::Paused(GoalPause::SafetyBrake) => "[Goal state: paused by the repeat safety brake. It lifts on an explicit rearm.]".to_string(),
-        GoalPauseCause::Paused(GoalPause::OperatorCompact) => "[Goal state: paused because the operator is compacting this session. This process is being replaced; nothing lifts this pause.]".to_string(),
-        GoalPauseCause::Paused(GoalPause::Owned(owner)) => format!(
-            "[Goal state: paused pending {} {}. It lifts automatically when that condition resolves; this delivery does not lift it.]",
-            owner.kind(), owner.id(),
-        ),
-    }
-}
-
 #[derive(Debug, Clone)]
 struct SessionBoundary {
     kind: &'static str,
@@ -2557,21 +2539,6 @@ fn continue_job_launch_locked(
             "Job has no current session to resume".to_string()
         }
     })?;
-    let safety_brake_rearmed = if prompt_resume.as_ref().is_some_and(|context| {
-        matches!(
-            context.goal_reactivation,
-            Some(GoalReactivation::Operator { .. })
-        )
-    }) {
-        crate::execution::jobs::rearm_codex_repeat_breaker(
-            owning_db.clone(),
-            job_id,
-            current_session_id,
-        )?
-    } else {
-        false
-    };
-
     // A session that can never take another turn refuses here, before the
     // follow-up turn and the `running` transition below are written. Refusing
     // after them left a post-resolution push (a turn-end check verdict, a
@@ -3661,7 +3628,7 @@ fn continue_job_launch_locked(
                     .ok_or_else(|| "resume project authority is unavailable".to_string())
             }
         })?;
-        let mut message_content = crate::storage::run_db_blocking(move || async move {
+        let message_content = crate::storage::run_db_blocking(move || async move {
             crate::agent_process::stdin::resolve_stable_images(
                 &orch.db,
                 &image_project_id,
@@ -3680,8 +3647,9 @@ fn continue_job_launch_locked(
         prompt_event.bytes = Some(message_content.text.len());
         prompt_event.emit();
         let stdin_started = std::time::Instant::now();
-        // Queued messages have no author provenance. Only typed attention or
-        // the condition's durable resolution can request a goal release.
+        // The message reaches the agent exactly as written, whatever the goal's
+        // state: it runs its own turn either way. Whether the goal continues
+        // past that turn is the operator's intent, which no delivery changes.
         let reactivation = prompt_resume
             .as_ref()
             .and_then(|context| context.goal_reactivation.clone())
@@ -3691,14 +3659,13 @@ fn continue_job_launch_locked(
                         .map(GoalReactivation::operator_message)
                 })
             });
-        if safety_brake_rearmed {
-            crate::backends::stdin::rearm_goal_safety_brake(&orch.process_state, &run_id)?;
-        }
+        let goal_intent = super::goal_intent_for_job(orch, job_id)?;
         match crate::backends::stdin::reactivate_goal(
             &orch.process_state,
             &run_id,
             reactivation.as_ref(),
             job_runnable,
+            goal_intent,
         )? {
             crate::backends::stdin::GoalReactivationResult::Lifted { kind, id } => {
                 crate::messages::transcript::insert_goal_reactivated_sync(
@@ -3721,8 +3688,6 @@ fn continue_job_launch_locked(
                         &cause,
                     )?;
                 }
-                message_content.text =
-                    format!("{}\n\n{}", goal_pause_notice(&cause), message_content.text);
             }
             crate::backends::stdin::GoalReactivationResult::Active => {}
         }

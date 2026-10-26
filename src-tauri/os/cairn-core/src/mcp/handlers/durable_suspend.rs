@@ -2765,52 +2765,19 @@ mod tests {
         assert_owned_sibling_completion_order(true).await;
     }
 
-    enum HoldBeforeOwnedPark {
-        OperatorStop,
-        RepeatBrake,
-    }
-
-    async fn assert_hold_survives_new_owned_park(hold: HoldBeforeOwnedPark) {
+    #[tokio::test]
+    async fn owned_park_after_operator_stop_stays_off() {
         let (orch, mut record, requests, goal_status) = owned_goal_env().await;
-        let notice = match hold {
-            HoldBeforeOwnedPark::OperatorStop => {
-                crate::orchestrator::lifecycle::stop_session(&orch, &record.run_id).unwrap();
-                // Ordinary delivery is admitted even though autonomous goal
-                // continuation is held. Its tool may need to park in turn.
-                deliver_owned_attention(&orch, false).await;
-                let next_turn = orch
-                    .process_state
-                    .get_current_turn_id(&record.run_id)
-                    .unwrap();
-                assert_ne!(next_turn, record.turn_id);
-                record.turn_id = next_turn;
-                "operator Stop"
-            }
-            HoldBeforeOwnedPark::RepeatBrake => {
-                for index in 0..3 {
-                    assert_eq!(
-                        crate::backends::codex::observe_and_interrupt_for_test(
-                            &orch,
-                            &record.run_id,
-                            &record.session_id,
-                            orch.db.local.clone(),
-                            &record.turn_id,
-                            &format!("before-park-repeat-{index}"),
-                            "still no progress",
-                        )
-                        .unwrap(),
-                        index == 2
-                    );
-                }
-                assert_eq!(
-                    owned_event_data(&orch, "system:codex_repeat_circuit_breaker")
-                        .await
-                        .len(),
-                    1
-                );
-                "repeat safety brake"
-            }
-        };
+        crate::orchestrator::lifecycle::operator_stop_run(&orch, &record.run_id).unwrap();
+        // Ordinary delivery is admitted even though autonomous goal
+        // continuation is off. Its tool may need to park in turn.
+        deliver_owned_attention(&orch, false).await;
+        let next_turn = orch
+            .process_state
+            .get_current_turn_id(&record.run_id)
+            .unwrap();
+        assert_ne!(next_turn, record.turn_id);
+        record.turn_id = next_turn;
         assert_eq!(*goal_status.lock().unwrap(), "paused");
         assert_eq!(owned_active_requests(&requests), 0);
         let earlier_deliveries = owned_prompts(&requests).len();
@@ -2834,33 +2801,22 @@ mod tests {
         assert_eq!(
             owned_active_requests(&requests),
             0,
-            "a new owned park must not erase a pre-existing sticky hold"
+            "a wait resolution must not turn the operator's goal back on"
         );
         assert_eq!(*goal_status.lock().unwrap(), "paused");
         let prompts = owned_prompts(&requests);
         assert_eq!(prompts.len(), earlier_deliveries + 1);
         let delivered = prompts.last().unwrap();
-        assert!(delivered.contains(notice), "{delivered}");
+        assert!(!delivered.contains("[Goal state"), "{delivered}");
         assert!(delivered.contains("result under pre-existing hold"));
         assert_eq!(tool_results(&orch).await.len(), 1);
         assert!(owned_event_data(&orch, "system:codex_goal_reactivated")
             .await
             .is_empty());
-        assert!(
-            owned_event_data(&orch, "system:codex_repeat_circuit_breaker_rearmed")
-                .await
-                .is_empty()
+        assert_eq!(
+            crate::execution::jobs::goal_intent_for_job(&orch, &record.job_id).unwrap(),
+            crate::execution::jobs::GoalIntent::Off
         );
-    }
-
-    #[tokio::test]
-    async fn owned_park_after_operator_stop_preserves_hold() {
-        assert_hold_survives_new_owned_park(HoldBeforeOwnedPark::OperatorStop).await;
-    }
-
-    #[tokio::test]
-    async fn owned_park_after_repeat_brake_preserves_hold() {
-        assert_hold_survives_new_owned_park(HoldBeforeOwnedPark::RepeatBrake).await;
     }
 
     #[tokio::test]
@@ -2987,7 +2943,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owned_check_push_midpark_preserves_and_names_wait_owner() {
+    async fn owned_check_push_midpark_preserves_the_wait_and_arrives_as_written() {
         let (orch, record, requests, goal_status) = owned_goal_env().await;
         assert!(
             suspend(&orch, &orch.db.local, &record)
@@ -3009,12 +2965,7 @@ mod tests {
         let prompts = owned_prompts(&requests);
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].contains("ownership-check"));
-        assert!(
-            prompts[0].contains(&format!("paused pending durable_wait {}", record.id)),
-            "{}",
-            prompts[0]
-        );
-        assert!(!prompts[0].contains("until the operator resumes"));
+        assert!(!prompts[0].contains("[Goal state"), "{}", prompts[0]);
         assert_eq!(*goal_status.lock().unwrap(), "paused");
     }
 
@@ -3049,8 +3000,11 @@ mod tests {
         }) }).await.unwrap()
     }
 
+    /// Stop turns the goal off. Neither the wait it raced, a peer's attention,
+    /// nor the operator's own message turns it back on; each still runs its
+    /// own turn. Only the operator's toggle does.
     #[tokio::test]
-    async fn owned_inflight_resolution_cannot_lift_operator_stop() {
+    async fn only_the_toggle_lifts_an_operator_stop() {
         let (orch, record, requests, goal_status) = owned_goal_env().await;
         assert!(
             suspend(&orch, &orch.db.local, &record)
@@ -3063,26 +3017,44 @@ mod tests {
         let resolving = resolve(&orch, &orch.db.local, &record, "real timeout result", false);
         let stopping = async {
             entered.await.unwrap();
-            crate::orchestrator::lifecycle::stop_session(&orch, &record.run_id).unwrap();
+            crate::orchestrator::lifecycle::operator_stop_run(&orch, &record.run_id).unwrap();
             release.send(()).unwrap();
         };
         let (resolved, ()) = tokio::join!(resolving, stopping);
         resolved.unwrap();
         assert_eq!(owned_active_requests(&requests), 0);
         assert!(owned_prompts(&requests)[0].contains("real timeout result"));
-        assert!(owned_prompts(&requests)[0].contains("operator Stop"));
         assert_eq!(tool_results(&orch).await.len(), 1);
         finish_owned_delivery(&orch).await;
         deliver_owned_attention(&orch, false).await;
         assert_eq!(owned_active_requests(&requests), 0);
-        assert!(owned_prompts(&requests)[1].contains("operator Stop"));
         finish_owned_delivery(&orch).await;
         deliver_owned_attention(&orch, true).await;
+        assert_eq!(
+            owned_active_requests(&requests),
+            0,
+            "an operator message runs its turn without turning the goal on"
+        );
+        let prompts = owned_prompts(&requests);
+        assert_eq!(prompts.len(), 3);
+        assert!(
+            prompts.iter().all(|prompt| !prompt.contains("[Goal state")),
+            "{prompts:?}"
+        );
+        assert_eq!(*goal_status.lock().unwrap(), "paused");
+        assert_eq!(
+            crate::execution::jobs::goal_intent_for_job(&orch, &record.job_id).unwrap(),
+            crate::execution::jobs::GoalIntent::Off
+        );
+
+        let state = crate::execution::jobs::set_job_goal_intent(
+            &orch,
+            &record.job_id,
+            crate::execution::jobs::GoalIntent::On,
+        )
+        .unwrap();
+        assert_eq!(state.intent, crate::execution::jobs::GoalIntent::On);
         assert_eq!(owned_active_requests(&requests), 1);
-        assert!(!owned_prompts(&requests)[2].contains("[Goal state: paused"));
-        let events = owned_event_data(&orch, "system:codex_goal_reactivated").await;
-        assert_eq!(events.len(), 1, "{events:?}");
-        assert!(events[0].contains("operator_message"), "{events:?}");
         assert_eq!(*goal_status.lock().unwrap(), "active");
     }
 
@@ -3108,7 +3080,7 @@ mod tests {
         let prompts = owned_prompts(&requests);
         assert_eq!(prompts.len(), 3);
         assert!(
-            prompts.iter().all(|p| p.contains("Goal state: complete")),
+            prompts.iter().all(|p| !p.contains("[Goal state")),
             "{prompts:?}"
         );
         assert_eq!(tool_results(&orch).await.len(), 1);
@@ -3166,7 +3138,7 @@ mod tests {
         let prompts = owned_prompts(&requests);
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].contains("A result"));
-        assert!(prompts[0].contains(&b.id), "{}", prompts[0]);
+        assert!(!prompts[0].contains("[Goal state"), "{}", prompts[0]);
         assert_eq!(tool_results(&orch).await.len(), 1);
         assert_eq!(
             load_resolution(&orch.db.local, &b.id)
@@ -3187,58 +3159,6 @@ mod tests {
         assert!(prompts[1].contains("B result"));
         assert!(!prompts[1].contains("[Goal state: paused"));
         assert_eq!(*goal_status.lock().unwrap(), "active");
-    }
-
-    #[tokio::test]
-    async fn owned_wait_resolution_cannot_lift_production_repeat_brake() {
-        let (orch, record, requests, goal_status) = owned_goal_env().await;
-        assert!(
-            suspend(&orch, &orch.db.local, &record)
-                .await
-                .unwrap()
-                .parked()
-                .await
-        );
-        for index in 0..3 {
-            let tripped = crate::backends::codex::observe_and_interrupt_for_test(
-                &orch,
-                &record.run_id,
-                &record.session_id,
-                orch.db.local.clone(),
-                &record.turn_id,
-                &format!("provider-repeat-{index}"),
-                "nothing has changed",
-            )
-            .unwrap();
-            assert_eq!(tripped, index == 2);
-        }
-        assert_eq!(
-            owned_event_data(&orch, "system:codex_repeat_circuit_breaker")
-                .await
-                .len(),
-            1
-        );
-        resolve(
-            &orch,
-            &orch.db.local,
-            &record,
-            "result after safety brake",
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(owned_active_requests(&requests), 0);
-        assert_eq!(tool_results(&orch).await.len(), 1);
-        let prompts = owned_prompts(&requests);
-        assert_eq!(prompts.len(), 1);
-        assert!(prompts[0].contains("repeat safety brake"), "{}", prompts[0]);
-        assert!(prompts[0].contains("result after safety brake"));
-        assert!(
-            owned_event_data(&orch, "system:codex_repeat_circuit_breaker_rearmed")
-                .await
-                .is_empty()
-        );
-        assert_eq!(*goal_status.lock().unwrap(), "paused");
     }
 
     #[tokio::test]

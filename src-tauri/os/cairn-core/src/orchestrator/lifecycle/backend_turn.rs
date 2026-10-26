@@ -1,5 +1,5 @@
 //! Host policy for backend turn completion. Provider facts arrive as a typed
-//! report; run finalization, task resumption, and safety pauses stay here.
+//! report; run finalization and task resumption stay here.
 
 use crate::agent_process::completion::{
     SessionLifetime, SessionTurnCompletion, SessionTurnOutcome,
@@ -17,8 +17,7 @@ use std::sync::Arc;
 
 pub(crate) use cairn_session::agent_process::completion::TurnFailureDisposition;
 
-/// Decisions already made by host recovery and repeat-output admission.
-/// These are not provider outcomes: a completed response can require a pause.
+/// Decisions already made by host recovery. These are not provider outcomes.
 pub(crate) use cairn_session::agent_process::completion::CodexTurnContext;
 
 /// Apply a report after the backend has flushed its final transcript chunks.
@@ -32,12 +31,6 @@ pub(crate) fn apply_codex_turn_completion(
     completion: SessionTurnCompletion,
     context: CodexTurnContext,
 ) {
-    if context.repeat_safety_pause {
-        super::transition_to_warm_safety_pause(orch, run_id);
-        emit_codex_run_turn_completed(emitter, run_id);
-        return;
-    }
-
     match completion.outcome {
         SessionTurnOutcome::Completed => {
             store_usage_result_event(
@@ -83,7 +76,7 @@ pub(crate) fn apply_codex_turn_completion(
                 completion.usage,
                 false,
             );
-            handle_codex_interrupted_turn(orch, run_db, emitter, run_id, session_id);
+            handle_codex_interrupted_turn(orch, run_db, emitter, run_id);
         }
         SessionTurnOutcome::Failed { status } => {
             store_usage_result_event(
@@ -127,17 +120,7 @@ fn handle_codex_interrupted_turn(
     run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
-    session_id: Option<&str>,
 ) {
-    if let Some(session_id) = session_id {
-        if crate::execution::jobs::codex_repeat_breaker_armed(run_db.clone(), run_id, session_id)
-            .unwrap_or(false)
-        {
-            super::transition_to_warm_safety_pause(orch, run_id);
-            emit_codex_run_turn_completed(emitter, run_id);
-            return;
-        }
-    }
     let terminal_tool_called = terminal_tool_called_for_run(orch, run_id);
     if should_finalize_task_run_on_interrupted_turn(
         terminal_tool_called,

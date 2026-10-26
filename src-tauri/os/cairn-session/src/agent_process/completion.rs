@@ -75,6 +75,5 @@ pub enum TurnFailureDisposition {
 }
 
 pub struct CodexTurnContext {
-    pub repeat_safety_pause: bool,
     pub failure_disposition: TurnFailureDisposition,
 }

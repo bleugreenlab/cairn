@@ -325,6 +325,15 @@ macro_rules! shared_tail_drop_check_test_outcomes_view {
     };
 }
 
+/// cairn/5337: the operator's durable on/off choice for a job's native provider
+/// goal. `jobs` is carried by both lineages, so the column is written once and
+/// composed into both.
+macro_rules! shared_tail_job_goal_intent {
+    () => {
+        migration!("0281_job_goal_intent")
+    };
+}
+
 /// cairn/4987: the base and incoming side a conflict session's committed
 /// resolution was resolved against, and the tip and destination of an
 /// outstanding take-committed-tip request. `jj_reconcile_items` is carried by
@@ -1571,6 +1580,7 @@ macro_rules! team_lineage {
             shared_tail_check_deferred_tests!(),
             shared_tail_execution_gates_execution_index!(),
             shared_tail_drop_check_test_outcomes_view!(),
+            shared_tail_job_goal_intent!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1855,6 +1865,7 @@ macro_rules! private_lineage {
             shared_tail_execution_gates_execution_index!(),
             shared_tail_drop_check_test_outcomes_view!(),
             private_execution_queue_build_volume_absent!(),
+            shared_tail_job_goal_intent!(),
         ]
     };
 }
@@ -3711,6 +3722,7 @@ mod tests {
                 "index_execution_gates_execution",
                 "drop_check_test_outcomes_view",
                 "execution_queue_build_volume_absent",
+                "job_goal_intent",
             ],
         );
     }
@@ -7245,6 +7257,8 @@ mod tests {
                 "check_deferred_tests",
                 "index_execution_gates_execution",
                 "drop_check_test_outcomes_view",
+                // cairn/5337: the operator's goal toggle on the shared `jobs` row.
+                "job_goal_intent",
             ],
         );
         assert_eq!(

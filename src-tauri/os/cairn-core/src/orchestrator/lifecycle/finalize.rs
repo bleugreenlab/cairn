@@ -232,80 +232,6 @@ pub(crate) fn release_process_admission(orch: &Orchestrator, run_id: &str) -> bo
     true
 }
 
-/// Park a repeated-output safety stop without projecting it as successful work.
-pub(crate) fn transition_to_warm_safety_pause(orch: &Orchestrator, run_id: &str) {
-    let turn_id = orch.process_state.get_current_turn_id(run_id);
-    if let Some(turn_id) = turn_id.as_deref() {
-        let result = run_db_blocking({
-            let dbs = orch.db.clone();
-            let emitter = orch.services.emitter.clone();
-            let turn_id = turn_id.to_string();
-            move || async move {
-                let db = crate::execution::routing::owning_db_for_turn(&dbs, &turn_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                crate::transitions::turn::yield_turn(
-                    &db,
-                    &turn_id,
-                    crate::models::TurnYieldReason::SafetyPause,
-                    &*emitter,
-                )
-                .await
-                .map_err(|error| error.to_string())
-            }
-        });
-        if let Err(error) = result {
-            log::error!("Failed to yield repeated-output safety pause for run {run_id}: {error}");
-            return;
-        }
-    }
-    orch.process_state.transition_to_warm(run_id);
-    if let Some(job_id) = job_id_for_run(orch, run_id) {
-        if let Err(error) = crate::execution::advancement::recompute_job(orch, &job_id) {
-            log::error!("Failed to recompute safety-paused job {job_id}: {error}");
-        }
-        emit_for_turn_end(orch, &job_id);
-        let parent_notice = run_db_blocking({
-            let dbs = orch.db.clone();
-            let job_id = job_id.clone();
-            move || async move {
-                let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let parent = db
-                    .query_opt_text(
-                        "SELECT parent_job_id FROM jobs WHERE id = ?1",
-                        (job_id.clone(),),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let Some(parent) = parent else {
-                    return Ok(None);
-                };
-                let content_ref = crate::messages::delivery::node_uri_for_job(&db, &job_id)
-                    .await
-                    .unwrap_or_else(|| job_id.clone());
-                crate::orchestrator::attention_push::push_with_fingerprint(
-                    &db,
-                    &parent,
-                    &content_ref,
-                    crate::orchestrator::attention_push::Wake::Wake,
-                    crate::orchestrator::attention_push::Boundary::Event,
-                    &format!("child-safety:{job_id}"),
-                    Some("paused"),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-                Ok(Some(parent))
-            }
-        });
-        if let Err(error) = parent_notice {
-            log::warn!("Failed to notify parent of safety-paused child {job_id}: {error}");
-        }
-    }
-    emit_agent_terminal_attention_once(orch, run_id, "paused");
-}
-
 fn goal_reconciliation_for_job_status(status: &str) -> Option<GoalReconciliation> {
     match status {
         "complete" => Some(GoalReconciliation::Complete),
@@ -355,9 +281,10 @@ fn reconcile_warm_codex_goal_from_job(orch: &Orchestrator, run_id: &str, job_id:
         log::error!("Cannot reconcile Codex goal for job {job_id}: unknown status {status}");
         return;
     };
-    if let Err(error) =
-        crate::backends::stdin::reconcile_goal(&orch.process_state, run_id, goal_status)
-    {
+    let reconciled = crate::execution::jobs::goal_intent_for_job(orch, job_id).and_then(|intent| {
+        crate::backends::stdin::reconcile_goal(&orch.process_state, run_id, goal_status, intent)
+    });
+    if let Err(error) = reconciled {
         log::error!(
             "Failed to reconcile Codex goal for authoritative job {job_id} ({status} -> {goal_status:?}): {error}"
         );

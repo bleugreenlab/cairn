@@ -142,10 +142,16 @@ pub enum DedupOutcome {
 use cairn_models::turn::SuspendKind;
 
 /// A process-scoped claim on a native goal's paused state.
+///
+/// The claim records why the provider goal is paused *right now*. Whether it may
+/// continue once that cause clears is a separate, durable decision: the job's
+/// operator goal intent, which every release path consults.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GoalPause {
-    OperatorHold,
-    SafetyBrake,
+    /// A Stop ended the live turn. It supersedes every other cause, because a
+    /// Stop also cancels whatever the turn was waiting on, and it lifts when the
+    /// job is next admitted to run.
+    Interrupted,
     /// The operator is tearing this process down to compact its session. No
     /// release path lifts it: the claim dies with the process, and the
     /// successor session starts on a fresh provider thread.
@@ -173,7 +179,7 @@ impl JobPauseState {
 impl GoalPause {
     pub fn may_supersede(&self, current: Option<&GoalPause>) -> bool {
         match self {
-            Self::OperatorHold | Self::SafetyBrake | Self::OperatorCompact => true,
+            Self::Interrupted | Self::OperatorCompact => true,
             // A newly established wait supersedes an older wait so stale results
             // cannot release the goal while the new condition remains pending.
             Self::Owned(_) => matches!(current, None | Some(Self::JobState(_) | Self::Owned(_))),
@@ -238,12 +244,16 @@ impl GoalPauseClaim {
         }
     }
 
-    /// Admission clears only unattributed and job-state pauses, never typed holds or waits.
+    /// Admission clears unattributed, job-state, and interrupt pauses, never
+    /// compaction or an owned wait.
     pub fn release_unowned(
         &mut self,
         activate: impl FnOnce() -> Result<(), String>,
     ) -> Result<bool, String> {
-        if !matches!(self.cause, None | Some(GoalPause::JobState(_))) {
+        if !matches!(
+            self.cause,
+            None | Some(GoalPause::JobState(_) | GoalPause::Interrupted)
+        ) {
             return Ok(false);
         }
         activate()?;
@@ -265,22 +275,16 @@ impl GoalPauseClaim {
         Ok(true)
     }
 
-    pub fn release_operator_hold(
-        &mut self,
-        activate: impl FnOnce() -> Result<(), String>,
-    ) -> Result<bool, String> {
-        if self.cause != Some(GoalPause::OperatorHold) {
-            return Ok(false);
+    /// Drop this durable condition's claim without activating the goal: the
+    /// condition resolved, but the operator has the goal turned off. Leaving the
+    /// claim would keep the goal waiting on a condition that can never resolve
+    /// again once the operator turns it back on.
+    pub fn consume(&mut self, owner: &GoalPauseOwner) -> bool {
+        if !matches!(&self.cause, Some(GoalPause::Owned(current)) if current == owner) {
+            return false;
         }
-        activate()?;
         self.cause = None;
-        Ok(true)
-    }
-
-    pub fn rearm_safety_brake(&mut self) {
-        if self.cause == Some(GoalPause::SafetyBrake) {
-            self.cause = Some(GoalPause::OperatorHold);
-        }
+        true
     }
 
     /// Restore a failed park's snapshot only if no later stake has superseded it.
@@ -2338,8 +2342,7 @@ mod goal_pause_claim_tests {
     fn causes() -> Vec<Option<GoalPause>> {
         vec![
             None,
-            Some(GoalPause::OperatorHold),
-            Some(GoalPause::SafetyBrake),
+            Some(GoalPause::Interrupted),
             Some(GoalPause::OperatorCompact),
             Some(GoalPause::Owned(GoalPauseOwner::DurableWait {
                 wait_id: "wait-a".into(),
@@ -2382,9 +2385,7 @@ mod goal_pause_claim_tests {
         for current in causes() {
             for proposed in causes().into_iter().flatten() {
                 let allowed = match proposed {
-                    GoalPause::OperatorHold
-                    | GoalPause::SafetyBrake
-                    | GoalPause::OperatorCompact => true,
+                    GoalPause::Interrupted | GoalPause::OperatorCompact => true,
                     GoalPause::Owned(_) => matches!(
                         current,
                         None | Some(GoalPause::JobState(_) | GoalPause::Owned(_))
@@ -2413,7 +2414,10 @@ mod goal_pause_claim_tests {
     #[test]
     fn release_unowned_clears_only_unowned_causes() {
         for cause in causes() {
-            let allowed = matches!(cause, None | Some(GoalPause::JobState(_)));
+            let allowed = matches!(
+                cause,
+                None | Some(GoalPause::JobState(_) | GoalPause::Interrupted)
+            );
             let mut claim = GoalPauseClaim {
                 cause: cause.clone(),
             };
@@ -2448,20 +2452,17 @@ mod goal_pause_claim_tests {
     }
 
     #[test]
-    fn rearm_safety_brake_is_unchanged() {
+    fn consume_drops_only_the_named_condition_without_activating() {
+        let owner = GoalPauseOwner::DurableWait {
+            wait_id: "wait-a".into(),
+        };
         for cause in causes() {
             let mut claim = GoalPauseClaim {
                 cause: cause.clone(),
             };
-            claim.rearm_safety_brake();
-            assert_eq!(
-                claim.inspect(),
-                if cause == Some(GoalPause::SafetyBrake) {
-                    Some(GoalPause::OperatorHold)
-                } else {
-                    cause
-                }
-            );
+            let matches = cause == Some(GoalPause::Owned(owner.clone()));
+            assert_eq!(claim.consume(&owner), matches);
+            assert_eq!(claim.inspect(), if matches { None } else { cause });
         }
     }
 }

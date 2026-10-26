@@ -1,7 +1,6 @@
 use super::{
     finalize_run, finalize_run_for_recovery, stop_job, stop_session, stop_session_internal,
-    suspend_run_for_durable_wait, transition_to_warm_safety_pause, transition_to_warm_state,
-    StopReason,
+    suspend_run_for_durable_wait, transition_to_warm_state, StopReason,
 };
 use crate::agent_process::process::{GoalPauseOwner, RunHandle};
 use crate::db::DbState;
@@ -17,58 +16,6 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Default)]
 struct SharedCaptureEmitter {
     events: Arc<Mutex<Vec<(String, Value)>>>,
-}
-
-#[tokio::test]
-async fn delegated_repeated_output_parks_as_safety_pause_and_notifies_parent() {
-    let db = test_db().await;
-    seed_top_level_run(&db, "run-safety", "job-safety", "turn-safety", "none").await;
-    db.execute_script(
-        "INSERT INTO jobs(id,issue_id,project_id,status,node_name,created_at,updated_at)
-           VALUES('job-parent','i-attn','p-attn','running','parent',1,1);
-         UPDATE jobs SET parent_job_id='job-parent' WHERE id='job-safety';",
-    )
-    .await
-    .unwrap();
-    let (orch, emitter) = test_orchestrator_with_emitter(db, None);
-    register_warm_process(&orch, "run-safety", Some("job-safety"));
-    orch.process_state
-        .set_current_turn_id("run-safety", Some("turn-safety"));
-
-    transition_to_warm_safety_pause(&orch, "run-safety");
-
-    assert_eq!(turn_state(&orch, "turn-safety").await, "yielded");
-    assert_eq!(
-        scalar_text(
-            &orch,
-            "SELECT yield_reason FROM turns WHERE id = ?1",
-            "turn-safety"
-        )
-        .await
-        .as_deref(),
-        Some("safety_pause")
-    );
-    assert_eq!(
-        scalar_text(&orch, "SELECT status FROM runs WHERE id = ?1", "run-safety")
-            .await
-            .as_deref(),
-        Some("live"),
-        "the warm session remains open and resumable"
-    );
-    // Delegated work reports to its parent; desktop terminal toasts are for
-    // top-level jobs. The parent push below is the actionable notification.
-    assert!(agent_attention_events(&emitter, "paused").is_empty());
-    assert!(agent_attention_events(&emitter, "failed").is_empty());
-    assert!(agent_attention_events(&emitter, "completed").is_empty());
-    let parent_pushes = orch.db.local.query_opt(
-        "SELECT COUNT(*) FROM attention_pushes WHERE recipient='job-parent' AND key='child-safety:job-safety'",
-        (),
-        |row| row.i64(0),
-    ).await.unwrap().unwrap_or(0);
-    assert_eq!(
-        parent_pushes, 1,
-        "a delegated parent sees one resumable safety pause"
-    );
 }
 
 #[tokio::test]
@@ -205,8 +152,9 @@ async fn user_stop_pauses_codex_goal_before_worst_order_idle_and_resumes_same_ba
                 id: None,
             }),
             crate::execution::jobs::JobRunnable::Attested,
+            crate::execution::jobs::GoalIntent::On,
         )
-        .expect("explicit attention should inspect and reactivate the paused goal"),
+        .expect("admission should inspect and reactivate the paused goal"),
         crate::backends::stdin::GoalReactivationResult::Lifted { .. }
     ));
     crate::backends::stdin::send_user_message(
@@ -1316,7 +1264,6 @@ mod backend_turn {
         run_id: &str,
         outcome: SessionTurnOutcome,
         lifetime: SessionLifetime,
-        safety_pause: bool,
         handled: bool,
     ) {
         apply_codex_turn_completion(
@@ -1337,7 +1284,6 @@ mod backend_turn {
                 session_lifetime: lifetime,
             },
             CodexTurnContext {
-                repeat_safety_pause: safety_pause,
                 failure_disposition: if handled {
                     TurnFailureDisposition::AlreadyHandled
                 } else {
@@ -1385,7 +1331,6 @@ mod backend_turn {
             SessionTurnOutcome::Completed,
             SessionLifetime::Persistent,
             false,
-            false,
         );
         assert_eq!(turn_state(&orch, "t").await, "complete");
         assert_eq!(
@@ -1420,7 +1365,6 @@ mod backend_turn {
             SessionTurnOutcome::Completed,
             SessionLifetime::OneShot,
             false,
-            false,
         );
         assert_eq!(turn_state(&orch, "t").await, "complete");
         assert_eq!(
@@ -1453,7 +1397,6 @@ mod backend_turn {
                 "run-child",
                 outcome,
                 SessionLifetime::Persistent,
-                false,
                 false,
             );
             assert_eq!(
@@ -1501,7 +1444,6 @@ mod backend_turn {
                 SessionTurnOutcome::Interrupted,
                 SessionLifetime::Persistent,
                 false,
-                false,
             );
             assert_eq!(
                 scalar_text(&orch, "SELECT status FROM runs WHERE id=?1", "run-child")
@@ -1524,42 +1466,6 @@ mod backend_turn {
     }
 
     #[tokio::test]
-    async fn safety_pause_overrides_success_and_preserves_the_pending_parent() {
-        let db = test_db().await;
-        seed_suspended_parent_with_running_child(&db, running_child_snapshot()).await;
-        let (orch, emitter) = test_orchestrator_with_emitter(db, None);
-        register_warm_process(&orch, "run-child", Some("j-child"));
-        orch.process_state
-            .set_current_turn_id("run-child", Some("child-turn"));
-        complete(
-            &orch,
-            "run-child",
-            SessionTurnOutcome::Completed,
-            SessionLifetime::Persistent,
-            true,
-            false,
-        );
-        assert_eq!(turn_state(&orch, "child-turn").await, "yielded");
-        assert_eq!(
-            scalar_text(
-                &orch,
-                "SELECT yield_reason FROM turns WHERE id=?1",
-                "child-turn"
-            )
-            .await
-            .as_deref(),
-            Some("safety_pause")
-        );
-        assert_eq!(turn_state(&orch, "succ").await, "pending");
-        assert_eq!(
-            result_count(&orch).await,
-            0,
-            "a safety pause must not manufacture a success result"
-        );
-        assert_eq!(emitter.events_named("run-turn-completed").len(), 1);
-    }
-
-    #[tokio::test]
     async fn already_handled_failure_records_usage_without_repeating_lifecycle_or_diagnostic() {
         let db = test_db().await;
         seed_suspended_parent_with_running_child(&db, running_child_snapshot()).await;
@@ -1574,7 +1480,6 @@ mod backend_turn {
                 status: "failed".into(),
             },
             SessionLifetime::Persistent,
-            false,
             true,
         );
         assert_eq!(
@@ -1626,7 +1531,6 @@ mod backend_turn {
                 session_lifetime: SessionLifetime::Persistent,
             },
             CodexTurnContext {
-                repeat_safety_pause: false,
                 failure_disposition: TurnFailureDisposition::DiagnosticRecorded,
             },
         );
@@ -1680,65 +1584,11 @@ mod backend_turn {
                     session_lifetime: SessionLifetime::Persistent,
                 },
                 CodexTurnContext {
-                    repeat_safety_pause: false,
                     failure_disposition: TurnFailureDisposition::AlreadyHandled,
                 },
             );
             assert_eq!(result_count(&orch).await, expected);
         }
-    }
-
-    #[tokio::test]
-    async fn persisted_repeat_breaker_overrides_interrupted_artifact_handoff() {
-        let db = test_db().await;
-        seed_suspended_parent_with_running_child(&db, running_child_snapshot()).await;
-        db.execute_script("INSERT INTO events(id,run_id,session_id,event_type,data,timestamp,created_at,sequence) VALUES('breaker','run-child','s-child','system:codex_repeat_circuit_breaker','{}',1,1,1);").await.unwrap();
-        let orch = test_orchestrator(db);
-        register_warm_process(&orch, "run-child", Some("j-child"));
-        orch.process_state
-            .set_current_turn_id("run-child", Some("child-turn"));
-        orch.process_state
-            .processes
-            .lock()
-            .unwrap()
-            .get("run-child")
-            .unwrap()
-            .terminal_tool_called
-            .store(true, std::sync::atomic::Ordering::Release);
-        apply_codex_turn_completion(
-            &orch,
-            &orch.db.local,
-            &orch.services.emitter,
-            "run-child",
-            Some("s-child"),
-            SessionTurnCompletion {
-                outcome: SessionTurnOutcome::Interrupted,
-                usage: TokenCounts::default(),
-                session_lifetime: SessionLifetime::Persistent,
-            },
-            CodexTurnContext {
-                repeat_safety_pause: false,
-                failure_disposition: TurnFailureDisposition::Unhandled,
-            },
-        );
-        assert_eq!(turn_state(&orch, "child-turn").await, "yielded");
-        assert_eq!(
-            scalar_text(
-                &orch,
-                "SELECT yield_reason FROM turns WHERE id=?1",
-                "child-turn"
-            )
-            .await
-            .as_deref(),
-            Some("safety_pause")
-        );
-        assert_eq!(turn_state(&orch, "succ").await, "pending");
-        assert_eq!(
-            scalar_text(&orch, "SELECT status FROM runs WHERE id=?1", "run-child")
-                .await
-                .as_deref(),
-            Some("live")
-        );
     }
 }
 
@@ -1946,10 +1796,9 @@ mod honest_pause_regressions {
     use super::*;
     use crate::agent_process::process::{GoalControl, GoalPause, JobPauseState, PauseIntent};
     use crate::backends::stdin::{
-        defer_codex_goal_turn, reactivate_goal, rearm_goal_safety_brake, GoalPauseCause,
-        GoalReactivationResult,
+        defer_codex_goal_turn, reactivate_goal, GoalPauseCause, GoalReactivationResult,
     };
-    use crate::execution::jobs::{goal_pause_notice, GoalReactivation, JobRunnable};
+    use crate::execution::jobs::{GoalIntent, GoalReactivation, JobRunnable};
 
     fn goal_reply(status: &str) -> Result<Value, String> {
         Ok(serde_json::json!({"result": {"goal": {
@@ -2067,8 +1916,14 @@ mod honest_pause_regressions {
     #[tokio::test]
     async fn blocked_job_finalization_pauses_as_job_state_not_operator_hold() {
         let (orch, control, requests) = blocked_child(vec![goal_reply("paused")]).await;
-        let result =
-            reactivate_goal(&orch.process_state, "run-child", None, JobRunnable::Unknown).unwrap();
+        let result = reactivate_goal(
+            &orch.process_state,
+            "run-child",
+            None,
+            JobRunnable::Unknown,
+            GoalIntent::On,
+        )
+        .unwrap();
         let GoalReactivationResult::StillPaused { cause } = result else {
             panic!("blocked work must remain paused without admission");
         };
@@ -2076,9 +1931,6 @@ mod honest_pause_regressions {
             cause,
             GoalPauseCause::Paused(GoalPause::JobState(JobPauseState::Blocked))
         );
-        let notice = goal_pause_notice(&cause);
-        assert!(notice.contains("blocked"));
-        assert!(!notice.to_lowercase().contains("operator"));
         assert_eq!(
             claim(&control),
             Some(GoalPause::JobState(JobPauseState::Blocked))
@@ -2095,7 +1947,8 @@ mod honest_pause_regressions {
                 &orch.process_state,
                 "run-child",
                 None,
-                JobRunnable::Attested
+                JobRunnable::Attested,
+                GoalIntent::On,
             )
             .unwrap(),
             GoalReactivationResult::Lifted {
@@ -2107,8 +1960,10 @@ mod honest_pause_regressions {
         assert_eq!(set_statuses(&requests), ["paused", "active"]);
     }
 
+    /// A Stop pauses as interrupted. Nothing lifts it but the job's admission,
+    /// and only while the operator's goal intent is on.
     #[tokio::test]
-    async fn operator_stop_stays_sticky_across_peer_traffic_and_owned_resolutions() {
+    async fn stop_pause_lifts_only_on_admission_with_the_goal_on() {
         let db = test_db().await;
         seed_top_level_run(&db, "run-pause", "job-pause", "turn-pause", "none").await;
         let orch = test_orchestrator(db);
@@ -2128,7 +1983,7 @@ mod honest_pause_regressions {
             ],
         );
         stop_session_internal(&orch, "run-pause", StopReason::OperatorStop).unwrap();
-        assert_eq!(claim(&control), Some(GoalPause::OperatorHold));
+        assert_eq!(claim(&control), Some(GoalPause::Interrupted));
         assert!(requests
             .lock()
             .unwrap()
@@ -2137,35 +1992,39 @@ mod honest_pause_regressions {
         let unrelated = GoalReactivation::OwnedConditionResolved(GoalPauseOwner::DurableWait {
             wait_id: "unrelated-wait".into(),
         });
-        for trigger in [None, Some(&unrelated)] {
-            assert!(matches!(
-                reactivate_goal(
-                    &orch.process_state,
-                    "run-pause",
-                    trigger,
-                    JobRunnable::Attested
-                )
-                .unwrap(),
-                GoalReactivationResult::StillPaused {
-                    cause: GoalPauseCause::Paused(GoalPause::OperatorHold)
-                }
-            ));
-            assert_eq!(claim(&control), Some(GoalPause::OperatorHold));
+        for (trigger, runnable, intent, expected) in [
+            (
+                None,
+                JobRunnable::Unknown,
+                GoalIntent::On,
+                GoalPauseCause::Paused(GoalPause::Interrupted),
+            ),
+            (
+                Some(&unrelated),
+                JobRunnable::Attested,
+                GoalIntent::Off,
+                GoalPauseCause::OperatorOff,
+            ),
+        ] {
+            assert_eq!(
+                reactivate_goal(&orch.process_state, "run-pause", trigger, runnable, intent)
+                    .unwrap(),
+                GoalReactivationResult::StillPaused { cause: expected }
+            );
+            assert_eq!(claim(&control), Some(GoalPause::Interrupted));
             assert_eq!(set_statuses(&requests), ["paused"]);
         }
         assert!(matches!(
             reactivate_goal(
                 &orch.process_state,
                 "run-pause",
-                Some(&GoalReactivation::Operator {
-                    kind: "explicit_resume",
-                    id: None,
-                }),
-                JobRunnable::Attested
+                None,
+                JobRunnable::Attested,
+                GoalIntent::On,
             )
             .unwrap(),
             GoalReactivationResult::Lifted {
-                kind: "explicit_resume",
+                kind: "job_runnable",
                 ..
             }
         ));
@@ -2188,23 +2047,27 @@ mod honest_pause_regressions {
             ],
         );
         assert_eq!(claim(&control), None);
-        let result =
-            reactivate_goal(&orch.process_state, "run-pause", None, JobRunnable::Unknown).unwrap();
+        let result = reactivate_goal(
+            &orch.process_state,
+            "run-pause",
+            None,
+            JobRunnable::Unknown,
+            GoalIntent::On,
+        )
+        .unwrap();
         let GoalReactivationResult::StillPaused { cause } = result else {
             panic!("unattested pause must remain");
         };
         assert_eq!(cause, GoalPauseCause::Unattributed);
         assert_eq!(claim(&control), None);
-        let notice = goal_pause_notice(&cause);
-        assert!(!notice.to_lowercase().contains("operator"));
-        assert!(!notice.contains("Stop"));
         assert!(set_statuses(&requests).is_empty());
         assert!(matches!(
             reactivate_goal(
                 &orch.process_state,
                 "run-pause",
                 None,
-                JobRunnable::Attested
+                JobRunnable::Attested,
+                GoalIntent::On,
             )
             .unwrap(),
             GoalReactivationResult::Lifted {
@@ -2217,63 +2080,8 @@ mod honest_pause_regressions {
     }
 
     #[tokio::test]
-    async fn safety_brake_and_complete_semantics_are_unchanged() {
+    async fn complete_goal_is_never_reactivated() {
         let orch = test_orchestrator(test_db().await);
-        let (control, requests) = register_codex(
-            &orch,
-            "run-pause",
-            "job-pause",
-            "turn-pause",
-            vec![
-                goal_reply("active"),
-                goal_reply("paused"),
-                Ok(Value::Null),
-                goal_reply("paused"),
-                goal_reply("paused"),
-                goal_reply("active"),
-            ],
-        );
-        crate::backends::stdin::send_interrupt(
-            &orch.process_state,
-            "run-pause",
-            PauseIntent::Stake(GoalPause::SafetyBrake),
-        )
-        .unwrap();
-        assert!(matches!(
-            reactivate_goal(
-                &orch.process_state,
-                "run-pause",
-                None,
-                JobRunnable::Attested
-            )
-            .unwrap(),
-            GoalReactivationResult::StillPaused {
-                cause: GoalPauseCause::Paused(GoalPause::SafetyBrake)
-            }
-        ));
-        assert_eq!(claim(&control), Some(GoalPause::SafetyBrake));
-        assert_eq!(set_statuses(&requests), ["paused"]);
-        rearm_goal_safety_brake(&orch.process_state, "run-pause").unwrap();
-        assert_eq!(claim(&control), Some(GoalPause::OperatorHold));
-        assert!(matches!(
-            reactivate_goal(
-                &orch.process_state,
-                "run-pause",
-                Some(&GoalReactivation::Operator {
-                    kind: "explicit_resume",
-                    id: None,
-                }),
-                JobRunnable::Attested
-            )
-            .unwrap(),
-            GoalReactivationResult::Lifted {
-                kind: "explicit_resume",
-                ..
-            }
-        ));
-        assert_eq!(claim(&control), None);
-        assert_eq!(set_statuses(&requests), ["paused", "active"]);
-
         let (complete_control, complete_requests) = register_codex(
             &orch,
             "run-complete",
@@ -2286,7 +2094,8 @@ mod honest_pause_regressions {
                 &orch.process_state,
                 "run-complete",
                 None,
-                JobRunnable::Attested
+                JobRunnable::Attested,
+                GoalIntent::On,
             )
             .unwrap(),
             GoalReactivationResult::StillPaused {
@@ -2331,7 +2140,14 @@ mod honest_pause_regressions {
         }
         assert_eq!(set_statuses(&requests), ["paused"]);
         assert!(matches!(
-            reactivate_goal(&orch.process_state, "run-pause", None, JobRunnable::Unknown).unwrap(),
+            reactivate_goal(
+                &orch.process_state,
+                "run-pause",
+                None,
+                JobRunnable::Unknown,
+                GoalIntent::On,
+            )
+            .unwrap(),
             GoalReactivationResult::StillPaused {
                 cause: GoalPauseCause::Unattributed
             }
@@ -2342,7 +2158,8 @@ mod honest_pause_regressions {
                 &orch.process_state,
                 "run-pause",
                 None,
-                JobRunnable::Attested
+                JobRunnable::Attested,
+                GoalIntent::On,
             )
             .unwrap(),
             GoalReactivationResult::Lifted {
