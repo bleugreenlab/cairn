@@ -118,7 +118,7 @@ mod tests {
     /// The merge gate trusts jj's recorded conflict state: a sibling whose
     /// auto-rebase recorded a conflict is reported (with its commits and files),
     /// a cleanly-rebased sibling is not, and a non-jj project never gates.
-    /// Self-skips when jj is unresolvable.
+    /// Records a jj-unavailable skip when jj is unresolvable.
     ///
     /// Serialized on the shared `jj` key: like every test that drives the real
     /// jj binary, it must not run concurrently with another, or the spawned jj
@@ -126,22 +126,8 @@ mod tests {
     #[test]
     #[serial_test::serial(jj)]
     fn source_conflict_report_gates_and_enumerates_recorded_conflicts() {
-        let bin = match std::env::var("CAIRN_JJ_BIN")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                crate::env::command("jj")
-                    .arg("--version")
-                    .output()
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .map(|_| "jj".to_string())
-            }) {
-            Some(bin) => bin,
-            None => {
-                eprintln!("skipping jj_source_branch_conflicted_gates_only_recorded_conflicts: jj not resolvable");
-                return;
-            }
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
         };
         let run_git = |dir: &std::path::Path, args: &[&str]| {
             assert!(

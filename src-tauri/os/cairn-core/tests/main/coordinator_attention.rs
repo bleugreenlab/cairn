@@ -344,17 +344,44 @@ async fn seed_plan_gate_child(db: &LocalDb) {
     .unwrap();
 }
 
-/// Poll for the pushes under `key`. The review-readiness hook is detached from
-/// the recompute sweep, so the wake lands shortly after `recompute_job` returns.
-async fn await_push_rows(db: &LocalDb, key: &str) -> Vec<(String, String, Option<String>)> {
-    for _ in 0..100 {
-        let rows = push_rows(db, key).await;
-        if !rows.is_empty() {
-            return rows;
+/// How long a wait in this file may run before it is reported as a broken
+/// fixture. It is not a latency budget. Every wait polls for an observable the
+/// code under test produces on its own detached task or thread, and how long
+/// that takes is the host's scheduling latency, not the code's behaviour: these
+/// tests take about a second on an idle host and from thirteen to seventy-seven
+/// on a saturated Linux executor, where a fixed five-second window lost about one
+/// run in four. The guard sits far above any load seen and at half nextest's
+/// wedged-test bound, so a genuine hang still ends as a named panic saying which
+/// observable never arrived.
+const FIXTURE_GUARD: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Poll `probe` until it yields a value, or `None` once [`FIXTURE_GUARD`] has
+/// elapsed.
+async fn poll_until<T, Fut>(mut probe: impl FnMut() -> Fut) -> Option<T>
+where
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = std::time::Instant::now() + FIXTURE_GUARD;
+    loop {
+        if let Some(value) = probe().await {
+            return Some(value);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    panic!("no attention push was created for {key} within the wait window");
+}
+
+/// Wait for the pushes under `key`. The review-readiness hook is detached from
+/// the recompute sweep, so the wake lands after `recompute_job` returns.
+async fn await_push_rows(db: &LocalDb, key: &str) -> Vec<(String, String, Option<String>)> {
+    poll_until(move || async move {
+        let rows = push_rows(db, key).await;
+        (!rows.is_empty()).then_some(rows)
+    })
+    .await
+    .unwrap_or_else(|| panic!("no attention push was created for {key} within {FIXTURE_GUARD:?}"))
 }
 
 async fn push_rows(db: &LocalDb, key: &str) -> Vec<(String, String, Option<String>)> {
@@ -380,38 +407,43 @@ async fn push_rows(db: &LocalDb, key: &str) -> Vec<(String, String, Option<Strin
     .unwrap()
 }
 
-/// Wait (bounded) for the recorder to see `n` spawns. A cold resume is admitted
-/// durably and promoted on its own thread, so the spawn trails the call that
-/// queued it. Returns without failing; the caller's assertion reports a miss.
+/// Wait for the recorder to see `n` spawns. A cold resume is admitted durably
+/// and promoted on its own thread, so the spawn trails the call that queued it.
+/// Returns without failing; the caller's assertion reports a miss.
 async fn await_spawn_count(recorder: &RecordingProcessSpawner, n: usize) {
-    for _ in 0..100 {
-        if recorder.spawn_count() >= n {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    poll_until(move || async move { (recorder.spawn_count() >= n).then_some(()) }).await;
 }
 
-/// Wait (bounded) for the admission request of `run_id`'s launch to reach a
-/// terminal state, and return that state.
+async fn admission_state(db: &LocalDb, launch_key: &str) -> Option<String> {
+    db.query_opt_text(
+        "SELECT state FROM runtime_admission_requests WHERE launch_key=?1",
+        (launch_key.to_string(),),
+    )
+    .await
+    .unwrap()
+}
+
+/// Wait for the admission request of `run_id`'s launch to reach a terminal
+/// state, and return that state.
 async fn await_admission_settled(db: &LocalDb, run_id: &str) -> String {
     let launch_key = format!("ordinary:{run_id}");
-    for _ in 0..100 {
-        let state = db
-            .query_opt_text(
-                "SELECT state FROM runtime_admission_requests WHERE launch_key=?1",
-                (launch_key.clone(),),
-            )
+    let key = launch_key.as_str();
+    if let Some(settled) = poll_until(move || async move {
+        admission_state(db, key)
             .await
-            .unwrap();
-        if let Some(state) =
-            state.filter(|state| matches!(state.as_str(), "failed" | "cancelled" | "released"))
-        {
-            return state;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            .filter(|state| matches!(state.as_str(), "failed" | "cancelled" | "released"))
+    })
+    .await
+    {
+        return settled;
     }
-    panic!("the admission request for {launch_key} never settled within the wait window");
+    // `queued` here means no promotion pass leased the request: either the
+    // promoter never ran, or the lane declined it (a memory brake reads the
+    // host's real free memory). `leased`/`starting` means a start never returned.
+    panic!(
+        "the admission request for {launch_key} never settled within {FIXTURE_GUARD:?}; it is {:?}",
+        admission_state(db, key).await
+    );
 }
 
 async fn attention_event_count(db: &LocalDb) -> i64 {
