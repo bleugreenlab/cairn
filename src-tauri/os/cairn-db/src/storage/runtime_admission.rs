@@ -1225,14 +1225,19 @@ impl LaneBudget {
 /// is treated like `active` and gets no cover.
 const AWAITING_LAUNCH: &str = "(r.state IN ('leased','starting') OR (r.state='queued' AND NOT EXISTS (SELECT 1 FROM team_ordinary_admission_authority a WHERE a.request_id=r.request_id)))";
 
-/// Run ids whose ordinary launch is durably between enqueue and process
-/// registration: `queued`, `leased` or `starting`, private or team. These are
-/// launch claims as surely as the in-memory one is, and they hold through the
-/// handoff to the promoter, which takes the job's launch lock only later. An
-/// `active` row is deliberately excluded: it means a process registered, so a
-/// run holding one with no process handle really is stale.
+/// The workspace key of the ephemeral-call admission ledger. Call rows are
+/// runner-local and carry their launch identity as `call:{run_id}`.
+pub const CALL_ADMISSION_WORKSPACE: &str = "local-runtime";
+
+/// Run ids whose launch is durably between enqueue and process registration:
+/// an ordinary launch `queued`, `leased` or `starting` (private or team), or an
+/// ephemeral call in the same three states. These are launch claims as surely
+/// as the in-memory one is, and they hold through the handoff to the promoter,
+/// which may take minutes to reach process registration. An `active` row is
+/// deliberately excluded: it means a process registered, so a run holding one
+/// with no process handle really is stale.
 pub async fn pending_launch_run_ids(db: &LocalDb) -> DbResult<HashSet<String>> {
-    Ok(db
+    let mut pending: HashSet<String> = db
         .query_all(
             format!("SELECT p.run_id FROM prepared_ordinary_launches p JOIN runtime_admission_requests r ON r.request_id=p.request_id WHERE {AWAITING_LAUNCH}"),
             (),
@@ -1240,7 +1245,97 @@ pub async fn pending_launch_run_ids(db: &LocalDb) -> DbResult<HashSet<String>> {
         )
         .await?
         .into_iter()
-        .collect())
+        .collect();
+    pending.extend(
+        db.query_all(
+            "SELECT c.run_id FROM prepared_runtime_calls c JOIN runtime_admission_requests r ON r.request_id=c.request_id WHERE r.state IN ('queued','leased','starting')",
+            (),
+            |row| row.text(0),
+        )
+        .await?,
+    );
+    Ok(pending)
+}
+
+/// A team replica carries no admission table (the rows are runner-local), so a
+/// settle write against one has nothing to withdraw.
+async fn has_admission_table(conn: &crate::turso::Connection) -> DbResult<bool> {
+    let mut table = conn
+        .query(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_admission_requests'",
+            (),
+        )
+        .await?;
+    Ok(table.next().await?.is_some())
+}
+
+/// Cancel the still-`queued` call request of `run_id` inside the caller's
+/// write, the call-ledger sibling of [`withdraw_queued_ordinary_admission`].
+/// Returns whether a row was cancelled.
+///
+/// Only `queued` rows are touched: a queued row has no owner and no process.
+/// A `leased`, `starting` or `active` row may have a process behind it, and
+/// leaves those states only through the path that also stops that process
+/// (`on_call_run_finalized` in cairn-core), which the caller runs after its
+/// write commits.
+pub async fn withdraw_queued_call_admission(
+    conn: &crate::turso::Connection,
+    run_id: &str,
+    detail: &str,
+    now: i64,
+) -> DbResult<bool> {
+    if !has_admission_table(conn).await? {
+        return Ok(false);
+    }
+    let changed = conn
+        .execute(
+            "UPDATE runtime_admission_requests SET state='cancelled',failure_detail=?3,updated_at=?4 WHERE workspace_key=?1 AND launch_key=?2 AND state='queued'",
+            params![
+                CALL_ADMISSION_WORKSPACE,
+                format!("call:{run_id}"),
+                detail.to_string(),
+                now
+            ],
+        )
+        .await?;
+    Ok(changed == 1)
+}
+
+/// A call admission row that still occupies or awaits a slot, with the run it
+/// would launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsettledCallAdmission {
+    pub request_id: String,
+    /// `queued`, `leased`, `starting` or `active`.
+    pub state: String,
+    pub resource_lane: String,
+    pub run_id: String,
+    pub prepared_json: String,
+    /// The run's status when its row lives in this database. `None` when the
+    /// run lives elsewhere (a team replica) or no longer exists; the caller
+    /// resolves those against the run's owning database.
+    pub local_run_status: Option<String>,
+}
+
+/// Every call admission row still `queued`, `leased`, `starting` or `active`,
+/// in queue order, joined with its run's local status so a sweep can find the
+/// rows whose run is already over without a lookup per row.
+pub async fn list_unsettled_call_admissions(db: &LocalDb) -> DbResult<Vec<UnsettledCallAdmission>> {
+    db.query_all(
+        "SELECT r.request_id,r.state,r.resource_lane,c.run_id,c.prepared_json,ru.status FROM runtime_admission_requests r JOIN prepared_runtime_calls c ON c.request_id=r.request_id LEFT JOIN runs ru ON ru.id=c.run_id WHERE r.workspace_key=?1 AND r.state IN ('queued','leased','starting','active') ORDER BY r.enqueue_seq",
+        (CALL_ADMISSION_WORKSPACE.to_string(),),
+        |row| {
+            Ok(UnsettledCallAdmission {
+                request_id: row.text(0)?,
+                state: row.text(1)?,
+                resource_lane: row.text(2)?,
+                run_id: row.text(3)?,
+                prepared_json: row.text(4)?,
+                local_run_status: row.opt_text(5)?,
+            })
+        },
+    )
+    .await
 }
 
 /// A queued request withdrawn because its run settled first.
@@ -1271,16 +1366,9 @@ pub async fn withdraw_queued_ordinary_admission(
     detail: &str,
     now: i64,
 ) -> DbResult<Option<WithdrawnAdmission>> {
-    let mut table = conn
-        .query(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_admission_requests'",
-            (),
-        )
-        .await?;
-    if table.next().await?.is_none() {
+    if !has_admission_table(conn).await? {
         return Ok(None);
     }
-    drop(table);
     let launch_key = format!("ordinary:{run_id}");
     let mut rows = conn
         .query(
@@ -2618,6 +2706,96 @@ mod tests {
         assert_eq!(occupancy[0].in_flight_requests, 2);
         assert_eq!(occupancy[0].in_flight_unestimated, 2);
         assert_eq!(occupancy[0].queued, 0);
+    }
+
+    /// The call ledger answers the same three questions as the ordinary one: a
+    /// row awaiting launch is a claim, only a queued row is withdrawn in-write,
+    /// and every row still holding or awaiting a slot is listed with its run's
+    /// status so a sweep can find the ones whose run is already over.
+    #[tokio::test]
+    async fn call_rows_are_launch_claims_until_active_and_only_queued_ones_withdraw() {
+        let db = crate::storage::migrated_test_db("admission-call-claims.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO jobs(id,project_id,status,created_at,updated_at) VALUES('j','p','running',1,1);",
+        )
+        .await
+        .unwrap();
+        for (seq, (state, run, run_status)) in [
+            ("queued", "call-queued", "starting"),
+            ("leased", "call-leased", "starting"),
+            ("starting", "call-starting", "starting"),
+            ("active", "call-active", "crashed"),
+            ("released", "call-released", "exited"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db.execute_script(&format!(
+                "INSERT INTO runs(id,project_id,job_id,status,created_at,updated_at) VALUES('{run}','p','j','{run_status}',1,1);
+                 INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,created_at,updated_at)
+                   VALUES('call-admission:{run}','local-runtime','claude-cli','call:{run}','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,{seq},'{state}','local-call-promoter',1,1,1);
+                 INSERT INTO prepared_runtime_calls(request_id,run_id,prepared_json,created_at) VALUES('call-admission:{run}','{run}','{{}}',1);"
+            ))
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            pending_launch_run_ids(&db).await.unwrap(),
+            ["call-queued", "call-leased", "call-starting"]
+                .into_iter()
+                .map(String::from)
+                .collect::<HashSet<_>>(),
+            "a call awaiting launch is a claim; an active one is not"
+        );
+
+        let unsettled = list_unsettled_call_admissions(&db).await.unwrap();
+        assert_eq!(
+            unsettled
+                .iter()
+                .map(|row| (
+                    row.run_id.as_str(),
+                    row.state.as_str(),
+                    row.local_run_status.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("call-queued", "queued", Some("starting")),
+                ("call-leased", "leased", Some("starting")),
+                ("call-starting", "starting", Some("starting")),
+                ("call-active", "active", Some("crashed")),
+            ]
+        );
+
+        for run in ["call-queued", "call-leased", "call-starting", "call-active"] {
+            let run_owned = run.to_string();
+            let withdrawn = db
+                .write(move |conn| {
+                    let run = run_owned.clone();
+                    Box::pin(async move {
+                        withdraw_queued_call_admission(conn, &run, "run settled", 5).await
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(withdrawn, run == "call-queued", "{run}");
+        }
+        assert_eq!(
+            state_of(&db, "call-admission:call-queued").await,
+            "cancelled"
+        );
+        assert_eq!(state_of(&db, "call-admission:call-leased").await, "leased");
+        assert_eq!(
+            state_of(&db, "call-admission:call-starting").await,
+            "starting"
+        );
+        assert_eq!(state_of(&db, "call-admission:call-active").await, "active");
+        assert!(!pending_launch_run_ids(&db)
+            .await
+            .unwrap()
+            .contains("call-queued"));
     }
 
     #[test]

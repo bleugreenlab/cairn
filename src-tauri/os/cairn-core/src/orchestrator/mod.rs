@@ -3081,6 +3081,10 @@ impl Orchestrator {
                 if let Err(error) = tokio::task::spawn_blocking(move || {
                     let _span = tracing::info_span!(target: "profiler", "process_sweep").entered();
                     crate::runs::reap::reap_stale_runs(&orch);
+                    // A call row whose run is over holds a lane unit and the
+                    // only handle on its process; close both before the warm
+                    // trim and promotion measure the lanes.
+                    crate::execution::jobs::heal_settled_call_admissions(&orch, None);
                     crate::orchestrator::lifecycle::sweep_stranded_watchdog_jobs(&orch);
                     orch.collect_warm(crate::agent_process::gc::SpawnRoom::None);
                     // After the warm trim, so a queue head measures the memory
@@ -3088,6 +3092,7 @@ impl Orchestrator {
                     // anything other than an agent session still wakes it.
                     crate::execution::jobs::withdraw_orphaned_ordinary_admissions(&orch);
                     crate::execution::jobs::promote_private_lanes_blocking(&orch);
+                    crate::execution::jobs::promote_call_lanes(&orch);
                     if let Some(gc) = orch.warm_gc.as_ref() {
                         gc.cleanup_stale_views();
                     }

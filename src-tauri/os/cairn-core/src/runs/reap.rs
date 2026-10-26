@@ -35,10 +35,22 @@
 //!    between them. The in-memory [`crate::orchestrator::JobLaunchClaim`] covers
 //!    preparation through the durable enqueue, and is dropped only after the
 //!    admission row commits. From then the `runtime_admission_requests` row is
-//!    the claim: a `queued`, `leased` or `starting` row for the run
-//!    ([`crate::storage::pending_launch_run_ids`]) means a launch is in flight.
-//!    An `active` row is not cover, because it means a process registered, so a
-//!    run holding one with no handle really is stale.
+//!    the claim: a `queued`, `leased` or `starting` row for the run, whether an
+//!    ordinary launch or an ephemeral call
+//!    ([`crate::storage::pending_launch_run_ids`]), means a launch is in flight.
+//!    A call's promoter can take minutes to reach process registration on a
+//!    host that is still reconciling after boot, and that wait is covered by
+//!    the row, not by the grace. An `active` row is not cover, because it means
+//!    a process registered, so a run holding one with no handle really is
+//!    stale.
+//!
+//! ## What settling releases
+//!
+//! Settling withdraws a still-queued admission row in the same write. A call
+//! row past `queued` is then closed through
+//! [`crate::execution::jobs::on_call_run_finalized`], the one path that stops
+//! the call's process as it releases the row: once its run is over, the row is
+//! the only thing that could ever stop that process.
 //! 3. **Older than [`STALE_RUN_GRACE_SECS`].** The claims are the real cover for
 //!    the spawn window; the grace is what keeps a gap in that cover from being
 //!    expressed as a crashed run, and makes a just-inserted row un-reapable by
@@ -194,6 +206,9 @@ pub fn reap_stale_runs_for_job(orch: &Orchestrator, db: &Arc<LocalDb>, job_id: &
             &job_id[..job_id.len().min(8)],
             turn_ids.len()
         );
+        // An ephemeral call's row still holding a slot is released and its
+        // process (if one appears) stopped; a no-op for every other run.
+        crate::execution::jobs::on_call_run_finalized(orch, run_id);
     }
     emit_settled(orch, db, &settled);
     settled.len()

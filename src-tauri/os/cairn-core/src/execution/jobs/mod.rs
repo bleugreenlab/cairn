@@ -63,7 +63,10 @@ mod status;
 mod turns;
 mod workflow;
 
-pub(crate) use calls::{on_call_run_finalized, prepare_call_run, start_call_run};
+pub(crate) use calls::{
+    heal_settled_call_admissions, on_call_run_finalized, prepare_call_run, promote_call_lanes,
+    start_call_run,
+};
 pub(crate) use ordinary_admission::{
     promote_private_lane, recover_on_startup as recover_ordinary_admissions_on_startup,
 };

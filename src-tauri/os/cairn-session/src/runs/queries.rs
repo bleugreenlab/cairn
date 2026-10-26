@@ -1576,8 +1576,11 @@ async fn reconcile_stale_runs_db(
 
 /// Settle one stale run: mark it `crashed` with `exit_reason`, terminalize the
 /// turns it stranded (`running -> interrupted`, `pending -> failed`), and
-/// withdraw its still-queued ordinary admission request in the same write, so
-/// the queue never carries a launch whose run is already over. Returns the ids
+/// withdraw its still-queued admission request (ordinary or call) in the same
+/// write, so the queue never carries a launch whose run is already over. A
+/// call row past `queued` may have a process behind it, so it is not touched
+/// here: the caller hands the settled run to the call-release path, which
+/// stops that process as it releases the row. Returns the ids
 /// of the turns settled, or `None` when the run was no longer non-terminal and
 /// nothing was written.
 ///
@@ -1622,6 +1625,13 @@ pub async fn settle_stale_run(
     {
         cairn_attention::push::return_withdrawn_delivery_conn(conn, &withdrawn).await;
     }
+    cairn_db::storage::withdraw_queued_call_admission(
+        conn,
+        run_id,
+        &format!("run settled as stale ({exit_reason})"),
+        now,
+    )
+    .await?;
 
     let mut turn_rows = conn
         .query(

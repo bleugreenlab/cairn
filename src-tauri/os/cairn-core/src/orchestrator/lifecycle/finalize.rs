@@ -937,6 +937,12 @@ fn finalize_run_inner(
             current_status,
             status
         );
+        // A real exit still owes the call ledger its release. The run may have
+        // been settled by something that never saw a process (the stale-run
+        // sweep, the boot reconcile) while the process was still spawning; this
+        // exit is then the only event that will ever release its slot and stop
+        // it. Idempotent when the first finalize already did both.
+        crate::execution::jobs::on_call_run_finalized(orch, run_id);
         // Still emit run-completed so task handlers waiting on this event are unblocked.
         let _ = orch
             .services

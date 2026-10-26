@@ -280,15 +280,18 @@ pub(crate) fn start_call_run(
     // Stateless HTTP has no resident runtime to reconstruct and must not acquire
     // a durable-DB failure mode merely because its independent API stream claim
     // is non-zero.
-    if capability.class == crate::backends::RuntimeClass::StatelessHttp {
-        return start_call_run_now(orch, prepared);
-    }
+    //
     // Codex classification is provisional until authentication resolves the
     // exact app-server pool key. Persisting the provisional `None` key would
     // charge every logical stream as a separate resident process.
-    if capability.class == crate::backends::RuntimeClass::MultiplexedServer
-        && capability.claim.server_instance_key.is_none()
+    //
+    // Both start without a durable row, so the in-memory launch claim is what
+    // keeps the stale-run sweep off the run until its process registers.
+    if capability.class == crate::backends::RuntimeClass::StatelessHttp
+        || (capability.class == crate::backends::RuntimeClass::MultiplexedServer
+            && capability.claim.server_instance_key.is_none())
     {
+        let _launch = orch.claim_job_launch(&prepared.job_id, &prepared.run_id);
         return start_call_run_now(orch, prepared);
     }
 
@@ -317,7 +320,7 @@ pub(crate) fn start_call_run(
                 &db,
                 crate::storage::NewAdmissionRequest {
                     request_id,
-                    workspace_key: "local-runtime".into(),
+                    workspace_key: crate::storage::CALL_ADMISSION_WORKSPACE.into(),
                     resource_lane: lane,
                     launch_key: format!("call:{run_id}"),
                     resource_claim: crate::storage::RuntimeResourceClaim {
@@ -355,6 +358,63 @@ pub(crate) fn start_call_run(
 
 const CALL_ADMISSION_OWNER: &str = "local-call-promoter";
 
+/// This boot's call lease owner. Boot-scoped like ordinary admission's, so
+/// startup recovery can requeue an earlier boot's leases without requeueing a
+/// call this boot already started (which would launch it a second time).
+fn call_lease_owner(orch: &Orchestrator) -> String {
+    format!("{CALL_ADMISSION_OWNER}@{}", orch.boot_at)
+}
+
+fn decode_prepared_call(prepared_json: &str) -> Option<PreparedCallRun> {
+    serde_json::from_str(prepared_json).ok()
+}
+
+/// The concurrency ceiling of the lane a prepared call admits on. `None`
+/// collapses to Claude, matching `backend_for_name`.
+fn call_lane_ceiling(prepared: Option<&PreparedCallRun>) -> usize {
+    let backend_name = prepared.and_then(admission_backend_name);
+    crate::backends::backend_for_name(backend_name.as_deref())
+        .call_batch_capability()
+        .max_concurrency
+        .unwrap_or(usize::MAX)
+}
+
+/// Close `lease` into `terminal`, fenced on the owner and generation it was
+/// read with so a replacement lease is never closed by mistake. Returns
+/// whether this write closed it.
+fn finish_call_lease(
+    orch: &Orchestrator,
+    lease: &crate::storage::AdmissionRequest,
+    terminal: &'static str,
+    detail: Option<&'static str>,
+) -> bool {
+    let db = orch.db.local.clone();
+    let launch_key = lease.launch_key.clone();
+    let owner = lease.lease_owner.clone().unwrap_or_default();
+    let generation = lease.lease_generation;
+    run_db(async move {
+        crate::storage::finish_admission_by_launch_key(
+            &db,
+            crate::storage::CALL_ADMISSION_WORKSPACE,
+            &launch_key,
+            &owner,
+            generation,
+            terminal,
+            detail,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .unwrap_or_else(|error| {
+        log::warn!(
+            "call admission {} could not be closed as {terminal}: {error}",
+            lease.request_id
+        );
+        false
+    })
+}
+
 fn lease_next_call(
     orch: &Orchestrator,
     lane: &str,
@@ -362,13 +422,14 @@ fn lease_next_call(
 ) -> Result<Option<crate::storage::AdmissionRequest>, String> {
     let db = orch.db.local.clone();
     let lane = lane.to_string();
+    let owner = call_lease_owner(orch);
     let now = chrono::Utc::now().timestamp();
     run_db(async move {
         crate::storage::lease_next_admission_with_capacity(
             &db,
-            "local-runtime",
+            crate::storage::CALL_ADMISSION_WORKSPACE,
             &lane,
-            CALL_ADMISSION_OWNER,
+            &owner,
             now,
             now + 300,
             crate::storage::RuntimeResourceCapacity {
@@ -386,15 +447,17 @@ fn start_leased_call(
     lease: crate::storage::AdmissionRequest,
     prepared: PreparedCallRun,
 ) -> Result<(), String> {
+    let owner = lease.lease_owner.clone().unwrap_or_default();
     let transition = |from: &'static str, to: &'static str| {
         let db = orch.db.local.clone();
         let id = lease.request_id.clone();
+        let owner = owner.clone();
         let generation = lease.lease_generation;
         run_db(async move {
             crate::storage::transition_admission(
                 &db,
                 &id,
-                CALL_ADMISSION_OWNER,
+                &owner,
                 generation,
                 from,
                 to,
@@ -431,6 +494,7 @@ fn start_call_admission_heartbeat(orch: &Orchestrator, lease: &crate::storage::A
     };
     let db = orch.db.local.clone();
     let request_id = lease.request_id.clone();
+    let owner = lease.lease_owner.clone().unwrap_or_default();
     let generation = lease.lease_generation;
     handle.spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -441,7 +505,7 @@ fn start_call_admission_heartbeat(orch: &Orchestrator, lease: &crate::storage::A
             match crate::storage::heartbeat_admission(
                 &db,
                 &request_id,
-                CALL_ADMISSION_OWNER,
+                &owner,
                 generation,
                 now,
                 now + 300,
@@ -565,28 +629,42 @@ fn start_call_run_now(orch: &Orchestrator, prepared: &PreparedCallRun) -> Result
 /// uncapped/non-call runs; idempotent, so hooking it from more than one terminal
 /// path (finalize + the stop reconcile early-return) never double-counts.
 pub(crate) fn on_call_run_finalized(orch: &Orchestrator, run_id: &str) {
+    let _ = settle_call_admission(orch, run_id);
+}
+
+/// What closing one run's call admission did, for the heal sweep's log line.
+struct SettledCallAdmission {
+    request_id: String,
+    prior_state: String,
+    /// Whether this pass moved the row to a terminal state.
+    closed: bool,
+    /// Whether a registered process handle was stopped.
+    process_stopped: bool,
+}
+
+/// [`on_call_run_finalized`], reporting what it did. `None` when the run has
+/// no call admission row.
+fn settle_call_admission(orch: &Orchestrator, run_id: &str) -> Option<SettledCallAdmission> {
     let request = run_db({
         let db = orch.db.local.clone();
         let key = format!("call:{run_id}");
         async move {
-            crate::storage::get_admission_request_by_launch_key(&db, "local-runtime", &key)
-                .await
-                .map_err(|e| e.to_string())
+            crate::storage::get_admission_request_by_launch_key(
+                &db,
+                crate::storage::CALL_ADMISSION_WORKSPACE,
+                &key,
+            )
+            .await
+            .map_err(|e| e.to_string())
         }
     })
     .ok()
-    .flatten();
-    let Some(request) = request else {
-        return;
-    };
+    .flatten()?;
     let held_slot = matches!(request.state.as_str(), "leased" | "starting" | "active");
-    let db = orch.db.local.clone();
-    let id = request.request_id.clone();
-    let launch_key = request.launch_key.clone();
-    let state = request.state.clone();
-    let generation = request.lease_generation;
-    let _ = run_db(async move {
-        if state == "queued" {
+    let closed = if request.state == "queued" {
+        let db = orch.db.local.clone();
+        let id = request.request_id.clone();
+        run_db(async move {
             crate::storage::cancel_queued_admission(
                 &db,
                 &id,
@@ -595,22 +673,17 @@ pub(crate) fn on_call_run_finalized(orch: &Orchestrator, run_id: &str) {
             )
             .await
             .map_err(|e| e.to_string())
-        } else {
-            crate::storage::finish_admission_by_launch_key(
-                &db,
-                "local-runtime",
-                &launch_key,
-                CALL_ADMISSION_OWNER,
-                generation,
-                "released",
-                None,
-                chrono::Utc::now().timestamp(),
-            )
-            .await
-            .map_err(|e| e.to_string())
-        }
-    });
+        })
+        .unwrap_or(false)
+    } else if held_slot {
+        // Fenced on the lease as read, whichever boot's promoter took it: a
+        // row an earlier boot leased is released by the same write.
+        finish_call_lease(orch, &request, "released", None)
+    } else {
+        false
+    };
 
+    let mut process_stopped = false;
     if held_slot {
         // The freed slot must correspond to a DEAD process, not a warm one still
         // holding ~450 MB of `claude` RSS — otherwise the ceiling bounds slot
@@ -620,12 +693,27 @@ pub(crate) fn on_call_run_finalized(orch: &Orchestrator, run_id: &str) {
         // memory (CAIRN-2548). No-op when the kill path already removed the handle
         // (e.g. `kill_session_with_reason`), and cheap for a queued/uncapped run
         // (never reached — `held_slot` is false there).
-        crate::orchestrator::lifecycle::release_and_stop_process(orch, run_id);
+        process_stopped = crate::orchestrator::lifecycle::release_and_stop_process(orch, run_id);
     }
 
-    let finalized_prepared = run_db({
+    let finalized_prepared = prepared_call_for(orch, &request.request_id);
+    promote_next_call(
+        orch,
+        &request.resource_lane,
+        call_lane_ceiling(finalized_prepared.as_ref()),
+    );
+    Some(SettledCallAdmission {
+        request_id: request.request_id,
+        prior_state: request.state,
+        closed,
+        process_stopped,
+    })
+}
+
+fn prepared_call_for(orch: &Orchestrator, request_id: &str) -> Option<PreparedCallRun> {
+    run_db({
         let db = orch.db.local.clone();
-        let id = request.request_id.clone();
+        let id = request_id.to_string();
         async move {
             crate::storage::get_prepared_runtime_call(&db, &id)
                 .await
@@ -634,61 +722,234 @@ pub(crate) fn on_call_run_finalized(orch: &Orchestrator, run_id: &str) {
     })
     .ok()
     .flatten()
-    .and_then(|p| serde_json::from_str::<PreparedCallRun>(&p.prepared_json).ok());
-    let backend_name = finalized_prepared.as_ref().and_then(admission_backend_name);
-    let backend = crate::backends::backend_for_name(backend_name.as_deref());
-    let ceiling = backend
-        .call_batch_capability()
-        .max_concurrency
-        .unwrap_or(usize::MAX);
-    promote_next_call(orch, &request.resource_lane, ceiling);
+    .and_then(|p| decode_prepared_call(&p.prepared_json))
 }
 
-/// Promote exactly the lease returned by the durable repository. Promotion is
-/// lane-driven rather than tied to the request which happened to trigger it:
-/// fairness may select a different queued request, and dropping that lease would
-/// strand it until expiry.
-fn promote_next_call(orch: &Orchestrator, lane: &str, ceiling: usize) {
-    if let Ok(Some(next_lease)) = lease_next_call(orch, lane, ceiling) {
-        let next = run_db({
-            let db = orch.db.local.clone();
-            let id = next_lease.request_id.clone();
-            async move {
-                crate::storage::get_prepared_runtime_call(&db, &id)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
-        })
-        .ok()
-        .flatten();
-        if let Some(next) =
-            next.and_then(|p| serde_json::from_str::<PreparedCallRun>(&p.prepared_json).ok())
-        {
-            if let Err(e) = start_leased_call(orch, next_lease, next.clone()) {
-                // Fail-closed: an admitted-but-unstartable call must fail its run via
-                // the normal error path so the workflow await resolves — never leave
-                // it silently queued/starting.
-                log::error!("admitted call {} failed to start: {e}", next.run_id);
-                crate::orchestrator::lifecycle::fail_run(
-                    orch,
-                    &next.run_id,
-                    &format!("call admission start failed: {e}"),
-                );
-            }
+/// Lease and start the next launchable call on `lane`. Promotion is lane-driven
+/// rather than tied to the request which happened to trigger it: fairness may
+/// select a different queued request, and dropping that lease would strand it
+/// until expiry.
+///
+/// A lease whose run is already over is closed, never launched. Startup
+/// recovery requeues an earlier boot's rows, and a row can sit queued while its
+/// run is settled elsewhere; launching either would spawn a process for a run
+/// nothing will ever finalize again. The pass then moves on, so the slot that
+/// triggered it still goes to live work.
+///
+/// Returns whether a call was started (a start that failed still consumed its
+/// lease and failed its run); `false` when the lane is empty, at its ceiling,
+/// or unreadable.
+fn promote_next_call(orch: &Orchestrator, lane: &str, ceiling: usize) -> bool {
+    loop {
+        let Ok(Some(next_lease)) = lease_next_call(orch, lane, ceiling) else {
+            return false;
+        };
+        let Some(next) = prepared_call_for(orch, &next_lease.request_id) else {
+            log::warn!(
+                "call admission {} has no readable prepared call; failing it rather than holding its slot",
+                next_lease.request_id
+            );
+            finish_call_lease(
+                orch,
+                &next_lease,
+                "failed",
+                Some("leased call has no prepared payload"),
+            );
+            continue;
+        };
+        // An unreadable owning database proves nothing, so only a positive
+        // answer closes the lease.
+        if super::private_lane::run_settled(orch, &next.run_id) == Some(true) {
+            log::warn!(
+                "call admission {}: run {} already settled; cancelling the lease instead of launching it",
+                next_lease.request_id,
+                &next.run_id[..next.run_id.len().min(8)]
+            );
+            finish_call_lease(
+                orch,
+                &next_lease,
+                "cancelled",
+                Some("run settled before launch"),
+            );
+            continue;
         }
+        if let Err(e) = start_leased_call(orch, next_lease, next.clone()) {
+            // Fail-closed: an admitted-but-unstartable call must fail its run via
+            // the normal error path so the workflow await resolves — never leave
+            // it silently queued/starting.
+            log::error!("admitted call {} failed to start: {e}", next.run_id);
+            crate::orchestrator::lifecycle::fail_run(
+                orch,
+                &next.run_id,
+                &format!("call admission start failed: {e}"),
+            );
+        }
+        return true;
     }
 }
 
-/// Fail-fast every ephemeral call left in-flight by a host crash so it cannot
-/// strand `starting` forever now that a real admission ceiling makes queuing
-/// reachable (CAIRN-2548).
+/// Drain every call lane holding queued work as far as its ceiling admits.
 ///
-/// [`crate::execution::jobs::call_admission::CallAdmission`]'s queue is
-/// in-memory: a runner restart loses it, so a queued Claude call — persisted
-/// `starting` with no process and nothing in-memory to promote it — would hang
-/// its parked workflow await indefinitely, violating the fail-closed contract.
+/// Event-driven promotion (an enqueue, a release) covers the steady state;
+/// this is the backstop that runs at boot and on every process sweep, so a
+/// queued call is never stranded by a slot that freed without an event, such
+/// as one the heal below released.
+pub(crate) fn promote_call_lanes(orch: &Orchestrator) {
+    let rows = match run_db({
+        let db = orch.db.local.clone();
+        async move {
+            crate::storage::list_unsettled_call_admissions(&db)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            log::warn!("call admission could not list queued calls: {error}");
+            return;
+        }
+    };
+    let mut lanes: Vec<(String, usize)> = Vec::new();
+    for row in rows.iter().filter(|row| row.state == "queued") {
+        if lanes.iter().any(|(lane, _)| *lane == row.resource_lane) {
+            continue;
+        }
+        let ceiling = call_lane_ceiling(decode_prepared_call(&row.prepared_json).as_ref());
+        lanes.push((row.resource_lane.clone(), ceiling));
+    }
+    for (lane, ceiling) in lanes {
+        while promote_next_call(orch, &lane, ceiling) {}
+    }
+}
+
+/// Close every call admission row whose run is already over, through the one
+/// path that also stops the process behind it ([`on_call_run_finalized`], which
+/// releases the row and then runs `release_and_stop_process`). Returns how
+/// many rows were closed.
+///
+/// A row outliving its run is not a bookkeeping leak: an `active` row's
+/// heartbeat renews it forever and holds a lane unit, and once its run is
+/// settled nothing else will ever stop the process behind it. Both the boot
+/// pass and the periodic sweep run this, so a host carrying such rows heals on
+/// its own.
+///
+/// `orphans` is the boot pass's OS process table. After a restart a process the
+/// predecessor started is registered nowhere, and the only identity left is
+/// the session id in its argv. A call's session is minted for one run and never
+/// resumed, so a process naming the session of a call whose run is over cannot
+/// be live work. The periodic sweep passes `None`: on a live host every call
+/// process it started is registered, so the release path stops it.
+pub(crate) fn heal_settled_call_admissions(
+    orch: &Orchestrator,
+    orphans: Option<&dyn crate::agent_process::orphan::ProcessTable>,
+) -> usize {
+    let rows = match run_db({
+        let db = orch.db.local.clone();
+        async move {
+            crate::storage::list_unsettled_call_admissions(&db)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            log::warn!("call admission heal could not list call rows: {error}");
+            return 0;
+        }
+    };
+    let settled: Vec<(crate::storage::UnsettledCallAdmission, String)> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let evidence = match row.local_run_status.as_deref() {
+                Some("starting" | "live") => return None,
+                Some(status) => format!("its run is {status}"),
+                // The run lives in another database or is gone; an unreadable
+                // owning database proves nothing.
+                None => match super::private_lane::run_settled(orch, &row.run_id) {
+                    Some(true) => "its run is terminal or gone in its owning database".into(),
+                    _ => return None,
+                },
+            };
+            Some((row, evidence))
+        })
+        .collect();
+    if settled.is_empty() {
+        return 0;
+    }
+
+    let unregistered_holder = |row: &crate::storage::UnsettledCallAdmission| {
+        row.state != "queued" && orch.process_state.has_process(&row.run_id) == Some(false)
+    };
+    // One listing for the whole pass, and only when some row could have an
+    // orphan behind it.
+    let listing = orphans
+        .filter(|_| settled.iter().any(|(row, _)| unregistered_holder(row)))
+        .map(|table| table.list());
+
+    let mut healed = 0;
+    for (row, evidence) in settled {
+        let run = &row.run_id[..row.run_id.len().min(8)];
+        // Orphans first, so the promotion the release triggers measures the
+        // memory they held.
+        let mut orphan_outcome = None;
+        if let (Some(table), Some(entries)) = (orphans, listing.as_ref()) {
+            if unregistered_holder(&row) {
+                if let Some(prepared) = decode_prepared_call(&row.prepared_json) {
+                    let matches = crate::agent_process::orphan::orphans_naming_sessions(
+                        entries,
+                        std::slice::from_ref(&prepared.session_id),
+                        std::process::id(),
+                    );
+                    let (stopped, survived): (Vec<u32>, Vec<u32>) = matches
+                        .iter()
+                        .map(|(pid, _)| *pid)
+                        .partition(|pid| table.stop(*pid));
+                    orphan_outcome = Some(match (stopped.is_empty(), survived.is_empty()) {
+                        (true, true) => format!("no process names session {}", prepared.session_id),
+                        (_, true) => format!("stopped orphan pid(s) {stopped:?}"),
+                        _ => format!(
+                            "stopped orphan pid(s) {stopped:?}, could NOT confirm {survived:?} stopped"
+                        ),
+                    });
+                }
+            }
+        }
+        let Some(settlement) = settle_call_admission(orch, &row.run_id) else {
+            continue;
+        };
+        let process = if settlement.process_stopped {
+            "stopped its registered process".to_string()
+        } else if let Some(outcome) = orphan_outcome {
+            outcome
+        } else if settlement.prior_state == "queued" {
+            "it never launched a process".to_string()
+        } else {
+            "no registered process".to_string()
+        };
+        log::warn!(
+            "call admission heal: run {run} row {} was {} but {evidence}; {} the row; {process}",
+            settlement.request_id,
+            settlement.prior_state,
+            if settlement.closed {
+                "closed"
+            } else {
+                "could not close"
+            },
+        );
+        if settlement.closed {
+            healed += 1;
+        }
+    }
+    healed
+}
+
+/// Recover the call admission ledger after a restart, then fail fast every
+/// ephemeral call left in flight with nothing to launch it, so none strands
+/// `starting` forever (CAIRN-2548).
+///
 /// The undelivered set is exactly the runs still holding a `workflow_call`
-/// journal link. Each non-terminal one is driven through the normal
+/// journal link. One whose admission row is still queued or in flight is left
+/// to the promoter; each other non-terminal one is driven through the normal
 /// [`crate::orchestrator::lifecycle::finalize_run`]`(Crashed)` path — identical
 /// to how any other crashed call is handled — which journals the call as a
 /// failure (the workflow replay then resolves that ordinal as `null`) and drops
@@ -698,10 +959,36 @@ fn promote_next_call(orch: &Orchestrator, lane: &str, ceiling: usize) {
 /// workflow scripts, so it only ever touches stale pre-crash runs, never a
 /// freshly re-issued call.
 pub(crate) async fn fail_orphaned_calls_on_startup(orch: &Orchestrator) {
+    recover_calls_on_startup(
+        orch,
+        std::sync::Arc::new(crate::agent_process::orphan::OsProcessTable),
+    )
+    .await;
+}
+
+/// [`fail_orphaned_calls_on_startup`] against an injected process table.
+///
+/// Order matters. The heal runs first, while an `active` row still says a
+/// process stood behind its call: requeueing it would erase that and turn it
+/// into a launch to retry. Only this boot's leases are spared by the requeue.
+/// Promotion then drains the lanes, closing any requeued row whose run the
+/// boot reconcile already settled rather than launching it.
+async fn recover_calls_on_startup(
+    orch: &Orchestrator,
+    orphans: std::sync::Arc<dyn crate::agent_process::orphan::ProcessTable>,
+) {
+    let healer = orch.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        heal_settled_call_admissions(&healer, Some(orphans.as_ref()));
+    })
+    .await
+    {
+        log::warn!("startup call recovery: heal worker failed: {error}");
+    }
     if let Err(error) = crate::storage::requeue_orphaned_admissions(
         &orch.db.local,
-        "local-runtime",
-        None,
+        crate::storage::CALL_ADMISSION_WORKSPACE,
+        Some(&call_lease_owner(orch)),
         chrono::Utc::now().timestamp(),
     )
     .await
@@ -713,6 +1000,10 @@ pub(crate) async fn fail_orphaned_calls_on_startup(orch: &Orchestrator) {
             .await
     {
         log::warn!("startup call recovery: failed to reap expired leases: {error}");
+    }
+    let promoter = orch.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || promote_call_lanes(&promoter)).await {
+        log::warn!("startup call recovery: promotion worker failed: {error}");
     }
     let run_ids = match crate::workflow_journal::list_undelivered_call_run_ids(&orch.db.local).await
     {
@@ -728,32 +1019,19 @@ pub(crate) async fn fail_orphaned_calls_on_startup(orch: &Orchestrator) {
         let launch_key = format!("call:{run_id}");
         if let Ok(Some(request)) = crate::storage::get_admission_request_by_launch_key(
             &orch.db.local,
-            "local-runtime",
+            crate::storage::CALL_ADMISSION_WORKSPACE,
             &launch_key,
         )
         .await
         {
-            if request.state == "queued" {
-                if let Ok(Some(stored)) =
-                    crate::storage::get_prepared_runtime_call(&orch.db.local, &request.request_id)
-                        .await
-                {
-                    if let Ok(prepared) =
-                        serde_json::from_str::<PreparedCallRun>(&stored.prepared_json)
-                    {
-                        let backend_name = admission_backend_name(&prepared);
-                        let backend = crate::backends::backend_for_name(backend_name.as_deref());
-                        let ceiling = backend
-                            .call_batch_capability()
-                            .max_concurrency
-                            .unwrap_or(usize::MAX);
-                        promote_next_call(orch, &request.resource_lane, ceiling);
-                        // This request may remain queued because bounded priority
-                        // selected another request. Queued is recoverable state,
-                        // never evidence that this run should be crashed.
-                        continue;
-                    }
-                }
+            // Queued is recoverable state that the drain above or a later
+            // release will promote, and a leased, starting or active row is a
+            // launch this boot made. Neither is evidence the run should crash.
+            if matches!(
+                request.state.as_str(),
+                "queued" | "leased" | "starting" | "active"
+            ) {
+                continue;
             }
         }
         let owning = crate::execution::routing::owning_db_for_run(&orch.db, &run_id)
@@ -1197,6 +1475,50 @@ async fn insert_restart_run_rows(
 }
 
 #[cfg(test)]
+mod admission_backend_tests_support {
+    use super::*;
+    use crate::models::{AgentConfig, ConfirmPolicy, OutputSchema, OutputSchemaInfo};
+
+    /// A Claude call as `prepare_call_run` would build it.
+    pub(super) fn prepared_for(run_id: &str) -> PreparedCallRun {
+        PreparedCallRun {
+            job_id: "j".into(),
+            run_id: run_id.into(),
+            session_id: "s".into(),
+            agent_config: AgentConfig {
+                id: "Explore".into(),
+                name: "Explore".into(),
+                description: String::new(),
+                prompt: String::new(),
+                tools: Vec::new(),
+                tier: None,
+                workspace_id: None,
+                project_id: None,
+                created_at: 0,
+                updated_at: 0,
+                disallowed_tools: None,
+                skills: None,
+                fence: None,
+                backend_preference: None,
+                icon: None,
+                selection: None,
+                extras: None,
+            },
+            selected_model: Some(Model::new("sonnet")),
+            prompt: "do the thing".into(),
+            output_schema: OutputSchemaInfo {
+                schema: OutputSchema::Preset("return".into()),
+                artifact_name: Some("return".into()),
+                confirm_policy: ConfirmPolicy::default(),
+                tool_name: None,
+                description: None,
+            },
+            execution_id: None,
+        }
+    }
+}
+
+#[cfg(test)]
 mod admission_backend_tests {
     use super::*;
     use crate::models::{
@@ -1623,6 +1945,303 @@ mod restart_call_tests {
         assert_eq!(
             run_status_now(&db, "call-run").await.as_deref(),
             Some("starting")
+        );
+    }
+
+    // ---- Call admission rows outliving their runs (cairn/5336) ------------
+
+    /// Base rows every call-admission scenario hangs its calls off.
+    async fn seed_call_project(db: &LocalDb) {
+        db.execute_script(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1);
+             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1);
+             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',3,'T','active',1,1);
+             INSERT INTO jobs (id, project_id, issue_id, status, agent_config_id, uri_segment, node_name, created_at, updated_at) VALUES ('j-wf','p','i','running','workflow','wf','Flow',1,1);",
+        )
+        .await
+        .unwrap();
+    }
+
+    fn prepared_call_json(run_id: &str, session_id: &str) -> String {
+        let mut prepared = super::admission_backend_tests_support::prepared_for(run_id);
+        prepared.session_id = session_id.to_string();
+        prepared.job_id = format!("j-{run_id}");
+        serde_json::to_string(&prepared).unwrap()
+    }
+
+    /// One call: its job, session, run (`run_status`, created long past the
+    /// stale-run grace) and its admission row in `state` with its prepared
+    /// payload, exactly as `start_call_run` persists them.
+    async fn seed_call_admission(
+        db: &LocalDb,
+        run: &str,
+        run_status: &str,
+        state: &str,
+        owner: Option<&str>,
+        seq: i64,
+    ) {
+        let owner = owner.map_or("NULL".to_string(), |owner| format!("'{owner}'"));
+        db.execute_script(&format!(
+            "INSERT INTO jobs (id, project_id, issue_id, parent_job_id, status, agent_config_id, output_contract, uri_segment, node_name, created_at, updated_at) VALUES ('j-{run}','p','i','j-wf','running','Explore','{{\"schemaType\":\"return\"}}','{run}','Explore',1,1);
+             INSERT INTO sessions (id, job_id, created_at, updated_at) VALUES ('s-{run}','j-{run}',1,1);
+             INSERT INTO runs (id, job_id, issue_id, project_id, session_id, status, start_mode, created_at, updated_at) VALUES ('{run}','j-{run}','i','p','s-{run}','{run_status}','fresh',1,1);
+             INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,lease_expires_at,created_at,updated_at)
+               VALUES('call-admission:{run}','local-runtime','claude-cli','call:{run}','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,{seq},'{state}',{owner},1,9999999999,1,1);"
+        ))
+        .await
+        .unwrap();
+        crate::storage::persist_prepared_runtime_call(
+            db,
+            crate::storage::PreparedRuntimeCall {
+                request_id: format!("call-admission:{run}"),
+                run_id: run.to_string(),
+                prepared_json: prepared_call_json(run, &format!("s-{run}")),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn admission_state(db: &LocalDb, run: &str) -> String {
+        crate::storage::get_admission_request(db, &format!("call-admission:{run}"))
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+    }
+
+    fn register_call_process(orch: &Orchestrator, run: &str) {
+        use crate::agent_process::process::RunHandle;
+        orch.process_state.processes.lock().unwrap().register(
+            run.to_string(),
+            RunHandle::test_handle(Some(&format!("s-{run}")), Some(&format!("j-{run}"))),
+        );
+    }
+
+    /// A call waiting minutes for its promoter to reach process registration is
+    /// covered by its row however long it waits; once the row is `active` and
+    /// no handle stands behind it, the run IS stale, and settling it releases
+    /// the row instead of leaving it to hold a lane unit forever.
+    #[tokio::test]
+    async fn a_waiting_call_row_is_cover_and_an_active_one_without_a_process_is_reaped_and_released(
+    ) {
+        let (orch, db) = orch_with_db().await;
+        seed_call_project(&db).await;
+        seed_call_admission(&db, "call-queued", "starting", "queued", None, 1).await;
+        seed_call_admission(
+            &db,
+            "call-leased",
+            "starting",
+            "leased",
+            Some("local-call-promoter"),
+            2,
+        )
+        .await;
+        seed_call_admission(
+            &db,
+            "call-starting",
+            "starting",
+            "starting",
+            Some("local-call-promoter"),
+            3,
+        )
+        .await;
+        seed_call_admission(
+            &db,
+            "call-active",
+            "live",
+            "active",
+            Some("local-call-promoter"),
+            4,
+        )
+        .await;
+        // Its own lane, so the slot its release frees promotes nothing: a
+        // promoted call here would try to spawn a real CLI and fail its run.
+        db.execute(
+            "UPDATE runtime_admission_requests SET resource_lane='isolated' WHERE request_id='call-admission:call-active'",
+            (),
+        )
+        .await
+        .unwrap();
+
+        // Every run was created at t=1, far past the grace, and none has a
+        // handle. Only the active one lacks a claim.
+        assert_eq!(crate::runs::reap::reap_stale_runs(&orch), 1);
+        for run in ["call-queued", "call-leased", "call-starting"] {
+            assert_eq!(
+                run_status_now(&db, run).await.as_deref(),
+                Some("starting"),
+                "{run} is mid-launch and must not be crashed"
+            );
+        }
+        assert_eq!(
+            run_status_now(&db, "call-active").await.as_deref(),
+            Some("crashed")
+        );
+        assert_eq!(admission_state(&db, "call-active").await, "released");
+        assert_eq!(admission_state(&db, "call-queued").await, "queued");
+    }
+
+    /// The incident's step 5: the run was settled while its process was still
+    /// spawning, so the process's real exit reaches `finalize_run` as a
+    /// re-entry. It must still release the row and stop the process.
+    #[tokio::test]
+    async fn finalizing_an_already_crashed_call_still_releases_its_row_and_stops_its_process() {
+        let (orch, db) = orch_with_db().await;
+        seed_call_project(&db).await;
+        seed_call_admission(
+            &db,
+            "call-run",
+            "crashed",
+            "active",
+            Some("local-call-promoter"),
+            1,
+        )
+        .await;
+        register_call_process(&orch, "call-run");
+
+        crate::orchestrator::lifecycle::finalize_run(
+            &orch,
+            "call-run",
+            crate::models::RunStatus::Exited,
+        );
+
+        assert_eq!(admission_state(&db, "call-run").await, "released");
+        assert_eq!(orch.process_state.has_process("call-run"), Some(false));
+        assert_eq!(
+            run_status_now(&db, "call-run").await.as_deref(),
+            Some("crashed"),
+            "the settled outcome stands"
+        );
+    }
+
+    /// Settling a run withdraws its queued call row in the same write.
+    #[tokio::test]
+    async fn settling_a_stale_run_cancels_its_queued_call_row() {
+        let (_orch, db) = orch_with_db().await;
+        seed_call_project(&db).await;
+        seed_call_admission(&db, "call-run", "starting", "queued", None, 1).await;
+
+        let settled = db
+            .write(|conn| {
+                Box::pin(async move {
+                    crate::runs::queries::settle_stale_run(conn, "call-run", "crash", 5).await
+                })
+            })
+            .await
+            .unwrap();
+
+        assert!(settled.is_some());
+        assert_eq!(admission_state(&db, "call-run").await, "cancelled");
+    }
+
+    /// The host state cairn/5336 measured, seeded exactly, heals in one boot
+    /// pass: active rows whose run crashed are released and their processes
+    /// stopped (a registered warm one through its handle, an unregistered one
+    /// by the session id in its argv), a queued row whose run crashed is
+    /// cancelled, an earlier boot's lease is released, and a call this boot
+    /// already leased is left alone.
+    #[tokio::test]
+    async fn boot_recovery_heals_call_rows_whose_runs_are_over_and_stops_their_processes() {
+        use crate::agent_process::orphan::RecordingProcessTable;
+        let (orch, db) = orch_with_db().await;
+        seed_call_project(&db).await;
+        let this_boot = call_lease_owner(&orch);
+        seed_call_admission(&db, "dead-queued", "crashed", "queued", None, 1).await;
+        seed_call_admission(
+            &db,
+            "dead-warm",
+            "crashed",
+            "active",
+            Some("local-call-promoter"),
+            2,
+        )
+        .await;
+        seed_call_admission(
+            &db,
+            "dead-orphan",
+            "crashed",
+            "active",
+            Some("local-call-promoter"),
+            3,
+        )
+        .await;
+        seed_call_admission(
+            &db,
+            "live-this-boot",
+            "starting",
+            "leased",
+            Some(&this_boot),
+            4,
+        )
+        .await;
+        register_call_process(&orch, "dead-warm");
+        let table = std::sync::Arc::new(RecordingProcessTable::new(vec![
+            (
+                4242,
+                "claude --print --session-id s-dead-orphan".to_string(),
+            ),
+            (4343, "claude --print --session-id s-unrelated".to_string()),
+        ]));
+
+        recover_calls_on_startup(&orch, table.clone()).await;
+
+        assert_eq!(admission_state(&db, "dead-queued").await, "cancelled");
+        assert_eq!(admission_state(&db, "dead-warm").await, "released");
+        assert_eq!(orch.process_state.has_process("dead-warm"), Some(false));
+        assert_eq!(admission_state(&db, "dead-orphan").await, "released");
+        assert_eq!(
+            table.stopped(),
+            vec![4242],
+            "only the orphan naming a dead call's session is stopped"
+        );
+        let live = crate::storage::get_admission_request(&db, "call-admission:live-this-boot")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (live.state.as_str(), live.lease_owner.as_deref()),
+            ("leased", Some(this_boot.as_str())),
+            "a lease this boot took is not requeued"
+        );
+        assert_eq!(
+            run_status_now(&db, "live-this-boot").await.as_deref(),
+            Some("starting")
+        );
+    }
+
+    /// The periodic sweep heals the same state without a restart, and a lane
+    /// whose dead rows held every unit admits again: a queued row whose run
+    /// crashed is closed by the promoter rather than launched.
+    #[tokio::test]
+    async fn the_sweep_releases_dead_rows_and_promotion_never_launches_a_settled_run() {
+        let (orch, db) = orch_with_db().await;
+        seed_call_project(&db).await;
+        seed_call_admission(
+            &db,
+            "dead-warm",
+            "crashed",
+            "active",
+            Some("local-call-promoter"),
+            1,
+        )
+        .await;
+        register_call_process(&orch, "dead-warm");
+        seed_call_admission(&db, "dead-queued", "crashed", "queued", None, 2).await;
+
+        // Promotion alone reaches the queued row first: it must close it.
+        promote_call_lanes(&orch);
+        assert_eq!(admission_state(&db, "dead-queued").await, "cancelled");
+        assert_eq!(orch.process_state.has_process("dead-queued"), Some(false));
+
+        assert_eq!(heal_settled_call_admissions(&orch, None), 1);
+        assert_eq!(admission_state(&db, "dead-warm").await, "released");
+        assert_eq!(orch.process_state.has_process("dead-warm"), Some(false));
+        assert_eq!(
+            heal_settled_call_admissions(&orch, None),
+            0,
+            "a second pass finds nothing"
         );
     }
 

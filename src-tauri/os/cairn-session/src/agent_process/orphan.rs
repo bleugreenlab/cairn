@@ -15,9 +15,12 @@
 //! <uuid>`), a UUID match is unambiguous, and unlike a stored pid it cannot be
 //! defeated by pid reuse. Deliberately no pid column exists for this reason.
 //!
-//! This runs only from the startup sweep, when the runner owns no agent processes
-//! of its own, so a match is by definition someone else's orphan. Calling it
-//! anywhere else would risk signalling a live agent and is not supported.
+//! This runs only from startup recovery, where a match is by construction
+//! someone else's orphan: the stale-run reconcile matches sessions of runs that
+//! predate this host's boot, and startup call recovery matches the sessions of
+//! ephemeral calls whose run is already over and whose process this host never
+//! registered (a call session belongs to one run and is never resumed). Calling
+//! it anywhere else would risk signalling a live agent and is not supported.
 //!
 //! ## Known gap
 //!
