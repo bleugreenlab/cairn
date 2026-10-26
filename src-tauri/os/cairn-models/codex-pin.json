@@ -1,15 +1,15 @@
 {
   "integration": 1,
-  "version": "0.163.0",
-  "tag": "rust-v0.163.0",
-  "reason": "Upstream stable bump from 0.153.3 with integration 1 unchanged. Merged by hand before the codex-contract lane existed (cairn/5104, PR #4109); the post-merge codex:pin verify smoke passed.",
+  "version": "0.164.0",
+  "tag": "rust-v0.164.0",
+  "reason": "Upstream stable bump from 0.163.0 with integration 1 unchanged; lands automatically only through the pinBump merge precondition, which requires codex-pin and codex-contract (macOS, Linux) passed on the PR head.",
   "skip": [],
   "packages": {
-    "aarch64-apple-darwin": { "sha256": "b0344fc2e41f15e0071147e5869008047b8ff4bf2c4a8897975d3bae3f103b34", "size": 133412281 },
-    "x86_64-apple-darwin": { "sha256": "0c182d6194da7003943678dc87866b54b3dee719edaf8d092f304affbc6b57d1", "size": 144982749 },
-    "aarch64-unknown-linux-musl": { "sha256": "9d8ecf2d19d3e184877983902d6c85de48b3888dcb72c382a8a0c975845927fb", "size": 149800043 },
-    "x86_64-unknown-linux-musl": { "sha256": "582646c6bf0561eb0de540f7fc85b9121b0091a826bc6e96830b7f1722122182", "size": 159424486 },
-    "aarch64-pc-windows-msvc": { "sha256": "6bbada389cd1ce26783e837fd9ba4711fb4542f432044f7955139e27e27acfde", "size": 150223371 },
-    "x86_64-pc-windows-msvc": { "sha256": "901028b285614a9974f431f9d9f6534b3e5ed8d62eba4ba64f4762c00f040522", "size": 162230206 }
+    "aarch64-apple-darwin": { "sha256": "dd99e9092270691a67bdde7be04ac283dea9da8e86cbde356c2cc851a79205fa", "size": 136007998 },
+    "x86_64-apple-darwin": { "sha256": "cfb2a9988d7ea448511166a35789af07a0065d1117db54350b17d46cf03d0294", "size": 147158682 },
+    "aarch64-unknown-linux-musl": { "sha256": "5918add6c7e9cf1e14a9af1b4c0f4bf1d24a43903faac26df5dc4c019ea91bd5", "size": 152400557 },
+    "x86_64-unknown-linux-musl": { "sha256": "3ec55053109608d5038f7e50750f7d25f768dfd740fef071aa710e2559b63aac", "size": 162338756 },
+    "aarch64-pc-windows-msvc": { "sha256": "735deb6af84fd927084429f7a371ee38670a013baace6df24985780f7ef67355", "size": 154368833 },
+    "x86_64-pc-windows-msvc": { "sha256": "700116be3143576d006467af8576f7f4c9dada1feddfdb7f69743bfde0997018", "size": 167144380 }
   }
 }
