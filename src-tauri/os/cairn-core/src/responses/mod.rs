@@ -463,7 +463,7 @@ fn seconds(duration: Duration) -> String {
 impl InvocationBound {
     /// What the caller itself asked for: the ask a cap overrode, or the limit
     /// when no cap did.
-    fn requested(&self) -> Option<Duration> {
+    pub(crate) fn requested(&self) -> Option<Duration> {
         match &self.cap {
             Some(cap) => cap.requested,
             None => Some(self.limit),
@@ -545,7 +545,9 @@ impl InvocationInterrupt {
         self.0.borrow().clone()
     }
 
-    async fn wait(&mut self) -> Interruption {
+    /// Resolve once an interruption fires; never, if its interrupter is
+    /// dropped without firing.
+    pub(crate) async fn wait(&mut self) -> Interruption {
         // The read guard is released before any further await, which keeps
         // this future `Send`.
         let fired = self

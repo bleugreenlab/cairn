@@ -305,7 +305,7 @@ Partial failures never abort: a failed target stays in place under an `[error]` 
     #[tool(
         description = r#"Execute an ordered batch of synchronous invocations, or suspend this turn on a sole `waitFor` item. Each item in `commands` is exactly one of: a shell `command`; a `target` skill-script URI (cairn://skills/<id>/scripts/<name>) with optional `payload.args`; a `target` external MCP tool (cairn://mcp/<server>/<tool>) with named arguments in `payload.args_json` (read cairn://mcp/<server> for each tool's arg shape); or inline `code` with a required `interpreter` (`typescript`/`javascript` via bun, `python` via uv, `matlab`). Inline code is the default way to run code that isn't a CLI invocation — the interpreter execs the source directly, so there is no shell and no quoting; keep it synchronous and run-to-completion, and put long-running or background processes in a terminal resource via `write`. Add `repl:<slug>` to an inline item to evaluate it in a stateful REPL session created at `cairn:~/repl/<slug>`. A batch may not mix tree-bound items (shell, inline code, skill scripts) with MCP or REPL items.
 
-Items run in PARALLEL by default; `sequential:true` runs in order (fail-fast unless `stop_on_error:false`). Output composes under `=== <header> ===` headers in input order. One call in, one final result out: a batch that outlives the 120-second synchronous window suspends and resumes with the finished result. An item's `timeout` (ms) kills that item at the bound and reports whatever output it produced rather than terminating the call. For a tree-bound batch in which every item declares a timeout, those bounds also limit how long the batch waits for a busy machine (the parallel maximum or sequential sum, capped at the 6-hour batch ceiling) and tell a remote executor how long to hold its queue place; if any item omits one, the batch may wait up to that ceiling. An omitted timeout also lets a tree-bound item run to completion under the ceiling. A response item (`cairn://responses/...`) runs to its `timeout`, or without one to its definition's declared timeout, under the same ceiling, and its batch suspends past the window like a long shell batch; a `cairn.run` of one from @cairn/sdk inside a shell item has no call of its own to suspend on and ends at 120 seconds. MCP-tool, REPL, and decide (`cairn://models/decide`) items execute on the host inside the 120-second window, and a longer `timeout` is cut to 120 seconds.
+Items run in PARALLEL by default; `sequential:true` runs in order (fail-fast unless `stop_on_error:false`). Output composes under `=== <header> ===` headers in input order. One call in, one final result out: a batch that outlives the 120-second synchronous window suspends and resumes with the finished result. An item's `timeout` (ms) kills that item at the bound and reports whatever output it produced rather than terminating the call. For a tree-bound batch in which every item declares a timeout, those bounds also limit how long the batch waits for a busy machine (the parallel maximum or sequential sum, capped at the 6-hour batch ceiling) and tell a remote executor how long to hold its queue place; if any item omits one, the batch may wait up to that ceiling. An omitted timeout also lets a tree-bound item run to completion under the ceiling. A response item (`cairn://responses/...`) runs to its `timeout`, or without one to its definition's declared timeout, under the same ceiling, and its batch suspends past the window like a long shell batch. An MCP-tool item runs to its declared `timeout` under the same ceiling and suspends the same way; without one it keeps the MCP gateway's 30-second default, so declare `timeout` on a tool call you know runs long. Stopping the run cancels an in-flight MCP request. A `cairn.run` of a response or MCP-tool item from @cairn/sdk inside a shell item has no call of its own to suspend on and ends at 120 seconds. REPL and decide (`cairn://models/decide`) items execute on the host inside the 120-second window, and a longer `timeout` is cut to 120 seconds.
 
 If a successful batch dirties the tree, `commit_msg` is required and commits all worktree changes once after success (`^` amends); without it the worktree is restored to HEAD. `branch` runs the batch against another revision — a branch name, a commit, or a node URI — to tell a regression from a failure already on the base (read `cairn:@/check-results/<base>?suite=S&environment=current` first: the ledger may already hold that verdict, and diffs and ancestry are `cairn:@/vcs/...` reads, not branch runs); it is verdict-only: tracked writes are discarded, and commit_msg, MCP, and REPL items are rejected. `executor` places the batch on a specific machine (`{name:"..."}`) or platform (`{os:"linux"}`), optionally refined by `requiredToolchains`; read cairn://executors for what is available, and omit it otherwise.
 
@@ -665,14 +665,23 @@ mod tests {
             "RunItemInput.timeout must say what omitting it means: {timeout}"
         );
 
-        // Host-executed items (MCP tool calls, REPL sends) never enter the
-        // suspendable routed path, so the ceiling above them is the grace window,
-        // not the batch ceiling. Advertising one generic bound over both classes
-        // is what made the contract describe states the system cannot reach.
+        // Host items that cannot suspend (REPL sends, decide items) are bounded
+        // by the grace window, not the batch ceiling. Advertising one generic
+        // bound over both classes is what made the contract describe states the
+        // system cannot reach.
         for surface in [&description, &timeout] {
             assert!(
                 normalize(surface).contains(&grace),
                 "the host-item bound ({grace}) must be advertised alongside the batch ceiling: {surface}"
+            );
+        }
+
+        // MCP-tool items suspend with their batch, so no surface may claim the
+        // host-item cap cuts them.
+        for surface in [&description, &timeout] {
+            assert!(
+                !surface.contains("MCP-tool, REPL"),
+                "MCP-tool items are no longer capped at the window: {surface}"
             );
         }
 

@@ -3352,21 +3352,19 @@ pub(crate) fn clamp_run_item_timeout_ms(requested: Option<u32>) -> u32 {
         .min(MAX_RUN_ITEM_TIMEOUT_MS)
 }
 
-/// The largest kill bound an item that executes ON THE HOST may carry — an MCP
-/// gateway call or a REPL send.
+/// The largest kill bound a host item that cannot suspend may carry: a decide,
+/// a REPL send, or an executor action.
 ///
-/// These items never enter [`run_routed_batch`], so the batch cannot suspend for
-/// them and the call stays attached to its socket. The host answers within the
-/// grace window, so a host item that outlives grace cannot deliver its result at
+/// A batch of only these items never suspends ([`HostBatch::may_outlive_grace`]),
+/// so the call stays attached to its socket. The host answers within the grace
+/// window, so such an item that outlived grace could not deliver its result at
 /// all: the transport gives up first and the whole batch is discarded with no
 /// output. Capping the bound at grace converts that silent transport death into
-/// an ordinary item timeout with a real result block — the same trade the batch
-/// ceiling makes for routed items, sized to the ceiling that actually sits above
-/// this path.
+/// an ordinary item timeout with a real result block.
 ///
-/// This is deliberately NOT [`MAX_RUN_ITEM_TIMEOUT_MS`]. Letting a host item ask
-/// for six hours would advertise a bound the transport underneath it cannot
-/// honor, which is the exact class of defect this file exists to remove.
+/// Response and MCP-tool items are host items too, but their batch suspends
+/// ([`run_suspendable_host_batch`]), so they take the run-item ceiling instead
+/// ([`response_item_bound`], [`mcp_item_bound`]).
 pub(crate) const MAX_HOST_ITEM_TIMEOUT_MS: u32 =
     cairn_common::run_contract::RUN_GRACE_WINDOW_MS as u32;
 
@@ -3374,10 +3372,10 @@ pub(crate) const MAX_HOST_ITEM_TIMEOUT_MS: u32 =
 /// at compile time rather than by a test that could be deleted.
 const _: () = assert!(MAX_HOST_ITEM_TIMEOUT_MS < MAX_RUN_ITEM_TIMEOUT_MS);
 
-/// The clamp for a host-executed item's kill bound. `None` is preserved rather
-/// than filled, because these items have their own meaningful defaults below
-/// this bound (the MCP gateway's own call timeout); "run to completion" is a
-/// promise only the suspendable routed path can keep.
+/// The clamp for the kill bound of a host item that cannot suspend. `None` is
+/// preserved rather than filled, so a caller with a meaningful default of its
+/// own below this bound keeps it; "run to completion" is a promise only a batch
+/// that can suspend can keep.
 pub(crate) fn clamp_host_item_timeout_ms(requested: Option<u32>) -> Option<u32> {
     requested.map(|ms| ms.min(MAX_HOST_ITEM_TIMEOUT_MS))
 }
@@ -3408,8 +3406,8 @@ pub(crate) fn host_item_bound(requested: Option<u32>) -> crate::responses::Invoc
     }
 }
 
-/// Why a response item cannot outlive the run-item ceiling.
-pub(crate) const RUN_ITEM_CEILING_WHY: &str = "A response item suspends with its batch and runs as long as its definition declares, up to the 6-hour ceiling on a single `run` batch, which no item outlives.";
+/// Why a response or MCP-tool item cannot outlive the run-item ceiling.
+pub(crate) const RUN_ITEM_CEILING_WHY: &str = "A response or MCP-tool item suspends with its batch and runs to its own bound, up to the 6-hour ceiling on a single `run` batch, which no item outlives.";
 
 /// The bound a response item runs under: its own ask up to the run-item
 /// ceiling, and the ceiling when it asked for nothing, so that the definition's
@@ -3428,22 +3426,46 @@ pub(crate) fn response_item_bound(requested: Option<u32>) -> crate::responses::I
     }
 }
 
-/// Why a response item ended at the host-item window although response items
-/// can otherwise suspend: the call had nothing to park on, so its answer had
-/// to arrive while the transport above it was still waiting.
-pub(crate) const UNPARKED_RESPONSE_WHY: &str = "This call had no `run` tool call of its own to suspend on, so it had to answer inside the window its transport waits for. A `cairn.run` from @cairn/sdk inside a shell or script item is the usual case; two byte-identical `run` calls issued together are the other. Call the response as a top-level `run` item to let it run to its declared timeout.";
+/// Why an MCP-tool item that declared no `timeout` is held to the gateway's
+/// default rather than left to run to completion.
+pub(crate) const MCP_GATEWAY_DEFAULT_WHY: &str = "An external server is arbitrary code, so a call that declares no bound is held to the gateway's default; declare `timeout` on the item, up to the 6-hour run-item ceiling, for a call you know runs long.";
 
-/// What a response item journals when the run that called it was stopped.
-const RUN_STOPPED_REASON: &str = "the run that called it was stopped before it answered";
+/// The bound an MCP-tool item runs under: its own ask up to the run-item
+/// ceiling, and the gateway's default when it asked for nothing. An undeclared
+/// call to arbitrary code never rides the six-hour horizon. It can reach the
+/// ceiling because its batch suspends ([`run_suspendable_host_batch`]).
+pub(crate) fn mcp_item_bound(requested: Option<u32>) -> crate::responses::InvocationBound {
+    match requested {
+        Some(_) => response_item_bound(requested),
+        None => crate::responses::InvocationBound {
+            limit: crate::mcp::gateway::DEFAULT_MCP_TIMEOUT,
+            cap: Some(crate::responses::BoundCap {
+                name: "MCP gateway default",
+                requested: None,
+                why: MCP_GATEWAY_DEFAULT_WHY,
+            }),
+        },
+    }
+}
 
-/// What a response item journals when the `run` call carrying it was dropped
-/// before it could suspend (the transport went away).
+/// Why an item that could otherwise suspend ended at the host-item window: the
+/// call had nothing to park on, so its answer had to arrive while the
+/// transport above it was still waiting.
+pub(crate) const UNPARKED_HOST_BATCH_WHY: &str = "This call had no `run` tool call of its own to suspend on, so it had to answer inside the window its transport waits for. A `cairn.run` from @cairn/sdk inside a shell or script item is the usual case; two byte-identical `run` calls issued together are the other. Make the call as a top-level `run` item to let it run to its declared timeout.";
+
+/// What a response item journals, and an MCP-tool item reports, when the run
+/// that called it was stopped.
+pub(crate) const RUN_STOPPED_REASON: &str = "the run that called it was stopped before it answered";
+
+/// What a response item journals, and an MCP-tool item reports, when the `run`
+/// call carrying it was dropped before it could suspend (the transport went
+/// away).
 const CALL_ABANDONED_REASON: &str =
     "the `run` call that issued it was abandoned before it answered";
 
 /// How often a suspended host batch looks for the stop that cancels it. A stop
 /// marks the suspension row and nothing else, and only this batch's own task
-/// can end its response items, so it has to look.
+/// can end its response and MCP-tool items, so it has to look.
 const HOST_BATCH_STOP_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What this batch may legally take: sequential items run one after another,
@@ -3557,9 +3579,10 @@ fn room_wait_horizon_unix_ms(
 /// Settle every process item's kill bound once, before the dispatch seam, so no
 /// layer below has to re-derive it.
 ///
-/// Response and decide items keep the caller's ask instead: when one times out,
-/// its failure has to say what was asked as well as what was enforced, and
-/// [`host_item_bound`] derives both where the item runs.
+/// Response, decide, and MCP-tool items keep the caller's ask instead: when one
+/// times out, its failure has to say what was asked as well as what was
+/// enforced, and [`response_item_bound`], [`host_item_bound`], and
+/// [`mcp_item_bound`] derive both where the item runs.
 fn apply_run_item_timeouts(resolved: &mut [(String, Result<RunSpec, String>)]) {
     for (_, spec) in resolved {
         if let Ok(RunSpec::Shell { timeout, .. } | RunSpec::Script { timeout, .. }) = spec {
@@ -4337,18 +4360,20 @@ struct HostBatch {
 
 impl HostBatch {
     /// Whether the batch holds an item allowed to run past the grace window. A
-    /// response item is: it runs as long as its definition declares. Every
-    /// other host item is capped at the window and never needs to suspend.
+    /// response item is: it runs as long as its definition declares. So is an
+    /// MCP-tool item: it runs to its declared `timeout`. Decide, REPL, and
+    /// executor-action items are capped at the window and never need to
+    /// suspend.
     fn may_outlive_grace(&self) -> bool {
         self.resolved
             .iter()
-            .any(|(_, spec)| matches!(spec, Ok(RunSpec::ResponseCall { .. })))
+            .any(|(_, spec)| matches!(spec, Ok(RunSpec::ResponseCall { .. } | RunSpec::McpCall(_))))
     }
 }
 
 /// Run a host batch's items: in order with fail-fast, or each on its own task.
-/// `interrupt` reaches every response item, and once it fires a sequential
-/// batch starts nothing further.
+/// `interrupt` reaches every response and MCP-tool item, and once it fires a
+/// sequential batch starts nothing further.
 async fn run_host_items(
     orch: &Orchestrator,
     batch: HostBatch,
@@ -4471,9 +4496,10 @@ fn joined_host_outcomes(
     })
 }
 
-/// Interrupts a host batch's response items when the call carrying them is
-/// dropped before it hands them to a suspension. The host batch's counterpart
-/// of [`AbortOnDrop`]: aborting would end the items without their journal rows.
+/// Interrupts a host batch's response and MCP-tool items when the call carrying
+/// them is dropped before it hands them to a suspension. The host batch's
+/// counterpart of [`AbortOnDrop`]: aborting would end response items without
+/// their journal rows.
 struct InterruptOnDrop(Option<Interrupter>);
 
 impl InterruptOnDrop {
@@ -4497,9 +4523,9 @@ impl Drop for InterruptOnDrop {
     }
 }
 
-/// Run a host batch holding a response item, which may legitimately take
-/// minutes, racing it against the grace window exactly as a routed batch is
-/// raced ([`run_routed_batch`]).
+/// Run a host batch holding a response or MCP-tool item, either of which may
+/// legitimately take minutes, racing it against the grace window exactly as a
+/// routed batch is raced ([`run_routed_batch`]).
 ///
 /// Past grace the call parks on the same durable suspension a routed batch
 /// takes, marked as holding no tree, and the batch keeps running on its own
@@ -4508,9 +4534,10 @@ impl Drop for InterruptOnDrop {
 /// A call with no `run` tool call of its own to park on (a `cairn.run` from
 /// @cairn/sdk inside a shell or script item) cannot suspend, and nothing above
 /// the host would still be listening past grace: the callback contract sizes
-/// every wrapper just above it. So its response items are ended at grace with
-/// a bound failure that says why, journaled like any other outcome, rather
-/// than left to finish for a caller that has already gone.
+/// every wrapper just above it. So its response and MCP-tool items are ended at
+/// grace with a bound failure that says why (a response journals it like any
+/// other outcome, an MCP call is cancelled at its server) rather than left to
+/// finish for a caller that has already gone.
 async fn run_suspendable_host_batch(
     orch: &Orchestrator,
     settlement: RunBatchSettlement,
@@ -4550,7 +4577,7 @@ async fn run_suspendable_host_batch(
                 interrupter.interrupt(Interruption::Capped {
                     limit: grace,
                     name: "host-item cap",
-                    why: UNPARKED_RESPONSE_WHY,
+                    why: UNPARKED_HOST_BATCH_WHY,
                 });
                 handle.await
             }
@@ -4573,8 +4600,9 @@ struct SuspendedCall {
 ///
 /// The batch ceiling is enforced here as it is for a routed batch. A stop is
 /// enforced here too: it cancels the suspension row, which this task watches,
-/// and the response items still running are interrupted so they journal the
-/// stop and release their provider requests to their own timeouts. The stop
+/// and the items still running are interrupted. A response item journals the
+/// stop and releases its provider request to its own timeout; an MCP-tool item
+/// reports itself stopped and its request is cancelled at the server. The stop
 /// itself already answered the call and ended the turn, so nothing resolves.
 async fn settle_suspended_host_batch(
     orch: &Orchestrator,
@@ -8027,6 +8055,24 @@ mod host_batch_tests {
         timeout: Option<u32>,
         parkable: bool,
     ) -> (RunBatchSettlement, HostBatch) {
+        let item = (
+            "cairn://responses/slow".to_string(),
+            RunSpec::ResponseCall {
+                response_id: "slow".into(),
+                project: None,
+                args: json!({}),
+                timeout,
+            },
+        );
+        batch_of(orch, item, parkable).await
+    }
+
+    /// One item of any host kind, parkable as [`batch`] describes.
+    async fn batch_of(
+        orch: &Orchestrator,
+        (header, spec): (String, RunSpec),
+        parkable: bool,
+    ) -> (RunBatchSettlement, HostBatch) {
         let request = McpCallbackRequest {
             thread_id: None,
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
@@ -8064,19 +8110,275 @@ mod host_batch_tests {
             cwd: request.cwd.clone(),
             tool_use_id: "tool-1".into(),
             run_context: Some(context),
-            resolved: vec![(
-                "cairn://responses/slow".into(),
-                Ok(RunSpec::ResponseCall {
-                    response_id: "slow".into(),
-                    project: None,
-                    args: json!({}),
-                    timeout,
-                }),
-            )],
+            resolved: vec![(header, Ok(spec))],
             sequential: false,
             stop_on_error: true,
         };
         (settlement, batch)
+    }
+
+    /// A stand-in external server whose one tool answers after `delay`. It
+    /// records the bound the gateway was handed and whether a call was
+    /// abandoned (its future dropped unanswered), which is what cancels the
+    /// request at a real server.
+    struct SlowTool {
+        delay: Duration,
+        sent: Mutex<Option<Option<u32>>>,
+        abandoned: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct MarkAbandoned(Arc<std::sync::atomic::AtomicBool>, bool);
+
+    impl Drop for MarkAbandoned {
+        fn drop(&mut self) {
+            if !self.1 {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mcp::gateway::McpGateway for SlowTool {
+        async fn list_tools(
+            &self,
+            _: &str,
+            _: &str,
+            _: &crate::security::BrokeredMcpConfig,
+        ) -> Result<crate::mcp::gateway::McpToolCatalog, String> {
+            Ok(Default::default())
+        }
+        async fn list_resources(
+            &self,
+            _: &str,
+            _: &str,
+            _: &crate::security::BrokeredMcpConfig,
+        ) -> Result<Vec<crate::mcp::gateway::McpResourceDef>, String> {
+            Ok(Vec::new())
+        }
+        async fn read_resource(
+            &self,
+            _: &str,
+            _: &str,
+            _: &crate::security::BrokeredMcpConfig,
+            _: &str,
+        ) -> Result<String, String> {
+            Ok(String::new())
+        }
+        async fn call_tool_once(
+            &self,
+            _: &str,
+            _: &str,
+            _: &crate::security::BrokeredMcpConfig,
+            _: &str,
+            _: serde_json::Value,
+            _: Option<serde_json::Value>,
+            _: Option<String>,
+            timeout_ms: Option<u32>,
+            _: Option<&str>,
+        ) -> Result<crate::mcp::gateway::McpCallOutcome, String> {
+            *self.sent.lock().unwrap() = Some(timeout_ms);
+            let mut pending = MarkAbandoned(self.abandoned.clone(), false);
+            tokio::time::sleep(self.delay).await;
+            pending.1 = true;
+            Ok(crate::mcp::gateway::McpCallOutcome::Complete(
+                crate::mcp::gateway::McpToolCallResult::from_text("the tool answered"),
+            ))
+        }
+        async fn close_session(&self, _: &str) {}
+    }
+
+    /// Install a [`SlowTool`] and hand back its records.
+    fn slow_tool(
+        orch: &Orchestrator,
+        delay: Duration,
+    ) -> (
+        Arc<std::sync::atomic::AtomicBool>,
+        impl Fn() -> Option<Option<u32>>,
+    ) {
+        let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tool = Arc::new(SlowTool {
+            delay,
+            sent: Mutex::new(None),
+            abandoned: abandoned.clone(),
+        });
+        assert!(orch.set_mcp_gateway(tool.clone()).is_ok());
+        (abandoned, move || *tool.sent.lock().unwrap())
+    }
+
+    fn mcp_item(timeout: Option<u32>) -> (String, RunSpec) {
+        (
+            "cairn://mcp/fake/slow".to_string(),
+            RunSpec::McpCall(Box::new(super::types::McpCallSpec {
+                server: "fake".into(),
+                credential_key: "fake".into(),
+                tool: "slow".into(),
+                args: json!({}),
+                config: serde_json::from_value(json!({})).unwrap(),
+                timeout,
+            })),
+        )
+    }
+
+    fn was(abandoned: &std::sync::atomic::AtomicBool) -> bool {
+        abandoned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The contract this change exists for: an MCP call declared longer than
+    /// the synchronous window suspends its batch and resumes with the tool's
+    /// result, rather than being cut at the window.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_call_that_outlives_grace_suspends_and_resumes_with_its_result() {
+        let orch = env().await;
+        let (abandoned, sent) = slow_tool(&orch, Duration::from_millis(800));
+        let (settlement, batch) = batch_of(&orch, mcp_item(Some(5_000)), true).await;
+
+        let text =
+            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(100)).await;
+        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
+        let (state, condition) = wait_row(&orch).await;
+        assert_eq!(state, "pending");
+        assert!(condition.contains("\"host\":true"), "{condition}");
+
+        let result = eventually(Duration::from_secs(10), || {
+            tool_result_containing(&orch, "the tool answered")
+        })
+        .await
+        .expect("the parked call resumes with the tool's result");
+        let resumed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(resumed["toolUseId"], "tool-1");
+        assert_eq!(resumed["toolResult"], "the tool answered");
+        assert_eq!(resumed["isError"], false);
+        assert_eq!(
+            sent(),
+            Some(Some(5_000)),
+            "the gateway is held to the declared bound, not the host-item cap"
+        );
+        assert!(!was(&abandoned));
+    }
+
+    /// An omitted `timeout` is not "run to completion": an external server is
+    /// arbitrary code, so the call keeps the gateway's 30 s default, and its
+    /// failure names that bound and how to raise it. Time is paused so the
+    /// thirty seconds pass at once.
+    #[tokio::test]
+    async fn an_mcp_call_with_no_timeout_fails_at_the_gateway_default_and_says_so() {
+        let orch = env().await;
+        let (abandoned, sent) = slow_tool(&orch, Duration::from_secs(600));
+        let (_, mut batch) = batch_of(&orch, mcp_item(None), true).await;
+        // No run context: the item touches no database, so paused time can
+        // advance freely.
+        batch.run_context = None;
+
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let outcomes = run_host_items(&orch, batch, None).await;
+        // Paused time advances to the timer wheel's next tick, a hair past.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(30) && elapsed < Duration::from_secs(31),
+            "{elapsed:?}"
+        );
+        assert_eq!(outcomes.len(), 1);
+        assert!(!outcomes[0].succeeded);
+        assert_eq!(
+            outcomes[0].body,
+            format!(
+                "MCP call 'fake/slow' timed out at the 30 s MCP gateway default (no timeout was requested). {MCP_GATEWAY_DEFAULT_WHY}"
+            )
+        );
+        assert!(MCP_GATEWAY_DEFAULT_WHY.contains("declare `timeout` on the item"));
+        assert_eq!(sent(), Some(Some(30_000)));
+        assert!(
+            was(&abandoned),
+            "the timed-out call was dropped, so cancelled"
+        );
+    }
+
+    /// A stop cancels the suspension row and nothing else. The batch's task
+    /// notices, interrupts the MCP item, and the gateway call is dropped,
+    /// which cancels the request at the server. The stop already answered the
+    /// call, so nothing resumes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopping_the_run_cancels_a_suspended_mcp_call() {
+        let orch = env().await;
+        let (abandoned, _) = slow_tool(&orch, Duration::from_secs(30));
+        let (settlement, batch) = batch_of(&orch, mcp_item(Some(60_000)), true).await;
+
+        let text =
+            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(100)).await;
+        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
+        orch.db
+            .local
+            .execute(
+                "UPDATE agent_waits SET state='cancelled' WHERE run_id='run-1' AND state='pending'",
+                (),
+            )
+            .await
+            .unwrap();
+        let stopped = Instant::now();
+
+        eventually(Duration::from_secs(5), || async {
+            was(&abandoned).then_some(())
+        })
+        .await
+        .expect("the in-flight MCP request is cancelled");
+        assert!(
+            stopped.elapsed() < Duration::from_millis(2_500),
+            "cancelled {:?} after the stop",
+            stopped.elapsed()
+        );
+        assert!(tool_result_containing(&orch, "tool-1").await.is_none());
+    }
+
+    /// What the interrupted MCP item itself reports when the run stops.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_mcp_item_reports_itself_stopped() {
+        let orch = env().await;
+        let (abandoned, _) = slow_tool(&orch, Duration::from_secs(30));
+        let (_, batch) = batch_of(&orch, mcp_item(Some(60_000)), true).await;
+        let (interrupter, interrupt) = crate::responses::interruption();
+
+        let (outcomes, ()) = tokio::join!(run_host_items(&orch, batch, Some(&interrupt)), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            interrupter.interrupt(Interruption::Cancelled(RUN_STOPPED_REASON.into()));
+        });
+        assert!(!outcomes[0].succeeded);
+        assert_eq!(
+            outcomes[0].body,
+            "MCP call 'fake/slow' stopped: the run that called it was stopped before it answered. Its request was cancelled at the server."
+        );
+        assert!(was(&abandoned));
+    }
+
+    /// A nested `cairn.run` has nothing to park on, so an MCP call it makes
+    /// ends at the window with the same why a response gets, and is cancelled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_that_cannot_park_ends_its_mcp_call_at_the_window_and_says_why() {
+        let orch = env().await;
+        let (abandoned, _) = slow_tool(&orch, Duration::from_secs(6));
+        let (settlement, batch) = batch_of(&orch, mcp_item(Some(5_000)), false).await;
+
+        let started = Instant::now();
+        let text =
+            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(200)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        let named = format!(
+            "MCP call 'fake/slow' timed out at the 0.2 s host-item cap (requested 5 s). {UNPARKED_HOST_BATCH_WHY}"
+        );
+        assert!(text.contains(&named), "{text}");
+        assert!(!UNPARKED_HOST_BATCH_WHY.contains("response"));
+        assert!(was(&abandoned));
+        let parked: i64 = orch
+            .db
+            .local
+            .query_one("SELECT COUNT(*) FROM agent_waits", (), |row| row.i64(0))
+            .await
+            .unwrap();
+        assert_eq!(parked, 0, "nothing was parked");
     }
 
     async fn journal(orch: &Orchestrator) -> Vec<cairn_db::storage::ResponseInvocationRecord> {
@@ -8261,10 +8563,10 @@ mod host_batch_tests {
             started.elapsed()
         );
         let named = format!(
-            "response timed out at the 0.2 s host-item cap (no timeout was requested; the definition declares 300 s). {UNPARKED_RESPONSE_WHY}"
+            "response timed out at the 0.2 s host-item cap (no timeout was requested; the definition declares 300 s). {UNPARKED_HOST_BATCH_WHY}"
         );
         assert!(text.contains(&named), "{text}");
-        assert!(UNPARKED_RESPONSE_WHY.contains("@cairn/sdk"));
+        assert!(UNPARKED_HOST_BATCH_WHY.contains("@cairn/sdk"));
         let rows = journal(&orch).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].error.as_deref(), Some(named.as_str()));
@@ -8332,6 +8634,28 @@ mod host_batch_tests {
             timeout: None,
         })
         .may_outlive_grace());
+        assert!(host(mcp_item(None).1).may_outlive_grace());
+    }
+
+    /// MCP-tool items take the run-item ceiling when they declare a bound and
+    /// the gateway's default when they declare none; never the host-item cap.
+    #[test]
+    fn an_mcp_item_is_bounded_by_its_ask_or_the_gateway_default() {
+        let ceiling = Duration::from_millis(u64::from(MAX_RUN_ITEM_TIMEOUT_MS));
+        let asked = mcp_item_bound(Some(240_000));
+        assert_eq!(asked.limit, Duration::from_secs(240));
+        assert_eq!(
+            asked.describe(None),
+            "timed out at the 240 s bound its caller requested."
+        );
+        assert_eq!(mcp_item_bound(Some(u32::MAX)).limit, ceiling);
+        let unasked = mcp_item_bound(None);
+        assert_eq!(unasked.limit, crate::mcp::gateway::DEFAULT_MCP_TIMEOUT);
+        assert_eq!(unasked.limit, Duration::from_secs(30));
+        assert!(MCP_GATEWAY_DEFAULT_WHY.contains(&format!(
+            "{}-hour",
+            cairn_common::run_contract::RUN_BATCH_CEILING_HOURS
+        )));
     }
 }
 

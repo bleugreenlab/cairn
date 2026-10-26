@@ -24,6 +24,15 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::security::BrokeredMcpConfig;
 
+/// How long a gateway operation waits when its caller names no bound: a
+/// connect, a listing, a resource read, or a `tools/call` with no `timeout`.
+///
+/// An external server is arbitrary code, so an undeclared call is never left to
+/// ride a longer horizon than this; a caller that knows a call is long declares
+/// its bound. It lives beside the trait rather than in the host crate that
+/// enforces it so the `run` handler can name it in a timeout failure.
+pub const DEFAULT_MCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A bidirectional byte stream suitable for an MCP client transport.
 pub trait DuplexIo: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 

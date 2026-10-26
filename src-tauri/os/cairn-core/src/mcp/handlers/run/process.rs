@@ -411,7 +411,7 @@ pub(crate) async fn run_one(
         // MCP calls are proxied RPC through the host gateway, not process
         // exec — handle and return here.
         RunSpec::McpCall(spec) => {
-            return run_mcp_call(orch, request, run_context, cwd, header, *spec).await;
+            return run_mcp_call(orch, request, run_context, cwd, header, *spec, interrupt).await;
         }
         // A REPL send writes to a live eval-server's persistent stdin and awaits
         // one framed response — not a process exec.
@@ -579,6 +579,11 @@ pub(crate) async fn run_one(
 
 /// Execute a proxied MCP `tools/call` through the host gateway. A missing
 /// gateway or a down/erroring server fails this item only — never the batch.
+///
+/// The item runs to its bound ([`super::mcp_item_bound`]) unless `interrupt`
+/// ends it first: a stopped run, an abandoned call, or a window above it that
+/// closed. Ending early in any way drops the gateway call, which cancels the
+/// request at the server.
 async fn run_mcp_call(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -586,6 +591,7 @@ async fn run_mcp_call(
     cwd: &str,
     header: String,
     spec: McpCallSpec,
+    interrupt: Option<&crate::responses::InvocationInterrupt>,
 ) -> ItemOutcome {
     let McpCallSpec {
         server,
@@ -605,24 +611,45 @@ async fn run_mcp_call(
         .map(|c| c.job_id.clone())
         .unwrap_or_else(|| cwd.to_string());
 
-    // A gateway call is host work on an attached socket, so its bound is the
-    // host-item bound, not the batch ceiling. `None` stays `None`: the gateway's
-    // own default call timeout is the meaningful floor here.
-    let timeout = super::clamp_host_item_timeout_ms(timeout);
-    match gateway
-        .call_tool_once(
-            &session_key,
-            &credential_key,
-            &config.brokered(&credential_key, "mcp tool call"),
-            &tool,
-            args.clone(),
-            None,
-            None,
-            timeout,
-            None,
-        )
-        .await
-    {
+    // The bound is enforced here, around the gateway call, so its failure can
+    // say what set it. The gateway is handed the same bound, but this timer
+    // starts first (it also covers connecting) and is polled first, so it is
+    // the one that fires.
+    let bound = super::mcp_item_bound(timeout);
+    let limit_ms = u32::try_from(bound.limit.as_millis()).unwrap_or(u32::MAX);
+    let brokered = config.brokered(&credential_key, "mcp tool call");
+    let call = gateway.call_tool_once(
+        &session_key,
+        &credential_key,
+        &brokered,
+        &tool,
+        args.clone(),
+        None,
+        None,
+        Some(limit_ms),
+        None,
+    );
+    let mut interrupt = interrupt.cloned();
+    let outcome = tokio::select! {
+        biased;
+        interruption = async {
+            match interrupt.as_mut() {
+                Some(interrupt) => interrupt.wait().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            return ItemOutcome::failed(header, mcp_call_interrupted(&server, &tool, &bound, interruption));
+        }
+        () = tokio::time::sleep(bound.limit) => {
+            return ItemOutcome::failed(
+                header,
+                format!("MCP call '{server}/{tool}' {}", bound.describe(None)),
+            );
+        }
+        outcome = call => outcome,
+    };
+    drop(brokered);
+    match outcome {
         Ok(McpCallOutcome::Complete(result)) => ItemOutcome {
             header,
             body: append_link_affordance(result.text, &result.links, &server),
@@ -642,12 +669,40 @@ async fn run_mcp_call(
                 tool,
                 args,
                 config,
-                timeout,
+                Some(limit_ms),
                 outcome,
             )
             .await
         }
         Err(e) => ItemOutcome::failed(header, e),
+    }
+}
+
+/// What an MCP-tool item reports when its batch interrupted it.
+fn mcp_call_interrupted(
+    server: &str,
+    tool: &str,
+    bound: &crate::responses::InvocationBound,
+    interruption: crate::responses::Interruption,
+) -> String {
+    use crate::responses::{BoundCap, Interruption, InvocationBound};
+    match interruption {
+        Interruption::Cancelled(reason) => format!(
+            "MCP call '{server}/{tool}' stopped: {reason}. Its request was cancelled at the server."
+        ),
+        // A window above the item closed first, so the failure reads as that
+        // window's bound, naming what the item itself had asked for.
+        Interruption::Capped { limit, name, why } => {
+            let capped = InvocationBound {
+                limit,
+                cap: Some(BoundCap {
+                    name,
+                    requested: bound.requested(),
+                    why,
+                }),
+            };
+            format!("MCP call '{server}/{tool}' {}", capped.describe(None))
+        }
     }
 }
 
