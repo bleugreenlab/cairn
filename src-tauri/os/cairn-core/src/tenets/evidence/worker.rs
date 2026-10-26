@@ -9,6 +9,11 @@
 //! leaves it there: retrying cannot help until the catalog changes. Only the
 //! startup pass re-queues those events ([`requeue_unanswerable`]), so
 //! configuring a decision-capable offer and restarting re-evaluates them.
+//!
+//! An embedding outage is not the event's failure. While the shared embedding
+//! gate is paused or the provider is failing, an event is left exactly as it
+//! was and the next sweep tries again; only a refused request or a failed
+//! judgement spends one of its [`super::MAX_ATTEMPTS`].
 
 use std::sync::Arc;
 
@@ -20,7 +25,7 @@ use super::events::{
 use super::judge::{self, Sign};
 use super::vectors::{project_tenet_vectors, tenet_embed_text, vector_db};
 use super::{stable_id, CONFIDENCE_FLOOR, EMBED_CHUNK, KNN_FLOOR, KNN_K, SWEEP_INTERVAL};
-use crate::embeddings::{InputType, COHERE_DIMS, COHERE_MODEL};
+use crate::embeddings::{Corpus, Embed, EmbedFailure, Embedded, Purpose, VectorKey};
 use crate::models::decision::{Decision, DecisionNode, MeasuredBy};
 use crate::orchestrator::{DecisionFailure, Orchestrator};
 use crate::services::EventEmitter;
@@ -39,12 +44,11 @@ pub trait EvidenceDeps: Send + Sync {
     fn now(&self) -> i64;
     /// Every open database: the private one and each team replica.
     async fn dbs(&self) -> Vec<Arc<LocalDb>>;
-    /// `Ok(None)` when no gateway token is available.
-    async fn embed(
-        &self,
-        texts: Vec<String>,
-        input: InputType,
-    ) -> Result<Option<Vec<Vec<f32>>>, String>;
+    /// Embed `texts` into the resource corpus through the shared embedder.
+    async fn embed(&self, purpose: Purpose, texts: Vec<String>) -> Result<Embedded, EmbedFailure>;
+    /// The space resource vectors are stored in now; `None` when no
+    /// embedding offer is selected.
+    fn vector_key(&self) -> Option<VectorKey>;
     /// Answer `decision` about `input` through the models facet's `decide`,
     /// in `project_id`'s model scope.
     async fn judge(
@@ -60,6 +64,7 @@ pub trait EvidenceDeps: Send + Sync {
 
 struct OrchestratorDeps {
     orch: Orchestrator,
+    embedder: Arc<dyn Embed>,
     device: String,
 }
 
@@ -77,15 +82,12 @@ impl EvidenceDeps for OrchestratorDeps {
         self.orch.db.all_dbs().await
     }
 
-    async fn embed(
-        &self,
-        texts: Vec<String>,
-        input: InputType,
-    ) -> Result<Option<Vec<Vec<f32>>>, String> {
-        self.orch
-            .embedding_client()
-            .embed(texts, input, Some(COHERE_DIMS))
-            .await
+    async fn embed(&self, purpose: Purpose, texts: Vec<String>) -> Result<Embedded, EmbedFailure> {
+        self.embedder.embed(Corpus::Resources, purpose, texts).await
+    }
+
+    fn vector_key(&self) -> Option<VectorKey> {
+        self.embedder.active(Corpus::Resources)
     }
 
     async fn judge(
@@ -127,7 +129,12 @@ pub fn spawn(orch: Orchestrator) {
                 return;
             }
         };
-        let deps = OrchestratorDeps { orch, device };
+        let embedder = orch.embedder();
+        let deps = OrchestratorDeps {
+            orch,
+            embedder,
+            device,
+        };
         requeue_unanswerable(&deps).await;
         let mut interval = tokio::time::interval(SWEEP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -156,6 +163,9 @@ pub enum Processed {
     Lost,
     /// One failed attempt was recorded.
     Failed(String),
+    /// Embedding is paused, failing, or not configured; the event was left
+    /// untouched for the next sweep.
+    Deferred(String),
 }
 
 /// Return every event this machine skipped for want of a decision-capable
@@ -225,7 +235,14 @@ pub async fn process(deps: &dyn EvidenceDeps, db: &LocalDb, event: &PendingEvent
                 Some(count) => Processed::Done(count),
                 None => Processed::Lost,
             }),
-        Err(error) => Err(error),
+        Err(Failure::Embedding(failure)) if failure.is_provider_outcome() => {
+            log::debug!(
+                "tenet evidence for {} waits for embedding: {failure}",
+                event.source_uri
+            );
+            return Processed::Deferred(failure.to_string());
+        }
+        Err(failure) => Err(failure.to_string()),
     };
     match settled {
         Ok(processed) => {
@@ -268,30 +285,34 @@ struct StoredVerdict {
     measured_by: MeasuredBy,
 }
 
-async fn embed_required(
-    deps: &dyn EvidenceDeps,
-    texts: Vec<String>,
-    input: InputType,
-) -> Result<Vec<Vec<f32>>, String> {
-    let expected = texts.len();
-    let vectors = deps
-        .embed(texts, input)
-        .await?
-        .ok_or_else(|| "no embedding gateway token is available".to_string())?;
-    if vectors.len() != expected {
-        return Err(format!(
-            "embedding returned {} vectors for {expected} texts",
-            vectors.len()
-        ));
+/// Why an evaluation produced nothing.
+enum Failure {
+    /// Embedding did not answer; only a refused request is the event's fault.
+    Embedding(EmbedFailure),
+    /// Anything else: storage, or a failed judgement.
+    Other(String),
+}
+
+impl From<String> for Failure {
+    fn from(error: String) -> Self {
+        Self::Other(error)
     }
-    Ok(vectors)
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Embedding(failure) => failure.fmt(f),
+            Self::Other(error) => f.write_str(error),
+        }
+    }
 }
 
 async fn evaluate(
     deps: &dyn EvidenceDeps,
     db: &LocalDb,
     event: &PendingEvent,
-) -> Result<Evaluation, String> {
+) -> Result<Evaluation, Failure> {
     let approved = crate::tenets::list(
         db,
         &event.project_id,
@@ -305,10 +326,14 @@ async fn evaluate(
         return Ok(Evaluation::Skip("no approved tenets"));
     };
 
-    // Ensure every approved tenet has a vector. Each chunk is saved as soon as
-    // it returns, so a later failure keeps what earlier chunks paid for.
+    // Ensure every approved tenet has a vector in the space queries are
+    // embedded in now. Each chunk is saved as soon as it returns, so a later
+    // failure keeps what earlier chunks paid for.
+    let key = deps
+        .vector_key()
+        .ok_or(Failure::Embedding(EmbedFailure::Unconfigured))?;
     let vectors_db = vector_db(db);
-    let mut vectors = project_tenet_vectors(vectors_db, &project_key)
+    let mut vectors = project_tenet_vectors(vectors_db, &project_key, &key)
         .await
         .map_err(|error| format!("could not load tenet vectors: {error}"))?;
     let missing: Vec<&TenetView> = approved
@@ -317,14 +342,17 @@ async fn evaluate(
         .collect();
     for chunk in missing.chunks(EMBED_CHUNK) {
         let texts = chunk.iter().map(|view| tenet_embed_text(view)).collect();
-        let embedded = embed_required(deps, texts, InputType::SearchDocument).await?;
-        for (view, vector) in chunk.iter().zip(embedded) {
+        let embedded = deps
+            .embed(Purpose::Document, texts)
+            .await
+            .map_err(Failure::Embedding)?;
+        for (view, vector) in chunk.iter().zip(embedded.vectors) {
             crate::embeddings::queries::upsert_resource_embedding_async(
                 vectors_db,
                 &view.uri,
                 &crate::embeddings::vector::to_bytes(&vector),
-                COHERE_MODEL,
-                COHERE_DIMS as i32,
+                &embedded.model,
+                embedded.dims as i32,
             )
             .await
             .map_err(|error| format!("could not save a tenet vector: {error}"))?;
@@ -332,8 +360,11 @@ async fn evaluate(
         }
     }
 
-    let query = embed_required(deps, vec![event.text.clone()], InputType::SearchQuery)
-        .await?
+    let query = deps
+        .embed(Purpose::Query, vec![event.text.clone()])
+        .await
+        .map_err(Failure::Embedding)?
+        .vectors
         .pop()
         .unwrap_or_default();
     let mut scored: Vec<(f32, &TenetView)> = approved
@@ -380,7 +411,7 @@ async fn evaluate(
         Err(DecisionFailure::Unanswerable(refusal)) => {
             return Ok(Evaluation::Unanswerable(refusal))
         }
-        Err(DecisionFailure::Failed(error)) => return Err(error),
+        Err(DecisionFailure::Failed(error)) => return Err(Failure::Other(error)),
     };
     let verdicts = judge::parse(&decision, &candidates)
         .into_iter()

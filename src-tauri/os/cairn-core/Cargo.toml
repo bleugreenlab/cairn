@@ -180,10 +180,6 @@ name = "vibe_corpus_dump"
 required-features = ["internal-api"]
 
 [[example]]
-name = "backfill_resource_embeddings"
-required-features = ["internal-api"]
-
-[[example]]
 name = "tenet_evidence_dry_run"
 required-features = ["internal-api"]
 

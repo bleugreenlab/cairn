@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -12,12 +13,12 @@ use cairn_models_types::embedding::{
 use cairn_models_types::usage::{BillingUnit, Charge};
 use serde_json::{json, Value};
 
-use super::{embed, families};
+use super::{embed, embed_with, families};
 use crate::interface::complete::{
     Complete, CompletionCall, CompletionError, CompletionReply, Delivery,
 };
 use crate::interface::embed::{
-    EmbedCall, EmbedError, EmbedRequest, EmbedRoute, Purpose, EMBED_FIXES,
+    EmbedCall, EmbedError, EmbedRequest, EmbedRoute, Purpose, Width, EMBED_FIXES,
 };
 use crate::interface::{Catalog, CatalogProvider};
 use crate::wire::embeddings::gateway::GatewayEmbedResponse;
@@ -106,11 +107,13 @@ fn gateway_reply(count: usize, model: &str) -> CompletionReply {
     })
 }
 
+/// A request for `texts`; `dims` asks for exactly that width, unset for the
+/// native one.
 fn request(texts: &[&str], purpose: Purpose, dims: Option<u32>) -> EmbedRequest {
     EmbedRequest {
         texts: texts.iter().map(|text| text.to_string()).collect(),
         purpose,
-        dims,
+        width: dims.map_or(Width::Native, Width::Exactly),
     }
 }
 
@@ -483,7 +486,7 @@ fn an_oversized_request_is_split_in_order_and_joined_in_input_order() {
         &EmbedRequest {
             texts: all.clone(),
             purpose: Purpose::Document,
-            dims: None,
+            width: Width::Native,
         },
     )
     .unwrap();
@@ -680,6 +683,233 @@ fn no_texts_or_an_empty_text_is_refused_before_any_post() {
         assert_eq!(error, EmbedError::InvalidRequest(expected.into()));
         assert!(complete.requests().is_empty());
     }
+}
+
+// Retry
+
+/// A non-2xx as the wire reports it.
+fn http(status: u16, retry_after: Option<u64>) -> CompletionError {
+    CompletionError::Http {
+        status,
+        message: format!("Cairn gateway embed returned HTTP {status}: x"),
+        retry_after: retry_after.map(Duration::from_secs),
+    }
+}
+
+/// Embed one text on the gateway with a sleep that only records, answering
+/// what happened and every wait.
+fn on_gateway_recording_sleeps(
+    complete: &Scripted,
+    request: &EmbedRequest,
+) -> (
+    Result<crate::interface::embed::Embeddings, EmbedError>,
+    Vec<Duration>,
+) {
+    let slept = RefCell::new(Vec::new());
+    let result = embed_with(
+        complete,
+        EmbedCall {
+            route: &gateway(),
+            model: "cohere-embed-v4",
+            capabilities: &EmbeddingCapabilities::cairn_gateway(),
+            request,
+            timeout: Duration::from_secs(5),
+        },
+        &|wait| slept.borrow_mut().push(wait),
+    );
+    (result, slept.into_inner())
+}
+
+fn secs(values: &[u64]) -> Vec<Duration> {
+    values.iter().copied().map(Duration::from_secs).collect()
+}
+
+#[test]
+fn a_transient_failure_is_retried_after_a_doubling_delay() {
+    let complete = Scripted::answering(vec![
+        Err(http(500, None)),
+        Err(http(500, None)),
+        Ok(gateway_reply(1, "cohere-embed-v4")),
+    ]);
+    let (result, slept) =
+        on_gateway_recording_sleeps(&complete, &request(&["x"], Purpose::Document, None));
+    assert_eq!(result.unwrap().vectors.len(), 1);
+    assert_eq!(slept, secs(&[2, 4]));
+    assert_eq!(complete.requests().len(), 3);
+}
+
+#[test]
+fn three_transient_failures_fail_the_call() {
+    let complete = Scripted::answering(vec![
+        Err(http(502, None)),
+        Err(http(503, None)),
+        Err(http(500, None)),
+    ]);
+    let (result, slept) =
+        on_gateway_recording_sleeps(&complete, &request(&["x"], Purpose::Document, None));
+    let error = result.unwrap_err();
+    assert_eq!(error, EmbedError::Completion(http(500, None)));
+    assert!(error.is_transient());
+    assert_eq!(slept, secs(&[2, 4]));
+}
+
+#[test]
+fn a_short_retry_after_is_waited_out_when_longer_than_the_backoff() {
+    let complete = Scripted::answering(vec![
+        Err(http(429, Some(5))),
+        Ok(gateway_reply(1, "cohere-embed-v4")),
+    ]);
+    let (result, slept) =
+        on_gateway_recording_sleeps(&complete, &request(&["x"], Purpose::Document, None));
+    assert!(result.is_ok());
+    assert_eq!(slept, secs(&[5]));
+}
+
+#[test]
+fn a_long_retry_after_returns_at_once_carrying_the_wait() {
+    // The gateway's throttle (cairn/5344) asks for 60 s: the caller's pause
+    // honours it, not a blocking thread inside the call.
+    for asked in [60, 120] {
+        let complete = Scripted::answering(vec![Err(http(429, Some(asked)))]);
+        let (result, slept) =
+            on_gateway_recording_sleeps(&complete, &request(&["x"], Purpose::Document, None));
+        let error = result.unwrap_err();
+        assert!(error.is_transient());
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(asked)));
+        assert!(slept.is_empty());
+        assert_eq!(complete.requests().len(), 1);
+    }
+}
+
+#[test]
+fn a_refusal_is_never_retried() {
+    for status in [400, 401, 402, 403, 404] {
+        let complete = Scripted::answering(vec![Err(http(status, None))]);
+        let (result, slept) =
+            on_gateway_recording_sleeps(&complete, &request(&["x"], Purpose::Document, None));
+        let error = result.unwrap_err();
+        assert!(!error.is_transient(), "{status}");
+        assert!(slept.is_empty(), "{status}");
+        assert_eq!(complete.requests().len(), 1, "{status}");
+    }
+    // Errors of the request or the reply, rather than the provider, are
+    // never transient either.
+    assert!(!EmbedError::InvalidRequest("x".into()).is_transient());
+    assert!(!EmbedError::WidthMismatch {
+        admitted: None,
+        got: 1
+    }
+    .is_transient());
+}
+
+// Preferred widths
+
+#[test]
+fn a_preferred_width_the_gateway_cannot_return_falls_back_to_native() {
+    let complete = Scripted::answering(vec![Ok(gateway_reply(1, "cohere-embed-v4"))]);
+    let result = run(
+        &complete,
+        &gateway(),
+        "cohere-embed-v4",
+        &EmbeddingCapabilities::cairn_gateway(),
+        &EmbedRequest {
+            texts: vec!["x".into()],
+            purpose: Purpose::Document,
+            width: Width::Preferred(256),
+        },
+    )
+    .unwrap();
+    assert!(complete.requests()[0].1.get("dims").is_none());
+    assert_eq!(result.dims, 1536);
+
+    // The same on an OpenAI-wire native-only model: nothing is sent.
+    let complete = Scripted::answering(vec![Ok(in_order(1, 2560))]);
+    let result = run(
+        &complete,
+        &hub(),
+        "qwen/qwen3-embedding-4b",
+        &plain(Some(2560), EmbeddingWidths::NativeOnly),
+        &EmbedRequest {
+            texts: vec!["x".into()],
+            purpose: Purpose::Document,
+            width: Width::Preferred(256),
+        },
+    )
+    .unwrap();
+    assert!(complete.requests()[0].1.get("dimensions").is_none());
+    assert_eq!(result.dims, 2560);
+}
+
+#[test]
+fn a_preferred_width_the_offer_can_return_is_sent() {
+    let complete = Scripted::answering(vec![Ok(in_order(1, 256))]);
+    let result = run(
+        &complete,
+        &hub(),
+        "nomic-embed-text",
+        &plain(Some(768), EmbeddingWidths::UpTo { min: 64 }),
+        &EmbedRequest {
+            texts: vec!["x".into()],
+            purpose: Purpose::Document,
+            width: Width::Preferred(256),
+        },
+    )
+    .unwrap();
+    assert_eq!(complete.requests()[0].1["dimensions"], 256);
+    assert_eq!(result.dims, 256);
+}
+
+#[test]
+fn a_preferred_width_never_keeps_an_offer_from_being_selected() {
+    let (offer, _) = two_offer_catalog()
+        .embedding_offer(
+            Some("qwen/qwen3-embedding-4b"),
+            &EmbedRequest {
+                texts: vec!["x".into()],
+                purpose: Purpose::Query,
+                width: Width::Preferred(256),
+            },
+        )
+        .unwrap();
+    assert_eq!(offer.model, "qwen/qwen3-embedding-4b");
+}
+
+#[test]
+fn the_gateway_bounds_every_request_at_48000_characters() {
+    // 100,000 characters in ten texts.
+    let texts: Vec<String> = (0..10)
+        .map(|index| format!("{index}").repeat(10_000))
+        .collect();
+    let complete = Scripted::answering(vec![
+        Ok(gateway_reply(4, "cohere-embed-v4")),
+        Ok(gateway_reply(4, "cohere-embed-v4")),
+        Ok(gateway_reply(2, "cohere-embed-v4")),
+    ]);
+    let result = run(
+        &complete,
+        &gateway(),
+        "cohere-embed-v4",
+        &EmbeddingCapabilities::cairn_gateway(),
+        &EmbedRequest {
+            texts: texts.clone(),
+            purpose: Purpose::Document,
+            width: Width::Native,
+        },
+    )
+    .unwrap();
+    assert_eq!(result.vectors.len(), 10);
+    let sizes: Vec<usize> = complete
+        .requests()
+        .iter()
+        .map(|(_, body)| {
+            sent_texts(body, "texts")
+                .iter()
+                .map(|text| text.chars().count())
+                .sum()
+        })
+        .collect();
+    assert_eq!(sizes, [40_000, 40_000, 20_000]);
+    assert!(sizes.iter().all(|size| *size <= 48_000));
 }
 
 // Order and identity

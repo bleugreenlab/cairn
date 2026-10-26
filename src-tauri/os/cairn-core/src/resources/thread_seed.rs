@@ -30,7 +30,7 @@
 use cairn_db::turso::params;
 use cairn_tokenize::{count, Family};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::storage::{LocalDb, RowExt};
 use crate::tenets::{TenetOrigin, TenetStatus, TenetView};
@@ -1239,27 +1239,39 @@ async fn relevance_rank(
             .into_iter()
             .map(|number| cairn_common::uri::build_issue_uri(input.project_key, number as i32)),
     );
-    let mut work: Vec<Vec<f32>> = Vec::new();
+    let mut work: Vec<(crate::embeddings::VectorKey, Vec<f32>)> = Vec::new();
     for uri in &work_uris {
-        if let Some(vector) = resource_vector(input.vectors, uri)
+        if let Some(stored) = resource_vector(input.vectors, uri)
             .await
             .map_err(|error| format!("failed to read the vector of {uri}: {error}"))?
         {
-            work.push(vector);
+            work.push(stored);
         }
     }
     if work.is_empty() {
         return Ok(None);
     }
 
-    let tenet_vectors = project_tenet_vectors(input.vectors, input.project_key)
-        .await
-        .map_err(|error| format!("failed to read tenet vectors: {error}"))?;
+    // A piece of work is compared only with tenets embedded in its own space.
+    let mut tenet_vectors: Vec<(crate::embeddings::VectorKey, HashMap<String, Vec<f32>>)> =
+        Vec::new();
+    for (key, _) in &work {
+        if tenet_vectors.iter().any(|(known, _)| known == key) {
+            continue;
+        }
+        let vectors = project_tenet_vectors(input.vectors, input.project_key, key)
+            .await
+            .map_err(|error| format!("failed to read tenet vectors: {error}"))?;
+        tenet_vectors.push((key.clone(), vectors));
+    }
     let similarity = |view: &TenetView| -> Option<f32> {
-        let vector = tenet_vectors.get(&view.uri)?;
         work.iter()
-            .filter(|other| other.len() == vector.len())
-            .map(|other| crate::embeddings::vector::cosine_similarity(vector, other))
+            .filter_map(|(key, other)| {
+                let (_, space) = tenet_vectors.iter().find(|(known, _)| known == key)?;
+                let vector = space.get(&view.uri)?;
+                (vector.len() == other.len())
+                    .then(|| crate::embeddings::vector::cosine_similarity(vector, other))
+            })
             .reduce(f32::max)
     };
     let recent_since = input.now - crate::tenets::evidence::RECENT_EVIDENCE_SECS;
@@ -3745,8 +3757,8 @@ mod tests {
             db,
             uri,
             &crate::embeddings::vector::to_bytes(vector),
-            crate::embeddings::COHERE_MODEL,
-            crate::embeddings::COHERE_DIMS as i32,
+            "cohere-embed-v4",
+            vector.len() as i32,
         )
         .await
         .unwrap();

@@ -6,7 +6,7 @@
 //! (no login) and sends it as the Bearer token to `/embed`. The token is
 //! long-lived (~30 days), persisted locally in the single-row `anon_device`
 //! table, and re-registered lazily near expiry. When an account *is* connected,
-//! the account JWT takes precedence (see `Orchestrator::embed_token_provider`).
+//! the account JWT takes precedence (see `resolve_embed_token`).
 
 use std::{future::Future, sync::Arc};
 

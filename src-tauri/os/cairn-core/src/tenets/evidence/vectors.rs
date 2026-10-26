@@ -4,11 +4,12 @@
 //! Vectors live in the private database's `resource_embeddings`, keyed by
 //! canonical URI, like every other corpus vector; each machine holds its own
 //! copy. A tenet's text is immutable once approved, so its vector never goes
-//! stale, and a superseded tenet drops out through its status.
+//! stale, and a superseded tenet drops out through its status. A vector is
+//! only ever compared with one from the same model at the same width.
 
 use std::collections::HashMap;
 
-use crate::embeddings::{COHERE_DIMS, COHERE_MODEL};
+use crate::embeddings::VectorKey;
 use crate::storage::{DbResult, LocalDb};
 use crate::tenets::TenetView;
 
@@ -25,17 +26,18 @@ pub fn project_tenet_prefix(project_key: &str) -> String {
     )
 }
 
-/// Every stored tenet vector of a project, by tenet URI.
+/// Every stored tenet vector of a project in `key`'s space, by tenet URI.
 pub async fn project_tenet_vectors(
     vectors: &LocalDb,
     project_key: &str,
+    key: &VectorKey,
 ) -> DbResult<HashMap<String, Vec<f32>>> {
     Ok(
         crate::embeddings::queries::resource_embeddings_with_prefix_async(
             vectors,
             &project_tenet_prefix(project_key),
-            COHERE_MODEL,
-            COHERE_DIMS as i32,
+            &key.model,
+            key.dims.map(|dims| dims as i32),
         )
         .await?
         .into_iter()
@@ -43,14 +45,24 @@ pub async fn project_tenet_vectors(
     )
 }
 
-/// One resource's stored vector, when it was embedded by the current model at
-/// the current width.
-pub async fn resource_vector(vectors: &LocalDb, uri: &str) -> DbResult<Option<Vec<f32>>> {
+/// One resource's stored vector, and the space it was made in.
+pub async fn resource_vector(
+    vectors: &LocalDb,
+    uri: &str,
+) -> DbResult<Option<(VectorKey, Vec<f32>)>> {
     Ok(
         crate::embeddings::queries::get_resource_embedding_async(vectors, uri)
             .await?
-            .filter(|record| record.model == COHERE_MODEL && record.dims == COHERE_DIMS as i32)
-            .map(|record| crate::embeddings::vector::from_bytes(&record.embedding)),
+            .filter(|record| record.dims > 0)
+            .map(|record| {
+                (
+                    VectorKey {
+                        model: record.model,
+                        dims: Some(record.dims as u32),
+                    },
+                    crate::embeddings::vector::from_bytes(&record.embedding),
+                )
+            }),
     )
 }
 

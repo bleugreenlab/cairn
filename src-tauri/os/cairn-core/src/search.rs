@@ -78,6 +78,8 @@ const EXCERPT_CHARS: usize = 150;
 /// replica.
 pub struct SemanticLane<'a> {
     pub search: &'a SemanticSearch,
+    /// Embeds the query.
+    pub embedder: &'a dyn crate::embeddings::Embed,
     pub vectors: &'a LocalDb,
 }
 
@@ -256,7 +258,13 @@ async fn semantic_hits(
 ) -> Vec<SearchIndexHit> {
     let Some(scored) = lane
         .search
-        .rank_turns(lane.vectors, filters.project_id.as_deref(), query, limit)
+        .rank_turns(
+            lane.embedder,
+            lane.vectors,
+            filters.project_id.as_deref(),
+            query,
+            limit,
+        )
         .await
     else {
         return Vec::new();

@@ -36,38 +36,25 @@
 //! a turn missed by a failed pass is simply still pending on the next one.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
-use super::client::{EmbeddingClient, InputType, COHERE_MODEL};
-use super::extract_embeddable_text;
+use super::embedder::{Corpus, Embed, EmbedFailure, Purpose};
 use super::vector;
+use super::{extract_embeddable_text, truncate_chars, EMBED_TEXT_BUDGET};
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_db::turso::{params, Value};
 
-/// The width span vectors are requested at.
-///
-/// The gateway ignores it: `/embed` accepts `dims` but never reads it and always
-/// returns 1536-wide Cohere Embed v4 vectors (`api/src/routes/embed.ts`), and
-/// span rows store the width that came back, so turn vectors are stored at
-/// 1536, not 256.
-pub const SPAN_DIMS: u32 = 256;
-
-/// Character budget for one turn's text.
-///
-/// Generous enough to carry a substantial exchange, bounded so a single
-/// runaway turn cannot dominate a batch's request size.
-const TURN_TEXT_BUDGET: usize = 16_000;
-
-/// Ceiling on turns per gateway call.
+/// Ceiling on turns per embedding call.
 const EMBED_BATCH: usize = 16;
 
-/// Ceiling on characters per gateway call.
+/// Ceiling on characters per embedding call.
 ///
-/// Batching by count alone is what makes an oversized request possible: a batch
-/// of sixteen turns is trivial when they are short and enormous when they are
-/// all at the per-turn budget. Bounding the request itself means no batch can
-/// be too large to accept, so a gateway failure is transient and retrying is
-/// the right response — rather than a poison batch the sweep re-forms and
-/// re-fails forever, since it always takes the same newest-first page.
+/// A call is also the unit the sweep persists: each finished call's vectors
+/// are written before the next is sent, so a failure costs one call, never the
+/// pass. Batching by count alone would make that unit enormous when sixteen
+/// turns all sit at the per-turn budget; the facet bounds what one provider
+/// request carries on its own, so this only bounds what one failure loses.
 const EMBED_BATCH_CHARS: usize = 48_000;
 
 /// Turns considered by one sweep pass. One pass is one bounded unit of work;
@@ -84,9 +71,9 @@ const SWEEP_IDLE_SECS: u64 = 60;
 /// that it does not monopolize the gateway that live embedding shares.
 const SWEEP_BACKLOG_PAUSE_SECS: u64 = 2;
 
-/// How long to wait after a failing pass. A gateway that is refusing calls
-/// should not be retried on the backlog cadence.
-const SWEEP_ERROR_BACKOFF_SECS: u64 = 300;
+/// How long to wait when the install boundary cannot be read or recorded:
+/// a database problem, which the next loop retries.
+const BOUNDARY_RETRY_SECS: u64 = 300;
 
 /// `dims` marking a turn whose prose could not be established — an archived
 /// event that did not reconstruct.
@@ -103,6 +90,11 @@ const SWEEP_ERROR_BACKOFF_SECS: u64 = 300;
 /// a tombstone is a settled answer, this is an unsettled one, and
 /// [`Scope::Deferred`] retries it on the slow cadence. Both are excluded from
 /// retrieval by `dims > 0`.
+///
+/// The marker is written once, when the turn is first found unreadable. A
+/// retry that still cannot read it writes nothing: the retry walks a cursor
+/// over turn ids, so nothing about the row has to change for the walk to move
+/// on, and a pass that embeds nothing leaves no trace.
 const DEFERRED_DIMS: i32 = -1;
 
 /// How often a caught-up sweep re-examines all of history.
@@ -158,6 +150,28 @@ pub struct SweepSummary {
     /// Turns still pending after this pass — true means there is more work, so
     /// the caller can keep passes coming.
     pub remaining: bool,
+    /// The last turn the pass considered, in its scope's order: where a
+    /// [`Scope::Deferred`] walk resumes.
+    pub last_turn: Option<String>,
+}
+
+/// Why a sweep pass stopped short.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SweepError {
+    /// Embedding failed or is paused. The gate has already logged the outage;
+    /// the turns not reached stay pending.
+    Embedding(EmbedFailure),
+    /// Reading the pass's turns failed.
+    Storage(String),
+}
+
+impl std::fmt::Display for SweepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Embedding(failure) => failure.fmt(f),
+            Self::Storage(error) => f.write_str(error),
+        }
+    }
 }
 
 /// Which turns a sweep pass will consider.
@@ -175,7 +189,7 @@ pub struct SweepSummary {
 ///   looks above the newest embedded turn, so such a turn falls permanently
 ///   below the floor. Recovering it means re-scanning from this install's own
 ///   boundary, which is not a history upload and needs no account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     /// Un-embedded turns created at or after `since`, newest first.
     ///
@@ -195,7 +209,15 @@ pub enum Scope {
     /// is overwhelmingly pre-boundary — the very transcripts [`Scope::All`] is
     /// gated to protect. Like every other scope, it has to answer both
     /// questions above, not just the correctness one.
-    Deferred { since: Option<i64> },
+    ///
+    /// Walked in turn-id order from just past `after`, so successive passes
+    /// rotate through every deferred turn without writing anything to mark
+    /// where they have been. The caller holds the cursor and starts over when
+    /// a page comes back short.
+    Deferred {
+        since: Option<i64>,
+        after: Option<String>,
+    },
 }
 
 /// Run the sweep forever on the current tokio runtime.
@@ -211,30 +233,37 @@ pub enum Scope {
 /// `has_account` reports a CONNECTED ACCOUNT, not merely a usable gateway
 /// token. Every install registers an anonymous device token, so a token alone
 /// says nothing about consent; see [`Scope`].
+///
+/// A failed pass waits out the embedding gate (see
+/// [`super::embedder`]) rather than a cadence of its own: every consumer is
+/// paused by the same outage, for the same time.
 pub fn spawn_turn_embedding_sweep(
-    client: EmbeddingClient,
-    db: std::sync::Arc<LocalDb>,
-    has_account: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    embedder: Arc<dyn Embed>,
+    db: Arc<LocalDb>,
+    has_account: Arc<dyn Fn() -> bool + Send + Sync>,
 ) {
     tokio::spawn(async move {
+        let embedder = embedder.as_ref();
         let mut last_reconcile = std::time::Instant::now();
         let mut catching_up = true;
+        // Where the deferred retry resumes; held here, never written.
+        let mut deferred_after: Option<String> = None;
         loop {
             // Everything below is scoped by this boundary, so an install that
             // has not established one yet does nothing at all rather than
             // guessing. Re-read each loop because establishing it can fail.
             let Some(boundary) = install_boundary(&db).await else {
-                tokio::time::sleep(std::time::Duration::from_secs(SWEEP_ERROR_BACKOFF_SECS)).await;
+                tokio::time::sleep(Duration::from_secs(BOUNDARY_RETRY_SECS)).await;
                 continue;
             };
 
             // Fast pass: the newest edge, so a turn that just ended becomes
             // searchable promptly, ahead of anything still being walked.
             let live_floor = live_boundary(&db, boundary).await;
-            let mut wait = match run_pass(&db, &client, Scope::Since(live_floor)).await {
-                Some(remaining) if remaining => SWEEP_BACKLOG_PAUSE_SECS,
+            let mut wait = match run_pass(&db, embedder, Scope::Since(live_floor)).await {
+                Some(summary) if summary.remaining => SWEEP_BACKLOG_PAUSE_SECS,
                 Some(_) => SWEEP_IDLE_SECS,
-                None => SWEEP_ERROR_BACKOFF_SECS,
+                None => gate_wait(embedder),
             };
 
             // Wider pass, on a slower cadence: an anti-join whose cost tracks
@@ -254,14 +283,14 @@ pub fn spawn_turn_embedding_sweep(
                 } else {
                     Scope::Since(boundary)
                 };
-                match run_pass(&db, &client, scope).await {
-                    Some(remaining) => {
-                        catching_up = remaining;
-                        if remaining {
+                match run_pass(&db, embedder, scope).await {
+                    Some(summary) => {
+                        catching_up = summary.remaining;
+                        if summary.remaining {
                             wait = SWEEP_BACKLOG_PAUSE_SECS;
                         }
                     }
-                    None => wait = SWEEP_ERROR_BACKOFF_SECS,
+                    None => wait = gate_wait(embedder),
                 }
                 // Retry whatever could not be read before. Bounded and out of
                 // the way: these carry marker rows, so they never crowd the
@@ -276,15 +305,32 @@ pub fn spawn_turn_embedding_sweep(
                 // gate exists to protect.
                 let deferred = Scope::Deferred {
                     since: (!has_account()).then_some(boundary),
+                    after: deferred_after.clone(),
                 };
-                if run_pass(&db, &client, deferred).await.is_none() {
-                    wait = SWEEP_ERROR_BACKOFF_SECS;
+                match run_pass(&db, embedder, deferred).await {
+                    // A short page is the end of the walk: start over.
+                    Some(summary) => {
+                        deferred_after = summary.remaining.then_some(summary.last_turn).flatten();
+                    }
+                    None => wait = gate_wait(embedder),
                 }
             }
 
-            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            tokio::time::sleep(Duration::from_secs(wait)).await;
         }
     });
+}
+
+/// How long a failed pass waits: until the embedding gate opens, and never
+/// less than the backlog pause.
+fn gate_wait(embedder: &dyn Embed) -> u64 {
+    embedder
+        .health()
+        .retry_at
+        .and_then(|at| at.duration_since(SystemTime::now()).ok())
+        .map_or(SWEEP_BACKLOG_PAUSE_SECS, |wait| {
+            wait.as_secs().max(SWEEP_BACKLOG_PAUSE_SECS)
+        })
 }
 
 /// When this install began participating in the transcript, established once on
@@ -349,10 +395,10 @@ async fn install_boundary(db: &LocalDb) -> Option<i64> {
     Some(newest)
 }
 
-/// Run one pass, logging what it did. `None` means the pass failed; `Some(more)`
-/// reports whether work remains in that scope.
-async fn run_pass(db: &LocalDb, client: &EmbeddingClient, scope: Scope) -> Option<bool> {
-    match embed_pending(db, client, scope, SWEEP_LIMIT).await {
+/// Run one pass, logging what it did. `None` means the pass failed; otherwise
+/// the summary says whether work remains in that scope.
+async fn run_pass(db: &LocalDb, embedder: &dyn Embed, scope: Scope) -> Option<SweepSummary> {
+    match embed_pending(db, embedder, scope.clone(), SWEEP_LIMIT).await {
         Ok(Some(summary)) => {
             if summary.embedded > 0 || summary.tombstoned > 0 || summary.deferred > 0 {
                 log::debug!(
@@ -363,11 +409,17 @@ async fn run_pass(db: &LocalDb, client: &EmbeddingClient, scope: Scope) -> Optio
                     summary.remaining,
                 );
             }
-            Some(summary.remaining)
+            Some(summary)
         }
-        // No gateway token at all. The lane stays as sparse as it is and search
-        // keeps answering from the full-text index alone.
-        Ok(None) => Some(false),
+        // Embedding is not configured on this device. The lane stays as
+        // sparse as it is and search keeps answering from the full-text index
+        // alone.
+        Ok(None) => Some(SweepSummary::default()),
+        // A provider outage is logged once by the gate, not once per pass.
+        Err(SweepError::Embedding(failure)) if failure.is_provider_outcome() => {
+            log::debug!("turn embeddings ({scope:?}) stopped: {failure}");
+            None
+        }
         Err(error) => {
             log::warn!("turn embeddings ({scope:?}) failed: {error}");
             None
@@ -399,29 +451,37 @@ async fn live_boundary(db: &LocalDb, started_at: i64) -> i64 {
 
 /// Embed the newest turns in `scope` that have ended and have no vector yet.
 ///
-/// Returns `Ok(None)` when no gateway token is available at all: nothing is
-/// read, nothing is written, and the semantic lane simply stays as sparse as it
-/// was. That is the silent degrade — search falls back to full text.
+/// Returns `Ok(None)` when embedding is not configured on this device: nothing
+/// is read, nothing is written, and the semantic lane simply stays as sparse as
+/// it was. That is the silent degrade — search falls back to full text.
 ///
-/// An error leaves every turn in the pass pending. That is the point: a
-/// tombstone must mean "swept successfully, no prose found" and nothing else,
-/// because nothing ever clears one.
+/// An embedding failure stops the pass where it is. Each finished call's
+/// vectors are already written, and every turn not reached stays pending. That
+/// is the point: a tombstone must mean "swept successfully, no prose found"
+/// and nothing else, because nothing ever clears one.
 pub async fn embed_pending(
     db: &LocalDb,
-    client: &EmbeddingClient,
+    embedder: &dyn Embed,
     scope: Scope,
     limit: usize,
-) -> Result<Option<SweepSummary>, String> {
-    // Ask the cheap question first. Discovering the absence of a token at the
-    // gateway call would mean loading and reconstructing a page of turns on
-    // every pass, forever, to learn nothing.
-    if !client.has_token() {
-        return Ok(None);
+) -> Result<Option<SweepSummary>, SweepError> {
+    // Ask the cheap question first. Discovering a closed gate at the call
+    // would mean loading and reconstructing a page of turns on every pass, for
+    // as long as an outage lasts, to learn nothing.
+    if !embedder.ready() {
+        let health = embedder.health();
+        if !health.configured {
+            return Ok(None);
+        }
+        return Err(SweepError::Embedding(EmbedFailure::Paused {
+            retry_at: health.retry_at.unwrap_or_else(SystemTime::now),
+        }));
     }
 
+    let retrying = matches!(scope, Scope::Deferred { .. });
     let pending = load_pending_turns(db, scope, limit)
         .await
-        .map_err(|error| format!("loading pending turns: {error}"))?;
+        .map_err(|error| SweepError::Storage(format!("loading pending turns: {error}")))?;
     if pending.is_empty() {
         return Ok(Some(SweepSummary::default()));
     }
@@ -432,11 +492,18 @@ pub async fn embed_pending(
     // would be a log line.
     let prose = load_turn_texts(db, &pending)
         .await
-        .map_err(|error| format!("loading turn text: {error}"))?;
+        .map_err(|error| SweepError::Storage(format!("loading turn text: {error}")))?;
     let mut summary = SweepSummary {
         remaining: pending.len() == limit,
+        last_turn: pending.last().map(|turn| turn.turn_id.clone()),
         ..SweepSummary::default()
     };
+    // Rows that carry no vector are labelled with the model they were swept
+    // for, like every other row.
+    let model = embedder
+        .active(Corpus::Turns)
+        .map(|key| key.model)
+        .unwrap_or_default();
 
     let mut texts: HashMap<String, String> = HashMap::new();
     let mut with_text: Vec<PendingTurn> = Vec::new();
@@ -457,9 +524,15 @@ pub async fn embed_pending(
     }
 
     // Marking a deferral is what lets the sweep move past it. Counting it
-    // would leave the turn at the head of every future page.
+    // would leave the turn at the head of every future page. A turn reached
+    // through its marker already carries one, and rewriting it would record a
+    // write for a pass that embedded nothing.
     for turn in &deferred {
-        if let Err(error) = upsert_turn_vector(db, turn, &[], DEFERRED_DIMS).await {
+        if retrying {
+            summary.deferred += 1;
+            continue;
+        }
+        if let Err(error) = upsert_turn_vector(db, turn, &[], &model, DEFERRED_DIMS).await {
             log::warn!(
                 "turn embeddings: deferral for {} failed: {error}",
                 turn.turn_id
@@ -472,7 +545,7 @@ pub async fn embed_pending(
     // A turn of pure tool results has nothing to embed. Record that fact so the
     // turn is not reconsidered by every future pass.
     for turn in &empty {
-        if let Err(error) = upsert_turn_vector(db, turn, &[], 0).await {
+        if let Err(error) = upsert_turn_vector(db, turn, &[], &model, 0).await {
             log::warn!(
                 "turn embeddings: tombstone for {} failed: {error}",
                 turn.turn_id
@@ -487,24 +560,22 @@ pub async fn embed_pending(
             .iter()
             .map(|turn| texts.remove(&turn.turn_id).unwrap_or_default())
             .collect();
-        match client
-            .embed(batch, InputType::SearchDocument, Some(SPAN_DIMS))
+        match embedder
+            .embed(Corpus::Turns, Purpose::Document, batch)
             .await
         {
-            // The token lapsed mid-pass: leave every remaining turn pending and
-            // say so, rather than tombstoning turns we simply could not reach.
-            Ok(None) => return Ok(None),
-            Ok(Some(vectors)) if vectors.len() != chunk.len() => {
-                return Err(format!(
-                    "embed gateway returned {} vectors for {} turns",
-                    vectors.len(),
-                    chunk.len()
-                ));
-            }
-            Ok(Some(vectors)) => {
-                for (turn, embedding) in chunk.iter().zip(vectors.iter()) {
+            Ok(embedded) => {
+                for (turn, embedding) in chunk.iter().zip(embedded.vectors.iter()) {
                     let bytes = vector::to_bytes(embedding);
-                    match upsert_turn_vector(db, turn, &bytes, embedding.len() as i32).await {
+                    match upsert_turn_vector(
+                        db,
+                        turn,
+                        &bytes,
+                        &embedded.model,
+                        embedding.len() as i32,
+                    )
+                    .await
+                    {
                         Ok(()) => summary.embedded += 1,
                         Err(error) => log::warn!(
                             "turn embeddings: upsert for {} failed: {error}",
@@ -513,7 +584,11 @@ pub async fn embed_pending(
                     }
                 }
             }
-            Err(error) => return Err(error),
+            // Embedding was switched off mid-pass: leave every remaining turn
+            // pending and say so, rather than tombstoning turns we simply
+            // could not reach.
+            Err(EmbedFailure::Unconfigured) => return Ok(None),
+            Err(failure) => return Err(SweepError::Embedding(failure)),
         }
     }
 
@@ -600,18 +675,20 @@ async fn load_pending_turns(
             )
             .await
         }
-        // Least-recently-attempted first, so retries rotate rather than
-        // hammering the same unreadable turns every reconcile.
-        Scope::Deferred { since } => {
+        // In turn-id order from the caller's cursor, so retries rotate through
+        // every unreadable turn rather than hammering the same page, without
+        // writing anything to remember where they got to.
+        Scope::Deferred { since, after } => {
             db.query_all(
                 &format!(
                     "{COLUMNS} JOIN turn_embeddings te ON te.turn_id = t.id \
-                     WHERE te.dims = ?1 AND t.created_at >= ?2 \
-                     ORDER BY te.updated_at ASC LIMIT ?3"
+                     WHERE te.dims = ?1 AND t.created_at >= ?2 AND te.turn_id > ?3 \
+                     ORDER BY te.turn_id ASC LIMIT ?4"
                 ),
                 params![
                     DEFERRED_DIMS as i64,
                     since.unwrap_or(i64::MIN),
+                    after.unwrap_or_default(),
                     limit as i64
                 ],
                 row_to_turn,
@@ -667,7 +744,7 @@ async fn load_turn_texts(
             (
                 turn_id,
                 TurnProse {
-                    text: fit_to_budget(parts, TURN_TEXT_BUDGET),
+                    text: fit_to_budget(parts, EMBED_TEXT_BUDGET),
                     uncertain: false,
                 },
             )
@@ -832,26 +909,13 @@ fn fit_to_budget(parts: Vec<String>, budget: usize) -> String {
         .join(SEPARATOR)
 }
 
-/// Truncate to at most `max_bytes`, never splitting a character.
-fn truncate_chars(text: &str, max_bytes: usize) -> &str {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let end = text
-        .char_indices()
-        .map(|(index, _)| index)
-        .take_while(|index| *index <= max_bytes)
-        .last()
-        .unwrap_or(0);
-    &text[..end]
-}
-
-/// Persist one turn's vector. An empty `embedding` with `dims = 0` is the
-/// tombstone for a turn that carried no embeddable prose.
+/// Persist one turn's vector under `model`. An empty `embedding` with
+/// `dims = 0` is the tombstone for a turn that carried no embeddable prose.
 async fn upsert_turn_vector(
     db: &LocalDb,
     turn: &PendingTurn,
     embedding: &[u8],
+    model: &str,
     dims: i32,
 ) -> DbResult<()> {
     let now = chrono::Utc::now().timestamp();
@@ -872,7 +936,7 @@ async fn upsert_turn_vector(
             turn.project_id.clone(),
             turn.sequence as i64,
             embedding.to_vec(),
-            COHERE_MODEL,
+            model,
             dims as i64,
             now
         ],
@@ -937,6 +1001,17 @@ const CACHE_TTL_SECS: u64 = 60;
 /// Cache key standing for "every project".
 const ALL_PROJECTS: &str = "";
 
+/// The longest a search waits for its query to embed before answering from
+/// text alone.
+///
+/// The lane is additive and interactive, while the door it embeds through is
+/// built for background consumers: the facet retries a transient failure
+/// inside the call (seconds of backoff, or up to three request timeouts), and
+/// a person typing into the palette should not wait out any of it. The embed
+/// still runs to the end on its blocking task, which settles the shared gate
+/// itself, so a search that stops waiting still records how it went.
+const QUERY_EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
+
 // This lane cannot tell you whether it found anything, and does not try.
 //
 // A dense retriever always returns nearest neighbors, and the geometry of
@@ -972,7 +1047,6 @@ struct CachedVectors {
 /// megabytes. Holding them makes each query pure arithmetic over a few tens of
 /// thousands of short vectors.
 pub struct SemanticSearch {
-    client: EmbeddingClient,
     cache: tokio::sync::RwLock<HashMap<String, CachedVectors>>,
     /// Serializes cache misses. Without it, two searches arriving after the TTL
     /// lapses each load the whole corpus — tens of megabytes, twice — which a
@@ -980,26 +1054,33 @@ pub struct SemanticSearch {
     loading: tokio::sync::Mutex<()>,
 }
 
+impl Default for SemanticSearch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SemanticSearch {
-    pub fn new(client: EmbeddingClient) -> Self {
+    pub fn new() -> Self {
         Self {
-            client,
             cache: tokio::sync::RwLock::new(HashMap::new()),
             loading: tokio::sync::Mutex::new(()),
         }
     }
 
-    /// Rank stored turns against `query`, best first.
+    /// Rank stored turns against `query`, embedded through `embedder`, best
+    /// first.
     ///
-    /// Returns `None` whenever the lane cannot answer — no account connected,
-    /// no vectors stored yet, or a gateway failure. Every one is the same
-    /// instruction to the caller: serve the full-text answer unchanged. The
-    /// lane is additive, never required.
+    /// Returns `None` whenever the lane cannot answer — no vectors stored yet,
+    /// embedding not configured or paused, or the query failing to embed.
+    /// Every one is the same instruction to the caller: serve the full-text
+    /// answer unchanged. The lane is additive, never required.
     ///
     /// It does NOT judge whether its answer is any good; it cannot. See the
     /// note on that above.
     pub async fn rank_turns(
         &self,
+        embedder: &dyn Embed,
         db: &LocalDb,
         project_id: Option<&str>,
         query: &str,
@@ -1015,19 +1096,17 @@ impl SemanticSearch {
 
         // Asymmetric embedding is the validated retrieval win: the corpus is
         // embedded as documents, the query as a query.
-        let query_vector = match self
-            .client
-            .embed(
-                vec![query.to_string()],
-                InputType::SearchQuery,
-                Some(SPAN_DIMS),
-            )
-            .await
-        {
-            Ok(Some(mut vectors)) => vectors.pop()?,
-            Ok(None) => return None,
-            Err(error) => {
-                log::debug!("semantic search: embedding the query failed: {error}");
+        let embedding = embedder.embed(Corpus::Turns, Purpose::Query, vec![query.to_string()]);
+        let query_vector = match tokio::time::timeout(QUERY_EMBED_TIMEOUT, embedding).await {
+            Ok(Ok(mut embedded)) => embedded.vectors.pop()?,
+            Ok(Err(failure)) => {
+                log::debug!("semantic search: embedding the query failed: {failure}");
+                return None;
+            }
+            Err(_) => {
+                log::debug!(
+                    "semantic search: the query did not embed within {QUERY_EMBED_TIMEOUT:?}"
+                );
                 return None;
             }
         };
@@ -1209,24 +1288,20 @@ mod tests {
 
     // ===== database-backed =====
 
-    use crate::api::ApiConfig;
+    use crate::embeddings::embedder::stub::StubEmbed;
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("cairn-turn-embeddings-turso.db").await
     }
 
-    /// A client with no device token at all.
-    fn tokenless_client() -> EmbeddingClient {
-        EmbeddingClient::new(ApiConfig::default(), std::sync::Arc::new(|| None))
+    /// An install with no embedding credential at all.
+    fn tokenless_client() -> StubEmbed {
+        StubEmbed::unconfigured()
     }
 
-    /// A client holding a token. Safe for turns that need no gateway call — a
-    /// turn with no prose forms no batch, so nothing is sent.
-    fn tokened_client() -> EmbeddingClient {
-        EmbeddingClient::new(
-            ApiConfig::default(),
-            std::sync::Arc::new(|| Some("test-token".to_string())),
-        )
+    /// A working embedder, labelling vectors as the gateway's.
+    fn tokened_client() -> StubEmbed {
+        StubEmbed::cohere()
     }
 
     async fn seed_project(db: &LocalDb) {
@@ -1314,6 +1389,7 @@ mod tests {
                 sequence: 1,
             },
             &vector::to_bytes(&[0.5, 0.5]),
+            "cohere-embed-v4",
             2,
         )
         .await
@@ -1443,6 +1519,7 @@ mod tests {
                     sequence: 1,
                 },
                 &[],
+                "cohere-embed-v4",
                 DEFERRED_DIMS,
             )
             .await
@@ -1453,9 +1530,16 @@ mod tests {
         // archival is what makes a turn old — so this population is mostly
         // pre-boundary. Unfloored, it would retry uploading exactly the
         // transcripts the account gate protects.
-        let floored = load_pending_turns(&db, Scope::Deferred { since: Some(300) }, 10)
-            .await
-            .unwrap();
+        let floored = load_pending_turns(
+            &db,
+            Scope::Deferred {
+                since: Some(300),
+                after: None,
+            },
+            10,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             floored
                 .iter()
@@ -1464,9 +1548,7 @@ mod tests {
             vec!["turn-new"]
         );
 
-        let unfloored = load_pending_turns(&db, Scope::Deferred { since: None }, 10)
-            .await
-            .unwrap();
+        let unfloored = load_pending_turns(&db, retry_from(None), 10).await.unwrap();
         assert_eq!(unfloored.len(), 2);
     }
 
@@ -1509,9 +1591,7 @@ mod tests {
         assert_eq!(summary.tombstoned, 0);
 
         // Retryable, but through its own scope — not by sitting in the page.
-        let retryable = load_pending_turns(&db, Scope::Deferred { since: None }, 10)
-            .await
-            .unwrap();
+        let retryable = load_pending_turns(&db, retry_from(None), 10).await.unwrap();
         assert_eq!(retryable.len(), 1);
         assert_eq!(retryable[0].turn_id, "turn-archived");
         // And not a vector: a deferral is an unsettled answer, not a hit.
@@ -1599,6 +1679,7 @@ mod tests {
                 sequence: 1,
             },
             &vector::to_bytes(&[1.0]),
+            "cohere-embed-v4",
             1,
         )
         .await
@@ -1672,6 +1753,7 @@ mod tests {
                 sequence: 7,
             },
             &vector::to_bytes(&[0.25, -0.5, 1.0]),
+            "cohere-embed-v4",
             3,
         )
         .await
@@ -1688,5 +1770,266 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(load_vectors(&db, None).await.unwrap().len(), 1);
+    }
+
+    /// The unfloored deferred retry, resuming after `after`.
+    fn retry_from(after: Option<&str>) -> Scope {
+        Scope::Deferred {
+            since: None,
+            after: after.map(str::to_string),
+        }
+    }
+
+    /// A turn whose one archived event did not reconstruct.
+    async fn seed_unreadable(db: &LocalDb, turn_id: &str, created_at: i64) {
+        seed_turn(db, turn_id, "complete", created_at, &[("assistant", "")]).await;
+        db.execute(
+            "UPDATE events SET storage_mode = 'zstd' WHERE turn_id = ?1",
+            params![turn_id],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn count_rows(db: &LocalDb, sql: &str) -> i64 {
+        db.query_one(sql, (), |row| row.i64(0)).await.unwrap()
+    }
+
+    /// An embedder that takes far longer than a person waits, as one does
+    /// while the facet retries a failing provider.
+    struct Slow;
+
+    #[async_trait::async_trait]
+    impl Embed for Slow {
+        async fn embed(
+            &self,
+            _corpus: Corpus,
+            _purpose: Purpose,
+            _texts: Vec<String>,
+        ) -> Result<crate::embeddings::Embedded, EmbedFailure> {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Err(EmbedFailure::Failed("HTTP 500".into()))
+        }
+        fn active(&self, _corpus: Corpus) -> Option<crate::embeddings::VectorKey> {
+            None
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+        fn health(&self) -> crate::embeddings::EmbedHealth {
+            crate::embeddings::EmbedHealth::default()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_query_embed_answers_from_text_within_the_bound() {
+        let db = migrated_db().await;
+        seed_project(&db).await;
+        seed_turn(&db, "turn-1", "complete", 100, &[("assistant", "a")]).await;
+        upsert_turn_vector(
+            &db,
+            &PendingTurn {
+                turn_id: "turn-1".to_string(),
+                session_id: "session-turn-1".to_string(),
+                job_id: None,
+                project_id: Some("project-1".to_string()),
+                sequence: 1,
+            },
+            &vector::to_bytes(&[1.0, 0.0, 0.0]),
+            "cohere-embed-v4",
+            3,
+        )
+        .await
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let ranked = SemanticSearch::new()
+            .rank_turns(&Slow, &db, None, "anything", 5)
+            .await;
+        assert_eq!(ranked, None);
+        let waited = started.elapsed();
+        assert!(
+            waited >= QUERY_EMBED_TIMEOUT && waited < QUERY_EMBED_TIMEOUT * 2,
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_paused_gate_sends_nothing_and_writes_nothing() {
+        let db = migrated_db().await;
+        seed_project(&db).await;
+        seed_turn(&db, "turn-a", "complete", 100, &[("assistant", "a")]).await;
+        seed_turn(&db, "turn-b", "complete", 200, &[("assistant", "b")]).await;
+        let embedder = tokened_client();
+        embedder.set_paused(true);
+
+        let error = embed_pending(&db, &embedder, Scope::All, 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, SweepError::Embedding(EmbedFailure::Paused { .. })),
+            "{error:?}"
+        );
+        assert!(embedder.calls().is_empty());
+        assert_eq!(pending_count(&db).await.unwrap(), 2);
+        assert_eq!(
+            count_rows(&db, "SELECT COUNT(*) FROM turn_embeddings").await,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_call_keeps_the_calls_before_it_and_leaves_the_rest_pending() {
+        let db = migrated_db().await;
+        seed_project(&db).await;
+        // Three calls' worth: 16, 16, then 1.
+        for index in 0..(2 * EMBED_BATCH as i64 + 1) {
+            seed_turn(
+                &db,
+                &format!("turn-{index:02}"),
+                "complete",
+                100 + index,
+                &[("assistant", "prose")],
+            )
+            .await;
+        }
+        let embedder = tokened_client();
+        embedder.script(vec![None, Some(EmbedFailure::Failed("HTTP 500".into()))]);
+
+        let error = embed_pending(&db, &embedder, Scope::All, SWEEP_LIMIT)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            SweepError::Embedding(EmbedFailure::Failed("HTTP 500".into()))
+        );
+        let calls = embedder.calls();
+        assert_eq!(calls.len(), 2, "nothing is sent after the failure");
+        assert_eq!(calls[0].texts.len(), EMBED_BATCH);
+        assert_eq!(
+            (calls[0].corpus, calls[0].purpose),
+            (Corpus::Turns, Purpose::Document)
+        );
+        assert_eq!(
+            count_rows(
+                &db,
+                "SELECT COUNT(*) FROM turn_embeddings
+                  WHERE model = 'cohere-embed-v4' AND dims = 1536"
+            )
+            .await,
+            EMBED_BATCH as i64,
+            "the first call's vectors are kept, labelled with what made them"
+        );
+        assert_eq!(pending_count(&db).await.unwrap(), EMBED_BATCH as i64 + 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retry_that_still_cannot_read_a_turn_writes_nothing() {
+        let db = migrated_db().await;
+        seed_project(&db).await;
+        for (index, turn_id) in ["turn-a", "turn-b", "turn-c"].into_iter().enumerate() {
+            seed_unreadable(&db, turn_id, 100 + index as i64).await;
+        }
+        let embedder = tokened_client();
+        let first = embed_pending(&db, &embedder, Scope::All, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.deferred, 3);
+        db.execute("UPDATE turn_embeddings SET updated_at = 5", ())
+            .await
+            .unwrap();
+        let rows = || async {
+            db.query_all(
+                "SELECT turn_id, dims, model, created_at, updated_at
+                   FROM turn_embeddings ORDER BY turn_id",
+                (),
+                |row| {
+                    Ok((
+                        row.text(0)?,
+                        row.i64(1)?,
+                        row.text(2)?,
+                        row.i64(3)?,
+                        row.i64(4)?,
+                    ))
+                },
+            )
+            .await
+            .unwrap()
+        };
+        let before = rows().await;
+
+        for _ in 0..2 {
+            let retry = embed_pending(&db, &embedder, retry_from(None), 10)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (retry.deferred, retry.embedded, retry.tombstoned),
+                (3, 0, 0)
+            );
+        }
+        assert_eq!(rows().await, before, "two retries wrote nothing");
+        assert!(embedder.calls().is_empty());
+
+        // A turn that has become readable is embedded over its marker.
+        db.execute(
+            "UPDATE events SET storage_mode = NULL, data = '{\"content\":\"recovered\"}'
+              WHERE turn_id = 'turn-b'",
+            (),
+        )
+        .await
+        .unwrap();
+        let retry = embed_pending(&db, &embedder, retry_from(None), 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((retry.deferred, retry.embedded), (2, 1));
+        assert_eq!(
+            count_rows(
+                &db,
+                "SELECT COUNT(*) FROM turn_embeddings WHERE turn_id = 'turn-b' AND dims = 1536"
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_deferred_walk_visits_every_marker_and_wraps() {
+        let db = migrated_db().await;
+        seed_project(&db).await;
+        let ids: Vec<String> = (0..5).map(|index| format!("turn-d{index}")).collect();
+        for (index, turn_id) in ids.iter().enumerate() {
+            seed_unreadable(&db, turn_id, 100 + index as i64).await;
+        }
+        let embedder = tokened_client();
+        embed_pending(&db, &embedder, Scope::All, 10)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The sweep loop's own cursor handling, page size two.
+        let mut after: Option<String> = None;
+        let mut pages: Vec<Vec<String>> = Vec::new();
+        for _ in 0..4 {
+            let scope = retry_from(after.as_deref());
+            let page = load_pending_turns(&db, scope.clone(), 2).await.unwrap();
+            pages.push(page.into_iter().map(|turn| turn.turn_id).collect());
+            let summary = embed_pending(&db, &embedder, scope, 2)
+                .await
+                .unwrap()
+                .unwrap();
+            after = summary.remaining.then_some(summary.last_turn).flatten();
+        }
+        assert_eq!(
+            pages,
+            [
+                vec![ids[0].clone(), ids[1].clone()],
+                vec![ids[2].clone(), ids[3].clone()],
+                vec![ids[4].clone()],
+                vec![ids[0].clone(), ids[1].clone()],
+            ]
+        );
     }
 }

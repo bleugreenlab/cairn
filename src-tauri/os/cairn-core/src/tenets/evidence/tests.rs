@@ -11,7 +11,7 @@ use super::events::{self, NewEvent, PendingEvent};
 use super::wake::{self, decayed};
 use super::worker::{self, EvidenceDeps, Processed};
 use super::*;
-use crate::embeddings::InputType;
+use crate::embeddings::{EmbedFailure as Outcome, Embedded, Purpose, VectorKey};
 use crate::issues::crud;
 use crate::models::decision::{
     choice_confidence, Decision, DecisionAnswer, DecisionNode, DecisionQuestion, MeasuredBy,
@@ -120,8 +120,14 @@ async fn event_row(db: &LocalDb, id: &str) -> (String, i64, i64, Option<String>)
 
 #[derive(Clone, Copy)]
 enum EmbedFailure {
+    /// No credential on this device.
     NoToken,
+    /// The gate is closed after an earlier failure.
+    Paused,
+    /// The provider failed.
     Gateway,
+    /// The request itself was refused.
+    Refused,
 }
 
 /// One decision the worker asked for.
@@ -146,7 +152,7 @@ struct Fake {
     dbs: Vec<Arc<LocalDb>>,
     needles: Vec<(String, Vec<f32>)>,
     failures: Mutex<HashMap<usize, EmbedFailure>>,
-    embed_calls: Mutex<Vec<(Vec<String>, InputType)>>,
+    embed_calls: Mutex<Vec<(Vec<String>, Purpose)>>,
     verdicts: Mutex<Value>,
     judge_failure: Mutex<Option<DecisionFailure>>,
     judge_calls: Mutex<Vec<JudgeCall>>,
@@ -229,22 +235,36 @@ impl EvidenceDeps for Fake {
     async fn dbs(&self) -> Vec<Arc<LocalDb>> {
         self.dbs.clone()
     }
-    async fn embed(
-        &self,
-        texts: Vec<String>,
-        input: InputType,
-    ) -> Result<Option<Vec<Vec<f32>>>, String> {
+    async fn embed(&self, purpose: Purpose, texts: Vec<String>) -> Result<Embedded, Outcome> {
         let index = {
             let mut calls = self.embed_calls.lock().unwrap();
-            calls.push((texts.clone(), input));
+            calls.push((texts.clone(), purpose));
             calls.len() - 1
         };
         match self.failures.lock().unwrap().get(&index) {
-            Some(EmbedFailure::NoToken) => return Ok(None),
-            Some(EmbedFailure::Gateway) => return Err("embed gateway returned 503".into()),
+            Some(EmbedFailure::NoToken) => return Err(Outcome::Unconfigured),
+            Some(EmbedFailure::Paused) => {
+                return Err(Outcome::Paused {
+                    retry_at: std::time::SystemTime::now(),
+                })
+            }
+            Some(EmbedFailure::Gateway) => {
+                return Err(Outcome::Failed("embed gateway returned 503".into()))
+            }
+            Some(EmbedFailure::Refused) => return Err(Outcome::Rejected("text 0 is empty".into())),
             None => {}
         }
-        Ok(Some(texts.iter().map(|text| self.vector(text)).collect()))
+        Ok(Embedded {
+            vectors: texts.iter().map(|text| self.vector(text)).collect(),
+            model: "fake-embed".into(),
+            dims: 4,
+        })
+    }
+    fn vector_key(&self) -> Option<VectorKey> {
+        Some(VectorKey {
+            model: "fake-embed".into(),
+            dims: Some(4),
+        })
     }
     async fn judge(
         &self,
@@ -573,32 +593,67 @@ async fn an_event_with_no_approved_tenets_is_skipped_without_a_network_call() {
 }
 
 #[tokio::test]
-async fn unavailable_embeddings_back_off_then_fail_after_five_attempts() {
+async fn an_embedding_outage_spends_none_of_an_events_attempts() {
     let db = fixture("evidence-embed-unavailable.db").await;
+    approve(&db, 1, "t-design", "Uploads go through the store").await;
+    let event = add_event(&db, "1", A, "work").await;
+    let before = event_row(&db, &event.id).await;
+    // An outage lasting far longer than five attempts' worth of sweeps.
+    for _ in 0..8 {
+        for failure in [
+            EmbedFailure::NoToken,
+            EmbedFailure::Paused,
+            EmbedFailure::Gateway,
+        ] {
+            let fake = Fake::new(A, 1_000, &db);
+            fake.fail_call(0, failure);
+            assert!(matches!(
+                worker::process(&fake, &db, &event).await,
+                Processed::Deferred(_)
+            ));
+            assert!(fake.judges().is_empty());
+        }
+    }
+    assert_eq!(
+        event_row(&db, &event.id).await,
+        before,
+        "the event is exactly as it was: pending, no attempt spent, no error"
+    );
+    assert_eq!(before.0, "pending");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM tenet_evidence").await, 0);
+
+    // Once embedding answers, it is judged as if nothing had happened.
+    let fake = Fake::new(A, 2_000, &db).needle("", &[1.0, 0.0, 0.0, 0.0]);
+    fake.set_verdicts(json!([{"tenet": 1, "verdict": "supports", "probability": 0.9}]));
+    assert_eq!(
+        worker::process(&fake, &db, &event).await,
+        Processed::Done(1)
+    );
+}
+
+#[tokio::test]
+async fn a_refused_embedding_backs_off_then_fails_after_five_attempts() {
+    let db = fixture("evidence-embed-refused.db").await;
     approve(&db, 1, "t-design", "Uploads go through the store").await;
     let mut event = add_event(&db, "1", A, "work").await;
     let fake = Fake::new(A, 1_000, &db);
-    fake.fail_call(0, EmbedFailure::NoToken);
+    fake.fail_call(0, EmbedFailure::Refused);
     assert!(matches!(
         worker::process(&fake, &db, &event).await,
         Processed::Failed(_)
     ));
     let (state, attempts, next, error) = event_row(&db, &event.id).await;
     assert_eq!((state.as_str(), attempts, next), ("pending", 1, 1_060));
-    assert!(error.unwrap().contains("token"));
-    assert!(fake.judges().is_empty());
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM tenet_evidence").await, 0);
+    assert!(error.unwrap().contains("refused"));
 
-    // A gateway error is a failed attempt too; the fifth gives up.
     for attempt in 1..5 {
         event.attempts = attempt;
         let fake = Fake::new(A, 2_000, &db);
-        fake.fail_call(0, EmbedFailure::Gateway);
+        fake.fail_call(0, EmbedFailure::Refused);
         worker::process(&fake, &db, &event).await;
     }
-    let (state, attempts, _, error) = event_row(&db, &event.id).await;
+    let (state, attempts, _, _) = event_row(&db, &event.id).await;
     assert_eq!((state.as_str(), attempts), ("failed", 5));
-    assert!(error.unwrap().contains("503"));
 }
 
 #[tokio::test]
@@ -616,17 +671,24 @@ async fn tenet_vectors_saved_before_a_failure_persist() {
         EMBED_CHUNK as i64,
         "the first chunk was saved before the second failed"
     );
-    assert_eq!(event_row(&db, &event.id).await.1, 1);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM resource_embeddings WHERE model = 'fake-embed' AND dims = 4"
+        )
+        .await,
+        EMBED_CHUNK as i64,
+        "labelled with the space that produced them"
+    );
+    assert_eq!(event_row(&db, &event.id).await.1, 0);
 
     // The retry embeds only the tenet still missing, then the event.
-    let mut event = event;
-    event.attempts = 1;
     let fake = Fake::new(A, 2_000, &db);
     worker::process(&fake, &db, &event).await;
     let calls = fake.embed_calls.lock().unwrap().clone();
     assert_eq!(calls[0].0.len(), 1);
-    assert_eq!(calls[0].1, InputType::SearchDocument);
-    assert_eq!(calls[1].1, InputType::SearchQuery);
+    assert_eq!(calls[0].1, Purpose::Document);
+    assert_eq!(calls[1].1, Purpose::Query);
 }
 
 /// A unit vector at cosine `similarity` from the first axis.
@@ -897,7 +959,7 @@ async fn with_no_decision_capable_offer_the_event_is_skipped_with_the_refusal_un
     // An event skipped for an ordinary reason, after an earlier failed
     // attempt left a `last_error`, is not mistaken for a refusal.
     let mut ordinary = add_event(&db, "2", A, "unrelated work").await;
-    fake.fail_call(fake.embeds(), EmbedFailure::Gateway);
+    fake.fail_call(fake.embeds(), EmbedFailure::Refused);
     worker::process(&fake, &db, &ordinary).await;
     assert!(event_row(&db, &ordinary.id).await.3.is_some());
     ordinary.attempts = 1;

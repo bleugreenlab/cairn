@@ -3,7 +3,9 @@
 //!
 //! Reads a corpus-dump JSONL produced by `examples/vibe_corpus_dump.rs` (each row
 //! carries the embeddable `text`, `run_progress`, and `dist_prev_error`), embeds
-//! the assistant events through the `/embed` gateway, partitions them by the
+//! the assistant events through the `/embed` gateway (the models facet's `embed`
+//! verb, as the app does), records the model and width the reply measured,
+//! partitions them by the
 //! validated behavioral labels, computes unit mean-difference contrast vectors,
 //! and builds the 101-point empirical percentile table per axis.
 //!
@@ -20,13 +22,8 @@
 //!     cargo run --example compute_vibe_axes --features internal-api -- \
 //!       <dump.jsonl> [OUT_JSON] [--max N]
 
-use std::sync::Arc;
-
-use cairn_core::internal::api::ApiConfig;
 use cairn_core::internal::embeddings::vibes::average_vectors;
-use cairn_core::internal::embeddings::{
-    EmbeddingClient, InputType, TokenProvider, COHERE_DIMS, COHERE_MODEL,
-};
+use cairn_core::internal::embeddings::{gateway_embedder, Corpus, Purpose};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -67,16 +64,11 @@ async fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok());
 
-    let jwt = std::env::var("CAIRN_DEVICE_JWT").ok();
-    if jwt.is_none() {
+    let Some(jwt) = std::env::var("CAIRN_DEVICE_JWT").ok() else {
         eprintln!("error: CAIRN_DEVICE_JWT is required to call the gateway");
         std::process::exit(1);
-    }
-    let token: TokenProvider = {
-        let jwt = jwt.clone();
-        Arc::new(move || jwt.clone())
     };
-    let client = EmbeddingClient::new(ApiConfig::default(), token);
+    let embedder = gateway_embedder(jwt);
 
     // 1) Load assistant rows with their behavioral labels.
     let content = std::fs::read_to_string(&dump_path).expect("read dump jsonl");
@@ -106,14 +98,18 @@ async fn main() {
 
     // 2) Embed in batches; keep each (unit vector, labels).
     let mut labeled: Vec<Labeled> = Vec::new();
+    let mut space: Option<(String, u32)> = None;
     for chunk in rows.chunks(96) {
         let texts: Vec<String> = chunk.iter().map(|(t, _, _)| t.clone()).collect();
-        let vecs = client
-            .embed(texts, InputType::SearchDocument, Some(COHERE_DIMS))
+        let embedded = embedder
+            .embed(Corpus::Resources, Purpose::Document, texts)
             .await
-            .expect("embed request failed")
-            .expect("gateway returned no embeddings (check JWT/account)");
-        for ((_, prog, dprev), v) in chunk.iter().zip(vecs.into_iter()) {
+            .unwrap_or_else(|failure| panic!("embed request failed: {failure}"));
+        let this = (embedded.model.clone(), embedded.dims);
+        if space.get_or_insert_with(|| this.clone()) != &this {
+            panic!("the gateway changed vector space mid-run: {space:?} then {this:?}");
+        }
+        for ((_, prog, dprev), v) in chunk.iter().zip(embedded.vectors.into_iter()) {
             labeled.push(Labeled {
                 vector: unit(&v),
                 run_progress: *prog,
@@ -161,9 +157,10 @@ async fn main() {
         }));
     }
 
+    let (model, dims) = space.expect("no rows were embedded");
     let out = serde_json::json!({
-        "model": COHERE_MODEL,
-        "dims": COHERE_DIMS,
+        "model": model,
+        "dims": dims,
         "axes": axes_json,
     });
     std::fs::write(&out_path, serde_json::to_string(&out).expect("serialize")).expect("write axes");

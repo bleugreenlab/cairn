@@ -65,13 +65,39 @@ impl Purpose {
     }
 }
 
+/// The width a request wants its vectors at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Width {
+    /// The model's native width; nothing is sent.
+    #[default]
+    Native,
+    /// Exactly this width; an offer that cannot return it is refused.
+    Exactly(u32),
+    /// This width when the offer can return it, else the native one. Never
+    /// refused: a consumer stating a preference stores whatever width the
+    /// result reports.
+    Preferred(u32),
+}
+
+impl Width {
+    /// The width an offer declaring `capabilities` returns for this request,
+    /// when that is known before asking: `None` for an exact width the offer
+    /// refuses, or a native width it does not state.
+    pub fn on(self, capabilities: &EmbeddingCapabilities) -> Option<u32> {
+        match admit(capabilities, self) {
+            Ok(Some(width)) => Some(width),
+            Ok(None) => capabilities.native_dims,
+            Err(_) => None,
+        }
+    }
+}
+
 /// What to embed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbedRequest {
     pub texts: Vec<String>,
     pub purpose: Purpose,
-    /// The width wanted. Unset takes the model's native width.
-    pub dims: Option<u32>,
+    pub width: Width,
 }
 
 /// One vector per text, in input order, and what produced them.
@@ -185,6 +211,22 @@ impl fmt::Display for EmbedError {
     }
 }
 
+impl EmbedError {
+    /// Whether the same request may succeed later: only a provider failure
+    /// the provider itself called passing ([`CompletionError::is_transient`]).
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Completion(error) if error.is_transient())
+    }
+
+    /// How long the provider asked to be left alone, when it said.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Completion(error) => error.retry_after(),
+            _ => None,
+        }
+    }
+}
+
 impl std::error::Error for EmbedError {}
 
 impl From<CompletionError> for EmbedError {
@@ -202,7 +244,8 @@ impl From<NoOffer> for EmbedError {
 impl Catalog {
     /// The offer that embeds `request`, with what it declares: the best offer
     /// serving `embed` for `requested` (unset takes the first) that can return
-    /// the width asked for.
+    /// the width asked for. A [`Width::Preferred`] request is admitted by
+    /// every offer, at the preference or natively.
     pub fn embedding_offer(
         &self,
         requested: Option<&str>,
@@ -215,7 +258,7 @@ impl Catalog {
             },
             |offer| match &offer.served.verb {
                 Verb::Embed(capabilities) => {
-                    admit(capabilities, request.dims).map(|_| capabilities.clone())
+                    admit(capabilities, request.width).map(|_| capabilities.clone())
                 }
                 _ => Err(EmbedError::Unsupported("it does not embed".to_string())),
             },

@@ -20,6 +20,16 @@ fn serve_once(
     status: &'static str,
     reply: &'static str,
 ) -> (String, std::sync::mpsc::Receiver<String>) {
+    serve_once_with(status, "", reply)
+}
+
+/// [`serve_once`], with `extra` (whole `name: value\r\n` lines) added to the
+/// reply's headers.
+fn serve_once_with(
+    status: &'static str,
+    extra: &'static str,
+    reply: &'static str,
+) -> (String, std::sync::mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let (sender, received) = std::sync::mpsc::channel();
@@ -49,7 +59,7 @@ fn serve_once(
         };
         let _ = write!(
             stream,
-            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n{reply}",
             reply.len()
         );
         let _ = sender.send(request);
@@ -189,8 +199,19 @@ fn gateway_error(status: &'static str, reply: &'static str) -> CompletionError {
         .unwrap_err()
 }
 
+/// The error a non-2xx with no `Retry-After` is, `text` naming its status.
 fn upstream(text: &str) -> CompletionError {
-    CompletionError::Upstream(text.to_string())
+    let status = text
+        .split("HTTP ")
+        .nth(1)
+        .and_then(|rest| rest.get(..3))
+        .and_then(|code| code.parse().ok())
+        .expect("the message names its status");
+    CompletionError::Http {
+        status,
+        message: text.to_string(),
+        retry_after: None,
+    }
 }
 
 #[test]
@@ -287,6 +308,86 @@ fn the_gateways_error_bodies_keep_their_sentence() {
         gateway_error("500 Internal Server Error", "Internal Server Error"),
         upstream("Cairn gateway embed returned HTTP 500: Internal Server Error")
     );
+}
+
+#[test]
+fn a_throttle_carries_its_status_and_retry_after_as_values() {
+    // The gateway's throttle since cairn/5344: 429, delta-seconds.
+    let (url, _) = serve_once_with(
+        "429 Too Many Requests",
+        "retry-after: 7\r\n",
+        r#"{"error":"throttled","upstream":"bedrock","reason":"daily cap","retry_after_seconds":7}"#,
+    );
+    let error =
+        gateway::post_gateway_embed(&gateway_endpoint(url), json!({}), Duration::from_secs(5))
+            .unwrap_err();
+    assert_eq!(
+        error,
+        CompletionError::Http {
+            status: 429,
+            message: "Cairn gateway embed returned HTTP 429: throttled".into(),
+            retry_after: Some(Duration::from_secs(7)),
+        }
+    );
+    assert!(error.is_transient());
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
+    // The display is the one an `Upstream` message always had.
+    assert_eq!(
+        error.to_string(),
+        "completion provider failed: Cairn gateway embed returned HTTP 429: throttled"
+    );
+
+    // An HTTP-date is not a delay this reads; the caller's backoff applies.
+    let (url, _) = serve_once_with(
+        "503 Service Unavailable",
+        "retry-after: Wed, 21 Oct 2026 07:28:00 GMT\r\n",
+        "busy",
+    );
+    let error =
+        gateway::post_gateway_embed(&gateway_endpoint(url), json!({}), Duration::from_secs(5))
+            .unwrap_err();
+    assert_eq!(error.retry_after(), None);
+    assert!(error.is_transient());
+}
+
+#[test]
+fn transient_failures_are_told_from_refusals() {
+    // The gateway before cairn/5344 reported Bedrock throttling as a bare 500.
+    assert!(gateway_error("500 Internal Server Error", "Internal Server Error").is_transient());
+    assert!(gateway_error("502 Bad Gateway", r#"{"error":"upstream_error"}"#).is_transient());
+    assert!(!gateway_error(
+        "401 Unauthorized",
+        r#"{"error":"Invalid or expired token"}"#
+    )
+    .is_transient());
+    assert!(!openai_error(
+        "402 Payment Required",
+        r#"{"error":{"message":"Insufficient credits"}}"#
+    )
+    .is_transient());
+    assert!(CompletionError::Timeout.is_transient());
+    assert!(!CompletionError::InvalidResponse("x".into()).is_transient());
+    assert!(!CompletionError::Upstream("x".into()).is_transient());
+}
+
+#[test]
+fn a_refused_connection_is_unreachable_and_transient() {
+    // Bind and drop a listener: nothing answers on its port afterwards.
+    let address = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let error = openai::post_embeddings(
+        &endpoint(format!("http://{address}/v1/embeddings")),
+        json!({}),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, CompletionError::Unreachable(text) if text.starts_with("Hub embeddings request failed")),
+        "{error:?}"
+    );
+    assert!(error.is_transient());
 }
 
 #[test]

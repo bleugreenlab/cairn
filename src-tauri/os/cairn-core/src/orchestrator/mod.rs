@@ -76,8 +76,8 @@ use crate::db::DbState;
 use crate::effects::executor::EffectExecutor;
 use crate::effects::types::WorkflowEffect;
 use crate::embeddings::{
-    spawn_embed_worker, turns::SemanticSearch, EmbedJob, EmbeddingClient, PositionConfig,
-    PositionKind, PositionMeta, VibeState,
+    spawn_embed_worker, turns::SemanticSearch, EmbedGate, EmbedJob, PositionConfig, PositionKind,
+    PositionMeta, VibeState,
 };
 use crate::mcp::gateway::McpGateway;
 use crate::mcp::McpAuthState;
@@ -574,7 +574,7 @@ impl OrchestratorBuilder {
             embed_tx: Arc::new(Mutex::new(None)),
             era_summary_tx: crate::threads::era_worker::sender_slot(),
             tenet_evidence_hint: Arc::new(tokio::sync::Notify::new()),
-            embed_client: std::sync::OnceLock::new(),
+            embed_gate: Arc::new(EmbedGate::default()),
             semantic_search: std::sync::OnceLock::new(),
             anon_device_manager,
             account_manager: self.account_manager,
@@ -1166,12 +1166,10 @@ pub struct Orchestrator {
     /// Wakes the tenet evidence worker after a conclusion commits. Pending
     /// event rows are the source of truth; this only shortens the wait.
     tenet_evidence_hint: Arc<tokio::sync::Notify>,
-    /// The `/embed` gateway client, built once so the embed worker and search's
-    /// semantic lane share one connection pool. Built lazily because it needs
-    /// the account managers, which are wired after the struct is assembled.
-    embed_client: std::sync::OnceLock<EmbeddingClient>,
-    /// Search's semantic lane: the query-embedding client plus the resident
-    /// copy of the span vectors it scans.
+    /// The embedding health gate every consumer shares, so one outage pauses
+    /// all of them and is logged once. See `embeddings::embedder`.
+    embed_gate: Arc<EmbedGate>,
+    /// Search's semantic lane: the resident copy of the span vectors it scans.
     semantic_search: std::sync::OnceLock<Arc<SemanticSearch>>,
 
     // === Team connection state (multi-team) ===
@@ -1381,7 +1379,7 @@ pub struct Orchestrator {
 /// JWT as fallback. An *expired* account JWT is treated as absent (see
 /// `AccountManager::get_jwt`), so it falls through to the anonymous token rather
 /// than shadowing it — keeping vibe coloring and the recommender alive when the
-/// account token lapses. Single source of truth for `embed_token_provider`'s
+/// account token lapses. Single source of truth for the gateway's token
 /// precedence so it can be unit-tested without a full Orchestrator.
 fn resolve_embed_token(account: &AccountManager, anon: &AnonDeviceManager) -> Option<String> {
     account
@@ -2003,19 +2001,12 @@ impl Orchestrator {
         .map_err(CloudObjectGrantMintError::Unavailable)
     }
 
-    /// The shared `/embed` gateway client.
-    pub fn embedding_client(&self) -> &EmbeddingClient {
-        self.embed_client.get_or_init(|| {
-            EmbeddingClient::new(self.api_config.clone(), self.embed_token_provider())
-        })
-    }
-
-    /// Search's semantic lane. Always available; it answers only when an
-    /// account is connected and span vectors exist, and search degrades to the
-    /// text index whenever it does not.
+    /// Search's semantic lane. Always available; it answers only when span
+    /// vectors exist and the query embeds, and search degrades to the text
+    /// index whenever it does not.
     pub fn semantic_search(&self) -> &Arc<SemanticSearch> {
         self.semantic_search
-            .get_or_init(|| Arc::new(SemanticSearch::new(self.embedding_client().clone())))
+            .get_or_init(|| Arc::new(SemanticSearch::new()))
     }
 
     /// Start the process-lifetime workers that hold this orchestrator: thread-era
@@ -2032,10 +2023,9 @@ impl Orchestrator {
 
     pub fn start_embed_worker(&self) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let client = self.embedding_client().clone();
         spawn_embed_worker(
             rx,
-            client,
+            self.embedder(),
             self.db.clone(),
             self.vibe_state.clone(),
             self.services.emitter.clone(),
@@ -2051,7 +2041,7 @@ impl Orchestrator {
         // transcripts is what requires a connected account.
         let account_manager = self.account_manager.clone();
         crate::embeddings::turns::spawn_turn_embedding_sweep(
-            self.embedding_client().clone(),
+            self.embedder(),
             self.db.local.clone(),
             Arc::new(move || account_manager.get_jwt().ok().flatten().is_some()),
         );
@@ -2215,15 +2205,6 @@ impl Orchestrator {
         self.thread_status_cache.invalidate(project_id, reason);
     }
 
-    /// Token provider for the `/embed` gateway: prefers the connected account's
-    /// JWT, falling back to the anonymous device JWT when logged out. Returns
-    /// `None` only when neither is available (embedding then no-ops).
-    fn embed_token_provider(&self) -> crate::embeddings::TokenProvider {
-        let am = self.account_manager.clone();
-        let anon = self.anon_device_manager.clone();
-        Arc::new(move || resolve_embed_token(&am, &anon))
-    }
-
     /// Spawn a background task that registers an anonymous device JWT for the
     /// `/embed` gateway and keeps it fresh. Registers immediately, then
     /// re-checks every ~12h (well inside the 30-day token TTL). Best-effort:
@@ -2231,7 +2212,7 @@ impl Orchestrator {
     /// the API level (reuses the persisted device_id).
     ///
     /// Runs unconditionally, even when an account is connected: the account JWT
-    /// takes precedence in `embed_token_provider`, but keeping the anon token
+    /// takes precedence in `resolve_embed_token`, but keeping the anon token
     /// warm means embedding keeps working immediately on logout. The anon token
     /// is `type: "device_anon"` and is only ever accepted by `/embed`.
     pub fn start_anon_device(&self) {

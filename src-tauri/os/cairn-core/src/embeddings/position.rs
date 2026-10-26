@@ -258,6 +258,8 @@ pub struct EvictionFlush {
     pub(crate) sessions: Vec<(String, Vec<f32>)>,
     /// `(owner_uri, centroid)` to upsert into `resource_embeddings`.
     pub(crate) owners: Vec<(String, Vec<f32>)>,
+    /// The `(model, dims)` the centroids are stored under.
+    pub(crate) space: Option<(String, u32)>,
 }
 
 /// In-memory position state across all live sessions and their owning nodes/chats.
@@ -265,6 +267,9 @@ pub(crate) struct PositionEngine {
     sessions: HashMap<String, SessionLive>,
     owners: HashMap<String, OwnerAccum>,
     cfg: PositionConfig,
+    /// The `(model, dims)` of the vectors folded so far: what a centroid is
+    /// labelled with when it is stored.
+    space: Option<(String, u32)>,
 }
 
 impl PositionEngine {
@@ -273,7 +278,24 @@ impl PositionEngine {
             sessions: HashMap::new(),
             owners: HashMap::new(),
             cfg,
+            space: None,
         }
+    }
+
+    /// Record the `(model, dims)` of the vectors about to be folded.
+    pub(crate) fn note_space(&mut self, model: &str, dims: u32) {
+        if self
+            .space
+            .as_ref()
+            .is_none_or(|(known, width)| known != model || *width != dims)
+        {
+            self.space = Some((model.to_string(), dims));
+        }
+    }
+
+    /// The `(model, dims)` of the vectors folded so far.
+    pub(crate) fn space(&self) -> Option<(String, u32)> {
+        self.space.clone()
     }
 
     pub(crate) fn has_session(&self, session_id: &str) -> bool {
@@ -397,7 +419,11 @@ impl PositionEngine {
             }
         }
 
-        EvictionFlush { sessions, owners }
+        EvictionFlush {
+            sessions,
+            owners,
+            space: self.space.clone(),
+        }
     }
 
     /// Drain everything for a final flush (channel close / shutdown).
@@ -412,7 +438,11 @@ impl PositionEngine {
             .drain()
             .map(|(uri, a)| (uri, a.summary_vector()))
             .collect();
-        EvictionFlush { sessions, owners }
+        EvictionFlush {
+            sessions,
+            owners,
+            space: self.space.clone(),
+        }
     }
 }
 

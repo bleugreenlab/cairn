@@ -10,15 +10,20 @@
 //! The door always takes a model. Stored vectors are keyed by `(model, width)`,
 //! so letting the catalog pick would let a catalog change switch vector spaces
 //! underneath them, and would let an unset model land on the cloud gateway
-//! without the consent its caller gates. The legacy `EmbeddingClient` path
-//! stays beside this door until its callers move.
+//! without the consent its caller gates.
+//!
+//! Cairn's own consumers reach this door through [`Orchestrator::embedder`]:
+//! the one selected model ([`active_selection`]) behind the shared health gate
+//! (`crate::embeddings::embedder`).
 //!
 //! [`Complete`]: cairn_models::interface::complete::Complete
+
+use std::sync::Arc;
 
 use cairn_models::embed::{embed, gateway, openai};
 use cairn_models::interface::complete::CompletionError;
 use cairn_models::interface::embed::{
-    EmbedCall, EmbedError, EmbedRequest, EmbedRoute, Embeddings, EMBED_TIMEOUT,
+    EmbedCall, EmbedError, EmbedRequest, EmbedRoute, Embeddings, Purpose, Width, EMBED_TIMEOUT,
 };
 use cairn_models::interface::{CatalogProvider, ModelScope, Models, SelectedOffer};
 use cairn_models::types::catalog::{
@@ -31,6 +36,52 @@ use cairn_models::types::embedding::{
 use super::{resolve_embed_token, Orchestrator};
 use crate::backends::custom::CustomProviderConfig;
 use crate::credentials::{ApiProvider, ProviderAuth};
+use crate::embeddings::embedder::{EmbedSource, FacetEmbedder, SelectedEmbedOffer};
+use crate::embeddings::Embed;
+
+/// The embedding model every Cairn consumer uses: the Cairn gateway's Cohere
+/// Embed v4, the model every stored vector was made by.
+pub(crate) fn active_selection() -> String {
+    format!("{CAIRN_GATEWAY_KEY}/{CAIRN_GATEWAY_EMBED_MODEL}")
+}
+
+/// The selected model, as this workspace reaches it.
+struct WorkspaceEmbedSource {
+    orch: Orchestrator,
+}
+
+impl EmbedSource for WorkspaceEmbedSource {
+    fn selection(&self) -> String {
+        active_selection()
+    }
+
+    /// The gateway is called with this device's Cairn token; an install
+    /// without one has embedding off, which is not an outage.
+    fn configured(&self) -> bool {
+        self.orch.embed_token().is_some()
+    }
+
+    fn offer(&self) -> Option<SelectedEmbedOffer> {
+        let catalog = self.orch.catalog(&ModelScope::default()).ok()?;
+        let probe = EmbedRequest {
+            texts: Vec::new(),
+            purpose: Purpose::Document,
+            width: Width::Native,
+        };
+        let (offer, capabilities) = catalog
+            .embedding_offer(Some(&active_selection()), &probe)
+            .ok()?;
+        Some(SelectedEmbedOffer {
+            model: offer.model,
+            capabilities,
+        })
+    }
+
+    fn embed(&self, request: &EmbedRequest) -> Result<Embeddings, EmbedError> {
+        self.orch
+            .embed_blocking(&ModelScope::default(), &active_selection(), request)
+    }
+}
 
 /// The Cairn gateway as a catalog provider: one model, Cohere Embed v4, at the
 /// gateway's fixed width. Probed by nothing; present when a token resolves.
@@ -80,6 +131,15 @@ fn cairn_gateway_provider() -> CatalogProvider {
 }
 
 impl Orchestrator {
+    /// The door Cairn's own consumers embed through: the selected model,
+    /// behind the gate they all share.
+    pub fn embedder(&self) -> Arc<dyn Embed> {
+        Arc::new(FacetEmbedder::new(
+            Arc::new(WorkspaceEmbedSource { orch: self.clone() }),
+            self.embed_gate.clone(),
+        ))
+    }
+
     /// The gateway's catalog entry, when this device holds a Cairn token.
     /// Every install registers an anonymous one, so this is normally present.
     pub(crate) fn embed_gateway_provider(&self) -> Option<CatalogProvider> {
@@ -232,7 +292,7 @@ mod tests {
     use cairn_models::interface::complete::{
         Complete, CompletionCall, CompletionError, CompletionReply,
     };
-    use cairn_models::interface::embed::{EmbedError, EmbedRequest, EmbedRoute, Purpose};
+    use cairn_models::interface::embed::{EmbedError, EmbedRequest, EmbedRoute, Purpose, Width};
     use cairn_models::interface::{ModelScope, Models, SelectedOffer};
     use cairn_models::types::catalog::{ServedVerb, Verb, VerbKind, Wire};
     use cairn_models::types::embedding::{EmbeddingCapabilities, CAIRN_GATEWAY_KEY};
@@ -339,7 +399,7 @@ mod tests {
         EmbedRequest {
             texts: vec!["what is cairn".into()],
             purpose,
-            dims: None,
+            width: Width::Native,
         }
     }
 
@@ -473,77 +533,63 @@ mod tests {
             .contains("no embedding route"));
     }
 
-    fn cosine(a: &[f32], b: &[f32]) -> f64 {
-        let dot: f64 = a
-            .iter()
-            .zip(b)
-            .map(|(x, y)| f64::from(*x) * f64::from(*y))
-            .sum();
-        let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-        dot / (norm(a) * norm(b))
-    }
-
-    /// The facet's gateway provider and the legacy `EmbeddingClient` land in
-    /// the same vector space: same width, and each vector the same direction
-    /// (Bedrock is not promised to be bit-deterministic, so not the same
-    /// bytes). Registers an anonymous device token, as every install does.
+    /// Cairn's consumers reach the gateway through the shared door, and its
+    /// vectors are labelled as every stored one already is. Registers an
+    /// anonymous device token, as every install does.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "reaches Cairn's cloud gateway"]
-    async fn the_facet_gateway_and_the_legacy_client_agree() {
-        use crate::embeddings::InputType;
+    async fn the_shared_door_reaches_the_gateway_at_the_stored_width() {
+        use crate::embeddings::{Corpus, VectorKey};
         let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
         orch.anon_device_manager.ensure_registered().await;
-        assert!(
-            orch.embed_gateway_provider().is_some(),
-            "no device token registered"
-        );
-        let texts = vec![
-            "Cairn orchestrates agents across a workspace.".to_string(),
-            "The embedding verb verifies every width it returns.".to_string(),
-        ];
-        let started = std::time::Instant::now();
-        let facet = orch
+        let embedder = orch.embedder();
+        assert!(embedder.ready(), "no device token registered");
+        let embedded = embedder
             .embed(
-                ModelScope::default(),
-                "cohere-embed-v4".into(),
-                EmbedRequest {
-                    texts: texts.clone(),
-                    purpose: Purpose::Document,
-                    dims: None,
-                },
+                Corpus::Turns,
+                Purpose::Document,
+                vec![
+                    "Cairn orchestrates agents across a workspace.".to_string(),
+                    "The embedding verb verifies every width it returns.".to_string(),
+                ],
             )
             .await
             .unwrap();
-        let facet_latency = started.elapsed();
-        let started = std::time::Instant::now();
-        let legacy = orch
-            .embedding_client()
-            .embed(texts, InputType::SearchDocument, None)
-            .await
-            .unwrap()
-            .expect("a token resolved");
-        let legacy_latency = started.elapsed();
-        println!(
-            "facet: {} x {} ({} ms, usage {}); legacy: {} x {} ({} ms)",
-            facet.vectors.len(),
-            facet.dims,
-            facet_latency.as_millis(),
-            serde_json::to_string(&facet.usage).unwrap(),
-            legacy.len(),
-            legacy[0].len(),
-            legacy_latency.as_millis()
-        );
         assert_eq!(
-            (facet.provider.as_str(), facet.model.as_str()),
-            ("cairn", "cohere-embed-v4")
+            (embedded.model.as_str(), embedded.dims),
+            ("cohere-embed-v4", 1536)
         );
-        assert_eq!(facet.vectors.len(), legacy.len());
-        for (ours, theirs) in facet.vectors.iter().zip(&legacy) {
-            assert_eq!(ours.len(), theirs.len());
-            let similarity = cosine(ours, theirs);
-            println!("cosine {similarity:.8}");
-            assert!(similarity >= 0.9999, "cosine {similarity}");
-        }
+        assert_eq!(embedded.vectors.len(), 2);
+        assert_eq!(
+            embedder.active(Corpus::Turns),
+            Some(VectorKey {
+                model: "cohere-embed-v4".into(),
+                dims: Some(1536)
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_device_token_embedding_is_off_not_failing() {
+        use crate::embeddings::{Corpus, EmbedFailure};
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
+        let embedder = orch.embedder();
+        assert!(!embedder.ready());
+        assert_eq!(
+            embedder
+                .embed(Corpus::Resources, Purpose::Document, vec!["x".into()])
+                .await,
+            Err(EmbedFailure::Unconfigured)
+        );
+        let health = embedder.health();
+        assert!(!health.configured);
+        assert_eq!(health.unavailable_since, None);
+        assert_eq!(embedder.active(Corpus::Resources), None);
+    }
+
+    #[test]
+    fn the_selection_names_the_gateway_offer() {
+        assert_eq!(super::active_selection(), "cairn/cohere-embed-v4");
     }
 
     #[test]

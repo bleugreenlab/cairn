@@ -33,7 +33,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
 use tracing::Instrument;
 
-use super::client::{EmbeddingClient, InputType, COHERE_DIMS, COHERE_MODEL};
+use super::embedder::{Corpus, Embed, EmbedFailure, Embedded, Purpose};
 use super::position::{EvictionFlush, PositionConfig, PositionEngine, PositionKind, PositionMeta};
 use super::queries;
 use super::vector;
@@ -92,7 +92,7 @@ const IDLE_TTL_SECS: u64 = 300;
 /// still fold into session position) but not colored.
 pub fn spawn_embed_worker(
     mut rx: UnboundedReceiver<EmbedJob>,
-    client: EmbeddingClient,
+    embedder: Arc<dyn Embed>,
     dbs: Arc<DbState>,
     vibe_state: Option<Arc<VibeState>>,
     emitter: Arc<dyn EventEmitter>,
@@ -124,7 +124,7 @@ pub fn spawn_embed_worker(
                         }
                     }
                     let batch_size = batch.len();
-                    process_batch(&client, &dbs, vibe_state.as_deref(), &emitter, &mut engine, batch)
+                    process_batch(embedder.as_ref(), &dbs, vibe_state.as_deref(), &emitter, &mut engine, batch)
                         .instrument(
                             tracing::info_span!(target: "profiler", "embed_batch", size = batch_size),
                         )
@@ -138,7 +138,8 @@ pub fn spawn_embed_worker(
                     // Finalize idle sessions/owners, then upsert summary
                     // centroids for still-active owners on this coarse cadence.
                     apply_flush(&dbs.local, engine.evict_idle(Instant::now(), Duration::from_secs(IDLE_TTL_SECS))).await;
-                    upsert_owner_summaries(&dbs.local, engine.take_dirty_owners()).await;
+                    let space = engine.space();
+                    upsert_owner_summaries(&dbs.local, engine.take_dirty_owners(), space.as_ref()).await;
                 }
             }
         }
@@ -157,7 +158,7 @@ enum EmbedTarget {
 }
 
 async fn process_batch(
-    client: &EmbeddingClient,
+    embedder: &dyn Embed,
     dbs: &DbState,
     vibe_state: Option<&VibeState>,
     emitter: &Arc<dyn EventEmitter>,
@@ -175,6 +176,9 @@ async fn process_batch(
                     log::warn!("Failed to delete resource embedding for {}: {}", uri, e);
                 }
             }
+            // Nothing to embed, and one blank text would refuse the batch.
+            EmbedJob::Event { text, .. } | EmbedJob::Resource { text, .. }
+                if text.trim().is_empty() => {}
             EmbedJob::Event {
                 event_id,
                 text,
@@ -194,19 +198,16 @@ async fn process_batch(
         return;
     }
 
-    match client
-        .embed(texts, InputType::SearchDocument, Some(COHERE_DIMS))
+    match embedder
+        .embed(Corpus::Resources, Purpose::Document, texts)
         .await
     {
-        Ok(Some(vectors)) => {
-            if vectors.len() != targets.len() {
-                log::warn!(
-                    "embed: expected {} vectors, got {}",
-                    targets.len(),
-                    vectors.len()
-                );
-                return;
-            }
+        Ok(Embedded {
+            vectors,
+            model,
+            dims,
+        }) => {
+            engine.note_space(&model, dims);
             for (target, vector) in targets.iter().zip(vectors.iter()) {
                 match target {
                     EmbedTarget::Event { event_id, position } => {
@@ -220,6 +221,7 @@ async fn process_batch(
                                         &assignment.css_color,
                                         assignment.phase,
                                         assignment.friction,
+                                        &model,
                                     )
                                     .await
                                     {
@@ -282,8 +284,8 @@ async fn process_batch(
                             db,
                             uri,
                             &bytes,
-                            COHERE_MODEL,
-                            COHERE_DIMS as i32,
+                            &model,
+                            dims as i32,
                         )
                         .await
                         {
@@ -299,11 +301,22 @@ async fn process_batch(
                 persist_current_pos(db, &session_id, &pos).await;
             }
         }
-        Ok(None) => {
-            // No account connected — skip; colors stay neutral, vectors unwritten,
-            // and no position is built (nothing to fold).
+        // Not configured: colors stay neutral, vectors unwritten, and no
+        // position is built (nothing to fold).
+        Err(EmbedFailure::Unconfigured) => {}
+        // The gate has logged the outage once; this batch is dropped.
+        Err(failure @ (EmbedFailure::Paused { .. } | EmbedFailure::Failed(_))) => {
+            log::debug!(
+                "embed: dropped a batch of {} job(s): {failure}",
+                targets.len()
+            );
         }
-        Err(e) => log::warn!("embed batch failed: {}", e),
+        Err(failure @ EmbedFailure::Rejected(_)) => {
+            log::warn!(
+                "embed: a batch of {} job(s) was refused: {failure}",
+                targets.len()
+            );
+        }
     }
 }
 
@@ -323,18 +336,13 @@ async fn persist_event_vibe_for_event(
     css_color: &str,
     phase: f32,
     friction: f32,
+    model: &str,
 ) -> Result<Arc<LocalDb>, String> {
     let event_db = routing::owning_db_for_event(dbs, event_id)
         .await
         .map_err(|e| e.to_string())?;
     queries::upsert_event_vibe_async(
-        &event_db,
-        event_id,
-        session_id,
-        css_color,
-        phase,
-        friction,
-        COHERE_MODEL,
+        &event_db, event_id, session_id, css_color, phase, friction, model,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -409,7 +417,7 @@ async fn apply_flush(db: &LocalDb, flush: EvictionFlush) {
     for (session_id, pos) in flush.sessions {
         persist_current_pos(db, &session_id, &pos).await;
     }
-    upsert_owner_summaries(db, flush.owners).await;
+    upsert_owner_summaries(db, flush.owners, flush.space.as_ref()).await;
 }
 
 async fn persist_current_pos(db: &LocalDb, session_id: &str, pos: &[f32]) {
@@ -422,20 +430,24 @@ async fn persist_current_pos(db: &LocalDb, session_id: &str, pos: &[f32]) {
     }
 }
 
-async fn upsert_owner_summaries(db: &LocalDb, owners: Vec<(String, Vec<f32>)>) {
+/// Store owner centroids under `space`, the `(model, dims)` of the vectors
+/// folded into them. With no space known nothing was folded, so there is
+/// nothing new to store.
+async fn upsert_owner_summaries(
+    db: &LocalDb,
+    owners: Vec<(String, Vec<f32>)>,
+    space: Option<&(String, u32)>,
+) {
+    let Some((model, dims)) = space else {
+        return;
+    };
     for (uri, summary) in owners {
         if summary.is_empty() {
             continue;
         }
         let bytes = vector::to_bytes(&summary);
-        if let Err(e) = queries::upsert_resource_embedding_async(
-            db,
-            &uri,
-            &bytes,
-            COHERE_MODEL,
-            COHERE_DIMS as i32,
-        )
-        .await
+        if let Err(e) =
+            queries::upsert_resource_embedding_async(db, &uri, &bytes, model, *dims as i32).await
         {
             log::warn!("Failed to persist summary centroid for {}: {}", uri, e);
         }
@@ -476,6 +488,64 @@ mod tests {
                 uri: "cairn://skills/x".to_string(),
             }
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_job_reaches_the_provider_within_the_text_budget() {
+        use crate::embeddings::embedder::stub::ScriptedSource;
+        use crate::embeddings::EMBED_TEXT_BUDGET;
+        use crate::storage::{RowExt, SearchIndex};
+
+        let local = Arc::new(crate::storage::migrated_test_db("worker-text-caps.db").await);
+        let index =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let dbs = DbState::new(local.clone(), index);
+        let emitter: Arc<dyn EventEmitter> =
+            Arc::new(crate::services::testing::CapturingEmitter::new());
+        let source = ScriptedSource::new("worker-text-caps");
+        source.answer(vec![Ok(())]);
+        let embedder = source.embedder();
+
+        // A 130,000-character artifact of two-byte characters, a 50,000-character
+        // event, and a blank event that would otherwise refuse the batch.
+        let artifact = "é".repeat(130_000);
+        let event = "x".repeat(50_000);
+        let batch = vec![
+            EmbedJob::Resource {
+                uri: "cairn://p/proj/1/1/builder/artifact".into(),
+                text: artifact,
+            },
+            EmbedJob::Event {
+                event_id: "event-1".into(),
+                text: event,
+                position: None,
+            },
+            EmbedJob::Event {
+                event_id: "event-2".into(),
+                text: "  ".into(),
+                position: None,
+            },
+        ];
+        let mut engine = PositionEngine::new(PositionConfig::default());
+        process_batch(&embedder, &dbs, None, &emitter, &mut engine, batch).await;
+
+        let sent = source.sent();
+        assert_eq!(sent.len(), 1);
+        let texts = &sent[0].texts;
+        assert_eq!(texts.len(), 2, "the blank event is not sent");
+        assert_eq!(texts[0], "é".repeat(EMBED_TEXT_BUDGET / 2));
+        assert_eq!(texts[1].len(), EMBED_TEXT_BUDGET);
+        assert!(texts.iter().all(|text| text.len() <= EMBED_TEXT_BUDGET));
+        let stored = local
+            .query_one(
+                "SELECT model, dims FROM resource_embeddings
+                  WHERE uri = 'cairn://p/proj/1/1/builder/artifact'",
+                (),
+                |row| Ok((row.text(0)?, row.i64(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored, ("cohere-embed-v4".to_string(), 3));
     }
 
     #[test]
@@ -534,9 +604,17 @@ mod tests {
         .await
         .unwrap();
 
-        persist_event_vibe_for_event(&dbs, event_id, Some("sess-team"), "#123456", 0.25, 0.75)
-            .await
-            .unwrap();
+        persist_event_vibe_for_event(
+            &dbs,
+            event_id,
+            Some("sess-team"),
+            "#123456",
+            0.25,
+            0.75,
+            "cohere-embed-v4",
+        )
+        .await
+        .unwrap();
 
         let count = |db: Arc<LocalDb>| async move {
             db.query_one(

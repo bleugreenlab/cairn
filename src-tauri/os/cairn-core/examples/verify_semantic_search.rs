@@ -19,13 +19,10 @@
 //!     cargo run --example verify_semantic_search --features internal-api \
 //!       -- <DB_PATH> "a paraphrase query" ["another"]
 
-use std::sync::Arc;
-
-use cairn_core::internal::api::ApiConfig;
+use cairn_core::internal::embeddings::gateway_embedder;
 use cairn_core::internal::embeddings::turns::{
     embed_pending, pending_count, turn_excerpts, Scope, SemanticSearch, SWEEP_LIMIT,
 };
-use cairn_core::internal::embeddings::{EmbeddingClient, TokenProvider};
 use cairn_core::internal::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
 use cairn_core::search::{search_content, SemanticLane};
 
@@ -64,8 +61,7 @@ async fn main() {
         Some(jwt) => jwt,
         None => register_anonymous_device().await,
     };
-    let token: TokenProvider = Arc::new(move || Some(jwt.clone()));
-    let client = EmbeddingClient::new(ApiConfig::default(), token);
+    let embedder = gateway_embedder(jwt);
 
     let db = LocalDb::open(std::path::PathBuf::from(db_path))
         .await
@@ -88,7 +84,7 @@ async fn main() {
     let started = std::time::Instant::now();
     let mut embedded = 0usize;
     while embedded < budget {
-        match embed_pending(&db, &client, Scope::All, SWEEP_LIMIT).await {
+        match embed_pending(&db, embedder.as_ref(), Scope::All, SWEEP_LIMIT).await {
             Ok(Some(summary)) => {
                 embedded += summary.embedded + summary.tombstoned;
                 if !summary.remaining {
@@ -114,11 +110,14 @@ async fn main() {
         .ok()
         .map(|path| SearchIndex::open_or_create(path).expect("open search index"));
 
-    let semantic = SemanticSearch::new(client);
+    let semantic = SemanticSearch::new();
     for query in queries {
         println!("=== {query} ===");
         let started = std::time::Instant::now();
-        let Some(scored) = semantic.rank_turns(&db, None, query, 15).await else {
+        let Some(scored) = semantic
+            .rank_turns(embedder.as_ref(), &db, None, query, 15)
+            .await
+        else {
             println!("  (no semantic match)\n");
             continue;
         };
@@ -149,6 +148,7 @@ async fn main() {
             None,
             Some(SemanticLane {
                 search: &semantic,
+                embedder: embedder.as_ref(),
                 vectors: &db,
             }),
         )

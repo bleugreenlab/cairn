@@ -42,12 +42,22 @@ fn header_map(provider_name: &str, headers: &[(String, String)]) -> Result<Heade
     Ok(map)
 }
 
+/// A `Retry-After` in delta-seconds. Cairn's gateway sends only that form, and
+/// an HTTP-date is ignored rather than guessed at: the caller's own backoff
+/// still applies without it.
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
 /// One POST of `body` to `url`, answering the reply text of a 2xx.
 ///
-/// A non-2xx keeps its status in the message, so a host can tell exhausted
+/// A non-2xx is [`CompletionError::Http`]: its status and `Retry-After` as
+/// values, and a message naming the status, so a host can tell exhausted
 /// credits (402) from a rate limit (429), followed by the sentence the
 /// provider wrote. `hint` adds a clause for a status that usually means the
-/// wrong kind of model.
+/// wrong kind of model. A request that never reached the provider is
+/// [`CompletionError::Unreachable`].
 fn post(
     provider_name: &str,
     what: &str,
@@ -70,10 +80,13 @@ fn post(
             if error.is_timeout() {
                 CompletionError::Timeout
             } else {
-                CompletionError::Upstream(format!("{provider_name} {what} request failed: {error}"))
+                CompletionError::Unreachable(format!(
+                    "{provider_name} {what} request failed: {error}"
+                ))
             }
         })?;
     let status = response.status();
+    let wait = retry_after(response.headers());
     let text = response.text().map_err(|error| {
         if error.is_timeout() {
             CompletionError::Timeout
@@ -86,10 +99,14 @@ fn post(
         let hint = hint(code)
             .map(|hint| format!(" ({hint})"))
             .unwrap_or_default();
-        return Err(CompletionError::Upstream(format!(
-            "{provider_name} {what} returned HTTP {code}: {}{hint}",
-            upstream_error_detail(&text)
-        )));
+        return Err(CompletionError::Http {
+            status: code,
+            message: format!(
+                "{provider_name} {what} returned HTTP {code}: {}{hint}",
+                upstream_error_detail(&text)
+            ),
+            retry_after: wait,
+        });
     }
     Ok(text)
 }

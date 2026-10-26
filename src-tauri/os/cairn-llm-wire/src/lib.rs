@@ -8,6 +8,8 @@
 //! A leaf: it reaches no other workspace crate, so a host that only needs to
 //! speak these protocols can depend on it without the session runtime.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -248,6 +250,19 @@ pub enum CompletionError {
     InvalidRequest(String),
     #[error("completion provider failed: {0}")]
     Upstream(String),
+    /// The provider answered with a non-2xx status. `message` reads exactly
+    /// as an [`Self::Upstream`] message would; `retry_after` is the reply's
+    /// `Retry-After`, when it sent one in delta-seconds.
+    #[error("completion provider failed: {message}")]
+    Http {
+        status: u16,
+        message: String,
+        retry_after: Option<Duration>,
+    },
+    /// The request never reached the provider: a refused connection, a
+    /// failed DNS lookup, a TLS failure.
+    #[error("completion provider failed: {0}")]
+    Unreachable(String),
     #[error("completion response was invalid: {0}")]
     InvalidResponse(String),
     /// A streamed generation failed. The text is the transport's own message,
@@ -257,6 +272,26 @@ pub enum CompletionError {
 }
 
 impl CompletionError {
+    /// Whether trying the same request again later may succeed: a timeout,
+    /// an unreachable provider, or a status that names a passing condition
+    /// (a rate limit, an overloaded or failing upstream). A refusal of the
+    /// request or the credential is not, and neither is an unreadable reply.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Timeout | Self::Unreachable(_) => true,
+            Self::Http { status, .. } => matches!(status, 408 | 429 | 500 | 502 | 503 | 504),
+            _ => false,
+        }
+    }
+
+    /// How long the provider asked to be left alone, when it said.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Http { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
     /// The message a streamed generation reports: a stream failure's own text,
     /// or any other failure's display.
     pub fn into_stream_text(self) -> String {

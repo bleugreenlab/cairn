@@ -2,19 +2,25 @@
 
 use cairn_models_types::embedding::{EmbeddingCapabilities, EmbeddingWidths};
 
-use crate::interface::embed::EmbedError;
+use crate::interface::embed::{EmbedError, Width};
 
 /// The `dimensions` to send for `requested` on an offer declaring
 /// `capabilities`: `None` for the native width (nothing is sent, so a server
-/// that does not know the field still answers), or the width itself. A width
-/// the offer does not return is refused here, before any request.
+/// that does not know the field still answers), or the width itself. An exact
+/// width the offer does not return is refused here, before any request; a
+/// preferred one falls back to the native width.
 pub(crate) fn admit(
     capabilities: &EmbeddingCapabilities,
-    requested: Option<u32>,
+    requested: Width,
 ) -> Result<Option<u32>, EmbedError> {
-    let Some(width) = requested else {
-        return Ok(None);
-    };
+    match requested {
+        Width::Native => Ok(None),
+        Width::Exactly(width) => exactly(capabilities, width),
+        Width::Preferred(width) => Ok(exactly(capabilities, width).unwrap_or(None)),
+    }
+}
+
+fn exactly(capabilities: &EmbeddingCapabilities, width: u32) -> Result<Option<u32>, EmbedError> {
     let Some(native) = capabilities.native_dims else {
         return Err(EmbedError::Unsupported(format!(
             "its native width is not known, so it is only asked for that width, not {width}"

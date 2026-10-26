@@ -11,6 +11,8 @@ mod split;
 #[cfg(test)]
 mod tests;
 
+use std::time::Duration;
+
 use cairn_models_types::embedding::{BatchLimits, PurposeHandling};
 use cairn_models_types::usage::{Charge, Measure, Meter, MeteredUsage};
 
@@ -31,9 +33,49 @@ pub fn local_server_limits(max_input_tokens: Option<u32>) -> BatchLimits {
     }
 }
 
+/// Attempts one sub-batch gets, the first included.
+const ATTEMPTS: u32 = 3;
+/// The wait before the second attempt; it doubles for each one after.
+const FIRST_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// The longest `Retry-After` slept inside a call. A provider asking for more
+/// gets its error back at once, carrying the wait, so the caller's own pause
+/// honours it instead of a blocking thread sitting on it.
+const MAX_IN_CALL_WAIT: Duration = Duration::from_secs(30);
+
+/// Run `attempt` until it succeeds, fails for good, or has been tried
+/// [`ATTEMPTS`] times. Only a transient failure is retried, after the doubling
+/// delay or the provider's `Retry-After`, whichever is longer.
+fn with_retry<T>(
+    sleep: &dyn Fn(Duration),
+    mut attempt: impl FnMut() -> Result<T, CompletionError>,
+) -> Result<T, CompletionError> {
+    let mut tried = 1;
+    loop {
+        let error = match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let asked = error.retry_after().unwrap_or_default();
+        if !error.is_transient() || tried >= ATTEMPTS || asked > MAX_IN_CALL_WAIT {
+            return Err(error);
+        }
+        sleep((FIRST_RETRY_DELAY * 2u32.pow(tried - 1)).max(asked));
+        tried += 1;
+    }
+}
+
 /// Embed `call.request` on one offer: one vector per text, in input order, at
-/// the admitted width.
+/// the admitted width. A transient provider failure is retried within the
+/// call; see [`with_retry`].
 pub fn embed(complete: &dyn Complete, call: EmbedCall<'_>) -> Result<Embeddings, EmbedError> {
+    embed_with(complete, call, &std::thread::sleep)
+}
+
+fn embed_with(
+    complete: &dyn Complete,
+    call: EmbedCall<'_>,
+    sleep: &dyn Fn(Duration),
+) -> Result<Embeddings, EmbedError> {
     let EmbedCall {
         route,
         model,
@@ -51,7 +93,7 @@ pub fn embed(complete: &dyn Complete, call: EmbedCall<'_>) -> Result<Embeddings,
             "text {index} is empty; every text must have content"
         )));
     }
-    let dimensions = admit::admit(capabilities, request.dims)?;
+    let dimensions = admit::admit(capabilities, request.width)?;
     let texts = with_purpose(&request.texts, request.purpose, &capabilities.purpose);
     let batches = split::batches(&texts, &capabilities.limits)?;
 
@@ -70,16 +112,18 @@ pub fn embed(complete: &dyn Complete, call: EmbedCall<'_>) -> Result<Embeddings,
                 let input_type = matches!(capabilities.purpose, PurposeHandling::Native)
                     .then(|| request.purpose.input_type());
                 let body = openai_wire::build_body(model, batch, dimensions, input_type);
-                let reply = complete
-                    .complete(CompletionCall::whole(wire, body, timeout))?
-                    .into_embeddings()?;
+                let reply = with_retry(sleep, || {
+                    complete.complete(CompletionCall::whole(wire, body.clone(), timeout))
+                })?
+                .into_embeddings()?;
                 openai::vectors(reply, batch.len(), route.provider_name())?
             }
             EmbedRoute::Gateway(_) => {
                 let body = gateway_wire::build_body(batch, request.purpose.input_type());
-                let reply = complete
-                    .complete(CompletionCall::whole(wire, body, timeout))?
-                    .into_gateway_embed()?;
+                let reply = with_retry(sleep, || {
+                    complete.complete(CompletionCall::whole(wire, body.clone(), timeout))
+                })?
+                .into_gateway_embed()?;
                 gateway::vectors(reply, batch.len())?
             }
         };

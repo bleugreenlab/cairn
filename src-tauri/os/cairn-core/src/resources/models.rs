@@ -1577,7 +1577,7 @@ mod tests {
         both.push(gateway);
         assert_eq!(
             super::served(&both).as_deref(),
-            Some("complete, session (openai-chat); embed (cairn-embed: 1536 · native width only · native purpose · ≤96 texts)")
+            Some("complete, session (openai-chat); embed (cairn-embed: 1536 · native width only · native purpose · ≤96 texts · ≤48000 chars)")
         );
     }
 

@@ -1881,6 +1881,7 @@ pub(super) async fn read_project_search(
     if let Err(error) = orch.db.apply_pending_search().await {
         return format!("Search index update failed: {error}");
     }
+    let embedder = orch.embedder();
     match crate::search::search_content(
         &routed_db,
         &orch.db.search_index,
@@ -1888,6 +1889,7 @@ pub(super) async fn read_project_search(
         Some(filters),
         Some(crate::search::SemanticLane {
             search: orch.semantic_search(),
+            embedder: embedder.as_ref(),
             vectors: &orch.db.local,
         }),
     )

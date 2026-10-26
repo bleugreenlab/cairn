@@ -1,12 +1,13 @@
-//! Embedding storage, vibe coloring, and the async gateway worker.
+//! Embedding storage, vibe coloring, and the async embed worker.
 //!
-//! Embeddings are produced by the cloud `/embed` gateway (Bedrock Cohere v4),
-//! not locally. Assistant event text is embedded at store time by an async
-//! worker, used to assign a vibe color (persisted in `event_vibes`), then
-//! discarded. Corpus resources (issues, skills, memories, artifacts) persist
-//! their vectors in `resource_embeddings` for in-engine recall.
+//! Embeddings are produced by the models facet's `embed` verb, through the
+//! one door every consumer shares ([`embedder`]): Cairn's cloud gateway
+//! (Cohere Embed v4) today. Assistant event text is embedded at store time by
+//! an async worker, used to assign a vibe color (persisted in `event_vibes`),
+//! then discarded. Corpus resources (issues, skills, memories, artifacts)
+//! persist their vectors in `resource_embeddings` for in-engine recall.
 
-pub mod client;
+pub mod embedder;
 pub mod position;
 pub mod queries;
 pub mod resource_text;
@@ -15,11 +16,37 @@ pub mod vector;
 pub mod vibes;
 mod worker;
 
-pub use client::{EmbeddingClient, InputType, TokenProvider, COHERE_DIMS, COHERE_MODEL};
+#[cfg(feature = "internal-api")]
+pub use embedder::gateway_embedder;
+pub use embedder::{
+    Corpus, Embed, EmbedFailure, EmbedGate, EmbedHealth, Embedded, Purpose, VectorKey,
+};
 pub use position::{PositionConfig, PositionKind, PositionMeta};
 pub(crate) use resource_text::artifact_embed_text;
 pub use vibes::VibeState;
 pub use worker::{spawn_embed_worker, EmbedJob};
+
+/// The most any one text sends, in bytes, whatever its kind: a turn, an event,
+/// a resource, a tenet, a query.
+///
+/// Generous enough to carry a substantial exchange, bounded so one runaway
+/// text (an artifact can run to 130,000 characters) cannot dominate a
+/// request. [`embedder::FacetEmbedder`] applies it to every text it is given.
+pub const EMBED_TEXT_BUDGET: usize = 16_000;
+
+/// Truncate to at most `max_bytes`, never splitting a character.
+pub(crate) fn truncate_chars(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let end = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    &text[..end]
+}
 
 /// Extract embeddable text from a TranscriptEvent JSON string.
 /// Combines content and thinking fields, separated by newline.

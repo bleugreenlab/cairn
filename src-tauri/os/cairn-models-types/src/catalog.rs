@@ -1140,7 +1140,7 @@ mod tests {
                 "nativeDims": 1536,
                 "widths": "nativeOnly",
                 "purpose": "native",
-                "limits": {"maxTexts": 96},
+                "limits": {"maxTexts": 96, "maxChars": 48000},
                 "wire": "cairn-embed"
             })
         );

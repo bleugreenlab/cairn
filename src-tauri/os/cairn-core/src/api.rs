@@ -73,11 +73,6 @@ impl ApiConfig {
         format!("{}/bugs/reports", self.base_url)
     }
 
-    /// Embedding gateway endpoint (Bedrock Cohere Embed v4).
-    pub(crate) fn embed_url(&self) -> String {
-        format!("{}/embed", self.base_url)
-    }
-
     /// Team sync-config endpoint (GET, member-authed). Returns the broker
     /// `syncUrl` plus bootstrap metadata, or 404/503 when not yet provisioned.
     pub(crate) fn team_sync_config_url(&self, team_id: &str) -> String {

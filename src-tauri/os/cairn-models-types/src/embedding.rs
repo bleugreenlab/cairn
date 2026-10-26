@@ -81,7 +81,9 @@ impl EmbeddingCapabilities {
     /// `api/src/lib/bedrock.ts`). Honouring other widths needs a new request
     /// field on the server, because installed clients already send `dims` and
     /// store whatever width comes back. At most 96 texts per request, Cohere's
-    /// cap, which the gateway's own batcher flushes at.
+    /// cap, which the gateway's own batcher flushes at, and 48,000 characters:
+    /// measured 10-18, 47 KB requests succeeded while 62 KB ones failed
+    /// intermittently.
     pub fn cairn_gateway() -> Self {
         Self {
             native_dims: Some(1536),
@@ -89,7 +91,7 @@ impl EmbeddingCapabilities {
             purpose: PurposeHandling::Native,
             limits: BatchLimits {
                 max_texts: Some(96),
-                max_chars: None,
+                max_chars: Some(48_000),
                 max_input_tokens: None,
             },
         }
@@ -189,7 +191,7 @@ mod tests {
                 "nativeDims": 1536,
                 "widths": "nativeOnly",
                 "purpose": "native",
-                "limits": {"maxTexts": 96}
+                "limits": {"maxTexts": 96, "maxChars": 48000}
             })
         );
         let matryoshka = EmbeddingCapabilities {
@@ -255,7 +257,7 @@ mod tests {
     fn a_summary_names_width_purpose_and_limits() {
         assert_eq!(
             EmbeddingCapabilities::cairn_gateway().summary(),
-            "1536 · native width only · native purpose · ≤96 texts"
+            "1536 · native width only · native purpose · ≤96 texts · ≤48000 chars"
         );
         let qwen = EmbeddingCapabilities {
             native_dims: Some(2560),

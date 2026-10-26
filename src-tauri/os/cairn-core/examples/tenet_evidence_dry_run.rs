@@ -32,10 +32,8 @@
 //!       -- <DB_PATH> [PROJECT_KEY=cairn] [N=20]
 
 use std::io::Write;
-use std::sync::Arc;
 
-use cairn_core::internal::api::ApiConfig;
-use cairn_core::internal::embeddings::{EmbeddingClient, InputType, TokenProvider, COHERE_DIMS};
+use cairn_core::internal::embeddings::{gateway_embedder, Corpus, Embed, Purpose};
 use cairn_core::internal::storage::{LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
 use cairn_core::tenets::evidence::{events, judge, vectors, EMBED_CHUNK, KNN_FLOOR, KNN_K};
 use cairn_core::tenets::{TenetFilter, TenetStatus, TenetView};
@@ -94,28 +92,23 @@ async fn register_anonymous_device() -> String {
 }
 
 async fn embed_all(
-    client: &EmbeddingClient,
+    embedder: &dyn Embed,
+    jwt: &str,
     texts: Vec<String>,
-    input: InputType,
+    purpose: Purpose,
 ) -> Vec<Vec<f32>> {
     let mut out = Vec::with_capacity(texts.len());
     for chunk in texts.chunks(EMBED_CHUNK) {
-        // The gateway refuses intermittently; the worker retries with backoff,
-        // and so does this.
-        let mut result = client.embed(chunk.to_vec(), input, Some(COHERE_DIMS)).await;
-        for attempt in 1..=4 {
-            if result.is_ok() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(2 * attempt)).await;
-            result = client.embed(chunk.to_vec(), input, Some(COHERE_DIMS)).await;
-        }
-        match result {
-            Ok(Some(vectors)) => out.extend(vectors),
-            Ok(None) => panic!("the gateway declined: no device token"),
-            Err(error) => {
-                eprintln!("chunk of {} failed ({error}); bisecting", chunk.len());
-                bisect(client, chunk, input).await;
+        // A transient gateway failure is retried inside the facet, as it is
+        // for the worker.
+        match embedder
+            .embed(Corpus::Resources, purpose, chunk.to_vec())
+            .await
+        {
+            Ok(embedded) => out.extend(embedded.vectors),
+            Err(failure) => {
+                eprintln!("chunk of {} failed ({failure}); bisecting", chunk.len());
+                bisect(jwt, chunk, purpose).await;
                 panic!("embedding failed");
             }
         }
@@ -124,10 +117,14 @@ async fn embed_all(
 }
 
 /// Narrow a failing chunk to the texts the gateway refuses on their own.
-async fn bisect(client: &EmbeddingClient, texts: &[String], input: InputType) {
+///
+/// It probes with a fresh embedder each time: the shared one's gate closed on
+/// the failure that started the bisection.
+async fn bisect(jwt: &str, texts: &[String], purpose: Purpose) {
+    let probe = gateway_embedder(jwt.to_string());
     let total: usize = texts.iter().map(String::len).sum();
-    if client
-        .embed(texts.to_vec(), input, Some(COHERE_DIMS))
+    if probe
+        .embed(Corpus::Resources, purpose, texts.to_vec())
         .await
         .is_ok()
     {
@@ -141,8 +138,8 @@ async fn bisect(client: &EmbeddingClient, texts: &[String], input: InputType) {
     }
     eprintln!("  {} text(s), {total} bytes: refused", texts.len());
     let (left, right) = texts.split_at(texts.len() / 2);
-    Box::pin(bisect(client, left, input)).await;
-    Box::pin(bisect(client, right, input)).await;
+    Box::pin(bisect(jwt, left, purpose)).await;
+    Box::pin(bisect(jwt, right, purpose)).await;
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -244,19 +241,20 @@ async fn main() {
         Some(jwt) => jwt,
         None => register_anonymous_device().await,
     };
-    let token: TokenProvider = Arc::new(move || Some(jwt.clone()));
-    let client = EmbeddingClient::new(ApiConfig::default(), token);
+    let embedder = gateway_embedder(jwt.clone());
 
     let tenet_vectors = embed_all(
-        &client,
+        embedder.as_ref(),
+        &jwt,
         approved.iter().map(vectors::tenet_embed_text).collect(),
-        InputType::SearchDocument,
+        Purpose::Document,
     )
     .await;
     let event_vectors = embed_all(
-        &client,
+        embedder.as_ref(),
+        &jwt,
         snapshots.iter().map(|event| event.text.clone()).collect(),
-        InputType::SearchQuery,
+        Purpose::Query,
     )
     .await;
 
