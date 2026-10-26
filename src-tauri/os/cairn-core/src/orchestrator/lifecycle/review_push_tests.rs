@@ -2278,9 +2278,10 @@ async fn set_prod_head_turn(db: &LocalDb, state: &str, reason: Option<&str>) {
 /// observable. The probe restores the slot either way, leaving each subsequent
 /// turn-end in a test independently observable.
 ///
-/// Deterministic: under a test runtime `detach_onto_runtime` reaches
-/// `tokio::spawn`, so the detached suite — the only other party that releases
-/// the slot — cannot poll until the test next awaits.
+/// Deterministic: the suite is spawned onto the orchestrator's runtime, which in
+/// a test is the test's own current-thread runtime, so the detached suite — the
+/// only other party that releases the slot — cannot poll until the test next
+/// awaits.
 fn wave_scheduled(orch: &Orchestrator, job_id: &str) -> bool {
     let claimed_by_probe = orch.try_begin_turn_end_checks(job_id).is_some();
     orch.end_turn_end_checks(job_id);

@@ -1076,6 +1076,13 @@ mod pass {
         assert!(compaction_due(&census_now(&fx)), "nothing was repacked");
     }
 
+    /// A rescued ref past the retention window: retired by a prune and by
+    /// nothing else.
+    fn expired_rescued_ref() -> String {
+        let old_ms = (unix_now() - 40 * DAY as i64) * 1000;
+        format!("refs/cairn/rescued/old/{old_ms}")
+    }
+
     async fn sample_count(fx: &Fixture, kind: &str) -> i64 {
         fx.orch
             .db
@@ -1089,6 +1096,41 @@ mod pass {
             .unwrap()
     }
 
+    /// A runner that leaked check refs before it stopped needs no operator:
+    /// the first pass of the next one retires every check ref no batch holds
+    /// once it is past the cross-process grace. That is the check runner's own
+    /// deletion completed, not a prune, so a store opted out of pruning gets
+    /// it too.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn the_first_pass_retires_check_refs_an_earlier_runner_left_behind() {
+        let Some(fx) = fixture().await else {
+            eprintln!("skipping check-ref recovery test: jj not resolvable");
+            return;
+        };
+        // Packed refs carry no age of their own, so these are old.
+        fx.create_ref("refs/cairn/checks/left-behind");
+        fx.create_ref("refs/cairn/checks/recovery-held-by-a-batch");
+        git(&fx.repo, &["pack-refs", "--all"]);
+        crate::execution::checks::hold_check_ref("refs/cairn/checks/recovery-held-by-a-batch");
+        // A loose ref written moments ago may belong to another process's batch.
+        fx.create_ref("refs/cairn/checks/recovery-just-written");
+        set_prune_confirmed(&fx.orch.db.local, "p-refs", &fx.project.store, false)
+            .await
+            .unwrap();
+
+        run_pass(&fx.orch).await;
+
+        assert!(!fx.has_ref("refs/cairn/checks/left-behind"));
+        assert!(fx.has_ref("refs/cairn/checks/recovery-held-by-a-batch"));
+        assert!(fx.has_ref("refs/cairn/checks/recovery-just-written"));
+        assert_eq!(
+            sample_count(&fx, "prune").await,
+            0,
+            "the store is opted out, so nothing else was pruned"
+        );
+    }
+
     /// Nobody has to remember a switch: a small store is pruned by default,
     /// and an explicit opt-out keeps it measured and untouched.
     #[tokio::test]
@@ -1098,8 +1140,9 @@ mod pass {
             eprintln!("skipping ref-store pass test: jj not resolvable");
             return;
         };
-        fx.create_ref("refs/cairn/checks/finished");
-        git(&fx.repo, &["pack-refs", "--all"]);
+        // Only a prune retires this; check refs are retired on every pass.
+        let expired = expired_rescued_ref();
+        fx.create_ref(&expired);
 
         set_prune_confirmed(&fx.orch.db.local, "p-refs", &fx.project.store, false)
             .await
@@ -1107,7 +1150,7 @@ mod pass {
         run_pass(&fx.orch).await;
         assert_eq!(sample_count(&fx, "measure").await, 1);
         assert_eq!(sample_count(&fx, "prune").await, 0, "opted out");
-        assert!(fx.has_ref("refs/cairn/checks/finished"));
+        assert!(fx.has_ref(&expired));
 
         fx.orch
             .db
@@ -1118,7 +1161,7 @@ mod pass {
         run_pass(&fx.orch).await;
         assert_eq!(sample_count(&fx, "prune").await, 1, "pruned by default");
         assert_eq!(fx.last_prune().await.0, "ok");
-        assert!(!fx.has_ref("refs/cairn/checks/finished"));
+        assert!(!fx.has_ref(&expired));
         let overview = ref_store_overview(&fx.orch, "p-refs", &fx.repo).await;
         let reclaim = overview
             .last_reclaim
@@ -1147,7 +1190,9 @@ mod pass {
             eprintln!("skipping ref-store first-prune gate test: jj not resolvable");
             return;
         };
-        fx.create_ref("refs/cairn/checks/finished");
+        // Only a prune retires this; check refs are retired on every pass.
+        let expired = expired_rescued_ref();
+        fx.create_ref(&expired);
         git(&fx.repo, &["pack-refs", "--all"]);
         // Grow `packed-refs` past the 4 MB threshold with stale keep refs.
         let packed = fx.repo.join(".git/packed-refs");
@@ -1185,17 +1230,14 @@ mod pass {
             "the wait is recorded once a day, not every hour"
         );
         assert_eq!(fx.last_prune().await.0, AWAITING_CONFIRMATION);
-        assert!(
-            fx.has_ref("refs/cairn/checks/finished"),
-            "nothing was pruned"
-        );
+        assert!(fx.has_ref(&expired), "nothing was pruned");
 
         set_prune_confirmed(&fx.orch.db.local, "p-refs", &fx.project.store, true)
             .await
             .unwrap();
         run_pass(&fx.orch).await;
         assert_eq!(fx.last_prune().await.0, "ok");
-        assert!(!fx.has_ref("refs/cairn/checks/finished"));
+        assert!(!fx.has_ref(&expired));
         assert!(
             std::fs::metadata(&packed).map_or(0, |meta| meta.len()) < PACKED_BYTES_THRESHOLD,
             "the confirmed prune shrank packed-refs"

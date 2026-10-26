@@ -9,9 +9,7 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, DbError, RowExt};
 
 use super::common::*;
-use super::review_push::{
-    detach_onto_runtime, emit_for_turn_end, spawn_checks_settled_edge, spawn_turn_end_checks,
-};
+use super::review_push::{emit_for_turn_end, spawn_checks_settled_edge, spawn_turn_end_checks};
 
 /// Warm a run whose current turn is durably yielded to a provider-owned hold.
 /// The hold's owner writes the yield and the hold together; this only parks the
@@ -554,20 +552,17 @@ fn maybe_kill_completed_call_child(orch: &Orchestrator, run_id: &str) {
         "Reaping completed call child run {} (call_complete): a one-shot call is never resumed",
         &run_id[..run_id.len().min(8)]
     );
-    let orch = orch.clone();
+    let reaper = orch.clone();
     let run_id = run_id.to_string();
-    detach_onto_runtime(
-        async move {
-            if let Err(e) = crate::orchestrator::lifecycle::kill_session_with_reason(
-                &orch,
-                &run_id,
-                "call_complete",
-            ) {
-                log::warn!("Failed to reap completed call child {}: {}", run_id, e);
-            }
-        },
-        || {},
-    );
+    orch.spawn_detached(async move {
+        if let Err(e) = crate::orchestrator::lifecycle::kill_session_with_reason(
+            &reaper,
+            &run_id,
+            "call_complete",
+        ) {
+            log::warn!("Failed to reap completed call child {}: {}", run_id, e);
+        }
+    });
 }
 
 /// Terminalize a node-less delegated child (an ephemeral call or a workflow)

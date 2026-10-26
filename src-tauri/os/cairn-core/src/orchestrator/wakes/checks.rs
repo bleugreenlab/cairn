@@ -211,13 +211,14 @@ pub(crate) async fn subscribe_checks_settled_once(
 /// Routing to an already-consumed one-shot row is a no-op, so a subscription
 /// that fired some other way in the meantime is not disturbed.
 fn spawn_verdictless_confirm(orch: &Orchestrator, target_job_id: &str, label: &str, uri: &str) {
-    let (orch, target_job_id, label, uri) = (
+    let (confirming, target_job_id, label, uri) = (
         orch.clone(),
         target_job_id.to_string(),
         label.to_string(),
         uri.to_string(),
     );
-    crate::orchestrator::lifecycle::detach_onto_runtime(
+    orch.spawn_detached({
+        let orch = confirming;
         async move {
             tokio::time::sleep(std::time::Duration::from_millis(
                 crate::execution::checks_settlement::VERDICTLESS_DWELL_MS as u64,
@@ -239,7 +240,6 @@ fn spawn_verdictless_confirm(orch: &Orchestrator, target_job_id: &str, label: &s
             if let Err(error) = route_checks_settled(&orch, &label, &uri, &snapshot).await {
                 log::warn!("checks-settled confirm for {uri}: routing failed ({error})");
             }
-        },
-        || {},
-    );
+        }
+    });
 }

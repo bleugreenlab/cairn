@@ -2186,17 +2186,68 @@ struct CheckRefRetirement {
     attempts: u32,
 }
 
-/// Released check refs per project store, and whether a sweeper is already
-/// scheduled to delete them.
+/// Released check refs per project store, and the sweep that will delete them.
 #[derive(Default)]
 struct PendingRetirements {
     refs: Vec<CheckRefRetirement>,
-    sweeping: bool,
+    /// Alive exactly as long as the store's sweep is (see [`CheckRefSweepLease`]).
+    /// Dead means no sweep will see `refs`, so the next release starts one.
+    sweep: std::sync::Weak<()>,
 }
 
 static RETIRING_CHECK_REFS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<std::path::PathBuf, PendingRetirements>>,
 > = std::sync::LazyLock::new(Default::default);
+
+/// The pending-retirement table, whoever panicked while holding it: the table
+/// is valid between every statement that touches it, and the sweep's lease
+/// must reach it while unwinding.
+fn retiring_check_refs(
+) -> std::sync::MutexGuard<'static, HashMap<std::path::PathBuf, PendingRetirements>> {
+    RETIRING_CHECK_REFS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A store's one live sweep of released check refs.
+///
+/// Made before the sweep is spawned and moved into it, so it is dropped with
+/// the sweep however the sweep ends: finished, panicked, or dropped unpolled or
+/// mid-await because the runtime it ran on went away. Dropping it gives every
+/// ref the sweep took but did not settle back to the store's pending list and
+/// marks the store as having no sweep, so the next release starts one. Without
+/// it a dropped sweep left its store marked as swept for the life of the
+/// process: every later release queued behind a sweep that would never come,
+/// each ref still held and so out of the ref-store sweep's reach as well.
+struct CheckRefSweepLease {
+    store_dir: std::path::PathBuf,
+    alive: Arc<()>,
+    /// Taken from pending and neither deleted nor given up on yet.
+    in_flight: Vec<CheckRefRetirement>,
+}
+
+impl Drop for CheckRefSweepLease {
+    fn drop(&mut self) {
+        let unfinished = std::mem::take(&mut self.in_flight);
+        let mut all = retiring_check_refs();
+        let Some(pending) = all.get_mut(&self.store_dir) else {
+            // A sweep that ran out of work removed the entry itself.
+            return;
+        };
+        if !unfinished.is_empty() {
+            log::warn!(
+                "the sweep of released check refs in {} ended before settling {} of them; \
+                 they are queued again for the next sweep",
+                self.store_dir.display(),
+                unfinished.len()
+            );
+            pending.refs.extend(unfinished);
+        }
+        if std::ptr::eq(pending.sweep.as_ptr(), Arc::as_ptr(&self.alive)) {
+            pending.sweep = std::sync::Weak::new();
+        }
+    }
+}
 
 /// How long released refs accumulate before one deletion retires them all.
 /// Every deletion takes `packed-refs.lock`, which jj exports inside the store
@@ -2217,27 +2268,37 @@ static CHECK_REF_RETIRE_TRANSACTIONS: std::sync::LazyLock<
 > = std::sync::LazyLock::new(Default::default);
 
 fn retire_check_ref(orch: &Orchestrator, store_dir: &Path, retirement: CheckRefRetirement) {
-    let schedule = {
-        let mut all = RETIRING_CHECK_REFS.lock().unwrap();
+    if let Some(sweep) = queue_check_ref_retirement(orch, store_dir, retirement) {
+        // On the orchestrator's runtime, never the caller's. A ref is often
+        // released from a destructor while the task holding it is dropped, and
+        // the caller's runtime may be the very one going away.
+        orch.spawn_detached(sweep);
+    }
+}
+
+/// Queue `retirement` for deletion, returning the sweep to start when the store
+/// has no live one.
+fn queue_check_ref_retirement(
+    orch: &Orchestrator,
+    store_dir: &Path,
+    retirement: CheckRefRetirement,
+) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+    let lease = {
+        let mut all = retiring_check_refs();
         let pending = all.entry(store_dir.to_path_buf()).or_default();
         pending.refs.push(retirement);
-        !std::mem::replace(&mut pending.sweeping, true)
+        if pending.sweep.strong_count() > 0 {
+            return None;
+        }
+        let alive = Arc::new(());
+        pending.sweep = Arc::downgrade(&alive);
+        CheckRefSweepLease {
+            store_dir: store_dir.to_path_buf(),
+            alive,
+            in_flight: Vec::new(),
+        }
     };
-    if !schedule {
-        return;
-    }
-    let sweep = sweep_retiring_check_refs(orch.clone(), store_dir.to_path_buf());
-    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        runtime.spawn(sweep);
-    } else {
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("check ref retirement runtime")
-                .block_on(sweep);
-        });
-    }
+    Some(sweep_retiring_check_refs(orch.clone(), lease))
 }
 
 /// Delete the store's released check refs in batches until none are left.
@@ -2246,18 +2307,19 @@ fn retire_check_ref(orch: &Orchestrator, store_dir: &Path, retirement: CheckRefR
 /// — but deleting takes `packed-refs.lock`, and taking it under one Background
 /// acquisition keeps the deletion from contending with the jj exports that run
 /// inside the lock, while letting any foreground work go first.
-async fn sweep_retiring_check_refs(orch: Orchestrator, store_dir: std::path::PathBuf) {
+async fn sweep_retiring_check_refs(orch: Orchestrator, mut lease: CheckRefSweepLease) {
+    let store_dir = lease.store_dir.clone();
     loop {
         tokio::time::sleep(CHECK_REF_RETIRE_DEBOUNCE).await;
-        let batch = {
-            let mut all = RETIRING_CHECK_REFS.lock().unwrap();
+        {
+            let mut all = retiring_check_refs();
             let pending = all.entry(store_dir.clone()).or_default();
             if pending.refs.is_empty() {
                 all.remove(&store_dir);
                 return;
             }
-            std::mem::take(&mut pending.refs)
-        };
+            lease.in_flight = std::mem::take(&mut pending.refs);
+        }
         let guard = orch
             .acquire_jj_store_lock(
                 &store_dir,
@@ -2268,15 +2330,24 @@ async fn sweep_retiring_check_refs(orch: Orchestrator, store_dir: std::path::Pat
         let mut failed = Vec::new();
         let mut by_repository: HashMap<std::path::PathBuf, Vec<CheckRefRetirement>> =
             HashMap::new();
-        for retirement in batch {
+        for retirement in &lease.in_flight {
             by_repository
                 .entry(retirement.repository.clone())
                 .or_default()
-                .push(retirement);
+                .push(retirement.clone());
         }
         for (repository, refs) in by_repository {
             let _phase = guard.phase(format!("delete {} check refs", refs.len()));
-            failed.extend(delete_check_refs(&repository, refs).await);
+            let failures = delete_check_refs(&repository, refs).await;
+            // What this repository's deletion settled leaves the lease now; the
+            // failures stay in it until they are queued again below.
+            lease.in_flight.retain(|retirement| {
+                retirement.repository != repository
+                    || failures
+                        .iter()
+                        .any(|(failure, _)| failure.reference == retirement.reference)
+            });
+            failed.extend(failures);
         }
         drop(guard);
         #[cfg(test)]
@@ -2313,15 +2384,11 @@ async fn sweep_retiring_check_refs(orch: Orchestrator, store_dir: std::path::Pat
                 );
             }
         }
-        if !retry.is_empty() {
-            RETIRING_CHECK_REFS
-                .lock()
-                .unwrap()
-                .entry(store_dir.clone())
-                .or_default()
-                .refs
-                .extend(retry);
-        }
+        // Queue the retries and let go of the batch in one step, so no instant
+        // has a ref in neither place.
+        let mut all = retiring_check_refs();
+        all.entry(store_dir.clone()).or_default().refs.extend(retry);
+        lease.in_flight.clear();
     }
 }
 
@@ -11152,6 +11219,143 @@ fi
             "the ref is removed after the store lock is acquired",
             || !check_ref_exists(&repo, &reference),
         )
+        .await;
+    }
+
+    fn retirement_of(repo: &Path, reference: &str, commit: &str) -> CheckRefRetirement {
+        CheckRefRetirement {
+            repository: repo.to_path_buf(),
+            reference: reference.to_string(),
+            commit: commit.to_string(),
+            attempts: 0,
+        }
+    }
+
+    fn pending_check_ref_retirements(store: &Path) -> usize {
+        retiring_check_refs()
+            .get(store)
+            .map_or(0, |pending| pending.refs.len())
+    }
+
+    /// A ref is often released by a destructor while the task holding it is
+    /// dropped, and that task may be on a runtime that is itself going away,
+    /// as a turn-end wave started off any runtime used to be. Its retirement
+    /// must not go down with that runtime.
+    #[tokio::test]
+    async fn a_check_ref_released_on_a_runtime_that_then_ends_is_still_retired() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (repo, commit) = committed_git_repo(&temp);
+        let store = temp.path().join("store");
+        let reference = "refs/cairn/checks/runtime-ended".to_string();
+        let wave = std::thread::spawn({
+            let (orch, repo, store) = (orch.clone(), repo.clone(), store.clone());
+            move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let published =
+                        publish_check_commit_ref(&orch, &repo, &store, &commit, "runtime-ended")
+                            .await
+                            .expect("the sealed check reference publishes");
+                    drop(published);
+                });
+                // The runtime drops here, with anything that was spawned onto it.
+            }
+        });
+        tokio::task::spawn_blocking(move || wave.join().unwrap())
+            .await
+            .unwrap();
+        wait_until(
+            "the released ref outlives its runtime and is retired",
+            || !check_ref_exists(&repo, &reference) && !check_ref_is_held(&reference),
+        )
+        .await;
+    }
+
+    /// A sweep that ends with its batch taken but not deleted gives the batch
+    /// back and lets the next release start a new sweep, rather than leaving
+    /// the store marked as swept, and its refs held, for the rest of the
+    /// process.
+    #[tokio::test]
+    async fn a_sweep_dropped_mid_batch_hands_its_batch_to_the_next_sweep() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (repo, commit) = committed_git_repo(&temp);
+        let store = temp.path().join("store");
+        let (first, second) = (
+            "refs/cairn/checks/mid-batch-first",
+            "refs/cairn/checks/mid-batch-second",
+        );
+        for reference in [first, second] {
+            git(&repo, &["update-ref", reference, &commit]);
+            hold_check_ref(reference);
+        }
+        // Holding the store makes the sweep take its batch and then wait.
+        let held = orch
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Background,
+                "hold the sweep mid-batch",
+            )
+            .await;
+        let sweep = queue_check_ref_retirement(&orch, &store, retirement_of(&repo, first, &commit))
+            .expect("a store with no live sweep starts one");
+        let sweep = tokio::spawn(sweep);
+        wait_until("the sweep has taken its batch", || {
+            pending_check_ref_retirements(&store) == 0
+        })
+        .await;
+        sweep.abort();
+        assert!(sweep.await.unwrap_err().is_cancelled());
+        drop(held);
+        assert_eq!(
+            pending_check_ref_retirements(&store),
+            1,
+            "the unfinished batch is queued again"
+        );
+        assert!(
+            check_ref_is_held(first),
+            "and its ref is still owed a deletion"
+        );
+
+        retire_check_ref(&orch, &store, retirement_of(&repo, second, &commit));
+        wait_until("the next sweep retires both batches", || {
+            [first, second].iter().all(|reference| {
+                !check_ref_exists(&repo, reference) && !check_ref_is_held(reference)
+            })
+        })
+        .await;
+    }
+
+    /// A sweep dropped before it ever ran, as a task spawned onto a runtime
+    /// already shutting down is, leaves no store marked as swept.
+    #[tokio::test]
+    async fn a_sweep_dropped_before_it_ran_leaves_its_store_unswept() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (repo, commit) = committed_git_repo(&temp);
+        let store = temp.path().join("store");
+        let (first, second) = (
+            "refs/cairn/checks/unpolled-first",
+            "refs/cairn/checks/unpolled-second",
+        );
+        for reference in [first, second] {
+            git(&repo, &["update-ref", reference, &commit]);
+            hold_check_ref(reference);
+        }
+        let sweep = queue_check_ref_retirement(&orch, &store, retirement_of(&repo, first, &commit))
+            .expect("a store with no live sweep starts one");
+        drop(sweep);
+
+        retire_check_ref(&orch, &store, retirement_of(&repo, second, &commit));
+        wait_until("a new sweep retires both refs", || {
+            [first, second].iter().all(|reference| {
+                !check_ref_exists(&repo, reference) && !check_ref_is_held(reference)
+            })
+        })
         .await;
     }
 

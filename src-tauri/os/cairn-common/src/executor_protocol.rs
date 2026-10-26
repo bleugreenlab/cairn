@@ -5057,6 +5057,15 @@ pub struct LearnedResourceEstimate {
 /// `Cancel`. No message or field changes. What a runner gets wrong talking to
 /// an older executor: nothing; that executor receives `Lost` and `Cancel` in
 /// the situations it already handles them.
+///
+/// cairn/5324 does not move the number. Runner-side turn-end work now runs on
+/// the orchestrator's runtime instead of one built for the turn, and the
+/// runner's sweep of released `refs/cairn/checks/*` refs survives being
+/// dropped. In the runner-only `fleet/mod.rs` and `fleet/queue.rs` that changes
+/// only which helper starts two runner-local database consumers and the wording
+/// of a doc comment. Check refs live in the runner's repository and an executor
+/// never names one. What a runner gets wrong talking to an older executor:
+/// nothing; no frame, field or value changes.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 157;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.

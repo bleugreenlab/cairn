@@ -12,8 +12,9 @@
 //! and records it. Once a day it prunes each store:
 //!
 //! 1. Cairn's own refs whose lifecycle ended: `refs/cairn/checks/*` that no
-//!    check batch holds, `refs/cairn/stranded/*` whose issue was resolved more
-//!    than the retention window ago, and `refs/cairn/rescued/*` older than it.
+//!    check batch holds (which every pass also retires, below),
+//!    `refs/cairn/stranded/*` whose issue was resolved more than the retention
+//!    window ago, and `refs/cairn/rescued/*` older than it.
 //! 2. Under the store lock, the store's view. First the origin tracking ref of
 //!    every agent branch Cairn's records say is finished
 //!    ([`BranchLifecycle`]) is retired with its `<branch>@origin` remote
@@ -40,7 +41,14 @@
 //! running, or while the operator's git holds `index.lock` or
 //! `packed-refs.lock`; a skipped prune is recorded and retried next hour.
 //!
-//! Separately from the prune, every hour, the object database is compacted
+//! Separately from the prune, and ahead of it, every hour retires the
+//! `refs/cairn/checks/*` refs no check batch in this process holds once they
+//! are past the grace a batch in another process may need. Each is a deletion
+//! the check runner owed and never made, so this runs whatever the prune gate
+//! says, and the first pass after a restart recovers whatever the previous
+//! process leaked.
+//!
+//! Also separately from the prune, every hour, the object database is compacted
 //! whenever git's own auto-gc thresholds trip ([`compaction_due`]): small packs
 //! are rolled up geometrically under a multi-pack index. Compaction removes
 //! nothing, so it takes no lock and waits for no confirmation; only an
@@ -175,6 +183,7 @@ impl Orchestrator {
 
 async fn run_pass(orch: &Orchestrator) {
     for project in project_stores(orch).await {
+        retire_unheld_check_refs(&project).await;
         let started = unix_now();
         let (census, objects) = match census_store(&project.store).await {
             Ok(Some((_, census, objects))) => (census, objects),
@@ -1201,13 +1210,7 @@ async fn sweep_cairn_refs(
     let now = SystemTime::now();
     let mut sweep = CairnRefSweep::default();
 
-    let expired_checks: Vec<RefTarget> = checks
-        .into_iter()
-        .filter(|target| {
-            !crate::execution::checks::check_ref_is_held(&target.name)
-                && ref_older_than(git_dir, &target.name, now - CHECK_REF_GRACE)
-        })
-        .collect();
+    let expired_checks = unheld_check_refs(git_dir, checks, now);
 
     let mut expired_stranded = Vec::new();
     for target in stranded {
@@ -1245,6 +1248,61 @@ async fn sweep_cairn_refs(
         sweep.locked += retired.locked;
     }
     Ok(sweep)
+}
+
+/// The check refs no check batch is coming back for: none in this process
+/// holds them, and they are past the grace a batch in another process on this
+/// machine may still need.
+fn unheld_check_refs(git_dir: &Path, checks: Vec<RefTarget>, now: SystemTime) -> Vec<RefTarget> {
+    checks
+        .into_iter()
+        .filter(|target| {
+            !crate::execution::checks::check_ref_is_held(&target.name)
+                && ref_older_than(git_dir, &target.name, now - CHECK_REF_GRACE)
+        })
+        .collect()
+}
+
+/// Finish the deletions of check refs whose batches will never delete them.
+///
+/// A check batch deletes its own ref, so an unheld one past the grace is one
+/// whose deletion never ran: its runner stopped first, or its retirement was
+/// lost. At start-up that is every check ref an earlier process left, so the
+/// first pass after a restart recovers whatever that process leaked, with no
+/// operator involved. It runs on every pass and whatever the store's prune gate
+/// says, because it completes a deletion the check runner already owed rather
+/// than pruning anything the gate protects.
+async fn retire_unheld_check_refs(project: &ProjectStore) {
+    let store = project.store.clone();
+    let retired = blocking(move || {
+        let Some(git_dir) = crate::jj::store_git_dir(&store) else {
+            return Ok(None);
+        };
+        if operator_git_busy(&git_dir) {
+            return Ok(None);
+        }
+        let checks = crate::jj::list_refs(&git_dir, CHECK_PREFIX)?;
+        let expired = unheld_check_refs(&git_dir, checks, SystemTime::now());
+        if expired.is_empty() {
+            return Ok(None);
+        }
+        crate::jj::retire_refs(PackedRefs::JjStore(&store), &git_dir, &expired).map(Some)
+    })
+    .await;
+    match retired {
+        Ok(Some(retired)) => log::info!(
+            "ref store {}: retired {} check ref(s) no check batch holds; {} left in place \
+             behind a leftover ref lock",
+            project.store.display(),
+            retired.removed,
+            retired.locked
+        ),
+        Ok(None) => {}
+        Err(error) => log::warn!(
+            "ref store {}: retiring check refs no check batch holds failed: {error}",
+            project.store.display()
+        ),
+    }
 }
 
 /// A packed ref has no age of its own; it was packed by a maintenance pass or

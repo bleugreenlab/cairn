@@ -1499,7 +1499,10 @@ pub(crate) fn spawn_queue_journal(
     // dropping the fleet can never close the channel and release the database.
     let queue = std::sync::Arc::downgrade(&queue);
     let on_spawn_failure = queue.clone();
-    crate::orchestrator::lifecycle::detach_onto_runtime(
+    // The consumer spawns nothing, so a runtime of its own is enough when the
+    // caller has none.
+    crate::orchestrator::spawn_onto(
+        tokio::runtime::Handle::try_current().ok().as_ref(),
         async move {
             if let Err(error) = expire_previous_incarnations(&db, &runner_incarnation).await {
                 log::warn!("{error}");

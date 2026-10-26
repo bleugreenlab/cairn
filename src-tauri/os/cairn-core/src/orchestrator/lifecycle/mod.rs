@@ -43,9 +43,7 @@ pub use review_push::{
     create_review_push_for_pr_open, evaluate_review_readiness, rearm_one_bounded_failed_review,
     rearm_review_checks_on_startup,
 };
-pub(crate) use review_push::{
-    detach_onto_runtime, spawn_checks_settled_edge, spawn_turn_end_checks,
-};
+pub(crate) use review_push::{spawn_checks_settled_edge, spawn_turn_end_checks};
 #[cfg(test)]
 pub(crate) use stop::USER_STOP_TOOL_RESULT;
 pub(crate) use stop::{
@@ -111,6 +109,3 @@ mod warm_completion_tests;
 /// undelivered row.
 #[cfg(test)]
 mod review_push_tests;
-
-#[cfg(test)]
-mod detach_tests;

@@ -1258,12 +1258,12 @@ pub struct Fleet {
     /// The runtime this fleet was built on, which outlives any one caller.
     ///
     /// A coalesced leader answers for everyone who joined its execution, so it
-    /// cannot run on the runtime of whichever caller happened to open it. That
-    /// caller may be a turn-end review wave on a current-thread runtime of its
-    /// own (`detach_onto_runtime`), and cancelling the wave drops that runtime
-    /// and every task on it, a leader included, mid-execution. Absent on a
-    /// fleet built off any runtime, which `Fleet::default()` is; its leaders
-    /// run on the caller's runtime.
+    /// cannot run on the runtime of whichever caller happened to open it: that
+    /// runtime may end first, and ending drops every task on it, a leader
+    /// included, mid-execution. Synchronous code driving async work through a
+    /// runtime built for the one call (`run_db_blocking` and its siblings) is
+    /// on exactly such a runtime. Absent on a fleet built off any runtime,
+    /// which `Fleet::default()` is; its leaders run on the caller's runtime.
     host_runtime: Option<tokio::runtime::Handle>,
     /// Executions carried across a link gap that the reattached connection has
     /// not yet accounted for, with the generation that owes the accounting.
@@ -2378,8 +2378,10 @@ impl Fleet {
         let connections = Arc::downgrade(&self.connections);
         let refusals = Arc::downgrade(&self.preparation_refusals);
         // Off the caller's runtime when it has one, and on a thread of its own
-        // when it does not (an orchestrator built outside a runtime).
-        crate::orchestrator::lifecycle::detach_onto_runtime(
+        // when it does not (an orchestrator built outside a runtime). The task
+        // spawns nothing, so a runtime of its own is enough.
+        crate::orchestrator::spawn_onto(
+            tokio::runtime::Handle::try_current().ok().as_ref(),
             async move {
                 match preparation::load_all(&db).await {
                     Ok(rows) => {

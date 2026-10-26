@@ -375,15 +375,9 @@ fn publish_projection(orch: &Orchestrator, execution_id: &str, outcome: &Recompu
         .collect();
     for issue_id in review_issue_ids {
         let orch_for_review = orch.clone();
-        crate::orchestrator::lifecycle::detach_onto_runtime(
-            async move {
-                crate::orchestrator::lifecycle::evaluate_review_readiness(
-                    &orch_for_review,
-                    &issue_id,
-                )
+        orch.spawn_detached(async move {
+            crate::orchestrator::lifecycle::evaluate_review_readiness(&orch_for_review, &issue_id)
                 .await;
-            },
-            || {},
-        );
+        });
     }
 }

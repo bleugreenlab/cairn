@@ -1446,26 +1446,27 @@ impl Orchestrator {
     /// built on, regardless of the caller's thread, so whatever it spawns in turn
     /// outlives the caller. Off any runtime it gets a thread and a runtime of
     /// its own.
+    ///
+    /// This is how work that starts on a thread with no runtime of its own (an
+    /// agent backend's stdout loop firing a turn-end hook) gets one: never a
+    /// runtime built for the occasion, which would drop every task the work
+    /// spawned for others the moment the work itself returned.
     pub(crate) fn spawn_detached(
         &self,
         task: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
-        match &self.runtime {
-            Some(runtime) => {
-                runtime.spawn(task);
-            }
-            None => {
-                std::thread::spawn(move || {
-                    match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(runtime) => runtime.block_on(task),
-                        Err(error) => log::error!("detached task: no runtime: {error}"),
-                    }
-                });
-            }
-        }
+        self.spawn_detached_or(task, || {});
+    }
+
+    /// [`Self::spawn_detached`], calling `on_spawn_failure` in place of `task`
+    /// when the task cannot be started at all, so a caller holding something the
+    /// task would have released (a single-flight slot) can release it.
+    pub(crate) fn spawn_detached_or(
+        &self,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+        on_spawn_failure: impl FnOnce() + Send + 'static,
+    ) {
+        spawn_onto(self.runtime.as_ref(), task, on_spawn_failure);
     }
 
     /// Queue a persisted fallback era for its one-way generated-summary upgrade.
@@ -3424,6 +3425,42 @@ impl Orchestrator {
         });
     }
 }
+
+/// Run `task` to completion in the background on `runtime`, or, given none, on
+/// a thread with a current-thread runtime of its own. Never blocks the caller.
+///
+/// Everything `task` spawns lands on the runtime `task` runs on, and is dropped
+/// mid-await when that runtime is. A runtime built here is dropped the moment
+/// `task` returns, so it suits only a task that spawns nothing meant to outlive
+/// it. Work that may spawn for others (a coalesced leader, a ref-retirement
+/// sweep) goes through [`Orchestrator::spawn_detached`], which supplies the
+/// orchestrator's own runtime. If the fallback runtime cannot be built, `task`
+/// never runs and `on_spawn_failure` is called in its place.
+pub(crate) fn spawn_onto(
+    runtime: Option<&tokio::runtime::Handle>,
+    task: impl std::future::Future<Output = ()> + Send + 'static,
+    on_spawn_failure: impl FnOnce() + Send + 'static,
+) {
+    if let Some(runtime) = runtime {
+        runtime.spawn(task);
+        return;
+    }
+    std::thread::spawn(move || {
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(task),
+            Err(error) => {
+                log::error!("detached task: failed to build a runtime to run it on: {error}");
+                on_spawn_failure();
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod detach_tests;
 
 #[cfg(test)]
 pub(crate) mod launch_coverage_tests;

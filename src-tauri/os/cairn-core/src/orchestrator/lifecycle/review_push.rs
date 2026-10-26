@@ -343,7 +343,11 @@ pub(crate) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
     let orch_for_release = orch.clone();
     let job_id_for_release = job_id.to_string();
     let attempt_for_failure = attempt_id.clone();
-    detach_onto_runtime(
+    // On the orchestrator's runtime, not one built for this wave: the wave opens
+    // shared executions and releases check refs whose sweeps must outlive it,
+    // and a cancelled wave returning early would otherwise drop them with it.
+    // Cancellation itself is unchanged; `cancel` stops this wave's own lanes.
+    orch.spawn_detached_or(
         async move {
             crate::execution::checks_turn_end::run_turn_end_checks(
                 orch_clone,
@@ -359,7 +363,7 @@ pub(crate) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
             );
         },
         move || {
-            // Runtime construction failed, so the future above never reached
+            // No runtime could be had, so the future above never reached
             // `run_turn_end_checks` (which releases the single-flight slot itself
             // on every path). This is the ONLY path where the slot would leak, so
             // release it here to let a later turn-end retry.
@@ -429,51 +433,10 @@ fn withdrawn_turn_end_wave(orch: &Orchestrator, job_id: &str) -> Option<String> 
 /// stdout thread with no ambient runtime, and the settlement snapshot reads the
 /// repository.
 pub(crate) fn spawn_checks_settled_edge(orch: &Orchestrator, job_id: &str) {
-    let orch = orch.clone();
+    let edge_orch = orch.clone();
     let job_id = job_id.to_string();
-    detach_onto_runtime(
-        async move {
-            crate::orchestrator::wakes::route_checks_settled_edge(&orch, &job_id).await;
-        },
-        || {},
-    );
-}
-
-/// Detach `fut` onto a runtime that is guaranteed to run it, without ever
-/// blocking the caller — which at turn-end is an agent backend's plain
-/// `std::thread` stdout loop, not a Tokio worker.
-///
-/// With an ambient Tokio runtime this is a plain `tokio::spawn`. Without one —
-/// the COMMON turn-end case, since the two turn-end hooks fire from the backends'
-/// non-runtime stdout threads — spawn a detached `std::thread` that builds its
-/// own current-thread runtime and `block_on`s the future. Unlike the sibling
-/// detach helpers (`execution::dispatch::run_dispatch_db`,
-/// `execution::triggers::block_on_trigger_db`) this thread is NOT joined: the
-/// turn-end suite can run for many minutes and the caller is the turn-end path,
-/// which must return immediately so the turn can end.
-///
-/// If the current-thread runtime cannot be built (OS resource exhaustion) the
-/// future never runs; `on_spawn_failure` is invoked so the caller can compensate
-/// (e.g. release a single-flight slot the future would otherwise have released).
-pub(crate) fn detach_onto_runtime(
-    fut: impl std::future::Future<Output = ()> + Send + 'static,
-    on_spawn_failure: impl FnOnce() + Send + 'static,
-) {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::spawn(fut);
-        return;
-    }
-    std::thread::spawn(move || {
-        match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime.block_on(fut),
-            Err(error) => {
-                log::error!("detach_onto_runtime: failed to build current-thread runtime: {error}");
-                on_spawn_failure();
-            }
-        }
+    orch.spawn_detached(async move {
+        crate::orchestrator::wakes::route_checks_settled_edge(&edge_orch, &job_id).await;
     });
 }
 
