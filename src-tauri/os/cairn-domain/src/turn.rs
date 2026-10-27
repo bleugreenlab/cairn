@@ -148,6 +148,11 @@ pub enum TurnEndReason {
     /// The operator compacted the session while the turn was live: its process
     /// was killed and the job continued on a fresh session from the digest.
     OperatorCompact,
+    /// The host restarted under the turn: the boot sweep settled the run the
+    /// turn was bound to. Marks the job for its one automatic resume after
+    /// boot, and tells that resume to warn the agent that any tool call in
+    /// flight has an unknown outcome.
+    HostRestart,
 }
 
 impl std::fmt::Display for TurnEndReason {
@@ -162,6 +167,7 @@ impl std::fmt::Display for TurnEndReason {
             TurnEndReason::Superseded => write!(f, "superseded"),
             TurnEndReason::PermissionResumeRefused => write!(f, "permission_resume_refused"),
             TurnEndReason::OperatorCompact => write!(f, "operator_compact"),
+            TurnEndReason::HostRestart => write!(f, "host_restart"),
         }
     }
 }
@@ -180,6 +186,7 @@ impl std::str::FromStr for TurnEndReason {
             "superseded" => Ok(TurnEndReason::Superseded),
             "permission_resume_refused" => Ok(TurnEndReason::PermissionResumeRefused),
             "operator_compact" => Ok(TurnEndReason::OperatorCompact),
+            "host_restart" => Ok(TurnEndReason::HostRestart),
             _ => Err(format!("Unknown turn end reason: {}", s)),
         }
     }

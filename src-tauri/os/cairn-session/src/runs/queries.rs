@@ -211,6 +211,18 @@ const PROMPT_COLUMNS: &str = "id, run_id, questions, response, created_at, answe
 /// or assumed.
 pub const ORPHAN_REAPED_EXIT_REASON: &str = "orphan_reaped";
 
+/// Which question [`settle_stale_run`] is answering, which decides what it
+/// writes on the turns the run stranded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleRunSettlement {
+    /// The startup sweep: the run belonged to a host that is gone. Its turns
+    /// are marked `host_restart` so the job is resumed once after boot.
+    HostRestart,
+    /// The in-session reaper: a run with no process behind it that no launch
+    /// claimed. Its turns keep the ordinary crash settlement.
+    Reaped,
+}
+
 #[derive(Default)]
 pub struct ReconcileResult {
     stale_run_count: usize,
@@ -1234,12 +1246,12 @@ async fn reconcile_stale_runs_db(
     // Filtered in Rust rather than SQL so the boundary has exactly one definition
     // and cannot drift from the fence's. The candidate set is only non-terminal
     // runs, so the rows read are few.
-    let stale: Vec<(String, Option<String>)> = db
+    let stale: Vec<(String, Option<String>, Option<String>)> = db
         .read(|conn| {
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT id, session_id, started_at, created_at
+                        "SELECT id, session_id, started_at, created_at, job_id
                          FROM runs
                          WHERE status IN ('starting', 'live')",
                         (),
@@ -1255,7 +1267,7 @@ async fn reconcile_stale_runs_db(
                             boot_at,
                         )
                     {
-                        stale.push((id, session_id));
+                        stale.push((id, session_id, row.opt_text(4)?));
                     }
                 }
                 Ok(stale)
@@ -1265,7 +1277,7 @@ async fn reconcile_stale_runs_db(
         .map_err(CairnError::from)?;
     // Signalling happens BEFORE the rows are written, so each row records the
     // outcome it actually had rather than being corrected afterwards.
-    let session_ids: Vec<String> = stale.iter().filter_map(|(_, s)| s.clone()).collect();
+    let session_ids: Vec<String> = stale.iter().filter_map(|(_, s, _)| s.clone()).collect();
     let reaped = crate::agent_process::orphan::reap_sessions(processes, &session_ids);
 
     db.write(move |conn| {
@@ -1279,7 +1291,7 @@ async fn reconcile_stale_runs_db(
             let mut reaped_count = 0usize;
             let mut stale_run_count = 0usize;
             let mut reproject_job_ids = std::collections::HashSet::new();
-            for (run_id, session_id) in &stale {
+            for (run_id, session_id, job_id) in &stale {
                 let was_reaped = session_id
                     .as_deref()
                     .is_some_and(|session_id| reaped.iter().any(|s| s == session_id));
@@ -1288,7 +1300,14 @@ async fn reconcile_stale_runs_db(
                 } else {
                     "crash"
                 };
-                let Some(settled_turns) = settle_stale_run(conn, run_id, exit_reason, now).await?
+                let Some(settled_turns) = settle_stale_run(
+                    conn,
+                    run_id,
+                    exit_reason,
+                    StaleRunSettlement::HostRestart,
+                    now,
+                )
+                .await?
                 else {
                     continue;
                 };
@@ -1297,6 +1316,15 @@ async fn reconcile_stale_runs_db(
                     reaped_count += 1;
                 }
                 turn_count += settled_turns.len();
+                // Every job whose run this sweep settled is re-derived, whether
+                // or not a turn was stranded on the run: its cached `running`
+                // was written for a run that no longer exists, and nothing else
+                // re-derives a job no process will ever finalize.
+                if let Some(job_id) = job_id {
+                    if !claimed_job_ids.contains(job_id) {
+                        reproject_job_ids.insert(job_id.clone());
+                    }
+                }
             }
 
             // Select only after stale runs have settled. A predecessor's resume
@@ -1475,9 +1503,9 @@ async fn reconcile_stale_runs_db(
             // Under the fixed projection a delegated task cannot derive Idle: its
             // packet always carries an output contract, so it requires output and
             // is not long-running. A task cached `running` by a host crash is
-            // deliberately not selected: it keeps the ordinary crash semantics
-            // (interrupted, then Pending, then relaunched) through the repairs
-            // above.
+            // deliberately not selected: the stale-run settlement above marks its
+            // turn `host_restart` and re-derives it to Pending, and the boot
+            // resume relaunches it once after the callback gateway is ready.
             //
             // `idle` alone does not mean finished, though. Under the defect a task
             // legitimately parked mid-work also read `idle`: one waiting on its
@@ -1575,7 +1603,7 @@ async fn reconcile_stale_runs_db(
 }
 
 /// Settle one stale run: mark it `crashed` with `exit_reason`, terminalize the
-/// turns it stranded (`running -> interrupted`, `pending -> failed`), and
+/// turns it stranded, and
 /// withdraw its still-queued admission request (ordinary or call) in the same
 /// write, so the queue never carries a launch whose run is already over. A
 /// call row past `queued` may have a process behind it, so it is not touched
@@ -1594,10 +1622,22 @@ async fn reconcile_stale_runs_db(
 /// Shared so "what settling a stale run means" has exactly one definition:
 /// [`reconcile_stale_runs`] owns the question at startup, and
 /// [`crate::runs::reap`] owns it inside a live session.
+///
+/// The stranded turns settle by `settlement`:
+///
+/// - [`StaleRunSettlement::HostRestart`]: `running -> interrupted` and
+///   `pending -> cancelled`, both with end reason `host_restart`. A pending turn
+///   never reached its provider, so it is cancelled (resumable) rather than
+///   failed. An attention delivery stamped into it returns to the pending
+///   queue when its run never started, which is the only case the sweep can
+///   prove the prompt never reached a process.
+/// - [`StaleRunSettlement::Reaped`]: `running -> interrupted` and
+///   `pending -> failed`, with no end reason.
 pub async fn settle_stale_run(
     conn: &Connection,
     run_id: &str,
     exit_reason: &str,
+    settlement: StaleRunSettlement,
     now: i64,
 ) -> DbResult<Option<Vec<String>>> {
     let updated = conn
@@ -1649,20 +1689,46 @@ pub async fn settle_stale_run(
 
     let mut settled = Vec::new();
     for (turn_id, turn_state) in stranded {
-        let target_state = match turn_state.as_str() {
-            "running" => "interrupted",
-            "pending" => "failed",
+        let (target_state, end_reason) = match (settlement, turn_state.as_str()) {
+            (StaleRunSettlement::HostRestart, "running") => ("interrupted", Some("host_restart")),
+            (StaleRunSettlement::HostRestart, "pending") => ("cancelled", Some("host_restart")),
+            (StaleRunSettlement::Reaped, "running") => ("interrupted", None),
+            (StaleRunSettlement::Reaped, "pending") => ("failed", None),
             _ => continue,
         };
         conn.execute(
             "UPDATE turns
              SET state = ?1,
-                 ended_at = ?2,
+                 end_reason = COALESCE(?2, end_reason),
+                 ended_at = ?3,
                  updated_at = ?3
              WHERE id = ?4",
-            params![target_state, now, now, turn_id.as_str()],
+            params![target_state, end_reason, now, turn_id.as_str()],
         )
         .await?;
+        // The sweep never saw the handoff, so it reverts only what it can prove
+        // was undelivered: a run that never started cannot have carried the
+        // prompt, while a started one may have, and a native resume of its
+        // session must not receive the same wake twice.
+        if settlement == StaleRunSettlement::HostRestart && turn_state == "pending" {
+            match cairn_attention::push::revert_turn_deliveries_conn(
+                conn,
+                &turn_id,
+                cairn_attention::push::TurnDelivery::Unknown,
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(restored) => log::info!(
+                    "stale run {run_id}: returned {restored} push(es) from never-started turn {turn_id} to the pending queue"
+                ),
+                // Losing the revert costs one wake; failing the write would
+                // leave the run unsettled.
+                Err(error) => log::warn!(
+                    "stale run {run_id}: could not return turn {turn_id}'s attention delivery ({error}); that wake will not be redelivered"
+                ),
+            }
+        }
         settled.push(turn_id);
     }
     Ok(Some(settled))

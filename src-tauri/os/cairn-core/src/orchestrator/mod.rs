@@ -2380,6 +2380,15 @@ impl Orchestrator {
         crate::mcp::handlers::durable_suspend::reconcile(self).await;
     }
 
+    /// Resume, once, each job whose turn this boot's stale-run sweep settled
+    /// because the host serving it is gone. Blocking; the transport runs it
+    /// detached once the MCP callback gateway is ready, because every resumed
+    /// agent calls straight back through that gateway. See
+    /// [`crate::runs::queries::resume_jobs_interrupted_by_restart`].
+    pub fn resume_jobs_interrupted_by_restart(&self) -> crate::runs::queries::RestartResumeSummary {
+        crate::runs::queries::resume_jobs_interrupted_by_restart(self, self.boot_at)
+    }
+
     pub async fn redispatch_crashed_workflows(&self) {
         crate::execution::jobs::redispatch_crashed_workflows(self).await;
     }

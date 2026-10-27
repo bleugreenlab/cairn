@@ -178,6 +178,7 @@ pub fn reap_stale_runs_for_job(orch: &Orchestrator, db: &Arc<LocalDb>, job_id: &
                             conn,
                             run_id,
                             STALE_RUN_EXIT_REASON,
+                            crate::runs::queries::StaleRunSettlement::Reaped,
                             now,
                         )
                         .await?

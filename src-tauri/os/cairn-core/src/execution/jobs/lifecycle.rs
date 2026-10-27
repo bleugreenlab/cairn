@@ -1581,6 +1581,10 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
     );
 
     // ---- Create initial turn ------------------------------------------------
+    // A launch that claims a job a host restart interrupted owes the agent the
+    // restart notice, whichever launcher won the job. Read it before the new
+    // turn becomes the job's latest.
+    let restart_note = restart_resume_note(&owning_db, job_id);
     let turn_id = ids::mint_child(job_id);
     create_initial_turn(orch, &turn_id, &session_id, job_id)?;
 
@@ -1590,7 +1594,14 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
     // Provenance rides in the opening prompt rather than a side channel: it is
     // the one piece of context a successor must not be able to miss, and this is
     // the event a rebuilt or compacted session re-reads.
-    for note in [continuation.briefing(), base_note].into_iter().flatten() {
+    for note in [
+        continuation.briefing(),
+        base_note,
+        restart_note.map(str::to_string),
+    ]
+    .into_iter()
+    .flatten()
+    {
         if !prompt.is_empty() {
             prompt.push_str("\n\n");
         }
@@ -2329,17 +2340,20 @@ pub fn in_flight_launch_for_test(
     in_flight_launch(orch, job_id).map(|run| run.map(|run| run.id))
 }
 
-/// Launch watchdog recovery while its caller holds this job's launch lock.
+/// Launch a recovery continuation while its caller holds this job's launch lock.
 ///
-/// This deliberately skips the public funnel's second lock acquisition. The
-/// recovery caller performs its claim-epoch and exact-head compare-and-set under
-/// the same guard immediately before entering here.
-pub(crate) fn continue_job_launch_locked_for_watchdog<'a>(
+/// This deliberately skips the public funnel's second lock acquisition, and with
+/// it the funnel's dormant-thread gate, so a caller that can reach a thread
+/// session checks dormancy itself. Each caller performs its own exact-head
+/// compare-and-set under the same guard immediately before entering here: the
+/// provider watchdog (claim epoch and head turn) and the boot resume of jobs a
+/// host restart interrupted (head turn, status, and launch claim).
+pub(crate) fn continue_job_launch_locked_for_recovery<'a>(
     orch: &Orchestrator,
     job_id: &str,
     prompt_resume: Option<ResumeContext>,
     launch_guard: std::sync::MutexGuard<'a, ()>,
-) -> Result<WatchdogContinuation, String> {
+) -> Result<RecoveryContinuation, String> {
     let ContinuationLaunch {
         run,
         turn_id,
@@ -2358,14 +2372,14 @@ pub(crate) fn continue_job_launch_locked_for_watchdog<'a>(
         Some(launch_guard),
     )?;
     Ok(if started {
-        WatchdogContinuation::Started { run, turn_id }
+        RecoveryContinuation::Started { run, turn_id }
     } else {
-        WatchdogContinuation::Queued { run, turn_id }
+        RecoveryContinuation::Queued { run, turn_id }
     })
 }
 
 #[derive(Debug)]
-pub(crate) enum WatchdogContinuation {
+pub(crate) enum RecoveryContinuation {
     Started { run: Run, turn_id: String },
     Queued { run: Run, turn_id: String },
 }
@@ -2517,7 +2531,7 @@ fn continue_job_launch_locked(
     // flush, the urgency nudge, parent wakes, permission and question answers,
     // durable-suspend resolution, delegation completion, memory review, DAG
     // actions, and watchdog recovery (which reaches it through
-    // `continue_job_launch_locked_for_watchdog`). Provider session recovery and
+    // `continue_job_launch_locked_for_recovery`). Provider session recovery and
     // native goal continuation both terminate in that watchdog path, so they are
     // covered here rather than needing their own guard.
     //
@@ -2572,6 +2586,8 @@ fn continue_job_launch_locked(
     let supersede_pending_retry = prompt_resume
         .as_ref()
         .is_some_and(|context| context.supersede_pending_retry);
+    // Read before the follow-up below becomes the job's latest turn.
+    let restart_note = restart_resume_note(&owning_db, job_id);
     let precreated_turn_id =
         if preclaimed_successor_turn_id.is_none() && preclaimed_retry_turn_id.is_none() {
             Some(create_followup_turn(
@@ -3417,16 +3433,16 @@ fn continue_job_launch_locked(
         .as_ref()
         .is_some_and(|ctx| ctx.suppress_self_suspend_note);
     let artifact_handoff_note = artifact_handoff_resume_note(owning_db.clone(), job_id)?;
-    let resume_note = match (
+    let resume_notes: Vec<String> = [
         (suppress_user_event && !suppress_self_suspend_note)
-            .then_some(RESUME_AFTER_SELF_SUSPEND_NOTE),
-        artifact_handoff_note.as_deref(),
-    ) {
-        (Some(self_suspend), Some(handoff)) => Some(format!("{self_suspend}\n\n{handoff}")),
-        (Some(self_suspend), None) => Some(self_suspend.to_string()),
-        (None, Some(handoff)) => Some(handoff.to_string()),
-        (None, None) => None,
-    };
+            .then(|| RESUME_AFTER_SELF_SUSPEND_NOTE.to_string()),
+        artifact_handoff_note,
+        restart_note.map(str::to_string),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let resume_note = (!resume_notes.is_empty()).then(|| resume_notes.join("\n\n"));
     let prompt = assemble_resume_prompt(
         resume_note.as_deref(),
         queued_block,
@@ -3825,6 +3841,61 @@ impl Drop for UndeliveredPushes {
             Err(error) => log::error!(
                 "launch failed after recording an attention delivery, and reverting it failed ({error}); those wakes will not be redelivered"
             ),
+        }
+    }
+}
+
+/// Told to an agent whose last turn a host restart cut off mid-flight. The
+/// restart killed the process between a tool call and its result, so the agent
+/// cannot know from its transcript whether that call took effect.
+pub(crate) const HOST_RESTART_RESUME_NOTE: &str = "Cairn restarted while your previous turn was in progress, and that turn was interrupted. Any tool call that was in flight when it stopped has an unknown outcome: it may or may not have taken effect. Check the worktree, and whatever your last calls touched, before re-running anything. Then continue your work.";
+
+/// Told to an agent whose queued turn a host restart cancelled before it
+/// started, whether the turn was runless (`orphaned_pending`) or bound to a
+/// stale run that never began it (`host_restart` with no `started_at`). Nothing
+/// from that turn ran, so there is no outcome to doubt.
+pub(crate) const ORPHANED_PENDING_RESUME_NOTE: &str = "Cairn restarted before your queued turn started, so nothing from it ran. Continue from where you were.";
+
+/// The restart notice owed to the next launch of `job_id`, read from the end
+/// reason of the job's latest work turn, and from whether that turn ever started. Memory review turns are not work, and a
+/// turn a refused launch cancelled never ran, so neither hides the restart that
+/// preceded it: an agent whose boot resume was refused still learns about the
+/// restart on whichever launch next reaches it. Callers read this before
+/// minting the launch's own turn.
+///
+/// The note frames a prompt and never gates one, so a failed read is logged and
+/// reads as no note.
+fn restart_resume_note(owning_db: &Arc<LocalDb>, job_id: &str) -> Option<&'static str> {
+    let db = owning_db.clone();
+    let job_id_owned = job_id.to_string();
+    let latest = run_db(async move {
+        db.query_opt(
+            "SELECT COALESCE(end_reason, ''), started_at IS NOT NULL FROM turns
+              WHERE job_id = ?1
+                AND start_reason != 'memory_review'
+                AND COALESCE(end_reason, '') != 'launch_refused'
+              ORDER BY created_at DESC, sequence DESC
+              LIMIT 1",
+            (job_id_owned,),
+            |row| Ok((row.text(0)?, row.i64(1)? != 0)),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    let host_restart = crate::models::TurnEndReason::HostRestart.to_string();
+    let orphaned = crate::models::TurnEndReason::OrphanedPending.to_string();
+    match latest {
+        Ok(Some((reason, true))) if reason == host_restart => Some(HOST_RESTART_RESUME_NOTE),
+        Ok(Some((reason, _))) if reason == host_restart || reason == orphaned => {
+            Some(ORPHANED_PENDING_RESUME_NOTE)
+        }
+        Ok(_) => None,
+        Err(error) => {
+            log::warn!(
+                "Could not read the latest turn of job {} for a restart notice: {error}",
+                &job_id[..job_id.len().min(8)]
+            );
+            None
         }
     }
 }
@@ -7052,7 +7123,7 @@ mod tests {
     }
 
     /// A passive wake: no user message, the suppressed-event shape the wake path
-    /// uses. This drives `continue_job_launch_locked_for_watchdog`, which is not a
+    /// uses. This drives `continue_job_launch_locked_for_recovery`, which is not a
     /// test-only door — it is the exact entry point a watchdog successor and the
     /// stranded-jobs sweep launch through. So this is also the end-to-end proof
     /// that a recovery successor lands on the session it was recovering rather
@@ -7065,7 +7136,7 @@ mod tests {
     /// the session assertions would also pass for a wake that never landed.
     #[tokio::test(flavor = "current_thread")]
     async fn a_passive_wake_launch_leaves_the_session_alone() {
-        use super::{continue_job_launch_locked_for_watchdog, ResumeContext, WatchdogContinuation};
+        use super::{continue_job_launch_locked_for_recovery, RecoveryContinuation, ResumeContext};
 
         let (orch, db) = standing_node("standing-node-wake").await;
         let before = session_state(&db).await;
@@ -7074,7 +7145,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let launch = continue_job_launch_locked_for_watchdog(
+        let launch = continue_job_launch_locked_for_recovery(
             &orch,
             "j",
             Some(ResumeContext {
@@ -7089,7 +7160,7 @@ mod tests {
         assert_eq!(session_state(&db).await, before);
         assert_eq!(before.1.as_deref(), Some("s1"));
         assert_eq!(before.2.as_deref(), Some("native-thread-1"));
-        let WatchdogContinuation::Started { run, turn_id } = launch else {
+        let RecoveryContinuation::Started { run, turn_id } = launch else {
             panic!("a wake on a warm process starts there, got {launch:?}");
         };
         assert_eq!(run.id, "r1", "the wake lands on the warm process's run");

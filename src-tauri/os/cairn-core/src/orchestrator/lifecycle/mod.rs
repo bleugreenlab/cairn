@@ -70,7 +70,7 @@ pub(crate) use finalize::{handle_session_crash, run_digest_reseed_fallback};
 #[cfg(test)]
 pub(crate) use review_push::{record_bounded_rearm_lookup_failure, review_artifact_ref};
 #[cfg(test)]
-pub(crate) use stop::{stop_session_internal, StopReason};
+pub(crate) use stop::{pending_tool_result_ids, stop_session_internal, StopReason};
 
 /// CAIRN-4609: the parent-facing stalled-child fact — which shapes produce it,
 /// which quiet-but-healthy shapes must not, and that repeated deaths update one

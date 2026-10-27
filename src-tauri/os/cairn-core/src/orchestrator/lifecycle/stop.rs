@@ -182,6 +182,18 @@ fn pending_tool_results(
     })
 }
 
+/// The ids of the tool calls a turn still owes results for, as
+/// [`pending_tool_results`] reads them.
+#[cfg(test)]
+pub(crate) fn pending_tool_result_ids(
+    orch: &Orchestrator,
+    run_id: &str,
+    turn_id: &str,
+) -> Result<Vec<String>, String> {
+    pending_tool_results(orch, run_id, turn_id)
+        .map(|pending| pending.into_iter().map(|call| call.tool_use_id).collect())
+}
+
 pub(crate) const USER_STOP_TOOL_RESULT: &str = "Run interrupted by user stop.";
 
 fn settle_pending_tool_results(

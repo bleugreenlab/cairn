@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::execution::jobs::{
-    continue_job_launch_locked_for_watchdog, ResumeContext, WatchdogContinuation,
+    continue_job_launch_locked_for_recovery, RecoveryContinuation, ResumeContext,
 };
 use crate::orchestrator::Orchestrator;
 use crate::runs::watchdog_ledger::{
@@ -638,7 +638,7 @@ pub fn recover_provider_watchdog(
                 successor: None,
             });
         }
-        let launch = continue_job_launch_locked_for_watchdog(
+        let launch = continue_job_launch_locked_for_recovery(
             orch,
             &target.job_id,
             Some(ResumeContext {
@@ -649,8 +649,8 @@ pub fn recover_provider_watchdog(
             launch_guard,
         )?;
         let (started, run, turn_id) = match launch {
-            WatchdogContinuation::Started { run, turn_id } => (true, run, turn_id),
-            WatchdogContinuation::Queued { run, turn_id } => (false, run, turn_id),
+            RecoveryContinuation::Started { run, turn_id } => (true, run, turn_id),
+            RecoveryContinuation::Queued { run, turn_id } => (false, run, turn_id),
         };
         let successor = (run.id, turn_id);
         record_successor_on_lease(db.clone(), identity, &successor.0, Some(&successor.1), now);
@@ -713,7 +713,7 @@ pub fn recover_provider_watchdog(
     if !recovery_claim_is_owned(db.clone(), identity, claimed_at)? {
         return Ok(ProviderWatchdogRecovery::LostClaim);
     }
-    let successor_launch = continue_job_launch_locked_for_watchdog(
+    let successor_launch = continue_job_launch_locked_for_recovery(
         orch,
         &target.job_id,
         Some(ResumeContext {
@@ -751,8 +751,8 @@ pub fn recover_provider_watchdog(
         }
     };
     let (started, run, turn_id) = match successor_launch {
-        WatchdogContinuation::Started { run, turn_id } => (true, run, turn_id),
-        WatchdogContinuation::Queued { run, turn_id } => (false, run, turn_id),
+        RecoveryContinuation::Started { run, turn_id } => (true, run, turn_id),
+        RecoveryContinuation::Queued { run, turn_id } => (false, run, turn_id),
     };
     let successor = (run.id, turn_id);
     if started {
@@ -1059,7 +1059,7 @@ pub(crate) fn sweep_stranded_watchdog_jobs(orch: &Orchestrator) -> usize {
             );
             continue;
         }
-        match continue_job_launch_locked_for_watchdog(
+        match continue_job_launch_locked_for_recovery(
             orch,
             &job_id,
             Some(ResumeContext {
@@ -1071,8 +1071,8 @@ pub(crate) fn sweep_stranded_watchdog_jobs(orch: &Orchestrator) -> usize {
         ) {
             Ok(launch) => {
                 let (started, run, successor_turn_id) = match launch {
-                    WatchdogContinuation::Started { run, turn_id } => (true, run, turn_id),
-                    WatchdogContinuation::Queued { run, turn_id } => (false, run, turn_id),
+                    RecoveryContinuation::Started { run, turn_id } => (true, run, turn_id),
+                    RecoveryContinuation::Queued { run, turn_id } => (false, run, turn_id),
                 };
                 record_successor_on_lease(
                     db.clone(),

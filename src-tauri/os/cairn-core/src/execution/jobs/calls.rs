@@ -2126,7 +2126,14 @@ mod restart_call_tests {
         let settled = db
             .write(|conn| {
                 Box::pin(async move {
-                    crate::runs::queries::settle_stale_run(conn, "call-run", "crash", 5).await
+                    crate::runs::queries::settle_stale_run(
+                        conn,
+                        "call-run",
+                        "crash",
+                        crate::runs::queries::StaleRunSettlement::Reaped,
+                        5,
+                    )
+                    .await
                 })
             })
             .await
