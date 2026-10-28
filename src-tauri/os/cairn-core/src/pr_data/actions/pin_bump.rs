@@ -725,7 +725,9 @@ fn compare_numeric_aware(left: &str, right: &str) -> Ordering {
 /// only when an identical-input verdict answered this exact commit. A row for
 /// any other commit never counts, which is what makes a verdict on the PR's
 /// parent "stale" rather than evidence. When several machines recorded a
-/// verdict on one platform, the most recently evaluated decides. The parsed
+/// verdict on one platform, the most recently evaluated decides, except that a
+/// newer run that ended without a verdict never hides one (the rule
+/// [`crate::execution::checks_status::select_lane_row`] states). The parsed
 /// result that decides verified-vs-unverified lives on the verdict cache row
 /// projected from the observation; when that row has since moved on to a newer
 /// observation the verdict reads as having no structured result, which fails
@@ -743,12 +745,30 @@ pub(crate) async fn head_verdicts(
     Ok(required
         .iter()
         .filter_map(|RequiredVerdict { check, platform }| {
-            recorded
+            let mut newest_first = recorded
                 .iter()
-                .find(|verdict| &verdict.check == check && &verdict.platform == platform)
+                .filter(|verdict| &verdict.check == check && &verdict.platform == platform);
+            let newest = newest_first.clone().next();
+            newest_first
+                .find(|verdict| answers_the_lane(verdict))
+                .or(newest)
                 .cloned()
         })
         .collect())
+}
+
+fn answers_the_lane(verdict: &CollectedVerdict) -> bool {
+    crate::execution::checks_status::row_existence(
+        verdict.passed,
+        verdict.failure_kind.as_deref(),
+        None,
+        verdict
+            .parsed
+            .as_ref()
+            .map(ParsedCheckResult::verdict_facts)
+            .as_ref(),
+    )
+    .answers_the_lane()
 }
 
 /// Every verdict recorded AT `commit` for each of `checks`, newest first within
@@ -1429,6 +1449,15 @@ pinBumps:
     }
 
     async fn record(db: &LocalDb, observation: Observation<'_>) {
+        record_with_failure_kind(db, observation, None).await;
+    }
+
+    /// Observations are immutable, so a death's kind is written with the row.
+    async fn record_with_failure_kind(
+        db: &LocalDb,
+        observation: Observation<'_>,
+        failure_kind: Option<&str>,
+    ) {
         let verdict = if observation.passed {
             "passed"
         } else {
@@ -1439,9 +1468,9 @@ pinBumps:
                 id, project_id, commit_sha, tree_hash, check_name, input_hash,
                 environment_fingerprint, exit_code, verdict, complete, reusable,
                 parser_version, result_schema_version, ran_at, duration_ms, cadence,
-                output_tail, verdict_platform
+                output_tail, verdict_platform, failure_kind
              ) VALUES (?1, 'project', ?2, 'tree', ?3, 'input', ?4, ?5, ?6, 1, 1,
-                       1, 1, ?7, 10, 'review', '', ?8)",
+                       1, 1, ?7, 10, 'review', '', ?8, ?9)",
             params![
                 observation.id,
                 observation.commit,
@@ -1450,7 +1479,8 @@ pinBumps:
                 i64::from(!observation.passed),
                 verdict,
                 observation.ran_at,
-                observation.platform
+                observation.platform,
+                failure_kind
             ],
         )
         .await
@@ -1604,5 +1634,43 @@ pinBumps:
             VerdictEvidence::Verified,
             "the cached verdict carries its structured result"
         );
+    }
+
+    /// A newer run on the same platform that died without a verdict does not
+    /// stand in for the verdict an earlier run recorded at the head.
+    #[tokio::test]
+    async fn pin_bump_head_verdicts_keep_a_verdict_over_a_newer_run_without_one() {
+        let db = verdict_db().await;
+        for (id, env, passed, at, failure_kind) in [
+            ("obs-pass", "env-a", true, 10, None),
+            ("obs-infra", "env-b", false, 20, Some("infrastructure")),
+        ] {
+            record_with_failure_kind(
+                &db,
+                Observation {
+                    id,
+                    commit: HEAD,
+                    check: "codex-pin",
+                    platform: "linux",
+                    environment: env,
+                    passed,
+                    ran_at: at,
+                },
+                failure_kind,
+            )
+            .await;
+            alias(&db, HEAD, "codex-pin", env, id, "fresh", at).await;
+        }
+
+        let required = [RequiredVerdict {
+            check: "codex-pin".to_string(),
+            platform: "linux".to_string(),
+        }];
+        let verdicts = head_verdicts(&db, "project", HEAD, &required)
+            .await
+            .unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].observation_id, "obs-pass");
+        assert!(verdicts[0].passed);
     }
 }

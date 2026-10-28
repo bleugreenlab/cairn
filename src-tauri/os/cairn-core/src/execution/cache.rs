@@ -101,7 +101,7 @@ pub(crate) async fn list_check_results_for_inputs_conn(
     conn: &Connection,
     project_id: &str,
     head: HeadVerdictKeys<'_>,
-) -> DbResult<Vec<CheckResultCacheEntry>> {
+) -> DbResult<Vec<crate::execution::checks_status::LaneRow>> {
     let scope = infra_suppression_scope(head.job_id, head.commit_sha);
     let mut lanes: Vec<(&String, &String)> = head.input_hashes.iter().collect();
     lanes.sort();
@@ -120,9 +120,11 @@ pub(crate) async fn list_check_results_for_inputs_conn(
                 ],
             )
             .await?;
-        if let Some(row) = rows.next().await? {
-            out.push(row_to_check_result(&row)?);
+        let mut lane = Vec::new();
+        while let Some(row) = rows.next().await? {
+            lane.push(row_to_check_result(&row)?);
         }
+        out.extend(crate::execution::checks_status::select_lane_row(lane));
     }
     Ok(out)
 }
@@ -225,8 +227,7 @@ fn head_rows_sql() -> String {
           WHERE r.project_id = ?1 AND r.check_name = ?2 AND r.input_hash = ?3
             AND (({} AND r.tree_hash = ?4)
                  OR ({} AND r.environment_fingerprint = ?5))
-          ORDER BY r.ran_at DESC, r.rowid DESC
-          LIMIT 1",
+          ORDER BY r.ran_at DESC, r.rowid DESC",
         RowFamily::Verdict.predicate("r.row_family"),
         RowFamily::InfraSuppression.predicate("r.row_family"),
     )
@@ -1595,7 +1596,7 @@ pub(crate) fn list_latest_passing_check_results_for_job(
 pub(crate) fn list_check_results_for_job(
     db: Arc<LocalDb>,
     job_id: &str,
-) -> Result<Vec<CheckResultCacheEntry>, String> {
+) -> Result<Vec<crate::execution::checks_status::LaneRow>, String> {
     let job_id = job_id.to_string();
     run_checkpoint_cache_db(async move { latest_check_results_for_job(&db, &job_id).await })
 }
@@ -1654,14 +1655,19 @@ pub(crate) fn observed_commit_for_job(
 pub(crate) async fn latest_check_results_for_job(
     db: &LocalDb,
     job_id: &str,
-) -> Result<Vec<CheckResultCacheEntry>, String> {
+) -> Result<Vec<crate::execution::checks_status::LaneRow>, String> {
     let job_id = job_id.to_string();
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "
+    let rows = db
+        .read(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                // `l` is each check's newest row; every row of this job at
+                // that row's inputs is a candidate for the lane, so a newer
+                // attempt that produced no verdict cannot hide the verdict
+                // recorded for the same inputs.
+                let mut rows = conn
+                    .query(
+                        "
                     SELECT c.project_id, c.tree_hash, c.input_hash, c.check_name, c.exit_code,
                            c.passed, c.output_tail, c.duration_ms, c.ran_at,
                            c.target_results_json, c.job_id, c.cached, c.failure_kind, c.executor_id,
@@ -1670,33 +1676,47 @@ pub(crate) async fn latest_check_results_for_job(
                            c.executor_started_at_unix_ms, c.executor_finished_at_unix_ms,
                            c.toolchain_fingerprint, c.infra_failure_streak,
                            c.defined_by_commit_sha
-                    FROM check_result_cache c
-                    WHERE c.job_id = ?1
+                    FROM check_result_cache l
+                    JOIN check_result_cache c
+                      ON c.job_id = l.job_id
+                     AND c.check_name = l.check_name
+                     AND c.input_hash = l.input_hash
+                    WHERE l.job_id = ?1
                       AND NOT EXISTS (
                           SELECT 1 FROM check_result_cache newer
-                          WHERE newer.job_id = c.job_id
-                            AND newer.check_name = c.check_name
-                            AND (newer.ran_at > c.ran_at
-                                 OR (newer.ran_at = c.ran_at
-                                     AND newer.tree_hash > c.tree_hash)
-                                 OR (newer.ran_at = c.ran_at
-                                     AND newer.tree_hash = c.tree_hash
-                                     AND newer.input_hash > c.input_hash))
+                          WHERE newer.job_id = l.job_id
+                            AND newer.check_name = l.check_name
+                            AND (newer.ran_at > l.ran_at
+                                 OR (newer.ran_at = l.ran_at
+                                     AND newer.tree_hash > l.tree_hash)
+                                 OR (newer.ran_at = l.ran_at
+                                     AND newer.tree_hash = l.tree_hash
+                                     AND newer.input_hash > l.input_hash))
                       )
-                    ORDER BY c.check_name ASC
+                    ORDER BY c.check_name ASC, c.ran_at DESC, c.tree_hash DESC, c.rowid DESC
                     ",
-                    params![job_id.as_str()],
-                )
-                .await?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next().await? {
-                out.push(row_to_check_result(&row)?);
-            }
-            Ok::<_, crate::storage::DbError>(out)
+                        params![job_id.as_str()],
+                    )
+                    .await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push(row_to_check_result(&row)?);
+                }
+                Ok::<_, crate::storage::DbError>(out)
+            })
         })
-    })
-    .await
-    .map_err(|e| format!("Failed to list job check result cache rows: {e}"))
+        .await
+        .map_err(|e| format!("Failed to list job check result cache rows: {e}"))?;
+    let mut lanes = Vec::new();
+    let mut rows = rows.into_iter().peekable();
+    while let Some(first) = rows.next() {
+        let mut lane = vec![first];
+        while let Some(next) = rows.next_if(|next| next.check_name == lane[0].check_name) {
+            lane.push(next);
+        }
+        lanes.extend(crate::execution::checks_status::select_lane_row(lane));
+    }
+    Ok(lanes)
 }
 
 /// Return rows attributable to one executor connection generation. This is the
@@ -4104,6 +4124,9 @@ mod tests {
             .map_err(|error| error.to_string())
         })
         .unwrap()
+        .into_iter()
+        .map(|lane| lane.row)
+        .collect()
     }
 
     #[tokio::test]
@@ -5823,10 +5846,51 @@ mod tests {
 
         let rows = list_check_results_for_job(db, "job-1").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].check_name, "frontend");
-        assert_eq!(rows[1].check_name, "rust");
-        assert_eq!(rows[1].tree_hash, "tree-new");
-        assert_eq!(rows[1].cached, Some(true));
+        assert_eq!(rows[0].row.check_name, "frontend");
+        assert_eq!(rows[1].row.check_name, "rust");
+        assert_eq!(rows[1].row.tree_hash, "tree-new");
+        assert_eq!(rows[1].row.cached, Some(true));
+    }
+
+    /// cairn://posts/453: a pass recorded on one machine, then a re-run on
+    /// another that could not even fetch the commit. Both rows survive (their
+    /// environments differ), and the newer one ended without a verdict, so the
+    /// lane still reads as the pass, with the failed attempt noted beside it.
+    /// The order they were recorded in does not change the answer.
+    #[tokio::test]
+    async fn job_listing_keeps_the_verdict_over_a_newer_attempt_that_produced_none() {
+        for (pass_at, infra_at) in [(100, 200), (200, 100)] {
+            let db = cache_db().await;
+            db.execute_script(&format!(
+                "
+                INSERT INTO check_result_cache
+                   (project_id, tree_hash, input_hash, check_name, exit_code, passed,
+                    output_tail, duration_ms, ran_at, job_id, cached, failure_kind,
+                    environment_fingerprint)
+                 VALUES
+                   ('project-a', 'tree', 'input', 'frontend', 0, 1, 'ok', 10, {pass_at},
+                    'job-1', 0, NULL, 'env-local'),
+                   ('project-a', 'tree', 'input', 'frontend', 1, 0,
+                    'cloud catalog lookup returned HTTP 404', 10, {infra_at}, 'job-1', 0,
+                    'infrastructure', 'env-fedora');
+                "
+            ))
+            .await
+            .unwrap();
+
+            let lanes = list_check_results_for_job(db, "job-1").unwrap();
+            assert_eq!(lanes.len(), 1);
+            assert!(lanes[0].row.passed, "the pass answers the lane");
+            assert_eq!(lanes[0].row.failure_kind, None);
+            assert_eq!(
+                lanes[0]
+                    .newer_attempt
+                    .as_ref()
+                    .map(|attempt| attempt.ran_at),
+                (infra_at > pass_at).then_some(infra_at),
+                "only an attempt newer than the verdict is noted"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1303,7 +1303,10 @@ pub struct CheckMachine {
 #[serde(rename_all = "camelCase")]
 pub struct ManualCheckNoVerdict {
     /// `infrastructure` when Cairn's own machinery failed around the check,
-    /// `suppressed` when Cairn declined to run it after repeated failures.
+    /// `suppressed` when Cairn declined to run it after repeated failures,
+    /// `empty` when its selection matched no tests, and otherwise the stored
+    /// failure kind of a run that died without a verdict (`killed`,
+    /// `environment`, `unclassified`, `cancelled`).
     pub kind: String,
     /// The consecutive infrastructure failures behind a `suppressed` decision.
     pub after_failures: Option<i64>,
@@ -1382,18 +1385,42 @@ fn manual_configured_check_result(
     }
 }
 
-/// Name a run that produced no verdict, using the same predicate the wake path
-/// uses to decide whether a red is the agent's business.
+/// Name a failed run that produced no verdict, by the classification the wake
+/// body, the turn-end checks section, and the merge gate share
+/// ([`row_existence`]). A run killed by a signal, one whose selection matched
+/// nothing, and one that died in Cairn's machinery all end without judging the
+/// change, so none of them may come back as a red.
+///
+/// A successful exit is never one: whether its green is verified is reported
+/// beside it as `verified` and `unverified_reason`.
+///
+/// [`row_existence`]: crate::execution::checks_status::row_existence
 fn manual_check_no_verdict(outcome: &CheckOutcome) -> Option<ManualCheckNoVerdict> {
-    if outcome.passed || outcome.is_genuine_failure() {
+    use crate::execution::checks_status::{row_existence, LaneExistence};
+    if outcome.passed {
         return None;
     }
+    let existence = row_existence(
+        false,
+        outcome.failure_kind.map(CheckFailureKind::as_str),
+        outcome.suppressed_after,
+        outcome
+            .parsed
+            .as_ref()
+            .map(ParsedCheckResult::verdict_facts)
+            .as_ref(),
+    );
+    let kind = match existence {
+        LaneExistence::Complete => return None,
+        LaneExistence::Breaker { .. } => "suppressed".to_string(),
+        LaneExistence::Died { kind } => match CheckFailureKind::from_stored(&kind) {
+            Some(failure) if failure.is_infrastructure() => "infrastructure".to_string(),
+            _ => kind,
+        },
+        other => other.label().to_string(),
+    };
     Some(ManualCheckNoVerdict {
-        kind: match outcome.suppressed_after {
-            Some(_) => "suppressed",
-            None => "infrastructure",
-        }
-        .to_string(),
+        kind,
         after_failures: outcome.suppressed_after,
         cause: outcome.output_tail.clone(),
     })
@@ -5392,6 +5419,24 @@ fn classify_check_failure(
         });
     }
 
+    // A shell reports a process ended by a signal as 128 + the signal. The
+    // termination signals are sent from outside (an OOM killer, a supervisor,
+    // a shutdown) and stop the run before it can report, so the exit is the
+    // signal's and says nothing about the change. Crash signals (SIGSEGV,
+    // SIGABRT) stay ordinary failures: those are the process's own outcome.
+    if let Some(signal) = exit_code.and_then(termination_signal) {
+        return Some(FailureClassification {
+            kind: CheckFailureKind::Killed,
+            reason: format!(
+                "Cairn: check process was terminated by {signal} (exit {}) before it reported \
+                 a verdict",
+                exit_code.unwrap_or_default()
+            ),
+            evidence_line: None,
+            cache_corruption: false,
+        });
+    }
+
     if let Some(result) = parsed.filter(|result| result.parser == "vitest") {
         // Vitest exited nonzero having reported neither a failing test nor a
         // failing suite. The dominant cause is an error that escaped a test file
@@ -5437,6 +5482,18 @@ fn classify_check_failure(
         });
     }
     None
+}
+
+/// The termination signal a shell exit status of 128 + N reports, for the
+/// signals something outside the process sends to stop it.
+fn termination_signal(exit_code: i32) -> Option<&'static str> {
+    match exit_code {
+        129 => Some("SIGHUP"),
+        130 => Some("SIGINT"),
+        137 => Some("SIGKILL"),
+        143 => Some("SIGTERM"),
+        _ => None,
+    }
 }
 
 /// Compose the `output_tail` a check row stores, within [`OUTPUT_TAIL_CHARS`]:
@@ -8102,9 +8159,14 @@ async fn reusable_verdict_conn(
 /// cross-tree rule would mark a lane answered that the next wave would
 /// actually run, and a waiter would settle on it while that wave was running.
 ///
-/// When both sources hold a row, the newer one wins. Reuse records only a
-/// commit alias and leaves the source row on the tree that produced it, so a
-/// row whose tree differs from the head's was reused here, not produced here.
+/// When both sources hold a row, [`select_lane_row`] chooses: an answer
+/// outranks an attempt that produced none, then the newer row wins. A reusable
+/// verdict is an answer by construction, so a later run at this head that could
+/// not produce one never hides it. Reuse records only a commit alias and leaves
+/// the source row on the tree that produced it, so a row whose tree differs
+/// from the head's was reused here, not produced here.
+///
+/// [`select_lane_row`]: crate::execution::checks_status::select_lane_row
 ///
 /// This entry point is for synchronous callers: every read happens in one
 /// transaction on one off-runtime hop. An async caller uses
@@ -8114,7 +8176,7 @@ pub(crate) fn head_verdicts(
     project_id: &str,
     checks: &HashMap<String, CheckCommand>,
     head: crate::execution::cache::HeadVerdictKeys<'_>,
-) -> Result<Vec<CheckResultCacheEntry>, String> {
+) -> Result<Vec<crate::execution::checks_status::LaneRow>, String> {
     let project_id = project_id.to_string();
     let checks = checks.clone();
     let head = crate::execution::cache::OwnedHeadVerdictKeys::from(head);
@@ -8135,12 +8197,13 @@ pub(crate) async fn head_verdicts_conn(
     project_id: &str,
     checks: &HashMap<String, CheckCommand>,
     head: crate::execution::cache::HeadVerdictKeys<'_>,
-) -> crate::storage::DbResult<Vec<CheckResultCacheEntry>> {
-    let mut by_name: HashMap<String, CheckResultCacheEntry> =
+) -> crate::storage::DbResult<Vec<crate::execution::checks_status::LaneRow>> {
+    use crate::execution::checks_status::{select_lane_row, LaneRow};
+    let mut by_name: HashMap<String, LaneRow> =
         crate::execution::cache::list_check_results_for_inputs_conn(conn, project_id, head)
             .await?
             .into_iter()
-            .map(|row| (row.check_name.clone(), row))
+            .map(|lane| (lane.row.check_name.clone(), lane))
             .collect();
     for (name, input_hash) in head.input_hashes {
         let Some(check) = checks.get(name) else {
@@ -8151,15 +8214,20 @@ pub(crate) async fn head_verdicts_conn(
         else {
             continue;
         };
-        if by_name
-            .get(name)
-            .is_none_or(|own| own.ran_at < reused.entry.ran_at)
-        {
-            by_name.insert(name.clone(), reused.entry);
+        // The head's own row leads, so it keeps the lane on a tie.
+        let candidates = match by_name.remove(name) {
+            Some(own) => [own.row, reused.entry]
+                .into_iter()
+                .chain(own.newer_attempt)
+                .collect(),
+            None => vec![reused.entry],
+        };
+        if let Some(lane) = select_lane_row(candidates) {
+            by_name.insert(name.clone(), lane);
         }
     }
-    let mut rows: Vec<CheckResultCacheEntry> = by_name.into_values().collect();
-    rows.sort_by(|left, right| left.check_name.cmp(&right.check_name));
+    let mut rows: Vec<LaneRow> = by_name.into_values().collect();
+    rows.sort_by(|left, right| left.row.check_name.cmp(&right.row.check_name));
     Ok(rows)
 }
 
@@ -14261,6 +14329,68 @@ cairn-common = { path = "../cairn-common" }
         );
     }
 
+    /// cairn/4650 specimen 4: an OOM killer's SIGTERM reached `rust-tests` as
+    /// exit 143 and rendered as a red about the change. A termination signal
+    /// is a killed run on every lane; a crash signal is still the process's own
+    /// failure.
+    #[test]
+    fn a_termination_signal_exit_is_a_killed_run_and_a_crash_is_not() {
+        for (exit, signal) in [(143, "SIGTERM"), (137, "SIGKILL")] {
+            let classified = classify_check_failure(
+                "bun run test:rust:tiered",
+                Some(exit),
+                false,
+                false,
+                None,
+                "   Compiling cairn-core v0.13.1\n",
+            )
+            .expect("a signal death is classified");
+            assert_eq!(classified.kind, CheckFailureKind::Killed);
+            assert!(classified.reason.contains(signal), "{}", classified.reason);
+        }
+        assert_eq!(
+            classify_check_failure(
+                "bun run test:rust:tiered",
+                Some(139),
+                false,
+                false,
+                None,
+                ""
+            ),
+            None,
+            "a segfault is the process's own outcome"
+        );
+    }
+
+    /// The manual reply classifies a failed run the way the wake body and the
+    /// merge gate do: a killed run and an empty selection are not reds, a
+    /// substrate failure keeps its machinery wording, and an ordinary red stays
+    /// a red.
+    #[test]
+    fn a_manual_run_without_a_verdict_never_reports_a_red() {
+        let kind = |failure_kind: Option<CheckFailureKind>| {
+            manual_check_no_verdict(&CheckOutcome {
+                failure_kind,
+                output_tail: "cause".to_string(),
+                ..outcome("rust-tests", false, Some(1))
+            })
+            .map(|no_verdict| no_verdict.kind)
+        };
+        assert_eq!(
+            kind(Some(CheckFailureKind::Killed)).as_deref(),
+            Some("killed")
+        );
+        assert_eq!(
+            kind(Some(CheckFailureKind::Selection)).as_deref(),
+            Some("empty")
+        );
+        assert_eq!(
+            kind(Some(CheckFailureKind::Capacity)).as_deref(),
+            Some("infrastructure")
+        );
+        assert_eq!(kind(None), None, "an ordinary red is a verdict");
+    }
+
     #[test]
     fn tracked_modification_evidence_is_legible_without_overwriting_command_output() {
         let mut output = "cargo check failed with code 101".to_string();
@@ -17739,6 +17869,9 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             },
         )
         .unwrap()
+        .into_iter()
+        .map(|lane| lane.row)
+        .collect()
     }
 
     /// Two heads on different trees that share a check's inputs both see the

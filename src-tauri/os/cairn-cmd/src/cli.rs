@@ -541,9 +541,22 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
                      below."
                 )
             }
-            _ => format!(
+            Some("killed") => format!(
+                "⚠ {suite} at {short_commit} was killed before it reached a verdict, so this \
+                 is not a result about your change. Run the command again; if it is killed \
+                 again, read the cause below."
+            ),
+            Some("empty") => format!(
+                "⚠ {suite} at {short_commit} selected no tests, so it has no verdict about your \
+                 change. The cause is below."
+            ),
+            Some("infrastructure") | None => format!(
                 "⚠ Cairn ran {suite} at {short_commit} and got no verdict. Cairn's own machinery \
                  failed, so this says nothing about your change. Run the command again."
+            ),
+            Some(kind) => format!(
+                "⚠ {suite} at {short_commit} ended without a verdict ({kind}). Read the cause \
+                 below before treating it as a result about your change."
             ),
         };
         return Ok((format!("{cache}\n{headline}\n{cause}"), false));
@@ -1553,6 +1566,46 @@ mod tests {
             !summary.contains('✗'),
             "a run with no verdict must not render as a red against the tree: {summary}"
         );
+    }
+
+    /// cairn/4650: a run killed by a signal, or one whose selection matched
+    /// nothing, renders as what happened to it, never as a red against the tree.
+    #[test]
+    fn check_run_response_renders_a_killed_or_empty_run_as_itself() {
+        for (kind, headline) in [
+            ("killed", "was killed before it reached a verdict"),
+            ("empty", "selected no tests"),
+            ("environment", "ended without a verdict (environment)"),
+        ] {
+            let (summary, passed) = render_check_run_response(
+                &serde_json::json!({
+                    "ok": true,
+                    "result": {
+                        "checkName": "rust-tests",
+                        "commitSha": "1234567890abcdef",
+                        "disposition": "fresh",
+                        "passed": false,
+                        "reusable": false,
+                        "environmentFingerprint": "",
+                        "observationId": "obs",
+                        "noVerdict": {
+                            "kind": kind,
+                            "afterFailures": null,
+                            "cause": "Cairn: check process was terminated by SIGTERM (exit 143)"
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert!(!passed);
+            assert!(summary.contains(headline), "{kind}: {summary}");
+            assert!(
+                summary.contains("terminated by SIGTERM"),
+                "{kind}: {summary}"
+            );
+            assert!(!summary.contains('✗'), "{kind}: {summary}");
+        }
     }
 
     #[test]

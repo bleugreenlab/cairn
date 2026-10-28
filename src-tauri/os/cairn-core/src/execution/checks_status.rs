@@ -250,6 +250,27 @@ impl LaneExistence {
             Self::NoSelectableWork => "not applicable",
         }
     }
+
+    /// Whether this state answers the lane from the change's own content: a
+    /// verdict, or a static check with nothing in its domain. Every other state
+    /// is an attempt that ended without an answer, and such an attempt never
+    /// displaces an answer recorded for the same inputs ([`select_lane_row`]).
+    pub(crate) fn answers_the_lane(&self) -> bool {
+        matches!(self, Self::Complete | Self::NoSelectableWork)
+    }
+
+    /// The state in a few words, carrying its cause where it has one.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Died { kind } => format!("died: {}", kind.replace('_', " ")),
+            Self::Breaker { after } => {
+                format!("suppressed after {after} infrastructure failures")
+            }
+            Self::Empty => "the selection matched no tests".to_string(),
+            Self::Incomplete(reason) => reason.to_string(),
+            other => other.label().to_string(),
+        }
+    }
 }
 
 /// [`LaneExistence`] of one recorded row: whether it exited zero, its stored
@@ -291,6 +312,97 @@ pub(crate) fn row_existence(
             reason @ (UnverifiedReason::IncompleteEnumeration | UnverifiedReason::IncompleteLint),
         ) => LaneExistence::Incomplete(reason),
     }
+}
+
+/// [`LaneExistence`] of one stored row: the classification every reader that
+/// chooses a lane's row, or renders one, consults.
+pub(crate) fn entry_existence(row: &CheckResultCacheEntry) -> LaneExistence {
+    let parsed = row
+        .target_results_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<ParsedCheckResult>(json).ok());
+    row_existence(
+        row.passed,
+        row.failure_kind.as_deref(),
+        (row.infra_failure_streak >= crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND)
+            .then_some(row.infra_failure_streak),
+        parsed
+            .as_ref()
+            .map(ParsedCheckResult::verdict_facts)
+            .as_ref(),
+    )
+}
+
+/// The row a lane is shown by, and the newer attempt it outranked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LaneRow {
+    pub(crate) row: CheckResultCacheEntry,
+    /// A newer attempt at the same inputs that ended without a verdict, kept
+    /// so a surface can say it happened without letting it stand for the lane.
+    pub(crate) newer_attempt: Option<CheckResultCacheEntry>,
+}
+
+impl From<CheckResultCacheEntry> for LaneRow {
+    fn from(row: CheckResultCacheEntry) -> Self {
+        Self {
+            row,
+            newer_attempt: None,
+        }
+    }
+}
+
+/// The row that represents one lane, chosen from every row recorded for it at
+/// one set of inputs (one input hash), which arrive newest first.
+///
+/// Answer quality outranks recency. A row that answers the lane
+/// ([`LaneExistence::answers_the_lane`]) is shown over any row that does not,
+/// however much newer: a run that could not fetch the commit, was killed, or
+/// selected nothing says nothing about inputs another run already judged, so it
+/// must not turn a recorded pass red, or a red into silence. Within one class
+/// the newest row wins, and arrival order breaks ties. Only when no row answers
+/// does the newest attempt stand alone, rendered as itself.
+pub(crate) fn select_lane_row(
+    rows: impl IntoIterator<Item = CheckResultCacheEntry>,
+) -> Option<LaneRow> {
+    let mut best: Option<(bool, CheckResultCacheEntry)> = None;
+    let mut newest_attempt: Option<CheckResultCacheEntry> = None;
+    for row in rows {
+        let answers = entry_existence(&row).answers_the_lane();
+        if !answers
+            && newest_attempt
+                .as_ref()
+                .is_none_or(|attempt| attempt.ran_at < row.ran_at)
+        {
+            newest_attempt = Some(row.clone());
+        }
+        let outranks = best.as_ref().is_none_or(|(best_answers, best_row)| {
+            (answers, row.ran_at) > (*best_answers, best_row.ran_at)
+        });
+        if outranks {
+            best = Some((answers, row));
+        }
+    }
+    let (answers, row) = best?;
+    let newer_attempt = newest_attempt.filter(|attempt| answers && attempt.ran_at > row.ran_at);
+    Some(LaneRow { row, newer_attempt })
+}
+
+/// The sentence a lane carries beside its answer when a newer attempt at the
+/// same inputs ended without one.
+pub(crate) fn newer_attempt_note(lane: &LaneRow) -> Option<String> {
+    let attempt = lane.newer_attempt.as_ref()?;
+    let answer = match entry_existence(&lane.row) {
+        LaneExistence::NoSelectableWork => "not applicable",
+        _ if lane.row.passed => "passed",
+        _ => "failed",
+    };
+    let at = crate::clock::stamp_millis(lane.row.ran_at)
+        .map(|stamp| format!(" at {stamp}"))
+        .unwrap_or_default();
+    Some(format!(
+        "latest attempt: no verdict ({}); last verdict: {answer}{at}",
+        entry_existence(attempt).describe()
+    ))
 }
 
 /// [`LaneExistence`] of one lane of the node projection, or `None` when the
@@ -628,8 +740,10 @@ pub struct NodeCheckStatus {
     /// change, on the base that head was on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) verified_on: Option<VerifiedHead>,
-    /// Why an [`NodeCheckState::Unsupported`] lane does not run, in the words
-    /// every surface shows.
+    /// A sentence every surface shows beside the lane: why an
+    /// [`NodeCheckState::Unsupported`] lane does not run, or that a newer
+    /// attempt at this lane's inputs ended without a verdict and the answer
+    /// shown is the one recorded before it ([`newer_attempt_note`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) notice: Option<String>,
 }
@@ -855,7 +969,7 @@ async fn live_statuses(
             };
             verified_on = rows
                 .iter()
-                .map(|row| (row.check_name.clone(), verified.clone()))
+                .map(|lane| (lane.row.check_name.clone(), verified.clone()))
                 .collect();
         }
     }
@@ -883,7 +997,7 @@ async fn plan_verdict_rows(
     project_id: &str,
     job_id: &str,
     plan: &Arc<WavePlan>,
-) -> Vec<CheckResultCacheEntry> {
+) -> Vec<LaneRow> {
     let project_id = project_id.to_string();
     let read_plan = plan.clone();
     let head = OwnedHeadVerdictKeys {
@@ -1132,12 +1246,15 @@ async fn settled_statuses(
             ) {
                 let missing: HashSet<String> = applicable
                     .iter()
-                    .filter(|name| !rows.iter().any(|row| &row.check_name == *name))
+                    .filter(|name| !rows.iter().any(|lane| &lane.row.check_name == *name))
                     .cloned()
                     .collect();
                 if !missing.is_empty() {
                     let job_rows = list_check_results_for_job(status_db.clone(), &status_job_id)
-                        .unwrap_or_default();
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|lane| lane.row)
+                        .collect();
                     for (row, verified) in carry_forward_unchanged_patch(
                         &missing,
                         &logical_head,
@@ -1159,7 +1276,7 @@ async fn settled_statuses(
                         },
                     ) {
                         verified_on.insert(row.check_name.clone(), verified);
-                        rows.push(row);
+                        rows.push(row.into());
                     }
                 }
             }
@@ -1194,9 +1311,9 @@ async fn settled_statuses(
     ))
 }
 
-fn rows_by_name(rows: Vec<CheckResultCacheEntry>) -> HashMap<String, CheckResultCacheEntry> {
+fn rows_by_name(rows: Vec<LaneRow>) -> HashMap<String, LaneRow> {
     rows.into_iter()
-        .map(|row| (row.check_name.clone(), row))
+        .map(|lane| (lane.row.check_name.clone(), lane))
         .collect()
 }
 
@@ -1204,7 +1321,7 @@ fn rows_by_name(rows: Vec<CheckResultCacheEntry>) -> HashMap<String, CheckResult
 /// carried from an earlier head, the head it was recorded on.
 #[derive(Default)]
 struct LaneVerdicts {
-    rows: HashMap<String, CheckResultCacheEntry>,
+    rows: HashMap<String, LaneRow>,
     verified_on: HashMap<String, VerifiedHead>,
 }
 
@@ -1245,7 +1362,8 @@ fn assemble_statuses(
             // `LaneEvidence::Recorded` outranks everything below, and this
             // returns before the `started` probe so a lane that already holds
             // a verdict never pays for a filesystem check it cannot use.
-            if let Some(row) = rows_by_name.get(&name) {
+            if let Some(lane) = rows_by_name.get(&name) {
+                let row = &lane.row;
                 let mut status = status_from_row(
                     job_id,
                     request_ids.get(&name).cloned(),
@@ -1258,6 +1376,7 @@ fn assemble_statuses(
                         .map(|id| orch.fleet.executor_name_for_text(id)),
                 );
                 status.verified_on = verified_on.get(&name).cloned();
+                status.notice = newer_attempt_note(lane);
                 return status;
             }
 
@@ -1384,13 +1503,10 @@ fn carry_forward_unchanged_patch(
 /// head was exercised when it was not. The stored flag cannot say this on its
 /// own, because the source row of a reuse is a fresh write (`cached = 0`) and the
 /// reuse itself records only a commit alias.
-fn attribute_reuse(
-    mut rows: Vec<CheckResultCacheEntry>,
-    head_tree_hash: &str,
-) -> Vec<CheckResultCacheEntry> {
-    for row in &mut rows {
-        if row.tree_hash != head_tree_hash {
-            row.cached = Some(true);
+fn attribute_reuse(mut rows: Vec<LaneRow>, head_tree_hash: &str) -> Vec<LaneRow> {
+    for lane in &mut rows {
+        if lane.row.tree_hash != head_tree_hash {
+            lane.row.cached = Some(true);
         }
     }
     rows
@@ -1631,6 +1747,9 @@ pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<Strin
             short_commit(&verified.base)
         ));
     }
+    if let Some(notice) = &status.notice {
+        parts.push(notice.clone());
+    }
     if parts.is_empty() {
         None
     } else {
@@ -1670,9 +1789,10 @@ fn row_attempted_nothing(row: &CheckResultCacheEntry) -> bool {
         .is_some_and(CheckFailureKind::attempted_nothing)
 }
 
-/// Failing lanes that get their own detail line in a wake body before the rest
-/// are rolled up by name. A wake is read at the top of a resume prompt: it names
-/// the reds and stops, and `/checks` holds the complete listing.
+/// Failing lanes, and lanes without a verdict, that get their own detail line in
+/// a wake body before the rest are rolled up by name. A wake is read at the top
+/// of a resume prompt: it names the reds and stops, and `/checks` holds the
+/// complete listing.
 const WAKE_DETAILED_FAILURES: usize = 4;
 /// Trailing chars of a failing lane's output kept when the lane named no failing
 /// test. Without it such a lane — a compiler, a linter, a build — would say only
@@ -1690,15 +1810,16 @@ const WAKE_ROLLUP_NAMES: usize = 12;
 /// the base fork point and the whole impact plan (jj, plus `cargo metadata` for
 /// target expansion) — seconds of work on a busy repository, taken while resume
 /// assembly holds the launch lock. A wake speaks about verdicts already recorded,
-/// so it reads exactly those: one indexed query for the job's latest row per
-/// check. The consequence is that a lane's last recorded verdict may predate this
-/// node's current tree; the URI in the wake header is the live surface.
+/// so it reads exactly those: one indexed query for the rows at each check's
+/// latest inputs, chosen by [`select_lane_row`]. The consequence is that a lane's
+/// last recorded verdict may predate this node's current tree; the URI in the
+/// wake header is the live surface.
 pub(crate) async fn check_wake_body(orch: &Orchestrator, job_id: &str) -> Option<String> {
     let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
         .await
         .ok()?;
     match crate::execution::cache::latest_check_results_for_job(&db, job_id).await {
-        Ok(rows) => format_check_wake_body(&rows),
+        Ok(lanes) => format_check_wake_body(&lanes),
         Err(error) => {
             log::debug!("check wake body for job {job_id}: {error}");
             None
@@ -1708,65 +1829,61 @@ pub(crate) async fn check_wake_body(orch: &Orchestrator, job_id: &str) -> Option
 
 /// Pure renderer for [`check_wake_body`], so the shape a wake speaks in is
 /// unit-tested without a database.
-pub(crate) fn format_check_wake_body(rows: &[CheckResultCacheEntry]) -> Option<String> {
-    if rows.is_empty() {
+///
+/// Every lane lands in exactly one bucket by [`entry_existence`], the same
+/// classification the turn-end checks section and the merge gate use: a
+/// verdict is passing or failing, and a lane that ended without one (killed,
+/// suppressed, an empty selection, a substrate failure) is listed as itself
+/// and counted in neither. The headline's failing count is therefore only ever
+/// reds about the change, and the passing list only ever greens that judged it.
+pub(crate) fn format_check_wake_body(lanes: &[LaneRow]) -> Option<String> {
+    if lanes.is_empty() {
         return None;
     }
-    let mut failing: Vec<&CheckResultCacheEntry> = rows
-        .iter()
-        .filter(|row| !row.passed && !row_attempted_nothing(row))
-        .collect();
-    failing.sort_by(|left, right| left.check_name.cmp(&right.check_name));
-    let names_of = |kind: CheckFailureKind| {
-        let mut names: Vec<String> = rows
-            .iter()
-            .filter(|row| row_kind_is(row, kind))
-            .map(|row| row.check_name.clone())
-            .collect();
-        names.sort();
-        names
-    };
-    let unplaceable = names_of(CheckFailureKind::NotPlaceable);
-    let unreadable = names_of(CheckFailureKind::ConfigUnreadable);
-    let unattempted = unplaceable.len() + unreadable.len();
-    let unplaceable_line = [
-        (
-            &unplaceable,
-            "not placeable (no machine in the fleet can run them yet)",
-        ),
-        (
-            &unreadable,
-            "not run (this build cannot read the project's .cairn/config.yaml)",
-        ),
-    ]
-    .into_iter()
-    .filter(|(names, _)| !names.is_empty())
-    .map(|(names, why)| format!("\n- ⚠ {why}: {}", join_capped(names, WAKE_ROLLUP_NAMES)))
-    .reduce(|lines, line| lines + &line);
-    let mut passing: Vec<String> = rows
-        .iter()
-        .filter(|row| row.passed)
-        .map(|row| row.check_name.clone())
-        .collect();
-    passing.sort();
-
-    if failing.is_empty() {
-        let mut out = format!(
+    let mut lanes: Vec<&LaneRow> = lanes.iter().collect();
+    lanes.sort_by(|left, right| left.row.check_name.cmp(&right.row.check_name));
+    let mut failing: Vec<&CheckResultCacheEntry> = Vec::new();
+    let mut no_verdict: Vec<(&CheckResultCacheEntry, LaneExistence)> = Vec::new();
+    let mut passing: Vec<String> = Vec::new();
+    let mut not_applicable: Vec<String> = Vec::new();
+    let mut unplaceable: Vec<String> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
+    for lane in &lanes {
+        let row = &lane.row;
+        // Never offered to placement: listed by why, apart from every bucket
+        // that counts a run.
+        if row_attempted_nothing(row) {
+            if row_kind_is(row, CheckFailureKind::ConfigUnreadable) {
+                unreadable.push(row.check_name.clone());
+            } else {
+                unplaceable.push(row.check_name.clone());
+            }
+            continue;
+        }
+        match entry_existence(row) {
+            LaneExistence::Complete if row.passed => passing.push(row.check_name.clone()),
+            LaneExistence::Complete => failing.push(row),
+            LaneExistence::NoSelectableWork => not_applicable.push(row.check_name.clone()),
+            existence => no_verdict.push((row, existence)),
+        }
+    }
+    let judged = passing.len() + failing.len() + no_verdict.len();
+    let clean = failing.is_empty() && no_verdict.is_empty();
+    let mut out = match (failing.len(), no_verdict.len()) {
+        (0, 0) if passing.is_empty() => "Project checks on this node: no lane holds a verdict.".to_string(),
+        (0, 0) => format!(
             "Project checks on this node: all {} passing ({}).",
             passing.len(),
             join_capped(&passing, WAKE_ROLLUP_NAMES)
-        );
-        if let Some(line) = unplaceable_line {
-            out.push_str(&line);
-        }
-        return Some(out);
-    }
-
-    let mut out = format!(
-        "Project checks on this node: {} of {} failing.\n",
-        failing.len(),
-        rows.len() - unattempted
-    );
+        ),
+        (0, silent) => format!(
+            "Project checks on this node: none failing; {silent} of {judged} without a verdict.\n"
+        ),
+        (failed, 0) => format!("Project checks on this node: {failed} of {judged} failing.\n"),
+        (failed, silent) => format!(
+            "Project checks on this node: {failed} of {judged} failing, {silent} without a verdict.\n"
+        ),
+    };
     for row in failing.iter().take(WAKE_DETAILED_FAILURES) {
         out.push_str(&format!(
             "\n- \u{2717} {} \u{2014} {}",
@@ -1785,28 +1902,94 @@ pub(crate) fn format_check_wake_body(rows: &[CheckResultCacheEntry]) -> Option<S
             join_capped(&rest, WAKE_ROLLUP_NAMES)
         ));
     }
-    if !passing.is_empty() {
+    for (row, existence) in no_verdict.iter().take(WAKE_DETAILED_FAILURES) {
+        out.push_str(&format!(
+            "\n- \u{2298} {} \u{2014} {}",
+            row.check_name,
+            wake_no_verdict_detail(row, existence)
+        ));
+    }
+    if no_verdict.len() > WAKE_DETAILED_FAILURES {
+        let rest: Vec<String> = no_verdict
+            .iter()
+            .skip(WAKE_DETAILED_FAILURES)
+            .map(|(row, _)| row.check_name.clone())
+            .collect();
+        out.push_str(&format!(
+            "\n- \u{2298} also without a verdict: {}",
+            join_capped(&rest, WAKE_ROLLUP_NAMES)
+        ));
+    }
+    if !clean && !passing.is_empty() {
         out.push_str(&format!(
             "\n- \u{2713} passing: {}",
             join_capped(&passing, WAKE_ROLLUP_NAMES)
         ));
     }
-    if let Some(line) = unplaceable_line {
-        out.push_str(&line);
+    if !not_applicable.is_empty() {
+        out.push_str(&format!(
+            "\n- not applicable (nothing in their domain changed): {}",
+            join_capped(&not_applicable, WAKE_ROLLUP_NAMES)
+        ));
+    }
+    for (names, why) in [
+        (
+            &unplaceable,
+            "not placeable (no machine in the fleet can run them yet)",
+        ),
+        (
+            &unreadable,
+            "not run (this build cannot read the project's .cairn/config.yaml)",
+        ),
+    ] {
+        if !names.is_empty() {
+            out.push_str(&format!(
+                "\n- ⚠ {why}: {}",
+                join_capped(names, WAKE_ROLLUP_NAMES)
+            ));
+        }
+    }
+    for lane in &lanes {
+        if let Some(note) = newer_attempt_note(lane) {
+            out.push_str(&format!("\n- {}: {note}", lane.row.check_name));
+        }
     }
     Some(out)
 }
 
-/// What one failing lane says for itself in a wake body: the verdict sentence,
-/// then the concrete failures — named tests when the runner named them, and the
-/// tail of the output when it did not.
-fn wake_failure_detail(row: &CheckResultCacheEntry) -> String {
-    if row.infra_failure_streak >= crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND {
-        return format!(
-            "not run \u{2014} suppressed after {} infrastructure failures",
-            row.infra_failure_streak
-        );
+/// What a lane that ended without a verdict says for itself in a wake body:
+/// what kept it from judging the change. Never a verdict sentence, which would
+/// send the reader after a failure the change did not cause.
+fn wake_no_verdict_detail(row: &CheckResultCacheEntry, existence: &LaneExistence) -> String {
+    match existence {
+        LaneExistence::Breaker { after } => {
+            format!("not run \u{2014} suppressed after {after} infrastructure failures")
+        }
+        LaneExistence::Died { .. } => {
+            format!(
+                "died without a verdict \u{2014} {}",
+                wake_failure_detail(row)
+            )
+        }
+        LaneExistence::Empty => {
+            let parsed = row
+                .target_results_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<ParsedCheckResult>(json).ok());
+            let reason = match verdict_evidence(row.passed, parsed.as_ref()) {
+                VerdictEvidence::Unverified(reason) => reason.to_string(),
+                _ => CheckFailureKind::Selection.describe(row.duration_ms),
+            };
+            format!("no verdict \u{2014} {reason}")
+        }
+        other => format!("no verdict \u{2014} {}", other.describe()),
     }
+}
+
+/// What one failing lane, or one that died, says for itself in a wake body: the
+/// sentence for how it ended, then the concrete failures — named tests when the
+/// runner named them, and the tail of the output when it did not.
+fn wake_failure_detail(row: &CheckResultCacheEntry) -> String {
     let parsed = row
         .target_results_json
         .as_deref()
@@ -2387,6 +2570,178 @@ mod tests {
         .unwrap()
     }
 
+    /// A wake body over rows that each answer their own lane.
+    fn wake(rows: impl IntoIterator<Item = CheckResultCacheEntry>) -> Option<String> {
+        let lanes: Vec<LaneRow> = rows.into_iter().map(LaneRow::from).collect();
+        format_check_wake_body(&lanes)
+    }
+
+    /// A row that ended without a verdict, recorded `ran_at` after the epoch.
+    fn died_row(name: &str, kind: CheckFailureKind, ran_at: i64) -> CheckResultCacheEntry {
+        CheckResultCacheEntry {
+            exit_code: 143,
+            failure_kind: Some(kind.as_str().to_string()),
+            output_tail: "Cairn: check process was terminated by SIGTERM (exit 143)".to_string(),
+            ran_at,
+            ..verdict_row(name, false)
+        }
+    }
+
+    /// A green whose own result says the selection matched nothing.
+    fn empty_selection_row(name: &str) -> CheckResultCacheEntry {
+        let mut parsed: ParsedCheckResult = serde_json::from_str(&parsed_json(0, &[])).unwrap();
+        parsed.selection = "empty".to_string();
+        CheckResultCacheEntry {
+            target_results_json: Some(serde_json::to_string(&parsed).unwrap()),
+            ..verdict_row(name, true)
+        }
+    }
+
+    /// The ruling on cairn/4650: for one lane at one set of inputs, an answer
+    /// outranks any attempt that produced none, in either order of arrival, and
+    /// the attempt is kept beside it only when it came after.
+    #[test]
+    fn a_verdict_outranks_a_newer_attempt_without_one_in_either_order() {
+        let pass = CheckResultCacheEntry {
+            ran_at: 100,
+            ..verdict_row("frontend-tests", true)
+        };
+        let attempt = died_row("frontend-tests", CheckFailureKind::Infrastructure, 200);
+
+        let lane = select_lane_row([attempt.clone(), pass.clone()]).unwrap();
+        assert_eq!(lane.row, pass);
+        assert_eq!(lane.newer_attempt, Some(attempt.clone()));
+        let note = newer_attempt_note(&lane).unwrap();
+        assert!(
+            note.starts_with(
+                "latest attempt: no verdict (died: infrastructure); last verdict: passed"
+            ),
+            "{note}"
+        );
+
+        let earlier_attempt = CheckResultCacheEntry {
+            ran_at: 50,
+            ..attempt.clone()
+        };
+        let lane = select_lane_row([pass.clone(), earlier_attempt]).unwrap();
+        assert_eq!(lane.row, pass);
+        assert_eq!(lane.newer_attempt, None, "an older attempt is not news");
+
+        let red = CheckResultCacheEntry {
+            ran_at: 100,
+            ..verdict_row("frontend-tests", false)
+        };
+        let lane = select_lane_row([attempt.clone(), red.clone()]).unwrap();
+        assert_eq!(lane.row, red, "a red is an answer too");
+
+        let lane = select_lane_row([attempt.clone()]).unwrap();
+        assert_eq!(
+            lane.row, attempt,
+            "with no answer, the attempt stands as itself"
+        );
+        assert_eq!(lane.newer_attempt, None);
+
+        let newer_pass = CheckResultCacheEntry {
+            ran_at: 300,
+            ..verdict_row("frontend-tests", true)
+        };
+        let lane = select_lane_row([newer_pass.clone(), red]).unwrap();
+        assert_eq!(lane.row, newer_pass, "between answers, the newer wins");
+    }
+
+    /// Specimen 1 (cairn/4604): a suppressed lane opened a wake with "2 of 5
+    /// failing". It holds no verdict, so it is counted in neither bucket.
+    #[test]
+    fn a_suppressed_lane_is_not_counted_as_failing() {
+        let mut suppressed = verdict_row("executor-windows-check", false);
+        suppressed.failure_kind = Some("infrastructure".to_string());
+        suppressed.infra_failure_streak = crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND;
+
+        let body = wake([suppressed, verdict_row("lint", true)]).unwrap();
+
+        assert!(
+            body.starts_with(
+                "Project checks on this node: none failing; 1 of 2 without a verdict."
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("⊘ executor-windows-check — not run — suppressed after"),
+            "{body}"
+        );
+        assert!(!body.contains('✗'), "{body}");
+        assert!(body.contains("✓ passing: lint"), "{body}");
+    }
+
+    /// Specimen 2 (cairn/4609): the summary listed an empty-selection lane
+    /// under passing while `/checks` called it unverified. It judged nothing,
+    /// so it is never a green.
+    #[test]
+    fn an_empty_selection_is_never_listed_as_passing() {
+        let body = wake([
+            empty_selection_row("rust-tests"),
+            verdict_row("rust-fmt", true),
+        ])
+        .unwrap();
+
+        assert!(
+            body.contains("⊘ rust-tests — no verdict — no tests matched the selection"),
+            "{body}"
+        );
+        assert!(body.contains("✓ passing: rust-fmt"), "{body}");
+        assert!(!body.contains("passing: rust-fmt, rust-tests"), "{body}");
+        assert!(!body.contains("all 2 passing"), "{body}");
+    }
+
+    /// Specimen 4: a run the OOM killer stopped is a death, not a verdict, and
+    /// beside a real red the headline counts only the red.
+    #[test]
+    fn a_killed_run_renders_as_a_death_and_only_reds_are_counted() {
+        let body = wake([
+            died_row("rust-tests", CheckFailureKind::Killed, 1),
+            verdict_row("typecheck", false),
+            verdict_row("lint", true),
+        ])
+        .unwrap();
+
+        assert!(
+            body.starts_with("Project checks on this node: 1 of 3 failing, 1 without a verdict."),
+            "{body}"
+        );
+        assert!(
+            body.contains("⊘ rust-tests — died without a verdict — killed (signal)"),
+            "{body}"
+        );
+        assert!(!body.contains("✗ rust-tests"), "{body}");
+        assert!(body.contains("✗ typecheck"), "{body}");
+    }
+
+    /// cairn://posts/453: the lane keeps its pass, and the wake says a newer
+    /// attempt produced no verdict instead of waking the author over it.
+    #[test]
+    fn a_wake_notes_a_newer_attempt_beside_the_verdict_it_kept() {
+        let pass = CheckResultCacheEntry {
+            ran_at: 100,
+            ..verdict_row("frontend-tests", true)
+        };
+        let lane = select_lane_row([
+            died_row("frontend-tests", CheckFailureKind::Infrastructure, 200),
+            pass,
+        ])
+        .unwrap();
+
+        let body = format_check_wake_body(&[lane]).unwrap();
+
+        assert!(
+            body.starts_with("Project checks on this node: all 1 passing (frontend-tests)."),
+            "{body}"
+        );
+        assert!(
+            body.contains("- frontend-tests: latest attempt: no verdict (died: infrastructure)"),
+            "{body}"
+        );
+    }
+
     /// The whole point of the wake body: an agent roused by a red check learns
     /// WHICH lane went red and WHAT failed in it, without spending a turn
     /// reading somewhere else to find out.
@@ -2401,7 +2756,7 @@ mod tests {
             verdict_row("lint", true),
         ];
 
-        let body = format_check_wake_body(&rows).unwrap();
+        let body = wake(rows).unwrap();
 
         assert!(
             body.starts_with("Project checks on this node: 1 of 3 failing."),
@@ -2422,7 +2777,7 @@ mod tests {
         failing.output_tail =
             "src/a.ts(3,1): error TS2322: Type 'string' is not assignable.".to_string();
 
-        let body = format_check_wake_body(&[failing]).unwrap();
+        let body = wake([failing]).unwrap();
 
         assert!(body.contains("✗ typecheck — exit 1"), "{body}");
         assert!(
@@ -2435,15 +2790,14 @@ mod tests {
     /// it covered rather than sending the reader to a resource.
     #[test]
     fn a_clean_run_says_so_in_one_line() {
-        let body =
-            format_check_wake_body(&[verdict_row("lint", true), verdict_row("api", true)]).unwrap();
+        let body = wake([verdict_row("lint", true), verdict_row("api", true)]).unwrap();
 
         assert_eq!(
             body,
             "Project checks on this node: all 2 passing (api, lint)."
         );
         assert!(
-            format_check_wake_body(&[]).is_none(),
+            wake([]).is_none(),
             "no recorded verdict leaves the caller its reference-only line"
         );
     }
@@ -2475,15 +2829,14 @@ mod tests {
              toolchains rust on windows; runs when a machine that satisfies it attaches"
         );
 
-        let body =
-            format_check_wake_body(&[not_placeable_row(), verdict_row("lint", true)]).unwrap();
+        let body = wake([not_placeable_row(), verdict_row("lint", true)]).unwrap();
         assert_eq!(
             body,
             "Project checks on this node: all 1 passing (lint).\n- ⚠ not placeable (no machine \
              in the fleet can run them yet): executor-windows-check"
         );
 
-        let body = format_check_wake_body(&[
+        let body = wake([
             not_placeable_row(),
             verdict_row("lint", true),
             verdict_row("typecheck", false),
@@ -2504,7 +2857,7 @@ mod tests {
         row.failure_kind = Some("infrastructure".to_string());
         row.infra_failure_streak = crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND;
 
-        let body = format_check_wake_body(&[row]).unwrap();
+        let body = wake([row]).unwrap();
 
         assert!(body.contains("not run — suppressed after"), "{body}");
     }
@@ -2737,7 +3090,7 @@ mod tests {
 
     #[test]
     fn a_rust_lint_red_wake_names_its_sites() {
-        let body = format_check_wake_body(&[rust_lint_row(
+        let body = wake([rust_lint_row(
             false,
             true,
             &["a.rs:1 rustfmt", "b.rs:2 clippy::needless_clone"],
@@ -2787,7 +3140,7 @@ mod tests {
         );
         assert_eq!(status.output_tail.as_deref(), Some(LINT_REPORT));
 
-        let body = format_check_wake_body(&[row]).unwrap();
+        let body = wake([row]).unwrap();
         assert!(
             body.contains(
                 "✗ rust-lint — 2 of 2 failed: b.rs:2 clippy::needless_clone, a.rs:1 rustfmt"
@@ -2946,7 +3299,13 @@ mod tests {
         let mut own = verdict_row("rust-tests", true);
         own.tree_hash = "tree-head".to_string();
 
-        let rows = attribute_reuse(vec![foreign_green, foreign_red, own], "tree-head");
+        let rows: Vec<CheckResultCacheEntry> = attribute_reuse(
+            vec![foreign_green.into(), foreign_red.into(), own.into()],
+            "tree-head",
+        )
+        .into_iter()
+        .map(|lane| lane.row)
+        .collect();
         let annotate = |row: &CheckResultCacheEntry| {
             format_status_annotation(&status_from_row(
                 "job",
