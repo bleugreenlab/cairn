@@ -12,7 +12,7 @@ use crate::execution::checks::{
     CheckFailureKind,
 };
 use crate::execution::checks_turn_end::{
-    read_turn_end_log_tail, resolve_job_coords, turn_end_check_started, JobCoords,
+    read_turn_end_log_tail, resolve_job_coords, turn_end_check_started, JobCoords, WavePlan,
 };
 use crate::execution::inputs::{
     any_check_declares_inputs, ResolvedInputs, TreeBlobs, TreeSnapshot,
@@ -21,7 +21,7 @@ use crate::execution::selection::plan_checks;
 use crate::jj::{logical_changed_files, logical_tree_hash, own_patch_against, OwnPatch};
 use crate::orchestrator::generation_cache::GenerationCache;
 use crate::orchestrator::Orchestrator;
-use crate::storage::LocalDb;
+use crate::storage::{LocalDb, RowExt};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
@@ -477,7 +477,22 @@ async fn compute_node_check_statuses(
     orch.node_check_status_cache
         .bind_project(job_id, &coords.project_id);
     let cadence = WaveCadence::of(orch, job_id);
-    let (branch, statuses) = if cadence.any() {
+    // A resolved node's branch is retired, or about to be, so neither of the
+    // branches below can resolve its head. Its lanes are answered from the last
+    // plan a wave recorded instead. An unreadable answer falls through to them,
+    // which fail the same transient way they always have.
+    let retired = retired_node_in(&db, job_id)
+        .await
+        .map_err(|error| log::debug!("node {job_id} retirement unreadable: {error}"))
+        .ok()
+        .flatten();
+    clock.lap("retirement");
+    let (branch, statuses) = if let Some(retired) = retired {
+        (
+            "retired",
+            retired_statuses(orch, job_id, &db, &coords, &retired, cadence).await,
+        )
+    } else if cadence.any() {
         (
             "live",
             live_statuses(orch, job_id, &db, &coords, cadence, &mut clock).await,
@@ -524,38 +539,19 @@ async fn live_statuses(
             orch,
             job_id,
             &contract.checks,
-            &HashMap::new(),
+            LaneVerdicts::default(),
             None,
-            &HashMap::new(),
             &orch.recent_turn_end_check_request_ids(job_id),
             cadence,
         ));
     };
-    if status.checks.is_empty() {
+    let plan = &status.plan;
+    if plan.checks.is_empty() {
         return Some(Vec::new());
     }
 
-    let rows = {
-        let project_id = coords.project_id.clone();
-        let checks = status.checks.clone();
-        let head = OwnedHeadVerdictKeys {
-            tree_hash: status.tree_hash.clone(),
-            input_hashes: status.input_hashes.clone(),
-            job_id: job_id.to_string(),
-            commit_sha: status.sealed_commit.clone(),
-        };
-        db.read(move |conn| {
-            Box::pin(
-                async move { head_verdicts_conn(conn, &project_id, &checks, head.keys()).await },
-            )
-        })
-        .await
-    };
+    let rows = plan_verdict_rows(db, &coords.project_id, job_id, plan).await;
     clock.lap("head_verdicts");
-    let rows = rows
-        .map_err(|error| log::debug!("node {job_id} live check verdicts unreadable: {error}"))
-        .map(|rows| attribute_reuse(rows, &status.tree_hash))
-        .unwrap_or_default();
     // Only a base replay that kept the branch's patch moves the head without
     // withdrawing the wave, so a wave pinned to an earlier head is answering
     // for the same change on the base that head was on, and its lanes say which
@@ -566,10 +562,10 @@ async fn live_statuses(
     if !rows.is_empty() {
         let head = resolve_job_logical_head(orch, job_id).await.ok();
         clock.lap("logical_head");
-        if head.is_some_and(|head| head != status.sealed_commit) {
+        if head.is_some_and(|head| head != plan.head) {
             let verified = VerifiedHead {
-                head: status.sealed_commit.clone(),
-                base: status.base.clone(),
+                head: plan.head.clone(),
+                base: plan.base.clone(),
             };
             verified_on = rows
                 .iter()
@@ -580,11 +576,140 @@ async fn live_statuses(
     Some(assemble_statuses(
         orch,
         job_id,
-        &status.checks,
-        &rows_by_name(rows),
-        Some(&status.applicable_names),
-        &verified_on,
+        &plan.checks,
+        LaneVerdicts {
+            rows: rows_by_name(rows),
+            verified_on,
+        },
+        Some(&plan.applicable_names),
         &status.request_ids,
+        cadence,
+    ))
+}
+
+/// The verdict rows that answer a plan's lanes: each check's row at the plan's
+/// tree, or the reusable verdict for its input hash. A pure database read, which
+/// is what lets both the live and the retired projection serve it without
+/// touching the repository.
+async fn plan_verdict_rows(
+    db: &Arc<LocalDb>,
+    project_id: &str,
+    job_id: &str,
+    plan: &Arc<WavePlan>,
+) -> Vec<CheckResultCacheEntry> {
+    let project_id = project_id.to_string();
+    let read_plan = plan.clone();
+    let head = OwnedHeadVerdictKeys {
+        tree_hash: plan.tree_hash.clone(),
+        input_hashes: plan.input_hashes.clone(),
+        job_id: job_id.to_string(),
+        commit_sha: plan.head.clone(),
+    };
+    db.read(move |conn| {
+        Box::pin(async move {
+            head_verdicts_conn(conn, &project_id, &read_plan.checks, head.keys()).await
+        })
+    })
+    .await
+    .map_err(|error| log::debug!("node {job_id} check verdicts unreadable: {error}"))
+    .map(|rows| attribute_reuse(rows, &plan.tree_hash))
+    .unwrap_or_default()
+}
+
+/// A node whose issue has resolved. Its branch is retired, or is about to be,
+/// and nothing will move its lanes again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetiredNode {
+    /// The issue's terminal status: `merged` or `closed`.
+    pub(crate) outcome: String,
+    /// The last plan a review wave recorded for this node. Its head is the last
+    /// one the node's lanes were planned against, which for a merged node is the
+    /// head the merge was judged on. `None` when no wave ever recorded one.
+    pub(crate) plan: Option<Arc<WavePlan>>,
+}
+
+impl RetiredNode {
+    pub(crate) fn head(&self) -> Option<&str> {
+        self.plan.as_deref().map(|plan| plan.head.as_str())
+    }
+}
+
+/// Whether `job_id` belongs to a resolved issue, and if so the last plan its
+/// lanes were recorded against.
+///
+/// Retirement is read from the issue rather than inferred from an unresolvable
+/// branch: a branch that fails to resolve is just as often a busy repository,
+/// and answering that from a recorded plan would show a live node stale lanes.
+/// A job with no branch of its own never had lanes, and is never retired.
+pub(crate) async fn retired_node_in(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Option<RetiredNode>, String> {
+    let row = db
+        .query_opt(
+            "SELECT i.status,
+                    (SELECT a.plan_json FROM turn_end_check_attempts a
+                      WHERE a.job_id = j.id AND a.plan_json IS NOT NULL
+                      ORDER BY a.created_at DESC, a.id DESC LIMIT 1)
+               FROM jobs j JOIN issues i ON i.id = j.issue_id
+              WHERE j.id = ?1 AND i.status IN ('merged', 'closed')
+                AND j.branch IS NOT NULL AND j.branch <> ''",
+            (job_id.to_string(),),
+            |row| Ok((row.text(0)?, row.opt_text(1)?)),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some((outcome, plan_json)) = row else {
+        return Ok(None);
+    };
+    let plan = plan_json.and_then(|json| {
+        serde_json::from_str::<WavePlan>(&json)
+            .map_err(|error| {
+                log::warn!("node {job_id}: recorded wave plan is unreadable ({error})")
+            })
+            .ok()
+            .map(Arc::new)
+    });
+    Ok(Some(RetiredNode { outcome, plan }))
+}
+
+/// [`retired_node_in`] against the database that owns the job.
+pub(crate) async fn node_retirement(orch: &Orchestrator, job_id: &str) -> Option<RetiredNode> {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .ok()?;
+    retired_node_in(&db, job_id)
+        .await
+        .map_err(|error| log::debug!("node {job_id} retirement unreadable: {error}"))
+        .ok()
+        .flatten()
+}
+
+/// The projection for a retired node: its last recorded plan's lanes, keyed
+/// exactly as the live projection keys them, so a wave that was still running
+/// at the merge and recorded afterwards is shown too. It reads nothing but the
+/// database. `None` when no wave ever recorded a plan, which callers tell apart
+/// from an unreadable node through [`node_retirement`].
+async fn retired_statuses(
+    orch: &Orchestrator,
+    job_id: &str,
+    db: &Arc<LocalDb>,
+    coords: &JobCoords,
+    retired: &RetiredNode,
+    cadence: WaveCadence,
+) -> Option<Vec<NodeCheckStatus>> {
+    let plan = retired.plan.as_ref()?;
+    let rows = plan_verdict_rows(db, &coords.project_id, job_id, plan).await;
+    Some(assemble_statuses(
+        orch,
+        job_id,
+        &plan.checks,
+        LaneVerdicts {
+            rows: rows_by_name(rows),
+            verified_on: HashMap::new(),
+        },
+        Some(&plan.applicable_names),
+        &orch.recent_turn_end_check_request_ids(job_id),
         cadence,
     ))
 }
@@ -766,9 +891,11 @@ async fn settled_statuses(
         orch,
         job_id,
         &contract.checks,
-        &rows_by_name,
+        LaneVerdicts {
+            rows: rows_by_name,
+            verified_on,
+        },
         applicable_names.as_ref(),
-        &verified_on,
         &orch.recent_turn_end_check_request_ids(job_id),
         cadence,
     ))
@@ -780,20 +907,31 @@ fn rows_by_name(rows: Vec<CheckResultCacheEntry>) -> HashMap<String, CheckResult
         .collect()
 }
 
+/// What answered each lane: its verdict row by check name, and, for a verdict
+/// carried from an earlier head, the head it was recorded on.
+#[derive(Default)]
+struct LaneVerdicts {
+    rows: HashMap<String, CheckResultCacheEntry>,
+    verified_on: HashMap<String, VerifiedHead>,
+}
+
 /// One status row per configured check, in name order, from what the branch
-/// resolved: the verdict rows by check, which checks apply (`None` when that
-/// could not be decided), the earlier head each carried verdict was recorded
-/// on, and the fabric request each lane was submitted as.
+/// resolved: the verdicts that answered its lanes, which checks apply (`None`
+/// when that could not be decided), and the fabric request each lane was
+/// submitted as.
 fn assemble_statuses(
     orch: &Orchestrator,
     job_id: &str,
     checks: &HashMap<String, CheckCommand>,
-    rows_by_name: &HashMap<String, CheckResultCacheEntry>,
+    verdicts: LaneVerdicts,
     applicable_names: Option<&HashSet<String>>,
-    verified_on: &HashMap<String, VerifiedHead>,
     request_ids: &HashMap<String, String>,
     cadence: WaveCadence,
 ) -> Vec<NodeCheckStatus> {
+    let LaneVerdicts {
+        rows: rows_by_name,
+        verified_on,
+    } = verdicts;
     let mut names = checks.keys().cloned().collect::<Vec<_>>();
     names.sort();
     names

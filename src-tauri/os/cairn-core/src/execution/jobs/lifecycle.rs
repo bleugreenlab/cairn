@@ -7777,6 +7777,42 @@ mod tests {
         );
     }
 
+    /// The preview an operator reads is the seed the forced resume delivers:
+    /// the same composed text, so the same size.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_digest_preview_measures_exactly_the_seed_its_resume_delivers() {
+        use crate::sessions::queries::get as get_session;
+
+        let (orch, db) = long_running_node("node-preview-equals-resume", 60).await;
+        let job = super::load_job(db.clone(), "j".to_string(), "preview")
+            .await
+            .unwrap();
+        let session = get_session(&db, "s1").await.unwrap();
+        let composed = match super::compose_forced_reseed(&orch, &db, &job, &session) {
+            Ok(composed) => composed.framed().to_string(),
+            Err(error) => panic!("composition failed: {error}"),
+        };
+        let preview = super::preview_job_digest(&orch, "j").unwrap();
+
+        let outcome = super::force_session_reseed(
+            &orch,
+            &db,
+            &job,
+            &session,
+            Some("claude"),
+            crate::sessions::queries::RotationReason::Reseed,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.seed_content, composed);
+        assert_eq!(
+            preview.estimated_tokens,
+            super::DigestPreview::of(&outcome.seed_content).estimated_tokens
+        );
+        assert_eq!(db.live_connections(), 0);
+    }
+
     /// A thread whose window is running out compacts for capacity, and records
     /// no cache reading for it — the same rule the ordinary node follows, on the
     /// path that has its own trigger and rotation reason.

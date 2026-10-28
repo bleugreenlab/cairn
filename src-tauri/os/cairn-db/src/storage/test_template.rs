@@ -93,8 +93,12 @@ async fn published_template() -> DbResult<PathBuf> {
         // Fold the logical log into the main file so every copy opens without
         // replaying it. A pass that loses still leaves a valid three-file set,
         // which the copy carries whole.
-        db.checkpoint(3, Duration::from_millis(10), Duration::from_secs(1))
-            .await?;
+        db.checkpoint(
+            3,
+            Duration::from_millis(10),
+            crate::storage::DrainBudget::fixed(Duration::from_secs(1)),
+        )
+        .await?;
     }
 
     let staged = staging.keep();

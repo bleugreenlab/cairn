@@ -85,6 +85,20 @@ use crate::storage::{DbResult, LocalDb, RowExt};
 /// Prefix of the stub substituted for an unresolvable coordinate.
 pub const STUB_PREFIX: &str = "content no longer resolvable";
 
+/// Events a bulk reader fetches and reconstructs per call: the transcript
+/// loader's page and the project export's batch.
+///
+/// The page is also the unit of transaction: each is read in its own short
+/// read and reconstructed before the next is fetched, so no reader holds a
+/// transaction open across a whole job's history. That is what lets the
+/// logical-log checkpoint run while a long transcript is read (tenet 1260).
+pub const RECONSTRUCT_BATCH_ROWS: usize = 512;
+
+/// The stored-bytes bound on one batch, beside [`RECONSTRUCT_BATCH_ROWS`], so a
+/// batch of unusually large events never holds more than a few tens of
+/// megabytes of transcript at once.
+pub const RECONSTRUCT_BATCH_BYTES: usize = 32 * 1024 * 1024;
+
 /// Reconstruct any archived events in `events` back to their full rendered form.
 ///
 /// Identity (a single scan, no allocation) when every row is `full`. See the

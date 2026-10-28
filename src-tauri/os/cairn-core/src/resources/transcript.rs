@@ -39,14 +39,9 @@ pub(crate) async fn era_source_digest(
     start_block: i64,
     end_block: i64,
 ) -> Result<String, String> {
-    let conn = db.connect().await.map_err(|error| error.to_string())?;
-    let events = load_job_events_ordered(
-        &conn,
-        job_id,
-        db.team_id().map(|_| db.content_store().as_ref()),
-        db.private_route_db().map(|db| db.as_ref()),
-    )
-    .await;
+    let events = load_job_events_ordered(db, job_id)
+        .await
+        .map_err(|error| error.to_string())?;
     let blocks = group_turn_blocks(&events);
     let start = start_block.max(0) as usize;
     let end = (end_block.max(start_block).max(0) as usize).min(blocks.len().saturating_sub(1));
@@ -154,81 +149,161 @@ pub(super) fn format_raw_transcript(events: &[EventRow], format: RawTranscriptFo
     }
 }
 
-/// Load events for a job in correct temporal order.
+/// Load events for a job in correct temporal order, reconstructed.
 ///
-/// Uses two-query strategy: loads run ordering from `runs.created_at`,
-/// then sorts events by `(run_position, created_at, rowid)`.
+/// Runs are ordered by `runs.created_at`, and each run's events by
+/// `(created_at, rowid)`:
 ///
-/// - `run_position` fixes cross-run ordering (UUID v4 alphabetical != temporal)
+/// - run position fixes cross-run ordering (UUID v4 alphabetical != temporal)
 /// - `created_at` separates events across seconds
-/// - `rowid` (via insertion-order index) is the stable intra-second tiebreaker,
-///   because `sequence` is unreliable on cold resume
+/// - `rowid` (insertion order) is the stable intra-second tiebreaker, because
+///   `sequence` is unreliable on cold resume
+///
+/// The caller must not hold a connection of its own across this call. It reads
+/// in pages of [`crate::storage::RECONSTRUCT_BATCH_ROWS`], each in its own
+/// short pooled read and reconstructed before the next is fetched, so no
+/// transaction stays open across a whole job's history. A digest preview of a
+/// long session used to hold one for up to fifteen minutes, which blocked the
+/// logical-log checkpoint and let the orchestrator's heap grow with the log
+/// (tenet 1260).
+///
+/// A read that fails partway fails the whole load rather than returning the
+/// pages before it. Paging turned one statement into many, each a chance for a
+/// transient error, and a seed composed from a silently shortened history
+/// would rotate a session onto it: a truncated digest is worse than none. A
+/// row that reads but does not parse is still skipped, as it always was.
 pub(super) async fn load_job_events_ordered(
-    conn: &cairn_db::turso::Connection,
+    db: &crate::storage::LocalDb,
     job_id: &str,
-    store: Option<&dyn crate::storage::ContentStore>,
-    private_route_db: Option<&crate::storage::LocalDb>,
-) -> Vec<EventRow> {
-    // 1. Load run_ids ordered by creation time
-    let mut ordered_run_ids: Vec<String> = Vec::new();
-    if let Ok(mut rows) = conn
-        .query(
-            "
-            SELECT id
-            FROM runs
-            WHERE job_id = ?1
-            ORDER BY created_at ASC
-            ",
-            (job_id,),
-        )
-        .await
-    {
-        while let Ok(Some(row)) = rows.next().await {
-            if let Ok(run_id) = row.text(0) {
-                ordered_run_ids.push(run_id);
+) -> crate::storage::DbResult<Vec<EventRow>> {
+    #[cfg(test)]
+    let page_rows = PAGE_ROWS_OVERRIDE
+        .try_with(|rows| *rows)
+        .unwrap_or(crate::storage::RECONSTRUCT_BATCH_ROWS);
+    #[cfg(not(test))]
+    let page_rows = crate::storage::RECONSTRUCT_BATCH_ROWS;
+    load_job_events_paged(db, job_id, page_rows, &mut || {}).await
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// The page size [`load_job_events_ordered`] uses inside a scope, so a
+    /// caller's whole output can be compared paged small and unpaged.
+    pub(super) static PAGE_ROWS_OVERRIDE: usize;
+}
+
+/// [`load_job_events_ordered`] with the page size and an observer called after
+/// each page, so tests can page small and check what is held between pages.
+async fn load_job_events_paged(
+    db: &crate::storage::LocalDb,
+    job_id: &str,
+    page_rows: usize,
+    after_page: &mut (dyn FnMut() + Send),
+) -> crate::storage::DbResult<Vec<EventRow>> {
+    let job = job_id.to_string();
+    let ordered_run_ids: Vec<String> = db
+        .read(move |conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id FROM runs WHERE job_id = ?1 ORDER BY created_at ASC",
+                        (job.as_str(),),
+                    )
+                    .await?;
+                let mut ids = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    if let Ok(run_id) = row.text(0) {
+                        ids.push(run_id);
+                    }
+                }
+                Ok(ids)
+            })
+        })
+        .await?;
+
+    let page_limit = i64::try_from(page_rows.max(1)).unwrap_or(i64::MAX);
+    let mut ordered = Vec::new();
+    for run_id in ordered_run_ids {
+        let mut run_events: Vec<(i64, crate::models::Event)> = Vec::new();
+        let mut after_rowid = i64::MIN;
+        loop {
+            let page = read_event_page(db, &run_id, after_rowid, page_limit).await?;
+            let Some(last_rowid) = page.last_rowid else {
+                break;
+            };
+            after_rowid = last_rowid;
+            let (rowids, events): (Vec<i64>, Vec<crate::models::Event>) =
+                page.events.into_iter().unzip();
+            // Reconstruction preserves length and order, and takes its own
+            // short read for coordinates, packs and blobs.
+            let events = crate::storage::reconstruct_events(db, events).await;
+            run_events.extend(rowids.into_iter().zip(events));
+            after_page();
+            if page.fetched < page_limit {
+                break;
             }
         }
+        // `(created_at, rowid)` is unique, so this is exactly the order the
+        // single unpaged `ORDER BY created_at, rowid` produced.
+        run_events.sort_by_key(|(rowid, event)| (event.created_at, *rowid));
+        ordered.extend(run_events.into_iter().map(|(_, event)| EventRow {
+            run_id: event.run_id,
+            sequence: event.sequence,
+            event_type: event.event_type,
+            data: event.data,
+            turn_id: event.turn_id,
+            created_at: event.created_at,
+        }));
     }
+    Ok(ordered)
+}
 
-    if ordered_run_ids.is_empty() {
-        return Vec::new();
-    }
+/// One keyset page of a run's events, in rowid order.
+struct EventPage {
+    /// Rows the statement returned, including any that failed to parse, so a
+    /// short page still means the run is exhausted.
+    fetched: i64,
+    /// The highest rowid returned; `None` when the page was empty.
+    last_rowid: Option<i64>,
+    events: Vec<(i64, crate::models::Event)>,
+}
 
-    // Select full event rows (archival columns included) so completed-node
-    // transcripts — the archived case — reconstruct from git coordinates before
-    // formatting. Live `full` rows pass through untouched.
-    let columns = crate::runs::queries::EVENT_COLUMNS;
-    let mut events: Vec<crate::models::Event> = Vec::new();
-    for run_id in ordered_run_ids {
-        let sql = format!(
-            "SELECT {columns} FROM events WHERE run_id = ?1 ORDER BY created_at ASC, rowid ASC"
-        );
-        if let Ok(mut rows) = conn.query(&sql, (run_id.as_str(),)).await {
-            while let Ok(Some(row)) = rows.next().await {
+async fn read_event_page(
+    db: &crate::storage::LocalDb,
+    run_id: &str,
+    after_rowid: i64,
+    limit: i64,
+) -> crate::storage::DbResult<EventPage> {
+    // Select full event rows (archival columns included) so archived rows
+    // reconstruct before formatting. Keyed on `(run_id, rowid)`, which is the
+    // order `idx_events_run_id` already holds its entries in.
+    let sql = format!(
+        "SELECT {}, rowid FROM events WHERE run_id = ?1 AND rowid > ?2 ORDER BY rowid ASC LIMIT ?3",
+        crate::runs::queries::EVENT_COLUMNS
+    );
+    let run_id = run_id.to_string();
+    db.read(move |conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(&sql, params![run_id.as_str(), after_rowid, limit])
+                .await?;
+            let mut page = EventPage {
+                fetched: 0,
+                last_rowid: None,
+                events: Vec::new(),
+            };
+            while let Some(row) = rows.next().await? {
+                let rowid = row.i64(crate::runs::queries::EVENT_COLUMN_COUNT)?;
+                page.fetched += 1;
+                page.last_rowid = Some(rowid);
                 if let Ok(event) = crate::runs::queries::event_from_row(&row) {
-                    events.push(event);
+                    page.events.push((rowid, event));
                 }
             }
-        }
-    }
-
-    crate::storage::events::reconstruct::reconstruct_events_with_conn_and_routes(
-        conn,
-        events,
-        store,
-        private_route_db,
-    )
-    .await
-    .into_iter()
-    .map(|event| EventRow {
-        run_id: event.run_id,
-        sequence: event.sequence,
-        event_type: event.event_type,
-        data: event.data,
-        turn_id: event.turn_id,
-        created_at: event.created_at,
+            Ok(page)
+        })
     })
-    .collect()
+    .await
 }
 
 pub(super) async fn load_turn_events(
@@ -1767,16 +1842,7 @@ mod tests {
         .await
         .unwrap();
 
-        let rows = db
-            .read(|conn| {
-                Box::pin(async move {
-                    Ok::<Vec<EventRow>, crate::storage::DbError>(
-                        load_job_events_ordered(conn, "job-mixed", None, None).await,
-                    )
-                })
-            })
-            .await
-            .unwrap();
+        let rows = load_job_events_ordered(&db, "job-mixed").await.unwrap();
         let rendered = format_raw_transcript(&rows, RawTranscriptFormat::Json);
         let events = rendered
             .lines()
@@ -1795,6 +1861,249 @@ mod tests {
             assert!(event.get("createdAt").is_some());
             assert!(event.get("payload").is_some());
         }
+    }
+
+    /// Three runs whose ids sort differently from their creation order, one
+    /// run several pages long with `created_at` running against insertion
+    /// order and with ties, a git-coordinate read, a zstd row, and a
+    /// quarantined row. The fixture's git repositories live as long as the
+    /// returned guard.
+    async fn paged_transcript_fixture() -> (
+        LocalDb,
+        crate::storage::events::reconstruct_fixture::Fixture,
+    ) {
+        use crate::storage::events::reconstruct_fixture::{
+            build_fixture, migrated_db, read_event, seed_chain,
+        };
+        crate::mcp::handlers::read::register_archived_file_renderer();
+        let fx = build_fixture();
+        let db = migrated_db().await;
+        seed_chain(
+            &db,
+            fx.origin.to_str().unwrap(),
+            Some((fx.pack.clone(), fx.idx.clone())),
+        )
+        .await;
+        db.execute_script(
+            "INSERT INTO runs(id, job_id, status, created_at, updated_at) VALUES ('run-c','job','exited',2,2);
+             INSERT INTO runs(id, job_id, status, created_at, updated_at) VALUES ('run-a','job','exited',3,3);",
+        )
+        .await
+        .unwrap();
+
+        let read = read_event(&fx.tip, &["file:a.txt"]);
+        let zstd = crate::storage::compress(b"{\"content\":\"from the archive\"}").unwrap();
+        // (id, run, created_at, data, storage_mode, content_commit, data_blob)
+        type FixtureRow<'a> = (
+            String,
+            &'a str,
+            i64,
+            String,
+            Option<&'a str>,
+            Option<String>,
+            Option<Vec<u8>>,
+        );
+        let mut rows: Vec<FixtureRow<'_>> = vec![
+            (
+                "r-zstd".into(),
+                "run",
+                5,
+                "{\"_archived\":true}".into(),
+                Some("zstd"),
+                None,
+                Some(zstd),
+            ),
+            (
+                "r-read".into(),
+                "run",
+                4,
+                read.data.clone(),
+                Some("gitcoord"),
+                Some(fx.tip.clone()),
+                None,
+            ),
+            (
+                "r-secret".into(),
+                "run",
+                6,
+                "{\"content\":\"sk-paged-secret\"}".into(),
+                None,
+                None,
+                None,
+            ),
+        ];
+        for index in 0..10i64 {
+            rows.push((
+                format!("c-{index}"),
+                "run-c",
+                100 - index / 2,
+                format!("{{\"content\":\"run-c event {index}\"}}"),
+                None,
+                None,
+                None,
+            ));
+        }
+        for index in 0..2i64 {
+            rows.push((
+                format!("a-{index}"),
+                "run-a",
+                200 + index,
+                format!("{{\"content\":\"run-a event {index}\"}}"),
+                None,
+                None,
+                None,
+            ));
+        }
+        for (sequence, (id, run_id, created_at, data, mode, commit, blob)) in
+            rows.into_iter().enumerate()
+        {
+            let event_type = if id == "r-read" {
+                "tool_result"
+            } else {
+                "user"
+            };
+            let codec = blob.as_ref().map(|_| crate::storage::CODEC_ZSTD_V1);
+            db.execute(
+                "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at,
+                                    storage_mode, content_commit, data_blob, codec)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?4, ?7, ?8, ?9, ?10)",
+                params![
+                    id.as_str(),
+                    run_id,
+                    sequence as i64,
+                    created_at,
+                    event_type,
+                    data.as_str(),
+                    mode,
+                    commit.as_deref(),
+                    blob,
+                    codec
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        (db, fx)
+    }
+
+    fn comparable(rows: &[EventRow]) -> Vec<(String, i32, String, String, i64)> {
+        rows.iter()
+            .map(|row| {
+                (
+                    row.run_id.clone(),
+                    row.sequence,
+                    row.event_type.clone(),
+                    row.data.clone(),
+                    row.created_at,
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_paged_load_is_row_for_row_the_unpaged_load_and_holds_nothing_between_pages() {
+        use crate::storage::quarantine::{quarantine, QuarantineSet, TRANSCRIPT_EVENT_SINK};
+        let (db, _fx) = paged_transcript_fixture().await;
+        let source = std::path::Path::new("paged-transcript-quarantine-source");
+        quarantine().install_for(
+            source,
+            QuarantineSet::from_entries([(
+                TRANSCRIPT_EVENT_SINK.to_string(),
+                "r-secret".to_string(),
+                "incident-paged".to_string(),
+            )]),
+        );
+
+        let mut live_between_pages = Vec::new();
+        let paged = {
+            let db = &db;
+            let live = &mut live_between_pages;
+            load_job_events_paged(db, "job", 3, &mut || live.push(db.live_connections()))
+                .await
+                .unwrap()
+        };
+        let unpaged = load_job_events_paged(&db, "job", usize::MAX, &mut || {})
+            .await
+            .unwrap();
+        quarantine().install_for(source, QuarantineSet::default());
+
+        assert_eq!(comparable(&paged), comparable(&unpaged));
+        assert_eq!(paged.len(), 15);
+
+        // Runs in creation order, not id order.
+        let runs: Vec<&str> = paged.iter().map(|row| row.run_id.as_str()).collect();
+        assert_eq!(&runs[..3], ["run"; 3]);
+        assert_eq!(&runs[3..13], ["run-c"; 10]);
+        assert_eq!(&runs[13..], ["run-a"; 2]);
+        // Within a run, (created_at, rowid): the read was inserted second but
+        // created first, and run-c's ties keep insertion order.
+        assert!(paged[0].data.contains("ALPHA"), "{}", paged[0].data);
+        assert!(!paged[0]
+            .data
+            .contains(crate::storage::events::reconstruct::STUB_PREFIX));
+        assert!(
+            paged[1].data.contains("from the archive"),
+            "{}",
+            paged[1].data
+        );
+        assert!(
+            !paged[2].data.contains("sk-paged-secret"),
+            "{}",
+            paged[2].data
+        );
+        let run_c: Vec<String> = paged[3..13].iter().map(|row| row.data.clone()).collect();
+        let expected: Vec<String> = [8, 9, 6, 7, 4, 5, 2, 3, 0, 1]
+            .iter()
+            .map(|index| format!("{{\"content\":\"run-c event {index}\"}}"))
+            .collect();
+        assert_eq!(run_c, expected);
+
+        assert!(
+            live_between_pages.len() >= 6,
+            "run of 3, run of 10 and run of 2 at three rows a page: {live_between_pages:?}"
+        );
+        assert!(
+            live_between_pages.iter().all(|live| *live == 0),
+            "a connection outlived its page: {live_between_pages:?}"
+        );
+    }
+
+    /// A read that fails partway fails the load: no caller is handed the pages
+    /// before the failure as if they were the whole history.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_that_fails_partway_fails_the_load_instead_of_truncating_it() {
+        let (db, _fx) = paged_transcript_fixture().await;
+        let mut pages = 0;
+        let failed = {
+            let db = &db;
+            let pages = &mut pages;
+            load_job_events_paged(db, "job", 3, &mut || {
+                *pages += 1;
+                if *pages == 2 {
+                    // Break every later page read. No connection is held
+                    // between pages, so the schema change lands at once.
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            db.exclusive(|conn| {
+                                Box::pin(async move {
+                                    conn.execute("ALTER TABLE events RENAME TO events_gone", ())
+                                        .await?;
+                                    Ok(())
+                                })
+                            })
+                            .await
+                            .unwrap();
+                        })
+                    });
+                }
+            })
+            .await
+        };
+        assert!(
+            failed.is_err(),
+            "a load whose later pages failed returned {} rows as the whole history",
+            failed.map(|rows| rows.len()).unwrap_or_default()
+        );
     }
 
     #[tokio::test]

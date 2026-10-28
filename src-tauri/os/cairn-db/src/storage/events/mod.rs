@@ -49,4 +49,7 @@ pub use cairn_codec::packfile::build_execution_pack;
 #[cfg(any(test, feature = "test-utils"))]
 pub use cairn_codec::testutil;
 
-pub use reconstruct::{reconstruct_events, reconstruct_events_reporting, Reconstruction};
+pub use reconstruct::{
+    reconstruct_events, reconstruct_events_reporting, Reconstruction, RECONSTRUCT_BATCH_BYTES,
+    RECONSTRUCT_BATCH_ROWS,
+};

@@ -162,28 +162,38 @@ pub(crate) async fn compose_thread_seed_with_policy(
     now: i64,
     policy: SeedPolicy,
 ) -> Result<ThreadSeed, String> {
-    let conn = connect_for_read(db).await?;
-    let events = load_job_events_ordered(
-        &conn,
-        job_id,
-        db.team_id().map(|_| db.content_store().as_ref()),
-        db.private_route_db().map(|db| db.as_ref()),
-    )
-    .await;
+    // No connection is held across the transcript load or the composition
+    // below: either would keep a transaction open for as long as a long
+    // session takes to read and render, which blocks the checkpoint
+    // (tenet 1260).
+    let events = load_job_events_ordered(db, job_id).await.map_err(|error| {
+        format!("Cannot compose a thread seed: its transcript could not be read: {error}")
+    })?;
     if events.is_empty() {
         return Err(
             "Cannot compose a thread seed: this job has no resumable transcript.".to_string(),
         );
     }
 
-    let coordinates = node_coordinates(&conn, job_id).await.ok_or_else(|| {
-        "Cannot compose a thread seed: the node has no addressable coordinates.".to_string()
-    })?;
+    let (coordinates, source_session_id, children, branches, store) = {
+        let conn = connect_for_read(db).await?;
+        let coordinates = node_coordinates(&conn, job_id).await.ok_or_else(|| {
+            "Cannot compose a thread seed: the node has no addressable coordinates.".to_string()
+        })?;
+        let source_session_id = current_session_id(&conn, job_id).await.ok_or_else(|| {
+            "Cannot compose a thread seed: the job has no current session.".to_string()
+        })?;
+        let children = load_children(&conn, job_id)
+            .await
+            .map_err(|error| format!("Failed to resolve this thread's children: {error}"))?;
+        let branches = load_branches(&conn, job_id)
+            .await
+            .map_err(|error| format!("Failed to resolve this thread's branches: {error}"))?;
+        let store = thread_store_census(&conn, job_id, now).await;
+        (coordinates, source_session_id, children, branches, store)
+    };
     let chat_uri = format!("{}/chat", coordinates.base_uri);
 
-    let source_session_id = current_session_id(&conn, job_id).await.ok_or_else(|| {
-        "Cannot compose a thread seed: the job has no current session.".to_string()
-    })?;
     let marks = compaction::unconsumed_marks(db, job_id, &source_session_id)
         .await
         .map_err(|error| format!("Failed to load thread compaction marks: {error}"))?;
@@ -206,12 +216,6 @@ pub(crate) async fn compose_thread_seed_with_policy(
             end_turn_id: None,
         });
     }
-    let children = load_children(&conn, job_id)
-        .await
-        .map_err(|error| format!("Failed to resolve this thread's children: {error}"))?;
-    let branches = load_branches(&conn, job_id)
-        .await
-        .map_err(|error| format!("Failed to resolve this thread's branches: {error}"))?;
     let open_children: Vec<String> = children
         .iter()
         .filter(|child| child.is_open())
@@ -258,7 +262,6 @@ pub(crate) async fn compose_thread_seed_with_policy(
     let arc = render_arc(db, job_id, now).await;
     let branches_census = render_branches(&branches, now);
     let census = render_children(&children, now);
-    let store = thread_store_census(&conn, job_id, now).await;
 
     let mut era_text = String::from("## Eras\n\n");
     let inline_count = policy.inline_eras.min(existing_eras.len());
@@ -2249,19 +2252,24 @@ pub(crate) async fn compose_node_seed(
     job: &crate::db_records::DbJob,
     budget_tokens: usize,
 ) -> Result<Option<String>, String> {
-    let conn = connect_for_read(db).await?;
-    let events = load_job_events_ordered(
-        &conn,
-        &job.id,
-        db.team_id().map(|_| db.content_store().as_ref()),
-        db.private_route_db().map(|db| db.as_ref()),
-    )
-    .await;
+    // As in the thread composer: no connection outlives the small reads.
+    let events = load_job_events_ordered(db, &job.id)
+        .await
+        .map_err(|error| {
+            format!("Cannot compose a seed: the transcript could not be read: {error}")
+        })?;
     if events.is_empty() {
         return Ok(None);
     }
 
-    let coordinates = node_coordinates(&conn, &job.id).await;
+    let (coordinates, artifacts) = {
+        let conn = connect_for_read(db).await?;
+        let coordinates = node_coordinates(&conn, &job.id).await;
+        let artifacts = artifact_names(&conn, &job.id)
+            .await
+            .map_err(|error| format!("Failed to list this node's artifacts: {error}"))?;
+        (coordinates, artifacts)
+    };
     let fallback_label = job
         .node_name
         .as_deref()
@@ -2291,9 +2299,6 @@ pub(crate) async fn compose_node_seed(
         ),
     };
     let chat_uri = format!("{home}/chat");
-    let artifacts = artifact_names(&conn, &job.id)
-        .await
-        .map_err(|error| format!("Failed to list this node's artifacts: {error}"))?;
     let documents = render_working_documents(coordinates.as_ref(), &home, &artifacts);
     let blocks = group_turn_blocks(&events);
     Ok(Some(compose_node_body(
@@ -3517,6 +3522,28 @@ mod tests {
         assert!(seed.content.contains(DONE_CHILD));
     }
 
+    /// Paging the transcript load changes how it is read, never what is read:
+    /// the composed seed is byte-identical at three rows a page and unpaged.
+    #[tokio::test]
+    async fn a_thread_seed_is_byte_identical_whatever_the_transcript_page_size() {
+        use super::super::transcript::PAGE_ROWS_OVERRIDE;
+        let db = thread_fixture("thread-seed-paged.db").await;
+        mark_done_child(&db).await;
+        let paged = PAGE_ROWS_OVERRIDE
+            .scope(3, compose_thread_seed(&db, THREAD_JOB, NOW))
+            .await
+            .unwrap();
+        let unpaged = PAGE_ROWS_OVERRIDE
+            .scope(usize::MAX, compose_thread_seed(&db, THREAD_JOB, NOW))
+            .await
+            .unwrap();
+        assert_eq!(paged.content, unpaged.content);
+        assert_eq!(paged.entries, unpaged.entries);
+        assert_eq!(paged.source_bytes, unpaged.source_bytes);
+        assert_eq!(paged.candidate_bytes, unpaged.candidate_bytes);
+        assert_eq!(db.live_connections(), 0);
+    }
+
     #[tokio::test]
     async fn the_arc_changes_the_seed_without_changing_the_chapters() {
         // Authored intent and generated chapters are produced by different
@@ -4071,8 +4098,7 @@ mod tests {
     /// The whole history rendered at reseed fidelity, as the retired
     /// full-history digest carried it.
     async fn whole_history_tokens(db: &LocalDb) -> usize {
-        let conn = connect_for_read(db).await.unwrap();
-        let events = load_job_events_ordered(&conn, NODE_JOB, None, None).await;
+        let events = load_job_events_ordered(db, NODE_JOB).await.unwrap();
         let blocks = group_turn_blocks(&events);
         let all: Vec<usize> = (0..blocks.len()).collect();
         let meta = DigestMeta {
@@ -4082,6 +4108,91 @@ mod tests {
             status: "running",
         };
         seed_tokens(&render_blocks(&blocks, &all, "chat", &meta))
+    }
+
+    /// Tenet 1260's acceptance for digests, on a real history: composing the
+    /// seed of the job with the most events leaves every checkpoint pass able
+    /// to drain, no holder older than five seconds, and the log under its
+    /// ceiling. Run against an APFS clone of the live database set, never the
+    /// live file:
+    ///
+    /// ```text
+    /// cp -c cairn.db cairn.db-wal cairn.db-log /tmp/probe/
+    /// CAIRN_CHECKPOINT_PROBE_DB=/tmp/probe/cairn.db \
+    ///   bun run test:rust -p cairn-core --lib digest_probe -- --ignored --nocapture
+    /// ```
+    ///
+    /// `CAIRN_PROBE_JOB` picks a job instead of searching for the longest.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real database copy via CAIRN_CHECKPOINT_PROBE_DB"]
+    async fn digest_probe_against_a_real_database_copy() {
+        use crate::storage::checkpoint_probe::under_checkpoint_pressure;
+        let path = std::env::var("CAIRN_CHECKPOINT_PROBE_DB")
+            .expect("set CAIRN_CHECKPOINT_PROBE_DB to a copy of a real database set");
+        crate::mcp::handlers::read::register_archived_file_renderer();
+        let db = std::sync::Arc::new(LocalDb::open(&path).await.unwrap());
+        let job_id = match std::env::var("CAIRN_PROBE_JOB") {
+            Ok(job_id) => job_id,
+            Err(_) => db
+                .query_opt_text(
+                    "SELECT r.job_id FROM events e JOIN runs r ON r.id = e.run_id \
+                     GROUP BY r.job_id ORDER BY count(*) DESC LIMIT 1",
+                    (),
+                )
+                .await
+                .unwrap()
+                .expect("the copy has no events"),
+        };
+        let events = db
+            .query_opt_i64(
+                "SELECT count(*) FROM events e JOIN runs r ON r.id = e.run_id WHERE r.job_id = ?1",
+                (job_id.clone(),),
+            )
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        let job = {
+            let job_id = job_id.clone();
+            db.read(move |conn| {
+                Box::pin(async move {
+                    crate::execution::jobs::load_job_conn(conn, &job_id)
+                        .await
+                        .map(|job| job.expect("the probed job exists"))
+                })
+            })
+            .await
+            .unwrap()
+        };
+        println!("probing job {job_id}: {events} events");
+
+        let budget = SeedPolicy::default().budget_tokens;
+        let (seed, pressure) =
+            under_checkpoint_pressure(db.clone(), compose_node_seed(&db, &job, budget)).await;
+        let seed = seed.unwrap().unwrap_or_default();
+        println!("compose_node_seed: {} seed bytes; {pressure}", seed.len());
+        for pass in &pressure.passes {
+            println!("  {pass}");
+        }
+        pressure.assert_stayed_out_of_the_way();
+    }
+
+    #[tokio::test]
+    async fn a_node_seed_is_byte_identical_whatever_the_transcript_page_size() {
+        use super::super::transcript::PAGE_ROWS_OVERRIDE;
+        let db = node_fixture(
+            "node-seed-paged.db",
+            40,
+            &"analysis of the parser module and its callers ".repeat(30),
+            true,
+        )
+        .await;
+        let budget = SeedPolicy::default().budget_tokens;
+        let paged = PAGE_ROWS_OVERRIDE.scope(3, node_seed(&db, budget)).await;
+        let unpaged = PAGE_ROWS_OVERRIDE
+            .scope(usize::MAX, node_seed(&db, budget))
+            .await;
+        assert_eq!(paged, unpaged);
+        assert_eq!(db.live_connections(), 0);
     }
 
     #[tokio::test]

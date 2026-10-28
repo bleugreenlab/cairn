@@ -44,8 +44,8 @@ pub(crate) fn embed_route(
 }
 
 use crate::backends::{
-    AgentBackend, CompletionError, CompletionOutcome, CompletionRequest, CompletionShape,
-    ResolvedTools, SessionConfig,
+    AgentBackend, CompletionError, CompletionFailure, CompletionOutcome, CompletionRequest,
+    CompletionShape, ResolvedTools, SessionConfig,
 };
 use crate::credentials::{ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
@@ -92,7 +92,7 @@ impl AgentBackend for OpenRouterBackend {
         request: CompletionRequest,
         orch: &Orchestrator,
         _admitted: crate::backends::Admitted,
-    ) -> Result<CompletionOutcome, CompletionError> {
+    ) -> Result<CompletionOutcome, CompletionFailure> {
         use crate::backends::http_loop::{Connection, WireAdapter};
         use crate::backends::openai_compat::completion_body;
         use cairn_models::interface::complete::{CompletionCall, CompletionReply, CompletionWire};

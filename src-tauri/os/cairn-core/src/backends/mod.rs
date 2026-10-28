@@ -63,6 +63,33 @@ use crate::models::Model;
 use crate::orchestrator::Orchestrator;
 pub use cairn_models::wire::CompletionError;
 
+/// Why a one-shot completion did not answer, with the account it ran on when
+/// the backend had already chosen one. A failure that is the account's own
+/// (signed out, terms not accepted, out of credit) is actionable only when it
+/// names the account.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CompletionFailure {
+    pub error: CompletionError,
+    pub account_id: Option<String>,
+}
+
+impl CompletionFailure {
+    /// Attributes a failure to the account the completion was running on.
+    pub fn on_account(account_id: Option<String>) -> impl FnOnce(CompletionError) -> Self {
+        move |error| Self { error, account_id }
+    }
+}
+
+/// A failure before any account was chosen.
+impl From<CompletionError> for CompletionFailure {
+    fn from(error: CompletionError) -> Self {
+        Self {
+            error,
+            account_id: None,
+        }
+    }
+}
+
 impl From<&SessionConfig> for cairn_models::wire::GenerationConfig {
     fn from(config: &SessionConfig) -> Self {
         Self {
@@ -296,8 +323,8 @@ pub trait AgentBackend: Send + Sync {
         _request: CompletionRequest,
         _orch: &Orchestrator,
         _admitted: crate::backends::Admitted,
-    ) -> Result<CompletionOutcome, CompletionError> {
-        Err(CompletionError::BackendUnavailable)
+    ) -> Result<CompletionOutcome, CompletionFailure> {
+        Err(CompletionError::BackendUnavailable.into())
     }
 
     fn completion_shape(&self) -> CompletionShape {

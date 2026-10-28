@@ -351,6 +351,15 @@ macro_rules! shared_tail_compile_facts {
     };
 }
 
+/// cairn/5282: a review wave's plan kept on its attempt row, so a node whose
+/// branch has retired still answers `/checks` from the head its lanes were
+/// recorded for. `turn_end_check_attempts` is carried by both lineages.
+macro_rules! shared_tail_turn_end_check_attempt_plan {
+    () => {
+        migration!("0284_turn_end_check_attempt_plan")
+    };
+}
+
 /// cairn/4987: the base and incoming side a conflict session's committed
 /// resolution was resolved against, and the tip and destination of an
 /// outstanding take-committed-tip request. `jj_reconcile_items` is carried by
@@ -1599,6 +1608,7 @@ macro_rules! team_lineage {
             shared_tail_drop_check_test_outcomes_view!(),
             shared_tail_job_goal_intent!(),
             shared_tail_compile_facts!(),
+            shared_tail_turn_end_check_attempt_plan!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1886,6 +1896,7 @@ macro_rules! private_lineage {
             shared_tail_job_goal_intent!(),
             private_purpose_debts!(),
             shared_tail_compile_facts!(),
+            shared_tail_turn_end_check_attempt_plan!(),
         ]
     };
 }
@@ -3756,6 +3767,7 @@ mod tests {
                 "job_goal_intent",
                 "purpose_debts",
                 "compile_facts",
+                "turn_end_check_attempt_plan",
             ],
         );
     }
@@ -7293,6 +7305,8 @@ mod tests {
                 // cairn/5337: the operator's goal toggle on the shared `jobs` row.
                 "job_goal_intent",
                 "compile_facts",
+                // cairn/5282: a review wave's plan kept on its attempt row.
+                "turn_end_check_attempt_plan",
             ],
         );
         assert_eq!(

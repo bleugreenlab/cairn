@@ -16,7 +16,7 @@
 use cairn_models::interface::NoOffer;
 use cairn_models::types::catalog::VerbKind;
 
-use super::{AgentBackend, CompletionError, CompletionOutcome, CompletionRequest, SessionConfig};
+use super::{AgentBackend, CompletionFailure, CompletionOutcome, CompletionRequest, SessionConfig};
 use crate::orchestrator::Orchestrator;
 
 /// Proof a launch passed the verb gate. Only this module can make one, and
@@ -31,8 +31,9 @@ pub struct Admitted {
 pub(crate) enum LaunchError {
     /// The model does not serve completions; nothing was sent.
     Unserved(NoOffer),
-    /// The backend was asked and failed.
-    Completion(CompletionError),
+    /// The backend was asked and failed, on the account it names when it had
+    /// chosen one.
+    Completion(CompletionFailure),
 }
 
 /// Start `config` on `backend`, which serves `provider`, once its model is
@@ -101,6 +102,7 @@ mod tests {
 
     use super::*;
     use crate::backends::codex::CodexBackend;
+    use crate::backends::CompletionError;
     use crate::backends::{CompletionMessage, CompletionRole, ResolvedTools};
     use crate::orchestrator::launch_coverage_tests::config;
     use crate::orchestrator::models::tests::bare_orchestrator;
@@ -181,9 +183,9 @@ mod tests {
             _: CompletionRequest,
             _: &Orchestrator,
             _: Admitted,
-        ) -> Result<CompletionOutcome, CompletionError> {
+        ) -> Result<CompletionOutcome, CompletionFailure> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            Err(CompletionError::BackendUnavailable)
+            Err(CompletionError::BackendUnavailable.into())
         }
         fn supports_resume(&self) -> bool {
             false
@@ -267,7 +269,10 @@ mod tests {
             start_session(orch, "codex", &backend, unnamed).unwrap();
             assert!(matches!(
                 complete(orch, "codex", &backend, request("gpt-5.5")),
-                Err(LaunchError::Completion(CompletionError::BackendUnavailable))
+                Err(LaunchError::Completion(CompletionFailure {
+                    error: CompletionError::BackendUnavailable,
+                    account_id: None,
+                }))
             ));
             // A model discovery has not listed serves what Codex serves for
             // any model.

@@ -569,6 +569,19 @@ mod tests {
             // only, forwards its arguments and returns the runner's payload,
             // like `fleet.rs`.
             "src-tauri/src/commands/landing_gate.rs",
+            // The channel agent-text grant: main-webview only, local runner
+            // only — channel bindings belong to this desktop's own runner, so
+            // it never routes to a peer. Forwards one runner command with its
+            // typed address, target, and enabled arguments and returns only the
+            // runner's payload.
+            "src-tauri/src/commands/channels.rs",
+            // Tenet verdicts and tenet-gated recipe changes: both route through
+            // `operator_target`, which refuses every webview but main before
+            // choosing the local runner or a configured peer. `runner_client`
+            // loads the token belonging to that exact target and carries it
+            // only in the request header; the module forwards its arguments and
+            // returns only the runner's payload.
+            "src-tauri/src/commands/tenets.rs",
             // Test fixtures, which mint their own throwaway credentials.
             "src-tauri/cairn-orch/tests/transport.rs",
             "src-tauri/cairn-transport/src/routes/invoke/tests.rs",

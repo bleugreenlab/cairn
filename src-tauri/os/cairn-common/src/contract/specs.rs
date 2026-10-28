@@ -1023,7 +1023,7 @@ pub(crate) const PROJECT_REMOTE_URL: KeySpec = KeySpec::with_aliases(
 pub(crate) const PROJECT_ACTION: KeySpec = KeySpec::new(
     "action",
     KeyType::Str,
-    "export (requires path): write every row the project owns to a self-contained local archive, archived transcript events reconstructed to plain content; runs against a live project from one snapshot",
+    "export (requires path): write every row the project owns to a self-contained local archive, archived transcript events reconstructed to plain content; holds no transaction across the export (each table's rows are selected up front, then read in short pages); until a production-copy run confirms it, export a cairn-sized project from an APFS clone rather than the live instance",
 );
 pub(crate) const PROJECT_EXPORT_PATH: KeySpec = KeySpec::new(
     "path",

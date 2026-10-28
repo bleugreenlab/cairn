@@ -329,6 +329,38 @@ impl SessionProvider for RecordingClaude {
     }
 }
 
+/// What the Claude CLI answers when the account's holder has not accepted
+/// updated consumer terms: a refusal only that account's holder can clear.
+const TERMS_REFUSAL: &str = "API Error: 400 We've updated our Consumer Terms and Privacy Policy. You'll need to accept them in claude.ai with the email in /status to continue.";
+
+/// A Claude CLI whose account refuses every one-shot with [`TERMS_REFUSAL`].
+struct TermsRefusingClaude(Arc<Recorder>);
+
+impl SessionProvider for TermsRefusingClaude {
+    fn open(
+        &self,
+        host: &dyn SessionHost,
+        spec: SessionSpec,
+    ) -> Result<LaunchedSession, SessionError> {
+        let result = json!({
+            "type": "result", "subtype": "success", "session_id": spec.start.session_id(),
+            "is_error": true, "result": TERMS_REFUSAL,
+        });
+        Ok(LaunchedSession {
+            control: Box::new(RecordingControl {
+                recorder: self.0.clone(),
+                provider: "claude",
+            }),
+            events: SessionEvents::ClaudeStream {
+                stdout: Box::new(std::io::Cursor::new(format!("{result}\n").into_bytes())),
+                stderr: None,
+            },
+            process: Arc::new(Mutex::new(None)),
+            facts: facts(&spec, "claude", "claude-refused", host),
+        })
+    }
+}
+
 struct RecordingCodex(Arc<Recorder>);
 
 impl SessionProvider for RecordingCodex {
@@ -1127,6 +1159,78 @@ async fn claude_and_codex_serve_responses_through_the_facet() {
     }
 
     recorder.release();
+}
+
+/// A Claude one-shot the routed account refuses fails naming that account, so
+/// a response the account refused is journaled against it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_claude_one_shot_names_the_account_it_ran_on() {
+    use cairn_models::subscription::testing::TempHomes;
+
+    let recorder = Arc::new(Recorder::default());
+    let mut orch = super::models::tests::bare_orchestrator().await;
+    orch.models_runtime = ModelRuntime {
+        complete: Arc::new(RecordingComplete(recorder.clone())),
+        claude: Arc::new(TermsRefusingClaude(recorder.clone())),
+        codex: Arc::new(RecordingCodex(recorder.clone())),
+        host: Arc::new(InertHost),
+        codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
+    };
+    let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
+    orch.subscriptions = Arc::new(homes.clone());
+    orch.update_settings(crate::models::UpdateSettings {
+        enabled_providers: Some(vec!["claude".to_string()]),
+        ..Default::default()
+    })
+    .unwrap();
+    let profile = orch
+        .add_account(
+            ApiProvider::Anthropic,
+            "Max".into(),
+            ProviderAuth::ClaudeProfile { oauth: None },
+            None,
+        )
+        .unwrap();
+    homes.sign_in(&profile.id);
+
+    match complete_on(&orch, "claude", one_shot_request("haiku", None)).await {
+        Err(launch::LaunchError::Completion(failure)) => {
+            assert_eq!(
+                failure.error,
+                CompletionError::Upstream(TERMS_REFUSAL.to_string())
+            );
+            assert_eq!(failure.account_id.as_deref(), Some(profile.id.as_str()));
+        }
+        other => panic!("expected the account's refusal, got {other:?}"),
+    }
+
+    let definition = crate::responses::parse_definition(
+        "---\nname: Refused\ndescription: a refused response\nmodel: haiku\nbackend: claude\ntimeout: 30s\n---\nSay hi",
+    )
+    .unwrap();
+    let refused = crate::responses::invoke_definition(
+        &orch,
+        &definition,
+        &json!({}),
+        "builtin:refused",
+        crate::responses::ResponseCaller::Internal {
+            label: "coverage".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.to_string().contains(TERMS_REFUSAL), "{refused}");
+    let rows = crate::storage::list_response_invocations(
+        &orch.db.local,
+        "workspace",
+        "builtin:refused",
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    assert_eq!(rows[0].account_id.as_deref(), Some(profile.id.as_str()));
 }
 
 /// A decision is answered only by a decision-capable offer. A subscription-only

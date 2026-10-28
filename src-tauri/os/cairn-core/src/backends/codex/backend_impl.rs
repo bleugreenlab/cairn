@@ -50,8 +50,8 @@ impl Drop for UnclaimedServer {
 }
 
 use super::super::{
-    AgentBackend, CompletionError, CompletionOutcome, CompletionRequest, CompletionShape,
-    ResolvedTools, SessionConfig,
+    AgentBackend, CompletionError, CompletionFailure, CompletionOutcome, CompletionRequest,
+    CompletionShape, ResolvedTools, SessionConfig,
 };
 use cairn_models::types::catalog::{
     DiscoveredModel, OptionChoice, OptionKind, ProviderOptionDescriptor, ProviderOptionKey,
@@ -569,7 +569,7 @@ impl AgentBackend for CodexBackend {
         request: CompletionRequest,
         orch: &Orchestrator,
         _admitted: crate::backends::Admitted,
-    ) -> Result<CompletionOutcome, CompletionError> {
+    ) -> Result<CompletionOutcome, CompletionFailure> {
         use crate::backends::one_shot::{
             instructions, map_one_shot_error, map_open_error, one_shot_timeout,
             response_scratch_dir,
@@ -581,7 +581,8 @@ impl AgentBackend for CodexBackend {
         if request.messages.is_empty() {
             return Err(CompletionError::InvalidRequest(
                 "at least one message is required".to_string(),
-            ));
+            )
+            .into());
         }
         let selection = select_routed_serving_identity(
             orch,
@@ -591,86 +592,92 @@ impl AgentBackend for CodexBackend {
             SelectionMode::Serve,
         )
         .map_err(CompletionError::Upstream)?;
-        let codex_auth = selection.identity.codex_auth.as_ref().ok_or_else(|| {
-            CompletionError::Upstream(crate::backends::codex::NO_CODEX_CREDENTIAL.to_string())
-        })?;
-        let (server, _) =
-            acquire_pooled_server(orch, codex_auth).map_err(CompletionError::Upstream)?;
-        let scratch = response_scratch_dir()?;
-        let extras = request.options.clone();
-        let spec = SessionSpec {
-            start: SessionStart::New {
-                session_id: uuid::Uuid::new_v4().to_string(),
-            },
-            model: Some(request.model.clone()),
-            effort: extras.reasoning_effort,
-            approval: ApprovalMode::Deny,
-            output_schema: request.output_schema.clone(),
-            cwd: scratch.path(),
-            env: BTreeMap::new(),
-            mcp: None,
-            secrets: SecretEnv::new(),
-            account_id: selection.account_id.clone(),
-            provider: ProviderSpec::Codex(CodexSpec {
-                server: CodexServer::Shared(server.router()),
-                base_instructions: instructions(&request),
-                developer_instructions: None,
-                service_tier: extras.service_tier,
-                native_goal: NativeGoal::Leave,
-                native_tools: CodexNativeTools::None,
-                resume_fallback: None,
-            }),
-        };
-        let started = std::time::Instant::now();
-        let runtime = orch.models_runtime();
-        let mut launched = runtime
-            .codex
-            .open(runtime.host.as_ref(), spec)
-            .map_err(map_open_error)?;
-        let thread_id = launched.facts.backend_session_id.clone().ok_or_else(|| {
-            CompletionError::InvalidResponse("Codex opened a thread without an id".to_string())
-        })?;
-        // Routed before the turn starts, so none of its notifications are
-        // dropped; the guard removes the route on every exit.
-        let notifications = server.register_completion(&thread_id);
-        let _route = super::pool::PooledCall::new(server.clone(), thread_id);
-        if let SessionEvents::CodexAppServer {
-            notifications: slot,
-            ..
-        } = &mut launched.events
-        {
-            *slot = Some(notifications);
-        }
-        launched
-            .control
-            .open_turn(&MessageContent::text(request.single_prompt()))
-            .map_err(CompletionError::Upstream)?;
-        let reply =
-            await_one_shot(launched, one_shot_timeout(&request)).map_err(map_one_shot_error)?;
-        let latency_ms = started.elapsed().as_millis() as u64;
+        // From here on the call runs on the routed account, so a failure names
+        // it.
+        let account_id = selection.account_id.clone();
+        let serve = || -> Result<CompletionOutcome, CompletionError> {
+            let codex_auth = selection.identity.codex_auth.as_ref().ok_or_else(|| {
+                CompletionError::Upstream(crate::backends::codex::NO_CODEX_CREDENTIAL.to_string())
+            })?;
+            let (server, _) =
+                acquire_pooled_server(orch, codex_auth).map_err(CompletionError::Upstream)?;
+            let scratch = response_scratch_dir()?;
+            let extras = request.options.clone();
+            let spec = SessionSpec {
+                start: SessionStart::New {
+                    session_id: uuid::Uuid::new_v4().to_string(),
+                },
+                model: Some(request.model.clone()),
+                effort: extras.reasoning_effort,
+                approval: ApprovalMode::Deny,
+                output_schema: request.output_schema.clone(),
+                cwd: scratch.path(),
+                env: BTreeMap::new(),
+                mcp: None,
+                secrets: SecretEnv::new(),
+                account_id: selection.account_id.clone(),
+                provider: ProviderSpec::Codex(CodexSpec {
+                    server: CodexServer::Shared(server.router()),
+                    base_instructions: instructions(&request),
+                    developer_instructions: None,
+                    service_tier: extras.service_tier,
+                    native_goal: NativeGoal::Leave,
+                    native_tools: CodexNativeTools::None,
+                    resume_fallback: None,
+                }),
+            };
+            let started = std::time::Instant::now();
+            let runtime = orch.models_runtime();
+            let mut launched = runtime
+                .codex
+                .open(runtime.host.as_ref(), spec)
+                .map_err(map_open_error)?;
+            let thread_id = launched.facts.backend_session_id.clone().ok_or_else(|| {
+                CompletionError::InvalidResponse("Codex opened a thread without an id".to_string())
+            })?;
+            // Routed before the turn starts, so none of its notifications are
+            // dropped; the guard removes the route on every exit.
+            let notifications = server.register_completion(&thread_id);
+            let _route = super::pool::PooledCall::new(server.clone(), thread_id);
+            if let SessionEvents::CodexAppServer {
+                notifications: slot,
+                ..
+            } = &mut launched.events
+            {
+                *slot = Some(notifications);
+            }
+            launched
+                .control
+                .open_turn(&MessageContent::text(request.single_prompt()))
+                .map_err(CompletionError::Upstream)?;
+            let reply =
+                await_one_shot(launched, one_shot_timeout(&request)).map_err(map_one_shot_error)?;
+            let latency_ms = started.elapsed().as_millis() as u64;
 
-        let parsed = match request.output_schema {
-            Some(_) => Some(serde_json::from_str(&reply.text).map_err(|error| {
-                CompletionError::InvalidResponse(format!(
-                    "Codex's answer is not the requested JSON: {error}"
-                ))
-            })?),
-            None => None,
+            let parsed = match request.output_schema {
+                Some(_) => Some(serde_json::from_str(&reply.text).map_err(|error| {
+                    CompletionError::InvalidResponse(format!(
+                        "Codex's answer is not the requested JSON: {error}"
+                    ))
+                })?),
+                None => None,
+            };
+            Ok(CompletionOutcome {
+                text: reply.text,
+                parsed,
+                model: request.model,
+                // Codex reports no price; a subscription's would be notional.
+                usage: reply
+                    .usage
+                    .as_ref()
+                    .map(cairn_models::usage::metered)
+                    .unwrap_or_default()
+                    .with_cost(None),
+                latency_ms,
+                account_id: selection.account_id,
+            })
         };
-        Ok(CompletionOutcome {
-            text: reply.text,
-            parsed,
-            model: request.model,
-            // Codex reports no price; a subscription's would be notional.
-            usage: reply
-                .usage
-                .as_ref()
-                .map(cairn_models::usage::metered)
-                .unwrap_or_default()
-                .with_cost(None),
-            latency_ms,
-            account_id: selection.account_id,
-        })
+        serve().map_err(CompletionFailure::on_account(account_id))
     }
 
     fn completion_shape(&self) -> CompletionShape {

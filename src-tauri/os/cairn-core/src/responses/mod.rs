@@ -107,7 +107,7 @@ pub async fn invoke_definition(
                 cost: outcome.cost,
             })
         }
-        Err(error) => {
+        Err(AttemptFailure { error, account_id }) => {
             crate::storage::insert_response_invocation(
                 &orch.db.local,
                 NewResponseInvocation {
@@ -129,7 +129,7 @@ pub async fn invoke_definition(
                     output_tokens: None,
                     cost: None,
                     created_at: now,
-                    account_id: None,
+                    account_id,
                 },
             )
             .await
@@ -669,10 +669,30 @@ struct CompletionAttempt {
     rendered: String,
     model: Model,
     backend: String,
-    result: Result<ResponseTestOutcome, ResponseError>,
+    result: Result<ResponseTestOutcome, AttemptFailure>,
     /// The provider request still running after its caller was released.
     /// Releasing the caller always ends the attempt in an error.
     detached: Option<DetachedRequest>,
+}
+
+/// Why a completion ended without an accepted answer, with the account the
+/// provider request that ended it ran on. The account is `None` when no request
+/// had chosen one: a refusal before launch, an interruption, or a request still
+/// running when its caller was released.
+#[derive(Debug, PartialEq)]
+pub(crate) struct AttemptFailure {
+    pub(crate) error: ResponseError,
+    pub(crate) account_id: Option<String>,
+}
+
+/// A failure no account served.
+impl From<ResponseError> for AttemptFailure {
+    fn from(error: ResponseError) -> Self {
+        Self {
+            error,
+            account_id: None,
+        }
+    }
 }
 
 /// Why a caller stopped waiting for its provider request.
@@ -706,7 +726,7 @@ impl Interruption {
 }
 
 type CompletionJoin = tokio::task::JoinHandle<(
-    Result<crate::backends::CompletionOutcome, ResponseError>,
+    Result<crate::backends::CompletionOutcome, AttemptFailure>,
     std::time::Instant,
 )>;
 
@@ -734,7 +754,13 @@ impl DetachedRequest {
         tokio::spawn(async move {
             let (ended, returned_at) = match self.task.await {
                 Ok((Ok(_), returned_at)) => ("result", returned_at),
-                Ok((Err(ResponseError::Timeout), returned_at)) => ("timeout", returned_at),
+                Ok((
+                    Err(AttemptFailure {
+                        error: ResponseError::Timeout,
+                        ..
+                    }),
+                    returned_at,
+                )) => ("timeout", returned_at),
                 Ok((Err(_), returned_at)) => ("error", returned_at),
                 // A panicked request stamped no instant of its own.
                 Err(_) => ("error", std::time::Instant::now()),
@@ -768,6 +794,7 @@ pub async fn test_definition(
     complete_definition(orch, definition, args, project_id, project_path, None, None)
         .await?
         .result
+        .map_err(|failure| failure.error)
 }
 
 /// Invoke one named, tool-free model completion. Named invocations journal their
@@ -860,7 +887,7 @@ pub async fn invoke(
                 cost: outcome.cost,
             })
         }
-        Err(error) => {
+        Err(AttemptFailure { error, account_id }) => {
             let journaled = crate::storage::insert_response_invocation(
                 &orch.db.local,
                 NewResponseInvocation {
@@ -882,7 +909,7 @@ pub async fn invoke(
                     output_tokens: None,
                     cost: None,
                     created_at: now,
-                    account_id: None,
+                    account_id,
                 },
             )
             .await;
@@ -938,7 +965,8 @@ async fn complete_definition(
             if !orch.provider_enabled(&backend_name) {
                 return Err(ResponseError::BackendUnavailable(format!(
                     "the {backend_name} provider isn't enabled in this workspace; enable it in Settings → Providers"
-                )));
+                ))
+                .into());
             }
             let backend = backend_for_name(Some(&backend_name));
             backend
@@ -950,11 +978,12 @@ async fn complete_definition(
             crate::backends::launch::complete(orch, &backend_name, backend.as_ref(), request)
                 .map_err(|error| match error {
                     crate::backends::launch::LaunchError::Unserved(refusal) => {
-                        ResponseError::Unserved(refusal.to_string())
+                        ResponseError::Unserved(refusal.to_string()).into()
                     }
-                    crate::backends::launch::LaunchError::Completion(error) => {
-                        map_completion_error(error)
-                    }
+                    crate::backends::launch::LaunchError::Completion(failure) => AttemptFailure {
+                        error: map_completion_error(failure.error),
+                        account_id: failure.account_id,
+                    },
                 })
         }),
     )
@@ -966,7 +995,7 @@ type CompletionExecutor = Arc<
             String,
             CompletionRequest,
             &Orchestrator,
-        ) -> Result<crate::backends::CompletionOutcome, ResponseError>
+        ) -> Result<crate::backends::CompletionOutcome, AttemptFailure>
         + Send
         + Sync,
 >;
@@ -1019,7 +1048,8 @@ async fn complete_definition_with_executor(
                         .to_string(),
                     result: Err(ResponseError::BackendUnavailable(format!(
                         "no enabled provider serves the '{tier}' tier ({error})"
-                    ))),
+                    ))
+                    .into()),
                     detached: None,
                 })
             }
@@ -1056,12 +1086,14 @@ async fn complete_definition_with_executor(
         output_schema: output_schema.clone(),
         timeout: definition.timeout,
     };
-    let mut terminal_error = None;
+    // The failure that ends the call is the last attempt's, account and all: a
+    // retry that ran on a different account replaces the first one's.
+    let mut terminal_error: Option<AttemptFailure> = None;
     let mut accepted = None;
     let mut detached = None;
     for attempt in 0..=1 {
         if let Some(interruption) = interrupt.as_ref().and_then(InvocationInterrupt::fired) {
-            terminal_error = Some(interrupted(interruption));
+            terminal_error = Some(interrupted(interruption).into());
             break;
         }
         let mut request_for_attempt = request.clone();
@@ -1119,16 +1151,16 @@ async fn complete_definition_with_executor(
                     model: model.to_string(),
                     held_to,
                 });
-                terminal_error = Some(error);
+                terminal_error = Some(error.into());
                 break;
             }
         };
         let completion = match joined {
             Ok((completion, _)) => completion,
             Err(error) => {
-                terminal_error = Some(ResponseError::Upstream(format!(
-                    "completion task failed: {error}"
-                )));
+                terminal_error = Some(
+                    ResponseError::Upstream(format!("completion task failed: {error}")).into(),
+                );
                 break;
             }
         };
@@ -1165,19 +1197,33 @@ async fn complete_definition_with_executor(
                         role: CompletionRole::User,
                         content: format!("Your previous answer violated the required output contract: {error}. Return a corrected answer only."),
                     });
-                        terminal_error = Some(ResponseError::ContractViolation(error));
+                        terminal_error = Some(AttemptFailure {
+                            error: ResponseError::ContractViolation(error),
+                            account_id: outcome.account_id,
+                        });
                     }
-                    Err(error) => terminal_error = Some(ResponseError::ContractViolation(error)),
+                    Err(error) => {
+                        terminal_error = Some(AttemptFailure {
+                            error: ResponseError::ContractViolation(error),
+                            account_id: outcome.account_id,
+                        })
+                    }
                 }
             }
             // The provider's timeout fired, but it was the bound's, not the
             // definition's: name the bound, exactly as if its timer had won.
-            Err(ResponseError::Timeout) if shortened_by_bound => {
-                terminal_error = deadline.map(|(_, bound)| outlived(bound));
+            Err(AttemptFailure {
+                error: ResponseError::Timeout,
+                account_id,
+            }) if shortened_by_bound => {
+                terminal_error = deadline.map(|(_, bound)| AttemptFailure {
+                    error: outlived(bound),
+                    account_id,
+                });
                 break;
             }
-            Err(error) => {
-                terminal_error = Some(error);
+            Err(failure) => {
+                terminal_error = Some(failure);
                 break;
             }
         }
@@ -1187,8 +1233,9 @@ async fn complete_definition_with_executor(
         model,
         backend: backend_name,
         result: accepted.ok_or_else(|| {
-            terminal_error
-                .unwrap_or_else(|| ResponseError::Upstream("completion produced no result".into()))
+            terminal_error.unwrap_or_else(|| {
+                ResponseError::Upstream("completion produced no result".into()).into()
+            })
         }),
         detached,
     })
@@ -2063,7 +2110,7 @@ mod tests {
             Arc::new(move |_, request, _| {
                 *sent_for_backend.lock().unwrap() = Some(request.timeout);
                 std::thread::sleep(Duration::from_secs(2));
-                Err(ResponseError::Timeout)
+                Err(ResponseError::Timeout.into())
             }),
         )
         .await
@@ -2081,7 +2128,9 @@ mod tests {
             Err(ResponseError::OutlivedBound {
                 bound,
                 declared: Duration::from_secs(300),
-            })
+            }
+            .into()),
+            "a request still running when its caller left has served no account yet"
         );
         let sent = sent_timeout.lock().unwrap().expect("the request was sent");
         assert!(sent <= Duration::from_millis(200), "{sent:?}");
@@ -2133,7 +2182,7 @@ mod tests {
                 Some(&interrupt),
                 Arc::new(|_, _, _| {
                     std::thread::sleep(Duration::from_secs(2));
-                    Err(ResponseError::Timeout)
+                    Err(ResponseError::Timeout.into())
                 }),
             ),
             async {
@@ -2150,7 +2199,7 @@ mod tests {
         let attempt = attempt.unwrap();
         assert_eq!(
             attempt.result,
-            Err(ResponseError::Cancelled("stopped".into())),
+            Err(ResponseError::Cancelled("stopped".into()).into()),
             "the first interruption is the one journaled"
         );
         assert_eq!(
@@ -2181,7 +2230,7 @@ mod tests {
             "no request was started to detach"
         );
         assert_eq!(
-            capped.result.unwrap_err().to_string(),
+            capped.result.unwrap_err().error.to_string(),
             "response timed out at the 120 s host-item cap (requested 600 s; the definition declares 300 s). Why."
         );
     }
@@ -2327,7 +2376,12 @@ mod tests {
             limit: Duration::from_secs(60),
             cap: None,
         };
-        let timed_out: CompletionExecutor = Arc::new(|_, _, _| Err(ResponseError::Timeout));
+        let timed_out: CompletionExecutor = Arc::new(|_, _, _| {
+            Err(AttemptFailure {
+                error: ResponseError::Timeout,
+                account_id: Some("acct-timeout".into()),
+            })
+        });
 
         let shortened = complete_definition_with_executor(
             &orch,
@@ -2342,8 +2396,14 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            matches!(&shortened.result, Err(ResponseError::OutlivedBound { .. })),
-            "{:?}",
+            matches!(
+                &shortened.result,
+                Err(AttemptFailure {
+                    error: ResponseError::OutlivedBound { .. },
+                    account_id: Some(account),
+                }) if account == "acct-timeout"
+            ),
+            "renamed for the bound, the timeout keeps the account it ran on: {:?}",
             shortened.result
         );
 
@@ -2359,7 +2419,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(declared.result, Err(ResponseError::Timeout));
+        assert_eq!(
+            declared.result,
+            Err(AttemptFailure {
+                error: ResponseError::Timeout,
+                account_id: Some("acct-timeout".into()),
+            })
+        );
     }
 
     #[tokio::test]
@@ -2384,8 +2450,143 @@ mod tests {
         assert_eq!(attempt.backend, "ghost");
         assert!(matches!(
             attempt.result,
-            Err(ResponseError::BackendUnavailable(reason)) if reason.contains("'ghost/sm' tier")
+            Err(AttemptFailure {
+                error: ResponseError::BackendUnavailable(reason),
+                account_id: None,
+            }) if reason.contains("'ghost/sm' tier")
         ));
+    }
+
+    /// A provider failure is journaled on the account that served it, so an
+    /// account-level refusal (terms not accepted, signed out) names the account
+    /// to fix. A refusal before anything launched names none.
+    #[tokio::test]
+    async fn a_failed_invocation_journals_the_account_it_ran_on() {
+        const TERMS: &str = "API Error: 400 We've updated our Consumer Terms and Privacy Policy.";
+        let orch = test_orchestrator().await;
+        let responses = orch.config_dir.join("responses");
+        std::fs::create_dir_all(&responses).unwrap();
+        std::fs::write(
+            responses.join("refused.md"),
+            "---\nname: Refused\ndescription: refused\nmodel: test-model\nbackend: openrouter\ntimeout: 30s\n---\nAnswer",
+        )
+        .unwrap();
+        std::fs::write(
+            responses.join("unserved.md"),
+            "---\nname: Unserved\ndescription: unserved\ntier: ghost/sm\ntimeout: 30s\n---\nAnswer",
+        )
+        .unwrap();
+        test_completion::install(
+            &orch.config_dir,
+            Arc::new(|_, _, _| {
+                Err(AttemptFailure {
+                    error: ResponseError::Upstream(TERMS.into()),
+                    account_id: Some("acct-journal".into()),
+                })
+            }),
+        );
+        let caller = || ResponseCaller::Internal {
+            label: "test".into(),
+        };
+        let journaled = |id: &'static str| {
+            let orch = orch.clone();
+            async move {
+                let mut rows =
+                    crate::storage::list_response_invocations(&orch.db.local, "workspace", id, 10)
+                        .await
+                        .unwrap();
+                assert_eq!(rows.len(), 1, "{id}");
+                rows.remove(0)
+            }
+        };
+
+        let refused = invoke(&orch, "refused", &json!({}), caller(), None, None).await;
+        assert_eq!(refused, Err(ResponseError::Upstream(TERMS.into())));
+        let row = journaled("refused").await;
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.account_id.as_deref(), Some("acct-journal"));
+        assert!(
+            row.error
+                .as_deref()
+                .is_some_and(|error| error.contains(TERMS)),
+            "{:?}",
+            row.error
+        );
+
+        let unserved = invoke(&orch, "unserved", &json!({}), caller(), None, None).await;
+        assert!(
+            matches!(unserved, Err(ResponseError::BackendUnavailable(_))),
+            "{unserved:?}"
+        );
+        let row = journaled("unserved").await;
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.account_id, None, "no account was ever chosen");
+    }
+
+    /// The call's failure is the last attempt's, account included: a retry
+    /// that ran on a different account replaces the first attempt's.
+    #[tokio::test]
+    async fn a_retry_fails_on_the_account_it_ran_on() {
+        let orch = test_orchestrator().await;
+        let definition = parse_definition(
+            "---\nname: Retry\ndescription: retry\nmodel: test-model\nbackend: openrouter\ntimeout: 30s\noutput:\n  type: object\n  required: [answer]\n  properties:\n    answer: { type: string }\n---\nAnswer",
+        )
+        .unwrap();
+        let off_contract = |account: &str| CompletionOutcome {
+            text: "not json".into(),
+            parsed: None,
+            model: "test-model".into(),
+            usage: Default::default(),
+            latency_ms: 1,
+            account_id: Some(account.into()),
+        };
+        let args = json!({});
+        let run = |second: Result<CompletionOutcome, AttemptFailure>| {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let second = Mutex::new(Some(second));
+            complete_definition_with_executor(
+                &orch,
+                &definition,
+                &args,
+                None,
+                None,
+                None,
+                None,
+                Arc::new(move |_, _, _| {
+                    match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                        0 => Ok(off_contract("acct-first")),
+                        _ => second.lock().unwrap().take().expect("two attempts at most"),
+                    }
+                }),
+            )
+        };
+
+        let refused = run(Err(AttemptFailure {
+            error: ResponseError::Upstream("refused".into()),
+            account_id: Some("acct-retry".into()),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            refused.result,
+            Err(AttemptFailure {
+                error: ResponseError::Upstream("refused".into()),
+                account_id: Some("acct-retry".into()),
+            })
+        );
+
+        let violated = run(Ok(off_contract("acct-retry"))).await.unwrap();
+        assert!(
+            matches!(
+                &violated.result,
+                Err(AttemptFailure {
+                    error: ResponseError::ContractViolation(_),
+                    account_id: Some(account),
+                }) if account == "acct-retry"
+            ),
+            "an off-contract answer is charged to the account that gave it: {:?}",
+            violated.result
+        );
     }
 
     #[test]

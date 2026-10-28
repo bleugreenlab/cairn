@@ -61,8 +61,8 @@ mod adapter;
 pub mod models;
 
 use crate::backends::{
-    AgentBackend, CompletionError, CompletionOutcome, CompletionRequest, CompletionShape,
-    ResolvedTools, SessionConfig,
+    AgentBackend, CompletionError, CompletionFailure, CompletionOutcome, CompletionRequest,
+    CompletionShape, ResolvedTools, SessionConfig,
 };
 use crate::credentials::{ActualTargetKind, ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
@@ -282,11 +282,11 @@ impl AgentBackend for ActualBackend {
         request: CompletionRequest,
         orch: &Orchestrator,
         _admitted: crate::backends::Admitted,
-    ) -> Result<CompletionOutcome, CompletionError> {
+    ) -> Result<CompletionOutcome, CompletionFailure> {
         let adapter =
             adapter::ActualAdapter::new(orch, &request.model, request.project_id.as_deref())
                 .map_err(|_| CompletionError::BackendUnavailable)?;
-        adapter.complete(orch.models_runtime().complete.as_ref(), request)
+        Ok(adapter.complete(orch.models_runtime().complete.as_ref(), request)?)
     }
 
     fn completion_shape(&self) -> CompletionShape {

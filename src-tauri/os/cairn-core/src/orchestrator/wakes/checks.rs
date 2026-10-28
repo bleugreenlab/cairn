@@ -23,8 +23,12 @@ pub(crate) fn format_checks_settled_message(
     uri: &str,
     snapshot: &ChecksSnapshot,
 ) -> String {
+    let headline = match snapshot.outcome().as_str() {
+        "settled" => "Checks settled".to_string(),
+        outcome => format!("Checks {}", outcome.replace('_', " ")),
+    };
     let mut out = format!(
-        "[Checks settled] `{label}` \u{2014} {} ({}). Read {uri} for the lanes' own output.",
+        "[{headline}] `{label}` \u{2014} {} ({}). Read {uri} for the lanes' own output.",
         snapshot.verdict(),
         snapshot.tally()
     );
@@ -32,6 +36,11 @@ pub(crate) fn format_checks_settled_message(
     if !lanes.is_empty() {
         out.push_str("\n\n");
         out.push_str(&lanes.join("\n"));
+    }
+    if let Some(note) = snapshot.retirement_note() {
+        out.push_str("\n\n");
+        out.push_str(&note);
+        return out;
     }
     if let crate::execution::checks_settlement::Settlement::Settled { verdictless } =
         &snapshot.settlement
@@ -187,7 +196,10 @@ pub(crate) async fn subscribe_checks_settled_once(
     if crate::execution::checks_settlement::arm_wave_for_waiter(orch, target_job_id, &snapshot) {
         snapshot = node_checks_settlement(orch, target_job_id, None).await?;
     }
-    if immediate_fire(&snapshot.settlement) {
+    // A retired node's settled reading is final, verdictless or not: no wave
+    // can arm on a branch that is gone, so there is no window to confirm past.
+    let retired_and_settled = snapshot.retired.is_some() && snapshot.settlement.is_settled();
+    if immediate_fire(&snapshot.settlement) || retired_and_settled {
         route_checks_settled(orch, label, uri, &snapshot).await?;
         return Ok(ChecksSubscribeOutcome::AlreadySettled);
     }

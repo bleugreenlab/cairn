@@ -851,6 +851,7 @@ async fn checks_settled_wake_fires_once_for_its_own_node_then_is_consumed() {
         settlement: classify(&statuses, HeadTurn::Idle, false),
         statuses,
         terminal_reason: None,
+        retired: None,
     };
     assert!(matches!(snapshot.settlement, Settlement::Settled { .. }));
 
@@ -989,6 +990,7 @@ fn checks_settled_message_carries_verdict_tally_lanes_and_gaps() {
         settlement: classify(&statuses, HeadTurn::Idle, false),
         statuses,
         terminal_reason: Some("issue merged before submission".to_string()),
+        retired: None,
     };
     let uri = "cairn://p/p/1/1/builder/checks";
     let message = format_checks_settled_message("builder", uri, &snapshot);

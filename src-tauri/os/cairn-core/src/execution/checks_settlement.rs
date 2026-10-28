@@ -15,7 +15,8 @@
 //! includes them and NAMES them, rather than implying a verdict is still coming.
 
 use crate::execution::checks_status::{
-    format_status_annotation, node_check_statuses, NodeCheckState, NodeCheckStatus,
+    format_status_annotation, node_check_statuses, node_retirement, NodeCheckState,
+    NodeCheckStatus, RetiredNode,
 };
 use crate::messages::delivery::HeadTurn;
 use crate::orchestrator::Orchestrator;
@@ -137,9 +138,81 @@ pub(crate) struct ChecksSnapshot {
     pub(crate) statuses: Vec<NodeCheckStatus>,
     pub(crate) settlement: Settlement,
     pub(crate) terminal_reason: Option<String>,
+    /// Set once the node's issue has resolved and its branch retired. Its lanes
+    /// are then the ones recorded for its last planned head, and nothing will
+    /// move them again.
+    pub(crate) retired: Option<Retirement>,
+}
+
+/// How a node stopped being a place lanes can run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Retirement {
+    /// The issue's terminal status: `merged` or `closed`.
+    pub(crate) outcome: String,
+    /// The head the lanes were recorded for. `None` when the node retired before
+    /// any review wave recorded a plan, so there are no lanes on record.
+    pub(crate) head: Option<String>,
+}
+
+impl From<&RetiredNode> for Retirement {
+    fn from(retired: &RetiredNode) -> Self {
+        Self {
+            outcome: retired.outcome.clone(),
+            head: retired.head().map(ToString::to_string),
+        }
+    }
 }
 
 impl ChecksSnapshot {
+    /// Whether the node retired before its lanes all answered: either a lane
+    /// was still owed a verdict when its branch went, or no wave ever recorded a
+    /// plan for it, so there are no lanes on record at all.
+    fn retired_unsettled(&self) -> bool {
+        let Some(retired) = &self.retired else {
+            return false;
+        };
+        retired.head.is_none()
+            || matches!(
+                &self.settlement,
+                Settlement::Settled { verdictless } if !verdictless.is_empty()
+            )
+    }
+
+    /// How a wait on these lanes resolved. `settled` when they stopped with
+    /// every verdict in, whether or not the node has since retired; a node that
+    /// retired first resolves as `merged_before_settlement` or
+    /// `closed_before_settlement`, with each lane at its last state.
+    pub(crate) fn outcome(&self) -> String {
+        match &self.retired {
+            Some(retired) if self.retired_unsettled() => {
+                format!("{}_before_settlement", retired.outcome)
+            }
+            _ => "settled".to_string(),
+        }
+    }
+
+    /// One sentence on a retired node: how it retired and which head its lanes
+    /// are for. `None` for a node still live.
+    pub(crate) fn retirement_note(&self) -> Option<String> {
+        let retired = self.retired.as_ref()?;
+        let outcome = &retired.outcome;
+        let Some(head) = retired.head.as_deref() else {
+            return Some(format!(
+                "This node was {outcome} before any review wave recorded a plan, so no lanes \
+                 are on record for the head it was {outcome} at."
+            ));
+        };
+        let head = &head[..head.len().min(12)];
+        Some(if self.retired_unsettled() {
+            format!(
+                "This node was {outcome} while lanes for its head {head} still owed a verdict. \
+                 Its branch is retired, so nothing will run them; each lane shows its last state."
+            )
+        } else {
+            format!("This node was {outcome}; these are the verdicts recorded for its last head, {head}.")
+        })
+    }
+
     /// The one word an orchestrator branches on.
     ///
     /// Neither `incomplete` nor `not_applicable` is folded into a verdict: a
@@ -153,6 +226,16 @@ impl ChecksSnapshot {
             Settlement::Settled { verdictless } => !verdictless.is_empty(),
             Settlement::Moving(_) => return "moving",
         };
+        // A node that retired with no lanes on record has an empty lane set
+        // because nothing was recorded, not because nothing applied. Reading
+        // that as a pass would vouch for a head no lane ever answered.
+        if self
+            .retired
+            .as_ref()
+            .is_some_and(|retired| retired.head.is_none())
+        {
+            return "incomplete";
+        }
         let any = |state: NodeCheckState| self.statuses.iter().any(|s| s.state == state);
         if any(NodeCheckState::Failed) {
             "failed"
@@ -232,18 +315,36 @@ impl ChecksSnapshot {
 /// arming path surfaces that as a refusal; a poll loop that has already armed
 /// treats it as a transient and keeps waiting, since a momentarily unreadable
 /// repository says nothing about whether the lanes settled.
+///
+/// A node whose issue has resolved is never `Err` for want of a branch: its
+/// lanes are the ones recorded for its last planned head, and one that retired
+/// before any wave recorded a plan answers with no lanes and its retirement.
 pub(crate) async fn node_checks_settlement(
     orch: &Orchestrator,
     job_id: &str,
     suite: Option<&str>,
 ) -> Result<ChecksSnapshot, String> {
-    let statuses = node_check_statuses(orch, job_id).await.ok_or_else(|| {
-        "this node has no resolvable check contract (no worktree, recipe node, or \
-         .cairn/config.yaml at its head)"
-            .to_string()
-    })?;
+    let retired = node_retirement(orch, job_id).await;
+    let lanes_on_record = retired
+        .as_ref()
+        .is_none_or(|retired| retired.plan.is_some());
+    let statuses = match node_check_statuses(orch, job_id).await {
+        Some(statuses) => statuses,
+        None if !lanes_on_record => Vec::new(),
+        None => {
+            return Err(
+                "this node has no resolvable check contract (no worktree, recipe \
+                 node, or .cairn/config.yaml at its head)"
+                    .to_string(),
+            )
+        }
+    };
     let statuses = match suite {
         None => statuses,
+        // Which suites the node configured went unrecorded with its plan, so a
+        // named one cannot be told apart from a misspelling. Its answer is the
+        // retirement either way.
+        Some(_) if !lanes_on_record => statuses,
         Some(suite) => {
             let matched: Vec<NodeCheckStatus> = statuses
                 .iter()
@@ -266,7 +367,14 @@ pub(crate) async fn node_checks_settlement(
             matched
         }
     };
-    let turn = crate::messages::delivery::head_turn_for_job_async(orch, job_id).await;
+    // A retired node's turn can no longer change the tree its lanes describe:
+    // that tree's branch is gone. Holding the wait open for the turn would wait
+    // on something with no bearing on the answer.
+    let turn = if retired.is_some() {
+        HeadTurn::Idle
+    } else {
+        crate::messages::delivery::head_turn_for_job_async(orch, job_id).await
+    };
     let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
         .await
         .map_err(|error| error.to_string())?;
@@ -297,6 +405,7 @@ pub(crate) async fn node_checks_settlement(
         statuses,
         settlement,
         terminal_reason,
+        retired: retired.as_ref().map(Retirement::from),
     })
 }
 
@@ -306,6 +415,11 @@ pub(crate) async fn node_checks_settlement(
 /// Write lanes are excluded on purpose. A review wave never runs them, so arming
 /// one for a verdictless write lane would arm a wave that cannot answer it.
 pub(crate) fn owes_a_review_wave(snapshot: &ChecksSnapshot) -> bool {
+    // A retired node has no branch for a wave to check out; its verdictless
+    // lanes are the ones its retirement abandoned, and that is their answer.
+    if snapshot.retired.is_some() {
+        return false;
+    }
     let Settlement::Settled { verdictless } = &snapshot.settlement else {
         return false;
     };
@@ -612,6 +726,7 @@ mod tests {
             statuses,
             settlement,
             terminal_reason: None,
+            retired: None,
         }
     }
 
@@ -662,6 +777,33 @@ mod tests {
         for case in &cases {
             assert!(!owes_a_review_wave(case), "{:?}", case.settlement);
         }
+
+        // A retired node's verdictless review lane was abandoned with its
+        // branch, and there is no branch left for a wave to run on.
+        let mut retired = snapshot(
+            vec![lane("rust-tests", NodeCheckState::Pending)],
+            HeadTurn::Idle,
+            false,
+        );
+        retired.retired = Some(Retirement {
+            outcome: "merged".to_string(),
+            head: Some("abc".to_string()),
+        });
+        assert!(!owes_a_review_wave(&retired));
+    }
+
+    /// A node that retired before any wave recorded a plan has no lanes on
+    /// record. That empty set is an absence of evidence, so it must not read as
+    /// the vacuous pass an empty lane set otherwise does.
+    #[test]
+    fn a_node_retired_with_no_lanes_on_record_is_incomplete_not_passed() {
+        let mut snapshot = snapshot(Vec::new(), HeadTurn::Idle, false);
+        assert_eq!(snapshot.verdict(), "passed");
+        snapshot.retired = Some(Retirement {
+            outcome: "merged".to_string(),
+            head: None,
+        });
+        assert_eq!(snapshot.verdict(), "incomplete");
     }
 
     /// A check the impact gate excluded will never run, and that is a decided
@@ -699,6 +841,7 @@ mod tests {
                 statuses,
                 settlement,
                 terminal_reason: None,
+                retired: None,
             }
         };
         assert_eq!(
@@ -758,12 +901,14 @@ mod tests {
             settlement: classify(&statuses, HeadTurn::Idle, false),
             statuses: statuses.clone(),
             terminal_reason: None,
+            retired: None,
         };
         assert_eq!(settled.lane_lines(), vec!["- rust-lint [no verdict]"]);
         let moving = ChecksSnapshot {
             settlement: classify(&statuses, HeadTurn::Idle, true),
             statuses,
             terminal_reason: None,
+            retired: None,
         };
         assert_eq!(moving.lane_lines(), vec!["- rust-lint [pending]"]);
     }

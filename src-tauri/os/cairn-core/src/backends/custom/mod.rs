@@ -28,8 +28,8 @@ pub(crate) mod models;
 mod tests;
 
 use crate::backends::{
-    AgentBackend, CompletionError, CompletionOutcome, CompletionRequest, CompletionShape,
-    ResolvedTools, SessionConfig,
+    AgentBackend, CompletionError, CompletionFailure, CompletionOutcome, CompletionRequest,
+    CompletionShape, ResolvedTools, SessionConfig,
 };
 use crate::credentials::{
     ApiProvider, CustomEmbeddingModel, CustomModelPolicy, CustomProtocol, CustomSampling,
@@ -378,12 +378,12 @@ impl AgentBackend for CustomBackend {
         request: CompletionRequest,
         orch: &Orchestrator,
         _admitted: crate::backends::Admitted,
-    ) -> Result<CompletionOutcome, CompletionError> {
+    ) -> Result<CompletionOutcome, CompletionFailure> {
         let config = self
             .config(orch, request.project_id.as_deref())
             .map_err(|_| CompletionError::BackendUnavailable)?;
-        adapter::CustomAdapter::new(config)
-            .complete(orch.models_runtime().complete.as_ref(), request)
+        Ok(adapter::CustomAdapter::new(config)
+            .complete(orch.models_runtime().complete.as_ref(), request)?)
     }
 
     fn completion_shape(&self) -> CompletionShape {

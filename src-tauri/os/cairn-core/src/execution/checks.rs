@@ -5366,7 +5366,7 @@ pub(crate) async fn cancel_stale_review_on_branch_advance(
             let verifying = orch
                 .turn_end_check_runtime_status(&stale)
                 .map(|status| {
-                    let tree = status.tree_hash;
+                    let tree = &status.plan.tree_hash;
                     format!("tree {}", &tree[..tree.len().min(12)])
                 })
                 .unwrap_or_else(|| "a tree it had not published yet".to_string());

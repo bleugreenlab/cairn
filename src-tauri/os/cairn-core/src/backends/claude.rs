@@ -40,8 +40,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use super::{
-    AgentBackend, BackendFailure, CompletionError, CompletionOutcome, CompletionRequest,
-    ResolvedTools, SessionConfig,
+    AgentBackend, BackendFailure, CompletionError, CompletionFailure, CompletionOutcome,
+    CompletionRequest, ResolvedTools, SessionConfig,
 };
 use cairn_models::types::catalog::DiscoveredModel;
 
@@ -1749,7 +1749,7 @@ impl AgentBackend for ClaudeBackend {
         request: CompletionRequest,
         orch: &Orchestrator,
         _admitted: crate::backends::Admitted,
-    ) -> Result<CompletionOutcome, CompletionError> {
+    ) -> Result<CompletionOutcome, CompletionFailure> {
         use super::one_shot::{
             instructions, map_one_shot_error, map_open_error, one_shot_timeout,
             response_scratch_dir,
@@ -1760,7 +1760,8 @@ impl AgentBackend for ClaudeBackend {
         if request.messages.is_empty() {
             return Err(CompletionError::InvalidRequest(
                 "at least one message is required".to_string(),
-            ));
+            )
+            .into());
         }
         let selection = select_routed_serving_identity(
             orch,
@@ -1770,82 +1771,88 @@ impl AgentBackend for ClaudeBackend {
             SelectionMode::Serve,
         )
         .map_err(CompletionError::Upstream)?;
-        let (secrets, _) = claude_launch_credential(orch, &selection.identity)
-            .map_err(CompletionError::Upstream)?;
-        // A subscription's cost figure is notional; only an API key's is spent.
-        let metered = matches!(
-            selection.identity.claude_auth,
-            Some(crate::credentials::ClaudeAuth::ApiKey(_))
-        );
-        let scratch = response_scratch_dir()?;
-        let extras = request.options.clone();
-        let spec = SessionSpec {
-            start: SessionStart::New {
-                session_id: uuid::Uuid::new_v4().to_string(),
-            },
-            model: Some(request.model.clone()),
-            effort: extras
-                .reasoning_effort
-                .or_else(|| extras.max_thinking_tokens.map(|_| "high".to_string())),
-            approval: ApprovalMode::Deny,
-            output_schema: request.output_schema.clone(),
-            cwd: scratch.path(),
-            env: BTreeMap::new(),
-            mcp: None,
-            secrets,
-            account_id: selection.account_id.clone(),
-            provider: ProviderSpec::Claude(ClaudeSpec {
-                system_prompt: PlacedFile {
-                    dir: scratch.path(),
-                    name: "system-prompt.md".to_string(),
-                    contents: instructions(&request),
+        // From here on the call runs on the routed account, so a failure names
+        // it: the CLI's account-level refusals arrive as ordinary errors.
+        let account_id = selection.account_id.clone();
+        let serve = || -> Result<CompletionOutcome, CompletionError> {
+            let (secrets, _) = claude_launch_credential(orch, &selection.identity)
+                .map_err(CompletionError::Upstream)?;
+            // A subscription's cost figure is notional; only an API key's is spent.
+            let metered = matches!(
+                selection.identity.claude_auth,
+                Some(crate::credentials::ClaudeAuth::ApiKey(_))
+            );
+            let scratch = response_scratch_dir()?;
+            let extras = request.options.clone();
+            let spec = SessionSpec {
+                start: SessionStart::New {
+                    session_id: uuid::Uuid::new_v4().to_string(),
                 },
-                hook_settings: None,
-                allowed_tools: Vec::new(),
-                disallowed_tools: Vec::new(),
-                mode: ClaudeMode::OneShot {
-                    prompt: request.single_prompt(),
-                },
-            }),
-        };
-        let started = std::time::Instant::now();
-        let runtime = orch.models_runtime();
-        let launched = runtime
-            .claude
-            .open(runtime.host.as_ref(), spec)
-            .map_err(map_open_error)?;
-        let reply =
-            await_one_shot(launched, one_shot_timeout(&request)).map_err(map_one_shot_error)?;
-        let latency_ms = started.elapsed().as_millis() as u64;
-        drop(scratch);
+                model: Some(request.model.clone()),
+                effort: extras
+                    .reasoning_effort
+                    .or_else(|| extras.max_thinking_tokens.map(|_| "high".to_string())),
+                approval: ApprovalMode::Deny,
+                output_schema: request.output_schema.clone(),
+                cwd: scratch.path(),
+                env: BTreeMap::new(),
+                mcp: None,
+                secrets,
+                account_id: selection.account_id.clone(),
+                provider: ProviderSpec::Claude(ClaudeSpec {
+                    system_prompt: PlacedFile {
+                        dir: scratch.path(),
+                        name: "system-prompt.md".to_string(),
+                        contents: instructions(&request),
+                    },
+                    hook_settings: None,
+                    allowed_tools: Vec::new(),
+                    disallowed_tools: Vec::new(),
+                    mode: ClaudeMode::OneShot {
+                        prompt: request.single_prompt(),
+                    },
+                }),
+            };
+            let started = std::time::Instant::now();
+            let runtime = orch.models_runtime();
+            let launched = runtime
+                .claude
+                .open(runtime.host.as_ref(), spec)
+                .map_err(map_open_error)?;
+            let reply =
+                await_one_shot(launched, one_shot_timeout(&request)).map_err(map_one_shot_error)?;
+            let latency_ms = started.elapsed().as_millis() as u64;
+            drop(scratch);
 
-        // With a schema the CLI's text is a summary; the answer is the value
-        // its StructuredOutput tool returned.
-        let (text, parsed) = if request.output_schema.is_some() {
-            let structured = reply.structured.ok_or_else(|| {
-                CompletionError::InvalidResponse(
-                    "Claude returned no structured output for the requested schema".to_string(),
-                )
-            })?;
-            let text = serde_json::to_string(&structured)
-                .map_err(|error| CompletionError::InvalidResponse(error.to_string()))?;
-            (text, Some(structured))
-        } else {
-            (reply.text, None)
+            // With a schema the CLI's text is a summary; the answer is the value
+            // its StructuredOutput tool returned.
+            let (text, parsed) = if request.output_schema.is_some() {
+                let structured = reply.structured.ok_or_else(|| {
+                    CompletionError::InvalidResponse(
+                        "Claude returned no structured output for the requested schema".to_string(),
+                    )
+                })?;
+                let text = serde_json::to_string(&structured)
+                    .map_err(|error| CompletionError::InvalidResponse(error.to_string()))?;
+                (text, Some(structured))
+            } else {
+                (reply.text, None)
+            };
+            Ok(CompletionOutcome {
+                text,
+                parsed,
+                model: request.model,
+                usage: reply
+                    .usage
+                    .as_ref()
+                    .map(cairn_models::usage::metered)
+                    .unwrap_or_default()
+                    .with_cost(reply.cost_usd.filter(|_| metered)),
+                latency_ms,
+                account_id: selection.account_id,
+            })
         };
-        Ok(CompletionOutcome {
-            text,
-            parsed,
-            model: request.model,
-            usage: reply
-                .usage
-                .as_ref()
-                .map(cairn_models::usage::metered)
-                .unwrap_or_default()
-                .with_cost(reply.cost_usd.filter(|_| metered)),
-            latency_ms,
-            account_id: selection.account_id,
-        })
+        serve().map_err(CompletionFailure::on_account(account_id))
     }
 
     fn supports_resume(&self) -> bool {

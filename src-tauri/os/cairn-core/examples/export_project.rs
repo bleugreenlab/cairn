@@ -5,7 +5,9 @@
 //! the live instance. Use it when the app is quit, or against a copy-on-write
 //! clone of the live file set (`cp -c cairn.db cairn.db-log cairn.db-wal DIR/`
 //! on APFS), which costs no space and never opens the live file from a second
-//! process.
+//! process. The export holds no transaction across its run, but until its
+//! production-copy probe has passed, a cairn-sized project belongs on a clone
+//! rather than the live instance.
 //!
 //! Private projects only: a team project's rows live in its team replica, which
 //! only the running app has open and routed.

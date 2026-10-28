@@ -806,25 +806,17 @@ struct TurnEndCancelInner {
     status: Mutex<Option<TurnEndCheckRuntimeStatus>>,
 }
 
-/// The immutable facts a running review wave planned with, published once its
-/// planning finishes. They are everything the live `/checks` projection reads,
-/// so a poll while the wave runs does no VCS or config work of its own.
+/// What a running review wave publishes once its planning finishes: the plan,
+/// which is everything the live `/checks` projection reads, so a poll while the
+/// wave runs does no VCS or config work of its own, and the fabric request each
+/// lane has been submitted as.
+///
+/// A base replay that keeps the branch's patch does not withdraw the wave, so
+/// the node's head can move past `plan.head` while the wave still runs; the
+/// status poll names that head on the lanes the wave answers.
 #[derive(Clone)]
 pub(crate) struct TurnEndCheckRuntimeStatus {
-    pub tree_hash: String,
-    /// The branch head the wave pinned, and the fork point it measured the
-    /// head's change from. A base replay that keeps the branch's patch does not
-    /// withdraw the wave, so the node's head can move past this commit while the
-    /// wave still runs; the status poll names it on the lanes the wave answers.
-    pub sealed_commit: String,
-    pub base: String,
-    /// The checks contract `sealed_commit` declares, which the wave planned
-    /// with.
-    pub checks: Arc<HashMap<String, crate::config::project_settings::CheckCommand>>,
-    pub applicable_names: HashSet<String>,
-    /// Every configured check's input hash at `tree_hash`: the key the wave
-    /// reuses and records under, so the status poll reads lanes by it too.
-    pub input_hashes: HashMap<String, String>,
+    pub plan: Arc<crate::execution::checks_turn_end::WavePlan>,
     pub request_ids: HashMap<String, String>,
 }
 
@@ -880,21 +872,11 @@ impl TurnEndCancel {
 
     pub(crate) fn set_runtime_status(
         &self,
-        tree_hash: String,
-        sealed_commit: String,
-        base: String,
-        checks: Arc<HashMap<String, crate::config::project_settings::CheckCommand>>,
-        applicable_names: HashSet<String>,
-        input_hashes: HashMap<String, String>,
+        plan: Arc<crate::execution::checks_turn_end::WavePlan>,
     ) {
         if let Ok(mut status) = self.inner.status.lock() {
             *status = Some(TurnEndCheckRuntimeStatus {
-                tree_hash,
-                sealed_commit,
-                base,
-                checks,
-                applicable_names,
-                input_hashes,
+                plan,
                 request_ids: HashMap::new(),
             });
         }

@@ -16,6 +16,9 @@ mod search_index;
 #[cfg(any(test, feature = "test-utils"))]
 mod test_template;
 
+#[cfg(any(test, feature = "test-utils"))]
+pub mod checkpoint_probe;
+
 pub mod authority;
 pub mod content_store;
 pub mod events;
@@ -46,8 +49,8 @@ pub use fact_log::{
 };
 pub use feed::{FeedAck, FeedHome, FeedHomeKind, FeedPage, FEED_PAGE_DEFAULT, FEED_PAGE_MAX};
 pub use local_db::{
-    db_set_paths, db_set_size, install_crypto_provider, move_db_set, CheckpointReport, DrainReport,
-    LocalDb, RetryConfig, TrackedConnection,
+    db_set_paths, db_set_size, install_crypto_provider, move_db_set, CheckpointReport, DrainBudget,
+    DrainReport, LocalDb, RetryConfig, TrackedConnection,
 };
 pub use migration::{
     repair_index_entry_drift, run_integrity_sweep, IntegritySweepOutcome, Migration,
@@ -102,7 +105,7 @@ pub use events::{
     build_execution_pack, compress, count_commits_ahead, decompress, list_range_commits,
     reconstruct_events, reconstruct_events_reporting, render_range_file_diffs, render_range_patch,
     NodeDiffFile, ObjectStore, RangeCommit, RangeFileSummary, RangePatch, Reconstruction,
-    ResolvePathError, CODEC_NONE, CODEC_ZSTD_V1,
+    ResolvePathError, CODEC_NONE, CODEC_ZSTD_V1, RECONSTRUCT_BATCH_BYTES, RECONSTRUCT_BATCH_ROWS,
 };
 
 /// A freshly migrated, temp-backed test database. Exposed under `test-utils`

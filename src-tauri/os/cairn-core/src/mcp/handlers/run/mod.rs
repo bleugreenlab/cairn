@@ -8032,7 +8032,7 @@ mod host_batch_tests {
                 *recorded.lock().unwrap() = Some(request.timeout);
                 if request.timeout < delay {
                     std::thread::sleep(request.timeout);
-                    return Err(ResponseError::Timeout);
+                    return Err(ResponseError::Timeout.into());
                 }
                 std::thread::sleep(delay);
                 Ok(CompletionOutcome {

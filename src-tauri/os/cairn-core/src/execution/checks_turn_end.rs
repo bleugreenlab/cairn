@@ -116,6 +116,53 @@ pub(crate) struct TurnEndAttempt {
     pub reason: Option<String>,
 }
 
+/// The immutable facts a review wave planned with: the head it pinned, the fork
+/// point it measured that head's change from, the head's tree, the checks
+/// contract the head declares, which of those checks apply, and every check's
+/// input hash at the tree.
+///
+/// They are everything the `/checks` projection reads about a head, so a wave
+/// publishes them twice. In memory while it runs, so the live projection does no
+/// VCS work of its own; and on its attempt row for good, because once a merge or
+/// close retires the node's branch none of this can be recomputed, and the
+/// retired projection answers from the last plan recorded here.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WavePlan {
+    pub head: String,
+    pub base: String,
+    pub tree_hash: String,
+    pub checks: std::collections::HashMap<String, crate::config::project_settings::CheckCommand>,
+    pub applicable_names: std::collections::HashSet<String>,
+    pub input_hashes: std::collections::HashMap<String, String>,
+}
+
+/// Keep the plan a wave published on its attempt row: the durable half of
+/// [`WavePlan`]. Best-effort, like the deferral record. A wave that cannot
+/// record its plan still runs; only the retired projection of this one head
+/// goes without it.
+async fn record_wave_plan(db: &LocalDb, job_id: &str, attempt_id: &str, plan: &WavePlan) {
+    let recorded = match serde_json::to_string(plan) {
+        Ok(json) => db
+            .execute(
+                "UPDATE turn_end_check_attempts SET sealed_commit = ?1, plan_json = ?2
+                  WHERE id = ?3 AND job_id = ?4",
+                (plan.head.as_str(), json.as_str(), attempt_id, job_id),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    if let Err(error) = recorded {
+        log::warn!(
+            "turn-end checks for job {}: could not record the wave's plan ({error}); \
+             this head's lanes will not be readable once its branch retires",
+            short_id(job_id)
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TurnEndDisposition {
     Skipped(&'static str),
@@ -1043,17 +1090,20 @@ async fn run_turn_end_checks_inner(
         None => false,
     };
 
-    // Publish the immutable facts the 1 Hz status poll needs. They remain valid
-    // until the single-flight slot is released because this suite is pinned to
-    // the sealed tree.
-    cancel.set_runtime_status(
-        tree_hash.clone(),
-        sealed_commit.clone(),
-        wave_base,
-        std::sync::Arc::new(checks.clone()),
+    // Publish the immutable facts this wave planned with: on its attempt row
+    // for good, and in memory for the 1 Hz status poll. The in-memory copy stays
+    // valid until the single-flight slot is released because this suite is
+    // pinned to the sealed tree.
+    let plan = std::sync::Arc::new(WavePlan {
+        head: sealed_commit.clone(),
+        base: wave_base,
+        tree_hash: tree_hash.clone(),
+        checks: checks.clone(),
         applicable_names,
-        input_hashes.clone(),
-    );
+        input_hashes: input_hashes.clone(),
+    });
+    record_wave_plan(&owning_db, job_id, attempt_id, &plan).await;
+    cancel.set_runtime_status(plan);
 
     // 7. Loop-break gate: drop any plan whose INPUT hash (the content of just
     // that check's impact-matched files) is infrastructure-suppressed; every
@@ -1753,6 +1803,10 @@ pub(crate) async fn render_turn_end_checks_section(
     orch: &Orchestrator,
     job_id: &str,
 ) -> Option<String> {
+    if let Some(retired) = crate::execution::checks_status::node_retirement(orch, job_id).await {
+        let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id).await;
+        return Some(format_retired_checks_section(&retired, statuses.as_deref()));
+    }
     let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id).await?;
     format_checks_section(&statuses)
 }
@@ -1763,13 +1817,55 @@ pub(crate) async fn render_turn_end_checks_section(
 fn format_checks_section(
     statuses: &[crate::execution::checks_status::NodeCheckStatus],
 ) -> Option<String> {
-    use crate::execution::checks_status::{
-        format_status_annotation, formatted_failure_names, NodeCheckState,
-    };
     if statuses.is_empty() {
         return None;
     }
     let mut out = String::from("\n### Systematic checks\n\n");
+    push_check_lines(&mut out, statuses, "pending");
+    Some(out)
+}
+
+/// The section for a node whose issue has resolved. Always rendered: a retired
+/// node's lanes are on record or they are not, and either way the reader is told
+/// which, and for which head, rather than that results are still to come.
+/// `statuses` is `None` when the recorded lanes could not be read.
+fn format_retired_checks_section(
+    retired: &crate::execution::checks_status::RetiredNode,
+    statuses: Option<&[crate::execution::checks_status::NodeCheckStatus]>,
+) -> String {
+    let outcome = &retired.outcome;
+    let mut out = String::from("\n### Systematic checks\n\n");
+    let Some(head) = retired.head() else {
+        out.push_str(&format!(
+            "This node was {outcome} before any review wave recorded a plan, so no lanes are \
+             on record for it.\n"
+        ));
+        return out;
+    };
+    let head = &head[..head.len().min(12)];
+    out.push_str(&format!(
+        "This node was {outcome}. Its branch is retired, so these are the lanes recorded for \
+         its last head, `{head}`, and nothing will run them again.\n\n"
+    ));
+    match statuses {
+        Some([]) => out.push_str("That head configured no checks.\n"),
+        Some(statuses) => push_check_lines(&mut out, statuses, "no verdict"),
+        None => out.push_str("Its recorded lanes could not be read just now.\n"),
+    }
+    out
+}
+
+/// One line per lane, with a failing or running lane's output beneath it.
+/// `pending_label` names a lane with no verdict: one still to come on a live
+/// node, one that will never come on a retired node.
+fn push_check_lines(
+    out: &mut String,
+    statuses: &[crate::execution::checks_status::NodeCheckStatus],
+    pending_label: &str,
+) {
+    use crate::execution::checks_status::{
+        format_status_annotation, formatted_failure_names, NodeCheckState,
+    };
     for status in statuses {
         match status.state {
             NodeCheckState::Passed => {
@@ -1812,13 +1908,14 @@ fn format_checks_section(
                     out.push_str("\n```\n");
                 }
             }
-            NodeCheckState::Pending => out.push_str(&format!("- {}: pending\n", status.name)),
+            NodeCheckState::Pending => {
+                out.push_str(&format!("- {}: {pending_label}\n", status.name));
+            }
             NodeCheckState::NotApplicable => {
                 out.push_str(&format!("- {}: not applicable\n", status.name));
             }
         }
     }
-    Some(out)
 }
 
 /// The node's coordinates resolved from a `job_id` in one query.
@@ -2937,6 +3034,45 @@ mod tests {
     #[test]
     fn section_is_none_when_no_configured_checks() {
         assert!(format_checks_section(&[]).is_none());
+    }
+
+    /// A retired node's section names how it retired and the head its lanes
+    /// were recorded for, and never reads as results still to come.
+    #[test]
+    fn retired_section_names_its_head_and_never_reads_as_awaiting_results() {
+        use crate::execution::checks_status::RetiredNode;
+        let plan = WavePlan {
+            head: "0123456789abcdef".to_string(),
+            base: "base".to_string(),
+            tree_hash: "tree".to_string(),
+            checks: Default::default(),
+            applicable_names: Default::default(),
+            input_hashes: Default::default(),
+        };
+        let merged = RetiredNode {
+            outcome: "merged".to_string(),
+            plan: Some(std::sync::Arc::new(plan)),
+        };
+        let lanes = [
+            status("rust", NodeCheckState::Passed),
+            status("lint", NodeCheckState::Pending),
+        ];
+        let s = format_retired_checks_section(&merged, Some(&lanes));
+        assert!(s.contains("This node was merged"), "{s}");
+        assert!(s.contains("`0123456789ab`"), "{s}");
+        assert!(s.contains("\u{2713} rust"), "{s}");
+        assert!(s.contains("- lint: no verdict"), "{s}");
+        assert!(!s.contains("pending"), "{s}");
+
+        let unrecorded = RetiredNode {
+            outcome: "closed".to_string(),
+            plan: None,
+        };
+        let s = format_retired_checks_section(&unrecorded, None);
+        assert!(
+            s.contains("closed before any review wave recorded a plan"),
+            "{s}"
+        );
     }
 
     #[test]

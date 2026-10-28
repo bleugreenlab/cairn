@@ -436,6 +436,12 @@ async fn checks(
         };
         let now = chrono::Utc::now().timestamp_millis();
         match &snapshot.settlement {
+            // A retired node's lanes are final the moment they stop: its branch
+            // is gone, so no wave can arm for them, and the restart-protection
+            // dwell guards a window that can no longer open.
+            Settlement::Settled { .. } if snapshot.retired.is_some() => {
+                return Ok(settled_result(uri, suite, &snapshot, now - created))
+            }
             Settlement::Settled { verdictless } if verdictless.is_empty() => {
                 return Ok(settled_result(uri, suite, &snapshot, now - created))
             }
@@ -474,7 +480,7 @@ fn settled_result(
         Settlement::Moving(_) => Vec::new(),
     };
     let mut value = serde_json::json!({
-        "outcome": "settled",
+        "outcome": snapshot.outcome(),
         "checks": uri,
         "verdict": snapshot.verdict(),
         "summary": snapshot.tally(),
@@ -484,7 +490,13 @@ fn settled_result(
     if let Some(suite) = suite {
         value["suite"] = serde_json::json!(suite);
     }
-    if !verdictless.is_empty() {
+    if let (Some(retired), Some(note)) = (&snapshot.retired, snapshot.retirement_note()) {
+        value["retired"] = serde_json::json!({"as": retired.outcome, "head": retired.head});
+        value["note"] = serde_json::json!(note);
+        if !verdictless.is_empty() {
+            value["verdictless"] = serde_json::json!(verdictless);
+        }
+    } else if !verdictless.is_empty() {
         value["verdictless"] = serde_json::json!(verdictless);
         let reason = snapshot.terminal_reason.as_deref().unwrap_or(
             "legacy check state has no durable attempt reason; the restart-protection dwell elapsed",
@@ -955,6 +967,7 @@ mod tests {
             settlement: classify(&statuses, HeadTurn::Idle, false),
             statuses,
             terminal_reason: Some("issue merged before submission".to_string()),
+            retired: None,
         };
         let uri = "cairn://p/cairn/3427/1/builder/checks";
         let value: serde_json::Value =
@@ -981,6 +994,7 @@ mod tests {
             settlement: classify(&statuses, HeadTurn::Idle, false),
             statuses,
             terminal_reason: None,
+            retired: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&settled_result(uri, Some("rust-tests"), &clean, 5)).unwrap();
@@ -988,6 +1002,202 @@ mod tests {
         assert_eq!(value["suite"], "rust-tests");
         assert!(value.get("verdictless").is_none());
         assert!(value.get("note").is_none());
+    }
+
+    /// A child node whose issue has resolved, the way a merge or close leaves
+    /// it. Its project's repository path does not exist, so nothing here can
+    /// resolve a branch, a worktree, or a contract at a head: whatever the wait
+    /// answers, it answers from the database. `lanes` is the plan its last review
+    /// wave recorded (`None` for a node that retired before any wave recorded
+    /// one), and `answered` the lanes that wrote a verdict for it.
+    async fn seed_retired_child(
+        orch: &Orchestrator,
+        outcome: &str,
+        branch: &str,
+        lanes: Option<&[&str]>,
+        answered: &[&str],
+    ) {
+        let db = &orch.db.local;
+        let issue = format!(
+            "INSERT INTO issues (id,project_id,number,title,status,created_at,updated_at) \
+             VALUES ('i2','p',2,'Child','{outcome}',1,1)"
+        );
+        let job = format!(
+            "INSERT INTO jobs (id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at,uri_segment,branch) \
+             VALUES ('child','e2','i2','p','Builder','running',1,1,'builder','{branch}')"
+        );
+        for sql in [
+            issue.as_str(),
+            "INSERT INTO executions (id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES ('e2','recipe','i2','p','running',1,1)",
+            job.as_str(),
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+        let Some(lanes) = lanes else {
+            return;
+        };
+        let check: crate::config::project_settings::CheckCommand =
+            serde_json::from_value(serde_json::json!({"command": "true", "when": "review"}))
+                .unwrap();
+        let plan = crate::execution::checks_turn_end::WavePlan {
+            head: "feedfacecafe0123".to_string(),
+            base: "base".to_string(),
+            tree_hash: "tree-at-merge".to_string(),
+            checks: lanes
+                .iter()
+                .map(|name| (name.to_string(), check.clone()))
+                .collect(),
+            applicable_names: lanes.iter().map(|name| name.to_string()).collect(),
+            input_hashes: lanes
+                .iter()
+                .map(|name| (name.to_string(), format!("in-{name}")))
+                .collect(),
+        };
+        let plan_json = serde_json::to_string(&plan).unwrap();
+        db.execute(
+            "INSERT INTO turn_end_check_attempts (id,job_id,state,reason,created_at,updated_at,sealed_commit,plan_json) \
+             VALUES ('a1','child','failed','the issue resolved',1,1,?1,?2)",
+            (plan.head.as_str(), plan_json.as_str()),
+        )
+        .await
+        .unwrap();
+        for name in answered {
+            let input_hash = format!("in-{name}");
+            db.execute(
+                "INSERT INTO check_result_cache(project_id,tree_hash,input_hash,check_name,exit_code,passed,output_tail,duration_ms,ran_at,job_id) \
+                 VALUES('p','tree-at-merge',?1,?2,0,1,'',1,1,'child')",
+                (input_hash.as_str(), *name),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn wait_on_child(orch: &Orchestrator) -> serde_json::Value {
+        let armed = record(
+            Condition::Checks {
+                uri: "cairn://p/prj/2/1/builder/checks".into(),
+                job_id: "child".into(),
+                suite: None,
+            },
+            None,
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            trigger(orch.clone(), orch.db.local.clone(), armed),
+        )
+        .await
+        .expect("a wait on a retired node must resolve, not poll a branch that is gone")
+        .expect("a retired node's lanes are readable");
+        serde_json::from_str(&result).unwrap()
+    }
+
+    /// cairn/5282. The operator merged while the wait was armed, judging on lanes
+    /// that had answered. The wait resolves with those verdicts and names the
+    /// head they were for, and `/checks` shows the same lanes, rather than the
+    /// wait dying as unreadable and the page claiming nothing ever ran.
+    #[tokio::test]
+    async fn a_wait_on_a_merged_node_resolves_with_the_verdicts_recorded_for_its_last_head() {
+        let orch = test_orchestrator().await;
+        seed_retired_child(
+            &orch,
+            "merged",
+            "agent/child",
+            Some(&["lint", "rust-tests"]),
+            &["lint", "rust-tests"],
+        )
+        .await;
+
+        let value = wait_on_child(&orch).await;
+        assert_eq!(value["outcome"], "settled", "{value}");
+        assert_eq!(value["retired"]["as"], "merged", "{value}");
+        assert_eq!(value["retired"]["head"], "feedfacecafe0123", "{value}");
+        assert!(value.get("verdictless").is_none(), "{value}");
+        let lanes = value["lanes"].as_array().unwrap();
+        assert_eq!(lanes.len(), 2, "{value}");
+        assert!(
+            lanes
+                .iter()
+                .all(|lane| !lane.as_str().unwrap().contains("[no verdict]")),
+            "{value}"
+        );
+
+        let section =
+            crate::execution::checks_turn_end::render_turn_end_checks_section(&orch, "child")
+                .await
+                .expect("a merged node's /checks is never blank");
+        assert!(section.contains("This node was merged"), "{section}");
+        assert!(section.contains("`feedfacecafe`"), "{section}");
+        assert!(section.contains("rust-tests"), "{section}");
+    }
+
+    /// A merge that lands while a lane still owes its verdict abandons it. The
+    /// wait says so in its outcome and lists every lane at its last state.
+    #[tokio::test]
+    async fn a_wait_on_a_node_merged_mid_wave_resolves_merged_before_settlement() {
+        let orch = test_orchestrator().await;
+        seed_retired_child(
+            &orch,
+            "merged",
+            "agent/child",
+            Some(&["lint", "rust-tests"]),
+            &["rust-tests"],
+        )
+        .await;
+
+        let value = wait_on_child(&orch).await;
+        assert_eq!(value["outcome"], "merged_before_settlement", "{value}");
+        assert_eq!(value["verdict"], "incomplete", "{value}");
+        assert_eq!(value["verdictless"], serde_json::json!(["lint"]), "{value}");
+        assert_eq!(value["retired"]["head"], "feedfacecafe0123", "{value}");
+        let lanes: Vec<&str> = value["lanes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|lane| lane.as_str().unwrap())
+            .collect();
+        assert!(lanes.contains(&"- lint [no verdict]"), "{value}");
+        assert!(
+            value["note"]
+                .as_str()
+                .unwrap()
+                .contains("nothing will run them"),
+            "{value}"
+        );
+    }
+
+    /// A node that retired before any review wave recorded a plan has no lanes
+    /// on record. It still resolves, typed, and never reads as a pass.
+    #[tokio::test]
+    async fn a_node_closed_before_any_plan_was_recorded_resolves_without_lanes() {
+        let orch = test_orchestrator().await;
+        seed_retired_child(&orch, "closed", "agent/child", None, &[]).await;
+
+        let value = wait_on_child(&orch).await;
+        assert_eq!(value["outcome"], "closed_before_settlement", "{value}");
+        assert_eq!(value["verdict"], "incomplete", "{value}");
+        assert!(value["retired"]["head"].is_null(), "{value}");
+
+        let section =
+            crate::execution::checks_turn_end::render_turn_end_checks_section(&orch, "child")
+                .await
+                .unwrap();
+        assert!(
+            section.contains("closed before any review wave recorded a plan"),
+            "{section}"
+        );
+    }
+
+    /// Retirement is not a way around the arming refusal: a node that never had
+    /// a branch never had a contract, resolved issue or not.
+    #[tokio::test]
+    async fn a_node_that_never_had_a_branch_is_still_refused() {
+        let orch = test_orchestrator().await;
+        seed_retired_child(&orch, "merged", "", None, &[]).await;
+        let error = node_checks_settlement(&orch, "child", None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("no resolvable check contract"), "{error}");
     }
 
     /// The wait's half of CAIRN-3153. An exit wait reads its answer off the

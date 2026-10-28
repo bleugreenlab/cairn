@@ -519,8 +519,10 @@ impl LocalDb {
     /// leaked on any of those paths would wedge the drain shut permanently, and
     /// the symptom — checkpointing quietly stops working — is invisible until
     /// the log has grown for a day.
-    #[cfg(test)]
-    fn live_connections(&self) -> usize {
+    ///
+    /// Public so readers in other crates can assert the property the checkpoint
+    /// depends on: that a long read holds no connection between its pages.
+    pub fn live_connections(&self) -> usize {
         self.gate.lock().live.len()
     }
 
@@ -1031,7 +1033,9 @@ impl LocalDb {
     /// the door while the ones already open finish, and only then attempts. The
     /// hold reopens the gate when it drops, on every path out of this function
     /// including a panic inside the engine, so a caller waiting at the gate waits
-    /// at most `drain_budget` plus this checkpoint.
+    /// at most `drain.ceiling` plus this checkpoint. How long the drain waits
+    /// within that ceiling is [`DrainBudget::for_open`] of the number of
+    /// connections open at the moment the gate closed.
     ///
     /// The attempt is made whether or not the drain completed. A drain that
     /// expires means a long-lived transaction is still open and the attempt will
@@ -1057,7 +1061,7 @@ impl LocalDb {
         &self,
         max_attempts: usize,
         between_attempts: Duration,
-        drain_budget: Duration,
+        drain_budget: DrainBudget,
     ) -> DbResult<CheckpointReport> {
         // `checkpoint` is public and callers are not required to coordinate.
         // Keep this permit outside every other operation in the pass so a second
@@ -1275,16 +1279,24 @@ impl ConnectionGate {
         }
     }
 
-    /// Close the gate and wait up to `budget` for the connections already open
-    /// to be released.
+    /// Close the gate and wait for the connections already open to be released,
+    /// for as long as `drain` allows given how many were open at the close.
+    ///
+    /// The count is sampled under the same lock that shuts the gate, so it is
+    /// exactly the set this drain has to wait out: nothing can join it after.
     ///
     /// Returns the hold whether or not the drain finished, so the caller decides
     /// what a partial drain is worth and the gate reopens when that hold drops
     /// either way.
-    async fn close(self: &Arc<Self>, budget: Duration) -> (GateHold, DrainReport) {
+    async fn close(self: &Arc<Self>, drain: DrainBudget) -> (GateHold, DrainReport) {
         let started = Instant::now();
-        self.lock().closed = true;
+        let open_at_close = {
+            let mut state = self.lock();
+            state.closed = true;
+            state.live.len()
+        };
         let hold = GateHold { gate: self.clone() };
+        let budget = drain.for_open(open_at_close);
         let deadline = started + budget;
 
         loop {
@@ -1302,7 +1314,17 @@ impl ConnectionGate {
                 (state.live.len(), oldest)
             };
             if still_open == 0 {
-                return (hold, DrainReport::drained(started.elapsed()));
+                return (
+                    hold,
+                    DrainReport {
+                        drained: true,
+                        open_at_close,
+                        budget,
+                        still_open: 0,
+                        oldest: None,
+                        waited: started.elapsed(),
+                    },
+                );
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1310,6 +1332,8 @@ impl ConnectionGate {
                     hold,
                     DrainReport {
                         drained: false,
+                        open_at_close,
+                        budget,
                         still_open,
                         oldest,
                         waited: started.elapsed(),
@@ -1400,6 +1424,57 @@ impl std::fmt::Debug for TrackedConnection {
     }
 }
 
+/// How long a checkpoint pass may hold the gate shut waiting for the
+/// connections already open, as a function of how many there were.
+///
+/// A fixed budget fails exactly when it matters. Each open connection is a
+/// transaction that has to finish before the fold can run, and production has
+/// had ten to forty-five of them open at once; half a second drains ten short
+/// ones and none of forty-five. Scaling with the count lets a crowded pass wait
+/// long enough to win, while the ceiling keeps the stall every database call
+/// pays during the drain bounded no matter how crowded the machine is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainBudget {
+    /// The wait with nothing open, and the least any pass waits.
+    pub floor: Duration,
+    /// Added for each connection open when the gate closes.
+    pub per_open: Duration,
+    /// The most any pass waits, however many were open.
+    pub ceiling: Duration,
+}
+
+impl DrainBudget {
+    /// The drain the production checkpoint pass runs: half a second for a
+    /// quiet machine, fifty milliseconds more per open connection, and never
+    /// more than two and a half seconds of stall. Defined here, beside the
+    /// type, so `db_maintenance` and the production-copy probes cannot drift
+    /// apart.
+    pub const PRODUCTION: Self = Self {
+        floor: Duration::from_millis(500),
+        per_open: Duration::from_millis(50),
+        ceiling: Duration::from_millis(2_500),
+    };
+
+    /// A budget that ignores the count. For tests and for the startup fold,
+    /// where nothing else is running.
+    pub const fn fixed(budget: Duration) -> Self {
+        Self {
+            floor: budget,
+            per_open: Duration::ZERO,
+            ceiling: budget,
+        }
+    }
+
+    /// `floor + per_open × open`, clamped to `[floor, ceiling]`.
+    pub fn for_open(&self, open: usize) -> Duration {
+        let open = u32::try_from(open).unwrap_or(u32::MAX);
+        let ceiling = self.ceiling.max(self.floor);
+        self.floor
+            .saturating_add(self.per_open.saturating_mul(open))
+            .clamp(self.floor, ceiling)
+    }
+}
+
 /// What one attempt to empty the gate achieved.
 ///
 /// The failure fields are the point of this type. A drain that expires means
@@ -1414,6 +1489,11 @@ pub struct DrainReport {
     /// Whether every connection open when the gate closed had been released
     /// before the budget expired.
     pub drained: bool,
+    /// Connections live at the instant the gate closed: the set this drain had
+    /// to wait out, and what `budget` was derived from.
+    pub open_at_close: usize,
+    /// How long this drain was allowed to wait.
+    pub budget: Duration,
     /// Connections still live at the deadline.
     pub still_open: usize,
     /// Where the longest-held live connection came from, and how long it had
@@ -1424,23 +1504,14 @@ pub struct DrainReport {
     pub waited: Duration,
 }
 
-impl DrainReport {
-    fn drained(waited: Duration) -> Self {
-        Self {
-            drained: true,
-            still_open: 0,
-            oldest: None,
-            waited,
-        }
-    }
-}
-
 impl std::fmt::Display for DrainReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "drain_ms={} drained={}",
+            "drain_ms={} budget_ms={} open_at_close={} drained={}",
             self.waited.as_millis(),
+            self.budget.as_millis(),
+            self.open_at_close,
             self.drained
         )?;
         if !self.drained {
@@ -1741,7 +1812,7 @@ mod tests {
     /// a test asserting that a checkpoint WINS must not be able to fail on a
     /// loaded CI machine for want of a few milliseconds. Tests that assert the
     /// budget EXPIRES pass their own short one.
-    const DRAIN_BUDGET: Duration = Duration::from_secs(5);
+    const DRAIN_BUDGET: DrainBudget = DrainBudget::fixed(Duration::from_secs(5));
 
     /// Attempts a test pass makes. More than production's three, so that a test
     /// asserting `attempts == 1` is asserting the gate did its job rather than
@@ -2909,6 +2980,109 @@ mod tests {
         assert_eq!(integrity, "ok");
     }
 
+    #[test]
+    fn a_drain_budget_grows_with_what_is_open_and_stays_inside_its_bounds() {
+        let drain = DrainBudget {
+            floor: Duration::from_millis(500),
+            per_open: Duration::from_millis(50),
+            ceiling: Duration::from_millis(2_500),
+        };
+        assert_eq!(drain.for_open(0), Duration::from_millis(500));
+        assert_eq!(drain.for_open(10), Duration::from_millis(1_000));
+        assert_eq!(drain.for_open(40), Duration::from_millis(2_500));
+        assert_eq!(drain.for_open(usize::MAX), Duration::from_millis(2_500));
+        let mut previous = Duration::ZERO;
+        for open in 0..100 {
+            let budget = drain.for_open(open);
+            assert!(budget >= previous, "for_open must be monotone");
+            assert!(budget >= drain.floor && budget <= drain.ceiling);
+            previous = budget;
+        }
+
+        let fixed = DrainBudget::fixed(Duration::from_millis(300));
+        assert_eq!(fixed.for_open(0), Duration::from_millis(300));
+        assert_eq!(fixed.for_open(1_000), Duration::from_millis(300));
+
+        // An inverted ceiling cannot panic `clamp`; the floor wins.
+        let inverted = DrainBudget {
+            floor: Duration::from_millis(500),
+            per_open: Duration::from_millis(50),
+            ceiling: Duration::from_millis(100),
+        };
+        assert_eq!(inverted.for_open(10), Duration::from_millis(500));
+    }
+
+    /// The production shape behind tenet 1260: ten transactions open, none of
+    /// them pathological, all finishing inside a second. A fixed half-second
+    /// drain loses to them every time; a budget that scales with the count
+    /// waits them out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_drain_that_scales_with_still_open_outlasts_ten_short_holders() {
+        async fn hold_ten_for(db: &LocalDb, hold: Duration) -> tokio::task::JoinHandle<()> {
+            let mut holders = Vec::new();
+            for _ in 0..10 {
+                let conn = db.connect().await.unwrap();
+                conn.execute(db.concurrent_begin(), ()).await.unwrap();
+                holders.push(conn);
+            }
+            tokio::spawn(async move {
+                sleep(hold).await;
+                for conn in holders.drain(..) {
+                    conn.execute("ROLLBACK", ()).await.unwrap();
+                }
+            })
+        }
+
+        let db = test_db().await.unwrap();
+        db.execute("INSERT INTO counters(id, value) VALUES ('a', 1)", ())
+            .await
+            .unwrap();
+
+        let releasing = hold_ten_for(&db, Duration::from_millis(800)).await;
+        let fixed = db
+            .checkpoint(
+                1,
+                Duration::ZERO,
+                DrainBudget::fixed(Duration::from_millis(500)),
+            )
+            .await
+            .unwrap();
+        releasing.await.unwrap();
+        assert!(!fixed.drain.drained, "{fixed}");
+        assert_eq!(fixed.drain.open_at_close, 10, "{fixed}");
+        assert_eq!(fixed.drain.budget, Duration::from_millis(500), "{fixed}");
+        assert_eq!(db.live_connections(), 0);
+
+        let releasing = hold_ten_for(&db, Duration::from_millis(800)).await;
+        let scaled = db
+            .checkpoint(
+                1,
+                Duration::ZERO,
+                DrainBudget {
+                    floor: Duration::from_millis(500),
+                    per_open: Duration::from_millis(100),
+                    ceiling: Duration::from_secs(3),
+                },
+            )
+            .await
+            .unwrap();
+        releasing.await.unwrap();
+        assert!(scaled.drain.drained, "{scaled}");
+        assert_eq!(scaled.drain.open_at_close, 10, "{scaled}");
+        assert_eq!(
+            scaled.drain.budget,
+            Duration::from_millis(1_500),
+            "{scaled}"
+        );
+        assert!(scaled.succeeded(), "{scaled}");
+        let line = scaled.to_string();
+        assert!(
+            line.contains("budget_ms=1500") && line.contains("open_at_close=10"),
+            "{line}"
+        );
+        assert_eq!(db.live_connections(), 0);
+    }
+
     // ========================================================================
     // The connection gate
     //
@@ -3060,7 +3234,11 @@ mod tests {
         );
 
         let report = db
-            .checkpoint(1, Duration::ZERO, Duration::from_millis(50))
+            .checkpoint(
+                1,
+                Duration::ZERO,
+                DrainBudget::fixed(Duration::from_millis(50)),
+            )
             .await
             .unwrap();
 
@@ -3141,7 +3319,11 @@ mod tests {
 
         assert_eq!(db.live_connections(), 0);
         let report = db
-            .checkpoint(1, Duration::ZERO, Duration::from_millis(50))
+            .checkpoint(
+                1,
+                Duration::ZERO,
+                DrainBudget::fixed(Duration::from_millis(50)),
+            )
             .await
             .unwrap();
         assert!(
@@ -3178,7 +3360,11 @@ mod tests {
         rows.next().await.unwrap().unwrap();
 
         let blocked = db
-            .checkpoint(1, Duration::ZERO, Duration::from_millis(50))
+            .checkpoint(
+                1,
+                Duration::ZERO,
+                DrainBudget::fixed(Duration::from_millis(50)),
+            )
             .await
             .unwrap();
         assert!(
@@ -3191,7 +3377,11 @@ mod tests {
         assert_eq!(db.live_connections(), 0);
 
         let unblocked = db
-            .checkpoint(1, Duration::ZERO, Duration::from_millis(50))
+            .checkpoint(
+                1,
+                Duration::ZERO,
+                DrainBudget::fixed(Duration::from_millis(50)),
+            )
             .await
             .unwrap();
         assert!(
@@ -3213,7 +3403,11 @@ mod tests {
         held.execute(db.concurrent_begin(), ()).await.unwrap();
 
         let report = db
-            .checkpoint(1, Duration::ZERO, Duration::from_millis(50))
+            .checkpoint(
+                1,
+                Duration::ZERO,
+                DrainBudget::fixed(Duration::from_millis(50)),
+            )
             .await
             .unwrap();
         assert!(!report.drain.drained, "{report}");
@@ -3262,9 +3456,13 @@ mod tests {
                 // Long enough that the outer read is certainly still open when
                 // the gate closes, short enough that the suite does not crawl.
                 sleep(Duration::from_millis(50)).await;
-                db.checkpoint(1, Duration::ZERO, Duration::from_millis(200))
-                    .await
-                    .unwrap()
+                db.checkpoint(
+                    1,
+                    Duration::ZERO,
+                    DrainBudget::fixed(Duration::from_millis(200)),
+                )
+                .await
+                .unwrap()
             })
         };
 
@@ -3410,9 +3608,13 @@ mod tests {
         let checkpointing = {
             let db = db.clone();
             tokio::spawn(async move {
-                db.checkpoint(1, Duration::ZERO, Duration::from_millis(100))
-                    .await
-                    .unwrap()
+                db.checkpoint(
+                    1,
+                    Duration::ZERO,
+                    DrainBudget::fixed(Duration::from_millis(100)),
+                )
+                .await
+                .unwrap()
             })
         };
 

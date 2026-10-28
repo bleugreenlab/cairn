@@ -118,6 +118,12 @@ pub(crate) async fn cleanup_issue_jobs(
         .await
         .map_err(|e| e.to_string())?;
     let (job_ids, targets) = issue_targets(&db, &issue_id).await?;
+    // The issue's resolution has committed, and it moves every one of its
+    // nodes' `/checks` projections from the live branch to the plan recorded
+    // for its last head. Nothing else announces that move to the cache.
+    for job_id in &job_ids {
+        orch.invalidate_node_check_status(job_id, "issue-resolution");
+    }
 
     kill_terminals_for_jobs(orch, &db, &job_ids).await;
     kill_repls_for_jobs(orch, &job_ids).await;

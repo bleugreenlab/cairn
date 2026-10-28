@@ -32,8 +32,8 @@ mod tests;
 pub use usage::collect_opencode_usage_snapshot;
 
 use crate::backends::{
-    AgentBackend, CompletionError, CompletionOutcome, CompletionRequest, CompletionRole,
-    CompletionShape, ResolvedTools, SessionConfig,
+    AgentBackend, CompletionError, CompletionFailure, CompletionOutcome, CompletionRequest,
+    CompletionRole, CompletionShape, ResolvedTools, SessionConfig,
 };
 use crate::credentials::{ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
@@ -396,11 +396,12 @@ impl AgentBackend for OpenCodeBackend {
         request: CompletionRequest,
         orch: &Orchestrator,
         _admitted: crate::backends::Admitted,
-    ) -> Result<CompletionOutcome, CompletionError> {
+    ) -> Result<CompletionOutcome, CompletionFailure> {
         if request.messages.is_empty() {
             return Err(CompletionError::InvalidRequest(
                 "at least one message is required".to_string(),
-            ));
+            )
+            .into());
         }
         let api_key = opencode_api_key(orch).ok_or(CompletionError::BackendUnavailable)?;
         // A one-shot completion reaches the same three endpoint families a
@@ -409,7 +410,7 @@ impl AgentBackend for OpenCodeBackend {
             .map_err(CompletionError::InvalidRequest)?;
         let started = std::time::Instant::now();
         let llm = orch.models_runtime().complete.as_ref();
-        match protocol {
+        let outcome = match protocol {
             Wire::OpenAiChatCompletions => complete_chat(llm, &api_key, request, started),
             Wire::AnthropicMessages => complete_messages(llm, &api_key, request, started),
             Wire::OpenAiResponses => complete_responses(llm, &api_key, request, started),
@@ -417,7 +418,8 @@ impl AgentBackend for OpenCodeBackend {
                 "{} is served over an endpoint family Cairn has no mapping for.",
                 request.model
             ))),
-        }
+        };
+        Ok(outcome?)
     }
 
     fn completion_shape(&self) -> CompletionShape {

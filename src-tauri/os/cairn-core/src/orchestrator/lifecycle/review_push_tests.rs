@@ -130,6 +130,7 @@ fn waited_on_lanes(
         statuses,
         settlement,
         terminal_reason: None,
+        retired: None,
     }
 }
 

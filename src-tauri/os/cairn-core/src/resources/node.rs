@@ -1888,6 +1888,8 @@ pub(super) async fn read_node_chat(
         exec_seq,
         &visible_job_node_segment(&conn, &job).await,
     );
+    let turn_sequences = load_primary_session_turn_sequences(&conn, &job.id).await;
+    drop(conn);
     let meta = DigestMeta {
         label: node_name,
         project: project_key,
@@ -1896,8 +1898,8 @@ pub(super) async fn read_node_chat(
     };
     render_job_chat_digest(
         db,
-        &conn,
         &job.id,
+        &turn_sequences,
         &base_uri,
         &meta,
         &DigestOptions {
@@ -1914,30 +1916,30 @@ pub(super) async fn read_node_chat(
 /// Canonical `/chat` digest render for an already-resolved job. `base_uri`/`meta`
 /// are caller-built (the cosmetic header line plus truncation drill-down link
 /// scaffolding).
+///
+/// Takes no connection: the caller finishes its own reads and releases it
+/// first, so nothing holds a transaction across the transcript load and the
+/// render (tenet 1260).
 async fn render_job_chat_digest(
     db: &LocalDb,
-    conn: &cairn_db::turso::Connection,
     job_id: &str,
+    turn_sequences: &HashMap<String, i32>,
     base_uri: &str,
     meta: &DigestMeta<'_>,
     opts: &DigestOptions,
 ) -> String {
-    let event_rows = load_job_events_ordered(
-        conn,
-        job_id,
-        db.team_id().map(|_| db.content_store().as_ref()),
-        db.private_route_db().map(|db| db.as_ref()),
-    )
-    .await;
+    let event_rows = match load_job_events_ordered(db, job_id).await {
+        Ok(rows) => rows,
+        Err(error) => return format!("Failed to read this node's transcript: {error}"),
+    };
     if event_rows.is_empty() {
         return "No runs found for this node.".to_string();
     }
-    let turn_sequences = load_primary_session_turn_sequences(conn, job_id).await;
     format_transcript_digest_with(
         &event_rows,
         base_uri,
         meta,
-        &turn_sequences,
+        turn_sequences,
         crate::clock::host(),
         opts,
     )
@@ -1952,17 +1954,11 @@ async fn render_job_chat_digest(
 /// `cairn_models::continuation::verbatim_bytes`, so the two sides of the
 /// comparison describe the same history in the same terms.
 ///
-/// `None` when the job has no transcript to measure, which leaves the caller on
-/// native resume rather than rebuilding against a number it does not have.
+/// `None` when the job has no transcript to measure, or it could not be read,
+/// which leaves the caller on native resume rather than rebuilding against a
+/// number it does not have.
 pub(crate) async fn reseed_verbatim_baseline_bytes(db: &LocalDb, job_id: &str) -> Option<i64> {
-    let conn = connect_for_read(db).await.ok()?;
-    let event_rows = load_job_events_ordered(
-        &conn,
-        job_id,
-        db.team_id().map(|_| db.content_store().as_ref()),
-        db.private_route_db().map(|db| db.as_ref()),
-    )
-    .await;
+    let event_rows = load_job_events_ordered(db, job_id).await.ok()?;
     if event_rows.is_empty() {
         return None;
     }
@@ -1988,23 +1984,21 @@ pub(super) async fn read_node_chat_raw(
             Ok(resolved) => resolved,
             Err(error) => return error,
         };
+    drop(conn);
 
-    render_job_chat_raw(db, &conn, &job.id, format).await
+    render_job_chat_raw(db, &job.id, format).await
 }
 
+/// Takes no connection, for the same reason as [`render_job_chat_digest`].
 pub(super) async fn render_job_chat_raw(
     db: &LocalDb,
-    conn: &cairn_db::turso::Connection,
     job_id: &str,
     format: RawTranscriptFormat,
 ) -> String {
-    let event_rows = load_job_events_ordered(
-        conn,
-        job_id,
-        db.team_id().map(|_| db.content_store().as_ref()),
-        db.private_route_db().map(|db| db.as_ref()),
-    )
-    .await;
+    let event_rows = match load_job_events_ordered(db, job_id).await {
+        Ok(rows) => rows,
+        Err(error) => return format!("Failed to read this node's transcript: {error}"),
+    };
     if event_rows.is_empty() {
         return match format {
             RawTranscriptFormat::Markdown => "No runs found for this node.".to_string(),
@@ -2560,17 +2554,6 @@ pub(super) async fn read_task_chat(
             Err(error) => return error,
         };
 
-    let event_rows = load_job_events_ordered(
-        &conn,
-        &task_job.id,
-        db.team_id().map(|_| db.content_store().as_ref()),
-        db.private_route_db().map(|db| db.as_ref()),
-    )
-    .await;
-    if event_rows.is_empty() {
-        return "No runs found for this task.".to_string();
-    }
-
     let base_uri = build_task_chat_uri(
         project_key,
         number,
@@ -2579,6 +2562,15 @@ pub(super) async fn read_task_chat(
         task_name,
     );
     let turn_sequences = load_primary_session_turn_sequences(&conn, &task_job.id).await;
+    drop(conn);
+
+    let event_rows = match load_job_events_ordered(db, &task_job.id).await {
+        Ok(rows) => rows,
+        Err(error) => return format!("Failed to read this task's transcript: {error}"),
+    };
+    if event_rows.is_empty() {
+        return "No runs found for this task.".to_string();
+    }
     let meta = DigestMeta {
         label: task_name,
         project: project_key,
@@ -2621,14 +2613,12 @@ pub(super) async fn read_task_chat_raw(
             Ok(resolved) => resolved,
             Err(error) => return error,
         };
+    drop(conn);
 
-    let event_rows = load_job_events_ordered(
-        &conn,
-        &task_job.id,
-        db.team_id().map(|_| db.content_store().as_ref()),
-        db.private_route_db().map(|db| db.as_ref()),
-    )
-    .await;
+    let event_rows = match load_job_events_ordered(db, &task_job.id).await {
+        Ok(rows) => rows,
+        Err(error) => return format!("Failed to read this task's transcript: {error}"),
+    };
     if event_rows.is_empty() {
         return match format {
             RawTranscriptFormat::Markdown => "No runs found for this task.".to_string(),
