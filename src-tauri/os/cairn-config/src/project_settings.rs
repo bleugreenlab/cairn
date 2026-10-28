@@ -32,9 +32,10 @@ pub struct MaterializationSettings {
 // The check/materialization-populate config value types now live in `models::project`
 // (pure serde data, no upward dependency on config). Re-exported here so every
 // `project_settings::CheckCommand`-style path keeps resolving.
+use crate::models::{read_declared_check, DeclaredCheck};
 pub use crate::models::{
-    CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector, CheckTree, CheckWhen,
-    MainCadence, PopulateConfig,
+    CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector, CheckTree, CheckVocabulary,
+    CheckWhen, MainCadence, PopulateConfig, UnsupportedCheck,
 };
 
 /// Project settings as stored in YAML file.
@@ -48,6 +49,12 @@ pub struct ProjectSettingsFile {
     pub terminal_commands: Option<Vec<TerminalCommand>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks: Option<HashMap<String, CheckCommand>>,
+    /// Declared checks this build cannot run (see [`UnsupportedCheck`]). They
+    /// are kept out of `checks`, so nothing plans them and no editor that
+    /// replaces `checks` can see them, and [`parse_project_settings`] fills
+    /// this rather than serde: a settings save writes them back verbatim.
+    #[serde(skip)]
+    pub unsupported_checks: BTreeMap<String, UnsupportedCheck>,
     /// Inputs of a dependency-graph NODE that no manifest edge expresses, keyed
     /// by the same `rust:<crate>` / `ts:<package>` token a check's `scope` uses.
     /// Attaching them to the node rather than to a check makes them compose
@@ -186,8 +193,10 @@ struct LegacyProjectSettingsFile {
     copy_files: Option<Vec<String>>,
     #[serde(default)]
     terminal_commands: Option<Vec<LegacyTerminalCommand>>,
+    /// Read entry by entry under the build's vocabulary, so one value this
+    /// build does not know costs only the check that carries it.
     #[serde(default)]
-    checks: Option<HashMap<String, CheckCommand>>,
+    checks: Option<BTreeMap<String, serde_yaml::Value>>,
     #[serde(default)]
     extra_inputs: Option<HashMap<String, Vec<String>>>,
     #[serde(default)]
@@ -356,10 +365,12 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
     }
 }
 
-fn parse_project_settings_bytes(
+/// The config document's YAML root, after the checks every reader shares:
+/// UTF-8, well-formed YAML, and a mapping (or the comment-only null root).
+fn parse_project_config_root<'a>(
     path: &Path,
-    bytes: &[u8],
-) -> Result<(ProjectSettingsFile, ProjectConfigMigration), ProjectConfigError> {
+    bytes: &'a [u8],
+) -> Result<(&'a str, serde_yaml::Value), ProjectConfigError> {
     let content = std::str::from_utf8(bytes).map_err(|error| ProjectConfigError::InvalidUtf8 {
         path: path.to_path_buf(),
         source: error.to_string(),
@@ -381,6 +392,14 @@ fn parse_project_settings_bytes(
             path: path.to_path_buf(),
         });
     }
+    Ok((content, root))
+}
+
+fn parse_project_settings_bytes(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(ProjectSettingsFile, ProjectConfigMigration), ProjectConfigError> {
+    let (content, _root) = parse_project_config_root(path, bytes)?;
     let (settings, legacy) =
         parse_project_settings(content).map_err(|source| ProjectConfigError::Parse {
             path: path.to_path_buf(),
@@ -406,6 +425,15 @@ fn parse_project_settings_bytes(
 /// fields were found. A commit-sourced caller ignores the migration flag: a
 /// sealed commit is not something to rewrite.
 pub fn parse_project_settings(content: &str) -> Result<(ProjectSettingsFile, bool), String> {
+    parse_project_settings_under(content, &CheckVocabulary::this_build())
+}
+
+/// [`parse_project_settings`] under an explicit check vocabulary, which is how
+/// a test stands in for a build older than the config it reads.
+fn parse_project_settings_under(
+    content: &str,
+    vocabulary: &CheckVocabulary,
+) -> Result<(ProjectSettingsFile, bool), String> {
     // First try to parse as legacy format to detect deprecated fields
     let legacy: LegacyProjectSettingsFile = serde_yaml::from_str(content)
         .map_err(|e| format!("Failed to parse project config file: {}", e))?;
@@ -434,6 +462,29 @@ pub fn parse_project_settings(content: &str) -> Result<(ProjectSettingsFile, boo
     let needs_migration =
         has_ci_commands || has_copy_files || has_persistent || has_legacy_seed_ignored;
 
+    let mut checks = None;
+    let mut unsupported_checks = BTreeMap::new();
+    if let Some(declared) = legacy.checks {
+        let mut supported = HashMap::with_capacity(declared.len());
+        for (name, entry) in declared {
+            match read_declared_check(entry, vocabulary) {
+                Ok(DeclaredCheck::Supported(check)) => {
+                    supported.insert(name, check);
+                }
+                Ok(DeclaredCheck::Unsupported(unsupported)) => {
+                    unsupported_checks.insert(name, unsupported);
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Failed to parse project config file: checks.{name}: {error}"
+                    ))
+                }
+            }
+        }
+        note_unsupported_checks(&unsupported_checks);
+        checks = Some(supported);
+    }
+
     // Convert to current format (dropping deprecated fields)
     let mut settings = ProjectSettingsFile {
         setup_commands: legacy.setup_commands,
@@ -445,7 +496,8 @@ pub fn parse_project_settings(content: &str) -> Result<(ProjectSettingsFile, boo
                 })
                 .collect()
         }),
-        checks: legacy.checks,
+        checks,
+        unsupported_checks,
         extra_inputs: legacy.extra_inputs,
         default_branch: legacy.default_branch,
         references: legacy.references,
@@ -466,6 +518,28 @@ pub fn parse_project_settings(content: &str) -> Result<(ProjectSettingsFile, boo
     Ok((settings, needs_migration))
 }
 
+/// Log each unsupported check once per process. The config is parsed on every
+/// projection and cadence, so logging per parse would repeat the same line
+/// for as long as the build and the file disagree.
+fn note_unsupported_checks(unsupported: &BTreeMap<String, UnsupportedCheck>) {
+    static NOTED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    if unsupported.is_empty() {
+        return;
+    }
+    let mut noted = NOTED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (name, check) in unsupported {
+        if noted.insert(format!("{name}\0{}\0{}", check.field, check.value)) {
+            log::warn!(
+                "project config: check `{name}` is skipped: {}",
+                check.notice
+            );
+        }
+    }
+}
+
 /// Load the project's terminal commands.
 ///
 /// Reads `[project_path]/.cairn/config.yaml` directly without the migration
@@ -477,23 +551,63 @@ pub fn load_terminal_commands(project_path: &Path) -> Vec<crate::models::Termina
         .unwrap_or_default()
 }
 
-/// Load the project's canonical executor setup commands without rewriting config.
+/// The project's canonical executor setup: what placing ANY batch in the
+/// project reads from the live primary checkout.
 ///
-/// Build-slot submission uses this against the live primary checkout. Unlike
-/// [`load_project_settings_read_only`], errors remain visible so an unreadable or invalid
-/// setup policy fails as infrastructure before any command reaches an executor.
+/// Unlike [`load_project_settings_read_only`], errors remain visible so an
+/// unreadable or invalid setup policy fails before any command reaches an
+/// executor. Because such a failure refuses every execution in the project,
+/// this reads only the keys placement needs: a check, a backend preset, or any
+/// other section the running build cannot read must not take placement down
+/// with it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExecutionProjectPolicy {
     pub setup_commands: Vec<String>,
     pub populate: PopulateConfig,
 }
 
+/// The keys of `.cairn/config.yaml` that [`ExecutionProjectPolicy`] is read
+/// from. Every other key is ignored here.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecutionPolicySection {
+    #[serde(default)]
+    setup_commands: Option<Vec<String>>,
+    #[serde(default)]
+    materialization: Option<MaterializationSettings>,
+}
+
 pub fn load_execution_project_policy(
     project_path: &Path,
 ) -> Result<ExecutionProjectPolicy, String> {
-    load_project_settings_file(project_path).map(|(file, _)| ExecutionProjectPolicy {
-        setup_commands: file.setup_commands.unwrap_or_default(),
-        populate: file.materialization.unwrap_or_default().populate,
+    let path = get_project_config_path(project_path);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ExecutionProjectPolicy::default())
+        }
+        Err(error) => {
+            return Err(ProjectConfigError::Read {
+                path,
+                source: error.to_string(),
+            }
+            .to_string())
+        }
+    };
+    let (_, root) = parse_project_config_root(&path, &bytes).map_err(|error| error.to_string())?;
+    let section = match root {
+        serde_yaml::Value::Null => ExecutionPolicySection::default(),
+        root => serde_yaml::from_value::<ExecutionPolicySection>(root).map_err(|error| {
+            ProjectConfigError::Parse {
+                path: path.clone(),
+                source: error.to_string(),
+            }
+            .to_string()
+        })?,
+    };
+    Ok(ExecutionProjectPolicy {
+        setup_commands: section.setup_commands.unwrap_or_default(),
+        populate: section.materialization.unwrap_or_default().populate,
     })
 }
 
@@ -521,6 +635,9 @@ pub fn load_checks(project_path: &Path) -> Option<HashMap<String, CheckCommand>>
 pub struct ChecksContract {
     pub checks: HashMap<String, CheckCommand>,
     pub extra_inputs: HashMap<String, Vec<String>>,
+    /// Declared checks this build cannot run. Never planned; carried so every
+    /// surface that lists the contract can say why they are not running.
+    pub unsupported: BTreeMap<String, UnsupportedCheck>,
 }
 
 /// Load the checks contract from a CHECKOUT without migrating. See [`load_checks`]
@@ -546,6 +663,7 @@ pub fn checks_contract_from(file: ProjectSettingsFile) -> Option<ChecksContract>
     Some(ChecksContract {
         checks,
         extra_inputs: file.extra_inputs.unwrap_or_default(),
+        unsupported: file.unsupported_checks,
     })
 }
 
@@ -824,17 +942,45 @@ pub fn save_project_settings(
     .map_err(|error| error.to_string())
 }
 
+/// The settings as the document they render to: the typed fields, plus every
+/// unsupported check written back exactly as it was declared. A check the
+/// caller declared under the same name replaces it, since that is an edit of
+/// the check rather than a failure to read it.
+fn settings_document(
+    path: &Path,
+    settings: &ProjectSettingsFile,
+) -> Result<serde_yaml::Value, ProjectConfigError> {
+    let mut document =
+        serde_yaml::to_value(settings).map_err(|error| ProjectConfigError::Render {
+            path: path.to_path_buf(),
+            source: error.to_string(),
+        })?;
+    if settings.unsupported_checks.is_empty() {
+        return Ok(document);
+    }
+    let serde_yaml::Value::Mapping(root) = &mut document else {
+        return Ok(document);
+    };
+    let checks = root
+        .entry(serde_yaml::Value::String("checks".to_string()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+    if let serde_yaml::Value::Mapping(checks) = checks {
+        for (name, unsupported) in &settings.unsupported_checks {
+            checks
+                .entry(serde_yaml::Value::String(name.clone()))
+                .or_insert_with(|| unsupported.declared.clone());
+        }
+    }
+    Ok(document)
+}
+
 fn render_settings_yaml(
     path: &Path,
     original: Option<&[u8]>,
     existing_nonempty: bool,
     settings: &ProjectSettingsFile,
 ) -> Result<String, ProjectConfigError> {
-    let target_value =
-        serde_yaml::to_value(settings).map_err(|error| ProjectConfigError::Render {
-            path: path.to_path_buf(),
-            source: error.to_string(),
-        })?;
+    let target_value = settings_document(path, settings)?;
     let target_mapping = match &target_value {
         serde_yaml::Value::Mapping(m) => m,
         _ => {
@@ -858,10 +1004,11 @@ fn render_settings_yaml(
             });
     }
 
-    let yaml = serde_yaml::to_string(settings).map_err(|error| ProjectConfigError::Render {
-        path: path.to_path_buf(),
-        source: error.to_string(),
-    })?;
+    let yaml =
+        serde_yaml::to_string(&target_value).map_err(|error| ProjectConfigError::Render {
+            path: path.to_path_buf(),
+            source: error.to_string(),
+        })?;
     Ok(format!("# Cairn Project Configuration\n{}", yaml))
 }
 
@@ -1319,6 +1466,141 @@ checks:
         assert_eq!(
             settings.checks.unwrap().get("frontend").unwrap().when,
             CheckWhen::Review
+        );
+    }
+
+    /// The `landing-compile` check #4311 added to this repository's config,
+    /// which the app running at the time could not parse.
+    const LANDING_COMPILE: &str = r#"
+command: cargo check --manifest-path src-tauri/Cargo.toml --workspace --exclude cairn --tests --locked
+executor:
+  requiredToolchains:
+  - bun
+  - rust
+verdictPlatforms:
+- linux
+when: landing
+budgetSeconds: 600
+timeout: 1800
+impact:
+- src-tauri/**
+- .cairn/config.yaml
+"#;
+
+    /// This repository's own `.cairn/config.yaml` with `landing-compile` in it.
+    fn repository_config_with_landing_compile() -> (String, usize) {
+        let repository = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../.cairn/config.yaml"
+        ));
+        let mut document: serde_yaml::Value = serde_yaml::from_str(repository).unwrap();
+        let checks = document
+            .get_mut("checks")
+            .and_then(serde_yaml::Value::as_mapping_mut)
+            .expect("the repository config declares checks");
+        checks.remove("landing-compile");
+        let others = checks.len();
+        checks.insert(
+            "landing-compile".into(),
+            serde_yaml::from_str(LANDING_COMPILE).unwrap(),
+        );
+        (serde_yaml::to_string(&document).unwrap(), others)
+    }
+
+    fn build_without_landing() -> CheckVocabulary {
+        let mut older = CheckVocabulary::this_build();
+        older.when.retain(|word| word != "landing");
+        older
+    }
+
+    #[test]
+    fn a_build_without_the_landing_cadence_sets_aside_only_that_check() {
+        let (content, others) = repository_config_with_landing_compile();
+
+        let (settings, _) = parse_project_settings_under(&content, &build_without_landing())
+            .expect("one unknown cadence must not fail the project config");
+        let unsupported = settings
+            .unsupported_checks
+            .get("landing-compile")
+            .expect("landing-compile is listed as unsupported");
+        assert_eq!(unsupported.field, "when");
+        assert_eq!(unsupported.value, "landing");
+        assert_eq!(unsupported.known, ["write", "idle", "review"]);
+        assert_eq!(settings.unsupported_checks.len(), 1);
+        let checks = settings.checks.as_ref().unwrap();
+        assert!(!checks.contains_key("landing-compile"));
+        assert_eq!(checks.len(), others, "every other check is intact");
+
+        let contract = checks_contract_from(settings).unwrap();
+        assert_eq!(contract.checks.len(), others);
+        assert!(contract.unsupported.contains_key("landing-compile"));
+
+        // This build knows the cadence, so the same file reads with nothing set aside.
+        let (current, _) = parse_project_settings(&content).unwrap();
+        assert!(current.unsupported_checks.is_empty());
+        assert_eq!(current.checks.unwrap().len(), others + 1);
+    }
+
+    #[test]
+    fn placement_policy_never_reads_the_checks_section() {
+        let temp = TempDir::new().unwrap();
+        let config_path = get_project_config_path(temp.path());
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        // A check no build could read, beside a section that is not placement's.
+        let content =
+            "setupCommands:\n  - bun install\nchecks:\n  broken:\n    when: review\nbackends: 7\n";
+        std::fs::write(&config_path, content).unwrap();
+
+        assert!(load_project_settings_strict(temp.path()).is_err());
+        let policy = load_execution_project_policy(temp.path())
+            .expect("placement reads only setupCommands and materialization");
+        assert_eq!(policy.setup_commands, vec!["bun install"]);
+
+        // The file must still be YAML: a document nothing can read refuses
+        // placement, as before.
+        std::fs::write(&config_path, "setupCommands: [unterminated").unwrap();
+        let error = load_execution_project_policy(temp.path()).unwrap_err();
+        assert!(error.contains("failed to parse project config"), "{error}");
+    }
+
+    #[test]
+    fn a_malformed_check_still_fails_the_checks_contract_by_name() {
+        let error = parse_project_settings("checks:\n  frontend:\n    when: review\n").unwrap_err();
+        assert!(error.contains("checks.frontend"), "{error}");
+        assert!(error.contains("command"), "{error}");
+    }
+
+    #[test]
+    fn a_settings_save_keeps_a_check_this_build_cannot_read() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+        let path = get_project_config_path(temp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "checks:\n  # from a newer Cairn\n  future:\n    command: cargo check\n    when: nightly\n  frontend:\n    command: vitest run\n",
+        )
+        .unwrap();
+
+        let (loaded, _) = load_project_settings_strict(temp.path()).unwrap();
+        assert!(loaded.unsupported_checks.contains_key("future"));
+        // The settings editor saves the whole map of the checks it can show.
+        mutate_project_settings(temp.path(), |settings| {
+            let mut checks = settings.checks.clone().unwrap();
+            checks.get_mut("frontend").unwrap().policy = CheckPolicy::Gate;
+            settings.checks = Some(checks);
+            Ok(())
+        })
+        .unwrap();
+
+        let rendered = std::fs::read_to_string(&path).unwrap();
+        assert!(rendered.contains("when: nightly"), "{rendered}");
+        assert!(rendered.contains("# from a newer Cairn"), "{rendered}");
+        let (reloaded, _) = load_project_settings_strict(temp.path()).unwrap();
+        assert_eq!(reloaded.unsupported_checks["future"].value, "nightly");
+        assert_eq!(
+            reloaded.checks.unwrap()["frontend"].policy,
+            CheckPolicy::Gate
         );
     }
 

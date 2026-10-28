@@ -1338,10 +1338,12 @@ async fn check_verdict_coordinate(
         .await
         .ok()?;
     let CommitChecksContract {
-        contract: ChecksContract {
-            checks,
-            extra_inputs,
-        },
+        contract:
+            ChecksContract {
+                checks,
+                extra_inputs,
+                ..
+            },
         ..
     } = load_checks_contract_at_commit(&repository, &commit).await?;
     let check = checks.get(check_name)?;

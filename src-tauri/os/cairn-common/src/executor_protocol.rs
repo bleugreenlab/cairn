@@ -5081,6 +5081,16 @@ pub struct LearnedResourceEstimate {
 /// executor would fall back to the cloud catalog as it does for any 422. That
 /// pairing does not last, because executors take the runner's own build by
 /// build hash (`UpdateDirected`).
+///
+/// cairn/5403 does not move the number. It changes how the runner reads the
+/// project's `.cairn/config.yaml` before it builds a request: placement reads
+/// only `setupCommands` and `materialization`, and a check carrying a value
+/// this build does not know is set aside instead of failing the file. The
+/// setup commands and populate rules a request carries keep their shape and
+/// meaning. The one runner-emitted change is the sentence in an existing
+/// `CellOutcome::Unavailable` diagnostic for an unloadable config, which no
+/// executor reads. What a runner gets wrong talking to an older executor:
+/// nothing, because no message either peer sends has changed.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 157;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.

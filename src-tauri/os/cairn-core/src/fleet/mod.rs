@@ -10616,7 +10616,7 @@ impl Fleet {
             crate::config::project_settings::load_execution_project_policy(Path::new(project_path))
                 .map_err(|error| CellOutcome::Unavailable {
                     reason: CellUnavailableReason::Preparation,
-                    diagnostic: format!("load canonical project execution policy: {error}"),
+                    diagnostic: project_config_refusal(&error),
                 })?;
         self.stamp_project_requirements(request, &project_policy.setup_commands, project_path);
         Ok(PreparedExecution {
@@ -12845,6 +12845,23 @@ pub(crate) struct PlacementScope<'a> {
     pub(crate) project_requirements: &'a ProjectPlacementRequirements,
     /// The class of work asking, which a machine's role accepts or refuses.
     pub(crate) work_class: PlacementWorkClass,
+}
+
+/// The opening of every refusal caused by a project config that cannot be
+/// loaded. The surface that renders a refusal leads with this sentence, not
+/// with its environment framing, because the fault is a file in the
+/// repository rather than any machine.
+pub(crate) const PROJECT_CONFIG_REFUSAL: &str =
+    "this project's .cairn/config.yaml refuses every execution in the project";
+
+/// The refusal for a project whose canonical execution policy cannot be
+/// loaded: every batch, check lane, and terminal in the project is refused
+/// until the file loads, so the sentence says that before it says why.
+pub(crate) fn project_config_refusal(error: &str) -> String {
+    format!(
+        "{PROJECT_CONFIG_REFUSAL} until it loads, because {error}. Fix or revert the file, \
+         or run a Cairn build that understands it"
+    )
 }
 
 /// A project's placement requirements as its checkout at `project_path`
@@ -20857,7 +20874,8 @@ mod tests {
             CellOutcome::Unavailable {
                 reason: CellUnavailableReason::Preparation,
                 ref diagnostic,
-            } if diagnostic.contains("load canonical project execution policy")
+            } if diagnostic.starts_with(PROJECT_CONFIG_REFUSAL)
+                && diagnostic.contains("failed to parse project config")
         ));
         // Attach states the runner's drain posture, so an empty channel is not
         // the available evidence. What this guards is that a refused request

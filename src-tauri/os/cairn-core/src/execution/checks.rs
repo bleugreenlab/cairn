@@ -1036,10 +1036,12 @@ pub(crate) async fn resolve_check_contract_at_commit(
     } = target;
     let repository = PathBuf::from(&repository_path);
     let CommitChecksContract {
-        contract: ChecksContract {
-            checks,
-            extra_inputs,
-        },
+        contract:
+            ChecksContract {
+                checks,
+                extra_inputs,
+                unsupported,
+            },
         defined_by_commit,
     } = load_checks_contract_at_commit_detailed(&repository, &commit)
         .await
@@ -1050,7 +1052,10 @@ pub(crate) async fn resolve_check_contract_at_commit(
     );
     let check = checks
         .get(check_name)
-        .ok_or_else(|| format!("configured check {check_name:?} was not found"))?;
+        .ok_or_else(|| match unsupported.get(check_name) {
+            Some(unsupported) => format!("check {check_name:?} {}", unsupported.notice),
+            None => format!("configured check {check_name:?} was not found"),
+        })?;
     // Refused here, before anything is planned: a request this check cannot
     // answer must not cost a tree read, let alone a lane.
     let placement = crate::execution::check_placement::resolve_check_placement(
@@ -5734,10 +5739,12 @@ async fn run_write_checks_after_seal_inner(
     // (CAIRN-3333). A project-level Settings edit takes effect for a job on the
     // first commit that contains it.
     let CommitChecksContract {
-        contract: ChecksContract {
-            checks,
-            extra_inputs,
-        },
+        contract:
+            ChecksContract {
+                checks,
+                extra_inputs,
+                ..
+            },
         defined_by_commit,
     } = load_checks_contract_at_commit(&logical.object_repository_path, &logical.commit_id).await?;
     if checks.is_empty() {
@@ -9688,10 +9695,12 @@ pub(crate) async fn run_prospective_tree_checks(
     // not from the project checkout: the combined tree is what merges, so the
     // checks it must satisfy are the ones that tree declares.
     let Some(CommitChecksContract {
-        contract: ChecksContract {
-            checks,
-            extra_inputs,
-        },
+        contract:
+            ChecksContract {
+                checks,
+                extra_inputs,
+                ..
+            },
         defined_by_commit,
     }) = load_checks_contract_at_commit(Path::new(repository), commit_id).await
     else {
@@ -10747,6 +10756,7 @@ mod tests {
                     ChecksContract {
                         checks,
                         extra_inputs,
+                        ..
                     },
                 defined_by_commit,
             } = load_checks_contract_at_commit(repo, commit)
@@ -10916,6 +10926,7 @@ fi
                 ChecksContract {
                     checks,
                     extra_inputs,
+                    ..
                 },
             defined_by_commit,
         } = load_checks_contract_at_commit(&repo, &commit)

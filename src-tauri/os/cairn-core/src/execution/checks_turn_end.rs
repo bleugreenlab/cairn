@@ -1914,6 +1914,10 @@ fn push_check_lines(
             NodeCheckState::NotApplicable => {
                 out.push_str(&format!("- {}: not applicable\n", status.name));
             }
+            NodeCheckState::Unsupported => {
+                let notice = status.notice.as_deref().unwrap_or("needs a newer Cairn");
+                out.push_str(&format!("- {}: {notice}\n", status.name));
+            }
         }
     }
 }
@@ -2593,6 +2597,7 @@ mod tests {
             suppressed_after: None,
             executor: None,
             verified_on: None,
+            notice: None,
         }
     }
 

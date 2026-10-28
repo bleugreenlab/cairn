@@ -2,6 +2,7 @@
 
 use cairn_common::executor_protocol::ExecutorSelector;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,7 +96,15 @@ pub struct Project {
     pub repo_cloned: bool,
     /// Whether this project represents the Cairn workspace config root.
     pub is_workspace: bool,
+    /// Checks `.cairn/config.yaml` declares that this build cannot run, keyed by
+    /// check name. They are absent from `checks`, never planned, and kept in the
+    /// file by every settings save.
+    #[serde(default)]
+    pub unsupported_checks: BTreeMap<String, UnsupportedCheck>,
 }
+
+/// The platform families a check's `verdictPlatforms` may name.
+pub const VERDICT_PLATFORMS: &[&str] = &["macos", "linux", "windows"];
 
 fn deserialize_verdict_platforms<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
@@ -114,7 +123,7 @@ where
                 "verdictPlatforms entries must not be blank",
             ));
         }
-        if !matches!(platform.as_str(), "macos" | "linux" | "windows") {
+        if !VERDICT_PLATFORMS.contains(&platform.as_str()) {
             return Err(D::Error::custom(format!(
                 "unsupported verdict platform {value:?}; expected macos, linux, or windows"
             )));
@@ -520,5 +529,313 @@ impl CheckWhen {
             CheckWhen::Review => "review",
             CheckWhen::Landing => "landing",
         }
+    }
+}
+
+/// A declared check this build declines to run, because one of its fields
+/// carries a value outside the vocabulary the build was compiled with.
+///
+/// `.cairn/config.yaml` lives in the repository, so it can be newer than the
+/// running app: a merge can add a cadence before the app that reads it is
+/// rebuilt. That config is not wrong, and the build cannot correct it, so the
+/// one check that uses the value is set aside with this record and everything
+/// else in the file loads as usual. This is deliberately unlike the rule for a
+/// caller's own input, which is refused because the caller can fix it now.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnsupportedCheck {
+    /// The field holding the value, as written in the check entry.
+    pub field: String,
+    /// The value as written. A structured value is rendered inline.
+    pub value: String,
+    /// The values this build understands for `field`; empty when the field is
+    /// structured rather than a closed list of words.
+    pub known: Vec<String>,
+    /// The sentence every surface shows for this check.
+    pub notice: String,
+    /// The entry exactly as declared, so a settings save by this build writes
+    /// it back instead of deleting a check it could not read.
+    #[serde(skip)]
+    pub declared: serde_yaml::Value,
+}
+
+impl UnsupportedCheck {
+    fn new(field: &str, value: String, known: Vec<String>, declared: serde_yaml::Value) -> Self {
+        let mut notice =
+            format!("needs a newer Cairn: `{field}: {value}` is not understood by this build");
+        if !known.is_empty() {
+            notice.push_str(&format!(" (it knows {})", known.join(", ")));
+        }
+        Self {
+            field: field.to_string(),
+            value,
+            known,
+            notice,
+            declared,
+        }
+    }
+}
+
+/// The values this build understands in each closed-vocabulary field of a
+/// check entry. [`CheckVocabulary::this_build`] reads every list off the
+/// field's own deserializer, so it cannot drift from what the build parses;
+/// a test narrows it to stand in for an older build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckVocabulary {
+    pub policy: Vec<String>,
+    pub when: Vec<String>,
+    pub resource_class: Vec<String>,
+    pub tree: Vec<String>,
+    pub verdict_platforms: Vec<String>,
+}
+
+impl CheckVocabulary {
+    pub fn this_build() -> Self {
+        Self {
+            policy: serde_variants::<CheckPolicy>(),
+            when: serde_variants::<CheckWhen>(),
+            resource_class: serde_variants::<CheckResourceClass>(),
+            tree: serde_variants::<CheckTree>(),
+            verdict_platforms: VERDICT_PLATFORMS.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    /// The first value in `declared` this vocabulary does not cover, as
+    /// (field, value, known values).
+    fn first_unknown(
+        &self,
+        declared: &serde_yaml::Value,
+    ) -> Option<(&'static str, String, Vec<String>)> {
+        let entry = declared.as_mapping()?;
+        for (field, known) in [
+            ("policy", &self.policy),
+            ("when", &self.when),
+            ("resourceClass", &self.resource_class),
+            ("tree", &self.tree),
+        ] {
+            if let Some(serde_yaml::Value::String(value)) = entry.get(field) {
+                if !known.contains(value) {
+                    return Some((field, value.clone(), known.clone()));
+                }
+            }
+        }
+        if let Some(serde_yaml::Value::Sequence(platforms)) = entry.get("verdictPlatforms") {
+            for platform in platforms {
+                let serde_yaml::Value::String(value) = platform else {
+                    continue;
+                };
+                let normalized = value.trim().to_ascii_lowercase();
+                if !normalized.is_empty() && !self.verdict_platforms.contains(&normalized) {
+                    return Some((
+                        "verdictPlatforms",
+                        value.clone(),
+                        self.verdict_platforms.clone(),
+                    ));
+                }
+            }
+        }
+        // The selector nests closed vocabularies of its own (the containment
+        // envelope's process classes and edges), so it is judged whole by the
+        // deserializer the check itself uses.
+        if let Some(executor) = entry.get("executor") {
+            if deserialize_executor_selector(executor.clone()).is_err() {
+                return Some(("executor", render_inline(executor), Vec::new()));
+            }
+        }
+        None
+    }
+}
+
+/// One declared check entry, read under a vocabulary.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeclaredCheck {
+    Supported(CheckCommand),
+    Unsupported(UnsupportedCheck),
+}
+
+/// Read one check entry. A value outside `vocabulary` sets the check aside as
+/// [`DeclaredCheck::Unsupported`]; anything else wrong with the entry, such as
+/// a missing `command`, stays an error.
+pub fn read_declared_check(
+    declared: serde_yaml::Value,
+    vocabulary: &CheckVocabulary,
+) -> Result<DeclaredCheck, serde_yaml::Error> {
+    if let Some((field, value, known)) = vocabulary.first_unknown(&declared) {
+        return Ok(DeclaredCheck::Unsupported(UnsupportedCheck::new(
+            field, value, known, declared,
+        )));
+    }
+    serde_yaml::from_value(declared).map(DeclaredCheck::Supported)
+}
+
+fn render_inline(value: &serde_yaml::Value) -> String {
+    match value {
+        serde_yaml::Value::String(value) => value.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| {
+            serde_yaml::to_string(other)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        }),
+    }
+}
+
+/// The names a derived serde enum accepts, aliases included, captured from
+/// the variant list its `Deserialize` impl hands the deserializer.
+fn serde_variants<T: serde::de::DeserializeOwned>() -> Vec<String> {
+    use serde::de::{Error, Visitor};
+
+    struct Probe<'a>(&'a mut Option<&'static [&'static str]>);
+
+    impl<'de> serde::Deserializer<'de> for Probe<'_> {
+        type Error = serde::de::value::Error;
+
+        fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
+            Err(Self::Error::custom("not an enum"))
+        }
+
+        fn deserialize_enum<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            variants: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.0 = Some(variants);
+            Err(Self::Error::custom("variants captured"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map struct identifier ignored_any
+        }
+    }
+
+    let mut variants = None;
+    let _ = T::deserialize(Probe(&mut variants));
+    variants
+        .expect("a check vocabulary field is a derived serde enum")
+        .iter()
+        .map(|variant| variant.to_string())
+        .collect()
+}
+
+#[cfg(test)]
+mod check_vocabulary_tests {
+    use super::*;
+
+    fn entry(yaml: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn this_build_vocabulary_is_what_the_enums_accept() {
+        let vocabulary = CheckVocabulary::this_build();
+        assert_eq!(vocabulary.policy, ["advisory", "gate"]);
+        // `idle` is the legacy alias of `review`; the vocabulary must accept
+        // exactly what the deserializer does, alias included.
+        assert_eq!(vocabulary.when, ["write", "idle", "review", "landing"]);
+        assert_eq!(vocabulary.resource_class, ["shared", "exclusive"]);
+        assert_eq!(vocabulary.tree, ["full", "impact"]);
+        assert_eq!(vocabulary.verdict_platforms, ["macos", "linux", "windows"]);
+    }
+
+    #[test]
+    fn every_known_word_parses_under_the_real_enum() {
+        // The vocabulary is consulted BEFORE the strict parse, so a word it
+        // lists that the enum rejected would turn an unsupported check into a
+        // malformed one.
+        let vocabulary = CheckVocabulary::this_build();
+        for (field, words) in [
+            ("policy", &vocabulary.policy),
+            ("when", &vocabulary.when),
+            ("resourceClass", &vocabulary.resource_class),
+            ("tree", &vocabulary.tree),
+        ] {
+            for word in words {
+                let declared = entry(&format!("command: x\n{field}: {word}\n"));
+                assert!(
+                    matches!(
+                        read_declared_check(declared, &vocabulary),
+                        Ok(DeclaredCheck::Supported(_))
+                    ),
+                    "{field}: {word}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_word_an_older_build_lacks_sets_the_check_aside_with_its_value() {
+        let mut older = CheckVocabulary::this_build();
+        older.when.retain(|word| word != "landing");
+        let declared = entry("command: cargo check\nwhen: landing\nbudgetSeconds: 600\n");
+        let DeclaredCheck::Unsupported(unsupported) =
+            read_declared_check(declared.clone(), &older).unwrap()
+        else {
+            panic!("`when: landing` must be unsupported under a build without it");
+        };
+        assert_eq!(unsupported.field, "when");
+        assert_eq!(unsupported.value, "landing");
+        assert_eq!(unsupported.known, ["write", "idle", "review"]);
+        assert_eq!(
+            unsupported.notice,
+            "needs a newer Cairn: `when: landing` is not understood by this build \
+             (it knows write, idle, review)"
+        );
+        assert_eq!(unsupported.declared, declared);
+    }
+
+    #[test]
+    fn every_closed_field_is_covered() {
+        let vocabulary = CheckVocabulary::this_build();
+        for (yaml, field, value) in [
+            ("command: x\npolicy: blocking\n", "policy", "blocking"),
+            ("command: x\nwhen: nightly\n", "when", "nightly"),
+            ("command: x\nresourceClass: gpu\n", "resourceClass", "gpu"),
+            ("command: x\ntree: sparse\n", "tree", "sparse"),
+            (
+                "command: x\nverdictPlatforms: [linux, freebsd]\n",
+                "verdictPlatforms",
+                "freebsd",
+            ),
+        ] {
+            let DeclaredCheck::Unsupported(unsupported) =
+                read_declared_check(entry(yaml), &vocabulary).unwrap()
+            else {
+                panic!("{yaml} must be unsupported");
+            };
+            assert_eq!(
+                (unsupported.field.as_str(), unsupported.value.as_str()),
+                (field, value)
+            );
+        }
+
+        let DeclaredCheck::Unsupported(executor) = read_declared_check(
+            entry(
+                "command: x\nexecutor:\n  containment:\n    processClass: quantum\n    edges: []\n",
+            ),
+            &vocabulary,
+        )
+        .unwrap() else {
+            panic!("a selector this build cannot read must be unsupported");
+        };
+        assert_eq!(executor.field, "executor");
+        assert!(executor.value.contains("quantum"), "{}", executor.value);
+        assert!(executor.known.is_empty());
+        assert!(!executor.notice.contains("it knows"), "{}", executor.notice);
+    }
+
+    #[test]
+    fn a_malformed_entry_is_still_an_error() {
+        let vocabulary = CheckVocabulary::this_build();
+        assert!(read_declared_check(entry("when: review\n"), &vocabulary).is_err());
+        // A non-word where a word belongs is malformed, not a newer word.
+        assert!(read_declared_check(entry("command: x\nwhen: 3\n"), &vocabulary).is_err());
+        // The retired build-slot scalar is still tolerated, not unsupported.
+        assert!(matches!(
+            read_declared_check(entry("command: x\nexecutor: build-slot\n"), &vocabulary),
+            Ok(DeclaredCheck::Supported(_))
+        ));
     }
 }

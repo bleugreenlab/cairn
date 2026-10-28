@@ -52,10 +52,11 @@ pub use workspace::{
 
 // Project types
 pub use project::{
-    CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector, CheckTree, CheckWhen,
-    CreateProject, HumanBaseMergePolicy, HumanBaseMergePolicyError, HumanBaseMergePolicyReadState,
-    HumanBaseMergePolicyState, MainCadence, MoveProject, PopulateConfig, Project,
-    ProjectRemoteStatus, TerminalCommand, UpdateProject,
+    read_declared_check, CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector,
+    CheckTree, CheckVocabulary, CheckWhen, CreateProject, DeclaredCheck, HumanBaseMergePolicy,
+    HumanBaseMergePolicyError, HumanBaseMergePolicyReadState, HumanBaseMergePolicyState,
+    MainCadence, MoveProject, PopulateConfig, Project, ProjectRemoteStatus, TerminalCommand,
+    UnsupportedCheck, UpdateProject, VERDICT_PLATFORMS,
 };
 
 // Context token snapshot types

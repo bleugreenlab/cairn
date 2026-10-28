@@ -243,7 +243,11 @@ impl ChecksSnapshot {
             "incomplete"
         } else if any(NodeCheckState::Unverified) {
             "unverified"
-        } else if !any(NodeCheckState::Passed) && any(NodeCheckState::NotApplicable) {
+        } else if !any(NodeCheckState::Passed)
+            && (any(NodeCheckState::NotApplicable) || any(NodeCheckState::Unsupported))
+        {
+            // A lane this build cannot run vouches for nothing, so a node whose
+            // only lanes are such never reads as passed.
             "not_applicable"
         } else {
             "passed"
@@ -264,6 +268,7 @@ impl ChecksSnapshot {
             (count(NodeCheckState::Failed), "failed"),
             (count(NodeCheckState::Unverified), "unverified"),
             (count(NodeCheckState::NotApplicable), "not applicable"),
+            (count(NodeCheckState::Unsupported), "need a newer Cairn"),
             (count(NodeCheckState::Running), "running"),
             (count(NodeCheckState::Pending), "no verdict"),
         ] {
@@ -292,6 +297,7 @@ impl ChecksSnapshot {
                     NodeCheckState::Failed => "failed",
                     NodeCheckState::Running => "running",
                     NodeCheckState::NotApplicable => "not applicable",
+                    NodeCheckState::Unsupported => "unsupported",
                     // A pending lane in a SETTLED snapshot is one that stopped
                     // without a verdict, so it says that rather than "pending",
                     // which would read as "still queued".
@@ -605,6 +611,7 @@ mod tests {
             suppressed_after: None,
             executor: None,
             verified_on: None,
+            notice: None,
         }
     }
 
@@ -886,6 +893,20 @@ mod tests {
             snapshot(vec![
                 lane("a", NodeCheckState::Passed),
                 lane("b", NodeCheckState::NotApplicable)
+            ])
+            .verdict(),
+            "passed"
+        );
+        // A lane this build cannot run never stands in for a pass, and never
+        // blocks one either.
+        assert_eq!(
+            snapshot(vec![lane("landing-compile", NodeCheckState::Unsupported)]).verdict(),
+            "not_applicable"
+        );
+        assert_eq!(
+            snapshot(vec![
+                lane("a", NodeCheckState::Passed),
+                lane("landing-compile", NodeCheckState::Unsupported)
             ])
             .verdict(),
             "passed"

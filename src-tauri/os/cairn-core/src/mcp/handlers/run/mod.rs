@@ -5921,10 +5921,52 @@ async fn settle_joined_batch(
             .await
         }
         PlacedBatch::Refused(refusal) => refused(format!("{refusal}.")),
-        PlacedBatch::NoEnvironment(diagnostic) => refused(format!(
-            "this job's environment could not be reached ({diagnostic})."
-        )),
+        PlacedBatch::NoEnvironment(diagnostic) => refused(no_environment_detail(&diagnostic)),
         PlacedBatch::NoRoom(detail) => refused(detail),
+    }
+}
+
+/// The sentence for a batch whose environment could not be acquired. A project
+/// config the build cannot load is not a machine fault, so that refusal is
+/// stated as itself, without the stage labels in front of it.
+fn no_environment_detail(diagnostic: &str) -> String {
+    match diagnostic.find(crate::fleet::PROJECT_CONFIG_REFUSAL) {
+        Some(start) => format!("{}.", &diagnostic[start..]),
+        None => format!("this job's environment could not be reached ({diagnostic})."),
+    }
+}
+
+#[cfg(test)]
+mod no_environment_detail_tests {
+    use super::no_environment_detail;
+
+    #[test]
+    fn an_unloadable_project_config_is_named_as_the_project_wide_refusal() {
+        let diagnostic = format!(
+            "prepare execution environment placement: {}",
+            crate::fleet::project_config_refusal(
+                "failed to parse project config at /repo/.cairn/config.yaml: \
+                 did not find expected ',' or ']' at line 1 column 28"
+            )
+        );
+        let detail = no_environment_detail(&diagnostic);
+        assert_eq!(
+            detail,
+            "this project's .cairn/config.yaml refuses every execution in the project until it \
+             loads, because failed to parse project config at /repo/.cairn/config.yaml: did not \
+             find expected ',' or ']' at line 1 column 28. Fix or revert the file, or run a \
+             Cairn build that understands it."
+        );
+        assert!(!detail.contains("could not be reached"));
+    }
+
+    #[test]
+    fn a_machine_fault_keeps_its_environment_framing() {
+        assert_eq!(
+            no_environment_detail("select execution environment executor: none attached"),
+            "this job's environment could not be reached (select execution environment \
+             executor: none attached)."
+        );
     }
 }
 

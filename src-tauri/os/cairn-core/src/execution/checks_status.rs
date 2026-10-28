@@ -1,4 +1,6 @@
-use crate::config::project_settings::{CheckCommand, CheckPolicy, CheckWhen, ChecksContract};
+use crate::config::project_settings::{
+    CheckCommand, CheckPolicy, CheckWhen, ChecksContract, UnsupportedCheck,
+};
 use crate::execution::cache::{
     list_check_results_for_job, observed_commit_for_job, resolve_job_logical_head,
     CheckResultCacheEntry, HeadVerdictKeys, OwnedHeadVerdictKeys,
@@ -22,7 +24,7 @@ use crate::jj::{logical_changed_files, logical_tree_hash, own_patch_against, Own
 use crate::orchestrator::generation_cache::GenerationCache;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -414,6 +416,10 @@ pub struct NodeCheckStatus {
     /// change, on the base that head was on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) verified_on: Option<VerifiedHead>,
+    /// Why an [`NodeCheckState::Unsupported`] lane does not run, in the words
+    /// every surface shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) notice: Option<String>,
 }
 
 /// The head, and the fork point it was on, that a lane's verdict was recorded
@@ -435,6 +441,69 @@ pub enum NodeCheckState {
     Running,
     Pending,
     NotApplicable,
+    /// Declared by the contract, but in terms this build does not understand,
+    /// so it never runs here. Not a verdict, and not "does not apply": it
+    /// would apply on a newer build.
+    Unsupported,
+}
+
+/// The lanes for the checks a contract declares that this build cannot run.
+fn unsupported_lanes<'a>(
+    job_id: &str,
+    unsupported: &'a BTreeMap<String, UnsupportedCheck>,
+) -> impl Iterator<Item = NodeCheckStatus> + 'a {
+    let job_id = job_id.to_string();
+    unsupported.iter().map(move |(name, check)| {
+        // As declared, which may itself be the word this build lacks.
+        let declared = |field: &str, default: &str| {
+            check
+                .declared
+                .get(field)
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or(default)
+                .to_string()
+        };
+        NodeCheckStatus {
+            job_id: job_id.clone(),
+            request_id: None,
+            name: name.clone(),
+            state: NodeCheckState::Unsupported,
+            policy: declared("policy", CheckPolicy::Advisory.as_str()),
+            when: declared("when", CheckWhen::Write.as_str()),
+            cached: None,
+            duration_ms: None,
+            ran_at: None,
+            passed: None,
+            failed: None,
+            skipped: None,
+            deferred: None,
+            parser: None,
+            complete: None,
+            selection: None,
+            suite_failures: None,
+            failure_names: Vec::new(),
+            output_tail: None,
+            failure_kind: None,
+            suppressed_after: None,
+            executor: None,
+            verified_on: None,
+            notice: Some(check.notice.clone()),
+        }
+    })
+}
+
+/// `statuses` with the contract's unsupported lanes among them, in name order.
+fn with_unsupported_lanes(
+    mut statuses: Vec<NodeCheckStatus>,
+    job_id: &str,
+    unsupported: &BTreeMap<String, UnsupportedCheck>,
+) -> Vec<NodeCheckStatus> {
+    if unsupported.is_empty() {
+        return statuses;
+    }
+    statuses.extend(unsupported_lanes(job_id, unsupported));
+    statuses.sort_by(|a, b| a.name.cmp(&b.name));
+    statuses
 }
 
 pub async fn node_check_statuses(
@@ -535,7 +604,7 @@ async fn live_statuses(
             .contract_at_commit(Path::new(&coords.repository_path), &logical_head)
             .await?;
         clock.lap("contract");
-        return Some(assemble_statuses(
+        let statuses = assemble_statuses(
             orch,
             job_id,
             &contract.checks,
@@ -543,6 +612,11 @@ async fn live_statuses(
             None,
             &orch.recent_turn_end_check_request_ids(job_id),
             cadence,
+        );
+        return Some(with_unsupported_lanes(
+            statuses,
+            job_id,
+            &contract.unsupported,
         ));
     };
     let plan = &status.plan;
@@ -764,7 +838,7 @@ async fn settled_statuses(
         .await?;
     clock.lap("contract");
     if contract.checks.is_empty() {
-        return Some(Vec::new());
+        return Some(unsupported_lanes(job_id, &contract.unsupported).collect());
     }
 
     // Status resolution waits on jj, cargo metadata, and the synchronous cache
@@ -887,7 +961,7 @@ async fn settled_statuses(
     clock.lap("blocking");
     clock.record("blocking.head_verdicts", verdicts_elapsed);
 
-    Some(assemble_statuses(
+    let statuses = assemble_statuses(
         orch,
         job_id,
         &contract.checks,
@@ -898,6 +972,11 @@ async fn settled_statuses(
         applicable_names.as_ref(),
         &orch.recent_turn_end_check_request_ids(job_id),
         cadence,
+    );
+    Some(with_unsupported_lanes(
+        statuses,
+        job_id,
+        &contract.unsupported,
     ))
 }
 
@@ -1022,6 +1101,7 @@ fn assemble_statuses(
                 suppressed_after: None,
                 executor: None,
                 verified_on: None,
+                notice: None,
             }
         })
         .collect()
@@ -1216,6 +1296,7 @@ fn status_from_row(
             .then_some(row.infra_failure_streak),
         executor,
         verified_on: None,
+        notice: None,
     }
 }
 
@@ -1242,6 +1323,9 @@ pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<Strin
     // dress the absence of a result up as one.
     if status.suppressed_after.is_some() {
         return Some("suppressed".to_string());
+    }
+    if status.state == NodeCheckState::Unsupported {
+        return status.notice.clone();
     }
     let mut parts = Vec::new();
     match status.state {
@@ -1649,6 +1733,37 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn a_check_this_build_cannot_run_is_an_unsupported_lane_with_its_notice() {
+        let mut older = crate::models::CheckVocabulary::this_build();
+        older.when.retain(|word| word != "landing");
+        let declared: serde_yaml::Value =
+            serde_yaml::from_str("command: cargo check\nwhen: landing\npolicy: gate\n").unwrap();
+        let crate::models::DeclaredCheck::Unsupported(unsupported) =
+            crate::models::read_declared_check(declared, &older).unwrap()
+        else {
+            panic!("`when: landing` is unsupported without the variant");
+        };
+        let set = BTreeMap::from([("landing-compile".to_string(), unsupported)]);
+
+        let lanes = with_unsupported_lanes(Vec::new(), "job", &set);
+        assert_eq!(lanes.len(), 1);
+        let lane = &lanes[0];
+        assert_eq!(lane.state, NodeCheckState::Unsupported);
+        assert_eq!(lane.when, "landing");
+        assert_eq!(lane.policy, "gate");
+        let notice = format_status_annotation(lane).unwrap();
+        assert!(
+            notice.starts_with(
+                "needs a newer Cairn: `when: landing` is not understood by this build"
+            ),
+            "{notice}"
+        );
+        let json = serde_json::to_value(lane).unwrap();
+        assert_eq!(json["state"], "unsupported");
+        assert_eq!(json["notice"], serde_json::Value::String(notice));
+    }
 
     #[test]
     fn node_check_read_branches_are_counted_independently() {
@@ -2450,6 +2565,7 @@ mod tests {
             suppressed_after: None,
             executor: None,
             verified_on: None,
+            notice: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -2514,6 +2630,7 @@ mod tests {
             suppressed_after: None,
             executor: None,
             verified_on: None,
+            notice: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -2600,6 +2717,7 @@ mod tests {
             suppressed_after: None,
             executor: None,
             verified_on: None,
+            notice: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -2641,6 +2759,7 @@ mod tests {
             suppressed_after: None,
             executor: None,
             verified_on: None,
+            notice: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -2691,6 +2810,7 @@ mod tests {
             suppressed_after: None,
             executor: None,
             verified_on: None,
+            notice: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -2772,6 +2892,7 @@ mod tests {
             suppressed_after: Some(3),
             executor: None,
             verified_on: None,
+            notice: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -2871,6 +2992,7 @@ mod tests {
             suppressed_after: None,
             executor: None,
             verified_on: None,
+            notice: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
