@@ -5066,6 +5066,21 @@ pub struct LearnedResourceEstimate {
 /// of a doc comment. Check refs live in the runner's repository and an executor
 /// never names one. What a runner gets wrong talking to an older executor:
 /// nothing; no frame, field or value changes.
+///
+/// cairn/5116 does not move the number. The executor's managed object cache
+/// changes only on the executor's own disk: its manifest drops per-pack object
+/// lists, eviction runs between volume-derived watermarks and consolidates
+/// instead of rewriting, and the `haves` an object fetch sends now lead with
+/// the checkouts' heads. The fetch request keeps its shape (`haveCommits`,
+/// still at most 64 ids), so only which commits fill it changes. The runner's
+/// object fetch now drops a have its store does not hold instead of answering
+/// 422, which makes the object channel more tolerant, not different. What a
+/// runner gets wrong talking to an older executor: nothing; that executor
+/// still sends only pack roots, which a runner holds. An older runner talking
+/// to a newer executor could refuse an unknown head with 422, and the
+/// executor would fall back to the cloud catalog as it does for any 422. That
+/// pairing does not last, because executors take the runner's own build by
+/// build hash (`UpdateDirected`).
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 157;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.

@@ -183,6 +183,35 @@ pub fn build_reachable_pack(
     build_pack_from_oids(repository, &object_ids).map(Some)
 }
 
+/// The commits among `candidates` that `repository` holds, in their order.
+///
+/// A have the store does not know cannot narrow a pack, and handed to
+/// `rev-list --not` it fails the whole walk, so a fetch filters its haves
+/// through this first. The executor offers its checkouts' heads, and a head
+/// can be a commit sealed there and not yet received here.
+pub fn known_commits(repository: &Path, candidates: &[String]) -> Result<Vec<String>, String> {
+    validate_oids(candidates)?;
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut input = candidates.join("\n");
+    input.push('\n');
+    let checked = git(
+        repository,
+        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        Some(input.as_bytes()),
+        &[],
+    )?;
+    Ok(checked
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let oid = fields.next()?;
+            (fields.next() == Some("commit")).then(|| oid.to_owned())
+        })
+        .collect())
+}
+
 /// Build the complete AllowDelta object range `base_commit..delta_commit`.
 pub fn build_delta_pack(
     repository: &Path,

@@ -181,6 +181,10 @@ impl RunnerFetch {
 }
 
 /// Read-only runner-local pack construction. Call without the project-store lock.
+///
+/// A have this store does not hold narrows nothing and is dropped, rather
+/// than failing the fetch: an executor offers its checkouts' heads, and one
+/// may stand on a commit it sealed that has not reached this runner.
 pub fn build_local_reachable_pack(
     repository: &Path,
     want_commit: &str,
@@ -188,8 +192,9 @@ pub fn build_local_reachable_pack(
 ) -> Result<RunnerFetch, String> {
     let wants = [want_commit.to_owned()];
     let shallow_boundary = cairn_codec::transfer::shallow_boundary(repository, want_commit)?;
+    let haves = cairn_codec::transfer::known_commits(repository, have_commits)?;
     let Some((pack, builder_index)) =
-        cairn_codec::transfer::build_reachable_pack(repository, &wants, have_commits)?
+        cairn_codec::transfer::build_reachable_pack(repository, &wants, &haves)?
     else {
         return Ok(RunnerFetch {
             pack: None,
@@ -541,6 +546,55 @@ fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
 mod tests {
     use super::*;
     use cairn_common::executor_protocol::{GitObjectFormat, RepositoryIdentity};
+
+    /// An executor's checkout can stand on a commit it sealed that has not
+    /// reached the runner yet. Offered as a have, that commit used to fail the
+    /// whole fetch with a 422; it now narrows nothing, and a have the runner
+    /// does hold still narrows the pack to what the executor lacks.
+    #[test]
+    fn an_unknown_have_does_not_fail_the_fetch_and_a_known_one_narrows_it() {
+        const UNKNOWN: &str = "1111111111111111111111111111111111111111";
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+                .args(args)
+                .current_dir(repository)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repository.join("base"), "base\n").unwrap();
+        git(&["add", "base"]);
+        git(&["commit", "-qm", "base"]);
+        let parent = git(&["rev-parse", "HEAD"]);
+        std::fs::write(repository.join("next"), "next\n").unwrap();
+        git(&["add", "next"]);
+        git(&["commit", "-qm", "next"]);
+        let tip = git(&["rev-parse", "HEAD"]);
+
+        let count = |haves: &[String]| {
+            build_local_reachable_pack(repository, &tip, haves)
+                .unwrap()
+                .pack
+                .unwrap()
+                .object_count
+        };
+        let full = count(&[]);
+        assert_eq!(count(&[UNKNOWN.to_string()]), full);
+        let narrowed = count(&[UNKNOWN.to_string(), parent]);
+        assert!(
+            narrowed < full,
+            "{narrowed} objects is not fewer than {full}"
+        );
+    }
 
     #[test]
     fn canonical_validator_rejects_unframed_and_corrupt_pack_bytes() {
