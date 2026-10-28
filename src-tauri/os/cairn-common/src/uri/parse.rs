@@ -116,6 +116,7 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
             id: (*id).to_string(),
         }),
         ["models", "usage"] => Some(CairnResource::ModelsUsage),
+        ["models", "embeddings"] => Some(CairnResource::ModelsEmbeddings),
         ["inference"] => Some(CairnResource::Inference),
         ["inference", "recipes"] => Some(CairnResource::InferenceRecipes),
         ["inference", "deployments"] => Some(CairnResource::InferenceDeployments),

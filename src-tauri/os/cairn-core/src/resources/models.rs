@@ -2,7 +2,11 @@
 //!
 //! Each renders an answer from [`Models`], never from the orchestrator directly,
 //! so what these pages show is exactly what the facet interface says, and a
-//! test can seed any facet it likes. Accounts are rendered from their
+//! test can seed any facet it likes. The one exception is
+//! `cairn://models/embeddings`, which renders the orchestrator's
+//! `EmbeddingStatus` handed to it as a value: that status is what the stored
+//! vectors hold, which the facet does not know, and taking it as a value keeps
+//! the renderer just as testable. Accounts are rendered from their
 //! serialized form, the same projection the settings UI receives, which is why
 //! no credential value can reach a page: it was never in the projection.
 
@@ -47,6 +51,10 @@ const INDEX: &[(&str, &str)] = &[
     (
         "cairn://models/usage",
         "each provider's capacity per account and pooled, as Settings → Analytics shows it",
+    ),
+    (
+        "cairn://models/embeddings",
+        "the embedding model and how far history is embedded in it",
     ),
     (
         "cairn://models/sessions",
@@ -1124,6 +1132,112 @@ fn pool_block(pool: &ProviderPoolSnapshot, label: &str, out: &mut String) {
     }
 }
 
+/// `1234567` as `1,234,567`.
+fn grouped(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+fn instant(millis: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| millis.to_string())
+}
+
+/// `cairn://models/embeddings`: the embedding model and how far the stored
+/// vectors are in it.
+pub(crate) fn render_embeddings(
+    status: &crate::embeddings::status::EmbeddingStatus,
+    params: &[QueryParam],
+) -> String {
+    use crate::embeddings::status::EmbeddingState;
+    const URI: &str = "cairn://models/embeddings";
+    if let Some(error) = unsupported(URI, params, &[]) {
+        return error;
+    }
+    let mut out = String::from("# Embeddings\n\n");
+    let chosen = if status.explicit {
+        "set in `embeddingModel`"
+    } else {
+        "the default; `embeddingModel` is unset"
+    };
+    let _ = writeln!(out, "- Model: `{}` ({chosen})", status.selection);
+    if let Some(space) = &status.space {
+        let width = |dims: Option<u32>| dims.map_or("native".to_string(), |dims| dims.to_string());
+        let _ = writeln!(
+            out,
+            "- Widths: turns {}, resources {}",
+            width(space.turn_dims),
+            width(space.resource_dims)
+        );
+    }
+    let state = match &status.state {
+        EmbeddingState::Running => "running".to_string(),
+        EmbeddingState::Complete => "complete".to_string(),
+        EmbeddingState::Paused {
+            since,
+            last_error,
+            retry_at,
+        } => {
+            let mut paused = String::from("paused");
+            if let Some(since) = since {
+                let _ = write!(paused, " since {}", instant(*since));
+            }
+            if let Some(error) = last_error {
+                let _ = write!(paused, "; last error: {error}");
+            }
+            let _ = write!(paused, "; next attempt {}", instant(*retry_at));
+            paused
+        }
+        EmbeddingState::Unavailable { reason } => format!("unavailable: {reason}"),
+    };
+    let _ = writeln!(out, "- State: {state}");
+    if let Some(turns) = &status.turns {
+        let _ = write!(
+            out,
+            "- Turns: {} / {}",
+            grouped(turns.embedded),
+            grouped(turns.eligible)
+        );
+        if turns.deferred > 0 {
+            let _ = write!(out, " ({} deferred)", grouped(turns.deferred));
+        }
+        out.push('\n');
+    }
+    if status.space.is_some() {
+        match &status.resources {
+            Some(resources) => {
+                let _ = writeln!(
+                    out,
+                    "- Resources: {} / {}",
+                    grouped(resources.embedded),
+                    grouped(resources.eligible)
+                );
+            }
+            None => out.push_str(
+                "- Resources: counting (the first walk in this model has not finished)\n",
+            ),
+        }
+    }
+    let history = if status.consented {
+        "all of it"
+    } else {
+        "since this install (choosing a model or connecting an account includes earlier history)"
+    };
+    let _ = writeln!(out, "- History: {history}");
+    out.push_str(
+        "\nChange the model with write cairn://settings {embeddingModel: \"provider/model\"}; null returns to the Cairn gateway. A change deletes the old model's vectors and re-embeds history.\n",
+    );
+    out
+}
+
 pub(crate) fn render_usage(facet: &dyn Models, params: &[QueryParam]) -> String {
     const URI: &str = "cairn://models/usage";
     if let Some(error) = unsupported(URI, params, &["provider", "view"]) {
@@ -1262,6 +1376,7 @@ mod tests {
         "cairn://models/usage",
         "cairn://models/usage?provider=claude",
         "cairn://models/usage?view=requests",
+        "cairn://models/embeddings",
         "cairn://models/sessions",
     ];
 

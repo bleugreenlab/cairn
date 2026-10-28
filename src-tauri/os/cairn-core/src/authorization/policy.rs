@@ -36,6 +36,9 @@ const CAPABILITY_BEARING_SETTINGS: &[&str] = &[
     "decisionModel",
     "imageModel",
     "speechModel",
+    // Which provider every transcript, issue and memory is sent to for
+    // embedding, history included once it is set explicitly.
+    "embeddingModel",
     "openrouterRouting",
     "routeCallsViaOpenRouter",
     // Commands this workspace will execute on the host.

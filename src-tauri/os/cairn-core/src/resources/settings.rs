@@ -15,6 +15,40 @@ fn yes_no(value: bool) -> &'static str {
     }
 }
 
+/// The workspace's model defaults, each unset one shown as what it means.
+fn model_defaults(settings: &crate::models::Settings) -> String {
+    let line = |key: &str, value: Option<&str>, unset: String| match value {
+        Some(model) => format!("- {key}: `{model}`\n"),
+        None => format!("- {key}: unset ({unset})\n"),
+    };
+    [
+        line(
+            "decisionModel",
+            settings.decision_model.as_deref(),
+            "the catalog's best decision offer".into(),
+        ),
+        line(
+            "imageModel",
+            settings.image_model.as_deref(),
+            "a request naming no model is refused".into(),
+        ),
+        line(
+            "speechModel",
+            settings.speech_model.as_deref(),
+            "a request naming no model is refused".into(),
+        ),
+        line(
+            "embeddingModel",
+            settings.embedding_model.as_deref(),
+            format!(
+                "`{}`",
+                crate::orchestrator::embed::default_embedding_selection()
+            ),
+        ),
+    ]
+    .concat()
+}
+
 pub(super) async fn read_settings(orch: &Orchestrator) -> String {
     let mut out = String::from("# Workspace settings\n\n");
 
@@ -67,6 +101,7 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
         settings.seed_budget_tokens
     ));
     out.push_str(&format!("- seedEras: {}\n", settings.seed_eras));
+    out.push_str(&model_defaults(&settings));
     out.push_str(&format!(
         "- externalReplies: {:?}\n\n",
         settings.external_replies
@@ -278,4 +313,40 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
     out.push('\n');
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::models::UpdateSettings;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_model_default_renders_set_or_as_what_unset_means() {
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
+        let unset = super::read_settings(&orch).await;
+        assert!(
+            unset.contains("- decisionModel: unset (the catalog's best decision offer)"),
+            "{unset}"
+        );
+        assert!(unset.contains("- imageModel: unset (a request naming no model is refused)"));
+        assert!(unset.contains("- speechModel: unset (a request naming no model is refused)"));
+        assert!(unset.contains("- embeddingModel: unset (`cairn/cohere-embed-v4`)"));
+
+        orch.update_settings(UpdateSettings {
+            decision_model: Some(Some("sm".into())),
+            image_model: Some(Some("codex/gpt-image-2".into())),
+            speech_model: Some(Some("local-tts".into())),
+            embedding_model: Some(Some("ollama/nomic-embed-text".into())),
+            ..Default::default()
+        })
+        .unwrap();
+        let set = super::read_settings(&orch).await;
+        for line in [
+            "- decisionModel: `sm`",
+            "- imageModel: `codex/gpt-image-2`",
+            "- speechModel: `local-tts`",
+            "- embeddingModel: `ollama/nomic-embed-text`",
+        ] {
+            assert!(set.contains(line), "{line} in {set}");
+        }
+    }
 }

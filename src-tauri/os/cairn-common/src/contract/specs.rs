@@ -867,6 +867,11 @@ pub(crate) const SETTINGS_SPEECH_MODEL: KeySpec = KeySpec::new(
     KeyType::Str,
     "speech model a request naming none is spoken by; null clears it, and such a request is then refused",
 );
+pub(crate) const SETTINGS_EMBEDDING_MODEL: KeySpec = KeySpec::new(
+    "embeddingModel",
+    KeyType::Str,
+    "provider/model the workspace embeds with; changing it re-embeds history; null is cairn/cohere-embed-v4",
+);
 pub(crate) const SETTINGS_MERGE_TYPE: KeySpec =
     KeySpec::new("mergeType", KeyType::Str, "squash|merge|rebase");
 pub(crate) const SETTINGS_MEMORY_REVIEW_ENABLED: KeySpec = KeySpec::new(

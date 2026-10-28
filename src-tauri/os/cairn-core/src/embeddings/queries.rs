@@ -119,6 +119,22 @@ pub async fn get_resource_embedding_async(
     .await
 }
 
+/// `uri`'s stored vector when it is of `key`'s space; `None` when absent, a
+/// marker, or of another model or width.
+pub async fn resource_vector_in_space_async(
+    db: &LocalDb,
+    uri: &str,
+    key: &crate::embeddings::VectorKey,
+) -> DbResult<Option<Vec<f32>>> {
+    db.query_opt(
+        "SELECT embedding FROM resource_embeddings
+          WHERE uri = ?1 AND model = ?2 AND dims > 0 AND (?3 IS NULL OR dims = ?3)",
+        params![uri.to_string(), key.model.clone(), key.dims.map(i64::from)],
+        |row| Ok(crate::embeddings::vector::from_bytes(&row.blob(0)?)),
+    )
+    .await
+}
+
 /// Every resource vector under a URI prefix for one model, at `dims` when it
 /// is given, as `(uri, vector)`. The prefix is compared exactly, not as a
 /// LIKE pattern, so a `_` in a project key matches only itself.
@@ -130,7 +146,8 @@ pub async fn resource_embeddings_with_prefix_async(
 ) -> DbResult<Vec<(String, Vec<f32>)>> {
     db.query_all(
         "SELECT uri, embedding FROM resource_embeddings
-         WHERE substr(uri, 1, length(?1)) = ?1 AND model = ?2 AND (?3 IS NULL OR dims = ?3)",
+         WHERE substr(uri, 1, length(?1)) = ?1 AND model = ?2 AND dims > 0
+           AND (?3 IS NULL OR dims = ?3)",
         params![prefix, model, dims],
         |row| {
             Ok((
@@ -347,37 +364,56 @@ pub async fn get_event_vibes_for_events_async(
         .collect())
 }
 
-// ===== sessions.current_pos (live semantic position) =====
+// ===== session_positions (live semantic position) =====
+//
+// `sessions.current_pos` held these before the model became a setting. That
+// column is in the team lineage, where it cannot be dropped, so it stays
+// dormant: nothing reads or writes it.
 
-/// Persist a session's live position vector (little-endian f32 bytes).
-/// A no-op UPDATE (session row absent) is harmless — the position is
-/// best-effort continuity state.
-pub(crate) async fn set_session_current_pos_async(
+/// Persist a session's live position vector (little-endian f32 bytes),
+/// folded in `model` at `dims`.
+pub(crate) async fn set_session_position_async(
     db: &LocalDb,
     session_id: &str,
     bytes: &[u8],
+    model: &str,
+    dims: u32,
 ) -> DbResult<()> {
     db.execute(
-        "UPDATE sessions SET current_pos = ?2 WHERE id = ?1",
-        params![session_id, bytes],
+        "INSERT INTO session_positions(session_id, embedding, model, dims, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(session_id) DO UPDATE SET
+             embedding = excluded.embedding,
+             model = excluded.model,
+             dims = excluded.dims,
+             updated_at = excluded.updated_at",
+        params![
+            session_id,
+            bytes,
+            model,
+            dims as i64,
+            chrono::Utc::now().timestamp()
+        ],
     )
     .await
     .map(|_| ())
 }
 
-/// Read a session's persisted live position vector, if any.
-pub(crate) async fn get_session_current_pos_async(
+/// Read a session's persisted live position, if one was folded in `model` at
+/// `dims`. A position from another space is not a position in this one.
+pub(crate) async fn get_session_position_async(
     db: &LocalDb,
     session_id: &str,
+    model: &str,
+    dims: u32,
 ) -> DbResult<Option<Vec<u8>>> {
-    let session_id = session_id.to_string();
     db.query_opt(
-        "SELECT current_pos FROM sessions WHERE id = ?1",
-        params![session_id.as_str()],
-        |row| row.opt_blob(0),
+        "SELECT embedding FROM session_positions
+          WHERE session_id = ?1 AND model = ?2 AND dims = ?3",
+        params![session_id.to_string(), model.to_string(), dims as i64],
+        |row| row.blob(0),
     )
     .await
-    .map(Option::flatten)
 }
 
 /// Resolve the node URI a session rolls its summary centroid up into.
@@ -473,51 +509,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_pos_round_trips() {
+    async fn a_session_position_round_trips_within_its_space_only() {
         let db = migrated_db().await;
-        exec(
-            &db,
-            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('proj', 'default', 'Project', 'proj', '/tmp/proj', 1, 1)",
-        )
-        .await;
-        exec(
-            &db,
-            "INSERT INTO jobs(id, project_id, status, created_at, updated_at)
-             VALUES ('job-1', 'proj', 'running', 1, 1)",
-        )
-        .await;
-        exec(
-            &db,
-            "INSERT INTO sessions(id, job_id, created_at, updated_at)
-             VALUES ('sess-1', 'job-1', 1, 1)",
-        )
-        .await;
 
         // Unset → None.
         assert_eq!(
-            get_session_current_pos_async(&db, "sess-1").await.unwrap(),
+            get_session_position_async(&db, "sess-1", "m1", 3)
+                .await
+                .unwrap(),
             None
         );
 
         let bytes = crate::embeddings::vector::to_bytes(&[0.6_f32, 0.8, -0.25]);
-        set_session_current_pos_async(&db, "sess-1", &bytes)
+        set_session_position_async(&db, "sess-1", &bytes, "m1", 3)
             .await
             .unwrap();
-        let got = get_session_current_pos_async(&db, "sess-1")
+        let got = get_session_position_async(&db, "sess-1", "m1", 3)
             .await
             .unwrap()
-            .expect("current_pos should be set");
-        assert_eq!(got, bytes);
+            .expect("the position should be set");
         assert_eq!(
             crate::embeddings::vector::from_bytes(&got),
             vec![0.6_f32, 0.8, -0.25]
         );
 
-        // Unknown session → None.
+        // Another model, another width, or another session: no position.
+        for (session, model, dims) in [("sess-1", "m2", 3), ("sess-1", "m1", 4), ("nope", "m1", 3)]
+        {
+            assert_eq!(
+                get_session_position_async(&db, session, model, dims)
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_prefix_read_returns_only_vectors_of_the_asked_space() {
+        let db = migrated_db().await;
+        let one = crate::embeddings::vector::to_bytes(&[1.0_f32]);
+        for (uri, model, dims, bytes) in [
+            ("cairn://p/k/tenets/1", "m1", 1, one.clone()),
+            ("cairn://p/k/tenets/2", "m2", 1, one.clone()),
+            ("cairn://p/k/tenets/3", "m1", 0, Vec::new()),
+        ] {
+            upsert_resource_embedding_async(&db, uri, &bytes, model, dims)
+                .await
+                .unwrap();
+        }
+        let found = resource_embeddings_with_prefix_async(&db, "cairn://p/k/tenets/", "m1", None)
+            .await
+            .unwrap();
         assert_eq!(
-            get_session_current_pos_async(&db, "nope").await.unwrap(),
-            None
+            found.into_iter().map(|(uri, _)| uri).collect::<Vec<_>>(),
+            vec!["cairn://p/k/tenets/1".to_string()]
         );
     }
 

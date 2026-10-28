@@ -175,6 +175,17 @@ impl AnonDeviceManager {
             decrypt_jwt_from_storage(&encrypted).map(Some)
         })
     }
+
+    /// Hold `jwt` as this device's registered token, as registration would.
+    #[cfg(test)]
+    pub(crate) async fn store_token_for_test(&self, jwt: &str) {
+        insert_anon_device(&self.db, "test-device").await.unwrap();
+        let encrypted = crate::account::jwt::encrypt_jwt_for_storage(jwt).unwrap();
+        let expires_at = chrono::Utc::now().timestamp() + 3600;
+        update_anon_jwt(&self.db, "test-device", &encrypted, expires_at)
+            .await
+            .unwrap();
+    }
 }
 
 /// Human-readable presence name for this machine: hostname + platform. The

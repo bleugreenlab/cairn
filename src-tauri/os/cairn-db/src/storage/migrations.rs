@@ -166,6 +166,15 @@ macro_rules! private_purpose_debts {
     };
 }
 
+/// cairn/5379: the embedding model is a setting, so the space stored vectors
+/// share is recorded (`embedding_state`), and session positions move to a
+/// private table keyed by it. Private like every embedding store.
+macro_rules! private_embedding_space {
+    () => {
+        migration!("0285_embedding_space")
+    };
+}
+
 /// Runner-local recovery journal for the exact remote authority generation held
 /// by a team ordinary process and any terminal action still owed to Postgres.
 macro_rules! private_team_ordinary_admission_authority {
@@ -1897,6 +1906,7 @@ macro_rules! private_lineage {
             private_purpose_debts!(),
             shared_tail_compile_facts!(),
             shared_tail_turn_end_check_attempt_plan!(),
+            private_embedding_space!(),
         ]
     };
 }
@@ -2735,12 +2745,22 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
             target: ScopeTarget::ProjectScoped,
         }),
     ),
-    // turn_embedding_state: this host's sweep progress, alongside the
+    // embedding_state: this host's sweep progress, alongside the
     // archival-backfill progress the same reason already covers. It describes
-    // when THIS install began participating, so it is meaningless elsewhere.
+    // when THIS install began participating and which space its own vectors
+    // are in, so it is meaningless elsewhere.
     (
-        "turn_embedding_state",
+        "embedding_state",
         TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // session_positions: live semantic positions folded from this install's
+    // embeddings; shares resource_embeddings' deferral.
+    (
+        "session_positions",
+        TableScope::Private(PrivateReason::DeferredShared {
+            issue: "CAIRN-2210",
+            target: ScopeTarget::ProjectScoped,
+        }),
     ),
     // config_disables: a host-side resolution override; team-config propagation is
     // a separate cross-scope feature, deferred with a named owner.
@@ -3768,6 +3788,7 @@ mod tests {
                 "purpose_debts",
                 "compile_facts",
                 "turn_end_check_attempt_plan",
+                "embedding_space",
             ],
         );
     }
@@ -5242,6 +5263,93 @@ mod tests {
             .unwrap(),
             1,
             "the rebuild keeps the evidence that references a tenet"
+        );
+    }
+
+    /// cairn/5379: an install whose vectors all came from the Cairn gateway is
+    /// recorded as that space, with each corpus at the width it holds, and
+    /// its session positions carry over keyed by it. Nothing is deleted.
+    #[tokio::test]
+    async fn the_embedding_space_is_seeded_from_an_existing_gateway_install() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("embedding-space.turso.db"))
+            .await
+            .unwrap();
+        let head = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < "0285")
+            .cloned()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(head).run(&db).await.unwrap();
+        db.execute_batch(
+            "UPDATE turn_embedding_state SET install_boundary = 1786306333 WHERE id = 1;
+             INSERT INTO turn_embeddings(turn_id, session_id, sequence, embedding, model, dims,
+                                         created_at, updated_at)
+               VALUES ('t-tomb', 's', 1, x'', 'cohere-embed-v4', 0, 1, 1),
+                      ('t-vec', 's', 2, x'0000803f', 'cohere-embed-v4', 1536, 1, 1);
+             INSERT INTO resource_embeddings(uri, embedding, model, dims, created_at, updated_at)
+               VALUES ('cairn://p/k/1', x'0000803f', 'cohere-embed-v4', 1536, 1, 1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('project', 'default', 'Project', 'project', '/tmp/project', 1, 1);
+             INSERT INTO jobs(id, project_id, status, created_at, updated_at)
+               VALUES ('job', 'project', 'running', 1, 1);
+             INSERT INTO sessions(id, job_id, created_at, updated_at, current_pos)
+               VALUES ('s-pos', 'job', 1, 1, x'0000803f0000803f'),
+                      ('s-none', 'job', 1, 1, NULL);",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT install_boundary || '|' || provider || '/' || model || '|'
+                        || turn_dims || '|' || resource_dims
+                   FROM embedding_state WHERE id = 1",
+            )
+            .await
+            .unwrap(),
+            "1786306333|cairn/cohere-embed-v4|1536|1536"
+        );
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT group_concat(session_id || ':' || model || '/' || dims)
+                   FROM session_positions",
+            )
+            .await
+            .unwrap(),
+            "s-pos:cohere-embed-v4/2"
+        );
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM turn_embeddings")
+                .await
+                .unwrap(),
+            2,
+            "tombstones and vectors both survive"
+        );
+    }
+
+    /// A fresh install has no vectors, so it records no space: its first
+    /// reconcile records whatever it embeds with.
+    #[tokio::test]
+    async fn a_fresh_install_records_no_embedding_space() {
+        let db = migrated_db().await.unwrap();
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM embedding_state
+                  WHERE id = 1 AND provider IS NULL AND model IS NULL
+                    AND turn_dims IS NULL AND resource_dims IS NULL",
+            )
+            .await
+            .unwrap(),
+            1
         );
     }
 

@@ -255,7 +255,10 @@ pub(super) async fn apply_node_memory_patch(
         target.node_id,
         target.memory_seq,
     );
-    orch.enqueue_resource_embed(&memory_uri, memory.content.clone());
+    orch.enqueue_resource_embed(
+        &memory_uri,
+        crate::embeddings::resources::memory_embed_text(&memory),
+    );
     Ok(format!("Updated memory at {memory_uri}"))
 }
 

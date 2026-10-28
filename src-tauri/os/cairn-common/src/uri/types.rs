@@ -935,6 +935,8 @@ pub enum CairnResource {
     },
     /// Pooled capacity per installed provider (the provider card).
     ModelsUsage,
+    /// The workspace's embedding model and how far history is embedded in it.
+    ModelsEmbeddings,
     /// Every live model session on this host.
     ModelsSessions,
     /// One live model session, by session id or run id.
@@ -1076,6 +1078,7 @@ impl CairnResource {
             Self::ModelsAccounts => ResourceKind::ModelsAccounts,
             Self::ModelsAccount { .. } => ResourceKind::ModelsAccount,
             Self::ModelsUsage => ResourceKind::ModelsUsage,
+            Self::ModelsEmbeddings => ResourceKind::ModelsEmbeddings,
             Self::ModelsSessions => ResourceKind::ModelsSessions,
             Self::ModelsSession { .. } => ResourceKind::ModelsSession,
             Self::Inference => ResourceKind::Inference,

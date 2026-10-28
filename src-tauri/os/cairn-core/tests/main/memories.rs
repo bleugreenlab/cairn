@@ -446,9 +446,14 @@ async fn similar_memory_neighbors_use_node_uris() {
             .unwrap();
     }
 
-    let neighbors = db::similar_memory_neighbors(&local_db, &query, &query_uri, &[], 0.1, 5)
-        .await
-        .unwrap();
+    let space = cairn_core::internal::embeddings::VectorKey {
+        model: "test".into(),
+        dims: Some(3),
+    };
+    let neighbors =
+        db::similar_memory_neighbors(&local_db, &query, &query_uri, &[], 0.1, 5, &space)
+            .await
+            .unwrap();
     assert_eq!(neighbors.len(), 1);
     assert_eq!(neighbors[0].memory.id, "neighbor");
     assert_eq!(neighbors[0].uri, "cairn://p/sim/1/1/builder/memories/2");

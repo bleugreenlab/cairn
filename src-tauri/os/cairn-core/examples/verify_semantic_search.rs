@@ -76,9 +76,12 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2000);
+    let key = embedder
+        .active(cairn_core::internal::embeddings::Corpus::Turns)
+        .expect("the gateway offer is always selected here");
     eprintln!(
         "{} turn(s) pending; sweeping up to {budget}",
-        pending_count(&db).await.unwrap_or(0)
+        pending_count(&db, &key).await.unwrap_or(0)
     );
 
     let started = std::time::Instant::now();

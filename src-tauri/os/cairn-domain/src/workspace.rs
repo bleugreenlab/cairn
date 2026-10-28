@@ -302,6 +302,12 @@ pub struct Settings {
     /// same way as `image_model`.
     #[serde(default)]
     pub speech_model: Option<String>,
+    /// The model the workspace embeds with, as `provider/model`. `None` is
+    /// the Cairn gateway's Cohere Embed v4. Unlike the image and speech
+    /// defaults this is a vector space, not a fallback: changing it re-embeds
+    /// history.
+    #[serde(default)]
+    pub embedding_model: Option<String>,
 
     pub system_prompt: String,
     pub max_thinking_tokens: Option<i32>,
@@ -392,6 +398,10 @@ pub struct UpdateSettings {
     /// Set the workspace speech default; `null` or blank clears it.
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub speech_model: Option<Option<String>>,
+    /// Set the workspace embedding model; `null` or blank returns it to the
+    /// Cairn gateway's Cohere Embed v4.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub embedding_model: Option<Option<String>>,
 
     /// Deprecated - system_prompt is no longer used
     #[allow(dead_code)]

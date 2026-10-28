@@ -426,6 +426,7 @@ resource_samples! {
     ModelsAccounts {} => Parser,
     ModelsAccount { id: "acc_7b58857c-d1db".to_string() } => Parser,
     ModelsUsage {} => Parser,
+    ModelsEmbeddings {} => Parser,
     ModelsSessions {} => Parser,
     ModelsSession { id: "954588b6-c77d-47e6-b466-b48841cc52cb".to_string() } => Parser,
     Inference {} => Parser,

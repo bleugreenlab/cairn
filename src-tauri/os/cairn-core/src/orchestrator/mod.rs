@@ -26,7 +26,7 @@ mod subscription_periods;
 pub(crate) use decide::tests as decide_fixtures;
 pub(crate) use decide::{DecideRequest, DecisionFailure};
 pub(crate) mod base_branch_sync;
-mod embed;
+pub(crate) mod embed;
 pub use decide::DecisionDiagnostic;
 pub mod device_presence;
 pub mod docs;
@@ -77,7 +77,7 @@ use crate::effects::executor::EffectExecutor;
 use crate::effects::types::WorkflowEffect;
 use crate::embeddings::{
     spawn_embed_worker, turns::SemanticSearch, EmbedGate, EmbedJob, PositionConfig, PositionKind,
-    PositionMeta, VibeState,
+    PositionMeta, SpaceKeeper, SpaceState, Trigger, VibeState,
 };
 use crate::mcp::gateway::McpGateway;
 use crate::mcp::McpAuthState;
@@ -639,6 +639,7 @@ impl OrchestratorBuilder {
             era_summary_tx: crate::threads::era_worker::sender_slot(),
             tenet_evidence_hint: Arc::new(tokio::sync::Notify::new()),
             embed_gate: Arc::new(EmbedGate::default()),
+            embed_space: Arc::new(SpaceState::default()),
             semantic_search: std::sync::OnceLock::new(),
             anon_device_manager,
             account_manager: self.account_manager,
@@ -1226,6 +1227,10 @@ pub struct Orchestrator {
     /// The embedding health gate every consumer shares, so one outage pauses
     /// all of them and is logged once. See `embeddings::embedder`.
     embed_gate: Arc<EmbedGate>,
+    /// What keeps the stored vectors in the selected model's space: one
+    /// reconcile at a time, the switch counter, the resource sweep's count.
+    /// See `embeddings::space`.
+    embed_space: Arc<SpaceState>,
     /// Search's semantic lane: the resident copy of the span vectors it scans.
     semantic_search: std::sync::OnceLock<Arc<SemanticSearch>>,
 
@@ -2091,17 +2096,41 @@ impl Orchestrator {
             *guard = Some(tx);
         }
 
-        // The semantic lane's corpus sweep. `has_account` deliberately asks the
-        // ACCOUNT manager, not the token provider: every install registers an
-        // anonymous device token, so a usable token says nothing about consent.
-        // Live turns embed regardless; walking back through pre-existing
-        // transcripts is what requires a connected account.
-        let account_manager = self.account_manager.clone();
-        crate::embeddings::turns::spawn_turn_embedding_sweep(
-            self.embedder(),
+        // The sweeps start only once the stores are in the selected model's
+        // space: their first pass runs as soon as they are spawned, and would
+        // otherwise read another model's vectors as settled. Live turns embed
+        // regardless of consent; walking back through pre-existing history is
+        // what `history_consented` gates.
+        let orch = self.clone();
+        tokio::spawn(async move {
+            let keeper = orch.space_keeper();
+            if let Err(error) = keeper.reconcile(Trigger::Startup).await {
+                log::warn!(
+                    "embeddings: reconciling the embedding space at startup failed: {error}"
+                );
+            }
+            let consented: Arc<dyn Fn() -> bool + Send + Sync> = {
+                let orch = orch.clone();
+                Arc::new(move || orch.history_consented())
+            };
+            crate::embeddings::turns::spawn_turn_embedding_sweep(keeper.clone(), consented.clone());
+            crate::embeddings::resources::spawn_resource_sweep(
+                keeper,
+                consented,
+                Arc::new(orch.clone()),
+            );
+        });
+    }
+
+    /// The keeper of the stored vectors' space, over this orchestrator's
+    /// embedder and shared state.
+    pub fn space_keeper(&self) -> Arc<SpaceKeeper> {
+        Arc::new(SpaceKeeper::with_state(
             self.db.local.clone(),
-            Arc::new(move || account_manager.get_jwt().ok().flatten().is_some()),
-        );
+            self.embedder(),
+            self.embed_tx.clone(),
+            self.embed_space.clone(),
+        ))
     }
 
     /// Claim the turn-end-check single-flight slot for a job. Returns the job's

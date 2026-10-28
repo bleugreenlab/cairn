@@ -1040,6 +1040,10 @@ pub async fn resolve_node_memory_id(
     .await
 }
 
+/// Prior memories most like `query_memory`, compared in `space` (the active
+/// resource corpus's model and width) only: a vector of another model is not
+/// comparable, even at the same width, so a memory without one in `space`
+/// has no neighbours and is no one's neighbour.
 pub async fn similar_memory_neighbors(
     db: &LocalDb,
     query_memory: &Memory,
@@ -1047,16 +1051,20 @@ pub async fn similar_memory_neighbors(
     excluded_memory_ids: &[String],
     min_similarity: f32,
     limit: usize,
+    space: &crate::embeddings::VectorKey,
 ) -> DbResult<Vec<MemoryTriageNeighbor>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
 
-    let query_embedding =
-        match crate::embeddings::queries::get_resource_embedding_async(db, query_uri).await? {
-            Some(record) => vector::from_bytes(&record.embedding),
-            None => return Ok(Vec::new()),
-        };
+    // Vectors are private to this install, whichever database the memory is in.
+    let vectors = crate::tenets::evidence::vectors::vector_db(db);
+    let Some(query_embedding) =
+        crate::embeddings::queries::resource_vector_in_space_async(vectors, query_uri, space)
+            .await?
+    else {
+        return Ok(Vec::new());
+    };
     if query_embedding.is_empty() {
         return Ok(Vec::new());
     }
@@ -1069,12 +1077,12 @@ pub async fn similar_memory_neighbors(
             continue;
         }
         let uri = build_node_memory_uri_for_memory(db, &memory).await?;
-        let Some(record) =
-            crate::embeddings::queries::get_resource_embedding_async(db, &uri).await?
+        let Some(embedding) =
+            crate::embeddings::queries::resource_vector_in_space_async(vectors, &uri, space)
+                .await?
         else {
             continue;
         };
-        let embedding = vector::from_bytes(&record.embedding);
         if embedding.len() != query_embedding.len() {
             continue;
         }
@@ -1804,6 +1812,10 @@ mod tests {
         .await
         .unwrap();
 
+        let space = crate::embeddings::VectorKey {
+            model: "test".into(),
+            dims: Some(3),
+        };
         let neighbors = similar_memory_neighbors(
             &db,
             &current,
@@ -1811,9 +1823,28 @@ mod tests {
             &["current".to_string()],
             0.7,
             5,
+            &space,
         )
         .await
         .unwrap();
+
+        // Another space has no neighbours to offer, even at the same width.
+        let other = crate::embeddings::VectorKey {
+            model: "other".into(),
+            dims: Some(3),
+        };
+        assert!(similar_memory_neighbors(
+            &db,
+            &current,
+            &current_uri,
+            &["current".to_string()],
+            0.7,
+            5,
+            &other,
+        )
+        .await
+        .unwrap()
+        .is_empty());
 
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].memory.id, "prior");

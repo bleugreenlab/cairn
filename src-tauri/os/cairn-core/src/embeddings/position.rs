@@ -5,7 +5,8 @@
 //!
 //! - **Live position** (`SessionLive`): per-session, dual-timescale EMA over
 //!   event embeddings with pivot detection. Recency-biased — it answers "where
-//!   is this session right now?" Persisted to `sessions.current_pos`.
+//!   is this session right now?" Persisted to `session_positions`, keyed by
+//!   the `(model, dims)` it was folded in.
 //! - **Summary centroid** (`OwnerAccum`): per-node/chat, a substance-weighted
 //!   running mean (`sum` + total `weight`). A durable post-hoc signpost —
 //!   "what was this node about, overall?" Persisted to `resource_embeddings`
@@ -254,7 +255,7 @@ impl OwnerAccum {
 /// Vectors flushed out of the engine on eviction or shutdown.
 #[derive(Debug, Default, PartialEq)]
 pub struct EvictionFlush {
-    /// `(session_id, current_pos)` to persist to `sessions.current_pos`.
+    /// `(session_id, current_pos)` to persist to `session_positions`.
     pub(crate) sessions: Vec<(String, Vec<f32>)>,
     /// `(owner_uri, centroid)` to upsert into `resource_embeddings`.
     pub(crate) owners: Vec<(String, Vec<f32>)>,
@@ -282,15 +283,23 @@ impl PositionEngine {
         }
     }
 
-    /// Record the `(model, dims)` of the vectors about to be folded.
+    /// Record the `(model, dims)` of the vectors about to be folded. Vectors
+    /// from another space than the ones already folded are not comparable
+    /// with them, so a change drops every position and centroid held,
+    /// unflushed: they belong to a space that is being purged.
     pub(crate) fn note_space(&mut self, model: &str, dims: u32) {
-        if self
+        let changed = self
             .space
             .as_ref()
-            .is_none_or(|(known, width)| known != model || *width != dims)
-        {
-            self.space = Some((model.to_string(), dims));
+            .is_none_or(|(known, width)| known != model || *width != dims);
+        if !changed {
+            return;
         }
+        if self.space.is_some() {
+            self.sessions.clear();
+            self.owners.clear();
+        }
+        self.space = Some((model.to_string(), dims));
     }
 
     /// The `(model, dims)` of the vectors folded so far.
@@ -471,6 +480,24 @@ mod tests {
         let agent = cfg.weight_for(PositionKind::Agent, Some(100), "");
         // role_user (2.0) is exactly 2x role_agent (1.0).
         assert!((user - 2.0 * agent).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_batch_from_another_space_drops_everything_held() {
+        let mut engine = PositionEngine::new(PositionConfig::default());
+        let now = Instant::now();
+        engine.note_space("m1", 2);
+        engine.register_session("s1", Some("cairn://p/k/1/1/n".into()), None, now);
+        engine.fold("s1", &[1.0, 0.0], 1.0, now);
+        engine.note_space("m1", 2);
+        assert!(engine.has_session("s1"), "the same space keeps its state");
+
+        engine.note_space("m2", 2);
+        assert!(!engine.has_session("s1"));
+        assert!(!engine.has_owner("cairn://p/k/1/1/n"));
+        assert_eq!(engine.space(), Some(("m2".to_string(), 2)));
+        assert!(engine.take_dirty_sessions().is_empty());
+        assert!(engine.take_dirty_owners().is_empty());
     }
 
     #[test]

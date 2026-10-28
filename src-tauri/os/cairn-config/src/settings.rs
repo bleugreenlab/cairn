@@ -225,6 +225,10 @@ pub struct SettingsFile {
     /// The speech model a request naming none is spoken by. Absent: refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     speech_model: Option<String>,
+    /// The model the workspace embeds with, as `provider/model`. Absent: the
+    /// Cairn gateway's Cohere Embed v4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding_model: Option<String>,
 
     /// External MCP servers reachable through the `cairn://mcp/...` gateway.
     /// Keyed by server name. Project config overlays this set.
@@ -615,6 +619,7 @@ impl SettingsFile {
             decision_model: non_blank(&self.decision_model),
             image_model: non_blank(&self.image_model),
             speech_model: non_blank(&self.speech_model),
+            embedding_model: non_blank(&self.embedding_model),
             system_prompt: String::new(), // Deprecated, always empty
             max_thinking_tokens,
             merge_type: self.merge_type.clone().unwrap_or(MergeType::Squash),
@@ -678,6 +683,7 @@ impl SettingsFile {
             decision_model: settings.decision_model.clone(),
             image_model: settings.image_model.clone(),
             speech_model: settings.speech_model.clone(),
+            embedding_model: settings.embedding_model.clone(),
             mcp_servers: None,
             default_model: None,
             preferred_models: None,
@@ -1140,6 +1146,7 @@ const SETTINGS_DTO_KEYS: &[&str] = &[
     "decisionModel",
     "imageModel",
     "speechModel",
+    "embeddingModel",
     // Removed DTO keys remain here so the next save deletes stale YAML.
     "branchPrefix",
     "maxThinkingTokens",
@@ -1405,6 +1412,9 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
     }
     if let Some(value) = input.speech_model {
         current.speech_model = trimmed_model(value);
+    }
+    if let Some(value) = input.embedding_model {
+        current.embedding_model = trimmed_model(value);
     }
     if let Some(value) = input.max_thinking_tokens {
         current.max_thinking_tokens = value;
@@ -2046,6 +2056,55 @@ externalReplies: disabled
             serde_json::from_value(serde_json::json!({ "speechModel": "  " })).unwrap(),
         );
         assert_eq!(current.speech_model, None);
+    }
+
+    #[test]
+    fn the_embedding_model_is_trimmed_cleared_and_omitted_when_unset() {
+        let empty = serde_yaml::to_string(&SettingsFile::from_settings(&test_settings())).unwrap();
+        assert!(!empty.contains("embeddingModel"), "{empty}");
+
+        let mut current = test_settings();
+        apply_settings_update(
+            &mut current,
+            serde_json::from_value(serde_json::json!({
+                "embeddingModel": " ollama/nomic-embed-text ",
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            current.embedding_model.as_deref(),
+            Some("ollama/nomic-embed-text")
+        );
+        let yaml = serde_yaml::to_string(&SettingsFile::from_settings(&current)).unwrap();
+        assert!(
+            yaml.contains("embeddingModel: ollama/nomic-embed-text"),
+            "{yaml}"
+        );
+        let reloaded = serde_yaml::from_str::<SettingsFile>(&yaml)
+            .unwrap()
+            .to_settings();
+        assert_eq!(
+            reloaded.embedding_model.as_deref(),
+            Some("ollama/nomic-embed-text")
+        );
+
+        // An update that does not name it leaves it alone; null and blank clear it.
+        apply_settings_update(
+            &mut current,
+            serde_json::from_value(serde_json::json!({ "speechModel": "tts" })).unwrap(),
+        );
+        assert!(current.embedding_model.is_some());
+        apply_settings_update(
+            &mut current,
+            serde_json::from_value(serde_json::json!({ "embeddingModel": null })).unwrap(),
+        );
+        assert_eq!(current.embedding_model, None);
+        current.embedding_model = Some("x/y".into());
+        apply_settings_update(
+            &mut current,
+            serde_json::from_value(serde_json::json!({ "embeddingModel": "  " })).unwrap(),
+        );
+        assert_eq!(current.embedding_model, None);
     }
 
     #[test]

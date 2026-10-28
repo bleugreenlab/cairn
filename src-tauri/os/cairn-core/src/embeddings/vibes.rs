@@ -63,15 +63,19 @@ pub struct VibeAssignment {
 
 /// Holds the loaded contrast axes, ready for assignment. Expects a `phase` and a
 /// `friction` axis; an empty set assigns no color (callers fall back to neutral).
+///
+/// The axes are directions in one model's space at one width, the ones they
+/// were learned in. A vector from any other space projects onto them as
+/// noise, so it is not coloured at all.
 pub struct VibeState {
     axes: Vec<VibeAxis>,
+    model: String,
+    dims: u32,
 }
 
 #[derive(Deserialize)]
 struct BundledAxes {
-    #[allow(dead_code)]
     model: String,
-    #[allow(dead_code)]
     dims: u32,
     axes: Vec<BundledAxis>,
 }
@@ -103,12 +107,25 @@ impl VibeState {
                         percentiles: a.percentiles,
                     })
                     .collect::<Vec<_>>();
-                log::info!("VibeState loaded {} contrast axes", axes.len());
-                Self { axes }
+                log::info!(
+                    "VibeState loaded {} contrast axes for {} at {}",
+                    axes.len(),
+                    bundle.model,
+                    bundle.dims
+                );
+                Self {
+                    axes,
+                    model: bundle.model,
+                    dims: bundle.dims,
+                }
             }
             Err(e) => {
                 log::error!("Failed to parse bundled vibe axes: {e}");
-                Self { axes: Vec::new() }
+                Self {
+                    axes: Vec::new(),
+                    model: String::new(),
+                    dims: 0,
+                }
             }
         }
     }
@@ -118,9 +135,22 @@ impl VibeState {
         self.axes.iter().find(|a| a.name == name)
     }
 
-    /// Assign a vibe color to a single embedding. Returns `None` when the `phase`
-    /// or `friction` axis is missing (color falls back to neutral upstream).
-    pub(crate) fn assign_one(&self, event_id: &str, embedding: &[f32]) -> Option<VibeAssignment> {
+    /// Assign a vibe color to a single embedding stored under `key`. Returns
+    /// `None` when the `phase` or `friction` axis is missing, or when the
+    /// embedding is not of the space the axes were learned in (color falls
+    /// back to neutral upstream).
+    pub(crate) fn assign_one(
+        &self,
+        event_id: &str,
+        key: &super::VectorKey,
+        embedding: &[f32],
+    ) -> Option<VibeAssignment> {
+        if key.model != self.model
+            || key.dims != Some(self.dims)
+            || embedding.len() != self.dims as usize
+        {
+            return None;
+        }
         let phase_axis = self.axis("phase")?;
         let friction_axis = self.axis("friction")?;
 
@@ -382,47 +412,75 @@ mod tests {
         );
     }
 
+    fn synthetic(axes: Vec<VibeAxis>) -> VibeState {
+        VibeState {
+            axes,
+            model: "m".into(),
+            dims: 2,
+        }
+    }
+
+    fn key(model: &str, dims: u32) -> crate::embeddings::VectorKey {
+        crate::embeddings::VectorKey {
+            model: model.into(),
+            dims: Some(dims),
+        }
+    }
+
     #[test]
     fn assign_one_none_without_axes() {
-        let state = VibeState { axes: Vec::new() };
-        assert!(state.assign_one("evt", &[1.0, 0.0]).is_none());
+        let state = synthetic(Vec::new());
+        assert!(state.assign_one("evt", &key("m", 2), &[1.0, 0.0]).is_none());
     }
 
     #[test]
     fn assign_one_none_with_only_one_axis() {
-        let state = VibeState {
-            axes: vec![VibeAxis {
-                name: "phase".into(),
-                vector: vec![1.0, 0.0],
-                percentiles: ramp(-1.0, 1.0),
-            }],
-        };
-        assert!(state.assign_one("evt", &[1.0, 0.0]).is_none());
+        let state = synthetic(vec![VibeAxis {
+            name: "phase".into(),
+            vector: vec![1.0, 0.0],
+            percentiles: ramp(-1.0, 1.0),
+        }]);
+        assert!(state.assign_one("evt", &key("m", 2), &[1.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn only_a_vector_of_the_bundles_space_is_coloured() {
+        let state = VibeState::from_bundled();
+        let vector = vec![0.01; 1536];
+        assert!(state
+            .assign_one("evt", &key("cohere-embed-v4", 1536), &vector)
+            .is_some());
+        // Same width, another model: its projection would be noise.
+        assert!(state
+            .assign_one("evt", &key("qwen/qwen3-embedding-4b", 1536), &vector)
+            .is_none());
+        assert!(state
+            .assign_one("evt", &key("cohere-embed-v4", 256), &vector[..256])
+            .is_none());
     }
 
     #[test]
     fn assign_one_orders_phase_and_friction() {
         // Synthetic orthogonal axes: phase along x, friction along y, each with a
         // symmetric [-1,1] percentile ramp so rank ~ (proj + 1) / 2.
-        let state = VibeState {
-            axes: vec![
-                VibeAxis {
-                    name: "phase".into(),
-                    vector: vec![1.0, 0.0],
-                    percentiles: ramp(-1.0, 1.0),
-                },
-                VibeAxis {
-                    name: "friction".into(),
-                    vector: vec![0.0, 1.0],
-                    percentiles: ramp(-1.0, 1.0),
-                },
-            ],
-        };
+        let state = synthetic(vec![
+            VibeAxis {
+                name: "phase".into(),
+                vector: vec![1.0, 0.0],
+                percentiles: ramp(-1.0, 1.0),
+            },
+            VibeAxis {
+                name: "friction".into(),
+                vector: vec![0.0, 1.0],
+                percentiles: ramp(-1.0, 1.0),
+            },
+        ]);
+        let space = key("m", 2);
 
         // High phase (points along +x), neutral friction.
-        let ship = state.assign_one("ship", &[1.0, 0.0]).unwrap();
+        let ship = state.assign_one("ship", &space, &[1.0, 0.0]).unwrap();
         // Low phase (points along -x).
-        let explore = state.assign_one("explore", &[-1.0, 0.0]).unwrap();
+        let explore = state.assign_one("explore", &space, &[-1.0, 0.0]).unwrap();
         assert!(ship.phase > explore.phase);
         assert!((ship.phase - 1.0).abs() < 1e-3);
         assert!(explore.phase < 1e-3);
@@ -430,8 +488,8 @@ mod tests {
         assert!((ship.friction - 0.5).abs() < 1e-2);
 
         // High friction (points along +y) vs smooth (-y).
-        let stuck = state.assign_one("stuck", &[0.0, 1.0]).unwrap();
-        let smooth = state.assign_one("smooth", &[0.0, -1.0]).unwrap();
+        let stuck = state.assign_one("stuck", &space, &[0.0, 1.0]).unwrap();
+        let smooth = state.assign_one("smooth", &space, &[0.0, -1.0]).unwrap();
         assert!(stuck.friction > smooth.friction);
         assert!((stuck.friction - 1.0).abs() < 1e-3);
         assert!(smooth.friction < 1e-3);

@@ -197,21 +197,30 @@ async fn seed_description(
     }
     out.push_str("## Seeded memories\n\n");
     let batch_ids: Vec<String> = memories.iter().map(|memory| memory.id.clone()).collect();
+    // Neighbours are compared in the space the resource corpus is embedded
+    // in now; with no offer selected there are none to show.
+    let space = orch.embedder().active(crate::embeddings::Corpus::Resources);
     for memory in memories {
         let uri = crate::memories::db::build_node_memory_uri_for_memory(db, memory)
             .await
             .unwrap_or_else(|_| "unavailable".to_string());
         let _ = writeln!(out, "- [{}]({})", markdown_link_text(&memory.content), uri);
-        match crate::memories::db::similar_memory_neighbors(
-            db,
-            memory,
-            &uri,
-            &batch_ids,
-            TRIAGE_NEIGHBOR_MIN_SIMILARITY,
-            TRIAGE_NEIGHBOR_LIMIT,
-        )
-        .await
-        {
+        let neighbors = match &space {
+            Some(space) => {
+                crate::memories::db::similar_memory_neighbors(
+                    db,
+                    memory,
+                    &uri,
+                    &batch_ids,
+                    TRIAGE_NEIGHBOR_MIN_SIMILARITY,
+                    TRIAGE_NEIGHBOR_LIMIT,
+                    space,
+                )
+                .await
+            }
+            None => Ok(Vec::new()),
+        };
+        match neighbors {
             Ok(neighbors) if !neighbors.is_empty() => {
                 out.push_str("   - similar prior memories with outcomes:\n");
                 for neighbor in neighbors {

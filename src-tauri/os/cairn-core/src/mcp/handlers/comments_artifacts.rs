@@ -811,8 +811,19 @@ pub(crate) async fn write_artifact_change(
     // internal `(0, 0, name)` node coordinate, which rebuilt as the unaddressable
     // `cairn://p/KEY/0/0/{thread}/arc` and taught agents a URI that does not
     // resolve.
-    let artifact_uri = match crate::jobs::queries::home_uri_for_job(&db, &job_id).await {
-        Ok(Some(home)) => format!("{home}/{}", artifact_name.unwrap_or("artifact")),
+    //
+    // The name is the one the artifact is stored under, which is also what
+    // the resource sweep re-embeds it at (`embeddings::resources`): a write
+    // through the generic `/artifact` alias is stored under its type.
+    let artifact_uri = match crate::embeddings::resources::artifact_embed_uri(
+        &db,
+        &job_id,
+        stored.output_name.as_deref(),
+        &stored.artifact_type,
+    )
+    .await
+    {
+        Ok(Some(uri)) => uri,
         _ if task_name.is_some() => cairn_common::uri::build_task_artifact_uri_named(
             project_key,
             number,
@@ -829,8 +840,8 @@ pub(crate) async fn write_artifact_change(
             artifact_name,
         ),
     };
-    let text = crate::embeddings::artifact_embed_text(&stored.artifact_type, &effective_payload)
-        .unwrap_or_default();
+    let text =
+        crate::embeddings::resources::artifact_text(&stored.artifact_type, &effective_payload);
     orch.enqueue_resource_embed(&artifact_uri, text);
 
     // 4. Typed attention emit: the artifact landing IS the actionable fact, so

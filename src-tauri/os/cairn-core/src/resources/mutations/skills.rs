@@ -160,7 +160,10 @@ pub(super) async fn apply_skill_create(
         Some(project) => build_project_skill_uri(project, name, &[]),
         None => build_skill_uri(name, &[]),
     };
-    orch.enqueue_resource_embed(&skill_uri, description.to_string());
+    orch.enqueue_resource_embed(
+        &skill_uri,
+        crate::embeddings::resources::skill_embed_text(description),
+    );
 
     Ok(super::created_resource_ack("skill", name, &skill_uri))
 }
@@ -247,7 +250,10 @@ pub(super) async fn apply_skill_patch(
         Some(project) => build_project_skill_uri(project, skill_id, &[]),
         None => build_skill_uri(skill_id, &[]),
     };
-    orch.enqueue_resource_embed(&skill_uri, skill.description.clone());
+    orch.enqueue_resource_embed(
+        &skill_uri,
+        crate::embeddings::resources::skill_embed_text(&skill.description),
+    );
 
     Ok(format!("Updated skill '{skill_id}'"))
 }

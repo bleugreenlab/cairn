@@ -52,7 +52,7 @@ async fn insert_issue_with_context(
     authorship: crate::issues::crud::IssueAuthorship,
 ) -> Result<Issue, String> {
     let services = &orch.services;
-    let embed_text = description.clone().unwrap_or_default();
+    let embed_text = crate::embeddings::resources::issue_embed_text(description.as_deref());
     // The issue row is written to the database that owns the project (the team
     // replica for a team project, the private DB for a local one), resolved by
     // the caller via `for_project` so the row lands in the same DB it is read
@@ -743,7 +743,10 @@ pub(crate) async fn update_issue_by_project_number(
     // or dependency-only patch leaves the stored description untouched.
     let issue_uri = cairn_common::uri::build_issue_uri(&ctx.project_key, issue.number);
     if let Some(description) = embed_description {
-        orch.enqueue_resource_embed(&issue_uri, description);
+        orch.enqueue_resource_embed(
+            &issue_uri,
+            crate::embeddings::resources::issue_embed_text(Some(&description)),
+        );
     }
 
     if let Err(e) = orch.services.emitter.emit(

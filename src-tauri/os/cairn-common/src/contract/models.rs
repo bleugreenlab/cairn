@@ -130,6 +130,7 @@ pub(crate) const MODELS_CONTRACT: ResourceContract = ResourceContract {
         RelatedSpec { label: "answer typed questions with a named model (a run target)", kind: ResourceKind::ModelsDecide, actions: false },
         RelatedSpec { label: "accounts and their usage windows; sign in and re-measure", kind: ResourceKind::ModelsAccounts, actions: false },
         RelatedSpec { label: "pooled capacity per provider", kind: ResourceKind::ModelsUsage, actions: false },
+        RelatedSpec { label: "the embedding model and how far history is embedded in it", kind: ResourceKind::ModelsEmbeddings, actions: false },
         RelatedSpec { label: "live model sessions", kind: ResourceKind::ModelsSessions, actions: false },
     ],
     cross_actions: NO_CROSS_ACTIONS,
@@ -230,6 +231,17 @@ pub(crate) const MODELS_USAGE_CONTRACT: ResourceContract = ResourceContract {
         ProjectionSpec { key: "view", values: "card (default) | requests — per-request usage rows (not recorded yet; says what exists instead)" },
     ],
     related: &[RelatedSpec { label: "each account's windows", kind: ResourceKind::ModelsAccounts, actions: false }],
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const MODELS_EMBEDDINGS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ModelsEmbeddings,
+    uri_template: "cairn://models/embeddings",
+    name: "Embeddings",
+    description: "The workspace's embedding model and how far its stored vectors are in it, as Settings → Models → Embeddings shows: the model (the `embeddingModel` setting, or the Cairn gateway's Cohere Embed v4 when it is unset), the width each corpus is stored at, the state (running, paused with when it began, the last error and the next attempt, complete, or unavailable and why), turns embedded out of those eligible (and how many are deferred because their text could not be read yet), resources embedded out of those eligible once the resource sweep has counted them, and whether history before this install is in scope (it is when the model was chosen explicitly or an account is connected). Changing the model is a `cairn://settings` patch of `embeddingModel`; it deletes the old model's vectors and re-embeds history.",
+    read_projections: NO_PROJECTIONS,
+    related: &[RelatedSpec { label: "providers and the embedding models they offer", kind: ResourceKind::ModelsCatalog, actions: false }],
     cross_actions: NO_CROSS_ACTIONS,
     mutations: NO_MUTATIONS,
 };

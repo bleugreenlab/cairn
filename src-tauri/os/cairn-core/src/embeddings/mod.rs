@@ -11,6 +11,9 @@ pub mod embedder;
 pub mod position;
 pub mod queries;
 pub mod resource_text;
+pub mod resources;
+pub mod space;
+pub mod status;
 pub mod turns;
 pub mod vector;
 pub mod vibes;
@@ -19,10 +22,11 @@ mod worker;
 #[cfg(feature = "internal-api")]
 pub use embedder::gateway_embedder;
 pub use embedder::{
-    Corpus, Embed, EmbedFailure, EmbedGate, EmbedHealth, Embedded, Purpose, VectorKey,
+    Corpus, Embed, EmbedFailure, EmbedGate, EmbedHealth, EmbedSpace, Embedded, Purpose, VectorKey,
 };
 pub use position::{PositionConfig, PositionKind, PositionMeta};
 pub(crate) use resource_text::artifact_embed_text;
+pub use space::{Reconciled, ResourceProgress, SpaceKeeper, SpaceState, Trigger};
 pub use vibes::VibeState;
 pub use worker::{spawn_embed_worker, EmbedJob};
 

@@ -124,17 +124,16 @@ fn confirm_drafts_for_completed_job_in_db(
         }
     })?;
     for memory in &memories {
-        let memory_for_uri = memory.clone();
-        let content = memory.content.clone();
-        let uri = crate::execution::advancement::run_advancement_db({
+        let memory = memory.clone();
+        let target = crate::execution::advancement::run_advancement_db({
             let db = db.clone();
             async move {
-                crate::memories::db::build_node_memory_uri_for_memory(&db, &memory_for_uri)
+                crate::embeddings::resources::memory_embed_target(&db, &memory)
                     .await
                     .map_err(|e| e.to_string())
             }
         })?;
-        orch.enqueue_resource_embed(&uri, content);
+        orch.enqueue_resource_embed(&target.uri, target.text);
     }
     Ok(memories)
 }

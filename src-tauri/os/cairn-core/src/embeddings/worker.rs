@@ -8,10 +8,17 @@
 //!   position metadata), persisted in `event_vibes`, skipped when no vibe
 //!   axes are available. Second, **session position** — when the event
 //!   carries `PositionMeta`, fold the vector into the in-memory `PositionEngine`:
-//!   a per-session live position (persisted to `sessions.current_pos` each
+//!   a per-session live position (persisted to `session_positions` each
 //!   batch) and a per-node/chat summary (persisted to `resource_embeddings` on a
 //!   coarse timer and on idle eviction). The vector itself is never persisted —
 //!   only the color and the folded state.
+//! - `ResetSpace`: the embedding space changed (see [`super::space`]); drop
+//!   every in-memory position and centroid without flushing them.
+//!
+//! Folded state belongs to one vector space. A position or centroid is seeded
+//! only from a stored row of the engine's space, and written only while that
+//! is still the selected offer's space, so a switch never mixes two models
+//! into one centroid.
 //! - `Resource`: embed the text and persist the vector in `resource_embeddings`
 //!   keyed by canonical cairn:// URI, for in-engine corpus recall. Independent
 //!   of vibe centroids.
@@ -33,7 +40,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
 use tracing::Instrument;
 
-use super::embedder::{Corpus, Embed, EmbedFailure, Embedded, Purpose};
+use super::embedder::{Corpus, Embed, EmbedFailure, Embedded, Purpose, VectorKey};
 use super::position::{EvictionFlush, PositionConfig, PositionEngine, PositionKind, PositionMeta};
 use super::queries;
 use super::vector;
@@ -60,6 +67,8 @@ pub enum EmbedJob {
     Resource { uri: String, text: String },
     /// Remove the persisted vector for `uri`.
     ResourceDelete { uri: String },
+    /// The stores moved to another vector space: forget every position held.
+    ResetSpace,
 }
 
 impl EmbedJob {
@@ -107,7 +116,8 @@ pub fn spawn_embed_worker(
                 maybe_first = rx.recv() => {
                     let Some(first) = maybe_first else {
                         // Channel closed: final flush of all in-memory state.
-                        apply_flush(&dbs.local, engine.drain_all()).await;
+                        let active = embedder.active(Corpus::Resources);
+                        apply_flush(&dbs.local, engine.drain_all(), active.as_ref()).await;
                         break;
                     };
                     let mut batch = vec![first];
@@ -130,16 +140,24 @@ pub fn spawn_embed_worker(
                         )
                         .await;
                     if closed {
-                        apply_flush(&dbs.local, engine.drain_all()).await;
+                        let active = embedder.active(Corpus::Resources);
+                        apply_flush(&dbs.local, engine.drain_all(), active.as_ref()).await;
                         break;
                     }
                 }
                 _ = idle.tick() => {
                     // Finalize idle sessions/owners, then upsert summary
                     // centroids for still-active owners on this coarse cadence.
-                    apply_flush(&dbs.local, engine.evict_idle(Instant::now(), Duration::from_secs(IDLE_TTL_SECS))).await;
-                    let space = engine.space();
-                    upsert_owner_summaries(&dbs.local, engine.take_dirty_owners(), space.as_ref()).await;
+                    let active = embedder.active(Corpus::Resources);
+                    apply_flush(
+                        &dbs.local,
+                        engine.evict_idle(Instant::now(), Duration::from_secs(IDLE_TTL_SECS)),
+                        active.as_ref(),
+                    )
+                    .await;
+                    let folded = engine.space();
+                    let space = current_space(folded.as_ref(), active.as_ref());
+                    upsert_owner_summaries(&dbs.local, engine.take_dirty_owners(), space).await;
                 }
             }
         }
@@ -171,6 +189,7 @@ async fn process_batch(
     let mut texts: Vec<String> = Vec::new();
     for job in batch {
         match job {
+            EmbedJob::ResetSpace => *engine = PositionEngine::new(PositionConfig::default()),
             EmbedJob::ResourceDelete { uri } => {
                 if let Err(e) = queries::delete_resource_embedding_async(db, &uri).await {
                     log::warn!("Failed to delete resource embedding for {}: {}", uri, e);
@@ -208,12 +227,18 @@ async fn process_batch(
             dims,
         }) => {
             engine.note_space(&model, dims);
+            let key = VectorKey {
+                model: model.clone(),
+                dims: Some(dims),
+            };
             for (target, vector) in targets.iter().zip(vectors.iter()) {
                 match target {
                     EmbedTarget::Event { event_id, position } => {
                         if should_color(position) {
                             if let Some(vibe_state) = vibe_state {
-                                if let Some(assignment) = vibe_state.assign_one(event_id, vector) {
+                                if let Some(assignment) =
+                                    vibe_state.assign_one(event_id, &key, vector)
+                                {
                                     match persist_event_vibe_for_event(
                                         dbs,
                                         event_id,
@@ -297,8 +322,9 @@ async fn process_batch(
 
             // Flush live positions touched this batch (naturally debounced by
             // the batch cadence). Summary centroids flush on the coarser timer.
+            let space = (model.clone(), dims);
             for (session_id, pos) in engine.take_dirty_sessions() {
-                persist_current_pos(db, &session_id, &pos).await;
+                persist_current_pos(db, &session_id, &pos, &space).await;
             }
         }
         // Not configured: colors stay neutral, vectors unwritten, and no
@@ -351,10 +377,12 @@ async fn persist_event_vibe_for_event(
 
 /// Fold one event vector into the engine, lazily registering the session on
 /// first sight. Registration resolves the owning node/chat URI and seeds the
-/// live position from any persisted `current_pos` — one code path covering both
+/// live position from any persisted position — one code path covering both
 /// fresh start (no persisted position) and resume (position reloaded rather
 /// than rebuilt). The owner summary is reloaded from its own persisted raw sum
 /// so idle gaps and restarts resume the running mean instead of resetting it.
+/// Both seeds are taken only from rows of the engine's space; a row from
+/// another is ignored, and overwritten by the next flush.
 ///
 /// A transient error resolving the owner skips this event (it will retry on the
 /// next one) rather than caching a `None` owner for the session's lifetime,
@@ -366,6 +394,9 @@ async fn fold_event(
     vector: &[f32],
 ) {
     let now = Instant::now();
+    let Some((model, dims)) = engine.space() else {
+        return;
+    };
     if !engine.has_session(&meta.session_id) {
         let owner_uri = match queries::resolve_session_owner_uri_async(db, &meta.session_id).await {
             Ok(uri) => uri,
@@ -378,7 +409,7 @@ async fn fold_event(
                 return;
             }
         };
-        let seed = queries::get_session_current_pos_async(db, &meta.session_id)
+        let seed = queries::get_session_position_async(db, &meta.session_id, &model, dims)
             .await
             .ok()
             .flatten()
@@ -392,10 +423,11 @@ async fn fold_event(
         if let Some(uri) = owner_uri.as_deref() {
             if !engine.has_owner(uri) {
                 match queries::get_resource_embedding_async(db, uri).await {
-                    Ok(Some(record)) => {
+                    Ok(Some(record)) if record.model == model && record.dims == dims as i32 => {
                         engine.seed_owner(uri, vector::from_bytes(&record.embedding), now);
                     }
-                    Ok(None) => {}
+                    // Absent, or another space's: the summary starts afresh.
+                    Ok(_) => {}
                     Err(e) => {
                         log::warn!(
                             "position: summary reload failed for {} ({}); will retry",
@@ -412,21 +444,40 @@ async fn fold_event(
     engine.fold(&meta.session_id, vector, meta.weight, now);
 }
 
-/// Persist the flushed sessions and owner centroids from an eviction/drain.
-async fn apply_flush(db: &LocalDb, flush: EvictionFlush) {
-    for (session_id, pos) in flush.sessions {
-        persist_current_pos(db, &session_id, &pos).await;
-    }
-    upsert_owner_summaries(db, flush.owners, flush.space.as_ref()).await;
+/// The engine's space, when it is still the selected offer's: state folded
+/// in a space the stores have since left is not written back.
+fn current_space<'a>(
+    space: Option<&'a (String, u32)>,
+    active: Option<&VectorKey>,
+) -> Option<&'a (String, u32)> {
+    let (model, dims) = space?;
+    let active = active?;
+    (active.model == *model && active.dims.is_none_or(|width| width == *dims))
+        .then_some(space)
+        .flatten()
 }
 
-async fn persist_current_pos(db: &LocalDb, session_id: &str, pos: &[f32]) {
+/// Persist the flushed sessions and owner centroids from an eviction/drain,
+/// when they are of the selected offer's space (`active`).
+async fn apply_flush(db: &LocalDb, flush: EvictionFlush, active: Option<&VectorKey>) {
+    let Some(space) = current_space(flush.space.as_ref(), active) else {
+        return;
+    };
+    for (session_id, pos) in flush.sessions {
+        persist_current_pos(db, &session_id, &pos, space).await;
+    }
+    upsert_owner_summaries(db, flush.owners, Some(space)).await;
+}
+
+async fn persist_current_pos(db: &LocalDb, session_id: &str, pos: &[f32], space: &(String, u32)) {
     if pos.is_empty() {
         return;
     }
     let bytes = vector::to_bytes(pos);
-    if let Err(e) = queries::set_session_current_pos_async(db, session_id, &bytes).await {
-        log::warn!("Failed to persist current_pos for {}: {}", session_id, e);
+    if let Err(e) =
+        queries::set_session_position_async(db, session_id, &bytes, &space.0, space.1).await
+    {
+        log::warn!("Failed to persist the position of {}: {}", session_id, e);
     }
 }
 

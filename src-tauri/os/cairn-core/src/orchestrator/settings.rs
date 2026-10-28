@@ -109,7 +109,28 @@ impl Orchestrator {
                 "validate Telegram channel settings",
             )
         })?;
+        let embedding_before = self.get_settings().embedding_model;
         let current = settings::update_settings(&self.config_dir, input, &self.provider_names())?;
+
+        // A new embedding model is a new vector space: bring the stores into
+        // it now rather than at the sweep's next loop, so search stops
+        // answering from the old model at once. Every settings write funnels
+        // through here, whichever surface made it.
+        if current.embedding_model != embedding_before {
+            let keeper = self.space_keeper();
+            super::spawn_onto(
+                self.runtime.as_ref(),
+                async move {
+                    if let Err(error) = keeper
+                        .reconcile(crate::embeddings::Trigger::SettingsChange)
+                        .await
+                    {
+                        log::warn!("embeddings: reconciling after a model change failed: {error}");
+                    }
+                },
+                || log::warn!("embeddings: could not schedule the reconcile after a model change"),
+            );
+        }
 
         // Emit config-changed event
         let _ = self.services.emitter.emit(

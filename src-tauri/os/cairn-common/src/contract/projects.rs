@@ -205,6 +205,7 @@ pub(crate) const SETTINGS_CONTRACT: ResourceContract =
                 SETTINGS_DECISION_MODEL,
                 SETTINGS_IMAGE_MODEL,
                 SETTINGS_SPEECH_MODEL,
+                SETTINGS_EMBEDDING_MODEL,
                 SETTINGS_GIT_IDENTITIES,
                 SETTINGS_ACCOUNTS,
                 SETTINGS_KEYBINDS,

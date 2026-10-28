@@ -426,8 +426,18 @@ async fn vector_distance_cos_executes_and_ranks() {
     )
     .await
     .unwrap();
+    // Nearer still, but another model's: never a candidate.
+    queries::upsert_resource_embedding_async(
+        &db,
+        "cairn://other-model",
+        &vector::to_bytes(&[0.9, 0.1, 0.0]),
+        "qwen/qwen3-embedding-4b",
+        3,
+    )
+    .await
+    .unwrap();
 
-    // Query vector closest to "cairn://a".
+    // Query vector closest to "cairn://a" in its own space.
     let q = vector::to_bytes(&[0.9, 0.1, 0.0]);
     let nearest = db
         .read(|conn| {
@@ -436,8 +446,10 @@ async fn vector_distance_cos_executes_and_ranks() {
                 let mut rows = conn
                     .query(
                         "SELECT uri, vector_distance_cos(embedding, vector32(?1)) AS d \
-                         FROM resource_embeddings ORDER BY d ASC LIMIT 1",
-                        params![q],
+                         FROM resource_embeddings \
+                         WHERE model = ?2 AND dims = ?3 \
+                         ORDER BY d ASC LIMIT 1",
+                        params![q, "cohere-embed-v4", 3_i64],
                     )
                     .await?;
                 let row = rows

@@ -37,7 +37,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use cairn_models::interface::complete::CompletionError;
 use cairn_models::interface::embed::{EmbedError, EmbedRequest, Embeddings, Width};
-use cairn_models::types::embedding::EmbeddingCapabilities;
+use cairn_models::types::embedding::{EmbeddingCapabilities, PurposeHandling};
 
 pub use cairn_models::interface::embed::Purpose;
 
@@ -78,6 +78,31 @@ impl Corpus {
 pub struct VectorKey {
     pub model: String,
     pub dims: Option<u32>,
+}
+
+/// The vector space every stored vector shares: the offer that makes them and
+/// the width each corpus is stored at (`None` when the offer does not state
+/// it before asking). Recorded in `embedding_state`; see [`super::space`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbedSpace {
+    pub provider: String,
+    pub model: String,
+    pub turn_dims: Option<u32>,
+    pub resource_dims: Option<u32>,
+}
+
+impl EmbedSpace {
+    /// The key `corpus`'s vectors are stored under in this space.
+    pub fn key(&self, corpus: Corpus) -> VectorKey {
+        VectorKey {
+            model: self.model.clone(),
+            dims: match corpus {
+                Corpus::Turns => self.turn_dims,
+                Corpus::Resources => self.resource_dims,
+            },
+        }
+    }
 }
 
 /// One vector per text, in input order, and what they are stored under.
@@ -153,14 +178,22 @@ pub trait Embed: Send + Sync {
     ) -> Result<Embedded, EmbedFailure>;
     /// What `corpus` is stored as now; `None` when no offer is selected.
     fn active(&self, corpus: Corpus) -> Option<VectorKey>;
+    /// The space the selected offer embeds into; `None` when the selection
+    /// does not resolve to an offer (provider absent, no credential).
+    fn space(&self) -> Option<EmbedSpace>;
     /// Whether a request would be sent now: configured, and not paused.
     fn ready(&self) -> bool;
     fn health(&self) -> EmbedHealth;
+    /// Forget any outage: the selection changed, so the old provider's
+    /// failures say nothing about the new one.
+    fn reset_health(&self);
 }
 
 /// The selected offer, as the gate needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedEmbedOffer {
+    /// The catalog provider serving it (`cairn`, `ollama`, `custom-…`).
+    pub provider: String,
     /// The id stored vectors are labelled with.
     pub model: String,
     pub capabilities: EmbeddingCapabilities,
@@ -270,6 +303,12 @@ impl EmbedGate {
             retry_at: state.retry_at,
         }
     }
+
+    /// Clear the gate in place, open and with no outage on record. Silent:
+    /// the outage belonged to a selection that is no longer in use.
+    pub fn reset(&self) {
+        *self.state() = HealthState::default();
+    }
 }
 
 /// [`Embed`] over the facet's `embed` verb, through one [`EmbedSource`],
@@ -348,9 +387,37 @@ fn report(selection: &str, transition: Transition) {
     }
 }
 
-/// `texts` as they are sent: each cut to the budget on a character boundary.
-/// No texts, or a text with nothing but whitespace, is refused here.
-fn capped(texts: Vec<String>) -> Result<Vec<String>, EmbedFailure> {
+/// The most one text may carry, in bytes, on `capabilities` for `purpose`:
+/// the shared budget, or the offer's own per-request character bound when it
+/// is smaller, less the instruction prefix the facet puts in front of it.
+///
+/// A text over the offer's bound is refused by the provider every time it is
+/// sent, which would wedge a newest-first sweep on it; cutting it here is
+/// what keeps a smaller offer usable. Bytes bound characters from above, so a
+/// byte budget under a character bound always fits.
+fn text_budget(capabilities: Option<&EmbeddingCapabilities>, purpose: Purpose) -> usize {
+    let Some(capabilities) = capabilities else {
+        return EMBED_TEXT_BUDGET;
+    };
+    let bound = capabilities
+        .limits
+        .max_chars
+        .map_or(EMBED_TEXT_BUDGET, |chars| {
+            EMBED_TEXT_BUDGET.min(chars as usize)
+        });
+    let prefix = match &capabilities.purpose {
+        PurposeHandling::Prefix { document, query } => match purpose {
+            Purpose::Document => document.len(),
+            Purpose::Query => query.len(),
+        },
+        PurposeHandling::Native | PurposeHandling::Ignored => 0,
+    };
+    bound.saturating_sub(prefix).max(1)
+}
+
+/// `texts` as they are sent: each cut to `budget` bytes on a character
+/// boundary. No texts, or a text with nothing but whitespace, is refused here.
+fn capped(texts: Vec<String>, budget: usize) -> Result<Vec<String>, EmbedFailure> {
     if texts.is_empty() {
         return Err(EmbedFailure::Rejected("there are no texts to embed".into()));
     }
@@ -361,7 +428,7 @@ fn capped(texts: Vec<String>) -> Result<Vec<String>, EmbedFailure> {
             if text.trim().is_empty() {
                 return Err(EmbedFailure::Rejected(format!("text {index} is empty")));
             }
-            Ok(match truncate_chars(&text, EMBED_TEXT_BUDGET) {
+            Ok(match truncate_chars(&text, budget) {
                 cut if cut.len() == text.len() => text,
                 cut => cut.to_string(),
             })
@@ -377,7 +444,11 @@ impl Embed for FacetEmbedder {
         purpose: Purpose,
         texts: Vec<String>,
     ) -> Result<Embedded, EmbedFailure> {
-        let texts = capped(texts)?;
+        let offer = self.source.offer();
+        let texts = capped(
+            texts,
+            text_budget(offer.as_ref().map(|offer| &offer.capabilities), purpose),
+        )?;
         if !self.source.configured() {
             return Err(EmbedFailure::Unconfigured);
         }
@@ -415,12 +486,25 @@ impl Embed for FacetEmbedder {
         })
     }
 
+    fn space(&self) -> Option<EmbedSpace> {
+        self.source.offer().map(|offer| EmbedSpace {
+            turn_dims: Corpus::Turns.width().on(&offer.capabilities),
+            resource_dims: Corpus::Resources.width().on(&offer.capabilities),
+            provider: offer.provider,
+            model: offer.model,
+        })
+    }
+
     fn ready(&self) -> bool {
         self.source.configured() && self.gate.closed_until(SystemTime::now()).is_none()
     }
 
     fn health(&self) -> EmbedHealth {
         self.gate.health(self.source.configured())
+    }
+
+    fn reset_health(&self) {
+        self.gate.reset();
     }
 }
 
@@ -456,6 +540,7 @@ impl EmbedSource for DeviceTokenGateway {
 
     fn offer(&self) -> Option<SelectedEmbedOffer> {
         Some(SelectedEmbedOffer {
+            provider: cairn_models::types::embedding::CAIRN_GATEWAY_KEY.to_string(),
             model: cairn_models::types::embedding::CAIRN_GATEWAY_EMBED_MODEL.to_string(),
             capabilities: EmbeddingCapabilities::cairn_gateway(),
         })
@@ -511,6 +596,8 @@ pub(crate) mod stub {
         pub configured: AtomicBool,
         /// How long each request takes before it answers.
         pub delay: Mutex<Duration>,
+        /// What the offer declares; the gateway's unless a test says otherwise.
+        pub capabilities: Mutex<EmbeddingCapabilities>,
         replies: Mutex<VecDeque<Result<(), EmbedError>>>,
         sent: Mutex<Vec<EmbedRequest>>,
     }
@@ -522,6 +609,7 @@ pub(crate) mod stub {
                 selection: selection.to_string(),
                 configured: AtomicBool::new(true),
                 delay: Mutex::new(Duration::ZERO),
+                capabilities: Mutex::new(EmbeddingCapabilities::cairn_gateway()),
                 replies: Mutex::new(VecDeque::new()),
                 sent: Mutex::new(Vec::new()),
             })
@@ -550,8 +638,9 @@ pub(crate) mod stub {
         }
         fn offer(&self) -> Option<SelectedEmbedOffer> {
             Some(SelectedEmbedOffer {
+                provider: "cairn".into(),
                 model: "cohere-embed-v4".into(),
-                capabilities: EmbeddingCapabilities::cairn_gateway(),
+                capabilities: self.capabilities.lock().unwrap().clone(),
             })
         }
         fn embed(&self, request: &EmbedRequest) -> Result<Embeddings, EmbedError> {
@@ -580,9 +669,17 @@ pub(crate) mod stub {
         pub texts: Vec<String>,
     }
 
+    /// The offer a [`StubEmbed`] answers as.
+    #[derive(Debug, Clone)]
+    struct StubOffer {
+        provider: String,
+        model: String,
+        dims: u32,
+    }
+
     pub(crate) struct StubEmbed {
-        pub model: String,
-        pub dims: u32,
+        /// The selected offer; `None` is a selection that does not resolve.
+        offer: Mutex<Option<StubOffer>>,
         /// Answers for the next calls, in order; `None` succeeds.
         script: Mutex<VecDeque<Option<EmbedFailure>>>,
         calls: Mutex<Vec<Call>>,
@@ -593,13 +690,38 @@ pub(crate) mod stub {
     impl StubEmbed {
         pub(crate) fn new(model: &str, dims: u32) -> Self {
             Self {
-                model: model.to_string(),
-                dims,
+                offer: Mutex::new(Some(StubOffer {
+                    provider: "cairn".to_string(),
+                    model: model.to_string(),
+                    dims,
+                })),
                 script: Mutex::new(VecDeque::new()),
                 calls: Mutex::new(Vec::new()),
                 paused: Mutex::new(false),
                 configured: AtomicBool::new(true),
             }
+        }
+
+        /// Switch the selected offer, as a settings change would.
+        pub(crate) fn set_space(&self, provider: &str, model: &str, dims: u32) {
+            *self.offer.lock().unwrap() = Some(StubOffer {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                dims,
+            });
+        }
+
+        /// Make the selection unresolvable: a provider gone, a token missing.
+        pub(crate) fn set_unresolved(&self) {
+            *self.offer.lock().unwrap() = None;
+        }
+
+        pub(crate) fn dims(&self) -> u32 {
+            self.selected().map_or(0, |offer| offer.dims)
+        }
+
+        fn selected(&self) -> Option<StubOffer> {
+            self.offer.lock().unwrap().clone()
         }
 
         /// A stub on an install with no embedding credential.
@@ -631,7 +753,7 @@ pub(crate) mod stub {
 
         /// The vector a text embeds to: its byte length, then ones.
         pub(crate) fn vector(&self, text: &str) -> Vec<f32> {
-            let mut vector = vec![1.0; self.dims as usize];
+            let mut vector = vec![1.0; self.dims() as usize];
             if let Some(first) = vector.first_mut() {
                 *first = text.len() as f32;
             }
@@ -655,7 +777,10 @@ pub(crate) mod stub {
                     retry_at: SystemTime::now() + FIRST_PAUSE,
                 });
             }
-            let texts = capped(texts)?;
+            let texts = capped(texts, EMBED_TEXT_BUDGET)?;
+            let Some(offer) = self.selected() else {
+                return Err(EmbedFailure::Failed("no embedding offer resolves".into()));
+            };
             self.calls.lock().unwrap().push(Call {
                 corpus,
                 purpose,
@@ -666,16 +791,29 @@ pub(crate) mod stub {
             }
             Ok(Embedded {
                 vectors: texts.iter().map(|text| self.vector(text)).collect(),
-                model: self.model.clone(),
-                dims: self.dims,
+                model: offer.model,
+                dims: offer.dims,
             })
         }
 
         fn active(&self, _corpus: Corpus) -> Option<VectorKey> {
-            Some(VectorKey {
-                model: self.model.clone(),
-                dims: Some(self.dims),
+            self.selected().map(|offer| VectorKey {
+                model: offer.model,
+                dims: Some(offer.dims),
             })
+        }
+
+        fn space(&self) -> Option<EmbedSpace> {
+            self.selected().map(|offer| EmbedSpace {
+                provider: offer.provider,
+                model: offer.model,
+                turn_dims: Some(offer.dims),
+                resource_dims: Some(offer.dims),
+            })
+        }
+
+        fn reset_health(&self) {
+            *self.paused.lock().unwrap() = false;
         }
 
         fn ready(&self) -> bool {
@@ -948,6 +1086,80 @@ mod tests {
         };
         assert_eq!(Corpus::Turns.width().on(&matryoshka), Some(256));
         assert_eq!(Corpus::Resources.width().on(&matryoshka), Some(768));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_is_cut_to_the_offers_own_bound_at_the_door() {
+        let source = Scripted::new("gate-offer-bound");
+        *source.capabilities.lock().unwrap() = EmbeddingCapabilities {
+            purpose: PurposeHandling::Prefix {
+                document: "search_document: ".into(),
+                query: "q: ".into(),
+            },
+            limits: cairn_models::types::embedding::BatchLimits {
+                max_chars: Some(1000),
+                ..Default::default()
+            },
+            ..EmbeddingCapabilities::cairn_gateway()
+        };
+        let (embedder, _) = gated(&source);
+        source.answer(vec![Ok(()), Ok(())]);
+        embedder
+            .embed(Corpus::Turns, Purpose::Document, vec!["a".repeat(5000)])
+            .await
+            .unwrap();
+        embedder
+            .embed(Corpus::Turns, Purpose::Query, vec!["b".repeat(5000)])
+            .await
+            .unwrap();
+        let sent = source.sent();
+        assert_eq!(sent[0].texts[0].len(), 1000 - "search_document: ".len());
+        assert_eq!(sent[1].texts[0].len(), 1000 - "q: ".len());
+        // The gateway itself is bounded only by the shared budget.
+        assert_eq!(
+            text_budget(
+                Some(&EmbeddingCapabilities::cairn_gateway()),
+                Purpose::Document
+            ),
+            EMBED_TEXT_BUDGET
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_gate_is_open_and_remembers_no_outage() {
+        let source = Scripted::new("gate-reset");
+        let (embedder, gate) = gated(&source);
+        source.answer(vec![Err(http(500, None))]);
+        embed_one(&embedder).await.unwrap_err();
+        assert!(!embedder.ready());
+        gate.reset();
+        assert!(embedder.ready());
+        assert_eq!(
+            embedder.health(),
+            EmbedHealth {
+                configured: true,
+                ..EmbedHealth::default()
+            }
+        );
+        // The next failure is the first of a new outage.
+        source.answer(vec![Err(http(500, None))]);
+        embed_one(&embedder).await.unwrap_err();
+        assert_eq!(wait(&embedder.health()), FIRST_PAUSE);
+    }
+
+    #[test]
+    fn the_space_is_the_offer_with_each_corpus_width() {
+        let source = Scripted::new("gate-space");
+        let embedder = source.embedder();
+        assert_eq!(
+            embedder.space(),
+            Some(EmbedSpace {
+                provider: "cairn".into(),
+                model: "cohere-embed-v4".into(),
+                turn_dims: Some(1536),
+                resource_dims: Some(1536),
+            })
+        );
     }
 
     #[test]

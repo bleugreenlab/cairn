@@ -1945,6 +1945,9 @@ async fn render_resource_body(
             }
         }
         CairnResource::ModelsUsage => crate::resources::models::render_usage(orch, &params),
+        CairnResource::ModelsEmbeddings => {
+            crate::resources::models::render_embeddings(&orch.embedding_status().await, &params)
+        }
         CairnResource::ModelsSessions => {
             match reject_query_params("cairn://models/sessions", &params) {
                 Some(error) => error,
