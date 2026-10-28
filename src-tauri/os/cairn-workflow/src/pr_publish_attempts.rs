@@ -285,10 +285,8 @@ async fn rearm(
     if let Err(error) = crate::advancement::recompute_execution_jobs(runtime, &execution) {
         log::warn!("Could not refresh execution projection after PR retry claim: {error}");
     }
-    let _ = runtime.emitter.emit(
-        "db-change",
-        serde_json::json!({"table":"action_runs","action":"update"}),
-    );
+    let change = cairn_db::changes::action_run_db_change_for_id(&db, id, "update").await;
+    let _ = runtime.emitter.emit("db-change", change);
     Ok(Some(dispatch))
 }
 

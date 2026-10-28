@@ -263,10 +263,8 @@ pub async fn mark_job_start_failed(
         }
         Err(e) => {
             log::warn!("Failed to reload job {} for db-change: {}", job_id, e);
-            let _ = orch.services.emitter.emit(
-                "db-change",
-                serde_json::json!({"table": "jobs", "action": "update"}),
-            );
+            let change = crate::notify::job_db_change_for_id(owning_db, job_id, "update").await;
+            let _ = orch.services.emitter.emit("db-change", change);
         }
     }
 

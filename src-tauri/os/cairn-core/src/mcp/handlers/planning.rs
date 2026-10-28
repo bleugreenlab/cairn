@@ -142,8 +142,6 @@ async fn ask_questions_owned(
         exec_seq,
         current_turn_id,
         owns_turn_loop,
-        issue_id,
-        project_id,
     ) = {
         // Owned-loop backends (OpenRouter) suspend the turn on a foreground
         // question instead of inline-waiting and entering AwaitingHost.
@@ -399,21 +397,13 @@ async fn ask_questions_owned(
             ctx.exec_seq,
             current_turn_id,
             owns_turn_loop,
-            ctx.issue_id,
-            ctx.project_id,
         )
     };
 
     // Emit events for frontend
-    let _ = services.emitter.emit(
-        "db-change",
-        serde_json::json!({
-            "table": "prompts",
-            "action": "insert",
-            "issueId": issue_id,
-            "projectId": project_id,
-        }),
-    );
+    let prompt_change =
+        crate::notify::prompt_db_change_for_id(&owning_db, &prompt_id, "insert").await;
+    let _ = services.emitter.emit("db-change", prompt_change);
     let run_change = crate::notify::run_db_change_for_id(&owning_db, &run_id, "update").await;
     let _ = services.emitter.emit("db-change", run_change);
 
@@ -1123,15 +1113,11 @@ async fn answer_prompt_id_impl(
             .flatten(),
         None => None,
     };
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({
-            "table": "prompts",
-            "action": "update",
-            "issueId": changed_issue.as_ref().map(|issue| issue.id.as_str()),
-            "projectId": changed_issue.as_ref().map(|issue| issue.project_id.as_str()),
-        }),
-    );
+    // Scoped from the prompt's own job rather than the issue, so a thread's
+    // question (no issue) still names its project and job.
+    let prompt_change =
+        crate::notify::prompt_db_change_for_id(&owning_db, &prompt_id_owned, "update").await;
+    let _ = orch.services.emitter.emit("db-change", prompt_change);
     if let Some(turn_id) = resume.successor_turn_id.as_deref() {
         let change = crate::notify::turn_db_change_for_id(&owning_db, turn_id, "update").await;
         let _ = orch.services.emitter.emit("db-change", change);

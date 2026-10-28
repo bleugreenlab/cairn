@@ -587,7 +587,7 @@ pub(crate) async fn replace_gates_observed(
         .map_err(|error| error.to_string())?;
 
     if let Some(released) = released {
-        super::sweep::announce_release(orch, execution_id, released).await;
+        super::sweep::announce_release(orch, &db, execution_id, released).await;
         return Ok(format!(
             "Removed every gate from {label}; with nothing left to wait on, it started now."
         ));

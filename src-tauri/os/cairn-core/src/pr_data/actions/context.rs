@@ -40,7 +40,7 @@ pub struct MrContext {
     pub(crate) is_local: bool,
     /// Scope for the `db-change` a mutation of this row emits, so a PR refresh
     /// invalidates one project's PR queries rather than every mounted one.
-    pub(crate) project_id: Option<String>,
+    pub(crate) project_id: String,
     pub(crate) issue_id: Option<String>,
 }
 
@@ -96,7 +96,7 @@ pub async fn query_mr_context_for_job(
                 repo_path: row.text(3)?,
                 job_id: row.text(4)?,
                 is_local: row.opt_i64(5)?.unwrap_or(0) != 0,
-                project_id: row.opt_text(6)?,
+                project_id: row.text(6)?,
                 issue_id: row.opt_text(7)?,
             })
         })
@@ -190,7 +190,7 @@ async fn query_pr_node_mr_context_for_artifact_job(
                 repo_path: row.text(3)?,
                 job_id: row.text(4)?,
                 is_local: row.opt_i64(5)?.unwrap_or(0) != 0,
-                project_id: row.opt_text(6)?,
+                project_id: row.text(6)?,
                 issue_id: row.opt_text(7)?,
             }));
         }
@@ -230,7 +230,7 @@ async fn query_mr_context_for_action_run_parent(
                 repo_path: row.text(3)?,
                 job_id: row.text(4)?,
                 is_local: row.opt_i64(5)?.unwrap_or(0) != 0,
-                project_id: row.opt_text(6)?,
+                project_id: row.text(6)?,
                 issue_id: row.opt_text(7)?,
             })
         })

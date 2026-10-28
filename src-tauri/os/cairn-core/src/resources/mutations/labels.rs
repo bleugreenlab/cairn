@@ -39,6 +39,7 @@ pub(super) async fn apply_label_patch(
     crate::labels::crud::update_label(&orch.db.local, label_id, UpdateLabel { name, color })
         .await?;
     emit_db_change(orch, "labels", "update");
+    // Sweep: a label is a workspace row, so its links can sit in any project.
     emit_db_change(orch, "issue_labels", "update");
     Ok(format!("Updated label '{label_id}'"))
 }
@@ -49,6 +50,7 @@ pub(super) async fn apply_label_delete(
 ) -> Result<String, String> {
     crate::labels::crud::delete_label(&orch.db.local, label_id).await?;
     emit_db_change(orch, "labels", "delete");
+    // Sweep: deleting a workspace label unlinks it from issues in any project.
     emit_db_change(orch, "issue_labels", "delete");
     emit_db_change(orch, "issues", "update");
     Ok(format!("Deleted label '{label_id}'"))

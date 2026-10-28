@@ -560,6 +560,69 @@ pub async fn list(db: &LocalDb, project_id: &str) -> Result<Vec<Issue>, CairnErr
     .map_err(CairnError::from)
 }
 
+/// One project's issue list, encoded once when it is published.
+///
+/// The encoding is the expensive part to repeat: on a production clone cairn's
+/// 5,309 issues are 19.5 MB of JSON and take ~0.7 s to serialize, so a snapshot
+/// that held rows would still pay that on every read. Readers hand these bytes
+/// to the wire as they are.
+#[derive(Clone)]
+pub struct EncodedIssueList(Arc<serde_json::value::RawValue>);
+
+impl PartialEq for EncodedIssueList {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.get() == other.0.get()
+    }
+}
+
+impl EncodedIssueList {
+    pub fn json(&self) -> Arc<serde_json::value::RawValue> {
+        self.0.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_json(json: &str) -> Self {
+        Self(Arc::from(
+            serde_json::value::RawValue::from_string(json.to_string()).unwrap(),
+        ))
+    }
+}
+
+/// The published issue list for one project, from the orchestrator's cadenced
+/// cache: a repeat read with nothing changed executes no SQL and encodes
+/// nothing. See [`crate::orchestrator::generation_cache::CadencedCache`].
+pub async fn published_issue_list(
+    orch: &crate::orchestrator::Orchestrator,
+    project_id: &str,
+) -> Result<EncodedIssueList, CairnError> {
+    orch.issue_list_cache
+        .get(project_id)
+        .await
+        .map_err(CairnError::Internal)
+}
+
+/// Rebuild one project's issue list, author displays resolved, and encode it:
+/// the issue list cache's rebuild.
+pub(crate) async fn rebuild_issue_list(
+    dbs: &crate::db::DbState,
+    project_id: &str,
+) -> Result<EncodedIssueList, String> {
+    let db = crate::projects::crud::owning_db(dbs, project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut issues = list(&db, project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    crate::identity::display::resolve_author_displays(&dbs.local, &mut issues).await;
+    // Encoding a large project's list is most of a second of pure CPU; keep it
+    // off the async workers that answer everything else.
+    let encoded = tokio::task::spawn_blocking(move || serde_json::value::to_raw_value(&issues))
+        .await
+        .map_err(|error| format!("the issue list encoder stopped: {error}"))?
+        .map_err(|error| format!("failed to encode the issue list: {error}"))?;
+    Ok(EncodedIssueList(Arc::from(encoded)))
+}
+
 pub async fn update(
     db: &LocalDb,
     clock: &dyn Clock,

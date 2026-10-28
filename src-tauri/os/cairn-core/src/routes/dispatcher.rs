@@ -444,31 +444,49 @@ async fn fire_label_sink(
     let db = orch.db.for_project(&project).await;
     let target = canonical.clone();
     let labels = labels.to_vec();
-    db.write(|conn| {
-        let target = target.clone();
-        let labels = labels.clone();
-        Box::pin(async move {
-            let resolved = crate::issues::relations::resolve_issue_uri(conn, &target)
+    let (issue_id, project_id) = db
+        .write(|conn| {
+            let target = target.clone();
+            let labels = labels.clone();
+            Box::pin(async move {
+                let resolved = crate::issues::relations::resolve_issue_uri(conn, &target)
+                    .await?
+                    .ok_or_else(|| {
+                        crate::storage::DbError::Row(format!("issue not found: {target}"))
+                    })?;
+                crate::labels::attach::add_issue_labels(
+                    conn,
+                    &resolved.issue_id,
+                    &labels,
+                    chrono::Utc::now().timestamp(),
+                )
+                .await
+                .map_err(crate::storage::DbError::Row)?;
+                let project_id = crate::storage::query_opt_text_conn(
+                    conn,
+                    "SELECT project_id FROM issues WHERE id = ?1",
+                    cairn_db::turso::params![resolved.issue_id.as_str()],
+                )
                 .await?
                 .ok_or_else(|| {
                     crate::storage::DbError::Row(format!("issue not found: {target}"))
                 })?;
-            crate::labels::attach::add_issue_labels(
-                conn,
-                &resolved.issue_id,
-                &labels,
-                chrono::Utc::now().timestamp(),
-            )
-            .await
-            .map_err(crate::storage::DbError::Row)?;
-            Ok(())
+                Ok((resolved.issue_id, project_id))
+            })
         })
-    })
-    .await
-    .map_err(|error| error.to_string())?;
+        .await
+        .map_err(|error| error.to_string())?;
+    // Attaching may mint labels, which are workspace rows.
     orch.notifier.emit_change("labels");
-    orch.notifier.emit_change("issue_labels");
-    orch.notifier.emit_change("issues");
+    let emitter = &orch.services.emitter;
+    let _ = emitter.emit(
+        "db-change",
+        crate::notify::issue_labels_db_change("insert", &issue_id, &project_id),
+    );
+    let _ = emitter.emit(
+        "db-change",
+        crate::notify::issue_db_change_ids("update", &issue_id, Some(&project_id)),
+    );
     Ok(canonical)
 }
 

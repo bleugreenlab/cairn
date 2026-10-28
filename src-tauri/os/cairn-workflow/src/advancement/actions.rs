@@ -269,27 +269,37 @@ pub fn create_action_run(
                 if let Some(attempt) = initial_pr_attempt {
                     crate::pr_publish_attempts::insert_attempt(conn,&attempt).await?;
                 }
-                Ok(())
+                Ok((issue_id, project_id, parent_job_id))
             })
         })
         .await
         .map_err(|e| format!("Failed to insert action_run: {e}"))
     });
-    if let Err(error) = inserted {
-        if let Some(intent) = initial_intent {
-            let runtime = runtime.clone();
-            if let Err(ack_error) = run_advancement_db(async move {
-                crate::pr_publish_attempts::finish_dispatch_intent(&runtime, &intent).await
-            }) {
-                log::warn!("Could not acknowledge unclaimed initial PR intent: {ack_error}");
+    let (issue_id, project_id, parent_job_id) = match inserted {
+        Ok(scope) => scope,
+        Err(error) => {
+            if let Some(intent) = initial_intent {
+                let runtime = runtime.clone();
+                if let Err(ack_error) = run_advancement_db(async move {
+                    crate::pr_publish_attempts::finish_dispatch_intent(&runtime, &intent).await
+                }) {
+                    log::warn!("Could not acknowledge unclaimed initial PR intent: {ack_error}");
+                }
             }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
 
     let _ = runtime.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "action_runs", "action": "insert"}),
+        cairn_db::changes::action_run_db_change_ids(
+            "insert",
+            &action_run_id,
+            execution_id,
+            issue_id.as_deref(),
+            parent_job_id.as_deref(),
+            &project_id,
+        ),
     );
 
     if node.node_type == "pr" {
@@ -849,6 +859,7 @@ pub fn mark_action_run_failed(
     let error = error.to_string();
     let log_action_run_id = action_run_id.clone();
     let log_error = error.clone();
+    let scope_db = db.clone();
     run_advancement_db(async move {
         db.write(|conn| {
             let (id,error) = (action_run_id.clone(), error.clone());
@@ -873,10 +884,13 @@ pub fn mark_action_run_failed(
     }
     log::error!("Action run {} failed: {}", log_action_run_id, log_error);
 
-    let _ = runtime.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "action_runs", "action": "update"}),
-    );
+    let change = run_advancement_db(async move {
+        Ok::<_, String>(
+            cairn_db::changes::action_run_db_change_for_id(&scope_db, &log_action_run_id, "update")
+                .await,
+        )
+    })?;
+    let _ = runtime.emitter.emit("db-change", change);
 
     Ok(())
 }

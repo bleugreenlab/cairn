@@ -249,14 +249,13 @@ async fn update_merge_request_github_cache(
 fn emit_merge_request_change(orch: &Orchestrator, mr_context: &MrContext, action: &str) {
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({
-            "table": "merge_requests",
-            "action": action,
-            "mergeRequestId": mr_context.mr_id,
-            "jobId": mr_context.job_id,
-            "projectId": mr_context.project_id,
-            "issueId": mr_context.issue_id,
-        }),
+        crate::notify::merge_request_db_change_ids(
+            action,
+            Some(&mr_context.mr_id),
+            Some(&mr_context.job_id),
+            mr_context.issue_id.as_deref(),
+            &mr_context.project_id,
+        ),
     );
 }
 
@@ -1166,9 +1165,8 @@ pub async fn render_live_pr_section(
         }
         // A merge Cairn did not perform moved the target on origin and nothing
         // told the store. Take it now rather than at the next poll.
-        if let (Some(project_id), Some((_, target))) =
-            (mr_context.project_id.clone(), source_branches.clone())
-        {
+        if let Some((_, target)) = source_branches.clone() {
+            let project_id = mr_context.project_id.clone();
             let orch = orch.clone();
             tokio::spawn(async move {
                 crate::orchestrator::base_branch_sync::sync(&orch, &project_id, &target).await;
@@ -1216,10 +1214,9 @@ pub async fn render_live_pr_section(
         out.push_str(&divergence.note(src));
         out.push('\n');
     }
-    if let (Some(project_id), Some((src, _))) = (mr_context.project_id.as_deref(), &source_branches)
-    {
+    if let Some((src, _)) = &source_branches {
         if let Some(warning) =
-            crate::mcp::handlers::run::held::held_warning(orch, project_id, src).await
+            crate::mcp::handlers::run::held::held_warning(orch, &mr_context.project_id, src).await
         {
             out.push('\n');
             out.push_str(&warning);

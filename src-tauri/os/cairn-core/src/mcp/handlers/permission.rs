@@ -521,10 +521,10 @@ pub(crate) async fn await_permission_decision(
             "input": tool_input,
         }),
     );
-    let _ = services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "permission_requests", "action": "insert"}),
-    );
+    let change =
+        crate::notify::permission_request_db_change_for_id(&orch.db.local, &request_id, "insert")
+            .await;
+    let _ = services.emitter.emit("db-change", change);
     if yielded_turn {
         if let Some(turn_id) = current_turn_id.as_deref() {
             let change =
@@ -875,10 +875,10 @@ pub(crate) async fn withdraw_permission_request(
         cause.sentence()
     );
     let emitter = &*orch.services.emitter;
-    let _ = emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "permission_requests", "action": "update"}),
-    );
+    let change =
+        crate::notify::permission_request_db_change_for_id(&orch.db.local, request_id, "update")
+            .await;
+    let _ = emitter.emit("db-change", change);
     if let Some(turn_id) = predecessor_turn_id {
         match hand_back {
             HandBack::Unyielded => {
@@ -1904,10 +1904,8 @@ async fn apply_allow_all(
     // session in memory), but the job-session lookup it drives reads the owning
     // database.
     propagate_fence_allow_to_processes(orch, db, &plan.execution_id, &plan.agent_id).await;
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "executions", "action": "update"}),
-    );
+    let change = crate::notify::execution_db_change_for_id(db, &plan.execution_id, "update").await;
+    let _ = orch.services.emitter.emit("db-change", change);
 }
 
 /// What a withdrawn request tells an answer, including an "Allow all" that
@@ -2446,10 +2444,9 @@ async fn resolve_permission_request_impl(
             .send((request_id.to_string(), broadcast_json));
     }
 
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "permission_requests", "action": "update"}),
-    );
+    let change =
+        crate::notify::permission_request_db_change_for_id(&owning_db, request_id, "update").await;
+    let _ = orch.services.emitter.emit("db-change", change);
     if let Some(PermissionSuccessor::Successor {
         turn_id, inserted, ..
     }) = resume.successor.as_ref()
@@ -3128,10 +3125,9 @@ async fn record_resume_error(
     {
         log::warn!("permission {request_id}: could not record resume refusal: {error}");
     }
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "permission_requests", "action": "update"}),
-    );
+    let change =
+        crate::notify::permission_request_db_change_for_id(owning_db, request_id, "update").await;
+    let _ = orch.services.emitter.emit("db-change", change);
 }
 
 /// Mint the grant an allowed authority request earns.

@@ -1602,16 +1602,17 @@ pub(super) fn transition_job_to_running(orch: &Orchestrator, job_id: &str) -> Re
         .services
         .emitter
         .emit("db-change", crate::notify::job_db_change(&job, "update"));
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({
-            "table": "executions",
-            "action": "update",
-            "issueId": issue_id.as_deref(),
-            "executionId": execution_id.as_deref(),
-            "projectId": job.project_id,
-        }),
-    );
+    if let Some(execution_id) = execution_id.as_deref() {
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            crate::notify::execution_db_change_ids(
+                "update",
+                execution_id,
+                issue_id.as_deref(),
+                &job.project_id,
+            ),
+        );
+    }
     if let Some(issue_id) = issue_id.as_deref() {
         let _ = orch.services.emitter.emit(
             "db-change",

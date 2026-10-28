@@ -262,7 +262,12 @@ pub(crate) fn dispatch_event_recipes(
                 // Notify frontend so execution/job lists refresh
                 let _ = orch.services.emitter.emit(
                     "db-change",
-                    serde_json::json!({"table": "executions", "action": "insert"}),
+                    crate::notify::execution_db_change_ids(
+                        "insert",
+                        &execution.id,
+                        execution.issue_id.as_deref(),
+                        execution.project_id.as_deref().unwrap_or(project_id),
+                    ),
                 );
                 // Per-job scoped `jobs` events are emitted in the Ok arm above.
                 let _ = orch.services.emitter.emit(

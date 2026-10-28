@@ -128,10 +128,8 @@ pub async fn update_execution_agent(
 
     propagate_agent_changes_to_processes(orch, execution_id, agent_id, &normalized_snapshot).await;
 
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "executions", "action": "update"}),
-    );
+    let change = crate::notify::execution_db_change_for_id(db, execution_id, "update").await;
+    let _ = orch.services.emitter.emit("db-change", change);
 
     Ok(())
 }

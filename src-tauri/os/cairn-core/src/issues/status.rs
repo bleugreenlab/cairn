@@ -235,11 +235,13 @@ pub async fn update_status(
                 .map_err(|e| e.to_string())?;
             // Reopening lifts resolution-cancelled jobs; let job and execution
             // views refetch.
-            for table in ["jobs", "executions"] {
-                let _ = orch.services.emitter.emit(
-                    "db-change",
-                    serde_json::json!({"table": table, "action": "update"}),
-                );
+            let mut changes =
+                crate::notify::job_db_changes_for_issue(&owning_db, id, "update").await;
+            changes.extend(
+                crate::notify::execution_db_changes_for_issue(&owning_db, id, "update").await,
+            );
+            for change in changes {
+                let _ = orch.services.emitter.emit("db-change", change);
             }
         }
         // Unreachable in practice: `check_resolution` above refuses an

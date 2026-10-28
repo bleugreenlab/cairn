@@ -446,10 +446,8 @@ pub async fn record_prompt_response(
         .await
         .map_err(|e| e.to_string())?;
 
-    let _ = emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "prompts", "action": "update"}),
-    );
+    let change = cairn_db::changes::prompt_db_change_for_id(db, &prompt_id, "update").await;
+    let _ = emitter.emit("db-change", change);
     if let Some(turn_id) = resume.successor_turn_id.as_deref() {
         let change = cairn_db::changes::turn_db_change_for_id(db, turn_id, "insert").await;
         let _ = emitter.emit("db-change", change);
@@ -533,10 +531,9 @@ pub async fn record_permission_response(
         .await
         .map_err(|e| e.to_string())?;
 
-    let _ = emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "permission_requests", "action": "update"}),
-    );
+    let change =
+        cairn_db::changes::permission_request_db_change_for_id(db, &request_id, "update").await;
+    let _ = emitter.emit("db-change", change);
     if let Some(turn_id) = resume.successor_turn_id.as_deref() {
         let change = cairn_db::changes::turn_db_change_for_id(db, turn_id, "insert").await;
         let _ = emitter.emit("db-change", change);

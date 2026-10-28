@@ -381,14 +381,14 @@ pub async fn store_condition_evaluation(
             "db-change",
             serde_json::json!({"table": "condition_evaluations", "action": "insert"}),
         );
-        let _ = emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "executions", "action": "update", "executionId": execution_id}),
-        );
-        let _ = emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "issues", "action": "update", "issueId": stored.issue_id}),
-        );
+        let execution_change =
+            cairn_db::changes::execution_db_change_for_id(db, &execution_id, "update").await;
+        let _ = emitter.emit("db-change", execution_change);
+        if let Some(issue_id) = stored.issue_id.as_deref() {
+            let issue_change =
+                cairn_db::changes::issue_db_change_for_id(db, issue_id, "update").await;
+            let _ = emitter.emit("db-change", issue_change);
+        }
     }
 
     Ok(stored)

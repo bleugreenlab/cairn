@@ -788,7 +788,10 @@ pub(crate) async fn write_artifact_change(
         seen_at: None,
         confirmed,
     };
-    orch.notifier.artifact(&artifact);
+    let artifact_db = crate::execution::routing::owning_db_for_job(&orch.db, &job_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    orch.notifier.artifact(&artifact_db, &artifact).await;
 
     let _ = services.emitter.emit(
         "artifact-submitted",
@@ -1017,7 +1020,10 @@ pub(crate) async fn capture_call_structured_output(
         seen_at: None,
         confirmed: true,
     };
-    orch.notifier.artifact(&artifact);
+    let artifact_db = crate::execution::routing::owning_db_for_job(&orch.db, &job_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    orch.notifier.artifact(&artifact_db, &artifact).await;
     let _ = orch.services.emitter.emit(
         "artifact-submitted",
         serde_json::json!({

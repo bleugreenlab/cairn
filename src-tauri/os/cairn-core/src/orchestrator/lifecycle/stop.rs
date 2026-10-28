@@ -944,21 +944,21 @@ pub fn stop_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
         format!("Failed to recompute job {job_id} after job-level stop: {error}")
     })?;
 
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "prompts", "action": "update"}),
-    );
-    let change = run_db_blocking({
+    let (prompt_change, turn_change) = run_db_blocking({
         let dbs = orch.db.clone();
         let job_id = job_id.to_string();
         move || async move {
             let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(crate::notify::turn_db_change_for_job_id(&db, &job_id, "update").await)
+            Ok((
+                crate::notify::prompt_db_change_for_job(&db, &job_id, "update").await,
+                crate::notify::turn_db_change_for_job_id(&db, &job_id, "update").await,
+            ))
         }
     })?;
-    let _ = orch.services.emitter.emit("db-change", change);
+    let _ = orch.services.emitter.emit("db-change", prompt_change);
+    let _ = orch.services.emitter.emit("db-change", turn_change);
 
     Ok(())
 }

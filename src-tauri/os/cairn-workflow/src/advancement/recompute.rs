@@ -1222,6 +1222,11 @@ pub struct RecomputeOutcome {
     pub changes: Vec<JobStatusChange>,
     /// Issues this sweep moved from non-terminal to terminal.
     pub newly_terminal_issue_ids: Vec<String>,
+    /// The swept execution's issue, if it has one.
+    pub issue_id: Option<String>,
+    /// The swept execution's project, so the execution and issue changes it
+    /// announces can be scoped to one project's projections.
+    pub project_id: Option<String>,
 }
 
 /// Sweep every job in an execution in topological order, writing changed caches
@@ -1296,7 +1301,7 @@ pub async fn sweep_execution_jobs_conn(
         .collect();
     let order = topo_order(&node_ids, &control);
 
-    let issue_id = execution_issue_id_conn(conn, execution_id).await?;
+    let (issue_id, project_id) = execution_placement_conn(conn, execution_id).await?;
     let issue_terminal = match issue_id.as_deref() {
         Some(issue_id) => issue_is_terminal_conn(conn, issue_id).await?,
         None => false,
@@ -1495,19 +1500,41 @@ pub async fn sweep_execution_jobs_conn(
 
     recompute_execution_status_conn(conn, execution_id).await?;
     let mut newly_terminal_issue_ids = Vec::new();
-    if let Some(issue_id) = issue_id {
-        if recompute_issue_status_conn(conn, &issue_id)
+    if let Some(issue_id) = issue_id.as_deref() {
+        if recompute_issue_status_conn(conn, issue_id)
             .await?
             .became_terminal
         {
-            newly_terminal_issue_ids.push(issue_id);
+            newly_terminal_issue_ids.push(issue_id.to_string());
         }
     }
 
     Ok(RecomputeOutcome {
         changes,
         newly_terminal_issue_ids,
+        issue_id,
+        project_id,
     })
+}
+
+/// An execution's issue and project. `executions.project_id` is nullable on
+/// older rows, so the issue supplies it.
+async fn execution_placement_conn(
+    conn: &cairn_db::turso::Connection,
+    execution_id: &str,
+) -> DbResult<(Option<String>, Option<String>)> {
+    let mut rows = conn
+        .query(
+            "SELECT e.issue_id, COALESCE(e.project_id, i.project_id)
+             FROM executions e LEFT JOIN issues i ON i.id = e.issue_id
+             WHERE e.id = ?1",
+            (execution_id,),
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok((row.opt_text(0)?, row.opt_text(1)?)),
+        None => Ok((None, None)),
+    }
 }
 
 /// Terminalize a node-less delegated child job (an ephemeral call or a workflow)
@@ -1778,21 +1805,33 @@ pub fn reduce_delegated_child_job(
 ) -> Result<Option<JobStatus>, String> {
     let db = runtime.database(WorkflowOwner::Job(job_id))?;
     let job_id_owned = job_id.to_string();
-    let derived = run_advancement_db(async move {
-        db.write(|conn| {
-            let job_id = job_id_owned.clone();
-            Box::pin(async move { reduce_delegated_child_job_conn(conn, &job_id).await })
-        })
-        .await
-        .map_err(|e| e.to_string())
-    })?;
-    if derived.is_some() {
-        for table in ["jobs", "executions"] {
-            let _ = runtime.emitter.emit(
-                "db-change",
-                serde_json::json!({"table": table, "action": "update"}),
-            );
+    let (derived, changes) = run_advancement_db(async move {
+        let derived = db
+            .write(|conn| {
+                let job_id = job_id_owned.clone();
+                Box::pin(async move { reduce_delegated_child_job_conn(conn, &job_id).await })
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut changes = Vec::new();
+        if derived.is_some() {
+            changes
+                .push(cairn_db::changes::job_db_change_for_id(&db, &job_id_owned, "update").await);
+            if let Some(scope) = cairn_db::changes::load_job_scope(&db, &job_id_owned).await {
+                if let Some(execution_id) = scope.execution_id.as_deref() {
+                    changes.push(cairn_db::changes::execution_db_change_ids(
+                        "update",
+                        execution_id,
+                        scope.issue_id.as_deref(),
+                        &scope.project_id,
+                    ));
+                }
+            }
         }
+        Ok::<_, String>((derived, changes))
+    })?;
+    for change in changes {
+        let _ = runtime.emitter.emit("db-change", change);
     }
     Ok(derived)
 }

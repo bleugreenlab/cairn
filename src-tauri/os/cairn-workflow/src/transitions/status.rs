@@ -153,24 +153,24 @@ pub async fn transition_job_readiness(
         "db-change",
         cairn_db::changes::job_db_change(&job, "update"),
     );
-    let _ = emitter.emit(
-        "db-change",
-        serde_json::json!({
-            "table": "executions",
-            "action": "update",
-            "issueId": issue_id.as_deref(),
-            "executionId": execution_id.as_deref(),
-        }),
-    );
-    let _ = emitter.emit(
-        "db-change",
-        issue_id.as_deref().map_or_else(
-            || serde_json::json!({"table": "issues", "action": "update"}),
-            |issue_id| {
-                cairn_db::changes::issue_db_change_ids("update", issue_id, Some(&job.project_id))
-            },
-        ),
-    );
+    if let Some(execution_id) = execution_id.as_deref() {
+        let _ = emitter.emit(
+            "db-change",
+            cairn_db::changes::execution_db_change_ids(
+                "update",
+                execution_id,
+                issue_id.as_deref(),
+                &job.project_id,
+            ),
+        );
+    }
+    // A job outside any issue (a thread's) moved no issue row.
+    if let Some(issue_id) = issue_id.as_deref() {
+        let _ = emitter.emit(
+            "db-change",
+            cairn_db::changes::issue_db_change_ids("update", issue_id, Some(&job.project_id)),
+        );
+    }
     Ok(())
 }
 

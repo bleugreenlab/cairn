@@ -220,11 +220,36 @@ fn publish_projection(orch: &Orchestrator, execution_id: &str, outcome: &Recompu
             ),
         );
     }
-    for table in ["executions", "issues"] {
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": table, "action": "update"}),
-        );
+    let project_id = outcome.project_id.as_deref().or_else(|| {
+        outcome
+            .changes
+            .first()
+            .map(|change| change.project_id.as_str())
+    });
+    match project_id {
+        Some(project_id) => {
+            let issue_id = outcome.issue_id.as_deref();
+            let _ = orch.services.emitter.emit(
+                "db-change",
+                crate::notify::execution_db_change_ids(
+                    "update",
+                    execution_id,
+                    issue_id,
+                    project_id,
+                ),
+            );
+            if let Some(issue_id) = issue_id {
+                let _ = orch.services.emitter.emit(
+                    "db-change",
+                    crate::notify::issue_db_change_ids("update", issue_id, Some(project_id)),
+                );
+            }
+        }
+        // Unreachable for a real row: a change names its job's project, and a
+        // terminal edge names an issue, which always has one.
+        None => log::warn!(
+            "execution {execution_id} recomputed with no project placement; not announced"
+        ),
     }
 
     // Everything below is an effect of a job's own facts moving. A job settling

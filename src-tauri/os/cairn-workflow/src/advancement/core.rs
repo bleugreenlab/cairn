@@ -55,13 +55,12 @@ pub fn advance_execution_impl(
             if let Some(execution_id) = job.execution_id.as_deref() {
                 let _ = runtime.emitter.emit(
                     "db-change",
-                    serde_json::json!({
-                        "table": "executions",
-                        "action": "update",
-                        "issueId": job.issue_id,
-                        "executionId": execution_id,
-                        "projectId": job.project_id,
-                    }),
+                    cairn_db::changes::execution_db_change_ids(
+                        "update",
+                        execution_id,
+                        job.issue_id.as_deref(),
+                        &job.project_id,
+                    ),
                 );
             }
             if let Some(issue_id) = job.issue_id.as_deref() {

@@ -374,7 +374,13 @@ pub async fn resolve_pr_node(
     orch.invalidate_pr_refresh(&merge_context.mr.job_id, "pull-request-resolved");
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "merge_requests", "action": "update"}),
+        crate::notify::merge_request_db_change_ids(
+            "update",
+            Some(&merge_context.mr.mr_id),
+            Some(&merge_context.mr.job_id),
+            merge_context.issue_id.as_deref(),
+            &merge_context.project_id,
+        ),
     );
     if let Some(issue_id) = merge_context.issue_id.as_deref() {
         let _ = orch.services.emitter.emit(

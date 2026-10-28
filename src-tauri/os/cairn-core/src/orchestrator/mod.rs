@@ -124,6 +124,7 @@ pub struct OrchestratorBuilder {
     notifier: Notifier,
     thread_status_cache: Arc<generation_cache::ThreadStatusCache>,
     issue_status_cache: Arc<generation_cache::IssueStatusCache>,
+    issue_list_cache: Arc<generation_cache::IssueListCache>,
     api_config: ApiConfig,
     effect_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEffect>>,
     browser_command_tx: Option<crate::browsers::BrowserCommandTx>,
@@ -193,6 +194,12 @@ const NOT_CANCELLED: u8 = u8::MAX;
 /// drive the same binary, or the outcome depends on whether the machine happens
 /// to have its own jj on PATH. `JjEnv::resolve` still honours `CAIRN_JJ_BIN`
 /// ahead of this path, so a suite that pins a private copy keeps it.
+/// Why a projection rebuild found no databases: the runner that owned them has
+/// been dropped.
+fn runner_gone() -> String {
+    "the runner is shutting down".to_string()
+}
+
 fn default_jj_binary_path() -> String {
     #[cfg(any(test, feature = "test-utils"))]
     if let Some(sidecar) = cairn_vcs::jj::testing::provisioned_jj() {
@@ -222,13 +229,68 @@ impl OrchestratorBuilder {
         // anywhere in the crate — passes the projection generations on its way
         // out. Wrapping in `build()` instead would leave `Notifier` bound to the
         // raw emitter and silently miss the job and thread mutations it carries.
-        let thread_status_cache = Arc::new(generation_cache::ThreadStatusCache::with_coalescing(
+        //
+        // The sidebar projections announce what they publish on the host's own
+        // emitter, not the wrapped one: an announcement is not a write, and
+        // nothing that invalidates a projection should see it. Their rebuilds
+        // hold the databases weakly, so a driver task outliving the runner
+        // finds nothing to rebuild rather than keeping it alive.
+        let announce = |projection: &'static str| -> generation_cache::Announce {
+            let emitter = services.emitter.clone();
+            Arc::new(move |project_id: &str| {
+                let _ = emitter.emit(
+                    "db-change",
+                    crate::notify::projection_published_db_change(projection, project_id),
+                );
+            })
+        };
+        let dbs = Arc::downgrade(&db);
+        let thread_status_cache = generation_cache::ThreadStatusCache::new(
             "thread status projection",
-            generation_cache::THREAD_STATUS_COALESCE_FLOOR,
-        ));
-        let issue_status_cache = Arc::new(generation_cache::IssueStatusCache::new(
+            generation_cache::STATUS_ROLLUP_FLOOR,
+            generation_cache::rebuild_with({
+                let dbs = dbs.clone();
+                move |project_id: String| {
+                    let dbs = dbs.clone();
+                    async move {
+                        let dbs = dbs.upgrade().ok_or_else(runner_gone)?;
+                        crate::jobs::queries::rebuild_thread_status(&dbs, &project_id)
+                            .await
+                            .map(Arc::new)
+                    }
+                }
+            }),
+            announce("thread_status"),
+        );
+        let issue_status_cache = generation_cache::IssueStatusCache::new(
             "issue status projection",
-        ));
+            generation_cache::STATUS_ROLLUP_FLOOR,
+            generation_cache::rebuild_with({
+                let dbs = dbs.clone();
+                move |project_id: String| {
+                    let dbs = dbs.clone();
+                    async move {
+                        let dbs = dbs.upgrade().ok_or_else(runner_gone)?;
+                        crate::jobs::queries::rebuild_issue_status(&dbs, &project_id)
+                            .await
+                            .map(Arc::new)
+                    }
+                }
+            }),
+            announce("issue_status"),
+        );
+        let issue_list_cache = generation_cache::IssueListCache::new(
+            "issue list projection",
+            generation_cache::ISSUE_LIST_FLOOR,
+            generation_cache::rebuild_with(move |project_id: String| {
+                let dbs = dbs.clone();
+                async move {
+                    let dbs = dbs.upgrade().ok_or_else(runner_gone)?;
+                    crate::issues::crud::rebuild_issue_list(&dbs, &project_id).await
+                }
+            }),
+            announce("issue_list"),
+        );
         let services = Arc::new(Services {
             process: services.process.clone(),
             git: services.git.clone(),
@@ -237,6 +299,7 @@ impl OrchestratorBuilder {
                 services.emitter.clone(),
                 thread_status_cache.clone(),
                 issue_status_cache.clone(),
+                issue_list_cache.clone(),
             )),
             clock: services.clock.clone(),
             fs: services.fs.clone(),
@@ -276,6 +339,7 @@ impl OrchestratorBuilder {
             notifier,
             thread_status_cache,
             issue_status_cache,
+            issue_list_cache,
             api_config: ApiConfig::default(),
             effect_tx: None,
             browser_command_tx: None,
@@ -630,9 +694,18 @@ impl OrchestratorBuilder {
             ),
             thread_status_cache: self.thread_status_cache,
             issue_status_cache: self.issue_status_cache,
+            issue_list_cache: self.issue_list_cache,
             codex_pool: Arc::new(crate::backends::codex::pool::CodexAppServerPool::default()),
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            // The sidebar caches rebuild on the runner's own runtime, whatever
+            // thread or short-lived runtime the write that invalidates them
+            // arrives on.
+            orchestrator
+                .thread_status_cache
+                .bind_runtime(handle.clone());
+            orchestrator.issue_status_cache.bind_runtime(handle.clone());
+            orchestrator.issue_list_cache.bind_runtime(handle.clone());
             let mut pulls = crate::storage::subscribe_team_pull_applied();
             let snapshot = Arc::downgrade(&orchestrator.sidebar_active_issues);
             let generation = Arc::downgrade(&orchestrator.sidebar_active_issues_generation);
@@ -1095,11 +1168,13 @@ pub struct Orchestrator {
         >,
     >,
     /// Per-project thread activity rollup, keyed by project id. Shared with the
-    /// emitter decorator that advances its generation.
+    /// emitter decorator that invalidates it.
     pub(crate) thread_status_cache: Arc<generation_cache::ThreadStatusCache>,
-    /// Per-project issue activity/PR rollup, keyed by project id. Shares the
-    /// emitter decorator that advances the thread rollup's generation.
+    /// Per-project issue activity/PR rollup, keyed by project id, on the same
+    /// terms.
     pub(crate) issue_status_cache: Arc<generation_cache::IssueStatusCache>,
+    /// Per-project issue list, encoded once per publish, on the same terms.
+    pub(crate) issue_list_cache: Arc<generation_cache::IssueListCache>,
     /// Runner-owned persistent commit-addressed execution workspaces.
     pub fleet: Arc<crate::fleet::Fleet>,
     /// Runtime-only object-channel credentials and staged managed-executor uploads.
@@ -2046,15 +2121,30 @@ impl Orchestrator {
             jobs.remove(job_id);
         }
         self.invalidate_node_check_status(job_id, "check-submission");
+        self.announce_checks_running(job_id);
         Some(cancel)
     }
 
     /// Release the turn-end-check single-flight slot for a job. Idempotent.
     pub fn end_turn_end_checks(&self, job_id: &str) {
-        if let Ok(mut map) = self.turn_end_checks_in_flight.lock() {
-            map.remove(job_id);
-        }
+        let released = self
+            .turn_end_checks_in_flight
+            .lock()
+            .is_ok_and(|mut map| map.remove(job_id).is_some());
         self.invalidate_node_check_status(job_id, "check-settlement");
+        if released {
+            self.announce_checks_running(job_id);
+        }
+    }
+
+    /// The issue row's checks-running glyph is decorated onto every read from
+    /// this in-memory flag, outside the published snapshot, so a rebuild would
+    /// find nothing changed. Announce the projection directly for every project
+    /// whose snapshot names the job, and the reader's next fetch decorates it
+    /// afresh.
+    fn announce_checks_running(&self, job_id: &str) {
+        self.issue_status_cache
+            .announce_where(|snapshot| snapshot.job_ids.contains(job_id));
     }
 
     /// Whether a turn-end check run is currently in flight for a job — the signal
@@ -2176,15 +2266,12 @@ impl Orchestrator {
         self.pr_refresh_cache.invalidate(job_id, reason);
     }
 
-    /// Advance the correctness generation for a project's thread activity rollup.
-    ///
-    /// The projection reads threads, their jobs, those jobs' head turns,
-    /// unanswered prompts, and pending permissions — and nothing else. A merge
-    /// request, a check result, or an issue transition cannot move it, so routing
-    /// those here would rebuild a whole-project SQL rollup to arrive at the same
-    /// answer.
-    pub fn invalidate_thread_status(&self, project_id: &str, reason: &'static str) {
-        self.thread_status_cache.invalidate(project_id, reason);
+    /// Rebuild a project's thread rollup now, past the floor, because a person
+    /// just acknowledged something on it (marked a thread viewed) and is
+    /// looking at the badge it should clear. The only caller allowed to skip
+    /// the floor; every write goes through the emitter instead.
+    pub fn acknowledge_thread_status(&self, project_id: &str, reason: &'static str) {
+        self.thread_status_cache.invalidate_now(project_id, reason);
     }
 
     /// Spawn a background task that registers an anonymous device JWT for the

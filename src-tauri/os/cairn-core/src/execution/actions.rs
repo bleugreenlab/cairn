@@ -93,10 +93,8 @@ pub async fn complete_action_run(
                 Ok(())
             })
         }).await.map_err(|e|e.to_string())?;
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "action_runs", "action": "update"}),
-        );
+        let change = crate::notify::action_run_db_change_for_id(&db, action_run_id, "update").await;
+        let _ = orch.services.emitter.emit("db-change", change);
         if let Err(error) = cairn_workflow::pr_publish_attempts::acknowledge_settled_dispatch(
             &crate::workflow_host::runtime(orch),
             action_run_id,
@@ -113,12 +111,25 @@ pub async fn complete_action_run(
         // in-flight `cairn watch` explicitly here.
         let pr_action_run = get_action_run(&db, action_run_id).await?;
         crate::execution::advancement::recompute_execution_jobs(orch, &pr_action_run.execution_id)?;
-        for table in ["issues", "executions"] {
+        if let Some(issue_id) = pr_action_run.issue_id.as_deref() {
             let _ = orch.services.emitter.emit(
                 "db-change",
-                serde_json::json!({"table": table, "action": "update"}),
+                crate::notify::issue_db_change_ids(
+                    "update",
+                    issue_id,
+                    Some(&pr_action_run.project_id),
+                ),
             );
         }
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            crate::notify::execution_db_change_ids(
+                "update",
+                &pr_action_run.execution_id,
+                pr_action_run.issue_id.as_deref(),
+                &pr_action_run.project_id,
+            ),
+        );
         if let Some(issue_id) = pr_action_run.issue_id.as_deref() {
             orch.wake_for_issue(issue_id).await;
         }
@@ -128,10 +139,8 @@ pub async fn complete_action_run(
     // Mark action_run as complete
     update_action_run_complete(&db, action_run_id, output_json.as_deref(), now).await?;
 
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "action_runs", "action": "update"}),
-    );
+    let change = crate::notify::action_run_db_change_for_id(&db, action_run_id, "update").await;
+    let _ = orch.services.emitter.emit("db-change", change);
 
     Ok(result)
 }
@@ -917,7 +926,13 @@ pub(crate) async fn open_pr_for_job(
     orch.invalidate_pr_refresh(producing_job_id, "pull-request-seeded");
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "merge_requests", "action": "insert"}),
+        crate::notify::merge_request_db_change_ids(
+            "insert",
+            None,
+            Some(producing_job_id),
+            issue_id,
+            project_id,
+        ),
     );
 
     let github = if has_remote {
@@ -958,7 +973,13 @@ pub(crate) async fn open_pr_for_job(
     orch.invalidate_pr_refresh(producing_job_id, "pull-request-opened");
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "merge_requests", "action": "update"}),
+        crate::notify::merge_request_db_change_ids(
+            "update",
+            None,
+            Some(producing_job_id),
+            issue_id,
+            project_id,
+        ),
     );
 
     match crate::pr_data::actions::refresh_pr_for_job(orch, producing_job_id).await {

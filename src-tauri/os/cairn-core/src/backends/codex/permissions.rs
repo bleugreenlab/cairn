@@ -460,10 +460,19 @@ fn request_codex_permission(
             "input": tool_input,
         }),
     );
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "permission_requests", "action": "insert"}),
-    );
+    let change = run_backend_db(CODEX_BACKEND_NAME, {
+        let db = run_db.clone();
+        let request_id = request_id.clone();
+        async move {
+            Ok::<_, String>(
+                crate::notify::permission_request_db_change_for_id(&db, &request_id, "insert")
+                    .await,
+            )
+        }
+    });
+    if let Ok(change) = change {
+        let _ = orch.services.emitter.emit("db-change", change);
+    }
 
     let mut rx = orch.permission_responses.subscribe();
 

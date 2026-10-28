@@ -1030,9 +1030,10 @@ async fn mark_publication_unconfirmed(
     for job_id in merge_request_jobs_for_branch(db, project_id, branch).await {
         orch.invalidate_pr_refresh(&job_id, "source-head-unpublished");
     }
+    // Every open request on the branch moved, all within this one project.
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "merge_requests", "action": "update"}),
+        crate::notify::merge_request_db_change_ids("update", None, None, None, project_id),
     );
     Ok(())
 }

@@ -247,6 +247,7 @@ async fn evaluate_gates(
     let ctx = GateContext::new(orch, now);
     let mut evaluation = Evaluation::default();
     let mut all_satisfied = true;
+    let mut gates_moved = false;
     for gate in gates {
         if gate.is_satisfied() {
             continue;
@@ -280,7 +281,7 @@ async fn evaluate_gates(
                 continue;
             }
         }
-        record_outcome(db, gate, outcome, now).await?;
+        gates_moved |= record_outcome(db, gate, outcome, now).await?;
         if outcome == GateOutcome::Satisfied {
             continue;
         }
@@ -297,6 +298,7 @@ async fn evaluate_gates(
             _ => match vocabulary.foreclosed(&ctx, &clause).await {
                 Ok(Some(reason)) => {
                     latched_now = latch_foreclosure(db, gate, &reason, now).await?;
+                    gates_moved |= latched_now;
                     if latched_now {
                         evaluation.foreclosed.push(gate.id.clone());
                     }
@@ -335,6 +337,18 @@ async fn evaluate_gates(
         )
         .await?;
     }
+    // A release announces itself through `announce_release`. Short of one, a
+    // newly recorded outcome or foreclosure still changes what the gate census
+    // on this issue's row says, and nothing else would tell the issue list.
+    if gates_moved && !evaluation.released {
+        let change = crate::notify::execution_gates_db_change_for_execution(
+            db,
+            &execution.execution_id,
+            "update",
+        )
+        .await;
+        let _ = orch.services.emitter.emit("db-change", change);
+    }
     Ok(evaluation)
 }
 
@@ -358,18 +372,18 @@ async fn deliver_tenet_decision(
     Ok(())
 }
 
-/// Record a gate's newest resolution, latching satisfaction. Skips the write
-/// when nothing would change, so a quiet gate costs a read per tick, not a
-/// write.
+/// Record a gate's newest resolution, latching satisfaction, and report whether
+/// it wrote. Skips the write when nothing would change, so a quiet gate costs a
+/// read per tick, not a write.
 async fn record_outcome(
     db: &LocalDb,
     gate: &ExecutionGate,
     outcome: GateOutcome,
     now: i64,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let satisfied_at = (outcome == GateOutcome::Satisfied).then_some(now);
     if satisfied_at.is_none() && gate.last_outcome.as_deref() == Some(outcome.as_str()) {
-        return Ok(());
+        return Ok(false);
     }
     let gate_id = gate.id.clone();
     db.write(|conn| {
@@ -379,6 +393,7 @@ async fn record_outcome(
         })
     })
     .await
+    .map(|()| true)
     .map_err(|error| format!("failed to record gate outcome: {error}"))
 }
 
@@ -416,7 +431,7 @@ async fn release_in(
         return Ok(false);
     };
     log::info!("released held execution {execution_id} ({cause:?})");
-    announce_release(orch, execution_id, released).await;
+    announce_release(orch, db, execution_id, released).await;
     Ok(true)
 }
 
@@ -432,14 +447,23 @@ pub(crate) struct Released {
 /// The post-commit tail of a release — the same tail a fresh launch has: stop
 /// the agents its fence froze, emit, then enqueue `AdvanceDag` for the
 /// released row.
-pub(crate) async fn announce_release(orch: &Orchestrator, execution_id: &str, released: Released) {
+pub(crate) async fn announce_release(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    execution_id: &str,
+    released: Released,
+) {
     let Released {
         issue_id,
         supersessions,
     } = released;
     crate::execution::recipe::stop_superseded_agents(orch, &supersessions);
-    orch.notifier.emit_change("executions");
-    orch.notifier.emit_change("jobs");
+    let execution_change =
+        crate::notify::execution_db_change_for_id(db, execution_id, "update").await;
+    let _ = orch.services.emitter.emit("db-change", execution_change);
+    for change in crate::notify::job_db_changes_for_execution(db, execution_id, "insert").await {
+        let _ = orch.services.emitter.emit("db-change", change);
+    }
     if let Some(tx) = orch.effect_tx.as_ref() {
         let _ = tx.send(crate::effects::types::WorkflowEffect::AdvanceDag {
             execution_id: execution_id.to_string(),

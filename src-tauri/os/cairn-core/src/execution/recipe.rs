@@ -173,14 +173,21 @@ pub(crate) fn start_recipe_execution_and_advance(
         intent,
         &gates,
     )?;
+    let execution_change =
+        crate::notify::execution_db_change_ids("insert", &execution.id, Some(issue_id), project_id);
     if !gates.is_empty() {
-        orch.notifier.emit_change("executions");
+        let _ = orch.services.emitter.emit("db-change", execution_change);
         crate::execution::gates::sweep::notify_gate_evidence_changed();
         return Ok(execution);
     }
-    let _jobs = create_jobs_for_execution(orch, &execution.id)?;
-    orch.notifier.emit_change("executions");
-    orch.notifier.emit_change("jobs");
+    let jobs = create_jobs_for_execution(orch, &execution.id)?;
+    let _ = orch.services.emitter.emit("db-change", execution_change);
+    for job in &jobs {
+        let _ = orch
+            .services
+            .emitter
+            .emit("db-change", crate::notify::job_db_change(job, "insert"));
+    }
     if let Some(ref tx) = orch.effect_tx {
         let _ = tx.send(crate::effects::types::WorkflowEffect::AdvanceDag {
             execution_id: execution.id.clone(),

@@ -228,7 +228,7 @@ async fn setup_merge(bin: &str, wedge_target: bool) -> MergeFixture {
             repo_path: repo_path.clone(),
             job_id: "job-src".to_string(),
             is_local: false,
-            project_id: None,
+            project_id: "proj-1".to_string(),
             issue_id: None,
         },
         issue_id: Some("issue".to_string()),

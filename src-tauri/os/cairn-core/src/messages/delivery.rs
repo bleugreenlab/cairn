@@ -86,10 +86,8 @@ pub async fn append_thread_message(
         "db-change",
         serde_json::json!({"table":"messages", "action":"insert", "threadId":thread_id}),
     );
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table":"threads", "action":"update", "threadId":thread_id}),
-    );
+    let thread_change = crate::notify::thread_db_change_for_id(db, thread_id, "update").await;
+    let _ = orch.services.emitter.emit("db-change", thread_change);
     Ok(message.id)
 }
 

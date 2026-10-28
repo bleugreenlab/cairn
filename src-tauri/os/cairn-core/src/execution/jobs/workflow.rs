@@ -921,7 +921,10 @@ pub async fn launch_standalone_workflow(
     )
     .await
     .map_err(|e| e.to_string())?;
-    orch.notifier.emit_change("issues");
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        crate::notify::issue_db_change(&issue, "insert"),
+    );
 
     // 4. Mint the single execution that hosts the workflow node.
     let now = chrono::Utc::now().timestamp() as i32;
@@ -990,7 +993,15 @@ pub async fn launch_standalone_workflow(
             .await
             .map_err(|e| e.to_string())?;
     }
-    orch.notifier.emit_change("executions");
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        crate::notify::execution_db_change_ids(
+            "insert",
+            &execution_id,
+            Some(&issue.id),
+            project_id,
+        ),
+    );
 
     // 5. Create the top-level node-less workflow job + turn, then spawn the
     //    supervised process. No delegated packet is persisted — there is no caller

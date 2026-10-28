@@ -120,12 +120,7 @@ async fn insert_issue_with_context(
     if !issue.labels.is_empty() {
         if let Err(e) = services.emitter.emit(
             "db-change",
-            serde_json::json!({
-                "table": "issue_labels",
-                "action": "insert",
-                "issueId": issue.id,
-                "projectId": issue.project_id,
-            }),
+            crate::notify::issue_labels_db_change("insert", &issue.id, &issue.project_id),
         ) {
             log::error!("Failed to emit db-change event: {}", e);
         }
@@ -762,12 +757,7 @@ pub(crate) async fn update_issue_by_project_number(
     if labels_changed {
         if let Err(e) = orch.services.emitter.emit(
             "db-change",
-            serde_json::json!({
-                "table": "issue_labels",
-                "action": "update",
-                "issueId": issue.id,
-                "projectId": issue.project_id,
-            }),
+            crate::notify::issue_labels_db_change("update", &issue.id, &issue.project_id),
         ) {
             log::error!("Failed to emit db-change event: {}", e);
         }

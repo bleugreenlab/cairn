@@ -359,7 +359,13 @@ pub(crate) async fn sync_create_pr_artifact_for_job(
     orch.invalidate_pr_refresh(&mr_context.job_id, "pull-request-title-or-body");
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "merge_requests", "action": "update"}),
+        crate::notify::merge_request_db_change_ids(
+            "update",
+            Some(&mr_context.mr_id),
+            Some(&mr_context.job_id),
+            mr_context.issue_id.as_deref(),
+            &mr_context.project_id,
+        ),
     );
     Ok(true)
 }

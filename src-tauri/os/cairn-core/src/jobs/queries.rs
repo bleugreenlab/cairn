@@ -782,57 +782,39 @@ pub async fn node_status_indicators(
     .map_err(CairnError::from)
 }
 
-/// Live status for one thread — the unit a thread row renders.
-/// The published thread rollup for one project, materialized once per
-/// generation.
+/// The published thread rollup for one project.
 ///
-/// The SQL below joins every thread's jobs and evaluates a correlated head-turn,
-/// prompt and permission lookup per job, so it costs the same whether one thread
-/// moved or none did. Its invalidation sources fire continuously during normal
-/// work, which is how an idle app came to re-run a whole-project rollup in a
-/// loop. Reading through the fence makes a repeat read of unchanged state an
-/// in-memory clone, and collapses a concurrent cold burst to one SQL execution.
+/// The SQL behind it joins every thread's jobs and evaluates a correlated
+/// head-turn, prompt and permission lookup per job, so it costs the same whether
+/// one thread moved or none did. It is served from the orchestrator's cadenced
+/// cache: a read returns the last published snapshot at once, and the cache
+/// rebuilds at most once per [`STATUS_ROLLUP_FLOOR`] and announces a changed
+/// answer. A read waits only on a cold start.
+///
+/// [`STATUS_ROLLUP_FLOOR`]: crate::orchestrator::generation_cache::STATUS_ROLLUP_FLOOR
 pub async fn published_thread_status_indicators(
     orch: &crate::orchestrator::Orchestrator,
     project_id: &str,
 ) -> Result<Vec<ThreadStatusIndicator>, CairnError> {
-    let failure: std::sync::Mutex<Option<CairnError>> = std::sync::Mutex::new(None);
-    let published = orch
-        .thread_status_cache
-        .get_or_compute(project_id, || async {
-            let db = match crate::execution::routing::owning_db_for_project(&orch.db, project_id)
-                .await
-            {
-                Ok(db) => db,
-                Err(error) => {
-                    if let Ok(mut slot) = failure.lock() {
-                        *slot = Some(error);
-                    }
-                    return None;
-                }
-            };
-            match thread_status_snapshot(&db, project_id).await {
-                Ok(snapshot) => Some(std::sync::Arc::new(snapshot)),
-                Err(error) => {
-                    if let Ok(mut slot) = failure.lock() {
-                        *slot = Some(error);
-                    }
-                    None
-                }
-            }
-        })
-        .await;
+    orch.thread_status_cache
+        .get(project_id)
+        .await
+        .map(|snapshot| snapshot.indicators.clone())
+        .map_err(CairnError::Internal)
+}
 
-    match published {
-        Some(snapshot) => Ok(snapshot.indicators.clone()),
-        None => Err(failure
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take())
-            .unwrap_or_else(|| {
-                CairnError::Internal("failed to rebuild the thread status rollup".to_string())
-            })),
-    }
+/// Rebuild one project's thread rollup from its owning database: the thread
+/// status cache's rebuild, and nothing else's.
+pub(crate) async fn rebuild_thread_status(
+    dbs: &crate::db::DbState,
+    project_id: &str,
+) -> Result<ThreadStatusSnapshot, String> {
+    let db = crate::execution::routing::owning_db_for_project(dbs, project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    thread_status_snapshot(&db, project_id)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Everything one project's thread rows show, plus the evidence needed to decide
@@ -841,6 +823,9 @@ pub async fn published_thread_status_indicators(
 /// The two halves are materialized together because they are read together and a
 /// half-fenced projection is not fenced: while the unread count was recomputed on
 /// every read, a warm activity snapshot saved nothing a sidebar poll could feel.
+///
+/// Compared whole after each rebuild, so an unchanged rollup is not announced.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ThreadStatusSnapshot {
     pub(crate) indicators: Vec<ThreadStatusIndicator>,
     /// Every job the rollup above actually read.
@@ -1355,22 +1340,9 @@ const ISSUE_STATUS_JOB_ROWS_SQL: &str = "SELECT
           ORDER BY t.created_at DESC, t.sequence DESC
           LIMIT 1)
     ) AS head_turn_state,
-    MAX(
-        COALESCE((
-            SELECT MAX(ms.updated_at)
-              FROM message_streams ms
-             WHERE ms.turn_id = j.current_turn_id
-        ), 0),
-        COALESCE((
-            SELECT MAX(ev.created_at)
-              FROM events ev
-             WHERE ev.turn_id = j.current_turn_id
-        ), 0),
-        COALESCE((
-            SELECT ct.updated_at
-              FROM turns ct
-             WHERE ct.id = j.current_turn_id
-        ), j.updated_at)
+    COALESCE(
+        (SELECT ct.updated_at FROM turns ct WHERE ct.id = j.current_turn_id),
+        j.updated_at
     ) AS activity_updated_at,
     EXISTS (
         SELECT 1 FROM prompts p
@@ -1614,6 +1586,7 @@ pub async fn issue_status_indicators(
 /// all: in the hour profiled for CAIRN-4331 it spent 756 seconds answering 1,275
 /// reads, nearly all of which were driven by `db-change` traffic rather than by
 /// anyone looking.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct IssueStatusSnapshot {
     pub(crate) indicators: Vec<IssueStatusIndicator>,
     /// The current-execution jobs the rollup read. See
@@ -1622,62 +1595,43 @@ pub(crate) struct IssueStatusSnapshot {
     pub(crate) job_ids: HashSet<String>,
 }
 
-/// The published issue rollup for one project, materialized once per generation.
+/// The published issue rollup for one project, served on the same terms as
+/// [`published_thread_status_indicators`].
 ///
-/// `checks_running` stays outside the fence deliberately. It is an in-memory
+/// `checks_running` stays outside the snapshot deliberately. It is an in-memory
 /// orchestrator fact with no DB row, so no `db-change` could invalidate it; the
-/// transport command decorates every read from `job_ids`, which means it is
-/// always current even when the rest of the row is being served from a snapshot.
+/// transport command decorates every read from `job_ids`, and the orchestrator
+/// announces the projection whenever that fact flips for a job it names.
 pub async fn published_issue_status_indicators(
     orch: &crate::orchestrator::Orchestrator,
     project_id: &str,
 ) -> Result<Vec<IssueStatusIndicator>, CairnError> {
-    let failure: std::sync::Mutex<Option<CairnError>> = std::sync::Mutex::new(None);
-    let published = orch
-        .issue_status_cache
-        .get_or_compute(project_id, || async {
-            let db = match crate::execution::routing::owning_db_for_project(&orch.db, project_id)
-                .await
-            {
-                Ok(db) => db,
-                Err(error) => {
-                    if let Ok(mut slot) = failure.lock() {
-                        *slot = Some(error);
-                    }
-                    return None;
-                }
-            };
-            match issue_status_indicators(&db, project_id).await {
-                Ok(indicators) => {
-                    let job_ids = indicators
-                        .iter()
-                        .flat_map(|indicator| indicator.job_ids.iter().cloned())
-                        .collect();
-                    Some(std::sync::Arc::new(IssueStatusSnapshot {
-                        indicators,
-                        job_ids,
-                    }))
-                }
-                Err(error) => {
-                    if let Ok(mut slot) = failure.lock() {
-                        *slot = Some(error);
-                    }
-                    None
-                }
-            }
-        })
-        .await;
+    orch.issue_status_cache
+        .get(project_id)
+        .await
+        .map(|snapshot| snapshot.indicators.clone())
+        .map_err(CairnError::Internal)
+}
 
-    match published {
-        Some(snapshot) => Ok(snapshot.indicators.clone()),
-        None => Err(failure
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take())
-            .unwrap_or_else(|| {
-                CairnError::Internal("failed to rebuild the issue status rollup".to_string())
-            })),
-    }
+/// Rebuild one project's issue rollup: the issue status cache's rebuild.
+pub(crate) async fn rebuild_issue_status(
+    dbs: &crate::db::DbState,
+    project_id: &str,
+) -> Result<IssueStatusSnapshot, String> {
+    let db = crate::execution::routing::owning_db_for_project(dbs, project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let indicators = issue_status_indicators(&db, project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let job_ids = indicators
+        .iter()
+        .flat_map(|indicator| indicator.job_ids.iter().cloned())
+        .collect();
+    Ok(IssueStatusSnapshot {
+        indicators,
+        job_ids,
+    })
 }
 
 fn node_name_from_snapshot(snapshot_json: &str, node_id: &str) -> Option<String> {
@@ -2004,17 +1958,16 @@ mod tests {
             "jobs must use an indexed search, got {plan:?}"
         );
         assert!(
-            plan.iter()
-                .any(|step| { step.contains("SEARCH ms USING INDEX idx_message_streams_turn_id") }),
-            "message streams must be searched by turn_id, got {plan:?}"
-        );
-        assert!(
             !plan.iter().any(|step| step.contains("SCAN j")),
             "issue status must not scan jobs, got {plan:?}"
         );
+        // The rollup reads no transcript, which is what keeps it out of the
+        // highest-volume invalidation stream in the workspace.
         assert!(
-            !plan.iter().any(|step| step.contains("SCAN ms")),
-            "issue status must not scan message streams, got {plan:?}"
+            !plan
+                .iter()
+                .any(|step| step.contains(" ms ") || step.contains(" ev ")),
+            "issue status must not read message streams or events, got {plan:?}"
         );
 
         let sql = format!("EXPLAIN QUERY PLAN {ISSUE_STATUS_PR_ROWS_SQL}");
@@ -2929,9 +2882,11 @@ mod tests {
             );
         }
 
-        let counters = orch.thread_status_cache.counters();
-        assert_eq!(counters.misses, 1, "one rebuild served every read");
-        assert_eq!(counters.hits, 10);
+        assert_eq!(
+            orch.thread_status_cache.rebuilds(),
+            1,
+            "one rebuild served every read"
+        );
     }
 
     /// The whole fix, end to end through the real orchestrator wiring: an agent
@@ -2964,7 +2919,7 @@ mod tests {
         published_thread_status_indicators(&orch, "p")
             .await
             .unwrap();
-        assert_eq!(orch.thread_status_cache.counters().misses, 1);
+        assert_eq!(orch.thread_status_cache.rebuilds(), 1);
 
         for _ in 0..500 {
             let _ = orch.services.emitter.emit(
@@ -2980,17 +2935,18 @@ mod tests {
                 .unwrap();
         }
 
+        orch.thread_status_cache.settle("p").await;
         assert_eq!(
-            orch.thread_status_cache.counters().misses,
+            orch.thread_status_cache.rebuilds(),
             1,
             "an issue node's transcript must not cost the thread sidebar a single \
              census, however long the agent runs"
         );
     }
 
-    /// The other half of the same contract: the thread's OWN transcript is not
-    /// ignored. It waits out the coalescing floor rather than being dropped, and
-    /// the structural write that follows it is never deferred at all.
+    /// The other half of the same contract: the thread's OWN work is not
+    /// ignored. It reaches the snapshot within one floor, rebuilt by the cache
+    /// itself rather than by whichever read happens to come next.
     #[tokio::test(flavor = "current_thread")]
     async fn a_threads_own_work_still_reaches_the_sidebar() {
         let db = test_db().await;
@@ -3006,14 +2962,74 @@ mod tests {
             "db-change",
             serde_json::json!({"table": "turns", "projectId": "p", "jobId": "j"}),
         );
-        published_thread_status_indicators(&orch, "p")
+        orch.thread_status_cache.settle("p").await;
+        assert_eq!(
+            orch.thread_status_cache.rebuilds(),
+            2,
+            "a turn on the thread's own job rebuilds the rollup"
+        );
+    }
+
+    /// The issue list through the real wiring: a repeat read with nothing
+    /// changed rebuilds nothing (so runs no SQL and encodes nothing), agent
+    /// transcript and turn traffic leaves it alone, and an issue write reaches
+    /// it within a floor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_issue_list_is_served_warm_and_moves_only_with_its_inputs() {
+        let db = test_db().await;
+        seed_one_quiet_thread(&db).await;
+        exec(
+            &db,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('i', 'p', 1, 'Before', 'active', 1, 1)",
+        )
+        .await;
+        let orch = orchestrator_over(db);
+
+        let first = crate::issues::crud::published_issue_list(&orch, "p")
             .await
             .unwrap();
+        assert!(first.json().get().contains("\"Before\""));
+        for _ in 0..10 {
+            let again = crate::issues::crud::published_issue_list(&orch, "p")
+                .await
+                .unwrap();
+            assert!(again == first);
+        }
         assert_eq!(
-            orch.thread_status_cache.counters().misses,
-            2,
-            "a turn on the thread's own job is a lifecycle write and rebuilds at once"
+            orch.issue_list_cache.rebuilds(),
+            1,
+            "warm reads rebuild nothing"
         );
+
+        for table in ["events", "turns", "jobs", "prompts", "merge_requests"] {
+            let _ = orch.services.emitter.emit(
+                "db-change",
+                serde_json::json!({"table": table, "projectId": "p", "jobId": "j"}),
+            );
+        }
+        orch.issue_list_cache.settle("p").await;
+        assert_eq!(
+            orch.issue_list_cache.rebuilds(),
+            1,
+            "agent traffic does not move an issue row"
+        );
+
+        exec(
+            &orch.db.local,
+            "UPDATE issues SET title = 'After' WHERE id = 'i'",
+        )
+        .await;
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            crate::notify::issue_db_change_ids("update", "i", Some("p")),
+        );
+        orch.issue_list_cache.settle("p").await;
+        let after = crate::issues::crud::published_issue_list(&orch, "p")
+            .await
+            .unwrap();
+        assert!(after.json().get().contains("\"After\""));
+        assert_eq!(orch.issue_list_cache.rebuilds(), 2);
     }
 
     /// A concurrent cold burst produces one rebuild between them, not one each.
@@ -3040,7 +3056,7 @@ mod tests {
             assert_eq!(reader.await.unwrap(), 1);
         }
 
-        assert_eq!(orch.thread_status_cache.counters().misses, 1);
+        assert_eq!(orch.thread_status_cache.rebuilds(), 1);
     }
 
     /// The snapshot follows a real transition, and only a real one. A turn going
@@ -3065,8 +3081,9 @@ mod tests {
         published_thread_status_indicators(&orch, "p")
             .await
             .unwrap();
+        orch.thread_status_cache.settle("p").await;
         assert_eq!(
-            orch.thread_status_cache.counters().misses,
+            orch.thread_status_cache.rebuilds(),
             1,
             "a merge request is not an input to thread activity"
         );
@@ -3091,6 +3108,7 @@ mod tests {
             "db-change",
             serde_json::json!({"table": "turns", "projectId": "p"}),
         );
+        orch.thread_status_cache.settle("p").await;
 
         let running = published_thread_status_indicators(&orch, "p")
             .await
@@ -3100,7 +3118,7 @@ mod tests {
             NodeActivity::Running,
             "the transition must reach the UI, not sit behind a warm snapshot"
         );
-        assert_eq!(orch.thread_status_cache.counters().misses, 2);
+        assert_eq!(orch.thread_status_cache.rebuilds(), 2);
     }
 
     /// A thread's session and a task it spawned both resolve a home URI, and the
@@ -3311,11 +3329,11 @@ mod tests {
     async fn issue_awaiting_input_outranks_a_running_sibling_job() {
         let db = test_db().await;
         seed_active_issue(&db).await;
-        // A running sibling whose turn started first but later emitted streamed output.
+        // A running sibling whose turn started first but moved most recently.
         exec(
             &db,
             "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
-             VALUES ('t-run', 's-run', 'j-run', 1, 'running', 'initial', 1, 1)",
+             VALUES ('t-run', 's-run', 'j-run', 1, 'running', 'initial', 1, 5)",
         )
         .await;
         exec(
@@ -3343,10 +3361,13 @@ mod tests {
              VALUES ('run-running', 'j-run', 'i', 1, 5)",
         )
         .await;
+        // Streamed output is transcript, which the issue rollup does not read:
+        // it would otherwise rebuild on every token. Ordering follows the
+        // current turn's last transition instead.
         exec(
             &db,
             "INSERT INTO message_streams(id, run_id, turn_id, backend, sequence, status, created_at, updated_at)
-             VALUES ('stream-running', 'run-running', 't-run', 'codex', 1, 'open', 1, 5)",
+             VALUES ('stream-running', 'run-running', 't-run', 'codex', 1, 'open', 1, 9)",
         )
         .await;
         exec(
@@ -3844,8 +3865,8 @@ mod tests {
         }
 
         // The issue rollup, whose cost tracks in-progress issues rather than
-        // transcript length. It has no coalescing floor, so this number is what
-        // a cold-generation read costs outright.
+        // transcript length. This number is what one rebuild costs outright,
+        // before the floor bounds how often it is paid.
         for issues in [25usize, 50, 100] {
             let db = census_fixture_read(4, 200, true).await;
             seed_issues(&db, issues, 3).await;
@@ -3858,6 +3879,127 @@ mod tests {
             println!(
                 "[issues] {issues} active issues x 3 jobs: {:?}",
                 started.elapsed() / 5
+            );
+        }
+    }
+
+    /// The same three sidebar projections priced against a real database.
+    ///
+    /// Point `CAIRN_MEASURE_DB` at an APFS clone of a production database
+    /// (`cp -c ~/.cairn/cairn.db{,-log,-wal} $TMPDIR/...`), never at a live file:
+    ///
+    /// ```text
+    /// CAIRN_MEASURE_DB=$TMPDIR/clone/cairn.db \
+    ///   cargo test -p cairn-core --lib projection_cost_on_a_database_clone -- --ignored --nocapture
+    /// ```
+    ///
+    /// It splits `list_issues` into the parts that run per call (the issue
+    /// SELECT, labels, the gate census) and prices the serialized payload, which
+    /// is what decides whether a snapshot should hold rows or encoded JSON.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "measurement against an external database; set CAIRN_MEASURE_DB"]
+    async fn projection_cost_on_a_database_clone() {
+        let Ok(path) = std::env::var("CAIRN_MEASURE_DB") else {
+            println!("CAIRN_MEASURE_DB is not set; nothing to measure");
+            return;
+        };
+        let db = LocalDb::open(&path).await.unwrap();
+        let projects = db
+            .query_all(
+                "SELECT p.id, p.key, (SELECT COUNT(*) FROM issues i WHERE i.project_id = p.id)
+                 FROM projects p ORDER BY 3 DESC",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?, row.i64(2)?)),
+            )
+            .await
+            .unwrap();
+        let average = |started: std::time::Instant, n: u32| started.elapsed() / n;
+        for (project_id, key, issue_count) in projects {
+            if issue_count == 0 {
+                continue;
+            }
+            // One untimed pass so every figure below is a warm-page-cache read.
+            let issues = crate::issues::crud::list(&db, &project_id).await.unwrap();
+            let ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+
+            let started = std::time::Instant::now();
+            for _ in 0..3 {
+                crate::issues::crud::list(&db, &project_id).await.unwrap();
+            }
+            let whole = average(started, 3);
+
+            let started = std::time::Instant::now();
+            for _ in 0..3 {
+                let project = project_id.clone();
+                db.query_all(
+                    "SELECT * FROM issues WHERE project_id = ?1 ORDER BY number DESC",
+                    params![project.as_str()],
+                    |row| row.text(0),
+                )
+                .await
+                .unwrap();
+            }
+            let select = average(started, 3);
+
+            let started = std::time::Instant::now();
+            for _ in 0..3 {
+                let ids = ids.clone();
+                db.read(|conn| {
+                    let ids = ids.clone();
+                    Box::pin(async move {
+                        crate::labels::attach::list_labels_for_issues(conn, &ids).await
+                    })
+                })
+                .await
+                .unwrap();
+            }
+            let labels = average(started, 3);
+
+            let started = std::time::Instant::now();
+            for _ in 0..3 {
+                let ids = ids.clone();
+                db.read(|conn| {
+                    let ids = ids.clone();
+                    Box::pin(async move {
+                        crate::execution::gates::census::gated_executions_for_issues_conn(
+                            conn, &ids,
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap();
+            }
+            let gates = average(started, 3);
+
+            let mut displayed = issues.clone();
+            let started = std::time::Instant::now();
+            crate::identity::display::resolve_author_displays(&db, &mut displayed).await;
+            let authors = started.elapsed();
+
+            let started = std::time::Instant::now();
+            let encoded = serde_json::to_vec(&displayed).unwrap();
+            let encode = started.elapsed();
+            let description_bytes: usize = issues.iter().map(|issue| issue.description.len()).sum();
+
+            let started = std::time::Instant::now();
+            let thread = super::thread_status_snapshot(&db, &project_id)
+                .await
+                .unwrap();
+            let thread_census = started.elapsed();
+            let started = std::time::Instant::now();
+            let issue_rollup = issue_status_indicators(&db, &project_id).await.unwrap();
+            let issue_census = started.elapsed();
+
+            println!(
+                "[{key} {project_id}] {issue_count} issues: list_issues {whole:?} \
+                 (select {select:?}, labels {labels:?}, gates {gates:?}), authors {authors:?}, \
+                 encode {encode:?}, payload {} bytes ({description_bytes} in descriptions); \
+                 thread census {thread_census:?} ({} threads), issue census {issue_census:?} \
+                 ({} rows)",
+                encoded.len(),
+                thread.indicators.len(),
+                issue_rollup.len(),
             );
         }
     }

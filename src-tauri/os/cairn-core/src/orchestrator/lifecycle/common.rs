@@ -6,13 +6,6 @@ use crate::models::{RunStatus, TurnEndReason, TurnState};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, DbError};
 
-fn emit_db_change(orch: &Orchestrator, table: &str, action: &str) {
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": table, "action": action}),
-    );
-}
-
 fn transition_error(
     entity: &'static str,
     id: &str,
@@ -56,7 +49,7 @@ pub(super) fn apply_turn_outcome(
     let turn_id = turn_id.to_string();
     let outcome_str = outcome.to_string();
     let end_reason = end_reason.map(|reason| reason.to_string());
-    run_db_blocking({
+    let change = run_db_blocking({
         let dbs = orch.db.clone();
         move || async move {
             let db = crate::execution::routing::owning_db_for_turn(&dbs, &turn_id)
@@ -150,10 +143,11 @@ pub(super) fn apply_turn_outcome(
                 })
             })
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+            Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "update").await)
         }
     })?;
-    emit_db_change(orch, "turns", "update");
+    let _ = orch.services.emitter.emit("db-change", change);
     Ok(())
 }
 
@@ -164,7 +158,7 @@ pub(super) fn interrupt_turn(
 ) -> Result<(), String> {
     let turn_id = turn_id.to_string();
     let end_reason = end_reason.map(|reason| reason.to_string());
-    run_db_blocking({
+    let change = run_db_blocking({
         let dbs = orch.db.clone();
         move || async move {
             let db = crate::execution::routing::owning_db_for_turn(&dbs, &turn_id)
@@ -240,10 +234,11 @@ pub(super) fn interrupt_turn(
                 })
             })
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+            Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "update").await)
         }
     })?;
-    emit_db_change(orch, "turns", "update");
+    let _ = orch.services.emitter.emit("db-change", change);
     Ok(())
 }
 

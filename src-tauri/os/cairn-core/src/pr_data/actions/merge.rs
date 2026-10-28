@@ -1584,7 +1584,7 @@ mod tests {
                 repo_path: "/tmp/repo".to_string(),
                 job_id: "job".to_string(),
                 is_local: false,
-                project_id: None,
+                project_id: "project".to_string(),
                 issue_id: None,
             },
             issue_id: Some("issue".to_string()),

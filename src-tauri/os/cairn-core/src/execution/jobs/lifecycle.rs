@@ -399,6 +399,19 @@ impl PendingLaunchTurnGuard<'_> {
         self.wrote_running_job_id = Some(job_id.to_string());
     }
 
+    fn emit_turn_change(&self, turn_id: &str) {
+        let change = run_db({
+            let db = self.db.clone();
+            let turn_id = turn_id.to_string();
+            async move {
+                Ok::<_, String>(crate::notify::turn_db_change_for_id(&db, &turn_id, "update").await)
+            }
+        });
+        if let Ok(change) = change {
+            let _ = self.orch.services.emitter.emit("db-change", change);
+        }
+    }
+
     fn adopted(&mut self) {
         self.turn_id = None;
         self.run_id = None;
@@ -433,10 +446,7 @@ impl Drop for PendingLaunchTurnGuard<'_> {
                     "failed to settle preclaimed successor {turn_id} after launch failure: {error}"
                 );
             }
-            let _ = self.orch.services.emitter.emit(
-                "db-change",
-                serde_json::json!({"table": "turns", "action": "update", "turnId": turn_id}),
-            );
+            self.emit_turn_change(&turn_id);
         }
         if let Some(turn_id) = turn_id {
             let result = run_db({
@@ -454,10 +464,7 @@ impl Drop for PendingLaunchTurnGuard<'_> {
             if let Err(error) = result {
                 log::error!("failed to cancel pending successor after launch failure: {error}");
             }
-            let _ = self.orch.services.emitter.emit(
-                "db-change",
-                serde_json::json!({"table": "turns", "action": "update", "turnId": turn_id}),
-            );
+            self.emit_turn_change(&turn_id);
         }
         if let Some(run_id) = self.inserted_run_id.take() {
             crate::orchestrator::lifecycle::release_and_stop_process(self.orch, &run_id);

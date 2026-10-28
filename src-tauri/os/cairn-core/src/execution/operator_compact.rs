@@ -621,10 +621,22 @@ fn settle_asks_and_turns(
                 .await
                 .map_err(|error| format!("failed to withdraw pending questions: {error}"))
         })?;
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "prompts", "action": "update"}),
-        );
+        let changes = run_db_blocking({
+            let db = db.clone();
+            let questions = live.questions.clone();
+            move || async move {
+                let mut changes = Vec::with_capacity(questions.len());
+                for question in &questions {
+                    changes.push(
+                        crate::notify::prompt_db_change_for_id(&db, question, "update").await,
+                    );
+                }
+                Ok::<_, String>(changes)
+            }
+        })?;
+        for change in changes {
+            let _ = orch.services.emitter.emit("db-change", change);
+        }
     }
 
     if !live.waits.is_empty() {

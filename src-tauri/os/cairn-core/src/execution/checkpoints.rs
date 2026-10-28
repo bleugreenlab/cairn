@@ -20,7 +20,7 @@ pub async fn approve_job_inner(orch: &Orchestrator, job_id: &str) -> Result<Vec<
         })
         .await
         .map_err(|e| e.to_string())?;
-    orch.notifier.artifact(&artifact);
+    orch.notifier.artifact(&db, &artifact).await;
     crate::execution::advancement::recompute_job(orch, job_id)?;
     Ok(vec![])
 }
@@ -38,14 +38,17 @@ pub fn confirm_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
         }
     })?;
     let job_id_owned = job_id.to_string();
-    let artifact = crate::execution::advancement::run_advancement_db(async move {
-        db.write(|conn| {
-            let job_id = job_id_owned.clone();
-            Box::pin(async move { confirm_latest_artifact_conn(conn, &job_id).await })
-        })
-        .await
-        .map_err(|e| e.to_string())
+    let notifier = orch.notifier.clone();
+    crate::execution::advancement::run_advancement_db(async move {
+        let artifact = db
+            .write(|conn| {
+                let job_id = job_id_owned.clone();
+                Box::pin(async move { confirm_latest_artifact_conn(conn, &job_id).await })
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        notifier.artifact(&db, &artifact).await;
+        Ok(())
     })?;
-    orch.notifier.artifact(&artifact);
     crate::execution::advancement::recompute_job(orch, job_id)
 }

@@ -47,12 +47,11 @@ impl Notifier {
         let _ = self.emitter.emit("db-change", run_db_change(r, "update"));
     }
 
-    pub fn event(&self, _e: &models::Event) {
-        self.emit_change("events");
-    }
-
-    pub(crate) fn artifact(&self, a: &models::Artifact) {
-        self.emit_change("artifacts");
+    /// Announce an artifact write, scoped to the job that owns it. `db` is the
+    /// database the artifact was written to.
+    pub(crate) async fn artifact(&self, db: &crate::storage::LocalDb, a: &models::Artifact) {
+        let change = artifact_db_change_for_id(db, &a.id, "update").await;
+        let _ = self.emitter.emit("db-change", change);
         // Every artifact write announces itself here, so this is the one place
         // a confirmation can tell held executions their evidence moved.
         if a.confirmed {
@@ -64,15 +63,11 @@ impl Notifier {
         self.emit_change("comments");
     }
 
-    // --- Delete ---
-
-    pub fn deleted(&self, table: &str, _id: &str) {
-        self.emit_change(table);
-    }
-
     // --- Generic ---
 
-    /// Emit a `db-change` event for an arbitrary table.
+    /// Emit an unscoped `db-change` event for a table no sidebar projection
+    /// reads. A projection input must go through its scoped builder instead
+    /// (`projection_input_emits_go_through_scoped_builders` enforces it).
     pub(crate) fn emit_change(&self, table: &str) {
         let _ = self.emitter.emit("db-change", json!({"table": table}));
     }
@@ -184,17 +179,6 @@ mod tests {
         let events = emitter.events_named("db-change");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["table"], "todos");
-    }
-
-    #[test]
-    fn notifier_deleted_emits() {
-        let (notifier, emitter) = test_notifier();
-
-        notifier.deleted("issues", "i-1");
-
-        let events = emitter.events_named("db-change");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["table"], "issues");
     }
 
     #[test]
@@ -382,6 +366,347 @@ mod tests {
         assert!(payload.get("sessionId").is_some());
         assert!(payload["sessionId"].is_null());
         assert!(payload["session_id"].is_null());
+    }
+
+    // ── Projection-input scoping, enforced at the source ──
+
+    /// Unscoped emits on a projection input that are genuine multi-row sweeps:
+    /// each can have moved any project, so invalidating every project's
+    /// snapshot is the honest answer. `(path under src-tauri, table, why)`.
+    const UNSCOPED_SWEEPS: &[(&str, &str, &str)] = &[
+        (
+            "os/cairn-session/src/runs/queries.rs",
+            "runs",
+            "reconcile_stale_runs settles stale runs of every project at startup",
+        ),
+        (
+            "os/cairn-session/src/runs/queries.rs",
+            "turns",
+            "reconcile_stale_runs settles orphaned turns of every project at startup",
+        ),
+        (
+            "os/cairn-core/src/resources/mutations/labels.rs",
+            "issue_labels",
+            "a workspace label's links can sit in any project",
+        ),
+        (
+            "os/cairn-core/src/resources/mutations/labels.rs",
+            "issues",
+            "deleting a workspace label changes issues in any project",
+        ),
+        (
+            "cairn-transport/src/routes/invoke/sync_commands/records.rs",
+            "issue_labels",
+            "deleting a workspace label unlinks it from issues in any project",
+        ),
+    ];
+
+    /// The files that ARE the scoped builders.
+    const BUILDER_FILES: &[&str] = &["os/cairn-db/src/changes.rs", "os/cairn-core/src/notify.rs"];
+
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if name != "tests" {
+                    rust_sources(&path, out);
+                }
+            } else if name.ends_with(".rs") && name != "tests.rs" && !name.ends_with("_tests.rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// What the lexer is inside of where one line ends and the next begins.
+    /// Strings span lines (SQL, raw strings), so this has to carry over.
+    #[derive(Default)]
+    struct LexState {
+        /// `Some(hashes)` inside a raw string, `Some(usize::MAX)` inside a
+        /// plain one.
+        string: Option<usize>,
+        block_comments: usize,
+    }
+
+    const PLAIN_STRING: usize = usize::MAX;
+
+    impl LexState {
+        fn in_code(&self) -> bool {
+            self.string.is_none() && self.block_comments == 0
+        }
+    }
+
+    fn is_ident(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    /// `{` minus `}` on one line, outside strings, char literals and comments,
+    /// advancing `state` past the line.
+    fn brace_delta(state: &mut LexState, line: &str) -> i64 {
+        let chars: Vec<char> = line.chars().collect();
+        let at = |i: usize| chars.get(i).copied();
+        let mut delta = 0;
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if state.block_comments > 0 {
+                match (c, at(i + 1)) {
+                    ('*', Some('/')) => {
+                        state.block_comments -= 1;
+                        i += 2;
+                    }
+                    ('/', Some('*')) => {
+                        state.block_comments += 1;
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+                continue;
+            }
+            match state.string {
+                Some(PLAIN_STRING) => {
+                    match c {
+                        '\\' => i += 1,
+                        '"' => state.string = None,
+                        _ => {}
+                    }
+                    i += 1;
+                    continue;
+                }
+                Some(hashes) => {
+                    if c == '"' && (1..=hashes).all(|offset| at(i + offset) == Some('#')) {
+                        state.string = None;
+                        i += hashes;
+                    }
+                    i += 1;
+                    continue;
+                }
+                None => {}
+            }
+            match c {
+                '/' if at(i + 1) == Some('/') => break,
+                '/' if at(i + 1) == Some('*') => {
+                    state.block_comments += 1;
+                    i += 1;
+                }
+                '"' => state.string = Some(PLAIN_STRING),
+                'r' if matches!(at(i + 1), Some('"' | '#'))
+                    && (i == 0
+                        || !is_ident(chars[i - 1])
+                        || (chars[i - 1] == 'b' && (i < 2 || !is_ident(chars[i - 2])))) =>
+                {
+                    let hashes = chars[i + 1..].iter().take_while(|h| **h == '#').count();
+                    if at(i + 1 + hashes) == Some('"') {
+                        state.string = Some(hashes);
+                        i += 1 + hashes;
+                    }
+                }
+                // A char literal (`'x'`, `'\n'`, `'"'`); anything else after a
+                // quote is a lifetime.
+                '\'' if at(i + 1) == Some('\\') => {
+                    i += 2;
+                    while i < chars.len() && chars[i] != '\'' {
+                        i += 1;
+                    }
+                }
+                '\'' if at(i + 2) == Some('\'') => i += 2,
+                '{' => delta += 1,
+                '}' => delta -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        delta
+    }
+
+    /// Line-numbered production lines: every `#[cfg(test)]` item (a test module
+    /// above all) is dropped, so a test may build any frame it likes.
+    fn production_lines(source: &str) -> Vec<(usize, &str)> {
+        let mut kept = Vec::new();
+        let mut state = LexState::default();
+        let mut pending_test_item = false;
+        let mut skip_depth: Option<i64> = None;
+        for (index, line) in source.lines().enumerate() {
+            let starts_in_code = state.in_code();
+            let delta = brace_delta(&mut state, line);
+            if let Some(depth) = skip_depth.as_mut() {
+                *depth += delta;
+                if *depth <= 0 {
+                    skip_depth = None;
+                }
+                continue;
+            }
+            let trimmed = line.trim();
+            if starts_in_code && trimmed.starts_with("#[cfg(test)]") {
+                pending_test_item = true;
+                continue;
+            }
+            if pending_test_item {
+                if trimmed.starts_with("#[") || trimmed.is_empty() {
+                    continue;
+                }
+                pending_test_item = false;
+                if delta > 0 {
+                    skip_depth = Some(delta);
+                }
+                continue;
+            }
+            if !trimmed.starts_with("//") {
+                kept.push((index + 1, line));
+            }
+        }
+        kept
+    }
+
+    /// Every string literal on a line, in order.
+    fn string_literals(line: &str) -> Vec<&str> {
+        line.split('"').skip(1).step_by(2).collect()
+    }
+
+    /// The tables a line emits a `db-change` for by name rather than through a
+    /// builder.
+    fn named_tables(line: &str, lookahead: &[(usize, &str)]) -> Vec<String> {
+        let mut tables = Vec::new();
+        let mut rest = line;
+        while let Some(at) = rest.find("\"table\"") {
+            rest = &rest[at + "\"table\"".len()..];
+            if let Some(value) = rest.trim_start().strip_prefix(':') {
+                if let Some(literal) = value.trim_start().strip_prefix('"') {
+                    if let Some(end) = literal.find('"') {
+                        tables.push(literal[..end].to_string());
+                    }
+                }
+            }
+        }
+        for helper in ["emit_change(", "emit_db_change("] {
+            let mut rest = line;
+            while let Some(at) = rest.find(helper) {
+                rest = &rest[at + helper.len()..];
+                if let Some(first) = string_literals(rest).first() {
+                    tables.push((*first).to_string());
+                }
+            }
+        }
+        // `for table in ["jobs", "executions"] { emit("db-change", json!({"table": table})) }`
+        if line.contains("for table in [")
+            && lookahead.iter().any(|(_, next)| next.contains("db-change"))
+        {
+            tables.extend(string_literals(line).into_iter().map(str::to_string));
+        }
+        tables
+    }
+
+    #[test]
+    fn projection_input_emits_go_through_scoped_builders() {
+        use crate::orchestrator::generation_cache::{
+            every_projection_input_table, WORKSPACE_PROJECTION_INPUT_TABLES,
+        };
+        let scoped: Vec<&str> = every_projection_input_table()
+            .into_iter()
+            .filter(|table| !WORKSPACE_PROJECTION_INPUT_TABLES.contains(table))
+            .collect();
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let os = manifest
+            .parent()
+            .expect("cairn-core lives under src-tauri/os");
+        let src_tauri = os.parent().expect("src-tauri/os lives under src-tauri");
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(os).expect("read src-tauri/os").flatten() {
+            rust_sources(&entry.path().join("src"), &mut files);
+        }
+        rust_sources(&src_tauri.join("cairn-transport/src"), &mut files);
+        assert!(
+            files.len() > 100,
+            "the scan found only {} files",
+            files.len()
+        );
+
+        let mut violations = Vec::new();
+        let mut sweeps_seen = std::collections::HashSet::new();
+        for file in &files {
+            let relative = file
+                .strip_prefix(src_tauri)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if BUILDER_FILES.contains(&relative.as_str()) {
+                continue;
+            }
+            let source = std::fs::read_to_string(file).expect("read source");
+            let lines = production_lines(&source);
+            for (position, (number, line)) in lines.iter().enumerate() {
+                let lookahead = &lines[position + 1..(position + 7).min(lines.len())];
+                for table in named_tables(line, lookahead) {
+                    if !scoped.contains(&table.as_str()) {
+                        continue;
+                    }
+                    if let Some(sweep) = UNSCOPED_SWEEPS
+                        .iter()
+                        .find(|(path, swept, _)| *path == relative && *swept == table)
+                    {
+                        sweeps_seen.insert((sweep.0, sweep.1));
+                        continue;
+                    }
+                    violations.push(format!("{relative}:{number}: `{table}`: {}", line.trim()));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "db-change frames on a project-scoped projection input must carry projectId \
+             (and jobId where the row has one). Use a scoped builder from \
+             cairn_db::changes (re-exported by crate::notify) instead of naming the table; \
+             a genuine multi-row sweep belongs in UNSCOPED_SWEEPS with its reason.\n{}",
+            violations.join("\n")
+        );
+        let stale: Vec<_> = UNSCOPED_SWEEPS
+            .iter()
+            .filter(|(path, table, _)| !sweeps_seen.contains(&(*path, *table)))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "UNSCOPED_SWEEPS entries no longer match a site: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn the_source_scan_sees_every_raw_form_and_skips_test_modules() {
+        let source = r##"
+fn live() {
+    emit("db-change", json!({"table": "turns", "action": "update"}));
+    orch.notifier.emit_change("jobs");
+    emit_db_change(orch, "issues", "update");
+    for table in ["executions"] {
+        let _ = emitter.emit("db-change", json!({"table": table}));
+    }
+    // emit_change("jobs") in a comment is not an emit
+}
+#[cfg(test)]
+mod tests {
+    fn frame() { json!({"table": "prompts", "x": "{"}); }
+    const QUOTE: char = '"';
+    const BRACE: char = '}';
+    fn sql<'a>(x: &'a str) -> &'a str { x }
+    const MULTI: &str = "spans
+        } lines";
+    const RAW: &str = r#"a "quoted" } raw"#;
+    fn later() { json!({"table": "jobs"}); }
+}
+fn after() { emit_change("runs"); }
+"##;
+        let lines = production_lines(source);
+        let found: Vec<String> = lines
+            .iter()
+            .enumerate()
+            .flat_map(|(position, (_, line))| {
+                named_tables(line, &lines[position + 1..(position + 7).min(lines.len())])
+            })
+            .collect();
+        assert_eq!(found, ["turns", "jobs", "issues", "executions", "runs"]);
     }
 
     fn test_job() -> models::Job {
