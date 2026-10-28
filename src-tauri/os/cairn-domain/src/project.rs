@@ -704,7 +704,13 @@ pub fn read_declared_check(
     if let Some(unsupported) = vocabulary.set_aside(&declared) {
         return Ok(DeclaredCheck::Unsupported(unsupported));
     }
-    serde_yaml::from_value(declared).map(DeclaredCheck::Supported)
+    // Deserialized from the entry's text, not from the `Value`: in a `Value` a
+    // plain `false` or `1800` is already a bool or a number, which a `String`
+    // field refuses, while the text deserializer reads a plain scalar as a
+    // string wherever the field wants one. `command: false` must keep meaning
+    // the shell command it meant when the whole file was parsed from text.
+    let text = serde_yaml::to_string(&declared)?;
+    serde_yaml::from_str(&text).map(DeclaredCheck::Supported)
 }
 
 fn render_inline(value: &serde_yaml::Value) -> String {
@@ -905,6 +911,23 @@ mod check_vocabulary_tests {
         assert!(executor.value.contains("quantum"), "{}", executor.value);
         assert!(executor.known.is_empty());
         assert!(!executor.notice.contains("it knows"), "{}", executor.notice);
+    }
+
+    #[test]
+    fn a_plain_scalar_reads_as_a_string_where_the_field_wants_one() {
+        let vocabulary = CheckVocabulary::this_build();
+        for (yaml, command) in [
+            ("command: false\n", "false"),
+            ("command: true\n", "true"),
+            ("command: 7\n", "7"),
+            ("command: 'false'\n", "false"),
+        ] {
+            let Ok(DeclaredCheck::Supported(check)) = read_declared_check(entry(yaml), &vocabulary)
+            else {
+                panic!("{yaml} must read as a supported check");
+            };
+            assert_eq!(check.command, command, "{yaml}");
+        }
     }
 
     #[test]

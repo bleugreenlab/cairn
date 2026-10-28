@@ -11113,9 +11113,9 @@ mod tests {
                         ..
                     },
                 defined_by_commit,
-            } = load_checks_contract_at_commit(repo, commit)
+            } = load_checks_contract_at_commit_detailed(repo, commit)
                 .await
-                .expect("sealed commit declares the check");
+                .unwrap_or_else(|error| panic!("{}", error.manual_diagnostic(commit)));
             let tree_hash = crate::jj::logical_tree_hash(jj, repo, commit).unwrap();
             let entries = crate::jj::tree_entries(jj, repo, commit).ok();
             let blobs = TreeBlobs {
@@ -13032,7 +13032,7 @@ cairn-common = { path = "../cairn-common" }
             "checks:\n  strict:\n    command: true\n    executor:\n      unknownFutureField: true\n",
         )
         .unwrap();
-        let invalid_schema = commit_at(&repo, "invalid schema");
+        let unreadable_selector = commit_at(&repo, "unreadable selector");
 
         assert!(matches!(
             checks_contract_at_commit_detailed(&repo, &missing),
@@ -13047,14 +13047,28 @@ cairn-common = { path = "../cairn-common" }
             Err(CommitChecksContractError::InvalidUtf8(_))
         ));
 
-        for commit in [&malformed, &invalid_schema] {
-            let error = checks_contract_at_commit_detailed(&repo, commit).unwrap_err();
-            assert!(matches!(&error, CommitChecksContractError::Parse(_)));
-            let diagnostic = error.manual_diagnostic(commit);
-            assert!(diagnostic.contains(".cairn/config.yaml"));
-            assert!(diagnostic.contains(commit));
-            assert!(diagnostic.contains("failed to parse"));
-        }
+        let error = checks_contract_at_commit_detailed(&repo, &malformed).unwrap_err();
+        assert!(matches!(&error, CommitChecksContractError::Parse(_)));
+        let diagnostic = error.manual_diagnostic(&malformed);
+        assert!(diagnostic.contains(".cairn/config.yaml"));
+        assert!(diagnostic.contains(&malformed));
+        assert!(diagnostic.contains("failed to parse"));
+
+        // A selector this build cannot read costs only its own check: the
+        // commit's contract loads, with that check set aside and named.
+        let sealed = checks_contract_at_commit_detailed(&repo, &unreadable_selector)
+            .expect("an unreadable selector does not fail the commit's contract");
+        assert!(sealed.contract.checks.is_empty());
+        assert_eq!(sealed.contract.unsupported.len(), 1);
+        let strict = &sealed.contract.unsupported["strict"];
+        assert_eq!(strict.field, "executor");
+        assert_eq!(strict.value, r#"{"unknownFutureField":true}"#);
+        assert!(strict.known.is_empty());
+        assert!(
+            strict.notice.contains("needs a newer Cairn"),
+            "{}",
+            strict.notice
+        );
 
         let unreadable = "0000000000000000000000000000000000000000";
         let error = checks_contract_at_commit_detailed(&repo, unreadable).unwrap_err();
@@ -13073,7 +13087,7 @@ cairn-common = { path = "../cairn-common" }
 
         assert!(checks_contract_at_commit(&repo, &invalid_utf8).is_none());
         assert!(checks_contract_at_commit(&repo, &malformed).is_none());
-        assert!(checks_contract_at_commit(&repo, &invalid_schema).is_none());
+        assert!(checks_contract_at_commit(&repo, &unreadable_selector).is_some());
     }
 
     // --- passing-baseline delta selection ---------------------------------

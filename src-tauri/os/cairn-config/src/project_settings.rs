@@ -1611,43 +1611,63 @@ checks:
         );
     }
 
-    /// The `landing-compile` check #4311 added to this repository's config,
-    /// which the app running at the time could not parse.
-    const LANDING_COMPILE: &str = r#"
-command: cargo check --manifest-path src-tauri/Cargo.toml --workspace --exclude cairn --tests --locked
-executor:
-  requiredToolchains:
-  - bun
-  - rust
-verdictPlatforms:
-- linux
-when: landing
-budgetSeconds: 600
-timeout: 1800
-impact:
-- src-tauri/**
-- .cairn/config.yaml
+    /// A fixture modelled on this repository's `.cairn/config.yaml`, not the
+    /// file itself: the `landing-compile` check exactly as #4311 merged it,
+    /// which the app running at the time could not parse, beside siblings of
+    /// the other shapes (a `write` check, a `review` check, and one placed by
+    /// an executor selector with `verdictPlatforms`). Carried inline because
+    /// the public mirror `check:external-host` builds has no `.cairn/`.
+    const CONFIG_WITH_LANDING_COMPILE: &str = r#"
+setupCommands:
+- bun install --frozen-lockfile
+defaultBranch: main
+checks:
+  containment-inventory:
+    command: bun run containment:inventory:check
+    policy: advisory
+    when: write
+    impact:
+    - src-tauri/os/cairn-common/src/executor_protocol.rs
+    - docs/security/executor-containment.md
+  licenses:
+    command: bun run check:licenses
+    when: review
+    policy: advisory
+    impact:
+    - src-tauri/Cargo.lock
+    - src-tauri/deny.toml
+  invoke-admission:
+    command: 'bun run test:rust -p cairn-transport --lib routes::invoke::admission::'
+    executor:
+      requiredToolchains:
+      - bun
+      - rust
+    verdictPlatforms:
+    - linux
+    policy: advisory
+    when: write
+    impact:
+    - src-tauri/cairn-transport/src/routes/invoke/**
+  landing-compile:
+    command: cargo check --manifest-path src-tauri/Cargo.toml --workspace --exclude cairn --tests --locked
+    executor:
+      requiredToolchains:
+      - bun
+      - rust
+    verdictPlatforms:
+    - linux
+    when: landing
+    budgetSeconds: 600
+    timeout: 1800
+    impact:
+    - src-tauri/**
+    - rust-toolchain*
+    - .cairn/config.yaml
+    - package.json
+    - scripts/**
+    - fixtures/**
+    - test-fixtures/**
 "#;
-
-    /// This repository's own `.cairn/config.yaml` with `landing-compile` in it.
-    fn repository_config_with_landing_compile() -> (String, usize) {
-        let repository = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../.cairn/config.yaml"
-        ));
-        let mut document: serde_yaml::Value = serde_yaml::from_str(repository).unwrap();
-        let checks = document
-            .get_mut("checks")
-            .and_then(serde_yaml::Value::as_mapping_mut)
-            .expect("the repository config declares checks");
-        checks.remove("landing-compile");
-        let others = checks.len();
-        checks.insert(
-            "landing-compile".into(),
-            serde_yaml::from_str(LANDING_COMPILE).unwrap(),
-        );
-        (serde_yaml::to_string(&document).unwrap(), others)
-    }
 
     fn build_without_landing() -> CheckVocabulary {
         let mut older = CheckVocabulary::this_build();
@@ -1657,9 +1677,36 @@ impact:
 
     #[test]
     fn a_build_without_the_landing_cadence_sets_aside_only_that_check() {
-        let (content, others) = repository_config_with_landing_compile();
+        assert_only_landing_compile_set_aside(CONFIG_WITH_LANDING_COMPILE, 3);
+    }
 
-        let (settings, _) = parse_project_settings_under(&content, &build_without_landing())
+    /// The same proof over the live repository config, with `landing-compile`
+    /// put back as #4311 merged it. Read at runtime and skipped when absent:
+    /// the public mirror carries no `.cairn/`.
+    #[test]
+    fn the_repository_config_under_a_build_without_landing_sets_aside_only_that_check() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.cairn/config.yaml");
+        let Ok(repository) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let fixture: serde_yaml::Value = serde_yaml::from_str(CONFIG_WITH_LANDING_COMPILE).unwrap();
+        let landing_compile = fixture["checks"]["landing-compile"].clone();
+
+        let mut document: serde_yaml::Value = serde_yaml::from_str(&repository).unwrap();
+        let checks = document
+            .get_mut("checks")
+            .and_then(serde_yaml::Value::as_mapping_mut)
+            .expect("the repository config declares checks");
+        checks.remove("landing-compile");
+        let others = checks.len();
+        checks.insert("landing-compile".into(), landing_compile);
+
+        assert_only_landing_compile_set_aside(&serde_yaml::to_string(&document).unwrap(), others);
+    }
+
+    /// `content` declares `landing-compile` beside `others` sibling checks.
+    fn assert_only_landing_compile_set_aside(content: &str, others: usize) {
+        let (settings, _) = parse_project_settings_under(content, &build_without_landing())
             .expect("one unknown cadence must not fail the project config");
         let unsupported = settings
             .unsupported_checks
@@ -1678,7 +1725,7 @@ impact:
         assert!(contract.unsupported.contains_key("landing-compile"));
 
         // This build knows the cadence, so the same file reads with nothing set aside.
-        let (current, _) = parse_project_settings(&content).unwrap();
+        let (current, _) = parse_project_settings(content).unwrap();
         assert!(current.unsupported_checks.is_empty());
         assert_eq!(current.checks.unwrap().len(), others + 1);
     }
