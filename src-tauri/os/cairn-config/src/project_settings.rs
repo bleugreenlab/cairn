@@ -1613,10 +1613,11 @@ checks:
 
     /// A fixture modelled on this repository's `.cairn/config.yaml`, not the
     /// file itself: the `landing-compile` check exactly as #4311 merged it,
-    /// which the app running at the time could not parse, beside siblings of
-    /// the other shapes (a `write` check, a `review` check, and one placed by
-    /// an executor selector with `verdictPlatforms`). Carried inline because
-    /// the public mirror `check:external-host` builds has no `.cairn/`.
+    /// whose `when: landing` cadence this build does not have (the landing
+    /// gate was removed), beside siblings of the other shapes (a `write`
+    /// check, a `review` check, and one placed by an executor selector with
+    /// `verdictPlatforms`). Carried inline because the public mirror
+    /// `check:external-host` builds has no `.cairn/`.
     const CONFIG_WITH_LANDING_COMPILE: &str = r#"
 setupCommands:
 - bun install --frozen-lockfile
@@ -1669,14 +1670,8 @@ checks:
     - test-fixtures/**
 "#;
 
-    fn build_without_landing() -> CheckVocabulary {
-        let mut older = CheckVocabulary::this_build();
-        older.when.retain(|word| word != "landing");
-        older
-    }
-
     #[test]
-    fn a_build_without_the_landing_cadence_sets_aside_only_that_check() {
+    fn a_check_with_a_cadence_this_build_lacks_is_set_aside_alone() {
         assert_only_landing_compile_set_aside(CONFIG_WITH_LANDING_COMPILE, 3);
     }
 
@@ -1684,7 +1679,7 @@ checks:
     /// put back as #4311 merged it. Read at runtime and skipped when absent:
     /// the public mirror carries no `.cairn/`.
     #[test]
-    fn the_repository_config_under_a_build_without_landing_sets_aside_only_that_check() {
+    fn the_repository_config_with_landing_compile_put_back_sets_aside_only_that_check() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.cairn/config.yaml");
         let Ok(repository) = std::fs::read_to_string(&path) else {
             return;
@@ -1706,7 +1701,7 @@ checks:
 
     /// `content` declares `landing-compile` beside `others` sibling checks.
     fn assert_only_landing_compile_set_aside(content: &str, others: usize) {
-        let (settings, _) = parse_project_settings_under(content, &build_without_landing())
+        let (settings, _) = parse_project_settings(content)
             .expect("one unknown cadence must not fail the project config");
         let unsupported = settings
             .unsupported_checks
@@ -1723,11 +1718,6 @@ checks:
         let contract = checks_contract_from(settings).unwrap();
         assert_eq!(contract.checks.len(), others);
         assert!(contract.unsupported.contains_key("landing-compile"));
-
-        // This build knows the cadence, so the same file reads with nothing set aside.
-        let (current, _) = parse_project_settings(content).unwrap();
-        assert!(current.unsupported_checks.is_empty());
-        assert_eq!(current.checks.unwrap().len(), others + 1);
     }
 
     #[test]
@@ -1793,7 +1783,7 @@ checks:
 
     #[test]
     fn landing_judges_only_what_the_branch_changed_against_the_target() {
-        let older = build_without_landing();
+        let vocabulary = CheckVocabulary::this_build();
         let with_landing = CONFIG_WITH_LANDING_COMPILE;
         let base = "checks:\n  frontend:\n    command: vitest run\n";
         let broken = "checks:\n  frontend:\n    when: review\n";
@@ -1802,26 +1792,17 @@ checks:
                 Some(fork.as_bytes()),
                 Some(target.as_bytes()),
                 Some(head.as_bytes()),
-                &older,
+                &vocabulary,
             )
         };
 
-        // The #4311 shape: the branch adds a cadence this build lacks.
+        // The #4311 shape: the branch declares a cadence this build lacks.
         let LandingConfigJudgement::NeedsNewerBuild(unsupported) = judge(base, base, with_landing)
         else {
             panic!("a landed check this build cannot run must be named");
         };
         assert_eq!(unsupported.keys().collect::<Vec<_>>(), ["landing-compile"]);
         assert_eq!(unsupported["landing-compile"].value, "landing");
-        // The build that knows the cadence lands the same file with nothing to say.
-        assert_eq!(
-            judge_landing_config(
-                Some(base.as_bytes()),
-                Some(base.as_bytes()),
-                Some(with_landing.as_bytes())
-            ),
-            LandingConfigJudgement::Unaffected
-        );
         // A check the target already sets aside the same way is not news.
         assert_eq!(
             judge(base, with_landing, &format!("{with_landing}\n# edited\n")),
@@ -1851,12 +1832,17 @@ checks:
             LandingConfigJudgement::Unaffected
         );
         assert_eq!(
-            judge_landing_config_under(None, None, None, &older),
+            judge_landing_config_under(None, None, None, &vocabulary),
             LandingConfigJudgement::Unaffected
         );
         // Deleting the file lands the defaults, which every build reads.
         assert_eq!(
-            judge_landing_config_under(Some(base.as_bytes()), Some(base.as_bytes()), None, &older),
+            judge_landing_config_under(
+                Some(base.as_bytes()),
+                Some(base.as_bytes()),
+                None,
+                &vocabulary
+            ),
             LandingConfigJudgement::Unaffected
         );
     }

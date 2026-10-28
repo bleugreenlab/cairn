@@ -96,7 +96,7 @@ impl ConfigSides {
             &format!("heads(::bookmarks(exact:{target:?}) & ::bookmarks(exact:{source:?}))"),
         )?;
         // The managed store shares the project repository's objects, so its
-        // commits are read there, as the landing gate reads them.
+        // commits are read there.
         let read = |commit: &str| {
             crate::mcp::handlers::read::file_at_commit(
                 repository.to_path_buf(),

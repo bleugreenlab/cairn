@@ -354,14 +354,6 @@ pub struct CheckCommand {
     /// on. See docs/checks.md, "Checks that need no tree".
     #[serde(default, skip_serializing_if = "CheckTree::is_full")]
     pub tree: CheckTree,
-
-    /// For a `when: landing` check: how many SECONDS a merge waits for a cell
-    /// to be admitted before it refuses as "gate unavailable". The run itself
-    /// is bounded by `timeout`, separately. Absent uses the landing default.
-    /// Not part of the check's result identity: how long a merge was willing
-    /// to wait for a machine does not change what the machine answers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget_seconds: Option<u32>,
 }
 
 /// A check's `tree:` declaration.
@@ -467,13 +459,6 @@ pub enum CheckWhen {
     /// silently disabling every check for that project.
     #[serde(alias = "idle")]
     Review,
-    /// Landing cadence: runs only when a pull request lands on the project's
-    /// default branch, against the MERGE RESULT (the target's live tip plus
-    /// the branch's change), before the target moves. A red refuses the merge;
-    /// a check that cannot get a cell within its `budgetSeconds` refuses it as
-    /// unavailable rather than passing it. Never runs at commit or turn end.
-    /// See docs/checks.md, "The landing cadence".
-    Landing,
 }
 
 fn default_check_policy() -> CheckPolicy {
@@ -527,7 +512,6 @@ impl CheckWhen {
         match self {
             CheckWhen::Write => "write",
             CheckWhen::Review => "review",
-            CheckWhen::Landing => "landing",
         }
     }
 }
@@ -815,13 +799,12 @@ mod check_vocabulary_tests {
                 "fixes",
                 "mainCadence",
                 "tree",
-                "budgetSeconds",
             ]
         );
         assert_eq!(vocabulary.policy, ["advisory", "gate"]);
         // `idle` is the legacy alias of `review`; the vocabulary must accept
         // exactly what the deserializer does, alias included.
-        assert_eq!(vocabulary.when, ["write", "idle", "review", "landing"]);
+        assert_eq!(vocabulary.when, ["write", "idle", "review"]);
         assert_eq!(vocabulary.resource_class, ["shared", "exclusive"]);
         assert_eq!(vocabulary.tree, ["full", "impact"]);
         assert_eq!(vocabulary.verdict_platforms, ["macos", "linux", "windows"]);
@@ -853,12 +836,12 @@ mod check_vocabulary_tests {
     }
 
     #[test]
-    fn a_word_an_older_build_lacks_sets_the_check_aside_with_its_value() {
-        let mut older = CheckVocabulary::this_build();
-        older.when.retain(|word| word != "landing");
+    fn a_word_this_build_lacks_sets_the_check_aside_with_its_value() {
+        // A cadence a build does not have (here `landing`, which an earlier
+        // build had) sets the check aside before its other unknown keys.
         let declared = entry("command: cargo check\nwhen: landing\nbudgetSeconds: 600\n");
         let DeclaredCheck::Unsupported(unsupported) =
-            read_declared_check(declared.clone(), &older).unwrap()
+            read_declared_check(declared.clone(), &CheckVocabulary::this_build()).unwrap()
         else {
             panic!("`when: landing` must be unsupported under a build without it");
         };
@@ -945,11 +928,11 @@ mod check_vocabulary_tests {
 
     #[test]
     fn a_key_this_build_does_not_know_sets_the_check_aside() {
-        // `budgetSeconds` before the build that introduced it: the check would
-        // otherwise run with no budget, a meaning its author did not write.
+        // `fixes` under a build that predates it: the check would otherwise run
+        // as a pure verdict, a meaning its author did not write.
         let mut older = CheckVocabulary::this_build();
-        older.keys.retain(|key| key != "budgetSeconds");
-        let declared = entry("command: cargo check\nbudgetSeconds: 600\n");
+        older.keys.retain(|key| key != "fixes");
+        let declared = entry("command: cargo check\nfixes: true\n");
         let DeclaredCheck::Unsupported(unsupported) =
             read_declared_check(declared.clone(), &older).unwrap()
         else {
@@ -957,12 +940,12 @@ mod check_vocabulary_tests {
         };
         assert_eq!(
             (unsupported.field.as_str(), unsupported.value.as_str()),
-            ("budgetSeconds", "600")
+            ("fixes", "true")
         );
         assert_eq!(
             unsupported.notice,
-            "needs a newer Cairn, or the key is misspelled: `budgetSeconds` is not a check key \
-             this build understands"
+            "needs a newer Cairn, or the key is misspelled: `fixes` is not a check key this \
+             build understands"
         );
         assert_eq!(unsupported.declared, declared);
         // The same entry is fully readable by the build that knows the key.

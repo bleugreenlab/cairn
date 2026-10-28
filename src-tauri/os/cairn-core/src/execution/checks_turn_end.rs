@@ -2702,7 +2702,6 @@ mod tests {
             duration_ms: 1,
             suppressed_after: None,
             not_recorded: None,
-            compile_failure: None,
         }
     }
 

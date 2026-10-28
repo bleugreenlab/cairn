@@ -200,7 +200,11 @@ impl Orchestrator {
 
     /// Embed `issue`'s description for recall, as the agent `write` path does
     /// when it creates or patches one. `db` is the database that owns it.
-    pub async fn enqueue_issue_embed(&self, db: &crate::storage::LocalDb, issue: &crate::models::Issue) {
+    pub async fn enqueue_issue_embed(
+        &self,
+        db: &crate::storage::LocalDb,
+        issue: &crate::models::Issue,
+    ) {
         let key = db
             .query_opt(
                 "SELECT key FROM projects WHERE id = ?1",

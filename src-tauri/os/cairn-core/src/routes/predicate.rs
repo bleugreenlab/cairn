@@ -1193,7 +1193,6 @@ mod tests {
                 "check_verdict",
                 "clock",
                 "tenet_verdict",
-                "compiles",
             ]
         );
         // A gate fact is level-resolved, not matched against a stream, so a

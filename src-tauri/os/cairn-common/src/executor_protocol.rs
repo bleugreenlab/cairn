@@ -4887,6 +4887,14 @@ pub struct LearnedResourceEstimate {
 /// runner today is the default. What a runner gets wrong talking to an older
 /// executor: nothing, because nothing it reads has changed.
 ///
+/// cairn/5427 does not move the number. It removes the landing compile gate,
+/// the one runner caller that shortened a review check request's
+/// `waitHorizonUnixMs` to its own admission budget; every review check request
+/// now carries the ordinary parking horizon, which is the value that field held
+/// for every other caller. No frame, field or value an executor decodes
+/// changes. What a runner gets wrong talking to an older executor: nothing,
+/// because it sends a horizon the older executor already reads.
+///
 /// cairn/5283 does not move the number. It restores one parameter name in
 /// the executor's dependency-catalog preparation that a merge had split, so
 /// the executor compiles again; the catalog root it is handed and uses is the

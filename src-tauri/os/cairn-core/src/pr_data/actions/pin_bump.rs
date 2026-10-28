@@ -776,10 +776,9 @@ fn answers_the_lane(verdict: &CollectedVerdict) -> bool {
 /// run, a reuse aliased to this commit).
 ///
 /// The one reader of "what was recorded at this commit": the `pinBump`
-/// precondition takes the newest per platform from it, and the verdict
-/// existence gate asks whether any of them is a complete verdict. A row whose
+/// precondition takes the newest per platform from it. A row whose
 /// observation names no platform reads with an empty one.
-pub(crate) async fn commit_verdicts(
+async fn commit_verdicts(
     db: &LocalDb,
     project_id: &str,
     commit: &str,

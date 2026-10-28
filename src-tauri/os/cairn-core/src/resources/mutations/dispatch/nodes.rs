@@ -173,7 +173,6 @@ pub(super) async fn dispatch(
                                 method,
                                 resolution_attribution(orch, request).await,
                                 precondition,
-                                crate::pr_data::actions::OperatorOverrides::default(),
                             )
                             .await
                             .map_err(|error| build_failure(index, item, error))?

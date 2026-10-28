@@ -1003,7 +1003,7 @@ async fn merge_pr_for_job_marks_merged_and_resolves_issue() {
     let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
     provision_jj_merge(&cfg.path().join("config"), repo.path());
 
-    let msg = actions::merge_pr_for_job(&orch, &job, None, None, None, Default::default())
+    let msg = actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .unwrap();
     assert!(msg.contains("merged"));
@@ -1118,9 +1118,8 @@ async fn record_verified_verdict(
 }
 
 /// A project whose `main` declares one review check with no impact, so it
-/// applies to every change, and `feature` sealed one commit ahead. Returns the
-/// feature head commit.
-fn provision_checked_change(bin: &str, config_dir: &Path) -> (TempDir, String) {
+/// applies to every change, and `feature` sealed one commit ahead.
+fn provision_checked_change(bin: &str, config_dir: &Path) -> TempDir {
     let repo = temp_jj_project();
     std::fs::create_dir_all(repo.path().join(".cairn")).unwrap();
     std::fs::write(
@@ -1144,21 +1143,19 @@ fn provision_checked_change(bin: &str, config_dir: &Path) -> (TempDir, String) {
     let jj = jj::environment(bin, config_dir);
     std::fs::write(ws.join("change.txt"), "a change nobody checked\n").unwrap();
     jj::seal(&jj, &ws, "an unchecked change", None).unwrap();
-    let head = jj_bookmark_commit(bin, config_dir, repo.path(), "feature");
-    (repo, head)
+    repo
 }
 
-/// The cairn/5167 shape: a head no lane ever judged is refused, naming the
-/// check and the run that would judge it; an agent cannot waive it; the
-/// operator can, and the waiver is journaled with the merge and written on the
-/// issue, so the landing is never a silent one.
+/// The cairn/5167 shape, now one click: a head whose applicable check no lane
+/// ever judged lands on an ordinary merge, whoever asks for it, and is
+/// journaled as an ordinary landing. No landing gate reads verdicts.
 #[tokio::test]
-async fn a_head_without_a_verdict_is_refused_and_only_the_operator_lands_it() {
+async fn a_head_without_a_verdict_lands_on_an_ordinary_merge() {
     let bin =
         common::jj_bin().expect("jj must be provisioned in the build slot or available on PATH");
     let (_temp, db) = common::migrated_db().await;
     let cfg = tempfile::tempdir().unwrap();
-    let (repo, head) = provision_checked_change(&bin, &cfg.path().join("config"));
+    let repo = provision_checked_change(&bin, &cfg.path().join("config"));
     let project = create_project(&db, "nvh", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     insert_execution(&db, "exec-nvh", &project, &issue).await;
@@ -1166,24 +1163,7 @@ async fn a_head_without_a_verdict_is_refused_and_only_the_operator_lands_it() {
     let mr = create_local_merge_request(&db, &job, &project, &issue).await;
     let orch = orchestrator_with_http_in(db, MockHttpClient::new(), &cfg).await;
 
-    let refusal = actions::merge_pr_for_job(&orch, &job, None, None, None, Default::default())
-        .await
-        .expect_err("a head with no verdict must not land");
-    assert!(refusal.contains(actions::NO_VERDICT), "{refusal}");
-    assert!(refusal.contains("- unit (advisory): absent"), "{refusal}");
-    assert!(
-        refusal.contains("`cairn check run unit --branch feature`"),
-        "{refusal}"
-    );
-    assert_eq!(mr_status(&orch.db.local, &mr).await, "open");
-
-    let waiver = actions::OperatorOverrides {
-        verdict_waiver: Some(actions::VerdictWaiver {
-            reason: "fleet starved; ran it by hand".into(),
-        }),
-        ..Default::default()
-    };
-    let refusal = actions::merge_pr_for_job(
+    let message = actions::merge_pr_for_job(
         &orch,
         &job,
         None,
@@ -1191,50 +1171,18 @@ async fn a_head_without_a_verdict_is_refused_and_only_the_operator_lands_it() {
             "cairn://p/nvh/1/1/builder".into(),
         )),
         None,
-        waiver.clone(),
     )
     .await
-    .expect_err("an agent cannot waive verdicts");
-    assert!(refusal.contains("the operator's act"), "{refusal}");
-    assert_eq!(mr_status(&orch.db.local, &mr).await, "open");
-
-    actions::merge_pr_for_job(
-        &orch,
-        &job,
-        None,
-        Some(actions::PrResolutionAttribution::operator_ui()),
-        None,
-        waiver,
-    )
-    .await
-    .expect("the operator lands it");
+    .expect("a head without verdicts lands");
+    assert!(message.contains("merged"), "{message}");
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
 
     let journal = merge_journal(&orch.db.local, &mr).await;
     let landed = journal
         .iter()
         .find(|(sequence, state, _)| *sequence == 1 && state == "succeeded")
-        .and_then(|(_, _, detail)| detail.clone())
-        .expect("the landing is journaled with its detail");
-    assert!(
-        landed.contains("verdicts waived by operator-ui: fleet starved; ran it by hand")
-            && landed.contains(&head[..12])
-            && landed.contains("unit (absent)"),
-        "{landed}"
-    );
-    let comments = orch
-        .db
-        .local
-        .query_opt_i64(
-            "SELECT COUNT(*) FROM comments WHERE issue_id = ?1 AND content LIKE ?2",
-            (
-                issue.clone(),
-                "%Merged without a complete verdict%unit (absent)%",
-            ),
-        )
-        .await
-        .unwrap();
-    assert_eq!(comments, Some(1), "the waiver is written on the issue");
+        .expect("the landing is journaled");
+    assert_eq!(landed.2, None, "an ordinary landing records nothing more");
 }
 
 /// `(sequence, state, detail)` for every journal event of one merge request.
@@ -1283,7 +1231,6 @@ async fn pin_bump_merge_refuses_without_head_verdicts_and_journals_the_violation
         None,
         None,
         Some(actions::MergePrecondition::PinBump),
-        Default::default(),
     )
     .await
     .expect_err("a bump without verdicts must be refused");
@@ -1345,7 +1292,6 @@ async fn pin_bump_merge_lands_a_verified_bump_and_records_its_evidence() {
         None,
         None,
         Some(actions::MergePrecondition::PinBump),
-        Default::default(),
     )
     .await
     .unwrap();
@@ -1407,7 +1353,7 @@ async fn merge_pr_for_job_remote_default_branch_merges_via_github() {
     provision_jj_merge(&config_dir, repo.path());
     let base_before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
-    let msg = actions::merge_pr_for_job(&orch, &job, None, None, None, Default::default())
+    let msg = actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .unwrap();
     assert!(msg.contains("via GitHub"), "reports a GitHub merge: {msg}");
@@ -1449,7 +1395,7 @@ async fn merge_pr_for_job_remote_merge_failure_leaves_unmarked() {
     provision_jj_merge(&config_dir, repo.path());
     let base_before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
-    let err = actions::merge_pr_for_job(&orch, &job, None, None, None, Default::default())
+    let err = actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .expect_err("a GitHub-refused merge must fail closed");
     assert!(
@@ -1511,7 +1457,7 @@ async fn merge_pr_for_job_remote_refuses_undocumented_protocol_bump_before_githu
     )
     .unwrap();
 
-    let err = actions::merge_pr_for_job(&orch, &job, None, None, None, Default::default())
+    let err = actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .expect_err("an undocumented protocol version must not land");
     assert!(
@@ -1542,7 +1488,7 @@ async fn merge_pr_for_job_refuses_conflicted_source_with_actionable_detail() {
     let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
     provision_jj_conflict(&bin, &cfg.path().join("config"), repo.path());
 
-    let err = actions::merge_pr_for_job(&orch, &job, None, None, None, Default::default())
+    let err = actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .expect_err("a conflicted source must be refused");
     assert!(
@@ -1825,7 +1771,7 @@ async fn merge_pr_for_job_squashes_multiple_commits_to_one() {
     let pre = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
     // `None` selects the default `squash` shape.
-    actions::merge_pr_for_job(&orch, &job, None, None, None, Default::default())
+    actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .unwrap();
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
@@ -1879,7 +1825,7 @@ async fn merge_pr_for_job_squash_retry_is_idempotent() {
     provision_jj_merge_multi(&config_dir, repo.path());
 
     // First merge: squashes the three commits to one.
-    actions::merge_pr_for_job(&orch, &job, None, None, None, Default::default())
+    actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .unwrap();
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
@@ -1890,7 +1836,7 @@ async fn merge_pr_for_job_squash_retry_is_idempotent() {
     // idempotence guard must keep the default tip put. The retry's later
     // resolution may no-op or error on the already-merged node, but the store
     // tip is settled before that point, so assert on it directly.
-    let _ = actions::merge_pr_for_job(&orch, &job, None, None, None, Default::default()).await;
+    let _ = actions::merge_pr_for_job(&orch, &job, None, None, None).await;
     let after_retry = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
     assert_eq!(
         landed, after_retry,
@@ -1922,7 +1868,7 @@ async fn merge_pr_for_job_workspace_keeps_real_commits() {
 
     let pre = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
-    actions::merge_pr_for_job(&orch, &job, None, None, None, Default::default())
+    actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .unwrap();
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
@@ -2081,7 +2027,7 @@ async fn merge_pr_for_job_advances_producing_execution() {
     let (cfg, orch, mut rx) = orchestrator_with_effect_channel(db, MockHttpClient::new()).await;
     provision_jj_merge(&cfg.path().join("config"), repo.path());
 
-    actions::merge_pr_for_job(&orch, &job, None, None, None, Default::default())
+    actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .unwrap();
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");

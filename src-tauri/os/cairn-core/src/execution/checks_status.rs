@@ -180,8 +180,8 @@ pub(crate) fn check_state_from_facts(
     }
 }
 
-/// Whether an applicable lane holds a verdict a merge may rest on, and what it
-/// holds instead when it does not.
+/// Whether an applicable lane holds a verdict, and what it holds instead when
+/// it does not.
 ///
 /// A different question from [`VerdictEvidence`], which asks whether a GREEN is
 /// verified. Here a red is as complete as a green: the question is whether the
@@ -196,8 +196,8 @@ pub(crate) fn check_state_from_facts(
 ///
 /// Emptiness splits in two. A static check whose result says its selection was
 /// empty (a lint whose cone holds no crate the change touched) had no
-/// selectable work: not a verdict, never a green (cairn/5325), and not a
-/// refusal either, because there was nothing in its domain to judge. A test
+/// selectable work: not a verdict and never a green (cairn/5325), but not a
+/// missing answer either, because there was nothing in its domain to judge. A test
 /// runner's empty selection over a change its impact matched is the cairn/5325
 /// defect (impact names files the selection maps to no test), and stays
 /// `Empty`.
@@ -226,16 +226,6 @@ pub(crate) enum LaneExistence {
 }
 
 impl LaneExistence {
-    pub(crate) fn is_complete(&self) -> bool {
-        matches!(self, Self::Complete)
-    }
-
-    /// Whether this state stops a landing: everything but a verdict and a
-    /// lane with nothing in its domain to judge.
-    pub(crate) fn blocks_landing(&self) -> bool {
-        !matches!(self, Self::Complete | Self::NoSelectableWork)
-    }
-
     /// The one word every surface names this state by.
     pub(crate) fn label(&self) -> &'static str {
         match self {
@@ -1352,12 +1342,7 @@ fn assemble_statuses(
             // A review check does not apply when the impact gate excluded it
             // from this tree's plan; it will never run, so it is neither
             // running nor pending.
-            // A landing check runs against a merge result at the moment of
-            // landing, never against a node's head, so no wave there will
-            // produce it; listing it as pending would hold every node's
-            // settlement at incomplete.
-            let not_applicable = check.when == CheckWhen::Landing
-                || applicable_names.is_some_and(|names| !names.contains(&name));
+            let not_applicable = applicable_names.is_some_and(|names| !names.contains(&name));
 
             // `LaneEvidence::Recorded` outranks everything below, and this
             // returns before the `started` probe so a lane that already holds
@@ -3643,6 +3628,140 @@ mod tests {
         assert_eq!(
             format_status_annotation(&status).as_deref(),
             Some("failed to spawn")
+        );
+    }
+
+    fn lane(name: &str, state: NodeCheckState) -> NodeCheckStatus {
+        test_status(name, "advisory", "review", state)
+    }
+
+    fn with_tests(mut lane: NodeCheckStatus, selection: &str, passed: usize) -> NodeCheckStatus {
+        lane.parser = Some("nextest".into());
+        lane.selection = Some(selection.into());
+        lane.complete = Some(true);
+        lane.passed = Some(passed);
+        lane.failed = Some(0);
+        lane.skipped = Some(0);
+        lane
+    }
+
+    fn rust_lint(selection: &str, complete: bool) -> NodeCheckStatus {
+        let mut lane = lane("rust-lint", NodeCheckState::Unverified);
+        lane.parser = Some("rust-lint".into());
+        lane.selection = Some(selection.into());
+        lane.complete = Some(complete);
+        lane.passed = Some(0);
+        lane.failed = Some(0);
+        lane.skipped = Some(0);
+        lane
+    }
+
+    #[test]
+    fn every_lane_state_maps_to_its_existence() {
+        let idle = WaveCadence::default();
+        let reviewing = WaveCadence::reviewing_for_test();
+        let died = |kind: &str, after: Option<i64>| {
+            let mut lane = lane("rust-tests", NodeCheckState::Failed);
+            lane.failure_kind = Some(kind.into());
+            lane.suppressed_after = after;
+            lane
+        };
+        let incomplete = {
+            let mut lane = with_tests(lane("rust-tests", NodeCheckState::Unverified), "full", 4);
+            lane.complete = Some(false);
+            lane
+        };
+        let cases: Vec<(NodeCheckStatus, WaveCadence, Option<LaneExistence>)> = vec![
+            (
+                with_tests(lane("rust-tests", NodeCheckState::Passed), "full", 3),
+                idle,
+                Some(LaneExistence::Complete),
+            ),
+            (
+                lane("rust-tests", NodeCheckState::Failed),
+                idle,
+                Some(LaneExistence::Complete),
+            ),
+            // A script check's green carries no structured result: its exit
+            // code is the verdict.
+            (
+                lane("migrations", NodeCheckState::Unverified),
+                idle,
+                Some(LaneExistence::Complete),
+            ),
+            (
+                lane("rust-tests", NodeCheckState::Pending),
+                idle,
+                Some(LaneExistence::Absent),
+            ),
+            (
+                lane("rust-tests", NodeCheckState::Pending),
+                reviewing,
+                Some(LaneExistence::Pending { running: false }),
+            ),
+            (
+                lane("rust-tests", NodeCheckState::Running),
+                reviewing,
+                Some(LaneExistence::Pending { running: true }),
+            ),
+            (
+                died("infrastructure", None),
+                idle,
+                Some(LaneExistence::Died {
+                    kind: "infrastructure".into(),
+                }),
+            ),
+            (
+                died("infrastructure", Some(3)),
+                idle,
+                Some(LaneExistence::Breaker { after: 3 }),
+            ),
+            (
+                with_tests(lane("rust-tests", NodeCheckState::Unverified), "empty", 0),
+                idle,
+                Some(LaneExistence::Empty),
+            ),
+            (
+                incomplete,
+                idle,
+                Some(LaneExistence::Incomplete(
+                    UnverifiedReason::IncompleteEnumeration,
+                )),
+            ),
+            // A static check whose cone held nothing the change touched had no
+            // selectable work; one that stopped before measuring decided nothing.
+            (
+                rust_lint("empty", false),
+                idle,
+                Some(LaneExistence::NoSelectableWork),
+            ),
+            (
+                rust_lint("unknown", false),
+                idle,
+                Some(LaneExistence::Incomplete(UnverifiedReason::IncompleteLint)),
+            ),
+            (
+                lane("rust-tests", NodeCheckState::NotApplicable),
+                idle,
+                None,
+            ),
+            (lane("next-check", NodeCheckState::Unsupported), idle, None),
+        ];
+        for (status, cadence, expected) in cases {
+            let shown = format!("{status:?}");
+            assert_eq!(lane_existence(&status, cadence), expected, "{shown}");
+        }
+    }
+
+    /// A write-cadence wave in flight does not make a review lane pending.
+    #[test]
+    fn only_a_wave_of_the_lanes_own_cadence_makes_it_pending() {
+        assert_eq!(
+            lane_existence(
+                &lane("rust-tests", NodeCheckState::Pending),
+                WaveCadence::writing_for_test()
+            ),
+            Some(LaneExistence::Absent)
         );
     }
 }
