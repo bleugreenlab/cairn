@@ -6,8 +6,8 @@ use crate::execution::cache::{
     CheckResultCacheEntry, HeadVerdictKeys, OwnedHeadVerdictKeys,
 };
 use crate::execution::check_parsers::{
-    extract_running_tests, format_failure_excerpt, format_failure_names, report_excerpt,
-    tail_chars, ParsedCheckResult, VerdictFacts, MAX_FAILURE_NAMES, RUST_LINT_PARSER,
+    error_anchored_tail, extract_running_tests, format_failure_excerpt, format_failure_names,
+    report_excerpt, ParsedCheckResult, VerdictFacts, MAX_FAILURE_NAMES, RUST_LINT_PARSER,
 };
 use crate::execution::checks::{
     check_input_hashes, head_verdicts, head_verdicts_conn, load_checks_contract_at_commit,
@@ -1852,7 +1852,7 @@ fn wake_failure_detail(row: &CheckResultCacheEntry) -> String {
         None if named => return header,
         None => {
             let excerpt = format_failure_excerpt(parsed.as_ref(), row.output_tail.trim_end());
-            tail_chars(excerpt.trim_end(), WAKE_EXCERPT_CHARS)
+            error_anchored_tail(excerpt.trim_end(), WAKE_EXCERPT_CHARS)
         }
     };
     if excerpt.trim().is_empty() {

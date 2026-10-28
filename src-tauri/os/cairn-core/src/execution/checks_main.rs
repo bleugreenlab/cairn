@@ -41,8 +41,9 @@ use cairn_common::executor_protocol::{CheckSelectorSource, ExecutorSelector};
 use crate::config::project_settings::CheckCommand;
 use crate::execution::check_placement::CheckPlacementOverride;
 use crate::execution::checks::{
-    execute_check_contract, load_checks_contract_at_commit, resolve_check_contract_at_commit,
-    CheckRunProducer, CheckRunTarget, MAIN_CADENCE_STREAM_PREFIX,
+    execute_check_contract, load_checks_contract_at_commit_detailed,
+    resolve_check_contract_at_commit, CheckRunProducer, CheckRunTarget, CommitChecksContract,
+    CommitChecksContractError, MAIN_CADENCE_STREAM_PREFIX,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
@@ -98,34 +99,54 @@ struct CadencePass {
 
 /// The per-project cadence slot: one pass in flight, at most one queued.
 #[derive(Default)]
-pub(crate) struct CadenceSlots(
-    HashMap<String, CadencePass>,
+pub(crate) struct CadenceSlots {
+    passes: HashMap<String, CadencePass>,
     /// Questions a refused lane is waiting on to settle, so a lane refused by
     /// every pass against one debt gets one waiter, not one per pass.
-    HashSet<crate::fleet::purpose::PurposeKey>,
-);
+    debts: HashSet<crate::fleet::purpose::PurposeKey>,
+    /// Per project, the tip whose checks contract could not be read: one
+    /// outcome per tip, announced once and not read again until the tip moves.
+    unreadable_contracts: HashMap<String, String>,
+}
 
 impl CadenceSlots {
     /// Claim the one waiter for `key`'s settlement. `false` when one is
     /// already waiting.
     fn watch_debt(&mut self, key: &crate::fleet::purpose::PurposeKey) -> bool {
-        self.1.insert(key.clone())
+        self.debts.insert(key.clone())
     }
 
     fn debt_settled(&mut self, key: &crate::fleet::purpose::PurposeKey) {
-        self.1.remove(key);
+        self.debts.remove(key);
+    }
+
+    /// Whether `commit`'s contract is still to be read: `false` once that
+    /// exact tip's was found unreadable.
+    fn contract_owed(&self, project_id: &str, commit: &str) -> bool {
+        self.unreadable_contracts
+            .get(project_id)
+            .is_none_or(|tip| tip != commit)
+    }
+
+    fn contract_read(&mut self, project_id: &str, commit: &str, readable: bool) {
+        if readable {
+            self.unreadable_contracts.remove(project_id);
+        } else {
+            self.unreadable_contracts
+                .insert(project_id.to_string(), commit.to_string());
+        }
     }
 
     /// Ask for a pass. Returns `true` when the caller must start one; otherwise
     /// the request was folded into the single queued successor.
     fn request(&mut self, project_id: &str, branch: &str, trigger: Trigger, now: i64) -> bool {
-        match self.0.get_mut(project_id) {
+        match self.passes.get_mut(project_id) {
             Some(pass) => {
                 pass.queued = Some(pass.queued.map_or(trigger, |queued| queued.max(trigger)));
                 false
             }
             None => {
-                self.0.insert(
+                self.passes.insert(
                     project_id.to_string(),
                     CadencePass {
                         branch: branch.to_string(),
@@ -141,21 +162,21 @@ impl CadenceSlots {
     /// A pass ended. Returns the queued successor's trigger, keeping the slot
     /// held for it, or releases the slot when nothing queued.
     fn finish(&mut self, project_id: &str, now: i64) -> Option<Trigger> {
-        let pass = self.0.get_mut(project_id)?;
+        let pass = self.passes.get_mut(project_id)?;
         match pass.queued.take() {
             Some(next) => {
                 pass.armed_at_unix_ms = now;
                 Some(next)
             }
             None => {
-                self.0.remove(project_id);
+                self.passes.remove(project_id);
                 None
             }
         }
     }
 
     fn in_flight(&self, project_id: &str) -> Option<(String, i64)> {
-        self.0
+        self.passes
             .get(project_id)
             .map(|pass| (pass.branch.clone(), pass.armed_at_unix_ms))
     }
@@ -335,10 +356,10 @@ async fn run_pass(
     let commit = cairn_vcs::resolve_coordinate(&repository, default_branch)
         .await
         .map_err(|error| format!("default head '{default_branch}' is unresolvable: {error}"))?;
-    let contract = load_checks_contract_at_commit(&repo_root, &commit)
-        .await
-        .ok_or_else(|| format!("the checks contract at {commit} could not be read"))?;
-    let lanes = cadence_lanes(&contract.contract.checks);
+    let lanes = tip_lanes(&orch.main_cadence, project_id, &commit, || {
+        load_checks_contract_at_commit_detailed(&repo_root, &commit)
+    })
+    .await?;
     if lanes.is_empty() {
         return Ok(());
     }
@@ -359,6 +380,52 @@ async fn run_pass(
     )
     .await;
     Ok(())
+}
+
+/// The lanes `commit`'s checks contract declares, read through `load`.
+///
+/// A commit with no `.cairn/config.yaml`, or one that declares no checks, has
+/// no lanes: that is an answer, and it is silent. A contract that cannot be
+/// read is one outcome per tip: the first pass on the tip fails with the
+/// diagnostic, which is announced, and every later pass on that tip skips the
+/// read until the tip moves, rather than failing again on every observed
+/// advance.
+async fn tip_lanes<F, Fut>(
+    slots: &std::sync::Mutex<CadenceSlots>,
+    project_id: &str,
+    commit: &str,
+    load: F,
+) -> Result<Vec<CadenceLane>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<CommitChecksContract, CommitChecksContractError>>,
+{
+    let owed = slots.lock().unwrap().contract_owed(project_id, commit);
+    if !owed {
+        log::debug!(
+            "main cadence for project {project_id}: the checks contract at {commit} was already found unreadable; waiting for the tip to move"
+        );
+        return Ok(Vec::new());
+    }
+    let loaded = load().await;
+    let readable = matches!(
+        loaded,
+        Ok(_) | Err(CommitChecksContractError::Missing | CommitChecksContractError::NoChecks)
+    );
+    slots
+        .lock()
+        .unwrap()
+        .contract_read(project_id, commit, readable);
+    match loaded {
+        Ok(contract) => Ok(cadence_lanes(&contract.contract.checks)),
+        Err(CommitChecksContractError::Missing | CommitChecksContractError::NoChecks) => {
+            Ok(Vec::new())
+        }
+        Err(error) => Err(format!(
+            "{}; the cadence will not read it again until the tip moves",
+            error.manual_diagnostic(commit)
+        )),
+    }
 }
 
 /// Refresh origin and reconcile the canonical bookmark, so the pass attests
@@ -622,7 +689,7 @@ async fn report_lane(
             log::warn!("main cadence previous-row lookup failed: {error}");
             Comparison::Baseline
         });
-    let bracket = match (comparison.previous(), repository, commit) {
+    let bracket = match (bracket_base(&verdict, &comparison), repository, commit) {
         (Some(previous), Some(repository), Some(commit)) => {
             merge_bracket(
                 orch,
@@ -770,8 +837,25 @@ async fn deliver(orch: &Orchestrator, db: &LocalDb, project_id: &str, thread: &s
 pub(crate) enum TestOutcome {
     Passed,
     Skipped,
-    /// The failure's signature: see [`failure_signature`].
-    Failed(String),
+    Failed(Failure),
+}
+
+/// What a failed test's excerpt says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Failure {
+    /// See [`failure_signature`].
+    pub(crate) signature: String,
+    /// The machine condition the excerpt names, if any: see [`host_condition`].
+    pub(crate) host_condition: Option<&'static str>,
+}
+
+impl Failure {
+    fn from_excerpt(excerpt: &str) -> Self {
+        Self {
+            signature: failure_signature(excerpt),
+            host_condition: host_condition(excerpt),
+        }
+    }
 }
 
 /// One cadence observation, read back from the store.
@@ -812,12 +896,6 @@ impl CadenceRow {
     }
     fn ran(&self) -> usize {
         self.passed() + self.failed()
-    }
-    fn failure(&self, test: &str) -> Option<&str> {
-        match self.tests.get(test) {
-            Some(TestOutcome::Failed(signature)) => Some(signature),
-            _ => None,
-        }
     }
 }
 
@@ -928,7 +1006,7 @@ async fn load_row(
             let outcome = match status.as_str() {
                 "passed" => TestOutcome::Passed,
                 "skipped" => TestOutcome::Skipped,
-                _ => TestOutcome::Failed(failure_signature(excerpt.as_deref().unwrap_or(""))),
+                _ => TestOutcome::Failed(Failure::from_excerpt(excerpt.as_deref().unwrap_or(""))),
             };
             (test, outcome)
         })
@@ -1034,6 +1112,37 @@ impl Comparison {
             | Comparison::AnyExecutor { previous } => Some(previous),
         }
     }
+
+    /// The newest complete row for the lane on any executor. A merge is
+    /// covered when any host's complete row sits on a tree that includes it,
+    /// so coverage ends here, not at the attempt's own host's previous row.
+    fn coverage(&self) -> Option<&CadenceRow> {
+        match self {
+            Comparison::Baseline => None,
+            // `neighbour` is set exactly when another executor's row is newer.
+            Comparison::SameExecutor {
+                previous,
+                neighbour,
+            } => Some(neighbour.as_deref().unwrap_or(previous)),
+            Comparison::OtherExecutor { previous } | Comparison::AnyExecutor { previous } => {
+                Some(previous)
+            }
+        }
+    }
+}
+
+/// Where an attempt's merge list starts. A complete row's list spans the
+/// window its per-host diff measures; an incomplete attempt's lists what no
+/// host's complete row covers yet.
+fn bracket_base<'a>(
+    verdict: &CadenceVerdict,
+    comparison: &'a Comparison,
+) -> Option<&'a CadenceRow> {
+    if verdict.is_complete() {
+        comparison.previous()
+    } else {
+        comparison.coverage()
+    }
 }
 
 /// Choose the comparison for an attempt on `executor_id` from that executor's
@@ -1129,6 +1238,39 @@ fn failure_signature(excerpt: &str) -> String {
         first
     };
     truncate(line, 200)
+}
+
+/// OS errors that describe the machine a test ran on rather than the tree it
+/// tested: the face a census names, and the spellings that carry it (Rust's
+/// `Display` and `Debug` of the error, SQLite's message). They are searched
+/// for over the whole excerpt, not the signature: a failure that wraps the
+/// error (`Custom { kind: StorageFull, error: PathError { path:
+/// "/tmp/cairn-change-project-2jgZmE", .. } }`) carries a per-test temp path
+/// on its signature line, so no two of them share a signature.
+const HOST_CONDITIONS: &[(&str, &[&str])] = &[
+    (
+        "No space left on device",
+        &["no space left on device", "storagefull", "(os error 28)"],
+    ),
+    (
+        "Text file busy",
+        &["text file busy", "executablefilebusy", "(os error 26)"],
+    ),
+    ("database is locked", &["database is locked"]),
+];
+
+/// How many failures in one row must share a host condition before they are
+/// read as a census of the host rather than as tests. One test that hit a full
+/// disk is still a red to look at; a run of them is the machine.
+const HOST_CONDITION_MIN: usize = 2;
+
+/// The host condition a failure excerpt names: see [`HOST_CONDITIONS`].
+fn host_condition(excerpt: &str) -> Option<&'static str> {
+    let excerpt = excerpt.to_ascii_lowercase();
+    HOST_CONDITIONS
+        .iter()
+        .find(|(_, spellings)| spellings.iter().any(|spelling| excerpt.contains(spelling)))
+        .map(|(face, _)| *face)
 }
 
 // ---------------------------------------------------------------------------
@@ -1442,27 +1584,113 @@ fn render_bracket(out: &mut String, heading: &str, bracket: &Bracket) {
     }
 }
 
-/// Newly-red tests grouped by failure signature, largest group first.
-fn newly_red_groups<'a>(
-    current: &'a CadenceRow,
-    previous: Option<&CadenceRow>,
-) -> Vec<(&'a str, Vec<&'a str>)> {
-    let mut groups: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (test, outcome) in &current.tests {
-        let TestOutcome::Failed(signature) = outcome else {
-            continue;
-        };
-        if previous.is_some_and(|previous| previous.failure(test).is_some()) {
-            continue;
-        }
-        groups
-            .entry(signature.as_str())
-            .or_default()
-            .push(test.as_str());
-    }
+/// Tests grouped by failure signature, largest group first.
+type FailureGroups<'a> = Vec<(&'a str, Vec<&'a str>)>;
+
+fn sorted_groups<'a>(groups: BTreeMap<&'a str, Vec<&'a str>>) -> FailureGroups<'a> {
     let mut groups: Vec<_> = groups.into_iter().collect();
     groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
     groups
+}
+
+fn group_size(groups: &[(&str, Vec<&str>)]) -> usize {
+    groups.iter().map(|(_, tests)| tests.len()).sum()
+}
+
+/// Failures in one row that share one OS error: the host's census, not tests.
+#[derive(Debug)]
+struct HostConditionGroup<'a> {
+    face: &'static str,
+    tests: Vec<&'a str>,
+}
+
+/// How a complete row differs from the row it is compared with. A test moved
+/// only when both rows observed it: a test with no row in the compared
+/// observation (born after that row's tree, or renamed since) has no earlier
+/// state to have moved from.
+#[derive(Debug, Default)]
+struct RowDiff<'a> {
+    /// At least [`HOST_CONDITION_MIN`] failures sharing one host condition,
+    /// largest first. They are counted in no other field.
+    host_conditions: Vec<HostConditionGroup<'a>>,
+    /// Red here; passed or skipped in the compared row. Against no row at all
+    /// (a baseline), every failure.
+    newly_red: FailureGroups<'a>,
+    /// Passed here, red in the compared row.
+    newly_green: Vec<&'a str>,
+    /// Red here, with no row in the compared observation.
+    first_red: FailureGroups<'a>,
+    /// Passed here, with no row in the compared observation.
+    first_green: Vec<&'a str>,
+    /// A row in the compared observation, none in this one.
+    removed: Vec<&'a str>,
+    /// Red in the compared row, skipped in this one.
+    red_now_skipped: usize,
+    /// Red in both rows.
+    still_red: usize,
+}
+
+fn row_diff<'a>(current: &'a CadenceRow, previous: Option<&'a CadenceRow>) -> RowDiff<'a> {
+    let mut diff = RowDiff::default();
+    let mut faces: BTreeMap<&'static str, Vec<&str>> = BTreeMap::new();
+    for (test, outcome) in &current.tests {
+        if let TestOutcome::Failed(Failure {
+            host_condition: Some(face),
+            ..
+        }) = outcome
+        {
+            faces.entry(*face).or_default().push(test.as_str());
+        }
+    }
+    faces.retain(|_, tests| tests.len() >= HOST_CONDITION_MIN);
+    let on_host: HashSet<&str> = faces.values().flatten().copied().collect();
+    diff.host_conditions = faces
+        .into_iter()
+        .map(|(face, tests)| HostConditionGroup { face, tests })
+        .collect();
+    diff.host_conditions
+        .sort_by(|a, b| b.tests.len().cmp(&a.tests.len()).then(a.face.cmp(b.face)));
+    let mut newly_red: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut first_red: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (test, outcome) in &current.tests {
+        let test = test.as_str();
+        // `None`: nothing to compare with. `Some(None)`: the compared row has
+        // no row for this test.
+        let before = previous.map(|previous| previous.tests.get(test));
+        let was_red = matches!(before, Some(Some(TestOutcome::Failed(_))));
+        match outcome {
+            TestOutcome::Failed(_) if on_host.contains(test) => {}
+            TestOutcome::Failed(failure) => {
+                let signature = failure.signature.as_str();
+                match before {
+                    Some(None) => first_red.entry(signature).or_default().push(test),
+                    _ if was_red => diff.still_red += 1,
+                    _ => newly_red.entry(signature).or_default().push(test),
+                }
+            }
+            TestOutcome::Passed => match before {
+                Some(None) => diff.first_green.push(test),
+                _ if was_red => diff.newly_green.push(test),
+                _ => {}
+            },
+            TestOutcome::Skipped => {
+                if was_red {
+                    diff.red_now_skipped += 1;
+                }
+            }
+        }
+    }
+    if let Some(previous) = previous {
+        diff.removed = previous
+            .tests
+            .keys()
+            .filter(|test| !current.tests.contains_key(*test))
+            .map(String::as_str)
+            .collect();
+    }
+    diff.newly_red = sorted_groups(newly_red);
+    diff.first_red = sorted_groups(first_red);
+    diff
 }
 
 /// Pass/fail of one test in a row; `None` when it was skipped or absent.
@@ -1575,6 +1803,58 @@ fn render_groups(out: &mut String, groups: &[(&str, Vec<&str>)], neighbour: Opti
     }
 }
 
+/// Each host-condition group: the error and the host, the discriminator, and
+/// the tests it holds.
+fn render_host_conditions(
+    out: &mut String,
+    row: &CadenceRow,
+    groups: &[HostConditionGroup<'_>],
+    previous: Option<&CadenceRow>,
+    neighbour: Option<&CadenceRow>,
+) {
+    for group in groups {
+        let count = group.tests.len();
+        let passed = |other: &CadenceRow| {
+            group
+                .tests
+                .iter()
+                .filter(|test| passed_in(other, test) == Some(true))
+                .count()
+        };
+        out.push_str(&format!(
+            "\n**HOST CONDITION on `{}`: {count} tests failed on `{}`** — one OS error across {count} tests is a condition of this machine, not of the tree, so none of them is counted as newly red or still red.\n",
+            host(row),
+            group.face
+        ));
+        let mut discriminator = match previous {
+            Some(previous) => format!(
+                "- Discriminator: {} of {count} passed on `{}` at the compared row ({}, commit `{}`)",
+                passed(previous),
+                host(previous),
+                previous.reference,
+                short_commit(&previous.commit)
+            ),
+            None => "- Discriminator: there is no earlier complete row to compare with".to_string(),
+        };
+        if let Some(neighbour) = neighbour {
+            discriminator.push_str(&format!(
+                "; {} of {count} passed on `{}` in the same window ({})",
+                passed(neighbour),
+                host(neighbour),
+                neighbour.reference
+            ));
+        }
+        discriminator.push_str(". The same test passing on the same host one tip earlier separates the host from the tree; a rerun here after the condition clears confirms it.\n");
+        out.push_str(&discriminator);
+        for test in group.tests.iter().take(MAX_IDS_PER_GROUP) {
+            out.push_str(&format!("  - `{test}`\n"));
+        }
+        if count > MAX_IDS_PER_GROUP {
+            out.push_str(&format!("  - … and {} more\n", count - MAX_IDS_PER_GROUP));
+        }
+    }
+}
+
 /// The "Compared with" line: which row the diff is against, and on which host.
 fn render_basis(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow) {
     let line = match report.comparison {
@@ -1649,33 +1929,47 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
         Comparison::OtherExecutor { previous } => (None, Some(host(previous))),
         Comparison::Baseline | Comparison::AnyExecutor { .. } => (None, None),
     };
-    let groups = newly_red_groups(row, previous);
-    let newly_red: usize = groups.iter().map(|(_, tests)| tests.len()).sum();
-    let (newly_green, unreported): (Vec<&str>, Vec<&str>) = previous
-        .map(|previous| {
-            previous
-                .tests
-                .iter()
-                .filter(|(test, outcome)| {
-                    matches!(outcome, TestOutcome::Failed(_)) && row.failure(test).is_none()
-                })
-                .map(|(test, _)| test.as_str())
-                .partition(|test| row.tests.get(*test) == Some(&TestOutcome::Passed))
-        })
-        .unwrap_or_default();
-    let still_red = row.failed() - newly_red;
-    let headline = if row.failed() == 0 {
+    let diff = row_diff(row, previous);
+    let newly_red = group_size(&diff.newly_red);
+    let first_red = group_size(&diff.first_red);
+    let mut headline = if row.failed() == 0 {
         format!("all {} passed", thousands(row.ran()))
     } else {
         format!("{} failed", thousands(row.failed()))
     };
-    let movement = match cross_host {
+    if !diff.host_conditions.is_empty() {
+        let conditions: Vec<String> = diff
+            .host_conditions
+            .iter()
+            .map(|group| {
+                format!(
+                    "{} tests failed on one host condition: {}",
+                    group.tests.len(),
+                    group.face
+                )
+            })
+            .collect();
+        headline.push_str(&format!(" — {}", conditions.join("; ")));
+    }
+    let mut movement = match cross_host {
         Some(other) => format!(
             "cross-host against `{other}`: {newly_red} red here only, {} green here only",
-            newly_green.len()
+            diff.newly_green.len()
         ),
-        None => format!("{newly_red} newly red, {} newly green", newly_green.len()),
+        None => format!(
+            "{newly_red} newly red, {} newly green",
+            diff.newly_green.len()
+        ),
     };
+    if first_red + diff.first_green.len() > 0 {
+        movement.push_str(&format!(
+            " · first observed here: {first_red} red, {} green",
+            diff.first_green.len()
+        ));
+    }
+    if !diff.removed.is_empty() {
+        movement.push_str(&format!(" · {} removed", diff.removed.len()));
+    }
     out.push_str(&format!(
         "**Main cadence · {} · {} on `{}` · `{}`: {headline} — {movement}**\n\n",
         report.check,
@@ -1685,6 +1979,7 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
     ));
     row_identity(out, row);
     render_basis(out, report, row);
+    render_host_conditions(out, row, &diff.host_conditions, previous, neighbour);
     if newly_red > 0 {
         let title = match cross_host {
             Some(other) => format!("RED HERE, NOT RED ON `{other}`"),
@@ -1693,25 +1988,50 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
         out.push_str(&format!(
             "\n**{title}: {newly_red} test{} in {} failure group{}**\n",
             plural(newly_red),
-            groups.len(),
-            plural(groups.len())
+            diff.newly_red.len(),
+            plural(diff.newly_red.len())
         ));
-        render_groups(out, &groups, neighbour);
+        render_groups(out, &diff.newly_red, neighbour);
     }
-    if !newly_green.is_empty() {
+    if first_red > 0 {
+        out.push_str(&format!(
+            "\n**FIRST OBSERVATION ON THIS HOST: RED · {first_red} test{} in {} failure group{}** — no row in the compared observation, so there is no earlier state to have moved from. A merge listed under **Merges since the compared row** added or renamed {}.\n",
+            plural(first_red),
+            diff.first_red.len(),
+            plural(diff.first_red.len()),
+            if first_red == 1 { "it" } else { "them" }
+        ));
+        render_groups(out, &diff.first_red, neighbour);
+    }
+    if !diff.newly_green.is_empty() {
         let title = match cross_host {
             Some(other) => format!("GREEN HERE, RED ON `{other}`"),
             None => "NEWLY GREEN".to_string(),
         };
-        out.push_str(&format!("\n**{title}: {}**\n", newly_green.len()));
-        render_tests(out, "", &newly_green);
+        out.push_str(&format!("\n**{title}: {}**\n", diff.newly_green.len()));
+        render_tests(out, "", &diff.newly_green);
     }
-    if !unreported.is_empty() {
+    if !diff.first_green.is_empty() {
         out.push_str(&format!(
-            "\n{} previously red test{} reported no result in this row (renamed, removed, or skipped), so {} not counted as green.\n",
-            unreported.len(),
-            if unreported.len() == 1 { "" } else { "s" },
-            if unreported.len() == 1 { "it is" } else { "they are" }
+            "\n**FIRST OBSERVATION ON THIS HOST: GREEN · {}** — no row in the compared observation.\n",
+            diff.first_green.len()
+        ));
+        render_tests(out, "", &diff.first_green);
+    }
+    if !diff.removed.is_empty() {
+        out.push_str(&format!(
+            "\n**REMOVED SINCE THE COMPARED ROW: {}** — a row in the compared observation and none in this one (removed or renamed).\n",
+            diff.removed.len()
+        ));
+        render_tests(out, "", &diff.removed);
+    }
+    if diff.red_now_skipped > 0 {
+        let one = diff.red_now_skipped == 1;
+        out.push_str(&format!(
+            "\n{} previously red test{} skipped in this row, so {} not counted as green.\n",
+            diff.red_now_skipped,
+            if one { " was" } else { "s were" },
+            if one { "it is" } else { "they are" }
         ));
     }
     if previous.is_some() {
@@ -1720,7 +2040,7 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
         } else {
             "Still red"
         };
-        out.push_str(&format!("\n**{label}:** {still_red} (not listed)\n"));
+        out.push_str(&format!("\n**{label}:** {} (not listed)\n", diff.still_red));
     }
     if let Comparison::SameExecutor {
         previous,
@@ -1760,18 +2080,10 @@ fn render_incomplete(
         row_identity(out, row);
         let tail = row.output_tail.trim();
         if !tail.is_empty() {
-            let tail: String = tail
-                .lines()
-                .rev()
-                .take(25)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
             out.push_str(&format!(
                 "\nOutput tail:\n```\n{}\n```\n",
-                truncate(&tail, MAX_CAUSE_CHARS).replace("```", "'''")
+                crate::execution::check_parsers::error_anchored_tail(tail, MAX_CAUSE_CHARS)
+                    .replace("```", "'''")
             ));
         }
     }
@@ -1809,8 +2121,25 @@ fn render_incomplete(
             since(previous)
         )),
     }
+    if let (Some(previous), Some(covering)) =
+        (report.comparison.previous(), report.comparison.coverage())
+    {
+        if covering.id != previous.id {
+            out.push_str(&format!(
+                "- Covered through: {} on `{}`, at {}, the newest complete row on {} on any executor. A merge is covered when any host's complete row includes it, so the list below starts there.\n",
+                covering.reference,
+                host(covering),
+                since(covering),
+                report.platform
+            ));
+        }
+    }
     if report.comparison.previous().is_some() && report.commit.is_some() {
-        render_bracket(out, "Merges not covered by a complete row", report.bracket);
+        render_bracket(
+            out,
+            "Merges not covered by a complete row on any executor",
+            report.bracket,
+        );
     }
 }
 
@@ -1889,8 +2218,8 @@ mod tests {
         }
     }
 
-    fn failed(signature: &str) -> TestOutcome {
-        TestOutcome::Failed(signature.to_string())
+    fn failed(excerpt: &str) -> TestOutcome {
+        TestOutcome::Failed(Failure::from_excerpt(excerpt))
     }
 
     /// `row` as recorded on another executor.
@@ -2004,6 +2333,64 @@ mod tests {
             .await
             .expect("settlement wakes the waiter")
             .unwrap();
+    }
+
+    /// Performance's specimen: project `rs` logged "the checks contract at
+    /// <sha> could not be read" about every 30 minutes on an unchanged tip,
+    /// 48 lines on 10-21. Its config declares MCP servers and references and
+    /// no checks, which is no lanes, not a failure.
+    #[tokio::test]
+    async fn an_unreadable_contract_is_one_outcome_per_tip_and_no_checks_is_no_lanes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let slots = std::sync::Mutex::new(CadenceSlots::default());
+        let reads = AtomicUsize::new(0);
+        let unreadable = || {
+            reads.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<CommitChecksContract, _>(CommitChecksContractError::Parse(
+                    "mapping values are not allowed here".into(),
+                ))
+            }
+        };
+        let first = tip_lanes(&slots, "p", "tip-1", unreadable).await;
+        assert!(
+            first
+                .as_ref()
+                .is_err_and(|error| error.contains("failed to parse") && error.contains("tip-1")),
+            "{first:?}"
+        );
+        assert_eq!(
+            tip_lanes(&slots, "p", "tip-1", unreadable).await,
+            Ok(Vec::new()),
+            "one recorded outcome per tip"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "an unchanged tip is not read again"
+        );
+        assert!(
+            tip_lanes(&slots, "q", "tip-1", unreadable).await.is_err(),
+            "projects are independent"
+        );
+        assert!(
+            tip_lanes(&slots, "p", "tip-2", unreadable).await.is_err(),
+            "a moved tip is read again"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+
+        let no_checks =
+            || async { Err::<CommitChecksContract, _>(CommitChecksContractError::NoChecks) };
+        let no_config =
+            || async { Err::<CommitChecksContract, _>(CommitChecksContractError::Missing) };
+        assert_eq!(
+            tip_lanes(&slots, "rs", "tip-1", no_checks).await,
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            tip_lanes(&slots, "rs", "tip-1", no_config).await,
+            Ok(Vec::new())
+        );
     }
 
     #[test]
@@ -2146,11 +2533,16 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("1 previously red test reported no result"),
+            text.contains("4 newly red, 1 newly green · 1 removed"),
             "{text}"
         );
+        let removed = text
+            .find("REMOVED SINCE THE COMPARED ROW: 1**")
+            .expect("a vanished test is listed as removed");
+        assert!(text[removed..].contains("- `core::removed`"), "{text}");
+        let green = text.find("NEWLY GREEN").unwrap();
         assert!(
-            !text.contains("`core::removed`"),
+            !text[green..removed].contains("core::removed"),
             "a vanished test is not green: {text}"
         );
         assert!(text.contains("**Still red:** 1 (not listed)"), "{text}");
@@ -2159,6 +2551,160 @@ mod tests {
             "still-red tests are counted, not listed"
         );
         assert!(text.contains("ran 3h"), "{text}");
+    }
+
+    /// Specimen 203c35ce: two tests born in a merge after the compared row's
+    /// tree were rendered newly red against a row that could not have had them.
+    #[test]
+    fn a_test_with_no_row_in_the_compared_observation_is_a_first_observation() {
+        let previous = row(
+            "prev",
+            "aaaaaaaaaaaaaaaa",
+            HOUR,
+            &[
+                ("core::steady", TestOutcome::Passed),
+                ("core::steady_red", failed("stale")),
+                ("core::dropped_a", TestOutcome::Passed),
+                ("core::dropped_b", failed("gone")),
+            ],
+        );
+        let seeding = "assertion `left == right` failed: seeded clone";
+        let current = row(
+            "cur",
+            "bbbbbbbbbbbbbbbb",
+            2 * HOUR,
+            &[
+                ("core::steady", TestOutcome::Passed),
+                ("core::steady_red", failed("stale")),
+                ("clone_seeding::seeds_the_clone", failed(seeding)),
+                ("clone_seeding::seeds_the_index", failed(seeding)),
+                ("clone_seeding::reuses_the_seed", TestOutcome::Passed),
+            ],
+        );
+        let bracket = Bracket {
+            merges: vec![BracketMerge {
+                commit: "4227422742274227".into(),
+                subject: "Seed clones from the store (cairn/5100) (#4227)".into(),
+                pr: Some(4227),
+                issue: Some("cairn/5100".into()),
+            }],
+            ..Bracket::default()
+        };
+        let text = report(
+            &CadenceVerdict::Complete(current),
+            &same(&previous),
+            &bracket,
+        );
+        assert!(
+            text.contains("3 failed — 0 newly red, 0 newly green · first observed here: 2 red, 1 green · 2 removed"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("NEWLY RED") && !text.contains("NEWLY GREEN"),
+            "a test the compared row never observed cannot have moved: {text}"
+        );
+        let first_red = text
+            .find("**FIRST OBSERVATION ON THIS HOST: RED · 2 tests in 1 failure group**")
+            .expect("first-observation reds are their own section");
+        assert!(
+            text[first_red..].contains("- `clone_seeding::seeds_the_clone`")
+                && text[first_red..].contains("- `clone_seeding::seeds_the_index`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("**FIRST OBSERVATION ON THIS HOST: GREEN · 1**")
+                && text.contains("- `clone_seeding::reuses_the_seed`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("**REMOVED SINCE THE COMPARED ROW: 2**")
+                && text.contains("- `core::dropped_a`")
+                && text.contains("- `core::dropped_b`"),
+            "a removed test is said, not silent: {text}"
+        );
+        assert!(text.contains("**Still red:** 1 (not listed)"), "{text}");
+        assert!(
+            text.contains("- `422742274227` #4227 · cairn/5100"),
+            "the bracket names the landing that added them: {text}"
+        );
+    }
+
+    /// Specimen 5715631a: fedora's tmpfs `/tmp` ran out of inodes and 48
+    /// tests failed with `StorageFull`, each under its own temp path, so each
+    /// had its own signature and all of them rendered newly red.
+    #[test]
+    fn a_shared_os_error_across_many_failures_is_one_host_condition_never_newly_red() {
+        let names: Vec<String> = (0..50)
+            .map(|n| format!("mcp_file_changes::case_{n:02}"))
+            .collect();
+        let enospc = |n: usize| {
+            format!(
+                "thread 'mcp_file_changes::case_{n:02}' (23610{n}) panicked at os/cairn-core/tests/main/mcp_file_changes.rs:979:14:\ncalled `Result::unwrap()` on an `Err` value: Custom {{ kind: StorageFull, error: PathError {{ path: \"/tmp/cairn-change-project-{n:06x}\", err: Os {{ code: 28, kind: StorageFull, message: \"No space left on device\" }} }} }}\nnote: run with `RUST_BACKTRACE=1`"
+            )
+        };
+        let passing: Vec<(&str, TestOutcome)> = names
+            .iter()
+            .map(|name| (name.as_str(), TestOutcome::Passed))
+            .collect();
+        let full: Vec<(&str, TestOutcome)> = names
+            .iter()
+            .enumerate()
+            .map(|(n, name)| (name.as_str(), failed(&enospc(n))))
+            .collect();
+        let signatures: HashSet<String> = full
+            .iter()
+            .filter_map(|(_, outcome)| match outcome {
+                TestOutcome::Failed(failure) => Some(failure.signature.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            signatures.len(),
+            50,
+            "every failure has its own signature, as in the specimen"
+        );
+
+        let previous = on("fedora", row("prev", "aaaaaaaaaaaaaaaa", HOUR, &passing));
+        let current = on("fedora", row("cur", "bbbbbbbbbbbbbbbb", 5 * HOUR, &full));
+        let text = report(
+            &CadenceVerdict::Complete(current),
+            &same(&previous),
+            &Bracket::default(),
+        );
+        assert!(
+            text.contains("50 failed — 50 tests failed on one host condition: No space left on device — 0 newly red, 0 newly green"),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("**HOST CONDITION").count(),
+            1,
+            "one census group: {text}"
+        );
+        assert!(
+            text.contains(
+                "**HOST CONDITION on `fedora`: 50 tests failed on `No space left on device`**"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Discriminator: 50 of 50 passed on `fedora` at the compared row (cairn://p/cairn/check-observations/prev"),
+            "{text}"
+        );
+        assert!(text.contains("- … and 40 more"), "{text}");
+        assert!(!text.contains("NEWLY RED"), "{text}");
+        assert!(text.contains("**Still red:** 0"), "{text}");
+
+        // One test that hit the condition is still a red to look at.
+        let mut lone = passing.clone();
+        lone[0].1 = failed("called `Result::unwrap()` on an `Err` value: database is locked");
+        let current = on("fedora", row("cur", "bbbbbbbbbbbbbbbb", 5 * HOUR, &lone));
+        let text = report(
+            &CadenceVerdict::Complete(current),
+            &same(&previous),
+            &Bracket::default(),
+        );
+        assert!(text.contains("1 failed — 1 newly red"), "{text}");
+        assert!(!text.contains("HOST CONDITION"), "{text}");
     }
 
     #[test]
@@ -2298,6 +2844,26 @@ mod tests {
             !text.contains("passed**") && !text.contains("all 0 passed"),
             "{text}"
         );
+
+        // The only error, above more warnings than the message quotes, still
+        // leads the quoted tail.
+        let mut buried = row("cur3", "bbbbbbbbbbbb", HOUR, &[]);
+        buried.exit_code = 101;
+        buried.verdict_passed = false;
+        buried.output_tail = format!(
+            "error[E0425]: cannot find value `turn_id` in this scope\n   --> os/cairn-core/src/lib.rs:7:9\n{}error: could not compile `cairn-core` (lib) due to 1 previous error",
+            "warning: unused variable: `scratch`\n".repeat(80)
+        );
+        let text = report(
+            &classify_row(buried),
+            &Comparison::Baseline,
+            &Bracket::default(),
+        );
+        assert!(
+            text.contains("Output tail:\n```\nerror[E0425]: cannot find value `turn_id` in this scope\n   --> os/cairn-core/src/lib.rs:7:9\n…\n"),
+            "{text}"
+        );
+        assert!(text.contains("due to 1 previous error\n```"), "{text}");
 
         let mut green_but_empty = row("cur2", "bbbbbbbbbbbb", HOUR, &[]);
         green_but_empty.verdict_passed = true;
@@ -2457,6 +3023,77 @@ mod tests {
             "the host census is not reported as newly green: {text}"
         );
         assert!(text[green..census].contains("`core::fixed`"), "{text}");
+    }
+
+    /// Specimen 03d65964: bbs's no-verdict wake listed five merges as
+    /// uncovered that fedora's complete row e0f326a1 had covered 17 minutes
+    /// earlier.
+    #[test]
+    fn merges_not_covered_are_keyed_by_tree_across_executors() {
+        let previous = row(
+            "prev",
+            "aaaaaaaaaaaaaaaa",
+            HOUR,
+            &[("a", TestOutcome::Passed)],
+        );
+        let fedora = on(
+            "fedora",
+            row(
+                "other",
+                "cccccccccccccccc",
+                2 * HOUR,
+                &[("a", TestOutcome::Passed)],
+            ),
+        );
+        let mut partial = row(
+            "cur",
+            "bbbbbbbbbbbbbbbb",
+            3 * HOUR,
+            &[("a", TestOutcome::Passed)],
+        );
+        partial.complete = false;
+        let no_verdict = classify_row(partial.clone());
+        let comparison = Comparison::SameExecutor {
+            previous: previous.clone(),
+            neighbour: Some(Box::new(fedora)),
+        };
+        assert_eq!(
+            bracket_base(&no_verdict, &comparison).map(|row| row.id.as_str()),
+            Some("other"),
+            "an incomplete attempt's merge list starts at the newest complete row on any host"
+        );
+        partial.complete = true;
+        assert_eq!(
+            bracket_base(&classify_row(partial), &comparison).map(|row| row.id.as_str()),
+            Some("prev"),
+            "a complete row's merge list stays the window of its per-host diff"
+        );
+        let death = CadenceVerdict::Death {
+            cause: "no machine".into(),
+        };
+        assert_eq!(
+            bracket_base(&death, &same(&previous)).map(|row| row.id.as_str()),
+            Some("prev")
+        );
+
+        let text = report(&no_verdict, &comparison, &Bracket::default());
+        assert!(
+            text.contains("Last complete row: cairn://p/cairn/check-observations/prev, the previous row on `bbs`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Covered through: cairn://p/cairn/check-observations/other on `fedora`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("**Merges not covered by a complete row on any executor (0)**"),
+            "{text}"
+        );
+        let text = report(&no_verdict, &same(&previous), &Bracket::default());
+        assert!(
+            !text.contains("Covered through"),
+            "this host's own row is the newest: {text}"
+        );
     }
 
     #[test]

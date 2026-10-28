@@ -937,7 +937,7 @@ pub(crate) fn format_failure_excerpt(parsed: Option<&ParsedCheckResult>, raw_tai
             return head_chars(&composed.join("\n"), FAILURE_EXCERPT_CHARS);
         }
     }
-    tail_chars(raw_tail, FAILURE_EXCERPT_CHARS)
+    error_anchored_tail(raw_tail, FAILURE_EXCERPT_CHARS)
 }
 
 /// A check's `report` as a renderer shows it: led by whatever the stored
@@ -989,6 +989,59 @@ pub(crate) fn tail_chars(s: &str, max: usize) -> String {
         return s.to_string();
     }
     s.chars().skip(n - max).collect()
+}
+
+/// What stands between an anchored error and the tail it leads.
+const ANCHOR_ELISION: &str = "\n…\n";
+
+/// The trailing `max` chars of `s`, led by its first error when the cut would
+/// drop it.
+///
+/// A build prints its error once and then however many warnings and footers
+/// follow, so an end-anchored window alone can keep `could not compile … due
+/// to 1 previous error` while losing the one error it counts, and a reader
+/// takes the last warning for the cause. When the window misses it, the first
+/// `error[`/`error:` line and its `-->` location lead verbatim, then an
+/// elision mark, then the end-anchored remainder.
+pub(crate) fn error_anchored_tail(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        return s.to_string();
+    }
+    let window = s
+        .char_indices()
+        .nth(total - max)
+        .map_or(s.len(), |(at, _)| at);
+    let Some((start, end)) = first_error_span(s).filter(|(start, _)| *start < window) else {
+        return tail_chars(s, max);
+    };
+    let lead = head_chars(s[start..end].trim_end(), max / 2);
+    let budget = max.saturating_sub(lead.chars().count() + ANCHOR_ELISION.chars().count());
+    format!("{lead}{ANCHOR_ELISION}{}", tail_chars(&s[end..], budget))
+}
+
+/// The byte span of `s`'s first error line, through its `-->` location when
+/// one follows within two lines.
+fn first_error_span(s: &str) -> Option<(usize, usize)> {
+    let mut offset = 0;
+    let mut lines = s.split_inclusive('\n').map(|line| {
+        let at = offset;
+        offset += line.len();
+        (at, line)
+    });
+    let (start, first) = lines.find(|(_, line)| {
+        let line = strip_ansi(line);
+        let line = line.trim_start();
+        line.starts_with("error[") || line.starts_with("error:")
+    })?;
+    let mut end = start + first.len();
+    for (at, line) in lines.take(2) {
+        if strip_ansi(line).trim_start().starts_with("-->") {
+            end = at + line.len();
+            break;
+        }
+    }
+    Some((start, end))
 }
 
 /// `head_chars` with a distinct name for message-length capping intent.
@@ -1605,6 +1658,49 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             failures: vec![],
         };
         assert!(format_failure_names(&parsed).is_none());
+    }
+
+    /// Specimen 59dbccd5: cairn-core emitted one `error[E0425]` and 32
+    /// warnings; the end-anchored tail kept the warnings and the `could not
+    /// compile … due to 1 previous error` footer but not the error, and a
+    /// builder read the last warning as the cause.
+    #[test]
+    fn a_truncated_tail_keeps_the_first_error_and_its_location() {
+        let mut output = String::from(
+            "   Compiling cairn-core v0.1.0\nerror[E0425]: cannot find value `turn_id` in this scope\n   --> os/cairn-core/src/execution/checks_main.rs:612:9\n    |\n612 |         turn_id,\n    |         ^^^^^^^ not found in this scope\n\n",
+        );
+        for n in 0..32 {
+            output.push_str(&format!(
+                "warning: unused variable: `scratch_{n}`\n   --> os/cairn-core/src/lib.rs:{n}:9\n    |\n    = note: `#[warn(unused_variables)]` on by default\n\n"
+            ));
+        }
+        output.push_str(
+            "error: could not compile `cairn-core` (lib) due to 1 previous error; 32 warnings emitted\n",
+        );
+        assert!(
+            !tail_chars(&output, 1_500).contains("error[E0425]"),
+            "the plain tail loses the error, which is the defect"
+        );
+        let excerpt = error_anchored_tail(&output, 1_500);
+        assert!(excerpt.chars().count() <= 1_500, "{excerpt}");
+        assert!(
+            excerpt.starts_with(
+                "error[E0425]: cannot find value `turn_id` in this scope\n   --> os/cairn-core/src/execution/checks_main.rs:612:9\n…\n"
+            ),
+            "{excerpt}"
+        );
+        assert!(
+            excerpt.ends_with("due to 1 previous error; 32 warnings emitted\n"),
+            "{excerpt}"
+        );
+
+        // An untruncated output, a window that already holds the error, and an
+        // output with no error are plain tails.
+        assert_eq!(error_anchored_tail(&output, 100_000), output);
+        let late = format!("{}error[E0308]: mismatched types\n", "noise\n".repeat(400));
+        assert_eq!(error_anchored_tail(&late, 300), tail_chars(&late, 300));
+        let quiet = "warning: unused\n".repeat(400);
+        assert_eq!(error_anchored_tail(&quiet, 300), tail_chars(&quiet, 300));
     }
 
     #[test]

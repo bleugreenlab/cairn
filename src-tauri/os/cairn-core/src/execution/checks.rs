@@ -278,7 +278,7 @@ fn write_check_planning_infrastructure_failure(error: &str) -> String {
 }
 
 #[derive(Debug)]
-enum CommitChecksContractError {
+pub(crate) enum CommitChecksContractError {
     Missing,
     NoChecks,
     Read(String),
@@ -288,7 +288,7 @@ enum CommitChecksContractError {
 }
 
 impl CommitChecksContractError {
-    fn manual_diagnostic(&self, commit: &str) -> String {
+    pub(crate) fn manual_diagnostic(&self, commit: &str) -> String {
         match self {
             Self::Missing | Self::NoChecks => {
                 format!("commit {commit} declares no configured checks")
@@ -4078,11 +4078,12 @@ fn plan_write_wave(planning: WriteWavePlanning) -> Option<Result<PlannedWriteWav
         head,
         base,
         // Unsupported checks are never planned, so planning has no use for them.
-        contract: ChecksContract {
-            checks,
-            extra_inputs,
-            ..
-        },
+        contract:
+            ChecksContract {
+                checks,
+                extra_inputs,
+                ..
+            },
         db,
         project_id,
         job_id,
@@ -4948,8 +4949,9 @@ impl From<String> for CheckExecutionFailure {
     }
 }
 use crate::execution::check_parsers::{
-    extract_running_tests, format_failure_excerpt, format_failure_names, parse_check_output,
-    ParsedCheckResult, MAX_FAILURE_NAMES, RESULT_ARTIFACT_JSON_MARKER, RUST_LINT_PARSER,
+    error_anchored_tail, extract_running_tests, format_failure_excerpt, format_failure_names,
+    parse_check_output, ParsedCheckResult, MAX_FAILURE_NAMES, RESULT_ARTIFACT_JSON_MARKER,
+    RUST_LINT_PARSER,
 };
 use crate::execution::selection::{plan_checks, whole_suite_command, CheckPlan, CheckScope};
 use crate::jj::{
@@ -5440,7 +5442,8 @@ fn classify_check_failure(
 /// Compose the `output_tail` a check row stores, within [`OUTPUT_TAIL_CHARS`]:
 /// the classification and its evidence (when the death was classified), then
 /// the check's own `report` (when its result file carried one), then as much of
-/// the output's tail as still fits.
+/// the output's tail as still fits. The tail is [`error_anchored_tail`], so a
+/// build error printed above a long run of warnings survives the cut.
 ///
 /// The report has to lead because the tail cannot be trusted to hold it. A
 /// script prints its verdict on stdout, the body puts stderr after stdout, and
@@ -5459,7 +5462,7 @@ fn classified_output_excerpt(
         .and_then(|result| result.report.as_deref())
         .filter(|report| !report.trim().is_empty());
     if classification.is_none() && report.is_none() {
-        return tail(&chatter, OUTPUT_TAIL_CHARS);
+        return error_anchored_tail(&chatter, OUTPUT_TAIL_CHARS);
     }
     let mut prefix = String::new();
     if let Some(classification) = classification {
@@ -5484,7 +5487,7 @@ fn classified_output_excerpt(
     }
     prefix.push_str("\n\nFinal output:\n");
     let remaining = OUTPUT_TAIL_CHARS.saturating_sub(prefix.chars().count());
-    prefix.push_str(&tail(&chatter, remaining));
+    prefix.push_str(&error_anchored_tail(&chatter, remaining));
     prefix.chars().take(OUTPUT_TAIL_CHARS).collect()
 }
 
@@ -6995,7 +6998,7 @@ pub(crate) fn checks_contract_at_commit(
         .ok()
 }
 
-async fn load_checks_contract_at_commit_detailed(
+pub(crate) async fn load_checks_contract_at_commit_detailed(
     object_repository: &Path,
     commit: &str,
 ) -> Result<CommitChecksContract, CommitChecksContractError> {
