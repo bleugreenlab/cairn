@@ -8,20 +8,14 @@
 //! returning a compact inline pass/fail line. A cache hit returns the stored
 //! verdict without re-running.
 //!
-//! ## Contract source: live project config, not the worktree
+//! ## One commit: the one the write sealed
 //!
-//! The `checks` contract is read from the project's MAIN-CHECKOUT
-//! `.cairn/config.yaml` (located by `project_id`), which is exactly the file the
-//! Settings UI edits. It is not read from a mutable executor projection's committed
-//! copy: that copy is snapshotted when the branch is cut, so a project-level
-//! checks edit made while a session is in flight would never reach it. Sourcing
-//! the contract live means a Settings edit takes effect on the very next commit
-//! of an in-flight session with no restart. The live project config wins
-//! outright over a branch's own committed `.cairn/config.yaml`; the worktree copy
-//! is a fallback only when the project repo path cannot be resolved. Everything
-//! else — the changed-file set, impact-glob matching, the cache tree hash, and
-//! the check commands' working directory — still targets the sealed worktree
-//! commit. See [`load_live_project_checks`].
+//! Everything a wave reads comes from the commit the triggering call sealed: the
+//! `checks` contract that commit declares in its own `.cairn/config.yaml`
+//! ([`checks_contract_at_commit`], CAIRN-3333), the changed-file set, impact-glob
+//! matching, the cache tree hash, and the tree the slot materializes. The caller
+//! names that commit through [`WriteCheckTarget`]; a `write` prepares against the
+//! branch's pre-write tip, so its resolution alone would evaluate the parent.
 //!
 //! ## Scope
 //!
@@ -3998,6 +3992,147 @@ async fn submit_single_planned_check_batch(
     })
 }
 
+/// Everything a write wave's synchronous planning unit reads, resolved before it
+/// runs.
+struct WriteWavePlanning {
+    jj: JjEnv,
+    repository: PathBuf,
+    /// The commit the wave evaluates: the one the triggering call sealed.
+    head: String,
+    base: String,
+    /// The contract `head` declares.
+    contract: ChecksContract,
+    db: Arc<LocalDb>,
+    project_id: String,
+    job_id: String,
+}
+
+/// A write wave's plan, every part of it derived from one commit.
+struct PlannedWriteWave {
+    /// The applicable `when:write` checks, each paired with its cache key on
+    /// `sealed_commit`'s tree.
+    keyed: Vec<(CheckPlan, String)>,
+    tree_hash: String,
+    /// The commit the slot materializes and the observations are recorded under.
+    sealed_commit: String,
+    transport: Vec<(String, String)>,
+}
+
+/// Plan a write wave against `planning.head`: its changed files since `base`,
+/// the checks they select, and each check's cache key on that tree. `None` when
+/// nothing applies (or the change set is unreadable); `Some(Err)` when a
+/// selected check's transport cannot be built.
+///
+/// Synchronous: VCS inspection and the cache bridge wait on subprocesses and
+/// joined threads, so callers run it off the async runtime's workers.
+fn plan_write_wave(planning: WriteWavePlanning) -> Option<Result<PlannedWriteWave, String>> {
+    let WriteWavePlanning {
+        jj,
+        repository,
+        head,
+        base,
+        // Unsupported checks are never planned, so planning has no use for them.
+        contract: ChecksContract {
+            checks,
+            extra_inputs,
+            ..
+        },
+        db,
+        project_id,
+        job_id,
+    } = planning;
+    let changed = logical_changed_files(&jj, &repository, &base, &head)
+        .inspect_err(|error| {
+            log::warn!(
+                "write-cadence checks: changed files of {base}..{head} unreadable; nothing \
+                 planned: {error}"
+            );
+        })
+        .ok()?;
+    if changed.is_empty() {
+        return None;
+    }
+    // The sealed tree's entry listing feeds BOTH halves of input resolution:
+    // the manifest blobs the dependency closures are derived from, and the
+    // per-check filtered-tree cache component. One read serves both, and it
+    // is skipped entirely when no check declares inputs at all.
+    let entries = if any_check_declares_inputs(checks.values()) {
+        tree_entries(&jj, &repository, &head).ok()
+    } else {
+        None
+    };
+    let blobs = TreeBlobs {
+        jj: &jj,
+        repository: &repository,
+    };
+    let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
+    let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
+    let plans = applicable_write_checks(&checks, &inputs, &changed, &repository);
+    if plans.is_empty() {
+        return None;
+    }
+    let tree_hash = logical_tree_hash(&jj, &repository, &head).ok()?;
+    let base_content = if plans
+        .iter()
+        .any(|plan| needs_executor_base_content(&plan.name))
+    {
+        match executor_base_content_bundle(&jj, &repository, &base, &changed) {
+            Ok(content) => Some(content),
+            Err(error) => return Some(Err(error)),
+        }
+    } else {
+        None
+    };
+    let transport = check_transport_env(&changed, base_content);
+    // The narrowing baseline is this JOB's last green run of each check, not the
+    // project's most recent row of any status. Both qualifiers carry weight: a
+    // sibling branch's tree is not an anchor on this branch's lineage, and a red
+    // run must not displace the green one it superseded.
+    let baseline_by_check: HashMap<String, CheckResultCacheEntry> =
+        list_latest_passing_check_results_for_job(db.clone(), &job_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| (row.check_name.clone(), row))
+            .collect();
+    let keyed: Vec<(CheckPlan, String)> = plans
+        .into_iter()
+        .map(|plan| {
+            let check = checks
+                .get(&plan.name)
+                .expect("planned check must retain its configured definition");
+            let selector = inputs.for_check(&plan.name);
+            let input_hash = check_input_hash(check, selector, entries.as_deref(), &tree_hash);
+            let should_reselect =
+                get_check_result(db.clone(), &project_id, &plan.name, &input_hash)
+                    .ok()
+                    .flatten()
+                    .is_none();
+            let selected_plan = if should_reselect {
+                let selected_changed = selected_changed_files_for_miss(
+                    baseline_by_check.get(&plan.name),
+                    entries.as_deref(),
+                    check,
+                    &inputs,
+                    selector,
+                    &changed,
+                    &blobs,
+                );
+                replan_one_check(&plan.name, check, &inputs, &selected_changed, &repository)
+                    .unwrap_or(plan)
+            } else {
+                plan
+            };
+            (selected_plan, input_hash)
+        })
+        .collect();
+    Some(Ok(PlannedWriteWave {
+        keyed,
+        tree_hash,
+        sealed_commit: head,
+        transport,
+    }))
+}
+
 /// Give every substrate failure in a settled batch the time its request was
 /// actually outstanding. A completed check carries its executor's own measured
 /// duration and is left alone.
@@ -5457,7 +5592,7 @@ pub(crate) async fn run_write_checks_after_seal(
     run_context: Option<&RunContext>,
     cwd: &str,
     tool_use_id: &str,
-    sealed_resolution: Option<&crate::mcp::handlers::branch::BranchResolution>,
+    target: WriteCheckTarget<'_>,
 ) -> Option<String> {
     // No run context ⇒ no run id to stream against and no job to anchor the diff.
     let run_context = run_context?.clone();
@@ -5468,7 +5603,7 @@ pub(crate) async fn run_write_checks_after_seal(
     let wave_orch = orch.clone();
     let cwd = cwd.to_string();
     let tool_use_id = tool_use_id.to_string();
-    let sealed_resolution = sealed_resolution.cloned();
+    let sealed_resolution = target.sealed_resolution();
     await_write_check_wave(
         guard,
         WRITE_CHECK_INLINE_WAIT,
@@ -5487,6 +5622,35 @@ pub(crate) async fn run_write_checks_after_seal(
         },
     )
     .await
+}
+
+/// The commit a write-cadence wave evaluates.
+pub(crate) enum WriteCheckTarget<'a> {
+    /// The call sealed `commit` on `branch`. `branch` is the resolution the
+    /// call prepared against, so its `commit_id` is the branch's PRE-write tip:
+    /// only its coordinates are taken, and the wave evaluates `commit`.
+    Sealed {
+        branch: &'a crate::mcp::handlers::branch::BranchResolution,
+        commit: &'a str,
+    },
+    /// The calling session's own branch head, resolved when the wave starts.
+    CurrentHead,
+}
+
+impl WriteCheckTarget<'_> {
+    /// The branch resolved AT the sealed commit, or `None` when the wave is to
+    /// resolve the session's head itself.
+    fn sealed_resolution(&self) -> Option<crate::mcp::handlers::branch::BranchResolution> {
+        match self {
+            Self::Sealed { branch, commit } => {
+                Some(crate::mcp::handlers::branch::BranchResolution {
+                    commit_id: (*commit).to_string(),
+                    ..(*branch).clone()
+                })
+            }
+            Self::CurrentHead => None,
+        }
+    }
 }
 
 /// How long a committing `write` or `run` waits inline for its when:write
@@ -5761,123 +5925,30 @@ async fn run_write_checks_after_seal_inner(
     );
 
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let planning_jj = jj.clone();
-    let planning_repo = logical.repository_path;
-    let planning_head = logical.commit_id;
-    let planning_base = live_base.unwrap_or(logical.default_commit_id);
-    let planning_checks = checks.clone();
-    let planning_extra_inputs = extra_inputs.clone();
-    let planning_db = orch.db.local.clone();
-    let planning_project_id = run_context.project_id.clone();
-    let planning_job_id = run_context.job_id.clone();
+    let planning = WriteWavePlanning {
+        jj: jj.clone(),
+        repository: logical.repository_path,
+        head: logical.commit_id,
+        base: live_base.unwrap_or(logical.default_commit_id),
+        contract: ChecksContract {
+            checks: checks.clone(),
+            extra_inputs: extra_inputs.clone(),
+            ..Default::default()
+        },
+        db: orch.db.local.clone(),
+        project_id: run_context.project_id.clone(),
+        job_id: run_context.job_id.clone(),
+    };
     let planning_started = std::time::Instant::now();
-    let planned = tokio::task::spawn_blocking(move || {
-        let changed =
-            logical_changed_files(&planning_jj, &planning_repo, &planning_base, &planning_head)
-                .inspect_err(|error| {
-                    log::warn!(
-                        "write-cadence checks: changed files of {planning_base}..{planning_head} \
-                         unreadable; nothing planned: {error}"
-                    );
-                })
-                .ok()?;
-        if changed.is_empty() {
-            return None;
-        }
-        // The sealed tree's entry listing feeds BOTH halves of input resolution:
-        // the manifest blobs the dependency closures are derived from, and the
-        // per-check filtered-tree cache component. One read serves both, and it
-        // is skipped entirely when no check declares inputs at all.
-        let entries = if any_check_declares_inputs(planning_checks.values()) {
-            tree_entries(&planning_jj, &planning_repo, &planning_head).ok()
-        } else {
-            None
-        };
-        let blobs = TreeBlobs {
-            jj: &planning_jj,
-            repository: &planning_repo,
-        };
-        let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
-        let inputs = ResolvedInputs::resolve(&planning_checks, &planning_extra_inputs, &snapshot);
-        let plans = applicable_write_checks(&planning_checks, &inputs, &changed, &planning_repo);
-        if plans.is_empty() {
-            return None;
-        }
-        let tree_hash = logical_tree_hash(&planning_jj, &planning_repo, &planning_head).ok()?;
-        let base_content = if plans
-            .iter()
-            .any(|plan| needs_executor_base_content(&plan.name))
-        {
-            match executor_base_content_bundle(
-                &planning_jj,
-                &planning_repo,
-                &planning_base,
-                &changed,
-            ) {
-                Ok(content) => Some(content),
-                Err(error) => return Some(Err(error)),
-            }
-        } else {
-            None
-        };
-        let transport = check_transport_env(&changed, base_content);
-        let sealed_commit = planning_head.clone();
-        // The narrowing baseline is this JOB's last green run of each check, not the
-        // project's most recent row of any status. Both qualifiers carry weight: a
-        // sibling branch's tree is not an anchor on this branch's lineage, and a red
-        // run must not displace the green one it superseded.
-        let baseline_by_check: HashMap<String, CheckResultCacheEntry> =
-            list_latest_passing_check_results_for_job(planning_db.clone(), &planning_job_id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|row| (row.check_name.clone(), row))
-                .collect();
-        let keyed: Vec<(CheckPlan, String)> = plans
-            .into_iter()
-            .map(|plan| {
-                let check = planning_checks
-                    .get(&plan.name)
-                    .expect("planned check must retain its configured definition");
-                let selector = inputs.for_check(&plan.name);
-                let input_hash = check_input_hash(check, selector, entries.as_deref(), &tree_hash);
-                let should_reselect = get_check_result(
-                    planning_db.clone(),
-                    &planning_project_id,
-                    &plan.name,
-                    &input_hash,
-                )
-                .ok()
-                .flatten()
-                .is_none();
-                let selected_plan = if should_reselect {
-                    let selected_changed = selected_changed_files_for_miss(
-                        baseline_by_check.get(&plan.name),
-                        entries.as_deref(),
-                        check,
-                        &inputs,
-                        selector,
-                        &changed,
-                        &blobs,
-                    );
-                    replan_one_check(
-                        &plan.name,
-                        check,
-                        &inputs,
-                        &selected_changed,
-                        &planning_repo,
-                    )
-                    .unwrap_or(plan)
-                } else {
-                    plan
-                };
-                (selected_plan, input_hash)
-            })
-            .collect();
-        Some(Ok((keyed, tree_hash, sealed_commit, transport)))
-    })
-    .await
-    .ok()??;
-    let (keyed, tree_hash, sealed_commit, transport) = match planned {
+    let planned = tokio::task::spawn_blocking(move || plan_write_wave(planning))
+        .await
+        .ok()??;
+    let PlannedWriteWave {
+        keyed,
+        tree_hash,
+        sealed_commit,
+        transport,
+    } = match planned {
         Ok(planned) => planned,
         Err(error) => {
             return Some(write_check_planning_infrastructure_failure(&error));
@@ -20452,5 +20523,159 @@ mod manual_transport_tests {
 
         let missing = load_manual_run_row(&db, "run-absent").await.unwrap_err();
         assert!(missing.contains("run-absent"), "{missing}");
+    }
+}
+
+#[cfg(test)]
+mod write_wave_target_tests {
+    use super::*;
+    use crate::jj::tests::{git, git_stdout, init_project, jj_bin};
+    use crate::mcp::handlers::branch::BranchResolution;
+
+    fn commit(repo: &Path, files: &[(&str, &str)], message: &str) -> String {
+        for (path, content) in files {
+            let path = repo.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-q", "-m", message]);
+        git_stdout(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// A write prepares against the branch's tip, so the resolution it holds
+    /// after sealing still names the parent. The wave it fires has to plan, key,
+    /// and materialize the sealed commit, whose tree is the one carrying the
+    /// edit. The parent here already selects the check on its own changes, the
+    /// specimen shape: evaluating it yields a plausible verdict about a tree that
+    /// lacks the edit, recorded under the wrong commit.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_sealed_write_plans_its_checks_against_the_commit_it_sealed() {
+        let Some(bin) = jj_bin() else {
+            return;
+        };
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let repo = project.path().to_path_buf();
+        init_project(&repo);
+        let base = commit(
+            &repo,
+            &[
+                (
+                    ".cairn/config.yaml",
+                    "checks:\n  fmt:\n    command: cargo fmt --check\n    impact:\n      - src/**\n    when: write\n",
+                ),
+                ("src/lib.rs", "fn before() {}\n"),
+            ],
+            "declare fmt",
+        );
+        git(&repo, &["checkout", "-q", "-b", "agent/feature"]);
+        let parent = commit(&repo, &[("src/other.rs", "fn other() {}\n")], "parent");
+        let sealed = commit(
+            &repo,
+            &[("src/lib.rs", "#[allow(dead_code)]\nfn before() {}\n")],
+            "the write",
+        );
+
+        let jj = crate::jj::environment(&bin, home.path());
+        let coordinates = {
+            let (jj, home, repo) = (jj.clone(), home.path().to_path_buf(), repo.clone());
+            tokio::task::spawn_blocking(move || crate::jj::coordinate_repository(&jj, &home, &repo))
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let prepared_against = BranchResolution {
+            project_id: "project".into(),
+            repository_path: coordinates.clone(),
+            object_repository_path: repo.clone(),
+            rev: "agent/feature".into(),
+            commit_id: parent.clone(),
+            default_commit_id: base.clone(),
+            default_branch: "main".into(),
+        };
+
+        let evaluated = WriteCheckTarget::Sealed {
+            branch: &prepared_against,
+            commit: &sealed,
+        }
+        .sealed_resolution()
+        .expect("a sealed target resolves without the session");
+        assert_eq!(evaluated.commit_id, sealed);
+        assert_eq!(
+            evaluated.rev, "agent/feature",
+            "the branch coordinates carry"
+        );
+        assert!(WriteCheckTarget::CurrentHead.sealed_resolution().is_none());
+
+        let db = Arc::new(crate::storage::migrated_test_db("write-wave-target.db").await);
+        let plan_at = |head: &str| {
+            let contract = checks_contract_at_commit(&repo, head).expect("fmt is declared");
+            assert_eq!(contract.defined_by_commit, head);
+            let planning = WriteWavePlanning {
+                jj: jj.clone(),
+                repository: coordinates.clone(),
+                head: head.to_string(),
+                base: base.clone(),
+                contract: contract.contract,
+                db: db.clone(),
+                project_id: "project".into(),
+                job_id: "job".into(),
+            };
+            async move {
+                tokio::task::spawn_blocking(move || plan_write_wave(planning))
+                    .await
+                    .unwrap()
+                    .expect("fmt applies to a src change")
+                    .unwrap()
+            }
+        };
+
+        let wave = plan_at(&evaluated.commit_id).await;
+        assert_eq!(
+            wave.sealed_commit, sealed,
+            "the slot materializes, and the observations record, the sealed commit"
+        );
+        let names: Vec<&str> = wave
+            .keyed
+            .iter()
+            .map(|(plan, _)| plan.name.as_str())
+            .collect();
+        assert_eq!(names, ["fmt"]);
+        assert_eq!(
+            wave.tree_hash,
+            logical_tree_hash(&jj, &coordinates, &sealed).unwrap(),
+            "the observation's tree is the sealed commit's"
+        );
+        let shipped = wave
+            .transport
+            .iter()
+            .find(|(name, _)| name == CHANGED_FILES_CONTENT_ENV)
+            .map(|(_, value)| value.lines().collect::<BTreeSet<_>>())
+            .unwrap();
+        assert!(shipped.contains("src/lib.rs"), "{shipped:?}");
+        assert!(
+            git_stdout(
+                &repo,
+                &["show", &format!("{}:src/lib.rs", wave.sealed_commit)]
+            )
+            .contains("#[allow(dead_code)]"),
+            "the evaluated tree contains the edit"
+        );
+
+        // What the pre-write resolution would have evaluated: a real plan for
+        // the same check, keyed to a different tree that lacks the edit.
+        let stale = plan_at(&prepared_against.commit_id).await;
+        assert_eq!(stale.sealed_commit, parent);
+        assert_ne!(stale.tree_hash, wave.tree_hash);
+        assert_ne!(
+            stale.keyed[0].1, wave.keyed[0].1,
+            "fmt's key moves with the edit"
+        );
+        assert!(
+            !git_stdout(&repo, &["show", &format!("{parent}:src/lib.rs")])
+                .contains("#[allow(dead_code)]")
+        );
     }
 }

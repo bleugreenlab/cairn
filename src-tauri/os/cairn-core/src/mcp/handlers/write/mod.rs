@@ -261,14 +261,22 @@ async fn finish_minted_post_seal(
         )
         .await;
     }
-    let check_summary = crate::execution::checks::run_write_checks_after_seal(
-        orch,
-        run_context.as_ref(),
-        &request.cwd,
-        call.tool_use_id(),
-        Some(resolution),
-    )
-    .await;
+    let check_summary = match report.commit.as_ref().and_then(|commit| commit.sha.clone()) {
+        Some(sealed) => {
+            crate::execution::checks::run_write_checks_after_seal(
+                orch,
+                run_context.as_ref(),
+                &request.cwd,
+                call.tool_use_id(),
+                crate::execution::checks::WriteCheckTarget::Sealed {
+                    branch: resolution,
+                    commit: &sealed,
+                },
+            )
+            .await
+        }
+        None => None,
+    };
     report.post_seal = None;
     Ok(append_check_summary(
         serde_json::to_string(&report)
@@ -2407,52 +2415,58 @@ async fn handle_write_attempt(
         // inline wait elapses, with the wave finishing in the background. Gated on
         // an actual file change that produced a real commit sha — a
         // cairn://-resource-only write has no file change and never triggers.
-        let check_summary: Option<String> = if had_file_change
-            && commit
-                .as_ref()
-                .and_then(|report| report.sha.clone())
-                .is_some()
-        {
-            // An explicit thread-branch destination is backed by its own durable job.
-            // Checks and cancellation belong to that job rather than to the thread
-            // session that happened to advance it, otherwise the branch's `/checks`
-            // resource remains hollow and review waves attach to the wrong owner.
-            let run_context = check_run_context_for_destination(
-                crate::mcp::handlers::run_context::lookup_run(&orch.db.local, request)
-                    .await
-                    .ok(),
-                destination_job_id.as_deref(),
-            );
-            let tool_use_id = request
-                .tool_use_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            // This write sealed a source-touching commit → the branch advanced.
-            // Cancel any in-flight when:review suite for this job so the write-cadence
-            // checks below and the agent's next manual run inherit the freed CPU
-            // rather than competing with a dying suite. See
-            // cancel_stale_review_on_branch_advance for the rationale and job-id scoping.
-            if let Some(ctx) = run_context.as_ref() {
-                crate::execution::checks::cancel_stale_review_on_branch_advance(
-                    orch,
-                    &ctx.job_id,
-                    crate::execution::checks::BranchAdvance::Commit,
-                )
-                .await;
-            }
-            off_frame(|| {
-                crate::execution::checks::run_write_checks_after_seal(
-                    orch,
-                    run_context.as_ref(),
-                    &request.cwd,
-                    &tool_use_id,
-                    logical_resolution.as_ref(),
-                )
-            })
-            .await
-        } else {
-            None
-        };
+        let sealed_sha = commit.as_ref().and_then(|report| report.sha.clone());
+        let check_summary: Option<String> =
+            if let (true, Some(sealed_sha)) = (had_file_change, sealed_sha.as_deref()) {
+                // An explicit thread-branch destination is backed by its own durable job.
+                // Checks and cancellation belong to that job rather than to the thread
+                // session that happened to advance it, otherwise the branch's `/checks`
+                // resource remains hollow and review waves attach to the wrong owner.
+                let run_context = check_run_context_for_destination(
+                    crate::mcp::handlers::run_context::lookup_run(&orch.db.local, request)
+                        .await
+                        .ok(),
+                    destination_job_id.as_deref(),
+                );
+                let tool_use_id = request
+                    .tool_use_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                // This write sealed a source-touching commit → the branch advanced.
+                // Cancel any in-flight when:review suite for this job so the write-cadence
+                // checks below and the agent's next manual run inherit the freed CPU
+                // rather than competing with a dying suite. See
+                // cancel_stale_review_on_branch_advance for the rationale and job-id scoping.
+                if let Some(ctx) = run_context.as_ref() {
+                    crate::execution::checks::cancel_stale_review_on_branch_advance(
+                        orch,
+                        &ctx.job_id,
+                        crate::execution::checks::BranchAdvance::Commit,
+                    )
+                    .await;
+                }
+                // `logical_resolution` was resolved before this write applied, so its
+                // commit is the parent; the wave evaluates the commit just sealed.
+                let target = match logical_resolution.as_ref() {
+                    Some(branch) => crate::execution::checks::WriteCheckTarget::Sealed {
+                        branch,
+                        commit: sealed_sha,
+                    },
+                    None => crate::execution::checks::WriteCheckTarget::CurrentHead,
+                };
+                off_frame(|| {
+                    crate::execution::checks::run_write_checks_after_seal(
+                        orch,
+                        run_context.as_ref(),
+                        &request.cwd,
+                        &tool_use_id,
+                        target,
+                    )
+                })
+                .await
+            } else {
+                None
+            };
 
         if !promoted_memories.is_empty() {
             let commit_sha = commit.as_ref().and_then(|report| report.sha.clone());

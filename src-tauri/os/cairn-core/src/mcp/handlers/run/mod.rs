@@ -6574,7 +6574,7 @@ async fn settle_run_batch(
             s.run_context.as_ref(),
             &s.cwd,
             &s.tool_use_id,
-            None,
+            crate::execution::checks::WriteCheckTarget::CurrentHead,
         )
         .await
         {
