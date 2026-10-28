@@ -216,6 +216,7 @@ impl Default for GateVocabulary {
                 Arc::new(CheckVerdictFact),
                 Arc::new(ClockFact),
                 Arc::new(TenetVerdictFact),
+                Arc::new(CompilesFact),
             ],
         }
     }
@@ -1414,6 +1415,162 @@ async fn gated_ref(
         .await
 }
 
+/// `{fact: "compiles", project: "cairn", ref: "main"}`
+///
+/// Whether the tree a ref names now builds, read from the compile fact
+/// (`execution::compile_facts`), so "main compiles" is a gate on that fact and
+/// never on the issue number of whatever repair is in flight. A `builds` row
+/// for the ref's current tree satisfies it and a `does-not-build` row refutes
+/// it; a tree nothing has compiled, or only failed to compile, is quiet. The
+/// landing compile gate writes a `builds` row for every merge result it lands,
+/// so the default branch's tip carries one after every gated landing.
+///
+/// Never forecloses: a ref that does not build is repaired by its next commit.
+#[derive(Debug, Clone, Copy)]
+pub struct CompilesFact;
+
+const COMPILES_FIELDS: &[(&str, FieldKind)] =
+    &[("project", FieldKind::Scalar), ("ref", FieldKind::Scalar)];
+
+/// The project key a `compiles` clause names, as a bare key or a
+/// `cairn://p/KEY` URI.
+fn compiles_project(clause: &TriggerClause) -> Result<String, String> {
+    let raw = clause_str(clause, "project").unwrap_or_default().trim();
+    let key = raw
+        .strip_prefix("cairn://p/")
+        .unwrap_or(raw)
+        .trim_end_matches('/');
+    if key.is_empty() || key.contains('/') {
+        return Err(format!(
+            "compiles needs a 'project' naming one project, as a key or cairn://p/KEY; got {raw:?}"
+        ));
+    }
+    Ok(key.to_string())
+}
+
+#[async_trait]
+impl GateFact for CompilesFact {
+    fn fact(&self) -> &'static str {
+        "compiles"
+    }
+
+    fn fields(&self) -> &'static [(&'static str, FieldKind)] {
+        COMPILES_FIELDS
+    }
+
+    fn example(&self) -> TriggerClause {
+        BTreeMap::from([
+            ("fact".into(), Value::String(self.fact().into())),
+            ("project".into(), Value::String("cairn".into())),
+            ("ref".into(), Value::String("main".into())),
+        ])
+    }
+
+    fn validate(&self, clause: &TriggerClause) -> Result<(), String> {
+        compiles_project(clause)?;
+        if clause_str(clause, "ref").unwrap_or_default().trim().is_empty() {
+            return Err("compiles needs a 'ref' naming a branch or commit".into());
+        }
+        Ok(())
+    }
+
+    async fn resolve(
+        &self,
+        ctx: &GateContext<'_>,
+        clause: &TriggerClause,
+    ) -> DbResult<GateOutcome> {
+        let project = compiles_project(clause).map_err(DbError::Row)?;
+        let reference = clause_str(clause, "ref")
+            .ok_or_else(|| DbError::Row("compiles needs a 'ref' field".into()))?
+            .trim()
+            .to_string();
+        let db = ctx.orch().db.for_project(&project).await;
+        // An unknown project or a ref that does not resolve is an absence of
+        // evidence, never a failure: level resolution must be total.
+        let Some((project_id, tree_hash)) = compiles_coordinate(ctx, &db, &project, &reference).await
+        else {
+            return Ok(GateOutcome::NoEvidence);
+        };
+        let verdict = crate::execution::compile_facts::verdict_for_tree(&db, &project_id, &tree_hash)
+            .await
+            .map_err(DbError::internal)?;
+        Ok(match verdict.map(|fact| fact.outcome) {
+            Some(crate::execution::compile_facts::CompileOutcome::Builds) => GateOutcome::Satisfied,
+            Some(_) => GateOutcome::Refuted,
+            None => GateOutcome::NoEvidence,
+        })
+    }
+
+    async fn foreclosed(
+        &self,
+        _ctx: &GateContext<'_>,
+        _clause: &TriggerClause,
+    ) -> DbResult<Option<String>> {
+        Ok(None)
+    }
+
+    fn render(&self, clause: &TriggerClause) -> String {
+        format!(
+            "{} compiles in {}",
+            clause_str(clause, "ref").unwrap_or("?"),
+            clause_str(clause, "project").unwrap_or("?")
+        )
+    }
+}
+
+/// The project id and the git tree id of what `reference` names in it now.
+async fn compiles_coordinate(
+    ctx: &GateContext<'_>,
+    db: &LocalDb,
+    project_key: &str,
+    reference: &str,
+) -> Option<(String, String)> {
+    let key = project_key.to_string();
+    let (project_id, repository) = db
+        .read(move |conn| {
+            let key = key.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id, repo_path FROM projects WHERE lower(key) = lower(?1) LIMIT 1",
+                        params![key.as_str()],
+                    )
+                    .await?;
+                let Some(row) = rows.next().await? else {
+                    return Ok(None);
+                };
+                Ok(match row.opt_text(1)? {
+                    Some(repository) => Some((row.text(0)?, repository)),
+                    None => None,
+                })
+            })
+        })
+        .await
+        .ok()
+        .flatten()?;
+    let repository = PathBuf::from(repository);
+    let jj_binary_path = ctx.orch().jj_binary_path.clone();
+    let config_dir = ctx.orch().config_dir.clone();
+    let coordinate_repository = {
+        let jj_binary_path = jj_binary_path.clone();
+        let config_dir = config_dir.clone();
+        let repository = repository.clone();
+        tokio::task::spawn_blocking(move || {
+            let jj = JjEnv::resolve(&jj_binary_path, &config_dir);
+            crate::jj::coordinate_repository(&jj, &config_dir, &repository)
+        })
+        .await
+        .ok()?
+        .ok()?
+    };
+    let commit = cairn_vcs::resolve_coordinate(&coordinate_repository, reference)
+        .await
+        .ok()?;
+    let jj = JjEnv::resolve(&jj_binary_path, &config_dir);
+    let tree_hash = crate::jj::logical_tree_hash(&jj, &repository, &commit).ok()?;
+    Some((project_id, tree_hash))
+}
+
 /// A fact source that does not exist in the shipped vocabulary, standing in for
 /// the deliberately open `decision` arm. Shared with the registry tests, which
 /// assert that registering it moves the shared authoring surface too.
@@ -1622,7 +1779,7 @@ mod tests {
         assert_eq!(
             error,
             "unknown gate fact 'decision' \u{2014} known: issue_resolution, pr_state, \
-             artifact_confirmed, check_verdict, clock, tenet_verdict"
+             artifact_confirmed, check_verdict, clock, tenet_verdict, compiles"
         );
     }
 
@@ -1713,6 +1870,16 @@ mod tests {
                 ("fact", text("tenet_verdict")),
                 ("tenet", text("cairn://p/CAIRN/tenets/12")),
                 ("outcome", text("answered")),
+            ]),
+            clause(&[
+                ("fact", text("compiles")),
+                ("project", text("cairn")),
+                ("ref", text("main")),
+            ]),
+            clause(&[
+                ("fact", text("compiles")),
+                ("project", text("cairn://p/cairn")),
+                ("ref", text("main")),
             ]),
         ] {
             vocabulary

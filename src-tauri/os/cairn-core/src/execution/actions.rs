@@ -1202,6 +1202,7 @@ async fn handle_merge_pr(
             action_run.id.clone(),
         )),
         None,
+        None,
     )
     .await?;
     Ok(Some(serde_json::json!({ "merged": true })))

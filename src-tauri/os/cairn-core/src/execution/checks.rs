@@ -6769,7 +6769,7 @@ pub(crate) fn applicable_turn_end_checks(
                 .get(&plan.name)
                 .is_some_and(|check| match check.when {
                     CheckWhen::Review => true,
-                    CheckWhen::Write => false,
+                    CheckWhen::Write | CheckWhen::Landing => false,
                 })
         })
         .collect()
@@ -6812,6 +6812,27 @@ fn applicable_combined_tree_gate_checks(
             checks
                 .get(&plan.name)
                 .is_some_and(|check| check.policy == CheckPolicy::Gate)
+        })
+        .collect()
+}
+
+/// The `when: landing` checks a merge result's change set touches. An
+/// impact-scoped landing check no changed path matches does not run: the merge
+/// result is then identical, in that check's inputs, to the target tip it
+/// lands on, which every earlier landing already judged.
+fn applicable_landing_checks(
+    checks: &HashMap<String, CheckCommand>,
+    inputs: &ResolvedInputs,
+    changed: &[GraphFileChange],
+    repo_root: &Path,
+) -> Vec<CheckPlan> {
+    plan_checks(checks, inputs, changed, repo_root)
+        .into_iter()
+        .filter(|plan| plan.applies)
+        .filter(|plan| {
+            checks
+                .get(&plan.name)
+                .is_some_and(|check| check.when == CheckWhen::Landing)
         })
         .collect()
 }
@@ -7077,6 +7098,13 @@ pub(crate) struct CheckOutcome {
     /// evidence. This is producer-owned evidence; callers must not infer it from
     /// an empty environment fingerprint.
     pub(crate) not_recorded: Option<String>,
+    /// The cargo build failure in this run's WHOLE output, when the command
+    /// failed because something did not compile. Parsed before the output is
+    /// cut to its tail, which on a many-error failure keeps cargo's summaries
+    /// and loses the errors. `None` for a pass, a substrate failure, a reused
+    /// verdict (whose full output is gone), and any failure cargo did not
+    /// report as a build failure.
+    pub(crate) compile_failure: Option<crate::execution::compile_signature::CompileFailure>,
 }
 
 impl CheckOutcome {
@@ -8061,6 +8089,7 @@ where
             suppressed_after: None,
             recorded: Some(recorded),
             not_recorded: None,
+            compile_failure: None,
         };
         // A cache hit jumps straight from pending to its final state.
         board.transition_cached(
@@ -8214,6 +8243,9 @@ where
                 // Parse before classifying: positive assertion failures outrank any
                 // incidental infrastructure warning in the combined output.
                 let parsed = parse_check_output(&plan.command, &output);
+                let compile_failure = (!passed && substrate_failure.is_none())
+                    .then(|| crate::execution::compile_signature::parse_compile_failure(&output))
+                    .flatten();
                 let mut classification = if let Some(substrate) = substrate_failure.as_ref() {
                     Some(FailureClassification {
                         kind: substrate_failure_kind(substrate),
@@ -8385,6 +8417,7 @@ where
                                 suppressed_after: None,
                                 recorded,
                                 not_recorded: None,
+                                compile_failure: None,
                             };
                             board.transition(
                                 index,
@@ -8566,7 +8599,48 @@ where
                     suppressed_after: None,
                     recorded,
                     not_recorded,
+                    compile_failure,
                 };
+                // A lane that hit a build failure records it as the tree's
+                // compile fact, so the hold, attribution, and gates can read
+                // it rather than compile again. The landing gate writes its
+                // own row, which also names the base and the head it merged.
+                if let Some(failure) = outcome.compile_failure.as_ref() {
+                    if !tool_use_id.starts_with(LANDING_GATE_SUITE_PREFIX) {
+                        use crate::execution::compile_facts::{
+                            record_compile_fact_blocking, CompileFactWrite, CompileOutcome,
+                            CompileSource,
+                        };
+                        let source =
+                            if job_id == crate::execution::checks_main::cadence_owner(project_id) {
+                                CompileSource::MainCadence
+                            } else {
+                                CompileSource::Lane(plan.name.clone())
+                            };
+                        let fact = CompileFactWrite {
+                            project_id: project_id.to_string(),
+                            tree_commit: commit.evaluated.to_string(),
+                            tree_hash: tree_hash.to_string(),
+                            base_commit: None,
+                            head_commit: None,
+                            merge_request_id: None,
+                            platform: provenance
+                                .as_ref()
+                                .and_then(|meta| meta.verdict_platform.clone()),
+                            executor_id: provenance.as_ref().map(|meta| meta.executor_id.clone()),
+                            scope: plan.command.clone(),
+                            check_name: Some(plan.name.clone()),
+                            outcome: CompileOutcome::DoesNotBuild,
+                            failure: Some(failure.clone()),
+                            diagnostic_tail: Some(failure.render()),
+                            source,
+                            observation_id: outcome.recorded.as_ref().map(|recorded| recorded.id.clone()),
+                        };
+                        if let Err(error) = record_compile_fact_blocking(db.clone(), fact) {
+                            log::warn!("check {}: {error}", plan.name);
+                        }
+                    }
+                }
                 board.transition(
                     index,
                     if passed { "passed" } else { "failed" },
@@ -8728,6 +8802,7 @@ pub(crate) fn record_suppressed_check(
         // evaluation's verdict.
         recorded: None,
         not_recorded: None,
+        compile_failure: None,
     }
 }
 
@@ -8798,6 +8873,7 @@ pub(crate) fn record_unplaceable_check(
         suppressed_after: None,
         recorded: None,
         not_recorded: None,
+        compile_failure: None,
     }
 }
 
@@ -8831,6 +8907,7 @@ fn record_cancelled_check(
         suppressed_after: None,
         recorded: None,
         not_recorded: Some(format!("cancelled: {}", cause.sentence())),
+        compile_failure: None,
     }
 }
 
@@ -9517,6 +9594,34 @@ fn key_review_tree_plans(
         .collect()
 }
 
+/// Which checks a prospective-tree verification runs, and how long each may
+/// wait for a cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProspectiveGate {
+    /// The integration-branch merge gate: applicable `policy: gate` review
+    /// checks on the runner's gating platform, parked until admission.
+    CombinedTree,
+    /// The landing cadence: applicable `when: landing` checks on their own
+    /// verdict platforms, each admitted within its `budgetSeconds` of
+    /// `started_unix_ms` or not at all.
+    Landing { started_unix_ms: u64 },
+}
+
+/// The suite label of a landing gate's runs, which the composer reads to leave
+/// the compile fact to the gate.
+pub(crate) const LANDING_GATE_SUITE_PREFIX: &str = "landing-gate:";
+
+/// How long a landing check waits for a cell when it declares no
+/// `budgetSeconds`.
+pub(crate) const DEFAULT_LANDING_BUDGET_SECONDS: u32 = 600;
+
+fn landing_admission_horizon(started_unix_ms: u64, check: Option<&CheckCommand>) -> u64 {
+    let budget = check
+        .and_then(|check| check.budget_seconds)
+        .unwrap_or(DEFAULT_LANDING_BUDGET_SECONDS);
+    started_unix_ms.saturating_add(u64::from(budget) * 1_000)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn verify_review_tree(
     orch: &Orchestrator,
@@ -9532,8 +9637,49 @@ pub(crate) async fn verify_review_tree(
     requesting_job_id: &str,
     priority: CellPriority,
 ) -> ReviewTreeGateResult {
+    match run_prospective_tree_checks(
+        orch,
+        result_db,
+        project_id,
+        repository,
+        planning_root,
+        commit_id,
+        base_commit_id,
+        tree_hash,
+        tree_entries,
+        changed,
+        requesting_job_id,
+        priority,
+        ProspectiveGate::CombinedTree,
+    )
+    .await
+    {
+        Ok(outcomes) => review_tree_gate_result(outcomes),
+        Err(error) => ReviewTreeGateResult::InfrastructureFailure(error),
+    }
+}
+
+/// Run the checks `gate` selects against a prospective commit, keyed and
+/// sealed to that commit's whole tree. `Ok` with no outcomes means nothing
+/// applied; `Err` means planning failed before anything was submitted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_prospective_tree_checks(
+    orch: &Orchestrator,
+    result_db: std::sync::Arc<LocalDb>,
+    project_id: &str,
+    repository: &str,
+    planning_root: &Path,
+    commit_id: &str,
+    base_commit_id: &str,
+    tree_hash: &str,
+    tree_entries: &[(String, String)],
+    changed: &[GraphFileChange],
+    requesting_job_id: &str,
+    priority: CellPriority,
+    gate: ProspectiveGate,
+) -> Result<Vec<CheckOutcome>, String> {
     if changed.is_empty() {
-        return ReviewTreeGateResult::Green;
+        return Ok(Vec::new());
     }
     // The gate's definition comes from the PROSPECTIVE commit it is verifying,
     // not from the project checkout: the combined tree is what merges, so the
@@ -9546,7 +9692,7 @@ pub(crate) async fn verify_review_tree(
         defined_by_commit,
     }) = load_checks_contract_at_commit(Path::new(repository), commit_id).await
     else {
-        return ReviewTreeGateResult::Green;
+        return Ok(Vec::new());
     };
     assert_eq!(
         defined_by_commit, commit_id,
@@ -9562,19 +9708,28 @@ pub(crate) async fn verify_review_tree(
     };
     let snapshot = TreeSnapshot::new(Some(tree_entries), &blobs);
     let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
-    let mut plans = applicable_combined_tree_gate_checks(&checks, &inputs, changed, planning_root);
-    retain_gating_platform_plans(
-        &mut plans,
-        &checks,
-        crate::execution::check_identity::gating_platform(),
-    );
+    let plans = match gate {
+        ProspectiveGate::CombinedTree => {
+            let mut plans =
+                applicable_combined_tree_gate_checks(&checks, &inputs, changed, planning_root);
+            retain_gating_platform_plans(
+                &mut plans,
+                &checks,
+                crate::execution::check_identity::gating_platform(),
+            );
+            plans
+        }
+        // A landing verdict counts from the platforms the check declares, which
+        // placement honours; the orchestrator's own OS is not one of its inputs.
+        ProspectiveGate::Landing { .. } => {
+            applicable_landing_checks(&checks, &inputs, changed, planning_root)
+        }
+    };
     if plans.is_empty() {
-        return ReviewTreeGateResult::Green;
+        return Ok(Vec::new());
     }
     if let Some(error) = plans.iter().find_map(|plan| plan.config_error.as_deref()) {
-        return ReviewTreeGateResult::InfrastructureFailure(format!(
-            "check planning failed before execution: {error}"
-        ));
+        return Err(format!("check planning failed before execution: {error}"));
     }
 
     let platform = check_platform_identity();
@@ -9602,7 +9757,7 @@ pub(crate) async fn verify_review_tree(
         ) {
             Ok(content) => Some(content),
             Err(error) => {
-                return ReviewTreeGateResult::InfrastructureFailure(format!(
+                return Err(format!(
                     "build executor protocol base content from {base_commit_id}: {error}"
                 ))
             }
@@ -9617,6 +9772,16 @@ pub(crate) async fn verify_review_tree(
         .iter()
         .map(|(plan, _)| {
             resolve_check_timeout_ms(checks.get(&plan.name), DEFAULT_REVIEW_CHECK_TIMEOUT_MS)
+        })
+        .collect();
+    let admission_horizons: Vec<Option<u64>> = keyed
+        .iter()
+        .map(|(plan, _)| match gate {
+            ProspectiveGate::CombinedTree => None,
+            ProspectiveGate::Landing { started_unix_ms } => Some(landing_admission_horizon(
+                started_unix_ms,
+                checks.get(&plan.name),
+            )),
         })
         .collect();
     let command_identity_inputs: Vec<_> = keyed
@@ -9709,7 +9874,12 @@ pub(crate) async fn verify_review_tree(
             &keyed,
             &sealed_coordinates,
             &infra_scopes,
-            &format!("merge-gate:{requesting_job_id}"),
+            &match gate {
+                ProspectiveGate::CombinedTree => format!("merge-gate:{requesting_job_id}"),
+                ProspectiveGate::Landing { .. } => {
+                    format!("{LANDING_GATE_SUITE_PREFIX}{requesting_job_id}")
+                }
+            },
             CheckExecMode::Isolated,
             Some(orch),
             &env,
@@ -9721,6 +9891,7 @@ pub(crate) async fn verify_review_tree(
                 let owner = resolved_owner.clone();
                 let env = execution_env.clone();
                 let timeout_ms = timeouts[index];
+                let admission_horizon_unix_ms = admission_horizons[index];
                 let executor = executors[index].clone();
                 let verdict_platforms = verdict_platforms[index].clone();
                 let resource_identity = command_identity_inputs[index].clone();
@@ -9749,6 +9920,7 @@ pub(crate) async fn verify_review_tree(
                         verdict_platforms,
                         resource_identity,
                         resource_class,
+                        admission_horizon_unix_ms,
                     });
                     submit_review_check(
                         orch,
@@ -9766,7 +9938,7 @@ pub(crate) async fn verify_review_tree(
         )
         .await
     };
-    review_tree_gate_result(outcomes)
+    Ok(outcomes)
 }
 
 fn review_tree_gate_result(outcomes: Vec<CheckOutcome>) -> ReviewTreeGateResult {
@@ -11945,6 +12117,9 @@ cairn-common = { path = "../cairn-common" }
                 "rust-fmt" | "lockfile" | "licenses" | "rust-lint" | "rust-tests"
                 | "external-host" | "codex-pin" | "codex-contract" | "invoke-admission"
                 | "check-inputs" => &["bun", "rust"],
+                // A bare cargo command, but `--workspace` reaches cairn-voice,
+                // whose build script runs bun.
+                "landing-compile" => &["bun", "rust"],
                 "executor-windows-check" | "executor-linux-check" | "executor-macos-check" => {
                     &["rust"]
                 }
@@ -12168,6 +12343,7 @@ cairn-common = { path = "../cairn-common" }
             verdict_platforms: None,
             fixes: false,
             main_cadence: None,
+            budget_seconds: None,
             tree: Default::default(),
         }
     }
@@ -12987,6 +13163,7 @@ cairn-common = { path = "../cairn-common" }
             duration_ms: 0,
             suppressed_after: None,
             not_recorded: None,
+            compile_failure: None,
         }
     }
 
@@ -13083,6 +13260,7 @@ cairn-common = { path = "../cairn-common" }
             duration_ms: 0,
             suppressed_after: None,
             not_recorded: None,
+            compile_failure: None,
         }];
         let s = format_check_summary(&results);
         // Header status line first.
@@ -13113,6 +13291,7 @@ cairn-common = { path = "../cairn-common" }
             duration_ms: 0,
             suppressed_after: None,
             not_recorded: None,
+            compile_failure: None,
         }
     }
 
@@ -13297,6 +13476,7 @@ cairn-common = { path = "../cairn-common" }
         CheckCommand {
             fixes: true,
             main_cadence: None,
+            budget_seconds: None,
             ..check(command, impact, CheckWhen::Write)
         }
     }
@@ -15386,6 +15566,7 @@ cairn-common = { path = "../cairn-common" }
             duration_ms: 1_800_000,
             suppressed_after: None,
             not_recorded: None,
+            compile_failure: None,
         }]);
         assert!(matches!(
             result,
@@ -16744,6 +16925,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             suppressed_after: Some(3),
             recorded: None,
             not_recorded: None,
+            compile_failure: None,
         };
         let reply = manual_configured_check_result(
             "rust-tests",
@@ -16780,6 +16962,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                 reusable: false,
             }),
             not_recorded: None,
+            compile_failure: None,
         };
         let reply = manual_configured_check_result(
             "rust-tests",
@@ -16817,6 +17000,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                 reusable: true,
             }),
             not_recorded: None,
+            compile_failure: None,
         };
         let first_id = uuid::Uuid::new_v4();
         let second_id = uuid::Uuid::new_v4();

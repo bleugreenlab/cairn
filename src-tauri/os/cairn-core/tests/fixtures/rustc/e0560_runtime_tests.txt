@@ -1,0 +1,82 @@
+p-link v2.4.7
+   Compiling symphonia-bundle-mp3 v0.6.1
+   Compiling symphonia-codec-pcm v0.6.1
+   Compiling symphonia-codec-adpcm v0.6.1
+   Compiling realfft v3.5.0
+   Compiling async-signal v0.2.14
+   Compiling cairn-voice v0.12.34 (/home/dev/.cairn-exec/build-slots/cairn/slot-847/src-tauri/cairn-voice)
+   Compiling async-process v2.5.0
+   Compiling rubato v0.16.2
+   Compiling symphonia v0.6.1
+   Compiling zbus_macros v5.16.0
+   Compiling ordered-multimap v0.7.3
+   Compiling tauri-macros v2.6.3
+   Compiling tauri-plugin-updater v2.10.0
+   Compiling tauri-plugin-dialog v2.6.0
+   Compiling tauri-plugin-process v2.3.1
+   Compiling tauri-plugin-opener v2.5.4
+   Compiling async-recursion v1.1.1
+   Compiling is-docker v0.2.0
+   Compiling rfd v0.16.0
+   Compiling is-wsl v0.4.0
+   Compiling rust-ini v0.21.3
+   Compiling pathdiff v0.2.3
+   Compiling open v5.3.3
+   Compiling cairn v0.12.34 (/home/dev/.cairn-exec/build-slots/cairn/slot-847/src-tauri)
+   Compiling minisign-verify v0.2.4
+   Compiling signal-hook v0.3.18
+   Compiling signal-hook-mio v0.2.5
+   Compiling crossterm v0.28.1
+   Compiling whisper-rs-sys v0.15.0
+   Compiling turso_sync_sdk_kit v0.8.0-pre.3 (https://github.com/tursodatabase/turso?rev=964faddd16b20ed7d5c090a879a138dbabeee508#964faddd)
+   Compiling cairn-cmd v0.12.34 (/home/dev/.cairn-exec/build-slots/cairn/slot-847/src-tauri/os/cairn-cmd)
+   Compiling zbus v5.16.0
+   Compiling tauri-plugin-single-instance v2.4.0
+   Compiling turso v0.8.0-pre.3 (https://github.com/tursodatabase/turso?rev=964faddd16b20ed7d5c090a879a138dbabeee508#964faddd)
+   Compiling cairn-db v0.12.34 (/home/dev/.cairn-exec/build-slots/cairn/slot-847/src-tauri/os/cairn-db)
+   Compiling cairn-attention v0.12.34 (/home/dev/.cairn-exec/build-slots/cairn/slot-847/src-tauri/os/cairn-attention)
+   Compiling cairn-analytics v0.12.34 (/home/dev/.cairn-exec/build-slots/cairn/slot-847/src-tauri/os/cairn-analytics)
+   Compiling cairn-session v0.12.34 (/home/dev/.cairn-exec/build-slots/cairn/slot-847/src-tauri/os/cairn-session)
+   Compiling cairn-workflow v0.12.34 (/home/dev/.cairn-exec/build-slots/cairn/slot-847/src-tauri/os/cairn-workflow)
+warning: unused imports: `MigrationRunner` and `TURSO_MIGRATIONS`
+ --> os/cairn-analytics/src/tests.rs:5:34
+  |
+5 | use cairn_db::storage::{LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
+  |                                  ^^^^^^^^^^^^^^^          ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0560]: struct `cairn_domain::decision::Decision` has no field named `input_tokens`
+   --> os/cairn-workflow/src/runtime_tests.rs:312:9
+    |
+312 |         input_tokens: Some(12),
+    |         ^^^^^^^^^^^^ `cairn_domain::decision::Decision` does not have this field
+    |
+    = note: available fields are: `usage`
+
+warning: `cairn-analytics` (lib test) generated 1 warning (run `cargo fix --lib -p cairn-analytics --tests` to apply 1 suggestion)
+For more information about this error, try `rustc --explain E0560`.
+error: could not compile `cairn-workflow` (lib test) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+warning: fields `computed_at`, `file_count`, and `edge_count` are never read
+   --> os/cairn-core/src/projects/codemap.rs:138:9
+    |
+136 | pub(crate) struct CachedCodeMap {
+    |                   ------------- fields in this struct
+137 |     pub base_commit_sha: String,
+138 |     pub computed_at: i64,
+    |         ^^^^^^^^^^^
+...
+143 |     pub file_count: i64,
+    |         ^^^^^^^^^^
+144 |     pub edge_count: i64,
+    |         ^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `cairn-core` (lib) generated 1 warning
+error: command `/home/dev/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/bin/cargo test --no-run --message-format json-render-diagnostics --workspace --features test-utils` exited with code 101
+error: script "test:rust:full" exited with code 101
+
+
+Exit code: 101

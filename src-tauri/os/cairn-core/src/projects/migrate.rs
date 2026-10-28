@@ -401,6 +401,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     delete_only("check_test_results", "observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_observation_relabels", "project_id = ?1 OR observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_deferred_tests", "observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
+    delete_only("compile_facts", "project_id = ?1"),
     delete_only("check_result_commit_aliases", "project_id = ?1 OR source_observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_result_cache", "project_id = ?1 OR source_observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("codemap_cache", "project_id = ?1"),

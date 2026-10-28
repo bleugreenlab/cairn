@@ -11,6 +11,7 @@
 mod conflict;
 mod context;
 mod create_pr;
+mod landing_gate;
 mod merge;
 mod pin_bump;
 pub(crate) mod refresh;
@@ -28,6 +29,9 @@ pub use context::{
     try_resolve_mr_context_for_job, MergeMrContext, MrContext, PrNodeResolution,
 };
 pub(crate) use create_pr::{publish_pr_branch_for_job, sync_create_pr_artifact_for_job};
+pub use landing_gate::{
+    parse_landing_gate_skip, refuse_landing_gate_skip_on_write, LandingGateSkip,
+};
 pub use merge::{
     merge_pr_for_job, parse_merge_precondition, reconcile_after_merge, CheckoutReconciliation,
     MergePrecondition,

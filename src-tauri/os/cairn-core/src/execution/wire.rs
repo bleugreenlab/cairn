@@ -229,6 +229,12 @@ pub(crate) struct ReviewCheckWireInput {
     pub(crate) verdict_platforms: Vec<String>,
     pub(crate) resource_identity: CheckResourceIdentityInput,
     pub(crate) resource_class: CheckResourceClass,
+    /// A deadline for ADMISSION, for the one caller that must answer within a
+    /// bound: the landing gate, which refuses a merge as "gate unavailable"
+    /// when no cell is admitted in time rather than waiting forever. `None`
+    /// parks the check until admission like every other check. The run, once
+    /// admitted, is bounded by `timeout_ms` alone.
+    pub(crate) admission_horizon_unix_ms: Option<u64>,
 }
 
 pub(crate) fn build_review_check_request(input: ReviewCheckWireInput) -> CellRequest {
@@ -249,7 +255,9 @@ pub(crate) fn build_review_check_request(input: ReviewCheckWireInput) -> CellReq
         cwd: String::new(),
         env: input.env,
         priority: input.priority,
-        wait_horizon_unix_ms,
+        wait_horizon_unix_ms: input
+            .admission_horizon_unix_ms
+            .unwrap_or(wait_horizon_unix_ms),
         waiting_since_unix_ms: unix_time_ms(),
         timeout_ms: input.timeout_ms,
         mutation_policy: MutationPolicy::PureVerdict,

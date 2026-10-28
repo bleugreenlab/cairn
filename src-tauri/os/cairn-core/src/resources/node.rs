@@ -1565,8 +1565,33 @@ pub(super) async fn read_node(
             if let Some(review) = review_decision {
                 output.push_str(&format!("Review: {}\n", review));
             }
+            // A merge the landing compile gate refused stays refused until the
+            // branch moves, so it renders as the conflict it is, with the
+            // errors and the remedy, before anyone merges again.
+            let landing_refusal = if pr_status == "open" && source_conflict.is_none() {
+                let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+                let store = crate::jj::project_store_dir(
+                    &orch.config_dir,
+                    std::path::Path::new(&repo_path),
+                );
+                match crate::jj::bookmark_commit(&jj, &store, &source_branch) {
+                    Some(head) => {
+                        crate::execution::compile_facts::landing_refusal_for_head(&conn, &head)
+                            .await
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
             if source_conflict.is_some() {
                 output.push_str("Mergeable: CONFLICTING\n");
+            } else if let Some(refusal) = landing_refusal.as_ref() {
+                output.push_str(&crate::execution::compile_facts::render_landing_refusal(
+                    refusal,
+                    &source_branch,
+                    &target_branch,
+                ));
             } else if let Some(merge) = mergeable {
                 output.push_str(&format!("Mergeable: {}\n", merge));
             }

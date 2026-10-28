@@ -133,6 +133,114 @@ pub(super) async fn prospective_store_merge_child(
     }
 }
 
+/// The commit a landing on the project DEFAULT branch would produce right now,
+/// built in the store and then undone, so the landing gate can judge the merge
+/// result before anything moves.
+///
+/// Unlike [`prospective_store_merge_child`], this fetches origin's live tip for
+/// a project with a remote and builds onto it, because the default branch
+/// advances outside Cairn's fold chain (another PR merged through GitHub, an
+/// external push) and a merge result built on the store's last-seen tip would
+/// be a tree that never lands. `target_tip` is the tip it was built on.
+/// The caller holds the store lock.
+pub(super) async fn prospective_default_landing(
+    orch: &Orchestrator,
+    merge_context: &MergeMrContext,
+    method: &str,
+) -> Result<ProspectiveMerge, String> {
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let store =
+        crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
+    let operation = crate::jj::operation_id(&jj, &store)?;
+    let source_tip = crate::jj::bookmark_commit(&jj, &store, &merge_context.source_branch)
+        .ok_or_else(|| {
+            format!(
+                "source bookmark `{}` did not resolve",
+                merge_context.source_branch
+            )
+        })?;
+    let transformed = store_merge_child_inner(orch, merge_context, method, false).await;
+    let result = transformed.and_then(|commit_id| {
+        // The fold fetched (for a remote) and built onto this revision; after
+        // a prospective fold it still names the base, since nothing was pushed.
+        let base_revision = if merge_context.mr.is_local {
+            merge_context.target_branch.clone()
+        } else {
+            format!("{}@origin", merge_context.target_branch)
+        };
+        let target_tip = crate::jj::revset_commit(&jj, &store, &base_revision)
+            .ok_or_else(|| format!("landing base `{base_revision}` did not resolve"))?;
+        let tree_hash = crate::jj::sealed_tree_hash_via_git(&jj, &store, &commit_id)?;
+        let tree_entries = crate::jj::tree_entries(&jj, &store, &commit_id)?;
+        let patch = jj.run(
+            &store,
+            &[
+                "diff",
+                "--ignore-working-copy",
+                "--git",
+                "--from",
+                &target_tip,
+                "--to",
+                &commit_id,
+            ],
+            "jj diff prospective landing",
+        )?;
+        Ok(ProspectiveMerge {
+            source_tip: source_tip.clone(),
+            target_tip,
+            commit_id,
+            tree_hash,
+            tree_entries,
+            changed_files: crate::jj::parse_git_diff(&patch),
+        })
+    });
+    let restore = crate::jj::restore_operation(&jj, &store, &operation);
+    match (result, restore) {
+        (Ok(plan), Ok(())) => Ok(plan),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(format!(
+            "failed to restore prospective landing operation: {error}"
+        )),
+        (Err(error), Err(restore_error)) => Err(format!(
+            "{error} (also failed to restore prospective landing operation: {restore_error})"
+        )),
+    }
+}
+
+/// The live tips a landing on the default branch would use now: the source
+/// bookmark, and the target as origin holds it (fetched) or as the store
+/// holds it for a project with no remote. The caller holds the store lock.
+pub(super) async fn live_default_landing_tips(
+    orch: &Orchestrator,
+    merge_context: &MergeMrContext,
+) -> Result<(String, String), String> {
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let store =
+        crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
+    let target = merge_context.target_branch.as_str();
+    let source =
+        crate::jj::bookmark_commit(&jj, &store, &merge_context.source_branch).ok_or_else(|| {
+            format!(
+                "source bookmark `{}` did not resolve",
+                merge_context.source_branch
+            )
+        })?;
+    let target_revision = if merge_context.mr.is_local {
+        target.to_string()
+    } else {
+        let _ = crate::jj::track_bookmark(&jj, &store, target);
+        crate::orchestrator::base_branch_sync::with_fetch_lock(orch, &store, || async {
+            crate::jj::fetch_remote_branch(&jj, &store, "origin", target)
+        })
+        .await
+        .map_err(|error| format!("fetch origin's `{target}`: {error}"))?;
+        format!("{target}@origin")
+    };
+    let target_tip = crate::jj::revset_commit(&jj, &store, &target_revision)
+        .ok_or_else(|| format!("`{target_revision}` did not resolve"))?;
+    Ok((source, target_tip))
+}
+
 pub(super) async fn land_verified_store_merge_child(
     orch: &Orchestrator,
     merge_context: &MergeMrContext,
@@ -211,7 +319,7 @@ async fn store_merge_child_inner(
     orch: &Orchestrator,
     merge_context: &MergeMrContext,
     method: &str,
-    _materialize_conflicts: bool,
+    publish: bool,
 ) -> Result<String, String> {
     let repo_path = merge_context.mr.repo_path.as_str();
     let target_branch = merge_context.target_branch.as_str();
@@ -423,7 +531,9 @@ async fn store_merge_child_inner(
             }
         }
 
-        if has_remote {
+        // A prospective landing fetches origin's live tip like a real one, so it
+        // builds exactly the tree that would land, and then publishes nothing.
+        if has_remote && publish {
             // Advance the rebased source's PR head on origin BEFORE advancing the
             // target. The rebase rewrote the source's commit id, so origin's PR
             // head must move to the rebased commit or GitHub never marks the PR

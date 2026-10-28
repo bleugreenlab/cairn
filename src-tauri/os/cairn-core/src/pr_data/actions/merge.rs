@@ -754,6 +754,7 @@ pub async fn merge_pr_for_job(
     merge_method: Option<String>,
     attribution: Option<super::PrResolutionAttribution>,
     precondition: Option<MergePrecondition>,
+    landing_gate_skip: Option<super::LandingGateSkip>,
 ) -> Result<String, String> {
     let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
         .await
@@ -766,10 +767,17 @@ pub async fn merge_pr_for_job(
     )
     .await;
     barrier.refuse_merge()?;
-    merge_pr_for_job_past_barrier(orch, job_id, merge_method, attribution, precondition)
-        .await
-        .map(|reply| barrier.prefix(reply))
-        .map_err(|error| barrier.prefix(error))
+    merge_pr_for_job_past_barrier(
+        orch,
+        job_id,
+        merge_method,
+        attribution,
+        precondition,
+        landing_gate_skip,
+    )
+    .await
+    .map(|reply| barrier.prefix(reply))
+    .map_err(|error| barrier.prefix(error))
 }
 
 async fn merge_pr_for_job_past_barrier(
@@ -778,6 +786,7 @@ async fn merge_pr_for_job_past_barrier(
     merge_method: Option<String>,
     attribution: Option<super::PrResolutionAttribution>,
     precondition: Option<MergePrecondition>,
+    landing_gate_skip: Option<super::LandingGateSkip>,
 ) -> Result<String, String> {
     // Route to the owning database (team replica or private DB). The merge
     // request, its issue, and the producing job for a team execution all live in
@@ -942,6 +951,7 @@ async fn merge_pr_for_job_past_barrier(
     let journal_merge_request_id = merge_context.mr.mr_id.clone();
     let journal_target_ref = merge_context.target_branch.clone();
     let journal_source_ref = merge_context.source_branch.clone();
+    let mut landing_journal_detail: Option<String> = None;
     let merge_result = async {
         let db = db.clone();
         // Gate on the TIP, not the whole range. A genuinely conflicted tip needs
@@ -999,6 +1009,29 @@ async fn merge_pr_for_job_past_barrier(
     if merge_context.target_branch == resolved_default {
         assert_main_checkout_clean_for_default_merge(&*orch.services.git, &repo_path)?;
     }
+    // The landing compile gate: the default branch takes only a merge result
+    // that compiles. Judged after every cheaper refusal above, because it is
+    // the one that costs a build.
+    let gated = if merge_context.target_branch == resolved_default {
+        let route_method =
+            default_landing_method(&merge_context, &resolved_default, merge_method.clone());
+        super::landing_gate::gate_default_landing(
+            orch,
+            &db,
+            job_id,
+            &merge_context,
+            &route_method,
+            landing_gate_skip.as_ref(),
+            attribution.as_ref(),
+        )
+        .await?
+    } else {
+        super::landing_gate::GatedLanding::ungated()
+    };
+    landing_journal_detail = gated.journal_detail.clone();
+    // The landing is bound to the head its gates judged: a pin bump's
+    // verified head, else the head the compile gate judged.
+    let bound_head = verified_head.clone().or(gated.source_tip.clone());
     log::info!(
         "merge_pr_for_job[{job_id}]: merge gates took {:?}",
         gate_started.elapsed()
@@ -1020,7 +1053,7 @@ async fn merge_pr_for_job_past_barrier(
             merge_method,
             merge_started,
             attribution,
-            verified_head.as_deref(),
+            bound_head.as_deref(),
         )
         .await;
     }
@@ -1047,16 +1080,21 @@ async fn merge_pr_for_job_past_barrier(
                 format!("merge fold for {}", merge_context.source_branch),
             )
             .await;
-        if let Some(verified_head) = verified_head.as_deref() {
+        if let Some(bound_head) = bound_head.as_deref() {
             let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
             let current = crate::jj::bookmark_commit_checked(
                 &jj,
                 &merge_store,
                 &merge_context.source_branch,
             )?;
-            if current.as_deref() != Some(verified_head) {
+            if current.as_deref() != Some(bound_head) {
+                let landing = if verified_head.is_some() {
+                    " as a pin bump"
+                } else {
+                    ""
+                };
                 return Err(format!(
-                    "Refusing to merge `{source}` as a pin bump: the branch moved from the verified head {verified_head} to {current} before the fold; merge again so the new head is verified.",
+                    "Refusing to merge `{source}`{landing}: the branch moved from the verified head {bound_head} to {current} before the fold; merge again so the new head is verified.",
                     source = merge_context.source_branch,
                     current = current.as_deref().unwrap_or("nothing"),
                 ));
@@ -1212,7 +1250,14 @@ async fn merge_pr_for_job_past_barrier(
             policy_json: &stored_policy,
         },
         &merge_result,
-        pin_bump_detail.as_deref(),
+        match (
+            pin_bump_detail.as_deref(),
+            landing_journal_detail.as_deref(),
+        ) {
+            (Some(pin_bump), Some(landing)) => Some(format!("{pin_bump}; {landing}")),
+            (pin_bump, landing) => pin_bump.or(landing).map(str::to_string),
+        }
+        .as_deref(),
     )
     .await?;
     merge_result

@@ -1,0 +1,103 @@
+ll v1.70.2
+   Compiling colorchoice v1.0.4
+   Compiling ttf-parser v0.25.1
+   Compiling cairn-vcs v0.12.34 (/home/dev/.cairn-exec/build-slots/cairn/slot-811/src-tauri/os/cairn-vcs)
+   Compiling adler32 v1.2.0
+   Compiling rangemap v1.7.1
+   Compiling anstyle-query v1.1.5
+   Compiling anstream v0.6.21
+   Compiling lopdf v0.42.0
+   Compiling libflate v2.3.0
+   Compiling markup5ever_rcdom v0.38.0+unofficial
+   Compiling headers v0.4.1
+   Compiling crypto_secretbox v0.1.1
+   Compiling enum-primitive-derive v0.3.0
+   Compiling adobe-cmap-parser v0.4.1
+   Compiling type1-encoding-parser v0.1.1
+   Compiling gtk-sys v0.18.2
+   Compiling simple_asn1 v0.6.3
+   Compiling fluent-uri v0.1.4
+   Compiling encoding_rs_io v0.1.7
+   Compiling euclid v0.20.14
+   Compiling pem v3.0.6
+   Compiling postscript v0.14.1
+   Compiling cff-parser v0.2.0
+   Compiling cairn-core v0.12.34 (/home/dev/.cairn-exec/build-slots/cairn/slot-811/src-tauri/os/cairn-core)
+   Compiling clap_lex v0.7.6
+   Compiling clap_builder v4.5.54
+   Compiling pdf-extract v0.12.1
+   Compiling jsonwebtoken v9.3.1
+   Compiling lsp-types v0.97.0
+   Compiling cairn-channels v0.12.34 (/home/dev/.cairn-exec/build-slots/cairn/slot-811/src-tauri/os/cairn-channels)
+   Compiling glib v0.18.5
+   Compiling grep-searcher v0.1.16
+   Compiling matfile v0.5.0
+   Compiling axum-extra v0.10.3
+   Compiling crypto_box v0.9.1
+   Compiling htmd v0.5.4
+   Compiling json5 v0.4.1
+   Compiling clap_derive v4.5.49
+   Compiling nix v0.30.1
+   Compiling gio v0.18.4
+   Compiling tokio-tungstenite v0.26.2
+   Compiling strength_reduce v0.2.4
+   Compiling transpose v0.2.3
+   Compiling process-wrap v8.2.1
+   Compiling primal-check v0.3.4
+   Compiling rustfft v6.4.1
+   Compiling darling_core v0.20.11
+   Compiling tauri-plugin v2.5.2
+   Compiling embed-resource v3.0.6
+   Compiling rustls-platform-verifier v0.6.2
+   Compiling reqwest v0.13.2
+   Compiling tauri-winres v0.3.5
+   Compiling clap v4.5.54
+   Compiling cairo-rs v0.18.5
+   Compiling cargo_toml v0.22.3
+   Compiling toml_edit v0.19.15
+   Compiling field-offset v0.3.6
+   Compiling pango v0.18.3
+   Compiling gdk-pixbuf v0.18.5
+   Compiling gdk v0.18.2
+   Compiling darling_macro v0.20.11
+   Compiling proc-macro-crate v1.3.1
+   Compiling tauri-build v2.6.3
+   Compiling symphonia-core v0.6.1
+   Compiling darling v0.20.11
+   Compiling wrapcenum-derive v0.4.1
+   Compiling nvml-wrapper-sys v0.10.0
+   Compiling gtk v0.18.2
+   Compiling gtk3-macros v0.18.2
+   Compiling atk v0.18.2
+   Compiling nvml-wrapper v0.13.0
+   Compiling soup3-sys v0.5.0
+   Compiling javascriptcore-rs-sys v1.1.1
+   Compiling cairn-exec v0.12.34 (/home/dev/.cairn-exec/build-slots/cairn/slot-811/src-tauri/cairn-exec)
+   Compiling webkit2gtk-sys v2.0.2
+   Compiling serial_test_derive v3.5.0
+error[E0425]: cannot find value `cairn_home` in this scope
+   --> cairn-exec/src/dependency_catalog.rs:236:24
+    |
+236 |     prepare_with_probe(cairn_home, checkout, cwd, command, env, cow::probe_pair)
+    |                        ^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `catalog` in this scope
+   --> cairn-exec/src/dependency_catalog.rs:256:16
+    |
+256 |     let root = catalog.to_path_buf();
+    |                ^^^^^^^ not found in this scope
+
+   Compiling turso_sync_sdk_kit v0.8.0-pre.3 (https://github.com/tursodatabase/turso?rev=964faddd16b20ed7d5c090a879a138dbabeee508#964faddd)
+   Compiling nix v0.31.3
+   Compiling x11 v2.21.0
+   Compiling regex-lite v0.1.9
+   Compiling serial_test v3.5.0
+   Compiling symphonia-metadata v0.6.1
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `cairn-exec` (lib) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: command `/home/dev/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/bin/cargo test --no-run --message-format json-render-diagnostics --workspace --features test-utils` exited with code 101
+error: script "test:rust:full" exited with code 101
+
+
+Exit code: 101

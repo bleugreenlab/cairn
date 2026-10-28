@@ -127,7 +127,11 @@ async fn change_target(
     payload: serde_json::Value,
     preview: bool,
 ) -> String {
-    let request = McpCallbackRequest {
+    handle_write(orch, &write_request(target, payload, preview)).await
+}
+
+fn write_request(target: &str, payload: serde_json::Value, preview: bool) -> McpCallbackRequest {
+    McpCallbackRequest {
         thread_id: None,
         cwd: std::env::temp_dir().to_string_lossy().to_string(),
         run_id: None,
@@ -141,8 +145,7 @@ async fn change_target(
             }]
         }),
         tool_use_id: None,
-    };
-    handle_write(orch, &request).await
+    }
 }
 
 /// Target the builder node's `pr` artifact (the NodeArtifact patch arm).
@@ -383,6 +386,66 @@ async fn unknown_or_non_string_precondition_is_refused_on_every_merge_surface() 
             .unwrap(),
         0,
         "a refused payload never reaches the merge"
+    );
+}
+
+/// A `cairn://` write is never a person's authority, so the landing-gate skip
+/// is refused on every merge surface, previewed or not, including with the
+/// `_cairn_origin: "cli"` marker that labels a write `operator-cli`: any caller
+/// can set it. The artifact surface takes open payload keys and refuses the
+/// skip by name, saying where the operator skips instead; the node and
+/// thread-branch surfaces declare closed key sets, so the write gate refuses
+/// the key before dispatch. Nothing reaches the merge.
+#[tokio::test]
+async fn landing_gate_skip_is_refused_on_every_resource_write_surface() {
+    let (temp, db, project_id, issue_id) = pr_action_node_fixture().await;
+    insert_merge_request(&db, &project_id, &issue_id).await;
+    insert_pr_action_run(&db, &project_id, &issue_id).await;
+    insert_thread_branch(&db, &project_id).await;
+    let orch = orchestrator(&temp, db.clone());
+
+    let [artifact, node, thread_branch] = MERGE_SURFACES;
+    for (target, refusal) in [
+        (
+            artifact,
+            "landingGateSkip is not accepted on a resource write",
+        ),
+        (node, "Unknown payload key(s)"),
+        (thread_branch, "Unknown payload key(s)"),
+    ] {
+        for preview in [true, false] {
+            for from_cli in [false, true] {
+                let mut request = write_request(
+                    target,
+                    json!({ "action": "merge", "landingGateSkip": "fleet down" }),
+                    preview,
+                );
+                if from_cli {
+                    request.payload["_cairn_origin"] = json!("cli");
+                }
+                let result = handle_write(&orch, &request).await;
+                assert!(
+                    result.contains(refusal)
+                        && result.contains("landingGateSkip")
+                        && !result.contains("Would merge"),
+                    "{target} preview={preview} cli={from_cli}: {result}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        common::query_i64(&db, "SELECT COUNT(*) FROM merge_attempt_events")
+            .await
+            .unwrap(),
+        0,
+        "a refused skip never reaches the merge"
+    );
+    assert_eq!(
+        db.query_text("SELECT status FROM merge_requests WHERE id = 'mr-1'", ())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("open")
     );
 }
 

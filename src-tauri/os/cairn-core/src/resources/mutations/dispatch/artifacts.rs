@@ -81,6 +81,10 @@ pub(super) async fn dispatch(
                     action,
                 )
                 .map_err(|error| build_failure(index, item, error))?;
+                crate::pr_data::actions::refuse_landing_gate_skip_on_write(
+                    payload.get("landingGateSkip"),
+                )
+                .map_err(|error| build_failure(index, item, error))?;
                 let job_id = crate::resources::resolve_node_or_task_job_id(
                     &orch.db.local,
                     project,
@@ -132,6 +136,7 @@ pub(super) async fn dispatch(
                                 method,
                                 resolution_attribution(orch, request).await,
                                 precondition,
+                                None,
                             )
                             .await
                             .map_err(|error| build_failure(index, item, error))?

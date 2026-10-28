@@ -1003,7 +1003,7 @@ async fn merge_pr_for_job_marks_merged_and_resolves_issue() {
     let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
     provision_jj_merge(&cfg.path().join("config"), repo.path());
 
-    let msg = actions::merge_pr_for_job(&orch, &job, None, None, None)
+    let msg = actions::merge_pr_for_job(&orch, &job, None, None, None, None)
         .await
         .unwrap();
     assert!(msg.contains("merged"));
@@ -1163,6 +1163,7 @@ async fn pin_bump_merge_refuses_without_head_verdicts_and_journals_the_violation
         None,
         None,
         Some(actions::MergePrecondition::PinBump),
+        None,
     )
     .await
     .expect_err("a bump without verdicts must be refused");
@@ -1224,6 +1225,7 @@ async fn pin_bump_merge_lands_a_verified_bump_and_records_its_evidence() {
         None,
         None,
         Some(actions::MergePrecondition::PinBump),
+        None,
     )
     .await
     .unwrap();
@@ -1285,7 +1287,7 @@ async fn merge_pr_for_job_remote_default_branch_merges_via_github() {
     provision_jj_merge(&config_dir, repo.path());
     let base_before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
-    let msg = actions::merge_pr_for_job(&orch, &job, None, None, None)
+    let msg = actions::merge_pr_for_job(&orch, &job, None, None, None, None)
         .await
         .unwrap();
     assert!(msg.contains("via GitHub"), "reports a GitHub merge: {msg}");
@@ -1327,7 +1329,7 @@ async fn merge_pr_for_job_remote_merge_failure_leaves_unmarked() {
     provision_jj_merge(&config_dir, repo.path());
     let base_before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
-    let err = actions::merge_pr_for_job(&orch, &job, None, None, None)
+    let err = actions::merge_pr_for_job(&orch, &job, None, None, None, None)
         .await
         .expect_err("a GitHub-refused merge must fail closed");
     assert!(
@@ -1389,7 +1391,7 @@ async fn merge_pr_for_job_remote_refuses_undocumented_protocol_bump_before_githu
     )
     .unwrap();
 
-    let err = actions::merge_pr_for_job(&orch, &job, None, None, None)
+    let err = actions::merge_pr_for_job(&orch, &job, None, None, None, None)
         .await
         .expect_err("an undocumented protocol version must not land");
     assert!(
@@ -1420,7 +1422,7 @@ async fn merge_pr_for_job_refuses_conflicted_source_with_actionable_detail() {
     let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
     provision_jj_conflict(&bin, &cfg.path().join("config"), repo.path());
 
-    let err = actions::merge_pr_for_job(&orch, &job, None, None, None)
+    let err = actions::merge_pr_for_job(&orch, &job, None, None, None, None)
         .await
         .expect_err("a conflicted source must be refused");
     assert!(
@@ -1703,7 +1705,7 @@ async fn merge_pr_for_job_squashes_multiple_commits_to_one() {
     let pre = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
     // `None` selects the default `squash` shape.
-    actions::merge_pr_for_job(&orch, &job, None, None, None)
+    actions::merge_pr_for_job(&orch, &job, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
@@ -1757,7 +1759,7 @@ async fn merge_pr_for_job_squash_retry_is_idempotent() {
     provision_jj_merge_multi(&config_dir, repo.path());
 
     // First merge: squashes the three commits to one.
-    actions::merge_pr_for_job(&orch, &job, None, None, None)
+    actions::merge_pr_for_job(&orch, &job, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
@@ -1768,7 +1770,7 @@ async fn merge_pr_for_job_squash_retry_is_idempotent() {
     // idempotence guard must keep the default tip put. The retry's later
     // resolution may no-op or error on the already-merged node, but the store
     // tip is settled before that point, so assert on it directly.
-    let _ = actions::merge_pr_for_job(&orch, &job, None, None, None).await;
+    let _ = actions::merge_pr_for_job(&orch, &job, None, None, None, None).await;
     let after_retry = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
     assert_eq!(
         landed, after_retry,
@@ -1800,7 +1802,7 @@ async fn merge_pr_for_job_workspace_keeps_real_commits() {
 
     let pre = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
-    actions::merge_pr_for_job(&orch, &job, None, None, None)
+    actions::merge_pr_for_job(&orch, &job, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
@@ -1959,7 +1961,7 @@ async fn merge_pr_for_job_advances_producing_execution() {
     let (cfg, orch, mut rx) = orchestrator_with_effect_channel(db, MockHttpClient::new()).await;
     provision_jj_merge(&cfg.path().join("config"), repo.path());
 
-    actions::merge_pr_for_job(&orch, &job, None, None, None)
+    actions::merge_pr_for_job(&orch, &job, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");

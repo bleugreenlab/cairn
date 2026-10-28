@@ -345,6 +345,14 @@ pub struct CheckCommand {
     /// on. See docs/checks.md, "Checks that need no tree".
     #[serde(default, skip_serializing_if = "CheckTree::is_full")]
     pub tree: CheckTree,
+
+    /// For a `when: landing` check: how many SECONDS a merge waits for a cell
+    /// to be admitted before it refuses as "gate unavailable". The run itself
+    /// is bounded by `timeout`, separately. Absent uses the landing default.
+    /// Not part of the check's result identity: how long a merge was willing
+    /// to wait for a machine does not change what the machine answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_seconds: Option<u32>,
 }
 
 /// A check's `tree:` declaration.
@@ -450,6 +458,13 @@ pub enum CheckWhen {
     /// silently disabling every check for that project.
     #[serde(alias = "idle")]
     Review,
+    /// Landing cadence: runs only when a pull request lands on the project's
+    /// default branch, against the MERGE RESULT (the target's live tip plus
+    /// the branch's change), before the target moves. A red refuses the merge;
+    /// a check that cannot get a cell within its `budgetSeconds` refuses it as
+    /// unavailable rather than passing it. Never runs at commit or turn end.
+    /// See docs/checks.md, "The landing cadence".
+    Landing,
 }
 
 fn default_check_policy() -> CheckPolicy {
@@ -503,6 +518,7 @@ impl CheckWhen {
         match self {
             CheckWhen::Write => "write",
             CheckWhen::Review => "review",
+            CheckWhen::Landing => "landing",
         }
     }
 }

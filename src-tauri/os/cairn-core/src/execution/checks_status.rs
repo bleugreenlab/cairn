@@ -804,7 +804,12 @@ fn assemble_statuses(
             // A review check does not apply when the impact gate excluded it
             // from this tree's plan; it will never run, so it is neither
             // running nor pending.
-            let not_applicable = applicable_names.is_some_and(|names| !names.contains(&name));
+            // A landing check runs against a merge result at the moment of
+            // landing, never against a node's head, so no wave there will
+            // produce it; listing it as pending would hold every node's
+            // settlement at incomplete.
+            let not_applicable = check.when == CheckWhen::Landing
+                || applicable_names.is_some_and(|names| !names.contains(&name));
 
             // `LaneEvidence::Recorded` outranks everything below, and this
             // returns before the `started` probe so a lane that already holds

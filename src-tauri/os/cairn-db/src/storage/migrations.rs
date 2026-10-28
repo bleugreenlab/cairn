@@ -343,6 +343,14 @@ macro_rules! shared_tail_job_goal_intent {
     };
 }
 
+/// cairn/5224, cairn/5236: the compile fact, one row per attempt to compile a
+/// tree. Beside the check results it is read from, so in both lineages.
+macro_rules! shared_tail_compile_facts {
+    () => {
+        migration!("0283_compile_facts")
+    };
+}
+
 /// cairn/4987: the base and incoming side a conflict session's committed
 /// resolution was resolved against, and the tip and destination of an
 /// outstanding take-committed-tip request. `jj_reconcile_items` is carried by
@@ -1590,6 +1598,7 @@ macro_rules! team_lineage {
             shared_tail_execution_gates_execution_index!(),
             shared_tail_drop_check_test_outcomes_view!(),
             shared_tail_job_goal_intent!(),
+            shared_tail_compile_facts!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1876,6 +1885,7 @@ macro_rules! private_lineage {
             private_execution_queue_build_volume_absent!(),
             shared_tail_job_goal_intent!(),
             private_purpose_debts!(),
+            shared_tail_compile_facts!(),
         ]
     };
 }
@@ -2210,6 +2220,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("check_observation_relabels", TableScope::ProjectScoped),
     ("check_test_results", TableScope::ProjectScoped),
     ("check_deferred_tests", TableScope::ProjectScoped),
+    ("compile_facts", TableScope::ProjectScoped),
     ("checkpoint_command_cache", TableScope::ProjectScoped),
     ("checkpoint_runs", TableScope::ProjectScoped),
     ("pr_publish_attempts", TableScope::ProjectScoped),
@@ -2814,6 +2825,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "check_deferred_tests",
         id_columns: &["observation_id"],
+    },
+    RekeyTableManifest {
+        table: "compile_facts",
+        id_columns: &["id", "project_id", "merge_request_id", "observation_id"],
     },
     RekeyTableManifest {
         table: "checkpoint_command_cache",
@@ -3740,6 +3755,7 @@ mod tests {
                 "execution_queue_build_volume_absent",
                 "job_goal_intent",
                 "purpose_debts",
+                "compile_facts",
             ],
         );
     }
@@ -7276,6 +7292,7 @@ mod tests {
                 "drop_check_test_outcomes_view",
                 // cairn/5337: the operator's goal toggle on the shared `jobs` row.
                 "job_goal_intent",
+                "compile_facts",
             ],
         );
         assert_eq!(
