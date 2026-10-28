@@ -5091,6 +5091,16 @@ pub struct LearnedResourceEstimate {
 /// `CellOutcome::Unavailable` diagnostic for an unloadable config, which no
 /// executor reads. What a runner gets wrong talking to an older executor:
 /// nothing, because no message either peer sends has changed.
+///
+/// cairn/5243 does not move the number. The executor's Cargo dependency
+/// catalog now admits `bun run test:rust:tiered` as a canonical wrapper beside
+/// `check:rust`, `test:rust` and `test:rust:full`, so a tiered lane's fresh cell
+/// is warmed from the catalog like theirs. The command line already reaches the
+/// executor in the batch's items; nothing new is sent and no frame, field or
+/// value changes. What a runner gets wrong talking to an older executor:
+/// nothing it would decode differently; that executor runs a tiered lane cold,
+/// rebuilding its dependencies from source, until the update directive brings
+/// it a build carrying this.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 157;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
