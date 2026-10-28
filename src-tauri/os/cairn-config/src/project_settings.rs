@@ -425,11 +425,15 @@ fn parse_project_settings_bytes(
 /// fields were found. A commit-sourced caller ignores the migration flag: a
 /// sealed commit is not something to rewrite.
 pub fn parse_project_settings(content: &str) -> Result<(ProjectSettingsFile, bool), String> {
-    parse_project_settings_under(content, &CheckVocabulary::this_build())
+    let parsed = parse_project_settings_under(content, &CheckVocabulary::this_build())?;
+    note_unsupported_checks(&parsed.0.unsupported_checks);
+    Ok(parsed)
 }
 
 /// [`parse_project_settings`] under an explicit check vocabulary, which is how
-/// a test stands in for a build older than the config it reads.
+/// a test stands in for a build older than the config it reads. Logs nothing:
+/// a caller judging a file the project does not run yet, such as a merge's
+/// preflight, must not report its checks as skipped.
 fn parse_project_settings_under(
     content: &str,
     vocabulary: &CheckVocabulary,
@@ -481,7 +485,6 @@ fn parse_project_settings_under(
                 }
             }
         }
-        note_unsupported_checks(&unsupported_checks);
         checks = Some(supported);
     }
 
@@ -594,12 +597,21 @@ pub fn load_execution_project_policy(
             .to_string())
         }
     };
-    let (_, root) = parse_project_config_root(&path, &bytes).map_err(|error| error.to_string())?;
+    execution_project_policy_from(&path, &bytes)
+}
+
+/// [`ExecutionProjectPolicy`] from the bytes of a config document; `path`
+/// only names it in an error.
+fn execution_project_policy_from(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<ExecutionProjectPolicy, String> {
+    let (_, root) = parse_project_config_root(path, bytes).map_err(|error| error.to_string())?;
     let section = match root {
         serde_yaml::Value::Null => ExecutionPolicySection::default(),
         root => serde_yaml::from_value::<ExecutionPolicySection>(root).map_err(|error| {
             ProjectConfigError::Parse {
-                path: path.clone(),
+                path: path.to_path_buf(),
                 source: error.to_string(),
             }
             .to_string()
@@ -609,6 +621,136 @@ pub fn load_execution_project_policy(
         setup_commands: section.setup_commands.unwrap_or_default(),
         populate: section.materialization.unwrap_or_default().populate,
     })
+}
+
+/// What failing to read a config document would cost the project, which is
+/// what a refusal to land it has to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreadableConfigCost {
+    /// Placement cannot load its policy, so every batch, check lane, and
+    /// terminal in the project is refused.
+    EveryExecution,
+    /// Placement still works, but the settings do not parse: no check is
+    /// planned for any commit carrying the file, and the project's terminals
+    /// and Settings do not load.
+    ChecksAndSettings,
+}
+
+/// A config document the running build cannot read, and what that costs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableProjectConfig {
+    pub cost: UnreadableConfigCost,
+    /// The parser's own words.
+    pub reason: String,
+}
+
+/// What the running build makes of one `.cairn/config.yaml` document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectConfigReading {
+    /// It loads. The checks it sets aside as unsupported are listed.
+    Readable {
+        unsupported: BTreeMap<String, UnsupportedCheck>,
+    },
+    Unreadable(UnreadableProjectConfig),
+}
+
+/// Read a config document's bytes the way the running build would read it from
+/// a checkout: the placement policy first, since that is what refuses every
+/// execution, then the whole settings file. `None` is an absent file, which
+/// reads as the defaults.
+pub fn read_project_config(content: Option<&[u8]>) -> ProjectConfigReading {
+    read_project_config_under(content, &CheckVocabulary::this_build())
+}
+
+fn read_project_config_under(
+    content: Option<&[u8]>,
+    vocabulary: &CheckVocabulary,
+) -> ProjectConfigReading {
+    let Some(bytes) = content else {
+        return ProjectConfigReading::Readable {
+            unsupported: BTreeMap::new(),
+        };
+    };
+    let unreadable =
+        |cost, reason| ProjectConfigReading::Unreadable(UnreadableProjectConfig { cost, reason });
+    let path = Path::new(".cairn").join("config.yaml");
+    if let Err(reason) = execution_project_policy_from(&path, bytes) {
+        return unreadable(UnreadableConfigCost::EveryExecution, reason);
+    }
+    // The policy read above confirmed the bytes are UTF-8.
+    let content = String::from_utf8_lossy(bytes);
+    match parse_project_settings_under(&content, vocabulary) {
+        Ok((settings, _)) => ProjectConfigReading::Readable {
+            unsupported: settings.unsupported_checks,
+        },
+        Err(reason) => unreadable(UnreadableConfigCost::ChecksAndSettings, reason),
+    }
+}
+
+/// What landing a branch's `.cairn/config.yaml` on the default branch would do
+/// to the build that is running now, which reads the default branch's copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LandingConfigJudgement {
+    /// Nothing changes for this build: the branch left the file as it found
+    /// it, the file it lands reads with nothing new set aside, or the target's
+    /// copy is already unreadable, which is not this landing's doing.
+    Unaffected,
+    /// The landed file would not load where the target's copy does.
+    Unreadable(UnreadableProjectConfig),
+    /// The landed file loads, but sets aside checks the target's copy runs or
+    /// does not declare: they will not run until the app is rebuilt.
+    NeedsNewerBuild(BTreeMap<String, UnsupportedCheck>),
+}
+
+/// Judge the file a branch would land, from its content at the fork point, on
+/// the target, and at the branch head (`None` where the file is absent).
+///
+/// The head is judged, not a merge result: the two agree whenever the branch
+/// is current with the target, which a base advance keeps it. Like the parse
+/// gate, only what the branch changed is judged, and only positive evidence
+/// counts against it: a defect the target already carries is not this
+/// landing's to answer for.
+pub fn judge_landing_config(
+    fork: Option<&[u8]>,
+    target: Option<&[u8]>,
+    head: Option<&[u8]>,
+) -> LandingConfigJudgement {
+    judge_landing_config_under(fork, target, head, &CheckVocabulary::this_build())
+}
+
+fn judge_landing_config_under(
+    fork: Option<&[u8]>,
+    target: Option<&[u8]>,
+    head: Option<&[u8]>,
+    vocabulary: &CheckVocabulary,
+) -> LandingConfigJudgement {
+    if head == fork {
+        return LandingConfigJudgement::Unaffected;
+    }
+    let on_target = read_project_config_under(target, vocabulary);
+    match read_project_config_under(head, vocabulary) {
+        ProjectConfigReading::Unreadable(unreadable) => match on_target {
+            ProjectConfigReading::Unreadable(_) => LandingConfigJudgement::Unaffected,
+            ProjectConfigReading::Readable { .. } => LandingConfigJudgement::Unreadable(unreadable),
+        },
+        ProjectConfigReading::Readable { mut unsupported } => {
+            if let ProjectConfigReading::Readable {
+                unsupported: already,
+            } = on_target
+            {
+                unsupported.retain(|name, check| {
+                    already.get(name).is_none_or(|before| {
+                        (&before.field, &before.value) != (&check.field, &check.value)
+                    })
+                });
+            }
+            if unsupported.is_empty() {
+                LandingConfigJudgement::Unaffected
+            } else {
+                LandingConfigJudgement::NeedsNewerBuild(unsupported)
+            }
+        }
+    }
 }
 
 pub fn load_setup_commands(project_path: &Path) -> Result<Vec<String>, String> {
@@ -1568,6 +1710,108 @@ impact:
         let error = parse_project_settings("checks:\n  frontend:\n    when: review\n").unwrap_err();
         assert!(error.contains("checks.frontend"), "{error}");
         assert!(error.contains("command"), "{error}");
+    }
+
+    #[test]
+    fn a_config_reads_as_what_failing_it_would_cost_the_project() {
+        let read = |content: &str| read_project_config(Some(content.as_bytes()));
+        assert_eq!(
+            read_project_config(None),
+            ProjectConfigReading::Readable {
+                unsupported: BTreeMap::new()
+            }
+        );
+        // Placement's own keys broken: every execution is refused.
+        let ProjectConfigReading::Unreadable(placement) = read("setupCommands: 7\n") else {
+            panic!("a setupCommands that is not a list cannot load placement");
+        };
+        assert_eq!(placement.cost, UnreadableConfigCost::EveryExecution);
+        let ProjectConfigReading::Unreadable(yaml) = read("checks: [unterminated") else {
+            panic!("a document that is not YAML cannot load placement");
+        };
+        assert_eq!(yaml.cost, UnreadableConfigCost::EveryExecution);
+        // Placement loads, the settings do not.
+        let ProjectConfigReading::Unreadable(settings) =
+            read("checks:\n  frontend:\n    when: review\n")
+        else {
+            panic!("a check with no command fails the settings");
+        };
+        assert_eq!(settings.cost, UnreadableConfigCost::ChecksAndSettings);
+        assert!(
+            settings.reason.contains("checks.frontend"),
+            "{}",
+            settings.reason
+        );
+    }
+
+    #[test]
+    fn landing_judges_only_what_the_branch_changed_against_the_target() {
+        let older = build_without_landing();
+        let (with_landing, _) = repository_config_with_landing_compile();
+        let base = "checks:\n  frontend:\n    command: vitest run\n";
+        let broken = "checks:\n  frontend:\n    when: review\n";
+        let judge = |fork: &str, target: &str, head: &str| {
+            judge_landing_config_under(
+                Some(fork.as_bytes()),
+                Some(target.as_bytes()),
+                Some(head.as_bytes()),
+                &older,
+            )
+        };
+
+        // The #4311 shape: the branch adds a cadence this build lacks.
+        let LandingConfigJudgement::NeedsNewerBuild(unsupported) = judge(base, base, &with_landing)
+        else {
+            panic!("a landed check this build cannot run must be named");
+        };
+        assert_eq!(unsupported.keys().collect::<Vec<_>>(), ["landing-compile"]);
+        assert_eq!(unsupported["landing-compile"].value, "landing");
+        // The build that knows the cadence lands the same file with nothing to say.
+        assert_eq!(
+            judge_landing_config(
+                Some(base.as_bytes()),
+                Some(base.as_bytes()),
+                Some(with_landing.as_bytes())
+            ),
+            LandingConfigJudgement::Unaffected
+        );
+        // A check the target already sets aside the same way is not news.
+        assert_eq!(
+            judge(base, &with_landing, &format!("{with_landing}\n# edited\n")),
+            LandingConfigJudgement::Unaffected
+        );
+
+        // A file that stops loading is refused, with what it would cost.
+        let LandingConfigJudgement::Unreadable(unreadable) = judge(base, base, broken) else {
+            panic!("a landed file that stops loading must be refused");
+        };
+        assert_eq!(unreadable.cost, UnreadableConfigCost::ChecksAndSettings);
+        let LandingConfigJudgement::Unreadable(placement) =
+            judge(base, base, "setupCommands: [unterminated")
+        else {
+            panic!("a landed file placement cannot read must be refused");
+        };
+        assert_eq!(placement.cost, UnreadableConfigCost::EveryExecution);
+
+        // Positive evidence only: the target is already unreadable, or the
+        // branch left the file as it found it.
+        assert_eq!(
+            judge(base, broken, broken),
+            LandingConfigJudgement::Unaffected
+        );
+        assert_eq!(
+            judge(broken, base, broken),
+            LandingConfigJudgement::Unaffected
+        );
+        assert_eq!(
+            judge_landing_config_under(None, None, None, &older),
+            LandingConfigJudgement::Unaffected
+        );
+        // Deleting the file lands the defaults, which every build reads.
+        assert_eq!(
+            judge_landing_config_under(Some(base.as_bytes()), Some(base.as_bytes()), None, &older),
+            LandingConfigJudgement::Unaffected
+        );
     }
 
     #[test]

@@ -118,8 +118,8 @@ pub(crate) struct TurnEndAttempt {
 
 /// The immutable facts a review wave planned with: the head it pinned, the fork
 /// point it measured that head's change from, the head's tree, the checks
-/// contract the head declares, which of those checks apply, and every check's
-/// input hash at the tree.
+/// contract the head declares (with the checks this build cannot run), which of
+/// those checks apply, and every check's input hash at the tree.
 ///
 /// They are everything the `/checks` projection reads about a head, so a wave
 /// publishes them twice. In memory while it runs, so the live projection does no
@@ -135,6 +135,81 @@ pub(crate) struct WavePlan {
     pub checks: std::collections::HashMap<String, crate::config::project_settings::CheckCommand>,
     pub applicable_names: std::collections::HashSet<String>,
     pub input_hashes: std::collections::HashMap<String, String>,
+    /// The checks the head declares that this build cannot run. Never planned,
+    /// but listed beside the lanes, so they do not vanish from `/checks` while
+    /// a wave runs or after the branch retires. A plan recorded before this
+    /// field existed reads as declaring none.
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty",
+        with = "recorded_unsupported"
+    )]
+    pub unsupported:
+        std::collections::BTreeMap<String, crate::config::project_settings::UnsupportedCheck>,
+}
+
+/// [`WavePlan::unsupported`] as recorded in `plan_json`: each check together
+/// with the entry it was declared as. `UnsupportedCheck` does not serialize
+/// that entry, and the `/checks` lane reads the check's declared `when` and
+/// `policy` from it.
+mod recorded_unsupported {
+    use crate::config::project_settings::UnsupportedCheck;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Recorded {
+        field: String,
+        value: String,
+        #[serde(default)]
+        known: Vec<String>,
+        notice: String,
+        #[serde(default)]
+        declared: serde_yaml::Value,
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        checks: &BTreeMap<String, UnsupportedCheck>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        checks
+            .iter()
+            .map(|(name, check)| {
+                (
+                    name,
+                    Recorded {
+                        field: check.field.clone(),
+                        value: check.value.clone(),
+                        known: check.known.clone(),
+                        notice: check.notice.clone(),
+                        declared: check.declared.clone(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<String, UnsupportedCheck>, D::Error> {
+        Ok(BTreeMap::<String, Recorded>::deserialize(deserializer)?
+            .into_iter()
+            .map(|(name, recorded)| {
+                (
+                    name,
+                    UnsupportedCheck {
+                        field: recorded.field,
+                        value: recorded.value,
+                        known: recorded.known,
+                        notice: recorded.notice,
+                        declared: recorded.declared,
+                    },
+                )
+            })
+            .collect())
+    }
 }
 
 /// Keep the plan a wave published on its attempt row: the durable half of
@@ -937,11 +1012,12 @@ async fn run_turn_end_checks_inner(
     // about. Definition and content come from the same tree, so a branch's own
     // `.cairn/config.yaml` edit governs its own cadence and no sibling's
     // (CAIRN-3333).
-    let (checks, extra_inputs, defined_by_commit) =
+    let (checks, extra_inputs, unsupported, defined_by_commit) =
         match load_checks_contract_at_commit(&repo_root, &sealed_commit).await {
             Some(loaded) if !loaded.contract.checks.is_empty() => (
                 loaded.contract.checks,
                 loaded.contract.extra_inputs,
+                loaded.contract.unsupported,
                 loaded.defined_by_commit,
             ),
             _ => {
@@ -1101,6 +1177,7 @@ async fn run_turn_end_checks_inner(
         checks: checks.clone(),
         applicable_names,
         input_hashes: input_hashes.clone(),
+        unsupported,
     });
     record_wave_plan(&owning_db, job_id, attempt_id, &plan).await;
     cancel.set_runtime_status(plan);
@@ -1780,7 +1857,9 @@ fn reports_fresh_infrastructure(outcomes: &[CheckOutcome]) -> bool {
     outcomes.iter().any(|outcome| {
         !outcome.passed
             && outcome.suppressed_after.is_none()
-            && outcome.failure_kind != Some(CheckFailureKind::NotPlaceable)
+            && !outcome
+                .failure_kind
+                .is_some_and(CheckFailureKind::attempted_nothing)
             && outcome
                 .failure_kind
                 .is_some_and(CheckFailureKind::is_infrastructure)
@@ -3110,6 +3189,7 @@ mod tests {
             checks: Default::default(),
             applicable_names: Default::default(),
             input_hashes: Default::default(),
+            unsupported: Default::default(),
         };
         let merged = RetiredNode {
             outcome: "merged".to_string(),

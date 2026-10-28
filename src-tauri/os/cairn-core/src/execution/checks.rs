@@ -2847,7 +2847,8 @@ pub(crate) async fn execute_job_verdict(
             // refusal carries the rows it was taken on, so this names the real
             // diagnostic instead of pointing at an operator-only log.
             CheckExecutionFailure::Suppressed(suppressed) => suppressed_check_message(&suppressed),
-            CheckExecutionFailure::NotPlaceable(reason) => reason,
+            CheckExecutionFailure::NotPlaceable(reason)
+            | CheckExecutionFailure::ConfigUnreadable(reason) => reason,
             CheckExecutionFailure::Cancelled(cause) => format!(
                 "Cairn cancelled this check before it produced a verdict: {}.",
                 cause.sentence()
@@ -3074,6 +3075,48 @@ pub(crate) fn refuse_unplaceable_items(
         }
     });
     refused
+}
+
+/// Remove every cell item while the project's canonical execution policy does
+/// not load, returning each one's refusal by index.
+///
+/// Preparation reads that policy from the project checkout before it places
+/// anything, and refuses every request in the project while it fails. Asked
+/// here first, the refusal is known for what it is, a file this build cannot
+/// read rather than a machine, so it is recorded as its own outcome and moves
+/// no infrastructure streak. Like [`refuse_unplaceable_items`] it is re-asked
+/// on every submission, so the first one after the file loads runs the lanes.
+/// Runner-answered lanes are not passed in: they read no setup policy.
+async fn refuse_items_under_unreadable_config(
+    orch: &Orchestrator,
+    project_id: &str,
+    items: &mut Vec<PlannedCheckBatchItem>,
+) -> HashMap<usize, Result<CheckExecResult, CheckExecutionFailure>> {
+    if items.is_empty() {
+        return HashMap::new();
+    }
+    // Without a local checkout there is no canonical policy to read here, and
+    // preparation answers for itself.
+    let Ok((Some(project_path), _)) =
+        crate::projects::crud::resolve_local_repo_path_and_key(&orch.db, project_id).await
+    else {
+        return HashMap::new();
+    };
+    let Err(error) = crate::config::project_settings::load_execution_project_policy(
+        std::path::Path::new(&project_path),
+    ) else {
+        return HashMap::new();
+    };
+    let refusal = crate::fleet::project_config_refusal(&error);
+    items
+        .drain(..)
+        .map(|item| {
+            (
+                item.index,
+                Err(CheckExecutionFailure::ConfigUnreadable(refusal.clone())),
+            )
+        })
+        .collect()
 }
 
 /// Pause before re-presenting a request whose selected executor disappeared or
@@ -3501,10 +3544,13 @@ async fn submit_admitted_check_batch(
     let (runner_items, mut cell_items): (Vec<_>, Vec<_>) = std::mem::take(&mut batch.items)
         .into_iter()
         .partition(|item| runner_globs(item).is_some());
+    let unreadable =
+        refuse_items_under_unreadable_config(orch, &batch.project_id, &mut cell_items).await;
     let unplaceable = refuse_unplaceable_items(&orch.fleet, &mut cell_items);
     cell_items.extend(runner_items);
     let (admitted, mut refused) =
         reserve_batch_items(orch.db.local.clone(), &batch.project_id, cell_items);
+    refused.extend(unreadable);
     refused.extend(unplaceable);
     // Runner lanes leave the batch after the reservation (so their suppression
     // budgets are the cell path's own) and run beside the cell lanes rather
@@ -4878,6 +4924,11 @@ pub(crate) enum CheckExecutionFailure {
     /// failure preceded it. The sentence names what was asked for and what the
     /// fleet has instead.
     NotPlaceable(String),
+    /// Submission declined to offer this command to placement because the
+    /// project's canonical execution policy does not load in this build, which
+    /// refuses every execution in the project. Nothing ran; the sentence names
+    /// the file and the parser's reason.
+    ConfigUnreadable(String),
     /// Cairn cancelled the check before it produced a verdict, for a stated
     /// cause. Not an execution result: nothing about the tree, the machine, or
     /// the substrate was learned, so like a suppression it is never stored or
@@ -5029,6 +5080,12 @@ pub enum CheckFailureKind {
     /// Nothing ran: this is the absence of a verdict until such a machine
     /// attaches, not a failure of anything.
     NotPlaceable,
+    /// The project's `.cairn/config.yaml` does not load in this build, so
+    /// placement refuses every execution in the project and the check was
+    /// never offered to it. Like [`Self::NotPlaceable`], the absence of a
+    /// verdict until the file loads (fixed, or read by a newer build), not a
+    /// failure of the code or of any machine.
+    ConfigUnreadable,
     /// Cairn cancelled the check before it produced a verdict: its job was
     /// stopped, a newer request replaced it, the runner was stopping. Neither
     /// a verdict about the code nor a fact about the substrate, so it is never
@@ -5053,6 +5110,17 @@ impl CheckFailureKind {
                 | CheckFailureKind::Capacity
                 | CheckFailureKind::RunnerError
                 | CheckFailureKind::NotPlaceable
+                | CheckFailureKind::ConfigUnreadable
+        )
+    }
+
+    /// Whether the check was never offered to placement: it holds no verdict,
+    /// opens no infrastructure streak, has no run to time, and runs on the
+    /// first wave after its cause clears.
+    pub(crate) fn attempted_nothing(self) -> bool {
+        matches!(
+            self,
+            CheckFailureKind::NotPlaceable | CheckFailureKind::ConfigUnreadable
         )
     }
 
@@ -5076,6 +5144,7 @@ impl CheckFailureKind {
             CheckFailureKind::Capacity => "capacity",
             CheckFailureKind::RunnerError => "runner_error",
             CheckFailureKind::NotPlaceable => "not_placeable",
+            CheckFailureKind::ConfigUnreadable => "config_unreadable",
             CheckFailureKind::Cancelled => "cancelled",
         }
     }
@@ -5095,6 +5164,7 @@ impl CheckFailureKind {
             "capacity" => Some(CheckFailureKind::Capacity),
             "runner_error" => Some(CheckFailureKind::RunnerError),
             "not_placeable" => Some(CheckFailureKind::NotPlaceable),
+            "config_unreadable" => Some(CheckFailureKind::ConfigUnreadable),
             "cancelled" => Some(CheckFailureKind::Cancelled),
             _ => None,
         }
@@ -5121,6 +5191,9 @@ impl CheckFailureKind {
             CheckFailureKind::RunnerError => "test runner failed".to_string(),
             CheckFailureKind::NotPlaceable => {
                 "not placeable — no machine in the fleet can run it".to_string()
+            }
+            CheckFailureKind::ConfigUnreadable => {
+                "not run — this build cannot read the project's .cairn/config.yaml".to_string()
             }
             CheckFailureKind::Cancelled => "cancelled".to_string(),
         }
@@ -8383,6 +8456,16 @@ where
                         board.transition(index, "unverified", summary_annotation(&outcome));
                         return (index, outcome);
                     }
+                    // Never offered to placement either: the project's config
+                    // does not load in this build.
+                    Err(CheckExecutionFailure::ConfigUnreadable(refusal)) => {
+                        let outcome = record_unreadable_config_check(
+                            db, project_id, commit, tree_hash, job_id, &plan.name, input_hash,
+                            &refusal,
+                        );
+                        board.transition(index, "unverified", summary_annotation(&outcome));
+                        return (index, outcome);
+                    }
                     // Cairn ended the check itself. Nothing was evaluated, and
                     // nothing failed, so nothing is recorded or counted.
                     Err(CheckExecutionFailure::Cancelled(cause)) => {
@@ -8445,6 +8528,7 @@ where
                     Err(
                         CheckExecutionFailure::Suppressed(_)
                         | CheckExecutionFailure::NotPlaceable(_)
+                        | CheckExecutionFailure::ConfigUnreadable(_)
                         | CheckExecutionFailure::Cancelled(_),
                     ) => {
                         unreachable!("a refused submission returns above")
@@ -9025,12 +9109,6 @@ pub(crate) fn record_suppressed_check(
 
 /// Record a lane submission never offered to placement because no machine the
 /// fleet knows of could take it.
-///
-/// One row per head, written under the head scope so it renders on this commit
-/// alone and is replaced in place by every later wave on the same commit rather
-/// than accumulating. No observation is recorded, because nothing was evaluated,
-/// and no streak moves (see [`crate::execution::cache::CheckResultCacheWrite::infra_streak_op`]):
-/// the lane is not failing, it is waiting for a machine.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_unplaceable_check(
     db: &Arc<LocalDb>,
@@ -9042,9 +9120,77 @@ pub(crate) fn record_unplaceable_check(
     input_hash: &str,
     reason: &str,
 ) -> CheckOutcome {
-    let output_tail = format!(
-        "{reason} Not attempted: it runs on the first wave after a machine that satisfies it attaches."
+    log::info!("check {check_name:?} is not placeable for job {job_id}; not offered to placement");
+    record_unattempted_check(
+        db,
+        project_id,
+        commit,
+        tree_hash,
+        job_id,
+        check_name,
+        input_hash,
+        CheckFailureKind::NotPlaceable,
+        format!(
+            "{reason} Not attempted: it runs on the first wave after a machine that satisfies it attaches."
+        ),
+    )
+}
+
+/// Record a lane submission never offered to placement because the project's
+/// config does not load in this build. `refusal` is the project-wide refusal
+/// preparation would have given.
+#[allow(clippy::too_many_arguments)]
+fn record_unreadable_config_check(
+    db: &Arc<LocalDb>,
+    project_id: &str,
+    commit: CheckRunCommit<'_>,
+    tree_hash: &str,
+    job_id: &str,
+    check_name: &str,
+    input_hash: &str,
+    refusal: &str,
+) -> CheckOutcome {
+    log::info!(
+        "check {check_name:?} for job {job_id} not offered to placement: the project config \
+         does not load in this build"
     );
+    record_unattempted_check(
+        db,
+        project_id,
+        commit,
+        tree_hash,
+        job_id,
+        check_name,
+        input_hash,
+        CheckFailureKind::ConfigUnreadable,
+        format!(
+            "{}. Not attempted: it runs on the first wave after the file loads.",
+            refusal.trim_end_matches('.')
+        ),
+    )
+}
+
+/// Record a lane submission that was never offered to placement, as a `kind`
+/// for which [`CheckFailureKind::attempted_nothing`] holds.
+///
+/// One row per head, written under the head scope so it renders on this commit
+/// alone and is replaced in place by every later wave on the same commit rather
+/// than accumulating. No observation is recorded, because nothing was evaluated,
+/// and no streak moves (see [`crate::execution::cache::CheckResultCacheWrite::infra_streak_op`]):
+/// the lane is not failing, it is waiting for its cause to clear.
+#[allow(clippy::too_many_arguments)]
+fn record_unattempted_check(
+    db: &Arc<LocalDb>,
+    project_id: &str,
+    commit: CheckRunCommit<'_>,
+    tree_hash: &str,
+    job_id: &str,
+    check_name: &str,
+    input_hash: &str,
+    kind: CheckFailureKind,
+    output_tail: String,
+) -> CheckOutcome {
+    debug_assert!(kind.attempted_nothing(), "{kind:?} describes an attempt");
     if let Err(error) = store_check_result(
         db.clone(),
         CheckResultCacheWrite {
@@ -9059,7 +9205,7 @@ pub(crate) fn record_unplaceable_check(
             target_results_json: None,
             job_id: Some(job_id.to_string()),
             cached: Some(false),
-            failure_kind: Some(CheckFailureKind::NotPlaceable.as_str().to_string()),
+            failure_kind: Some(kind.as_str().to_string()),
             executor_id: None,
             executor_device_id: None,
             executor_connection_generation: None,
@@ -9075,14 +9221,16 @@ pub(crate) fn record_unplaceable_check(
             verdict_environment_hash: None,
         },
     ) {
-        log::warn!("check {check_name:?}: could not record that it is not placeable: {error}");
+        log::warn!(
+            "check {check_name:?}: could not record that it was not attempted ({}): {error}",
+            kind.as_str()
+        );
     }
-    log::info!("check {check_name:?} is not placeable for job {job_id}; not offered to placement");
     CheckOutcome {
         name: check_name.to_string(),
         passed: false,
         exit_code: None,
-        failure_kind: Some(CheckFailureKind::NotPlaceable),
+        failure_kind: Some(kind),
         parsed: None,
         output_tail,
         cached: false,
@@ -9131,10 +9279,9 @@ fn record_cancelled_check(
 /// Whether this outcome holds no verdict at all — the check never ran, or Cairn
 /// ended it — so a summary must not mark it red.
 fn holds_no_verdict(outcome: &CheckOutcome) -> bool {
-    matches!(
-        outcome.failure_kind,
-        Some(CheckFailureKind::NotPlaceable | CheckFailureKind::Cancelled)
-    )
+    outcome
+        .failure_kind
+        .is_some_and(|kind| kind.attempted_nothing() || kind == CheckFailureKind::Cancelled)
 }
 
 /// Render the inline pass/fail summary appended to the originating tool result.
@@ -16163,6 +16310,8 @@ cairn-common = { path = "../cairn-common" }
             CheckFailureKind::Infrastructure,
             CheckFailureKind::Capacity,
             CheckFailureKind::RunnerError,
+            CheckFailureKind::NotPlaceable,
+            CheckFailureKind::ConfigUnreadable,
         ] {
             assert_eq!(CheckFailureKind::from_stored(kind.as_str()), Some(kind));
         }

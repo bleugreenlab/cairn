@@ -858,7 +858,8 @@ pub(super) const BOUNDED_REARM_CANDIDATES_SQL: &str = "WITH live_job AS (
                       SELECT job_id, tree_hash, input_hash, ran_at, check_name, failure_kind
                         FROM latest
                        WHERE recency = 1
-                         AND failure_kind IN ('capacity', 'infrastructure', 'not_placeable')
+                         AND failure_kind IN ('capacity', 'infrastructure', 'not_placeable',
+                                              'config_unreadable')
                          AND (
                            infra_failure_streak < ?1
                            OR ran_at <= (unixepoch() - ?2) * 1000
@@ -926,7 +927,8 @@ async fn bounded_rearm_candidates_in_db(
 /// branch's current tree, and the wave it would receive could execute the check.
 ///
 /// For a lane recorded as not placeable, that means a machine that could take
-/// it has since attached or enrolled. For a substrate failure, it means the
+/// it has since attached or enrolled. For a lane recorded while the project's
+/// config did not load, that means it loads now. For a substrate failure, the
 /// release this cadence performs would leave the check unsuppressed, asked the
 /// way the wave itself asks it (see [`rearm_would_free`]).
 ///
@@ -985,6 +987,13 @@ pub(super) async fn bounded_candidate_is_due(
     let check = loaded
         .as_ref()
         .and_then(|loaded| loaded.contract.checks.get(&candidate.check_name));
+    if candidate.failure_kind
+        == crate::execution::checks::CheckFailureKind::ConfigUnreadable.as_str()
+    {
+        // Read where preparation reads it: the project checkout.
+        return Ok(check.is_some()
+            && crate::config::project_settings::load_execution_project_policy(&repo_root).is_ok());
+    }
     if candidate.failure_kind == crate::execution::checks::CheckFailureKind::NotPlaceable.as_str() {
         // A check the commit no longer declares has nothing for a wave to run.
         return Ok(check.is_some_and(|check| {

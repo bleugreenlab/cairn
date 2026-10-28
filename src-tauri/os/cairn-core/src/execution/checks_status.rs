@@ -833,7 +833,7 @@ async fn live_statuses(
     };
     let plan = &status.plan;
     if plan.checks.is_empty() {
-        return Some(Vec::new());
+        return Some(unsupported_lanes(job_id, &plan.unsupported).collect());
     }
 
     let rows = plan_verdict_rows(db, &coords.project_id, job_id, plan).await;
@@ -859,7 +859,7 @@ async fn live_statuses(
                 .collect();
         }
     }
-    Some(assemble_statuses(
+    let statuses = assemble_statuses(
         orch,
         job_id,
         &plan.checks,
@@ -870,7 +870,8 @@ async fn live_statuses(
         Some(&plan.applicable_names),
         &status.request_ids,
         cadence,
-    ))
+    );
+    Some(with_unsupported_lanes(statuses, job_id, &plan.unsupported))
 }
 
 /// The verdict rows that answer a plan's lanes: each check's row at the plan's
@@ -986,7 +987,7 @@ async fn retired_statuses(
 ) -> Option<Vec<NodeCheckStatus>> {
     let plan = retired.plan.as_ref()?;
     let rows = plan_verdict_rows(db, &coords.project_id, job_id, plan).await;
-    Some(assemble_statuses(
+    let statuses = assemble_statuses(
         orch,
         job_id,
         &plan.checks,
@@ -997,7 +998,8 @@ async fn retired_statuses(
         Some(&plan.applicable_names),
         &orch.recent_turn_end_check_request_ids(job_id),
         cadence,
-    ))
+    );
+    Some(with_unsupported_lanes(statuses, job_id, &plan.unsupported))
 }
 
 /// The exact settled projection: what applies to this head and which verdict
@@ -1477,12 +1479,12 @@ fn status_from_row(
     };
     // A lane never offered to placement holds no verdict either way, so it reads
     // as unverified rather than as a red, and it has no run to time.
-    let not_placeable = failure_kind == Some(CheckFailureKind::NotPlaceable);
+    let attempted_nothing = failure_kind.is_some_and(CheckFailureKind::attempted_nothing);
     NodeCheckStatus {
         job_id: job_id.to_string(),
         request_id,
         name: name.to_string(),
-        state: if not_placeable {
+        state: if attempted_nothing {
             NodeCheckState::Unverified
         } else {
             check_state_from_evidence(row.passed, parsed.as_ref())
@@ -1490,7 +1492,7 @@ fn status_from_row(
         policy: policy.as_str().to_string(),
         when: when.as_str().to_string(),
         cached: row.cached,
-        duration_ms: (!not_placeable).then_some(row.duration_ms),
+        duration_ms: (!attempted_nothing).then_some(row.duration_ms),
         ran_at: Some(row.ran_at),
         passed: parsed.as_ref().map(|p| p.passed),
         failed: parsed.as_ref().map(|p| p.failed),
@@ -1526,9 +1528,12 @@ fn status_fast_tier_label(status: &NodeCheckStatus) -> Option<String> {
 
 pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<String> {
     // Checked ahead of suppression: a head row that was bounded earlier and is
-    // now not placeable at all says the newer, more useful thing.
+    // now not attempted at all says the newer, more useful thing.
     if status.failure_kind.as_deref() == Some(CheckFailureKind::NotPlaceable.as_str()) {
         return Some(not_placeable_annotation(status.output_tail.as_deref()));
+    }
+    if status.failure_kind.as_deref() == Some(CheckFailureKind::ConfigUnreadable.as_str()) {
+        return Some(UNREADABLE_CONFIG_ANNOTATION.to_string());
     }
     // A suppressed check produced no verdict at this tree — Cairn declined to run
     // it. Every arm below describes a verdict, so saying any of them here would
@@ -1648,8 +1653,21 @@ fn not_placeable_annotation(output_tail: Option<&str>) -> String {
     format!("not placeable — {why}; runs when a machine that satisfies it attaches")
 }
 
-fn is_not_placeable(row: &CheckResultCacheEntry) -> bool {
-    row.failure_kind.as_deref() == Some(CheckFailureKind::NotPlaceable.as_str())
+/// The line a lane renders as while the project's config does not load in
+/// this build. Why it does not load is in the stored row, and in the refusal
+/// every batch in the project gets.
+const UNREADABLE_CONFIG_ANNOTATION: &str =
+    "not run — this build cannot read the project's .cairn/config.yaml; runs once it loads";
+
+fn row_kind_is(row: &CheckResultCacheEntry, kind: CheckFailureKind) -> bool {
+    row.failure_kind.as_deref() == Some(kind.as_str())
+}
+
+fn row_attempted_nothing(row: &CheckResultCacheEntry) -> bool {
+    row.failure_kind
+        .as_deref()
+        .and_then(CheckFailureKind::from_stored)
+        .is_some_and(CheckFailureKind::attempted_nothing)
 }
 
 /// Failing lanes that get their own detail line in a wake body before the rest
@@ -1696,21 +1714,35 @@ pub(crate) fn format_check_wake_body(rows: &[CheckResultCacheEntry]) -> Option<S
     }
     let mut failing: Vec<&CheckResultCacheEntry> = rows
         .iter()
-        .filter(|row| !row.passed && !is_not_placeable(row))
+        .filter(|row| !row.passed && !row_attempted_nothing(row))
         .collect();
     failing.sort_by(|left, right| left.check_name.cmp(&right.check_name));
-    let mut unplaceable: Vec<String> = rows
-        .iter()
-        .filter(|row| is_not_placeable(row))
-        .map(|row| row.check_name.clone())
-        .collect();
-    unplaceable.sort();
-    let unplaceable_line = (!unplaceable.is_empty()).then(|| {
-        format!(
-            "\n- ⚠ not placeable (no machine in the fleet can run them yet): {}",
-            join_capped(&unplaceable, WAKE_ROLLUP_NAMES)
-        )
-    });
+    let names_of = |kind: CheckFailureKind| {
+        let mut names: Vec<String> = rows
+            .iter()
+            .filter(|row| row_kind_is(row, kind))
+            .map(|row| row.check_name.clone())
+            .collect();
+        names.sort();
+        names
+    };
+    let unplaceable = names_of(CheckFailureKind::NotPlaceable);
+    let unreadable = names_of(CheckFailureKind::ConfigUnreadable);
+    let unattempted = unplaceable.len() + unreadable.len();
+    let unplaceable_line = [
+        (
+            &unplaceable,
+            "not placeable (no machine in the fleet can run them yet)",
+        ),
+        (
+            &unreadable,
+            "not run (this build cannot read the project's .cairn/config.yaml)",
+        ),
+    ]
+    .into_iter()
+    .filter(|(names, _)| !names.is_empty())
+    .map(|(names, why)| format!("\n- ⚠ {why}: {}", join_capped(names, WAKE_ROLLUP_NAMES)))
+    .reduce(|lines, line| lines + &line);
     let mut passing: Vec<String> = rows
         .iter()
         .filter(|row| row.passed)
@@ -1733,7 +1765,7 @@ pub(crate) fn format_check_wake_body(rows: &[CheckResultCacheEntry]) -> Option<S
     let mut out = format!(
         "Project checks on this node: {} of {} failing.\n",
         failing.len(),
-        rows.len() - unplaceable.len()
+        rows.len() - unattempted
     );
     for row in failing.iter().take(WAKE_DETAILED_FAILURES) {
         out.push_str(&format!(
@@ -1975,6 +2007,49 @@ mod tests {
         let json = serde_json::to_value(lane).unwrap();
         assert_eq!(json["state"], "unsupported");
         assert_eq!(json["notice"], serde_json::Value::String(notice));
+    }
+
+    /// A wave records its plan as JSON, and both the live and the retired
+    /// projection list the plan's unsupported checks. The recorded form must
+    /// keep each declared entry, which the lane reads `when` and `policy` from,
+    /// and a plan recorded before the field existed must still read.
+    #[test]
+    fn a_recorded_wave_plan_keeps_the_checks_this_build_cannot_run() {
+        let mut older = crate::models::CheckVocabulary::this_build();
+        older.when.retain(|word| word != "landing");
+        let declared: serde_yaml::Value =
+            serde_yaml::from_str("command: cargo check\nwhen: landing\npolicy: gate\n").unwrap();
+        let crate::models::DeclaredCheck::Unsupported(unsupported) =
+            crate::models::read_declared_check(declared, &older).unwrap()
+        else {
+            panic!("`when: landing` is unsupported without the variant");
+        };
+        let plan = WavePlan {
+            head: "head".to_string(),
+            base: "base".to_string(),
+            tree_hash: "tree".to_string(),
+            checks: Default::default(),
+            applicable_names: Default::default(),
+            input_hashes: Default::default(),
+            unsupported: BTreeMap::from([("landing-compile".to_string(), unsupported)]),
+        };
+
+        let recorded: WavePlan =
+            serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(recorded, plan);
+        let lanes: Vec<_> = unsupported_lanes("job", &recorded.unsupported).collect();
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].state, NodeCheckState::Unsupported);
+        assert_eq!(
+            (lanes[0].when.as_str(), lanes[0].policy.as_str()),
+            ("landing", "gate")
+        );
+
+        let before_the_field: WavePlan = serde_json::from_str(
+            r#"{"head":"h","base":"b","treeHash":"t","checks":{},"applicableNames":[],"inputHashes":{}}"#,
+        )
+        .unwrap();
+        assert!(before_the_field.unsupported.is_empty());
     }
 
     #[test]

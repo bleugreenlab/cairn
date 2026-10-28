@@ -8,6 +8,7 @@
 //! `write` dispatcher when a driver patches the `/pr` artifact with a reserved
 //! `action` key.
 
+mod config_preflight;
 mod conflict;
 mod context;
 mod create_pr;

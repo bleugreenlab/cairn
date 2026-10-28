@@ -954,6 +954,7 @@ async fn merge_pr_for_job_past_barrier(
     let merge_context_issue_id = merge_context.issue_id.clone();
     let mut landing_journal_detail: Option<String> = None;
     let mut verdict_journal_detail: Option<String> = None;
+    let mut config_notice: Option<String> = None;
     let merge_result = async {
         let db = db.clone();
         // Gate on the TIP, not the whole range. A genuinely conflicted tip needs
@@ -1010,6 +1011,14 @@ async fn merge_pr_for_job_past_barrier(
     }
     if merge_context.target_branch == resolved_default {
         assert_main_checkout_clean_for_default_merge(&*orch.services.git, &repo_path)?;
+    }
+    // The running app reads the default branch's .cairn/config.yaml, so the
+    // build that is running judges the copy this landing puts there: a file it
+    // cannot load is refused, and one that sets checks aside lands with a
+    // notice. Ahead of the verdict and compile gates: it costs a few blob reads.
+    if merge_context.target_branch == resolved_default {
+        config_notice =
+            super::config_preflight::preflight_landing_config(orch, &merge_context).await?;
     }
     // Verdict existence: the default branch takes only a head that was
     // judged, red or green, on every check its change makes applicable. A read
@@ -1091,6 +1100,7 @@ async fn merge_pr_for_job_past_barrier(
     // preserve every commit. The conflict gate above has
     // already run for both paths.
     if should_merge_via_github(&merge_context) {
+        let notice = config_notice.clone();
         return merge_remote_pr_via_github(
             orch,
             db,
@@ -1101,7 +1111,8 @@ async fn merge_pr_for_job_past_barrier(
             attribution,
             bound_head.as_deref(),
         )
-        .await;
+        .await
+        .map(|reply| with_merge_notice(reply, notice.as_deref()));
     }
 
     // The shared jj store owns the merge: fold the child's commit into the
@@ -1280,7 +1291,10 @@ async fn merge_pr_for_job_past_barrier(
         "merge_pr_for_job[{job_id}]: synchronous merge path took {:?} (downstream reconcile deferred)",
         merge_started.elapsed()
     );
-        Ok("PR merged successfully".to_string())
+        Ok(with_merge_notice(
+            "PR merged successfully".to_string(),
+            config_notice.as_deref(),
+        ))
     }
     .await;
 
@@ -1300,6 +1314,7 @@ async fn merge_pr_for_job_past_barrier(
             pin_bump_detail.as_deref(),
             verdict_journal_detail.as_deref(),
             landing_journal_detail.as_deref(),
+            config_notice.as_deref(),
         ])
         .as_deref(),
     )
@@ -1336,6 +1351,15 @@ pub(super) async fn landing_record(db: &LocalDb, merge_request_id: &str) -> Opti
 fn merge_journal_detail(details: &[Option<&str>]) -> Option<String> {
     let details: Vec<&str> = details.iter().flatten().copied().collect();
     (!details.is_empty()).then(|| details.join("; "))
+}
+
+/// A merge's reply with a notice the person who merged must read, set apart
+/// as a `⚠️` paragraph: the PR view raises each such paragraph on its own.
+fn with_merge_notice(reply: String, notice: Option<&str>) -> String {
+    match notice {
+        Some(notice) => format!("{reply}\n\n⚠️ {notice}"),
+        None => reply,
+    }
 }
 
 /// Write the operator's verdict waiver on the merged PR's issue, so a merge

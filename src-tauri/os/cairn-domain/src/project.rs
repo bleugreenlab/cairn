@@ -533,7 +533,8 @@ impl CheckWhen {
 }
 
 /// A declared check this build declines to run, because one of its fields
-/// carries a value outside the vocabulary the build was compiled with.
+/// carries a value outside the vocabulary the build was compiled with, or the
+/// entry carries a key the build does not know.
 ///
 /// `.cairn/config.yaml` lives in the repository, so it can be newer than the
 /// running app: a merge can add a cadence before the app that reads it is
@@ -541,15 +542,17 @@ impl CheckWhen {
 /// one check that uses the value is set aside with this record and everything
 /// else in the file loads as usual. This is deliberately unlike the rule for a
 /// caller's own input, which is refused because the caller can fix it now.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UnsupportedCheck {
-    /// The field holding the value, as written in the check entry.
+    /// The field holding the value, as written in the check entry. For a key
+    /// this build does not know, the key itself.
     pub field: String,
     /// The value as written. A structured value is rendered inline.
     pub value: String,
     /// The values this build understands for `field`; empty when the field is
-    /// structured rather than a closed list of words.
+    /// structured rather than a closed list of words. For an unknown key, the
+    /// keys a check entry may carry.
     pub known: Vec<String>,
     /// The sentence every surface shows for this check.
     pub notice: String,
@@ -574,14 +577,36 @@ impl UnsupportedCheck {
             declared,
         }
     }
+
+    /// A key this build does not know. It may come from a newer Cairn, where it
+    /// can change what the check means (a budget, a selector, a switch), or be
+    /// a misspelling; this build cannot tell which, so it runs neither guess.
+    fn unknown_key(
+        key: &str,
+        value: String,
+        known: Vec<String>,
+        declared: serde_yaml::Value,
+    ) -> Self {
+        Self {
+            field: key.to_string(),
+            value,
+            known,
+            notice: format!(
+                "needs a newer Cairn, or the key is misspelled: `{key}` is not a check key this \
+                 build understands"
+            ),
+            declared,
+        }
+    }
 }
 
-/// The values this build understands in each closed-vocabulary field of a
-/// check entry. [`CheckVocabulary::this_build`] reads every list off the
-/// field's own deserializer, so it cannot drift from what the build parses;
-/// a test narrows it to stand in for an older build.
+/// The keys a check entry may carry, and the values this build understands in
+/// each closed-vocabulary field of one. [`CheckVocabulary::this_build`] reads
+/// every list off the deserializer that parses it, so it cannot drift from what
+/// the build parses; a test narrows it to stand in for an older build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckVocabulary {
+    pub keys: Vec<String>,
     pub policy: Vec<String>,
     pub when: Vec<String>,
     pub resource_class: Vec<String>,
@@ -592,6 +617,7 @@ pub struct CheckVocabulary {
 impl CheckVocabulary {
     pub fn this_build() -> Self {
         Self {
+            keys: serde_fields::<CheckCommand>(),
             policy: serde_variants::<CheckPolicy>(),
             when: serde_variants::<CheckWhen>(),
             resource_class: serde_variants::<CheckResourceClass>(),
@@ -600,12 +626,12 @@ impl CheckVocabulary {
         }
     }
 
-    /// The first value in `declared` this vocabulary does not cover, as
-    /// (field, value, known values).
-    fn first_unknown(
-        &self,
-        declared: &serde_yaml::Value,
-    ) -> Option<(&'static str, String, Vec<String>)> {
+    /// Why this build cannot read `declared`, when it cannot: the first value
+    /// this vocabulary does not cover, else the first key it does not know.
+    fn set_aside(&self, declared: &serde_yaml::Value) -> Option<UnsupportedCheck> {
+        let unsupported = |field: &str, value: String, known: Vec<String>| {
+            Some(UnsupportedCheck::new(field, value, known, declared.clone()))
+        };
         let entry = declared.as_mapping()?;
         for (field, known) in [
             ("policy", &self.policy),
@@ -615,7 +641,7 @@ impl CheckVocabulary {
         ] {
             if let Some(serde_yaml::Value::String(value)) = entry.get(field) {
                 if !known.contains(value) {
-                    return Some((field, value.clone(), known.clone()));
+                    return unsupported(field, value.clone(), known.clone());
                 }
             }
         }
@@ -626,11 +652,11 @@ impl CheckVocabulary {
                 };
                 let normalized = value.trim().to_ascii_lowercase();
                 if !normalized.is_empty() && !self.verdict_platforms.contains(&normalized) {
-                    return Some((
+                    return unsupported(
                         "verdictPlatforms",
                         value.clone(),
                         self.verdict_platforms.clone(),
-                    ));
+                    );
                 }
             }
         }
@@ -639,10 +665,24 @@ impl CheckVocabulary {
         // deserializer the check itself uses.
         if let Some(executor) = entry.get("executor") {
             if deserialize_executor_selector(executor.clone()).is_err() {
-                return Some(("executor", render_inline(executor), Vec::new()));
+                return unsupported("executor", render_inline(executor), Vec::new());
             }
         }
-        None
+        // A key the build does not know is judged here rather than ignored by
+        // the strict parse: ignoring it would run the check under a meaning its
+        // author did not write. A non-string key is left to the strict parse,
+        // which reports it as malformed.
+        entry.iter().find_map(|(key, value)| {
+            let key = key.as_str()?;
+            (!self.keys.iter().any(|known| known == key)).then(|| {
+                UnsupportedCheck::unknown_key(
+                    key,
+                    render_inline(value),
+                    self.keys.clone(),
+                    declared.clone(),
+                )
+            })
+        })
     }
 }
 
@@ -654,16 +694,15 @@ pub enum DeclaredCheck {
 }
 
 /// Read one check entry. A value outside `vocabulary` sets the check aside as
-/// [`DeclaredCheck::Unsupported`]; anything else wrong with the entry, such as
-/// a missing `command`, stays an error.
+/// [`DeclaredCheck::Unsupported`], as does a key the vocabulary does not list;
+/// anything else wrong with the entry, such as a missing `command`, stays an
+/// error.
 pub fn read_declared_check(
     declared: serde_yaml::Value,
     vocabulary: &CheckVocabulary,
 ) -> Result<DeclaredCheck, serde_yaml::Error> {
-    if let Some((field, value, known)) = vocabulary.first_unknown(&declared) {
-        return Ok(DeclaredCheck::Unsupported(UnsupportedCheck::new(
-            field, value, known, declared,
-        )));
+    if let Some(unsupported) = vocabulary.set_aside(&declared) {
+        return Ok(DeclaredCheck::Unsupported(unsupported));
     }
     serde_yaml::from_value(declared).map(DeclaredCheck::Supported)
 }
@@ -683,6 +722,18 @@ fn render_inline(value: &serde_yaml::Value) -> String {
 /// The names a derived serde enum accepts, aliases included, captured from
 /// the variant list its `Deserialize` impl hands the deserializer.
 fn serde_variants<T: serde::de::DeserializeOwned>() -> Vec<String> {
+    serde_names::<T>("a check vocabulary field is a derived serde enum")
+}
+
+/// The keys a derived serde struct accepts, captured from the field list its
+/// `Deserialize` impl hands the deserializer.
+fn serde_fields<T: serde::de::DeserializeOwned>() -> Vec<String> {
+    serde_names::<T>("a check entry is a derived serde struct")
+}
+
+/// The name list a derived `Deserialize` impl declares up front: an enum's
+/// variants or a struct's fields. Nothing is deserialized.
+fn serde_names<T: serde::de::DeserializeOwned>(expectation: &str) -> Vec<String> {
     use serde::de::{Error, Visitor};
 
     struct Probe<'a>(&'a mut Option<&'static [&'static str]>);
@@ -691,7 +742,7 @@ fn serde_variants<T: serde::de::DeserializeOwned>() -> Vec<String> {
         type Error = serde::de::value::Error;
 
         fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
-            Err(Self::Error::custom("not an enum"))
+            Err(Self::Error::custom("not a derived enum or struct"))
         }
 
         fn deserialize_enum<V: Visitor<'de>>(
@@ -704,19 +755,29 @@ fn serde_variants<T: serde::de::DeserializeOwned>() -> Vec<String> {
             Err(Self::Error::custom("variants captured"))
         }
 
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.0 = Some(fields);
+            Err(Self::Error::custom("fields captured"))
+        }
+
         serde::forward_to_deserialize_any! {
             bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
             bytes byte_buf option unit unit_struct newtype_struct seq tuple
-            tuple_struct map struct identifier ignored_any
+            tuple_struct map identifier ignored_any
         }
     }
 
-    let mut variants = None;
-    let _ = T::deserialize(Probe(&mut variants));
-    variants
-        .expect("a check vocabulary field is a derived serde enum")
+    let mut names = None;
+    let _ = T::deserialize(Probe(&mut names));
+    names
+        .expect(expectation)
         .iter()
-        .map(|variant| variant.to_string())
+        .map(|name| name.to_string())
         .collect()
 }
 
@@ -731,6 +792,26 @@ mod check_vocabulary_tests {
     #[test]
     fn this_build_vocabulary_is_what_the_enums_accept() {
         let vocabulary = CheckVocabulary::this_build();
+        assert_eq!(
+            vocabulary.keys,
+            [
+                "command",
+                "fullCommand",
+                "impact",
+                "scope",
+                "policy",
+                "when",
+                "resourceClass",
+                "timeout",
+                "executor",
+                "verdictEnvironment",
+                "verdictPlatforms",
+                "fixes",
+                "mainCadence",
+                "tree",
+                "budgetSeconds",
+            ]
+        );
         assert_eq!(vocabulary.policy, ["advisory", "gate"]);
         // `idle` is the legacy alias of `review`; the vocabulary must accept
         // exactly what the deserializer does, alias included.
@@ -837,5 +918,46 @@ mod check_vocabulary_tests {
             read_declared_check(entry("command: x\nexecutor: build-slot\n"), &vocabulary),
             Ok(DeclaredCheck::Supported(_))
         ));
+    }
+
+    #[test]
+    fn a_key_this_build_does_not_know_sets_the_check_aside() {
+        // `budgetSeconds` before the build that introduced it: the check would
+        // otherwise run with no budget, a meaning its author did not write.
+        let mut older = CheckVocabulary::this_build();
+        older.keys.retain(|key| key != "budgetSeconds");
+        let declared = entry("command: cargo check\nbudgetSeconds: 600\n");
+        let DeclaredCheck::Unsupported(unsupported) =
+            read_declared_check(declared.clone(), &older).unwrap()
+        else {
+            panic!("a key the build lacks must set the check aside");
+        };
+        assert_eq!(
+            (unsupported.field.as_str(), unsupported.value.as_str()),
+            ("budgetSeconds", "600")
+        );
+        assert_eq!(
+            unsupported.notice,
+            "needs a newer Cairn, or the key is misspelled: `budgetSeconds` is not a check key \
+             this build understands"
+        );
+        assert_eq!(unsupported.declared, declared);
+        // The same entry is fully readable by the build that knows the key.
+        assert!(matches!(
+            read_declared_check(declared, &CheckVocabulary::this_build()),
+            Ok(DeclaredCheck::Supported(_))
+        ));
+
+        // A misspelling reads the same way: the build cannot tell it from a
+        // newer key, and says both.
+        let DeclaredCheck::Unsupported(typo) = read_declared_check(
+            entry("command: x\ntimout: 60\n"),
+            &CheckVocabulary::this_build(),
+        )
+        .unwrap() else {
+            panic!("a misspelled key must not be silently ignored");
+        };
+        assert_eq!(typo.field, "timout");
+        assert!(typo.notice.contains("misspelled"), "{}", typo.notice);
     }
 }

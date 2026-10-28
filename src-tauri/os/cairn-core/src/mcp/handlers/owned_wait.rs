@@ -1053,6 +1053,7 @@ mod tests {
                 .iter()
                 .map(|name| (name.to_string(), format!("in-{name}")))
                 .collect(),
+            unsupported: Default::default(),
         };
         let plan_json = serde_json::to_string(&plan).unwrap();
         db.execute(

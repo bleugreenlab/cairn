@@ -848,8 +848,11 @@ impl CheckResultCacheWrite {
         }
         // A lane never offered to placement attempted nothing, so it neither
         // opens a streak nor proves the substrate healthy.
-        if self.failure_kind.as_deref()
-            == Some(crate::execution::checks::CheckFailureKind::NotPlaceable.as_str())
+        if self
+            .failure_kind
+            .as_deref()
+            .and_then(crate::execution::checks::CheckFailureKind::from_stored)
+            .is_some_and(crate::execution::checks::CheckFailureKind::attempted_nothing)
         {
             return InfraStreakOp::Hold;
         }
