@@ -1,0 +1,7 @@
+{
+  "description": "TEST ONLY relay sealed-v2 parity vector: 0x02 || crypto_box_seal, built deterministically by api/scripts/gen-sealed-v2-fixture.ts",
+  "recipientPublicKey": "B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9/AsrhtHHw=",
+  "recipientSecretKey": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+  "plaintext": "{\"action\":\"relay-parity\",\"format\":\"sealed-v2\",\"endpoint\":\"src_fixture\",\"number\":5127}",
+  "ciphertext": "Alhpr/RQVJcyy6rtXl35swptoxyw5XQrrVrUoado8aZ7BX2n0nkbi8K3JrLK6TfMGjn6/2j0NyMZSu7Yn0mhpTJ4VfdMg2Bf5+uGssgZR6FRrtK+nMeBJS+uuQxfUUBVOgSq7AuR9ATQJo6SCkIWj9ZEToqMaLS6hn8Ya2+afgIcJZrTYds="
+}

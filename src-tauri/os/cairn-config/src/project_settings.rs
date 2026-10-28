@@ -1794,7 +1794,7 @@ checks:
     #[test]
     fn landing_judges_only_what_the_branch_changed_against_the_target() {
         let older = build_without_landing();
-        let (with_landing, _) = repository_config_with_landing_compile();
+        let with_landing = CONFIG_WITH_LANDING_COMPILE;
         let base = "checks:\n  frontend:\n    command: vitest run\n";
         let broken = "checks:\n  frontend:\n    when: review\n";
         let judge = |fork: &str, target: &str, head: &str| {
@@ -1807,7 +1807,7 @@ checks:
         };
 
         // The #4311 shape: the branch adds a cadence this build lacks.
-        let LandingConfigJudgement::NeedsNewerBuild(unsupported) = judge(base, base, &with_landing)
+        let LandingConfigJudgement::NeedsNewerBuild(unsupported) = judge(base, base, with_landing)
         else {
             panic!("a landed check this build cannot run must be named");
         };
@@ -1824,7 +1824,7 @@ checks:
         );
         // A check the target already sets aside the same way is not news.
         assert_eq!(
-            judge(base, &with_landing, &format!("{with_landing}\n# edited\n")),
+            judge(base, with_landing, &format!("{with_landing}\n# edited\n")),
             LandingConfigJudgement::Unaffected
         );
 
