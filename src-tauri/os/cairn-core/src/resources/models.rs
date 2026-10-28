@@ -785,11 +785,8 @@ fn account_block(
             let signed_in_as = account["email"].as_str().unwrap_or(label);
             let _ = writeln!(
                 out,
-                "  - blocked: {} since {} ({}). {}",
-                hold.kind.summary(),
-                when(hold.since),
-                hold.detail,
-                hold.kind.operator_action(signed_in_as)
+                "  - blocked: {}",
+                hold.describe(&when(hold.since), signed_in_as)
             );
         }
         // Only a block still in force is one; a past block is history, as the
@@ -1073,9 +1070,15 @@ fn pool_block(pool: &ProviderPoolSnapshot, label: &str, out: &mut String) {
         let state = match account.state {
             ProviderPoolAccountState::Measured => "measured".to_string(),
             ProviderPoolAccountState::Unknown => "not measured yet".to_string(),
-            ProviderPoolAccountState::Blocked => match account.blocked_until {
-                Some(until) => format!("blocked until {}", when(until)),
-                None => "blocked".to_string(),
+            // The pool's label is the account's email where it has one, the
+            // name its owner signs in with.
+            ProviderPoolAccountState::Blocked => match (&account.held, account.blocked_until) {
+                (Some(hold), _) => format!(
+                    "blocked: {}",
+                    hold.describe(&when(hold.since), &account.label)
+                ),
+                (None, Some(until)) => format!("blocked until {}", when(until)),
+                (None, None) => "blocked".to_string(),
             },
             ProviderPoolAccountState::Error => format!(
                 "last probe failed: {}",
@@ -1780,6 +1783,43 @@ mod tests {
                 "/src/resources/testdata/models_usage_pool.md"
             ),
             &out,
+        );
+    }
+
+    #[test]
+    fn a_held_pool_account_names_its_hold_and_the_act_that_lifts_it() {
+        use cairn_models::types::pool::{build_provider_pool, PoolAccountInput};
+        let hold = crate::credentials::AccountHold {
+            since: 1_790_000_000,
+            kind: crate::credentials::AccountHoldKind::TermsAcceptance,
+            detail: "Please accept the updated Consumer Terms.".to_string(),
+        };
+        let pool = build_provider_pool(
+            "claude",
+            vec![PoolAccountInput {
+                account_id: "acc_1".to_string(),
+                label: "work@example.com".to_string(),
+                blocked_until: Some(1_790_000_600),
+                held: Some(hold.clone()),
+                ..Default::default()
+            }],
+            None,
+            None,
+            None,
+            1_790_000_100,
+        );
+        let mut out = String::new();
+        super::pool_block(&pool, "Claude (`claude`)", &mut out);
+        let line = format!(
+            "- Account work@example.com: blocked: {}",
+            hold.describe(&super::when(hold.since), "work@example.com")
+        );
+        assert!(out.contains(&line), "{out}");
+        // A hold is not lifted by the timer beneath it.
+        assert!(!out.contains("blocked until"), "{out}");
+        assert!(
+            !out.contains("Exhausted: every account is blocked (every model) until"),
+            "{out}"
         );
     }
 

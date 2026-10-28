@@ -1808,20 +1808,25 @@ pub(crate) async fn render_turn_end_checks_section(
         return Some(format_retired_checks_section(&retired, statuses.as_deref()));
     }
     let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id).await?;
-    format_checks_section(&statuses)
+    format_checks_section(
+        &statuses,
+        crate::execution::checks_status::WaveCadence::of(orch, job_id),
+    )
 }
 
 /// Pure renderer for the `### Systematic checks` section. Returns `None` when the
 /// project has no configured checks. Split out so every status renders without a
-/// DB or worktree.
+/// DB or worktree. `cadence` is the waves in flight, which is what separates a
+/// lane still to come (`pending`) from one nothing will produce (`absent`).
 fn format_checks_section(
     statuses: &[crate::execution::checks_status::NodeCheckStatus],
+    cadence: crate::execution::checks_status::WaveCadence,
 ) -> Option<String> {
     if statuses.is_empty() {
         return None;
     }
     let mut out = String::from("\n### Systematic checks\n\n");
-    push_check_lines(&mut out, statuses, "pending");
+    push_check_lines(&mut out, statuses, Some(cadence));
     Some(out)
 }
 
@@ -1849,24 +1854,69 @@ fn format_retired_checks_section(
     ));
     match statuses {
         Some([]) => out.push_str("That head configured no checks.\n"),
-        Some(statuses) => push_check_lines(&mut out, statuses, "no verdict"),
+        Some(statuses) => push_check_lines(&mut out, statuses, None),
         None => out.push_str("Its recorded lanes could not be read just now.\n"),
     }
     out
 }
 
 /// One line per lane, with a failing or running lane's output beneath it.
-/// `pending_label` names a lane with no verdict: one still to come on a live
-/// node, one that will never come on a retired node.
+///
+/// The words follow [`crate::execution::checks_status::LaneExistence`], the
+/// same states the merge's verdict gate names, so the block a reader sees
+/// before merging is the refusal they would get: a lane with no row is
+/// `pending` while a wave of its cadence is in flight and `absent` when none
+/// is, and a run that ended without a verdict reads as `died` or `breaker`,
+/// never as a red. `cadence` is `None` for a retired node, whose rowless lanes
+/// will never get a verdict.
 fn push_check_lines(
     out: &mut String,
     statuses: &[crate::execution::checks_status::NodeCheckStatus],
-    pending_label: &str,
+    cadence: Option<crate::execution::checks_status::WaveCadence>,
 ) {
     use crate::execution::checks_status::{
-        format_status_annotation, formatted_failure_names, NodeCheckState,
+        format_status_annotation, formatted_failure_names, lane_existence, LaneExistence,
+        NodeCheckState,
     };
     for status in statuses {
+        let existence = lane_existence(status, cadence.unwrap_or_default());
+        match existence {
+            Some(LaneExistence::Died { .. }) => {
+                let annotation = format_status_annotation(status)
+                    .map(|a| format!(" \u{2014} {a}"))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "- \u{2298} {}: died without a verdict{annotation}\n",
+                    status.name
+                ));
+                if let Some(detail) = status
+                    .output_tail
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    out.push_str("\n```\n");
+                    out.push_str(detail.trim_end());
+                    out.push_str("\n```\n");
+                }
+                continue;
+            }
+            Some(LaneExistence::NoSelectableWork) => {
+                out.push_str(&format!(
+                    "- {}: not applicable: no selectable work for this diff\n",
+                    status.name
+                ));
+                continue;
+            }
+            Some(LaneExistence::Breaker { after }) => {
+                out.push_str(&format!(
+                    "- \u{2298} {}: breaker \u{2014} not run after {after} consecutive \
+                     infrastructure failures, no verdict\n",
+                    status.name
+                ));
+                continue;
+            }
+            _ => {}
+        }
         match status.state {
             NodeCheckState::Passed => {
                 let annotation = format_status_annotation(status)
@@ -1908,9 +1958,14 @@ fn push_check_lines(
                     out.push_str("\n```\n");
                 }
             }
-            NodeCheckState::Pending => {
-                out.push_str(&format!("- {}: {pending_label}\n", status.name));
-            }
+            NodeCheckState::Pending => match (cadence, existence) {
+                (None, _) => out.push_str(&format!("- {}: no verdict\n", status.name)),
+                (Some(_), Some(LaneExistence::Absent)) => out.push_str(&format!(
+                    "- {}: absent \u{2014} no lane has run it on this head\n",
+                    status.name
+                )),
+                (Some(_), _) => out.push_str(&format!("- {}: pending\n", status.name)),
+            },
             NodeCheckState::NotApplicable => {
                 out.push_str(&format!("- {}: not applicable\n", status.name));
             }
@@ -3036,9 +3091,11 @@ mod tests {
         );
     }
 
+    use crate::execution::checks_status::WaveCadence;
+
     #[test]
     fn section_is_none_when_no_configured_checks() {
-        assert!(format_checks_section(&[]).is_none());
+        assert!(format_checks_section(&[], WaveCadence::default()).is_none());
     }
 
     /// A retired node's section names how it retired and the head its lanes
@@ -3084,7 +3141,7 @@ mod tests {
     fn section_renders_running_with_log_tail() {
         let mut running = status("rust", NodeCheckState::Running);
         running.output_tail = Some("compiling...\nrunning tests".to_string());
-        let s = format_checks_section(&[running]).unwrap();
+        let s = format_checks_section(&[running], WaveCadence::writing_for_test()).unwrap();
         assert!(s.contains("### Systematic checks"));
         assert!(s.contains("rust: _running\u{2026}_"));
         assert!(s.contains("running tests"));
@@ -3092,7 +3149,11 @@ mod tests {
 
     #[test]
     fn section_renders_running_without_a_log_yet() {
-        let s = format_checks_section(&[status("rust", NodeCheckState::Running)]).unwrap();
+        let s = format_checks_section(
+            &[status("rust", NodeCheckState::Running)],
+            WaveCadence::writing_for_test(),
+        )
+        .unwrap();
         assert!(s.contains("_running\u{2026}_"));
         assert!(!s.contains("```"));
     }
@@ -3109,7 +3170,7 @@ mod tests {
         failed.failed = Some(2);
         failed.passed = Some(38);
         failed.output_tail = Some("assertion failed: left == right".to_string());
-        let s = format_checks_section(&[passed, failed]).unwrap();
+        let s = format_checks_section(&[passed, failed], WaveCadence::default()).unwrap();
         assert!(s.contains("\u{2713} rust (12 tests)"));
         assert!(s.contains("\u{2717} frontend \u{2014} 2 of 40 failed"));
         assert!(s.contains("assertion failed: left == right"));
@@ -3129,7 +3190,7 @@ mod tests {
             "src/components/FileTabView.test.tsx: Cannot find module './readableMarkdown'"
                 .to_string(),
         );
-        let s = format_checks_section(&[failed]).unwrap();
+        let s = format_checks_section(&[failed], WaveCadence::default()).unwrap();
         assert!(
             s.contains("\u{2717} frontend-partial \u{2014} 1 suite failed to load"),
             "got: {s}"
@@ -3148,7 +3209,7 @@ mod tests {
         failed.passed = Some(38);
         failed.failed = Some(2);
         failed.suite_failures = Some(3);
-        let s = format_checks_section(&[failed]).unwrap();
+        let s = format_checks_section(&[failed], WaveCadence::default()).unwrap();
         assert!(
             s.contains(
                 "\u{2717} frontend-partial \u{2014} 2 of 40 failed, 3 suites failed to load"
@@ -3157,15 +3218,66 @@ mod tests {
         );
     }
 
+    /// A rowless lane is `pending` only while a wave of its own cadence is in
+    /// flight; with none, nothing is coming and it reads `absent`, the word the
+    /// merge's verdict gate refuses with.
     #[test]
     fn section_renders_not_run_states() {
-        let s = format_checks_section(&[
+        let lanes = [
             status("docs", NodeCheckState::NotApplicable),
             status("lint", NodeCheckState::Pending),
-        ])
-        .unwrap();
+        ];
+        let s = format_checks_section(&lanes, WaveCadence::writing_for_test()).unwrap();
         assert!(s.contains("docs: not applicable"));
-        assert!(s.contains("lint: pending"));
+        assert!(s.contains("lint: pending"), "{s}");
+        for idle in [WaveCadence::default(), WaveCadence::reviewing_for_test()] {
+            let s = format_checks_section(&lanes, idle).unwrap();
+            assert!(
+                s.contains("lint: absent \u{2014} no lane has run it on this head"),
+                "{s}"
+            );
+            assert!(!s.contains("pending"), "{s}");
+        }
+    }
+
+    /// A run that ended without a verdict is not a red, and a tripped breaker
+    /// says so rather than replaying the last failure as one.
+    #[test]
+    fn section_renders_died_and_breaker_lanes_apart_from_reds() {
+        let mut died = status("external-host", NodeCheckState::Failed);
+        died.failure_kind = Some("infrastructure".to_string());
+        died.output_tail = Some("could not materialize commit".to_string());
+        let mut breaker = status("rust-lint", NodeCheckState::Failed);
+        breaker.failure_kind = Some("infrastructure".to_string());
+        breaker.suppressed_after = Some(3);
+        let s = format_checks_section(&[died, breaker], WaveCadence::default()).unwrap();
+        assert!(
+            s.contains("\u{2298} external-host: died without a verdict"),
+            "{s}"
+        );
+        assert!(s.contains("could not materialize commit"), "{s}");
+        assert!(
+            s.contains("\u{2298} rust-lint: breaker \u{2014} not run after 3"),
+            "{s}"
+        );
+        assert!(!s.contains('\u{2717}'), "{s}");
+    }
+
+    /// A lint whose cone holds no crate the change touched had nothing to
+    /// judge: it reads as not applicable by content, never as a green or as an
+    /// unfinished run.
+    #[test]
+    fn section_renders_a_lint_with_no_selectable_work_as_not_applicable() {
+        let mut lint = status("rust-lint", NodeCheckState::Unverified);
+        lint.parser = Some("rust-lint".to_string());
+        lint.selection = Some("empty".to_string());
+        lint.complete = Some(false);
+        let s = format_checks_section(&[lint], WaveCadence::default()).unwrap();
+        assert!(
+            s.contains("- rust-lint: not applicable: no selectable work for this diff"),
+            "{s}"
+        );
+        assert!(!s.contains('\u{2713}') && !s.contains('\u{26a0}'), "{s}");
     }
 
     #[test]

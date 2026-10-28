@@ -225,6 +225,7 @@ impl CustomProviderConfig {
                 backend_key,
                 url: self.decisions_url(),
                 headers,
+                context_limits: None,
             })),
             CustomProtocol::OpenAiImages => Err(format!(
                 "{} speaks the OpenAI Images protocol, which cannot answer a decision",

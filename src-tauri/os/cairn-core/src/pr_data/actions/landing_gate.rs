@@ -56,46 +56,6 @@ pub struct LandingGateSkip {
     pub reason: String,
 }
 
-/// Read the operator's reason for landing without the compile gate. It must be
-/// a non-empty string: a skip without a reason would journal an override
-/// nobody can later read.
-pub fn parse_landing_gate_skip(
-    reason: Option<&serde_json::Value>,
-) -> Result<LandingGateSkip, String> {
-    match reason.and_then(serde_json::Value::as_str).map(str::trim) {
-        Some(reason) if !reason.is_empty() => Ok(LandingGateSkip {
-            reason: reason.to_string(),
-        }),
-        _ => Err(
-            "reason must be a non-empty string saying why it is safe to land without the \
-             compile gate"
-                .to_string(),
-        ),
-    }
-}
-
-/// Refuse a `landingGateSkip` on a `cairn://` write, whatever its value. A
-/// resource write carries an agent's session, or a `_cairn_origin` marker any
-/// caller can set, and neither is a person's authority. The skip is reached
-/// only through the runner's `merge_pr_skipping_landing_gate`, which checks the
-/// caller's operator credential before it reads anything. Called by the
-/// artifact merge surface, whose payload keys are open; the node and
-/// thread-branch surfaces declare closed key sets, so the write gate refuses
-/// the key there before dispatch.
-pub fn refuse_landing_gate_skip_on_write(value: Option<&serde_json::Value>) -> Result<(), String> {
-    if value.is_none() {
-        return Ok(());
-    }
-    Err(
-        "payload.landingGateSkip is not accepted on a resource write: skipping the landing \
-         compile gate is a person's act, and a write carries an agent's session or a \
-         `_cairn_origin` marker, never a person's authority. The operator lands without the \
-         gate from the desktop app's PR view, or as a signed-in owner or admin through the \
-         `merge_pr_skipping_landing_gate` command."
-            .to_string(),
-    )
-}
-
 /// What the gate established, for the landing that follows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct GatedLanding {
@@ -215,7 +175,8 @@ pub(crate) fn unavailable_refusal(
          Placement said: {refusal}\n\
          Merge again once a machine can take it. The operator may instead land it without the \
          gate, from the desktop app's PR view (\"Land without the compile gate\") or as a \
-         signed-in owner or admin; the skip is journaled against this refusal."
+         signed-in owner or admin through `merge_pr_as_operator` with `skipLandingGate`; the \
+         skip is journaled against this refusal."
     )
 }
 
@@ -502,7 +463,7 @@ async fn landing_checks_declared(orch: &Orchestrator, merge_context: &MergeMrCon
 /// established at the transport (`has_operator_authority`), and every
 /// resource-write path refuses a skip before it reaches the merge; this keeps a
 /// future caller that forgot both from landing a skip attributed to an agent.
-fn is_operator(attribution: Option<&PrResolutionAttribution>) -> bool {
+pub(super) fn is_operator(attribution: Option<&PrResolutionAttribution>) -> bool {
     attribution.is_some_and(|value| matches!(value.actor_kind, "operator-ui" | "operator-cli"))
 }
 
@@ -732,38 +693,6 @@ error: could not compile `cairn-core` (lib) due to 1 previous error
             assert!(
                 matches!(judge(&[run]), LandingJudgement::NotRun { .. }),
                 "{kind:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_skip_must_carry_a_reason() {
-        assert_eq!(
-            parse_landing_gate_skip(Some(&serde_json::json!("fleet down, verified by hand"))),
-            Ok(LandingGateSkip {
-                reason: "fleet down, verified by hand".into()
-            })
-        );
-        assert!(parse_landing_gate_skip(None).is_err());
-        assert!(parse_landing_gate_skip(Some(&serde_json::Value::Null)).is_err());
-        assert!(parse_landing_gate_skip(Some(&serde_json::json!("  "))).is_err());
-        assert!(parse_landing_gate_skip(Some(&serde_json::json!(true))).is_err());
-    }
-
-    /// Any value, even `null` or `false`, is refused on a write: the key's
-    /// presence is the attempt, and a write never carries the authority for it.
-    #[test]
-    fn a_write_never_carries_a_skip() {
-        assert_eq!(refuse_landing_gate_skip_on_write(None), Ok(()));
-        for value in [
-            serde_json::json!("fleet down"),
-            serde_json::Value::Null,
-            serde_json::json!(false),
-        ] {
-            let refusal = refuse_landing_gate_skip_on_write(Some(&value)).unwrap_err();
-            assert!(
-                refusal.contains("merge_pr_skipping_landing_gate"),
-                "{refusal}"
             );
         }
     }

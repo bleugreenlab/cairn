@@ -20,6 +20,10 @@ pub struct DecisionsEndpoint {
     /// The full URL a decision is posted to.
     pub url: String,
     pub headers: Vec<(String, String)>,
+    /// This deployment's context limits, as a sentence a request that
+    /// exceeds them is told (what they are, and what lifts them). `None`
+    /// when the provider documents none.
+    pub context_limits: Option<String>,
 }
 
 /// Header values carry bearer keys; only their names are printed.
@@ -37,6 +41,7 @@ impl std::fmt::Debug for DecisionsEndpoint {
                     .map(|(name, _)| format!("{name}: <redacted>"))
                     .collect::<Vec<_>>(),
             )
+            .field("context_limits", &self.context_limits)
             .finish()
     }
 }

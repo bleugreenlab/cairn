@@ -180,6 +180,158 @@ pub(crate) fn check_state_from_facts(
     }
 }
 
+/// Whether an applicable lane holds a verdict a merge may rest on, and what it
+/// holds instead when it does not.
+///
+/// A different question from [`VerdictEvidence`], which asks whether a GREEN is
+/// verified. Here a red is as complete as a green: the question is whether the
+/// head was judged at all, not how it came out. A result with no structured
+/// output is the command's exit code, which counts as a verdict (a script
+/// check, or a runner whose output Cairn does not parse); that is an interim
+/// for the test runners among them (`api`'s `bun test`, `frontend-tests`), which
+/// cairn/4941's parsers retire. A green whose own structured result says nothing
+/// was selected, or that the run was cut short, is not a verdict. Any recorded
+/// failure kind is a run that ended without a verdict, except a selection that
+/// matched nothing, which is an empty one.
+///
+/// Emptiness splits in two. A static check whose result says its selection was
+/// empty (a lint whose cone holds no crate the change touched) had no
+/// selectable work: not a verdict, never a green (cairn/5325), and not a
+/// refusal either, because there was nothing in its domain to judge. A test
+/// runner's empty selection over a change its impact matched is the cairn/5325
+/// defect (impact names files the selection maps to no test), and stays
+/// `Empty`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LaneExistence {
+    /// A red, or a green its own output does not contradict.
+    Complete,
+    /// No row at this head, and no wave in flight that would produce one.
+    Absent,
+    /// No row yet, but a wave has queued (`running: false`) or started it.
+    Pending { running: bool },
+    /// The last run at this head ended without a verdict: the substrate
+    /// failed, the run was killed, or the failure could not be classified.
+    /// `kind` is the stored failure kind.
+    Died { kind: String },
+    /// Cairn stopped running the check after this many consecutive
+    /// infrastructure failures.
+    Breaker { after: i64 },
+    /// A test runner selected nothing to judge for a change its impact matched.
+    Empty,
+    /// The run started judging and did not finish.
+    Incomplete(UnverifiedReason),
+    /// A static check found nothing in its domain in this change: not
+    /// applicable by content.
+    NoSelectableWork,
+}
+
+impl LaneExistence {
+    pub(crate) fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    /// Whether this state stops a landing: everything but a verdict and a
+    /// lane with nothing in its domain to judge.
+    pub(crate) fn blocks_landing(&self) -> bool {
+        !matches!(self, Self::Complete | Self::NoSelectableWork)
+    }
+
+    /// The one word every surface names this state by.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Absent => "absent",
+            Self::Pending { running: false } => "pending",
+            Self::Pending { running: true } => "running",
+            Self::Died { .. } => "died",
+            Self::Breaker { .. } => "breaker",
+            Self::Empty => "empty",
+            Self::Incomplete(_) => "incomplete",
+            Self::NoSelectableWork => "not applicable",
+        }
+    }
+}
+
+/// [`LaneExistence`] of one recorded row: whether it exited zero, its stored
+/// failure kind, the infrastructure streak when the breaker tripped on it, and
+/// its structured result's facts.
+pub(crate) fn row_existence(
+    passed: bool,
+    failure_kind: Option<&str>,
+    breaker_after: Option<i64>,
+    facts: Option<&VerdictFacts<'_>>,
+) -> LaneExistence {
+    if let Some(after) = breaker_after {
+        return LaneExistence::Breaker { after };
+    }
+    if let Some(kind) = failure_kind {
+        return if CheckFailureKind::from_stored(kind) == Some(CheckFailureKind::Selection) {
+            LaneExistence::Empty
+        } else {
+            LaneExistence::Died {
+                kind: kind.to_string(),
+            }
+        };
+    }
+    if passed && facts.is_some_and(|facts| !facts.is_test_runner() && facts.selection == "empty") {
+        return LaneExistence::NoSelectableWork;
+    }
+    match verdict_evidence_from_facts(passed, facts) {
+        VerdictEvidence::Failed
+        | VerdictEvidence::Verified
+        | VerdictEvidence::Unverified(UnverifiedReason::NoStructuredResult) => {
+            LaneExistence::Complete
+        }
+        VerdictEvidence::Unverified(
+            UnverifiedReason::EmptySelection
+            | UnverifiedReason::NoTestsRan
+            | UnverifiedReason::AllSkipped(_),
+        ) => LaneExistence::Empty,
+        VerdictEvidence::Unverified(
+            reason @ (UnverifiedReason::IncompleteEnumeration | UnverifiedReason::IncompleteLint),
+        ) => LaneExistence::Incomplete(reason),
+    }
+}
+
+/// [`LaneExistence`] of one lane of the node projection, or `None` when the
+/// lane has nothing to say about the head: the impact gate excluded it, it runs
+/// only against a merge result at landing, or this build cannot run it.
+///
+/// A lane with no row is `Pending` only while a wave of its own cadence is in
+/// flight; with nothing in flight, nothing is coming, and it is `Absent`.
+pub(crate) fn lane_existence(
+    status: &NodeCheckStatus,
+    cadence: WaveCadence,
+) -> Option<LaneExistence> {
+    match status.state {
+        NodeCheckState::NotApplicable | NodeCheckState::Unsupported => None,
+        NodeCheckState::Running => Some(LaneExistence::Pending { running: true }),
+        NodeCheckState::Pending => Some(if cadence.covers(&status.when) {
+            LaneExistence::Pending { running: false }
+        } else {
+            LaneExistence::Absent
+        }),
+        NodeCheckState::Passed | NodeCheckState::Failed | NodeCheckState::Unverified => {
+            let facts = status.parser.as_deref().map(|parser| VerdictFacts {
+                parser: std::borrow::Cow::Borrowed(parser),
+                selection: std::borrow::Cow::Borrowed(
+                    status.selection.as_deref().unwrap_or("unknown"),
+                ),
+                complete: status.complete.unwrap_or(false),
+                passed: status.passed.unwrap_or(0),
+                failed: status.failed.unwrap_or(0),
+                skipped: status.skipped.unwrap_or(0),
+            });
+            Some(row_existence(
+                status.state != NodeCheckState::Failed,
+                status.failure_kind.as_deref(),
+                status.suppressed_after,
+                facts.as_ref(),
+            ))
+        }
+    }
+}
+
 impl Default for NodeCheckStatusCache {
     fn default() -> Self {
         Self {
@@ -293,14 +445,14 @@ impl NodeCheckStatusCache {
 }
 
 /// Which cadences have a wave in flight for a job.
-#[derive(Clone, Copy, Debug)]
-struct WaveCadence {
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WaveCadence {
     review: bool,
     write: bool,
 }
 
 impl WaveCadence {
-    fn of(orch: &Orchestrator, job_id: &str) -> Self {
+    pub(crate) fn of(orch: &Orchestrator, job_id: &str) -> Self {
         Self {
             review: orch.turn_end_checks_in_flight(job_id),
             write: orch.write_checks_in_flight(job_id),
@@ -309,6 +461,66 @@ impl WaveCadence {
 
     fn any(self) -> bool {
         self.review || self.write
+    }
+
+    /// Whether a wave that would run a lane of cadence `when` is in flight.
+    pub(crate) fn covers(self, when: &str) -> bool {
+        (self.review && when == CheckWhen::Review.as_str())
+            || (self.write && when == CheckWhen::Write.as_str())
+    }
+}
+
+#[cfg(test)]
+impl WaveCadence {
+    pub(crate) fn reviewing_for_test() -> Self {
+        Self {
+            review: true,
+            write: false,
+        }
+    }
+
+    pub(crate) fn writing_for_test() -> Self {
+        Self {
+            review: false,
+            write: true,
+        }
+    }
+}
+
+/// A lane with nothing but its identity and state, for tests that build the
+/// projection's output directly.
+#[cfg(test)]
+pub(crate) fn test_status(
+    name: &str,
+    policy: &str,
+    when: &str,
+    state: NodeCheckState,
+) -> NodeCheckStatus {
+    NodeCheckStatus {
+        job_id: "job".to_string(),
+        request_id: None,
+        name: name.to_string(),
+        state,
+        policy: policy.to_string(),
+        when: when.to_string(),
+        cached: None,
+        duration_ms: None,
+        ran_at: None,
+        passed: None,
+        failed: None,
+        skipped: None,
+        deferred: None,
+        parser: None,
+        complete: None,
+        selection: None,
+        suite_failures: None,
+        failure_names: Vec::new(),
+        output_tail: None,
+        failure_kind: None,
+        suppressed_after: None,
+        executor: None,
+        verified_on: None,
+        notice: None,
     }
 }
 

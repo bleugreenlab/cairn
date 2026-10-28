@@ -10,8 +10,9 @@
 //!
 //! Where an offer is reached is its backend's answer
 //! (`AgentBackend::decision_route`), from the wire the offer declares: a
-//! custom provider's Decisions or OpenAI-chat endpoint, or OpenRouter's
-//! System One endpoint for the decision models its listing reports. The
+//! custom provider's Decisions or OpenAI-chat endpoint, TypeSafe's System One
+//! endpoint on its own key, or OpenRouter's for the decision models its
+//! listing reports. The
 //! subscriptions and OpenCode serve no `decide`, so a workspace with only
 //! those refuses with the fixes rather than asking a chat model to report its
 //! own probabilities.
@@ -128,7 +129,7 @@ pub(crate) enum DecisionFailure {
     /// Nothing in scope can answer these questions as asked: no offer serves
     /// `decide`, the one selected cannot measure them, none could be
     /// confirmed, or the request itself cannot be asked (no model named,
-    /// malformed questions). Only a configuration or request change fixes it,
+    /// malformed questions, longer than the model's context). Only a configuration or request change fixes it,
     /// so retrying is pointless. The text names the fixes.
     Unanswerable(String),
     /// An offer that can answer was found and something went wrong reaching
@@ -642,9 +643,13 @@ impl Orchestrator {
             }
             Ok(_) => {}
         }
-        result
-            .map(|decision| (decision, offer))
-            .map_err(|error| DecisionFailure::Failed(error.to_string()))
+        result.map(|decision| (decision, offer)).map_err(|error| {
+            if error.refuses_the_request() {
+                DecisionFailure::Unanswerable(error.to_string())
+            } else {
+                DecisionFailure::Failed(error.to_string())
+            }
+        })
     }
 }
 
@@ -913,11 +918,14 @@ pub(crate) mod tests {
         assert_eq!(back, outcome);
     }
 
+    /// One System One request as it left: its URL, headers, and body.
+    type SentRequest = (String, Vec<(String, String)>, Value);
+
     /// Records where each System One request went and answers OpenRouter's
     /// documented reply.
     #[derive(Default)]
     struct OpenRouterDecisions {
-        sent: Mutex<Vec<(String, Vec<(String, String)>, Value)>>,
+        sent: Mutex<Vec<SentRequest>>,
     }
 
     impl Complete for OpenRouterDecisions {

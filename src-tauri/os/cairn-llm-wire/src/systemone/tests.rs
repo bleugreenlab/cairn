@@ -451,6 +451,7 @@ fn endpoint(url: String) -> DecisionsEndpoint {
             ("content-type".into(), "application/json".into()),
             ("authorization".into(), "Bearer sk-or-test".into()),
         ],
+        context_limits: None,
     }
 }
 
@@ -501,6 +502,43 @@ fn a_provider_error_carries_its_own_sentence() {
             "OpenRouter decision returned HTTP 402: Insufficient credits. Add more using https://openrouter.ai/credits"
                 .into()
         )
+    );
+}
+
+/// TypeSafe's documented overflow (HTTP 400 with `max_tokens_exceeded`) is
+/// its own typed error, never retried and never read as a refused question,
+/// and it says what the endpoint's limits are and what lifts them.
+#[test]
+fn a_request_longer_than_the_context_is_refused_with_the_endpoints_limits() {
+    let (url, _) = serve_once(
+        "400 Bad Request",
+        r#"{"detail":"max_tokens_exceeded: the request is longer than the model's context length"}"#,
+    );
+    let endpoint = DecisionsEndpoint {
+        provider_name: "TypeSafe".into(),
+        context_limits: Some("Jev reads at most 64k tokens per request.".into()),
+        ..endpoint(url)
+    };
+    let error =
+        post_systemone(&endpoint, predicates(&["a", "b"]), Duration::from_secs(5)).unwrap_err();
+    assert_eq!(
+        error,
+        CompletionError::ContextExceeded(
+            "TypeSafe refused the decision as longer than the model's context (max_tokens_exceeded: the request is longer than the model's context length). Jev reads at most 64k tokens per request."
+                .into()
+        )
+    );
+    assert!(!error.is_transient());
+}
+
+/// Any other 400 is the provider's sentence, as before.
+#[test]
+fn another_bad_request_is_not_a_context_refusal() {
+    let (url, _) = serve_once("400 Bad Request", r#"{"detail":"too much nesting"}"#);
+    let error = post_systemone(&endpoint(url), json!({}), Duration::from_secs(5)).unwrap_err();
+    assert_eq!(
+        error,
+        CompletionError::Upstream("OpenRouter decision returned HTTP 400: too much nesting".into())
     );
 }
 

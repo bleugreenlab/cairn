@@ -1196,6 +1196,13 @@ pub async fn render_live_pr_section(
             "Merged"
         };
         out.push_str(&format!("{verb} by {actor} at {}\n\n<details><summary>Resolution provenance</summary>\n\nSurface: `{}`\n\nLane snapshot: `{}`\n\n</details>\n", chrono::DateTime::from_timestamp(attribution.created_at, 0).map(|v| v.to_rfc3339()).unwrap_or_else(|| attribution.created_at.to_string()), attribution.surface, attribution.lane_snapshot));
+        // A landing past a gate (verdicts waived, the compile gate skipped)
+        // must never read like an ordinary one.
+        if attribution.action == "merge" {
+            if let Some(record) = super::merge::landing_record(&db, &mr_context.mr_id).await {
+                out.push_str(&format!("Landed with: {record}\n"));
+            }
+        }
     }
     if let Some(review) = &cache.review_decision {
         out.push_str(&format!("Review: {}\n", review));

@@ -265,6 +265,12 @@ pub enum CompletionError {
     Unreachable(String),
     #[error("completion response was invalid: {0}")]
     InvalidResponse(String),
+    /// The provider refused the request as longer than the model's context.
+    /// Only a shorter request (or a deployment with a longer context) can
+    /// succeed, so it is never transient. The text names the provider's limits
+    /// when its endpoint states them.
+    #[error("{0}")]
+    ContextExceeded(String),
     /// A streamed generation failed. The text is the transport's own message,
     /// displayed unchanged.
     #[error("{0}")]

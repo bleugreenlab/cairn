@@ -754,7 +754,7 @@ pub async fn merge_pr_for_job(
     merge_method: Option<String>,
     attribution: Option<super::PrResolutionAttribution>,
     precondition: Option<MergePrecondition>,
-    landing_gate_skip: Option<super::LandingGateSkip>,
+    overrides: super::OperatorOverrides,
 ) -> Result<String, String> {
     let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
         .await
@@ -773,7 +773,7 @@ pub async fn merge_pr_for_job(
         merge_method,
         attribution,
         precondition,
-        landing_gate_skip,
+        overrides,
     )
     .await
     .map(|reply| barrier.prefix(reply))
@@ -786,7 +786,7 @@ async fn merge_pr_for_job_past_barrier(
     merge_method: Option<String>,
     attribution: Option<super::PrResolutionAttribution>,
     precondition: Option<MergePrecondition>,
-    landing_gate_skip: Option<super::LandingGateSkip>,
+    overrides: super::OperatorOverrides,
 ) -> Result<String, String> {
     // Route to the owning database (team replica or private DB). The merge
     // request, its issue, and the producing job for a team execution all live in
@@ -951,7 +951,9 @@ async fn merge_pr_for_job_past_barrier(
     let journal_merge_request_id = merge_context.mr.mr_id.clone();
     let journal_target_ref = merge_context.target_branch.clone();
     let journal_source_ref = merge_context.source_branch.clone();
+    let merge_context_issue_id = merge_context.issue_id.clone();
     let mut landing_journal_detail: Option<String> = None;
+    let mut verdict_journal_detail: Option<String> = None;
     let merge_result = async {
         let db = db.clone();
         // Gate on the TIP, not the whole range. A genuinely conflicted tip needs
@@ -1009,6 +1011,32 @@ async fn merge_pr_for_job_past_barrier(
     if merge_context.target_branch == resolved_default {
         assert_main_checkout_clean_for_default_merge(&*orch.services.git, &repo_path)?;
     }
+    // Verdict existence: the default branch takes only a head that was
+    // judged, red or green, on every check its change makes applicable. A read
+    // of the node's lanes and the ledger, so it runs before the compile gate.
+    // Child PRs into an integration branch are judged on the combined tree
+    // below, and their integration branch is judged here when it lands.
+    let verdict_gate = if merge_context.target_branch == resolved_default {
+        Some(
+            super::verdict_gate::gate_verdict_existence(
+                orch,
+                &db,
+                &merge_context,
+                overrides.verdict_waiver.as_ref(),
+                attribution.as_ref(),
+            )
+            .await?,
+        )
+    } else if overrides.verdict_waiver.is_some() {
+        return Err(format!(
+            "Refusing to merge `{}`: a verdict waiver applies only to a landing on the default \
+             branch, and `{}` is not it. Merge without it.",
+            merge_context.source_branch, merge_context.target_branch
+        ));
+    } else {
+        None
+    };
+    verdict_journal_detail = verdict_gate.as_ref().and_then(|gate| gate.waived.clone());
     // The landing compile gate: the default branch takes only a merge result
     // that compiles. Judged after every cheaper refusal above, because it is
     // the one that costs a build.
@@ -1021,7 +1049,7 @@ async fn merge_pr_for_job_past_barrier(
             job_id,
             &merge_context,
             &route_method,
-            landing_gate_skip.as_ref(),
+            overrides.landing_gate_skip.as_ref(),
             attribution.as_ref(),
         )
         .await?
@@ -1029,9 +1057,27 @@ async fn merge_pr_for_job_past_barrier(
         super::landing_gate::GatedLanding::ungated()
     };
     landing_journal_detail = gated.journal_detail.clone();
-    // The landing is bound to the head its gates judged: a pin bump's
-    // verified head, else the head the compile gate judged.
-    let bound_head = verified_head.clone().or(gated.source_tip.clone());
+    // The landing is bound to the head its gates judged, and every gate must
+    // have judged the same one: a branch that moved between them carries no
+    // verdict for the head that would land.
+    let judged: Vec<&str> = [
+        verified_head.as_deref(),
+        verdict_gate.as_ref().map(|gate| gate.head.as_str()),
+        gated.source_tip.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if let Some(moved) = judged.windows(2).find(|pair| pair[0] != pair[1]) {
+        return Err(format!(
+            "Refusing to merge `{source}`: the branch moved from {from} to {to} while its gates \
+             judged it; merge again so one head is judged throughout.",
+            source = merge_context.source_branch,
+            from = moved[0],
+            to = moved[1],
+        ));
+    }
+    let bound_head = judged.first().map(|head| head.to_string());
     log::info!(
         "merge_pr_for_job[{job_id}]: merge gates took {:?}",
         gate_started.elapsed()
@@ -1250,17 +1296,69 @@ async fn merge_pr_for_job_past_barrier(
             policy_json: &stored_policy,
         },
         &merge_result,
-        match (
+        merge_journal_detail(&[
             pin_bump_detail.as_deref(),
+            verdict_journal_detail.as_deref(),
             landing_journal_detail.as_deref(),
-        ) {
-            (Some(pin_bump), Some(landing)) => Some(format!("{pin_bump}; {landing}")),
-            (pin_bump, landing) => pin_bump.or(landing).map(str::to_string),
-        }
+        ])
         .as_deref(),
     )
     .await?;
+    if let (Ok(_), Some(waived), Some(issue_id)) = (
+        &merge_result,
+        verdict_journal_detail.as_deref(),
+        merge_context_issue_id.as_deref(),
+    ) {
+        record_waiver_on_issue(orch, &db, issue_id, waived).await;
+    }
     merge_result
+}
+
+/// What the successful landing of a merge request recorded beyond an ordinary
+/// one (an operator's waiver or skip, a pin bump's evidence), for the merged
+/// PR's rendering.
+pub(super) async fn landing_record(db: &LocalDb, merge_request_id: &str) -> Option<String> {
+    db.query_opt_text(
+        "SELECT detail FROM merge_attempt_events
+          WHERE merge_request_id = ?1 AND sequence = 1 AND state = 'succeeded'
+            AND detail IS NOT NULL
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT 1",
+        params![merge_request_id],
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+/// What the merge journal's outcome event records beyond an ordinary landing:
+/// a pin bump's evidence, an operator's verdict waiver, a compile-gate skip.
+fn merge_journal_detail(details: &[Option<&str>]) -> Option<String> {
+    let details: Vec<&str> = details.iter().flatten().copied().collect();
+    (!details.is_empty()).then(|| details.join("; "))
+}
+
+/// Write the operator's verdict waiver on the merged PR's issue, so a merge
+/// that landed without its verdicts says so where the issue is read, not only
+/// in the merge journal. A failure is logged: the merge has already landed and
+/// the journal holds the waiver.
+async fn record_waiver_on_issue(orch: &Orchestrator, db: &LocalDb, issue_id: &str, waived: &str) {
+    let comment = crate::models::CreateComment {
+        issue_id: issue_id.to_string(),
+        content: format!(
+            "**Merged without a complete verdict for every applicable check.** {waived}."
+        ),
+        source: crate::models::CommentSource::User,
+    };
+    match crate::issues::comments::create(db, &*orch.services.clock, comment).await {
+        Ok(_) => {
+            let _ = orch.services.emitter.emit(
+                "db-change",
+                serde_json::json!({"table": "comments", "action": "insert"}),
+            );
+        }
+        Err(error) => log::warn!("verdict waiver not written on issue {issue_id}: {error}"),
+    }
 }
 
 #[cfg(test)]

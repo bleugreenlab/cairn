@@ -15,8 +15,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::usage::{
-    ProviderCreditsSnapshot, ProviderModelUsageRow, ProviderUsageErrorKind, ProviderUsageFamily,
-    ProviderUsageResetCredits, ProviderUsageScope, ProviderUsageWindow,
+    AccountHold, ProviderCreditsSnapshot, ProviderModelUsageRow, ProviderUsageErrorKind,
+    ProviderUsageFamily, ProviderUsageResetCredits, ProviderUsageScope, ProviderUsageWindow,
 };
 
 /// One provider's pooled capacity as the settings surface renders it.
@@ -49,7 +49,13 @@ pub struct ProviderPoolAccount {
     /// to decide whether the provider is still worth asking on open.
     pub source: Option<String>,
     pub captured_at: Option<i64>,
+    /// When a block still in force lifts. None under a hold, which no clock
+    /// lifts.
     pub blocked_until: Option<i64>,
+    /// Why the provider refuses this account until its operator acts. Present
+    /// means the account is blocked, whatever its windows still report.
+    #[serde(default)]
+    pub held: Option<AccountHold>,
     pub error: Option<String>,
     pub error_kind: Option<ProviderUsageErrorKind>,
     /// The usage resets this account holds, for a provider that has them.
@@ -154,6 +160,7 @@ pub struct PoolAccountInput {
     pub windows: Vec<ProviderUsageWindow>,
     pub windows_captured_at: Option<i64>,
     pub blocked_until: Option<i64>,
+    pub held: Option<AccountHold>,
     pub error: Option<String>,
     pub error_kind: Option<ProviderUsageErrorKind>,
     pub reset_credits: Option<ProviderUsageResetCredits>,
@@ -173,8 +180,21 @@ impl PoolAccountInput {
             })
     }
 
+    /// Whether the provider has said this account cannot be drawn from now:
+    /// the same test routing applies, so the pool never offers capacity no
+    /// launch can use. A hold blocks even beside windows full of headroom.
     fn is_blocked(&self, now: i64) -> bool {
-        self.blocked_until.is_some_and(|until| until > now)
+        self.held.is_some() || self.blocked_until.is_some_and(|until| until > now)
+    }
+
+    /// When the block on this account lifts by itself, or None when nothing
+    /// blocks it or a hold does. A hold has no end time, and a timed block
+    /// beneath one is not when the account returns, so none is reported.
+    fn block_end(&self, now: i64) -> Option<i64> {
+        if self.held.is_some() {
+            return None;
+        }
+        self.blocked_until.filter(|until| *until > now)
     }
 
     fn live_windows(&self, now: i64) -> impl Iterator<Item = &ProviderUsageWindow> {
@@ -217,7 +237,7 @@ impl PoolAccountInput {
                 account_id: self.account_id.clone(),
                 remaining_percent: Some(0.0),
                 state: ProviderPoolSegmentState::Blocked,
-                resets_at: self.blocked_until,
+                resets_at: self.block_end(now),
                 reset_at_text: None,
             };
         }
@@ -271,7 +291,8 @@ pub fn build_provider_pool(
             state: input.state(now),
             source: input.source.clone(),
             captured_at: input.windows_captured_at,
-            blocked_until: input.blocked_until.filter(|until| *until > now),
+            blocked_until: input.block_end(now),
+            held: input.held.clone(),
             error: input.error.clone(),
             error_kind: input.error_kind,
             reset_credits: input.resets(),
@@ -362,7 +383,9 @@ pub fn build_provider_pool(
             family_label: None,
             reach: ProviderPoolConstraintReach::Provider,
             scope_target: None,
-            next_reset_at: inputs.iter().filter_map(|input| input.blocked_until).min(),
+            // The pool returns when its first timed block lifts; a held
+            // account returns only when its operator acts.
+            next_reset_at: inputs.iter().filter_map(|input| input.block_end(now)).min(),
         });
     }
 
@@ -387,7 +410,7 @@ pub fn build_provider_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usage::ProviderUsageResetCredit;
+    use crate::usage::{AccountHoldKind, ProviderUsageResetCredit};
 
     const NOW: i64 = 1_000;
     const LATER: i64 = 9_000;
@@ -698,6 +721,98 @@ mod tests {
         assert_eq!(pool.accounts[1].blocked_until, Some(LATER));
     }
 
+    fn hold(kind: AccountHoldKind) -> AccountHold {
+        AccountHold {
+            since: NOW - 30,
+            kind,
+            detail: format!("{kind:?} from the provider"),
+        }
+    }
+
+    #[test]
+    fn a_held_account_contributes_zero_to_every_family_whichever_its_kind() {
+        for kind in [AccountHoldKind::Credits, AccountHoldKind::TermsAcceptance] {
+            // The Consumer Terms case: every window reports headroom, and the
+            // provider refuses every request anyway.
+            let mut held = claude_account("b", 90.0, 90.0, 90.0);
+            held.held = Some(hold(kind));
+            let pool = pool("claude", vec![claude_account("a", 60.0, 90.0, 20.0), held]);
+
+            assert_eq!(pool.families.len(), 3);
+            for family in &pool.families {
+                let segment = &family.segments[1];
+                assert_eq!(segment.state, ProviderPoolSegmentState::Blocked, "{kind:?}");
+                assert_eq!(segment.remaining_percent, Some(0.0), "{kind:?}");
+                // A hold has no end time, so none is invented for it.
+                assert_eq!(segment.resets_at, None, "{kind:?}");
+                assert_eq!(family.unknown_count, 0, "{kind:?}");
+                // Only the measured account's headroom, never the held one's.
+                assert_eq!(
+                    family.remaining_percent,
+                    family.segments[0].remaining_percent.unwrap(),
+                    "{kind:?}"
+                );
+                assert_eq!(family.next_reset_at, Some(LATER), "{kind:?}");
+            }
+            assert_eq!(family(&pool, "session").remaining_percent, 60.0);
+
+            let account = &pool.accounts[1];
+            assert_eq!(account.state, ProviderPoolAccountState::Blocked);
+            assert_eq!(account.held, Some(hold(kind)));
+            assert_eq!(account.blocked_until, None);
+            assert!(pool.constraints.is_empty(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_hold_outranks_a_timed_block_and_lends_the_pool_no_reset() {
+        let mut timed = claude_account("a", 60.0, 90.0, 20.0);
+        timed.blocked_until = Some(4_000);
+        // A re-probe timer recorded under the hold ends sooner than the other
+        // account's block, but the held account does not come back with it.
+        let mut held = claude_account("b", 90.0, 90.0, 90.0);
+        held.blocked_until = Some(3_000);
+        held.held = Some(hold(AccountHoldKind::TermsAcceptance));
+        let pool = pool("claude", vec![timed, held]);
+
+        assert_eq!(pool.accounts[1].blocked_until, None);
+        assert_eq!(family(&pool, "session").segments[1].resets_at, None);
+        assert_eq!(family(&pool, "session").segments[0].resets_at, Some(4_000));
+        assert_eq!(pool.constraints.len(), 1);
+        assert_eq!(pool.constraints[0].family_key, None);
+        assert_eq!(pool.constraints[0].next_reset_at, Some(4_000));
+    }
+
+    #[test]
+    fn a_pool_of_held_accounts_is_out_with_no_reset_to_wait_for() {
+        let mut credits = claude_account("a", 60.0, 90.0, 20.0);
+        credits.held = Some(hold(AccountHoldKind::Credits));
+        let mut terms = claude_account("b", 90.0, 90.0, 90.0);
+        terms.held = Some(hold(AccountHoldKind::TermsAcceptance));
+        let pool = pool("claude", vec![credits, terms]);
+
+        for family in &pool.families {
+            assert_eq!(family.remaining_percent, 0.0);
+            assert_eq!(family.next_reset_at, None);
+        }
+        assert_eq!(pool.constraints.len(), 1);
+        assert_eq!(
+            pool.constraints[0].reach,
+            ProviderPoolConstraintReach::Provider
+        );
+        assert_eq!(pool.constraints[0].next_reset_at, None);
+        assert_eq!(
+            pool.accounts
+                .iter()
+                .map(|account| account.held.as_ref().map(|hold| hold.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                Some(AccountHoldKind::Credits),
+                Some(AccountHoldKind::TermsAcceptance)
+            ]
+        );
+    }
+
     #[test]
     fn the_pool_reports_its_oldest_capture_not_its_newest() {
         let mut old = claude_account("a", 60.0, 90.0, 20.0);
@@ -883,5 +998,21 @@ mod tests {
         assert_eq!(json["families"][0]["name"], "Session");
         assert_eq!(json["families"][0]["segments"][0]["accountId"], "a");
         assert_eq!(json["families"][0]["segments"][0]["state"], "measured");
+    }
+
+    #[test]
+    fn a_held_account_serializes_its_reason_for_the_ui() {
+        let mut held = claude_account("a", 60.0, 90.0, 20.0);
+        held.held = Some(hold(AccountHoldKind::TermsAcceptance));
+        let json = serde_json::to_value(pool("claude", vec![held])).unwrap();
+        assert_eq!(json["accounts"][0]["state"], "blocked");
+        assert_eq!(
+            json["accounts"][0]["held"],
+            serde_json::json!({
+                "since": NOW - 30,
+                "kind": "terms_acceptance",
+                "detail": "TermsAcceptance from the provider",
+            })
+        );
     }
 }

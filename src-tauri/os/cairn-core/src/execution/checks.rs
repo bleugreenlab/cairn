@@ -6935,6 +6935,21 @@ async fn load_checks_contract_at_commit_detailed(
     .map_err(|error| CommitChecksContractError::BlockingTask(error.to_string()))?
 }
 
+/// Whether `commit` declares any check this build can run, or why that could
+/// not be read. A commit with no config, or a config with no `checks`, declares
+/// none. An unreadable or unparseable config is an error, never "none": a gate
+/// that read it as none would pass a head nobody checked.
+pub(crate) async fn checks_declared_at_commit(
+    object_repository: &Path,
+    commit: &str,
+) -> Result<bool, String> {
+    match load_checks_contract_at_commit_detailed(object_repository, commit).await {
+        Ok(contract) => Ok(!contract.contract.checks.is_empty()),
+        Err(CommitChecksContractError::Missing | CommitChecksContractError::NoChecks) => Ok(false),
+        Err(error) => Err(error.manual_diagnostic(commit)),
+    }
+}
+
 /// [`checks_contract_at_commit`] off the async caller's runtime thread. The read
 /// touches the object database, which is filesystem work.
 pub(crate) async fn load_checks_contract_at_commit(

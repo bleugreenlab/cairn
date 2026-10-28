@@ -97,6 +97,9 @@ pub fn post_systemone(
     let mut usage = None;
     loop {
         let reply = post_whole(endpoint, &body, timeout)?;
+        if let Some(exceeded) = context_exceeded(endpoint, &reply) {
+            return Err(exceeded);
+        }
         let Some((name, reason)) = refused_question(&reply, &body) else {
             let mut response = read(&reply.into_body(endpoint)?)?;
             response.usage = add_usage(usage, response.usage.take());
@@ -149,6 +152,31 @@ pub fn post_systemone(
             });
         }
     }
+}
+
+/// The error code TypeSafe documents for a request longer than the model's
+/// context (<https://docs.typesafe.ai/api/errors>), on an HTTP 400.
+const CONTEXT_EXCEEDED_CODE: &str = "max_tokens_exceeded";
+
+/// A failed POST that refused the request as longer than the model's
+/// context, as the typed error, carrying the provider's sentence and the
+/// endpoint's own statement of its limits.
+fn context_exceeded(endpoint: &DecisionsEndpoint, reply: &WholeReply) -> Option<CompletionError> {
+    if reply.status != reqwest::StatusCode::BAD_REQUEST
+        || !reply.text.contains(CONTEXT_EXCEEDED_CODE)
+    {
+        return None;
+    }
+    let mut sentence = format!(
+        "{} refused the decision as longer than the model's context ({})",
+        endpoint.provider_name,
+        upstream_error_detail(&reply.text)
+    );
+    if let Some(limits) = &endpoint.context_limits {
+        sentence.push_str(". ");
+        sentence.push_str(limits);
+    }
+    Some(CompletionError::ContextExceeded(sentence))
 }
 
 /// The question a failed POST says its model refused, with the gateway's

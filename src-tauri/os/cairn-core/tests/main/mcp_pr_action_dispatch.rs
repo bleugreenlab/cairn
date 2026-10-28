@@ -389,15 +389,16 @@ async fn unknown_or_non_string_precondition_is_refused_on_every_merge_surface() 
     );
 }
 
-/// A `cairn://` write is never a person's authority, so the landing-gate skip
-/// is refused on every merge surface, previewed or not, including with the
-/// `_cairn_origin: "cli"` marker that labels a write `operator-cli`: any caller
-/// can set it. The artifact surface takes open payload keys and refuses the
-/// skip by name, saying where the operator skips instead; the node and
-/// thread-branch surfaces declare closed key sets, so the write gate refuses
-/// the key before dispatch. Nothing reaches the merge.
+/// A `cairn://` write is never a person's authority, so no merge-gate override
+/// (a verdict waiver, a landing-gate skip) is accepted on any merge surface,
+/// previewed or not, including with the `_cairn_origin: "cli"` marker that
+/// labels a write `operator-cli`: any caller can set it. The artifact surface
+/// takes open payload keys and refuses the override by name, saying where the
+/// operator overrides instead; the node and thread-branch surfaces declare
+/// closed key sets, so the write gate refuses the key before dispatch.
+/// Nothing reaches the merge.
 #[tokio::test]
-async fn landing_gate_skip_is_refused_on_every_resource_write_surface() {
+async fn merge_gate_overrides_are_refused_on_every_resource_write_surface() {
     let (temp, db, project_id, issue_id) = pr_action_node_fixture().await;
     insert_merge_request(&db, &project_id, &issue_id).await;
     insert_pr_action_run(&db, &project_id, &issue_id).await;
@@ -405,31 +406,29 @@ async fn landing_gate_skip_is_refused_on_every_resource_write_surface() {
     let orch = orchestrator(&temp, db.clone());
 
     let [artifact, node, thread_branch] = MERGE_SURFACES;
-    for (target, refusal) in [
-        (
-            artifact,
-            "landingGateSkip is not accepted on a resource write",
-        ),
-        (node, "Unknown payload key(s)"),
-        (thread_branch, "Unknown payload key(s)"),
-    ] {
-        for preview in [true, false] {
-            for from_cli in [false, true] {
-                let mut request = write_request(
-                    target,
-                    json!({ "action": "merge", "landingGateSkip": "fleet down" }),
-                    preview,
-                );
-                if from_cli {
-                    request.payload["_cairn_origin"] = json!("cli");
+    for key in ["waiveVerdicts", "skipLandingGate", "landingGateSkip"] {
+        let artifact_refusal = format!("{key} is not accepted on a resource write");
+        for (target, refusal) in [
+            (artifact, artifact_refusal.as_str()),
+            (node, "Unknown payload key(s)"),
+            (thread_branch, "Unknown payload key(s)"),
+        ] {
+            for preview in [true, false] {
+                for from_cli in [false, true] {
+                    let mut payload = json!({ "action": "merge" });
+                    payload[key] = json!("fleet down");
+                    let mut request = write_request(target, payload, preview);
+                    if from_cli {
+                        request.payload["_cairn_origin"] = json!("cli");
+                    }
+                    let result = handle_write(&orch, &request).await;
+                    assert!(
+                        result.contains(refusal)
+                            && result.contains(key)
+                            && !result.contains("Would merge"),
+                        "{target} {key} preview={preview} cli={from_cli}: {result}"
+                    );
                 }
-                let result = handle_write(&orch, &request).await;
-                assert!(
-                    result.contains(refusal)
-                        && result.contains("landingGateSkip")
-                        && !result.contains("Would merge"),
-                    "{target} preview={preview} cli={from_cli}: {result}"
-                );
             }
         }
     }
@@ -438,7 +437,7 @@ async fn landing_gate_skip_is_refused_on_every_resource_write_surface() {
             .await
             .unwrap(),
         0,
-        "a refused skip never reaches the merge"
+        "a refused override never reaches the merge"
     );
     assert_eq!(
         db.query_text("SELECT status FROM merge_requests WHERE id = 'mr-1'", ())

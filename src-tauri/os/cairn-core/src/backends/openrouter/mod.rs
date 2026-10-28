@@ -182,6 +182,7 @@ impl AgentBackend for OpenRouterBackend {
                     backend_key: OPENROUTER_BACKEND_KEY.to_string(),
                     url: format!("{OPENROUTER_DECISIONS_BASE}/decisions"),
                     headers: http::openrouter_headers(&api_key),
+                    context_limits: None,
                 }))
             }
             wire => Err(format!("OpenRouter answers no decision over {wire}")),

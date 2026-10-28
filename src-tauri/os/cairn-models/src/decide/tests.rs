@@ -63,6 +63,7 @@ fn native_route() -> DecisionRoute {
         backend_key: "custom:acc_gateway".into(),
         url: "http://gateway/v1/decisions".into(),
         headers: vec![],
+        context_limits: None,
     })
 }
 
@@ -72,6 +73,7 @@ fn systemone_route() -> DecisionRoute {
         backend_key: "openrouter".into(),
         url: "https://openrouter.ai/api/alpha/decisions".into(),
         headers: vec![],
+        context_limits: None,
     })
 }
 

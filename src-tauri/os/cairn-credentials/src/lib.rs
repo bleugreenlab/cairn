@@ -8,6 +8,7 @@ pub mod lease;
 mod plan;
 pub mod store;
 
+pub use cairn_models_types::usage::{AccountHold, AccountHoldKind};
 pub use cairn_models_types::ApiProvider;
 pub use handle::CredentialStoreHandle;
 pub use plan::{jwt_claims, subscription_plan};
@@ -789,57 +790,6 @@ impl ProviderAuth {
     }
 }
 
-/// Why a provider refuses an account until its operator acts. Neither kind
-/// heals on a clock Cairn can see, so neither is a usage window.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AccountHoldKind {
-    /// Usage credits are exhausted, and a top-up is invisible to Cairn. The
-    /// default because every hold persisted before kinds existed was this.
-    #[default]
-    Credits,
-    /// The account's owner must accept the provider's updated Consumer Terms
-    /// (Anthropic answers every request with an HTTP 400 until they do).
-    TermsAcceptance,
-}
-
-/// A provider refusal that holds one account out of rotation until an
-/// operator acts.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct AccountHold {
-    /// Unix timestamp when the provider refused the account.
-    pub since: i64,
-    #[serde(default)]
-    pub kind: AccountHoldKind,
-    /// Non-secret provider detail suitable for operator-facing diagnostics:
-    /// the provider's own sentence where it gave one.
-    pub detail: String,
-}
-
-impl AccountHoldKind {
-    /// What stands in the way, as a clause.
-    pub fn summary(self) -> &'static str {
-        match self {
-            AccountHoldKind::Credits => "usage credits are exhausted",
-            AccountHoldKind::TermsAcceptance => {
-                "the account must accept the provider's updated Consumer Terms"
-            }
-        }
-    }
-
-    /// What the operator does to put the account back in rotation, as a
-    /// sentence. `signed_in_as` names the account the way its owner signs in.
-    pub fn operator_action(self, signed_in_as: &str) -> String {
-        match self {
-            AccountHoldKind::Credits => "Cairn cannot detect a top-up automatically; add credits, then mark the account available in Settings → Providers.".to_string(),
-            AccountHoldKind::TermsAcceptance => format!(
-                "Accept the updated Consumer Terms at claude.ai signed in as {signed_in_as}, then refresh this provider's usage (or mark the account available in Settings → Providers) to try it again."
-            ),
-        }
-    }
-}
-
 /// Persisted availability and subscription usage for one provider account.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -1011,6 +961,9 @@ impl ProviderAccount {
             (ApiProvider::Google, ProviderAuth::ApiKey { .. }) => vec!["native"],
             (ApiProvider::OpenRouter, ProviderAuth::ApiKey { .. }) => vec!["openrouter"],
             (ApiProvider::OpenCode, ProviderAuth::ApiKey { .. }) => vec!["opencode-go"],
+            (ApiProvider::TypeSafe, ProviderAuth::ApiKey { .. }) => {
+                vec![cairn_models_types::catalog::TYPESAFE_BACKEND_KEY]
+            }
             (ApiProvider::Ollama, ProviderAuth::BaseUrl { .. }) => vec!["ollama"],
             (ApiProvider::Actual, ProviderAuth::ActualTarget { .. }) => vec!["actual"],
             (ApiProvider::GitHub, ProviderAuth::ApiKey { .. }) => vec![],
@@ -1021,6 +974,8 @@ impl ProviderAccount {
             (ApiProvider::OpenRouter, ProviderAuth::OAuthToken { .. }) => vec![],
             // OpenCode Zen issues API keys from its console; there is no OAuth.
             (ApiProvider::OpenCode, ProviderAuth::OAuthToken { .. }) => vec![],
+            // TypeSafe issues API keys from its console; there is no OAuth.
+            (ApiProvider::TypeSafe, ProviderAuth::OAuthToken { .. }) => vec![],
             (ApiProvider::GitHub, ProviderAuth::OAuthToken { .. }) => vec![],
             // A Cairn-managed profile is the only subscription credential the
             // Claude backend accepts. A pasted `claude setup-token` value
@@ -3515,6 +3470,7 @@ mod tests {
                 ApiProvider::Google,
                 ApiProvider::OpenRouter,
                 ApiProvider::OpenCode,
+                ApiProvider::TypeSafe,
                 ApiProvider::Ollama,
                 ApiProvider::Actual,
                 ApiProvider::GitHub,
@@ -3536,6 +3492,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ApiProvider>(r#""opencode""#).unwrap(),
             ApiProvider::OpenCode
+        );
+        assert_eq!(
+            serde_json::from_str::<ApiProvider>(r#""typesafe""#).unwrap(),
+            ApiProvider::TypeSafe
         );
         assert_eq!(
             serde_json::from_str::<ApiProvider>(r#""openai""#).unwrap(),

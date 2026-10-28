@@ -111,9 +111,10 @@ pub struct DecisionCall<'a> {
 /// The fixes every no-offer refusal of a decision names.
 pub const DECISION_FIXES: &str =
     "A decision is answered by a decision model or by a local model's \
-logprobs, never by a chat model reporting its own probabilities. To fix it, add an OpenRouter API \
-key in Settings → Providers (its decision models, such as TypeSafe's Jev, answer over System \
-One), or add a custom provider there: either an OpenAI Decisions API key (https://api.openai.com/v1) \
+logprobs, never by a chat model reporting its own probabilities. To fix it, add a TypeSafe API \
+key in Settings → Providers (its Jev models answer over System One), or an OpenRouter API key \
+(its decision models, TypeSafe's Jev among them, answer the same way), or add a custom provider \
+there: either an OpenAI Decisions API key (https://api.openai.com/v1) \
 with the protocol set to Decisions, or an OpenAI-compatible server that returns logprobs (for \
 example vLLM) with the protocol set to OpenAI chat.";
 
@@ -183,6 +184,14 @@ impl DecideError {
             }
             _ => None,
         }
+    }
+
+    /// Whether only a different request can be answered: the provider
+    /// refused this one as asked (longer than the model's context), so
+    /// asking it again, or asking it later, cannot succeed. It says nothing
+    /// about the model, which still answers shorter requests.
+    pub fn refuses_the_request(&self) -> bool {
+        matches!(self, Self::Completion(CompletionError::ContextExceeded(_)))
     }
 }
 

@@ -565,10 +565,10 @@ mod tests {
             // forwards its arguments and returns the runner's payload, like
             // `permission.rs`.
             "src-tauri/src/commands/fleet.rs",
-            // The landing-gate skip proxy: main-webview only, local runner
-            // only, forwards its arguments and returns the runner's payload,
-            // like `fleet.rs`.
-            "src-tauri/src/commands/landing_gate.rs",
+            // The operator's merge-gate override proxy: main-webview only,
+            // local runner only, forwards its arguments and returns the
+            // runner's payload, like `fleet.rs`.
+            "src-tauri/src/commands/operator_merge.rs",
             // The channel agent-text grant: main-webview only, local runner
             // only — channel bindings belong to this desktop's own runner, so
             // it never routes to a peer. Forwards one runner command with its

@@ -3287,6 +3287,10 @@ impl Orchestrator {
                 .and_then(|catalog| catalog.get(backend_name).map(|entry| entry.models.clone()))
                 .unwrap_or_default();
             crate::backends::openrouter::discover_catalog_blocking(&previous)
+        } else if backend_name == crate::backends::typesafe::TYPESAFE_BACKEND_KEY {
+            // The declared models need the workspace's key, and the listing
+            // that confirms it is authenticated.
+            crate::backends::typesafe::discover_catalog_blocking(self)
         } else {
             match backend.discover_models() {
                 Ok(models) => (models, None),
@@ -3436,6 +3440,8 @@ mod detach_tests;
 
 #[cfg(test)]
 pub(crate) mod launch_coverage_tests;
+#[cfg(test)]
+mod typesafe_tests;
 
 #[cfg(test)]
 mod tests {

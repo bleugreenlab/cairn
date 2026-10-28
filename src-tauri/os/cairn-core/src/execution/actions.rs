@@ -1202,7 +1202,7 @@ async fn handle_merge_pr(
             action_run.id.clone(),
         )),
         None,
-        None,
+        crate::pr_data::actions::OperatorOverrides::default(),
     )
     .await?;
     Ok(Some(serde_json::json!({ "merged": true })))

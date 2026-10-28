@@ -5,8 +5,10 @@
 //! record and hand back inert sessions, and a host that spawns nothing. Each
 //! provider in the shipped catalog, plus a custom one, is then launched
 //! through the ordinary `backend_for_name(key).start_session` path, and the
-//! recorder must have seen it. A provider added to the catalog without an
-//! adapter here fails, because `plan` has no answer for it.
+//! recorder must have seen it. A provider that answers decisions only
+//! (TypeSafe) has its session launch refused and a decision asked instead. A
+//! provider added to the catalog without an adapter here fails, because
+//! `plan` has no answer for it.
 
 use std::io::Read;
 use std::sync::{Arc, Condvar, Mutex};
@@ -48,6 +50,7 @@ const CLAUDE_KEY: &str = "sk-ant-coverage-claude-key";
 const CODEX_KEY: &str = "sk-coverage-codex-key";
 const OPENROUTER_KEY: &str = "sk-or-coverage-key";
 const OPENCODE_KEY: &str = "sk-oc-coverage-key";
+const TYPESAFE_KEY: &str = "ts-coverage-key";
 const WAIT: Duration = Duration::from_secs(20);
 
 /// Everything the fakes saw, and the gate that holds an HTTP turn open.
@@ -508,6 +511,9 @@ struct Plan {
     one_shot: Option<String>,
     /// Whether the session has a warm writer to send to and interrupt.
     warm: Option<&'static str>,
+    /// For a provider that answers decisions only: the call a decision must
+    /// make. Its session launch must be refused instead.
+    decide: Option<String>,
 }
 
 fn plan(key: &str) -> Plan {
@@ -516,6 +522,7 @@ fn plan(key: &str) -> Plan {
         launch: vec![format!("complete:chat:{key}:stream")],
         one_shot: Some(format!("complete:chat:{key}:whole")),
         warm: None,
+        decide: None,
     };
     match key {
         "claude" => Plan {
@@ -527,6 +534,7 @@ fn plan(key: &str) -> Plan {
             ],
             one_shot: None,
             warm: Some("claude"),
+            decide: None,
         },
         "codex" => Plan {
             model: "gpt-coverage",
@@ -539,9 +547,17 @@ fn plan(key: &str) -> Plan {
             ],
             one_shot: None,
             warm: Some("codex"),
+            decide: None,
         },
         "openrouter" => http("openai/gpt-coverage", key),
         "opencode-go" => http("glm-coverage", key),
+        "typesafe" => Plan {
+            model: "jev-1.14.0",
+            launch: Vec::new(),
+            one_shot: None,
+            warm: None,
+            decide: Some(format!("complete:systemone:{key}:whole")),
+        },
         "ollama" => http("qwen3:32b", key),
         "actual" => http("coverage-model", key),
         custom if custom.starts_with(CUSTOM_KEY_PREFIX) => http("qwen3.8-27b", custom),
@@ -577,6 +593,13 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
             },
         ),
         (
+            ApiProvider::TypeSafe,
+            "TypeSafe",
+            ProviderAuth::ApiKey {
+                value: TYPESAFE_KEY.into(),
+            },
+        ),
+        (
             ApiProvider::Ollama,
             "Ollama box",
             ProviderAuth::BaseUrl {
@@ -597,6 +620,14 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
         orch.add_account(provider, label.into(), auth, None)
             .unwrap();
     }
+    // A decision offer is selected among installed providers only.
+    let mut enabled = orch.enabled_providers();
+    enabled.push("typesafe".to_string());
+    orch.update_settings(crate::models::UpdateSettings {
+        enabled_providers: Some(enabled),
+        ..Default::default()
+    })
+    .unwrap();
     let mut glm = claude_models().remove(0);
     glm.id = "glm-coverage".into();
     glm.model = "glm-coverage".into();
@@ -607,6 +638,17 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
         ProviderModelCatalog {
             backend: "opencode-go".to_string(),
             models: vec![glm],
+            options: Vec::new(),
+            refreshed_at: Some(1),
+            error: None,
+        },
+    );
+    // What a keyed TypeSafe refresh always carries.
+    orch.model_catalog.write().unwrap().insert(
+        "typesafe".to_string(),
+        ProviderModelCatalog {
+            backend: "typesafe".to_string(),
+            models: crate::backends::typesafe::declared_models(),
             options: Vec::new(),
             refreshed_at: Some(1),
             error: None,
@@ -744,6 +786,39 @@ async fn every_catalog_provider_launches_through_the_facet() {
         let plan = plan(key);
         let run_id = format!("run-{key}");
         let session_id = format!("session-{key}");
+
+        if let Some(call) = &plan.decide {
+            // No session to launch: the door refuses it, and a decision
+            // reaches Complete over the wire the catalog declares (checked
+            // with the other launches below).
+            let backend = backend_for_name(Some(key));
+            let (launch_orch, launch_config, launch_key) = (
+                orch.clone(),
+                config(&run_id, &session_id, plan.model, false),
+                key.clone(),
+            );
+            let refused = tokio::task::spawn_blocking(move || {
+                launch::start_session(&launch_orch, &launch_key, backend.as_ref(), launch_config)
+            })
+            .await
+            .unwrap();
+            assert!(refused.is_err(), "{key} launched a session it cannot serve");
+            let request = serde_json::from_value(json!({
+                "model": format!("{key}/{}", plan.model),
+                "input": "hi",
+                "questions": [{"name": "greeting", "type": "predicate",
+                               "instructions": "Is this a greeting?"}],
+            }))
+            .unwrap();
+            let failed = orch.decide_named(None, request).await.unwrap_err();
+            assert!(
+                failed.to_string().contains("recorded, not sent"),
+                "{key}: {failed}"
+            );
+            assert!(recorder.saw(call), "{key} decision did not reach Complete");
+            continue;
+        }
+
         seed_run(&orch, &run_id, &session_id).await;
         let backend = backend_for_name(Some(key));
         let (launch_orch, launch_config, launch_key) = (
@@ -832,7 +907,9 @@ async fn every_catalog_provider_launches_through_the_facet() {
             .clone();
         provider.models = discovered.get(&key).cloned();
         provider.serves = orch.provider_serves(&key, None);
-        let verb = if delivery == "stream" {
+        let verb = if plan(&key).decide.is_some() {
+            VerbKind::Decide
+        } else if delivery == "stream" {
             VerbKind::Session
         } else {
             VerbKind::Complete
@@ -897,7 +974,13 @@ async fn every_catalog_provider_launches_through_the_facet() {
 
     // Secrets reached the providers (checked above) and nothing stored.
     let stored = stored_text(&orch).await;
-    for secret in [CLAUDE_KEY, CODEX_KEY, OPENROUTER_KEY, OPENCODE_KEY] {
+    for secret in [
+        CLAUDE_KEY,
+        CODEX_KEY,
+        OPENROUTER_KEY,
+        OPENCODE_KEY,
+        TYPESAFE_KEY,
+    ] {
         assert!(!stored.contains(secret), "{secret} reached a stored row");
     }
 }
@@ -1337,7 +1420,10 @@ async fn a_terms_refused_claude_one_shot_is_served_on_the_next_account() {
         .await
         .expect("the healthy account answers");
     assert_eq!(served.account_id.as_deref(), Some(healthy.as_str()));
-    assert!(recorder.saw("claude:refused"), "the fresh account was tried first");
+    assert!(
+        recorder.saw("claude:refused"),
+        "the fresh account was tried first"
+    );
     assert!(terms_hold(&orch, &fresh).is_some());
     assert!(terms_hold(&orch, &healthy).is_none());
 
@@ -1346,7 +1432,10 @@ async fn a_terms_refused_claude_one_shot_is_served_on_the_next_account() {
         .await
         .expect("the healthy account answers again");
     assert_eq!(again.account_id.as_deref(), Some(healthy.as_str()));
-    assert!(!recorder.saw("claude:refused"), "routing skipped the held account");
+    assert!(
+        !recorder.saw("claude:refused"),
+        "routing skipped the held account"
+    );
     recorder.release();
 }
 

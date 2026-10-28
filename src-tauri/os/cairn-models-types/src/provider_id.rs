@@ -22,6 +22,10 @@ pub enum ApiProvider {
     /// account and the backend is named for the subscription.
     #[serde(rename = "opencode", alias = "open_code")]
     OpenCode,
+    /// TypeSafe's API (Jev). Its key reaches System One, which answers
+    /// decisions only, so the one backend it serves has no agents or responses.
+    #[serde(rename = "typesafe")]
+    TypeSafe,
     /// Ollama APIs
     #[serde(rename = "ollama")]
     Ollama,
@@ -60,6 +64,7 @@ impl ApiProvider {
             ApiProvider::Google => "google",
             ApiProvider::OpenRouter => "openrouter",
             ApiProvider::OpenCode => "opencode",
+            ApiProvider::TypeSafe => "typesafe",
             ApiProvider::Ollama => "ollama",
             ApiProvider::Actual => "actual",
             ApiProvider::GitHub => "github",
@@ -76,6 +81,7 @@ impl ApiProvider {
             ApiProvider::Google,
             ApiProvider::OpenRouter,
             ApiProvider::OpenCode,
+            ApiProvider::TypeSafe,
             ApiProvider::Ollama,
             ApiProvider::Actual,
             ApiProvider::GitHub,
@@ -93,6 +99,7 @@ impl std::fmt::Display for ApiProvider {
             ApiProvider::Google => write!(f, "Google"),
             ApiProvider::OpenRouter => write!(f, "OpenRouter"),
             ApiProvider::OpenCode => write!(f, "OpenCode"),
+            ApiProvider::TypeSafe => write!(f, "TypeSafe"),
             ApiProvider::Ollama => write!(f, "Ollama"),
             ApiProvider::Actual => write!(f, "Actual"),
             ApiProvider::GitHub => write!(f, "GitHub"),

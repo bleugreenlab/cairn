@@ -1087,6 +1087,7 @@ mod tests {
             backend_key: "openrouter".into(),
             url: format!("{}/decisions", super::super::OPENROUTER_DECISIONS_BASE),
             headers: super::super::http::openrouter_headers(&api_key),
+            context_limits: None,
         });
         let option = |value: &str, description: &str| DecisionOption {
             value: value.into(),

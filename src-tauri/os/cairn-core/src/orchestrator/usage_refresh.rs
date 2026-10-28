@@ -80,6 +80,13 @@ pub fn unsupported_usage_snapshot(backend: &str) -> ProviderUsageSnapshot {
             "actual_usage",
             "Inference runs on hardware you own, so Actual reports no token budget or cost.",
         ),
+        // TypeSafe publishes no usage or balance endpoint; each decision
+        // reports its own input tokens instead.
+        "typesafe" => ProviderUsageSnapshot::unsupported(
+            "typesafe",
+            "typesafe_usage",
+            "TypeSafe reports no balance or usage window; each decision reports the input tokens it billed.",
+        ),
         other => ProviderUsageSnapshot::unsupported(
             other,
             "unsupported_provider_usage",

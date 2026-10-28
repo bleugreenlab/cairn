@@ -283,6 +283,7 @@ fn endpoint(url: String) -> DecisionsEndpoint {
             ("content-type".into(), "application/json".into()),
             ("authorization".into(), "Bearer sk-test".into()),
         ],
+        context_limits: None,
     }
 }
 

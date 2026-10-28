@@ -736,11 +736,36 @@ pub(crate) async fn head_verdicts(
     head_commit: &str,
     required: &[RequiredVerdict],
 ) -> Result<Vec<CollectedVerdict>, String> {
-    let keys = (
-        project_id.to_string(),
-        head_commit.to_string(),
-        required.to_vec(),
-    );
+    let mut checks: Vec<String> = required.iter().map(|r| r.check.clone()).collect();
+    checks.sort();
+    checks.dedup();
+    let recorded = commit_verdicts(db, project_id, head_commit, &checks).await?;
+    Ok(required
+        .iter()
+        .filter_map(|RequiredVerdict { check, platform }| {
+            recorded
+                .iter()
+                .find(|verdict| &verdict.check == check && &verdict.platform == platform)
+                .cloned()
+        })
+        .collect())
+}
+
+/// Every verdict recorded AT `commit` for each of `checks`, newest first within
+/// a check, from any machine and any cadence (a lane, a manual whole-suite
+/// run, a reuse aliased to this commit).
+///
+/// The one reader of "what was recorded at this commit": the `pinBump`
+/// precondition takes the newest per platform from it, and the verdict
+/// existence gate asks whether any of them is a complete verdict. A row whose
+/// observation names no platform reads with an empty one.
+pub(crate) async fn commit_verdicts(
+    db: &LocalDb,
+    project_id: &str,
+    commit: &str,
+    checks: &[String],
+) -> Result<Vec<CollectedVerdict>, String> {
+    let keys = (project_id.to_string(), commit.to_string(), checks.to_vec());
     let sql = format!(
         "SELECT a.check_name, o.verdict_platform, a.commit_sha, o.id, a.disposition,
                 o.verdict, o.failure_kind, c.target_results_json
@@ -749,44 +774,36 @@ pub(crate) async fn head_verdicts(
            LEFT JOIN check_result_cache c
              ON c.source_observation_id = o.id AND {}
           WHERE a.project_id = ?1 AND a.commit_sha = ?2 AND a.check_name = ?3
-            AND o.verdict_platform = ?4
-          ORDER BY a.evaluated_at DESC, o.ran_at DESC, o.rowid DESC
-          LIMIT 1",
+          ORDER BY a.evaluated_at DESC, o.ran_at DESC, o.rowid DESC",
         crate::execution::cache::verdict_row_predicate("c.row_family"),
     );
     db.read(|conn| {
         let keys = keys.clone();
         let sql = sql.clone();
         Box::pin(async move {
-            let (project_id, head_commit, required) = keys;
+            let (project_id, commit, checks) = keys;
             let mut verdicts = Vec::new();
-            for RequiredVerdict { check, platform } in &required {
+            for check in &checks {
                 let mut rows = conn
                     .query(
                         &sql,
-                        params![
-                            project_id.as_str(),
-                            head_commit.as_str(),
-                            check.as_str(),
-                            platform.as_str()
-                        ],
+                        params![project_id.as_str(), commit.as_str(), check.as_str()],
                     )
                     .await?;
-                let Some(row) = rows.next().await? else {
-                    continue;
-                };
-                verdicts.push(CollectedVerdict {
-                    check: row.text(0)?,
-                    platform: row.text(1)?,
-                    commit_sha: row.text(2)?,
-                    observation_id: row.text(3)?,
-                    disposition: row.text(4)?,
-                    passed: row.text(5)? == "passed",
-                    failure_kind: row.opt_text(6)?,
-                    parsed: row
-                        .opt_text(7)?
-                        .and_then(|json| serde_json::from_str::<ParsedCheckResult>(&json).ok()),
-                });
+                while let Some(row) = rows.next().await? {
+                    verdicts.push(CollectedVerdict {
+                        check: row.text(0)?,
+                        platform: row.opt_text(1)?.unwrap_or_default(),
+                        commit_sha: row.text(2)?,
+                        observation_id: row.text(3)?,
+                        disposition: row.text(4)?,
+                        passed: row.text(5)? == "passed",
+                        failure_kind: row.opt_text(6)?,
+                        parsed: row
+                            .opt_text(7)?
+                            .and_then(|json| serde_json::from_str::<ParsedCheckResult>(&json).ok()),
+                    });
+                }
             }
             Ok(verdicts)
         })

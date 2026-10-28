@@ -37,6 +37,7 @@ pub mod openrouter;
 mod run_state;
 pub(crate) use run_state::is_task_spawned_run;
 pub mod stdin;
+pub mod typesafe;
 pub(crate) mod workflow;
 
 #[cfg(feature = "test-utils")]
@@ -383,6 +384,7 @@ pub(crate) fn backend_for_name(name: Option<&str>) -> Box<dyn AgentBackend> {
         Some("codex") => Box::new(codex::CodexBackend),
         Some("openrouter") => Box::new(openrouter::OpenRouterBackend),
         Some(opencode::OPENCODE_BACKEND_KEY) => Box::new(opencode::OpenCodeBackend),
+        Some(typesafe::TYPESAFE_BACKEND_KEY) => Box::new(typesafe::TypeSafeBackend),
         Some("ollama") => Box::new(ollama::OllamaBackend),
         Some(actual::ACTUAL_BACKEND_KEY) => Box::new(actual::ActualBackend),
         // A custom provider's key names the account that defines it. Resolving

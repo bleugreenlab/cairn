@@ -268,7 +268,7 @@ pub(super) async fn dispatch(
                                 .map(str::to_string),
                             attribution,
                             precondition,
-                            None,
+                            crate::pr_data::actions::OperatorOverrides::default(),
                         )
                         .await
                     } else {

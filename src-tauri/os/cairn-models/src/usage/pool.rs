@@ -102,6 +102,7 @@ pub fn provider_usage_pool(
             // Health is the only writer of blocks, so it is the only reader of
             // them too.
             blocked_until: health.and_then(|health| health.blocked_until),
+            held: health.and_then(|health| health.held.clone()),
             error: snapshot.and_then(|s| s.error.clone()),
             error_kind: snapshot.and_then(|s| s.error_kind),
             // Reset credits live only in the live snapshot; health does not
@@ -118,4 +119,90 @@ pub fn provider_usage_pool(
         unsupported_reason.or_else(|| shared.as_ref().and_then(|s| s.unsupported_reason.clone())),
         now,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_credentials::{
+        AccountHold, AccountHoldKind, AccountSource, ApiProvider, ProviderAccount,
+        ProviderAccountHealth, ProviderAuth,
+    };
+    use cairn_models_types::pool::{ProviderPoolAccountState, ProviderPoolSegmentState};
+    use cairn_models_types::usage::{ProviderUsageScope, ProviderUsageWindow};
+
+    const NOW: i64 = 10_000;
+
+    fn claude_account(id: &str, held: Option<AccountHold>) -> ProviderAccount {
+        ProviderAccount {
+            id: id.to_string(),
+            label: id.to_string(),
+            api_provider: ApiProvider::Anthropic,
+            source: AccountSource::Configured,
+            auth: ProviderAuth::ClaudeProfile { oauth: None },
+            project_id: None,
+            sort_order: 0,
+            created_at: 0,
+            last_used_at: None,
+            email: Some(format!("{id}@example.com")),
+            plan: None,
+            plan_choice: None,
+            health: Some(ProviderAccountHealth {
+                windows: vec![ProviderUsageWindow {
+                    id: "session".to_string(),
+                    label: "Session".to_string(),
+                    scope: ProviderUsageScope::Session,
+                    scope_target: None,
+                    used_percent: 10.0,
+                    remaining_percent: 90.0,
+                    resets_at: Some(NOW + 3_600),
+                    reset_at_text: None,
+                    window_duration_mins: None,
+                }],
+                blocked_until: None,
+                blocked_until_declared: false,
+                held,
+                captured_at: NOW - 60,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_hold_in_persisted_health_reaches_the_pool() {
+        let hold = AccountHold {
+            since: NOW - 30,
+            kind: AccountHoldKind::TermsAcceptance,
+            detail: "Please accept the updated Consumer Terms.".to_string(),
+        };
+        let store = CredentialStore {
+            user_id: "u".to_string(),
+            accounts: vec![
+                claude_account("open", None),
+                claude_account("held", Some(hold.clone())),
+            ],
+            git_identities: Vec::new(),
+            project_overrides: Default::default(),
+            retired_logins: Vec::new(),
+            config_dir: std::path::PathBuf::from("/test-config-root"),
+        };
+
+        let pool = provider_usage_pool(&UsageBook::new(), Some(&store), "claude", None, NOW);
+
+        let held = pool
+            .accounts
+            .iter()
+            .find(|account| account.account_id == "held")
+            .expect("held account is in the pool");
+        assert_eq!(held.held, Some(hold));
+        assert_eq!(held.state, ProviderPoolAccountState::Blocked);
+        let session = &pool.families[0];
+        let segment = session
+            .segments
+            .iter()
+            .find(|segment| segment.account_id == "held")
+            .unwrap();
+        assert_eq!(segment.state, ProviderPoolSegmentState::Blocked);
+        // 90% headroom on each account, and only the open one's is capacity.
+        assert_eq!(session.remaining_percent, 90.0);
+    }
 }

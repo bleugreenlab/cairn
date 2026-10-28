@@ -154,6 +154,18 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         keywords: &["opencode", "zen", "go", "deepseek", "kimi", "glm"],
     },
     ProviderDescriptor {
+        key: Cow::Borrowed(TYPESAFE_BACKEND_KEY),
+        display_name: Cow::Borrowed("TypeSafe"),
+        category: ProviderCategory::Api,
+        api_provider: ApiProvider::TypeSafe,
+        summary: "TypeSafe's Jev decision models, answering typed questions with calibrated probabilities on a metered API key. Decisions only: no agents or responses.",
+        setup_action: "Add API key",
+        setup_requirement: "Add a TypeSafe API key.",
+        catalog_driven: false,
+        supports_mcp_install: false,
+        keywords: &["typesafe", "jev", "decisions", "system one"],
+    },
+    ProviderDescriptor {
         key: Cow::Borrowed("ollama"),
         display_name: Cow::Borrowed("Ollama"),
         category: ProviderCategory::Local,
@@ -369,6 +381,7 @@ where
 }
 
 pub const OPENCODE_BACKEND_KEY: &str = "opencode-go";
+pub const TYPESAFE_BACKEND_KEY: &str = "typesafe";
 pub const ACTUAL_BACKEND_KEY: &str = "actual";
 pub const CLAUDE_FAMILY_BACKEND: &str = "claude";
 /// The persisted backend key of a Codex session.
