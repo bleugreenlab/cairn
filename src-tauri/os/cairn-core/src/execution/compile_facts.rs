@@ -122,7 +122,10 @@ pub(crate) async fn record_compile_fact(
         .failure
         .as_ref()
         .map(|failure| serde_json::to_string(&signature(failure)).unwrap_or_default());
-    let first = fact.failure.as_ref().and_then(|failure| failure.first_failed().cloned());
+    let first = fact
+        .failure
+        .as_ref()
+        .and_then(|failure| failure.first_failed().cloned());
     let row_id = id.clone();
     db.write(move |conn| {
         let fact = fact.clone();
@@ -175,9 +178,9 @@ pub(crate) fn record_compile_fact_blocking(
     db: Arc<LocalDb>,
     fact: CompileFactWrite,
 ) -> Result<String, String> {
-    crate::execution::cache::run_checkpoint_cache_db(async move {
-        record_compile_fact(&db, fact).await
-    })
+    crate::execution::cache::run_checkpoint_cache_db(
+        async move { record_compile_fact(&db, fact).await },
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,7 +197,9 @@ pub(crate) struct CompileFact {
 const FACT_COLUMNS: &str =
     "id, tree_commit, base_commit, check_name, outcome, diagnostic_tail, source";
 
-fn fact_from_row(row: &cairn_db::turso::Row) -> Result<Option<CompileFact>, crate::storage::DbError> {
+fn fact_from_row(
+    row: &cairn_db::turso::Row,
+) -> Result<Option<CompileFact>, crate::storage::DbError> {
     let outcome = row.text(4)?;
     let Some(outcome) = CompileOutcome::parse(&outcome) else {
         return Ok(None);
@@ -384,10 +389,12 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(builds_fact_for_tree(&db, "project", "tree-a", "cargo check -p one")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            builds_fact_for_tree(&db, "project", "tree-a", "cargo check -p one")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A gate that could not run is not evidence either way, so it neither
@@ -398,14 +405,20 @@ mod tests {
         record_compile_fact(&db, write(CompileOutcome::NotRun, "tree-a", None))
             .await
             .unwrap();
-        assert!(verdict_for_tree(&db, "project", "tree-a").await.unwrap().is_none());
+        assert!(verdict_for_tree(&db, "project", "tree-a")
+            .await
+            .unwrap()
+            .is_none());
         record_compile_fact(&db, write(CompileOutcome::DoesNotBuild, "tree-a", None))
             .await
             .unwrap();
         record_compile_fact(&db, write(CompileOutcome::NotRun, "tree-a", None))
             .await
             .unwrap();
-        let verdict = verdict_for_tree(&db, "project", "tree-a").await.unwrap().unwrap();
+        let verdict = verdict_for_tree(&db, "project", "tree-a")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(verdict.outcome, CompileOutcome::DoesNotBuild);
     }
 
@@ -431,16 +444,23 @@ mod tests {
             r#"[{"code":"E0425","path":"os/cairn-models/src/auth.rs","line":12}]|cairn-models|lib"#
         );
         let refusal = db
-            .read(|conn| Box::pin(async move { Ok(landing_refusal_for_head(conn, "head-1").await) }))
+            .read(|conn| {
+                Box::pin(async move { Ok(landing_refusal_for_head(conn, "head-1").await) })
+            })
             .await
             .unwrap()
             .expect("the head's newest judgement is a red");
         let rendered = render_landing_refusal(&refusal, "agent/x", "main");
         assert!(
-            rendered.starts_with("Mergeable: CONFLICTING (the merge result onto `main` at base does not compile"),
+            rendered.starts_with(
+                "Mergeable: CONFLICTING (the merge result onto `main` at base does not compile"
+            ),
             "{rendered}"
         );
-        assert!(rendered.contains("Rebase `agent/x` onto current `main`"), "{rendered}");
+        assert!(
+            rendered.contains("Rebase `agent/x` onto current `main`"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("- os/cairn-models/src/auth.rs:12:5: error[E0425]"),
             "{rendered}"
@@ -450,9 +470,14 @@ mod tests {
             .await
             .unwrap();
         let cleared = db
-            .read(|conn| Box::pin(async move { Ok(landing_refusal_for_head(conn, "head-1").await) }))
+            .read(|conn| {
+                Box::pin(async move { Ok(landing_refusal_for_head(conn, "head-1").await) })
+            })
             .await
             .unwrap();
-        assert!(cleared.is_none(), "a later green judgement of the head clears it");
+        assert!(
+            cleared.is_none(),
+            "a later green judgement of the head clears it"
+        );
     }
 }

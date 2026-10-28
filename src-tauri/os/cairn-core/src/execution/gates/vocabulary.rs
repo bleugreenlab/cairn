@@ -1468,7 +1468,11 @@ impl GateFact for CompilesFact {
 
     fn validate(&self, clause: &TriggerClause) -> Result<(), String> {
         compiles_project(clause)?;
-        if clause_str(clause, "ref").unwrap_or_default().trim().is_empty() {
+        if clause_str(clause, "ref")
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
             return Err("compiles needs a 'ref' naming a branch or commit".into());
         }
         Ok(())
@@ -1487,13 +1491,15 @@ impl GateFact for CompilesFact {
         let db = ctx.orch().db.for_project(&project).await;
         // An unknown project or a ref that does not resolve is an absence of
         // evidence, never a failure: level resolution must be total.
-        let Some((project_id, tree_hash)) = compiles_coordinate(ctx, &db, &project, &reference).await
+        let Some((project_id, tree_hash)) =
+            compiles_coordinate(ctx, &db, &project, &reference).await
         else {
             return Ok(GateOutcome::NoEvidence);
         };
-        let verdict = crate::execution::compile_facts::verdict_for_tree(&db, &project_id, &tree_hash)
-            .await
-            .map_err(DbError::internal)?;
+        let verdict =
+            crate::execution::compile_facts::verdict_for_tree(&db, &project_id, &tree_hash)
+                .await
+                .map_err(DbError::internal)?;
         Ok(match verdict.map(|fact| fact.outcome) {
             Some(crate::execution::compile_facts::CompileOutcome::Builds) => GateOutcome::Satisfied,
             Some(_) => GateOutcome::Refuted,

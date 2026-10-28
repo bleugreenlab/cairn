@@ -82,9 +82,7 @@ pub fn parse_landing_gate_skip(
 /// artifact merge surface, whose payload keys are open; the node and
 /// thread-branch surfaces declare closed key sets, so the write gate refuses
 /// the key there before dispatch.
-pub fn refuse_landing_gate_skip_on_write(
-    value: Option<&serde_json::Value>,
-) -> Result<(), String> {
+pub fn refuse_landing_gate_skip_on_write(value: Option<&serde_json::Value>) -> Result<(), String> {
     if value.is_none() {
         return Ok(());
     }
@@ -269,8 +267,13 @@ pub(super) async fn gate_default_landing(
             prospective_default_landing(orch, merge_context, method).await?
         };
         let landing = landing_commands_at(Path::new(repository), &prospective.commit_id).await;
-        let judgement = if reused_green(db, &merge_context.project_id, &prospective.tree_hash, &landing)
-            .await
+        let judgement = if reused_green(
+            db,
+            &merge_context.project_id,
+            &prospective.tree_hash,
+            &landing,
+        )
+        .await
         {
             log::info!(
                 "landing gate[{job_id}]: the merge result of `{source}` ({}) already has a \
@@ -441,9 +444,12 @@ async fn record_landing_facts(
             platform: machine
                 .as_ref()
                 .and_then(|machine| machine.verdict_platform.clone()),
-            executor_id: machine
-                .and_then(|machine| machine.executor_id)
-                .or_else(|| outcome.recorded.as_ref().and_then(|r| r.executor_id.clone())),
+            executor_id: machine.and_then(|machine| machine.executor_id).or_else(|| {
+                outcome
+                    .recorded
+                    .as_ref()
+                    .and_then(|r| r.executor_id.clone())
+            }),
             scope: landing
                 .get(&outcome.name)
                 .cloned()
@@ -453,7 +459,10 @@ async fn record_landing_facts(
             failure,
             diagnostic_tail,
             source: CompileSource::LandingGate,
-            observation_id: outcome.recorded.as_ref().map(|recorded| recorded.id.clone()),
+            observation_id: outcome
+                .recorded
+                .as_ref()
+                .map(|recorded| recorded.id.clone()),
         };
         if let Err(error) = record_compile_fact(db, fact).await {
             log::warn!("landing gate: {error}");
@@ -752,7 +761,10 @@ error: could not compile `cairn-core` (lib) due to 1 previous error
             serde_json::json!(false),
         ] {
             let refusal = refuse_landing_gate_skip_on_write(Some(&value)).unwrap_err();
-            assert!(refusal.contains("merge_pr_skipping_landing_gate"), "{refusal}");
+            assert!(
+                refusal.contains("merge_pr_skipping_landing_gate"),
+                "{refusal}"
+            );
         }
     }
 

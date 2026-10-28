@@ -8634,7 +8634,10 @@ where
                             failure: Some(failure.clone()),
                             diagnostic_tail: Some(failure.render()),
                             source,
-                            observation_id: outcome.recorded.as_ref().map(|recorded| recorded.id.clone()),
+                            observation_id: outcome
+                                .recorded
+                                .as_ref()
+                                .map(|recorded| recorded.id.clone()),
                         };
                         if let Err(error) = record_compile_fact_blocking(db.clone(), fact) {
                             log::warn!("check {}: {error}", plan.name);

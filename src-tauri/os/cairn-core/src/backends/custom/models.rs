@@ -19,6 +19,11 @@
 //! Nothing is inferred from the id, which on a custom endpoint is often the
 //! operator's alias (`embed`, `big`).
 //!
+//! An entry may also say what it stands for: vLLM's `root` names the model it
+//! loaded, and bgllm's alias entries name their target in `alias_of`. That
+//! upstream identity, not the id, is what a model's tokenizer and embedding
+//! family are looked up by, so an alias embeds exactly as its target does.
+//!
 //! Embedding models the operator declared ride on top of either shape: a
 //! listed id they name serves `embed` (and only `embed`) at the declared
 //! width, and one the listing did not name is added. Because they are the
@@ -57,6 +62,11 @@ struct ModelEntry {
     /// was started from one (a local path otherwise, which pins nothing).
     #[serde(default)]
     root: Option<String>,
+    /// bgllm's alias entries name the id they stand for here (`embed` for
+    /// `qwen/qwen3-embedding-4b`): the same statement `root` makes, from a
+    /// server that serves aliases rather than renamed models.
+    #[serde(default)]
+    alias_of: Option<String>,
     /// What the model takes and gives, on servers that say (OpenRouter's
     /// shape; the plain OpenAI listing has no such field).
     #[serde(default)]
@@ -74,28 +84,68 @@ pub(crate) fn discover_blocking(
     if config.protocol.is_speech() {
         return discover_speech(config);
     }
-    let (mut models, error) = listed(config);
-    declare_embeddings(config, &mut models);
-    (models, error)
+    let (mut offered, error) = listed(config);
+    declare_embeddings(config, &mut offered);
+    (
+        offered.into_iter().map(|offer| offer.model).collect(),
+        error,
+    )
+}
+
+/// A model this provider offers, with the upstream identity its listing
+/// reported for it.
+struct Offered {
+    model: DiscoveredModel,
+    /// What the listing said this id stands for (`root` or `alias_of`). None
+    /// when the listing said neither, or did not name the id at all.
+    upstream: Option<String>,
+}
+
+impl Offered {
+    fn unlisted(model: DiscoveredModel) -> Self {
+        Self {
+            model,
+            upstream: None,
+        }
+    }
+
+    /// The id this model's embedding family is looked up by: the upstream the
+    /// listing reported, else the id itself. When the listing failed or never
+    /// named the id, the id is all there is; an alias then names no family and
+    /// embeds with no purpose prefix, which is nothing guessed rather than a
+    /// family guessed from its name.
+    fn family_id(&self) -> &str {
+        self.upstream.as_deref().unwrap_or(&self.model.id)
+    }
 }
 
 /// Each declared embedding model, serving `embed` over the embeddings route at
-/// its declared width. Purpose handling comes from the model's family.
+/// its declared width. Purpose handling comes from the model's family, found
+/// through the upstream the listing reported for the declared id.
 ///
 /// A listed model the server already labelled an embedding model is merged
 /// with, not replaced: the declaration wins on width and widths, and the
 /// server's reported modalities stand.
-fn declare_embeddings(config: &CustomProviderConfig, models: &mut Vec<DiscoveredModel>) {
+fn declare_embeddings(config: &CustomProviderConfig, offered: &mut Vec<Offered>) {
     for declared in &config.embeddings {
-        let index = match models.iter().position(|model| model.id == declared.id) {
+        let index = match offered
+            .iter()
+            .position(|offer| offer.model.id == declared.id)
+        {
             Some(index) => index,
             None => {
-                models.push(model(config, declared.id.clone(), None, None));
-                models.len() - 1
+                offered.push(Offered::unlisted(model(
+                    config,
+                    declared.id.clone(),
+                    None,
+                    None,
+                )));
+                offered.len() - 1
             }
         };
-        let model = &mut models[index];
-        let mut capabilities = model
+        let offer = &mut offered[index];
+        let mut capabilities = offer
+            .model
             .serves
             .as_ref()
             .and_then(|serves| {
@@ -104,7 +154,8 @@ fn declare_embeddings(config: &CustomProviderConfig, models: &mut Vec<Discovered
                     _ => None,
                 })
             })
-            .unwrap_or_else(|| embedding_capabilities(&declared.id, None));
+            .unwrap_or_else(|| embedding_capabilities(offer.family_id(), None));
+        let model = &mut offer.model;
         capabilities.native_dims = Some(declared.dims);
         capabilities.widths = declared.widths.clone();
         model.serves = Some(serves_embed(capabilities));
@@ -139,27 +190,32 @@ fn serves_embed(capabilities: EmbeddingCapabilities) -> Vec<ServedVerb> {
 /// outputs. Text keeps the provider-wide claim (`serves: None`); embeddings
 /// alone serve `embed`; any other output serves nothing, its modality kept
 /// verbatim. No `architecture`, or no outputs in it, says nothing.
-fn listed_model(config: &CustomProviderConfig, entry: ModelEntry) -> DiscoveredModel {
-    let mut model = model(config, entry.id, entry.max_model_len, entry.root);
-    let Some(architecture) = entry.architecture else {
-        return model;
+fn listed_model(config: &CustomProviderConfig, entry: ModelEntry) -> Offered {
+    let upstream = entry.root.or(entry.alias_of);
+    let mut offer = Offered {
+        model: model(config, entry.id, entry.max_model_len, upstream.clone()),
+        upstream,
     };
-    model.modalities = architecture.modalities();
+    let Some(architecture) = entry.architecture else {
+        return offer;
+    };
+    offer.model.modalities = architecture.modalities();
     if let Some(output) = &architecture.output_modalities {
         if architecture.embeds_only() {
-            model.serves = Some(serves_embed(embedding_capabilities(&model.id, None)));
+            let capabilities = embedding_capabilities(offer.family_id(), None);
+            offer.model.serves = Some(serves_embed(capabilities));
         } else if !output.contains(&Modality::Text) {
-            model.serves = Some(Vec::new());
+            offer.model.serves = Some(Vec::new());
         }
     }
-    model
+    offer
 }
 
-fn listed(config: &CustomProviderConfig) -> (Vec<DiscoveredModel>, Option<String>) {
+fn listed(config: &CustomProviderConfig) -> (Vec<Offered>, Option<String>) {
     match &config.models {
         CustomModelPolicy::Explicit { ids } => (
             ids.iter()
-                .map(|id| model(config, id.clone(), None, None))
+                .map(|id| Offered::unlisted(model(config, id.clone(), None, None)))
                 .collect(),
             None,
         ),
@@ -310,7 +366,7 @@ fn model(
     config: &CustomProviderConfig,
     id: String,
     context_window: Option<i64>,
-    root: Option<String>,
+    upstream: Option<String>,
 ) -> DiscoveredModel {
     // A chat or Decisions provider's protocol fixes what every model serves,
     // so the provider declares it once. A speech model's capabilities depend
@@ -321,13 +377,14 @@ fn model(
             wire: config.wire(),
         }]
     });
-    // A reported root is the server's statement of what it loaded, and is
-    // authoritative: an unknown root (a local path, a fine-tune, an unpinned
-    // repository) selects nothing even when the served id looks like a pinned
-    // repository. Only with no root at all is the id the upstream identity,
-    // since vLLM serves a model under its repository id unless renamed.
+    // A reported upstream (`root`, `alias_of`) is the server's statement of
+    // what it serves, and is authoritative: an unknown one (a local path, a
+    // fine-tune, an unpinned repository) selects nothing even when the served
+    // id looks like a pinned repository. Only with none at all is the id the
+    // upstream identity, since vLLM serves a model under its repository id
+    // unless renamed.
     let backend_key = config.backend_key();
-    let upstream = root.as_deref().unwrap_or(&id);
+    let upstream = upstream.as_deref().unwrap_or(&id);
     let tokenizer = tokenizer_for(&backend_key, &id, Some(upstream));
     DiscoveredModel {
         id: id.clone(),
@@ -373,7 +430,7 @@ mod tests {
     use super::*;
     use crate::credentials::{CustomEmbeddingModel, CustomSampling};
     use cairn_models::types::catalog::VerbKind;
-    use cairn_models::types::embedding::EmbeddingWidths;
+    use cairn_models::types::embedding::{EmbeddingWidths, PurposeHandling};
 
     fn config(base_url: &str, models: CustomModelPolicy) -> CustomProviderConfig {
         CustomProviderConfig {
@@ -457,13 +514,13 @@ mod tests {
 
     /// What a discovering provider makes of `body`, declarations applied.
     fn discovered_from(config: &CustomProviderConfig, body: &str) -> Vec<DiscoveredModel> {
-        let mut models: Vec<DiscoveredModel> = decode_listing(body)
+        let mut offered: Vec<Offered> = decode_listing(body)
             .unwrap()
             .into_iter()
             .map(|entry| listed_model(config, entry))
             .collect();
-        declare_embeddings(config, &mut models);
-        models
+        declare_embeddings(config, &mut offered);
+        offered.into_iter().map(|offer| offer.model).collect()
     }
 
     fn undeclared() -> CustomProviderConfig {
@@ -615,6 +672,69 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    /// Only `embed`, declared at Qwen3-Embedding-4B's width.
+    fn declares_embed(models: CustomModelPolicy) -> CustomProviderConfig {
+        CustomProviderConfig {
+            embeddings: vec![CustomEmbeddingModel {
+                id: "embed".into(),
+                dims: 2560,
+                widths: EmbeddingWidths::NativeOnly,
+            }],
+            ..config("http://hub.invalid/v1", models)
+        }
+    }
+
+    #[test]
+    fn a_declared_alias_embeds_as_the_upstream_its_listing_names() {
+        let qwen = families::family("qwen/qwen3-embedding-4b").unwrap().purpose;
+        assert!(
+            matches!(&qwen, PurposeHandling::Prefix { query, .. } if query.starts_with("Instruct:"))
+        );
+        let config = declares_embed(CustomModelPolicy::Discover);
+        // vLLM reports what it loaded as `root`; bgllm names an alias's target
+        // in `alias_of`.
+        for entry in [
+            serde_json::json!({"id": "embed", "object": "model", "root": "Qwen/Qwen3-Embedding-4B"}),
+            serde_json::json!({"id": "embed", "object": "model", "alias_of": "qwen/qwen3-embedding-4b"}),
+        ] {
+            let models = discovered_from(&config, &listing(serde_json::json!([entry.clone()])));
+            let capabilities = embed_capabilities(find(&models, "embed"));
+            assert_eq!(capabilities.purpose, qwen, "{entry}");
+            assert_eq!(capabilities.native_dims, Some(2560), "{entry}");
+        }
+
+        // Not listed: the declared id is all there is, and `embed` names no
+        // family.
+        let (models, error) = discover_blocking(&declares_embed(CustomModelPolicy::Explicit {
+            ids: vec!["big".into()],
+        }));
+        assert_eq!(error, None);
+        assert_eq!(
+            embed_capabilities(find(&models, "embed")).purpose,
+            PurposeHandling::Ignored
+        );
+    }
+
+    #[test]
+    fn an_undeclared_alias_labelled_an_embedder_takes_its_targets_family() {
+        let config = undeclared();
+        let models = discovered_from(
+            &config,
+            &listing(serde_json::json!([{
+                "id": "embed",
+                "object": "model",
+                "alias_of": "qwen/qwen3-embedding-4b",
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["embeddings"]}
+            }])),
+        );
+        let capabilities = embed_capabilities(find(&models, "embed"));
+        assert_eq!(capabilities.native_dims, Some(2560));
+        assert_eq!(
+            capabilities.purpose,
+            families::family("qwen/qwen3-embedding-4b").unwrap().purpose
+        );
     }
 
     #[test]

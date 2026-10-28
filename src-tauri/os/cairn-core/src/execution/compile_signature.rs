@@ -344,8 +344,7 @@ error: could not compile `cairn-core` (lib) due to 1 previous error
     /// Captured verbatim (rust-tests main cadence on fedora, 10-20 13:23 PDT,
     /// observation 6637f7745091424caf7ff106): one E0560 between an
     /// unused-import warning and a dead-code warning, in a lib-test target.
-    const LEDGER_E0560: &str =
-        include_str!("../../tests/fixtures/rustc/e0560_runtime_tests.txt");
+    const LEDGER_E0560: &str = include_str!("../../tests/fixtures/rustc/e0560_runtime_tests.txt");
 
     fn sites(failure: &CompileFailure) -> Vec<(Option<&str>, Option<&str>, Option<u32>)> {
         failure
@@ -361,8 +360,16 @@ error: could not compile `cairn-core` (lib) due to 1 previous error
         assert_eq!(
             sites(&failure),
             vec![
-                (Some("E0425"), Some("cairn-exec/src/dependency_catalog.rs"), Some(236)),
-                (Some("E0425"), Some("cairn-exec/src/dependency_catalog.rs"), Some(256)),
+                (
+                    Some("E0425"),
+                    Some("cairn-exec/src/dependency_catalog.rs"),
+                    Some(236)
+                ),
+                (
+                    Some("E0425"),
+                    Some("cairn-exec/src/dependency_catalog.rs"),
+                    Some(256)
+                ),
             ],
             "the runner's `error: command` / `error: script` lines are not sites"
         );
@@ -373,7 +380,10 @@ error: could not compile `cairn-core` (lib) due to 1 previous error
                 target: "lib".into()
             }]
         );
-        assert_eq!(failure.errors[0].message, "cannot find value `cairn_home` in this scope");
+        assert_eq!(
+            failure.errors[0].message,
+            "cannot find value `cairn_home` in this scope"
+        );
     }
 
     #[test]
@@ -381,7 +391,11 @@ error: could not compile `cairn-core` (lib) due to 1 previous error
         let failure = parse_compile_failure_from_tail(LEDGER_E0560).expect("a build failure");
         assert_eq!(
             sites(&failure),
-            vec![(Some("E0560"), Some("os/cairn-workflow/src/runtime_tests.rs"), Some(312))]
+            vec![(
+                Some("E0560"),
+                Some("os/cairn-workflow/src/runtime_tests.rs"),
+                Some(312)
+            )]
         );
         assert_eq!(
             failure.first_failed(),
@@ -399,8 +413,14 @@ error: could not compile `cairn-core` (lib) due to 1 previous error
         let base = parse_compile_failure_from_tail(LEDGER_E0425).unwrap();
         let moved = parse_compile_failure_from_tail(
             &LEDGER_E0425
-                .replace("dependency_catalog.rs:236:24", "dependency_catalog.rs:237:24")
-                .replace("dependency_catalog.rs:256:16", "dependency_catalog.rs:257:16"),
+                .replace(
+                    "dependency_catalog.rs:236:24",
+                    "dependency_catalog.rs:237:24",
+                )
+                .replace(
+                    "dependency_catalog.rs:256:16",
+                    "dependency_catalog.rs:257:16",
+                ),
         )
         .unwrap();
         assert_ne!(sites(&base), sites(&moved));
