@@ -249,7 +249,7 @@ pub(crate) const EXECUTION: KeySpec = KeySpec::new(
 pub(crate) const TENET_PROPOSAL: KeySpec = KeySpec::new(
     "proposal",
     KeyType::Object,
-    "{statement} (how the project does things, for the operator to answer yes or no): a thread filing a tenet-gated recipe (planbuild, coordinator, PlanCoord by default) proposes this tenet to the operator and the execution is filed HELD on its verdict. Send exactly one of proposal or tenet on such a filing; `build` stays ungated for repair",
+    "{statement, rationale?}: `statement` is one sentence of how the project does things for the operator to answer yes or no (at most 200 characters, no URIs or reasoning); `rationale` carries why, the alternatives ruled out, and the canonical URIs where it was argued (at most 1500 characters). A thread filing a tenet-gated recipe (planbuild, coordinator, PlanCoord by default) proposes this tenet to the operator and the execution is filed HELD on its verdict. Send exactly one of proposal or tenet on such a filing; `build` stays ungated for repair",
 );
 pub(crate) const TENET_NUMBER: KeySpec = KeySpec::new(
     "tenet",

@@ -3,9 +3,12 @@
 //! A thread proposes a statement of how the project does things, and the
 //! operator answers `yes`, `no`, or `your_call`. `your_call` approves exactly
 //! as `yes` does; it is kept apart because it records that the operator simply
-//! trusted the thread, which calibrates how far a thread is trusted. A thread
-//! that wants the alternatives it rejected on record writes them into the
-//! statement.
+//! trusted the thread, which calibrates how far a thread is trusted.
+//!
+//! The statement is the one sentence the operator answers at a glance. What a
+//! decision rests on (why, the alternatives ruled out, and where it was
+//! argued) goes in the optional rationale beneath it, so a yes records the
+//! rejection without burying the line the verdict is given on.
 //!
 //! A tenet is immutable once proposed. The only transitions are the proposing
 //! thread withdrawing an unanswered proposal, the operator answering one, and a
@@ -57,13 +60,17 @@ pub const TABLE: &str = "tenets";
 /// projection's `gates` field finds executions through it.
 pub const TENET_GATE_FACT: &str = "tenet_verdict";
 
-/// The ceiling on a proposal's statement, in characters. A proposal is read
-/// by the operator in one glance; the reasoning behind it belongs in the issue
-/// it gates.
-pub const MAX_PROPOSAL_CHARS: usize = 1500;
+/// The ceiling on a proposal's statement, in characters: one sentence the
+/// operator answers at a glance.
+pub const MAX_STATEMENT_CHARS: usize = 200;
 
-pub const OVER_LENGTH_REFUSAL: &str =
-    "proposals are written for the operator; put detail in the issue description";
+/// The ceiling on a proposal's rationale, in characters. Detail beyond it
+/// belongs in the issue or chat turn the rationale cites.
+pub const MAX_RATIONALE_CHARS: usize = 1500;
+
+pub const OVER_LENGTH_REFUSAL: &str = "a tenet statement is one sentence the operator answers at a glance (≤200 chars); put the reasoning, rejected alternatives, and provenance links in `rationale`";
+
+pub const RATIONALE_OVER_LENGTH_REFUSAL: &str = "a tenet's rationale is at most 1500 characters; cite the issue or chat turn where it was argued instead of restating it";
 
 /// The refusal for any attempt to change a tenet's content.
 pub const IMMUTABLE_REFUSAL: &str = "tenets are immutable; withdraw and propose again";
@@ -79,7 +86,7 @@ pub fn retired_proposal_shape_refusal(prefix: &str) -> String {
     format!(
         "a tenet is one statement the operator answers yes or no: send {prefix}statement, \
          \"this is how we do things\", in place of `question` and `options`, which are retired. \
-         Alternatives you ruled out belong in the statement's own words."
+         Alternatives you ruled out belong in {prefix}rationale."
     )
 }
 
@@ -270,8 +277,11 @@ pub struct TenetRow {
     pub number: i64,
     pub proposing_thread_id: String,
     pub slug: Option<String>,
-    /// What the tenet says: how the project does things.
+    /// What the tenet says: how the project does things, in one sentence.
     pub statement: String,
+    /// Why, the alternatives ruled out, and where it was argued. `None` on a
+    /// tenet proposed without one, and on every tenet that predates the field.
+    pub rationale: Option<String>,
     pub status: TenetStatus,
     pub verdict: Option<Verdict>,
     pub comment: Option<String>,

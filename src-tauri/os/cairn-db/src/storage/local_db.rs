@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::ops::Deref;
-use std::panic::AssertUnwindSafe;
+use std::panic::{AssertUnwindSafe, Location};
 use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-utils"))]
 use std::sync::atomic::AtomicUsize;
@@ -10,6 +11,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use cairn_platform::runtime_regions;
 use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -198,6 +200,199 @@ const CHECKPOINT_THRESHOLD_DISABLED: i64 = -1;
 /// that within this pass.
 const CHECKPOINT_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// The source line that asked for a database connection: the caller of a
+/// public [`LocalDb`] entry point, captured with `#[track_caller]`.
+pub type Caller = &'static Location<'static>;
+
+/// How long one pooled READ statement may run before the engine interrupts it.
+///
+/// The engine checks this deadline before every VM instruction, which is what
+/// makes it a bound at all: a statement stepping inside a single `poll` cannot
+/// be dropped, timed out, or cancelled from Rust, and on 10-26 one such
+/// statement held a pooled connection for 9.9 hours, blocking every checkpoint
+/// while the logical log grew to 8.5 GB (tenet #1271). Ten minutes is far past
+/// any read the orchestrator has recorded, so reaching it means a runaway
+/// statement. Writes, `exclusive`, and `connect` connections are not bounded.
+pub const READ_STATEMENT_BOUND: Duration = Duration::from_secs(600);
+
+/// How far past the bound a pooled read that PARKS between statements (and so
+/// never trips the per-statement deadline) is dropped. Dropping the future
+/// retires its connection, and the engine rolls the transaction back.
+const PARKED_READ_SLACK: Duration = Duration::from_secs(5);
+
+/// How far past the bound the gate sweep interrupts a pooled read that is
+/// still held. The deadline and the outer timeout should both have ended it
+/// long before, so this firing is a finding, and it says so in the log.
+const READ_BACKSTOP_SLACK: Duration = Duration::from_secs(60);
+
+/// How much of a statement's SQL a label carries.
+const SQL_HEAD_CHARS: usize = 80;
+
+/// The runtime region a database call's polls run inside.
+const STATEMENT_REGION: &str = "db.statement";
+
+/// Lets a returned `impl Future` borrow `'s` without requiring every type it
+/// captures to outlive `'s`, which is what edition 2021's `+ 's` would demand
+/// of the closures and row types the entry points are generic over.
+pub trait Captures<T: ?Sized> {}
+impl<T: ?Sized, U: ?Sized> Captures<T> for U {}
+
+/// What a live connection is for, as the gate records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HolderKind {
+    /// A pooled read: `read` and the `query_*` helpers. The only kind bounded.
+    PooledRead,
+    /// A pooled write: `write`, `exclusive`, `execute*`, `consume_query`.
+    PooledWrite,
+    /// An out-of-pool connection from `connect` (or the content store), held
+    /// for as long as its caller keeps it.
+    Connect,
+}
+
+impl std::fmt::Display for HolderKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::PooledRead => "pooled read",
+            Self::PooledWrite => "pooled write",
+            Self::Connect => "connect",
+        })
+    }
+}
+
+/// `file:line`, without the column `Location`'s own `Display` adds.
+pub(crate) struct Site(pub(crate) Caller);
+
+impl std::fmt::Display for Site {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.0.file(), self.0.line())
+    }
+}
+
+/// `<file>:<line> <first 80 chars of sql, whitespace collapsed>`.
+fn statement_label(at: Caller, sql: Option<&str>) -> Arc<str> {
+    use std::fmt::Write as _;
+    let mut label = String::with_capacity(at.file().len() + 8 + SQL_HEAD_CHARS);
+    let _ = write!(label, "{}:{}", at.file(), at.line());
+    if let Some(sql) = sql {
+        label.push(' ');
+        let mut taken = 0;
+        let mut gap = false;
+        for ch in sql.trim().chars() {
+            if taken >= SQL_HEAD_CHARS {
+                break;
+            }
+            if ch.is_whitespace() {
+                gap = true;
+                continue;
+            }
+            if gap {
+                label.push(' ');
+                taken += 1;
+                gap = false;
+            }
+            label.push(ch);
+            taken += 1;
+        }
+    }
+    Arc::from(label)
+}
+
+/// What one database call is doing, shared by the call's future, its
+/// connection, and the connection's gate record: the statement it last issued,
+/// and for a pooled read a handle that can interrupt it.
+///
+/// Per call rather than per gate, so recording a statement takes an
+/// uncontended lock and never the gate's.
+#[derive(Clone)]
+pub(super) struct Holder(Arc<Mutex<HolderState>>);
+
+struct HolderState {
+    statement: Arc<str>,
+    /// A clone of a pooled read's connection, so the gate sweep can interrupt
+    /// it. Taken out when the slot drops: a clone keeps the core connection
+    /// alive, and the engine rolls a transaction back only when the last one
+    /// drops, which must happen before the gate reports the slot released.
+    interrupt: Option<Connection>,
+}
+
+impl Holder {
+    pub(super) fn new(caller: Caller, sql: Option<&str>) -> Self {
+        Self(Arc::new(Mutex::new(HolderState {
+            statement: statement_label(caller, sql),
+            interrupt: None,
+        })))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HolderState> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Record the statement this call is about to run, and rename the polling
+    /// thread's `db.statement` region to it. The region was entered with the
+    /// label current when the poll began, and the binding yields only on I/O,
+    /// so a statement over cached pages starts and runs inside that same poll.
+    fn set_statement(&self, at: Caller, sql: &str) {
+        let label = statement_label(at, Some(sql));
+        self.lock().statement = label.clone();
+        runtime_regions::set_innermost_detail(STATEMENT_REGION, label);
+    }
+
+    fn statement(&self) -> Arc<str> {
+        self.lock().statement.clone()
+    }
+
+    fn arm(&self, conn: Connection) {
+        self.lock().interrupt = Some(conn);
+    }
+
+    fn disarm(&self) {
+        let handle = self.lock().interrupt.take();
+        drop(handle);
+    }
+
+    /// Interrupt the running statement, if this is a pooled read that has one.
+    fn interrupt(&self) -> bool {
+        self.lock()
+            .interrupt
+            .as_ref()
+            .is_some_and(|conn| conn.interrupt().is_ok())
+    }
+}
+
+impl std::fmt::Debug for Holder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Holder").field(&self.statement()).finish()
+    }
+}
+
+/// Run `body` with each of its polls inside a `db.statement` runtime region
+/// naming the statement `holder` last recorded.
+///
+/// Per poll, because the guard is `!Send` and cannot be held across an await,
+/// and because a poll is exactly where a runaway statement sits: a worker that
+/// has not parked for an hour is inside one poll of one of these, and the
+/// runtime stall line then names the statement instead of only the worker.
+async fn named<F: Future>(holder: Holder, body: F) -> F::Output {
+    let mut body = std::pin::pin!(body);
+    std::future::poll_fn(move |cx| {
+        let _region = runtime_regions::enter_with(STATEMENT_REGION, holder.statement());
+        body.as_mut().poll(cx)
+    })
+    .await
+}
+
+/// One holder that has kept its connection past the watch threshold.
+#[derive(Debug, Clone)]
+pub struct OverdueHolder {
+    pub caller: Caller,
+    pub kind: HolderKind,
+    pub age: Duration,
+    /// `<file>:<line> <sql head>` of the statement it last issued.
+    pub statement: Arc<str>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     pub max_attempts: usize,
@@ -305,6 +500,8 @@ pub struct LocalDb {
     /// against reintroducing per-call connect.
     #[cfg(test)]
     connections_created: AtomicUsize,
+    /// [`READ_STATEMENT_BOUND`] outside tests, which shorten it.
+    read_bound: Duration,
 }
 
 impl std::fmt::Debug for LocalDb {
@@ -357,6 +554,7 @@ impl LocalDb {
             write_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),
+            read_bound: READ_STATEMENT_BOUND,
         };
         db.configure().await?;
         Ok(db)
@@ -415,6 +613,7 @@ impl LocalDb {
             write_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),
+            read_bound: READ_STATEMENT_BOUND,
         };
         db.configure().await?;
         Ok(db)
@@ -469,6 +668,7 @@ impl LocalDb {
             write_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),
+            read_bound: READ_STATEMENT_BOUND,
         };
         db.configure().await?;
         Ok(db)
@@ -524,6 +724,68 @@ impl LocalDb {
     /// depends on: that a long read holds no connection between its pages.
     pub fn live_connections(&self) -> usize {
         self.gate.lock().live.len()
+    }
+
+    /// A handle whose pooled reads are bounded at `bound` instead of
+    /// [`READ_STATEMENT_BOUND`], so tests can exercise the bound in
+    /// milliseconds.
+    #[cfg(test)]
+    pub(crate) fn with_read_bound(mut self, bound: Duration) -> Self {
+        self.read_bound = bound;
+        self
+    }
+
+    /// Every connection held longer than `threshold`, each reported once and
+    /// then again only every `rewarn` while it is still held.
+    ///
+    /// The same sweep is the last line of the pooled-read bound: a pooled read
+    /// still held [`READ_BACKSTOP_SLACK`] past the bound has outlived both the
+    /// engine deadline and the outer timeout, so it is interrupted here and
+    /// the interrupt is logged, because reaching it means one of those failed.
+    pub fn overdue_holders(&self, threshold: Duration, rewarn: Duration) -> Vec<OverdueHolder> {
+        let now = Instant::now();
+        let backstop = self.read_bound + READ_BACKSTOP_SLACK;
+        let mut overdue = Vec::new();
+        let mut runaway = Vec::new();
+        {
+            let mut state = self.gate.lock();
+            for live in state.live.values_mut() {
+                let age = now.saturating_duration_since(live.since);
+                if age < threshold {
+                    continue;
+                }
+                if live.kind == HolderKind::PooledRead && age >= backstop && !live.interrupted {
+                    live.interrupted = true;
+                    runaway.push((live.caller, age, live.holder.clone()));
+                }
+                if live
+                    .last_warned
+                    .is_some_and(|at| now.saturating_duration_since(at) < rewarn)
+                {
+                    continue;
+                }
+                live.last_warned = Some(now);
+                overdue.push(OverdueHolder {
+                    caller: live.caller,
+                    kind: live.kind,
+                    age,
+                    statement: live.holder.statement(),
+                });
+            }
+        }
+        for (caller, age, holder) in runaway {
+            let interrupted = holder.interrupt();
+            log::warn!(
+                "pooled read at {} outlived the {:?} read bound and its timeout ({:?} held); \
+                 interrupt from the gate sweep {}: {}",
+                Site(caller),
+                self.read_bound,
+                age,
+                if interrupted { "sent" } else { "had no handle" },
+                holder.statement(),
+            );
+        }
+        overdue
     }
 
     /// Current in-process mutation generation. Reading it never opens a database
@@ -613,9 +875,14 @@ impl LocalDb {
     /// makes the gate a statement about the whole process rather than about the
     /// pool, and it is not optional: the resource readers on this path are the
     /// bulk of the transactions a checkpoint has to wait out.
-    pub async fn connect(&self) -> DbResult<TrackedConnection> {
-        let slot = self.gate.admit("connect").await;
-        Ok(TrackedConnection::new(self.open_connection().await?, slot))
+    #[track_caller]
+    pub fn connect(&self) -> impl Future<Output = DbResult<TrackedConnection>> + Captures<&'_ ()> {
+        let caller = Location::caller();
+        let holder = Holder::new(caller, None);
+        named(holder.clone(), async move {
+            let slot = self.gate.admit(caller, HolderKind::Connect, holder).await;
+            Ok(TrackedConnection::new(self.open_connection().await?, slot))
+        })
     }
 
     /// Open a connection without registering it with the gate.
@@ -656,8 +923,17 @@ impl LocalDb {
     /// drain behind it is bounded by a budget. A nested call arriving while the
     /// gate is shut costs its caller a bounded pause and denies maintenance the
     /// quiet instant it was after; it cannot wait on its own caller forever.
-    async fn checkout(&self) -> DbResult<TrackedConnection> {
-        let slot = self.gate.admit("pool").await;
+    ///
+    /// A pooled read's connection gets the read bound as its engine deadline
+    /// and a write's gets none, set on every checkout because pooled
+    /// connections alternate between the two. Both are atomic stores.
+    async fn checkout(
+        &self,
+        caller: Caller,
+        kind: HolderKind,
+        holder: &Holder,
+    ) -> DbResult<TrackedConnection> {
+        let slot = self.gate.admit(caller, kind, holder.clone()).await;
         let pooled = self
             .idle
             .lock()
@@ -667,7 +943,42 @@ impl LocalDb {
             Some(conn) => conn,
             None => self.open_connection().await?,
         };
+        if kind == HolderKind::PooledRead {
+            conn.set_query_timeout(self.read_bound)?;
+            holder.arm(conn.clone());
+        } else {
+            conn.set_query_timeout(Duration::ZERO)?;
+        }
         Ok(TrackedConnection::new(conn, slot))
+    }
+
+    /// Run one pooled read under the bound, and turn either way of exceeding
+    /// it into [`DbError::ReadBoundExceeded`].
+    ///
+    /// The engine deadline ends a statement that steps past the bound; the
+    /// timeout here ends a read that parks between statements, which no
+    /// per-statement deadline sees. Dropping `body` on expiry drops its
+    /// connection unreleased, and the engine rolls its transaction back.
+    async fn bounded_read<T>(
+        &self,
+        caller: Caller,
+        holder: &Holder,
+        body: impl Future<Output = DbResult<T>>,
+    ) -> DbResult<T> {
+        let started = Instant::now();
+        match tokio::time::timeout(self.read_bound + PARKED_READ_SLACK, body).await {
+            Ok(Err(error)) if error.is_interrupt() => {}
+            Ok(result) => return result,
+            Err(_elapsed) => {}
+        }
+        let error = DbError::ReadBoundExceeded {
+            caller,
+            bound: self.read_bound,
+            elapsed: started.elapsed(),
+            statement: holder.statement(),
+        };
+        log::warn!("{error}");
+        Err(error)
     }
 
     /// Return a connection that provably holds no open transaction.
@@ -704,35 +1015,80 @@ impl LocalDb {
         self.write_transaction_count.load(Ordering::Relaxed)
     }
 
-    pub async fn read<T>(
+    /// Run `f` in one read transaction on a pooled connection.
+    ///
+    /// Bounded: a statement that runs past [`READ_STATEMENT_BOUND`], or a read
+    /// that is still open shortly after it, fails with
+    /// [`DbError::ReadBoundExceeded`] and its connection is retired.
+    #[track_caller]
+    pub fn read<T>(
         &self,
-        f: impl for<'a> FnOnce(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
+        f: impl for<'a> FnOnce(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
+    ) -> impl Future<Output = DbResult<T>> + Captures<&'_ ()> {
+        let caller = Location::caller();
+        let holder = Holder::new(caller, None);
+        named(holder.clone(), self.read_at(caller, holder, f))
+    }
+
+    async fn read_at<T>(
+        &self,
+        caller: Caller,
+        holder: Holder,
+        f: impl for<'a> FnOnce(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
     ) -> DbResult<T> {
         #[cfg(any(test, feature = "test-utils"))]
         self.read_transaction_count.fetch_add(1, Ordering::Relaxed);
-        let conn = self.checkout().await?;
-        let attempt = run_read_tx(&conn, self.concurrent_begin(), f).await;
-        if attempt.reusable {
-            self.release(conn);
-        }
-        attempt.result
+        self.bounded_read(caller, &holder, async {
+            let conn = self
+                .checkout(caller, HolderKind::PooledRead, &holder)
+                .await?;
+            let attempt = run_read_tx(&conn, self.concurrent_begin(), f).await;
+            // An interrupted connection is retired even when its ROLLBACK
+            // succeeded: what it was doing when the engine stopped it is not
+            // something the next caller should inherit.
+            let interrupted = attempt.result.as_ref().is_err_and(DbError::is_interrupt);
+            if attempt.reusable && !interrupted {
+                self.release(conn);
+            }
+            attempt.result
+        })
+        .await
     }
 
-    pub async fn write<T>(
+    #[track_caller]
+    pub fn write<T>(
         &self,
-        mut f: impl for<'a> FnMut(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
+        f: impl for<'a> FnMut(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
+    ) -> impl Future<Output = DbResult<T>> + Captures<&'_ ()> {
+        let caller = Location::caller();
+        let holder = Holder::new(caller, None);
+        named(holder.clone(), async move {
+            #[cfg(any(test, feature = "test-utils"))]
+            self.write_transaction_count.fetch_add(1, Ordering::Relaxed);
+            self.write_at(caller, holder, self.concurrent_begin(), f)
+                .await
+        })
+    }
+
+    #[track_caller]
+    pub fn exclusive<T>(
+        &self,
+        f: impl for<'a> FnMut(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
+    ) -> impl Future<Output = DbResult<T>> + Captures<&'_ ()> {
+        let caller = Location::caller();
+        let holder = Holder::new(caller, None);
+        named(holder.clone(), self.write_at(caller, holder, "BEGIN", f))
+    }
+
+    async fn write_at<T>(
+        &self,
+        caller: Caller,
+        holder: Holder,
+        begin_sql: &str,
+        mut f: impl for<'a> FnMut(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
     ) -> DbResult<T> {
-        #[cfg(any(test, feature = "test-utils"))]
-        self.write_transaction_count.fetch_add(1, Ordering::Relaxed);
-        self.transaction_with_begin(self.concurrent_begin(), &mut f)
+        self.transaction_with_begin(caller, &holder, begin_sql, &mut f)
             .await
-    }
-
-    pub async fn exclusive<T>(
-        &self,
-        mut f: impl for<'a> FnMut(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
-    ) -> DbResult<T> {
-        self.transaction_with_begin("BEGIN", &mut f).await
     }
 
     /// Runs one SELECT and collects every mapped row.
@@ -740,38 +1096,64 @@ impl LocalDb {
     /// A single SQL statement already observes one database snapshot. Avoiding an
     /// explicit BEGIN/COMMIT here removes two engine round-trips from the hottest
     /// read path. Call Self::read when several statements must share a snapshot.
+    /// Bounded like [`Self::read`].
     ///
     /// # Errors
     ///
     /// Returns database errors from opening the connection, running the query,
     /// fetching rows, or mapping each row.
-    pub async fn query_all<T, F>(
+    #[track_caller]
+    pub fn query_all<T, F>(
         &self,
         sql: impl Into<String>,
         params: impl IntoParams + Send + 'static,
         map: F,
-    ) -> DbResult<Vec<T>>
+    ) -> impl Future<Output = DbResult<Vec<T>>> + Captures<&'_ ()>
     where
         F: Fn(&Row) -> DbResult<T> + Send + 'static,
         T: Send + 'static,
     {
+        let caller = Location::caller();
         let sql = sql.into();
-        let conn = self.checkout().await?;
-        let result: DbResult<Vec<T>> = async {
-            let mut rows = conn.query(&sql, params).await?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next().await? {
-                out.push(map(&row)?);
+        let holder = Holder::new(caller, Some(&sql));
+        named(
+            holder.clone(),
+            self.query_all_at(caller, holder, sql, params, map),
+        )
+    }
+
+    async fn query_all_at<T, F>(
+        &self,
+        caller: Caller,
+        holder: Holder,
+        sql: String,
+        params: impl IntoParams,
+        map: F,
+    ) -> DbResult<Vec<T>>
+    where
+        F: Fn(&Row) -> DbResult<T>,
+    {
+        self.bounded_read(caller, &holder, async {
+            let conn = self
+                .checkout(caller, HolderKind::PooledRead, &holder)
+                .await?;
+            let result: DbResult<Vec<T>> = async {
+                let mut rows = conn.conn.query(&sql, params).await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push(map(&row)?);
+                }
+                Ok(out)
             }
-            Ok(out)
-        }
-        .await;
-        // Returned only on success: a query abandoned part-way through its rows
-        // leaves a statement whose state this layer has no way to assert on.
-        if result.is_ok() {
-            self.release(conn);
-        }
-        result
+            .await;
+            // Returned only on success: a query abandoned part-way through its rows
+            // leaves a statement whose state this layer has no way to assert on.
+            if result.is_ok() {
+                self.release(conn);
+            }
+            result
+        })
+        .await
     }
 
     /// Runs one SELECT and maps the first row, if present.
@@ -780,27 +1162,64 @@ impl LocalDb {
     ///
     /// Returns database errors from opening the connection, running the query,
     /// fetching the row, or mapping the row.
-    pub async fn query_opt<T, F>(
+    #[track_caller]
+    pub fn query_opt<T, F>(
         &self,
         sql: impl Into<String>,
         params: impl IntoParams + Send + 'static,
         map: F,
-    ) -> DbResult<Option<T>>
+    ) -> impl Future<Output = DbResult<Option<T>>> + Captures<&'_ ()>
     where
         F: Fn(&Row) -> DbResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let sql = sql.into();
-        let conn = self.checkout().await?;
-        let result: DbResult<Option<T>> = async {
-            let mut rows = conn.query(&sql, params).await?;
-            rows.next().await?.map(|row| map(&row)).transpose()
-        }
-        .await;
-        if result.is_ok() {
-            self.release(conn);
-        }
-        result
+        self.named_query_opt(Location::caller(), sql.into(), params, map)
+    }
+
+    fn named_query_opt<T, F>(
+        &self,
+        caller: Caller,
+        sql: String,
+        params: impl IntoParams + Send + 'static,
+        map: F,
+    ) -> impl Future<Output = DbResult<Option<T>>> + Captures<&'_ ()>
+    where
+        F: Fn(&Row) -> DbResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let holder = Holder::new(caller, Some(&sql));
+        named(
+            holder.clone(),
+            self.query_opt_at(caller, holder, sql, params, map),
+        )
+    }
+
+    async fn query_opt_at<T, F>(
+        &self,
+        caller: Caller,
+        holder: Holder,
+        sql: String,
+        params: impl IntoParams,
+        map: F,
+    ) -> DbResult<Option<T>>
+    where
+        F: Fn(&Row) -> DbResult<T>,
+    {
+        self.bounded_read(caller, &holder, async {
+            let conn = self
+                .checkout(caller, HolderKind::PooledRead, &holder)
+                .await?;
+            let result: DbResult<Option<T>> = async {
+                let mut rows = conn.conn.query(&sql, params).await?;
+                rows.next().await?.map(|row| map(&row)).transpose()
+            }
+            .await;
+            if result.is_ok() {
+                self.release(conn);
+            }
+            result
+        })
+        .await
     }
 
     /// Runs one SELECT and returns the first column of the
@@ -810,14 +1229,16 @@ impl LocalDb {
     ///
     /// Returns database errors from opening the connection, running the query,
     /// fetching the row, or reading column 0.
-    pub async fn query_opt_text(
+    #[track_caller]
+    pub fn query_opt_text(
         &self,
         sql: impl Into<String>,
         params: impl IntoParams + Send + 'static,
-    ) -> DbResult<Option<String>> {
-        self.query_opt(sql, params, |row| row.opt_text(0))
-            .await
-            .map(Option::flatten)
+    ) -> impl Future<Output = DbResult<Option<String>>> + Captures<&'_ ()> {
+        let query = self.named_query_opt(Location::caller(), sql.into(), params, |row| {
+            row.opt_text(0)
+        });
+        async move { query.await.map(Option::flatten) }
     }
 
     /// Runs one SELECT and returns the first column of the
@@ -827,14 +1248,15 @@ impl LocalDb {
     ///
     /// Returns database errors from opening the connection, running the query,
     /// fetching the row, or reading column 0.
-    pub async fn query_opt_i64(
+    #[track_caller]
+    pub fn query_opt_i64(
         &self,
         sql: impl Into<String>,
         params: impl IntoParams + Send + 'static,
-    ) -> DbResult<Option<i64>> {
-        self.query_opt(sql, params, |row| row.opt_i64(0))
-            .await
-            .map(Option::flatten)
+    ) -> impl Future<Output = DbResult<Option<i64>>> + Captures<&'_ ()> {
+        let query =
+            self.named_query_opt(Location::caller(), sql.into(), params, |row| row.opt_i64(0));
+        async move { query.await.map(Option::flatten) }
     }
 
     /// Runs one SELECT and returns the first column of the
@@ -844,12 +1266,13 @@ impl LocalDb {
     ///
     /// Returns database errors from opening the connection, running the query,
     /// fetching the row, or reading column 0.
-    pub async fn query_text(
+    #[track_caller]
+    pub fn query_text(
         &self,
         sql: impl Into<String>,
         params: impl IntoParams + Send + 'static,
-    ) -> DbResult<Option<String>> {
-        self.query_opt(sql, params, |row| row.text(0)).await
+    ) -> impl Future<Output = DbResult<Option<String>>> + Captures<&'_ ()> {
+        self.named_query_opt(Location::caller(), sql.into(), params, |row| row.text(0))
     }
 
     /// Runs one SELECT and requires one row.
@@ -859,19 +1282,23 @@ impl LocalDb {
     /// Returns database errors from opening the connection, running the query,
     /// fetching the row, or mapping the row. Returns `DbError::Row` when the
     /// query returns no rows.
-    pub async fn query_one<T, F>(
+    #[track_caller]
+    pub fn query_one<T, F>(
         &self,
         sql: impl Into<String>,
         params: impl IntoParams + Send + 'static,
         map: F,
-    ) -> DbResult<T>
+    ) -> impl Future<Output = DbResult<T>> + Captures<&'_ ()>
     where
         F: Fn(&Row) -> DbResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        self.query_opt(sql, params, map)
-            .await?
-            .ok_or_else(|| DbError::Row("query_one returned no rows".to_string()))
+        let query = self.named_query_opt(Location::caller(), sql.into(), params, map);
+        async move {
+            query
+                .await?
+                .ok_or_else(|| DbError::Row("query_one returned no rows".to_string()))
+        }
     }
 
     /// Runs one statement through the retrying write transaction path.
@@ -880,15 +1307,27 @@ impl LocalDb {
     ///
     /// Returns database errors from opening the write transaction, executing the
     /// statement, committing the transaction, or exhausting retry attempts.
-    pub async fn execute(&self, sql: impl Into<String>, params: impl IntoParams) -> DbResult<u64> {
+    #[track_caller]
+    pub fn execute(
+        &self,
+        sql: impl Into<String>,
+        params: impl IntoParams,
+    ) -> impl Future<Output = DbResult<u64>> + Captures<&'_ ()> {
+        let caller = Location::caller();
         let sql = sql.into();
-        let params = params.into_params()?;
-        self.write(move |conn| {
-            let sql = sql.clone();
-            let params = params.clone();
-            Box::pin(async move { Ok(conn.execute(&sql, params).await?) })
+        let holder = Holder::new(caller, Some(&sql));
+        let params = params.into_params();
+        named(holder.clone(), async move {
+            let params = params?;
+            #[cfg(any(test, feature = "test-utils"))]
+            self.write_transaction_count.fetch_add(1, Ordering::Relaxed);
+            self.write_at(caller, holder, self.concurrent_begin(), move |conn| {
+                let sql = sql.clone();
+                let params = params.clone();
+                Box::pin(async move { Ok(conn.conn.execute(&sql, params).await?) })
+            })
+            .await
         })
-        .await
     }
 
     /// Runs a semicolon-delimited SQL script through the retrying write
@@ -898,22 +1337,34 @@ impl LocalDb {
     ///
     /// Returns database errors from opening the write transaction, executing the
     /// script, committing the transaction, or exhausting retry attempts.
-    pub async fn execute_script(&self, sql: impl Into<String>) -> DbResult<()> {
+    #[track_caller]
+    pub fn execute_script(
+        &self,
+        sql: impl Into<String>,
+    ) -> impl Future<Output = DbResult<()>> + Captures<&'_ ()> {
+        let caller = Location::caller();
         let sql = sql.into();
-        self.write(move |conn| {
-            let sql = sql.clone();
-            Box::pin(async move {
-                conn.execute_batch(&sql).await?;
-                Ok(())
+        let holder = Holder::new(caller, Some(&sql));
+        named(holder.clone(), async move {
+            #[cfg(any(test, feature = "test-utils"))]
+            self.write_transaction_count.fetch_add(1, Ordering::Relaxed);
+            self.write_at(caller, holder, self.concurrent_begin(), move |conn| {
+                let sql = sql.clone();
+                Box::pin(async move {
+                    conn.conn.execute_batch(&sql).await?;
+                    Ok(())
+                })
             })
+            .await
         })
-        .await
     }
 
     async fn transaction_with_begin<T>(
         &self,
+        caller: Caller,
+        holder: &Holder,
         begin_sql: &str,
-        f: &mut impl for<'a> FnMut(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
+        f: &mut impl for<'a> FnMut(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
     ) -> DbResult<T> {
         let started_at = Instant::now();
         let mut backoff = self.retry.initial_backoff;
@@ -921,7 +1372,9 @@ impl LocalDb {
         let mut backoff_slept = Duration::ZERO;
 
         for attempt in 1..=self.retry.max_attempts {
-            let conn = self.checkout().await?;
+            let conn = self
+                .checkout(caller, HolderKind::PooledWrite, holder)
+                .await?;
             let outcome = run_tx(&conn, begin_sql, f).await;
             // Released between attempts as well as after the last one, so a
             // contended write that retries several times still reuses one warm
@@ -984,23 +1437,45 @@ impl LocalDb {
         })
     }
 
-    pub async fn execute_batch(&self, sql: &str) -> DbResult<()> {
-        let conn = self.checkout().await?;
-        let result = conn.execute_batch(sql).await;
-        if result.is_ok() {
-            self.release(conn);
-            self.record_mutation();
-        }
-        Ok(result?)
+    #[track_caller]
+    pub fn execute_batch<'s>(
+        &'s self,
+        sql: &'s str,
+    ) -> impl Future<Output = DbResult<()>> + Captures<&'s ()> {
+        let caller = Location::caller();
+        let holder = Holder::new(caller, Some(sql));
+        named(holder.clone(), async move {
+            let conn = self
+                .checkout(caller, HolderKind::PooledWrite, &holder)
+                .await?;
+            let result = conn.conn.execute_batch(sql).await;
+            if result.is_ok() {
+                self.release(conn);
+                self.record_mutation();
+            }
+            Ok(result?)
+        })
     }
 
-    pub async fn consume_query(&self, sql: &str) -> DbResult<()> {
-        let conn = self.checkout().await?;
-        let result = consume_on(&conn, sql).await;
-        if result.is_ok() {
-            self.release(conn);
-        }
-        result
+    /// Run one statement on a pooled connection and drain its rows: PRAGMAs and
+    /// `VACUUM INTO`, which is why it is admitted as a write and never bounded.
+    #[track_caller]
+    pub fn consume_query<'s>(
+        &'s self,
+        sql: &'s str,
+    ) -> impl Future<Output = DbResult<()>> + Captures<&'s ()> {
+        let caller = Location::caller();
+        let holder = Holder::new(caller, Some(sql));
+        named(holder.clone(), async move {
+            let conn = self
+                .checkout(caller, HolderKind::PooledWrite, &holder)
+                .await?;
+            let result = consume_on(&conn, sql).await;
+            if result.is_ok() {
+                self.release(conn);
+            }
+            result
+        })
     }
 
     /// Size in bytes of this database's logical log (`-log`) sidecar, or zero
@@ -1210,12 +1685,19 @@ struct GateState {
     live: HashMap<u64, LiveConnection>,
 }
 
-/// One live connection, recorded for the single purpose of explaining a drain
-/// that did not finish.
-#[derive(Debug, Clone, Copy)]
+/// One live connection, recorded to explain a drain that did not finish and a
+/// holder that has kept its connection too long: who asked for it, for what,
+/// since when, and what it is running now.
+#[derive(Debug)]
 struct LiveConnection {
-    origin: &'static str,
+    caller: Caller,
+    kind: HolderKind,
     since: Instant,
+    holder: Holder,
+    /// When the gate watch last reported this holder.
+    last_warned: Option<Instant>,
+    /// Whether the backstop has already interrupted it.
+    interrupted: bool,
 }
 
 impl ConnectionGate {
@@ -1241,7 +1723,12 @@ impl ConnectionGate {
     /// lose a reopen landing in between and park the caller until the next pass
     /// closed and reopened the gate — a stall of one whole interval, and one
     /// that would only show up under load.
-    pub(super) async fn admit(self: &Arc<Self>, origin: &'static str) -> ConnectionSlot {
+    pub(super) async fn admit(
+        self: &Arc<Self>,
+        caller: Caller,
+        kind: HolderKind,
+        holder: Holder,
+    ) -> ConnectionSlot {
         loop {
             let reopened = self.reopened.notified();
             tokio::pin!(reopened);
@@ -1254,13 +1741,18 @@ impl ConnectionGate {
                     state.live.insert(
                         id,
                         LiveConnection {
-                            origin,
+                            caller,
+                            kind,
                             since: Instant::now(),
+                            holder: holder.clone(),
+                            last_warned: None,
+                            interrupted: false,
                         },
                     );
                     return ConnectionSlot {
                         gate: self.clone(),
                         id,
+                        holder,
                     };
                 }
             }
@@ -1269,11 +1761,12 @@ impl ConnectionGate {
     }
 
     fn release(&self, id: u64) {
-        let emptied = {
+        let (removed, emptied) = {
             let mut state = self.lock();
-            state.live.remove(&id);
-            state.live.is_empty()
+            let removed = state.live.remove(&id);
+            (removed, state.live.is_empty())
         };
+        drop(removed);
         if emptied {
             self.drained.notify_waiters();
         }
@@ -1310,7 +1803,7 @@ impl ConnectionGate {
                     .live
                     .values()
                     .min_by_key(|live| live.since)
-                    .map(|live| (live.origin, live.since.elapsed()));
+                    .map(|live| (live.caller, live.since.elapsed()));
                 (state.live.len(), oldest)
             };
             if still_open == 0 {
@@ -1376,10 +1869,16 @@ impl Drop for GateHold {
 pub(super) struct ConnectionSlot {
     gate: Arc<ConnectionGate>,
     id: u64,
+    holder: Holder,
 }
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
+        // The interrupt handle first: it is a clone of the connection, and the
+        // engine rolls a dropped connection's transaction back only when the
+        // last clone goes, which has to happen before the drain hears this
+        // connection is gone.
+        self.holder.disarm();
         self.gate.release(self.id);
     }
 }
@@ -1390,14 +1889,47 @@ impl Drop for ConnectionSlot {
 /// Derefs to the connection, so callers use it exactly as they used a bare one
 /// and the resource layer's ~30 `connect_for_read` sites needed no edit at all.
 /// The wrapper's entire purpose is its `Drop`.
+///
+/// Its own `query` and `execute` shadow the connection's, with the same
+/// signatures, to record each statement's call site and SQL head on the
+/// connection's gate record before running it. That label is what the gate
+/// watch, a read-bound error, and the runtime stall line name. Statements run
+/// through `prepare` are not intercepted and keep the label of the last
+/// statement that was.
 pub struct TrackedConnection {
     conn: Connection,
-    _slot: ConnectionSlot,
+    slot: ConnectionSlot,
 }
 
 impl TrackedConnection {
     pub(super) fn new(conn: Connection, slot: ConnectionSlot) -> Self {
-        Self { conn, _slot: slot }
+        Self { conn, slot }
+    }
+
+    /// [`Connection::query`], recording the statement first.
+    #[track_caller]
+    pub fn query(
+        &self,
+        sql: impl AsRef<str>,
+        params: impl IntoParams,
+    ) -> impl Future<Output = turso::Result<turso::Rows>> + Captures<&'_ ()> {
+        self.slot
+            .holder
+            .set_statement(Location::caller(), sql.as_ref());
+        self.conn.query(sql, params)
+    }
+
+    /// [`Connection::execute`], recording the statement first.
+    #[track_caller]
+    pub fn execute(
+        &self,
+        sql: impl AsRef<str>,
+        params: impl IntoParams,
+    ) -> impl Future<Output = turso::Result<u64>> + Captures<&'_ ()> {
+        self.slot
+            .holder
+            .set_statement(Location::caller(), sql.as_ref());
+        self.conn.execute(sql, params)
     }
 
     /// Take the bare connection back, ending its registration.
@@ -1406,7 +1938,9 @@ impl TrackedConnection {
     /// free-list holds no transaction, so counting it would hold the drain above
     /// zero forever.
     fn into_connection(self) -> Connection {
-        self.conn
+        let Self { conn, slot } = self;
+        drop(slot);
+        conn
     }
 }
 
@@ -1496,9 +2030,9 @@ pub struct DrainReport {
     pub budget: Duration,
     /// Connections still live at the deadline.
     pub still_open: usize,
-    /// Where the longest-held live connection came from, and how long it had
-    /// been out.
-    pub oldest: Option<(&'static str, Duration)>,
+    /// The source line that asked for the longest-held live connection, and how
+    /// long it had been out.
+    pub oldest: Option<(Caller, Duration)>,
     /// How long the drain waited — the stall every database call in the process
     /// paid for this pass.
     pub waited: Duration,
@@ -1516,8 +2050,8 @@ impl std::fmt::Display for DrainReport {
         )?;
         if !self.drained {
             write!(f, " still_open={}", self.still_open)?;
-            if let Some((origin, age)) = &self.oldest {
-                write!(f, " oldest={origin}/{}ms", age.as_millis())?;
+            if let Some((caller, age)) = &self.oldest {
+                write!(f, " oldest={}/{}ms", Site(caller), age.as_millis())?;
             }
         }
         Ok(())
@@ -1688,11 +2222,11 @@ async fn end_tx(conn: &Connection, sql: &'static str) -> DbResult<()> {
 }
 
 async fn run_tx<T>(
-    conn: &Connection,
+    conn: &TrackedConnection,
     begin_sql: &str,
-    f: &mut impl for<'a> FnMut(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
+    f: &mut impl for<'a> FnMut(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
 ) -> TxAttempt<T> {
-    if let Err(error) = conn.execute(begin_sql, ()).await {
+    if let Err(error) = conn.conn.execute(begin_sql, ()).await {
         // A BEGIN that fails opened nothing, but it also means this connection
         // was not in the state the pool guarantees. Retire it rather than reason
         // about why.
@@ -1727,11 +2261,11 @@ async fn run_tx<T>(
 }
 
 async fn run_read_tx<T>(
-    conn: &Connection,
+    conn: &TrackedConnection,
     begin_sql: &str,
-    f: impl for<'a> FnOnce(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
+    f: impl for<'a> FnOnce(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
 ) -> TxAttempt<T> {
-    if let Err(error) = conn.execute(begin_sql, ()).await {
+    if let Err(error) = conn.conn.execute(begin_sql, ()).await {
         return TxAttempt {
             result: Err(error.into()),
             reusable: false,
@@ -2144,6 +2678,40 @@ mod tests {
         ",
     )];
 
+    /// What one trivial statement costs through the two hot entry points, in
+    /// nanoseconds per call. `cargo test --release -p cairn-db --lib --
+    /// --ignored --nocapture statement_overhead_probe`. Kept as the measurement
+    /// the per-statement naming and bound were held to: a budget of about two
+    /// microseconds per statement on top of what the engine itself costs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "measurement probe; run explicitly in release"]
+    async fn statement_overhead_probe() {
+        const CALLS: u32 = 20_000;
+        let db = test_db().await.unwrap();
+        for _ in 0..1_000 {
+            db.query_one("SELECT 1", (), |row| row.i64(0))
+                .await
+                .unwrap();
+        }
+        let mut best_one = u128::MAX;
+        let mut best_read = u128::MAX;
+        for _round in 0..5 {
+            let started = Instant::now();
+            for _ in 0..CALLS {
+                db.query_one("SELECT 1", (), |row| row.i64(0))
+                    .await
+                    .unwrap();
+            }
+            best_one = best_one.min(started.elapsed().as_nanos() / u128::from(CALLS));
+            let started = Instant::now();
+            for _ in 0..CALLS {
+                query_i64(&db, "SELECT 1").await.unwrap();
+            }
+            best_read = best_read.min(started.elapsed().as_nanos() / u128::from(CALLS));
+        }
+        println!("statement_overhead_probe: query_one={best_one}ns/call read={best_read}ns/call");
+    }
+
     async fn test_db() -> DbResult<LocalDb> {
         let temp = tempdir()?;
         let path = temp.keep().join("cairn-turso-test.db");
@@ -2401,6 +2969,7 @@ mod tests {
             write_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),
+            read_bound: READ_STATEMENT_BOUND,
         };
         db.configure().await?;
         MigrationRunner::new(TEST_SCHEMA.to_vec()).run(&db).await?;
@@ -3218,6 +3787,7 @@ mod tests {
 
         // Precisely what `connect_for_read` does: connect outside the pool, BEGIN,
         // and hold it for the life of the read.
+        let connect_line = line!() + 1;
         let reader = db.connect().await.unwrap();
         reader.execute(db.concurrent_begin(), ()).await.unwrap();
         let mut rows = reader
@@ -3247,14 +3817,21 @@ mod tests {
             "the drain claimed to empty while a read transaction was open: {report}"
         );
         assert_eq!(report.drain.still_open, 1, "{report}");
-        let (origin, _age) = report
+        let (caller, _age) = report
             .drain
             .oldest
             .expect("a drain that did not finish must name what it was waiting on");
         assert_eq!(
-            origin, "connect",
+            (caller.file(), caller.line()),
+            (file!(), connect_line),
             "the report must say WHERE the blocking transaction came from, or the \
              follow-up is another investigation instead of one log line"
+        );
+        assert!(
+            report
+                .to_string()
+                .contains(&format!("oldest={}:{connect_line}/", file!())),
+            "{report}"
         );
         assert!(!report.succeeded(), "{report}");
 
@@ -3268,6 +3845,332 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    /// A statement that never ends on its own: a recursive count with no bound.
+    /// It steps inside the engine without yielding, which is the 10-26 shape.
+    const RUNAWAY_COUNT: &str =
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c";
+
+    /// The pooled-read bound the tests below run under.
+    const TEST_READ_BOUND: Duration = Duration::from_millis(200);
+
+    fn read_bound_exceeded(error: &DbError) -> (Caller, Duration, Arc<str>) {
+        match error {
+            DbError::ReadBoundExceeded {
+                caller,
+                elapsed,
+                statement,
+                ..
+            } => (*caller, *elapsed, statement.clone()),
+            other => panic!("expected ReadBoundExceeded, got {other:?}"),
+        }
+    }
+
+    async fn assert_checkpoint_wins(db: &LocalDb) {
+        let report = db
+            .checkpoint(
+                1,
+                Duration::ZERO,
+                DrainBudget::fixed(Duration::from_millis(200)),
+            )
+            .await
+            .unwrap();
+        assert!(report.drain.drained && report.succeeded(), "{report}");
+    }
+
+    /// Dropping a read part-way releases its gate slot AND ends its MVCC
+    /// transaction, so cancelling a read can never leak what a checkpoint waits
+    /// on. A checkpoint winning is the proof of the second half: a slot alone
+    /// could be released while the engine still held the transaction.
+    #[tokio::test]
+    async fn a_dropped_read_future_releases_its_slot_and_its_transaction() {
+        let db = test_db().await.unwrap();
+        db.execute("INSERT INTO counters(id, value) VALUES ('a', 1)", ())
+            .await
+            .unwrap();
+        {
+            let read = db.read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn.query("SELECT COUNT(*) FROM counters", ()).await?;
+                    rows.next().await?;
+                    drop(rows);
+                    std::future::pending::<()>().await;
+                    Ok(())
+                })
+            });
+            let mut read = std::pin::pin!(read);
+            assert!(futures_util::poll!(read.as_mut()).is_pending());
+            assert_eq!(db.live_connections(), 1);
+        }
+        assert_eq!(db.live_connections(), 0);
+        assert_checkpoint_wins(&db).await;
+    }
+
+    /// The tenet's case: a pooled read statement stepping past the bound is
+    /// interrupted by the engine, fails naming its caller and its SQL, and
+    /// leaves nothing behind for the checkpoint to wait on. Multi-threaded
+    /// because the statement never yields the worker it runs on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runaway_pooled_read_is_interrupted_and_named() {
+        let db = test_db().await.unwrap().with_read_bound(TEST_READ_BOUND);
+
+        let line = line!() + 1;
+        let error = db.query_one(RUNAWAY_COUNT, (), |row| row.i64(0)).await;
+        let (caller, elapsed, statement) = read_bound_exceeded(&error.unwrap_err());
+        assert_eq!((caller.file(), caller.line()), (file!(), line));
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+        assert!(
+            statement.contains("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL"),
+            "{statement}"
+        );
+        assert_eq!(db.live_connections(), 0);
+        assert_checkpoint_wins(&db).await;
+
+        // Through a transaction closure, the label is the closure's statement.
+        let error = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn.query(RUNAWAY_COUNT, ()).await?;
+                    rows.next().await?;
+                    Ok(())
+                })
+            })
+            .await;
+        let (caller, _, statement) = read_bound_exceeded(&error.unwrap_err());
+        assert_eq!(caller.file(), file!());
+        assert!(
+            statement.starts_with(file!()) && statement.contains("WITH RECURSIVE"),
+            "{statement}"
+        );
+        assert_eq!(db.live_connections(), 0);
+        assert_checkpoint_wins(&db).await;
+    }
+
+    /// A read that parks between statements never trips the per-statement
+    /// deadline, so the outer timeout ends it, and dropping it rolls back.
+    #[tokio::test]
+    async fn a_parked_pooled_read_is_retired_at_the_bound() {
+        let db = test_db().await.unwrap().with_read_bound(TEST_READ_BOUND);
+        let started = Instant::now();
+        let error = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn.query("SELECT COUNT(*) FROM counters", ()).await?;
+                    rows.next().await?;
+                    drop(rows);
+                    std::future::pending::<()>().await;
+                    Ok(())
+                })
+            })
+            .await;
+        let (_, elapsed, statement) = read_bound_exceeded(&error.unwrap_err());
+        let deadline = TEST_READ_BOUND + PARKED_READ_SLACK;
+        assert!(elapsed >= deadline, "{elapsed:?}");
+        assert!(started.elapsed() < deadline + Duration::from_secs(5));
+        assert!(
+            statement.contains("SELECT COUNT(*) FROM counters"),
+            "{statement}"
+        );
+        assert_eq!(db.live_connections(), 0);
+        assert_checkpoint_wins(&db).await;
+    }
+
+    /// What the engine stopped is not handed to the next caller.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_interrupted_connection_is_not_returned_to_the_pool() {
+        let db = test_db().await.unwrap().with_read_bound(TEST_READ_BOUND);
+        db.query_one("SELECT 1", (), |row| row.i64(0))
+            .await
+            .unwrap();
+        let before = db.connections_created.load(Ordering::Relaxed);
+
+        let error = db.query_one(RUNAWAY_COUNT, (), |row| row.i64(0)).await;
+        read_bound_exceeded(&error.unwrap_err());
+        db.query_one("SELECT 1", (), |row| row.i64(0))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.connections_created.load(Ordering::Relaxed),
+            before + 1,
+            "the interrupted connection must be retired, so the next checkout opens a fresh one"
+        );
+    }
+
+    /// The bound is for pooled READS. A write, or a `connect` connection, on
+    /// which a statement runs well past it still succeeds, including a write on
+    /// the very connection a bounded read just used. The statement is sized
+    /// against this machine first so the test cannot pass by being fast.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writes_and_connect_are_not_bounded() {
+        let db = test_db().await.unwrap().with_read_bound(TEST_READ_BOUND);
+        let count_to = |n: u64| {
+            format!(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < {n}) \
+                 SELECT count(*) FROM c"
+            )
+        };
+
+        let unbounded = db.connect().await.unwrap();
+        let mut n = 50_000u64;
+        let slow = loop {
+            let sql = count_to(n);
+            let started = Instant::now();
+            let mut rows = unbounded.query(&sql, ()).await.unwrap();
+            rows.next().await.unwrap().unwrap();
+            let took = started.elapsed();
+            if took > TEST_READ_BOUND * 3 || n >= 1 << 28 {
+                break (n, took);
+            }
+            n *= 2;
+        };
+        assert!(
+            slow.1 > TEST_READ_BOUND * 3,
+            "no statement ran past the bound on a connect connection: {slow:?}"
+        );
+        drop(unbounded);
+
+        db.query_one("SELECT 1", (), |row| row.i64(0))
+            .await
+            .unwrap();
+        let pooled = db.connections_created.load(Ordering::Relaxed);
+        let sql = count_to(slow.0);
+        let started = Instant::now();
+        let counted = db
+            .write(|conn| {
+                let sql = sql.clone();
+                Box::pin(async move {
+                    let mut rows = conn.query(&sql, ()).await?;
+                    let row = rows.next().await?.expect("count row");
+                    row.i64(0)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(counted, i64::try_from(slow.0).unwrap());
+        assert!(
+            started.elapsed() > TEST_READ_BOUND,
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            db.connections_created.load(Ordering::Relaxed),
+            pooled,
+            "the write must have reused the connection the bounded read used"
+        );
+    }
+
+    /// The gate watch's source: each overdue holder once, then only again
+    /// after the re-warn interval, with who holds it and what it ran last.
+    #[tokio::test]
+    async fn overdue_holders_report_once_then_after_the_rewarn_interval() {
+        let db = test_db().await.unwrap();
+        let connect_line = line!() + 1;
+        let reader = db.connect().await.unwrap();
+        reader.execute(db.concurrent_begin(), ()).await.unwrap();
+        let threshold = Duration::from_millis(10);
+        let rewarn = Duration::from_millis(300);
+        assert!(db
+            .overdue_holders(Duration::from_secs(60), rewarn)
+            .is_empty());
+
+        sleep(Duration::from_millis(30)).await;
+        let first = db.overdue_holders(threshold, rewarn);
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!(first[0].kind, HolderKind::Connect);
+        assert_eq!(
+            (first[0].caller.file(), first[0].caller.line()),
+            (file!(), connect_line)
+        );
+        assert!(first[0].statement.contains("BEGIN"), "{:?}", first[0]);
+        assert!(db.overdue_holders(threshold, rewarn).is_empty());
+
+        sleep(rewarn + Duration::from_millis(50)).await;
+        assert_eq!(db.overdue_holders(threshold, rewarn).len(), 1);
+
+        drop(reader);
+        assert!(db.overdue_holders(threshold, Duration::ZERO).is_empty());
+    }
+
+    /// A statement a closure starts mid-poll renames the region that poll
+    /// entered, before anything yields. This is the 10-26 shape: an idle pooled
+    /// connection lets checkout, BEGIN, and the statement all happen in the
+    /// first poll, and the statement then steps inside it.
+    #[test]
+    fn a_statement_started_mid_poll_renames_the_running_region() {
+        const RUNTIME: &str = "cairn-db-midpoll-region-test";
+        let region = std::thread::spawn(|| {
+            runtime_regions::register_runtime_thread(RUNTIME);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let db = test_db().await.unwrap();
+                db.read(|conn| {
+                    Box::pin(async move {
+                        let rows = conn.query("SELECT 42", ());
+                        let region = runtime_regions::runtime_threads(RUNTIME)
+                            .into_iter()
+                            .find_map(|report| report.region);
+                        drop(rows);
+                        Ok(region)
+                    })
+                })
+                .await
+                .unwrap()
+            })
+        })
+        .join()
+        .unwrap()
+        .expect("the polling thread must report a region");
+        assert_eq!(region.label, STATEMENT_REGION);
+        let detail = region
+            .detail
+            .expect("a db.statement region carries its statement");
+        assert!(
+            detail.starts_with(file!()) && detail.ends_with(" SELECT 42"),
+            "{detail}"
+        );
+    }
+
+    /// What the runtime stall line reads: a thread polling a database call is
+    /// inside a `db.statement` region naming the call site and the SQL head,
+    /// whitespace collapsed.
+    #[test]
+    fn a_stepping_statement_is_named_in_its_runtime_region() {
+        const RUNTIME: &str = "cairn-db-region-test";
+        let line = line!() + 1;
+        let holder = Holder::new(Location::caller(), Some("SELECT  42\n\t FROM   t"));
+        let region = std::thread::spawn(move || {
+            runtime_regions::register_runtime_thread(RUNTIME);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(named(holder, async {
+                runtime_regions::runtime_threads(RUNTIME)
+                    .into_iter()
+                    .find_map(|report| report.region)
+            }))
+        })
+        .join()
+        .unwrap()
+        .expect("the polling thread must report a region");
+        assert_eq!(region.label, "db.statement");
+        assert_eq!(
+            region.detail.as_deref(),
+            Some(format!("{}:{line} SELECT 42 FROM t", file!()).as_str())
+        );
+    }
+
+    #[test]
+    fn a_statement_label_keeps_eighty_characters_of_sql() {
+        let sql = format!("SELECT {}", "x".repeat(200));
+        let label = statement_label(Location::caller(), Some(&sql));
+        let head = label.split_once(' ').unwrap().1;
+        assert_eq!(head.chars().count(), SQL_HEAD_CHARS);
+        assert!(head.starts_with("SELECT xxx"));
     }
 
     /// A query that abandons most of its rows leaves no transaction behind.

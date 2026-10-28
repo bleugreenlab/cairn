@@ -2086,8 +2086,152 @@ fn observation_test_page_sql() -> String {
     )
 }
 
+/// Whether a recorded result answers its lane
+/// ([`crate::execution::checks_status::LaneExistence::answers_the_lane`]),
+/// classified by the rule every lane reader applies: from its exit verdict, its
+/// stored failure kind, and its structured result when one was kept.
+fn result_answers_the_lane(
+    passed: bool,
+    failure_kind: Option<&str>,
+    target_results_json: Option<&str>,
+) -> bool {
+    let parsed = target_results_json.and_then(|json| {
+        serde_json::from_str::<crate::execution::check_parsers::ParsedCheckResult>(json).ok()
+    });
+    crate::execution::checks_status::row_existence(
+        passed,
+        failure_kind,
+        None,
+        parsed
+            .as_ref()
+            .map(|parsed| parsed.verdict_facts())
+            .as_ref(),
+    )
+    .answers_the_lane()
+}
+
+/// The verdict row at one projection key `(project, check, input hash,
+/// environment, schema)`, seeking the table's primary key.
+fn projected_verdict_row_sql() -> String {
+    format!(
+        "SELECT source_observation_id, passed, failure_kind, target_results_json
+           FROM check_result_cache INDEXED BY {CHECK_RESULT_CACHE_KEY_INDEX}
+          WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
+            AND environment_fingerprint = ?4 AND result_schema_version = ?5
+            AND {}",
+        RowFamily::Verdict.predicate("row_family"),
+    )
+}
+
+/// The observation one commit alias names: its verdict, failure kind, and the
+/// input hash it judged.
+const ALIASED_OBSERVATION_SQL: &str = "SELECT o.id, o.verdict, o.failure_kind, o.input_hash
+       FROM check_result_commit_aliases a
+       JOIN check_result_observations o ON o.id = a.source_observation_id
+      WHERE a.project_id = ?1 AND a.commit_sha = ?2 AND a.check_name = ?3
+        AND a.environment_fingerprint = ?4 AND a.result_schema_version = ?5";
+
+/// The verdict row at one projection key, when it exists.
+struct ProjectedVerdict {
+    source_observation_id: Option<String>,
+    passed: bool,
+    failure_kind: Option<String>,
+    target_results_json: Option<String>,
+}
+
+async fn projected_verdict(
+    conn: &Connection,
+    observation: &FreshCheckObservationWrite,
+    input_hash: &str,
+) -> DbResult<Option<ProjectedVerdict>> {
+    let mut rows = conn
+        .query(
+            &projected_verdict_row_sql(),
+            params![
+                observation.project_id.as_str(),
+                observation.check_name.as_str(),
+                input_hash,
+                observation.environment_fingerprint.as_str(),
+                observation.result_schema_version
+            ],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    Ok(Some(ProjectedVerdict {
+        source_observation_id: row.opt_text(0)?,
+        passed: row.i64(1)? != 0,
+        failure_kind: row.opt_text(2)?,
+        target_results_json: row.opt_text(3)?,
+    }))
+}
+
+/// Whether the hot projection row `observation` would replace holds an answer.
+async fn projection_holds_an_answer(
+    conn: &Connection,
+    observation: &FreshCheckObservationWrite,
+) -> DbResult<bool> {
+    Ok(
+        projected_verdict(conn, observation, &observation.input_hash)
+            .await?
+            .is_some_and(|row| {
+                result_answers_the_lane(
+                    row.passed,
+                    row.failure_kind.as_deref(),
+                    row.target_results_json.as_deref(),
+                )
+            }),
+    )
+}
+
+/// Whether the commit alias `observation` would replace names an answer. The
+/// aliased observation's structured result is read from the verdict row that
+/// still projects it; one a later observation has since displaced there is
+/// classified by its exit verdict and failure kind alone.
+async fn alias_names_an_answer(
+    conn: &Connection,
+    observation: &FreshCheckObservationWrite,
+) -> DbResult<bool> {
+    let mut rows = conn
+        .query(
+            ALIASED_OBSERVATION_SQL,
+            params![
+                observation.project_id.as_str(),
+                observation.commit_sha.as_str(),
+                observation.check_name.as_str(),
+                observation.environment_fingerprint.as_str(),
+                observation.result_schema_version
+            ],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(false);
+    };
+    let (id, verdict, failure_kind, input_hash) =
+        (row.text(0)?, row.text(1)?, row.opt_text(2)?, row.text(3)?);
+    drop(rows);
+    let target_results_json = projected_verdict(conn, observation, &input_hash)
+        .await?
+        .filter(|row| row.source_observation_id.as_deref() == Some(id.as_str()))
+        .and_then(|row| row.target_results_json);
+    Ok(result_answers_the_lane(
+        verdict == "passed",
+        failure_kind.as_deref(),
+        target_results_json.as_deref(),
+    ))
+}
+
 /// Atomically persist an immutable fresh observation, its test manifest, commit
 /// alias, and hot projection. Reuse remains gated by the immutable observation.
+///
+/// The alias and the projection are latest-evaluation pointers, and an attempt
+/// that produced no verdict (an infrastructure death, a killed run, an empty or
+/// incomplete selection) never moves one off an answer: it says nothing about
+/// inputs another run already judged. Such an attempt is still recorded as its
+/// own immutable observation; an infrastructure death also writes its
+/// head-scoped infrastructure row, which lane readers choose between with the
+/// answer it did not displace.
 #[allow(dead_code)]
 pub(crate) fn record_fresh_check_observation(
     db: Arc<LocalDb>,
@@ -2254,10 +2398,17 @@ pub(crate) fn record_fresh_check_observation(
                             i64::from(test.flaky)],
                     ).await?;
                 }
+                let answers = result_answers_the_lane(
+                    observation.verdict == "passed",
+                    observation.failure_kind.as_deref(),
+                    observation.target_results_json.as_deref(),
+                );
                 // A commit coordinate names the latest evaluation, not the
                 // immutable evidence itself. An explicit retry at the same
                 // coordinate supersedes this pointer while both source
-                // observations remain immutable and independently citable.
+                // observations remain immutable and independently citable,
+                // unless the retry produced no verdict and the pointer holds one.
+                if answers || !alias_names_an_answer(conn, &observation).await? {
                 conn.execute(
                     "DELETE FROM check_result_commit_aliases
                       WHERE project_id=?1 AND commit_sha=?2 AND check_name=?3
@@ -2285,6 +2436,8 @@ pub(crate) fn record_fresh_check_observation(
                         "fresh observation could not establish its commit alias",
                     ));
                 }
+                }
+                if answers || !projection_holds_an_answer(conn, &observation).await? {
                 conn.execute(
                         "INSERT INTO check_result_cache (
                             project_id, tree_hash, input_hash, check_name, environment_fingerprint,
@@ -2343,6 +2496,7 @@ pub(crate) fn record_fresh_check_observation(
                             observation.environment_fingerprint.as_str(), observation.result_schema_version,
                             observation.id.as_str()],
                     ).await?;
+                }
                 let infrastructure = observation
                     .failure_kind
                     .as_deref()
@@ -2993,6 +3147,7 @@ mod tests {
             ("claim escalation", claim_escalation_sql(), 6),
             ("charge streak", charge_streak_sql(2), 6),
             ("reset streak", reset_streak_sql(2), 5),
+            ("projected verdict row", projected_verdict_row_sql(), 5),
         ] {
             let plan = query_plan(&db, sql, binds).await;
             assert!(
@@ -5388,6 +5543,228 @@ mod tests {
         assert_eq!(observation_count, 2, "both immutable observations remain");
         assert_eq!(alias_source, "obs-2");
         assert_eq!(hot_source, "obs-2");
+    }
+
+    /// An attempt at `commit` in `environment` that ended without a verdict,
+    /// written the way the run path writes an infrastructure death: its
+    /// immutable observation, and its head-scoped infrastructure row.
+    fn record_infrastructure_death(db: &Arc<LocalDb>, id: &str, environment: &str, ran_at: i64) {
+        let mut died = observation(id, "commit-1", environment);
+        died.ran_at = ran_at;
+        died.exit_code = 75;
+        died.verdict = "failed".to_string();
+        died.failure_kind = Some("infrastructure".to_string());
+        died.reusable = false;
+        died.non_reusable_reason = Some("infrastructure failure".to_string());
+        died.output_tail = "cloud catalog lookup returned HTTP 404".to_string();
+        died.tests.clear();
+        record_fresh_check_observation(db.clone(), died).unwrap();
+        store_check_result(
+            db.clone(),
+            CheckResultCacheWrite {
+                input_hash: "input-rust".to_string(),
+                environment_fingerprint: infra_suppression_scope("job-1", "commit-1"),
+                ..failing_result("project-a", "tree-commit-1", "rust", Some("infrastructure"))
+            },
+        )
+        .unwrap();
+    }
+
+    /// Which observation `commit-1`'s alias and the hot projection name in
+    /// `environment`.
+    async fn pointers(db: &LocalDb, environment: &str) -> (String, String) {
+        let alias = db
+            .query_one(
+                "SELECT source_observation_id FROM check_result_commit_aliases
+                  WHERE project_id='project-a' AND commit_sha='commit-1' AND check_name='rust'
+                    AND environment_fingerprint=?1",
+                (environment.to_string(),),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        let hot = db
+            .query_one(
+                "SELECT source_observation_id FROM check_result_cache
+                  WHERE project_id='project-a' AND check_name='rust' AND input_hash='input-rust'
+                    AND environment_fingerprint=?1 AND row_family='verdict'",
+                (environment.to_string(),),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        (alias, hot)
+    }
+
+    /// A lane that judged its inputs and then died re-running them on the same
+    /// machine keeps its verdict. Before, the death's observation took both the
+    /// commit alias and the hot projection row, so a red became `died` to the
+    /// merge gate (spending the operator's waiver on a head known red), a green
+    /// stopped being reusable, and no reader could prefer the answer because
+    /// it no longer existed.
+    async fn assert_an_infrastructure_death_keeps(verdict: &str) {
+        let db = cache_db().await;
+        let mut answer = observation("obs-answer", "commit-1", "env-a");
+        if verdict == "failed" {
+            answer.exit_code = 1;
+            answer.verdict = "failed".to_string();
+            answer.tests[0].status = "failed".to_string();
+            answer.output_tail = "assertion failed".to_string();
+        }
+        record_fresh_check_observation(db.clone(), answer).unwrap();
+        record_infrastructure_death(&db, "obs-died", "env-a", 200);
+
+        assert_eq!(
+            db.query_one(
+                "SELECT COUNT(*) FROM check_result_observations
+                  WHERE id IN ('obs-answer','obs-died')",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap(),
+            2,
+            "{verdict}: both attempts stay recorded and citable"
+        );
+        assert_eq!(
+            pointers(&db, "env-a").await,
+            ("obs-answer".to_string(), "obs-answer".to_string()),
+            "{verdict}: the attempt without a verdict must not displace the answer"
+        );
+        let sibling = db
+            .query_one(
+                "SELECT failure_kind FROM check_result_cache
+                  WHERE project_id='project-a' AND check_name='rust' AND input_hash='input-rust'
+                    AND environment_fingerprint=?1 AND row_family='infra_suppression'",
+                (infra_suppression_scope("job-1", "commit-1"),),
+                |row| row.opt_text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sibling.as_deref(),
+            Some("infrastructure"),
+            "{verdict}: the death is still recorded beside the answer, for the head that hit it"
+        );
+        // With both rows standing, the lane readers have something to choose
+        // between: the answer is shown and the death is noted beside it.
+        let head = OwnedHeadVerdictKeys {
+            tree_hash: "tree-commit-1".to_string(),
+            input_hashes: [("rust".to_string(), "input-rust".to_string())].into(),
+            job_id: "job-1".to_string(),
+            commit_sha: "commit-1".to_string(),
+        };
+        let reader = db.clone();
+        let lanes = run_checkpoint_cache_db(async move {
+            reader
+                .read(move |conn| {
+                    Box::pin(async move {
+                        list_check_results_for_inputs_conn(conn, "project-a", head.keys()).await
+                    })
+                })
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert_eq!(lanes.len(), 1, "{verdict}: one lane, one state");
+        assert_eq!(lanes[0].row.passed, verdict == "passed");
+        assert_eq!(
+            lanes[0].row.failure_kind, None,
+            "{verdict}: select_lane_row shows the answer"
+        );
+        let attempt = lanes[0]
+            .newer_attempt
+            .as_ref()
+            .expect("the death is noted beside the answer");
+        assert_eq!(attempt.failure_kind.as_deref(), Some("infrastructure"));
+        let note = crate::execution::checks_status::newer_attempt_note(&lanes[0]).unwrap();
+        assert!(
+            note.contains(&format!("last verdict: {verdict}")),
+            "{verdict}: {note}"
+        );
+        let reused =
+            get_exact_reusable_check_result(db, "project-a", "rust", "input-rust", "env-a", 1)
+                .unwrap()
+                .expect("the answer stays reusable for these inputs");
+        assert_eq!(reused.passed, verdict == "passed");
+    }
+
+    #[tokio::test]
+    async fn an_infrastructure_death_keeps_the_red_it_did_not_judge() {
+        assert_an_infrastructure_death_keeps("failed").await;
+    }
+
+    #[tokio::test]
+    async fn an_infrastructure_death_keeps_the_green_it_did_not_judge() {
+        assert_an_infrastructure_death_keeps("passed").await;
+    }
+
+    /// The rule is about verdicts, not infrastructure: a killed run says no
+    /// more about the inputs than a lost fetch.
+    #[tokio::test]
+    async fn a_killed_run_keeps_the_answer_it_did_not_judge() {
+        let db = cache_db().await;
+        record_fresh_check_observation(db.clone(), observation("obs-green", "commit-1", "env-a"))
+            .unwrap();
+        let mut killed = observation("obs-killed", "commit-1", "env-a");
+        killed.ran_at = 200;
+        killed.exit_code = 143;
+        killed.verdict = "failed".to_string();
+        killed.failure_kind = Some("killed".to_string());
+        killed.reusable = false;
+        killed.tests.clear();
+        record_fresh_check_observation(db.clone(), killed).unwrap();
+
+        assert_eq!(
+            pointers(&db, "env-a").await,
+            ("obs-green".to_string(), "obs-green".to_string())
+        );
+    }
+
+    /// An answer still replaces an attempt that had none, and the newest of
+    /// several attempts without one still stands for the lane until an answer
+    /// arrives.
+    #[tokio::test]
+    async fn attempts_without_a_verdict_advance_until_an_answer_arrives() {
+        let db = cache_db().await;
+        record_infrastructure_death(&db, "obs-died-1", "env-a", 100);
+        record_infrastructure_death(&db, "obs-died-2", "env-a", 200);
+        assert_eq!(
+            pointers(&db, "env-a").await,
+            ("obs-died-2".to_string(), "obs-died-2".to_string()),
+            "with no answer, the newest attempt stands alone"
+        );
+
+        let mut red = observation("obs-red", "commit-1", "env-a");
+        red.ran_at = 300;
+        red.exit_code = 1;
+        red.verdict = "failed".to_string();
+        red.tests[0].status = "failed".to_string();
+        record_fresh_check_observation(db.clone(), red).unwrap();
+        assert_eq!(
+            pointers(&db, "env-a").await,
+            ("obs-red".to_string(), "obs-red".to_string()),
+            "an answer replaces the attempts before it"
+        );
+    }
+
+    /// Each environment keeps its own pointers: a death on one machine neither
+    /// displaces nor is displaced by another machine's answer.
+    #[tokio::test]
+    async fn a_death_in_another_environment_leaves_this_environments_answer_alone() {
+        let db = cache_db().await;
+        record_fresh_check_observation(db.clone(), observation("obs-green", "commit-1", "env-a"))
+            .unwrap();
+        record_infrastructure_death(&db, "obs-died", "env-b", 200);
+
+        assert_eq!(
+            pointers(&db, "env-a").await,
+            ("obs-green".to_string(), "obs-green".to_string())
+        );
+        assert_eq!(
+            pointers(&db, "env-b").await,
+            ("obs-died".to_string(), "obs-died".to_string())
+        );
     }
 
     #[tokio::test]

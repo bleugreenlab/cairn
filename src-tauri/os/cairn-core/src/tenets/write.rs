@@ -11,7 +11,7 @@ use cairn_db::turso::{params, Connection};
 use super::read::row_conn;
 use super::{
     emit_changed, successor_refusal, AnswerSource, TenetOrigin, TenetRow, TenetStatus, Verdict,
-    MAX_PROPOSAL_CHARS, OVER_LENGTH_REFUSAL,
+    MAX_RATIONALE_CHARS, MAX_STATEMENT_CHARS, OVER_LENGTH_REFUSAL, RATIONALE_OVER_LENGTH_REFUSAL,
 };
 use crate::execution::gates::sweep::notify_gate_evidence_changed;
 use crate::services::EventEmitter;
@@ -20,8 +20,10 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 /// What a thread proposes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proposal {
-    /// How the project does things, as the thread proposes it.
+    /// How the project does things, as the thread proposes it: one sentence.
     pub statement: String,
+    /// Why, the alternatives ruled out, and where it was argued.
+    pub rationale: Option<String>,
     /// An approved tenet this one replaces once it is itself approved.
     pub supersedes: Option<i64>,
     pub origin: TenetOrigin,
@@ -82,6 +84,7 @@ pub struct NewTenet {
     pub proposing_thread_id: String,
     pub slug: Option<String>,
     pub statement: String,
+    pub rationale: Option<String>,
     pub status: TenetStatus,
     pub verdict: Option<Verdict>,
     pub comment: Option<String>,
@@ -127,9 +130,9 @@ pub async fn insert_conn(conn: &Connection, tenet: &NewTenet) -> DbResult<(Strin
         "INSERT INTO tenets (
             id, project_id, number, proposing_thread_id, slug, statement, status, verdict,
             comment, answered_by_json, answer_source, answered_at, supersedes, origin,
-            legacy_json, proposer_principal_json, created_at, updated_at
+            legacy_json, proposer_principal_json, created_at, updated_at, rationale
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                   ?17, ?17)",
+                   ?17, ?17, ?18)",
         params![
             id.as_str(),
             tenet.project_id.as_str(),
@@ -147,7 +150,8 @@ pub async fn insert_conn(conn: &Connection, tenet: &NewTenet) -> DbResult<(Strin
             tenet.origin.as_str(),
             tenet.legacy.as_ref().map(encode).transpose()?,
             encode(&tenet.proposer)?,
-            tenet.now
+            tenet.now,
+            tenet.rationale.as_deref()
         ],
     )
     .await?;
@@ -160,23 +164,47 @@ fn encode<T: serde::Serialize>(value: &T) -> DbResult<String> {
     serde_json::to_string(value).map_err(|error| DbError::Row(error.to_string()))
 }
 
-/// The proposal's statement, trimmed, or the refusal naming what is wrong
-/// with it.
-pub(super) fn validate(proposal: &Proposal) -> Result<String, String> {
+/// A proposal's text as it is stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Validated {
+    pub statement: String,
+    pub rationale: Option<String>,
+}
+
+/// The proposal's statement and rationale, trimmed (a blank rationale is
+/// none), or the refusal naming what is wrong with them.
+pub(super) fn validate(proposal: &Proposal) -> Result<Validated, String> {
     let statement = proposal.statement.trim().to_string();
     if statement.is_empty() {
         return Err("a proposal needs a non-empty statement".into());
     }
     let chars = statement.chars().count();
-    if chars > MAX_PROPOSAL_CHARS {
+    if chars > MAX_STATEMENT_CHARS {
         return Err(format!(
-            "{OVER_LENGTH_REFUSAL} (this statement is {chars} characters; it may be at most {MAX_PROPOSAL_CHARS})"
+            "{OVER_LENGTH_REFUSAL} (this statement is {chars} characters; it may be at most {MAX_STATEMENT_CHARS})"
         ));
+    }
+    let rationale = proposal
+        .rationale
+        .as_deref()
+        .map(str::trim)
+        .filter(|rationale| !rationale.is_empty())
+        .map(str::to_string);
+    if let Some(rationale) = &rationale {
+        let chars = rationale.chars().count();
+        if chars > MAX_RATIONALE_CHARS {
+            return Err(format!(
+                "{RATIONALE_OVER_LENGTH_REFUSAL} (this rationale is {chars} characters)"
+            ));
+        }
     }
     if proposal.origin == TenetOrigin::MigratedRuling {
         return Err("migrated rulings are imported, never proposed".into());
     }
-    Ok(statement)
+    Ok(Validated {
+        statement,
+        rationale,
+    })
 }
 
 fn not_found(number: i64) -> String {
@@ -209,12 +237,16 @@ pub async fn propose(
     proposer: &Proposer,
     proposal: Proposal,
 ) -> Result<TenetRow, String> {
-    let statement = validate(&proposal)?;
+    let Validated {
+        statement,
+        rationale,
+    } = validate(&proposal)?;
     let new = NewTenet {
         project_id: proposer.project_id.clone(),
         proposing_thread_id: proposer.thread_id.clone(),
         slug: None,
         statement,
+        rationale,
         status: TenetStatus::Proposed,
         verdict: None,
         comment: None,

@@ -1481,6 +1481,9 @@ fn render_tenet_entry(view: &TenetView, from_thread: Option<&str>) -> String {
         tenet_date(row.answered_at.unwrap_or(row.updated_at)),
         row.statement
     );
+    if let Some(rationale) = &row.rationale {
+        entry.push_str(&format!("  rationale: {rationale}\n"));
+    }
     if let Some(comment) = &row.comment {
         entry.push_str(&format!("  comment: {comment}\n"));
     }
@@ -2567,6 +2570,7 @@ mod tests {
             proposing_thread_id: "thread".into(),
             slug: None,
             statement: text.to_string(),
+            rationale: None,
             status,
             verdict: answered.then_some(if status == TenetStatus::Declined {
                 crate::tenets::Verdict::No
@@ -2623,12 +2627,13 @@ mod tests {
     #[test]
     fn an_approved_tenet_renders_in_full_with_its_verdict() {
         let mut successor = tenet(4, TenetStatus::Approved, "Ship the lease change");
+        successor.row.rationale = Some("Leases expire; tokens do not.".into());
         successor.row.comment = Some("Do it this week".into());
         successor.row.supersedes = Some(2);
         let rendered = render_tenets(vec![successor]);
         assert!(
             rendered.contains(
-                "- **#4** (approved by anonymous device d-1, 2023-11-14) — Ship the lease change\n  comment: Do it this week\n  supersedes #2\n"
+                "- **#4** (approved by anonymous device d-1, 2023-11-14) — Ship the lease change\n  rationale: Leases expire; tokens do not.\n  comment: Do it this week\n  supersedes #2\n"
             ),
             "{rendered}"
         );

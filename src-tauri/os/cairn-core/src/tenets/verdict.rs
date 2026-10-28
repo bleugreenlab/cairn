@@ -4,8 +4,8 @@
 //! so neither can be lost or doubled:
 //!
 //! - the proposing thread gets one system direct message, keyed
-//!   `tenet-verdict:<id>`: the verdict, the statement, the comment, and what
-//!   it gated. A decline steers the
+//!   `tenet-verdict:<id>`: the verdict, the statement and its rationale, the
+//!   comment, and what it gated. A decline steers the
 //!   thread awake; an approval rides along quietly with its next turn.
 //! - every issue an approved tenet releases gets a comment naming the decision,
 //!   so the planner that starts on release reads what the operator decided
@@ -175,14 +175,21 @@ async fn gated_conn(conn: &Connection, uri: &str) -> DbResult<Vec<Gated>> {
     Ok(gated)
 }
 
-/// The approval comment a gated issue gets.
+/// The approval comment a gated issue gets: the statement in the headline,
+/// its rationale beneath it.
 fn approval_comment(tenet: &TenetRow, label: &str) -> String {
-    format!(
-        "Tenet #{} approved by the operator ({label}): {}\nComment: {}.",
-        tenet.number,
-        tenet.statement,
-        tenet.comment.as_deref().unwrap_or("none"),
-    )
+    let mut lines = vec![format!(
+        "Tenet #{} approved by the operator ({label}): {}",
+        tenet.number, tenet.statement
+    )];
+    if let Some(rationale) = &tenet.rationale {
+        lines.push(format!("Rationale: {rationale}"));
+    }
+    lines.push(format!(
+        "Comment: {}.",
+        tenet.comment.as_deref().unwrap_or("none")
+    ));
+    lines.join("\n")
 }
 
 fn verdict_message(
@@ -203,6 +210,9 @@ fn verdict_message(
         format!("The operator ({label}) answered tenet #{number} ({uri}): {verdict}."),
         format!("Statement: {}", tenet.statement),
     ];
+    if let Some(rationale) = &tenet.rationale {
+        lines.push(format!("Rationale: {rationale}"));
+    }
     lines.push(format!(
         "Comment: {}",
         tenet.comment.as_deref().unwrap_or("none")

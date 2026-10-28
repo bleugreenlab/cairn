@@ -52,8 +52,16 @@ fn design() -> Proposer {
 fn proposal(statement: &str) -> Proposal {
     Proposal {
         statement: statement.into(),
+        rationale: None,
         supersedes: None,
         origin: TenetOrigin::Standing,
+    }
+}
+
+fn with_rationale(statement: &str, rationale: &str) -> Proposal {
+    Proposal {
+        rationale: Some(rationale.into()),
+        ..proposal(statement)
     }
 }
 
@@ -147,14 +155,61 @@ async fn a_proposal_is_refused_when_its_statement_is_blank_or_too_long() {
 
     let blank = refuse(proposal("   ")).await;
     assert!(blank.contains("non-empty statement"), "{blank}");
-    let over = refuse(proposal(&"x".repeat(MAX_PROPOSAL_CHARS + 1))).await;
+    assert_eq!(MAX_STATEMENT_CHARS, 200);
+    let over = refuse(proposal(&"x".repeat(MAX_STATEMENT_CHARS + 1))).await;
     assert!(over.starts_with(OVER_LENGTH_REFUSAL), "{over}");
+    assert!(
+        over.contains(
+            "put the reasoning, rejected alternatives, and provenance links in `rationale`"
+        ),
+        "the refusal says where the essay goes: {over}"
+    );
+    assert!(over.contains("this statement is 201 characters"), "{over}");
+    assert_eq!(MAX_RATIONALE_CHARS, 1500);
+    let long_rationale = refuse(with_rationale(
+        "Short.",
+        &"y".repeat(MAX_RATIONALE_CHARS + 1),
+    ))
+    .await;
+    assert!(
+        long_rationale.starts_with(RATIONALE_OVER_LENGTH_REFUSAL),
+        "{long_rationale}"
+    );
 
     assert!(
         emitter.captured().is_empty(),
         "a refused proposal writes nothing"
     );
     assert_eq!(pending_count(&db, PROJECT).await.unwrap(), 0);
+}
+
+/// A statement at the cap with a rationale at its cap is accepted, and both
+/// read back; a blank rationale is no rationale.
+#[tokio::test]
+async fn a_statement_and_rationale_at_their_caps_are_proposed_and_read_back() {
+    let db = fixture("tenets-rationale.db").await;
+    let statement = "s".repeat(MAX_STATEMENT_CHARS);
+    let rationale = "r".repeat(MAX_RATIONALE_CHARS);
+    let tenet = propose_ok(
+        &db,
+        &design(),
+        with_rationale(&statement, &format!("  {rationale}  ")),
+    )
+    .await;
+    assert_eq!(tenet.statement, statement);
+    assert_eq!(tenet.rationale.as_deref(), Some(rationale.as_str()));
+
+    let read = view(&db, tenet.number).await;
+    assert_eq!(read.row.rationale.as_deref(), Some(rationale.as_str()));
+    let json = serde_json::to_value(&read).unwrap();
+    assert_eq!(json["rationale"], rationale.as_str());
+
+    let bare = propose_ok(&db, &design(), with_rationale("Bare.", "   ")).await;
+    assert_eq!(bare.rationale, None);
+    assert_eq!(
+        serde_json::to_value(view(&db, bare.number).await).unwrap()["rationale"],
+        serde_json::Value::Null
+    );
 }
 
 #[tokio::test]
@@ -501,6 +556,7 @@ async fn a_migrated_slug_resolves_to_its_canonical_number() {
         proposing_thread_id: DESIGN.into(),
         slug: Some("rulings-become-tenets".into()),
         statement: "Rulings become tenets".into(),
+        rationale: None,
         status: TenetStatus::Approved,
         verdict: Some(Verdict::Yes),
         comment: None,

@@ -3599,10 +3599,47 @@ async fn a_thread_proposes_and_withdraws_tenets_but_never_answers_or_edits_them(
         retired.error
     );
 
+    // An essay in the statement is refused, saying where the essay goes.
+    let essay = apply_as_run(
+        &orch,
+        &tenet_item(
+            "cairn://p/cairn/tenets",
+            ChangeMode::Append,
+            serde_json::json!({"statement": "x".repeat(201)}),
+        ),
+        &run,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        essay.error.contains(crate::tenets::OVER_LENGTH_REFUSAL),
+        "{}",
+        essay.error
+    );
+    let typed = apply_as_run(
+        &orch,
+        &tenet_item(
+            "cairn://p/cairn/tenets",
+            ChangeMode::Append,
+            serde_json::json!({"statement": "S.", "rationale": 3}),
+        ),
+        &run,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        typed.error.contains("rationale must be a string"),
+        "{}",
+        typed.error
+    );
+
     let propose = tenet_item(
         "cairn://p/cairn/tenets",
         ChangeMode::Append,
-        serde_json::json!({"statement": "X ships via Y, not Z."}),
+        serde_json::json!({
+            "statement": "X ships via Y.",
+            "rationale": "Rejected: Z, because it doubles the release time (cairn://p/cairn/1).",
+        }),
     );
     let proposed = apply_as_run(&orch, &propose, &run).await.unwrap();
     assert!(proposed.contains("cairn://p/cairn/tenets/1"), "{proposed}");
@@ -3615,6 +3652,18 @@ async fn a_thread_proposes_and_withdraws_tenets_but_never_answers_or_edits_them(
         .unwrap()
         .unwrap();
     assert_eq!(tenet.row.origin, crate::tenets::TenetOrigin::Standing);
+    assert_eq!(tenet.row.statement, "X ships via Y.");
+    assert_eq!(
+        tenet.row.rationale.as_deref(),
+        Some("Rejected: Z, because it doubles the release time (cairn://p/cairn/1).")
+    );
+    let entity = crate::resources::tenets::read_entity(&orch.db.local, "cairn", "1", &[]).await;
+    assert!(
+        entity.contains(
+            "X ships via Y.\n\n## Rationale\n\nRejected: Z, because it doubles the release time"
+        ),
+        "the entity reads the rationale back beneath the statement: {entity}"
+    );
     assert_eq!(
         tenet.row.proposer,
         cairn_common::identity::PrincipalRef::Agent {

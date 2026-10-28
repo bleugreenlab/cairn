@@ -13,6 +13,7 @@ pub(super) async fn dispatch(
     item: &ChangeItem,
     dry_run: bool,
     resource: &CairnResource,
+    applied_data: &mut Option<serde_json::Value>,
 ) -> ResourceMutationResult<Option<String>> {
     let summary = match (resource, item.mode) {
         (CairnResource::IssueExecutions { project, number }, ChangeMode::Append) => {
@@ -107,7 +108,7 @@ pub(super) async fn dispatch(
                         .unwrap_or_default()
                 )
             } else {
-                executions::start_execution_from_collection(
+                let started = executions::start_execution_from_collection(
                     orch,
                     project,
                     *number,
@@ -121,7 +122,11 @@ pub(super) async fn dispatch(
                     tenet,
                 )
                 .await
-                .map_err(|error| build_failure(index, item, error))?
+                .map_err(|error| build_failure(index, item, error))?;
+                if let Some(tenet) = started.proposed_tenet {
+                    *applied_data = Some(serde_json::json!({ "tenet": tenet }));
+                }
+                started.summary
             }
         }
         (

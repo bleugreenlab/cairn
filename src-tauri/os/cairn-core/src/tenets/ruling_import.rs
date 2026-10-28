@@ -419,6 +419,9 @@ fn new_tenet(
         proposing_thread_id: candidate.thread_id.clone(),
         slug: Some(slug),
         statement: candidate.text.clone(),
+        // A ruling's rationale is kept verbatim in `legacy` with its
+        // provenance, as every earlier import kept it.
+        rationale: None,
         status,
         verdict: Some(verdict),
         comment: None,

@@ -369,6 +369,15 @@ macro_rules! shared_tail_turn_end_check_attempt_plan {
     };
 }
 
+/// cairn/5433: a tenet's reasoning lives in `rationale`, beside the
+/// one-sentence statement the operator answers. `tenets` is carried by both
+/// lineages.
+macro_rules! shared_tail_tenet_rationale {
+    () => {
+        migration!("0286_tenet_rationale")
+    };
+}
+
 /// cairn/4987: the base and incoming side a conflict session's committed
 /// resolution was resolved against, and the tip and destination of an
 /// outstanding take-committed-tip request. `jj_reconcile_items` is carried by
@@ -1618,6 +1627,7 @@ macro_rules! team_lineage {
             shared_tail_job_goal_intent!(),
             shared_tail_compile_facts!(),
             shared_tail_turn_end_check_attempt_plan!(),
+            shared_tail_tenet_rationale!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1907,6 +1917,7 @@ macro_rules! private_lineage {
             shared_tail_compile_facts!(),
             shared_tail_turn_end_check_attempt_plan!(),
             private_embedding_space!(),
+            shared_tail_tenet_rationale!(),
         ]
     };
 }
@@ -3789,6 +3800,7 @@ mod tests {
                 "compile_facts",
                 "turn_end_check_attempt_plan",
                 "embedding_space",
+                "tenet_rationale",
             ],
         );
     }
@@ -7415,6 +7427,8 @@ mod tests {
                 "compile_facts",
                 // cairn/5282: a review wave's plan kept on its attempt row.
                 "turn_end_check_attempt_plan",
+                // cairn/5433: a tenet's rationale beside its statement.
+                "tenet_rationale",
             ],
         );
         assert_eq!(

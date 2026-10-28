@@ -6,7 +6,7 @@
 //! `tenet_gated_recipes`: planbuild, coordinator, and PlanCoord by default)
 //! wait for the operator. Such a filing carries exactly one of:
 //!
-//! - `proposal: {statement}`, proposed to the operator on the spot; or
+//! - `proposal: {statement, rationale?}`, proposed to the operator on the spot; or
 //! - `tenet: <n>`, one of the same thread's proposed or approved tenets, which
 //!   is how one approval releases every filing of a whole plan.
 //!
@@ -33,7 +33,10 @@ use crate::storage::LocalDb;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TenetClaim {
     /// Propose this statement now and hold on its verdict.
-    Proposal { statement: String },
+    Proposal {
+        statement: String,
+        rationale: Option<String>,
+    },
     /// Hold on this existing tenet of the filing thread.
     Existing(i64),
 }
@@ -95,8 +98,9 @@ impl TenetFiling {
 fn parse_proposal(value: &Value, key_prefix: &str) -> Result<TenetClaim, String> {
     let shape = || {
         format!(
-            "{key_prefix}.proposal must be {{statement: string}}: how the project does things, \
-             for the operator to answer yes or no"
+            "{key_prefix}.proposal must be {{statement: string, rationale?: string}}: the statement \
+             is one sentence of how the project does things, for the operator to answer yes or no; \
+             the rationale carries why, the alternatives ruled out, and where it was argued"
         )
     };
     let object = value.as_object().ok_or_else(shape)?;
@@ -105,7 +109,10 @@ fn parse_proposal(value: &Value, key_prefix: &str) -> Result<TenetClaim, String>
             "{key_prefix}.proposal."
         )));
     }
-    if object.keys().any(|key| key != "statement") {
+    if object
+        .keys()
+        .any(|key| key != "statement" && key != "rationale")
+    {
         return Err(shape());
     }
     let statement = object
@@ -113,7 +120,14 @@ fn parse_proposal(value: &Value, key_prefix: &str) -> Result<TenetClaim, String>
         .and_then(Value::as_str)
         .ok_or_else(shape)?
         .to_string();
-    Ok(TenetClaim::Proposal { statement })
+    let rationale = match object.get("rationale") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_str().ok_or_else(shape)?.to_string()),
+    };
+    Ok(TenetClaim::Proposal {
+        statement,
+        rationale,
+    })
 }
 
 /// The refusal for a caller that names a tenet while acting for no thread.
@@ -122,8 +136,8 @@ pub const NON_THREAD_FILING_REFUSAL: &str = "`proposal` and `tenet` belong to a 
 fn missing_tenet_refusal(recipe: &str, key_prefix: &str) -> String {
     format!(
         "a thread files `{recipe}` only behind a tenet the operator answers. Send exactly one of \
-         {key_prefix}.proposal: {{statement}}, a statement of how the project does things \
-         proposed to the operator now for a yes or no, or {key_prefix}.tenet: <n>, one of your thread's proposed or approved \
+         {key_prefix}.proposal: {{statement, rationale?}}, one sentence of how the project does \
+         things proposed to the operator now for a yes or no, or {key_prefix}.tenet: <n>, one of your thread's proposed or approved \
          tenets (one approval can release every filing of a plan). The execution is filed HELD \
          until the operator answers. `build` is for repair only, not a way around this."
     )
@@ -229,9 +243,13 @@ pub(crate) async fn plan(
         (None, _) => return Ok(None),
     };
     let claim = match claim {
-        TenetClaim::Proposal { statement } => {
+        TenetClaim::Proposal {
+            statement,
+            rationale,
+        } => {
             let proposal = Proposal {
                 statement,
+                rationale,
                 supersedes: None,
                 origin: TenetOrigin::FilingGate,
             };
@@ -479,6 +497,12 @@ impl FilingGate {
                 self.uri
             );
         }
+    }
+
+    /// The tenet's URI when this filing proposed it: the proposal the operator
+    /// is now asked to answer, as opposed to an existing tenet it names.
+    pub(crate) fn proposed_uri(&self) -> Option<&str> {
+        self.proposed.then_some(self.uri.as_str())
     }
 
     /// What a held filing says about its tenet.

@@ -221,18 +221,27 @@ fn resolve_home_suffix(home_uri: &str, suffix: &str) -> String {
 /// polling, which is the bulk of the database traffic on an idle machine, and
 /// they are out of the pool. A quiesce that did not see them would drain to zero
 /// and still lose the checkpoint lock (CAIRN-4167).
-pub(super) async fn connect_for_read(db: &LocalDb) -> Result<TrackedConnection, String> {
-    let conn = db
-        .connect()
-        .await
-        .map_err(|error| storage_error("Database error", error))?;
-    // Backend-aware: a synced (non-MVCC) replica cannot run `BEGIN CONCURRENT`,
-    // so route through the one source of truth for the begin statement on this
-    // handle (plain `BEGIN` on synced, `BEGIN CONCURRENT` on local).
-    conn.execute(db.concurrent_begin(), ())
-        .await
-        .map_err(|error| storage_error("Database error", error.into()))?;
-    Ok(conn)
+///
+/// `#[track_caller]` so the gate records the reader that called this, not this
+/// helper: a drain report or a gate-watch warning naming `common.rs` for every
+/// resource read would name nothing.
+#[track_caller]
+pub(super) fn connect_for_read(
+    db: &LocalDb,
+) -> impl std::future::Future<Output = Result<TrackedConnection, String>> + '_ {
+    let connecting = db.connect();
+    async move {
+        let conn = connecting
+            .await
+            .map_err(|error| storage_error("Database error", error))?;
+        // Backend-aware: a synced (non-MVCC) replica cannot run `BEGIN CONCURRENT`,
+        // so route through the one source of truth for the begin statement on this
+        // handle (plain `BEGIN` on synced, `BEGIN CONCURRENT` on local).
+        conn.execute(db.concurrent_begin(), ())
+            .await
+            .map_err(|error| storage_error("Database error", error.into()))?;
+        Ok(conn)
+    }
 }
 
 /// The one-glyph rendering of a node's run state, shared by every surface that
@@ -1347,6 +1356,27 @@ pub(super) fn parse_optional_usize_param(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gate names the resource reader that opened the transaction, so a
+    /// drain report or a held-too-long warning points at the reader rather than
+    /// at this shared helper.
+    #[tokio::test]
+    async fn connect_for_read_is_attributed_to_its_caller() {
+        let db = crate::storage::migrated_test_db("connect-for-read-caller.db").await;
+        let line = line!() + 1;
+        let conn = connect_for_read(&db).await.unwrap();
+        let held = db.overdue_holders(
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+        );
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(
+            (held[0].caller.file(), held[0].caller.line()),
+            (file!(), line)
+        );
+        drop(conn);
+        assert_eq!(db.live_connections(), 0);
+    }
 
     /// `cairn:~/attachments` names the CONVERSATION's attachments, not the
     /// node's: an attachment is anchored where the chat lives. Appending the

@@ -3665,6 +3665,32 @@ line2', X'0001020AFF', 2.5),
         (orch, db_dir)
     }
 
+    /// `PRAGMA query_only` is per connection and the SQL projection runs on a
+    /// pooled one, so the read must not hand the pool a connection that refuses
+    /// the next caller's writes.
+    #[tokio::test]
+    async fn a_db_sql_read_leaves_its_pooled_connection_writable() {
+        let db = crate::storage::migrated_test_db("db-sql-query-only.db").await;
+        let projection = DbSqlProjection {
+            sql: "SELECT 1".to_string(),
+            offset: 0,
+            limit: 10,
+            format: DbSqlFormat::Text,
+        };
+        run_sql_projection(&db, &projection).await.unwrap();
+        // Sequential pooled calls reuse one connection, so this write draws the
+        // connection the projection just released.
+        db.exclusive(|conn| {
+            Box::pin(async move {
+                conn.execute("CREATE TABLE after_db_sql_read (x INTEGER)", ())
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn db_sql_projection_renders_rows_and_record_metadata() {
         let (orch, _db_dir) = db_projection_orch().await;

@@ -1139,6 +1139,7 @@ dependencies = [
  "cairn-codec",
  "cairn-common",
  "cairn-domain",
+ "cairn-platform",
  "chrono",
  "futures-util",
  "log",
@@ -8175,7 +8176,7 @@ dependencies = [
 [[package]]
 name = "turso"
 version = "0.8.0-pre.3"
-source = "git+https://github.com/tursodatabase/turso?rev=964faddd16b20ed7d5c090a879a138dbabeee508#964faddd16b20ed7d5c090a879a138dbabeee508"
+source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -8194,7 +8195,7 @@ dependencies = [
 [[package]]
 name = "turso_core"
 version = "0.8.0-pre.3"
-source = "git+https://github.com/tursodatabase/turso?rev=964faddd16b20ed7d5c090a879a138dbabeee508#964faddd16b20ed7d5c090a879a138dbabeee508"
+source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
 dependencies = [
  "aegis",
  "aes",
@@ -8266,7 +8267,7 @@ dependencies = [
 [[package]]
 name = "turso_ext"
 version = "0.8.0-pre.3"
-source = "git+https://github.com/tursodatabase/turso?rev=964faddd16b20ed7d5c090a879a138dbabeee508#964faddd16b20ed7d5c090a879a138dbabeee508"
+source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",
@@ -8276,7 +8277,7 @@ dependencies = [
 [[package]]
 name = "turso_macros"
 version = "0.8.0-pre.3"
-source = "git+https://github.com/tursodatabase/turso?rev=964faddd16b20ed7d5c090a879a138dbabeee508#964faddd16b20ed7d5c090a879a138dbabeee508"
+source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8286,7 +8287,7 @@ dependencies = [
 [[package]]
 name = "turso_parser"
 version = "0.8.0-pre.3"
-source = "git+https://github.com/tursodatabase/turso?rev=964faddd16b20ed7d5c090a879a138dbabeee508#964faddd16b20ed7d5c090a879a138dbabeee508"
+source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
 dependencies = [
  "bitflags 2.10.0",
  "memchr",
@@ -8300,7 +8301,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit"
 version = "0.8.0-pre.3"
-source = "git+https://github.com/tursodatabase/turso?rev=964faddd16b20ed7d5c090a879a138dbabeee508#964faddd16b20ed7d5c090a879a138dbabeee508"
+source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -8316,7 +8317,7 @@ dependencies = [
 [[package]]
 name = "turso_sdk_kit_macros"
 version = "0.8.0-pre.3"
-source = "git+https://github.com/tursodatabase/turso?rev=964faddd16b20ed7d5c090a879a138dbabeee508#964faddd16b20ed7d5c090a879a138dbabeee508"
+source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8326,7 +8327,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_engine"
 version = "0.8.0-pre.3"
-source = "git+https://github.com/tursodatabase/turso?rev=964faddd16b20ed7d5c090a879a138dbabeee508#964faddd16b20ed7d5c090a879a138dbabeee508"
+source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -8348,7 +8349,7 @@ dependencies = [
 [[package]]
 name = "turso_sync_sdk_kit"
 version = "0.8.0-pre.3"
-source = "git+https://github.com/tursodatabase/turso?rev=964faddd16b20ed7d5c090a879a138dbabeee508#964faddd16b20ed7d5c090a879a138dbabeee508"
+source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
 dependencies = [
  "bindgen",
  "env_logger",
