@@ -5976,7 +5976,19 @@ async fn run_write_checks_after_seal_inner(
         }
     }
 
-    let batch_outcome = if miss_indices.is_empty() {
+    // The write cell runs on this runner's colocated machine; a lane whose
+    // platforms exclude it leaves the cell rather than waiting on a machine
+    // that can never answer it.
+    let split = split_write_wave(
+        &keyed,
+        &checks,
+        &miss_indices,
+        crate::execution::check_identity::gating_platform(),
+        &orch
+            .fleet
+            .executor_name_for_text(crate::fleet::COLOCATED_EXECUTOR_ID),
+    );
+    let batch_outcome = if split.cell.is_empty() {
         None
     } else {
         Some(
@@ -5988,7 +6000,7 @@ async fn run_write_checks_after_seal_inner(
                     checks: &checks,
                     extra_inputs: &extra_inputs,
                     keyed: &keyed,
-                    order: &fixer_first_submission_order(&keyed, &checks, &miss_indices),
+                    order: &fixer_first_submission_order(&keyed, &checks, &split.cell),
                     timeouts: &timeouts,
                     sealed_commit: &sealed_commit,
                     cell_env: &cell_env,
@@ -5996,6 +6008,7 @@ async fn run_write_checks_after_seal_inner(
                     tool_use_id,
                     status_board: Some(status_board.clone()),
                 },
+                MutationPolicy::AllowDelta,
             )
             .await,
         )
@@ -6119,7 +6132,7 @@ async fn run_write_checks_after_seal_inner(
                 checks: &checks,
                 extra_inputs: &extra_inputs,
                 keyed: &keyed,
-                order: &miss_indices,
+                order: &split.cell,
                 timeouts: &timeouts,
                 sealed_commit: &sealed_commit,
                 cell_env: &cell_env,
@@ -6131,6 +6144,7 @@ async fn run_write_checks_after_seal_inner(
             &published.paths,
             &published.commit,
             published.landed_on_tested_base,
+            &split.spilled,
         )
         .await;
         let rekeyed = match rekeyed {
@@ -6161,6 +6175,49 @@ async fn run_write_checks_after_seal_inner(
         .as_ref()
         .map(|published| published.commit.as_str())
         .unwrap_or(sealed_commit.as_str());
+    // Spilled lanes run only now, after the cell and any fold, at the commit
+    // this wave lands and keyed on that tree. Running them beside the cell would
+    // key a verdict to a tree a fix then replaced; ordering them after it makes
+    // that impossible by construction rather than by timing.
+    if !split.spilled.is_empty() {
+        log::info!(
+            "when:write checks: {} lane(s) declare platforms the write cell is not on; running them verdict-only at {observation_commit}: {:?}",
+            split.spilled.len(),
+            split
+                .spilled
+                .iter()
+                .map(|index| keyed[*index].0.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        let spilled = submit_write_check_batch_for(
+            orch,
+            WriteCheckBatchRequest {
+                run_context,
+                repo_root,
+                checks: &checks,
+                extra_inputs: &extra_inputs,
+                keyed: &keyed,
+                order: &split.spilled,
+                timeouts: &timeouts,
+                sealed_commit: observation_commit,
+                cell_env: &cell_env,
+                process_env: &process_env,
+                tool_use_id,
+                status_board: Some(status_board.clone()),
+            },
+            MutationPolicy::PureVerdict,
+        )
+        .await;
+        batched_results.extend(spilled.results);
+    }
+    // A fixer the write cell cannot run is a lane-configuration error: nothing
+    // ran, and the sentence names the config line to change.
+    for (index, refusal) in &split.refused {
+        batched_results.insert(
+            *index,
+            Err(CheckExecutionFailure::NotPlaceable(refusal.clone())),
+        );
+    }
     let batched_results = Arc::new(std::sync::Mutex::new(batched_results));
     let retry_orch = orch.clone();
     let retry_context = run_context.clone();
@@ -6352,12 +6409,71 @@ struct WriteCheckBatchRequest<'a> {
     status_board: Option<CheckStatusBoard>,
 }
 
+/// How a write-cadence wave's cache misses split by where each may run.
+///
+/// The write cell is the job's colocated checkout, the one place a fix can fold
+/// back into the commit, so its mobility is pinned. A lane whose
+/// `verdictPlatforms` exclude the write cell's platform can never be answered
+/// there, and a request naming a platform is answered only by a run on that
+/// platform. Such a lane leaves the cell as a verdict-only lane placed on a
+/// matching machine, unless it is a declared fixer, whose delta can fold only
+/// from the write cell.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WriteWaveSplit {
+    /// Run in the write cell, which may fold a fix.
+    cell: Vec<usize>,
+    /// Run verdict-only on a machine their own platforms admit, at the commit
+    /// the wave lands, after the cell (and any fold) is done.
+    spilled: Vec<usize>,
+    /// Declared fixers the write cell cannot run, with the sentence saying why.
+    refused: Vec<(usize, String)>,
+}
+
+fn split_write_wave(
+    keyed: &[(CheckPlan, String)],
+    checks: &HashMap<String, CheckCommand>,
+    misses: &[usize],
+    write_cell_platform: &str,
+    write_cell_machine: &str,
+) -> WriteWaveSplit {
+    let mut split = WriteWaveSplit::default();
+    for &index in misses {
+        let name = &keyed[index].0.name;
+        let Some(check) = checks.get(name) else {
+            split.cell.push(index);
+            continue;
+        };
+        let platforms = crate::execution::check_identity::verdict_platforms(check);
+        if platforms
+            .iter()
+            .any(|platform| platform.eq_ignore_ascii_case(write_cell_platform))
+        {
+            split.cell.push(index);
+        } else if check.fixes {
+            split.refused.push((
+                index,
+                format!(
+                    "check `{name}` fixes files but its verdictPlatforms [{}] exclude the write cell on {write_cell_machine} ({write_cell_platform}); a fix folds only from the write cell. Widen verdictPlatforms or drop `fixes` in .cairn/config.yaml",
+                    platforms.join(", ")
+                ),
+            ));
+        } else {
+            split.spilled.push(index);
+        }
+    }
+    split
+}
+
 /// Submit one build-slot batch for the given cache-MISS plan indices, in the
 /// given execution order. Every failure mode resolves to per-index failures, so
 /// the caller always holds exactly one outcome per submitted index.
+///
+/// `mutation_policy` is `AllowDelta` for the write cell, whose fix folds, and
+/// `PureVerdict` for the lanes a [`WriteWaveSplit`] spilled to other platforms.
 async fn submit_write_check_batch_for(
     orch: &Orchestrator,
     batch: WriteCheckBatchRequest<'_>,
+    mutation_policy: MutationPolicy,
 ) -> PlannedCheckBatchOutcome {
     let WriteCheckBatchRequest {
         run_context,
@@ -6443,7 +6559,7 @@ async fn submit_write_check_batch_for(
                     env: cell_env.to_vec(),
                     items,
                     run_context: Some(run_context.clone()),
-                    mutation_policy: MutationPolicy::AllowDelta,
+                    mutation_policy,
                     status_board,
                     purpose: None,
                 },
@@ -6503,6 +6619,7 @@ async fn rekey_wave_onto_fix(
     fixed_paths: &[String],
     fixed_commit: &str,
     fix_landed_on_tested_base: bool,
+    deferred: &[usize],
 ) -> Result<FixedWave, String> {
     let logical = crate::mcp::handlers::branch::resolve_current_for_read(
         orch,
@@ -6608,9 +6725,12 @@ async fn rekey_wave_onto_fix(
         .map_err(|error| format!("join the post-fix planning unit: {error}"))??;
 
     // An invalidated verdict may still be answerable from the cache on the FIXED
-    // tree; only a genuine miss needs the slot.
+    // tree; only a genuine miss needs the slot. A deferred lane is never
+    // re-verified here: it has not run yet, it runs at the fixed commit once
+    // this returns, and the write cell is the one place it cannot run.
     let misses: Vec<usize> = invalidated
         .into_iter()
+        .filter(|index| !deferred.contains(index))
         .filter(|index| {
             needs_execution(
                 orch.db.local.clone(),
@@ -6645,6 +6765,7 @@ async fn rekey_wave_onto_fix(
             sealed_commit: &head,
             ..wave
         },
+        MutationPolicy::AllowDelta,
     )
     .await;
     Ok(FixedWave {
@@ -13554,6 +13675,59 @@ cairn-common = { path = "../cairn-common" }
         let mut covered = order.clone();
         covered.sort_unstable();
         assert_eq!(covered, vec![0, 1, 2, 3]);
+    }
+
+    /// #435: a lane declaring only a platform the write cell is not on leaves
+    /// the cell as a verdict-only lane instead of waiting on a machine that can
+    /// never answer it. A lane that admits the cell's platform stays, and a
+    /// declared fixer the cell cannot run is refused, because its fix can fold
+    /// only from the write cell.
+    #[test]
+    fn a_write_wave_splits_by_the_write_cell_platform() {
+        let (mut checks, keyed) = write_wave();
+        let here = crate::execution::check_identity::gating_platform();
+        let elsewhere = if here == "linux" { "macos" } else { "linux" };
+        checks.get_mut("api").unwrap().verdict_platforms = Some(vec![elsewhere.to_string()]);
+        checks.get_mut("lockfile").unwrap().verdict_platforms =
+            Some(vec![here.to_string(), elsewhere.to_string()]);
+
+        let split = split_write_wave(&keyed, &checks, &[0, 1, 2, 3], here, "bgsrv-mac");
+        assert_eq!(
+            split.cell,
+            vec![1, 2, 3],
+            "undeclared and admitting lanes stay"
+        );
+        assert_eq!(
+            split.spilled,
+            vec![0],
+            "the lane naming only another platform leaves"
+        );
+        assert!(split.refused.is_empty());
+
+        checks.get_mut("rust-fmt").unwrap().verdict_platforms = Some(vec![elsewhere.to_string()]);
+        let split = split_write_wave(&keyed, &checks, &[0, 1, 2, 3], here, "bgsrv-mac");
+        assert_eq!(split.cell, vec![1, 2]);
+        assert_eq!(split.spilled, vec![0]);
+        let [(index, refusal)] = split.refused.as_slice() else {
+            panic!("the excluded fixer is refused: {:?}", split.refused);
+        };
+        assert_eq!(*index, 3);
+        assert_eq!(
+            refusal,
+            &format!(
+                "check `rust-fmt` fixes files but its verdictPlatforms [{elsewhere}] exclude the write cell on bgsrv-mac ({here}); a fix folds only from the write cell. Widen verdictPlatforms or drop `fixes` in .cairn/config.yaml"
+            )
+        );
+
+        // Only cache misses are split; a hit never meets placement.
+        let split = split_write_wave(&keyed, &checks, &[1], here, "bgsrv-mac");
+        assert_eq!(
+            split,
+            WriteWaveSplit {
+                cell: vec![1],
+                ..WriteWaveSplit::default()
+            }
+        );
     }
 
     #[test]

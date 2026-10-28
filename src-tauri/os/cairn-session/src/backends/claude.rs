@@ -81,8 +81,9 @@ pub trait ClaudeHost: Send + Sync {
 pub struct ProviderLimitReport<'a> {
     /// The terminal result's text, the only place the CLI states a reset clock.
     pub result_text: Option<&'a str>,
-    /// The turn's classification: credit exhaustion, reported by an earlier
-    /// structured error, wins over a bare rolling-window 429.
+    /// The turn's classification: credit exhaustion or a Consumer Terms
+    /// refusal, reported by an earlier structured error, wins over a bare
+    /// rolling-window 429.
     pub depletion: ProviderDepletion,
     /// This turn's blocking `rate_limit_event` already persisted the provider's
     /// own block, which a reset-less re-probe quarantine must not overwrite.
@@ -2937,6 +2938,41 @@ mod depletion_order_tests {
                 "eof:handled=true:blocking=true"
             ]
         );
+    }
+
+    // An account whose owner has not accepted Anthropic's updated terms: a
+    // structured HTTP 400 and then the failed result repeating it. The turn
+    // holds as that refusal, so the host holds the account and repins the
+    // session the way a limit does, and never completes the turn.
+    #[tokio::test]
+    async fn a_consumer_terms_refusal_holds_as_terms_acceptance() {
+        const REFUSAL: &str = "API Error: 400 We've updated our Consumer Terms and Privacy Policy. You'll need to accept them in claude.ai with the email in /status to continue.";
+        let assistant = serde_json::json!({
+            "type": "assistant", "uuid": "a1", "session_id": "s1",
+            "is_api_error_message": true, "api_error_status": 400,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": REFUSAL}]}
+        })
+        .to_string();
+        let result = serde_json::json!({
+            "type": "result", "subtype": "success", "session_id": "s1",
+            "is_error": true, "api_error_status": 400, "result": REFUSAL
+        })
+        .to_string();
+        let calls = run_script(&[&assistant, &result]).await;
+        assert_eq!(
+            calls,
+            [
+                "provider_limit:TermsAcceptance:false:None",
+                "eof:handled=true:blocking=true"
+            ]
+        );
+
+        // Any other 400 is the turn's failure, not the account's.
+        let calls = run_script(&[
+            r#"{"type":"result","subtype":"success","session_id":"s1","is_error":true,"api_error_status":400,"result":"API Error: 400 prompt is too long"}"#,
+        ])
+        .await;
+        assert_eq!(calls, ["complete", "eof:handled=false:blocking=false"]);
     }
 
     // A blocking limit event and then the process exits with no result: the

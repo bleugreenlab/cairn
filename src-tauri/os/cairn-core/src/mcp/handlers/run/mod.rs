@@ -3274,7 +3274,7 @@ async fn finalize_delta_receipt(
 }
 
 use hygiene::check_cd_commands;
-use output::{collect_run_images, compose_run_output, run_envelope};
+use output::{collect_run_images, compose_run_output, run_envelope, run_input_refusal};
 use process::run_one;
 pub(crate) use process::READ_ONLY_CHECKOUT_DENIAL;
 use resolve::resolve_run_item;
@@ -3744,15 +3744,20 @@ async fn expand_procedure_target(
 /// Handle run tool call - an ordered batch of synchronous shell commands and
 /// skill-script invocations. Parallel by default; `sequential` runs in order.
 pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
+    // Asked of the raw call, before the lenient parse below drops what the
+    // grammar does not define: a dropped `executor` or `commitMsg` is a batch
+    // placed or committed other than its caller asked.
+    if let Some(refusal) = cairn_common::run_grammar::run_grammar_refusal(&request.payload) {
+        return run_input_refusal(refusal);
+    }
     let mut payload: RunPayload = match super::parse_payload(request) {
         Ok(payload) => payload,
-        Err(error) => return run_envelope(error, Vec::new()),
+        Err(error) => return run_input_refusal(error),
     };
 
     if payload.commands.is_empty() {
-        return run_envelope(
+        return run_input_refusal(
             "Invalid payload: `commands` must contain at least one item".to_string(),
-            Vec::new(),
         );
     }
 
@@ -4287,7 +4292,6 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 commit_msg: payload.commit_msg,
                 verdict_only: branch_target.is_some(),
                 revision_label,
-                selector: payload.executor.clone(),
                 logical_resolution,
                 store_lock,
                 // Publication reads repository identity off this, which every
@@ -4323,7 +4327,6 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         commit_msg: payload.commit_msg,
         verdict_only: branch_target.is_some(),
         revision_label,
-        selector: None,
         logical_resolution,
         store_lock,
         routed_request: None,
@@ -4811,11 +4814,12 @@ impl CannotHold {
         }
     }
 
-    /// The note a batch that ran elsewhere for this reason carries.
+    /// Why a batch left its home for this reason. The machine it ran on is the
+    /// result's first line; this says why it is not the home.
     fn ran_elsewhere_note(&self, home: &str) -> String {
         use cairn_common::executor_protocol::describe_gib;
         format!(
-            "Ran on **{}**: this batch's measured memory (~{}) exceeds what {home} can ever hold ({}). Your execution environment there is unchanged.",
+            "It ran on **{}** because this batch's measured memory (~{}) exceeds what {home} can ever hold ({}). Your execution environment there is unchanged.",
             self.alternative_executor_name,
             describe_gib(self.ceiling.estimate_bytes),
             describe_gib(self.ceiling.ceiling_bytes),
@@ -4921,18 +4925,58 @@ impl BatchResidence {
         .await;
         Self::decide(Some(selector), home.as_ref(), commit_present)
     }
+}
 
-    fn note(self, selector: Option<&ExecutorSelector>) -> Option<String> {
-        if self != Self::Detached {
-            return None;
+/// The line that opens every result a machine produced: the machine that ran
+/// the batch, its platform, and the job's environment machine when the batch
+/// ran away from it. `None` when no machine can be named truthfully, which is
+/// only an outcome nothing claimed.
+///
+/// Taken from the claim (the machine that actually took the batch), and from
+/// the outcome's own metadata only when no claim was recorded. Never from the
+/// selector: a selector says where the batch was asked to go, not where it ran.
+fn ran_on_line(
+    orch: &Orchestrator,
+    claimed: Option<&crate::fleet::CellPlacement>,
+    outcome: &CellOutcome,
+    detached_from: Option<&str>,
+) -> Option<String> {
+    let (name, os) = match claimed {
+        Some(placement) => (
+            match placement.name.is_empty() {
+                true => orch.fleet.executor_name_for_text(&placement.executor_id),
+                false => placement.name.clone(),
+            },
+            placement
+                .platform
+                .as_ref()
+                .map(|platform| platform.os.clone()),
+        ),
+        None => {
+            let CellOutcome::Completed { metadata, .. } = outcome else {
+                return None;
+            };
+            if metadata.executor_id.is_empty() {
+                return None;
+            }
+            (
+                orch.fleet.executor_name_for_text(&metadata.executor_id),
+                orch.fleet
+                    .executor_platform(&metadata.executor_id)
+                    .map(|platform| platform.os),
+            )
         }
-        let selector = selector?;
-        let destination = selector
-            .name
-            .as_deref()
-            .map(|name| format!("**{name}**"))
-            .unwrap_or_else(|| format!("an executor matching **{}**", selector.describe()));
-        Some(format!("Ran on {destination}"))
+    };
+    Some(ran_on_text(&name, os.as_deref(), detached_from))
+}
+
+fn ran_on_text(name: &str, os: Option<&str>, detached_from: Option<&str>) -> String {
+    let platform = os.map(|os| format!(" ({os})")).unwrap_or_default();
+    match detached_from.filter(|home| *home != name) {
+        Some(home) => format!(
+            "Ran on **{name}**{platform}, detached from the job's environment on **{home}**."
+        ),
+        None => format!("Ran on **{name}**{platform}."),
     }
 }
 
@@ -4982,44 +5026,7 @@ async fn resident_processes(
     db: &crate::storage::LocalDb,
     job_id: &str,
 ) -> Vec<String> {
-    let owned_job_id = job_id.to_string();
-    let terminals = db
-        .read(move |conn| {
-            let job_id = owned_job_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT t.slug FROM job_terminals t
-                         JOIN jobs j ON j.id = t.job_id
-                         WHERE t.job_id = ?1
-                           AND t.status = 'running'
-                           AND COALESCE(j.branch, '') != ''
-                         ORDER BY t.slug",
-                        (job_id.as_str(),),
-                    )
-                    .await?;
-                let mut slugs = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    slugs.push(row.text(0)?);
-                }
-                Ok(slugs)
-            })
-        })
-        .await
-        .unwrap_or_else(|error| {
-            log::warn!("Could not list running terminals for job {job_id}: {error}");
-            Vec::new()
-        });
-    terminals
-        .into_iter()
-        .map(|slug| format!("terminal `{slug}`"))
-        .chain(
-            orch.repl_state
-                .resident_slugs(job_id)
-                .into_iter()
-                .map(|slug| format!("REPL `{slug}`")),
-        )
-        .collect()
+    crate::fleet::residency::job_live_processes(orch, db, job_id, true).await
 }
 
 /// Why a committing batch cannot go where it asked: the live process it would
@@ -5070,8 +5077,6 @@ struct RunBatchSettlement {
     verdict_only: bool,
     /// For a `branch:` run, the label naming the revision it ran against.
     revision_label: Option<String>,
-    /// The caller's own executor selector, for the note a detached batch earns.
-    selector: Option<ExecutorSelector>,
     logical_resolution: Option<super::branch::BranchResolution>,
     store_lock: Option<std::path::PathBuf>,
     routed_request: Option<CellRequest>,
@@ -5266,7 +5271,10 @@ enum PlacedBatch {
 /// each claim needs in order to be true.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PlacementNotes {
-    /// "Ran on X: ..." for a batch detached because its home cannot hold it.
+    /// "Ran on **X** (os).", the machine that claimed the batch. True only of
+    /// an outcome that executed there, which is the only kind that carries it.
+    ran_on: Option<String>,
+    /// Why a batch detached because its home cannot hold it ran where it did.
     /// True only of an outcome that executed there.
     ran_elsewhere: Option<String>,
     /// The batch was placed on a machine its measured memory exceeds. Set only
@@ -5305,7 +5313,10 @@ fn settled_failure_text(
     let text = failure_without_result(outcome, grant_without_result, commits, ceiling)?.text();
     let note = match outcome {
         CellOutcome::FailedAfterExecution { .. } | CellOutcome::Completed { .. } => {
-            notes.executed()
+            [notes.ran_on.clone(), notes.executed()]
+                .into_iter()
+                .flatten()
+                .reduce(|left, right| format!("{left}\n\n{right}"))
         }
         CellOutcome::Unavailable { .. }
         | CellOutcome::StorageFailure { .. }
@@ -5523,6 +5534,7 @@ async fn place_and_run_attempts(
                 &environment.base_commit,
                 placement.ceiling_horizon_unix_ms,
                 placement.template.waiting_since_unix_ms,
+                None,
             )
             .await
             {
@@ -5572,6 +5584,7 @@ async fn place_and_run_attempts(
             *grant_without_result = Some(grant);
         }
         let above_ceiling = executed.above_ceiling;
+        let claimed = executed.account.placement;
         let outcome = executed.outcome;
         if residence == BatchResidence::Home && cannot_hold.is_none() {
             if let Some(learned) = CannotHold::from_outcome(&outcome) {
@@ -5582,7 +5595,12 @@ async fn place_and_run_attempts(
         if !crate::fleet::placement::classify_cell_outcome(&outcome, orch.fleet.link_restoration())
             .is_capacity()
         {
+            let detached_from = match residence {
+                BatchResidence::Detached => home_name.as_deref(),
+                BatchResidence::Home => None,
+            };
             let notes = PlacementNotes {
+                ran_on: ran_on_line(orch, claimed.as_ref(), &outcome, detached_from),
                 ran_elsewhere: detached_for_memory.map(|cannot_hold| {
                     cannot_hold.ran_elsewhere_note(home_name.as_deref().unwrap_or("its home"))
                 }),
@@ -6044,7 +6062,7 @@ async fn settle_routed_run_batch(
             routed_delta,
             routed_tracked_modifications,
             publication_request.as_ref(),
-            notes.executed(),
+            Some(&notes),
             metadata.cell_origin.as_ref(),
         )
     })
@@ -6120,7 +6138,7 @@ async fn settle_run_batch(
         cairn_common::executor_protocol::TrackedModificationEvidence,
     >,
     publication_request: Option<&CellRequest>,
-    placement_note: Option<String>,
+    notes: Option<&PlacementNotes>,
     cell_origin: Option<&cairn_common::executor_protocol::CellOrigin>,
 ) -> SettledRunBatch {
     // Suspension is backend control flow, not item output. This guard is the
@@ -6142,10 +6160,17 @@ async fn settle_run_batch(
     if let Some(label) = &s.revision_label {
         result = format!("{}\n\n{result}", ran_against_line(label, cell_origin));
     }
-    let residence_note = [residence.note(s.selector.as_ref()), placement_note]
-        .into_iter()
-        .flatten()
-        .reduce(|left, right| format!("{left}\n\n{right}"));
+    // Every batch a machine ran opens by naming it, selector or not, so a
+    // batch is never somewhere its caller cannot see. Host items (MCP tools,
+    // decide, REPL sends) run on the host and carry no line.
+    if let Some(line) = notes.and_then(|notes| notes.ran_on.as_deref()) {
+        let body = match result.is_empty() {
+            true => "(no output)",
+            false => result.as_str(),
+        };
+        result = format!("{line}\n\n{body}");
+    }
+    let residence_note = notes.and_then(PlacementNotes::executed);
 
     if s.discards_tracked_changes(residence) {
         let mut modified_paths = std::collections::BTreeSet::new();
@@ -6769,12 +6794,59 @@ mod tests {
         );
     }
 
+    /// Every executed batch names its machine, selector or not; a detached one
+    /// also names the environment it left, and a home it never left is not
+    /// called a detachment.
     #[test]
-    fn detached_residence_note_is_compact_and_home_is_silent() {
-        let selector = named("bglab-ub");
-        let note = BatchResidence::Detached.note(Some(&selector)).unwrap();
-        assert_eq!(note, "Ran on **bglab-ub**");
-        assert!(BatchResidence::Home.note(Some(&selector)).is_none());
+    fn the_ran_on_line_names_the_machine_and_any_environment_left() {
+        assert_eq!(
+            ran_on_text("bgsrv-ub", Some("linux"), None),
+            "Ran on **bgsrv-ub** (linux)."
+        );
+        assert_eq!(
+            ran_on_text("bglab-ub", Some("linux"), Some("bgsrv-mac")),
+            "Ran on **bglab-ub** (linux), detached from the job's environment on **bgsrv-mac**."
+        );
+        assert_eq!(
+            ran_on_text("bgsrv-mac", None, Some("bgsrv-mac")),
+            "Ran on **bgsrv-mac**."
+        );
+    }
+
+    /// A batch that executed and then failed still says where; one that never
+    /// ran says nothing ran and names no machine as though it had.
+    #[test]
+    fn only_an_executed_outcome_names_the_machine_it_ran_on() {
+        let notes = PlacementNotes {
+            ran_on: Some("Ran on **bgsrv-ub** (linux).".into()),
+            ..PlacementNotes::default()
+        };
+        let failed = settled_failure_text(
+            &CellOutcome::FailedAfterExecution {
+                request_id: "r".into(),
+                attempt_id: "a".into(),
+                diagnostic: "executor process was killed".into(),
+            },
+            None,
+            false,
+            None,
+            &notes,
+        )
+        .unwrap();
+        assert!(failed.contains("Ran on **bgsrv-ub** (linux)."), "{failed}");
+        let refused = settled_failure_text(
+            &CellOutcome::Unavailable {
+                reason: cairn_common::executor_protocol::CellUnavailableReason::NoMatchingExecutor,
+                diagnostic: "no executor named fedora is enrolled".into(),
+            },
+            None,
+            false,
+            None,
+            &notes,
+        )
+        .unwrap();
+        assert!(refused.contains("No commands ran."), "{refused}");
+        assert!(!refused.contains("Ran on"), "{refused}");
     }
 
     fn named(name: &str) -> ExecutorSelector {
@@ -7006,7 +7078,8 @@ mod tests {
 
     fn oversized_notes(detached: bool) -> PlacementNotes {
         PlacementNotes {
-            ran_elsewhere: detached.then(|| "Ran on **bglab-mac**: this batch's measured memory (~9.6 GiB) exceeds what bgsrv-ub can ever hold (7.7 GiB). Your execution environment there is unchanged.".to_string()),
+            ran_on: Some("Ran on **bglab-mac** (macos).".to_string()),
+            ran_elsewhere: detached.then(|| "It ran on **bglab-mac** because this batch's measured memory (~9.6 GiB) exceeds what bgsrv-ub can ever hold (7.7 GiB). Your execution environment there is unchanged.".to_string()),
             above_ceiling: Some("Note: no executor can hold this batch's measured ~9.6 GiB (largest ceiling 7.7 GiB on bgsrv-ub); it was placed on **bgsrv-ub** at the clamp.".into()),
         }
     }
@@ -7078,7 +7151,10 @@ mod tests {
     #[test]
     fn a_completed_batch_carries_every_placement_note() {
         let executed = oversized_notes(true).executed().unwrap();
-        assert!(executed.starts_with("Ran on **bglab-mac**"), "{executed}");
+        assert!(
+            executed.starts_with("It ran on **bglab-mac** because"),
+            "{executed}"
+        );
         assert!(executed.contains("at the clamp"), "{executed}");
         assert_eq!(PlacementNotes::default().executed(), None);
     }
@@ -7091,7 +7167,7 @@ mod tests {
             .ran_elsewhere_note("bgsrv-ub");
         assert_eq!(
             note,
-            "Ran on **bglab-mac**: this batch's measured memory (~9.6 GiB) exceeds what bgsrv-ub can ever hold (7.7 GiB). Your execution environment there is unchanged."
+            "It ran on **bglab-mac** because this batch's measured memory (~9.6 GiB) exceeds what bgsrv-ub can ever hold (7.7 GiB). Your execution environment there is unchanged."
         );
     }
 
@@ -7107,6 +7183,70 @@ mod tests {
         let detached = committing.attempt(Some(&home), true, BatchResidence::Detached);
         assert_eq!(detached.pinned_executor_id, None);
         assert_eq!(detached.mutation_policy, MutationPolicy::AllowDelta);
+    }
+
+    /// cairn/5360's acceptance, as the run path decides it: the job's
+    /// environment is on bginf-halo and a batch names fedora. It goes to fedora
+    /// (unpinned and carrying fedora's selector, so placement can choose nothing
+    /// else), or it is refused naming bginf-halo and the live process. It is
+    /// never pinned to bginf-halo while asking for fedora, except in the one
+    /// uncertain case, where it still carries the selector and placement refuses
+    /// the mismatch (`fleet::tests::a_batch_naming_another_machine_than_its_environment_runs_there_or_nowhere`).
+    #[test]
+    fn a_batch_pinning_b_beside_an_environment_on_a_runs_on_b_or_is_refused_naming_a() {
+        let fedora = named("fedora");
+        let on_halo = |live: &[&str]| HomeFacts {
+            executor_name: "bginf-halo".into(),
+            satisfies_selector: Some(false),
+            resident_processes: live.iter().map(|p| p.to_string()).collect(),
+            cannot_hold: None,
+        };
+        let halo = HomeExecutor {
+            executor_id: "bginf-halo".into(),
+        };
+        let placement = |commit_present: bool| {
+            let mut placement = test_placement(commit_present);
+            placement.template.executor = Some(fedora.clone());
+            placement
+        };
+
+        // A verdict-only batch goes where it asked, even beside a live terminal.
+        let residence =
+            BatchResidence::decide(Some(&fedora), Some(&on_halo(&["terminal `lab`"])), false)
+                .unwrap();
+        assert_eq!(residence, BatchResidence::Detached);
+        let request = placement(false).attempt(Some(&halo), true, residence);
+        assert_eq!(request.pinned_executor_id, None);
+        assert_eq!(request.executor.as_ref(), Some(&fedora));
+        assert_eq!(request.mutation_policy, MutationPolicy::PureVerdict);
+
+        // A committing batch with nothing live in the environment goes too.
+        let residence = BatchResidence::decide(Some(&fedora), Some(&on_halo(&[])), true).unwrap();
+        assert_eq!(residence, BatchResidence::Detached);
+        let request = placement(true).attempt(Some(&halo), true, residence);
+        assert_eq!(request.pinned_executor_id, None);
+        assert_eq!(request.executor.as_ref(), Some(&fedora));
+
+        // A committing batch beside a live terminal is refused naming both.
+        let refusal =
+            BatchResidence::decide(Some(&fedora), Some(&on_halo(&["terminal `lab`"])), true)
+                .unwrap_err();
+        assert!(
+            refusal.contains("terminal `lab` is running in this job's working tree on bginf-halo"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("fedora"), "{refusal}");
+
+        // Uncertain: the batch stays home, but its attempt keeps the selector.
+        let unknown = HomeFacts {
+            satisfies_selector: None,
+            ..on_halo(&["terminal `lab`"])
+        };
+        let residence = BatchResidence::decide(Some(&fedora), Some(&unknown), true).unwrap();
+        assert_eq!(residence, BatchResidence::Home);
+        let request = placement(true).attempt(Some(&halo), true, residence);
+        assert_eq!(request.pinned_executor_id.as_deref(), Some("bginf-halo"));
+        assert_eq!(request.executor.as_ref(), Some(&fedora));
     }
 
     fn test_placement(commit_present: bool) -> BatchPlacement {
@@ -7857,6 +7997,36 @@ mod decide_door_tests {
             .unwrap_or(envelope)
     }
 
+    /// The rs/778 call exactly: the selector sat inside the item, the lenient
+    /// parse dropped it, and the batch ran on the job's residency machine. The
+    /// SDK and CLI reach `handle_run` without the MCP schema, so core refuses it
+    /// itself, typed as invalid input, before anything runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keys_outside_the_run_grammar_are_refused_before_anything_runs() {
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
+        for (payload, expected) in [
+            (
+                json!({"commands": [{"command": "hostname", "executor": {"name": "fedora"}}]}),
+                "`commands[0].executor` is a call-level option: one batch runs on one machine. Move it beside `commands`",
+            ),
+            (
+                json!({"commands": [{"command": "true"}], "commitMsg": "m"}),
+                "unknown key `commitMsg`; did you mean `commit_msg`?",
+            ),
+            (
+                json!({"commands": [{"command": "true", "timout": 5, "zzqq": 1}]}),
+                "2 keys are outside the run grammar",
+            ),
+        ] {
+            let envelope = super::handle_run(&orch, &request(payload.clone())).await;
+            let value: Value = serde_json::from_str(&envelope).expect("a run envelope");
+            assert_eq!(value["invalid_input"], json!(true), "{payload}: {envelope}");
+            let text = value["text"].as_str().expect("envelope text");
+            assert!(text.contains(expected), "{payload}: {text}");
+            assert!(text.ends_with("Nothing ran."), "{payload}: {text}");
+        }
+    }
+
     /// Every advertised run target reaches its own dispatch arm, never the
     /// skill-script fallback: the table and the resolver cannot drift apart.
     #[tokio::test(flavor = "multi_thread")]
@@ -8135,7 +8305,6 @@ mod host_batch_tests {
             commit_msg: None,
             verdict_only: true,
             revision_label: None,
-            selector: None,
             logical_resolution: None,
             store_lock: None,
             routed_request: None,

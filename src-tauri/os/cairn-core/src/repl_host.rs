@@ -93,6 +93,9 @@ pub enum ReplOpenKind {
 pub struct ReplOpen {
     pub info: ReplInfo,
     pub kind: ReplOpenKind,
+    /// " on **machine**", plus a note when its environment moved there: where
+    /// the interpreter runs, said at the moment it starts.
+    pub placement: String,
 }
 
 impl ReplOpen {
@@ -100,19 +103,23 @@ impl ReplOpen {
     /// starts empty — the transcript survives, the bindings do not, and anything
     /// vaguer would mislead.
     pub fn summary(&self) -> String {
-        let ReplOpen { info, kind } = self;
+        let ReplOpen {
+            info,
+            kind,
+            placement,
+        } = self;
         match kind {
             ReplOpenKind::Created => {
-                format!("Started {} REPL {}", info.interpreter, info.slug)
+                format!("Started {} REPL {}{placement}", info.interpreter, info.slug)
             }
             ReplOpenKind::Resumed => format!(
-                "Resumed {} REPL {} as generation {} — the transcript continues, but the \
+                "Resumed {} REPL {}{placement} as generation {} — the transcript continues, but the \
                  namespace starts EMPTY (nothing is rebound). Re-send the setup you need.",
                 info.interpreter, info.slug, info.generation
             ),
             ReplOpenKind::AlreadyRunning => {
                 format!(
-                    "REPL {} is already running ({})",
+                    "REPL {} is already running ({}){placement}",
                     info.slug, info.interpreter
                 )
             }
@@ -144,6 +151,7 @@ pub async fn open_repl(
     slug: &str,
     interpreter: Option<ReplLang>,
     deps: Option<Vec<String>>,
+    selector: Option<&cairn_common::executor_protocol::ExecutorSelector>,
 ) -> Result<ReplOpen, String> {
     // Creating a generation spans a durable write (`store::begin`, inside
     // `spawn_session`) and a registry claim (`insert_if_absent`). Hold the slug's
@@ -155,10 +163,29 @@ pub async fn open_repl(
     let lifecycle = orch.repl_state.lifecycle_lock(job_id, slug);
     let _lifecycle = lifecycle.lock().await;
 
-    if orch.repl_state.contains(job_id, slug) {
+    if let Some(running) = orch.repl_state.get(job_id, slug) {
+        // A live REPL cannot move, so a create naming a machine it is not on
+        // is refused rather than answered with the session somewhere else.
+        let machine = crate::fleet::residency::verify_resident_landing(
+            orch,
+            running.holder(),
+            selector,
+            &format!("REPL `{slug}`"),
+        )
+        .map_err(|_| {
+            format!(
+                "REPL `{slug}` is already running on **{}**, which does not match the executor this create names. Stop it first (write cairn:~/repl/{slug} mode delete), or create it without `executor`.",
+                running.landing().machine.as_deref().unwrap_or("another machine")
+            )
+        })?;
         return Ok(ReplOpen {
             info: info_for(orch, job_id, slug).await?,
             kind: ReplOpenKind::AlreadyRunning,
+            placement: crate::fleet::residency::ResidentLanding {
+                machine,
+                rehomed_from: None,
+            }
+            .describe(),
         });
     }
     let existing = store::load(&orch.db.local, job_id, slug)
@@ -201,8 +228,10 @@ pub async fn open_repl(
         interpreter,
         slug,
         &deps,
+        selector,
     )
     .await?;
+    let placement = session.landing().describe();
     // Insert only if the slot is still vacant: a concurrent create that spawned
     // between the check above and here must not have its session orphaned.
     if !orch
@@ -225,6 +254,7 @@ pub async fn open_repl(
         return Ok(ReplOpen {
             info: info_for(orch, job_id, slug).await?,
             kind: ReplOpenKind::AlreadyRunning,
+            placement: String::new(),
         });
     }
     repl::emit_repl_change(orch, if resumed { "update" } else { "create" });
@@ -235,6 +265,7 @@ pub async fn open_repl(
         } else {
             ReplOpenKind::Created
         },
+        placement,
     })
 }
 
@@ -287,6 +318,7 @@ pub async fn create_job_repl(
         &slug,
         Some(interpreter),
         (!deps.is_empty()).then_some(deps),
+        None,
     )
     .await?;
     if opened.kind != ReplOpenKind::AlreadyRunning {

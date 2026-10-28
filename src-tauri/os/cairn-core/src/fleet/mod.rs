@@ -8685,6 +8685,24 @@ impl Fleet {
         }
     }
 
+    /// What is running inside a residency's cell, as its executor last reported
+    /// it: resident processes, a batch in flight, a prior epoch still draining.
+    /// `None` when no connected executor reports the residency.
+    pub(crate) fn residency_occupancy(
+        &self,
+        holder: &ResidencyHolder,
+    ) -> Option<cairn_common::executor_protocol::CellOccupancy> {
+        let connections = self.lock_connections();
+        connections.values().find_map(|connection| {
+            connection.snapshot.cells.iter().find_map(|cell| {
+                cell.residency
+                    .as_ref()
+                    .filter(|residency| residency.holder == *holder)
+                    .map(|_| cell.occupancy.clone())
+            })
+        })
+    }
+
     #[allow(clippy::result_large_err)]
     /// The live fence for a residency as the fleet currently observes it. This
     /// lets a caller that knows only the holder — job teardown, say — address it
@@ -22042,6 +22060,70 @@ mod tests {
         request.executor = None;
         request.placement_mobility = PlacementMobility::SpillEligible;
         request
+    }
+
+    /// cairn/5360's acceptance at placement: a job's environment is on
+    /// `bginf-halo` and a batch names `fedora`. Unpinned (the run path detaches
+    /// it), only fedora can take it. Pinned to the environment (the one case a
+    /// selector-bearing batch stays home: a committing batch beside a live
+    /// process whose machine could not answer the selector), no machine can,
+    /// and the environment's machine refuses it for the selector rather than
+    /// running it there.
+    #[test]
+    fn a_batch_naming_another_machine_than_its_environment_runs_there_or_nowhere() {
+        let now = unix_time_ms();
+        let connections: HashMap<String, ExecutorConnectionState> = [
+            fleet_entry_at("bginf-halo", "linux", 0, &[], now),
+            fleet_entry_at("fedora", "linux", 0, &[], now),
+        ]
+        .into_iter()
+        .collect();
+        let mut request = targeted_request("linux");
+        request.repository = RepositoryLocator::ManagedObjects {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            object_format: GitObjectFormat::Sha1,
+        };
+        request.placement_mobility = PlacementMobility::SpillEligible;
+        request.executor = Some(ExecutorSelector {
+            name: Some("fedora".into()),
+            ..ExecutorSelector::default()
+        });
+        let usable = |request: &CellRequest| -> Vec<String> {
+            let mut usable: Vec<String> = connections
+                .values()
+                .filter(|entry| {
+                    candidate_rejection(entry, PlacementScope::of(request), now).is_none()
+                })
+                .map(|entry| entry.identity.executor_id.clone())
+                .collect();
+            usable.sort();
+            usable
+        };
+
+        assert_eq!(usable(&request), vec!["fedora".to_string()]);
+        assert!(matches!(
+            candidate_rejection(
+                &connections["bginf-halo"],
+                PlacementScope::of(&request),
+                now
+            ),
+            Some(PlacementRejectionReason::SelectorMismatch { .. })
+        ));
+
+        request.pinned_executor_id = Some("bginf-halo".into());
+        assert!(
+            usable(&request).is_empty(),
+            "a pin never overrides the selector"
+        );
+        assert!(matches!(
+            candidate_rejection(
+                &connections["bginf-halo"],
+                PlacementScope::of(&request),
+                now
+            ),
+            Some(PlacementRejectionReason::SelectorMismatch { .. })
+        ));
     }
 
     #[test]

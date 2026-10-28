@@ -7,10 +7,10 @@ use super::run::MAX_BUFFER_SIZE;
 use crate::services::{ensure_submitted_line, LeaseTerminalBinding, PtySession};
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::executor_protocol::{
-    CellOwnerRef, ResidencyAcquireRequest, ResidencyFence, ResidencyOperation, ResidencyResult,
-    ResidentProcessEvent, ResidentProcessEventKind, ResidentProcessIoMode, ResidentProcessKind,
-    ResidentProcessSpec, ResidentProcessStatus, ResidentPtySize, ResidentSandboxPolicy,
-    RESIDENT_PROCESS_DEFAULT_SHELL, RESIDENT_PROCESS_SHELL_COMMAND_FLAG,
+    CellOwnerRef, ExecutorSelector, ResidencyAcquireRequest, ResidencyFence, ResidencyOperation,
+    ResidencyResult, ResidentProcessEvent, ResidentProcessEventKind, ResidentProcessIoMode,
+    ResidentProcessKind, ResidentProcessSpec, ResidentProcessStatus, ResidentPtySize,
+    ResidentSandboxPolicy, RESIDENT_PROCESS_DEFAULT_SHELL, RESIDENT_PROCESS_SHELL_COMMAND_FLAG,
 };
 use cairn_common::ids;
 use cairn_common::uri::CairnResource;
@@ -225,9 +225,39 @@ async fn rollback_terminal_creation(orch: &Orchestrator, session_id: &str, fence
 /// and reappeared with an empty screen and no explanation reads as lost work, so
 /// every involuntary stop and every restart is stated where it happened. The
 /// wording names what an operator sees rather than the machinery underneath.
-const EXECUTOR_LOST_NOTICE: &str = "\r\nThe executor running this terminal went away. \
-Cairn will start the terminal again when an executor takes the work back up.\r\n";
-const TERMINAL_RESTARTED_NOTICE: &str = "\r\nCairn started this terminal again.\r\n";
+fn executor_lost_notice(machine: Option<&str>) -> String {
+    let running = match machine {
+        Some(machine) => format!("The executor running this terminal ({machine})"),
+        None => "The executor running this terminal".to_string(),
+    };
+    format!(
+        "\r\n{running} went away. Cairn will start the terminal again when an executor takes the work back up.\r\n"
+    )
+}
+
+fn terminal_restarted_notice(machine: Option<&str>) -> String {
+    match machine {
+        Some(machine) => format!("\r\nCairn started this terminal again, on {machine}.\r\n"),
+        None => "\r\nCairn started this terminal again.\r\n".to_string(),
+    }
+}
+
+/// The machine a live terminal session runs on, by the name an operator uses.
+/// `None` for a session with no executor-hosted lease or an unrouted one.
+pub(crate) fn terminal_machine_name(orch: &Orchestrator, session_id: &str) -> Option<String> {
+    let session = orch
+        .pty_state
+        .sessions
+        .lock()
+        .ok()?
+        .get(session_id)
+        .cloned()?;
+    let holder = {
+        let session = session.lock().ok()?;
+        session.lease.as_ref()?.fence.holder.clone()
+    };
+    crate::fleet::residency::residency_machine_name(orch, &holder)
+}
 const RESTART_DID_NOT_HOLD_NOTICE: &str = "\r\nThis terminal stopped again right after \
 Cairn started it, so it has been left stopped.\r\n";
 
@@ -320,7 +350,8 @@ fn exit_disposition(
 /// before this restart settles is left stopped rather than started once more.
 fn note_terminal_restart(orch: &Orchestrator, terminal_uri: &str, session_id: &str) {
     orch.pty_state.note_terminal_restart(terminal_uri);
-    announce_in_terminal(orch, session_id, TERMINAL_RESTARTED_NOTICE);
+    let notice = terminal_restarted_notice(terminal_machine_name(orch, session_id).as_deref());
+    announce_in_terminal(orch, session_id, &notice);
 }
 
 /// Restart every terminal an execution environment still owes a shell, which is
@@ -505,7 +536,7 @@ async fn restart_terminal_process(
             .await
             .map_err(|error| error.to_string())?;
         }
-        let target = materialize_terminal_lease(orch, target).await?;
+        let (target, _) = materialize_terminal_lease(orch, target, None).await?;
         let session_id = spawn_terminal_session(
             orch,
             resource,
@@ -949,7 +980,7 @@ pub(crate) async fn create_interactive_terminal_from_resource(
         .await
         .map_err(|error| error.to_string())?;
     let lease_started_at = std::time::Instant::now();
-    let target = materialize_terminal_lease(orch, target).await?;
+    let (target, _) = materialize_terminal_lease(orch, target, None).await?;
     let lease_ms = lease_started_at.elapsed().as_millis();
     let spawn_started_at = std::time::Instant::now();
     // The title rides into the row's own insert rather than a follow-up update:
@@ -982,12 +1013,33 @@ pub(crate) async fn create_interactive_terminal_from_resource(
     Ok(session_id)
 }
 
+/// Acquire the environment a terminal runs in, on a machine that satisfies
+/// `selector` when one is given (see `fleet::residency::place_for_resident_process`
+/// for the rule), and say where it came up.
 async fn materialize_terminal_lease(
     orch: &Orchestrator,
     mut target: TerminalResourceTarget,
-) -> Result<TerminalResourceTarget, String> {
-    let request = terminal_residency_acquisition(orch, &target).await?;
+    selector: Option<&ExecutorSelector>,
+) -> Result<
+    (
+        TerminalResourceTarget,
+        crate::fleet::residency::ResidentLanding,
+    ),
+    String,
+> {
+    let mut request = terminal_residency_acquisition(orch, &target).await?;
     let holder = request.holder.clone();
+    let surface = format!("terminal `{}`", target.slug);
+    let rehomed_from = crate::fleet::residency::place_for_resident_process(
+        orch,
+        &orch.db.local,
+        &holder,
+        target.job_id.as_deref(),
+        selector,
+        &surface,
+    )
+    .await?;
+    request.executor = selector.cloned();
     // The freshly resolved bookmark tip lives in the request before the fleet's
     // idempotent route resolution can overwrite initial_base_commit with an
     // existing residency's pinned commit. Capture it now so the gate below
@@ -1002,12 +1054,19 @@ async fn materialize_terminal_lease(
         .operate_residency(orch, ResidencyOperation::Acquire { request })
         .await;
     let ResidencyResult::State { cell } = result else {
-        // The typed refusal is the diagnostic; the agent gets the one thing it can
-        // act on, which is that the terminal did not start and a retry is fine.
         log::warn!("terminal lease acquisition refused: {result:?}");
+        // A placement refusal names the machines and what each answered, which
+        // is what a create that named a machine needs to act on.
         return Err(
-            "Could not start the terminal: its environment did not become available. Retry."
-                .to_string(),
+            match crate::fleet::residency::acquisition_refusal_text(&result) {
+                Some(reason) => {
+                    format!("Could not start {surface}: {reason}. Nothing was started.")
+                }
+                None => {
+                    "Could not start the terminal: its environment did not become available. Retry."
+                        .to_string()
+                }
+            },
         );
     };
     let fence = {
@@ -1021,6 +1080,12 @@ async fn materialize_terminal_lease(
             cell_epoch: cell.cell_epoch,
         }
     };
+    // Acquisition rejoins an environment wherever it already is, so the
+    // selector is judged once more against the machine it actually came up on.
+    // Nothing is released on a mismatch: the environment is the job's, and
+    // whatever re-created it there may be using it.
+    let machine =
+        crate::fleet::residency::verify_resident_landing(orch, &fence.holder, selector, &surface)?;
     let cwd = cell.path;
     if job_terminal {
         // Force the managed checkout to the current bookmark tip before the shell
@@ -1043,7 +1108,13 @@ async fn materialize_terminal_lease(
     }
     target.cwd = cwd;
     target.lease = Some(fence);
-    Ok(target)
+    Ok((
+        target,
+        crate::fleet::residency::ResidentLanding {
+            machine,
+            rehomed_from,
+        },
+    ))
 }
 
 /// Force a job terminal's managed checkout to `tip` before its shell spawns. The
@@ -2409,6 +2480,7 @@ pub(crate) async fn create_terminal_from_resource(
     description: Option<&str>,
     wake: Option<TerminalWakeSpec>,
     caller_run_id: Option<&str>,
+    selector: Option<&ExecutorSelector>,
 ) -> Result<String, String> {
     let target = resolve_terminal_resource_target(&orch.db.local, resource)
         .await
@@ -2430,7 +2502,7 @@ pub(crate) async fn create_terminal_from_resource(
     ensure_terminal_slug_available(&orch.db.local, &target)
         .await
         .map_err(|e| e.to_string())?;
-    let target = materialize_terminal_lease(orch, target).await?;
+    let (target, landing) = materialize_terminal_lease(orch, target, selector).await?;
     let session_id = spawn_terminal_session(
         orch,
         resource.clone(),
@@ -2451,8 +2523,10 @@ pub(crate) async fn create_terminal_from_resource(
 
     let slug = resource_slug(resource);
     let uri = resource.to_uri();
+    // Where it runs, said at the moment it starts, in every shape of reply.
+    let started = format!("{slug}{}", landing.describe());
     let Some(wake) = wake else {
-        return Ok(format!("Started terminal {slug}"));
+        return Ok(format!("Started terminal {started}"));
     };
     let job_id = subscriber_job_id.expect("wake subscriber resolved before spawn");
     let row = lookup_terminal_for_wake_by_session_id(&orch.db.local, &session_id)
@@ -2495,26 +2569,26 @@ pub(crate) async fn create_terminal_from_resource(
                 | TerminalWakeSubscriptionOutcome::ExitAlreadyQueued,
             ),
         ) => Ok(format!(
-            "Started terminal {slug}; subscribed to exit — end your turn to resume when it finishes ({uri})"
+            "Started terminal {started}; subscribed to exit — end your turn to resume when it finishes ({uri})"
         )),
         (TerminalWakeSpec::Output(phrase), Ok(TerminalWakeSubscriptionOutcome::ExitAlreadyQueued)) => Ok(format!(
-            "Started terminal {slug}; it already exited before \"{phrase}\" appeared, so resume is queued for turn end ({uri})"
+            "Started terminal {started}; it already exited before \"{phrase}\" appeared, so resume is queued for turn end ({uri})"
         )),
         (TerminalWakeSpec::Output(phrase), Ok(TerminalWakeSubscriptionOutcome::OutputRegistered | TerminalWakeSubscriptionOutcome::OutputPersisted)) => Ok(format!(
-            "Started terminal {slug}; watching output for \"{phrase}\" (also wakes on exit) — end your turn to resume when it appears ({uri})"
+            "Started terminal {started}; watching output for \"{phrase}\" (also wakes on exit) — end your turn to resume when it appears ({uri})"
         )),
         (TerminalWakeSpec::Output(phrase), Ok(TerminalWakeSubscriptionOutcome::OutputAlreadyQueued)) => Ok(format!(
-            "Started terminal {slug}; output \"{phrase}\" already appeared, so resume is queued for turn end ({uri})"
+            "Started terminal {started}; output \"{phrase}\" already appeared, so resume is queued for turn end ({uri})"
         )),
         (_, Err(error)) => Ok(format!(
-            "Started terminal {slug}; automatic wake could not be registered ({error}). Subscribe via cairn:~/wakes: {{subscribe:{{kind:\"terminal\",ref:\"{uri}\",on:{}}}}}",
+            "Started terminal {started}; automatic wake could not be registered ({error}). Subscribe via cairn:~/wakes: {{subscribe:{{kind:\"terminal\",ref:\"{uri}\",on:{}}}}}",
             match wake {
                 TerminalWakeSpec::Exit => "\"exit\"".to_string(),
                 TerminalWakeSpec::Output(phrase) => format!("\"output\",phrase:\"{phrase}\""),
             }
         )),
         _ => Ok(format!(
-            "Started terminal {slug}; automatic wake registered ({uri})"
+            "Started terminal {started}; automatic wake registered ({uri})"
         )),
     }
 }
@@ -2795,10 +2869,17 @@ async fn spawn_terminal_session(
                     // nothing, release nothing.
                     ExitDisposition::LeaveAlone => return,
                     ExitDisposition::Recover => {
+                        let notice = executor_lost_notice(
+                            crate::fleet::residency::residency_machine_name(
+                                &event_orch,
+                                &event.holder,
+                            )
+                            .as_deref(),
+                        );
                         emit_terminal_data(
                             &*event_orch.services.emitter,
                             &event_sid,
-                            EXECUTOR_LOST_NOTICE,
+                            &notice,
                             &event_buffer,
                             &event_log,
                         );

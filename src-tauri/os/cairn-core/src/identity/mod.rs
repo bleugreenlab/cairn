@@ -341,7 +341,7 @@ mod tests {
             }],
             blocked_until: None,
             blocked_until_declared: false,
-            depleted: None,
+            held: None,
             captured_at,
         });
         account
@@ -442,7 +442,7 @@ mod tests {
             }],
             blocked_until: None,
             blocked_until_declared: false,
-            depleted: None,
+            held: None,
             captured_at,
         });
         account

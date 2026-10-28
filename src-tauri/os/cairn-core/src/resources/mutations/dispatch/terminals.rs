@@ -63,6 +63,13 @@ pub(super) async fn dispatch(
                 }
                 None => None,
             };
+            let selector = match payload.get("executor") {
+                Some(value) => Some(
+                    crate::fleet::residency::parse_resident_selector(value)
+                        .map_err(|error| build_failure(index, item, error))?,
+                ),
+                None => None,
+            };
             if wake.is_some()
                 && matches!(resource, CairnResource::ProjectTerminal { .. })
                 && request.run_id.is_none()
@@ -77,7 +84,10 @@ pub(super) async fn dispatch(
                 let wake_suffix = wake
                     .as_ref()
                     .map_or_else(String::new, terminal::TerminalWakeSpec::dry_run_suffix);
-                format!("Would start terminal {slug}: {command}{wake_suffix}")
+                let placement = selector.as_ref().map_or_else(String::new, |selector| {
+                    format!(" on {}", selector.describe())
+                });
+                format!("Would start terminal {slug}{placement}: {command}{wake_suffix}")
             } else {
                 terminal::create_terminal_from_resource(
                     orch,
@@ -86,6 +96,7 @@ pub(super) async fn dispatch(
                     description,
                     wake,
                     request.run_id.as_deref(),
+                    selector.as_ref(),
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?

@@ -407,7 +407,7 @@ pub(crate) const PROJECT_TERMINAL_CONTRACT: ResourceContract =
             MutationSpec {
                 mode: ChangeMode::Create,
                 required: &[COMMAND],
-                optional: &[DESCRIPTION, WAKE],
+                optional: &[DESCRIPTION, WAKE, RESIDENT_EXECUTOR],
                 label: "start terminal",
                 example: "write({changes:[{target:\"cairn://p/PROJECT/terminal/SLUG\",mode:\"create\",payload:{command:\"...\",wake:\"exit\"}}]})",
             },

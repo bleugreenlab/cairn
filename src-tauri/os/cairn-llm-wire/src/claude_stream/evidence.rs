@@ -30,23 +30,53 @@ pub enum ProviderDepletion {
     /// Usage credits are exhausted. Nothing Cairn can observe heals this, so
     /// the account stays out of rotation until an operator retries it.
     Credits,
+    /// The account's owner has not accepted Anthropic's updated Consumer
+    /// Terms, so every request fails with an HTTP 400 until they accept in
+    /// claude.ai. That is not a usage window and has no reset: the account
+    /// stays out of rotation until an operator acts.
+    TermsAcceptance,
+}
+
+/// The provider's own sentence when a refusal says the account must accept
+/// Anthropic's updated Consumer Terms, without the CLI's `API Error: 400`
+/// prefix. `None` for any other text.
+pub fn terms_acceptance_refusal(text: &str) -> Option<&str> {
+    if !(text.contains("Consumer Terms") && text.contains("accept them in claude.ai")) {
+        return None;
+    }
+    let text = text.trim();
+    Some(
+        text.strip_prefix("API Error:")
+            .map(|rest| {
+                rest.trim_start()
+                    .trim_start_matches(|c: char| c.is_ascii_digit())
+                    .trim_start()
+            })
+            .unwrap_or(text),
+    )
 }
 
 impl ClaudeEvent {
     /// Classify only the CLI's structured synthetic API-error message. The
-    /// credit-marker check happens after that structural gate, so the same
-    /// words quoted in ordinary assistant prose are inert.
+    /// marker checks happen after that structural gate, so the same words
+    /// quoted in ordinary assistant prose are inert.
     pub fn provider_depletion(&self) -> Option<ProviderDepletion> {
         let ClaudeEvent::Assistant {
             message,
             is_api_error_message: true,
-            api_error_status: Some(429),
+            api_error_status,
             ..
         } = self
         else {
             return None;
         };
         let text = message.text();
+        if terms_acceptance_refusal(&text).is_some() {
+            return Some(ProviderDepletion::TermsAcceptance);
+        }
+        if *api_error_status != Some(429) {
+            return None;
+        }
         if text.contains("cc_cli_limit_message") || text.contains("/usage-credits") {
             Some(ProviderDepletion::Credits)
         } else {
@@ -58,7 +88,8 @@ impl ClaudeEvent {
 /// The depletion a failed terminal `result` ends its turn with. The CLI
 /// reports credit exhaustion as a structured assistant error followed by a
 /// generic error result, so a depletion classified earlier in the turn is
-/// authoritative; a bare HTTP 429 result is a rolling-window block.
+/// authoritative. A failed result that states the Consumer Terms refusal is
+/// that refusal; a bare HTTP 429 result is a rolling-window block.
 pub fn terminal_provider_depletion(
     is_error: bool,
     data: &Value,
@@ -67,9 +98,17 @@ pub fn terminal_provider_depletion(
     if !is_error {
         return None;
     }
-    pending.or_else(|| {
-        result_is_rate_limited(data).then_some(ProviderDepletion::RollingWindow { resets_at: None })
-    })
+    pending
+        .or_else(|| {
+            data.get("result")
+                .and_then(Value::as_str)
+                .and_then(terms_acceptance_refusal)
+                .map(|_| ProviderDepletion::TermsAcceptance)
+        })
+        .or_else(|| {
+            result_is_rate_limited(data)
+                .then_some(ProviderDepletion::RollingWindow { resets_at: None })
+        })
 }
 
 /// The Claude CLI's wording when `--resume <id>` finds no conversation for the

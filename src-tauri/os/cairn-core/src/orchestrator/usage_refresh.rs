@@ -255,6 +255,14 @@ impl Orchestrator {
             };
         };
 
+        // An explicit refresh is how an operator says they accepted the
+        // provider's terms. Admitted before the freshness floor, because the
+        // admission is the point of the refresh and the measurement is not.
+        if provider == RoutedProvider::Claude {
+            if let Err(error) = self.admit_terms_reprobe(&account_id) {
+                log::warn!("Failed to admit a terms re-probe for {account_id}: {error}");
+            }
+        }
         let now = chrono::Utc::now().timestamp();
         if let Some((age_secs, snapshot)) = self.fresh_measurement(backend, &account_id, now) {
             return UsageRefresh {
@@ -587,6 +595,73 @@ mod tests {
             .await;
         assert_eq!(refreshed[0].measurement, UsageMeasurement::Discarded);
         assert!(health_windows(&orch, &id).is_empty());
+    }
+
+    /// A terms hold survives an automatic measurement, because the usage
+    /// endpoint can answer for an account whose completions are refused. An
+    /// explicit refresh lifts it so the next launch re-probes the account; a
+    /// credits hold waits for Mark available. Either way the accounts page
+    /// says what stands in the way and what to do.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_explicit_refresh_admits_a_terms_reprobe_and_nothing_else() {
+        use crate::credentials::AccountHoldKind;
+        let root = tempfile::tempdir().unwrap().keep();
+        let homes = TempHomes::new(root.join("homes"));
+        let orch = orchestrator_at(&root, &homes).await;
+        let terms = managed_claude(&orch);
+        let credits = managed_claude(&orch);
+        orch.update_account_metadata(&terms, Some("owner@example.com".to_string()), None)
+            .unwrap();
+        orch.record_account_hold(
+            &terms,
+            AccountHoldKind::TermsAcceptance,
+            "We've updated our Consumer Terms and Privacy Policy. You'll need to accept them in claude.ai with the email in /status to continue.".to_string(),
+        )
+        .unwrap();
+        orch.record_account_hold(
+            &credits,
+            AccountHoldKind::Credits,
+            "credits_required".into(),
+        )
+        .unwrap();
+        let held = |id: &str| {
+            orch.get_credential_store()
+                .unwrap()
+                .accounts
+                .into_iter()
+                .find(|account| account.id == id)
+                .and_then(|account| account.health?.held)
+        };
+
+        orch.record_account_health(&terms, measured(90.0).windows, None)
+            .unwrap();
+        assert!(held(&terms).is_some(), "a measurement is not acceptance");
+
+        let list = page(&orch, "cairn://models/accounts?provider=claude").await;
+        assert!(
+            list.contains("blocked: the account must accept the provider's updated Consumer Terms"),
+            "{list}"
+        );
+        assert!(
+            list.contains("You'll need to accept them in claude.ai"),
+            "{list}"
+        );
+        assert!(
+            list.contains(
+                "Accept the updated Consumer Terms at claude.ai signed in as owner@example.com"
+            ),
+            "{list}"
+        );
+        assert!(
+            list.contains("blocked: usage credits are exhausted"),
+            "{list}"
+        );
+
+        homes.script_usage(measured(90.0), None);
+        orch.refresh_provider_usage("claude", UsageRefreshTarget::Pool { project_id: None })
+            .await;
+        assert!(held(&terms).is_none(), "the refresh admitted a re-probe");
+        assert!(held(&credits).is_some(), "a refresh cannot see a top-up");
     }
 
     #[tokio::test(flavor = "multi_thread")]

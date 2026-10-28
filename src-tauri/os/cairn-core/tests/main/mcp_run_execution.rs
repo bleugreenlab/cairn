@@ -3435,6 +3435,7 @@ async fn repl_state_persists_across_handle_run_calls() {
         ReplLang::Python,
         "analysis",
         &[],
+        None,
     )
     .await
     else {
@@ -3512,6 +3513,7 @@ async fn repl_typescript_rejects_deps() {
         ReplLang::Typescript,
         "ts",
         &["react".to_string()],
+        None,
     )
     .await;
     let err = match result {
@@ -3556,6 +3558,7 @@ async fn repl_typescript_state_persists_across_handle_run_calls() {
         ReplLang::Typescript,
         "ts",
         &[],
+        None,
     )
     .await
     else {
@@ -3704,6 +3707,7 @@ async fn repl_funnel_records_history_and_emits_events() {
         ReplLang::Python,
         "fn",
         &[],
+        None,
     )
     .await
     else {
@@ -3887,6 +3891,7 @@ async fn repl_row_outlives_the_process_and_resumes_as_a_new_generation() {
         "lex",
         Some(ReplLang::Typescript),
         None,
+        None,
     )
     .await
     .expect_err("a different interpreter must be refused");
@@ -3938,6 +3943,7 @@ async fn repl_spawns_for_a_branchless_thread_session() {
         ReplLang::Python,
         "thread",
         &[],
+        None,
     )
     .await;
     match branchless {
@@ -3993,6 +3999,7 @@ async fn repl_spawns_for_a_branchless_thread_session() {
         ReplLang::Python,
         "node",
         &[],
+        None,
     )
     .await
     else {
@@ -4334,6 +4341,7 @@ async fn repl_stop_keeps_the_transcript_and_resume_starts_an_empty_namespace() {
         "lex",
         Some(ReplLang::Python),
         None,
+        None,
     )
     .await
     else {
@@ -4382,6 +4390,7 @@ async fn repl_stop_keeps_the_transcript_and_resume_starts_an_empty_namespace() {
         &cwd,
         Some(&ctx),
         "lex",
+        None,
         None,
         None,
     )
@@ -4594,6 +4603,7 @@ async fn open_repl_serializes_generation_creation_per_slug() {
                 "lex",
                 Some(ReplLang::Python),
                 None,
+                None,
             )
             .await
         }
@@ -4664,6 +4674,7 @@ async fn repl_registry_guards_close_recreate_during_inflight() {
         ReplLang::Python,
         "fn",
         &[],
+        None,
     )
     .await
     else {
@@ -4686,6 +4697,7 @@ async fn repl_registry_guards_close_recreate_during_inflight() {
         ReplLang::Python,
         "fn",
         &[],
+        None,
     )
     .await
     else {
@@ -4720,6 +4732,7 @@ async fn repl_registry_guards_close_recreate_during_inflight() {
         ReplLang::Python,
         "fn",
         &[],
+        None,
     )
     .await
     else {
@@ -4768,6 +4781,7 @@ async fn repl_funnel_dead_session_unregisters_and_emits_exited() {
         ReplLang::Python,
         "dead",
         &[],
+        None,
     )
     .await
     else {

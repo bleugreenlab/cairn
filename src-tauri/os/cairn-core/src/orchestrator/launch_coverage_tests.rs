@@ -333,8 +333,14 @@ impl SessionProvider for RecordingClaude {
 /// updated consumer terms: a refusal only that account's holder can clear.
 const TERMS_REFUSAL: &str = "API Error: 400 We've updated our Consumer Terms and Privacy Policy. You'll need to accept them in claude.ai with the email in /status to continue.";
 
-/// A Claude CLI whose account refuses every one-shot with [`TERMS_REFUSAL`].
-struct TermsRefusingClaude(Arc<Recorder>);
+/// [`TERMS_REFUSAL`] without the CLI's `API Error: 400` prefix: the provider's
+/// own sentence, which a hold keeps as its reason.
+const TERMS_SENTENCE: &str = "We've updated our Consumer Terms and Privacy Policy. You'll need to accept them in claude.ai with the email in /status to continue.";
+
+/// A Claude CLI that refuses one-shots with [`TERMS_REFUSAL`]: on every
+/// account, or only on the one named, answering on any other as
+/// [`RecordingClaude`] does.
+struct TermsRefusingClaude(Arc<Recorder>, Option<String>);
 
 impl SessionProvider for TermsRefusingClaude {
     fn open(
@@ -342,6 +348,14 @@ impl SessionProvider for TermsRefusingClaude {
         host: &dyn SessionHost,
         spec: SessionSpec,
     ) -> Result<LaunchedSession, SessionError> {
+        if self
+            .1
+            .as_ref()
+            .is_some_and(|refusing| spec.account_id.as_ref() != Some(refusing))
+        {
+            return RecordingClaude(self.0.clone()).open(host, spec);
+        }
+        self.0.record("claude:refused");
         let result = json!({
             "type": "result", "subtype": "success", "session_id": spec.start.session_id(),
             "is_error": true, "result": TERMS_REFUSAL,
@@ -1161,8 +1175,21 @@ async fn claude_and_codex_serve_responses_through_the_facet() {
     recorder.release();
 }
 
-/// A Claude one-shot the routed account refuses fails naming that account, so
-/// a response the account refused is journaled against it.
+/// The terms hold a refused account carries, if any.
+fn terms_hold(orch: &Orchestrator, account_id: &str) -> Option<crate::credentials::AccountHold> {
+    orch.get_credential_store()?
+        .accounts
+        .into_iter()
+        .find(|account| account.id == account_id)?
+        .health?
+        .held
+        .filter(|hold| hold.kind == crate::credentials::AccountHoldKind::TermsAcceptance)
+}
+
+/// A Claude one-shot the only account refuses until its owner accepts the
+/// provider's updated terms holds that account and fails naming it and what
+/// lifts the hold. A response asked of it afterwards is refused by routing
+/// with the same account and act, without launching anything.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_claude_one_shot_names_the_account_it_ran_on() {
     use cairn_models::subscription::testing::TempHomes;
@@ -1171,7 +1198,7 @@ async fn a_refused_claude_one_shot_names_the_account_it_ran_on() {
     let mut orch = super::models::tests::bare_orchestrator().await;
     orch.models_runtime = ModelRuntime {
         complete: Arc::new(RecordingComplete(recorder.clone())),
-        claude: Arc::new(TermsRefusingClaude(recorder.clone())),
+        claude: Arc::new(TermsRefusingClaude(recorder.clone(), None)),
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
         codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
@@ -1193,16 +1220,21 @@ async fn a_refused_claude_one_shot_names_the_account_it_ran_on() {
         .unwrap();
     homes.sign_in(&profile.id);
 
+    let action = "Accept the updated Consumer Terms at claude.ai signed in as Max";
     match complete_on(&orch, "claude", one_shot_request("haiku", None)).await {
         Err(launch::LaunchError::Completion(failure)) => {
-            assert_eq!(
-                failure.error,
-                CompletionError::Upstream(TERMS_REFUSAL.to_string())
-            );
+            let CompletionError::Upstream(message) = &failure.error else {
+                panic!("expected the account's refusal, got {:?}", failure.error);
+            };
+            assert!(message.contains(TERMS_SENTENCE), "{message}");
+            assert!(message.contains(&profile.id), "{message}");
+            assert!(message.contains(action), "{message}");
             assert_eq!(failure.account_id.as_deref(), Some(profile.id.as_str()));
         }
         other => panic!("expected the account's refusal, got {other:?}"),
     }
+    let hold = terms_hold(&orch, &profile.id).expect("the refusal held the account");
+    assert_eq!(hold.detail, TERMS_SENTENCE);
 
     let definition = crate::responses::parse_definition(
         "---\nname: Refused\ndescription: a refused response\nmodel: haiku\nbackend: claude\ntimeout: 30s\n---\nSay hi",
@@ -1219,7 +1251,10 @@ async fn a_refused_claude_one_shot_names_the_account_it_ran_on() {
     )
     .await
     .unwrap_err();
-    assert!(refused.to_string().contains(TERMS_REFUSAL), "{refused}");
+    let refused = refused.to_string();
+    assert!(refused.contains(TERMS_SENTENCE), "{refused}");
+    assert!(refused.contains(&profile.id), "{refused}");
+    assert!(refused.contains(action), "{refused}");
     let rows = crate::storage::list_response_invocations(
         &orch.db.local,
         "workspace",
@@ -1230,7 +1265,89 @@ async fn a_refused_claude_one_shot_names_the_account_it_ran_on() {
     .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status, "failed");
-    assert_eq!(rows[0].account_id.as_deref(), Some(profile.id.as_str()));
+    assert_eq!(
+        recorder
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| *call == "claude:refused")
+            .count(),
+        1,
+        "the held account was not launched again"
+    );
+}
+
+/// The account routing prefers because its usage is untouched is the one
+/// whose owner has not accepted the provider's updated terms. Its refusal
+/// holds it, and the same call is answered on the next account.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terms_refused_claude_one_shot_is_served_on_the_next_account() {
+    use cairn_models::subscription::testing::TempHomes;
+    use cairn_models::types::usage::{ProviderUsageScope, ProviderUsageWindow};
+
+    let recorder = Arc::new(Recorder::default());
+    let mut orch = super::models::tests::bare_orchestrator().await;
+    let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
+    orch.subscriptions = Arc::new(homes.clone());
+    orch.update_settings(crate::models::UpdateSettings {
+        enabled_providers: Some(vec!["claude".to_string()]),
+        ..Default::default()
+    })
+    .unwrap();
+    let add = |label: &str, remaining: f64| {
+        let account = orch
+            .add_account(
+                ApiProvider::Anthropic,
+                label.into(),
+                ProviderAuth::ClaudeProfile { oauth: None },
+                None,
+            )
+            .unwrap();
+        homes.sign_in(&account.id);
+        orch.record_account_health(
+            &account.id,
+            vec![ProviderUsageWindow {
+                id: "session".into(),
+                label: "session".into(),
+                scope: ProviderUsageScope::Session,
+                scope_target: None,
+                used_percent: 100.0 - remaining,
+                remaining_percent: remaining,
+                resets_at: None,
+                reset_at_text: None,
+                window_duration_mins: None,
+            }],
+            None,
+        )
+        .unwrap();
+        account.id
+    };
+    let fresh = add("Fresh", 100.0);
+    let healthy = add("Healthy", 10.0);
+    orch.models_runtime = ModelRuntime {
+        complete: Arc::new(RecordingComplete(recorder.clone())),
+        claude: Arc::new(TermsRefusingClaude(recorder.clone(), Some(fresh.clone()))),
+        codex: Arc::new(RecordingCodex(recorder.clone())),
+        host: Arc::new(InertHost),
+        codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
+    };
+
+    let served = complete_on(&orch, "claude", one_shot_request("haiku", None))
+        .await
+        .expect("the healthy account answers");
+    assert_eq!(served.account_id.as_deref(), Some(healthy.as_str()));
+    assert!(recorder.saw("claude:refused"), "the fresh account was tried first");
+    assert!(terms_hold(&orch, &fresh).is_some());
+    assert!(terms_hold(&orch, &healthy).is_none());
+
+    recorder.calls.lock().unwrap().clear();
+    let again = complete_on(&orch, "claude", one_shot_request("haiku", None))
+        .await
+        .expect("the healthy account answers again");
+    assert_eq!(again.account_id.as_deref(), Some(healthy.as_str()));
+    assert!(!recorder.saw("claude:refused"), "routing skipped the held account");
+    recorder.release();
 }
 
 /// A decision is answered only by a decision-capable offer. A subscription-only

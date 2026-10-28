@@ -54,6 +54,17 @@ pub(super) async fn dispatch(
                 None => None,
             };
             let deps = parse_deps(index, item)?;
+            let selector = match item
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("executor"))
+            {
+                Some(value) => Some(
+                    crate::fleet::residency::parse_resident_selector(value)
+                        .map_err(|error| build_failure(index, item, error))?,
+                ),
+                None => None,
+            };
             if dry_run {
                 match interpreter {
                     Some(lang) => format!("Would open {} REPL {slug}", lang.label()),
@@ -70,6 +81,7 @@ pub(super) async fn dispatch(
                     slug,
                     interpreter,
                     deps,
+                    selector.as_ref(),
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?
@@ -130,6 +142,7 @@ async fn create_repl(
     slug: &str,
     interpreter: Option<ReplLang>,
     deps: Option<Vec<String>>,
+    selector: Option<&cairn_common::executor_protocol::ExecutorSelector>,
 ) -> Result<String, String> {
     let target_job =
         repl::resolve_node_repl_job_id(&orch.db.local, project, number, exec_seq, node_id)
@@ -164,6 +177,7 @@ async fn create_repl(
         slug,
         interpreter,
         deps,
+        selector,
     )
     .await
     .map(|opened| opened.summary())

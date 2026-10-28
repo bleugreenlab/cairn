@@ -101,6 +101,13 @@ pub(crate) const REPL_DEPS: KeySpec = KeySpec::new(
     KeyType::Array,
     "python-only: package names preloaded via uv (uv run --with)",
 );
+/// The selector a terminal or REPL create takes: `run`'s own, under the same
+/// honour-or-refuse rule.
+pub(crate) const RESIDENT_EXECUTOR: KeySpec = KeySpec::new(
+    "executor",
+    KeyType::Object,
+    "{name} for one machine as cairn://executors lists it, or {os} for any machine on that platform, optionally with requiredToolchains (the selector run takes). Started there or refused naming what prevents it, such as a live terminal or REPL holding this job's environment on another machine; an idle environment on another machine moves, losing its uncommitted files. Omit to join the job's environment wherever it is. The reply and the page name the machine",
+);
 pub(crate) const WAKE: KeySpec = KeySpec::new(
     "wake",
     KeyType::Str,

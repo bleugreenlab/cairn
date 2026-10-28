@@ -125,9 +125,18 @@ pub struct ReadFileInput {
     pub paths: Vec<String>,
 }
 
-/// Validate a run batch: non-empty, and each item has exactly one of
-/// `command` / `target`. Returns the first problem as a user-facing message.
+/// Validate a run batch: every key is one the run grammar defines, the batch is
+/// non-empty, and each item has exactly one of `command` / `target` / `code`.
+/// Returns the problem as a user-facing message.
 pub fn validate_run_input(input: &RunInput) -> Result<(), String> {
+    // Re-serializing restores the call's own keys: the modeled fields under
+    // their wire names and every captured unknown one where the caller put it.
+    // The grammar refusal is cairn-core's text verbatim, from the one function
+    // both sides call.
+    let raw = serde_json::to_value(input).map_err(|error| error.to_string())?;
+    if let Some(refusal) = cairn_common::run_grammar::run_grammar_refusal(&raw) {
+        return Err(refusal);
+    }
     if input.commands.is_empty() {
         return Err("`commands` must contain at least one item".to_string());
     }
@@ -149,8 +158,9 @@ pub fn validate_run_input(input: &RunInput) -> Result<(), String> {
             || item.payload.is_some()
             || item.interpreter.is_some()
             || item.timeout.is_some()
+            || item.background.is_some()
         {
-            return Err("a waitFor item cannot include command, target, code, repl, payload, interpreter, or timeout".to_string());
+            return Err("a waitFor item cannot include command, target, code, repl, payload, interpreter, timeout, or background".to_string());
         }
         return Ok(());
     }
@@ -239,12 +249,6 @@ pub fn validate_run_input(input: &RunInput) -> Result<(), String> {
                 .to_string(),
         );
     }
-    if input.constraints.is_some() {
-        return Err(
-            "`constraints` was replaced by `executor`: state {name:\"<public-name>\"} for one machine or {os:\"linux\"} for any machine on a platform, optionally with requiredToolchains. Read cairn://executors for the names available"
-                .to_string(),
-        );
-    }
     if let Some(executor) = &input.executor {
         validate_executor_selector(executor)?;
     }
@@ -302,9 +306,12 @@ pub struct RunInput {
     pub branch: Option<String>,
     /// Which machine runs this batch: `{name}` for one executor by its public
     /// name, or `{os}` for any machine on that platform, optionally refined by
-    /// `requiredToolchains`. Read cairn://executors to see the names, platforms,
-    /// and toolchains available. Omit unless the batch must land somewhere
-    /// specific.
+    /// `requiredToolchains`. The batch runs on a machine that satisfies it or is
+    /// refused naming what prevents it, never quietly elsewhere. It sits beside
+    /// `commands` (one batch runs on one machine); one inside a command item is
+    /// refused. Every result's first line names the machine the batch ran on.
+    /// Read cairn://executors for the names, platforms, and toolchains
+    /// available. Omit unless the batch must land somewhere specific.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<RunExecutorSelectorInput>,
     /// A short written reason for committing files that contain literal Git
@@ -313,17 +320,18 @@ pub struct RunInput {
     /// or a test fixture; the reason is recorded with the commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict_markers_reason: Option<String>,
-    /// The retired placement key, captured for the sole purpose of refusing it.
+    /// Every key the run grammar does not define, captured for the sole purpose
+    /// of refusing it.
     ///
-    /// Ignoring it is the exact failure this vocabulary replaced: a caller that
-    /// believed it had pinned a machine would have its batch run wherever the
-    /// fleet felt like, with nothing anywhere to see. Deserializing it into a
-    /// named field is what lets [`validate_run_input`] answer with the key that
-    /// replaced it instead of a generic unknown-field error; it is kept out of
-    /// the published schema and never forwarded.
-    #[serde(default, skip_serializing)]
+    /// Dropping an unknown key is how an `executor` written inside an item ran
+    /// a batch on a machine its caller never asked for. Capturing the leftovers
+    /// (rather than denying them in the deserializer, which stops at the first)
+    /// lets [`validate_run_input`] name every one with its location through
+    /// `cairn_common::run_grammar`. Kept out of the published schema; a call
+    /// carrying any is refused before it is forwarded.
+    #[serde(flatten)]
     #[schemars(skip)]
-    pub constraints: Option<serde_json::Value>,
+    pub(crate) unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Which machine a batch is asking for: `name` for one executor, or `os` for
@@ -390,6 +398,11 @@ pub struct RunItemInput {
     /// first with a `write` to `cairn:~/repl/<slug>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repl: Option<String>,
+    /// For a `cairn://workflows/...` target only: `true` returns the workflow
+    /// URI at once and wakes the caller when it completes, instead of
+    /// suspending the call until the workflow finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
     /// Suspend this turn without polling until a duration elapses, a terminal
     /// exits/prints a phrase, or another node's project check lanes settle. Must
     /// be the sole item in the batch. Examples: `{waitFor:{duration:"3m"}}`,
@@ -397,6 +410,11 @@ pub struct RunItemInput {
     /// `{waitFor:{kind:"checks",ref:"cairn://p/CAIRN/123/1/builder/checks",on:"settled"}}`.
     #[serde(default, rename = "waitFor", skip_serializing_if = "Option::is_none")]
     pub wait_for: Option<WaitForInput>,
+    /// Keys an item does not define, captured to be refused by name (see
+    /// [`RunInput::unknown`]).
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub(crate) unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -467,6 +485,11 @@ pub struct RunItemPayloadInput {
     /// (`cairn://mcp/<server>/<tool>`), forwarded to the server's `tools/call`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     args_json: Option<serde_json::Value>,
+    /// Keys a payload does not define, captured to be refused by name (see
+    /// [`RunInput::unknown`]).
+    #[serde(flatten)]
+    #[schemars(skip)]
+    unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -639,11 +662,68 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("cairn://executors"), "{error}");
-        // And it never rides along to the backend as an unrecognized key.
-        assert!(serde_json::to_value(&legacy)
-            .expect("serialize RunInput")
-            .get("constraints")
-            .is_none());
+    }
+
+    /// The rs/778 specimen exactly: the selector rode inside the item, was
+    /// dropped by the deserializer, and the batch ran on the job's residency
+    /// machine. It is refused with the call-level shape, and nothing runs.
+    #[test]
+    fn an_item_level_executor_is_refused_with_the_move_it_text() {
+        let input = run_input(serde_json::json!({
+            "commands": [{"command": "hostname", "executor": {"name": "fedora"}}]
+        }));
+        let error = validate_run_input(&input).expect_err("a misplaced executor is refused");
+        assert_eq!(
+            Some(error.as_str()),
+            cairn_common::run_grammar::run_grammar_refusal(&serde_json::json!({
+                "commands": [{"command": "hostname", "executor": {"name": "fedora"}}]
+            }))
+            .as_deref(),
+            "the MCP refusal is the core text verbatim"
+        );
+        assert!(
+            error.contains("`commands[0].executor` is a call-level option: one batch runs on one machine. Move it beside `commands`"),
+            "{error}"
+        );
+        assert!(error.ends_with("Nothing ran."), "{error}");
+    }
+
+    /// A camelCase `commitMsg` would drop the commit with it; an item with two
+    /// unknown keys names both. Every offending key is reported in one refusal.
+    #[test]
+    fn unknown_keys_are_refused_together_by_location() {
+        let input = run_input(serde_json::json!({
+            "commands": [{"command": "true", "timout": 5, "zzqq": true}],
+            "commitMsg": "m"
+        }));
+        let error = validate_run_input(&input).expect_err("unknown keys are refused");
+        assert!(error.contains("did you mean `commit_msg`"), "{error}");
+        assert!(error.contains("`commands[0].timout`"), "{error}");
+        assert!(error.contains("`commands[0].zzqq`"), "{error}");
+        assert!(error.ends_with("Nothing ran."), "{error}");
+    }
+
+    /// `background` is a documented workflow-target key: it reaches the
+    /// backend instead of being dropped.
+    #[test]
+    fn background_is_forwarded() {
+        let input = run_input(serde_json::json!({
+            "commands": [{"target": "cairn://workflows/w", "background": true}]
+        }));
+        assert!(validate_run_input(&input).is_ok());
+        assert_eq!(
+            serde_json::to_value(&input).expect("serialize RunInput")["commands"][0]["background"],
+            serde_json::json!(true)
+        );
+    }
+
+    /// The capture of unknown keys stays out of the schema the model reads.
+    #[test]
+    fn the_published_run_schema_does_not_advertise_the_capture() {
+        let schema = serde_json::to_string(&schemars::schema_for!(RunInput))
+            .expect("the run tool schema serializes");
+        assert!(!schema.contains("\"unknown\""), "{schema}");
+        assert!(schema.contains("\"background\""), "{schema}");
     }
 
     /// The retired key is refused, not advertised. Publishing it in the tool

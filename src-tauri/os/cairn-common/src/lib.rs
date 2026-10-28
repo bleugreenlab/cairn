@@ -34,6 +34,7 @@ pub mod query;
 pub mod read;
 pub mod retired_home;
 pub mod run_contract;
+pub mod run_grammar;
 pub mod runtime;
 pub mod scratch;
 pub mod security;

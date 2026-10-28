@@ -146,7 +146,24 @@ fn water_fill_budgets(natural: &[usize], total: usize) -> Vec<usize> {
 /// Serializing a struct of string/array fields does not fail in practice; the
 /// fallback returns the bare text so a run never errors on rendering.
 pub(super) fn run_envelope(text: String, images: Vec<ImageBlock>) -> String {
-    let envelope = RunBatchEnvelope { text, images };
+    encode_envelope(RunBatchEnvelope {
+        text,
+        images,
+        invalid_input: false,
+    })
+}
+
+/// The envelope for a call refused as malformed before anything ran. Marked so
+/// the transport edges surface it as an input error rather than a batch result.
+pub(super) fn run_input_refusal(text: String) -> String {
+    encode_envelope(RunBatchEnvelope {
+        text,
+        images: Vec::new(),
+        invalid_input: true,
+    })
+}
+
+fn encode_envelope(envelope: RunBatchEnvelope) -> String {
     serde_json::to_string(&envelope).unwrap_or(envelope.text)
 }
 

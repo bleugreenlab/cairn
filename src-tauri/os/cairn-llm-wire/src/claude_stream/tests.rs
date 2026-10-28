@@ -884,3 +884,61 @@ fn assistant_credit_depletion_followed_by_generic_error_result_is_terminal() {
     );
     assert_eq!(terminal_provider_depletion(false, &data, pending), None);
 }
+
+/// What Anthropic answers every request on an account whose owner has not
+/// accepted its updated Consumer Terms, as the CLI reported it on 2026-10-25.
+const TERMS_REFUSAL: &str = "API Error: 400 We've updated our Consumer Terms and Privacy Policy. You'll need to accept them in claude.ai with the email in /status to continue.";
+
+#[test]
+fn the_consumer_terms_refusal_keeps_the_providers_sentence() {
+    assert_eq!(
+        terms_acceptance_refusal(TERMS_REFUSAL),
+        Some("We've updated our Consumer Terms and Privacy Policy. You'll need to accept them in claude.ai with the email in /status to continue.")
+    );
+    assert_eq!(
+        terms_acceptance_refusal("API Error: 400 messages: text content blocks must be non-empty"),
+        None
+    );
+    assert_eq!(terms_acceptance_refusal("Consumer Terms"), None);
+}
+
+#[test]
+fn a_structured_terms_refusal_classifies_whatever_its_status() {
+    let line = serde_json::json!({
+        "type": "assistant", "uuid": "a1", "session_id": "s1",
+        "is_api_error_message": true, "api_error_status": 400,
+        "message": {"role": "assistant", "content": [{"type": "text", "text": TERMS_REFUSAL}]}
+    })
+    .to_string();
+    let (event, _) = parse_event(&line).unwrap();
+    assert_eq!(
+        event.provider_depletion(),
+        Some(ProviderDepletion::TermsAcceptance)
+    );
+
+    // An unrelated structured 400 is not an account condition.
+    let (other, _) = parse_event(r#"{"type":"assistant","uuid":"a1","session_id":"s1","is_api_error_message":true,"api_error_status":400,"message":{"role":"assistant","content":"API Error: 400 prompt is too long"}}"#).unwrap();
+    assert_eq!(other.provider_depletion(), None);
+
+    // The same words in ordinary prose are inert.
+    let prose = serde_json::json!({
+        "type": "assistant", "uuid": "a1", "session_id": "s1",
+        "message": {"role": "assistant", "content": TERMS_REFUSAL}
+    })
+    .to_string();
+    let (prose, _) = parse_event(&prose).unwrap();
+    assert_eq!(prose.provider_depletion(), None);
+}
+
+#[test]
+fn a_failed_result_stating_the_terms_refusal_is_terminal() {
+    let data = serde_json::json!({"api_error_status": 400, "result": TERMS_REFUSAL});
+    assert_eq!(
+        terminal_provider_depletion(true, &data, None),
+        Some(ProviderDepletion::TermsAcceptance)
+    );
+    assert_eq!(terminal_provider_depletion(false, &data, None), None);
+    let unrelated =
+        serde_json::json!({"api_error_status": 400, "result": "API Error: 400 prompt is too long"});
+    assert_eq!(terminal_provider_depletion(true, &unrelated, None), None);
+}

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use cairn_common::executor_protocol::{
-    CellOutcome, CellOwnerRef, CellPriority, OwnerDeathPolicy, RepositoryLocator,
+    CellOutcome, CellOwnerRef, CellPriority, ExecutorSelector, OwnerDeathPolicy, RepositoryLocator,
     ResidencyAcquireRequest, ResidencyFailureKind, ResidencyFence, ResidencyFootprint,
     ResidencyHolder, ResidencyOperation, ResidencyResult,
 };
@@ -219,6 +219,11 @@ pub(crate) async fn live_checkout_residency_request(
 /// so every surface calls this and the second caller lands in the first caller's
 /// cell. The renewal that follows is what lets an environment survive a long
 /// stretch of agent thinking between two batches.
+///
+/// `selector` is set only by a terminal or REPL create that names a machine,
+/// after [`place_for_resident_process`] has settled that the environment may
+/// be placed there. A run batch passes `None`: its environment is placement,
+/// and its own selector is decided per batch (`BatchResidence`).
 pub(crate) async fn acquire_job_residency(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -226,8 +231,9 @@ pub(crate) async fn acquire_job_residency(
     base_commit: &str,
     wait_horizon_unix_ms: u64,
     waiting_since_unix_ms: u64,
+    selector: Option<&ExecutorSelector>,
 ) -> Result<ResidencyFence, PlacementRefusal> {
-    let request = job_residency_request(
+    let mut request = job_residency_request(
         db,
         job_id,
         base_commit,
@@ -236,6 +242,7 @@ pub(crate) async fn acquire_job_residency(
     )
     .await
     .map_err(PlacementRefusal::structural)?;
+    request.executor = selector.cloned();
     let fence = acquire(orch, request).await?;
     let _ = renew(orch, &fence).await;
     Ok(fence)
@@ -533,4 +540,439 @@ pub(crate) async fn release(orch: &Orchestrator, fence: &ResidencyFence) -> Resu
 pub(crate) async fn rollback(orch: &Orchestrator, fence: &ResidencyFence, process_key: &str) {
     let _ = stop(orch, fence, process_key).await;
     let _ = release(orch, fence).await;
+}
+
+/// The sentence an acquisition refusal carries to the agent: where acquisition
+/// stopped, and the placement reason underneath it naming the machines. `None`
+/// for a reply that is not a refusal.
+pub(crate) fn acquisition_refusal_text(result: &ResidencyResult) -> Option<String> {
+    let ResidencyResult::Failed {
+        diagnostic,
+        cell_outcome,
+        ..
+    } = result
+    else {
+        return None;
+    };
+    Some(match cell_outcome.as_deref() {
+        Some(CellOutcome::Unavailable {
+            diagnostic: placement,
+            ..
+        }) if !placement.is_empty() => format!("{diagnostic}: {placement}"),
+        _ => diagnostic.clone(),
+    })
+}
+
+// --- placing a terminal or REPL that names a machine ---
+//
+// A terminal or REPL is the one thing that binds a job's environment to a
+// machine: it is a live stateful process the job's later batches use. Without
+// a selector it joins the environment wherever it already is. With one, the
+// environment must be on a machine that satisfies it, or the create is refused
+// naming what prevents it. It is never started somewhere else quietly.
+//
+// An environment with nothing live in it binds nothing (execution homes
+// dissolve: a residency is placement, not a constraint), so one sitting on the
+// wrong machine is released and acquired again where the create asked. The
+// warmth the released cell held is the cost the explicit pin pays.
+
+/// The machine holding an environment, as a create that names a machine sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResidentHome {
+    pub executor_name: String,
+    /// Whether that machine satisfies the create's selector. `None` when it is
+    /// away and the selector asks what only a live advertisement answers.
+    pub satisfies_selector: Option<bool>,
+    /// What is live inside the environment, in the words a refusal uses. Empty
+    /// means nothing binds it to its machine.
+    pub live: Vec<String>,
+}
+
+/// What a terminal or REPL create does about where its environment is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResidentPlacement {
+    /// Acquire, carrying the selector if there is one: there is no environment
+    /// yet, or it is already somewhere acceptable.
+    Acquire,
+    /// Nothing live holds the environment on `from`, which does not satisfy the
+    /// selector: release it there and acquire it where the selector asks.
+    Rehome { from: String },
+    /// Something live holds the environment on a machine the selector refuses.
+    Refuse(String),
+}
+
+/// The create-time rule, pure so every case can be pinned in a test.
+///
+/// A machine that is away and cannot answer the selector is not a mismatch:
+/// the create acquires with the selector, and [`verify_resident_landing`] judges
+/// the machine the environment actually came up on.
+pub(crate) fn decide_resident_placement(
+    surface: &str,
+    selector: Option<&ExecutorSelector>,
+    home: Option<&ResidentHome>,
+) -> ResidentPlacement {
+    let Some(selector) = selector.filter(|selector| !selector.is_empty()) else {
+        return ResidentPlacement::Acquire;
+    };
+    let Some(home) = home.filter(|home| home.satisfies_selector == Some(false)) else {
+        return ResidentPlacement::Acquire;
+    };
+    if home.live.is_empty() {
+        return ResidentPlacement::Rehome {
+            from: home.executor_name.clone(),
+        };
+    }
+    let (holders, verb, pronoun) = match home.live.as_slice() {
+        [only] => (only.clone(), "holds", "it"),
+        many => (many.join(", "), "hold", "them"),
+    };
+    ResidentPlacement::Refuse(format!(
+        "{surface} was not started: {holders} {verb} this job's environment on **{machine}**, which does not match {destination}. Stop {pronoun} first, or create {surface} without `executor` to join it on **{machine}**. Nothing was started.",
+        machine = home.executor_name,
+        destination = selector_destination(selector),
+    ))
+}
+
+fn selector_destination(selector: &ExecutorSelector) -> String {
+    match &selector.name {
+        Some(name) => format!("**{name}**"),
+        None => format!("an executor matching {}", selector.describe()),
+    }
+}
+
+/// Settle where a terminal's or REPL's environment must be before its process
+/// starts. With no selector there is nothing to settle. Returns the machine the
+/// environment was moved off, when [`ResidentPlacement::Rehome`] moved it, so
+/// the create can say so.
+pub(crate) async fn place_for_resident_process(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    holder: &ResidencyHolder,
+    job_id: Option<&str>,
+    selector: Option<&ExecutorSelector>,
+    surface: &str,
+) -> Result<Option<String>, String> {
+    let Some(selector) = selector.filter(|selector| !selector.is_empty()) else {
+        return Ok(None);
+    };
+    let home = match orch.fleet.residency_route_executor(holder) {
+        None => None,
+        Some(executor_id) => {
+            let satisfies_selector = orch
+                .fleet
+                .recorded_executor_satisfies_selector(&executor_id, selector);
+            let live = match satisfies_selector {
+                Some(false) => resident_occupants(orch, db, holder, job_id).await,
+                _ => Vec::new(),
+            };
+            Some(ResidentHome {
+                executor_name: orch.fleet.executor_name_for_text(&executor_id),
+                satisfies_selector,
+                live,
+            })
+        }
+    };
+    match decide_resident_placement(surface, Some(selector), home.as_ref()) {
+        ResidentPlacement::Acquire => Ok(None),
+        ResidentPlacement::Refuse(refusal) => Err(refusal),
+        ResidentPlacement::Rehome { from } => {
+            if let Some(fence) = orch.fleet.residency_fence(holder) {
+                release(orch, &fence).await.map_err(|error| {
+                    format!("{surface} was not started: this job's environment on **{from}** could not be released to move it ({error}). Nothing was started.")
+                })?;
+            }
+            tracing::info!(
+                %holder,
+                from = %from,
+                wanted = %selector.describe(),
+                "{surface} named a machine its environment's host does not satisfy, and nothing live held the environment there, so it is re-homed"
+            );
+            Ok(Some(from))
+        }
+    }
+}
+
+/// After acquisition: the machine the environment came up on, or a refusal when
+/// it does not satisfy the create's selector. Acquisition rejoins an existing
+/// environment wherever it is, so this is what makes a selector binding even
+/// when a batch re-created the environment between the decision and now.
+pub(crate) fn verify_resident_landing(
+    orch: &Orchestrator,
+    holder: &ResidencyHolder,
+    selector: Option<&ExecutorSelector>,
+    surface: &str,
+) -> Result<Option<String>, String> {
+    let Some(executor_id) = orch.fleet.residency_route_executor(holder) else {
+        return Ok(None);
+    };
+    let machine = orch.fleet.executor_name_for_text(&executor_id);
+    if let Some(selector) = selector.filter(|selector| !selector.is_empty()) {
+        if orch
+            .fleet
+            .recorded_executor_satisfies_selector(&executor_id, selector)
+            == Some(false)
+        {
+            return Err(format!(
+                "{surface} was not started: this job's environment is on **{machine}**, which does not match {}. Nothing was started.",
+                selector_destination(selector)
+            ));
+        }
+    }
+    Ok(Some(machine))
+}
+
+/// Where a terminal or REPL came up, for the create's own reply.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ResidentLanding {
+    /// The machine its environment is on.
+    pub machine: Option<String>,
+    /// The machine the environment was moved off to honour the selector.
+    pub rehomed_from: Option<String>,
+}
+
+impl ResidentLanding {
+    /// " on **X**", plus what moving the environment cost, appended to a
+    /// create's "Started ..." line.
+    pub(crate) fn describe(&self) -> String {
+        let mut text = match &self.machine {
+            Some(machine) => format!(" on **{machine}**"),
+            None => String::new(),
+        };
+        if let Some(from) = &self.rehomed_from {
+            text.push_str(&format!(
+                ". This job's environment moved here from **{from}**, where nothing live held it; uncommitted files and installed packages there did not move"
+            ));
+        }
+        text
+    }
+}
+
+/// Parse the `executor` a terminal or REPL create carries: the same selector
+/// `run` takes (`{name}` or `{os}`, optionally with `requiredToolchains`), and
+/// nothing a create cannot honour.
+pub(crate) fn parse_resident_selector(
+    value: &serde_json::Value,
+) -> Result<ExecutorSelector, String> {
+    let selector: ExecutorSelector = serde_json::from_value(value.clone()).map_err(|_| {
+        "payload.executor takes `name` (one machine, as cairn://executors lists it) or `os` (any machine on that platform), optionally with `requiredToolchains`".to_string()
+    })?;
+    if selector.requires_macos_nested_sandbox_write || selector.containment.is_some() {
+        return Err(
+            "payload.executor takes `name`, `os`, and `requiredToolchains` only".to_string(),
+        );
+    }
+    selector
+        .validate()
+        .map_err(|error| format!("payload.executor: {error}"))?;
+    Ok(selector)
+}
+
+/// The machine a residency is on, by the name an operator uses, for a page that
+/// must say where its process runs.
+pub(crate) fn residency_machine_name(
+    orch: &Orchestrator,
+    holder: &ResidencyHolder,
+) -> Option<String> {
+    orch.fleet
+        .residency_route_executor(holder)
+        .map(|executor_id| orch.fleet.executor_name_for_text(&executor_id))
+}
+
+/// What is live in an environment, named: the job's running terminals and live
+/// REPLs from the durable side, then anything else its executor reports (a
+/// process the rows do not name, a batch in flight).
+async fn resident_occupants(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    holder: &ResidencyHolder,
+    job_id: Option<&str>,
+) -> Vec<String> {
+    let mut live = match job_id {
+        Some(job_id) => job_live_processes(orch, db, job_id, false).await,
+        None => Vec::new(),
+    };
+    if let Some(occupancy) = orch.fleet.residency_occupancy(holder) {
+        if live.is_empty() {
+            live.extend(
+                occupancy
+                    .live_processes()
+                    .map(|(key, _)| format!("a live process (`{key}`)")),
+            );
+        }
+        if occupancy.command.is_some() || occupancy.draining.is_some() {
+            live.push("a run batch in flight".to_string());
+        }
+    }
+    live
+}
+
+/// A job's running terminals and live REPLs, as `terminal `slug`` and
+/// `REPL `slug``.
+///
+/// `managed_branch_only` keeps a branchless owner's processes out: those live
+/// in the project's own checkout under a separate holder, and share nothing
+/// with the job's run batches.
+pub(crate) async fn job_live_processes(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_id: &str,
+    managed_branch_only: bool,
+) -> Vec<String> {
+    let owned_job_id = job_id.to_string();
+    let terminals = db
+        .read(move |conn| {
+            let job_id = owned_job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT t.slug FROM job_terminals t
+                         JOIN jobs j ON j.id = t.job_id
+                         WHERE t.job_id = ?1
+                           AND t.status = 'running'
+                           AND (?2 = 0 OR COALESCE(j.branch, '') != '')
+                         ORDER BY t.slug",
+                        (job_id.as_str(), i64::from(managed_branch_only)),
+                    )
+                    .await?;
+                let mut slugs = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    slugs.push(row.text(0)?);
+                }
+                Ok(slugs)
+            })
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%job_id, %error, "could not list running terminals");
+            Vec::new()
+        });
+    terminals
+        .into_iter()
+        .map(|slug| format!("terminal `{slug}`"))
+        .chain(
+            orch.repl_state
+                .resident_slugs(job_id)
+                .into_iter()
+                .map(|slug| format!("REPL `{slug}`")),
+        )
+        .collect()
+}
+
+#[cfg(test)]
+mod resident_placement_tests {
+    use super::*;
+
+    fn named(name: &str) -> ExecutorSelector {
+        ExecutorSelector {
+            name: Some(name.to_string()),
+            ..ExecutorSelector::default()
+        }
+    }
+
+    fn home(satisfies: Option<bool>, live: &[&str]) -> ResidentHome {
+        ResidentHome {
+            executor_name: "bginf-halo".to_string(),
+            satisfies_selector: satisfies,
+            live: live.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    /// No selector: the terminal joins the environment wherever it is.
+    #[test]
+    fn no_selector_joins_the_environment() {
+        assert_eq!(
+            decide_resident_placement(
+                "terminal `lab`",
+                None,
+                Some(&home(Some(false), &["REPL `py`"]))
+            ),
+            ResidentPlacement::Acquire
+        );
+    }
+
+    /// A selector with no environment yet, or one already on a matching
+    /// machine, acquires carrying the selector.
+    #[test]
+    fn a_selector_acquires_when_absent_or_satisfied() {
+        let selector = named("bgsrv-mac");
+        assert_eq!(
+            decide_resident_placement("terminal `lab`", Some(&selector), None),
+            ResidentPlacement::Acquire
+        );
+        assert_eq!(
+            decide_resident_placement(
+                "terminal `lab`",
+                Some(&selector),
+                Some(&home(Some(true), &[]))
+            ),
+            ResidentPlacement::Acquire
+        );
+    }
+
+    /// A machine that is away is not a mismatch: acquire, and judge the landing.
+    #[test]
+    fn an_unanswerable_home_is_not_a_mismatch() {
+        assert_eq!(
+            decide_resident_placement(
+                "terminal `lab`",
+                Some(&named("bgsrv-mac")),
+                Some(&home(None, &["REPL `py`"]))
+            ),
+            ResidentPlacement::Acquire
+        );
+    }
+
+    /// #428: a lab pinned to bgsrv-mac, environment idle on bginf-halo. Nothing
+    /// live binds it there, so it moves.
+    #[test]
+    fn an_idle_environment_on_the_wrong_machine_is_re_homed() {
+        assert_eq!(
+            decide_resident_placement(
+                "terminal `lab`",
+                Some(&named("bgsrv-mac")),
+                Some(&home(Some(false), &[]))
+            ),
+            ResidentPlacement::Rehome {
+                from: "bginf-halo".to_string()
+            }
+        );
+    }
+
+    /// A live process on the wrong machine is the one binding fact, and the
+    /// refusal names it and the machine, never a 'home'.
+    #[test]
+    fn a_live_process_on_the_wrong_machine_refuses_naming_it() {
+        let ResidentPlacement::Refuse(refusal) = decide_resident_placement(
+            "REPL `py`",
+            Some(&named("bgsrv-mac")),
+            Some(&home(Some(false), &["terminal `dev`"])),
+        ) else {
+            panic!("a live terminal on the wrong machine refuses");
+        };
+        assert_eq!(
+            refusal,
+            "REPL `py` was not started: terminal `dev` holds this job's environment on **bginf-halo**, which does not match **bgsrv-mac**. Stop it first, or create REPL `py` without `executor` to join it on **bginf-halo**. Nothing was started."
+        );
+        assert!(!refusal.contains("home"), "{refusal}");
+
+        let ResidentPlacement::Refuse(many) = decide_resident_placement(
+            "terminal `lab`",
+            Some(&ExecutorSelector {
+                os: Some("macos".to_string()),
+                ..ExecutorSelector::default()
+            }),
+            Some(&home(
+                Some(false),
+                &["terminal `dev`", "a run batch in flight"],
+            )),
+        ) else {
+            panic!("live work on the wrong machine refuses");
+        };
+        assert!(
+            many.contains("terminal `dev`, a run batch in flight hold"),
+            "{many}"
+        );
+        assert!(many.contains("Stop them first"), "{many}");
+        assert!(many.contains("an executor matching"), "{many}");
+    }
 }

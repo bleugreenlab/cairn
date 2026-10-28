@@ -59,6 +59,7 @@ fn collapse_envelope_text_extracts_run_text_and_drops_images() {
     let envelope = cairn_common::read::RunBatchEnvelope {
         text: "=== look ===\nAX tree".to_string(),
         images: vec![cairn_common::read::ImageBlock::inline("image/png", "b64")],
+        invalid_input: false,
     };
     let json = serde_json::to_string(&envelope).unwrap();
     assert_eq!(collapse_envelope_text(json), "=== look ===\nAX tree");

@@ -27,7 +27,7 @@ pub use event::{
 };
 pub use evidence::{
     result_is_rate_limited, stderr_reports_session_id_in_use, stderr_reports_unknown_session,
-    terminal_provider_depletion, ProviderDepletion, StreamEvidence,
+    terminal_provider_depletion, terms_acceptance_refusal, ProviderDepletion, StreamEvidence,
 };
 pub use input::{
     build_message_content, send_control_response, send_interrupt_request, send_set_model_request,

@@ -19,7 +19,7 @@ pub(crate) const TASK_TERMINAL_CONTRACT: ResourceContract =
             MutationSpec {
                 mode: ChangeMode::Create,
                 required: &[COMMAND],
-                optional: &[DESCRIPTION, WAKE],
+                optional: &[DESCRIPTION, WAKE, RESIDENT_EXECUTOR],
                 label: "start terminal",
                 example: "write({changes:[{target:\"cairn:~/terminal/SLUG\",mode:\"create\",payload:{command:\"...\",wake:\"exit\"}}]})",
             },

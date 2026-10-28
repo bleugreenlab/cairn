@@ -32,9 +32,10 @@ use serde::{Deserialize, Serialize};
 use crate::mcp::handlers::RunContext;
 use crate::orchestrator::Orchestrator;
 use cairn_common::executor_protocol::{
-    ProcessSandboxMode, ResidencyFence, ResidencyOperation, ResidencyResult,
-    ResidentProcessCwdRoot, ResidentProcessEventKind, ResidentProcessIoMode, ResidentProcessKind,
-    ResidentProcessSpec, ResidentProcessStatus, ResidentProcessStream, ResidentRuntimeAsset,
+    ExecutorSelector, ProcessSandboxMode, ResidencyFence, ResidencyHolder, ResidencyOperation,
+    ResidencyResult, ResidentProcessCwdRoot, ResidentProcessEventKind, ResidentProcessIoMode,
+    ResidentProcessKind, ResidentProcessSpec, ResidentProcessStatus, ResidentProcessStream,
+    ResidentRuntimeAsset,
 };
 use store::{ReplExitReason, ReplRowStatus};
 
@@ -310,6 +311,10 @@ pub struct ReplSession {
     /// row denies.
     pub generation: i64,
     fence: ResidencyFence,
+    /// Where this generation's interpreter came up, captured at spawn: the
+    /// environment does not move while a live process holds it, so the machine
+    /// stays true for the session's life.
+    landing: crate::fleet::residency::ResidentLanding,
     /// `(repository, logical branch)` this session's checkout must follow.
     /// Carried on the session, resolved once at spawn, so re-aligning before an
     /// eval costs a branch resolution and not a database read.
@@ -335,6 +340,17 @@ pub struct ReplSession {
 }
 
 impl ReplSession {
+    /// Where this session's interpreter runs, and whether its environment was
+    /// moved to put it there.
+    pub(crate) fn landing(&self) -> &crate::fleet::residency::ResidentLanding {
+        &self.landing
+    }
+
+    /// The residency this session's interpreter lives in.
+    pub(crate) fn holder(&self) -> &ResidencyHolder {
+        &self.fence.holder
+    }
+
     /// Stop the interpreter without touching the lease. The home it runs in
     /// belongs to the job, not to this REPL, and outlives it.
     pub async fn stop_and_release(&self, orch: &Orchestrator) {
@@ -757,6 +773,11 @@ fn repl_process_env(
 }
 
 /// Start an eval server in an executor residency.
+///
+/// `selector` names the machine the REPL must run on, under the same
+/// create-time rule a terminal follows (`fleet::residency::place_for_resident_process`):
+/// placed there, its idle environment re-homed there, or refused naming what
+/// holds the environment elsewhere. `None` joins the environment wherever it is.
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_session(
     orch: &Orchestrator,
@@ -767,6 +788,7 @@ pub async fn spawn_session(
     interpreter: ReplLang,
     slug: &str,
     deps: &[String],
+    selector: Option<&ExecutorSelector>,
 ) -> Result<Arc<ReplSession>, String> {
     use crate::storage::RowExt;
     let job = job_id.to_string();
@@ -799,6 +821,24 @@ pub async fn spawn_session(
     // the same absolute paths as that owner's run batches and terminals.
     let fleet_config = crate::config::settings::load_fleet(&orch.config_dir);
     let wait_horizon_unix_ms = crate::fleet::default_wait_horizon_unix_ms(&fleet_config);
+    let surface = format!("REPL `{slug}`");
+    let holder = match managed_branch {
+        Some(_) => ResidencyHolder::Job {
+            job_id: job_id.to_string(),
+        },
+        None => ResidencyHolder::ProjectTerminals {
+            project_id: job_id.to_string(),
+        },
+    };
+    let rehomed_from = crate::fleet::residency::place_for_resident_process(
+        orch,
+        &orch.db.local,
+        &holder,
+        Some(job_id),
+        selector,
+        &surface,
+    )
+    .await?;
     let fence = match managed_branch.as_deref() {
         Some(branch) => {
             let tip = crate::fleet::residency::resolve_logical_commit(
@@ -814,9 +854,15 @@ pub async fn spawn_session(
                 &tip,
                 wait_horizon_unix_ms,
                 crate::fleet::unix_time_ms(),
+                selector,
             )
             .await
-            .map_err(|refusal| refusal.diagnostic)?;
+            .map_err(|refusal| {
+                format!(
+                    "Could not start {surface}: {}. Nothing was started.",
+                    refusal.diagnostic
+                )
+            })?;
             crate::fleet::residency::refresh(orch, &fence, &tip).await?;
             fence
         }
@@ -828,7 +874,7 @@ pub async fn spawn_session(
                 .await
                 .ok()
                 .map(|residence| residence.owner_ref);
-            let request = crate::fleet::residency::live_checkout_residency_request(
+            let mut request = crate::fleet::residency::live_checkout_residency_request(
                 job_id,
                 project_id,
                 &repo_path,
@@ -836,12 +882,28 @@ pub async fn spawn_session(
                 wait_horizon_unix_ms,
             )
             .await?;
+            request.executor = selector.cloned();
             let fence = crate::fleet::residency::acquire(orch, request)
                 .await
-                .map_err(|refusal| refusal.diagnostic)?;
+                .map_err(|refusal| {
+                    format!(
+                        "Could not start {surface}: {}. Nothing was started.",
+                        refusal.diagnostic
+                    )
+                })?;
             let _ = crate::fleet::residency::renew(orch, &fence).await;
             fence
         }
+    };
+
+    // Acquisition rejoins an environment wherever it already is, so the
+    // selector is judged once more against the machine it came up on. Nothing
+    // is released on a mismatch: the environment is the job's.
+    let machine =
+        crate::fleet::residency::verify_resident_landing(orch, &fence.holder, selector, &surface)?;
+    let landing = crate::fleet::residency::ResidentLanding {
+        machine,
+        rehomed_from,
     };
 
     // Process keys are unique within the home, so a REPL names itself by slug
@@ -944,6 +1006,7 @@ pub async fn spawn_session(
         project_id: record.project_id.clone(),
         generation: record.generation,
         fence: fence.clone(),
+        landing,
         managed_branch: managed_branch
             .clone()
             .map(|branch| (std::path::PathBuf::from(&repo_path), branch)),
@@ -1298,7 +1361,10 @@ pub fn render_status(
             .and_then(|s| s.created_at.elapsed().ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        banner.push_str(&format!(", running, up {uptime}s"));
+        match live.and_then(|s| s.landing.machine.as_deref()) {
+            Some(machine) => banner.push_str(&format!(", running on {machine}, up {uptime}s")),
+            None => banner.push_str(&format!(", running, up {uptime}s")),
+        }
     } else {
         let reason = record.exit_reason.unwrap_or(ReplExitReason::Closed);
         banner.push_str(&format!(", exited ({})", reason.as_str()));

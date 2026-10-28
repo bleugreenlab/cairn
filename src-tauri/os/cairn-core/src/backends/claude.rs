@@ -13,14 +13,16 @@ use crate::orchestrator::lifecycle::{
 use cairn_models::interface::session::{
     ClaudeMode, ClaudeSpec, ProviderSpec, SecretEnv, SessionError, SessionEvents, SessionSpec,
 };
-use cairn_models::wire::claude_stream::{ProviderDepletion, RateLimitInfo, StreamEvidence};
+use cairn_models::wire::claude_stream::{
+    terms_acceptance_refusal, ProviderDepletion, RateLimitInfo, StreamEvidence,
+};
 
 use super::run_state::{
     is_task_spawned_run, record_run_account, resolve_run_db, run_backend_db, run_job_id,
     run_status, transition_run_to_live,
 };
 
-use crate::credentials::{AccountBlock, RoutedProvider};
+use crate::credentials::{AccountBlock, AccountHoldKind, RoutedProvider};
 use crate::models::{ContextTokenState, RunStatus, TurnEndReason};
 use crate::orchestrator::session::{
     assemble_prompt_segments, flatten_prompt_segments, get_claude_path, insert_error_event,
@@ -297,6 +299,37 @@ fn next_reset_in_zone<T: chrono::TimeZone>(
     None
 }
 
+/// Why an account stopped serving, as a predicate on its name.
+fn depletion_why(depletion: ProviderDepletion) -> &'static str {
+    match depletion {
+        ProviderDepletion::RollingWindow { .. } => "reached its usage limit",
+        ProviderDepletion::Credits => "has no usage credits left",
+        ProviderDepletion::TermsAcceptance => "must accept Anthropic's updated Consumer Terms",
+    }
+}
+
+/// The hold a depletion puts on its account when no clock lifts it.
+fn account_hold_kind(depletion: ProviderDepletion) -> Option<AccountHoldKind> {
+    match depletion {
+        ProviderDepletion::RollingWindow { .. } => None,
+        ProviderDepletion::Credits => Some(AccountHoldKind::Credits),
+        ProviderDepletion::TermsAcceptance => Some(AccountHoldKind::TermsAcceptance),
+    }
+}
+
+/// How an account's owner signs in to the provider: its email where the
+/// provider reported one.
+fn signed_in_as(orch: &Orchestrator, account_id: &str) -> String {
+    orch.get_credential_store()
+        .and_then(|store| store.accounts.into_iter().find(|a| a.id == account_id))
+        .map(|account| account.email.unwrap_or(account.label))
+        .unwrap_or_else(|| account_id.to_string())
+}
+
+/// The reason a terms hold records when the provider's own sentence was not
+/// seen: the process exited before the result that carries it.
+const TERMS_REFUSAL_UNSEEN: &str = "Anthropic's updated Consumer Terms and Privacy Policy must be accepted in claude.ai before this account can be used.";
+
 /// Fail the account over when policy allows, then yield the refused turn and arm
 /// the hold that owns it. Returns whether the account's health was persisted.
 /// On `Err` neither the yield nor the hold landed, and the caller settles the
@@ -325,6 +358,7 @@ fn hold_claude_provider_limit(
         (None, "unknown")
     };
     let credits = matches!(depletion, ProviderDepletion::Credits);
+    let hold_kind = account_hold_kind(depletion);
     // Fail over before holding: a limit on one account is a reason to wait only
     // when no other eligible account can take the work. The declared reset is
     // the account's quarantine either way.
@@ -333,11 +367,13 @@ fn hold_claude_provider_limit(
         &host.run_db,
         &host.run_id,
         host.session_id.as_deref(),
-        if credits {
-            ProviderDepletion::Credits
-        } else {
-            ProviderDepletion::RollingWindow { resets_at: reset }
+        match depletion {
+            ProviderDepletion::RollingWindow { .. } => {
+                ProviderDepletion::RollingWindow { resets_at: reset }
+            }
+            held => held,
         },
+        text,
         block_recorded,
     );
     let quarantined = rotation.is_some();
@@ -352,6 +388,9 @@ fn hold_claude_provider_limit(
     } else if credits {
         // Credits do not refill on a clock Cairn can see.
         (None, "credits_depleted")
+    } else if hold_kind.is_some() {
+        // Nothing the provider said ends this; the operator does.
+        (None, "unknown")
     } else {
         (reset, source)
     };
@@ -452,14 +491,10 @@ fn hold_claude_provider_limit(
             .map(|rotation| rotation.old_label.clone())
             .unwrap_or_else(|| "Claude".to_string());
         let stamp = |at: i64| crate::clock::stamp(at).unwrap_or_else(|| at.to_string());
+        let why = depletion_why(depletion);
         let content = if tool_in_flight {
             // Account bookkeeping and the repin above still happened; only the
             // automatic resume is withheld.
-            let why = if credits {
-                "has no usage credits left"
-            } else {
-                "reached its usage limit"
-            };
             let resume = match (&switched_to, reset) {
                 (Some((_, to)), _) => {
                     format!("Switched this session to {to}; continue once to resume on it.")
@@ -474,13 +509,8 @@ fn hold_claude_provider_limit(
             };
             format!("{account} {why} while a tool call was still waiting for its result, so Cairn did not resume automatically: resuming could run that tool call again. {resume}")
         } else if let Some((_, to)) = &switched_to {
-            format!("{account} reached its usage limit. Switched this session to {to}; the unfinished work will continue on it automatically.")
+            format!("{account} {why}. Switched this session to {to}; the unfinished work will continue on it automatically.")
         } else if explicitly_pinned {
-            let why = if credits {
-                "has no usage credits left"
-            } else {
-                "reached its usage limit"
-            };
             match reset {
                 Some(at) => format!("The Claude account chosen for this execution, {account}, {why}. Work is held until its reset at {}, then will continue automatically. To resume sooner, choose another account or Automatic, then continue.", stamp(at)),
                 None => format!("The Claude account chosen for this execution, {account}, {why}. Work remains held; choose another account or Automatic, then continue."),
@@ -491,20 +521,23 @@ fn hold_claude_provider_limit(
             } else {
                 ""
             };
-            let why = if credits {
-                "has no usage credits left"
-            } else {
-                "reached its usage limit"
-            };
             match reset {
                 Some(at) if boundary_account.is_some() => {
                     let (_, first) = boundary_account.as_ref().expect("checked above");
                     format!("{account} {why}{none_left}. Work is held until {first} resets at {}, then account selection runs again and the work continues automatically.", stamp(at))
                 }
-                _ if credits => format!("{account} has no usage credits left{none_left}. Work remains held until an operator continues it."),
+                _ if hold_kind.is_some() => format!("{account} {why}{none_left}. Work remains held until an operator continues it."),
                 Some(at) => format!("{account} reached its usage limit{none_left}. Work is held until the provider reset at {}, then will continue automatically.", stamp(at)),
                 None => format!("{account} reached its usage limit{none_left}, without a readable reset time. Work remains held until an operator continues it."),
             }
+        };
+        // Only the operator lifts a hold, so the note says how.
+        let content = match (hold_kind, account_id.as_deref()) {
+            (Some(kind), Some(id)) => format!(
+                "{content} {}",
+                kind.operator_action(&signed_in_as(&host.orch, id))
+            ),
+            _ => content,
         };
         let (to_id, to_label) = switched_to.clone().unzip();
         crate::messages::transcript::insert_system_message_sync(
@@ -515,7 +548,11 @@ fn hold_claude_provider_limit(
             &content,
             serde_json::json!({"provider":"claude","kind":"provider_limit_hold",
                 "retryNotBefore":reset,"boundarySource":source,
-                "depletionKind": if credits { "credits" } else { "rolling_window" },
+                "depletionKind": match depletion {
+                    ProviderDepletion::RollingWindow { .. } => "rolling_window",
+                    ProviderDepletion::Credits => "credits",
+                    ProviderDepletion::TermsAcceptance => "terms_acceptance",
+                },
                 "fromAccountId":account_id,
                 "fromAccountLabel":rotation.as_ref().map(|rotation| rotation.old_label.clone()),
                 "toAccountId":to_id,"toAccountLabel":to_label,
@@ -1151,7 +1188,8 @@ struct AccountRotation {
 
 /// Record a depleted account's health, then repin the session away from it.
 /// Health is written first so routing already sees the account as unavailable
-/// when it picks the replacement. `None` when the run has no account or the
+/// when it picks the replacement. `observed_text` is the refusal's own words,
+/// kept as a terms hold's reason. `None` when the run has no account or the
 /// bookkeeping could not be persisted.
 fn rotate_depleted_account(
     orch: &Orchestrator,
@@ -1159,6 +1197,7 @@ fn rotate_depleted_account(
     run_id: &str,
     session_id: Option<&str>,
     depletion: ProviderDepletion,
+    observed_text: Option<&str>,
     health_recorded: bool,
 ) -> Option<AccountRotation> {
     let Ok(Some(target)) = rate_limit_retry_target(orch, run_db, run_id, session_id) else {
@@ -1166,7 +1205,21 @@ fn rotate_depleted_account(
     };
     let persisted = match depletion {
         ProviderDepletion::Credits => orch
-            .record_account_credit_depletion(&target.account_id, "credits_required".to_string())
+            .record_account_hold(
+                &target.account_id,
+                AccountHoldKind::Credits,
+                "credits_required".to_string(),
+            )
+            .map(|_| ()),
+        ProviderDepletion::TermsAcceptance => orch
+            .record_account_hold(
+                &target.account_id,
+                AccountHoldKind::TermsAcceptance,
+                observed_text
+                    .and_then(terms_acceptance_refusal)
+                    .unwrap_or(TERMS_REFUSAL_UNSEEN)
+                    .to_string(),
+            )
             .map(|_| ()),
         ProviderDepletion::RollingWindow { .. } if health_recorded => Ok(()),
         ProviderDepletion::RollingWindow { resets_at } => orch
@@ -1742,117 +1795,77 @@ impl AgentBackend for ClaudeBackend {
         .map(|_| ())
     }
 
-    /// One tool-free round trip: the CLI in print mode on the account routing
-    /// chose, with no MCP server, no native tools, and nothing persisted.
+    /// One tool-free round trip on the account routing chose (see
+    /// [`serve_one_shot`]), moved to the next account when the first is
+    /// refused until its owner accepts Anthropic's updated terms.
     fn complete(
         &self,
         request: CompletionRequest,
         orch: &Orchestrator,
         _admitted: crate::backends::Admitted,
     ) -> Result<CompletionOutcome, CompletionFailure> {
-        use super::one_shot::{
-            instructions, map_one_shot_error, map_open_error, one_shot_timeout,
-            response_scratch_dir,
-        };
-        use cairn_models::interface::session::{ApprovalMode, PlacedFile, SessionStart};
-        use cairn_models::session::one_shot::await_one_shot;
-
         if request.messages.is_empty() {
             return Err(CompletionError::InvalidRequest(
                 "at least one message is required".to_string(),
             )
             .into());
         }
-        let selection = select_routed_serving_identity(
-            orch,
-            RoutedProvider::Claude,
-            request.project_id.as_deref(),
-            Some(&request.model),
-            SelectionMode::Serve,
-        )
-        .map_err(CompletionError::Upstream)?;
-        // From here on the call runs on the routed account, so a failure names
-        // it: the CLI's account-level refusals arrive as ordinary errors.
-        let account_id = selection.account_id.clone();
-        let serve = || -> Result<CompletionOutcome, CompletionError> {
-            let (secrets, _) = claude_launch_credential(orch, &selection.identity)
-                .map_err(CompletionError::Upstream)?;
-            // A subscription's cost figure is notional; only an API key's is spent.
-            let metered = matches!(
-                selection.identity.claude_auth,
-                Some(crate::credentials::ClaudeAuth::ApiKey(_))
+        // An account whose owner has not accepted Anthropic's updated terms
+        // refuses every request while its usage looks untouched, so routing
+        // prefers it. Its refusal holds it out of rotation and the call is
+        // served on whichever account routing picks next. Each pass holds an
+        // account no earlier pass held, so the loop ends.
+        let mut refused: Vec<String> = Vec::new();
+        loop {
+            let selection = match select_routed_serving_identity(
+                orch,
+                RoutedProvider::Claude,
+                request.project_id.as_deref(),
+                Some(&request.model),
+                SelectionMode::Serve,
+            ) {
+                Ok(selection) => selection,
+                // Routing's refusal names each account's condition, so an
+                // account held just now is reported with what lifts its hold.
+                Err(reason) => {
+                    return Err(CompletionFailure {
+                        error: CompletionError::Upstream(reason),
+                        account_id: refused.pop(),
+                    })
+                }
+            };
+            // From here on the call runs on the routed account, so a failure
+            // names it: the CLI's account-level refusals arrive as ordinary
+            // errors.
+            let account_id = selection.account_id.clone();
+            let served = serve_one_shot(orch, &request, selection);
+            let refusal = match &served {
+                Err(CompletionError::Upstream(text)) => {
+                    terms_acceptance_refusal(text).map(str::to_string)
+                }
+                _ => None,
+            };
+            let (Some(sentence), Some(id)) = (refusal, account_id.clone()) else {
+                return served.map_err(CompletionFailure::on_account(account_id));
+            };
+            let held = !refused.contains(&id)
+                && orch
+                    .record_account_hold(&id, AccountHoldKind::TermsAcceptance, sentence.clone())
+                    .inspect_err(|error| log::warn!("Failed to hold Claude account {id}: {error}"))
+                    .is_ok();
+            if !held {
+                let action =
+                    AccountHoldKind::TermsAcceptance.operator_action(&signed_in_as(orch, &id));
+                return Err(CompletionFailure {
+                    error: CompletionError::Upstream(format!("{sentence} {action}")),
+                    account_id: Some(id),
+                });
+            }
+            log::warn!(
+                "Claude account {id} refused a response until its owner accepts Anthropic's updated Consumer Terms; it is held out of rotation"
             );
-            let scratch = response_scratch_dir()?;
-            let extras = request.options.clone();
-            let spec = SessionSpec {
-                start: SessionStart::New {
-                    session_id: uuid::Uuid::new_v4().to_string(),
-                },
-                model: Some(request.model.clone()),
-                effort: extras
-                    .reasoning_effort
-                    .or_else(|| extras.max_thinking_tokens.map(|_| "high".to_string())),
-                approval: ApprovalMode::Deny,
-                output_schema: request.output_schema.clone(),
-                cwd: scratch.path(),
-                env: BTreeMap::new(),
-                mcp: None,
-                secrets,
-                account_id: selection.account_id.clone(),
-                provider: ProviderSpec::Claude(ClaudeSpec {
-                    system_prompt: PlacedFile {
-                        dir: scratch.path(),
-                        name: "system-prompt.md".to_string(),
-                        contents: instructions(&request),
-                    },
-                    hook_settings: None,
-                    allowed_tools: Vec::new(),
-                    disallowed_tools: Vec::new(),
-                    mode: ClaudeMode::OneShot {
-                        prompt: request.single_prompt(),
-                    },
-                }),
-            };
-            let started = std::time::Instant::now();
-            let runtime = orch.models_runtime();
-            let launched = runtime
-                .claude
-                .open(runtime.host.as_ref(), spec)
-                .map_err(map_open_error)?;
-            let reply =
-                await_one_shot(launched, one_shot_timeout(&request)).map_err(map_one_shot_error)?;
-            let latency_ms = started.elapsed().as_millis() as u64;
-            drop(scratch);
-
-            // With a schema the CLI's text is a summary; the answer is the value
-            // its StructuredOutput tool returned.
-            let (text, parsed) = if request.output_schema.is_some() {
-                let structured = reply.structured.ok_or_else(|| {
-                    CompletionError::InvalidResponse(
-                        "Claude returned no structured output for the requested schema".to_string(),
-                    )
-                })?;
-                let text = serde_json::to_string(&structured)
-                    .map_err(|error| CompletionError::InvalidResponse(error.to_string()))?;
-                (text, Some(structured))
-            } else {
-                (reply.text, None)
-            };
-            Ok(CompletionOutcome {
-                text,
-                parsed,
-                model: request.model,
-                usage: reply
-                    .usage
-                    .as_ref()
-                    .map(cairn_models::usage::metered)
-                    .unwrap_or_default()
-                    .with_cost(reply.cost_usd.filter(|_| metered)),
-                latency_ms,
-                account_id: selection.account_id,
-            })
-        };
-        serve().map_err(CompletionFailure::on_account(account_id))
+            refused.push(id);
+        }
     }
 
     fn supports_resume(&self) -> bool {
@@ -1900,6 +1913,96 @@ impl AgentBackend for ClaudeBackend {
             max_concurrency: Some(*CLAUDE_CALL_MAX_CONCURRENCY),
         }
     }
+}
+
+/// One tool-free round trip: the CLI in print mode on the account routing
+/// chose, with no MCP server, no native tools, and nothing persisted.
+fn serve_one_shot(
+    orch: &Orchestrator,
+    request: &CompletionRequest,
+    selection: crate::orchestrator::session::RoutedSelection,
+) -> Result<CompletionOutcome, CompletionError> {
+    use super::one_shot::{
+        instructions, map_one_shot_error, map_open_error, one_shot_timeout, response_scratch_dir,
+    };
+    use cairn_models::interface::session::{ApprovalMode, PlacedFile, SessionStart};
+    use cairn_models::session::one_shot::await_one_shot;
+
+    let (secrets, _) =
+        claude_launch_credential(orch, &selection.identity).map_err(CompletionError::Upstream)?;
+    // A subscription's cost figure is notional; only an API key's is spent.
+    let metered = matches!(
+        selection.identity.claude_auth,
+        Some(crate::credentials::ClaudeAuth::ApiKey(_))
+    );
+    let scratch = response_scratch_dir()?;
+    let extras = request.options.clone();
+    let spec = SessionSpec {
+        start: SessionStart::New {
+            session_id: uuid::Uuid::new_v4().to_string(),
+        },
+        model: Some(request.model.clone()),
+        effort: extras
+            .reasoning_effort
+            .or_else(|| extras.max_thinking_tokens.map(|_| "high".to_string())),
+        approval: ApprovalMode::Deny,
+        output_schema: request.output_schema.clone(),
+        cwd: scratch.path(),
+        env: BTreeMap::new(),
+        mcp: None,
+        secrets,
+        account_id: selection.account_id.clone(),
+        provider: ProviderSpec::Claude(ClaudeSpec {
+            system_prompt: PlacedFile {
+                dir: scratch.path(),
+                name: "system-prompt.md".to_string(),
+                contents: instructions(request),
+            },
+            hook_settings: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            mode: ClaudeMode::OneShot {
+                prompt: request.single_prompt(),
+            },
+        }),
+    };
+    let started = std::time::Instant::now();
+    let runtime = orch.models_runtime();
+    let launched = runtime
+        .claude
+        .open(runtime.host.as_ref(), spec)
+        .map_err(map_open_error)?;
+    let reply = await_one_shot(launched, one_shot_timeout(request)).map_err(map_one_shot_error)?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    drop(scratch);
+
+    // With a schema the CLI's text is a summary; the answer is the value its
+    // StructuredOutput tool returned.
+    let (text, parsed) = if request.output_schema.is_some() {
+        let structured = reply.structured.ok_or_else(|| {
+            CompletionError::InvalidResponse(
+                "Claude returned no structured output for the requested schema".to_string(),
+            )
+        })?;
+        let text = serde_json::to_string(&structured)
+            .map_err(|error| CompletionError::InvalidResponse(error.to_string()))?;
+        (text, Some(structured))
+    } else {
+        (reply.text, None)
+    };
+    Ok(CompletionOutcome {
+        text,
+        parsed,
+        model: request.model.clone(),
+        usage: reply
+            .usage
+            .as_ref()
+            .map(cairn_models::usage::metered)
+            .unwrap_or_default()
+            .with_cost(reply.cost_usd.filter(|_| metered)),
+        latency_ms,
+        account_id: selection.account_id,
+    })
 }
 
 /// Claude's catalog: the shipped Claude models, offered only when a credential

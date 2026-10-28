@@ -279,7 +279,7 @@ pub(crate) const NODE_TERMINAL_CONTRACT: ResourceContract =
             MutationSpec {
                 mode: ChangeMode::Create,
                 required: &[COMMAND],
-                optional: &[DESCRIPTION, WAKE],
+                optional: &[DESCRIPTION, WAKE, RESIDENT_EXECUTOR],
                 label: "start terminal",
                 example: "write({changes:[{target:\"cairn:~/terminal/SLUG\",mode:\"create\",payload:{command:\"...\",wake:\"ready\"}}]})",
             },
@@ -313,7 +313,7 @@ pub(crate) const NODE_REPL_CONTRACT: ResourceContract =
             MutationSpec {
                 mode: ChangeMode::Create,
                 required: &[],
-                optional: &[REPL_INTERPRETER, REPL_DEPS],
+                optional: &[REPL_INTERPRETER, REPL_DEPS, RESIDENT_EXECUTOR],
                 label: "start or resume REPL",
                 example: "write({changes:[{target:\"cairn:~/repl/SLUG\",mode:\"create\",payload:{interpreter:\"python\",deps:[\"pandas\"]}}]})",
             },

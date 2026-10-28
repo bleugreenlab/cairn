@@ -778,6 +778,20 @@ fn account_block(
         if let Some(captured) = captured {
             let _ = writeln!(out, "  - measured {}", when(captured));
         }
+        // A hold is in force until an operator acts, so it carries the act.
+        if let Ok(hold) =
+            serde_json::from_value::<crate::credentials::AccountHold>(health["held"].clone())
+        {
+            let signed_in_as = account["email"].as_str().unwrap_or(label);
+            let _ = writeln!(
+                out,
+                "  - blocked: {} since {} ({}). {}",
+                hold.kind.summary(),
+                when(hold.since),
+                hold.detail,
+                hold.kind.operator_action(signed_in_as)
+            );
+        }
         // Only a block still in force is one; a past block is history, as the
         // settings credential status also reads it.
         match health["blockedUntil"].as_i64() {

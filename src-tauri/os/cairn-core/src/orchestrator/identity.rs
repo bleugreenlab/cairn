@@ -476,10 +476,10 @@ impl Orchestrator {
             blocked_until: block.map(crate::credentials::AccountBlock::until),
             blocked_until_declared: block
                 .is_some_and(crate::credentials::AccountBlock::is_declared),
-            depleted: account
+            held: account
                 .health
                 .as_ref()
-                .and_then(|health| health.depleted.clone()),
+                .and_then(|health| health.held.clone()),
             captured_at: chrono::Utc::now().timestamp(),
         });
         let label = account
@@ -491,11 +491,13 @@ impl Orchestrator {
         Ok(label)
     }
 
-    /// Mark credit exhaustion as sticky. Unlike a rolling provider block, this
-    /// remains unavailable until an operator explicitly retries the account.
-    pub(crate) fn record_account_credit_depletion(
+    /// Hold an account out of rotation for a refusal no clock heals: credit
+    /// exhaustion, or terms its owner has not accepted. Unlike a rolling
+    /// provider block, it stays unavailable until an operator acts.
+    pub(crate) fn record_account_hold(
         &self,
         id: &str,
+        kind: crate::credentials::AccountHoldKind,
         detail: String,
     ) -> Result<String, String> {
         let mut guard = self
@@ -512,7 +514,11 @@ impl Orchestrator {
         let health = account
             .health
             .get_or_insert_with(crate::credentials::ProviderAccountHealth::default);
-        health.depleted = Some(crate::credentials::AccountDepletion { since: now, detail });
+        health.held = Some(crate::credentials::AccountHold {
+            since: now,
+            kind,
+            detail,
+        });
         health.captured_at = now;
         let label = account
             .email
@@ -524,10 +530,31 @@ impl Orchestrator {
         Ok(label)
     }
 
-    /// Authorize one deliberate retry by clearing sticky credit depletion.
-    /// Automatic usage probes intentionally do not call this: they cannot see a
-    /// credit top-up, and therefore cannot safely put the account in rotation.
-    pub fn clear_account_credit_depletion(&self, id: &str) -> Result<AccountInfo, String> {
+    /// Authorize one deliberate retry by lifting an account's hold, whatever
+    /// its kind. Automatic usage probes intentionally do not call this: they
+    /// can see neither a credit top-up nor a terms acceptance, and therefore
+    /// cannot safely put the account in rotation.
+    pub fn clear_account_hold(&self, id: &str) -> Result<AccountInfo, String> {
+        self.lift_account_hold(id, |_| true).map(|(info, _)| info)
+    }
+
+    /// Lift a terms hold because an operator explicitly asked to re-measure
+    /// the account, which is how they say they have accepted the terms. The
+    /// usage endpoint is no evidence either way, so the account's next launch
+    /// is the re-probe: refused again, it is held again. A credits hold stays.
+    /// Answers whether a hold was lifted.
+    pub(crate) fn admit_terms_reprobe(&self, id: &str) -> Result<bool, String> {
+        self.lift_account_hold(id, |hold| {
+            hold.kind == crate::credentials::AccountHoldKind::TermsAcceptance
+        })
+        .map(|(_, lifted)| lifted)
+    }
+
+    fn lift_account_hold(
+        &self,
+        id: &str,
+        lifts: impl Fn(&crate::credentials::AccountHold) -> bool,
+    ) -> Result<(AccountInfo, bool), String> {
         let mut guard = self
             .credential_store
             .lock()
@@ -538,14 +565,20 @@ impl Orchestrator {
             .iter_mut()
             .find(|account| account.id == id)
             .ok_or_else(|| format!("Account not found: {id}"))?;
-        if let Some(health) = account.health.as_mut() {
-            health.depleted = None;
-        }
+        let lifted = account
+            .health
+            .as_mut()
+            .and_then(|health| health.held.take_if(|hold| lifts(hold)))
+            .is_some();
         let info = AccountInfo::from(&*account);
-        self.credential_store.persist_locked(store)?;
+        if lifted {
+            self.credential_store.persist_locked(store)?;
+        }
         drop(guard);
-        self.emit_config_changed();
-        Ok(info)
+        if lifted {
+            self.emit_config_changed();
+        }
+        Ok((info, lifted))
     }
 
     /// Probe a subscription account's remaining usage and record it.
@@ -652,10 +685,10 @@ impl Orchestrator {
                 windows: snapshot.windows.clone(),
                 blocked_until: None,
                 blocked_until_declared: false,
-                depleted: account
+                held: account
                     .health
                     .as_ref()
-                    .and_then(|health| health.depleted.clone()),
+                    .and_then(|health| health.held.clone()),
                 captured_at: chrono::Utc::now().timestamp(),
             });
             self.credential_store.persist_locked(store)?;
@@ -1942,7 +1975,7 @@ fi
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn sticky_credit_depletion_survives_usage_refresh_until_explicitly_cleared() {
+    async fn a_sticky_hold_survives_usage_refresh_until_explicitly_cleared() {
         let orch = test_orchestrator().await;
         let account = orch
             .add_account(
@@ -1953,10 +1986,18 @@ fi
             )
             .expect("profile added");
 
-        orch.record_account_credit_depletion(&account.id, "credits_required".to_string())
-            .expect("depletion stored");
+        orch.record_account_hold(
+            &account.id,
+            crate::credentials::AccountHoldKind::Credits,
+            "credits_required".to_string(),
+        )
+        .expect("hold stored");
         orch.record_account_health(&account.id, vec![usage_window("weekly", None, 75.0)], None)
             .expect("usage refresh stored");
+        assert!(
+            !orch.admit_terms_reprobe(&account.id).unwrap(),
+            "a terms re-probe never lifts a credits hold"
+        );
 
         let store = orch.get_credential_store().unwrap();
         assert!(store
@@ -1967,7 +2008,7 @@ fi
             .health
             .as_ref()
             .unwrap()
-            .depleted
+            .held
             .is_some());
         assert!(store
             .select_routed_account(
@@ -1981,8 +2022,8 @@ fi
             )
             .is_none());
 
-        orch.clear_account_credit_depletion(&account.id)
-            .expect("operator retry clears depletion");
+        orch.clear_account_hold(&account.id)
+            .expect("operator retry clears the hold");
         let cleared = orch.get_credential_store().unwrap();
         let health = cleared
             .accounts
@@ -1992,7 +2033,7 @@ fi
             .health
             .as_ref()
             .unwrap();
-        assert!(health.depleted.is_none());
+        assert!(health.held.is_none());
         assert_eq!(health.windows[0].remaining_percent, 75.0);
         assert!(cleared
             .select_routed_account(

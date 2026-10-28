@@ -3696,8 +3696,12 @@ mod tests {
 
         // Once the pinned account cannot serve, the existing session follows
         // the policy too.
-        orch.record_account_credit_depletion(&current, "credits_required".to_string())
-            .unwrap();
+        orch.record_account_hold(
+            &current,
+            crate::credentials::AccountHoldKind::Credits,
+            "credits_required".to_string(),
+        )
+        .unwrap();
         resolve("sess");
         assert_eq!(pin("sess").await.as_deref(), Some(chosen.as_str()));
     }
@@ -4069,7 +4073,7 @@ mod tests {
                 windows: Vec::new(),
                 blocked_until: Some(chrono::Utc::now().timestamp() + 300),
                 blocked_until_declared: false,
-                depleted: None,
+                held: None,
                 captured_at: chrono::Utc::now().timestamp(),
             }),
         });

@@ -285,4 +285,11 @@ pub struct RunBatchEnvelope {
     /// Fully composed batch text (the `=== <header> ===` item bodies).
     pub text: String,
     pub images: Vec<ImageBlock>,
+    /// The call was refused as malformed before anything ran, and `text` says
+    /// why. It is not retryable as sent: the caller must change the call. The
+    /// transport edges surface it as an input error (an MCP tool error, the
+    /// SDK's `CairnInputError`) so a script can tell 'you sent the wrong shape'
+    /// from 'the machine failed'.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub invalid_input: bool,
 }

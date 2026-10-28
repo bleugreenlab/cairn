@@ -789,14 +789,55 @@ impl ProviderAuth {
     }
 }
 
-/// Provider-reported credit exhaustion for one account.
+/// Why a provider refuses an account until its operator acts. Neither kind
+/// heals on a clock Cairn can see, so neither is a usage window.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountHoldKind {
+    /// Usage credits are exhausted, and a top-up is invisible to Cairn. The
+    /// default because every hold persisted before kinds existed was this.
+    #[default]
+    Credits,
+    /// The account's owner must accept the provider's updated Consumer Terms
+    /// (Anthropic answers every request with an HTTP 400 until they do).
+    TermsAcceptance,
+}
+
+/// A provider refusal that holds one account out of rotation until an
+/// operator acts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct AccountDepletion {
-    /// Unix timestamp when the provider reported the depletion.
+pub struct AccountHold {
+    /// Unix timestamp when the provider refused the account.
     pub since: i64,
-    /// Non-secret provider detail suitable for operator-facing diagnostics.
+    #[serde(default)]
+    pub kind: AccountHoldKind,
+    /// Non-secret provider detail suitable for operator-facing diagnostics:
+    /// the provider's own sentence where it gave one.
     pub detail: String,
+}
+
+impl AccountHoldKind {
+    /// What stands in the way, as a clause.
+    pub fn summary(self) -> &'static str {
+        match self {
+            AccountHoldKind::Credits => "usage credits are exhausted",
+            AccountHoldKind::TermsAcceptance => {
+                "the account must accept the provider's updated Consumer Terms"
+            }
+        }
+    }
+
+    /// What the operator does to put the account back in rotation, as a
+    /// sentence. `signed_in_as` names the account the way its owner signs in.
+    pub fn operator_action(self, signed_in_as: &str) -> String {
+        match self {
+            AccountHoldKind::Credits => "Cairn cannot detect a top-up automatically; add credits, then mark the account available in Settings → Providers.".to_string(),
+            AccountHoldKind::TermsAcceptance => format!(
+                "Accept the updated Consumer Terms at claude.ai signed in as {signed_in_as}, then refresh this provider's usage (or mark the account available in Settings → Providers) to try it again."
+            ),
+        }
+    }
 }
 
 /// Persisted availability and subscription usage for one provider account.
@@ -812,10 +853,12 @@ pub struct ProviderAccountHealth {
     /// before provenance existed never acquires a timer anyone can wait on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub blocked_until_declared: bool,
-    /// Credit exhaustion cannot be inferred to have healed with time. Only an
-    /// explicit operator retry clears this marker.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub depleted: Option<AccountDepletion>,
+    /// A refusal that cannot be inferred to have healed with time. Only an
+    /// operator's act clears it: an explicit retry, or for a terms hold an
+    /// explicit usage refresh. Read from `depleted` too, the name it was
+    /// persisted under when credits were its only kind.
+    #[serde(default, alias = "depleted", skip_serializing_if = "Option::is_none")]
+    pub held: Option<AccountHold>,
     pub captured_at: i64,
 }
 
@@ -861,7 +904,7 @@ impl ProviderAccountHealth {
     /// latest declared end of everything that does, or `None` when something
     /// blocking it has no declared end.
     fn available_at(&self, requested_model: Option<&str>, now: i64) -> Option<i64> {
-        if self.depleted.is_some() {
+        if self.held.is_some() {
             return None;
         }
         let mut at = now;
@@ -885,7 +928,7 @@ impl ProviderAccountHealth {
 
     /// Whether the provider has told Cairn this account cannot run yet.
     fn is_blocked(&self, now: i64) -> bool {
-        self.depleted.is_some() || self.blocked_until.is_some_and(|until| until > now)
+        self.held.is_some() || self.blocked_until.is_some_and(|until| until > now)
     }
 
     /// The tightest remaining headroom this snapshot still speaks for at `now`,
@@ -1152,14 +1195,21 @@ impl CredentialStore {
                     Some(format!(
                         "account is not compatible with backend '{backend}'"
                     ))
-                } else if let Some(depletion) = account
+                } else if let Some(hold) = account
                     .health
                     .as_ref()
-                    .and_then(|health| health.depleted.as_ref())
+                    .and_then(|health| health.held.as_ref())
                 {
+                    let signed_in_as = account.email.as_deref().unwrap_or(&account.label);
+                    // Unterminated: callers punctuate the reasons they join.
                     Some(format!(
-                        "usage credits are exhausted since {}; Cairn cannot detect a top-up automatically ({}). Retry this account after adding credits",
-                        depletion.since, depletion.detail
+                        "{} since {} ({}). {}",
+                        hold.kind.summary(),
+                        hold.since,
+                        hold.detail,
+                        hold.kind
+                            .operator_action(signed_in_as)
+                            .trim_end_matches('.')
                     ))
                 } else if account
                     .health
@@ -2007,7 +2057,7 @@ mod account_operation_tests {
             windows: Vec::new(),
             blocked_until: Some(99),
             blocked_until_declared: false,
-            depleted: None,
+            held: None,
             captured_at: 1,
         });
         let updated = store
@@ -2153,7 +2203,7 @@ mod tests {
             }],
             blocked_until: None,
             blocked_until_declared: false,
-            depleted: None,
+            held: None,
             captured_at,
         });
         account
@@ -2216,8 +2266,9 @@ mod tests {
         );
 
         let mut credits = limited("credits", Some(300), None);
-        credits.health.as_mut().unwrap().depleted = Some(AccountDepletion {
+        credits.health.as_mut().unwrap().held = Some(AccountHold {
             since: 150,
+            kind: AccountHoldKind::Credits,
             detail: "credits_required".to_string(),
         });
         let guess = limited("guess", Some(300), Some((500, false)));
@@ -2715,8 +2766,9 @@ mod tests {
     fn credit_depletion_stays_unavailable_without_a_time_expiry() {
         let mut store = test_store();
         let mut depleted = healthy_claude_account("depleted", 90.0, 100);
-        depleted.health.as_mut().unwrap().depleted = Some(AccountDepletion {
+        depleted.health.as_mut().unwrap().held = Some(AccountHold {
             since: 150,
+            kind: AccountHoldKind::Credits,
             detail: "credits_required".to_string(),
         });
         store.accounts = vec![depleted];
@@ -2753,8 +2805,65 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(health.depleted, None);
+        assert_eq!(health.held, None);
         assert!(!health.is_blocked(i64::MAX));
+    }
+
+    /// A store written when credits were the only hold names it `depleted`
+    /// and carries no kind.
+    #[test]
+    fn a_hold_persisted_as_depleted_reads_as_credits() {
+        let health: ProviderAccountHealth = serde_json::from_value(serde_json::json!({
+            "windows": [],
+            "depleted": {"since": 150, "detail": "credits_required"},
+            "capturedAt": 100
+        }))
+        .unwrap();
+
+        let hold = health.held.as_ref().expect("legacy hold read");
+        assert_eq!(hold.kind, AccountHoldKind::Credits);
+        assert!(health.is_blocked(i64::MAX));
+        let written = serde_json::to_value(&health).unwrap();
+        assert_eq!(written["held"]["kind"], "credits");
+        assert!(written.get("depleted").is_none());
+    }
+
+    /// An account that has not accepted the provider's terms has nothing
+    /// wrong with its usage, and was the preferred pick because of it.
+    #[test]
+    fn a_terms_hold_outranks_full_headroom_and_names_the_action() {
+        let mut store = test_store();
+        let mut unaccepted = healthy_claude_account("unaccepted", 100.0, 100);
+        unaccepted.email = Some("owner@example.com".to_string());
+        unaccepted.health.as_mut().unwrap().held = Some(AccountHold {
+            since: 150,
+            kind: AccountHoldKind::TermsAcceptance,
+            detail: "We've updated our Consumer Terms and Privacy Policy.".to_string(),
+        });
+        store.accounts = vec![unaccepted, healthy_claude_account("healthy", 10.0, 100)];
+
+        let selected = store
+            .select_routed_account(RoutedProvider::Claude, None, None, None, None, &[], 200)
+            .unwrap();
+        assert_eq!(selected.id, "healthy");
+
+        store.accounts.truncate(1);
+        assert!(store
+            .select_routed_account(RoutedProvider::Claude, None, None, None, None, &[], 200)
+            .is_none());
+        assert_eq!(
+            availability(&store, None, None),
+            RoutedAvailability::Unknown,
+            "no clock heals a terms hold"
+        );
+        let diagnostics =
+            store.routed_account_diagnostics(RoutedProvider::Claude, None, None, None, None, 200);
+        let reason = diagnostics[0].rejection.as_deref().unwrap();
+        assert!(reason.contains("updated Consumer Terms"), "{reason}");
+        assert!(
+            reason.contains("at claude.ai signed in as owner@example.com"),
+            "{reason}"
+        );
     }
 
     /// A subscription account measured empty is out of rotation only while
@@ -2817,7 +2926,7 @@ mod tests {
             }],
             blocked_until: None,
             blocked_until_declared: false,
-            depleted: None,
+            held: None,
             captured_at,
         });
         account

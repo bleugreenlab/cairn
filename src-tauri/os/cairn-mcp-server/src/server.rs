@@ -307,7 +307,7 @@ Partial failures never abort: a failed target stays in place under an `[error]` 
 
 Items run in PARALLEL by default; `sequential:true` runs in order (fail-fast unless `stop_on_error:false`). Output composes under `=== <header> ===` headers in input order. One call in, one final result out: a batch that outlives the 120-second synchronous window suspends and resumes with the finished result. An item's `timeout` (ms) kills that item at the bound and reports whatever output it produced rather than terminating the call. For a tree-bound batch in which every item declares a timeout, those bounds also limit how long the batch waits for a busy machine (the parallel maximum or sequential sum, capped at the 6-hour batch ceiling) and tell a remote executor how long to hold its queue place; if any item omits one, the batch may wait up to that ceiling. An omitted timeout also lets a tree-bound item run to completion under the ceiling. A response item (`cairn://responses/...`) runs to its `timeout`, or without one to its definition's declared timeout, under the same ceiling, and its batch suspends past the window like a long shell batch. An MCP-tool item runs to its declared `timeout` under the same ceiling and suspends the same way; without one it keeps the MCP gateway's 30-second default, so declare `timeout` on a tool call you know runs long. Stopping the run cancels an in-flight MCP request. A `cairn.run` of a response or MCP-tool item from @cairn/sdk inside a shell item has no call of its own to suspend on and ends at 120 seconds. REPL and decide (`cairn://models/decide`) items execute on the host inside the 120-second window, and a longer `timeout` is cut to 120 seconds.
 
-If a successful batch dirties the tree, `commit_msg` is required and commits all worktree changes once after success (`^` amends); without it the worktree is restored to HEAD. `branch` runs the batch against another revision — a branch name, a commit, or a node URI — to tell a regression from a failure already on the base (read `cairn:@/check-results/<base>?suite=S&environment=current` first: the ledger may already hold that verdict, and diffs and ancestry are `cairn:@/vcs/...` reads, not branch runs); it is verdict-only: tracked writes are discarded, and commit_msg, MCP, and REPL items are rejected. `executor` places the batch on a specific machine (`{name:"..."}`) or platform (`{os:"linux"}`), optionally refined by `requiredToolchains`; read cairn://executors for what is available, and omit it otherwise.
+If a successful batch dirties the tree, `commit_msg` is required and commits all worktree changes once after success (`^` amends); without it the worktree is restored to HEAD. `branch` runs the batch against another revision — a branch name, a commit, or a node URI — to tell a regression from a failure already on the base (read `cairn:@/check-results/<base>?suite=S&environment=current` first: the ledger may already hold that verdict, and diffs and ancestry are `cairn:@/vcs/...` reads, not branch runs); it is verdict-only: tracked writes are discarded, and commit_msg, MCP, and REPL items are rejected. `executor` places the batch on a specific machine (`{name:"..."}`) or platform (`{os:"linux"}`), optionally refined by `requiredToolchains`: the batch runs on a machine that satisfies it or is refused naming what prevents it, never quietly elsewhere. It is a call-level option beside `commands` (one batch runs on one machine), and one inside a command item is refused like any key outside this grammar; read cairn://executors for what is available, and omit it otherwise. Every result's first line names the machine the batch ran on.
 
 A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`), a terminal exits or prints a phrase (`{kind:"terminal",ref:"cairn:~/terminal/dev",on:"output",phrase:"ready"}`), or ANOTHER node's project check lanes settle (`{kind:"checks",ref:"cairn://p/CAIRN/123/1/builder/checks",on:"settled"}`, or `on:"verdict",suite:"..."` for one suite), resuming with the lanes' verdicts. You cannot wait on your own lanes; for those, end the turn on `write cairn:~/wakes {subscribe:{kind:"checks"}}` instead."#
     )]
@@ -355,6 +355,7 @@ A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`
                 RunBatchEnvelope {
                     text: outcome.result.clone(),
                     images: Vec::new(),
+                    invalid_input: false,
                 }
             });
         let text = assemble_reminders(cap_run_result(&envelope.text), &outcome.reminders);
@@ -362,6 +363,9 @@ A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`
         blocks.push(ContentBlock::text(text));
         for image in envelope.images {
             blocks.push(ContentBlock::image(image.data, image.mime_type));
+        }
+        if envelope.invalid_input {
+            return Ok(CallToolResult::error(blocks));
         }
         Ok(CallToolResult::success(blocks))
     }

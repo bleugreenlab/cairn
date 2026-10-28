@@ -157,6 +157,9 @@ pub(crate) async fn handle_read_resource(
         Some((end - info.created_at).max(0))
     };
 
+    let machine = (info.status == "running")
+        .then(|| crate::mcp::handlers::terminal::terminal_machine_name(orch, &info.session_id))
+        .flatten();
     let banner = format_status_banner(
         &parsed.slug,
         &info.status,
@@ -166,6 +169,7 @@ pub(crate) async fn handle_read_resource(
         idle_secs,
         total_bytes,
         log_path.as_deref(),
+        machine.as_deref(),
     );
     let mut body = format!("{banner}\n\n{output}");
 
@@ -259,10 +263,14 @@ fn format_status_banner(
     idle_secs: Option<i64>,
     total_bytes: usize,
     log_path: Option<&std::path::Path>,
+    machine: Option<&str>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if status == "running" {
-        parts.push("running".to_string());
+        parts.push(match machine {
+            Some(machine) => format!("running on {machine}"),
+            None => "running".to_string(),
+        });
         if let Some(rt) = runtime_secs {
             parts.push(format!("{} elapsed", fmt_duration(rt)));
         }
@@ -1078,20 +1086,58 @@ mod tests {
 
     #[test]
     fn banner_distinguishes_running_quiet_from_exited() {
-        let running_quiet =
-            format_status_banner("ci", "running", None, None, Some(70), Some(40), 1024, None);
+        let running_quiet = format_status_banner(
+            "ci",
+            "running",
+            None,
+            None,
+            Some(70),
+            Some(40),
+            1024,
+            None,
+            None,
+        );
         assert!(running_quiet.contains("running"));
         assert!(running_quiet.contains("elapsed"));
         assert!(running_quiet.contains("last output"));
 
         let running_no_output =
-            format_status_banner("ci", "running", None, None, Some(5), None, 0, None);
+            format_status_banner("ci", "running", None, None, Some(5), None, 0, None, None);
         assert!(running_no_output.contains("no output yet"));
 
-        let exited =
-            format_status_banner("ci", "exited", Some(0), None, Some(83), None, 2048, None);
+        let exited = format_status_banner(
+            "ci",
+            "exited",
+            Some(0),
+            None,
+            Some(83),
+            None,
+            2048,
+            None,
+            None,
+        );
         assert!(exited.contains("exited code 0"));
         assert!(exited.contains("ran"));
+    }
+
+    /// A running terminal's page names the machine its process runs on.
+    #[test]
+    fn banner_names_the_machine_a_running_terminal_runs_on() {
+        let banner = format_status_banner(
+            "lab",
+            "running",
+            None,
+            None,
+            Some(5),
+            None,
+            0,
+            None,
+            Some("bgsrv-mac"),
+        );
+        assert!(
+            banner.starts_with("[terminal lab: running on bgsrv-mac,"),
+            "{banner}"
+        );
     }
 
     /// A terminal Cairn settled because its process was lost has no exit code,
@@ -1106,6 +1152,7 @@ mod tests {
             Some(3240),
             None,
             512,
+            None,
             None,
         );
         assert!(lost.contains("exited"), "{lost}");
@@ -1129,6 +1176,7 @@ mod tests {
             None,
             1,
             Some(&existing),
+            None,
         );
         assert!(
             with_log.contains(&format!("log: {}", existing.display())),
@@ -1145,6 +1193,7 @@ mod tests {
             None,
             1,
             Some(&missing),
+            None,
         );
         assert!(!without_log.contains("log:"), "{without_log}");
     }
