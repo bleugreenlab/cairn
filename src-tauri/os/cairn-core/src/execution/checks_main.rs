@@ -683,12 +683,32 @@ async fn report_lane(
     verdict: CadenceVerdict,
 ) {
     let names = |executor: &str| orch.fleet.executor_name_for_text(executor);
-    let comparison = comparison_for(db, project_id, project_key, lane, verdict.row(), &names)
-        .await
-        .unwrap_or_else(|error| {
-            log::warn!("main cadence previous-row lookup failed: {error}");
-            Comparison::Baseline
-        });
+    // Without the chain (a pass that failed before resolving the tip, or an
+    // unreadable log), only the cadence's own rows can be placed on main.
+    let chain = match (repository, commit) {
+        (Some(repository), Some(commit)) => main_chain(orch, repository, commit)
+            .map_err(|error| {
+                log::warn!(
+                    "main cadence first-parent walk failed; comparing cadence rows only: {error}"
+                )
+            })
+            .ok(),
+        _ => None,
+    };
+    let comparison = comparison_for(
+        db,
+        project_id,
+        project_key,
+        lane,
+        verdict.row(),
+        chain.as_ref(),
+        &names,
+    )
+    .await
+    .unwrap_or_else(|error| {
+        log::warn!("main cadence previous-row lookup failed: {error}");
+        Comparison::Baseline
+    });
     let bracket = match (bracket_base(&verdict, &comparison), repository, commit) {
         (Some(previous), Some(repository), Some(commit)) => {
             merge_bracket(
@@ -858,13 +878,17 @@ impl Failure {
     }
 }
 
-/// One cadence observation, read back from the store.
+/// One whole-suite observation, read back from the store: the cadence's own
+/// attempt, or a row of any cadence it is compared with or covered by.
 #[derive(Clone, Debug)]
 pub(crate) struct CadenceRow {
     pub(crate) id: String,
     /// Canonical citation: `cairn://p/{key}/check-observations/{handle}`.
     pub(crate) reference: String,
     pub(crate) commit: String,
+    /// How the row was armed: `main` for the cadence's own, otherwise the
+    /// producer's cadence (`manual`, `review`, `write`).
+    pub(crate) cadence: String,
     pub(crate) platform: String,
     /// The executor identity the row recorded: what previous rows are keyed by.
     pub(crate) executor_id: Option<String>,
@@ -970,7 +994,7 @@ async fn load_row(
     let head = db
         .query_opt(
             "SELECT id, COALESCE(public_handle, id), commit_sha, COALESCE(verdict_platform, ''),
-                    executor_id, ran_at, verdict, exit_code, complete, output_tail
+                    executor_id, ran_at, verdict, exit_code, complete, output_tail, cadence
                FROM check_result_observations WHERE id = ?1",
             (observation_id.to_string(),),
             |row| {
@@ -985,14 +1009,26 @@ async fn load_row(
                     row.i64(7)?,
                     row.i64(8)?,
                     row.text(9)?,
+                    row.text(10)?,
                 ))
             },
         )
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("observation {observation_id} does not exist"))?;
-    let (id, handle, commit, platform, executor_id, ran_at, verdict, exit_code, complete, tail) =
-        head;
+    let (
+        id,
+        handle,
+        commit,
+        platform,
+        executor_id,
+        ran_at,
+        verdict,
+        exit_code,
+        complete,
+        tail,
+        cadence,
+    ) = head;
     let tests = db
         .query_all(
             "SELECT test_id, status, failure_excerpt FROM check_test_results WHERE observation_id = ?1",
@@ -1015,6 +1051,7 @@ async fn load_row(
         reference: format!("cairn://p/{project_key}/check-observations/{handle}"),
         id,
         commit,
+        cadence,
         platform,
         executor: executor_id.as_deref().map(names),
         executor_id,
@@ -1027,6 +1064,67 @@ async fn load_row(
     })
 }
 
+/// The default head's first-parent chain, tip first: the trees main has held,
+/// back [`BRACKET_SCAN`] landings. A whole-suite row on one of these commits
+/// observed a tree main held, whoever armed it (tenet 687: a measurement is
+/// keyed to the commit it measured, not to how it was armed).
+#[derive(Debug, Default)]
+pub(crate) struct MainChain {
+    depth: HashMap<String, usize>,
+}
+
+impl MainChain {
+    /// One commit per line, tip first.
+    fn from_log(output: &str) -> Self {
+        Self {
+            depth: output
+                .lines()
+                .map(str::trim)
+                .filter(|commit| !commit.is_empty())
+                .enumerate()
+                .map(|(depth, commit)| (commit.to_string(), depth))
+                .collect(),
+        }
+    }
+
+    /// How many landings behind the tip `commit` sits; `None` off the chain.
+    fn depth(&self, commit: &str) -> Option<usize> {
+        self.depth.get(commit).copied()
+    }
+}
+
+fn main_chain(orch: &Orchestrator, repository: &Path, tip: &str) -> Result<MainChain, String> {
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let revset = format!("first_ancestors({tip}, {BRACKET_SCAN})");
+    jj.run(
+        repository,
+        &[
+            "log",
+            "--ignore-working-copy",
+            "--no-graph",
+            "-r",
+            &revset,
+            "-T",
+            r#"commit_id ++ "\n""#,
+        ],
+        "jj log (main cadence first-parent chain)",
+    )
+    .map(|output| MainChain::from_log(&output))
+}
+
+/// Where a row sits relative to main's tip, nearest first: the tree it
+/// observed, then how recently it finished. A row's `ran_at` is its finish, so
+/// a long run armed on an older tip can finish after a short one on a newer
+/// tip; the tree decides. Without a chain, or off it, only the finish orders.
+fn tree_order(chain: Option<&MainChain>, row: &CadenceRow) -> (usize, std::cmp::Reverse<i64>) {
+    (
+        chain
+            .and_then(|chain| chain.depth(&row.commit))
+            .unwrap_or(usize::MAX),
+        std::cmp::Reverse(row.ran_at_ms),
+    )
+}
+
 /// Narrows [`latest_complete_row`]'s candidates; every field is optional.
 #[derive(Clone, Copy, Default)]
 struct RowFilter<'a> {
@@ -1036,10 +1134,27 @@ struct RowFilter<'a> {
     executor_id: Option<&'a str>,
     /// Never this row.
     excluding: Option<&'a str>,
+    /// Main's first-parent chain. A row of any cadence on it qualifies, and
+    /// the nearest tree wins. Without it only the cadence's own rows qualify,
+    /// newest finish first.
+    main_chain: Option<&'a MainChain>,
 }
 
-/// The newest cadence row for `lane` that classifies as complete and passes
-/// `filter`.
+/// How many recorded rows [`latest_complete_row`] reads before placing them on
+/// main's chain: rows on agent branches and narrowed selections share the
+/// table, so the newest few by finish time are not enough.
+const CANDIDATE_SCAN: i64 = 64;
+
+/// The newest whole-suite row for `lane` that classifies as complete and
+/// passes `filter`.
+///
+/// A row qualifies when it observed the whole suite: `selection = 'full'` (a
+/// fast, filtered, or empty selection is not the suite, tenet 695), nothing
+/// deferred (a tiered run's deferred tests are unobserved), and no failure kind
+/// (an infrastructure or killed run observed nothing). Its cadence is how it
+/// was armed, not what it observed, so with a chain any cadence's row on main's
+/// first-parent chain qualifies; the cadence's own rows qualify regardless,
+/// having been armed on main's tip.
 async fn latest_complete_row(
     db: &LocalDb,
     project_id: &str,
@@ -1050,12 +1165,14 @@ async fn latest_complete_row(
 ) -> Result<Option<CadenceRow>, String> {
     let candidates = db
         .query_all(
-            "SELECT id FROM check_result_observations
-              WHERE project_id = ?1 AND check_name = ?2 AND cadence = 'main'
-                AND verdict_platform = ?3 AND complete = 1 AND id != ?4
+            "SELECT id, commit_sha, cadence FROM check_result_observations
+              WHERE project_id = ?1 AND check_name = ?2 AND verdict_platform = ?3
+                AND complete = 1 AND failure_kind IS NULL
+                AND selection = 'full' AND deferred_count = 0 AND id != ?4
                 AND (?5 = '' OR input_hash = ?5)
                 AND (?6 = '' OR executor_id = ?6)
-              ORDER BY ran_at DESC LIMIT 8",
+                AND (?7 = 1 OR cadence = 'main')
+              ORDER BY ran_at DESC LIMIT ?8",
             (
                 project_id.to_string(),
                 lane.check.clone(),
@@ -1063,12 +1180,26 @@ async fn latest_complete_row(
                 filter.excluding.unwrap_or("").to_string(),
                 filter.input_hash.unwrap_or("").to_string(),
                 filter.executor_id.unwrap_or("").to_string(),
+                i64::from(filter.main_chain.is_some()),
+                CANDIDATE_SCAN,
             ),
-            |row| row.text(0),
+            |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
         )
         .await
         .map_err(|error| error.to_string())?;
-    for id in candidates {
+    let mut candidates: Vec<(String, usize)> = candidates
+        .into_iter()
+        .filter_map(|(id, commit, cadence)| {
+            let depth = filter.main_chain.and_then(|chain| chain.depth(&commit));
+            if depth.is_none() && cadence != "main" {
+                return None;
+            }
+            Some((id, depth.unwrap_or(usize::MAX)))
+        })
+        .collect();
+    // Stable, so rows on one tree keep the query's newest-finish-first order.
+    candidates.sort_by_key(|(_, depth)| *depth);
+    for (id, _) in candidates {
         if let CadenceVerdict::Complete(row) =
             classify_row(load_row(db, project_key, &id, names).await?)
         {
@@ -1146,11 +1277,13 @@ fn bracket_base<'a>(
 }
 
 /// Choose the comparison for an attempt on `executor_id` from that executor's
-/// newest complete row and the platform's newest complete row on any executor.
+/// newest complete row and the platform's newest complete row on any executor,
+/// "newest" in [`tree_order`].
 fn select_comparison(
     executor_id: Option<&str>,
     same_executor: Option<CadenceRow>,
     newest: Option<CadenceRow>,
+    chain: Option<&MainChain>,
 ) -> Comparison {
     let Some(executor_id) = executor_id else {
         return newest.map_or(Comparison::Baseline, |previous| Comparison::AnyExecutor {
@@ -1161,7 +1294,7 @@ fn select_comparison(
         Some(previous) => {
             let neighbour = newest.filter(|row| {
                 row.executor_id.as_deref() != Some(executor_id)
-                    && row.ran_at_ms > previous.ran_at_ms
+                    && tree_order(chain, row) < tree_order(chain, &previous)
             });
             Comparison::SameExecutor {
                 previous,
@@ -1175,13 +1308,14 @@ fn select_comparison(
 }
 
 /// What `current` (the attempt's own row, when it recorded one) is measured
-/// against.
+/// against: whole-suite rows of any cadence on `chain`, when it is known.
 async fn comparison_for(
     db: &LocalDb,
     project_id: &str,
     project_key: &str,
     lane: &CadenceLane,
     current: Option<&CadenceRow>,
+    chain: Option<&MainChain>,
     names: ExecutorNames<'_>,
 ) -> Result<Comparison, String> {
     let excluding = current.map(|row| row.id.as_str());
@@ -1196,6 +1330,7 @@ async fn comparison_for(
                 RowFilter {
                     executor_id: Some(executor_id),
                     excluding,
+                    main_chain: chain,
                     ..RowFilter::default()
                 },
                 names,
@@ -1211,12 +1346,13 @@ async fn comparison_for(
         lane,
         RowFilter {
             excluding,
+            main_chain: chain,
             ..RowFilter::default()
         },
         names,
     )
     .await?;
-    Ok(select_comparison(executor_id, same_executor, newest))
+    Ok(select_comparison(executor_id, same_executor, newest, chain))
 }
 
 /// The line of a failure excerpt that says what went wrong. A Rust panic opens
@@ -1510,6 +1646,18 @@ fn plural(count: usize) -> &'static str {
 
 fn host(row: &CadenceRow) -> &str {
     row.executor.as_deref().unwrap_or("unknown")
+}
+
+/// A compared or covering row as the message names it: how it was armed and
+/// where it ran ("the manual row on `bbs`"), so a hand-armed baseline reads
+/// apart from a cadence pass.
+fn armed(row: &CadenceRow) -> String {
+    let cadence = if row.cadence == "main" {
+        "cadence"
+    } else {
+        row.cadence.as_str()
+    };
+    format!("{cadence} row on `{}`", host(row))
 }
 
 fn age(now_ms: i64, then_ms: i64) -> String {
@@ -1859,28 +2007,28 @@ fn render_host_conditions(
 fn render_basis(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow) {
     let line = match report.comparison {
         Comparison::Baseline => format!(
-            "nothing. No earlier complete cadence row exists for {} on {}, so this row is the baseline and every failure is listed as newly red.",
+            "nothing. No earlier complete whole-suite row on main exists for {} on {}, so this row is the baseline and every failure is listed as newly red.",
             report.check, report.platform
         ),
         Comparison::SameExecutor { previous, .. } => format!(
-            "{}, the previous row on `{}` (commit `{}`, ran {} earlier)",
+            "{}, the previous {} (commit `{}`, ran {} earlier)",
             previous.reference,
-            host(previous),
+            armed(previous),
             short_commit(&previous.commit),
             age(row.ran_at_ms, previous.ran_at_ms)
         ),
         Comparison::OtherExecutor { previous } => format!(
-            "{} on `{}` (commit `{}`, ran {} earlier). No earlier complete row exists on `{}`, so this is a **cross-host comparison**: what differs below may be the two hosts (provisioning, load, toolchain) rather than the tree, and none of it is reported as newly red or green.",
+            "{}, the {} (commit `{}`, ran {} earlier). No earlier complete row exists on `{}`, so this is a **cross-host comparison**: what differs below may be the two hosts (provisioning, load, toolchain) rather than the tree, and none of it is reported as newly red or green.",
             previous.reference,
-            host(previous),
+            armed(previous),
             short_commit(&previous.commit),
             age(row.ran_at_ms, previous.ran_at_ms),
             host(row)
         ),
         Comparison::AnyExecutor { previous } => format!(
-            "{} on `{}` (commit `{}`, ran {} earlier). This row names no executor, so the comparison may cross hosts.",
+            "{}, the {} (commit `{}`, ran {} earlier). This row names no executor, so the comparison may cross hosts.",
             previous.reference,
-            host(previous),
+            armed(previous),
             short_commit(&previous.commit),
             age(row.ran_at_ms, previous.ran_at_ms)
         ),
@@ -2096,27 +2244,27 @@ fn render_incomplete(
     };
     match report.comparison {
         Comparison::Baseline => out.push_str(&format!(
-            "- Last complete row: none. No complete cadence row has ever been recorded for {} on {}.\n",
+            "- Last complete row: none. No complete whole-suite row on main has ever been recorded for {} on {}.\n",
             report.check, report.platform
         )),
         Comparison::SameExecutor { previous, .. } => out.push_str(&format!(
-            "- Last complete row: {}, the previous row on `{}`, at {}.\n",
+            "- Last complete row: {}, the previous {}, at {}.\n",
             previous.reference,
-            host(previous),
+            armed(previous),
             since(previous)
         )),
         Comparison::OtherExecutor { previous } => out.push_str(&format!(
-            "- Last complete row: none on `{}`. The newest complete row on {} is {} on `{}`, at {}.\n",
+            "- Last complete row: none on `{}`. The newest complete row on {} is {}, the {}, at {}.\n",
             row.map_or("this executor", host),
             report.platform,
             previous.reference,
-            host(previous),
+            armed(previous),
             since(previous)
         )),
         Comparison::AnyExecutor { previous } => out.push_str(&format!(
-            "- Last complete row: {} on `{}` (the newest on {}, any executor), at {}.\n",
+            "- Last complete row: {}, the {} (the newest on {}, any executor), at {}.\n",
             previous.reference,
-            host(previous),
+            armed(previous),
             report.platform,
             since(previous)
         )),
@@ -2126,9 +2274,9 @@ fn render_incomplete(
     {
         if covering.id != previous.id {
             out.push_str(&format!(
-                "- Covered through: {} on `{}`, at {}, the newest complete row on {} on any executor. A merge is covered when any host's complete row includes it, so the list below starts there.\n",
+                "- Covered through: {}, the {}, at {}, the newest complete row on {} on any executor. A merge is covered when any host's complete whole-suite row includes it, whoever armed the run, so the list below starts there.\n",
                 covering.reference,
-                host(covering),
+                armed(covering),
                 since(covering),
                 report.platform
             ));
@@ -2194,6 +2342,7 @@ mod tests {
             id: id.to_string(),
             reference: format!("cairn://p/cairn/check-observations/{id}"),
             commit: commit.to_string(),
+            cadence: "main".to_string(),
             platform: "linux".to_string(),
             executor_id: Some("bbs".to_string()),
             executor: Some("bbs".to_string()),
@@ -2491,7 +2640,7 @@ mod tests {
         assert!(text.contains("4 newly red, 1 newly green"), "{text}");
         assert!(
             text.contains(
-                "Compared with: cairn://p/cairn/check-observations/prev, the previous row on `bbs`"
+                "Compared with: cairn://p/cairn/check-observations/prev, the previous cadence row on `bbs`"
             ),
             "the comparison names its host: {text}"
         );
@@ -2837,7 +2986,7 @@ mod tests {
             "the compile error is quoted: {text}"
         );
         assert!(
-            text.contains("No complete cadence row has ever been recorded"),
+            text.contains("No complete whole-suite row on main has ever been recorded"),
             "{text}"
         );
         assert!(
@@ -2915,7 +3064,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("check-observations/prev on `bbs`")
+            text.contains("check-observations/prev, the cadence row on `bbs`")
                 && text.contains("No earlier complete row exists on `fedora`"),
             "the basis names both hosts: {text}"
         );
@@ -2992,7 +3141,10 @@ mod tests {
         );
         // Movement is measured on fedora's own history only.
         assert!(text.contains("2 newly red, 1 newly green"), "{text}");
-        assert!(text.contains("the previous row on `fedora`"), "{text}");
+        assert!(
+            text.contains("the previous cadence row on `fedora`"),
+            "{text}"
+        );
         assert!(
             text.contains("**1 test** · **one host**: passed on `bbs` — `left == right`"),
             "a red the other host's newer row passed is flagged: {text}"
@@ -3078,11 +3230,11 @@ mod tests {
 
         let text = report(&no_verdict, &comparison, &Bracket::default());
         assert!(
-            text.contains("Last complete row: cairn://p/cairn/check-observations/prev, the previous row on `bbs`"),
+            text.contains("Last complete row: cairn://p/cairn/check-observations/prev, the previous cadence row on `bbs`"),
             "{text}"
         );
         assert!(
-            text.contains("Covered through: cairn://p/cairn/check-observations/other on `fedora`"),
+            text.contains("Covered through: cairn://p/cairn/check-observations/other, the cadence row on `fedora`"),
             "{text}"
         );
         assert!(
@@ -3117,7 +3269,7 @@ mod tests {
         let comparison = Comparison::OtherExecutor { previous };
         let text = report(&classify_row(partial), &comparison, &Bracket::default());
         assert!(
-            text.contains("Last complete row: none on `fedora`. The newest complete row on linux is cairn://p/cairn/check-observations/prev on `bbs`"),
+            text.contains("Last complete row: none on `fedora`. The newest complete row on linux is cairn://p/cairn/check-observations/prev, the cadence row on `bbs`"),
             "{text}"
         );
         assert!(
@@ -3126,6 +3278,19 @@ mod tests {
         );
     }
 
+    /// One observation to store; [`insert_observation`] fills the usual shape.
+    struct Stored<'a> {
+        id: &'a str,
+        executor: &'a str,
+        ran_at: i64,
+        cadence: &'a str,
+        commit: &'a str,
+        selection: &'a str,
+        failure_kind: Option<&'a str>,
+        tests: &'a [(&'a str, &'a str)],
+    }
+
+    /// A complete whole-suite row on commit `c-{id}`.
     async fn insert_observation(
         db: &LocalDb,
         id: &str,
@@ -3134,6 +3299,35 @@ mod tests {
         cadence: &str,
         tests: &[(&str, &str)],
     ) {
+        let commit = format!("c-{id}");
+        store(
+            db,
+            Stored {
+                id,
+                executor,
+                ran_at,
+                cadence,
+                commit: &commit,
+                selection: "full",
+                failure_kind: None,
+                tests,
+            },
+        )
+        .await;
+    }
+
+    async fn store(db: &LocalDb, row: Stored<'_>) {
+        let Stored {
+            id,
+            executor,
+            ran_at,
+            cadence,
+            commit,
+            selection,
+            failure_kind,
+            tests,
+        } = row;
+        let failure_kind = failure_kind.map_or("NULL".to_string(), |kind| format!("'{kind}'"));
         // A failing exit with no failing test is not a verdict, so a row's
         // verdict follows its tests; a row with no tests is a compile failure.
         let (exit_code, verdict) = if tests.is_empty() {
@@ -3148,9 +3342,11 @@ mod tests {
                (id, project_id, commit_sha, tree_hash, check_name, input_hash,
                 environment_fingerprint, exit_code, verdict, complete, reusable,
                 parser_version, result_schema_version, ran_at, duration_ms, job_id,
-                cadence, output_tail, executor_id, verdict_platform, public_handle)
-             VALUES('{id}','p','c-{id}','t','rust-tests','i-{id}','env',{exit_code},'{verdict}',1,0,
-                    1,1,{ran_at},5,'main:p','{cadence}','','{executor}','linux','h-{id}');"
+                cadence, output_tail, executor_id, verdict_platform, public_handle,
+                selection, failure_kind)
+             VALUES('{id}','p','{commit}','t','rust-tests','i-{id}','env',{exit_code},'{verdict}',1,0,
+                    1,1,{ran_at},5,'main:p','{cadence}','','{executor}','linux','h-{id}',
+                    '{selection}',{failure_kind});"
         );
         for (test, status) in tests {
             script.push_str(&format!(
@@ -3161,9 +3357,7 @@ mod tests {
         db.execute_script(script).await.unwrap();
     }
 
-    #[tokio::test]
-    async fn the_previous_row_is_the_same_executors_with_a_platform_fallback() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn cadence_db(temp: &tempfile::TempDir) -> LocalDb {
         let db = LocalDb::open_migrated_for_test(temp.path().join("cadence.db"))
             .await
             .unwrap();
@@ -3174,17 +3368,29 @@ mod tests {
         )
         .await
         .unwrap();
-        let lane = CadenceLane {
+        db
+    }
+
+    fn linux_lane() -> CadenceLane {
+        CadenceLane {
             check: "rust-tests".into(),
             platform: "linux".into(),
             notify: "testing".into(),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn the_previous_row_is_the_same_executors_with_a_platform_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = cadence_db(&temp).await;
+        let lane = linux_lane();
         let names = |executor: &str| format!("{executor}-host");
+        // No first-parent chain is known here, so only cadence rows qualify.
         let comparison = |current: Option<CadenceRow>| {
             let db = &db;
             let lane = &lane;
             async move {
-                comparison_for(db, "p", "cairn", lane, current.as_ref(), &names)
+                comparison_for(db, "p", "cairn", lane, current.as_ref(), None, &names)
                     .await
                     .unwrap()
             }
@@ -3196,7 +3402,8 @@ mod tests {
         let id_of = |row: Option<&CadenceRow>| row.map(|row| row.id.clone());
 
         // Interleaved hosts, plus rows the lookup must never pick: a complete
-        // flag with no tests (a compile failure), a manual run, another platform.
+        // flag with no tests (a compile failure), and a manual run that no
+        // chain places on main.
         insert_observation(&db, "b1", "bbs", 1, "main", &[("a", "failed")]).await;
         insert_observation(&db, "f1", "fedora", 2, "main", &[("a", "passed")]).await;
         insert_observation(&db, "b2", "bbs", 3, "main", &[("a", "failed")]).await;
@@ -3257,6 +3464,148 @@ mod tests {
             Comparison::AnyExecutor { previous } => assert_eq!(previous.id, "n1"),
             other => panic!("expected the platform's newest, got {other:?}"),
         }
+    }
+
+    /// cairn/5431: a hand-armed whole-suite row on main observed main's tree,
+    /// so it covers the merges up to it and is a nearer comparison than an
+    /// older cadence row. Narrowed selections, failed runs, rows off main's
+    /// first-parent chain, and a longer run that finished later on an older
+    /// tree never take its place.
+    #[tokio::test]
+    async fn a_whole_suite_row_of_any_cadence_on_main_covers_and_compares() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = cadence_db(&temp).await;
+        let lane = linux_lane();
+        let names = |executor: &str| executor.to_string();
+        // Main's first-parent chain, tip first.
+        let chain = MainChain::from_log("tip\nx\nb\nq\na\n");
+        let comparison = |current: Option<CadenceRow>, with_chain: bool| {
+            let db = &db;
+            let lane = &lane;
+            let chain = with_chain.then_some(&chain);
+            async move {
+                comparison_for(db, "p", "cairn", lane, current.as_ref(), chain, &names)
+                    .await
+                    .unwrap()
+            }
+        };
+        let passed: &[(&str, &str)] = &[("a", "passed")];
+        let shaped = |id, executor, ran_at, cadence, commit, selection, failure_kind| Stored {
+            id,
+            executor,
+            ran_at,
+            cadence,
+            commit,
+            selection,
+            failure_kind,
+            tests: passed,
+        };
+        for row in [
+            // The cadence's last row, on A.
+            shaped("cad-a", "fedora", 1, "main", "a", "full", None),
+            // `cairn check run rust-tests --branch main` on B.
+            shaped("man-b", "bbs", 2, "manual", "b", "full", None),
+            // Nearer the tip than B, but none of them observed the suite.
+            shaped("fast-x", "bbs", 4, "manual", "x", "fast", None),
+            shaped("filtered-x", "bbs", 5, "review", "x", "filtered", None),
+            shaped(
+                "infra-x",
+                "bbs",
+                6,
+                "manual",
+                "x",
+                "full",
+                Some("infrastructure"),
+            ),
+            // A whole-suite row on an agent branch never observed main.
+            shaped("side", "bbs", 7, "review", "side", "full", None),
+            // A long run armed on an older tip, finishing after B's.
+            shaped("man-q", "bbs", 8, "manual", "q", "full", None),
+        ] {
+            store(&db, row).await;
+        }
+
+        // The cadence dies on the tip: B's manual row is the newest tree any
+        // complete whole-suite row observed, so the uncovered list starts at B.
+        let death = CadenceVerdict::Death {
+            cause: "no machine".into(),
+        };
+        let covered = comparison(None, true).await;
+        match &covered {
+            Comparison::AnyExecutor { previous } => {
+                assert_eq!(previous.id, "man-b");
+                assert_eq!(previous.cadence, "manual");
+            }
+            other => panic!("expected the platform's nearest row, got {other:?}"),
+        }
+        assert_eq!(
+            bracket_base(&death, &covered).map(|row| row.commit.as_str()),
+            Some("b"),
+            "merges up to and including B are covered"
+        );
+        let text = report(&death, &covered, &Bracket::default());
+        assert!(
+            text.contains("Last complete row: cairn://p/cairn/check-observations/h-man-b, the manual row on `bbs`"),
+            "{text}"
+        );
+
+        // Without the chain nothing places a manual row on main: the
+        // cadence's own row is all that qualifies.
+        match comparison(None, false).await {
+            Comparison::AnyExecutor { previous } => assert_eq!(previous.id, "cad-a"),
+            other => panic!("expected the cadence's own row, got {other:?}"),
+        }
+
+        // A cadence row on the tip compares with its own host's nearest row
+        // of any cadence, and the other host's nearer row is the neighbour
+        // and the coverage.
+        store(
+            &db,
+            shaped("man-f", "fedora", 3, "manual", "q", "full", None),
+        )
+        .await;
+        store(
+            &db,
+            shaped("cad-tip", "fedora", 10, "main", "tip", "full", None),
+        )
+        .await;
+        let tip = load_row(&db, "cairn", "cad-tip", &names).await.unwrap();
+        let compared = comparison(Some(tip.clone()), true).await;
+        match &compared {
+            Comparison::SameExecutor {
+                previous,
+                neighbour,
+            } => {
+                assert_eq!(previous.id, "man-f", "q is nearer the tip than A");
+                assert_eq!(
+                    neighbour.as_deref().map(|row| row.id.as_str()),
+                    Some("man-b")
+                );
+            }
+            other => panic!("expected a same-executor comparison, got {other:?}"),
+        }
+        assert_eq!(
+            compared.coverage().map(|row| row.id.as_str()),
+            Some("man-b")
+        );
+        let text = report(
+            &CadenceVerdict::Complete(tip),
+            &compared,
+            &Bracket::default(),
+        );
+        assert!(
+            text.contains("Compared with: cairn://p/cairn/check-observations/h-man-f, the previous manual row on `fedora`"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_first_parent_chain_reads_tip_first() {
+        let chain = MainChain::from_log("tip\n  mid \n\nroot\n");
+        assert_eq!(chain.depth("tip"), Some(0));
+        assert_eq!(chain.depth("mid"), Some(1));
+        assert_eq!(chain.depth("root"), Some(2));
+        assert_eq!(chain.depth("side"), None);
     }
 
     #[test]
