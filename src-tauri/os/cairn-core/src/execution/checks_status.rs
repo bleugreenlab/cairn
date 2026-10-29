@@ -7,7 +7,8 @@ use crate::execution::cache::{
 };
 use crate::execution::check_parsers::{
     error_anchored_tail, extract_running_tests, format_failure_excerpt, format_failure_names,
-    report_excerpt, ParsedCheckResult, VerdictFacts, MAX_FAILURE_NAMES, RUST_LINT_PARSER,
+    is_test_runner_parser, report_excerpt, ParsedCheckResult, VerdictFacts, MAX_FAILURE_NAMES,
+    RUST_LINT_PARSER,
 };
 use crate::execution::checks::{
     check_input_hashes, head_verdicts, head_verdicts_conn, load_checks_contract_at_commit,
@@ -187,9 +188,9 @@ pub(crate) fn check_state_from_facts(
 /// verified. Here a red is as complete as a green: the question is whether the
 /// head was judged at all, not how it came out. A result with no structured
 /// output is the command's exit code, which counts as a verdict (a script
-/// check, or a runner whose output Cairn does not parse); that is an interim
-/// for the test runners among them (`api`'s `bun test`, `frontend-tests`), which
-/// cairn/4941's parsers retire. A green whose own structured result says nothing
+/// check, or a runner whose output Cairn does not parse); for a test runner
+/// that is an interim until its output is parsed or it writes a result file.
+/// A green whose own structured result says nothing
 /// was selected, or that the run was cut short, is not a verdict. Any recorded
 /// failure kind is a run that ended without a verdict, except a selection that
 /// matched nothing, which is an empty one.
@@ -1670,7 +1671,9 @@ pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<Strin
             // Only a test runner's tallies are test counts. A lint or typecheck
             // parse carries zeros there, which would read as "no tests matched".
             let test_counts = match (status.parser.as_deref(), status.passed, status.failed) {
-                (Some("nextest" | "vitest"), Some(passed), Some(failed)) => Some((passed, failed)),
+                (Some(parser), Some(passed), Some(failed)) if is_test_runner_parser(parser) => {
+                    Some((passed, failed))
+                }
                 _ => None,
             };
             if let Some(label) = status_fast_tier_label(status) {

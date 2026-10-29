@@ -7570,12 +7570,8 @@ fn check_reuse_decision(
     if failure_kind.is_some() {
         return reject("check ended with an infrastructure or process failure");
     }
-    let configured_test_runner = command.contains("test:rust")
-        || command.contains("cargo test")
-        || command.contains("nextest")
-        || command.contains("vitest");
     let Some(parsed) = parsed else {
-        return if configured_test_runner {
+        return if crate::execution::check_parsers::is_test_runner_command(command) {
             reject("test runner did not produce a structured result")
         } else {
             CheckReuseDecision {
