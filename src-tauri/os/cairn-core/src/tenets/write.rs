@@ -277,7 +277,7 @@ pub async fn propose(
         })
         .await
         .map_err(|error| format!("Failed to propose tenet: {error}"))??;
-    emit_changed(emitter, "insert");
+    emit_changed(emitter, &proposer.project_id, "insert");
     Ok(outcome)
 }
 
@@ -324,7 +324,7 @@ pub async fn withdraw(
         })
         .await
         .map_err(|error| format!("Failed to withdraw tenet: {error}"))??;
-    emit_changed(emitter, "update");
+    emit_changed(emitter, &project_id, "update");
     notify_gate_evidence_changed();
     Ok(outcome)
 }
@@ -453,7 +453,7 @@ pub async fn answer(
         .await
         .map_err(|error| format!("Failed to record the verdict: {error}"))??;
     let (outcome, comments) = outcome;
-    emit_changed(emitter, "update");
+    emit_changed(emitter, &project_id, "update");
     if comments > 0 {
         if let Err(error) = emitter.emit(
             "db-change",
@@ -481,7 +481,7 @@ pub(crate) async fn release_deleted_thread_conn(
 ) -> DbResult<ReleasedTenets> {
     let mut rows = conn
         .query(
-            "SELECT number, status FROM tenets WHERE proposing_thread_id = ?1 ORDER BY number",
+            "SELECT number, status, project_id FROM tenets WHERE proposing_thread_id = ?1 ORDER BY number",
             params![thread_id],
         )
         .await?;
@@ -490,6 +490,7 @@ pub(crate) async fn release_deleted_thread_conn(
     while let Some(row) = rows.next().await? {
         let number = row.i64(0)?;
         let status = TenetStatus::parse(&row.text(1)?);
+        released.project_id = Some(row.text(2)?);
         if status.is_some_and(TenetStatus::has_verdict) {
             held.push(format!("#{number}"));
         }
@@ -514,19 +515,21 @@ pub(crate) async fn release_deleted_thread_conn(
 }
 
 /// What a thread deletion took from the tenets table.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ReleasedTenets {
     /// Every row removed, unanswered and withdrawn alike.
     pub removed: usize,
     /// The unanswered ones, each of which a gate may have named.
     pub pending: usize,
+    /// The project the removed rows belonged to; set whenever `removed > 0`.
+    pub project_id: Option<String>,
 }
 
 impl ReleasedTenets {
     /// Announce the removal, after the deleting transaction has committed.
     pub(crate) fn announce(self, emitter: &dyn EventEmitter) {
-        if self.removed > 0 {
-            emit_changed(emitter, "delete");
+        if let Some(project_id) = self.project_id.as_deref() {
+            emit_changed(emitter, project_id, "delete");
         }
         if self.pending > 0 {
             // A gate naming one of those proposals now names nothing.

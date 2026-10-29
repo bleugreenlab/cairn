@@ -849,6 +849,7 @@ async fn thread_status_snapshot(
 ) -> Result<ThreadStatusSnapshot, CairnError> {
     let activity = thread_activity_rows(db, project_id).await?;
     let unread = thread_unread_counts(db, project_id).await?;
+    let pending_tenets = thread_pending_tenet_counts(db, project_id).await?;
     Ok(ThreadStatusSnapshot {
         indicators: activity
             .rows
@@ -860,6 +861,10 @@ async fn thread_status_snapshot(
                     activity: row.activity,
                     unread_count: unread.count,
                     latest_event_rowid: unread.latest_event_rowid,
+                    pending_tenet_count: pending_tenets
+                        .get(&row.thread_id)
+                        .copied()
+                        .unwrap_or_default(),
                 }
             })
             .collect(),
@@ -868,9 +873,10 @@ async fn thread_status_snapshot(
 }
 
 /// Everything one thread row shows about itself beyond its name: whether work is
-/// happening under it right now, and how much of its transcript this operator
-/// has not seen. The two are rendered as mutually exclusive trailing states, but
-/// they are computed independently and both travel on one row.
+/// happening under it right now, how many of its tenets await the operator's
+/// verdict, and how much of its transcript this operator has not seen. They are
+/// rendered as mutually exclusive trailing states, but they are computed
+/// independently and all travel on one row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadStatusIndicator {
@@ -888,6 +894,10 @@ pub struct ThreadStatusIndicator {
     /// `mark_thread_viewed`, so the marker advances to exactly the position the
     /// count described rather than to whatever is newest when the write lands.
     latest_event_rowid: i64,
+    /// This thread's tenets still awaiting the operator's verdict (status
+    /// `proposed`). Work filed behind a tenet is held on exactly these, so a
+    /// nonzero count is the operator's own blocker and outranks the unread count.
+    pending_tenet_count: i64,
 }
 
 /// One thread's live activity — the half of a thread row that is a pure function
@@ -1144,6 +1154,43 @@ pub async fn thread_unread_counts(
                 entry.latest_event_rowid = entry.latest_event_rowid.max(latest_event_rowid);
             }
             Ok::<HashMap<String, ThreadUnread>, DbError>(by_thread)
+        })
+    })
+    .await
+    .map_err(CairnError::from)
+}
+
+// ============================================================================
+// Per-thread pending tenets
+// ============================================================================
+
+/// The one selector behind every thread's pending-tenet count: one grouped read
+/// of the project's `proposed` tenets, seeked by project through an index, rather
+/// than a lookup per thread row. A project holds tens of tenets, so filtering
+/// status after the project seek costs nothing a sidebar can feel.
+pub(crate) const THREAD_PENDING_TENETS_SQL: &str = "SELECT tn.proposing_thread_id, COUNT(*)
+   FROM tenets tn
+  WHERE tn.project_id = ?1 AND tn.status = 'proposed'
+  GROUP BY tn.proposing_thread_id";
+
+/// How many proposals each thread in a project has awaiting a verdict. A thread
+/// with none is absent from the map; the snapshot reads that as zero.
+pub async fn thread_pending_tenet_counts(
+    db: &LocalDb,
+    project_id: &str,
+) -> Result<HashMap<String, i64>, CairnError> {
+    let project_id = project_id.to_string();
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(THREAD_PENDING_TENETS_SQL, params![project_id.as_str()])
+                .await?;
+            let mut by_thread = HashMap::new();
+            while let Some(row) = rows.next().await? {
+                by_thread.insert(row.text(0)?, row.i64(1)?);
+            }
+            Ok::<HashMap<String, i64>, DbError>(by_thread)
         })
     })
     .await
@@ -2817,6 +2864,167 @@ mod tests {
             plan_text.contains("jobs") && plan_text.contains("idx_jobs_thread_id"),
             "the thread->jobs join must reach jobs through jobs(thread_id):\n{plan_text}"
         );
+    }
+
+    /// Seed tenets for a project's threads: `(id, number, thread, status)`. The
+    /// verdict column follows the status, as the table's CHECK requires.
+    async fn seed_tenets(db: &LocalDb, project: &str, rows: &[(&str, i64, &str, &str)]) {
+        for (id, number, thread, status) in rows {
+            let verdict = match *status {
+                "proposed" | "withdrawn" => None,
+                "declined" => Some("no"),
+                _ => Some("yes"),
+            };
+            let (id, project, number, thread, status) = (
+                id.to_string(),
+                project.to_string(),
+                *number,
+                thread.to_string(),
+                status.to_string(),
+            );
+            db.write(|conn| {
+                let (id, project, thread, status) =
+                    (id.clone(), project.clone(), thread.clone(), status.clone());
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO tenets (id, project_id, number, proposing_thread_id, statement,
+                             status, verdict, origin, proposer_principal_json, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, 'We do it this way.', ?5, ?6, 'standing', '{}', 1, 1)",
+                        params![
+                            id.as_str(),
+                            project.as_str(),
+                            number,
+                            thread.as_str(),
+                            status.as_str(),
+                            verdict
+                        ],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    /// A thread row counts only its OWN proposals still awaiting a verdict:
+    /// answered, withdrawn, and superseded tenets are not waiting on anyone,
+    /// another thread's proposals are not this thread's, and a thread with none
+    /// reports an explicit zero.
+    #[tokio::test]
+    async fn thread_status_counts_each_threads_pending_tenets() {
+        let db = test_db().await;
+        exec(
+            &db,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p', 'default', 'T', 'cairn', '/tmp/r', 1, 1),
+                    ('q', 'default', 'Q', 'other', '/tmp/q', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+             VALUES ('design', 'p', 'design', 'active', 'none', 1, 1),
+                    ('ops', 'p', 'ops', 'active', 'none', 1, 1),
+                    ('quiet', 'p', 'quiet', 'active', 'none', 1, 1),
+                    ('elsewhere', 'q', 'elsewhere', 'active', 'none', 1, 1)",
+        )
+        .await;
+        seed_tenets(
+            &db,
+            "p",
+            &[
+                ("t1", 1, "design", "proposed"),
+                ("t2", 2, "design", "proposed"),
+                ("t3", 3, "design", "approved"),
+                ("t4", 4, "design", "superseded"),
+                ("t5", 5, "ops", "proposed"),
+                ("t6", 6, "ops", "withdrawn"),
+                ("t7", 7, "ops", "declined"),
+            ],
+        )
+        .await;
+        seed_tenets(&db, "q", &[("q1", 1, "elsewhere", "proposed")]).await;
+
+        let snapshot = super::thread_status_snapshot(&db, "p").await.unwrap();
+        let pending: HashMap<String, i64> = snapshot
+            .indicators
+            .iter()
+            .map(|row| (row.thread_id.clone(), row.pending_tenet_count))
+            .collect();
+        assert_eq!(
+            pending,
+            HashMap::from([
+                ("design".to_string(), 2),
+                ("ops".to_string(), 1),
+                ("quiet".to_string(), 0),
+            ])
+        );
+    }
+
+    /// The count is one grouped statement over the project's tenets, reached by an
+    /// index seek on the project rather than a table scan or an automatic index.
+    #[tokio::test]
+    async fn thread_pending_tenets_seek_by_project() {
+        let db = test_db().await;
+        let sql = format!("EXPLAIN QUERY PLAN {}", super::THREAD_PENDING_TENETS_SQL);
+        let plan: Vec<String> = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn.query(&sql, params!["p"]).await?;
+                    let mut steps = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        steps.push(row.text(3)?);
+                    }
+                    Ok(steps)
+                })
+            })
+            .await
+            .unwrap();
+        let plan_text = plan.join("\n");
+        assert!(
+            plan_text.contains("SEARCH tn USING")
+                && plan_text.contains("project_id=?")
+                && !plan_text.contains("SCAN tn")
+                && !plan_text.contains("AUTOMATIC"),
+            "pending tenets must be read by an index seek on the project:\n{plan_text}"
+        );
+    }
+
+    /// An answer given anywhere reaches the sidebar: the scoped `tenets` frame
+    /// every tenet write emits colds the published rollup, and the rebuild
+    /// drops the answered proposal from its thread's count.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tenet_answer_reaches_the_published_thread_rollup() {
+        let db = test_db().await;
+        seed_one_quiet_thread(&db).await;
+        seed_tenets(
+            &db,
+            "p",
+            &[("t1", 1, "t", "proposed"), ("t2", 2, "t", "proposed")],
+        )
+        .await;
+        let orch = orchestrator_over(db);
+
+        let before = published_thread_status_indicators(&orch, "p")
+            .await
+            .unwrap();
+        assert_eq!(before[0].pending_tenet_count, 2);
+
+        exec(
+            &orch.db.local,
+            "UPDATE tenets SET status = 'approved', verdict = 'yes', answered_at = 2 WHERE id = 't1'",
+        )
+        .await;
+        crate::tenets::emit_changed(orch.services.emitter.as_ref(), "p", "update");
+        orch.thread_status_cache.settle("p").await;
+
+        let after = published_thread_status_indicators(&orch, "p")
+            .await
+            .unwrap();
+        assert_eq!(after[0].pending_tenet_count, 1);
+        assert_eq!(orch.thread_status_cache.rebuilds(), 2);
     }
 
     /// An orchestrator over a caller-supplied database, so a snapshot test can

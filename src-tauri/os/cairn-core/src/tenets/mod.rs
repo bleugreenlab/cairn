@@ -77,7 +77,7 @@ pub const IMMUTABLE_REFUSAL: &str = "tenets are immutable; withdraw and propose 
 
 /// Why an agent cannot record a verdict, and where the operator records one.
 pub const AGENT_VERDICT_REFUSAL: &str =
-    "verdicts belong to the operator: a tenet is answered in the desktop app, from the Tenets tab or the proposal's card in the chat, never by an agent";
+    "verdicts belong to the operator: a tenet is answered in the desktop app, from the proposing thread's Tenets facet, the proposal's card in the chat, or the project Tenets tab, never by an agent";
 
 /// The refusal for a proposal in the retired question-with-options shape,
 /// with `prefix` naming where the proposal sits in the payload (`payload.`,
@@ -316,6 +316,9 @@ pub async fn answer_and_wake(
         verdict,
     )
     .await?;
+    // The operator just answered and is looking at the badge the answer clears,
+    // so the thread rollup rebuilds now rather than after the cadence floor.
+    orch.acknowledge_thread_status(project_id, "tenet-answered");
     if let Some(session) = answered.wake.as_deref() {
         if let Err(error) = crate::messages::delivery::nudge_job_for_urgency(
             orch,
@@ -329,10 +332,14 @@ pub async fn answer_and_wake(
 }
 
 /// Announce a change to the tenets table to the desktop.
-pub fn emit_changed(emitter: &dyn EventEmitter, action: &str) {
+///
+/// The frame names its project because the thread status rollup reads this
+/// table: a scoped frame rebuilds that one project's sidebar, where an unscoped
+/// one would rebuild every project's.
+pub fn emit_changed(emitter: &dyn EventEmitter, project_id: &str, action: &str) {
     if let Err(error) = emitter.emit(
         "db-change",
-        serde_json::json!({"table": TABLE, "action": action}),
+        serde_json::json!({"table": TABLE, "projectId": project_id, "action": action}),
     ) {
         tracing::warn!(%error, "failed to emit tenets db-change notification");
     }

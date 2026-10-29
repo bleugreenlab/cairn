@@ -283,7 +283,7 @@ async fn import_project(
                 db_store::mark_rulings_imported(path);
             }
             if inserted > 0 {
-                emit_changed(emitter, "insert");
+                emit_changed(emitter, project_id, "insert");
             }
             report.projects.push(ProjectImport {
                 project_key: project_key.to_string(),

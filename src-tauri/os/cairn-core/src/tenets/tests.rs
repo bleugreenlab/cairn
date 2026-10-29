@@ -731,7 +731,7 @@ async fn deleting_a_thread_keeps_decided_tenets_and_drops_unanswered_ones() {
     assert!(get(&db, PROJECT, withdrawn.number).await.unwrap().is_none());
     assert_eq!(
         emitter.events_named("db-change"),
-        vec![serde_json::json!({"table": "tenets", "action": "delete"})],
+        vec![serde_json::json!({"table": "tenets", "projectId": PROJECT, "action": "delete"})],
         "removing a thread's proposals announces the tenets change once"
     );
 }
