@@ -2448,8 +2448,21 @@ fn describe_rationale(rationale: &ReservationRationale) -> String {
         .fallback
         .map(|fallback| format!(", fell back because {}", fallback.as_str()))
         .unwrap_or_default();
+    let killed = rationale
+        .memory_kill
+        .map(|kill| {
+            let alone = kill
+                .alone_on_machine_bytes
+                .map(|machine| format!(" while it ran alone on {}", bytes(machine)))
+                .unwrap_or_default();
+            format!(
+                "; memory floored at {} by an out-of-memory kill here{alone}",
+                bytes(kill.victim_resident_bytes)
+            )
+        })
+        .unwrap_or_default();
     let learned = format!(
-        "memory/disk learned from {evidence}{confidence} of `{key}` on {} with {}% headroom over a {} prior{fallback}",
+        "memory/disk learned from {evidence}{confidence} of `{key}` on {} with {}% headroom over a {} prior{fallback}{killed}",
         rationale.profile_context,
         rationale.headroom_percent,
         bytes(rationale.prior.memory_bytes)
@@ -2478,6 +2491,7 @@ mod rationale_tests {
             headroom_percent: 25,
             fallback: (sample_count < MIN_CONFIDENT_RESERVATION_SAMPLES)
                 .then_some(ReservationFallback::BelowConfidenceFloor),
+            memory_kill: None,
         }
     }
 
@@ -7755,6 +7769,7 @@ mod tests {
                     prior: ResourceReservation::default(),
                     headroom_percent: 25,
                     fallback: None,
+                    memory_kill: None,
                 },
                 sync_cost: PlacementSyncCost::Known { bytes: 12_345 },
                 object_transfer: None,

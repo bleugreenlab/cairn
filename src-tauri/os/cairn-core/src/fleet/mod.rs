@@ -2958,6 +2958,7 @@ fn home_cannot_hold(
         reason: PlacementRejectionReason::ExceedsMemoryCeiling {
             estimate_bytes: ceiling.estimate_bytes,
             ceiling_bytes: ceiling.ceiling_bytes,
+            killed_here: ceiling.killed_here,
         },
     }];
     rejected.extend(survey.rejected.iter().cloned());
@@ -3002,6 +3003,7 @@ fn above_memory_ceiling(
             rejection.reason = PlacementRejectionReason::ExceedsMemoryCeiling {
                 estimate_bytes: other.estimate_bytes,
                 ceiling_bytes: other.ceiling_bytes,
+                killed_here: other.killed_here,
             };
         }
     }
@@ -10812,6 +10814,7 @@ impl Fleet {
             .into();
         }
         let batch_profile_identities = plan.batch_identities.clone();
+        let batch_items_share_the_machine = plan.parallel_width > 1;
         let profile_identity = request.command_resource_identity.clone();
         // One entry stands for this work from here until it settles. Placement
         // may offer it to several machines in turn; the entry, the waiter behind
@@ -11249,6 +11252,15 @@ impl Fleet {
                     )
                     .await;
                 }
+                resource_profiles::observe_memory_kill(
+                    db.clone(),
+                    profile_identity.as_ref(),
+                    &profile_context,
+                    metadata,
+                    false,
+                    selected.capabilities.memory_budget_bytes,
+                )
+                .await;
                 resource_profiles::observe_completed(
                     db,
                     profile_identity.as_ref(),
@@ -11291,6 +11303,15 @@ impl Fleet {
                         item.succeeded && !item.timed_out && !item.suspended,
                         &item.body,
                     );
+                    resource_profiles::observe_memory_kill(
+                        db.clone(),
+                        Some(identity),
+                        &profile_context,
+                        &item_meta,
+                        batch_items_share_the_machine,
+                        selected.capabilities.memory_budget_bytes,
+                    )
+                    .await;
                     resource_profiles::observe_completed(
                         db.clone(),
                         Some(identity),
@@ -13824,6 +13845,7 @@ impl<'a> ScoredCandidate<'a> {
             .map(|ceiling| PlacementRejectionReason::ExceedsMemoryCeiling {
                 estimate_bytes: ceiling.estimate_bytes,
                 ceiling_bytes: ceiling.ceiling_bytes,
+                killed_here: ceiling.killed_here,
             });
         Self {
             entry,
@@ -14926,6 +14948,7 @@ fn unresolved_rationale(stated: &ResourceReservation) -> ReservationRationale {
         prior: stated.clone(),
         headroom_percent: 0,
         fallback: Some(ReservationFallback::CallerDeclared),
+        memory_kill: None,
     }
 }
 
@@ -22528,6 +22551,139 @@ mod tests {
             "{note}"
         );
         assert!(!note.contains("no executor can hold"), "{note}");
+    }
+
+    /// bgsrv-ub, freshly killed for memory, beside fedora, which has never run
+    /// the command. Placement after the kill is the question.
+    async fn killed_fleet(
+        db_name: &str,
+        ub_available: u64,
+        co_resident_compile_jobs: u32,
+    ) -> (Fleet, Arc<cairn_db::storage::LocalDb>, CellRequest) {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const UB_BUDGET: u64 = 11_042_782_208;
+        let db = Arc::new(crate::storage::migrated_test_db(db_name).await);
+        let identity = CommandResourceIdentity {
+            version: 1,
+            key: "test:rust".into(),
+        };
+        let pool = Fleet::default();
+        let now = unix_time_ms();
+        let mut connections = HashMap::new();
+        for (id, budget, available) in [
+            ("bgsrv-ub", UB_BUDGET, ub_available),
+            ("fedora", 100 * GIB, 60 * GIB),
+        ] {
+            let (id, mut entry) = fleet_entry_at(id, "linux", 0, &[], now);
+            entry.advertisement.capabilities.memory_budget_bytes = Some(budget);
+            measured_at(&mut entry, 0.01, available, 500 * GIB, now);
+            connections.insert(id, entry);
+        }
+        let ub = &connections["bgsrv-ub"];
+        resource_profiles::observe_memory_kill(
+            db.clone(),
+            Some(&identity),
+            &ReservationPlan::context_for(
+                &ub.identity.device_id,
+                &ub.identity.executor_id,
+                &ub.advertisement.capabilities,
+            ),
+            &resource_profiles::oom_killed_for_test(
+                3_650_722_201,
+                Some(13_000_000_000),
+                co_resident_compile_jobs,
+                now,
+            ),
+            false,
+            Some(UB_BUDGET),
+        )
+        .await;
+        *pool.lock_connections() = connections;
+        let mut request = spillable_request();
+        request.command_class = cairn_common::executor_protocol::CellCommandClass::CargoTest;
+        request.command_resource_identity = Some(identity);
+        request.repository = RepositoryLocator::ManagedObjects {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            object_format: GitObjectFormat::Sha1,
+        };
+        (pool, db, request)
+    }
+
+    async fn place_once(
+        pool: &Fleet,
+        db: Arc<cairn_db::storage::LocalDb>,
+        request: &CellRequest,
+    ) -> Placement {
+        let plan = ReservationPlan::new(db, request, None);
+        pool.select_executor_once_with(
+            request,
+            Some(&plan),
+            &ActivePlacementPolicy::default_profile(),
+            &HashMap::new(),
+            &AdmissionView::default(),
+            |_, _| SyncCost::Known(0),
+        )
+        .await
+        .unwrap()
+        .placed()
+        .unwrap()
+    }
+
+    /// cairn/5416's specimen: a `rustc` killed at 3.4 GiB beside another
+    /// compile on a 12.1 GiB machine now showing 2.5 GiB free. The re-armed
+    /// lane is charged the kill, not the 2 GiB class prior that fit, so it goes
+    /// to the machine that can take it, and the record says why with both
+    /// numbers.
+    #[tokio::test]
+    async fn a_command_killed_for_memory_is_not_placed_back_where_it_does_not_fit() {
+        let available = 2_684_354_560;
+        let (pool, db, request) = killed_fleet("oom-floor-placement.db", available, 1).await;
+        let placement = place_once(&pool, db, &request).await;
+        assert_eq!(placement.selected.executor_id, "fedora");
+        let refused = placement
+            .decision
+            .rejected
+            .iter()
+            .find(|rejection| rejection.executor_id == "bgsrv-ub")
+            .expect("the killed machine is on the record");
+        assert_eq!(
+            refused.reason,
+            PlacementRejectionReason::InsufficientMemory {
+                required_bytes: 3_650_722_201,
+                available_bytes: available,
+            }
+        );
+    }
+
+    /// Killed while it ran alone, the command is excluded from that machine
+    /// however idle it is now, and the exclusion names the kill.
+    #[tokio::test]
+    async fn a_command_killed_alone_is_placed_elsewhere_however_idle_its_machine_is() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let (pool, db, request) = killed_fleet("oom-alone-placement.db", 10 * GIB, 0).await;
+        let placement = place_once(&pool, db, &request).await;
+        assert_eq!(placement.selected.executor_id, "fedora");
+        assert!(placement.above_ceiling.is_none());
+        let refused = placement
+            .decision
+            .rejected
+            .iter()
+            .find(|rejection| rejection.executor_id == "bgsrv-ub")
+            .expect("the killed machine is on the record");
+        let PlacementRejectionReason::ExceedsMemoryCeiling {
+            killed_here: Some(kill),
+            ..
+        } = &refused.reason
+        else {
+            panic!(
+                "expected a ceiling naming the kill, got {:?}",
+                refused.reason
+            );
+        };
+        assert_eq!(kill.alone_on_machine_bytes, Some(13_000_000_000));
+        let said = refused.reason.describe();
+        assert!(said.contains("while it ran alone"), "{said}");
     }
 
     /// A big machine that is busy right now queues the work in its own

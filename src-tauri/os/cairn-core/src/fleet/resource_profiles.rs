@@ -1,10 +1,10 @@
 use super::{ResourceReservation, ResourceReservationSource};
 use crate::storage::LocalDb;
 use cairn_common::executor_protocol::{
-    CellCommandClass, CellExecutionMeta, CommandResourceIdentity, ContentionEstimate,
+    CellCommandClass, CellExecutionMeta, CommandResourceIdentity, CommandStop, ContentionEstimate,
     ContentionEvidence, ContentionFallback, DurationEstimate, DurationEvidence, DurationFallback,
     ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities, MeasurementQuality, MemoryCeiling,
-    ReservationFallback, ReservationRationale, DURATION_PROFILE_STALE_AFTER_MS,
+    MemoryKill, ReservationFallback, ReservationRationale, DURATION_PROFILE_STALE_AFTER_MS,
     DURATION_SAMPLE_WINDOW, MIN_CONFIDENT_DURATION_SAMPLES, MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 use cairn_db::turso::params;
@@ -65,6 +65,7 @@ impl MemoryFit {
             true => Self::Exceeds(MemoryCeiling {
                 estimate_bytes,
                 ceiling_bytes,
+                killed_here: None,
             }),
             false => Self::Holds,
         }
@@ -536,6 +537,7 @@ pub(super) fn declared_rationale(
         prior,
         headroom_percent: HEADROOM_PERCENT,
         fallback: Some(ReservationFallback::CallerDeclared),
+        memory_kill: None,
     }
 }
 
@@ -545,6 +547,9 @@ struct ResourceProfile {
     upper_peak_rss_bytes: Option<u64>,
     upper_disk_delta_bytes: Option<u64>,
     upper_duration_ms: Option<u64>,
+    /// The out-of-memory kills this context has recorded, kept apart from the
+    /// peak because the saturation quarantine must never read them.
+    memory_kill: Option<MemoryKill>,
 }
 
 /// The retained window a duration prediction is computed from, plus how much
@@ -589,6 +594,7 @@ fn profile_rationale(
         prior: prior.clone(),
         headroom_percent: HEADROOM_PERCENT,
         fallback,
+        memory_kill: profile.and_then(|profile| profile.memory_kill),
     }
 }
 
@@ -700,7 +706,7 @@ pub(super) async fn resolve_reservation(
         memory_budget_bytes,
         memory_quarantined,
     );
-    ResolvedResourceProfile {
+    let resolved = ResolvedResourceProfile {
         reservation: reservation.clone(),
         learned_estimate: Some(cairn_common::executor_protocol::LearnedResourceEstimate {
             sample_count: profile.sample_count,
@@ -732,7 +738,63 @@ pub(super) async fn resolve_reservation(
         memory_fit: fit_for(
             measured_memory_demand(&profile, memory_quarantined).max(borrowed_demand),
         ),
+    };
+    floored_by_kill(resolved, profile.memory_kill, memory_budget_bytes)
+}
+
+/// What a kill proved this command needs on this machine: the victim's
+/// resident size at death, or the whole machine when the command was killed
+/// while nothing else of Cairn's ran beside it.
+fn kill_floor(kill: &MemoryKill) -> u64 {
+    kill.victim_resident_bytes
+        .max(kill.alone_on_machine_bytes.unwrap_or(0))
+}
+
+/// Raise a resolution to what an out-of-memory kill on this machine proved.
+///
+/// The commands that get killed are exactly the ones whose process-tree peak
+/// nears the machine's budget, so the saturation quarantine discards that peak
+/// and, without this, the work is charged its class prior: a 2 GiB claim for a
+/// compile that has already died at 3.4 GiB fits a machine with 2.5 GiB free.
+/// A victim's own resident size is one process's number, which nothing beside
+/// it can inflate, so the floor is applied after the quarantine and never
+/// through it.
+///
+/// A floor lowers nothing and never claims a fit: it is a lower bound, so one
+/// under the cap leaves `memory_fit` as the rest of the evidence set it, and
+/// one over the cap is a ceiling that names the kill. The reservation it sets
+/// stays `Unmeasured`, because the killed run never reached its peak; that is
+/// also what makes the executor hold the claim against its available memory
+/// while the work is resident, which is the brake a second compile beside it
+/// needs.
+fn floored_by_kill(
+    mut resolved: ResolvedResourceProfile,
+    kill: Option<MemoryKill>,
+    memory_budget_bytes: Option<u64>,
+) -> ResolvedResourceProfile {
+    let Some(kill) = kill else {
+        return resolved;
+    };
+    let floor = kill_floor(&kill);
+    let charged =
+        memory_budget_bytes.map_or(floor, |budget| floor.min(memory_reservation_cap(budget)));
+    if charged > resolved.reservation.memory_bytes {
+        resolved.reservation.memory_bytes = charged;
+        resolved.reservation.source = ResourceReservationSource::Unmeasured;
     }
+    if let MemoryFit::Exceeds(ceiling) = MemoryFit::of(Some(floor), memory_budget_bytes) {
+        let measured_past_it = matches!(
+            resolved.memory_fit,
+            MemoryFit::Exceeds(held) if held.estimate_bytes > floor
+        );
+        if !measured_past_it {
+            resolved.memory_fit = MemoryFit::Exceeds(MemoryCeiling {
+                killed_here: Some(kill),
+                ..ceiling
+            });
+        }
+    }
+    resolved
 }
 
 /// What one completed execution may teach the learners.
@@ -863,7 +925,7 @@ pub(super) async fn observe_completed(
             .await;
         }
     }
-    let _ = update_profile(
+    let _ = update_profile_with(
         db,
         identity,
         context,
@@ -871,8 +933,107 @@ pub(super) async fn observe_completed(
         memory,
         disk,
         duration,
+        // A success here is the machine holding the command, which is the
+        // one thing that disproves "it cannot run here at all".
+        kind == CompletionKind::Succeeded,
     )
     .await;
+}
+
+/// Record an out-of-memory kill of `identity` on this machine context.
+///
+/// [`observe_completed`] still folds the killed run's process-tree peak into
+/// the profile, and for a killed command that peak is the one the saturation
+/// quarantine discards. The victim's own resident size is kept beside it as a
+/// floor ([`floored_by_kill`]) so the kill reaches the next placement of the
+/// same command here.
+///
+/// A kill while nothing else of Cairn's ran on the machine also records the
+/// machine's size: it is the machine's answer that it cannot run the command,
+/// not a crowding fact, and the floor it implies is a ceiling placement routes
+/// around until a run succeeds here or the machine grows past it. The load
+/// context is read at the command's start, so work admitted beside it later is
+/// invisible here; `shared_with_siblings` is what the caller knows that the
+/// load context does not, that a parallel batch's items ran beside each other.
+pub(super) async fn observe_memory_kill(
+    db: Arc<LocalDb>,
+    identity: Option<&CommandResourceIdentity>,
+    context: &ProfileContext,
+    metadata: &CellExecutionMeta,
+    shared_with_siblings: bool,
+    memory_budget_bytes: Option<u64>,
+) {
+    let Some(identity) = identity else { return };
+    let Some(CommandStop::OomKilled {
+        rss_bytes: Some(victim_resident_bytes),
+        machine_total_bytes,
+        ..
+    }) = &metadata.stop
+    else {
+        return;
+    };
+    let alone = !shared_with_siblings
+        && metadata.load_context.as_ref().is_some_and(|load| {
+            load.co_resident_compile_jobs == 0 && load.co_resident_light_jobs == 0
+        });
+    let alone_on_machine_bytes = alone
+        .then_some(machine_total_bytes.or(memory_budget_bytes))
+        .flatten();
+    let _ = record_memory_kill(
+        db,
+        identity,
+        context,
+        MemoryKill {
+            victim_resident_bytes: *victim_resident_bytes,
+            killed_at_unix_ms: metadata.finished_at_unix_ms,
+            alone_on_machine_bytes,
+        },
+    )
+    .await;
+}
+
+/// Fold one kill into a context's record, creating the row if the context has
+/// never completed the command. The victim floor only ever rises; a kill alone
+/// overwrites the machine size, and a crowded one leaves an earlier solo kill
+/// standing.
+async fn record_memory_kill(
+    db: Arc<LocalDb>,
+    identity: &CommandResourceIdentity,
+    context: &ProfileContext,
+    kill: MemoryKill,
+) -> Result<(), String> {
+    let identity = identity.clone();
+    let context = context.clone();
+    db.write(move |conn| {
+        let identity = identity.clone();
+        let context = context.clone();
+        Box::pin(async move {
+            conn.execute(
+                r#"INSERT INTO command_resource_profiles (identity_version, command_identity, executor_class, os, arch, toolchain_fingerprint, sample_count, updated_at_unix_ms, confidence_millis, oom_victim_rss_bytes, oom_killed_at_unix_ms, oom_alone_machine_bytes)
+                   VALUES (?1,?2,?3,?4,?5,?6,0,?7,0,?8,?7,?9)
+                   ON CONFLICT(identity_version, command_identity, executor_class, os, arch, toolchain_fingerprint) DO UPDATE SET
+                     updated_at_unix_ms=MAX(command_resource_profiles.updated_at_unix_ms, excluded.updated_at_unix_ms),
+                     oom_victim_rss_bytes=MAX(COALESCE(command_resource_profiles.oom_victim_rss_bytes, 0), excluded.oom_victim_rss_bytes),
+                     oom_killed_at_unix_ms=MAX(COALESCE(command_resource_profiles.oom_killed_at_unix_ms, 0), excluded.oom_killed_at_unix_ms),
+                     oom_alone_machine_bytes=COALESCE(excluded.oom_alone_machine_bytes, command_resource_profiles.oom_alone_machine_bytes)"#,
+                params![
+                    identity.version as i64,
+                    identity.key,
+                    context.executor_class,
+                    context.os,
+                    context.arch,
+                    context.toolchain_fingerprint,
+                    kill.killed_at_unix_ms as i64,
+                    kill.victim_resident_bytes as i64,
+                    kill.alone_on_machine_bytes.map(|bytes| bytes as i64)
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// The memory demand this machine's own profile measured, as a reservation
@@ -964,6 +1125,61 @@ pub(super) async fn seed_memory_profile_for_test(
     }
 }
 
+/// A completion the kernel's out-of-memory killer ended, for tests outside this
+/// module: `victim_resident_bytes` is the killed process's size, and
+/// `co_resident_compile_jobs` is what else of Cairn's was compiling there when
+/// it started.
+#[cfg(test)]
+pub(super) fn oom_killed_for_test(
+    victim_resident_bytes: u64,
+    machine_total_bytes: Option<u64>,
+    co_resident_compile_jobs: u32,
+    finished_at_unix_ms: u64,
+) -> CellExecutionMeta {
+    CellExecutionMeta {
+        warmth: Some(ExecutionWarmth::PreparedWarmSlot),
+        load_context: Some(ExecutionLoadContext {
+            co_resident_compile_jobs,
+            ..ExecutionLoadContext::default()
+        }),
+        environment_fingerprint: String::new(),
+        executor_id: "executor".into(),
+        executor_device_id: "device".into(),
+        executor_connection_generation: 1,
+        cell_id: "slot".into(),
+        cell_epoch: 1,
+        started_at_unix_ms: finished_at_unix_ms.saturating_sub(1_263_640),
+        finished_at_unix_ms,
+        duration_ms: Some(1_263_640),
+        peak_rss_bytes: Some(victim_resident_bytes),
+        peak_physical_footprint_bytes: None,
+        cpu: None,
+        allocation: None,
+        disk_delta_bytes: None,
+        measurement_quality: Some(
+            cairn_common::executor_protocol::ExecutionMeasurementQuality {
+                duration: MeasurementQuality::Authoritative,
+                memory: MeasurementQuality::Sampled,
+                disk: MeasurementQuality::Unavailable,
+                memory_platform: Some("linux".into()),
+                disk_boundary: "cell".into(),
+            },
+        ),
+        verdict_platform: None,
+        verdict_arch: None,
+        verdict_environment_hash: None,
+        sandbox: None,
+        toolchain_fingerprint: None,
+        containment: None,
+        stop: Some(CommandStop::OomKilled {
+            pid: 1_940_747,
+            rss_bytes: Some(victim_resident_bytes),
+            machine_total_bytes,
+        }),
+        cell_origin: None,
+    }
+}
+
 fn with_headroom(value: u64) -> u64 {
     value.saturating_mul(HEADROOM_NUMERATOR) / HEADROOM_DENOMINATOR
 }
@@ -990,7 +1206,8 @@ async fn load_profile(
         let context = context.clone();
         Box::pin(async move {
             let mut rows = conn.query(
-                "SELECT sample_count, upper_peak_rss_bytes, upper_disk_delta_bytes, upper_duration_ms
+                "SELECT sample_count, upper_peak_rss_bytes, upper_disk_delta_bytes, upper_duration_ms,
+                        oom_victim_rss_bytes, oom_killed_at_unix_ms, oom_alone_machine_bytes
                  FROM command_resource_profiles
                  WHERE identity_version=?1 AND command_identity=?2 AND executor_class=?3
                    AND os=?4 AND arch=?5 AND toolchain_fingerprint=?6",
@@ -1003,6 +1220,16 @@ async fn load_profile(
                     upper_peak_rss_bytes: row.get::<Option<i64>>(1)?.map(|value| value as u64),
                     upper_disk_delta_bytes: row.get::<Option<i64>>(2)?.map(|value| value as u64),
                     upper_duration_ms: row.get::<Option<i64>>(3)?.map(|value| value as u64),
+                    memory_kill: match (row.get::<Option<i64>>(4)?, row.get::<Option<i64>>(5)?) {
+                        (Some(victim), Some(killed_at)) => Some(MemoryKill {
+                            victim_resident_bytes: victim as u64,
+                            killed_at_unix_ms: killed_at as u64,
+                            alone_on_machine_bytes: row
+                                .get::<Option<i64>>(6)?
+                                .map(|value| value as u64),
+                        }),
+                        _ => None,
+                    },
                 })),
                 None => Ok(None),
             }
@@ -1177,6 +1404,7 @@ async fn record_duration(
     }).await.map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 async fn update_profile(
     db: Arc<LocalDb>,
     identity: &CommandResourceIdentity,
@@ -1185,6 +1413,25 @@ async fn update_profile(
     memory: Option<u64>,
     disk: Option<u64>,
     duration: Option<u64>,
+) -> Result<(), String> {
+    update_profile_with(
+        db, identity, context, finished, memory, disk, duration, false,
+    )
+    .await
+}
+
+/// [`update_profile`], also clearing a solo out-of-memory kill when this
+/// completion `held` the command, that is, succeeded on this machine.
+#[allow(clippy::too_many_arguments)]
+async fn update_profile_with(
+    db: Arc<LocalDb>,
+    identity: &CommandResourceIdentity,
+    context: &ProfileContext,
+    finished: u64,
+    memory: Option<u64>,
+    disk: Option<u64>,
+    duration: Option<u64>,
+    held: bool,
 ) -> Result<(), String> {
     let identity = identity.clone();
     let context = context.clone();
@@ -1201,8 +1448,9 @@ async fn update_profile(
                      upper_peak_rss_bytes=CASE WHEN excluded.upper_peak_rss_bytes IS NULL THEN command_resource_profiles.upper_peak_rss_bytes WHEN command_resource_profiles.upper_peak_rss_bytes IS NULL OR excluded.upper_peak_rss_bytes >= command_resource_profiles.upper_peak_rss_bytes THEN excluded.upper_peak_rss_bytes ELSE command_resource_profiles.upper_peak_rss_bytes - ((command_resource_profiles.upper_peak_rss_bytes - excluded.upper_peak_rss_bytes) / 32) END,
                      upper_disk_delta_bytes=CASE WHEN excluded.upper_disk_delta_bytes IS NULL THEN command_resource_profiles.upper_disk_delta_bytes WHEN command_resource_profiles.upper_disk_delta_bytes IS NULL OR excluded.upper_disk_delta_bytes >= command_resource_profiles.upper_disk_delta_bytes THEN excluded.upper_disk_delta_bytes ELSE command_resource_profiles.upper_disk_delta_bytes - ((command_resource_profiles.upper_disk_delta_bytes - excluded.upper_disk_delta_bytes) / 32) END,
                      upper_duration_ms=CASE WHEN excluded.upper_duration_ms IS NULL THEN command_resource_profiles.upper_duration_ms WHEN command_resource_profiles.upper_duration_ms IS NULL OR excluded.upper_duration_ms >= command_resource_profiles.upper_duration_ms THEN excluded.upper_duration_ms ELSE command_resource_profiles.upper_duration_ms - ((command_resource_profiles.upper_duration_ms - excluded.upper_duration_ms) / 32) END,
-                     confidence_millis=MIN(1000, (MIN(command_resource_profiles.sample_count + 1, 10000) * 1000) / 5)"#,
-                params![identity.version as i64, identity.key, context.executor_class, context.os, context.arch, context.toolchain_fingerprint, finished as i64, memory.map(|value| value as i64), disk.map(|value| value as i64), duration.map(|value| value as i64)],
+                     confidence_millis=MIN(1000, (MIN(command_resource_profiles.sample_count + 1, 10000) * 1000) / 5),
+                     oom_alone_machine_bytes=CASE WHEN ?11 = 1 THEN NULL ELSE command_resource_profiles.oom_alone_machine_bytes END"#,
+                params![identity.version as i64, identity.key, context.executor_class, context.os, context.arch, context.toolchain_fingerprint, finished as i64, memory.map(|value| value as i64), disk.map(|value| value as i64), duration.map(|value| value as i64), held as i64],
             ).await?;
             Ok(())
         })
@@ -1429,6 +1677,7 @@ mod tests {
                         upper_peak_rss_bytes: Some(10_000),
                         upper_disk_delta_bytes: Some(20_000),
                         upper_duration_ms: Some(480_000),
+                        memory_kill: None,
                     },
                     prior.clone(),
                     None,
@@ -1460,6 +1709,7 @@ mod tests {
                     upper_peak_rss_bytes: Some(1),
                     upper_disk_delta_bytes: Some(2),
                     upper_duration_ms: Some(3),
+                    memory_kill: None,
                 },
                 prior.clone(),
                 None,
@@ -1474,6 +1724,7 @@ mod tests {
                     upper_peak_rss_bytes: Some(1_000),
                     upper_disk_delta_bytes: Some(2_000),
                     upper_duration_ms: Some(3),
+                    memory_kill: None,
                 },
                 prior.clone(),
                 None,
@@ -1492,6 +1743,7 @@ mod tests {
                 upper_peak_rss_bytes: Some(10),
                 upper_disk_delta_bytes: Some(20),
                 upper_duration_ms: Some(30),
+                memory_kill: None,
             },
             ResourceReservation {
                 memory_bytes: 100,
@@ -1514,6 +1766,7 @@ mod tests {
                 upper_peak_rss_bytes: Some(100),
                 upper_disk_delta_bytes: Some(200),
                 upper_duration_ms: Some(300),
+                memory_kill: None,
             },
             ResourceReservation::default(),
             None,
@@ -1690,6 +1943,7 @@ mod tests {
             upper_peak_rss_bytes,
             upper_disk_delta_bytes: Some(20),
             upper_duration_ms: Some(30),
+            memory_kill: None,
         };
 
         let thin = reservation_for_profile(
@@ -2011,6 +2265,7 @@ mod tests {
             MemoryFit::Exceeds(MemoryCeiling {
                 estimate_bytes: with_headroom(peak),
                 ceiling_bytes: SPECIMEN_CAP,
+                killed_here: None,
             })
         );
     }
@@ -2104,8 +2359,245 @@ mod tests {
             MemoryFit::Exceeds(MemoryCeiling {
                 estimate_bytes: with_headroom(8 * GIB),
                 ceiling_bytes: SPECIMEN_CAP,
+                killed_here: None,
             })
         );
+    }
+
+    /// bgsrv-ub, the 12.1 GiB host of cairn/5416's specimens.
+    const SPECIMEN_TOTAL: u64 = 13_000_000_000;
+    /// The `rustc` the kernel killed beside another compile: 3.4 GiB.
+    const CROWDED_VICTIM: u64 = 3_650_722_201;
+
+    fn killed_here() -> (CommandResourceIdentity, ProfileContext) {
+        (
+            CommandResourceIdentity {
+                version: 1,
+                key: "test:rust".into(),
+            },
+            ProfileContext {
+                executor_class: "bgsrv-ub:bgsrv-ub".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                toolchain_fingerprint: "rust".into(),
+            },
+        )
+    }
+
+    async fn resolve_killed(
+        db: Arc<LocalDb>,
+        identity: &CommandResourceIdentity,
+        context: &ProfileContext,
+    ) -> ResolvedResourceProfile {
+        resolve_reservation(
+            db,
+            Some(identity),
+            context,
+            cold_start_prior(CellCommandClass::CargoTest, &capabilities()),
+            Some(SPECIMEN_BUDGET),
+            test_duration_context(),
+        )
+        .await
+    }
+
+    /// cairn/5416's first specimen. The tree's peak at the kill nears the whole
+    /// budget, so the quarantine discards it and the work fell back to its 2
+    /// GiB class prior, which fit the 2.5 GiB the machine had free. The
+    /// victim's own size survives the quarantine and is what the next placement
+    /// is charged.
+    #[tokio::test]
+    async fn a_kill_beside_other_work_floors_the_demand_the_quarantine_discarded() {
+        let db =
+            Arc::new(crate::storage::migrated_test_db("resource-profile-oom-crowded.db").await);
+        let (identity, context) = killed_here();
+        let mut killed = oom_killed_for_test(CROWDED_VICTIM, Some(SPECIMEN_TOTAL), 1, 10);
+        killed.peak_rss_bytes = Some(SPECIMEN_BUDGET);
+        observe_memory_kill(
+            db.clone(),
+            Some(&identity),
+            &context,
+            &killed,
+            false,
+            Some(SPECIMEN_BUDGET),
+        )
+        .await;
+        observe_completed(
+            db.clone(),
+            Some(&identity),
+            &context,
+            &killed,
+            CompletionKind::Failed,
+        )
+        .await;
+
+        let kill = MemoryKill {
+            victim_resident_bytes: CROWDED_VICTIM,
+            killed_at_unix_ms: 10,
+            alone_on_machine_bytes: None,
+        };
+        let profile = load_profile(db.clone(), &identity, &context)
+            .await
+            .unwrap()
+            .expect("the kill wrote the demand row");
+        assert_eq!(profile.memory_kill, Some(kill));
+        assert_eq!(profile.sample_count, 1, "the kill is not a second sample");
+
+        let resolved = resolve_killed(db, &identity, &context).await;
+        assert_eq!(
+            resolved.rationale.fallback,
+            Some(ReservationFallback::MemoryObservationQuarantined),
+            "the tree's peak is still quarantined"
+        );
+        assert_eq!(resolved.reservation.memory_bytes, CROWDED_VICTIM);
+        assert_eq!(
+            resolved.reservation.source,
+            ResourceReservationSource::Unmeasured,
+            "a run that died growing measured a floor, not an upper bound"
+        );
+        assert_eq!(resolved.rationale.memory_kill, Some(kill));
+        assert_eq!(
+            resolved.memory_fit,
+            MemoryFit::Unknown,
+            "a floor under the cap is not proof the machine holds the command"
+        );
+    }
+
+    /// A kill with nothing else of Cairn's on the machine is the machine's
+    /// answer that it cannot run the command at all. It stands as a ceiling
+    /// naming the kill, survives a later crowded kill, and gives way only when
+    /// the machine has held the command; the victim's floor outlives it.
+    #[tokio::test]
+    async fn a_kill_while_alone_is_a_ceiling_here_until_the_machine_holds_the_command() {
+        let db = Arc::new(crate::storage::migrated_test_db("resource-profile-oom-alone.db").await);
+        let (identity, context) = killed_here();
+        let victim = 6_871_947_673;
+        let kill = |db: Arc<LocalDb>, meta: CellExecutionMeta| {
+            let identity = identity.clone();
+            let context = context.clone();
+            async move {
+                observe_memory_kill(
+                    db,
+                    Some(&identity),
+                    &context,
+                    &meta,
+                    false,
+                    Some(SPECIMEN_BUDGET),
+                )
+                .await
+            }
+        };
+        kill(
+            db.clone(),
+            oom_killed_for_test(victim, Some(SPECIMEN_TOTAL), 0, 10),
+        )
+        .await;
+
+        let excluded = resolve_killed(db.clone(), &identity, &context).await;
+        let MemoryFit::Exceeds(ceiling) = excluded.memory_fit else {
+            panic!(
+                "a 6.4 GiB victim fits the cap; the solo kill is what excludes: {:?}",
+                excluded.memory_fit
+            );
+        };
+        assert_eq!(ceiling.ceiling_bytes, SPECIMEN_CAP);
+        assert_eq!(
+            ceiling.killed_here,
+            Some(MemoryKill {
+                victim_resident_bytes: victim,
+                killed_at_unix_ms: 10,
+                alone_on_machine_bytes: Some(SPECIMEN_TOTAL),
+            })
+        );
+        assert_eq!(excluded.reservation.memory_bytes, SPECIMEN_CAP);
+        let said = ceiling.describe();
+        assert!(
+            said.contains("killed it here for memory at 6.4 GiB resident while it ran alone on this 12.1 GiB machine"),
+            "{said}"
+        );
+
+        kill(
+            db.clone(),
+            oom_killed_for_test(victim / 2, Some(SPECIMEN_TOTAL), 2, 20),
+        )
+        .await;
+        let still = resolve_killed(db.clone(), &identity, &context).await;
+        let MemoryFit::Exceeds(ceiling) = still.memory_fit else {
+            panic!("a crowded kill does not answer for a solo one");
+        };
+        let recorded = ceiling.killed_here.unwrap();
+        assert_eq!(
+            recorded.victim_resident_bytes, victim,
+            "the floor only rises"
+        );
+        assert_eq!(recorded.killed_at_unix_ms, 20);
+
+        let mut held = oom_killed_for_test(GIB, Some(SPECIMEN_TOTAL), 0, 30);
+        held.stop = None;
+        observe_completed(
+            db.clone(),
+            Some(&identity),
+            &context,
+            &held,
+            CompletionKind::Succeeded,
+        )
+        .await;
+        let after = resolve_killed(db, &identity, &context).await;
+        assert!(
+            !matches!(after.memory_fit, MemoryFit::Exceeds(_)),
+            "the machine held it: {:?}",
+            after.memory_fit
+        );
+        assert_eq!(after.reservation.memory_bytes, victim);
+        assert_eq!(
+            after
+                .rationale
+                .memory_kill
+                .map(|kill| kill.alone_on_machine_bytes),
+            Some(None)
+        );
+    }
+
+    /// An item of a parallel batch ran beside its siblings, whatever the load
+    /// context taken at the batch's start says; and a run the kernel did not
+    /// kill records nothing.
+    #[tokio::test]
+    async fn only_an_out_of_memory_kill_with_nothing_beside_it_is_alone() {
+        let db =
+            Arc::new(crate::storage::migrated_test_db("resource-profile-oom-siblings.db").await);
+        let (identity, context) = killed_here();
+        let mut not_killed = oom_killed_for_test(CROWDED_VICTIM, Some(SPECIMEN_TOTAL), 0, 5);
+        not_killed.stop = None;
+        observe_memory_kill(
+            db.clone(),
+            Some(&identity),
+            &context,
+            &not_killed,
+            false,
+            Some(SPECIMEN_BUDGET),
+        )
+        .await;
+        assert!(load_profile(db.clone(), &identity, &context)
+            .await
+            .unwrap()
+            .is_none());
+
+        observe_memory_kill(
+            db.clone(),
+            Some(&identity),
+            &context,
+            &oom_killed_for_test(CROWDED_VICTIM, Some(SPECIMEN_TOTAL), 0, 10),
+            true,
+            Some(SPECIMEN_BUDGET),
+        )
+        .await;
+        let kill = load_profile(db, &identity, &context)
+            .await
+            .unwrap()
+            .unwrap()
+            .memory_kill
+            .unwrap();
+        assert_eq!(kill.victim_resident_bytes, CROWDED_VICTIM);
+        assert_eq!(kill.alone_on_machine_bytes, None);
     }
 
     #[test]
@@ -2116,6 +2608,7 @@ mod tests {
                 upper_peak_rss_bytes: Some(99),
                 upper_disk_delta_bytes: None,
                 upper_duration_ms: None,
+                memory_kill: None,
             },
             ResourceReservation {
                 memory_bytes: 100,

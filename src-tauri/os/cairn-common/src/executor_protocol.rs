@@ -5109,6 +5109,20 @@ pub struct LearnedResourceEstimate {
 /// nothing it would decode differently; that executor runs a tiered lane cold,
 /// rebuilding its dependencies from source, until the update directive brings
 /// it a build carrying this.
+///
+/// cairn/5416 does not move the number. A kernel out-of-memory kill now teaches
+/// the runner's resource profile a demand floor, read from the `OomKilled`
+/// stop and the load context every executor already sends. The new
+/// [`MemoryKill`], [`MemoryCeiling::killed_here`],
+/// [`ReservationRationale::memory_kill`] and the `killedHere` field of
+/// [`PlacementRejectionReason::ExceedsMemoryCeiling`] are runner placement
+/// vocabulary under the same argument as cairn/4931's: the runner alone
+/// constructs and reads them, and nothing it sends an executor carries them.
+/// The reservation a request carries keeps its shape; only its number can be
+/// larger and its source stays `unmeasured` when the floor set it, which every
+/// executor version already holds against its available memory while the
+/// work is resident. What a runner gets wrong talking to an older executor:
+/// nothing.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 157;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
@@ -12381,6 +12395,10 @@ pub struct ReservationRationale {
     /// Why no learned value was used, when none was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<ReservationFallback>,
+    /// An out-of-memory kill of this command on this machine context, whose
+    /// victim floors the memory reservation whatever the profile says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_kill: Option<MemoryKill>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -13183,7 +13201,9 @@ pub struct PlacementRejection {
 /// Only a measurement sets it, never a class prior, and never a quarantined
 /// peak: a peak near the whole budget measured the machine's saturation rather
 /// than the command, and treating it as demand would refuse that machine the
-/// work forever.
+/// work forever. A kill is the exception the quarantine cannot see past: when
+/// the kernel killed the command here for memory, [`Self::killed_here`] says so
+/// and the estimate is the floor that kill proved.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryCeiling {
@@ -13191,16 +13211,60 @@ pub struct MemoryCeiling {
     pub estimate_bytes: u64,
     /// The most this machine will ever reserve for one request.
     pub ceiling_bytes: u64,
+    /// The out-of-memory kill on this machine that set the estimate, when one
+    /// did rather than a completed run's peak.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub killed_here: Option<MemoryKill>,
 }
 
 impl MemoryCeiling {
-    /// The two numbers in the units a person reads them in.
+    /// The two numbers in the units a person reads them in, and the kill behind
+    /// them when there was one.
     pub fn describe(&self) -> String {
-        format!(
-            "its measured memory demand {} exceeds what this machine can ever hold ({})",
-            describe_gib(self.estimate_bytes),
-            describe_gib(self.ceiling_bytes)
-        )
+        let ceiling = describe_gib(self.ceiling_bytes);
+        match self.killed_here {
+            Some(kill) => kill.describe(&ceiling),
+            None => format!(
+                "its measured memory demand {} exceeds what this machine can ever hold ({ceiling})",
+                describe_gib(self.estimate_bytes),
+            ),
+        }
+    }
+}
+
+/// The kernel's out-of-memory killer ended this command on one machine.
+///
+/// The victim's resident size at death is a floor on what the command needs,
+/// never its peak: the process was still growing when it was killed. It is one
+/// process's own number, which nothing else on the machine can inflate, so it
+/// is not subject to the saturation quarantine that a process tree's peak is.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryKill {
+    /// The largest victim resident size any kill of this command here saw.
+    pub victim_resident_bytes: u64,
+    /// When the most recent kill happened.
+    pub killed_at_unix_ms: u64,
+    /// The machine's memory, when a kill happened while nothing else of
+    /// Cairn's ran there and no run has succeeded here since. Such a kill is
+    /// the machine's answer that it cannot run the command at all, not a
+    /// crowding fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alone_on_machine_bytes: Option<u64>,
+}
+
+impl MemoryKill {
+    fn describe(&self, ceiling: &str) -> String {
+        let resident = describe_gib(self.victim_resident_bytes);
+        match self.alone_on_machine_bytes {
+            Some(machine) => format!(
+                "the kernel killed it here for memory at {resident} resident while it ran alone on this {} machine, which can hold at most {ceiling} for one request",
+                describe_gib(machine)
+            ),
+            None => format!(
+                "the kernel killed it here for memory at {resident} resident, more than this machine can ever hold ({ceiling})"
+            ),
+        }
     }
 }
 
@@ -13277,6 +13341,8 @@ pub enum PlacementRejectionReason {
     ExceedsMemoryCeiling {
         estimate_bytes: u64,
         ceiling_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        killed_here: Option<MemoryKill>,
     },
     /// Usable, measured, and simply beaten by the machine that won.
     OutrankedBy { executor_name: String },
@@ -13427,9 +13493,11 @@ impl PlacementRejectionReason {
             Self::ExceedsMemoryCeiling {
                 estimate_bytes,
                 ceiling_bytes,
+                killed_here,
             } => MemoryCeiling {
                 estimate_bytes: *estimate_bytes,
                 ceiling_bytes: *ceiling_bytes,
+                killed_here: *killed_here,
             }
             .describe(),
             Self::OutrankedBy { executor_name } => format!("outranked by {executor_name}"),
@@ -15991,6 +16059,7 @@ mod tests {
                     prior: ResourceReservation::default(),
                     headroom_percent: 25,
                     fallback: None,
+                    memory_kill: None,
                 },
                 sync_cost: PlacementSyncCost::Known { bytes: 12_345 },
                 object_transfer: None,

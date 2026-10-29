@@ -175,6 +175,15 @@ macro_rules! private_embedding_space {
     };
 }
 
+/// cairn/5416: an out-of-memory kill of a profiled command records the
+/// victim's resident size as a demand floor on that machine context. Private
+/// with the rest of `command_resource_profiles`.
+macro_rules! private_command_resource_memory_kills {
+    () => {
+        migration!("0287_command_resource_memory_kills")
+    };
+}
+
 /// Runner-local recovery journal for the exact remote authority generation held
 /// by a team ordinary process and any terminal action still owed to Postgres.
 macro_rules! private_team_ordinary_admission_authority {
@@ -1918,6 +1927,7 @@ macro_rules! private_lineage {
             shared_tail_turn_end_check_attempt_plan!(),
             private_embedding_space!(),
             shared_tail_tenet_rationale!(),
+            private_command_resource_memory_kills!(),
         ]
     };
 }
@@ -3801,6 +3811,7 @@ mod tests {
                 "turn_end_check_attempt_plan",
                 "embedding_space",
                 "tenet_rationale",
+                "command_resource_memory_kills",
             ],
         );
     }
