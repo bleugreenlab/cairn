@@ -135,6 +135,10 @@ pub struct ParsedCheckResult {
     /// red's cause survives however much chatter the run printed after it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) report: Option<String>,
+    /// Where the lane's wall clock went, when its runner measured it (the
+    /// rust-tests runner does; see `scripts/lib/lane-phases.ts`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) phases: Option<CheckPhases>,
     /// The run's own statement that its exit vouches for nothing, and why: the
     /// producer judged the environment it ran in unfit to answer for the change
     /// (`runtime bun 1.3.13 ≠ pinned 1.4.4`). Taken from the structured result
@@ -142,6 +146,80 @@ pub struct ParsedCheckResult {
     /// unverified however complete the rest of the result is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) unverified: Option<String>,
+}
+
+/// A lane's duration divided into phases on one timeline, so they sum to the
+/// command's wall clock: `setup` (the command's prelude, probes, planning, and
+/// the fast tier's fixture run), `compile` (each cargo pass up to its `Finished`
+/// line), `test` (each pass after it), `doctest`, and `publish` (result
+/// assembly between and after passes).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CheckPhases {
+    /// `executor` when the timeline starts at the executor's spawn stamp,
+    /// `process` when it starts at the runner script, missing the prelude.
+    pub(crate) origin: String,
+    pub(crate) setup_ms: u64,
+    pub(crate) compile_ms: u64,
+    pub(crate) test_ms: u64,
+    #[serde(default)]
+    pub(crate) doctest_ms: u64,
+    pub(crate) publish_ms: u64,
+    /// Crates cargo compiled across every pass. Zero means nothing was stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compiled_units: Option<u64>,
+    #[serde(default)]
+    pub(crate) passes: Vec<CheckPhasePass>,
+}
+
+/// One cargo invocation of a lane: `full`, `related`, `targeted`, the fast
+/// tier's `local`, `warmup`, and `global`, or `doctest`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CheckPhasePass {
+    pub(crate) name: String,
+    pub(crate) wall_ms: u64,
+    pub(crate) compile_ms: u64,
+    pub(crate) test_ms: u64,
+    #[serde(default)]
+    pub(crate) compiled_units: u64,
+    /// nextest's own `Summary [ Xs ]` for the pass, when it printed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) summary_ms: Option<u64>,
+}
+
+/// More passes than any lane runs; a result claiming more is not a lane's.
+const MAX_PHASE_PASSES: usize = 16;
+
+impl CheckPhases {
+    /// The `phases` a result file carries, when it is one this core can store.
+    /// The file is the runner's input, so a malformed or implausible object is
+    /// dropped rather than trusted; the rest of the result still parses.
+    fn from_artifact(value: &serde_json::Value) -> Option<Self> {
+        let phases: Self = serde_json::from_value(value.get("phases")?.clone()).ok()?;
+        let representable = [
+            phases.setup_ms,
+            phases.compile_ms,
+            phases.test_ms,
+            phases.doctest_ms,
+            phases.publish_ms,
+        ]
+        .into_iter()
+        .chain(phases.compiled_units)
+        .chain(phases.passes.iter().flat_map(|pass| {
+            [
+                pass.wall_ms,
+                pass.compile_ms,
+                pass.test_ms,
+                pass.compiled_units,
+            ]
+        }))
+        .all(|value| i64::try_from(value).is_ok());
+        (matches!(phases.origin.as_str(), "executor" | "process")
+            && phases.passes.len() <= MAX_PHASE_PASSES
+            && representable)
+            .then_some(phases)
+    }
 }
 
 fn current_result_schema_version() -> u32 {
@@ -430,6 +508,7 @@ pub(crate) fn parse_check_output(command: &str, output: &str) -> Option<ParsedCh
             deferred: 0,
             failures: vec![],
             report: None,
+            phases: None,
             unverified: Some(reason),
         },
     })
@@ -545,6 +624,7 @@ fn parse_test_artifact(value: &serde_json::Value, parser: &str) -> Option<Parsed
         suite_failures: 0,
         deferred,
         report: None,
+        phases: CheckPhases::from_artifact(value),
         failures,
         unverified: None,
     })
@@ -591,6 +671,7 @@ fn parse_rust_lint_artifact(value: &serde_json::Value) -> Option<ParsedCheckResu
         failed: failures.len(),
         skipped: 0,
         suite_failures: 0,
+        phases: None,
         deferred: 0,
         failures,
         report,
@@ -634,6 +715,7 @@ fn parse_tsc(clean: &str) -> Option<ParsedCheckResult> {
         failed: failures.len(),
         skipped: 0,
         suite_failures: 0,
+        phases: None,
         deferred: 0,
         report: None,
         failures,
@@ -763,6 +845,7 @@ fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
         suite_failures,
         deferred: 0,
         report: None,
+        phases: None,
         failures,
         unverified: None,
     })
@@ -864,6 +947,7 @@ fn parse_vitest_summary(clean: &str) -> Option<ParsedCheckResult> {
         suite_failures: 0,
         deferred: 0,
         report: None,
+        phases: None,
         failures,
         unverified: None,
     })
@@ -1011,6 +1095,7 @@ fn parse_bun_test(clean: &str) -> Option<ParsedCheckResult> {
         suite_failures: totals.errors,
         deferred: 0,
         report: None,
+        phases: None,
         failures,
         unverified: None,
     })
@@ -1176,6 +1261,7 @@ fn parse_nextest(clean: &str) -> Option<ParsedCheckResult> {
         failed: grab(&COUNT_FAILED),
         skipped: grab(&COUNT_SKIPPED),
         suite_failures: 0,
+        phases: None,
         deferred: 0,
         report: None,
         failures,
@@ -1274,6 +1360,7 @@ fn parse_cargo_test(clean: &str) -> Option<ParsedCheckResult> {
         failed,
         skipped: ignored,
         suite_failures: 0,
+        phases: None,
         deferred: 0,
         report: None,
         failures,
@@ -1329,7 +1416,7 @@ pub(crate) fn format_failure_excerpt(parsed: Option<&ParsedCheckResult>, raw_tai
             return head_chars(&composed.join("\n"), FAILURE_EXCERPT_CHARS);
         }
     }
-    error_anchored_tail(raw_tail, FAILURE_EXCERPT_CHARS)
+    anchored_tail(raw_tail, FAILURE_EXCERPT_CHARS)
 }
 
 /// A check's `report` as a renderer shows it: led by whatever the stored
@@ -1386,16 +1473,22 @@ pub(crate) fn tail_chars(s: &str, max: usize) -> String {
 /// What stands between an anchored error and the tail it leads.
 const ANCHOR_ELISION: &str = "\n…\n";
 
-/// The trailing `max` chars of `s`, led by its first error when the cut would
-/// drop it.
+/// The trailing `max` chars of `s`, led by the lines a reader needs most when
+/// the cut would drop them: the first build error and nextest's `Summary`
+/// lines.
 ///
 /// A build prints its error once and then however many warnings and footers
 /// follow, so an end-anchored window alone can keep `could not compile … due
 /// to 1 previous error` while losing the one error it counts, and a reader
-/// takes the last warning for the cause. When the window misses it, the first
-/// `error[`/`error:` line and its `-->` location lead verbatim, then an
-/// elision mark, then the end-anchored remainder.
-pub(crate) fn error_anchored_tail(s: &str, max: usize) -> String {
+/// takes the last warning for the cause. A fast-tier pass prints its Summary
+/// and then one `TIMEOUT` line per deferred test, thousands of them, so the
+/// window keeps the deferrals and loses the one line saying how many tests ran
+/// and for how long.
+///
+/// Each anchor the window misses (the first `error[`/`error:` line with its
+/// `-->` location, and every `Summary [` line) leads verbatim in output order,
+/// within half of `max`, then an elision mark, then the end-anchored remainder.
+pub(crate) fn anchored_tail(s: &str, max: usize) -> String {
     let total = s.chars().count();
     if total <= max {
         return s.to_string();
@@ -1404,12 +1497,61 @@ pub(crate) fn error_anchored_tail(s: &str, max: usize) -> String {
         .char_indices()
         .nth(total - max)
         .map_or(s.len(), |(at, _)| at);
-    let Some((start, end)) = first_error_span(s).filter(|(start, _)| *start < window) else {
+    let mut anchors: Vec<(usize, usize)> = first_error_span(s)
+        .into_iter()
+        .chain(summary_spans(s))
+        .filter(|(start, _)| *start < window)
+        .collect();
+    if anchors.is_empty() {
         return tail_chars(s, max);
-    };
-    let lead = head_chars(s[start..end].trim_end(), max / 2);
+    }
+    anchors.sort_unstable();
+    let lead_budget = max / 2;
+    let mut lead = String::new();
+    let mut lead_end = 0;
+    for (start, end) in anchors {
+        if start < lead_end {
+            continue;
+        }
+        let piece = s[start..end].trim_end();
+        if lead.is_empty() {
+            lead = head_chars(piece, lead_budget);
+        } else {
+            let joint = if start == lead_end {
+                "\n"
+            } else {
+                ANCHOR_ELISION
+            };
+            if lead.chars().count() + joint.chars().count() + piece.chars().count() > lead_budget {
+                break;
+            }
+            lead.push_str(joint);
+            lead.push_str(piece);
+        }
+        lead_end = end;
+    }
     let budget = max.saturating_sub(lead.chars().count() + ANCHOR_ELISION.chars().count());
-    format!("{lead}{ANCHOR_ELISION}{}", tail_chars(&s[end..], budget))
+    format!(
+        "{lead}{ANCHOR_ELISION}{}",
+        tail_chars(&s[lead_end..], budget)
+    )
+}
+
+static NEXTEST_SUMMARY_LINE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*Summary\s+\[\s*[\d.]+s\]").unwrap());
+
+/// The byte spans of every nextest `Summary [ Xs ]` line in `s`.
+fn summary_spans(s: &str) -> Vec<(usize, usize)> {
+    let mut offset = 0;
+    s.split_inclusive('\n')
+        .filter_map(|line| {
+            let at = offset;
+            offset += line.len();
+            NEXTEST_SUMMARY_LINE
+                .is_match(&strip_ansi(line))
+                .then_some((at, at + line.len()))
+        })
+        .collect()
 }
 
 /// The byte span of `s`'s first error line, through its `-->` location when
@@ -2080,6 +2222,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             failed: 8,
             skipped: 0,
             suite_failures: 0,
+            phases: None,
             deferred: 0,
             report: None,
             unverified: None,
@@ -2109,6 +2252,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             failed: 0,
             skipped: 0,
             suite_failures: 0,
+            phases: None,
             deferred: 0,
             report: None,
             failures: vec![],
@@ -2138,7 +2282,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             !tail_chars(&output, 1_500).contains("error[E0425]"),
             "the plain tail loses the error, which is the defect"
         );
-        let excerpt = error_anchored_tail(&output, 1_500);
+        let excerpt = anchored_tail(&output, 1_500);
         assert!(excerpt.chars().count() <= 1_500, "{excerpt}");
         assert!(
             excerpt.starts_with(
@@ -2153,11 +2297,122 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
 
         // An untruncated output, a window that already holds the error, and an
         // output with no error are plain tails.
-        assert_eq!(error_anchored_tail(&output, 100_000), output);
+        assert_eq!(anchored_tail(&output, 100_000), output);
         let late = format!("{}error[E0308]: mismatched types\n", "noise\n".repeat(400));
-        assert_eq!(error_anchored_tail(&late, 300), tail_chars(&late, 300));
+        assert_eq!(anchored_tail(&late, 300), tail_chars(&late, 300));
         let quiet = "warning: unused\n".repeat(400);
-        assert_eq!(error_anchored_tail(&quiet, 300), tail_chars(&quiet, 300));
+        assert_eq!(anchored_tail(&quiet, 300), tail_chars(&quiet, 300));
+    }
+
+    /// One TIMEOUT line per deferral, as nextest reprints them after a fast-tier
+    /// pass's Summary (specimen c505b3fe deferred 1,029).
+    fn timeout_lines(count: usize) -> String {
+        (0..count)
+            .map(|n| {
+                format!(
+                    "     TIMEOUT [   1.002s] ({n:>5}/13327) cairn-vcs jj::tests::deferred_{n}\n"
+                )
+            })
+            .collect()
+    }
+
+    /// Every rust-tests fast-tier row on the ledger lost nextest's Summary:
+    /// the global pass's deferral list fills the window behind it.
+    #[test]
+    fn a_deferral_heavy_tail_keeps_every_nextest_summary() {
+        let output = format!(
+            "ℹ️  fast tier, local pass (no budget): cargo nextest run -p cairn-core\n\nstderr:\n\
+             \x1b[1;32m     Summary\x1b[0m [  63.900s] 412 tests run: 412 passed, 0 skipped\n\
+             {}     Summary [   5.400s] 3 tests run: 3 passed, 0 skipped\n\
+             {}     Summary [ 312.004s] 9811 tests run: 8782 passed, 1029 timed out, 41 skipped\n\
+             {}error: test run failed\nerror: script \"test:rust:tiered\" exited with code 100\n\n\nExit code: 100",
+            "        PASS [   0.004s] crate::passes\n".repeat(200),
+            "        PASS [   0.004s] crate::passes\n".repeat(200),
+            timeout_lines(1_029),
+        );
+        assert!(
+            !tail_chars(&output, 4_000).contains("Summary"),
+            "the plain tail loses every Summary, which is the defect"
+        );
+        let excerpt = anchored_tail(&output, 4_000);
+        assert!(excerpt.chars().count() <= 4_000, "{excerpt}");
+        assert!(
+            excerpt.starts_with(
+                "\x1b[1;32m     Summary\x1b[0m [  63.900s] 412 tests run: 412 passed, 0 skipped\n…\n     Summary [   5.400s] 3 tests run"
+            ),
+            "{excerpt}"
+        );
+        assert!(
+            excerpt.contains("     Summary [ 312.004s] 9811 tests run: 8782 passed, 1029 timed out, 41 skipped\n…\n"),
+            "{excerpt}"
+        );
+        assert!(excerpt.ends_with("Exit code: 100"), "{excerpt}");
+
+        // A build error and a Summary both above the window lead in output order.
+        let both = format!(
+            "error[E0425]: cannot find value `x`\n   --> os/cairn-core/src/lib.rs:1:1\n{}     Summary [   1.000s] 1 test run: 1 passed\n{}",
+            "noise\n".repeat(400),
+            timeout_lines(100),
+        );
+        let excerpt = anchored_tail(&both, 2_000);
+        assert!(
+            excerpt.starts_with(
+                "error[E0425]: cannot find value `x`\n   --> os/cairn-core/src/lib.rs:1:1\n…\n     Summary [   1.000s] 1 test run: 1 passed\n…\n"
+            ),
+            "{excerpt}"
+        );
+        assert!(excerpt.chars().count() <= 2_000);
+    }
+
+    /// c47874ea's Summary sits inside the window already, behind a short
+    /// failure list, so its tail is the plain one.
+    #[test]
+    fn a_summary_inside_the_window_is_not_repeated() {
+        let output = format!(
+            "{}     Summary [ 144.635s] 13117 tests run: 13116 passed (2 slow), 1 failed, 46 skipped\n        FAIL [   2.148s] ( 4648/13117) cairn-core mcp::auth::tests::the_operator_credential_has_no_unexpected_exposure_sites\nerror: test run failed\nerror: script \"test:rust:full\" exited with code 100\n\n\nExit code: 100",
+            "        PASS [   0.081s] (13090/13117) cairn-workflow transitions::outcome::tests::idle\n".repeat(300),
+        );
+        assert_eq!(anchored_tail(&output, 4_000), tail_chars(&output, 4_000));
+    }
+
+    #[test]
+    fn lane_phases_parse_from_the_result_file_and_implausible_ones_are_dropped() {
+        let with = |phases: &str| {
+            format!(
+                r#"{RESULT_ARTIFACT_JSON_MARKER}{{"schemaVersion":1,"parser":"nextest","complete":true,"selection":"full","undeclaredSkips":0,"tests":[],"phases":{phases}}}"#
+            )
+        };
+        let phases = r#"{"origin":"executor","setupMs":12000,"compileMs":408000,"testMs":149735,"doctestMs":0,"publishMs":1479,"compiledUnits":1,"passes":[{"name":"full","wallMs":557735,"compileMs":408000,"testMs":149735,"compiledUnits":1,"summaryMs":144635}]}"#;
+        let parsed = parse_check_output("bun run test:rust:full", &with(phases)).unwrap();
+        let measured = parsed
+            .phases
+            .as_ref()
+            .expect("the runner's phases are kept");
+        assert_eq!(
+            (
+                measured.setup_ms,
+                measured.compile_ms,
+                measured.test_ms,
+                measured.publish_ms
+            ),
+            (12_000, 408_000, 149_735, 1_479)
+        );
+        assert_eq!(measured.passes[0].summary_ms, Some(144_635));
+        // They ride into the stored result and back.
+        let stored = serde_json::to_string(&parsed).unwrap();
+        let back: ParsedCheckResult = serde_json::from_str(&stored).unwrap();
+        assert_eq!(back.phases, parsed.phases);
+
+        for bad in [
+            r#"{"origin":"guess","setupMs":1,"compileMs":1,"testMs":1,"publishMs":1}"#,
+            r#"{"origin":"process","setupMs":-1,"compileMs":1,"testMs":1,"publishMs":1}"#,
+            r#"{"origin":"process","setupMs":18446744073709551615,"compileMs":1,"testMs":1,"publishMs":1}"#,
+            r#""twelve minutes""#,
+        ] {
+            let parsed = parse_check_output("bun run test:rust", &with(bad)).unwrap();
+            assert_eq!(parsed.phases, None, "{bad}");
+            assert!(parsed.complete, "the rest of the result still parses");
+        }
     }
 
     #[test]
@@ -2174,6 +2429,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             failed: 1,
             skipped: 0,
             suite_failures: 0,
+            phases: None,
             deferred: 0,
             report: None,
             failures: vec![CheckFailure {
@@ -2197,6 +2453,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             failed: 1,
             skipped: 0,
             suite_failures: 0,
+            phases: None,
             deferred: 0,
             report: None,
             failures: vec![CheckFailure {

@@ -2842,7 +2842,7 @@ fn render_incomplete(
         if !tail.is_empty() {
             out.push_str(&format!(
                 "\nOutput tail:\n```\n{}\n```\n",
-                crate::execution::check_parsers::error_anchored_tail(tail, MAX_CAUSE_CHARS)
+                crate::execution::check_parsers::anchored_tail(tail, MAX_CAUSE_CHARS)
                     .replace("```", "'''")
             ));
         }

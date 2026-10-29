@@ -6,7 +6,7 @@ use crate::execution::cache::{
     CheckResultCacheEntry, HeadVerdictKeys, OwnedHeadVerdictKeys,
 };
 use crate::execution::check_parsers::{
-    error_anchored_tail, extract_running_tests, format_failure_excerpt, format_failure_names,
+    anchored_tail, extract_running_tests, format_failure_excerpt, format_failure_names,
     is_test_runner_parser, report_excerpt, ParsedCheckResult, VerdictFacts, MAX_FAILURE_NAMES,
     RUST_LINT_PARSER,
 };
@@ -2056,7 +2056,7 @@ fn wake_failure_detail(row: &CheckResultCacheEntry) -> String {
         None if named => return header,
         None => {
             let excerpt = format_failure_excerpt(parsed.as_ref(), row.output_tail.trim_end());
-            error_anchored_tail(excerpt.trim_end(), WAKE_EXCERPT_CHARS)
+            anchored_tail(excerpt.trim_end(), WAKE_EXCERPT_CHARS)
         }
     };
     if excerpt.trim().is_empty() {
@@ -2162,6 +2162,7 @@ pub(crate) fn formatted_failure_names(status: &NodeCheckStatus) -> Option<String
         failed: status.failed.unwrap_or(status.failure_names.len()),
         skipped: status.skipped.unwrap_or(0),
         suite_failures: status.suite_failures.unwrap_or(0),
+        phases: None,
         deferred: 0,
         report: None,
         failures: status
@@ -2579,6 +2580,7 @@ mod tests {
             failed: failures.len(),
             skipped: 0,
             suite_failures: 0,
+            phases: None,
             deferred: 0,
             report: None,
             failures: failures
@@ -3056,6 +3058,7 @@ mod tests {
             passed: 0,
             failed: 0,
             suite_failures: 0,
+            phases: None,
             deferred: 0,
             report: None,
             skipped: 0,
@@ -3089,6 +3092,7 @@ mod tests {
                 failed: failures.len(),
                 skipped: 0,
                 suite_failures: 0,
+                phases: None,
                 deferred: 0,
                 report: Some("✓ clippy: no new findings in your diff".to_string()),
                 failures: failures

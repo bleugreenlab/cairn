@@ -3,6 +3,7 @@
 //! Caching system for command results at checkpoint nodes to avoid
 //! re-executing expensive operations.
 
+use crate::execution::check_parsers::CheckPhases;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_db::turso::{params, Connection, Value};
@@ -1959,6 +1960,13 @@ pub(crate) struct FreshCheckObservationWrite {
     /// Tests the fast tier terminated at its per-test budget. Each one is also a
     /// `deferred` row in `tests`, persisted to `check_deferred_tests`.
     pub deferred_count: i64,
+    /// Where the lane's wall clock went, when its runner measured it.
+    pub phases: Option<CheckPhases>,
+    /// The executor's `ExecutionWarmth`: what the cell held when the command
+    /// started (`ExecutionWarmth::as_str`); `None` when it made no claim.
+    pub execution_warmth: Option<String>,
+    /// The executor's `CellOrigin` for the cell the command ran in.
+    pub cell_origin: Option<ObservedCellOrigin>,
     pub tests: Vec<CheckTestResultRow>,
     /// The suppression scopes this verdict is evidence ABOUT, and the only ones
     /// a genuine verdict clears. A pass on one machine says nothing about a
@@ -2033,9 +2041,109 @@ pub(crate) struct CheckResultObservationProjection {
     /// column existed.
     pub selection: Option<String>,
     pub deferred_count: i64,
+    /// The source observation's phase timings; `None` on rows recorded before
+    /// they existed and on lanes whose runner does not measure them.
+    pub phases: Option<CheckPhases>,
+    pub execution_warmth: Option<String>,
+    pub cell_origin: Option<ObservedCellOrigin>,
     pub tests: Vec<CheckTestResultRow>,
     pub test_total: usize,
     pub test_offset: usize,
+}
+
+/// Where the cell a command ran in came from, as the executor's `CellOrigin`
+/// reported it: the seed on the cell's first occupancy (`clone`, `catalog`,
+/// `cold`) or `reused` after it, and the `CacheDistance` from its tree to the
+/// command's commit when the executor measured one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedCellOrigin {
+    pub kind: String,
+    pub distance_files: Option<i64>,
+    pub distance_crates: Option<i64>,
+}
+
+impl ObservedCellOrigin {
+    pub(crate) fn from_executor(origin: &cairn_common::executor_protocol::CellOrigin) -> Self {
+        use cairn_common::executor_protocol::{CellProvenance, CellSeed};
+        let (kind, distance) = match &origin.provenance {
+            CellProvenance::Seeded {
+                seed: CellSeed::Clone { distance, .. },
+            } => ("clone", distance.as_ref()),
+            CellProvenance::Seeded {
+                seed: CellSeed::Catalog { .. },
+            } => ("catalog", None),
+            CellProvenance::Seeded {
+                seed: CellSeed::Cold,
+            } => ("cold", None),
+            CellProvenance::Reused { distance } => ("reused", distance.as_ref()),
+        };
+        Self {
+            kind: kind.to_string(),
+            distance_files: distance.map(|distance| i64::from(distance.files)),
+            distance_crates: distance.map(|distance| i64::from(distance.crates)),
+        }
+    }
+}
+
+/// The observation columns [`observation_phases`] decodes, in its order.
+const OBSERVATION_PHASE_COLUMNS: &str = "o.phase_setup_ms,o.phase_compile_ms,o.phase_test_ms,\
+     o.phase_doctest_ms,o.phase_publish_ms,o.phase_origin,o.compiled_units,\
+     o.phase_passes_json,o.execution_warmth,o.cell_origin_kind,\
+     o.cell_origin_distance_files,o.cell_origin_distance_crates";
+
+/// What [`observation_phases`] decodes: the phases when the row carries them,
+/// and the executor's warmth and cell origin either way.
+type ObservationMeasurements = (
+    Option<CheckPhases>,
+    Option<String>,
+    Option<ObservedCellOrigin>,
+);
+
+/// Decode [`OBSERVATION_PHASE_COLUMNS`] starting at column `at`.
+fn observation_phases(row: &cairn_db::turso::Row, at: usize) -> DbResult<ObservationMeasurements> {
+    let millis = |offset: usize| -> DbResult<Option<u64>> {
+        Ok(row
+            .opt_i64(at + offset)?
+            .and_then(|value| u64::try_from(value).ok()))
+    };
+    let phases = match (
+        millis(0)?,
+        millis(1)?,
+        millis(2)?,
+        millis(3)?,
+        millis(4)?,
+        row.opt_text(at + 5)?,
+    ) {
+        (
+            Some(setup_ms),
+            Some(compile_ms),
+            Some(test_ms),
+            doctest_ms,
+            Some(publish_ms),
+            Some(origin),
+        ) => Some(CheckPhases {
+            origin,
+            setup_ms,
+            compile_ms,
+            test_ms,
+            doctest_ms: doctest_ms.unwrap_or(0),
+            publish_ms,
+            compiled_units: millis(6)?,
+            passes: row
+                .opt_text(at + 7)?
+                .and_then(|passes| serde_json::from_str(&passes).ok())
+                .unwrap_or_default(),
+        }),
+        _ => None,
+    };
+    let cell_origin = row.opt_text(at + 9)?.map(|kind| -> DbResult<_> {
+        Ok(ObservedCellOrigin {
+            kind,
+            distance_files: row.opt_i64(at + 10)?,
+            distance_crates: row.opt_i64(at + 11)?,
+        })
+    });
+    Ok((phases, row.opt_text(at + 8)?, cell_origin.transpose()?))
 }
 
 /// Every per-test outcome of one observation, read through the
@@ -2248,6 +2356,7 @@ pub(crate) fn record_fresh_check_observation(
             Box::pin(async move {
                 // Keep immutable equality and insertion under Turso's positional
                 // bind limit by carrying the trailing provenance as one value.
+                let phases = observation.phases.as_ref();
                 let trailing_provenance = serde_json::json!({
                     "definedByCommitSha": observation.defined_by_commit_sha,
                     "publicHandle": observation.public_handle,
@@ -2256,6 +2365,19 @@ pub(crate) fn record_fresh_check_observation(
                     "verdictEnvironmentHash": observation.verdict_environment_hash,
                     "selection": observation.selection,
                     "deferredCount": observation.deferred_count,
+                    "phaseSetupMs": phases.map(|p| p.setup_ms),
+                    "phaseCompileMs": phases.map(|p| p.compile_ms),
+                    "phaseTestMs": phases.map(|p| p.test_ms),
+                    "phaseDoctestMs": phases.map(|p| p.doctest_ms),
+                    "phasePublishMs": phases.map(|p| p.publish_ms),
+                    "phaseOrigin": phases.map(|p| p.origin.as_str()),
+                    "compiledUnits": phases.and_then(|p| p.compiled_units),
+                    "phasePassesJson": phases
+                        .map(|p| serde_json::to_string(&p.passes).unwrap_or_else(|_| "[]".to_string())),
+                    "executionWarmth": observation.execution_warmth,
+                    "cellOriginKind": observation.cell_origin.as_ref().map(|o| o.kind.as_str()),
+                    "cellOriginDistanceFiles": observation.cell_origin.as_ref().and_then(|o| o.distance_files),
+                    "cellOriginDistanceCrates": observation.cell_origin.as_ref().and_then(|o| o.distance_crates),
                 })
                 .to_string();
                 let mut existing = conn
@@ -2278,7 +2400,19 @@ pub(crate) fn record_fresh_check_observation(
                            AND verdict_arch IS json_extract(?31,'$.verdictArch')
                            AND verdict_environment_hash IS json_extract(?31,'$.verdictEnvironmentHash')
                            AND selection IS json_extract(?31,'$.selection')
-                           AND deferred_count = json_extract(?31,'$.deferredCount')",
+                           AND deferred_count = json_extract(?31,'$.deferredCount')
+                           AND phase_setup_ms IS json_extract(?31,'$.phaseSetupMs')
+                           AND phase_compile_ms IS json_extract(?31,'$.phaseCompileMs')
+                           AND phase_test_ms IS json_extract(?31,'$.phaseTestMs')
+                           AND phase_doctest_ms IS json_extract(?31,'$.phaseDoctestMs')
+                           AND phase_publish_ms IS json_extract(?31,'$.phasePublishMs')
+                           AND phase_origin IS json_extract(?31,'$.phaseOrigin')
+                           AND compiled_units IS json_extract(?31,'$.compiledUnits')
+                           AND phase_passes_json IS json_extract(?31,'$.phasePassesJson')
+                           AND execution_warmth IS json_extract(?31,'$.executionWarmth')
+                           AND cell_origin_kind IS json_extract(?31,'$.cellOriginKind')
+                           AND cell_origin_distance_files IS json_extract(?31,'$.cellOriginDistanceFiles')
+                           AND cell_origin_distance_crates IS json_extract(?31,'$.cellOriginDistanceCrates')",
                         params![observation.id.as_str(), observation.project_id.as_str(),
                             observation.commit_sha.as_str(), observation.tree_hash.as_str(),
                             observation.check_name.as_str(), observation.input_hash.as_str(),
@@ -2342,7 +2476,11 @@ pub(crate) fn record_fresh_check_observation(
                         executor_lease_epoch, executor_started_at_unix_ms,
                         executor_finished_at_unix_ms, runner_build_id, toolchain_fingerprint,
                         output_tail, defined_by_commit_sha, public_handle, verdict_platform,
-                        verdict_arch, verdict_environment_hash, selection, deferred_count
+                        verdict_arch, verdict_environment_hash, selection, deferred_count,
+                        phase_setup_ms, phase_compile_ms, phase_test_ms, phase_doctest_ms,
+                        phase_publish_ms, phase_origin, compiled_units, phase_passes_json,
+                        execution_warmth, cell_origin_kind, cell_origin_distance_files,
+                        cell_origin_distance_crates
                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
                               ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,
                               json_extract(?31,'$.definedByCommitSha'),
@@ -2351,7 +2489,19 @@ pub(crate) fn record_fresh_check_observation(
                               json_extract(?31,'$.verdictArch'),
                               json_extract(?31,'$.verdictEnvironmentHash'),
                               json_extract(?31,'$.selection'),
-                              json_extract(?31,'$.deferredCount'))
+                              json_extract(?31,'$.deferredCount'),
+                              json_extract(?31,'$.phaseSetupMs'),
+                              json_extract(?31,'$.phaseCompileMs'),
+                              json_extract(?31,'$.phaseTestMs'),
+                              json_extract(?31,'$.phaseDoctestMs'),
+                              json_extract(?31,'$.phasePublishMs'),
+                              json_extract(?31,'$.phaseOrigin'),
+                              json_extract(?31,'$.compiledUnits'),
+                              json_extract(?31,'$.phasePassesJson'),
+                              json_extract(?31,'$.executionWarmth'),
+                              json_extract(?31,'$.cellOriginKind'),
+                              json_extract(?31,'$.cellOriginDistanceFiles'),
+                              json_extract(?31,'$.cellOriginDistanceCrates'))
                        ON CONFLICT(id) DO NOTHING",
                     Vec::<cairn_db::turso::Value>::from([
                         observation.id.as_str().into(), observation.project_id.as_str().into(),
@@ -2599,7 +2749,7 @@ pub(crate) fn get_check_result_observation(
             let keys = keys.clone();
             Box::pin(async move {
                 let mut rows = conn.query(
-                    "SELECT a.disposition,a.tree_hash,a.input_hash,a.evaluated_at,
+                    format!("SELECT a.disposition,a.tree_hash,a.input_hash,a.evaluated_at,
                             o.id,o.project_id,o.commit_sha,o.tree_hash,o.check_name,o.input_hash,
                             o.environment_fingerprint,o.exit_code,o.verdict,o.failure_kind,o.complete,
                             o.reusable,o.non_reusable_reason,o.parser_version,o.result_schema_version,
@@ -2608,15 +2758,17 @@ pub(crate) fn get_check_result_observation(
                             o.executor_lease_epoch,o.executor_started_at_unix_ms,
                             o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
                             o.output_tail,a.defined_by_commit_sha,o.defined_by_commit_sha,
-                            o.verdict_platform,o.verdict_arch,o.selection,o.deferred_count
+                            o.verdict_platform,o.verdict_arch,o.selection,o.deferred_count,
+                            {OBSERVATION_PHASE_COLUMNS}
                        FROM check_result_commit_aliases a
                        JOIN check_result_observations o ON o.id=a.source_observation_id
                       WHERE a.project_id=?1 AND a.commit_sha=?2 AND a.check_name=?3
-                        AND a.environment_fingerprint=?4 AND a.result_schema_version=?5",
+                        AND a.environment_fingerprint=?4 AND a.result_schema_version=?5"),
                     params![keys.0.as_str(),keys.1.as_str(),keys.2.as_str(),keys.3.as_str(),result_schema_version]
                 ).await?;
                 let Some(row) = rows.next().await? else { return Ok(None); };
                 let observation_id = row.text(4)?;
+                let (phases, execution_warmth, cell_origin) = observation_phases(&row, 40)?;
                 let mut projection = CheckResultObservationProjection {
                     disposition: row.text(0)?,
                     defined_by_commit_sha: row.opt_text(34)?,
@@ -2640,7 +2792,8 @@ pub(crate) fn get_check_result_observation(
                     toolchain_fingerprint: row.opt_text(32)?,
                     verdict_platform: row.opt_text(36)?, verdict_arch: row.opt_text(37)?,
                     output_tail: row.text(33)?,
-                    selection: row.opt_text(38)?, deferred_count: row.i64(39)?, tests: Vec::new(),
+                    selection: row.opt_text(38)?, deferred_count: row.i64(39)?,
+                    phases, execution_warmth, cell_origin, tests: Vec::new(),
                     test_total: 0, test_offset: offset,
                 };
                 let mut totals = conn.query(
@@ -2677,7 +2830,7 @@ fn observation_by_handle_sql() -> String {
                 o.executor_lease_epoch,o.executor_started_at_unix_ms,
                 o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
                 o.output_tail,o.defined_by_commit_sha,o.verdict_platform,o.verdict_arch,
-                o.selection,o.deferred_count
+                o.selection,o.deferred_count,{OBSERVATION_PHASE_COLUMNS}
            FROM check_result_observations o INDEXED BY {CHECK_OBSERVATION_HANDLE_INDEX}
           WHERE o.project_id=?1 AND o.public_handle=?2 AND o.public_handle IS NOT NULL"
     )
@@ -2705,6 +2858,7 @@ pub(crate) fn get_check_result_observation_by_handle(
                     return Ok(None);
                 };
                 let id = row.text(0)?;
+                let (phases, execution_warmth, cell_origin) = observation_phases(&row, 35)?;
                 let mut projection = CheckResultObservationProjection {
                     disposition: "fresh".into(),
                     defined_by_commit_sha: row.opt_text(30)?,
@@ -2746,6 +2900,9 @@ pub(crate) fn get_check_result_observation_by_handle(
                     output_tail: row.text(29)?,
                     selection: row.opt_text(33)?,
                     deferred_count: row.i64(34)?,
+                    phases,
+                    execution_warmth,
+                    cell_origin,
                     tests: Vec::new(),
                     test_total: 0,
                     test_offset: 0,
@@ -3276,6 +3433,9 @@ mod tests {
             infra_reset_scopes: Vec::new(),
             selection: None,
             deferred_count: 0,
+            phases: None,
+            execution_warmth: None,
+            cell_origin: None,
             project_id: "project-a".to_string(),
             commit_sha: commit.to_string(),
             defined_by_commit_sha: commit.to_string(),
@@ -3339,6 +3499,100 @@ mod tests {
         let error = record_fresh_check_observation(db, write)
             .expect_err("mixed sealed and loose coordinates must not become reusable evidence");
         assert!(error.contains("sealed check coordinate"), "{error}");
+    }
+
+    /// A lane's phases land in their own columns, so one SQL query can divide
+    /// minutes by phase; they read back on both observation paths, and a
+    /// re-record that disagrees about them is refused like any other field.
+    #[tokio::test]
+    async fn an_observation_keeps_where_its_minutes_went() {
+        use crate::execution::check_parsers::CheckPhasePass;
+        let db = cache_db().await;
+        let mut write = observation("obs-phases", "commit-phases", "env-phases");
+        write.duration_ms = 571_214;
+        write.execution_warmth = Some("repositoryOnly".to_string());
+        write.cell_origin = Some(ObservedCellOrigin {
+            kind: "clone".to_string(),
+            distance_files: Some(12),
+            distance_crates: Some(3),
+        });
+        write.phases = Some(CheckPhases {
+            origin: "executor".to_string(),
+            setup_ms: 12_000,
+            compile_ms: 408_000,
+            test_ms: 149_735,
+            doctest_ms: 0,
+            publish_ms: 1_479,
+            compiled_units: Some(37),
+            passes: vec![CheckPhasePass {
+                name: "full".to_string(),
+                wall_ms: 557_735,
+                compile_ms: 408_000,
+                test_ms: 149_735,
+                compiled_units: 37,
+                summary_ms: Some(144_635),
+            }],
+        });
+        record_fresh_check_observation(db.clone(), write.clone()).unwrap();
+        record_fresh_check_observation(db.clone(), write.clone()).unwrap();
+
+        let mut divergent = write.clone();
+        divergent.phases.as_mut().unwrap().test_ms += 1;
+        let error = record_fresh_check_observation(db.clone(), divergent).unwrap_err();
+        assert!(error.contains("different immutable fields"), "{error}");
+
+        let compile_share = db
+            .query_opt_i64(
+                "SELECT 100 * SUM(phase_compile_ms) / SUM(duration_ms)
+                   FROM check_result_observations
+                  WHERE phase_compile_ms IS NOT NULL AND executor_id = 'executor-1'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(compile_share, Some(71));
+
+        let by_handle =
+            get_check_result_observation_by_handle(db.clone(), "project-a", &write.public_handle)
+                .unwrap()
+                .unwrap();
+        assert_eq!(by_handle.phases, write.phases);
+        assert_eq!(
+            by_handle.execution_warmth.as_deref(),
+            Some("repositoryOnly")
+        );
+        assert_eq!(by_handle.cell_origin, write.cell_origin);
+        let mut moved_cell = write.clone();
+        moved_cell.cell_origin.as_mut().unwrap().distance_files = Some(13);
+        let error = record_fresh_check_observation(db.clone(), moved_cell).unwrap_err();
+        assert!(error.contains("different immutable fields"), "{error}");
+        let by_commit = get_check_result_observation(
+            db.clone(),
+            "project-a",
+            "commit-phases",
+            "rust",
+            "env-phases",
+            1,
+            None,
+            None,
+            10,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(by_commit.phases, write.phases);
+
+        // A lane whose runner measured nothing stores NULLs and reads `None`.
+        let unmeasured = observation("obs-unmeasured", "commit-unmeasured", "env-phases");
+        record_fresh_check_observation(db.clone(), unmeasured.clone()).unwrap();
+        let read =
+            get_check_result_observation_by_handle(db, "project-a", &unmeasured.public_handle)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            (read.phases, read.execution_warmth, read.cell_origin),
+            (None, None, None)
+        );
     }
 
     /// A fast-tier observation persists its deferrals beside, never inside,

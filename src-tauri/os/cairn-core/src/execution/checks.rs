@@ -4976,7 +4976,7 @@ impl From<String> for CheckExecutionFailure {
     }
 }
 use crate::execution::check_parsers::{
-    error_anchored_tail, extract_running_tests, format_failure_excerpt, format_failure_names,
+    anchored_tail, extract_running_tests, format_failure_excerpt, format_failure_names,
     parse_check_output, ParsedCheckResult, MAX_FAILURE_NAMES, RESULT_ARTIFACT_JSON_MARKER,
     RUST_LINT_PARSER,
 };
@@ -5499,7 +5499,7 @@ fn termination_signal(exit_code: i32) -> Option<&'static str> {
 /// Compose the `output_tail` a check row stores, within [`OUTPUT_TAIL_CHARS`]:
 /// the classification and its evidence (when the death was classified), then
 /// the check's own `report` (when its result file carried one), then as much of
-/// the output's tail as still fits. The tail is [`error_anchored_tail`], so a
+/// the output's tail as still fits. The tail is [`anchored_tail`], so a
 /// build error printed above a long run of warnings survives the cut.
 ///
 /// The report has to lead because the tail cannot be trusted to hold it. A
@@ -5519,7 +5519,7 @@ fn classified_output_excerpt(
         .and_then(|result| result.report.as_deref())
         .filter(|report| !report.trim().is_empty());
     if classification.is_none() && report.is_none() {
-        return error_anchored_tail(&chatter, OUTPUT_TAIL_CHARS);
+        return anchored_tail(&chatter, OUTPUT_TAIL_CHARS);
     }
     let mut prefix = String::new();
     if let Some(classification) = classification {
@@ -5544,7 +5544,7 @@ fn classified_output_excerpt(
     }
     prefix.push_str("\n\nFinal output:\n");
     let remaining = OUTPUT_TAIL_CHARS.saturating_sub(prefix.chars().count());
-    prefix.push_str(&error_anchored_tail(&chatter, remaining));
+    prefix.push_str(&anchored_tail(&chatter, remaining));
     prefix.chars().take(OUTPUT_TAIL_CHARS).collect()
 }
 
@@ -7846,6 +7846,13 @@ fn fresh_observation_write(
         target_results_json: parsed.and_then(|result| serde_json::to_string(result).ok()),
         selection: parsed.map(|result| result.selection.clone()),
         deferred_count: parsed.map(|result| result.deferred as i64).unwrap_or(0),
+        phases: parsed.and_then(|result| result.phases.clone()),
+        execution_warmth: provenance
+            .and_then(|meta| meta.warmth)
+            .map(|warmth| warmth.as_str().to_string()),
+        cell_origin: provenance
+            .and_then(|meta| meta.cell_origin.as_ref())
+            .map(crate::execution::cache::ObservedCellOrigin::from_executor),
         tests,
         infra_reset_scopes,
     }
@@ -13526,6 +13533,7 @@ cairn-common = { path = "../cairn-common" }
             failed,
             skipped: 0,
             suite_failures: 0,
+            phases: None,
             deferred: 0,
             report: None,
             unverified: None,
@@ -16573,6 +16581,9 @@ cairn-common = { path = "../cairn-common" }
             infra_reset_scopes: Vec::new(),
             selection: None,
             deferred_count: 0,
+            phases: None,
+            execution_warmth: None,
+            cell_origin: None,
             project_id: "project-a".to_string(),
             commit_sha: "commit-source".to_string(),
             defined_by_commit_sha: "commit-source".to_string(),
@@ -19543,6 +19554,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             failed,
             skipped: 0,
             suite_failures: 0,
+            phases: None,
             deferred: 0,
             report: None,
             failures: Vec::new(),
@@ -20295,6 +20307,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             passed: 1,
             failed: 0,
             suite_failures: 0,
+            phases: None,
             deferred: 0,
             report: None,
             skipped: 0,

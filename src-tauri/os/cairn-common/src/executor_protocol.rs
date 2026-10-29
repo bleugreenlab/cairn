@@ -5187,6 +5187,17 @@ pub struct LearnedResourceEstimate {
 /// talking to an older executor: nothing; the field is absent and the prompt
 /// quotes no line, and the older executor's pathless denials raise the same
 /// command-scoped crossing they always did. An older runner ignores the field.
+///
+/// cairn/5428 does not move the number. The executor now sets
+/// `CAIRN_CHECK_STARTED_AT_UNIX_MS` in each process item's environment, beside
+/// `CAIRN_CHECK_RESULT_PATH`, so the rust-tests runner can start its phase
+/// timeline at the spawn the executor's duration is measured from. It is a
+/// local environment variable handed to the child, never a frame or field, and
+/// the phases themselves travel inside the check result the executor already
+/// relays verbatim. What a runner gets wrong talking to an older executor:
+/// nothing; that executor's lanes report phases whose `origin` is `process`,
+/// timed from the runner script's own start, so their setup omits the
+/// command's prelude and says so.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 157;
 
 /// The version `build.rs` derived from the paragraphs above

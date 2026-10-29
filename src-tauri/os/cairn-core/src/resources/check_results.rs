@@ -373,6 +373,15 @@ fn render_observation(
             observation.deferred_count
         ));
     }
+    if let Some(phases) = &observation.phases {
+        body.extend(phase_lines(phases, observation.duration_ms));
+    }
+    if let Some(line) = cell_line(
+        observation.execution_warmth.as_deref(),
+        observation.cell_origin.as_ref(),
+    ) {
+        body.push(line);
+    }
     if let Some(generation) = observation.executor_connection_generation {
         body.push(format!("- Executor generation: {generation}"));
     }
@@ -546,6 +555,105 @@ fn render_miss(
     )
 }
 
+/// `- Cell: preparedWarmSlot · origin reused (12 files / 3 crates from the
+/// commit)`: the executor's warmth and cell origin under its own names, so a
+/// compile phase is read beside the cell state that decides it.
+fn cell_line(
+    warmth: Option<&str>,
+    origin: Option<&crate::execution::cache::ObservedCellOrigin>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(warmth) = warmth {
+        parts.push(warmth.to_string());
+    }
+    if let Some(origin) = origin {
+        let distance = match (origin.distance_files, origin.distance_crates) {
+            (Some(files), Some(crates)) => {
+                format!(" ({files} files / {crates} crates from the commit)")
+            }
+            _ => String::new(),
+        };
+        parts.push(format!("origin {}{distance}", origin.kind));
+    }
+    (!parts.is_empty()).then(|| format!("- Cell: {}", parts.join(" · ")))
+}
+
+/// `12 s`, `6 m 48 s`, `450 ms`: a phase's length at the precision it is read.
+fn phase_span(ms: u64) -> String {
+    if ms < 1_000 {
+        return format!("{ms} ms");
+    }
+    let seconds = (ms + 500) / 1_000;
+    if seconds < 60 {
+        format!("{seconds} s")
+    } else {
+        format!("{} m {} s", seconds / 60, seconds % 60)
+    }
+}
+
+/// `- Phases: setup 12 s · compile 6 m 48 s (37 crates compiled) · test 2 m 25 s
+/// · publish 4 s`, then the passes when the lane ran more than one. Whatever
+/// of `duration_ms` the timeline does not cover is named, so a row whose
+/// phases do not account for its duration says so.
+fn phase_lines(
+    phases: &crate::execution::check_parsers::CheckPhases,
+    duration_ms: i64,
+) -> Vec<String> {
+    let compiled = match phases.compiled_units {
+        Some(0) => " (nothing stale)".to_string(),
+        Some(1) => " (1 crate compiled)".to_string(),
+        Some(units) => format!(" ({units} crates compiled)"),
+        None => String::new(),
+    };
+    let mut parts = vec![
+        format!("setup {}", phase_span(phases.setup_ms)),
+        format!("compile {}{compiled}", phase_span(phases.compile_ms)),
+        format!("test {}", phase_span(phases.test_ms)),
+    ];
+    if phases.doctest_ms > 0 {
+        parts.push(format!("doctest {}", phase_span(phases.doctest_ms)));
+    }
+    parts.push(format!("publish {}", phase_span(phases.publish_ms)));
+    let measured = phases.setup_ms
+        + phases.compile_ms
+        + phases.test_ms
+        + phases.doctest_ms
+        + phases.publish_ms;
+    let outside = u64::try_from(duration_ms)
+        .unwrap_or(0)
+        .saturating_sub(measured);
+    if outside >= 1_000 {
+        parts.push(format!("outside the timeline {}", phase_span(outside)));
+    }
+    let origin = if phases.origin == "executor" {
+        ""
+    } else {
+        " (timed from the runner's start; the command's prelude is outside it)"
+    };
+    let mut lines = vec![format!("- Phases: {}{origin}", parts.join(" · "))];
+    if phases.passes.len() > 1 {
+        let passes: Vec<String> = phases
+            .passes
+            .iter()
+            .map(|pass| {
+                let run = if pass.name == "warmup" { "run" } else { "test" };
+                let summary = pass
+                    .summary_ms
+                    .map(|ms| format!(" (nextest {})", phase_span(ms)))
+                    .unwrap_or_default();
+                format!(
+                    "{} compile {}, {run} {}{summary}",
+                    pass.name,
+                    phase_span(pass.compile_ms),
+                    phase_span(pass.test_ms)
+                )
+            })
+            .collect();
+        lines.push(format!("- Passes: {}", passes.join(" · ")));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,6 +815,9 @@ mod tests {
             ],
             selection: Some("filtered".into()),
             deferred_count: 0,
+            phases: None,
+            execution_warmth: None,
+            cell_origin: None,
             test_total: 3,
             test_offset: 0,
         }
@@ -786,6 +897,98 @@ mod tests {
             None,
         );
         assert!(body.contains("- Verdict platform: unrecorded\n"), "{body}");
+    }
+
+    /// Specimen c47874ea's split and a tiered lane's three passes, as the page
+    /// shows them.
+    #[test]
+    fn observation_renders_where_its_minutes_went() {
+        use crate::execution::check_parsers::{CheckPhasePass, CheckPhases};
+        let pass = |name: &str, compile_ms, test_ms, summary_ms| CheckPhasePass {
+            name: name.into(),
+            wall_ms: compile_ms + test_ms,
+            compile_ms,
+            test_ms,
+            compiled_units: 0,
+            summary_ms,
+        };
+        let mut observation = cached_observation();
+        observation.duration_ms = 571_214;
+        observation.execution_warmth = Some("preparedWarmSlot".into());
+        observation.cell_origin = Some(crate::execution::cache::ObservedCellOrigin {
+            kind: "reused".into(),
+            distance_files: Some(12),
+            distance_crates: Some(3),
+        });
+        observation.phases = Some(CheckPhases {
+            origin: "executor".into(),
+            setup_ms: 12_000,
+            compile_ms: 408_000,
+            test_ms: 149_735,
+            doctest_ms: 0,
+            publish_ms: 1_479,
+            compiled_units: Some(37),
+            passes: vec![pass("full", 408_000, 149_735, Some(144_635))],
+        });
+        let query =
+            parse_query(&[param("suite", "rust-tests"), param("environment", "env-1")]).unwrap();
+        let render = |observation: &CheckResultObservationProjection| {
+            render_observation(
+                "cairn",
+                "main",
+                "target-commit",
+                &query,
+                observation,
+                None,
+                None,
+            )
+        };
+        let body = render(&observation);
+        assert!(
+            body.contains(
+                "- Phases: setup 12 s · compile 6 m 48 s (37 crates compiled) · test 2 m 30 s · publish 1 s\n"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "- Cell: preparedWarmSlot · origin reused (12 files / 3 crates from the commit)\n"
+            ),
+            "{body}"
+        );
+        assert!(
+            !body.contains("- Passes:"),
+            "one pass needs no breakdown: {body}"
+        );
+
+        observation.duration_ms = 836_000;
+        observation.phases = Some(CheckPhases {
+            origin: "process".into(),
+            setup_ms: 11_000,
+            compile_ms: 430_000,
+            test_ms: 388_000,
+            doctest_ms: 0,
+            publish_ms: 3_000,
+            compiled_units: Some(0),
+            passes: vec![
+                pass("local", 25_000, 65_000, Some(63_900)),
+                pass("warmup", 404_000, 6_000, Some(5_400)),
+                pass("global", 1_000, 323_000, Some(312_004)),
+            ],
+        });
+        let body = render(&observation);
+        assert!(
+            body.contains(
+                "- Phases: setup 11 s · compile 7 m 10 s (nothing stale) · test 6 m 28 s · publish 3 s · outside the timeline 4 s (timed from the runner's start; the command's prelude is outside it)\n"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "- Passes: local compile 25 s, test 1 m 5 s (nextest 1 m 4 s) · warmup compile 6 m 44 s, run 6 s (nextest 5 s) · global compile 1 s, test 5 m 23 s (nextest 5 m 12 s)\n"
+            ),
+            "{body}"
+        );
     }
 
     /// A legacy row has no truthful defining commit. It says so, rather than
