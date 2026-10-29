@@ -243,25 +243,25 @@ fn parse_pinned_rev(manifest: &str) -> Option<&str> {
         })
 }
 
-/// Roots of the machine-level tool cache `scripts/ensure-tursodb.ts` populates,
-/// under `CAIRN_HOME` and under the default `~/.cairn`. Both are checked because
-/// a run may set `CAIRN_HOME` elsewhere while the cache was built against the
-/// default home.
+/// Roots of the machine-level tool cache `scripts/ensure-tursodb.ts` populates:
+/// the executor's (`CAIRN_TOOL_CACHE`), then `tool-cache` under `CAIRN_HOME` and
+/// under the default `~/.cairn`. All are checked because a run may set
+/// `CAIRN_HOME` elsewhere while the cache was built against the default home.
 ///
 /// Machine-level rather than per-worktree on purpose: building tursodb from the
 /// pinned turso revision costs minutes, and every build slot would repeat it.
 fn cached_tursodb_roots() -> Vec<PathBuf> {
-    let mut homes = Vec::new();
+    let mut roots = Vec::new();
+    if let Some(cache) = std::env::var_os("CAIRN_TOOL_CACHE") {
+        roots.push(PathBuf::from(cache));
+    }
     if let Some(home) = std::env::var_os("CAIRN_HOME") {
-        homes.push(PathBuf::from(home));
+        roots.push(PathBuf::from(home).join("tool-cache"));
     }
     if let Some(home) = dirs::home_dir() {
-        homes.push(home.join(".cairn"));
+        roots.push(home.join(".cairn").join("tool-cache"));
     }
-    homes
-        .into_iter()
-        .map(|home| home.join("tools").join("tursodb"))
-        .collect()
+    roots.into_iter().map(|root| root.join("tursodb")).collect()
 }
 
 fn tursodb_exe() -> &'static str {
@@ -272,24 +272,34 @@ fn tursodb_exe() -> &'static str {
     }
 }
 
-/// The revision recorded beside a cached binary by the provisioner that built it.
-fn stamped_rev(root: &Path) -> Option<String> {
-    std::fs::read_to_string(root.join(".turso-rev"))
-        .ok()
-        .map(|stamp| stamp.trim().to_string())
-}
-
-/// Whether a cache stamped `stamp` may be used for the pinned revision `pinned`.
+/// The binary a cache root holds for the pinned revision, or `None` when the pin
+/// cannot be parsed.
 ///
-/// This check is the entire reason the stamp exists, and running the binary is no
+/// The provisioner keys each build by the revision it came from
+/// (`<root>/<rev>/bin/tursodb`) and publishes a revision's directory whole, so
+/// looking up the pinned key IS the revision check, and running the binary is no
 /// substitute for it: `tursodb --version` reports the release line
 /// (`0.7.0-pre.10`), which is IDENTICAL across every git revision sharing it. So
-/// [`runs`] proves a cached binary WORKS, never that it matches the pin. A stale
-/// or unstamped cache is exactly the silent ABI mismatch this design exists to
-/// prevent (CAIRN-2147), so it is refused rather than preferred — including when
-/// the pin itself cannot be parsed, because an unverifiable cache earns no trust.
-fn cache_is_current(stamp: Option<&str>, pinned: Option<&str>) -> bool {
-    matches!((stamp, pinned), (Some(stamp), Some(pinned)) if stamp == pinned)
+/// [`runs`] proves a cached binary WORKS, never that it matches the pin. Another
+/// revision's binary is exactly the silent ABI mismatch this design exists to
+/// prevent (CAIRN-2147), so it is never resolved — and with no parseable pin no
+/// cached binary is, because an unverifiable cache earns no trust.
+fn pinned_bin_in(root: &Path, pinned: Option<&str>) -> Option<PathBuf> {
+    Some(root.join(pinned?).join("bin").join(tursodb_exe()))
+}
+
+/// The revisions a cache root holds builds of, for a report that explains why
+/// none of them was used. Staging directories are dot-prefixed and skipped.
+fn cached_revisions(root: &Path) -> Vec<String> {
+    let mut revisions: Vec<String> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    revisions.sort();
+    revisions
 }
 
 /// Whether `bin` is a working `tursodb`, proved by RUNNING it rather than by
@@ -315,23 +325,21 @@ fn resolve_tursodb() -> Option<PathBuf> {
     }
     let pinned = parse_pinned_rev(DATABASE_MANIFEST);
     for root in cached_tursodb_roots() {
-        let bin = root.join("bin").join(tursodb_exe());
-        if !runs(&bin) {
-            continue;
-        }
-        let stamp = stamped_rev(&root);
-        if cache_is_current(stamp.as_deref(), pinned) {
+        if let Some(bin) = pinned_bin_in(&root, pinned).filter(|bin| runs(bin)) {
             return Some(bin);
         }
-        // Say so rather than silently falling through: a cache that exists but is
-        // wrong is the case a reader most needs explained.
-        eprintln!(
-            "ignoring cached tursodb at {}: built from {}, workspace pins {} — run `bun run \
-             ensure-tursodb` to rebuild it",
-            bin.display(),
-            stamp.as_deref().unwrap_or("an unrecorded revision"),
-            pinned.unwrap_or("an unparseable revision"),
-        );
+        // Say so rather than silently falling through: a cache that exists but
+        // holds only other revisions is the case a reader most needs explained.
+        let held = cached_revisions(&root);
+        if !held.is_empty() {
+            eprintln!(
+                "ignoring cached tursodb under {}: it holds {}, workspace pins {} — run `bun run \
+                 ensure-tursodb` to build it",
+                root.display(),
+                held.join(", "),
+                pinned.unwrap_or("an unparseable revision"),
+            );
+        }
     }
     runs(Path::new("tursodb")).then(|| PathBuf::from("tursodb"))
 }
@@ -381,7 +389,7 @@ pub fn wait_until_listening(addr: &str) -> Option<()> {
 /// Guards the revision check that keeps a stale machine-wide cache from feeding
 /// this suite a wrong-ABI `tursodb`. The cache outlives any one worktree, so
 /// after a pin bump the previous revision's binary is still sitting there,
-/// working and reporting the same `--version` — undetectable without the stamp.
+/// working and reporting the same `--version` — undetectable without its key.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,35 +418,51 @@ mod tests {
     }
 
     #[test]
-    fn a_cache_stamped_with_the_pinned_revision_is_current() {
+    fn the_pinned_revision_is_looked_up_under_its_own_key() {
         let pinned = "a".repeat(40);
-        assert!(cache_is_current(Some(&pinned), Some(&pinned)));
+        assert_eq!(
+            pinned_bin_in(Path::new("/cache/tursodb"), Some(&pinned)),
+            Some(
+                Path::new("/cache/tursodb")
+                    .join(&pinned)
+                    .join("bin")
+                    .join(tursodb_exe())
+            )
+        );
     }
 
     #[test]
-    fn a_cache_stamped_with_another_revision_is_refused() {
-        // The pin-bump case: the binary runs and reports the same release line,
-        // so only the stamp distinguishes it.
-        let stale = "a".repeat(40);
-        let pinned = "b".repeat(40);
-        assert!(!cache_is_current(Some(&stale), Some(&pinned)));
+    fn another_revisions_binary_is_never_resolved_for_the_pin() {
+        // The pin-bump case: the old binary runs and reports the same release
+        // line, so only its key distinguishes it.
+        let root = tempdir().unwrap();
+        let stale = root
+            .path()
+            .join("a".repeat(40))
+            .join("bin")
+            .join(tursodb_exe());
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, "").unwrap();
+        let resolved = pinned_bin_in(root.path(), Some(&"b".repeat(40))).unwrap();
+        assert_ne!(resolved, stale);
+        assert!(!resolved.exists());
     }
 
     #[test]
-    fn an_unstamped_cache_is_refused_rather_than_assumed_current() {
-        assert!(!cache_is_current(None, Some(&"a".repeat(40))));
+    fn no_cached_binary_is_resolved_when_the_pin_cannot_be_parsed() {
+        assert_eq!(pinned_bin_in(Path::new("/cache/tursodb"), None), None);
     }
 
     #[test]
-    fn a_cache_is_refused_when_the_pin_cannot_be_parsed() {
-        assert!(!cache_is_current(Some(&"a".repeat(40)), None));
-    }
-
-    #[test]
-    fn a_missing_stamp_file_reads_as_no_stamp_and_a_written_one_is_trimmed() {
-        let dir = tempdir().unwrap();
-        assert_eq!(stamped_rev(dir.path()), None);
-        std::fs::write(dir.path().join(".turso-rev"), "  abc123\n").unwrap();
-        assert_eq!(stamped_rev(dir.path()).as_deref(), Some("abc123"));
+    fn the_report_lists_published_revisions_and_skips_staging() {
+        let root = tempdir().unwrap();
+        assert!(cached_revisions(root.path()).is_empty());
+        for name in ["b".repeat(40), "a".repeat(40), ".staging-x-1".into()] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+        }
+        assert_eq!(
+            cached_revisions(root.path()),
+            vec!["a".repeat(40), "b".repeat(40)]
+        );
     }
 }

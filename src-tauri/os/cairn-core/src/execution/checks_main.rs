@@ -12,9 +12,14 @@
 //! Scheduling is coalesced per project and never preemptive. A whole-suite run
 //! takes most of an hour while merges land every few minutes, so a newer tip
 //! never cancels the run in flight; it queues at most one more pass, which
-//! attests whatever the tip is when that pass starts. A heartbeat re-arms every
-//! project on a fixed interval, so a tip that never got a complete row is
-//! retried and a lane that has gone quiet says so.
+//! attests whatever the tip is when that pass starts. The runner arms every
+//! project at boot ([`arm_at_boot`]), and a heartbeat re-arms every project on
+//! a fixed interval, so a tip that never got a complete row is retried and a
+//! lane that has gone quiet says so.
+//!
+//! A pass the runner's own restart cuts short is neither a death nor a failure:
+//! it is announced as **cancelled by restart**, recorded, and cited by the pass
+//! the next boot arms, so a restart never leaves main with no pass at all.
 //!
 //! A lane that does not produce a complete per-test verdict is announced louder
 //! than any red, with its cause class: **death** (the lane died: placement,
@@ -50,6 +55,12 @@ use crate::storage::{LocalDb, RowExt};
 
 /// A burst of merges settles into one pass.
 const SETTLE_WINDOW: Duration = Duration::from_secs(10);
+/// How long a boot pass waits before its first lane: the runner's boot grace.
+/// A restart closes every executor link, and placement refuses a lane outright
+/// when no machine for its platform is attached and none is known to be
+/// restoring, so a pass that started sooner would announce a death for a
+/// machine that was only reconnecting.
+const BOOT_SETTLE_WINDOW: Duration = Duration::from_secs(60);
 /// How often every project is re-armed without a merge.
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(6 * 60 * 60);
 /// The name cadence messages are sent under.
@@ -97,6 +108,39 @@ struct CadencePass {
     queued: Option<Trigger>,
 }
 
+/// A lane pass the runner's own restart cancelled: recorded as the runner
+/// stops, read back at boot, and cited by the pass that re-arms the lane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Interruption {
+    pub(crate) check: String,
+    pub(crate) platform: String,
+    /// The tip the cancelled pass was attesting.
+    pub(crate) commit: String,
+    pub(crate) stopped_at_unix_ms: i64,
+}
+
+impl Interruption {
+    /// The lane and what happened to it, as a clause.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "{} on {}, whose pass on `{}` the runner restart at {} cancelled",
+            self.check,
+            self.platform,
+            short_commit(&self.commit),
+            stamp(self.stopped_at_unix_ms)
+        )
+    }
+}
+
+/// The cadence pass armed for a project right now.
+pub(crate) struct InFlight {
+    pub(crate) branch: String,
+    pub(crate) armed_at_unix_ms: i64,
+    /// The lanes whose passes the last restart cancelled and which this pass
+    /// re-arms, until each lane reports.
+    pub(crate) rearming: Vec<Interruption>,
+}
+
 /// The per-project cadence slot: one pass in flight, at most one queued.
 #[derive(Default)]
 pub(crate) struct CadenceSlots {
@@ -107,6 +151,12 @@ pub(crate) struct CadenceSlots {
     /// Per project, the tip whose checks contract could not be read: one
     /// outcome per tip, announced once and not read again until the tip moves.
     unreadable_contracts: HashMap<String, String>,
+    /// Per project, the lanes the last restart cancelled that no pass has
+    /// reported on since; see [`arm_at_boot`].
+    interrupted: HashMap<String, Vec<Interruption>>,
+    /// Whether the startup default-advance catch-up has observed origin. Until
+    /// it has, a pass must not fetch; see [`run_pass`].
+    origin_observed: bool,
 }
 
 impl CadenceSlots {
@@ -135,6 +185,29 @@ impl CadenceSlots {
             self.unreadable_contracts
                 .insert(project_id.to_string(), commit.to_string());
         }
+    }
+
+    /// Hold `interruption` for the next pass to cite. A lane holds one: a later
+    /// cancel replaces an earlier one nothing cited.
+    fn interrupted(&mut self, project_id: &str, interruption: Interruption) {
+        let lanes = self.interrupted.entry(project_id.to_string()).or_default();
+        lanes.retain(|held| {
+            held.check != interruption.check || held.platform != interruption.platform
+        });
+        lanes.push(interruption);
+    }
+
+    /// Take the restart citation `lane` holds, once.
+    fn take_interruption(&mut self, project_id: &str, lane: &CadenceLane) -> Option<Interruption> {
+        let lanes = self.interrupted.get_mut(project_id)?;
+        let index = lanes
+            .iter()
+            .position(|held| held.check == lane.check && held.platform == lane.platform)?;
+        let taken = lanes.remove(index);
+        if lanes.is_empty() {
+            self.interrupted.remove(project_id);
+        }
+        Some(taken)
     }
 
     /// Ask for a pass. Returns `true` when the caller must start one; otherwise
@@ -170,22 +243,32 @@ impl CadenceSlots {
             }
             None => {
                 self.passes.remove(project_id);
+                // Every lane the pass ran has reported or was covered, so a
+                // citation still held names a lane the tip no longer declares.
+                self.interrupted.remove(project_id);
                 None
             }
         }
     }
 
-    fn in_flight(&self, project_id: &str) -> Option<(String, i64)> {
-        self.passes
-            .get(project_id)
-            .map(|pass| (pass.branch.clone(), pass.armed_at_unix_ms))
+    fn in_flight(&self, project_id: &str) -> Option<InFlight> {
+        self.passes.get(project_id).map(|pass| InFlight {
+            branch: pass.branch.clone(),
+            armed_at_unix_ms: pass.armed_at_unix_ms,
+            rearming: self
+                .interrupted
+                .get(project_id)
+                .cloned()
+                .unwrap_or_default(),
+        })
     }
 }
 
-/// The cadence pass running for `project_id` right now, if any: the branch it
-/// attests and when it was armed. While it runs the store holds no row for the
-/// new tip, so this is what tells "pending" from "never ran" (CAIRN-3823).
-pub(crate) fn in_flight(orch: &Orchestrator, project_id: &str) -> Option<(String, i64)> {
+/// The cadence pass armed for `project_id` right now, if any: the branch it
+/// attests, when it was armed, and the restart-cancelled passes it re-arms.
+/// While it runs the store holds no row for the new tip, so this is what tells
+/// "pending" from "never ran" (CAIRN-3823).
+pub(crate) fn in_flight(orch: &Orchestrator, project_id: &str) -> Option<InFlight> {
     orch.main_cadence.lock().unwrap().in_flight(project_id)
 }
 
@@ -211,7 +294,12 @@ pub(crate) fn spawn(
     tokio::spawn(async move {
         let mut trigger = trigger;
         loop {
-            tokio::time::sleep(SETTLE_WINDOW).await;
+            let settle = if trigger == Trigger::Startup {
+                BOOT_SETTLE_WINDOW
+            } else {
+                SETTLE_WINDOW
+            };
+            tokio::time::sleep(settle).await;
             // Supervised, so a panicking pass still releases the slot and is
             // announced rather than holding the project's cadence forever.
             let pass =
@@ -269,8 +357,48 @@ pub(crate) async fn spawn_all_current(orch: &Orchestrator, trigger: Trigger) {
     }
 }
 
+/// The boot repair edge: arm every project at once and start the heartbeat.
+///
+/// Runs as the runner comes up, not behind its gated maintenance. Behind it,
+/// the arm waited on the startup default-advance catch-up, which rebases every
+/// in-flight branch and took 11.6 minutes after the 10-28 restart: for that
+/// whole window main had no pass in flight or queued, and the pass the restart
+/// cancelled had no successor (cairn/5441). Arming is idempotent: requests
+/// during a pass fold into its one queued successor, and a lane whose inputs a
+/// complete row already covers is not re-run. A hand baseline already running
+/// on the same inputs is joined by the fleet's coalescing, not run twice.
+pub(crate) async fn arm_at_boot(orch: &Orchestrator) {
+    match take_interruptions(&orch.db.local).await {
+        Ok(interrupted) => {
+            let mut slots = orch.main_cadence.lock().unwrap();
+            for (project_id, interruption) in interrupted {
+                log::info!(
+                    "main cadence for project {project_id}: re-arming {}",
+                    interruption.describe()
+                );
+                slots.interrupted(&project_id, interruption);
+            }
+        }
+        Err(error) => log::warn!(
+            "main cadence: could not read back the passes the last restart cancelled, so the boot pass will not cite them: {error}"
+        ),
+    }
+    spawn_all_current(orch, Trigger::Startup).await;
+    spawn_heartbeat(orch);
+}
+
+/// The startup default-advance catch-up has observed origin and reconciled any
+/// advance that landed while the runner was down. From here a pass may fetch,
+/// and every project is armed again for the tip the catch-up saw: a pass
+/// already armed takes it as its queued successor, which finds its lanes
+/// covered unless the tip moved.
+pub(crate) async fn origin_observed(orch: &Orchestrator) {
+    orch.main_cadence.lock().unwrap().origin_observed = true;
+    spawn_all_current(orch, Trigger::Startup).await;
+}
+
 /// Re-arm every project every [`HEARTBEAT`]. The first tick waits a full
-/// interval: launch already armed every project.
+/// interval: boot already armed every project.
 pub(crate) fn spawn_heartbeat(orch: &Orchestrator) {
     let orch = orch.clone();
     tokio::spawn(async move {
@@ -335,9 +463,22 @@ async fn run_pass(
         .await
         .map_err(|error| error.to_string())?;
     let repo_root = PathBuf::from(repo_path);
+    // Until the startup catch-up has observed origin, a fetch here would move
+    // `<branch>@origin` under it. The catch-up reads that ref before and after
+    // its own fetch to find an advance that landed while the runner was down,
+    // and would read the moved ref as no advance, leaving every in-flight
+    // branch on the old base. So an early pass attests the store's current
+    // head, and the catch-up re-arms the cadence once it has looked.
+    let may_fetch = orch.main_cadence.lock().unwrap().origin_observed;
     // A stale store attests a stale tip, which its row names honestly; a pass
     // that gave up here would attest nothing at all.
-    if let Err(error) = refresh_default_branch(orch, project_id, &repo_root, default_branch).await {
+    if !may_fetch {
+        log::info!(
+            "main cadence for project {project_id}: the startup catch-up has not observed origin yet; attesting the store's current {default_branch} without fetching"
+        );
+    } else if let Err(error) =
+        refresh_default_branch(orch, project_id, &repo_root, default_branch).await
+    {
         log::warn!(
             "main cadence for project {project_id}: {error}; attesting the store's current {default_branch}"
         );
@@ -492,11 +633,25 @@ async fn run_lane(
 ) {
     match attempt_lane(orch, db.clone(), context, lane).await {
         LaneAttempt::Covered(row) => {
+            let rearmed = orch
+                .main_cadence
+                .lock()
+                .unwrap()
+                .take_interruption(context.project_id, lane);
+            if let Some(interruption) = rearmed {
+                log::info!(
+                    "main cadence: {} is answered by {}, which already covers `{}`",
+                    interruption.describe(),
+                    row.reference,
+                    short_commit(context.commit)
+                );
+            }
             if context.trigger == Trigger::Heartbeat {
                 announce_quiet_lane(orch, &db, context, lane, &row).await;
             }
         }
         LaneAttempt::Verdict(verdict) => {
+            let verdict = cancelled_by_restart(verdict, orch.fleet.runner_stopping_since());
             if matches!(verdict, CadenceVerdict::Death { .. }) {
                 rearm_on_debt_settlement(orch, context, lane);
             }
@@ -724,6 +879,32 @@ async fn report_lane(
         }
         _ => Bracket::default(),
     };
+    let rearmed = orch
+        .main_cadence
+        .lock()
+        .unwrap()
+        .take_interruption(project_id, lane);
+    if let (
+        CadenceVerdict::Cancelled {
+            stopped_at_unix_ms, ..
+        },
+        Some(commit),
+    ) = (&verdict, commit)
+    {
+        let interruption = Interruption {
+            check: lane.check.clone(),
+            platform: lane.platform.clone(),
+            commit: commit.to_string(),
+            stopped_at_unix_ms: *stopped_at_unix_ms,
+        };
+        if let Err(error) = record_interruption(&orch.db.local, project_id, &interruption).await {
+            log::warn!(
+                "main cadence {} on {}: could not record that the restart cancelled this lane, so the boot pass will not cite it: {error}",
+                lane.check,
+                lane.platform
+            );
+        }
+    }
     let content = render_report(&CadenceReport {
         check: &lane.check,
         platform: &lane.platform,
@@ -732,15 +913,18 @@ async fn report_lane(
         comparison: &comparison,
         bracket: &bracket,
         now_ms: now_ms(),
+        rearmed: rearmed.as_ref(),
     });
-    if verdict.is_complete() {
-        log::info!(
+    match &verdict {
+        CadenceVerdict::Complete(_) => log::info!(
             "main cadence {} on {}: row recorded",
             lane.check,
             lane.platform
-        );
-    } else {
-        log::error!("{content}");
+        ),
+        CadenceVerdict::Cancelled { .. } => log::info!("{content}"),
+        CadenceVerdict::NoVerdict { .. } | CadenceVerdict::Death { .. } => {
+            log::error!("{content}")
+        }
     }
     deliver(orch, db, project_id, &lane.notify, &content).await;
 }
@@ -808,9 +992,12 @@ async fn announce_pass_failure(
             None,
             &lane,
             None,
-            CadenceVerdict::Death {
-                cause: format!("the cadence pass failed before this lane could run: {cause}"),
-            },
+            cancelled_by_restart(
+                CadenceVerdict::Death {
+                    cause: format!("the cadence pass failed before this lane could run: {cause}"),
+                },
+                orch.fleet.runner_stopping_since(),
+            ),
         )
         .await;
     }
@@ -935,6 +1122,12 @@ pub(crate) enum CadenceVerdict {
     },
     /// The lane died before producing a result.
     Death { cause: String },
+    /// The runner began stopping while the lane ran, and the lane ended
+    /// without a result: see [`cancelled_by_restart`].
+    Cancelled {
+        cause: String,
+        stopped_at_unix_ms: i64,
+    },
 }
 
 impl CadenceVerdict {
@@ -942,7 +1135,7 @@ impl CadenceVerdict {
         match self {
             CadenceVerdict::Complete(row) => Some(row),
             CadenceVerdict::NoVerdict { row, .. } => row.as_ref(),
-            CadenceVerdict::Death { .. } => None,
+            CadenceVerdict::Death { .. } | CadenceVerdict::Cancelled { .. } => None,
         }
     }
     fn is_complete(&self) -> bool {
@@ -980,6 +1173,79 @@ fn classify_row(row: CadenceRow) -> CadenceVerdict {
         },
         None => CadenceVerdict::Complete(row),
     }
+}
+
+/// A lane that ended without a result while this runner was stopping was
+/// ended by the restart, whatever shape the ending took on the way out: the
+/// fleet answers a claim the stop interrupted as cancelled, and a pass cut
+/// short fails before its lanes. Neither judged the tree or a machine, and
+/// announcing one as a death sent readers looking for a machine fault that was
+/// a deploy. A result with a row is the tree's answer, stop or no stop.
+fn cancelled_by_restart(verdict: CadenceVerdict, stopping_since: Option<u64>) -> CadenceVerdict {
+    let Some(stopped_at) = stopping_since else {
+        return verdict;
+    };
+    match verdict {
+        CadenceVerdict::Death { cause } | CadenceVerdict::NoVerdict { row: None, cause } => {
+            CadenceVerdict::Cancelled {
+                cause,
+                stopped_at_unix_ms: i64::try_from(stopped_at).unwrap_or(i64::MAX),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Record a lane pass the restart cancelled, for the next boot to cite.
+async fn record_interruption(
+    db: &LocalDb,
+    project_id: &str,
+    interruption: &Interruption,
+) -> Result<(), String> {
+    db.execute(
+        "INSERT OR REPLACE INTO main_cadence_interruptions
+           (project_id, check_name, platform, commit_sha, stopped_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        (
+            project_id,
+            interruption.check.as_str(),
+            interruption.platform.as_str(),
+            interruption.commit.as_str(),
+            interruption.stopped_at_unix_ms,
+        ),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+/// Every recorded restart cancel, removed as it is read: one boot cites each.
+async fn take_interruptions(db: &LocalDb) -> Result<Vec<(String, Interruption)>, String> {
+    let interrupted = db
+        .query_all(
+            "SELECT project_id, check_name, platform, commit_sha, stopped_at
+               FROM main_cadence_interruptions",
+            (),
+            |row| {
+                Ok((
+                    row.text(0)?,
+                    Interruption {
+                        check: row.text(1)?,
+                        platform: row.text(2)?,
+                        commit: row.text(3)?,
+                        stopped_at_unix_ms: row.i64(4)?,
+                    },
+                ))
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if !interrupted.is_empty() {
+        db.execute("DELETE FROM main_cadence_interruptions", ())
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(interrupted)
 }
 
 /// Resolves a recorded executor identity to its public name.
@@ -1610,10 +1876,17 @@ pub(crate) struct CadenceReport<'a> {
     pub(crate) comparison: &'a Comparison,
     pub(crate) bracket: &'a Bracket,
     pub(crate) now_ms: i64,
+    /// The pass the runner's restart cancelled on this lane, when this one is
+    /// the boot re-arm that succeeds it.
+    pub(crate) rearmed: Option<&'a Interruption>,
 }
 
 fn short_commit(commit: &str) -> &str {
     commit.get(..12).unwrap_or(commit)
+}
+
+fn stamp(unix_ms: i64) -> String {
+    crate::fleet::purpose::stamp(u64::try_from(unix_ms).unwrap_or(0))
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -2202,26 +2475,50 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
     }
 }
 
+/// Why a lane posted no complete row.
+#[derive(Clone, Copy)]
+enum Unobserved {
+    Death,
+    NoVerdict,
+    Restart { stopped_at_unix_ms: i64 },
+}
+
 fn render_incomplete(
     out: &mut String,
     report: &CadenceReport<'_>,
     row: Option<&CadenceRow>,
     cause: &str,
-    death: bool,
+    class: Unobserved,
 ) {
     let tip = report
         .commit
         .or(row.map(|row| row.commit.as_str()))
         .map(|commit| format!(" · `{}`", short_commit(commit)))
         .unwrap_or_default();
-    out.push_str(&format!(
-        "🚨 **MAIN CADENCE DID NOT COMPLETE · {} · {}{tip}** — main is unobserved for {} on {} until a cadence row completes.\n\n",
-        report.check, report.platform, report.check, report.platform
-    ));
-    if death {
-        out.push_str("- Cause class: **death** — the lane died before it produced a result (the execution side of the seam: no machine, capacity, infrastructure, a stalled or killed run).\n");
-    } else {
-        out.push_str("- Cause class: **no-verdict** — the lane ran to an exit, but its result is not a per-test verdict (the testing side of the seam: a test target that did not compile, zero tests, an incomplete enumeration). It is not green.\n");
+    match class {
+        Unobserved::Restart { stopped_at_unix_ms } => {
+            out.push_str(&format!(
+                "⏸️ **MAIN CADENCE PASS CANCELLED BY RESTART · {} · {}{tip}** — the runner began stopping at {} while this lane ran. Main stays unobserved for {} on {} until the pass the runner arms at boot completes.\n\n",
+                report.check,
+                report.platform,
+                stamp(stopped_at_unix_ms),
+                report.check,
+                report.platform
+            ));
+            out.push_str("- Cause class: **cancelled by restart** — Cairn's own runner stopped mid-pass. Nothing died and nothing failed: neither the tree nor a machine was judged, and no row was recorded.\n");
+            out.push_str("- Re-arm: at boot the runner arms this lane again for whatever main is then, and that pass's report cites this one.\n");
+        }
+        Unobserved::Death | Unobserved::NoVerdict => {
+            out.push_str(&format!(
+                "🚨 **MAIN CADENCE DID NOT COMPLETE · {} · {}{tip}** — main is unobserved for {} on {} until a cadence row completes.\n\n",
+                report.check, report.platform, report.check, report.platform
+            ));
+            if matches!(class, Unobserved::Death) {
+                out.push_str("- Cause class: **death** — the lane died before it produced a result (the execution side of the seam: no machine, capacity, infrastructure, a stalled or killed run).\n");
+            } else {
+                out.push_str("- Cause class: **no-verdict** — the lane ran to an exit, but its result is not a per-test verdict (the testing side of the seam: a test target that did not compile, zero tests, an incomplete enumeration). It is not green.\n");
+            }
+        }
     }
     out.push_str(&format!("- Cause: {cause}\n"));
     if let Some(row) = row {
@@ -2301,15 +2598,33 @@ pub(crate) fn render_report(report: &CadenceReport<'_>) -> String {
             report,
             row.as_ref(),
             &truncate(cause, MAX_CAUSE_CHARS),
-            false,
+            Unobserved::NoVerdict,
         ),
         CadenceVerdict::Death { cause } => render_incomplete(
             &mut out,
             report,
             None,
             &truncate(cause, MAX_CAUSE_CHARS),
-            true,
+            Unobserved::Death,
         ),
+        CadenceVerdict::Cancelled {
+            cause,
+            stopped_at_unix_ms,
+        } => render_incomplete(
+            &mut out,
+            report,
+            None,
+            &truncate(cause, MAX_CAUSE_CHARS),
+            Unobserved::Restart {
+                stopped_at_unix_ms: *stopped_at_unix_ms,
+            },
+        ),
+    }
+    if let Some(interruption) = report.rearmed {
+        out.push_str(&format!(
+            "\n- Re-armed at boot: this pass succeeds {}.\n",
+            interruption.describe()
+        ));
     }
     out
 }
@@ -2396,14 +2711,22 @@ mod tests {
             comparison,
             bracket,
             now_ms: 10 * HOUR,
+            rearmed: None,
         })
+    }
+
+    /// The armed pass's branch and arming instant.
+    fn armed(slots: &CadenceSlots, project_id: &str) -> Option<(String, i64)> {
+        slots
+            .in_flight(project_id)
+            .map(|pass| (pass.branch, pass.armed_at_unix_ms))
     }
 
     #[test]
     fn requests_during_a_pass_coalesce_into_one_queued_successor() {
         let mut slots = CadenceSlots::default();
         assert!(slots.request("p", "main", Trigger::Startup, 1));
-        assert_eq!(slots.in_flight("p"), Some(("main".to_string(), 1)));
+        assert_eq!(armed(&slots, "p"), Some(("main".to_string(), 1)));
         // Three merges and a heartbeat while the first pass runs: no second
         // pass starts, and exactly one successor is owed.
         assert!(!slots.request("p", "main", Trigger::Heartbeat, 2));
@@ -2415,13 +2738,13 @@ mod tests {
             Some(Trigger::Merge),
             "the strongest reason is kept"
         );
-        assert_eq!(slots.in_flight("p"), Some(("main".to_string(), 6)));
+        assert_eq!(armed(&slots, "p"), Some(("main".to_string(), 6)));
         assert_eq!(
             slots.finish("p", 7),
             None,
             "one successor, never one per merge"
         );
-        assert_eq!(slots.in_flight("p"), None);
+        assert_eq!(armed(&slots, "p"), None);
         assert!(
             slots.request("p", "main", Trigger::Merge, 8),
             "a released slot starts afresh"
@@ -2539,6 +2862,175 @@ mod tests {
         assert_eq!(
             tip_lanes(&slots, "rs", "tip-1", no_config).await,
             Ok(Vec::new())
+        );
+    }
+
+    /// Testing's specimen (cairn/5441): the 15:48 rebuild cancelled the pass on
+    /// 5027f547 while merges had moved main to 7e1b2a9a, and after boot nothing
+    /// was armed. A pass binds no tip and resolves main only when it starts, so
+    /// the boot pass attests wherever main moved to. What must hold is that the
+    /// restart leaves exactly one armed pass, citing the cancelled one, however
+    /// many arms the boot, its catch-up, and the merges around them make.
+    #[tokio::test]
+    async fn a_pass_the_restart_cancelled_is_rearmed_exactly_once_at_boot_and_cited() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open_migrated_for_test(temp.path().join("cadence.db"))
+            .await
+            .unwrap();
+        let lane = CadenceLane {
+            check: "rust-tests".into(),
+            platform: "linux".into(),
+            notify: "testing".into(),
+        };
+
+        // Before the restart: a pass on the old tip, a merge queued behind it,
+        // and the stop ending its lane.
+        let mut before = CadenceSlots::default();
+        assert!(before.request("p", "main", Trigger::Merge, 1));
+        assert!(!before.request("p", "main", Trigger::Merge, 2));
+        let stopped_at = 3 * HOUR;
+        let ended = cancelled_by_restart(
+            CadenceVerdict::Death {
+                cause: "infrastructure: Cairn cancelled this check before it produced a verdict: Cairn's runner is stopping.".into(),
+            },
+            Some(stopped_at as u64),
+        );
+        assert!(
+            matches!(ended, CadenceVerdict::Cancelled { stopped_at_unix_ms, .. } if stopped_at_unix_ms == stopped_at),
+            "{ended:?}"
+        );
+        let cancelled = Interruption {
+            check: lane.check.clone(),
+            platform: lane.platform.clone(),
+            commit: "5027f5473a57a1b2".into(),
+            stopped_at_unix_ms: stopped_at,
+        };
+        record_interruption(&db, "p", &cancelled).await.unwrap();
+        // The process ends, and its slots, queued successor included, with it.
+        drop(before);
+
+        // Boot: a fresh process reads back what the restart cancelled, and arms.
+        let mut slots = CadenceSlots::default();
+        assert!(
+            slots.in_flight("p").is_none(),
+            "no pass survives the restart in memory"
+        );
+        for (project_id, interruption) in take_interruptions(&db).await.unwrap() {
+            slots.interrupted(&project_id, interruption);
+        }
+        assert!(
+            slots.request("p", "main", Trigger::Startup, 4),
+            "the boot arm starts a pass"
+        );
+        // The catch-up's re-arm and a merge seen during the boot pass are one
+        // queued successor, not more passes.
+        assert!(!slots.request("p", "main", Trigger::Startup, 5));
+        assert!(!slots.request("p", "main", Trigger::Merge, 6));
+        let armed = slots
+            .in_flight("p")
+            .expect("main has a pass armed after boot");
+        assert_eq!(armed.armed_at_unix_ms, 4);
+        assert_eq!(
+            armed.rearming,
+            vec![cancelled.clone()],
+            "the armed pass names the pass it re-arms"
+        );
+        assert!(
+            take_interruptions(&db).await.unwrap().is_empty(),
+            "one boot cites a cancel, not every boot"
+        );
+
+        // The lane's report on the moved tip cites the cancelled pass, once.
+        let cited = slots
+            .take_interruption("p", &lane)
+            .expect("the lane's first report takes the citation");
+        assert!(slots.take_interruption("p", &lane).is_none());
+        let moved = row(
+            "r",
+            "7e1b2a9a1d6bc3d4",
+            5 * HOUR,
+            &[("t", TestOutcome::Passed)],
+        );
+        let message = render_report(&CadenceReport {
+            check: "rust-tests",
+            platform: "linux",
+            commit: Some("7e1b2a9a1d6bc3d4"),
+            verdict: &CadenceVerdict::Complete(moved),
+            comparison: &Comparison::Baseline,
+            bracket: &Bracket::default(),
+            now_ms: 10 * HOUR,
+            rearmed: Some(&cited),
+        });
+        assert!(
+            message.contains("Re-armed at boot") && message.contains("`5027f5473a57`"),
+            "{message}"
+        );
+
+        assert_eq!(slots.finish("p", 7), Some(Trigger::Merge));
+        assert_eq!(slots.finish("p", 8), None);
+        assert!(slots.in_flight("p").is_none());
+    }
+
+    #[test]
+    fn a_lane_ended_by_the_restart_reads_as_cancelled_never_as_a_death() {
+        let death = CadenceVerdict::Death {
+            cause: "infrastructure: Cairn cancelled this check before it produced a verdict: Cairn's runner is stopping.".into(),
+        };
+        assert!(
+            matches!(
+                cancelled_by_restart(death.clone(), None),
+                CadenceVerdict::Death { .. }
+            ),
+            "without a stop, a death is a death"
+        );
+        assert!(matches!(
+            cancelled_by_restart(
+                CadenceVerdict::NoVerdict {
+                    row: None,
+                    cause: "lost".into()
+                },
+                Some(1)
+            ),
+            CadenceVerdict::Cancelled { .. }
+        ));
+        let complete = CadenceVerdict::Complete(row("r", "c", HOUR, &[("t", TestOutcome::Passed)]));
+        assert!(
+            matches!(
+                cancelled_by_restart(complete, Some(1)),
+                CadenceVerdict::Complete(_)
+            ),
+            "a row is the tree's answer, stop or no stop"
+        );
+
+        let cancelled = cancelled_by_restart(death, Some(9 * HOUR as u64));
+        let message = report(&cancelled, &Comparison::Baseline, &Bracket::default());
+        assert!(message.contains("CANCELLED BY RESTART"), "{message}");
+        assert!(message.contains("**cancelled by restart**"), "{message}");
+        assert!(
+            !message.contains("DID NOT COMPLETE") && !message.contains("**death**"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_citation_no_lane_took_ends_with_its_pass() {
+        let mut slots = CadenceSlots::default();
+        slots.interrupted(
+            "p",
+            Interruption {
+                check: "retired-check".into(),
+                platform: "linux".into(),
+                commit: "c".into(),
+                stopped_at_unix_ms: 1,
+            },
+        );
+        assert!(slots.request("p", "main", Trigger::Startup, 2));
+        assert_eq!(slots.in_flight("p").unwrap().rearming.len(), 1);
+        assert_eq!(slots.finish("p", 3), None);
+        assert!(slots.request("p", "main", Trigger::Merge, 4));
+        assert!(
+            slots.in_flight("p").unwrap().rearming.is_empty(),
+            "a lane the tip no longer declares is not re-armed forever"
         );
     }
 

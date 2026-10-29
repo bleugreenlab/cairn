@@ -2588,6 +2588,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "integrity_sweep_state",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // A main-cadence lane pass this runner's own restart cancelled, held only
+    // until the next boot's re-arm cites it.
+    (
+        "main_cadence_interruptions",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     (
         "pending_injections",
         TableScope::Private(PrivateReason::RunnerTransient),

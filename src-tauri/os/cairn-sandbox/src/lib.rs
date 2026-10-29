@@ -31,6 +31,7 @@ pub mod macos;
 mod nested;
 pub mod operator_credential;
 mod setuid_refusal;
+mod write_refusal;
 
 pub use nested::check_lane_nested_sandbox_evidence;
 pub use operator_credential::{
@@ -38,6 +39,7 @@ pub use operator_credential::{
     OperatorCredentialFloor, OPERATOR_CREDENTIAL_REFUSAL,
 };
 pub use setuid_refusal::setuid_refusal_note;
+pub use write_refusal::out_of_bounds_write_note;
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -584,9 +586,36 @@ pub fn default_writable_extra() -> Vec<PathBuf> {
     // first spawn of a fresh install writes there, and an absent path is inert
     // in the generated rules.
     dirs.push(cairn_common::scratch::scratch_root());
+    // The executor's tool cache, where a project's setup caches the tools it
+    // builds for itself (the pinned `tursodb`). Existence-filtered like the uv
+    // cache: the executor creates it before every spawn.
+    dirs.extend(tool_cache_grant());
     // Cairn's own log directory is deliberately absent; see
     // `the_cairn_log_dir_is_never_writable`.
     dirs
+}
+
+/// The executor's tool cache, when this process was handed one and it exists.
+///
+/// The executor exports `CAIRN_TOOL_CACHE` at bootstrap
+/// (`cairn_common::executor_paths::ExecutorPaths::tool_cache`). Only a
+/// directory carrying that layout's leaf name is accepted, because the grant is
+/// recursive and this function also runs in processes the executor did not
+/// start: a desktop app launched from a shell that happens to export
+/// `CAIRN_TOOL_CACHE=$HOME` must not hand every fenced spawn the home directory.
+pub(crate) fn tool_cache_grant() -> Option<PathBuf> {
+    tool_cache_grant_from(std::env::var_os(
+        cairn_common::executor_paths::TOOL_CACHE_ENV,
+    ))
+}
+
+fn tool_cache_grant_from(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let cache = PathBuf::from(value?);
+    let named = cache.file_name()
+        == Some(std::ffi::OsStr::new(
+            cairn_common::executor_paths::TOOL_CACHE_DIR,
+        ));
+    (named && cache.is_absolute() && cache.is_dir()).then_some(cache)
 }
 
 /// Standard temp directories that must stay writable so the toolchain (cargo,
@@ -1046,6 +1075,43 @@ mod tests {
             .iter()
             .all(|path| !(path.starts_with(&checkout) || checkout.starts_with(path))));
         assert!(policy.readable_paths().contains(&checkout));
+    }
+
+    #[test]
+    fn only_an_existing_absolute_tool_cache_is_granted() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp
+            .path()
+            .join(cairn_common::executor_paths::TOOL_CACHE_DIR);
+        assert_eq!(
+            tool_cache_grant_from(Some(cache.clone().into())),
+            None,
+            "a cache that does not exist yet grants nothing"
+        );
+        std::fs::create_dir(&cache).unwrap();
+        assert_eq!(
+            tool_cache_grant_from(Some(cache.clone().into())),
+            Some(cache)
+        );
+        assert_eq!(tool_cache_grant_from(None), None);
+        assert_eq!(
+            tool_cache_grant_from(Some("tool-cache".into())),
+            None,
+            "a relative value would resolve against each spawn's cwd"
+        );
+    }
+
+    #[test]
+    fn a_tool_cache_variable_naming_another_directory_grants_nothing() {
+        // The variable is read from this process's own environment, which a
+        // desktop app inherits from whatever shell launched it. A home
+        // directory is the case that matters: granting it would hand every
+        // fenced spawn the whole home.
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            tool_cache_grant_from(Some(home.path().as_os_str().to_owned())),
+            None
+        );
     }
 
     #[test]

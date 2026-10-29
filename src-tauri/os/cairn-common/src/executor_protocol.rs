@@ -4874,6 +4874,19 @@ pub struct LearnedResourceEstimate {
 /// log and never cross the link. What a runner gets wrong talking to an older
 /// executor: nothing; it is sent the longer list it already ignores.
 ///
+/// cairn/5443 does not move the number. An executor now keeps a tool cache
+/// under its build root (`ExecutorPaths::tool_cache`), exports it to the
+/// commands it runs as `CAIRN_TOOL_CACHE`, creates it before each spawn, and
+/// grants it to the confined policy it builds for that spawn. When a fenced
+/// command fails on a write outside every scope its cell may write, the
+/// executor appends an explanation naming that scope to the item's output,
+/// beside the setuid note it already appended. The variable and directory are
+/// local to the executor's host and the note is text inside the output field
+/// that already crosses; no frame, field or value changes. What a runner gets
+/// wrong talking to an older executor: nothing it decodes; that executor's
+/// confined cells still cannot write a tool cache, and `ensure-tursodb` says
+/// so by name instead of failing with cargo's bare `Permission denied`.
+///
 /// cairn/5189 moves where an executor's derived state lives behind
 /// `executor_paths::ExecutorPaths`, without a bump. With nothing configured
 /// every path is the one it was, and no frame, field or value changes: the
@@ -5157,6 +5170,12 @@ pub struct LearnedResourceEstimate {
 /// "Next action" line derived from the `CachesOwnerRetained` entry it already
 /// receives. What a runner gets wrong talking to an older executor: nothing;
 /// that executor reclaims less, and reports what it did in the same fields.
+///
+/// cairn/5441 does not move the number. The fleet gains a runner-side read of
+/// the instant this runner began stopping, which the main cadence uses to
+/// announce a lane the restart ended as cancelled rather than dead. Nothing is
+/// sent, and no frame, field or value an executor decodes changes. What a
+/// runner gets wrong talking to an older executor: nothing.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 157;
 
 /// The version `build.rs` derived from the paragraphs above

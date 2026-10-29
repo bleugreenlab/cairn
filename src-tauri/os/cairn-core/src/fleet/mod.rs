@@ -7702,6 +7702,12 @@ impl Fleet {
         }
     }
 
+    /// When this runner began shutting down, if it has. Work that ends after
+    /// this instant was ended by the stop, whatever shape its ending took.
+    pub(crate) fn runner_stopping_since(&self) -> Option<u64> {
+        self.runner_stop.at()
+    }
+
     /// Whether `key` owes anything right now.
     pub(crate) fn purpose_owes(&self, key: &purpose::PurposeKey) -> bool {
         self.purposes.lock().unwrap().pending_retirements(key) > 0

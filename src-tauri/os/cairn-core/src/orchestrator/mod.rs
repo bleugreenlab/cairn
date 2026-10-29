@@ -2621,6 +2621,16 @@ impl Orchestrator {
         });
     }
 
+    /// Arm the main cadence for every project at boot and start its heartbeat.
+    /// Both boot schedules call this outside any maintenance gate; see
+    /// `checks_main::arm_at_boot` for why.
+    pub fn spawn_main_cadence_boot(&self) {
+        let orch = self.clone();
+        tokio::spawn(async move {
+            crate::execution::checks_main::arm_at_boot(&orch).await;
+        });
+    }
+
     /// Reconcile in-flight default-branch workspaces once at startup for remote
     /// advances that landed while the app was closed. Live advances reach the
     /// store through `base_branch_sync`: the GitHub `push` webhook, Cairn's
@@ -2632,11 +2642,7 @@ impl Orchestrator {
         crate::projects::crud::reconcile_project_repositories(&self.db.local).await;
         crate::projects::crud::reconcile_default_branches(&self.db.local).await;
         crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(self).await;
-        crate::execution::checks_main::spawn_all_current(
-            self,
-            crate::execution::checks_main::Trigger::Startup,
-        )
-        .await;
+        crate::execution::checks_main::origin_observed(self).await;
         crate::orchestrator::base_advance::sweep_reconcile_intents(self).await;
     }
 
@@ -2653,12 +2659,7 @@ impl Orchestrator {
 
             crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(&orch)
                 .await;
-            crate::execution::checks_main::spawn_all_current(
-                &orch,
-                crate::execution::checks_main::Trigger::Startup,
-            )
-            .await;
-            crate::execution::checks_main::spawn_heartbeat(&orch);
+            crate::execution::checks_main::origin_observed(&orch).await;
             orch.spawn_reconcile_intent_sweep();
             crate::orchestrator::base_branch_sync::spawn_base_branch_poll(&orch);
         });

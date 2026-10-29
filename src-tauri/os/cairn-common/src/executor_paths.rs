@@ -28,6 +28,12 @@ pub const AUTHORITY_DIR: &str = ".authority";
 pub const MANAGED_OBJECTS_DIR: &str = "managed-objects";
 /// The dependency catalog's directory under the build root.
 pub const DEPENDENCY_CATALOG_DIR: &str = "dependency-catalog";
+/// The tool cache's directory under the build root.
+pub const TOOL_CACHE_DIR: &str = "tool-cache";
+/// The environment variable naming the tool cache to the processes an executor
+/// runs. The confined cell's policy grants exactly the directory it names (see
+/// `cairn_sandbox::default_writable_extra`).
+pub const TOOL_CACHE_ENV: &str = "CAIRN_TOOL_CACHE";
 /// Cache home's directory under a configured build root.
 pub const CACHE_HOME_DIR: &str = "cache-home";
 /// The environment variable naming cache home to processes Cairn launches.
@@ -174,6 +180,19 @@ impl ExecutorPaths {
         self.build_root.join(DEPENDENCY_CATALOG_DIR)
     }
 
+    /// Where tools a project's setup builds for itself are cached machine-wide,
+    /// keyed by the tool and the revision it was built from (for example the
+    /// pinned `tursodb`, `scripts/ensure-tursodb.ts`).
+    ///
+    /// It is the executor's, not the user's: it sits beside the dependency
+    /// catalog rather than in a home-directory cache, so a confined cell can be
+    /// granted it without being granted anything a person or another Cairn
+    /// component keeps there. `<cairn home>/tools`, in particular, holds the
+    /// managed Codex the app runs unconfined.
+    pub fn tool_cache(&self) -> PathBuf {
+        self.build_root.join(TOOL_CACHE_DIR)
+    }
+
     /// Where the external build caches live, or `None` for a home at a
     /// filesystem root, which has nowhere to keep them.
     pub fn cache_home(&self) -> Option<&Path> {
@@ -225,6 +244,7 @@ mod tests {
             paths.dependency_catalog(),
             Path::new("/Users/u/.cairn/dependency-catalog")
         );
+        assert_eq!(paths.tool_cache(), Path::new("/Users/u/.cairn/tool-cache"));
         assert_eq!(paths.cache_home(), Some(Path::new("/Users/u")));
     }
 
@@ -246,6 +266,10 @@ mod tests {
         assert_eq!(
             paths.dependency_catalog(),
             Path::new("/Volumes/Builds/cairn/dependency-catalog")
+        );
+        assert_eq!(
+            paths.tool_cache(),
+            Path::new("/Volumes/Builds/cairn/tool-cache")
         );
         assert_eq!(
             paths.cache_home(),

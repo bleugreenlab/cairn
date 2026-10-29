@@ -1456,18 +1456,23 @@ async fn render_held_executions(
 /// Silent when nothing is running, because then the rows and the cadence's
 /// thread messages already say everything there is to say.
 fn render_main_attestation(orch: &Orchestrator, project_id: &str) -> String {
-    let Some((branch, armed_at_unix_ms)) =
-        crate::execution::checks_main::in_flight(orch, project_id)
-    else {
+    let Some(armed) = crate::execution::checks_main::in_flight(orch, project_id) else {
         return String::new();
     };
-    let elapsed_seconds = (chrono::Utc::now().timestamp_millis() - armed_at_unix_ms).max(0) / 1000;
-    format!(
-        "## Main cadence\n\nA whole-suite pass over `{branch}` was armed {} ago. Its rows for \
+    let elapsed_seconds =
+        (chrono::Utc::now().timestamp_millis() - armed.armed_at_unix_ms).max(0) / 1000;
+    let mut out = format!(
+        "## Main cadence\n\nA whole-suite pass over `{}` was armed {} ago. Its rows for \
          the current default head are recorded when it finishes, so rows missing for it now are \
-         pending, not absent.\n\n",
+         pending, not absent.\n",
+        armed.branch,
         crate::clock::format_elapsed(elapsed_seconds)
-    )
+    );
+    for interruption in &armed.rearming {
+        out.push_str(&format!("\nIt re-arms {}.\n", interruption.describe()));
+    }
+    out.push('\n');
+    out
 }
 
 pub(super) async fn read_projects(db: &LocalDb) -> String {
