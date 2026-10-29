@@ -3,19 +3,22 @@ use std::future::Future;
 use std::ops::Deref;
 use std::panic::{AssertUnwindSafe, Location};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 #[cfg(any(test, feature = "test-utils"))]
 use std::sync::atomic::AtomicUsize;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex, MutexGuard, Once,
 };
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use cairn_platform::runtime_regions;
+use cairn_platform::stack::off_frame;
 use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
-use tokio::time::sleep;
+use tokio::time::{error::Elapsed, sleep, timeout};
 use turso::{params::IntoParams, Builder, Connection, Row};
 
 const CONTENTION_ATTEMPT_THRESHOLD: usize = 1;
@@ -233,7 +236,8 @@ const STATEMENT_REGION: &str = "db.statement";
 
 /// Lets a returned `impl Future` borrow `'s` without requiring every type it
 /// captures to outlive `'s`, which is what edition 2021's `+ 's` would demand
-/// of the closures and row types the entry points are generic over.
+/// of the `sql` and `params` types [`TrackedConnection`]'s statement methods
+/// are generic over.
 pub trait Captures<T: ?Sized> {}
 impl<T: ?Sized, U: ?Sized> Captures<T> for U {}
 
@@ -367,20 +371,49 @@ impl std::fmt::Debug for Holder {
     }
 }
 
-/// Run `body` with each of its polls inside a `db.statement` runtime region
-/// naming the statement `holder` last recorded.
+/// One database call, as the caller awaiting it holds it: the holder naming
+/// the call, and a pointer to the call's body.
 ///
-/// Per poll, because the guard is `!Send` and cannot be held across an await,
-/// and because a poll is exactly where a runaway statement sits: a worker that
-/// has not parked for an hour is inside one poll of one of these, and the
-/// runtime stall line then names the statement instead of only the worker.
-async fn named<F: Future>(holder: Holder, body: F) -> F::Output {
-    let mut body = std::pin::pin!(body);
-    std::future::poll_fn(move |cx| {
-        let _region = runtime_regions::enter_with(STATEMENT_REGION, holder.statement());
-        body.as_mut().poll(cx)
-    })
-    .await
+/// Nearly every layer of a served path awaits several of these, so their size
+/// is paid many times over. In an unoptimized build each awaited child is
+/// built in its parent's frame and kept in its state (see
+/// `cairn_platform::stack`). The body, which carries the checkout, the
+/// transaction, the read bound and the caller's own closure, is therefore
+/// built in [`off_frame`]'s frame and lives on the heap, so a call costs its
+/// caller three words whatever it does inside.
+/// `a_database_call_costs_its_caller_three_words` holds that.
+///
+/// Each poll runs inside a `db.statement` runtime region naming the statement
+/// the holder last recorded. Per poll, because the region guard is `!Send` and
+/// cannot be held across an await, and because a poll is exactly where a
+/// runaway statement sits: a worker that has not parked for an hour is inside
+/// one poll of one of these, and the runtime stall line then names the
+/// statement instead of only the worker.
+#[must_use = "a database call does nothing unless awaited"]
+pub struct DbCall<'s, T> {
+    holder: Holder,
+    body: BoxFuture<'s, DbResult<T>>,
+}
+
+impl<'s, T> DbCall<'s, T> {
+    fn new<Fut>(holder: Holder, make: impl FnOnce() -> Fut) -> Self
+    where
+        Fut: Future<Output = DbResult<T>> + Send + 's,
+    {
+        Self {
+            holder,
+            body: off_frame(make),
+        }
+    }
+}
+
+impl<T> Future for DbCall<'_, T> {
+    type Output = DbResult<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let _region = runtime_regions::enter_with(STATEMENT_REGION, self.holder.statement());
+        self.body.as_mut().poll(cx)
+    }
 }
 
 /// One holder that has kept its connection past the watch threshold.
@@ -876,10 +909,10 @@ impl LocalDb {
     /// pool, and it is not optional: the resource readers on this path are the
     /// bulk of the transactions a checkpoint has to wait out.
     #[track_caller]
-    pub fn connect(&self) -> impl Future<Output = DbResult<TrackedConnection>> + Captures<&'_ ()> {
+    pub fn connect(&self) -> DbCall<'_, TrackedConnection> {
         let caller = Location::caller();
         let holder = Holder::new(caller, None);
-        named(holder.clone(), async move {
+        DbCall::new(holder.clone(), move || async move {
             let slot = self.gate.admit(caller, HolderKind::Connect, holder).await;
             Ok(TrackedConnection::new(self.open_connection().await?, slot))
         })
@@ -952,21 +985,27 @@ impl LocalDb {
         Ok(TrackedConnection::new(conn, slot))
     }
 
-    /// Run one pooled read under the bound, and turn either way of exceeding
-    /// it into [`DbError::ReadBoundExceeded`].
+    /// How long a whole pooled read may stay open before it is dropped.
     ///
-    /// The engine deadline ends a statement that steps past the bound; the
-    /// timeout here ends a read that parks between statements, which no
-    /// per-statement deadline sees. Dropping `body` on expiry drops its
-    /// connection unreleased, and the engine rolls its transaction back.
-    async fn bounded_read<T>(
+    /// The engine deadline ends a statement that steps past the bound; this
+    /// ends a read that parks between statements, which no per-statement
+    /// deadline sees. Dropping the read on expiry drops its connection
+    /// unreleased, and the engine rolls its transaction back.
+    fn parked_read_limit(&self) -> Duration {
+        self.read_bound + PARKED_READ_SLACK
+    }
+
+    /// A pooled read's result from its run under [`Self::parked_read_limit`],
+    /// with either way of exceeding the bound turned into
+    /// [`DbError::ReadBoundExceeded`] and logged.
+    fn bounded_read_result<T>(
         &self,
         caller: Caller,
         holder: &Holder,
-        body: impl Future<Output = DbResult<T>>,
+        started: Instant,
+        outcome: Result<DbResult<T>, Elapsed>,
     ) -> DbResult<T> {
-        let started = Instant::now();
-        match tokio::time::timeout(self.read_bound + PARKED_READ_SLACK, body).await {
+        match outcome {
             Ok(Err(error)) if error.is_interrupt() => {}
             Ok(result) => return result,
             Err(_elapsed) => {}
@@ -1021,74 +1060,61 @@ impl LocalDb {
     /// that is still open shortly after it, fails with
     /// [`DbError::ReadBoundExceeded`] and its connection is retired.
     #[track_caller]
-    pub fn read<T>(
-        &self,
-        f: impl for<'a> FnOnce(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
-    ) -> impl Future<Output = DbResult<T>> + Captures<&'_ ()> {
+    pub fn read<'s, T: Send + 's>(
+        &'s self,
+        f: impl for<'a> FnOnce(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>> + Send + 's,
+    ) -> DbCall<'s, T> {
         let caller = Location::caller();
         let holder = Holder::new(caller, None);
-        named(holder.clone(), self.read_at(caller, holder, f))
-    }
-
-    async fn read_at<T>(
-        &self,
-        caller: Caller,
-        holder: Holder,
-        f: impl for<'a> FnOnce(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
-    ) -> DbResult<T> {
-        #[cfg(any(test, feature = "test-utils"))]
-        self.read_transaction_count.fetch_add(1, Ordering::Relaxed);
-        self.bounded_read(caller, &holder, async {
-            let conn = self
-                .checkout(caller, HolderKind::PooledRead, &holder)
-                .await?;
-            let attempt = run_read_tx(&conn, self.concurrent_begin(), f).await;
-            // An interrupted connection is retired even when its ROLLBACK
-            // succeeded: what it was doing when the engine stopped it is not
-            // something the next caller should inherit.
-            let interrupted = attempt.result.as_ref().is_err_and(DbError::is_interrupt);
-            if attempt.reusable && !interrupted {
-                self.release(conn);
-            }
-            attempt.result
+        DbCall::new(holder.clone(), move || async move {
+            #[cfg(any(test, feature = "test-utils"))]
+            self.read_transaction_count.fetch_add(1, Ordering::Relaxed);
+            let started = Instant::now();
+            let outcome = timeout(self.parked_read_limit(), async {
+                let conn = self
+                    .checkout(caller, HolderKind::PooledRead, &holder)
+                    .await?;
+                let attempt = run_read_tx(&conn, self.concurrent_begin(), f).await;
+                // An interrupted connection is retired even when its ROLLBACK
+                // succeeded: what it was doing when the engine stopped it is
+                // not something the next caller should inherit.
+                let interrupted = attempt.result.as_ref().is_err_and(DbError::is_interrupt);
+                if attempt.reusable && !interrupted {
+                    self.release(conn);
+                }
+                attempt.result
+            })
+            .await;
+            self.bounded_read_result(caller, &holder, started, outcome)
         })
-        .await
     }
 
     #[track_caller]
-    pub fn write<T>(
-        &self,
-        f: impl for<'a> FnMut(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
-    ) -> impl Future<Output = DbResult<T>> + Captures<&'_ ()> {
+    pub fn write<'s, T: Send + 's>(
+        &'s self,
+        f: impl for<'a> FnMut(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>> + Send + 's,
+    ) -> DbCall<'s, T> {
         let caller = Location::caller();
         let holder = Holder::new(caller, None);
-        named(holder.clone(), async move {
+        DbCall::new(holder.clone(), move || async move {
             #[cfg(any(test, feature = "test-utils"))]
             self.write_transaction_count.fetch_add(1, Ordering::Relaxed);
-            self.write_at(caller, holder, self.concurrent_begin(), f)
+            self.transaction_with_begin(caller, &holder, self.concurrent_begin(), f)
                 .await
         })
     }
 
     #[track_caller]
-    pub fn exclusive<T>(
-        &self,
-        f: impl for<'a> FnMut(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
-    ) -> impl Future<Output = DbResult<T>> + Captures<&'_ ()> {
+    pub fn exclusive<'s, T: Send + 's>(
+        &'s self,
+        f: impl for<'a> FnMut(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>> + Send + 's,
+    ) -> DbCall<'s, T> {
         let caller = Location::caller();
         let holder = Holder::new(caller, None);
-        named(holder.clone(), self.write_at(caller, holder, "BEGIN", f))
-    }
-
-    async fn write_at<T>(
-        &self,
-        caller: Caller,
-        holder: Holder,
-        begin_sql: &str,
-        mut f: impl for<'a> FnMut(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
-    ) -> DbResult<T> {
-        self.transaction_with_begin(caller, &holder, begin_sql, &mut f)
-            .await
+        DbCall::new(holder.clone(), move || async move {
+            self.transaction_with_begin(caller, &holder, "BEGIN", f)
+                .await
+        })
     }
 
     /// Runs one SELECT and collects every mapped row.
@@ -1108,7 +1134,7 @@ impl LocalDb {
         sql: impl Into<String>,
         params: impl IntoParams + Send + 'static,
         map: F,
-    ) -> impl Future<Output = DbResult<Vec<T>>> + Captures<&'_ ()>
+    ) -> DbCall<'_, Vec<T>>
     where
         F: Fn(&Row) -> DbResult<T> + Send + 'static,
         T: Send + 'static,
@@ -1116,44 +1142,35 @@ impl LocalDb {
         let caller = Location::caller();
         let sql = sql.into();
         let holder = Holder::new(caller, Some(&sql));
-        named(
-            holder.clone(),
-            self.query_all_at(caller, holder, sql, params, map),
-        )
-    }
-
-    async fn query_all_at<T, F>(
-        &self,
-        caller: Caller,
-        holder: Holder,
-        sql: String,
-        params: impl IntoParams,
-        map: F,
-    ) -> DbResult<Vec<T>>
-    where
-        F: Fn(&Row) -> DbResult<T>,
-    {
-        self.bounded_read(caller, &holder, async {
-            let conn = self
-                .checkout(caller, HolderKind::PooledRead, &holder)
-                .await?;
-            let result: DbResult<Vec<T>> = async {
-                let mut rows = conn.conn.query(&sql, params).await?;
-                let mut out = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    out.push(map(&row)?);
+        DbCall::new(holder.clone(), move || async move {
+            let started = Instant::now();
+            let outcome = timeout(self.parked_read_limit(), async {
+                let conn = self
+                    .checkout(caller, HolderKind::PooledRead, &holder)
+                    .await?;
+                // `move`, so the body owns `map` rather than holding a borrow
+                // of it across an await, which would demand `F: Sync`.
+                let (conn_ref, sql) = (&conn, &sql);
+                let result: DbResult<Vec<T>> = async move {
+                    let mut rows = conn_ref.conn.query(sql, params).await?;
+                    let mut out = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        out.push(map(&row)?);
+                    }
+                    Ok(out)
                 }
-                Ok(out)
-            }
+                .await;
+                // Returned only on success: a query abandoned part-way through
+                // its rows leaves a statement whose state this layer has no way
+                // to assert on.
+                if result.is_ok() {
+                    self.release(conn);
+                }
+                result
+            })
             .await;
-            // Returned only on success: a query abandoned part-way through its rows
-            // leaves a statement whose state this layer has no way to assert on.
-            if result.is_ok() {
-                self.release(conn);
-            }
-            result
+            self.bounded_read_result(caller, &holder, started, outcome)
         })
-        .await
     }
 
     /// Runs one SELECT and maps the first row, if present.
@@ -1168,58 +1185,55 @@ impl LocalDb {
         sql: impl Into<String>,
         params: impl IntoParams + Send + 'static,
         map: F,
-    ) -> impl Future<Output = DbResult<Option<T>>> + Captures<&'_ ()>
+    ) -> DbCall<'_, Option<T>>
     where
         F: Fn(&Row) -> DbResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        self.named_query_opt(Location::caller(), sql.into(), params, map)
+        self.select_first(Location::caller(), sql.into(), params, map, Ok)
     }
 
-    fn named_query_opt<T, F>(
+    /// The one SELECT behind [`Self::query_opt`] and the helpers built on it:
+    /// map the first row, if there is one, then `finish` that.
+    ///
+    /// `finish` runs inside the call's own body, so a helper adds no future
+    /// of its own around the call.
+    fn select_first<T, U, F>(
         &self,
         caller: Caller,
         sql: String,
         params: impl IntoParams + Send + 'static,
         map: F,
-    ) -> impl Future<Output = DbResult<Option<T>>> + Captures<&'_ ()>
+        finish: fn(Option<T>) -> DbResult<U>,
+    ) -> DbCall<'_, U>
     where
         F: Fn(&Row) -> DbResult<T> + Send + 'static,
         T: Send + 'static,
+        U: Send + 'static,
     {
         let holder = Holder::new(caller, Some(&sql));
-        named(
-            holder.clone(),
-            self.query_opt_at(caller, holder, sql, params, map),
-        )
-    }
-
-    async fn query_opt_at<T, F>(
-        &self,
-        caller: Caller,
-        holder: Holder,
-        sql: String,
-        params: impl IntoParams,
-        map: F,
-    ) -> DbResult<Option<T>>
-    where
-        F: Fn(&Row) -> DbResult<T>,
-    {
-        self.bounded_read(caller, &holder, async {
-            let conn = self
-                .checkout(caller, HolderKind::PooledRead, &holder)
-                .await?;
-            let result: DbResult<Option<T>> = async {
-                let mut rows = conn.conn.query(&sql, params).await?;
-                rows.next().await?.map(|row| map(&row)).transpose()
-            }
+        DbCall::new(holder.clone(), move || async move {
+            let started = Instant::now();
+            let outcome = timeout(self.parked_read_limit(), async {
+                let conn = self
+                    .checkout(caller, HolderKind::PooledRead, &holder)
+                    .await?;
+                // `move` for the same reason as in `query_all`.
+                let (conn_ref, sql) = (&conn, &sql);
+                let result: DbResult<Option<T>> = async move {
+                    let mut rows = conn_ref.conn.query(sql, params).await?;
+                    rows.next().await?.map(|row| map(&row)).transpose()
+                }
+                .await;
+                if result.is_ok() {
+                    self.release(conn);
+                }
+                result
+            })
             .await;
-            if result.is_ok() {
-                self.release(conn);
-            }
-            result
+            self.bounded_read_result(caller, &holder, started, outcome)
+                .and_then(finish)
         })
-        .await
     }
 
     /// Runs one SELECT and returns the first column of the
@@ -1234,11 +1248,14 @@ impl LocalDb {
         &self,
         sql: impl Into<String>,
         params: impl IntoParams + Send + 'static,
-    ) -> impl Future<Output = DbResult<Option<String>>> + Captures<&'_ ()> {
-        let query = self.named_query_opt(Location::caller(), sql.into(), params, |row| {
-            row.opt_text(0)
-        });
-        async move { query.await.map(Option::flatten) }
+    ) -> DbCall<'_, Option<String>> {
+        self.select_first(
+            Location::caller(),
+            sql.into(),
+            params,
+            |row| row.opt_text(0),
+            |value| Ok(value.flatten()),
+        )
     }
 
     /// Runs one SELECT and returns the first column of the
@@ -1253,10 +1270,14 @@ impl LocalDb {
         &self,
         sql: impl Into<String>,
         params: impl IntoParams + Send + 'static,
-    ) -> impl Future<Output = DbResult<Option<i64>>> + Captures<&'_ ()> {
-        let query =
-            self.named_query_opt(Location::caller(), sql.into(), params, |row| row.opt_i64(0));
-        async move { query.await.map(Option::flatten) }
+    ) -> DbCall<'_, Option<i64>> {
+        self.select_first(
+            Location::caller(),
+            sql.into(),
+            params,
+            |row| row.opt_i64(0),
+            |value| Ok(value.flatten()),
+        )
     }
 
     /// Runs one SELECT and returns the first column of the
@@ -1271,8 +1292,14 @@ impl LocalDb {
         &self,
         sql: impl Into<String>,
         params: impl IntoParams + Send + 'static,
-    ) -> impl Future<Output = DbResult<Option<String>>> + Captures<&'_ ()> {
-        self.named_query_opt(Location::caller(), sql.into(), params, |row| row.text(0))
+    ) -> DbCall<'_, Option<String>> {
+        self.select_first(
+            Location::caller(),
+            sql.into(),
+            params,
+            |row| row.text(0),
+            Ok,
+        )
     }
 
     /// Runs one SELECT and requires one row.
@@ -1288,17 +1315,14 @@ impl LocalDb {
         sql: impl Into<String>,
         params: impl IntoParams + Send + 'static,
         map: F,
-    ) -> impl Future<Output = DbResult<T>> + Captures<&'_ ()>
+    ) -> DbCall<'_, T>
     where
         F: Fn(&Row) -> DbResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let query = self.named_query_opt(Location::caller(), sql.into(), params, map);
-        async move {
-            query
-                .await?
-                .ok_or_else(|| DbError::Row("query_one returned no rows".to_string()))
-        }
+        self.select_first(Location::caller(), sql.into(), params, map, |row| {
+            row.ok_or_else(|| DbError::Row("query_one returned no rows".to_string()))
+        })
     }
 
     /// Runs one statement through the retrying write transaction path.
@@ -1308,20 +1332,16 @@ impl LocalDb {
     /// Returns database errors from opening the write transaction, executing the
     /// statement, committing the transaction, or exhausting retry attempts.
     #[track_caller]
-    pub fn execute(
-        &self,
-        sql: impl Into<String>,
-        params: impl IntoParams,
-    ) -> impl Future<Output = DbResult<u64>> + Captures<&'_ ()> {
+    pub fn execute(&self, sql: impl Into<String>, params: impl IntoParams) -> DbCall<'_, u64> {
         let caller = Location::caller();
         let sql = sql.into();
         let holder = Holder::new(caller, Some(&sql));
         let params = params.into_params();
-        named(holder.clone(), async move {
+        DbCall::new(holder.clone(), move || async move {
             let params = params?;
             #[cfg(any(test, feature = "test-utils"))]
             self.write_transaction_count.fetch_add(1, Ordering::Relaxed);
-            self.write_at(caller, holder, self.concurrent_begin(), move |conn| {
+            self.transaction_with_begin(caller, &holder, self.concurrent_begin(), move |conn| {
                 let sql = sql.clone();
                 let params = params.clone();
                 Box::pin(async move { Ok(conn.conn.execute(&sql, params).await?) })
@@ -1338,17 +1358,14 @@ impl LocalDb {
     /// Returns database errors from opening the write transaction, executing the
     /// script, committing the transaction, or exhausting retry attempts.
     #[track_caller]
-    pub fn execute_script(
-        &self,
-        sql: impl Into<String>,
-    ) -> impl Future<Output = DbResult<()>> + Captures<&'_ ()> {
+    pub fn execute_script(&self, sql: impl Into<String>) -> DbCall<'_, ()> {
         let caller = Location::caller();
         let sql = sql.into();
         let holder = Holder::new(caller, Some(&sql));
-        named(holder.clone(), async move {
+        DbCall::new(holder.clone(), move || async move {
             #[cfg(any(test, feature = "test-utils"))]
             self.write_transaction_count.fetch_add(1, Ordering::Relaxed);
-            self.write_at(caller, holder, self.concurrent_begin(), move |conn| {
+            self.transaction_with_begin(caller, &holder, self.concurrent_begin(), move |conn| {
                 let sql = sql.clone();
                 Box::pin(async move {
                     conn.conn.execute_batch(&sql).await?;
@@ -1364,7 +1381,7 @@ impl LocalDb {
         caller: Caller,
         holder: &Holder,
         begin_sql: &str,
-        f: &mut impl for<'a> FnMut(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
+        mut f: impl for<'a> FnMut(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>>,
     ) -> DbResult<T> {
         let started_at = Instant::now();
         let mut backoff = self.retry.initial_backoff;
@@ -1375,7 +1392,7 @@ impl LocalDb {
             let conn = self
                 .checkout(caller, HolderKind::PooledWrite, holder)
                 .await?;
-            let outcome = run_tx(&conn, begin_sql, f).await;
+            let outcome = run_tx(&conn, begin_sql, &mut f).await;
             // Released between attempts as well as after the last one, so a
             // contended write that retries several times still reuses one warm
             // connection instead of creating one per attempt.
@@ -1438,13 +1455,10 @@ impl LocalDb {
     }
 
     #[track_caller]
-    pub fn execute_batch<'s>(
-        &'s self,
-        sql: &'s str,
-    ) -> impl Future<Output = DbResult<()>> + Captures<&'s ()> {
+    pub fn execute_batch<'s>(&'s self, sql: &'s str) -> DbCall<'s, ()> {
         let caller = Location::caller();
         let holder = Holder::new(caller, Some(sql));
-        named(holder.clone(), async move {
+        DbCall::new(holder.clone(), move || async move {
             let conn = self
                 .checkout(caller, HolderKind::PooledWrite, &holder)
                 .await?;
@@ -1460,13 +1474,10 @@ impl LocalDb {
     /// Run one statement on a pooled connection and drain its rows: PRAGMAs and
     /// `VACUUM INTO`, which is why it is admitted as a write and never bounded.
     #[track_caller]
-    pub fn consume_query<'s>(
-        &'s self,
-        sql: &'s str,
-    ) -> impl Future<Output = DbResult<()>> + Captures<&'s ()> {
+    pub fn consume_query<'s>(&'s self, sql: &'s str) -> DbCall<'s, ()> {
         let caller = Location::caller();
         let holder = Holder::new(caller, Some(sql));
-        named(holder.clone(), async move {
+        DbCall::new(holder.clone(), move || async move {
             let conn = self
                 .checkout(caller, HolderKind::PooledWrite, &holder)
                 .await?;
@@ -2710,6 +2721,67 @@ mod tests {
             best_read = best_read.min(started.elapsed().as_nanos() / u128::from(CALLS));
         }
         println!("statement_overhead_probe: query_one={best_one}ns/call read={best_read}ns/call");
+    }
+
+    /// Awaiting a database call costs the caller's frame and state the call's
+    /// holder and a pointer to its body, however much the body grows. A served
+    /// path awaits these at nearly every layer, and in an unoptimized build
+    /// each layer pays about twice the size of what it awaits, so a body built
+    /// by value here is what cairn-core's served-path stack guard measures.
+    #[tokio::test]
+    async fn a_database_call_costs_its_caller_three_words() {
+        const BUDGET: usize = 3 * std::mem::size_of::<usize>();
+        let db = test_db().await.unwrap();
+        let sql = String::from("PRAGMA user_version");
+        let sizes = [
+            ("connect", size_of_val(&db.connect())),
+            (
+                "read",
+                size_of_val(&db.read(|_| Box::pin(async { Ok(()) }))),
+            ),
+            (
+                "write",
+                size_of_val(&db.write(|_| Box::pin(async { Ok(()) }))),
+            ),
+            (
+                "exclusive",
+                size_of_val(&db.exclusive(|_| Box::pin(async { Ok(()) }))),
+            ),
+            (
+                "query_all",
+                size_of_val(&db.query_all("SELECT 1", (), |row| row.i64(0))),
+            ),
+            (
+                "query_opt",
+                size_of_val(&db.query_opt("SELECT 1", (), |row| row.i64(0))),
+            ),
+            (
+                "query_one",
+                size_of_val(&db.query_one("SELECT 1", (), |row| row.i64(0))),
+            ),
+            ("query_text", size_of_val(&db.query_text("SELECT 'a'", ()))),
+            (
+                "query_opt_text",
+                size_of_val(&db.query_opt_text("SELECT 'a'", ())),
+            ),
+            (
+                "query_opt_i64",
+                size_of_val(&db.query_opt_i64("SELECT 1", ())),
+            ),
+            ("execute", size_of_val(&db.execute("SELECT 1", ()))),
+            (
+                "execute_script",
+                size_of_val(&db.execute_script("SELECT 1")),
+            ),
+            ("execute_batch", size_of_val(&db.execute_batch(&sql))),
+            ("consume_query", size_of_val(&db.consume_query(&sql))),
+        ];
+        for (entry, size) in sizes {
+            assert!(
+                size <= BUDGET,
+                "awaiting `{entry}` costs its caller {size} bytes, over {BUDGET}"
+            );
+        }
     }
 
     async fn test_db() -> DbResult<LocalDb> {
@@ -4148,11 +4220,13 @@ mod tests {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .unwrap();
-            runtime.block_on(named(holder, async {
-                runtime_regions::runtime_threads(RUNTIME)
-                    .into_iter()
-                    .find_map(|report| report.region)
-            }))
+            runtime
+                .block_on(DbCall::new(holder, || async {
+                    Ok(runtime_regions::runtime_threads(RUNTIME)
+                        .into_iter()
+                        .find_map(|report| report.region))
+                }))
+                .unwrap()
         })
         .join()
         .unwrap()

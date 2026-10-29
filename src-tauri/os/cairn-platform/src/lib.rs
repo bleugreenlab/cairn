@@ -6,5 +6,6 @@ pub mod process;
 pub mod process_tree;
 pub mod runtime_regions;
 pub mod services;
+pub mod stack;
 
 pub mod clock;

@@ -62,9 +62,9 @@ use super::{
 };
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
-use crate::stack::off_frame;
 use cairn_common::contract::{contract_for, MutationSpec, ResourceKind};
 use cairn_common::uri::CairnResource;
+use cairn_platform::stack::off_frame;
 
 fn append_payload(index: usize, item: &ChangeItem) -> ResourceMutationResult<&serde_json::Value> {
     item.payload

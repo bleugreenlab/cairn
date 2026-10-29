@@ -107,7 +107,6 @@ mod orchestrator;
 mod resources;
 mod resume_timing;
 mod services;
-mod stack;
 mod storage;
 mod team_remote_intents;
 mod vcs_maintenance;

@@ -33,8 +33,8 @@ pub use types::{
 
 use crate::mcp::vcs::{acquire_store_lock, STORE_LOCK_TIMEOUT};
 use crate::orchestrator::JjStoreOperationTrace;
-use crate::stack::off_frame;
 use crate::storage::RowExt;
+use cairn_platform::stack::off_frame;
 use commit_barrier::{run_commit_barrier, CommitBarrierOutcome};
 use std::path::Path;
 

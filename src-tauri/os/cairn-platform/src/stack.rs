@@ -16,11 +16,13 @@
 //! which has returned before the caller polls, and leaves the caller holding a
 //! pointer in both its frame and its state.
 //!
-//! Use it on the spine of a deep call chain where a child future is large, and on
+//! Use it on the spine of a deep call chain where a child future is large, on
 //! every arm of a dispatcher that awaits children in sequence, whose frame
-//! otherwise grows with each arm added. The cost is one allocation per call.
+//! otherwise grows with each arm added, and on a leaf that nearly every path
+//! awaits many times over, as `cairn-db`'s `LocalDb` entry points do. The cost
+//! is one allocation per call.
 //!
-//! `os/cairn-core/tests/main/stack_headroom.rs` holds the tool path to a stack
+//! `cairn-core`'s `tests/main/stack_headroom.rs` holds the tool path to a stack
 //! budget, so a regression fails there by name instead of as an overflow in
 //! whichever unrelated test happens to run deepest.
 
@@ -40,6 +42,6 @@ use std::pin::Pin;
 /// because a closure capturing by mutable reference cannot let a borrow of it
 /// escape through its result.
 #[inline(never)]
-pub(crate) fn off_frame<Fut: Future>(make: impl FnOnce() -> Fut) -> Pin<Box<Fut>> {
+pub fn off_frame<Fut: Future>(make: impl FnOnce() -> Fut) -> Pin<Box<Fut>> {
     Box::pin(make())
 }
