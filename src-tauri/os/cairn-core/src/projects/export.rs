@@ -138,6 +138,7 @@ const EXPORT_ONLY: &[TableCopySpec] = &[
     owned("prepared_runtime_calls", &[owner(OwnerSet::Runs, "run_id IN {ids}")]),
     owned("response_invocations", &[direct("project_id = ?1"), owner(OwnerSet::Runs, "caller_run_id IN {ids}")]),
     owned("runtime_admission_requests", &[owner(OwnerSet::Jobs, "request_id IN (SELECT request_id FROM prepared_ordinary_launches WHERE job_id IN {ids})"), owner(OwnerSet::Runs, "request_id IN (SELECT request_id FROM prepared_runtime_calls WHERE run_id IN {ids})")]),
+    owned("session_positions", &[owner(OwnerSet::Sessions, "session_id IN {ids}")]),
     owned("team_ordinary_admission_authority", &[owner(OwnerSet::Jobs, "request_id IN (SELECT request_id FROM prepared_ordinary_launches WHERE job_id IN {ids})")]),
     owned("thread_automations", &[owner(OwnerSet::Threads, "thread_id IN {ids}")]),
     owned("thread_compaction_entries", &[owner(OwnerSet::Jobs, "job_id IN {ids}")]),
