@@ -119,6 +119,7 @@ const EXPORT_ONLY: &[TableCopySpec] = &[
     export_only("pack_catalog_backfill_attempts", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     export_only("pr_resolution_attributions", "merge_request_id IN (SELECT id FROM merge_requests WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
     export_only("tool_analytics_hourly", "project_id = ?1 OR run_id IN (SELECT id FROM runs WHERE project_id = ?1)"),
+    export_only("run_activity_minutes", "run_id IN (SELECT id FROM runs WHERE project_id = ?1)"),
     // Private lineage, naming the project directly.
     export_only("config_disables", "project_id = ?1"),
     export_only("execution_queue", "project_id = ?1"),

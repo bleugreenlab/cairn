@@ -387,6 +387,15 @@ macro_rules! shared_tail_tenet_rationale {
     };
 }
 
+/// cairn/5396: per-run minutes with model output, the measure behind
+/// analytics' agent time. Maintained by a trigger on `events`, which both
+/// lineages carry.
+macro_rules! shared_tail_run_activity_minutes {
+    () => {
+        migration!("0288_run_activity_minutes")
+    };
+}
+
 /// cairn/4987: the base and incoming side a conflict session's committed
 /// resolution was resolved against, and the tip and destination of an
 /// outstanding take-committed-tip request. `jj_reconcile_items` is carried by
@@ -1637,6 +1646,7 @@ macro_rules! team_lineage {
             shared_tail_compile_facts!(),
             shared_tail_turn_end_check_attempt_plan!(),
             shared_tail_tenet_rationale!(),
+            shared_tail_run_activity_minutes!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1928,6 +1938,7 @@ macro_rules! private_lineage {
             private_embedding_space!(),
             shared_tail_tenet_rationale!(),
             private_command_resource_memory_kills!(),
+            shared_tail_run_activity_minutes!(),
         ]
     };
 }
@@ -2356,6 +2367,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("queued_messages", TableScope::ProjectScoped),
     ("repl_exchanges", TableScope::ProjectScoped),
     ("resource_surfacings", TableScope::ProjectScoped),
+    ("run_activity_minutes", TableScope::ProjectScoped),
     ("runs", TableScope::ProjectScoped),
     ("search_outbox", TableScope::ProjectScoped),
     ("session_skyline_cache", TableScope::ProjectScoped),
@@ -3176,6 +3188,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
         id_columns: &["id", "job_id"],
     },
     RekeyTableManifest {
+        table: "run_activity_minutes",
+        id_columns: &["run_id"],
+    },
+    RekeyTableManifest {
         table: "token_rollup",
         id_columns: &["id", "project_id", "run_id", "job_id"],
     },
@@ -3812,6 +3828,7 @@ mod tests {
                 "embedding_space",
                 "tenet_rationale",
                 "command_resource_memory_kills",
+                "run_activity_minutes",
             ],
         );
     }
@@ -7440,6 +7457,7 @@ mod tests {
                 "turn_end_check_attempt_plan",
                 // cairn/5433: a tenet's rationale beside its statement.
                 "tenet_rationale",
+                "run_activity_minutes",
             ],
         );
         assert_eq!(
