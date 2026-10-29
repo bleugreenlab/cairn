@@ -29,7 +29,8 @@ use cairn_common::executor_protocol::{
 use cairn_common::executor_protocol::{
     DiskDecline, DiskReliefOutlook, OccupancyLineageReport, OccupancyRule, OccupiedTreeSkip,
     QuarantineTargetStrip, RetiredHomeAccounting, RetiredHomeState, SkippedEntry,
-    StorageReclaimRung, StorageRungReclaim, StorageWithheld, StorageWithheldReason,
+    StoragePressureOutcome, StoragePressureReport, StorageReclaimRung, StorageRungReclaim,
+    StorageWithheld, StorageWithheldReason,
 };
 
 /// Questions held back from their next answer because an earlier answer may
@@ -1875,6 +1876,9 @@ fn render_storage_pressure(executor: &ExecutorInspection) -> String {
             for withheld in &pressure.withheld {
                 out.push_str(&format!("- Not reclaimed: {}\n", withheld_line(withheld)));
             }
+            if let Some(lever) = external_cache_lever(pressure) {
+                out.push_str(&lever);
+            }
             for skip in &pressure.occupied_skips {
                 out.push_str(&format!(
                     "- Skipped: `{}` {}\n",
@@ -1904,6 +1908,28 @@ fn render_storage_pressure(executor: &ExecutorInspection) -> String {
         out.push_str(&occupancy_lineage_line(lineage));
     }
     out
+}
+
+/// The operator's next action after a pass that took every rung it may and
+/// still fell short: the external caches the executor accounts but never
+/// deletes. Named with their size, because "held by policy" alone left the
+/// reader with nothing to do while a machine stayed wedged.
+fn external_cache_lever(pressure: &StoragePressureReport) -> Option<String> {
+    if pressure.outcome != StoragePressureOutcome::Unrelieved {
+        return None;
+    }
+    let caches = pressure.withheld.iter().find(|withheld| {
+        withheld.reason == StorageWithheldReason::CachesOwnerRetained
+            && (withheld.bytes > 0 || withheld.unmeasured)
+    })?;
+    let size = if caches.unmeasured {
+        format!("at least {}", bytes(caches.bytes))
+    } else {
+        bytes(caches.bytes)
+    };
+    Some(format!(
+        "- Next action: {size} in external caches (CI targets, the asset cache, the sccache store) is the lever left; the executor never deletes them, so trimming them is the operator's\n"
+    ))
 }
 
 /// One class of bytes a pressure pass left in place, naming why and what
@@ -4387,6 +4413,7 @@ mod storage_section_tests {
             "- Not reclaimed: 31.0 GiB in 1 cell fenced behind processes from an ended epoch, which the executor will not signal",
             "- Not reclaimed: 3.0 GiB in 1 managed cache in use",
             "- Not reclaimed: 0 B in 0 managed caches the pass did not take",
+            "- Next action: 1.0 GiB in external caches (CI targets, the asset cache, the sccache store) is the lever left",
         ] {
             assert!(rendered.contains(expected), "missing {expected:?} in {rendered}");
         }

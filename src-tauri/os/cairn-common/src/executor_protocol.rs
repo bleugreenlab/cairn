@@ -5135,6 +5135,19 @@ pub struct LearnedResourceEstimate {
 /// as consecutive versions and neither renumbers by hand. No frame, field or
 /// value changes. What a runner gets wrong talking to an older executor:
 /// nothing; the number is the same.
+///
+/// cairn/5453 does not move the number. The executor's storage reclamation
+/// changes only on its own disk: a tree entering quarantine loses its build
+/// output first, a retirement whose stage-aside a full volume refuses deletes
+/// build output in place and retries, and the quarantine-target rung reaches
+/// expired quarantines and cells fenced in place. Those strips are reported
+/// through the existing `QuarantineTargets` rung and `QuarantineTargetStrip`
+/// entries, whose shapes are unchanged; a strip's `path` can now name a live
+/// slot path rather than only a renamed quarantine, which the runner renders
+/// as the opaque string it already was. The runner's storage page adds a
+/// "Next action" line derived from the `CachesOwnerRetained` entry it already
+/// receives. What a runner gets wrong talking to an older executor: nothing;
+/// that executor reclaims less, and reports what it did in the same fields.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 157;
 
 /// The version `build.rs` derived from the paragraphs above
