@@ -1443,33 +1443,52 @@ async fn render_held_executions(
 // Projects collection + project settings readers
 // ============================================================================
 
-/// The main-cadence pass running right now, if one is.
+/// The main-cadence work running right now, if any.
 ///
-/// A pass records nothing until its whole-suite lanes return — most of an hour
+/// A lane records nothing until its whole-suite run returns — most of an hour
 /// for the Rust suite — so for that whole window the store holds no cadence
-/// observation for the freshly advanced head. Read alone, that is the same
-/// emptiness a cadence that never ran would leave behind, and CAIRN-3823 was
-/// filed on exactly that reading. The line below is the difference: while it is
-/// present, the absence of rows for the current head is a pass still working,
-/// not a gap.
+/// observation of that lane for the freshly advanced head. Read alone, that is
+/// the same emptiness a cadence that never ran would leave behind, and
+/// CAIRN-3823 was filed on exactly that reading. The lines below are the
+/// difference: while a lane is listed, the absence of its rows for the current
+/// head is a run still working, not a gap.
 ///
 /// Silent when nothing is running, because then the rows and the cadence's
 /// thread messages already say everything there is to say.
 fn render_main_attestation(orch: &Orchestrator, project_id: &str) -> String {
-    let Some(armed) = crate::execution::checks_main::in_flight(orch, project_id) else {
+    let Some(in_flight) = crate::execution::checks_main::in_flight(orch, project_id) else {
         return String::new();
     };
-    let elapsed_seconds =
-        (chrono::Utc::now().timestamp_millis() - armed.armed_at_unix_ms).max(0) / 1000;
-    let mut out = format!(
-        "## Main cadence\n\nA whole-suite pass over `{}` was armed {} ago. Its rows for \
-         the current default head are recorded when it finishes, so rows missing for it now are \
-         pending, not absent.\n",
-        armed.branch,
-        crate::clock::format_elapsed(elapsed_seconds)
+    let now = chrono::Utc::now().timestamp_millis();
+    let ago = |armed_at_unix_ms: i64| {
+        crate::clock::format_elapsed((now - armed_at_unix_ms).max(0) / 1000)
+    };
+    let mut out = String::from(
+        "## Main cadence\n\nEach lane records its row for the current default head when its run \
+         finishes, so a listed lane's rows missing for it now are pending, not absent.\n\n",
     );
-    for interruption in &armed.rearming {
-        out.push_str(&format!("\nIt re-arms {}.\n", interruption.describe()));
+    if let Some((branch, armed_at_unix_ms)) = &in_flight.resolving {
+        out.push_str(&format!(
+            "- Resolving `{branch}`'s tip and its lanes, armed {} ago.\n",
+            ago(*armed_at_unix_ms)
+        ));
+    }
+    for lane in &in_flight.lanes {
+        out.push_str(&format!(
+            "- {} on {}: a whole-suite run over `{}`, armed {} ago{}.\n",
+            lane.check,
+            lane.platform,
+            lane.commit.get(..12).unwrap_or(&lane.commit),
+            ago(lane.armed_at_unix_ms),
+            if lane.queued {
+                ", with one more run queued for a newer tip"
+            } else {
+                ""
+            }
+        ));
+    }
+    for interruption in &in_flight.rearming {
+        out.push_str(&format!("- Re-arms {}.\n", interruption.describe()));
     }
     out.push('\n');
     out

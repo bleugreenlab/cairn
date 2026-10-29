@@ -9,10 +9,12 @@
 //! the tests that turned red or green since the lane's previous complete row,
 //! and the merges between the two rows.
 //!
-//! Scheduling is coalesced per project and never preemptive. A whole-suite run
+//! Scheduling is coalesced per lane and never preemptive. A whole-suite run
 //! takes most of an hour while merges land every few minutes, so a newer tip
-//! never cancels the run in flight; it queues at most one more pass, which
-//! attests whatever the tip is when that pass starts. The runner arms every
+//! never cancels the run in flight; it queues at most one more run of that
+//! lane, on the newest tip an arm resolved. Lanes never wait for each other: a
+//! lane parked for hours on one platform does not hold back another platform's
+//! next row, and a lane's own re-arm runs only that lane. The runner arms every
 //! project at boot ([`arm_at_boot`]), and a heartbeat re-arms every project on
 //! a fixed interval, so a tip that never got a complete row is retried and a
 //! lane that has gone quiet says so.
@@ -36,7 +38,7 @@
 //! the hosts as movement. Only when the executor has no complete row does the
 //! platform's newest row stand in, and the message says so (see [`Comparison`]).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,10 +104,82 @@ pub(crate) enum Trigger {
     Merge,
 }
 
-struct CadencePass {
+/// A lane within a project: its check and platform.
+type LaneKey = (String, String);
+
+/// Which of a tip's lanes an arm runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LaneScope {
+    /// Every lane the tip declares: a merge, a launch, the heartbeat.
+    All,
+    /// Only these lanes. A lane's own re-arm names only itself, so one
+    /// platform's settled debt never re-runs another platform's lane.
+    Only(BTreeSet<LaneKey>),
+}
+
+impl LaneScope {
+    fn lane(lane: &CadenceLane) -> Self {
+        LaneScope::Only(BTreeSet::from([lane.key()]))
+    }
+
+    /// The scope of one arm that absorbed both requests.
+    fn union(self, other: LaneScope) -> LaneScope {
+        match (self, other) {
+            (LaneScope::Only(mut lanes), LaneScope::Only(more)) => {
+                lanes.extend(more);
+                LaneScope::Only(lanes)
+            }
+            _ => LaneScope::All,
+        }
+    }
+
+    fn includes(&self, lane: &CadenceLane) -> bool {
+        match self {
+            LaneScope::All => true,
+            LaneScope::Only(lanes) => lanes.contains(&lane.key()),
+        }
+    }
+}
+
+/// The tip an arm resolved, which its lanes attest. Plain data, so a busy
+/// lane's queued successor carries the newest tip any arm resolved for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Tip {
+    project_id: String,
+    project_key: String,
+    repo_path: String,
+    default_branch: String,
+    repository: PathBuf,
+    commit: String,
+}
+
+impl Tip {
+    fn context(&self, trigger: Trigger) -> PassContext<'_> {
+        PassContext {
+            project_id: &self.project_id,
+            project_key: &self.project_key,
+            repo_path: &self.repo_path,
+            default_branch: &self.default_branch,
+            repository: &self.repository,
+            commit: &self.commit,
+            trigger,
+        }
+    }
+}
+
+/// A project's arm: settling, refreshing origin, and resolving the tip and
+/// its lanes. It ends as soon as the lanes are handed to their slots.
+struct Arming {
     branch: String,
     armed_at_unix_ms: i64,
-    queued: Option<Trigger>,
+    queued: Option<(Trigger, LaneScope)>,
+}
+
+/// One lane's run in flight, and at most one successor.
+struct LaneRun {
+    commit: String,
+    armed_at_unix_ms: i64,
+    queued: Option<(Trigger, Tip)>,
 }
 
 /// A lane pass the runner's own restart cancelled: recorded as the runner
@@ -132,19 +206,36 @@ impl Interruption {
     }
 }
 
-/// The cadence pass armed for a project right now.
+/// The cadence work armed for a project right now.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InFlight {
-    pub(crate) branch: String,
-    pub(crate) armed_at_unix_ms: i64,
-    /// The lanes whose passes the last restart cancelled and which this pass
-    /// re-arms, until each lane reports.
+    /// The arm still resolving the tip, if one is: its branch and when it was
+    /// armed.
+    pub(crate) resolving: Option<(String, i64)>,
+    /// Each lane's run, in lane order.
+    pub(crate) lanes: Vec<LaneInFlight>,
+    /// The lanes whose passes the last restart cancelled and which the armed
+    /// work re-arms, until each lane reports.
     pub(crate) rearming: Vec<Interruption>,
 }
 
-/// The per-project cadence slot: one pass in flight, at most one queued.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LaneInFlight {
+    pub(crate) check: String,
+    pub(crate) platform: String,
+    /// The tip the running attempt attests.
+    pub(crate) commit: String,
+    pub(crate) armed_at_unix_ms: i64,
+    /// Whether a successor on a newer tip is owed when it ends.
+    pub(crate) queued: bool,
+}
+
+/// The cadence slots: per project, one arm in flight and at most one queued;
+/// per lane, one run in flight and at most one queued.
 #[derive(Default)]
 pub(crate) struct CadenceSlots {
-    passes: HashMap<String, CadencePass>,
+    arming: HashMap<String, Arming>,
+    lanes: HashMap<(String, LaneKey), LaneRun>,
     /// Questions a refused lane is waiting on to settle, so a lane refused by
     /// every pass against one debt gets one waiter, not one per pass.
     debts: HashSet<crate::fleet::purpose::PurposeKey>,
@@ -210,18 +301,47 @@ impl CadenceSlots {
         Some(taken)
     }
 
-    /// Ask for a pass. Returns `true` when the caller must start one; otherwise
-    /// the request was folded into the single queued successor.
-    fn request(&mut self, project_id: &str, branch: &str, trigger: Trigger, now: i64) -> bool {
-        match self.passes.get_mut(project_id) {
-            Some(pass) => {
-                pass.queued = Some(pass.queued.map_or(trigger, |queued| queued.max(trigger)));
+    /// Drop the restart citations of lanes the tip no longer declares: no lane
+    /// will report on them, so they would otherwise be re-armed forever.
+    fn forget_undeclared_interruptions(&mut self, project_id: &str, declared: &[CadenceLane]) {
+        let Some(lanes) = self.interrupted.get_mut(project_id) else {
+            return;
+        };
+        lanes.retain(|held| {
+            declared
+                .iter()
+                .any(|lane| lane.check == held.check && lane.platform == held.platform)
+        });
+        if lanes.is_empty() {
+            self.interrupted.remove(project_id);
+        }
+    }
+
+    /// Ask for an arm. Returns `true` when the caller must start one;
+    /// otherwise the request was folded into the single queued successor,
+    /// which runs every lane either request named.
+    fn request(
+        &mut self,
+        project_id: &str,
+        branch: &str,
+        trigger: Trigger,
+        scope: LaneScope,
+        now: i64,
+    ) -> bool {
+        match self.arming.get_mut(project_id) {
+            Some(arming) => {
+                arming.queued = Some(match arming.queued.take() {
+                    Some((queued, queued_scope)) => {
+                        (queued.max(trigger), queued_scope.union(scope))
+                    }
+                    None => (trigger, scope),
+                });
                 false
             }
             None => {
-                self.passes.insert(
+                self.arming.insert(
                     project_id.to_string(),
-                    CadencePass {
+                    Arming {
                         branch: branch.to_string(),
                         armed_at_unix_ms: now,
                         queued: None,
@@ -232,29 +352,95 @@ impl CadenceSlots {
         }
     }
 
-    /// A pass ended. Returns the queued successor's trigger, keeping the slot
-    /// held for it, or releases the slot when nothing queued.
-    fn finish(&mut self, project_id: &str, now: i64) -> Option<Trigger> {
-        let pass = self.passes.get_mut(project_id)?;
-        match pass.queued.take() {
+    /// An arm ended. Returns the queued successor's trigger and scope, keeping
+    /// the slot held for it, or releases the slot when nothing queued.
+    fn finish(&mut self, project_id: &str, now: i64) -> Option<(Trigger, LaneScope)> {
+        let arming = self.arming.get_mut(project_id)?;
+        match arming.queued.take() {
             Some(next) => {
-                pass.armed_at_unix_ms = now;
+                arming.armed_at_unix_ms = now;
                 Some(next)
             }
             None => {
-                self.passes.remove(project_id);
-                // Every lane the pass ran has reported or was covered, so a
-                // citation still held names a lane the tip no longer declares.
-                self.interrupted.remove(project_id);
+                self.arming.remove(project_id);
+                None
+            }
+        }
+    }
+
+    /// Offer `tip` to `lane`. Returns `true` when the caller must start the
+    /// lane's run; otherwise the lane is busy and `tip` becomes its one queued
+    /// successor, replacing an older queued tip. Another lane's run never
+    /// enters into it.
+    fn offer(&mut self, lane: &CadenceLane, tip: &Tip, trigger: Trigger, now: i64) -> bool {
+        let key = (tip.project_id.clone(), lane.key());
+        match self.lanes.get_mut(&key) {
+            Some(run) => {
+                let trigger = run
+                    .queued
+                    .as_ref()
+                    .map_or(trigger, |(queued, _)| (*queued).max(trigger));
+                run.queued = Some((trigger, tip.clone()));
+                false
+            }
+            None => {
+                self.lanes.insert(
+                    key,
+                    LaneRun {
+                        commit: tip.commit.clone(),
+                        armed_at_unix_ms: now,
+                        queued: None,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// A lane's run ended. Returns its queued successor, keeping the slot held
+    /// for it, or releases the slot when nothing queued.
+    fn lane_finished(
+        &mut self,
+        project_id: &str,
+        lane: &CadenceLane,
+        now: i64,
+    ) -> Option<(Trigger, Tip)> {
+        let key = (project_id.to_string(), lane.key());
+        let run = self.lanes.get_mut(&key)?;
+        match run.queued.take() {
+            Some((trigger, tip)) => {
+                run.commit = tip.commit.clone();
+                run.armed_at_unix_ms = now;
+                Some((trigger, tip))
+            }
+            None => {
+                self.lanes.remove(&key);
                 None
             }
         }
     }
 
     fn in_flight(&self, project_id: &str) -> Option<InFlight> {
-        self.passes.get(project_id).map(|pass| InFlight {
-            branch: pass.branch.clone(),
-            armed_at_unix_ms: pass.armed_at_unix_ms,
+        let resolving = self
+            .arming
+            .get(project_id)
+            .map(|arming| (arming.branch.clone(), arming.armed_at_unix_ms));
+        let mut lanes: Vec<LaneInFlight> = self
+            .lanes
+            .iter()
+            .filter(|((project, _), _)| project == project_id)
+            .map(|((_, (check, platform)), run)| LaneInFlight {
+                check: check.clone(),
+                platform: platform.clone(),
+                commit: run.commit.clone(),
+                armed_at_unix_ms: run.armed_at_unix_ms,
+                queued: run.queued.is_some(),
+            })
+            .collect();
+        lanes.sort_by(|a, b| (&a.check, &a.platform).cmp(&(&b.check, &b.platform)));
+        (resolving.is_some() || !lanes.is_empty()).then(|| InFlight {
+            resolving,
+            lanes,
             rearming: self
                 .interrupted
                 .get(project_id)
@@ -264,17 +450,17 @@ impl CadenceSlots {
     }
 }
 
-/// The cadence pass armed for `project_id` right now, if any: the branch it
-/// attests, when it was armed, and the restart-cancelled passes it re-arms.
-/// While it runs the store holds no row for the new tip, so this is what tells
-/// "pending" from "never ran" (CAIRN-3823).
+/// The cadence work armed for `project_id` right now, if any: an arm resolving
+/// the tip, each lane's run, and the restart-cancelled passes they re-arm.
+/// While a lane runs the store holds no row of its for the new tip, so this is
+/// what tells "pending" from "never ran" (CAIRN-3823).
 pub(crate) fn in_flight(orch: &Orchestrator, project_id: &str) -> Option<InFlight> {
     orch.main_cadence.lock().unwrap().in_flight(project_id)
 }
 
-/// Arm a cadence pass for the project's default branch. Calling this on every
-/// observed advance is intended: requests coalesce into the running pass's one
-/// queued successor.
+/// Arm every lane for the project's default branch. Calling this on every
+/// observed advance is intended: requests coalesce into the running arm's one
+/// queued successor, and each lane folds the tip into its own.
 pub(crate) fn spawn(
     orch: &Orchestrator,
     project_id: String,
@@ -282,17 +468,37 @@ pub(crate) fn spawn(
     default_branch: String,
     trigger: Trigger,
 ) {
-    let start =
-        orch.main_cadence
-            .lock()
-            .unwrap()
-            .request(&project_id, &default_branch, trigger, now_ms());
+    arm(
+        orch,
+        project_id,
+        repo_path,
+        default_branch,
+        trigger,
+        LaneScope::All,
+    );
+}
+
+fn arm(
+    orch: &Orchestrator,
+    project_id: String,
+    repo_path: String,
+    default_branch: String,
+    trigger: Trigger,
+    scope: LaneScope,
+) {
+    let start = orch.main_cadence.lock().unwrap().request(
+        &project_id,
+        &default_branch,
+        trigger,
+        scope.clone(),
+        now_ms(),
+    );
     if !start {
         return;
     }
     let orch = orch.clone();
     tokio::spawn(async move {
-        let mut trigger = trigger;
+        let (mut trigger, mut scope) = (trigger, scope);
         loop {
             let settle = if trigger == Trigger::Startup {
                 BOOT_SETTLE_WINDOW
@@ -300,19 +506,27 @@ pub(crate) fn spawn(
                 SETTLE_WINDOW
             };
             tokio::time::sleep(settle).await;
-            // Supervised, so a panicking pass still releases the slot and is
+            // Supervised, so a panicking arm still releases the slot and is
             // announced rather than holding the project's cadence forever.
-            let pass =
-                tokio::spawn({
-                    let orch = orch.clone();
-                    let project_id = project_id.clone();
-                    let repo_path = repo_path.clone();
-                    let default_branch = default_branch.clone();
-                    async move {
-                        run_pass(&orch, &project_id, &repo_path, &default_branch, trigger).await
-                    }
-                })
-                .await;
+            let pass = tokio::spawn({
+                let orch = orch.clone();
+                let project_id = project_id.clone();
+                let repo_path = repo_path.clone();
+                let default_branch = default_branch.clone();
+                let scope = scope.clone();
+                async move {
+                    run_pass(
+                        &orch,
+                        &project_id,
+                        &repo_path,
+                        &default_branch,
+                        trigger,
+                        &scope,
+                    )
+                    .await
+                }
+            })
+            .await;
             let failure = match pass {
                 Ok(Ok(())) => None,
                 Ok(Err(error)) => Some(error),
@@ -320,7 +534,7 @@ pub(crate) fn spawn(
             };
             if let Some(cause) = failure {
                 log::error!("main cadence pass for project {project_id} failed: {cause}");
-                announce_pass_failure(&orch, &project_id, &repo_path, &cause).await;
+                announce_pass_failure(&orch, &project_id, &repo_path, &scope, &cause).await;
             }
             let next = orch
                 .main_cadence
@@ -328,7 +542,45 @@ pub(crate) fn spawn(
                 .unwrap()
                 .finish(&project_id, now_ms());
             match next {
-                Some(next) => trigger = next,
+                Some((next, next_scope)) => (trigger, scope) = (next, next_scope),
+                None => break,
+            }
+        }
+    });
+}
+
+/// Run `lane` on `tip`, then on each successor queued for it while it ran.
+fn start_lane(orch: &Orchestrator, tip: Tip, lane: CadenceLane, trigger: Trigger) {
+    let orch = orch.clone();
+    tokio::spawn(async move {
+        let (mut tip, mut trigger) = (tip, trigger);
+        loop {
+            // Supervised, so a panicking run still releases the lane's slot
+            // and is announced rather than holding the lane forever.
+            let run = tokio::spawn({
+                let orch = orch.clone();
+                let tip = tip.clone();
+                let lane = lane.clone();
+                async move { run_lane(&orch, &tip, &lane, trigger).await }
+            })
+            .await;
+            if let Err(join) = run {
+                let cause = format!("the cadence lane panicked: {join}");
+                log::error!(
+                    "main cadence {} on {} for project {}: {cause}",
+                    lane.check,
+                    lane.platform,
+                    tip.project_id
+                );
+                announce_lane_death(&orch, &tip, &lane, cause).await;
+            }
+            let next =
+                orch.main_cadence
+                    .lock()
+                    .unwrap()
+                    .lane_finished(&tip.project_id, &lane, now_ms());
+            match next {
+                Some((next, next_tip)) => (trigger, tip) = (next, next_tip),
                 None => break,
             }
         }
@@ -424,6 +676,12 @@ pub(crate) struct CadenceLane {
     pub(crate) notify: String,
 }
 
+impl CadenceLane {
+    fn key(&self) -> LaneKey {
+        (self.check.clone(), self.platform.clone())
+    }
+}
+
 /// Every lane a checks contract declares, in a stable order.
 fn cadence_lanes(checks: &HashMap<String, CheckCommand>) -> Vec<CadenceLane> {
     let mut lanes: Vec<CadenceLane> = checks
@@ -458,6 +716,7 @@ async fn run_pass(
     repo_path: &str,
     default_branch: &str,
     trigger: Trigger,
+    scope: &LaneScope,
 ) -> Result<(), String> {
     let db = crate::execution::routing::owning_db_for_project(&orch.db, project_id)
         .await
@@ -497,29 +756,46 @@ async fn run_pass(
     let commit = cairn_vcs::resolve_coordinate(&repository, default_branch)
         .await
         .map_err(|error| format!("default head '{default_branch}' is unresolvable: {error}"))?;
-    let lanes = tip_lanes(&orch.main_cadence, project_id, &commit, || {
+    let declared = tip_lanes(&orch.main_cadence, project_id, &commit, || {
         load_checks_contract_at_commit_detailed(&repo_root, &commit)
     })
     .await?;
+    if declared.is_empty() {
+        return Ok(());
+    }
+    orch.main_cadence
+        .lock()
+        .unwrap()
+        .forget_undeclared_interruptions(project_id, &declared);
+    let lanes: Vec<CadenceLane> = declared
+        .into_iter()
+        .filter(|lane| scope.includes(lane))
+        .collect();
     if lanes.is_empty() {
         return Ok(());
     }
-    let project_key = project_key(&db, project_id).await?;
-    let context = PassContext {
-        project_id,
-        project_key: &project_key,
-        repo_path,
-        default_branch,
-        repository: &repository,
-        commit: &commit,
-        trigger,
+    let tip = Tip {
+        project_id: project_id.to_string(),
+        project_key: project_key(&db, project_id).await?,
+        repo_path: repo_path.to_string(),
+        default_branch: default_branch.to_string(),
+        repository,
+        commit,
     };
-    futures_util::future::join_all(
-        lanes
-            .iter()
-            .map(|lane| run_lane(orch, db.clone(), &context, lane)),
-    )
-    .await;
+    // Each lane runs on its own slot, so the arm ends here: a lane still
+    // running from an earlier tip takes this one as its queued successor and
+    // holds back no other lane.
+    let now = now_ms();
+    for lane in lanes {
+        let start = orch
+            .main_cadence
+            .lock()
+            .unwrap()
+            .offer(&lane, &tip, trigger, now);
+        if start {
+            start_lane(orch, tip.clone(), lane, trigger);
+        }
+    }
     Ok(())
 }
 
@@ -625,12 +901,21 @@ enum LaneAttempt {
     Verdict(CadenceVerdict),
 }
 
-async fn run_lane(
-    orch: &Orchestrator,
-    db: Arc<LocalDb>,
-    context: &PassContext<'_>,
-    lane: &CadenceLane,
-) {
+async fn run_lane(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, trigger: Trigger) {
+    let db = match crate::execution::routing::owning_db_for_project(&orch.db, &tip.project_id).await
+    {
+        Ok(db) => db,
+        Err(error) => {
+            log::error!(
+                "main cadence {} on {} for project {}: the project's database is unreachable, so this lane can neither run nor report: {error}",
+                lane.check,
+                lane.platform,
+                tip.project_id
+            );
+            return;
+        }
+    };
+    let context = &tip.context(trigger);
     match attempt_lane(orch, db.clone(), context, lane).await {
         LaneAttempt::Covered(row) => {
             let rearmed = orch
@@ -671,7 +956,8 @@ async fn run_lane(
 }
 
 /// If this lane died because its question still owes a displaced answer's
-/// death, arm the project again the moment that debt settles.
+/// death, arm this lane again the moment that debt settles. Only this lane:
+/// another platform's lane is not re-run because this one's debt settled.
 ///
 /// The wait has no bound of its own: it lasts as long as the evidence takes,
 /// and settling is the only thing that ends it. One waiter per question, so a
@@ -689,18 +975,20 @@ fn rearm_on_debt_settlement(orch: &Orchestrator, context: &PassContext<'_>, lane
     let project_id = context.project_id.to_string();
     let repo_path = context.repo_path.to_string();
     let default_branch = context.default_branch.to_string();
+    let scope = LaneScope::lane(lane);
     tokio::spawn(async move {
         orch.fleet.purpose_debt_cleared(&key).await;
         orch.main_cadence.lock().unwrap().debt_settled(&key);
         log::info!(
-            "purpose {key} owes nothing now; re-arming the main cadence for project {project_id}"
+            "purpose {key} owes nothing now; re-arming its main cadence lane for project {project_id}"
         );
-        spawn(
+        arm(
             &orch,
             project_id,
             repo_path,
             default_branch,
             Trigger::DebtSettled,
+            scope,
         );
     });
 }
@@ -960,19 +1248,46 @@ async fn announce_quiet_lane(
     deliver(orch, db, context.project_id, &lane.notify, &content).await;
 }
 
-/// A pass that failed before reaching its lanes still owes each lane its
-/// loudest message. The tip's contract was unreadable, so the lanes come from
-/// the project checkout's configuration.
+/// A lane run that ended without reaching its report (it panicked) still owes
+/// its lane the loudest message.
+async fn announce_lane_death(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, cause: String) {
+    let Ok(db) = crate::execution::routing::owning_db_for_project(&orch.db, &tip.project_id).await
+    else {
+        return;
+    };
+    report_lane(
+        orch,
+        &db,
+        &tip.project_id,
+        &tip.project_key,
+        Some(&tip.repository),
+        lane,
+        Some(&tip.commit),
+        cancelled_by_restart(
+            CadenceVerdict::Death { cause },
+            orch.fleet.runner_stopping_since(),
+        ),
+    )
+    .await;
+}
+
+/// A pass that failed before reaching its lanes still owes each lane in its
+/// scope its loudest message. The tip's contract was unreadable, so the lanes
+/// come from the project checkout's configuration.
 async fn announce_pass_failure(
     orch: &Orchestrator,
     project_id: &str,
     repo_path: &str,
+    scope: &LaneScope,
     cause: &str,
 ) {
     let Some(checks) = crate::config::project_settings::load_checks(Path::new(repo_path)) else {
         return;
     };
-    let lanes = cadence_lanes(&checks);
+    let lanes: Vec<CadenceLane> = cadence_lanes(&checks)
+        .into_iter()
+        .filter(|lane| scope.includes(lane))
+        .collect();
     if lanes.is_empty() {
         return;
     }
@@ -2715,44 +3030,167 @@ mod tests {
         })
     }
 
-    /// The armed pass's branch and arming instant.
-    fn armed(slots: &CadenceSlots, project_id: &str) -> Option<(String, i64)> {
+    fn macos_lane() -> CadenceLane {
+        CadenceLane {
+            platform: "macos".into(),
+            ..linux_lane()
+        }
+    }
+
+    fn tip(project_id: &str, commit: &str) -> Tip {
+        Tip {
+            project_id: project_id.into(),
+            project_key: "cairn".into(),
+            repo_path: "/tmp/repo".into(),
+            default_branch: "main".into(),
+            repository: PathBuf::from("/tmp/store"),
+            commit: commit.into(),
+        }
+    }
+
+    /// The arm resolving the tip: its branch and arming instant.
+    fn resolving(slots: &CadenceSlots, project_id: &str) -> Option<(String, i64)> {
         slots
             .in_flight(project_id)
-            .map(|pass| (pass.branch, pass.armed_at_unix_ms))
+            .and_then(|in_flight| in_flight.resolving)
     }
 
     #[test]
-    fn requests_during_a_pass_coalesce_into_one_queued_successor() {
+    fn requests_during_an_arm_coalesce_into_one_queued_successor() {
+        let all = || LaneScope::All;
         let mut slots = CadenceSlots::default();
-        assert!(slots.request("p", "main", Trigger::Startup, 1));
-        assert_eq!(armed(&slots, "p"), Some(("main".to_string(), 1)));
-        // Three merges and a heartbeat while the first pass runs: no second
-        // pass starts, and exactly one successor is owed.
-        assert!(!slots.request("p", "main", Trigger::Heartbeat, 2));
-        assert!(!slots.request("p", "main", Trigger::Merge, 3));
-        assert!(!slots.request("p", "main", Trigger::Merge, 4));
-        assert!(!slots.request("p", "main", Trigger::Heartbeat, 5));
+        assert!(slots.request("p", "main", Trigger::Startup, all(), 1));
+        assert_eq!(resolving(&slots, "p"), Some(("main".to_string(), 1)));
+        // Three merges and a heartbeat while the first arm runs: no second
+        // arm starts, and exactly one successor is owed.
+        assert!(!slots.request("p", "main", Trigger::Heartbeat, all(), 2));
+        assert!(!slots.request("p", "main", Trigger::Merge, all(), 3));
+        assert!(!slots.request("p", "main", Trigger::Merge, all(), 4));
+        assert!(!slots.request("p", "main", Trigger::Heartbeat, all(), 5));
         assert_eq!(
             slots.finish("p", 6),
-            Some(Trigger::Merge),
+            Some((Trigger::Merge, LaneScope::All)),
             "the strongest reason is kept"
         );
-        assert_eq!(armed(&slots, "p"), Some(("main".to_string(), 6)));
+        assert_eq!(resolving(&slots, "p"), Some(("main".to_string(), 6)));
         assert_eq!(
             slots.finish("p", 7),
             None,
             "one successor, never one per merge"
         );
-        assert_eq!(armed(&slots, "p"), None);
+        assert_eq!(slots.in_flight("p"), None);
         assert!(
-            slots.request("p", "main", Trigger::Merge, 8),
+            slots.request("p", "main", Trigger::Merge, all(), 8),
             "a released slot starts afresh"
         );
         assert!(
-            slots.request("q", "trunk", Trigger::Merge, 8),
+            slots.request("q", "trunk", Trigger::Merge, all(), 8),
             "projects are independent"
         );
+    }
+
+    /// cairn/5270: every lane of a pass used to be joined, so the next pass
+    /// (and the Linux row it would record) waited for the slowest lane, and a
+    /// macOS lane parked for its whole four-hour placement bound would have
+    /// held Linux for four hours. Each lane now holds only its own slot.
+    #[test]
+    fn a_busy_lane_never_delays_another_lanes_successor() {
+        let (linux, macos) = (linux_lane(), macos_lane());
+        let mut slots = CadenceSlots::default();
+        assert!(slots.offer(&linux, &tip("p", "t1"), Trigger::Merge, 1));
+        assert!(slots.offer(&macos, &tip("p", "t1"), Trigger::Merge, 1));
+        // Two more tips while both run: each lane owes one successor, on the
+        // newest tip, with the strongest reason.
+        assert!(!slots.offer(&linux, &tip("p", "t2"), Trigger::Merge, 2));
+        assert!(!slots.offer(&macos, &tip("p", "t2"), Trigger::Merge, 2));
+        assert!(!slots.offer(&linux, &tip("p", "t3"), Trigger::Heartbeat, 3));
+        assert!(!slots.offer(&macos, &tip("p", "t3"), Trigger::Heartbeat, 3));
+
+        // Linux finishes while macOS is still parked, and starts its successor
+        // at once.
+        assert_eq!(
+            slots.lane_finished("p", &linux, 4),
+            Some((Trigger::Merge, tip("p", "t3")))
+        );
+        assert_eq!(slots.lane_finished("p", &linux, 5), None);
+        // The next merge, macOS still parked: idle Linux starts, macOS folds.
+        assert!(slots.offer(&linux, &tip("p", "t4"), Trigger::Merge, 6));
+        assert!(!slots.offer(&macos, &tip("p", "t4"), Trigger::Merge, 6));
+        assert_eq!(
+            slots.in_flight("p"),
+            Some(InFlight {
+                resolving: None,
+                lanes: vec![
+                    LaneInFlight {
+                        check: "rust-tests".into(),
+                        platform: "linux".into(),
+                        commit: "t4".into(),
+                        armed_at_unix_ms: 6,
+                        queued: false,
+                    },
+                    LaneInFlight {
+                        check: "rust-tests".into(),
+                        platform: "macos".into(),
+                        commit: "t1".into(),
+                        armed_at_unix_ms: 1,
+                        queued: true,
+                    },
+                ],
+                rearming: Vec::new(),
+            })
+        );
+
+        // macOS owes exactly one successor, on the newest tip.
+        assert_eq!(
+            slots.lane_finished("p", &macos, 7),
+            Some((Trigger::Merge, tip("p", "t4")))
+        );
+        assert_eq!(slots.lane_finished("p", &macos, 8), None);
+        assert!(
+            slots.offer(&macos, &tip("q", "t1"), Trigger::Merge, 8),
+            "projects are independent"
+        );
+    }
+
+    /// A lane's own re-arm (its settled debt) names only that lane, so the
+    /// macOS lane's debt never re-runs the Linux lane. A merge folded into the
+    /// same arm is what widens it to every lane.
+    #[test]
+    fn a_lane_rearm_runs_only_that_lane_unless_a_merge_widens_it() {
+        let (linux, macos) = (linux_lane(), macos_lane());
+        let only_macos = LaneScope::lane(&macos);
+        assert!(only_macos.includes(&macos));
+        assert!(!only_macos.includes(&linux));
+        assert!(LaneScope::All.includes(&linux));
+
+        let mut slots = CadenceSlots::default();
+        assert!(slots.request("p", "main", Trigger::Merge, LaneScope::All, 1));
+        assert!(!slots.request("p", "main", Trigger::DebtSettled, only_macos.clone(), 2));
+        assert_eq!(
+            slots.finish("p", 3),
+            Some((Trigger::DebtSettled, only_macos.clone())),
+            "a queued lane re-arm stays that lane's"
+        );
+        assert!(!slots.request(
+            "p",
+            "main",
+            Trigger::DebtSettled,
+            LaneScope::lane(&linux),
+            4
+        ));
+        assert!(!slots.request("p", "main", Trigger::DebtSettled, only_macos.clone(), 5));
+        assert_eq!(
+            slots.finish("p", 6),
+            Some((
+                Trigger::DebtSettled,
+                LaneScope::Only(BTreeSet::from([linux.key(), macos.key()]))
+            )),
+            "two lanes' re-arms are one arm for both"
+        );
+        assert!(!slots.request("p", "main", Trigger::Merge, LaneScope::All, 7));
+        assert!(!slots.request("p", "main", Trigger::DebtSettled, only_macos, 8));
+        assert_eq!(slots.finish("p", 9), Some((Trigger::Merge, LaneScope::All)));
+        assert_eq!(slots.finish("p", 10), None);
     }
 
     /// A settled debt outranks the routine re-arms, so a pass queued behind it
@@ -2763,10 +3201,13 @@ mod tests {
         assert!(Trigger::DebtSettled > Trigger::Startup);
         assert!(Trigger::DebtSettled < Trigger::Merge);
         let mut slots = CadenceSlots::default();
-        assert!(slots.request("p", "main", Trigger::Startup, 1));
-        assert!(!slots.request("p", "main", Trigger::Heartbeat, 2));
-        assert!(!slots.request("p", "main", Trigger::DebtSettled, 3));
-        assert_eq!(slots.finish("p", 4), Some(Trigger::DebtSettled));
+        assert!(slots.request("p", "main", Trigger::Startup, LaneScope::All, 1));
+        assert!(!slots.request("p", "main", Trigger::Heartbeat, LaneScope::All, 2));
+        assert!(!slots.request("p", "main", Trigger::DebtSettled, LaneScope::All, 3));
+        assert_eq!(
+            slots.finish("p", 4),
+            Some((Trigger::DebtSettled, LaneScope::All))
+        );
     }
 
     /// One debt, one waiter, however many passes it refuses.
@@ -2886,8 +3327,8 @@ mod tests {
         // Before the restart: a pass on the old tip, a merge queued behind it,
         // and the stop ending its lane.
         let mut before = CadenceSlots::default();
-        assert!(before.request("p", "main", Trigger::Merge, 1));
-        assert!(!before.request("p", "main", Trigger::Merge, 2));
+        assert!(before.offer(&lane, &tip("p", "5027f5473a57a1b2"), Trigger::Merge, 1));
+        assert!(!before.offer(&lane, &tip("p", "later"), Trigger::Merge, 2));
         let stopped_at = 3 * HOUR;
         let ended = cancelled_by_restart(
             CadenceVerdict::Death {
@@ -2919,17 +3360,17 @@ mod tests {
             slots.interrupted(&project_id, interruption);
         }
         assert!(
-            slots.request("p", "main", Trigger::Startup, 4),
+            slots.request("p", "main", Trigger::Startup, LaneScope::All, 4),
             "the boot arm starts a pass"
         );
         // The catch-up's re-arm and a merge seen during the boot pass are one
         // queued successor, not more passes.
-        assert!(!slots.request("p", "main", Trigger::Startup, 5));
-        assert!(!slots.request("p", "main", Trigger::Merge, 6));
+        assert!(!slots.request("p", "main", Trigger::Startup, LaneScope::All, 5));
+        assert!(!slots.request("p", "main", Trigger::Merge, LaneScope::All, 6));
         let armed = slots
             .in_flight("p")
             .expect("main has a pass armed after boot");
-        assert_eq!(armed.armed_at_unix_ms, 4);
+        assert_eq!(armed.resolving, Some(("main".to_string(), 4)));
         assert_eq!(
             armed.rearming,
             vec![cancelled.clone()],
@@ -2966,7 +3407,7 @@ mod tests {
             "{message}"
         );
 
-        assert_eq!(slots.finish("p", 7), Some(Trigger::Merge));
+        assert_eq!(slots.finish("p", 7), Some((Trigger::Merge, LaneScope::All)));
         assert_eq!(slots.finish("p", 8), None);
         assert!(slots.in_flight("p").is_none());
     }
@@ -3012,25 +3453,29 @@ mod tests {
         );
     }
 
+    /// Lanes report on their own slots after the arm has ended, so a citation
+    /// is dropped when the tip no longer declares its lane, not when an arm
+    /// ends: a citation for a lane still running must survive the arm.
     #[test]
-    fn a_citation_no_lane_took_ends_with_its_pass() {
+    fn a_citation_for_a_lane_the_tip_no_longer_declares_is_dropped() {
+        let interruption = |check: &str| Interruption {
+            check: check.into(),
+            platform: "linux".into(),
+            commit: "c".into(),
+            stopped_at_unix_ms: 1,
+        };
         let mut slots = CadenceSlots::default();
-        slots.interrupted(
-            "p",
-            Interruption {
-                check: "retired-check".into(),
-                platform: "linux".into(),
-                commit: "c".into(),
-                stopped_at_unix_ms: 1,
-            },
-        );
-        assert!(slots.request("p", "main", Trigger::Startup, 2));
-        assert_eq!(slots.in_flight("p").unwrap().rearming.len(), 1);
+        slots.interrupted("p", interruption("retired-check"));
+        slots.interrupted("p", interruption("rust-tests"));
+        assert!(slots.request("p", "main", Trigger::Startup, LaneScope::All, 2));
+        assert_eq!(slots.in_flight("p").unwrap().rearming.len(), 2);
+        slots.forget_undeclared_interruptions("p", &[linux_lane(), macos_lane()]);
         assert_eq!(slots.finish("p", 3), None);
-        assert!(slots.request("p", "main", Trigger::Merge, 4));
-        assert!(
-            slots.in_flight("p").unwrap().rearming.is_empty(),
-            "a lane the tip no longer declares is not re-armed forever"
+        assert!(slots.offer(&linux_lane(), &tip("p", "t"), Trigger::Startup, 3));
+        assert_eq!(
+            slots.in_flight("p").unwrap().rearming,
+            vec![interruption("rust-tests")],
+            "the running lane keeps its citation; the retired one is not re-armed forever"
         );
     }
 
