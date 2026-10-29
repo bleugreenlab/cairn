@@ -416,7 +416,6 @@ mod tests {
                 ceiling: cairn_common::executor_protocol::MemoryCeiling {
                     estimate_bytes: 10_352_608_320,
                     ceiling_bytes: 8_282_086_656,
-                    killed_here: None,
                 },
                 alternative_executor_id: "exec-big".into(),
                 alternative_executor_name: "bglab-mac".into(),

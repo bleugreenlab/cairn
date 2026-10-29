@@ -24,25 +24,12 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "m
 # Full-text search index. Descends here from cairn-core so its ~22s compile edge
 # moves out of the core hot path (the whole point of the extraction).
 tantivy = "0.26.1"
-# Embedded Turso — the local DB engine and authoritative source pin (URL and rev).
-# scripts/ensure-tursodb.ts and scripts/build-sync-supervisor.ts read both from
-# this line, so tursodb and the sync-supervisor image build the same source
-# (CAIRN-2147 ABI invariant); keep it on one line.
-#
-# FORK: https://github.com/bleugreen/turso, rev 31b95024 (branch
-# cairn/964faddd-connection-interrupt) is ONE commit on upstream 964faddd that
-# adds `Connection::set_query_timeout` and `Connection::interrupt` to the Rust
-# binding (no engine change), which LocalDb's pooled-read bound needs. The same
-# change is upstream PR https://github.com/tursodatabase/turso/pull/10992 (branch
-# cairn/connection-interrupt, head 963a6899, on turso main). The next person to
-# move cairn-db's turso revision removes the fork once upstream PR
-# https://github.com/tursodatabase/turso/pull/10992 is in that revision. Until
-# then, do not delete the fork or that branch: rev 31b95024 lives only there, and
-# every cold fetch and the sync-supervisor image build resolve it from there.
-#
-# 964faddd includes upstream's MVCC checkpoint rollback repair: stage root-map
-# mutations until pager commit and clear pending reads on teardown (CAIRN-3838).
-turso = { git = "https://github.com/bleugreen/turso", rev = "31b950246e8f93fa47ff0d1b78955ff3d1c69139", default-features = false, features = ["sync"] }
+# Embedded Turso — the local DB engine and authoritative revision pin.
+# The test provisioner reads this pin; sync-supervisor must build the same rev
+# (CAIRN-2147 ABI invariant). This revision includes upstream's MVCC checkpoint
+# rollback repair: stage root-map mutations until pager commit and clear pending
+# reads on teardown (CAIRN-3838).
+turso = { git = "https://github.com/tursodatabase/turso", rev = "964faddd16b20ed7d5c090a879a138dbabeee508", default-features = false, features = ["sync"] }
 # Direct rustls handle so `LocalDb::ensure_crypto_provider` can install a
 # process-wide default `CryptoProvider` before turso's sync TLS client is built.
 # See the doc comment on `ensure_crypto_provider` in storage/local_db.rs.
@@ -52,9 +39,6 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 # into cross-crate test-utils builds where dev-deps are absent (mirrors cairn-codec).
 tempfile = "3"
 cairn-common = { path = "../cairn-common" }
-# The per-thread region registry the runtime stall watchdog reads; a database
-# call tags each poll with the statement it is running (`local_db::named`).
-cairn-platform = { path = "../cairn-platform" }
 # The gix + zstd event-codec/object substrate; storage/events re-exports it.
 cairn-codec = { path = "../cairn-codec" }
 # Mints and matches the feed acknowledgement token. Agents copy that token out of

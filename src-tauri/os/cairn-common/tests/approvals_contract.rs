@@ -8,9 +8,9 @@
 
 use base64::Engine as _;
 use cairn_common::approvals::{
-    is_safe_head_ref, parse_canonical_p256_der_signature, validate_display_text, ApprovalDecision,
-    ApprovalEnrollmentBindingV1, ApprovalIntent, ApprovalRevocationBindingV1,
-    ApprovalSignatureAlgorithm, ApprovalSignatureFormat, BaseMergeIntentV2, PhoneApprovalAssertion,
+    parse_canonical_p256_der_signature, ApprovalDecision, ApprovalEnrollmentBindingV1,
+    ApprovalIntent, ApprovalRevocationBindingV1, ApprovalSignatureAlgorithm,
+    ApprovalSignatureFormat, BaseMergeIntentV1, PhoneApprovalAssertion,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -44,7 +44,7 @@ fn expect_str(value: &Value) -> &str {
 fn base_merge_intent_bytes_match_the_service() {
     let fixture = fixture();
     let recorded = &fixture["baseMergeIntent"];
-    let intent: BaseMergeIntentV2 = serde_json::from_value(recorded["intent"].clone()).unwrap();
+    let intent: BaseMergeIntentV1 = serde_json::from_value(recorded["intent"].clone()).unwrap();
 
     let canonical = intent.canonical_bytes().unwrap();
     assert_eq!(canonical, base64_bytes(&recorded["canonicalBytesBase64"]));
@@ -53,7 +53,7 @@ fn base_merge_intent_bytes_match_the_service() {
         recorded["canonicalBytesLength"].as_u64().unwrap()
     );
     assert_eq!(
-        hex(&ApprovalIntent::BaseMergeV2(intent).digest_sha256().unwrap()),
+        hex(&ApprovalIntent::BaseMergeV1(intent).digest_sha256().unwrap()),
         expect_str(&recorded["digestSha256"])
     );
 }
@@ -61,7 +61,7 @@ fn base_merge_intent_bytes_match_the_service() {
 #[test]
 fn phone_ceremony_signing_bytes_match_the_service() {
     let fixture = fixture();
-    let intent: BaseMergeIntentV2 =
+    let intent: BaseMergeIntentV1 =
         serde_json::from_value(fixture["baseMergeIntent"]["intent"].clone()).unwrap();
     let recorded = &fixture["phoneAssertion"];
     let assertion_json = &recorded["assertion"];
@@ -85,7 +85,7 @@ fn phone_ceremony_signing_bytes_match_the_service() {
     };
 
     let signing = assertion
-        .canonical_signing_bytes(&ApprovalIntent::BaseMergeV2(intent))
+        .canonical_signing_bytes(&ApprovalIntent::BaseMergeV1(intent))
         .unwrap();
     assert_eq!(signing, base64_bytes(&recorded["signingBytesBase64"]));
     assert_eq!(
@@ -181,46 +181,7 @@ fn strict_decoding_refuses_unknown_and_unrepresentable_fields() {
 
     let mut value = fixture["baseMergeIntent"]["intent"].clone();
     value.as_object_mut().unwrap().remove("audience");
-    assert!(serde_json::from_value::<BaseMergeIntentV2>(value).is_err());
-
-    let mut value = fixture["baseMergeIntent"]["intent"].clone();
-    value["merge_strategy"] = Value::String("fast_forward".into());
-    assert!(serde_json::from_value::<BaseMergeIntentV2>(value).is_err());
-}
-
-#[test]
-fn display_text_vectors_decide_the_same_way_on_every_side() {
-    let fixture = fixture();
-    let vectors = fixture["displayTextVectors"]["vectors"].as_array().unwrap();
-    assert!(vectors.iter().any(|vector| vector["accepted"] == true));
-    assert!(vectors.iter().any(|vector| vector["accepted"] == false));
-    for vector in vectors {
-        let label = expect_str(&vector["label"]);
-        let verdict = validate_display_text(
-            "vector",
-            expect_str(&vector["value"]),
-            vector["maxBytes"].as_u64().unwrap() as usize,
-            vector["allowNewline"].as_bool().unwrap(),
-        );
-        assert_eq!(
-            verdict.is_ok(),
-            vector["accepted"].as_bool().unwrap(),
-            "{label}"
-        );
-    }
-}
-
-#[test]
-fn head_ref_vectors_decide_the_same_way_on_every_side() {
-    let fixture = fixture();
-    for vector in fixture["headRefVectors"]["vectors"].as_array().unwrap() {
-        let label = expect_str(&vector["label"]);
-        assert_eq!(
-            is_safe_head_ref(expect_str(&vector["value"])),
-            vector["accepted"].as_bool().unwrap(),
-            "{label}"
-        );
-    }
+    assert!(serde_json::from_value::<BaseMergeIntentV1>(value).is_err());
 }
 
 #[test]

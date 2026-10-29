@@ -109,15 +109,11 @@ pub(super) async fn dispatch(
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-                let mut data = serde_json::json!({
+                *applied_data = Some(serde_json::json!({
                     "projectKey": outcome.project_key,
                     "number": outcome.number,
                     "uri": outcome.uri,
-                });
-                if let Some(tenet) = outcome.proposed_tenet {
-                    data["tenet"] = serde_json::Value::String(tenet);
-                }
-                *applied_data = Some(data);
+                }));
                 outcome.summary
             }
         }

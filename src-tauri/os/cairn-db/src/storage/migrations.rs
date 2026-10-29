@@ -3,20 +3,7 @@
 //! A migration's identity is written exactly once, as the name of its SQL file.
 //! `migration!` and `team_migration!` below turn that one filename stem into the
 //! registered version, the registered name, and the `include_str!` path, so the
-//! three can never disagree.
-//!
-//! Everything composed in this file is frozen history, up to and including
-//! migration [`CUTOVER`](super::migration_files::CUTOVER). Every later migration
-//! is a file in `turso_migrations/` and nothing else: `build.rs` derives the tail
-//! each lineage appends from the directory and the file's `-- lineage:` header
-//! (see `storage/migration_files.rs`). Nobody edits the composers, the per-
-//! migration macros, or the lineage pins below again; a new migration is
-//! authored as `NEXT_name.sql` and numbered by the landing.
-
-// The derived tail: `with_private_tail!` and `with_team_tail!`, which close each
-// lineage's array, and the stems they append (`DERIVED_PRIVATE_TAIL`,
-// `DERIVED_TEAM_TAIL`).
-include!(concat!(env!("OUT_DIR"), "/migration_tail.rs"));
+//! three can never disagree and renumbering is a file rename plus one string.
 
 /// Registers a private-lineage migration (`turso_migrations/`) from its SQL
 /// filename stem.
@@ -185,15 +172,6 @@ macro_rules! private_purpose_debts {
 macro_rules! private_embedding_space {
     () => {
         migration!("0285_embedding_space")
-    };
-}
-
-/// cairn/5416: an out-of-memory kill of a profiled command records the
-/// victim's resident size as a demand floor on that machine context. Private
-/// with the rest of `command_resource_profiles`.
-macro_rules! private_command_resource_memory_kills {
-    () => {
-        migration!("0287_command_resource_memory_kills")
     };
 }
 
@@ -388,24 +366,6 @@ macro_rules! shared_tail_compile_facts {
 macro_rules! shared_tail_turn_end_check_attempt_plan {
     () => {
         migration!("0284_turn_end_check_attempt_plan")
-    };
-}
-
-/// cairn/5433: a tenet's reasoning lives in `rationale`, beside the
-/// one-sentence statement the operator answers. `tenets` is carried by both
-/// lineages.
-macro_rules! shared_tail_tenet_rationale {
-    () => {
-        migration!("0286_tenet_rationale")
-    };
-}
-
-/// cairn/5396: per-run minutes with model output, the measure behind
-/// analytics' agent time. Maintained by a trigger on `events`, which both
-/// lineages carry.
-macro_rules! shared_tail_run_activity_minutes {
-    () => {
-        migration!("0288_run_activity_minutes")
     };
 }
 
@@ -1560,7 +1520,7 @@ macro_rules! private_channel_outbound_expired {
 
 macro_rules! team_lineage {
     ($($head:expr),* $(,)?) => {
-        with_team_tail![
+        &[
             $($head,)*
             shared_tail!(),
             shared_tail_token_rollup_hourly!(),
@@ -1658,8 +1618,6 @@ macro_rules! team_lineage {
             shared_tail_job_goal_intent!(),
             shared_tail_compile_facts!(),
             shared_tail_turn_end_check_attempt_plan!(),
-            shared_tail_tenet_rationale!(),
-            shared_tail_run_activity_minutes!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1667,18 +1625,13 @@ macro_rules! team_lineage {
             // on synced replica tables break Turso sync triggers. The unfenced
             // `turso_sync_roundtrip` lane failed 8/15 tests when this was modeled
             // as `0003_drop_projects_server_id`, so do not re-add that tail entry.
-            //
-            // ── DERIVED TAIL ────────────────────────────────────────────────
-            // Nothing is composed by hand past the cutover. `with_team_tail!`
-            // appends every post-cutover file headed `-- lineage: shared` or
-            // `-- lineage: team`, in number order.
         ]
     };
 }
 
 macro_rules! private_lineage {
     ($($head:expr),* $(,)?) => {
-        with_private_tail![
+        &[
             $($head,)*
             shared_tail!(),
             shared_tail_token_rollup_hourly!(),
@@ -1954,13 +1907,6 @@ macro_rules! private_lineage {
             shared_tail_compile_facts!(),
             shared_tail_turn_end_check_attempt_plan!(),
             private_embedding_space!(),
-            shared_tail_tenet_rationale!(),
-            private_command_resource_memory_kills!(),
-            shared_tail_run_activity_minutes!(),
-            // ── DERIVED TAIL ────────────────────────────────────────────────
-            // Nothing is composed by hand past the cutover. `with_private_tail!`
-            // appends every post-cutover file headed `-- lineage: shared` or
-            // `-- lineage: private`, in number order.
         ]
     };
 }
@@ -2356,11 +2302,8 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("jj_reconcile_intents", TableScope::ProjectScoped),
     ("jj_reconcile_items", TableScope::ProjectScoped),
     ("jj_reconcile_quarantines", TableScope::ProjectScoped),
-    // cairn/5222: the identifiers this installation's store bound at landing.
-    // A landing runs against this machine's store, so the record of what it
-    // allocated is this installation's own.
     (
-        "landing_allocations",
+        "contended_identifier_obligations",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     ("job_file_activity", TableScope::ProjectScoped),
@@ -2392,7 +2335,6 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("queued_messages", TableScope::ProjectScoped),
     ("repl_exchanges", TableScope::ProjectScoped),
     ("resource_surfacings", TableScope::ProjectScoped),
-    ("run_activity_minutes", TableScope::ProjectScoped),
     ("runs", TableScope::ProjectScoped),
     ("search_outbox", TableScope::ProjectScoped),
     ("session_skyline_cache", TableScope::ProjectScoped),
@@ -2586,12 +2528,6 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ),
     (
         "integrity_sweep_state",
-        TableScope::Private(PrivateReason::RunnerTransient),
-    ),
-    // A main-cadence lane pass this runner's own restart cancelled, held only
-    // until the next boot's re-arm cites it.
-    (
-        "main_cadence_interruptions",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     (
@@ -3219,10 +3155,6 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
         id_columns: &["id", "job_id"],
     },
     RekeyTableManifest {
-        table: "run_activity_minutes",
-        id_columns: &["run_id"],
-    },
-    RekeyTableManifest {
         table: "token_rollup",
         id_columns: &["id", "project_id", "run_id", "job_id"],
     },
@@ -3482,109 +3414,40 @@ mod tests {
         }
     }
 
-    /// The post-cutover stems one lineage takes, read from the directory at test
-    /// time through the same grammar `build.rs` used, so the compiled tail is
-    /// checked against the files rather than against itself.
-    fn directory_tail(team: bool) -> Vec<String> {
-        let directory =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../turso_migrations");
-        let mut files: Vec<(String, String)> = std::fs::read_dir(&directory)
-            .unwrap()
-            .map(|entry| {
-                let entry = entry.unwrap();
-                (
-                    entry.file_name().to_string_lossy().into_owned(),
-                    std::fs::read_to_string(entry.path()).unwrap_or_default(),
-                )
-            })
-            .collect();
-        files.sort();
-        crate::storage::migration_files::derive_tail(&files)
-            .unwrap()
-            .into_iter()
-            .filter(|migration| {
-                if team {
-                    migration.headers.lineage.reaches_team()
-                } else {
-                    migration.headers.lineage.reaches_private()
-                }
-            })
-            .map(|migration| migration.stem)
-            .collect()
-    }
-
-    /// Holds an applied lineage to its frozen pin, then its tail to the
-    /// directory.
+    /// Holds an applied lineage to its authored pin, naming what moved.
     ///
-    /// The pin is history: every migration up to the cutover, in the order the
-    /// lineage composes them. Nothing is added to it again. Every migration after
-    /// it is a file whose header names its lineage, appended in number order
-    /// (provisional `NEXT` stems last); the tail is asserted against the
-    /// directory rather than written down here, which is what lets two branches
-    /// add migrations without touching one shared line.
+    /// Adding a migration is by far the common way a pin breaks, so membership
+    /// drift is reported as the edit it calls for before the full ordered
+    /// comparison, which is then left to catch a genuine reorder.
     #[track_caller]
     fn assert_lineage_pin(lineage: &str, applied: &[String], pinned: &[&str]) {
         let names = applied_names(applied);
+        let unpinned: Vec<&str> = applied
+            .iter()
+            .zip(&names)
+            .filter(|(_, name)| !pinned.contains(name))
+            .map(|(stem, _)| stem.as_str())
+            .collect();
         assert!(
-            names.len() >= pinned.len(),
-            "the {lineage} lineage applies {} migrations but its frozen history pins {}",
-            names.len(),
-            pinned.len()
+            unpinned.is_empty(),
+            "you added migration {} to the {lineage} lineage; update this list: \
+             add its name at the position it occupies in the lineage",
+            unpinned.join(", ")
+        );
+        let unregistered: Vec<&str> = pinned
+            .iter()
+            .filter(|name| !names.contains(name))
+            .copied()
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "the {lineage} lineage no longer applies {}; remove it from this list",
+            unregistered.join(", ")
         );
         assert_eq!(
-            &names[..pinned.len()],
-            pinned,
-            "the {lineage} lineage's frozen history changed. Migrations up to {:04} are composed \
-             by hand and pinned here, and neither is edited again; a new migration is a \
-             `NEXT_name.sql` file with a `-- lineage:` header",
-            crate::storage::migration_files::CUTOVER
+            names, pinned,
+            "the {lineage} lineage applies its migrations in a different order than this list pins"
         );
-        // The runner applied the registry in order (`migrated_db` holds it to
-        // that), so the tail's stems are the registry's past the pin.
-        let registry = if lineage == "team" {
-            TEAM_MIGRATIONS
-        } else {
-            TURSO_MIGRATIONS
-        };
-        assert_eq!(applied.len(), registry.len());
-        let tail: Vec<String> = registry[pinned.len()..]
-            .iter()
-            .map(|migration| {
-                if crate::storage::migration::is_provisional_version(migration.version()) {
-                    migration.version().to_string()
-                } else {
-                    format!("{}_{}", migration.version(), migration.name())
-                }
-            })
-            .collect();
-        assert_eq!(
-            tail,
-            directory_tail(lineage == "team"),
-            "the {lineage} lineage's derived tail is not the post-cutover files of \
-             turso_migrations/ in number order"
-        );
-    }
-
-    /// The compiled tail lists exactly what the directory holds, so a build that
-    /// missed a new file (a stale `build.rs` run) fails here.
-    #[test]
-    fn the_compiled_tail_is_the_directory() {
-        assert_eq!(DERIVED_PRIVATE_TAIL, directory_tail(false).as_slice());
-        assert_eq!(DERIVED_TEAM_TAIL, directory_tail(true).as_slice());
-        let registered: Vec<&str> = TURSO_MIGRATIONS
-            .iter()
-            .rev()
-            .take(DERIVED_PRIVATE_TAIL.len())
-            .map(|migration| migration.name())
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        let expected: Vec<&str> = DERIVED_PRIVATE_TAIL
-            .iter()
-            .map(|stem| stem.split_once('_').map_or(*stem, |(_, name)| name))
-            .collect();
-        assert_eq!(registered, expected);
     }
 
     /// The full private lineage applied to a fresh database.
@@ -3926,9 +3789,6 @@ mod tests {
                 "compile_facts",
                 "turn_end_check_attempt_plan",
                 "embedding_space",
-                "tenet_rationale",
-                "command_resource_memory_kills",
-                "run_activity_minutes",
             ],
         );
     }
@@ -7555,9 +7415,6 @@ mod tests {
                 "compile_facts",
                 // cairn/5282: a review wave's plan kept on its attempt row.
                 "turn_end_check_attempt_plan",
-                // cairn/5433: a tenet's rationale beside its statement.
-                "tenet_rationale",
-                "run_activity_minutes",
             ],
         );
         assert_eq!(

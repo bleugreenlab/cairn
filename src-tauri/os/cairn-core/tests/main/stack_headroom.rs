@@ -7,7 +7,7 @@
 //! whichever unrelated test happened to run deepest, on whichever merge tipped
 //! it over, and read as flake. These tests run one served call on a thread with
 //! half that stack, so lost headroom fails here, by name, while there is still
-//! room to find what grew. `cairn_platform::stack` describes the remedy.
+//! room to find what grew. `cairn-core`'s `stack` module describes the remedy.
 //!
 //! Both calls enter through `dispatch_tool`, the one function every
 //! authenticated tool call passes through, so everything from the ownership

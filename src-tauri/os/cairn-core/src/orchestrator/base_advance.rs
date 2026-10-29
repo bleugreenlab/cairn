@@ -218,7 +218,7 @@ fn try_structural_merge(
             })
             .collect()
     };
-    let mut edits: Vec<crate::orchestrator::landing::bind::FileEdit> = Vec::new();
+    let mut plan = crate::orchestrator::contended_identifiers::ResolutionPlan::default();
     for (path, sides) in sides_at(ours) {
         let Ok(sides) = sides else {
             return Ok(None);
@@ -234,20 +234,22 @@ fn try_structural_merge(
         let Some(candidate) = rules.proven_merge(&path, base_text, ours_text, theirs_text) else {
             return Ok(None);
         };
-        edits.push(crate::orchestrator::landing::bind::FileEdit::Rewrite {
-            path,
-            content: candidate,
-        });
+        plan.edits.push(
+            crate::orchestrator::contended_identifiers::FileEdit::Rewrite {
+                path,
+                content: candidate,
+            },
+        );
     }
 
     let pre_op = crate::jj::operation_id(jj, store)?;
     let result = (|| {
-        crate::orchestrator::landing::bind::seal_edits(
+        seal_resolution_plan(
             jj,
             store,
             branch,
             ours,
-            &edits,
+            &plan,
             "Merge declared registry lists element-wise after base advance",
         )?;
         let committed = crate::jj::bookmark_commit(jj, store, branch)
@@ -286,36 +288,71 @@ fn try_structural_merge(
     }
 }
 
-/// Replay `branch` onto `target` for a landing, by the base advance's own
-/// means: jj's rebase with its parse gate, and on a conflict the structural
-/// merges `target` declares. A conflict nothing settles is refused, leaving the
-/// branch where it was; the landing never resolves a conflict an agent has not.
-/// The caller holds the store lock.
-pub(crate) fn replay_for_landing(
-    jj: &crate::jj::JjEnv,
-    store: &Path,
-    branch: &str,
-    target: &str,
-    target_name: &str,
-) -> Result<(), String> {
-    let diagnostic = match crate::jj::rebase_branch_onto(jj, store, branch, target)? {
-        crate::jj::RebaseOutcome::Rebased
-        | crate::jj::RebaseOutcome::RebasedOverConflictedAncestry { .. } => return Ok(()),
-        crate::jj::RebaseOutcome::Conflicted { diagnostic } => diagnostic,
+/// Preserve and escalate obligations bypassed by an external merge. The webhook
+/// path is non-fatal: failures are logged, while each successfully recognized
+/// orphan is retained in the private journal with a fix-forward diagnostic.
+async fn orphan_externally_merged_obligations(orch: &Orchestrator, db: &LocalDb, project_id: &str) {
+    let project_id_owned = project_id.to_string();
+    let merged: Result<Vec<(String, String)>, String> = db
+        .read(move |conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT DISTINCT source_branch, job_id FROM merge_requests
+                         WHERE project_id = ?1 AND status = 'merged'",
+                        (project_id_owned,),
+                    )
+                    .await?;
+                let mut merged = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    merged.push((row.text(0)?, row.text(1)?));
+                }
+                Ok(merged)
+            })
+        })
+        .await
+        .map_err(|error| error.to_string());
+    let Ok(merged) = merged else {
+        log::warn!("external advance could not inspect merged branches for orphaned identifier obligations");
+        return;
     };
-    let rules = crate::orchestrator::landing::merge_rules_at(jj, store, target);
-    let baseline = ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap_or_default());
-    match try_structural_merge(jj, store, branch, target, &diagnostic, &baseline, &rules) {
-        Ok(Some(report)) if report.rebased_clean.iter().any(|clean| clean == branch) => Ok(()),
-        Ok(_) => Err(crate::jj::base_conflict_refusal(
-            target_name,
-            branch,
-            &diagnostic.conflicting_paths(),
-        )),
-        Err(error) => Err(format!(
-            "{} (the declared structural merge declined: {error})",
-            crate::jj::base_conflict_refusal(target_name, branch, &diagnostic.conflicting_paths())
-        )),
+    for (branch, job_id) in merged {
+        let diagnostic = format!(
+            "`{branch}` merged outside Cairn while a contended identifier obligation was outstanding. The merge gate was bypassed; fix forward on the default branch by applying the missing identifier increment, then explicitly discharge this orphaned evidence."
+        );
+        match crate::orchestrator::contended_identifiers::orphan_obligations(
+            &orch.db.local,
+            project_id,
+            &branch,
+            &diagnostic,
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(_) => {
+                if let Some(run_id) = latest_run_for_job(db, &job_id) {
+                    let key = format!("external-merge-orphan:{project_id}:{branch}");
+                    if let Err(error) = queue_system_direct_once(
+                        orch,
+                        &run_id,
+                        &diagnostic,
+                        DeliveryUrgency::Steer,
+                        &key,
+                    ) {
+                        log::warn!(
+                            "external advance retained orphaned obligation for `{branch}` but could not escalate it: {error}"
+                        );
+                    }
+                } else {
+                    log::warn!(
+                        "external advance retained orphaned obligation for `{branch}`, but job `{job_id}` has no run to wake; {diagnostic}"
+                    );
+                }
+            }
+            Err(error) => log::warn!(
+                "external advance could not retain orphaned identifier obligation for `{branch}`: {error}"
+            ),
+        }
     }
 }
 
@@ -370,6 +407,456 @@ fn replay_kept_patch(
             false
         }
     }
+}
+
+fn lineage_stems_at(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    revision: &str,
+    lineage: &crate::orchestrator::contended_identifiers::SequentialFileLineage,
+) -> Result<BTreeSet<String>, String> {
+    let prefix = format!("{}/", lineage.dir);
+    crate::jj::paths_under_at(jj, store, revision, lineage.dir)?
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(&prefix)
+                .and_then(|name| name.strip_suffix(".sql"))
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    format!(
+                        "[{}] `{path}` is not a direct `.sql` child of `{}`",
+                        lineage.label, lineage.dir
+                    )
+                })
+        })
+        .collect()
+}
+
+fn registered_changes(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    fork: &str,
+    tip: &str,
+) -> Result<BTreeSet<String>, String> {
+    crate::jj::logical_changed_files(jj, store, fork, tip)
+        .map_err(|error| {
+            format!("could not read logical changes from `{fork}` to `{tip}`: {error}")
+        })
+        .map(|changes| {
+            changes
+                .into_iter()
+                .flat_map(|change| [Some(change.path), change.previous_path])
+                .flatten()
+                .filter(|path| crate::orchestrator::contended_identifiers::path_is_registered(path))
+                .collect()
+        })
+}
+
+/// Why the contended-identifier preflight stopped a replay before the graph
+/// moved. The two causes call for opposite handling, so they stay apart until
+/// the diagnostic is composed.
+#[derive(Debug)]
+enum PreflightFailure {
+    /// The branch graph could not be read the way the preflight needs. The same
+    /// tip and base fail the same way every time, so this is reported to the
+    /// branch's agent and quarantined rather than retried.
+    Graph(String),
+    /// Obligation bookkeeping could not be loaded or stored: the runner's own
+    /// state, retried and withheld from the agent.
+    Persistence(String),
+}
+
+impl PreflightFailure {
+    fn diagnostic(self) -> String {
+        match self {
+            Self::Graph(error) => format!("{} {error}", crate::jj::CONTENDED_PREFLIGHT_REFUSAL),
+            Self::Persistence(error) => format!(
+                "contended identifier obligations could not persist before graph mutation: {error}"
+            ),
+        }
+    }
+}
+
+/// Capture monotonic contributions before the rebase can absorb their evidence.
+/// Persistence precedes graph mutation deliberately: a crash after this point can
+/// lose the live delta, but the next sweep still has the floor.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep persistence scope and pre-rebase revision coordinates explicit."
+)]
+async fn persist_pre_rebase_obligations(
+    jj: &crate::jj::JjEnv,
+    db: &LocalDb,
+    project_id: &str,
+    store: &Path,
+    bookmark: &str,
+    baseline: &ReplayBaseline,
+    pre_tip: &str,
+    base: &str,
+) -> Result<BTreeSet<String>, PreflightFailure> {
+    use crate::orchestrator::contended_identifiers as contended;
+
+    let changes =
+        registered_changes(jj, store, &baseline.fork, pre_tip).map_err(PreflightFailure::Graph)?;
+    let stored: BTreeMap<String, contended::Obligation> =
+        contended::load_obligations(db, project_id, store, bookmark)
+            .await
+            .map_err(PreflightFailure::Persistence)?
+            .into_iter()
+            .map(|obligation| (obligation.identifier.clone(), obligation))
+            .collect();
+    for constant in contended::MONOTONIC_CONSTANTS {
+        let touched = changes.contains(constant.file)
+            || constant
+                .companions
+                .iter()
+                .any(|companion| changes.contains(companion.file));
+        let previous = stored.get(constant.label);
+        if !touched && previous.is_none() {
+            continue;
+        }
+        let evidence = constant_evidence(
+            jj,
+            store,
+            constant,
+            baseline,
+            pre_tip,
+            base,
+            previous.map(|obligation| obligation.delta),
+        )
+        .map_err(PreflightFailure::Graph)?;
+        if evidence.resolved.delta > 0 {
+            contended::upsert_obligation(
+                db,
+                project_id,
+                store,
+                bookmark,
+                constant.label,
+                evidence.resolved.delta,
+                evidence.fork_value,
+                evidence.branch_value,
+                evidence.base_value,
+                None,
+                constant.evidence.keeps_floor(),
+            )
+            .await
+            .map_err(PreflightFailure::Persistence)?;
+        }
+    }
+    Ok(changes)
+}
+
+/// One monotonic constant's inputs on one branch, and what they resolve to.
+struct ConstantEvidence {
+    fork_text: String,
+    fork_value: u64,
+    branch_value: u64,
+    base_text: String,
+    base_value: u64,
+    /// Heading versions the branch authored, ascending; always empty for an
+    /// arithmetic constant.
+    authored: Vec<u64>,
+    /// Heading versions on the tip and not at the fork that the base supplied
+    /// verbatim, so were not counted; always empty for an arithmetic constant.
+    absorbed: Vec<u64>,
+    resolved: crate::orchestrator::contended_identifiers::ConstantResolution,
+}
+
+/// Read a constant at the branch's baseline, the pre-rebase tip and the base,
+/// and resolve it by the constant's own [`DeltaEvidence`] rule.
+///
+/// The baseline is the fork unless the branch resolved the constant's file
+/// against a newer base, in which case it is that base: a resolution that took
+/// the base's value contributed nothing, and measured from the fork it would
+/// read as a bump.
+///
+/// [`DeltaEvidence`]: crate::orchestrator::contended_identifiers::DeltaEvidence
+fn constant_evidence(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    constant: &crate::orchestrator::contended_identifiers::MonotonicConstant,
+    baseline: &ReplayBaseline,
+    pre_tip: &str,
+    base: &str,
+    stored_delta: Option<u64>,
+) -> Result<ConstantEvidence, String> {
+    use crate::orchestrator::contended_identifiers as contended;
+
+    let read = |revision: &str| -> Result<(String, u64), String> {
+        let text = text_at_revision(jj, store, revision, constant.file)?;
+        let value = contended::read_constant(&text, constant.constant)
+            .ok_or_else(|| format!("could not read {} at `{revision}`", constant.constant))?;
+        Ok((text, value))
+    };
+    let (fork_text, fork_value) = read(baseline.baseline_for(constant.file))?;
+    let (branch_text, branch_value) = read(pre_tip)?;
+    let (base_text, base_value) = read(base)?;
+    let (authored, absorbed, resolved) = match constant.evidence.heading_prefix() {
+        Some(prefix) => {
+            let authored =
+                contended::authored_versions(&branch_text, &fork_text, &base_text, prefix);
+            let inherited = contended::heading_versions(&fork_text, prefix);
+            let absorbed = contended::heading_versions(&branch_text, prefix)
+                .into_iter()
+                .filter(|version| !inherited.contains(version) && !authored.contains(version))
+                .collect();
+            let resolved = contended::resolve_by_evidence(&authored, base_value);
+            (authored, absorbed, resolved)
+        }
+        None => (
+            Vec::new(),
+            Vec::new(),
+            contended::resolve_monotonic(fork_value, branch_value, base_value, stored_delta),
+        ),
+    };
+    Ok(ConstantEvidence {
+        fork_text,
+        fork_value,
+        branch_value,
+        base_text,
+        base_value,
+        authored,
+        absorbed,
+        resolved,
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep before/after revision coordinates explicit in resolution planning."
+)]
+fn plan_post_rebase_resolution(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    baseline: &ReplayBaseline,
+    pre_tip: &str,
+    base: &str,
+    rebased_tip: &str,
+    changes: &BTreeSet<String>,
+    obligations: &[crate::orchestrator::contended_identifiers::Obligation],
+) -> Result<crate::orchestrator::contended_identifiers::ResolutionPlan, String> {
+    use crate::orchestrator::contended_identifiers as contended;
+
+    let mut plan = contended::ResolutionPlan::default();
+    let mut registry_rewrites: BTreeMap<String, String> = BTreeMap::new();
+    for lineage in contended::SEQUENTIAL_FILE_LINEAGES {
+        if !changes.iter().any(|path| path.starts_with(lineage.dir)) {
+            continue;
+        }
+        let base_stems = lineage_stems_at(jj, store, base, lineage)?;
+        let branch_stems = lineage_stems_at(jj, store, rebased_tip, lineage)?;
+        let registry = registry_rewrites
+            .get(lineage.registry_file)
+            .cloned()
+            .unwrap_or(text_at_revision(
+                jj,
+                store,
+                rebased_tip,
+                lineage.registry_file,
+            )?);
+        let assignments =
+            contended::plan_lineage_renumber(lineage, &base_stems, &branch_stems, &registry)
+                .map_err(|refusal| refusal.reason)?;
+        if assignments.is_empty() {
+            continue;
+        }
+        // Best-effort: a missed site costs the agent a warning, not correctness,
+        // so a failed search must not refuse an otherwise sound resolution.
+        let literal_hits = crate::jj::grep_fixed_at(
+            jj,
+            store,
+            rebased_tip,
+            &contended::bare_version_needles(&assignments),
+            &contended::bare_version_pathspecs(lineage),
+        )
+        .unwrap_or_else(|error| {
+            log::warn!(
+                "[{}] bare version literal search at `{rebased_tip}` failed: {error}",
+                lineage.label
+            );
+            Vec::new()
+        });
+        for (from, to) in &assignments {
+            plan.edits.push(contended::FileEdit::Rename {
+                from: format!("{}/{}.sql", lineage.dir, from),
+                to: format!("{}/{}.sql", lineage.dir, to),
+            });
+            plan.movements.push(contended::Movement::Renumbered {
+                lineage: lineage.label.to_string(),
+                from: from.clone(),
+                to: to.clone(),
+                bare_literals: contended::bare_literal_sites(from, &literal_hits),
+            });
+        }
+        registry_rewrites.insert(
+            lineage.registry_file.to_string(),
+            contended::rewrite_registrations(&registry, lineage.macro_name, &assignments)
+                .map_err(|refusal| refusal.reason)?,
+        );
+    }
+    for (path, content) in registry_rewrites {
+        plan.edits
+            .push(contended::FileEdit::Rewrite { path, content });
+    }
+
+    let obligation_by_label: BTreeMap<&str, &contended::Obligation> = obligations
+        .iter()
+        .map(|obligation| (obligation.identifier.as_str(), obligation))
+        .collect();
+    for constant in contended::MONOTONIC_CONSTANTS {
+        let previous = obligation_by_label.get(constant.label).copied();
+        let touched = changes.contains(constant.file)
+            || constant
+                .companions
+                .iter()
+                .any(|companion| changes.contains(companion.file));
+        if !touched && previous.is_none() {
+            continue;
+        }
+        let evidence = constant_evidence(
+            jj,
+            store,
+            constant,
+            baseline,
+            pre_tip,
+            base,
+            previous.map(|obligation| obligation.delta),
+        )?;
+        let resolved = evidence.resolved;
+        let current_text = text_at_revision(jj, store, rebased_tip, constant.file)?;
+        let current = contended::read_constant(&current_text, constant.constant)
+            .ok_or_else(|| format!("could not read {} at `{rebased_tip}`", constant.constant))?;
+        // An arithmetic constant the branch contributed nothing to is left as
+        // the rebase produced it. A heading-evidenced one always converges on
+        // its target, which is how a number the branch moved without a
+        // paragraph — including one an earlier advance inflated — goes back to
+        // the base's value rather than riding the branch onto it.
+        let heading_evidence = constant.evidence.heading_prefix().is_some();
+        if !heading_evidence && (resolved.delta == 0 || current == resolved.target) {
+            if previous.is_some() {
+                plan.discharged.push(constant.label.to_string());
+            }
+            continue;
+        }
+        let rewritten = contended::rewrite_constant(
+            &current_text,
+            &[&evidence.fork_text, &evidence.base_text],
+            constant,
+            &evidence.authored,
+            resolved.target,
+        )
+        .map_err(|refusal| refusal.reason)?;
+        if rewritten == current_text {
+            if previous.is_some() {
+                plan.discharged.push(constant.label.to_string());
+            }
+            continue;
+        }
+        plan.edits.push(contended::FileEdit::Rewrite {
+            path: constant.file.to_string(),
+            content: rewritten,
+        });
+        // Renumbering a heading under a value that is already right moves no
+        // mirrored literal.
+        let companions = if current == resolved.target {
+            &[]
+        } else {
+            constant.companions
+        };
+        for companion in companions {
+            let companion_text = text_at_revision(jj, store, rebased_tip, companion.file)?;
+            plan.edits.push(contended::FileEdit::Rewrite {
+                path: companion.file.to_string(),
+                content: contended::rewrite_companion(
+                    &companion_text,
+                    companion,
+                    current,
+                    resolved.target,
+                )
+                .map_err(|refusal| refusal.reason)?,
+            });
+        }
+        plan.movements
+            .push(if heading_evidence && resolved.delta == 0 {
+                contended::Movement::Reset {
+                    identifier: constant.constant.to_string(),
+                    from: current,
+                    to: resolved.target,
+                    absorbed: evidence.absorbed,
+                }
+            } else {
+                contended::Movement::Advanced {
+                    identifier: constant.constant.to_string(),
+                    from: current,
+                    to: resolved.target,
+                    base: evidence.base_value,
+                    delta: resolved.delta,
+                    from_floor: resolved.from_floor,
+                    headings: heading_evidence.then(|| contended::HeadingTally {
+                        authored: evidence.authored.clone(),
+                        absorbed: evidence.absorbed,
+                    }),
+                }
+            });
+        plan.discharged.push(constant.label.to_string());
+    }
+    Ok(plan)
+}
+
+fn apply_resolution_plan(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    bookmark: &str,
+    tip: &str,
+    plan: &crate::orchestrator::contended_identifiers::ResolutionPlan,
+) -> Result<(), String> {
+    seal_resolution_plan(
+        jj,
+        store,
+        bookmark,
+        tip,
+        plan,
+        "Resolve contended sequential identifiers after base advance",
+    )
+}
+
+/// Apply `plan` on `tip` and seal it onto `bookmark` as one commit named by
+/// what produced it.
+fn seal_resolution_plan(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    bookmark: &str,
+    tip: &str,
+    plan: &crate::orchestrator::contended_identifiers::ResolutionPlan,
+    message: &str,
+) -> Result<(), String> {
+    use crate::orchestrator::contended_identifiers::FileEdit;
+    if plan.is_empty() {
+        return Ok(());
+    }
+    crate::jj::with_transient_workspace(jj, store, tip, |workspace| {
+        for edit in &plan.edits {
+            match edit {
+                FileEdit::Rename { from, to } => {
+                    let target = workspace.join(to);
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|error| format!("create `{}`: {error}", parent.display()))?;
+                    }
+                    std::fs::rename(workspace.join(from), &target)
+                        .map_err(|error| format!("rename `{from}` to `{to}`: {error}"))?;
+                }
+                FileEdit::Rewrite { path, content } => {
+                    std::fs::write(workspace.join(path), content)
+                        .map_err(|error| format!("rewrite `{path}`: {error}"))?;
+                }
+            }
+        }
+        let paths = plan.touched_paths();
+        let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+        crate::jj::seal_paths(jj, workspace, message, None, &path_refs, Some(bookmark))?;
+        Ok(())
+    })
 }
 
 /// A committed resolution carried onto one replay destination, and the paths
@@ -1650,8 +2137,8 @@ async fn reconcile_store_default_bookmark(
 }
 
 /// Bring origin's advanced default branch into the shared store and reconcile
-/// everything downstream of it: the default bookmark and every in-flight
-/// sibling, which is auto-rebased onto the new
+/// everything downstream of it: the default bookmark, externally merged
+/// obligations, and every in-flight sibling, which is auto-rebased onto the new
 /// tip — cleanly-rebased ones pushed, conflicts recorded non-blocking, and each
 /// sibling this reconcile actually rewrote notified (a waking `Steer` note when
 /// conflicted, a passive ride-along note when clean; the before/after commit-id
@@ -1746,6 +2233,7 @@ pub(crate) async fn reconcile_default_advance(
         &format!("external advance on {default_branch}"),
     )
     .await;
+    orphan_externally_merged_obligations(orch, &db, project_id).await;
     let siblings = load_sibling_jobs(&db, project_id, default_branch, EXCLUDE_NONE).await?;
     if siblings.is_empty() {
         log::debug!("external advance on {default_branch}: no in-flight siblings to reconcile");
@@ -3355,6 +3843,7 @@ async fn execute_reconcile_claim(
     let mut pending_quarantines: Vec<PendingReconcileQuarantine> = Vec::new();
     let mut before: HashMap<String, String> = HashMap::new();
     let mut after: HashMap<String, String> = HashMap::new();
+    let mut contended_resolution_notes: HashMap<String, String> = HashMap::new();
     let mut carry_notes: HashMap<String, String> = HashMap::new();
     let mut report = crate::jj::ReconcileReport::default();
     let mut any_branch_deferred = false;
@@ -3465,26 +3954,50 @@ async fn execute_reconcile_claim(
         // both measure from it; only an explicit one may carry content.
         let open_session =
             crate::orchestrator::conflict_session::load_active_session(db, branch).await?;
-        // What a structural merge measures each path from if this replay
-        // conflicts: the live fork, or the side the open session's resolution
-        // was made against.
-        let replay_baseline = current_tip.as_deref().and_then(|pre_tip| {
-            let fork = branch_fork_point(&jj, &store, pre_tip, &pinned_dest)?;
-            Some(
-                ReplayBaseline {
+        let pre_tip = current_tip.clone();
+        let fork = pre_tip
+            .as_deref()
+            .and_then(|tip| branch_fork_point(&jj, &store, tip, &pinned_dest));
+        let mut contended_context: Option<(ReplayBaseline, String, BTreeSet<String>)> = None;
+        let pre_resolution_failure = match (fork, pre_tip) {
+            (Some(fork), Some(pre_tip)) => {
+                let baseline = ReplayBaseline {
                     fork,
                     basis: open_session
                         .as_ref()
                         .map(|session| {
                             session
-                                .resolution_basis_at(&jj, &store, pre_tip)
+                                .resolution_basis_at(&jj, &store, &pre_tip)
                                 .unwrap_or_else(|_| session.resolution_basis.clone())
                         })
                         .unwrap_or_default(),
                 }
-                .verified(&jj, &store, pre_tip),
-            )
-        });
+                .verified(&jj, &store, &pre_tip);
+                match persist_pre_rebase_obligations(
+                    &jj,
+                    db,
+                    &claim.project_id,
+                    &store,
+                    branch,
+                    &baseline,
+                    &pre_tip,
+                    &pinned_dest,
+                )
+                .await
+                {
+                    Ok(changes) => {
+                        contended_context = Some((baseline, pre_tip, changes));
+                        None
+                    }
+                    Err(failure) => Some(failure.diagnostic()),
+                }
+            }
+            _ => Some(
+                "contended identifier preflight could not resolve the branch tip and fork point; \
+                 the base advance was left untouched"
+                    .to_string(),
+            ),
+        };
 
         // A requested replay is the explicit resolution operation: take the
         // branch's committed tip bytes for this session's conflicting paths.
@@ -3500,9 +4013,14 @@ async fn execute_reconcile_claim(
 
         let mut ambiguous_item = None;
         let mut divergence_resolved = false;
-        let mut item_report = if let Some(progress) =
-            progress.as_ref().filter(|p| p.status == "graph_moved")
-        {
+        let mut item_report = if let Some(error) = pre_resolution_failure {
+            let mut refused = crate::jj::ReconcileReport::default();
+            refused.failed.push(crate::jj::ReconcileFailure {
+                branch: branch.clone(),
+                error,
+            });
+            refused
+        } else if let Some(progress) = progress.as_ref().filter(|p| p.status == "graph_moved") {
             let mut resumed = crate::jj::ReconcileReport::default();
             match progress.outcome_kind.as_deref() {
                 Some("conflicted") => resumed.conflicted.push(branch.clone()),
@@ -3823,9 +4341,12 @@ async fn execute_reconcile_claim(
                 let _phase =
                     guard.phase(format!("prove and replay structural merge branch={branch}"));
                 let rules = crate::orchestrator::landing::merge_rules_at(&jj, &store, &pinned_dest);
-                let baseline = replay_baseline.clone().unwrap_or_else(|| {
-                    ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap_or_default())
-                });
+                let baseline = contended_context
+                    .as_ref()
+                    .map(|(baseline, _, _)| baseline.clone())
+                    .unwrap_or_else(|| {
+                        ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap_or_default())
+                    });
                 match try_structural_merge(
                     &jj,
                     &store,
@@ -3908,6 +4429,112 @@ async fn execute_reconcile_claim(
                 ),
             )
             .await?;
+        }
+
+        // Stage 1 runs on the clean rebased tree and before origin publication.
+        // Any refusal removes the clean classification, leaves every obligation
+        // outstanding, and therefore takes the existing waking failure path.
+        if item_report.rebased_clean.contains(branch) {
+            if let Some((baseline, pre_tip, changes)) = contended_context.as_ref() {
+                let rebased_tip = after
+                    .get(branch)
+                    .cloned()
+                    .or_else(|| crate::jj::bookmark_commit(&jj, &store, branch));
+                let resolution = async {
+                    let rebased_tip = rebased_tip.ok_or_else(|| {
+                        "contended identifier resolution could not resolve the rebased tip"
+                            .to_string()
+                    })?;
+                    let obligations = crate::orchestrator::contended_identifiers::load_obligations(
+                        db,
+                        &claim.project_id,
+                        &store,
+                        branch,
+                    )
+                    .await?;
+                    let plan = plan_post_rebase_resolution(
+                        &jj,
+                        &store,
+                        baseline,
+                        pre_tip,
+                        &pinned_dest,
+                        &rebased_tip,
+                        changes,
+                        &obligations,
+                    )?;
+                    if !plan.is_empty() {
+                        let guard = orch
+                            .acquire_jj_store_lock(
+                                &store, crate::orchestrator::StoreLockClass::Foreground,
+                                format!("contended identifier resolution: {branch}"),
+                            )
+                            .await;
+                        let _phase = guard.phase(format!("apply contended edits branch={branch}"));
+                        let live_tip = crate::jj::bookmark_commit(&jj, &store, branch)
+                            .ok_or_else(|| format!("bookmark `{branch}` disappeared before repair"))?;
+                        if live_tip != rebased_tip {
+                            return Err(format!(
+                                "bookmark `{branch}` moved from `{rebased_tip}` to `{live_tip}` before repair"
+                            ));
+                        }
+                        apply_resolution_plan(&jj, &store, branch, &rebased_tip, &plan)?;
+                    }
+                    for identifier in &plan.discharged {
+                        crate::orchestrator::contended_identifiers::discharge_obligation(
+                            db,
+                            &claim.project_id,
+                            &store,
+                            branch,
+                            identifier,
+                            crate::orchestrator::contended_identifiers::DischargeAttribution {
+                                actor_kind: "internal",
+                                actor_identity: Some(intent_id),
+                                surface: "base-advance-contended-identifier-resolution",
+                            },
+                        )
+                        .await?;
+                    }
+                    Ok::<_, String>(plan)
+                }
+                .await;
+                match resolution {
+                    Ok(plan) => {
+                        if !plan.is_empty() {
+                            if let Some(tip) = crate::jj::bookmark_commit(&jj, &store, branch) {
+                                after.insert(branch.clone(), tip);
+                            }
+                            item_report.silent.retain(|candidate| candidate != branch);
+                            contended_resolution_notes.insert(branch.clone(), plan.describe());
+                            if let Some(sibling) = siblings
+                                .iter()
+                                .find(|sibling| sibling.branch.as_deref() == Some(branch.as_str()))
+                            {
+                                orch.invalidate_node_check_status(
+                                    &sibling.id,
+                                    "contended-identifier-resolution",
+                                );
+                                crate::orchestrator::lifecycle::spawn_turn_end_checks(
+                                    orch,
+                                    &sibling.id,
+                                );
+                                crate::orchestrator::lifecycle::spawn_checks_settled_edge(
+                                    orch,
+                                    &sibling.id,
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        item_report
+                            .rebased_clean
+                            .retain(|candidate| candidate != branch);
+                        item_report.failed.push(crate::jj::ReconcileFailure {
+                            branch: branch.clone(),
+                            error: format!("contended identifier resolution refused: {error}"),
+                        });
+                    }
+                }
+            }
         }
 
         // Origin transfer and durable lineage persistence are deliberately
@@ -4190,6 +4817,7 @@ async fn execute_reconcile_claim(
             &siblings,
             &clean_rewritten,
             &notes.clean,
+            &contended_resolution_notes,
             intent_id,
         )?;
     }
@@ -4824,6 +5452,7 @@ where
             let guidance = match failure_kind {
                 "immutable_commit" => "jj refused to rewrite some of this branch's commits. The diagnostic above says why when Cairn could tell: if they are already on the default branch, the work landed and the PR and issue can close; if origin holds them under a remote bookmark this store does not track, nothing landed and that copy needs reconciling, so report the diagnostic.",
                 "missing_bookmark" => "This branch no longer exists and needs to be re-created; report the diagnostic above.",
+                crate::jj::CONTENDED_PREFLIGHT => "Cairn could not read this branch's change the way its migration and protocol-number check needs, so it moved nothing. A retry reads the same commits and fails the same way, so this is Cairn's to fix: report the diagnostic above.",
                 _ => "Report the diagnostic above.",
             };
             format!(
@@ -5006,6 +5635,7 @@ fn notify_clean_siblings(
     siblings: &[SiblingJob],
     clean: &[String],
     note: &str,
+    contended_resolutions: &HashMap<String, String>,
     delivery_scope: &str,
 ) -> Result<(), String> {
     for sibling in siblings {
@@ -5023,7 +5653,15 @@ fn notify_clean_siblings(
             continue;
         };
         let key = format!("{delivery_scope}:{branch}:clean");
-        queue_system_direct_once(orch, &run_id, note, DeliveryUrgency::Passive, &key)?;
+        let rendered = contended_resolutions.get(&branch).map_or_else(
+            || note.to_string(),
+            |resolution| {
+                format!(
+                    "{note}\n\nCairn resolved contended sequential identifiers before publishing this branch:\n{resolution}\n\nThe branch checks are being re-armed against these resolved values."
+                )
+            },
+        );
+        queue_system_direct_once(orch, &run_id, &rendered, DeliveryUrgency::Passive, &key)?;
         log::info!(
             "Passively notified jj sibling job {} of a clean base-advance rebase",
             sibling.id
@@ -8767,6 +9405,7 @@ mod tests {
             &siblings,
             &clean,
             &note,
+            &HashMap::new(),
             "test-clean",
         )
         .unwrap();
@@ -8778,6 +9417,7 @@ mod tests {
             &siblings,
             &clean,
             &note,
+            &HashMap::new(),
             "test-clean",
         )
         .unwrap();
@@ -9099,6 +9739,7 @@ mod tests {
 #[cfg(test)]
 mod real_store_collision_tests {
     use super::*;
+    use crate::orchestrator::contended_identifiers::{HeadingTally, Movement, Obligation};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -9110,6 +9751,7 @@ mod real_store_collision_tests {
         workspaces: TempDir,
         jj: crate::jj::JjEnv,
         store: PathBuf,
+        fork: String,
     }
 
     fn fixture(bin: &str) -> Fixture {
@@ -9121,6 +9763,7 @@ mod real_store_collision_tests {
             .join("src-tauri/os/cairn-db/src/storage/migrations.rs");
         std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
         std::fs::create_dir_all(repo.path().join("src-tauri/turso_migrations")).unwrap();
+        std::fs::create_dir_all(repo.path().join("src-tauri/os/cairn-common/src")).unwrap();
         std::fs::create_dir_all(repo.path().join(".cairn")).unwrap();
         // The destination's declared landing rules, which every replay onto
         // `main` reads at `main`.
@@ -9141,6 +9784,13 @@ mod real_store_collision_tests {
             )
             .unwrap();
         }
+        // Every monotonic constant the registry names lives in this one file, so
+        // the resolver reads all of them whenever the file changes. A fixture
+        // declaring only the constant a test moves fails on the one it does not.
+        std::fs::write(
+            repo.path().join("src-tauri/os/cairn-common/src/executor_protocol.rs"),
+            "/// Version 10 is the fork baseline.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 10;\npub const SUBSTRATE_HEALTH_SCHEMA_VERSION: u32 = 8;\n",
+        ).unwrap();
         let git = |args: &[&str]| {
             let out = crate::env::git()
                 .args(args)
@@ -9164,6 +9814,7 @@ mod real_store_collision_tests {
         // store, so the end-to-end replay tests drive the same one.
         let store = crate::jj::project_store_dir(home.path(), repo.path());
         crate::jj::ensure_project_store(&jj, &store, repo.path()).unwrap();
+        let fork = crate::jj::bookmark_commit(&jj, &store, "main").unwrap();
         Fixture {
             home: home.path().to_path_buf(),
             repo: repo.path().to_path_buf(),
@@ -9172,6 +9823,7 @@ mod real_store_collision_tests {
             workspaces,
             jj,
             store,
+            fork,
         }
     }
 
@@ -9301,6 +9953,144 @@ mod real_store_collision_tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial(jj)]
+    fn migrations_union_then_renumber_in_a_real_store() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let fx = fixture(&bin);
+        let destination_branch = "agent/migration-destination";
+        let branch = "agent/migration-branch";
+        let destination_ws = fx.workspaces.path().join("destination");
+        let branch_ws = fx.workspaces.path().join("branch");
+        crate::jj::add_workspace(
+            &fx.jj,
+            &fx.store,
+            &destination_ws,
+            destination_branch,
+            "main",
+            None,
+        )
+        .unwrap();
+        crate::jj::add_workspace(&fx.jj, &fx.store, &branch_ws, branch, "main", None).unwrap();
+
+        add_migration(&destination_ws, "0228_destination");
+        crate::jj::seal(&fx.jj, &destination_ws, "destination migration", None).unwrap();
+        add_migration(&branch_ws, "0228_branch");
+        // A test naming the migration by number keeps pointing at 0228 after
+        // the renumber, which is now the destination's migration.
+        std::fs::write(
+            branch_ws.join("src-tauri/os/cairn-db/src/storage/ordering_tests.rs"),
+            "// header\nassert_eq!(applied, \"0228\");\nlet unrelated = \"0229\";\n",
+        )
+        .unwrap();
+        crate::jj::seal(&fx.jj, &branch_ws, "branch migration", None).unwrap();
+        let pre_tip = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+        let destination =
+            crate::jj::bookmark_commit(&fx.jj, &fx.store, destination_branch).unwrap();
+        set_main(&fx, &destination);
+
+        let crate::jj::RebaseOutcome::Conflicted { diagnostic } =
+            crate::jj::rebase_branch_onto(&fx.jj, &fx.store, branch, "main").unwrap()
+        else {
+            panic!("adjacent registrations must conflict")
+        };
+        assert_eq!(
+            diagnostic.conflicting_paths(),
+            vec!["src-tauri/os/cairn-db/src/storage/migrations.rs"]
+        );
+        let report = try_structural_merge(
+            &fx.jj,
+            &fx.store,
+            branch,
+            "main",
+            &diagnostic,
+            &ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap()),
+            &crate::orchestrator::landing::merge_rules_at(&fx.jj, &fx.store, "main"),
+        )
+        .unwrap()
+        .expect("registered conflict has no human path");
+        assert_eq!(report.rebased_clean, vec![branch.to_string()]);
+        assert!(report.conflicted.is_empty());
+
+        let union_tip = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+        let changes = registered_changes(&fx.jj, &fx.store, &fx.fork, &pre_tip).unwrap();
+        let plan = plan_post_rebase_resolution(
+            &fx.jj,
+            &fx.store,
+            &ReplayBaseline::fork_only(&fx.fork),
+            &pre_tip,
+            &destination,
+            &union_tip,
+            &changes,
+            &[],
+        )
+        .unwrap();
+        assert!(plan.movements.iter().any(|movement| matches!(
+            movement,
+            Movement::Renumbered { from, to, bare_literals, .. }
+                if from == "0228_branch"
+                    && to == "0230_branch"
+                    && bare_literals == &["src-tauri/os/cairn-db/src/storage/ordering_tests.rs:2"]
+        )), "{:?}", plan.movements);
+        apply_resolution_plan(&fx.jj, &fx.store, branch, &union_tip, &plan).unwrap();
+
+        let resolved = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+        assert_eq!(
+            text_at(&fx, &resolved, "src-tauri/os/cairn-db/src/storage/migrations.rs"),
+            "fn migrations() {\n    vec![\n        migration!(\"0227_before\"),\n        migration!(\"0228_destination\"),\n        migration!(\"0230_branch\"),\n        migration!(\"0229_after\"),\n    ];\n}\n",
+            "both registrations land destination-first without moving surrounding entries"
+        );
+        for path in [
+            "src-tauri/turso_migrations/0228_destination.sql",
+            "src-tauri/turso_migrations/0230_branch.sql",
+        ] {
+            assert!(
+                crate::jj::file_show(&fx.jj, &fx.store, &resolved, path).is_ok(),
+                "{path}"
+            );
+        }
+        assert!(crate::jj::file_show(
+            &fx.jj,
+            &fx.store,
+            &resolved,
+            "src-tauri/turso_migrations/0228_branch.sql"
+        )
+        .is_err());
+    }
+
+    const PROTOCOL: &str = "src-tauri/os/cairn-common/src/executor_protocol.rs";
+    const PROTOCOL_LABEL: &str = "executor_protocol_version";
+
+    fn protocol_value(fx: &Fixture, revision: &str) -> u64 {
+        crate::orchestrator::contended_identifiers::read_constant(
+            &text_at(fx, revision, PROTOCOL),
+            "EXECUTOR_PROTOCOL_VERSION",
+        )
+        .expect("protocol constant")
+    }
+
+    /// One real protocol change on a main-line workspace: the constant moves to
+    /// `version` and a paragraph headed with it is prepended to the file, far
+    /// enough from the constant that a branch editing below it rebases cleanly.
+    fn bump_with_heading(fx: &Fixture, workspace: &Path, version: u64) -> String {
+        let path = workspace.join(PROTOCOL);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let moved = text.replace(
+            &format!("EXECUTOR_PROTOCOL_VERSION: u32 = {};", version - 1),
+            &format!("EXECUTOR_PROTOCOL_VERSION: u32 = {version};"),
+        );
+        assert_ne!(moved, text, "main line was not at {}", version - 1);
+        std::fs::write(
+            &path,
+            format!("/// Version {version} adds main's change {version}.\n{moved}"),
+        )
+        .unwrap();
+        crate::jj::seal(&fx.jj, workspace, &format!("protocol {version}"), None).unwrap();
+        crate::jj::bookmark_commit(&fx.jj, &fx.store, "agent/main-line").unwrap()
+    }
+
     fn main_line(fx: &Fixture) -> PathBuf {
         let workspace = fx.workspaces.path().join("main-line");
         crate::jj::add_workspace(
@@ -9313,6 +10103,780 @@ mod real_store_collision_tests {
         )
         .unwrap();
         workspace
+    }
+
+    async fn obligation_db(name: &str) -> LocalDb {
+        let db = crate::storage::migrated_test_db(name).await;
+        db.execute_script(
+            "INSERT INTO workspaces (id, name, created_at, updated_at)
+             VALUES ('ws', 'Workspace', 1, 1);
+             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p', 'ws', 'Project', 'P', '/repo', 1, 1);",
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    /// cairn/4838's regression. A branch that never touched the constant but
+    /// did edit the protocol file elsewhere, already advanced once, meets a
+    /// second advance. Its first job row would still record the original fork,
+    /// three protocol versions behind; read from there, those three versions'
+    /// paragraphs and number look like the branch's own work, which is how
+    /// branches carried 109 and 134 onto main. The fork comes from the live
+    /// merge-base instead, so nothing is owed and the constant lands on main's.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_stale_branch_that_never_bumped_lands_on_the_base_value() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let fx = fixture(&bin);
+        let db = obligation_db("stale-branch-protocol.db").await;
+        let branch = "agent/stale";
+        let branch_ws = fx.workspaces.path().join("stale");
+        let main_ws = main_line(&fx);
+        crate::jj::add_workspace(&fx.jj, &fx.store, &branch_ws, branch, "main", None).unwrap();
+        let path = branch_ws.join(PROTOCOL);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{text}pub const BRANCH_ONLY: u32 = 1;\n")).unwrap();
+        crate::jj::seal(&fx.jj, &branch_ws, "edit the protocol file elsewhere", None).unwrap();
+
+        for version in 11..=13 {
+            bump_with_heading(&fx, &main_ws, version);
+        }
+        let first_base = crate::jj::bookmark_commit(&fx.jj, &fx.store, "agent/main-line").unwrap();
+        set_main(&fx, &first_base);
+        assert_eq!(
+            crate::jj::rebase_branch_onto(&fx.jj, &fx.store, branch, "main").unwrap(),
+            crate::jj::RebaseOutcome::Rebased
+        );
+        for version in 14..=15 {
+            bump_with_heading(&fx, &main_ws, version);
+        }
+        let base = crate::jj::bookmark_commit(&fx.jj, &fx.store, "agent/main-line").unwrap();
+        set_main(&fx, &base);
+
+        let pre_tip = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+        let fork = branch_fork_point(&fx.jj, &fx.store, &pre_tip, &base).unwrap();
+        assert_eq!(fork, first_base, "the fork is where the branch sits now");
+        assert_ne!(fork, fx.fork, "never the archival fork it was cut from");
+        assert_eq!(protocol_value(&fx, &pre_tip), 13);
+        // What the archival fork would have claimed, with nothing to compare the
+        // tip's paragraphs against: three paragraphs this branch never wrote.
+        let archival = text_at(&fx, &fx.fork, PROTOCOL);
+        assert_eq!(
+            crate::orchestrator::contended_identifiers::authored_versions(
+                &text_at(&fx, &pre_tip, PROTOCOL),
+                &archival,
+                &archival,
+                "Version ",
+            ),
+            vec![11, 12, 13]
+        );
+        // Each of those paragraphs is main's verbatim, so even an archival fork
+        // charges the branch with none of them once the base is consulted.
+        assert!(
+            crate::orchestrator::contended_identifiers::authored_versions(
+                &text_at(&fx, &pre_tip, PROTOCOL),
+                &archival,
+                &text_at(&fx, &base, PROTOCOL),
+                "Version ",
+            )
+            .is_empty()
+        );
+
+        let changes = persist_pre_rebase_obligations(
+            &fx.jj,
+            &db,
+            "p",
+            &fx.store,
+            branch,
+            &ReplayBaseline::fork_only(&fork),
+            &pre_tip,
+            &base,
+        )
+        .await
+        .unwrap();
+        assert!(changes.contains(PROTOCOL), "the branch did edit the file");
+        assert!(
+            crate::orchestrator::contended_identifiers::load_obligations(
+                &db, "p", &fx.store, branch
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+
+        assert_eq!(
+            crate::jj::rebase_branch_onto(&fx.jj, &fx.store, branch, "main").unwrap(),
+            crate::jj::RebaseOutcome::Rebased
+        );
+        let rebased = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+        let plan = plan_post_rebase_resolution(
+            &fx.jj,
+            &fx.store,
+            &ReplayBaseline::fork_only(&fork),
+            &pre_tip,
+            &base,
+            &rebased,
+            &changes,
+            &[],
+        )
+        .unwrap();
+        assert!(plan.is_empty(), "{plan:?}");
+        assert_eq!(protocol_value(&fx, &rebased), 15);
+        assert!(
+            crate::orchestrator::contended_identifiers::protocol_ledger_refusal(
+                &fx.jj, &fx.store, branch, "main"
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    /// The agg/267 shape: a branch that merged its base in instead of being
+    /// rebased. Its fork with the next base is the merged base commit, and the
+    /// branch's own commit behind the merge does not descend from it, so a
+    /// revset diff over `fork..tip` has a gap jj refuses, and the preflight once
+    /// failed on it forever as a transient. Measured as a tree diff, the
+    /// preflight reads the branch's own registered change and the replay goes
+    /// through.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_tip_that_merged_its_base_passes_the_preflight_and_replays() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let fx = fixture(&bin);
+        let db = obligation_db("merged-tip-preflight.db").await;
+        let branch = "agent/merged-tip";
+        let branch_ws = fx.workspaces.path().join("merged-tip");
+        let main_ws = main_line(&fx);
+        crate::jj::add_workspace(&fx.jj, &fx.store, &branch_ws, branch, "main", None).unwrap();
+        let path = branch_ws.join(PROTOCOL);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{text}pub const BRANCH_ONLY: u32 = 1;\n")).unwrap();
+        crate::jj::seal(&fx.jj, &branch_ws, "edit the protocol file elsewhere", None).unwrap();
+        let own = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+
+        let merged_base = bump_with_heading(&fx, &main_ws, 11);
+        set_main(&fx, &merged_base);
+        fx.jj
+            .run(
+                &fx.store,
+                &[
+                    "new",
+                    "--no-edit",
+                    "--ignore-working-copy",
+                    &own,
+                    &merged_base,
+                    "-m",
+                    "Merge main into the branch",
+                ],
+                "merge the base into the branch",
+            )
+            .unwrap();
+        let merge = crate::jj::revset_commit(
+            &fx.jj,
+            &fx.store,
+            &format!("children({own}) & children({merged_base})"),
+        )
+        .expect("the merge commit resolves");
+        fx.jj
+            .run(
+                &fx.store,
+                &[
+                    "bookmark",
+                    "set",
+                    branch,
+                    "-r",
+                    &merge,
+                    "--ignore-working-copy",
+                ],
+                "point the branch at its merge",
+            )
+            .unwrap();
+
+        let base = bump_with_heading(&fx, &main_ws, 12);
+        set_main(&fx, &base);
+
+        let pre_tip = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+        assert_eq!(pre_tip, merge);
+        let fork = branch_fork_point(&fx.jj, &fx.store, &pre_tip, &base).unwrap();
+        assert_eq!(
+            fork, merged_base,
+            "the fork is the base commit the branch merged"
+        );
+        let gapped = fx
+            .jj
+            .run(
+                &fx.store,
+                &[
+                    "diff",
+                    "--ignore-working-copy",
+                    "--git",
+                    "-r",
+                    &format!("{fork}..{pre_tip}"),
+                ],
+                "range diff over the merged tip",
+            )
+            .expect_err("jj refuses the gapped range, or this fixture no longer reproduces it");
+        assert!(gapped.contains("gaps"), "{gapped}");
+
+        let changes = persist_pre_rebase_obligations(
+            &fx.jj,
+            &db,
+            "p",
+            &fx.store,
+            branch,
+            &ReplayBaseline::fork_only(&fork),
+            &pre_tip,
+            &base,
+        )
+        .await
+        .expect("the preflight reads a merged tip");
+        assert_eq!(
+            changes,
+            BTreeSet::from([PROTOCOL.to_string()]),
+            "the branch's own registered edit, and nothing the merged base brought"
+        );
+
+        assert_eq!(
+            crate::jj::rebase_branch_onto(&fx.jj, &fx.store, branch, "main").unwrap(),
+            crate::jj::RebaseOutcome::Rebased
+        );
+        let rebased = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+        let plan = plan_post_rebase_resolution(
+            &fx.jj,
+            &fx.store,
+            &ReplayBaseline::fork_only(&fork),
+            &pre_tip,
+            &base,
+            &rebased,
+            &changes,
+            &[],
+        )
+        .unwrap();
+        assert!(plan.is_empty(), "{plan:?}");
+        assert_eq!(protocol_value(&fx, &rebased), 12);
+        assert!(text_at(&fx, &rebased, PROTOCOL).contains("BRANCH_ONLY"));
+    }
+
+    /// A graph read the preflight cannot complete is the branch's to report,
+    /// not a transient: it is classified permanent and its diagnostic quotes
+    /// jj. Bookkeeping it cannot persist is the runner's, and stays retryable.
+    #[test]
+    fn preflight_failures_are_classified_by_their_cause() {
+        let graph = PreflightFailure::Graph(
+            "could not read logical changes from `a` to `b`: jj diff --git (logical range) \
+             failed: Error: Revision `a` doesn't exist"
+                .into(),
+        )
+        .diagnostic();
+        assert!(graph.contains("doesn't exist"), "{graph}");
+        assert_eq!(
+            crate::jj::reconcile_failure_kind(&graph),
+            crate::jj::CONTENDED_PREFLIGHT
+        );
+        assert!(!reconcile_has_transient_failures(&[
+            crate::jj::ReconcileFailure {
+                branch: "agent/x".into(),
+                error: graph,
+            }
+        ]));
+
+        let persistence = PreflightFailure::Persistence("database is locked".into()).diagnostic();
+        assert_eq!(
+            crate::jj::reconcile_failure_kind(&persistence),
+            "persistence"
+        );
+        assert!(reconcile_has_transient_failures(&[
+            crate::jj::ReconcileFailure {
+                branch: "agent/x".into(),
+                error: persistence,
+            }
+        ]));
+    }
+
+    /// A tip an earlier advance already inflated — base + 18, no paragraph —
+    /// is put back on the base's value by the next clean advance, and its
+    /// poisoned obligation is discharged rather than restored as a floor.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn an_inflated_tip_is_reset_to_the_base_value() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let fx = fixture(&bin);
+        let branch = "agent/inflated";
+        let branch_ws = fx.workspaces.path().join("inflated");
+        let main_ws = main_line(&fx);
+        crate::jj::add_workspace(&fx.jj, &fx.store, &branch_ws, branch, "main", None).unwrap();
+        let path = branch_ws.join(PROTOCOL);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            text.replace(
+                "EXECUTOR_PROTOCOL_VERSION: u32 = 10;",
+                "EXECUTOR_PROTOCOL_VERSION: u32 = 28;",
+            ),
+        )
+        .unwrap();
+        crate::jj::seal(&fx.jj, &branch_ws, "carry an inflated number", None).unwrap();
+        std::fs::write(main_ws.join("unrelated.txt"), "main moved on\n").unwrap();
+        crate::jj::seal(&fx.jj, &main_ws, "unrelated main change", None).unwrap();
+        let base = crate::jj::bookmark_commit(&fx.jj, &fx.store, "agent/main-line").unwrap();
+        set_main(&fx, &base);
+
+        let pre_tip = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+        let fork = branch_fork_point(&fx.jj, &fx.store, &pre_tip, &base).unwrap();
+        let refusal = crate::orchestrator::contended_identifiers::protocol_ledger_refusal(
+            &fx.jj, &fx.store, branch, "main",
+        )
+        .unwrap()
+        .expect("the merge gate holds an inflated branch");
+        assert!(refusal.contains("reads 28"), "{refusal}");
+
+        assert_eq!(
+            crate::jj::rebase_branch_onto(&fx.jj, &fx.store, branch, "main").unwrap(),
+            crate::jj::RebaseOutcome::Rebased
+        );
+        let rebased = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+        let changes = registered_changes(&fx.jj, &fx.store, &fork, &pre_tip).unwrap();
+        let poisoned = Obligation {
+            identifier: PROTOCOL_LABEL.into(),
+            delta: 18,
+            status: "outstanding".into(),
+            basis_fork_value: 10,
+            basis_branch_value: 28,
+            basis_base_value: 10,
+            last_diagnostic: None,
+        };
+        let plan = plan_post_rebase_resolution(
+            &fx.jj,
+            &fx.store,
+            &ReplayBaseline::fork_only(&fork),
+            &pre_tip,
+            &base,
+            &rebased,
+            &changes,
+            &[poisoned],
+        )
+        .unwrap();
+        assert_eq!(
+            plan.movements,
+            vec![Movement::Reset {
+                identifier: "EXECUTOR_PROTOCOL_VERSION".into(),
+                from: 28,
+                to: 10,
+                absorbed: vec![],
+            }]
+        );
+        assert_eq!(plan.discharged, vec![PROTOCOL_LABEL.to_string()]);
+        assert!(
+            plan.describe().contains("`/// Version 11 …`"),
+            "{}",
+            plan.describe()
+        );
+        apply_resolution_plan(&fx.jj, &fx.store, branch, &rebased, &plan).unwrap();
+
+        let resolved = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+        assert_eq!(protocol_value(&fx, &resolved), 10);
+        assert!(
+            crate::orchestrator::contended_identifiers::protocol_ledger_refusal(
+                &fx.jj, &fx.store, branch, "main"
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    /// A real protocol change survives main taking the same number: its
+    /// paragraph and constant both move to one above main's, and main's own
+    /// paragraph for the contended number is left alone.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_real_bump_survives_and_is_renumbered_above_main() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let fx = fixture(&bin);
+        let branch = "agent/real-bump";
+        let branch_ws = fx.workspaces.path().join("real-bump");
+        let main_ws = main_line(&fx);
+        crate::jj::add_workspace(&fx.jj, &fx.store, &branch_ws, branch, "main", None).unwrap();
+        // The branch's paragraph goes below the constant and main's above it,
+        // with an unchanged line between each and the identical constant edit,
+        // so the rebase is clean and only the semantic pass can see the clash.
+        let path = branch_ws.join(PROTOCOL);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{}/// Version 11 adds the branch's change.\n",
+                text.replace(
+                    "EXECUTOR_PROTOCOL_VERSION: u32 = 10;",
+                    "EXECUTOR_PROTOCOL_VERSION: u32 = 11;",
+                )
+            ),
+        )
+        .unwrap();
+        crate::jj::seal(&fx.jj, &branch_ws, "branch protocol change", None).unwrap();
+        let base = bump_with_heading(&fx, &main_ws, 11);
+        set_main(&fx, &base);
+
+        let pre_tip = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+        let fork = branch_fork_point(&fx.jj, &fx.store, &pre_tip, &base).unwrap();
+        assert_eq!(fork, fx.fork);
+        assert_eq!(
+            crate::jj::rebase_branch_onto(&fx.jj, &fx.store, branch, "main").unwrap(),
+            crate::jj::RebaseOutcome::Rebased
+        );
+        let rebased = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+        let changes = registered_changes(&fx.jj, &fx.store, &fork, &pre_tip).unwrap();
+        let plan = plan_post_rebase_resolution(
+            &fx.jj,
+            &fx.store,
+            &ReplayBaseline::fork_only(&fork),
+            &pre_tip,
+            &base,
+            &rebased,
+            &changes,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            plan.movements,
+            vec![Movement::Advanced {
+                identifier: "EXECUTOR_PROTOCOL_VERSION".into(),
+                from: 11,
+                to: 12,
+                base: 11,
+                delta: 1,
+                from_floor: false,
+                headings: Some(HeadingTally {
+                    authored: vec![11],
+                    absorbed: vec![],
+                }),
+            }]
+        );
+        assert!(
+            plan.describe().contains(
+                "11 → 12: base 11 + delta 1. Authored by this branch: 11 → 12. Absorbed from \
+                 the base and not counted: none."
+            ),
+            "{}",
+            plan.describe()
+        );
+        apply_resolution_plan(&fx.jj, &fx.store, branch, &rebased, &plan).unwrap();
+
+        let resolved = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+        let text = text_at(&fx, &resolved, PROTOCOL);
+        assert!(
+            text.contains("/// Version 11 adds main's change 11.\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("/// Version 12 adds the branch's change.\n"),
+            "{text}"
+        );
+        assert!(!text.contains("/// Version 11 adds the branch's"), "{text}");
+        assert_eq!(protocol_value(&fx, &resolved), 12);
+        assert!(
+            crate::orchestrator::contended_identifiers::protocol_ledger_refusal(
+                &fx.jj, &fx.store, branch, "main"
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    /// A branch whose own change sits at the end of the protocol file, and which
+    /// also took main's 11 bump by hand — main's paragraph and constant, byte
+    /// for byte — before main advanced to exactly that commit. `own_heading`
+    /// is the branch's own paragraph, if it changes the protocol.
+    fn branch_that_absorbed_mains_bump(
+        fx: &Fixture,
+        name: &str,
+        own_heading: &str,
+    ) -> (String, String, String) {
+        let branch = format!("agent/{name}");
+        let branch_ws = fx.workspaces.path().join(name);
+        let main_ws = main_line(fx);
+        crate::jj::add_workspace(&fx.jj, &fx.store, &branch_ws, &branch, "main", None).unwrap();
+        let base = bump_with_heading(fx, &main_ws, 11);
+        let path = branch_ws.join(PROTOCOL);
+        std::fs::write(
+            &path,
+            format!(
+                "{}pub const BRANCH_ONLY: u32 = 1;\n{own_heading}",
+                text_at(fx, &base, PROTOCOL)
+            ),
+        )
+        .unwrap();
+        crate::jj::seal(&fx.jj, &branch_ws, "hand-merge main's bump", None).unwrap();
+        set_main(fx, &base);
+        let pre_tip = crate::jj::bookmark_commit(&fx.jj, &fx.store, &branch).unwrap();
+        (branch, pre_tip, base)
+    }
+
+    /// Specimens 4906, 4925, 4931, 4907, 4926 and 4982: a branch that changes no
+    /// protocol, measured from a fork that predates main's bump, after it took
+    /// main's paragraph in. The merge gate accepts it as it stands, and the
+    /// replay leaves it on main's number instead of counting main's bump twice.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_no_bump_branch_that_absorbed_mains_bump_stays_on_mains_value() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let fx = fixture(&bin);
+        let (branch, pre_tip, base) = branch_that_absorbed_mains_bump(&fx, "absorbed", "");
+        let fork = branch_fork_point(&fx.jj, &fx.store, &pre_tip, &base).unwrap();
+        assert_eq!(fork, fx.fork, "measured from the stale fork at 10");
+        assert_eq!(protocol_value(&fx, &pre_tip), 11);
+        assert_eq!(
+            crate::orchestrator::contended_identifiers::protocol_ledger_refusal(
+                &fx.jj, &fx.store, &branch, "main"
+            ),
+            Ok(None),
+            "the gate does not charge the branch with main's paragraph"
+        );
+
+        assert_eq!(
+            crate::jj::rebase_branch_onto(&fx.jj, &fx.store, &branch, "main").unwrap(),
+            crate::jj::RebaseOutcome::Rebased
+        );
+        let rebased = crate::jj::bookmark_commit(&fx.jj, &fx.store, &branch).unwrap();
+        let changes = registered_changes(&fx.jj, &fx.store, &fork, &pre_tip).unwrap();
+        assert!(changes.contains(PROTOCOL));
+        let plan = plan_post_rebase_resolution(
+            &fx.jj,
+            &fx.store,
+            &ReplayBaseline::fork_only(&fork),
+            &pre_tip,
+            &base,
+            &rebased,
+            &changes,
+            &[],
+        )
+        .unwrap();
+        assert!(plan.is_empty(), "{plan:?}");
+        assert_eq!(protocol_value(&fx, &rebased), 11);
+    }
+
+    /// Specimen 4798: a real +1 branch that took main's paragraph for 11 in
+    /// beside its own paragraph for 11. It carries exactly one version onto
+    /// main's 11 — 12, not 13 — and only its own paragraph is renumbered.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_real_bump_that_absorbed_mains_bump_lands_one_above_main() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let fx = fixture(&bin);
+        let (branch, pre_tip, base) = branch_that_absorbed_mains_bump(
+            &fx,
+            "absorbed-real",
+            "/// Version 11 adds the branch's change.\n",
+        );
+        let fork = branch_fork_point(&fx.jj, &fx.store, &pre_tip, &base).unwrap();
+        let refusal = crate::orchestrator::contended_identifiers::protocol_ledger_refusal(
+            &fx.jj, &fx.store, &branch, "main",
+        )
+        .unwrap()
+        .expect("the branch's own paragraph still takes main's number");
+        assert!(refusal.contains("the next version is 12"), "{refusal}");
+
+        assert_eq!(
+            crate::jj::rebase_branch_onto(&fx.jj, &fx.store, &branch, "main").unwrap(),
+            crate::jj::RebaseOutcome::Rebased
+        );
+        let rebased = crate::jj::bookmark_commit(&fx.jj, &fx.store, &branch).unwrap();
+        let changes = registered_changes(&fx.jj, &fx.store, &fork, &pre_tip).unwrap();
+        let plan = plan_post_rebase_resolution(
+            &fx.jj,
+            &fx.store,
+            &ReplayBaseline::fork_only(&fork),
+            &pre_tip,
+            &base,
+            &rebased,
+            &changes,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            plan.movements,
+            vec![Movement::Advanced {
+                identifier: "EXECUTOR_PROTOCOL_VERSION".into(),
+                from: 11,
+                to: 12,
+                base: 11,
+                delta: 1,
+                from_floor: false,
+                headings: Some(HeadingTally {
+                    authored: vec![11],
+                    absorbed: vec![],
+                }),
+            }]
+        );
+        apply_resolution_plan(&fx.jj, &fx.store, &branch, &rebased, &plan).unwrap();
+
+        let resolved = crate::jj::bookmark_commit(&fx.jj, &fx.store, &branch).unwrap();
+        let text = text_at(&fx, &resolved, PROTOCOL);
+        assert!(
+            text.contains("/// Version 11 adds main's change 11.\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("/// Version 12 adds the branch's change.\n"),
+            "{text}"
+        );
+        assert_eq!(protocol_value(&fx, &resolved), 12);
+        assert_eq!(
+            crate::orchestrator::contended_identifiers::protocol_ledger_refusal(
+                &fx.jj, &fx.store, &branch, "main"
+            ),
+            Ok(None)
+        );
+    }
+
+    /// The merge gate reads the store, so it holds a branch base-advance never
+    /// reached: a number-only bump and an inflated one are refused, a bump that
+    /// brings its paragraph passes, and a destination that does not declare
+    /// the constant is not subject to the ledger at all.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn the_merge_gate_refuses_every_undocumented_protocol_number() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let fx = fixture(&bin);
+        let constant_line = "EXECUTOR_PROTOCOL_VERSION: u32 = 10;";
+        let cases = [
+            (
+                "agent/gate-inflated",
+                "EXECUTOR_PROTOCOL_VERSION: u32 = 28;",
+                "",
+                false,
+            ),
+            (
+                "agent/gate-number-only",
+                "EXECUTOR_PROTOCOL_VERSION: u32 = 11;",
+                "",
+                false,
+            ),
+            (
+                "agent/gate-documented",
+                "EXECUTOR_PROTOCOL_VERSION: u32 = 11;",
+                "/// Version 11 adds the gate's change.\n",
+                true,
+            ),
+        ];
+        for (branch, replacement, heading, allowed) in cases {
+            let workspace = fx.workspaces.path().join(branch.replace('/', "-"));
+            crate::jj::add_workspace(&fx.jj, &fx.store, &workspace, branch, "main", None).unwrap();
+            let path = workspace.join(PROTOCOL);
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(
+                &path,
+                format!("{heading}{}", text.replace(constant_line, replacement)),
+            )
+            .unwrap();
+            crate::jj::seal(&fx.jj, &workspace, branch, None).unwrap();
+            let refusal = crate::orchestrator::contended_identifiers::protocol_ledger_refusal(
+                &fx.jj, &fx.store, branch, "main",
+            )
+            .unwrap();
+            assert_eq!(refusal.is_none(), allowed, "{branch}: {refusal:?}");
+        }
+
+        let elsewhere = fx.workspaces.path().join("no-protocol");
+        crate::jj::add_workspace(
+            &fx.jj,
+            &fx.store,
+            &elsewhere,
+            "agent/no-protocol",
+            "main",
+            None,
+        )
+        .unwrap();
+        std::fs::remove_file(elsewhere.join(PROTOCOL)).unwrap();
+        crate::jj::seal(&fx.jj, &elsewhere, "a destination without the ledger", None).unwrap();
+        assert_eq!(
+            crate::orchestrator::contended_identifiers::protocol_ledger_refusal(
+                &fx.jj,
+                &fx.store,
+                "agent/gate-inflated",
+                "agent/no-protocol",
+            ),
+            Ok(None)
+        );
+    }
+
+    /// Inverts what this scenario once asserted. Two branches made the same
+    /// number-only bump; three-way merge took it once, and the arithmetic
+    /// resolver restored the second as `12` from its obligation. Neither branch
+    /// wrote a paragraph, so neither changed the protocol, and the restored
+    /// number was exactly the kind of undocumented version that stranded the
+    /// fleet. Heading evidence counts no contribution here: the second branch
+    /// lands on main's value and its obligation is discharged as satisfied.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_duplicate_number_only_bump_lands_on_the_base_value() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let fx = fixture(&bin);
+        let first = "agent/protocol-first";
+        let second = "agent/protocol-second";
+        let first_ws = fx.workspaces.path().join("first");
+        let second_ws = fx.workspaces.path().join("second");
+        crate::jj::add_workspace(&fx.jj, &fx.store, &first_ws, first, "main", None).unwrap();
+        crate::jj::add_workspace(&fx.jj, &fx.store, &second_ws, second, "main", None).unwrap();
+        let protocol = PROTOCOL;
+        for (workspace, label) in [(&first_ws, "first"), (&second_ws, "second")] {
+            std::fs::write(
+                workspace.join(protocol),
+                "/// Version 10 is the fork baseline.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 11;\npub const SUBSTRATE_HEALTH_SCHEMA_VERSION: u32 = 8;\n",
+            )
+            .unwrap();
+            crate::jj::seal(&fx.jj, workspace, &format!("{label} bump"), None).unwrap();
+        }
+
+        let first_tip = crate::jj::bookmark_commit(&fx.jj, &fx.store, first).unwrap();
+        let second_pre_tip = crate::jj::bookmark_commit(&fx.jj, &fx.store, second).unwrap();
+        set_main(&fx, &first_tip);
+        assert_eq!(
+            crate::jj::rebase_branch_onto(&fx.jj, &fx.store, second, "main").unwrap(),
+            crate::jj::RebaseOutcome::Rebased
+        );
+        let rebased = crate::jj::bookmark_commit(&fx.jj, &fx.store, second).unwrap();
+        let changes = registered_changes(&fx.jj, &fx.store, &fx.fork, &second_pre_tip).unwrap();
+        let obligation = Obligation {
+            identifier: PROTOCOL_LABEL.into(),
+            delta: 1,
+            status: "outstanding".into(),
+            basis_fork_value: 10,
+            basis_branch_value: 11,
+            basis_base_value: 11,
+            last_diagnostic: None,
+        };
+        let plan = plan_post_rebase_resolution(
+            &fx.jj,
+            &fx.store,
+            &ReplayBaseline::fork_only(&fx.fork),
+            &second_pre_tip,
+            &first_tip,
+            &rebased,
+            &changes,
+            &[obligation],
+        )
+        .unwrap();
+        assert!(plan.is_empty(), "{plan:?}");
+        assert_eq!(plan.discharged, vec![PROTOCOL_LABEL.to_string()]);
+        assert_eq!(protocol_value(&fx, &rebased), 11);
     }
 
     // ── End to end: request_branch_replay through the durable worker ────────
@@ -9775,136 +11339,13 @@ mod real_store_collision_tests {
         assert!(open_session(&r).await.is_none());
     }
 
-    /// cairn/5222 and cairn/5328: the branch commits D1's line beside its own
-    /// BEFORE the advance records a session. jj's line merge still conflicts at
-    /// the shared insertion point, so the session is recorded with that
-    /// resolution as `ours` and no basis, and later commits touch only other
-    /// files. The tip already holds both sides, so the request is accepted and
-    /// the replay lands it — no cosmetic edit to the file is needed.
-    #[tokio::test(flavor = "multi_thread")]
-    #[serial_test::serial(jj)]
-    async fn a_resolution_committed_before_the_session_was_recorded_is_taken() {
-        let Some(bin) = crate::jj::tests::jj_bin() else {
-            return;
-        };
-        let r = replay_harness(&bin, "replay-pre-resolved.db", &[(LIST, "head\n")]).await;
-        commit(
-            &r.fx,
-            &r.branch_ws,
-            BRANCH,
-            &[(LIST, "head\nX\n")],
-            "branch appends X",
-        );
-        let d1 = commit(
-            &r.fx,
-            &r.main_ws,
-            MAIN_LINE,
-            &[(LIST, "head\nA\n")],
-            "D1 appends A",
-        );
-        set_main(&r.fx, &d1);
-        let resolved = commit(
-            &r.fx,
-            &r.branch_ws,
-            BRANCH,
-            &[(LIST, "head\nA\nX\n")],
-            "carry D1's line ahead of the advance",
-        );
-        automatic_advance(&r).await;
-        let session = open_session(&r)
-            .await
-            .expect("the line merge still conflicts at the shared insertion point");
-        assert_eq!(session.ours.as_deref(), Some(resolved.as_str()));
-        assert_eq!(
-            resolved_against(&session, LIST),
-            None,
-            "no session existed when the resolution was committed, so none is recorded"
-        );
-        commit(
-            &r.fx,
-            &r.branch_ws,
-            BRANCH,
-            &[("other.txt", "unrelated\n")],
-            "an unrelated follow-up",
-        );
-
-        request_take_committed_tip(&r).await;
-        assert!(
-            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &d1),
-            "the replay landed: {:?}",
-            open_session(&r).await.map(|session| session.fingerprint())
-        );
-        assert_eq!(text_at(&r.fx, BRANCH, LIST), "head\nA\nX\n");
-        assert_eq!(text_at(&r.fx, BRANCH, "other.txt"), "unrelated\n");
-        assert!(open_session(&r).await.is_none());
-    }
-
-    /// The arm the fall-through must not open: a tip whose conflicting file is
-    /// still only the branch's side is refused, by name, even after commits to
-    /// other files have moved it.
-    #[tokio::test(flavor = "multi_thread")]
-    #[serial_test::serial(jj)]
-    async fn a_one_sided_tip_is_still_refused_by_name() {
-        let Some(bin) = crate::jj::tests::jj_bin() else {
-            return;
-        };
-        let r = replay_harness(&bin, "replay-one-sided.db", &[(LIST, "head\n")]).await;
-        commit(
-            &r.fx,
-            &r.branch_ws,
-            BRANCH,
-            &[(LIST, "head\nX\n")],
-            "branch appends X",
-        );
-        let d1 = commit(
-            &r.fx,
-            &r.main_ws,
-            MAIN_LINE,
-            &[(LIST, "head\nA\n")],
-            "D1 appends A",
-        );
-        set_main(&r.fx, &d1);
-        automatic_advance(&r).await;
-        let session = open_session(&r).await.expect("D1 conflicts");
-        let ours = session.ours.clone().expect("the session records ours");
-        let moved = commit(
-            &r.fx,
-            &r.branch_ws,
-            BRANCH,
-            &[("other.txt", "unrelated\n")],
-            "an unrelated change",
-        );
-
-        let refusal = request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, None)
-            .await
-            .expect_err("a one-sided tip has no resolution to take");
-        assert!(refusal.contains("resolves none"), "{refusal}");
-        assert!(refusal.contains(&format!("- `{LIST}`")), "{refusal}");
-        assert!(
-            refusal.contains(&format!("changes it on top of `{ours}`")),
-            "{refusal}"
-        );
-        let refused_with_reason =
-            request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, Some("trust me"))
-                .await
-                .expect_err("a stated reason cannot supply a resolution");
-        assert!(
-            refused_with_reason.contains("resolves none"),
-            "{refused_with_reason}"
-        );
-        assert_eq!(branch_tip(&r), moved, "a refused request moves nothing");
-    }
-
     /// Scenario 2, the specimen's own file: the branch resolved D1's migration
     /// registration and renumbered its own, then D2 registered a migration at
-    /// the number the branch took. The replayed registry holds every entry
-    /// once. The replay does not renumber the collision: numbering is the
-    /// landing's (`landing::bind`), which rebinds the branch's file against the
-    /// tip it lands on.
+    /// the number the branch took. The landed registry holds every entry once
+    /// and every number names one file.
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial(jj)]
-    async fn a_registry_resolution_against_d1_keeps_d2s_registration_and_leaves_numbers_to_the_landing(
-    ) {
+    async fn a_registry_resolution_against_d1_keeps_d2s_registration_and_renumbers() {
         let Some(bin) = crate::jj::tests::jj_bin() else {
             return;
         };
@@ -9974,7 +11415,8 @@ mod real_store_collision_tests {
         for (stem, expected) in [
             ("0228_destination", 1),
             ("0230_d2", 1),
-            ("0230_branch", 1),
+            ("0231_branch", 1),
+            ("0230_branch", 0),
             ("0228_branch", 0),
         ] {
             assert_eq!(
@@ -9986,13 +11428,133 @@ mod real_store_collision_tests {
         let files =
             crate::jj::paths_under_at(&r.fx.jj, &r.fx.store, BRANCH, "src-tauri/turso_migrations")
                 .unwrap();
-        for file in ["0230_branch.sql", "0230_d2.sql"] {
-            assert!(
-                files.contains(&format!("src-tauri/turso_migrations/{file}")),
-                "the replay moves no number: {files:?}"
-            );
-        }
+        let numbers: Vec<&str> = files
+            .iter()
+            .map(|path| &path["src-tauri/turso_migrations/".len()..][..4])
+            .collect();
+        let unique: BTreeSet<&str> = numbers.iter().copied().collect();
+        assert_eq!(
+            numbers.len(),
+            unique.len(),
+            "one file per number: {files:?}"
+        );
+        assert!(
+            files.contains("src-tauri/turso_migrations/0231_branch.sql"),
+            "{files:?}"
+        );
         assert_eq!(text_at(&r.fx, BRANCH, "other.txt"), "one\nmain\nbranch\n");
+    }
+
+    /// Scenario 4, cairn/4916's take-committed-tip specimens. The branch and D1
+    /// both append to the protocol file, so D1 records a session; D2 is an
+    /// unrelated change, so the base is still at D1's number when the replay
+    /// lands.
+    async fn protocol_resolution(bin: &str, name: &str, branch_bumps: bool) -> Replay {
+        let r = replay_harness(bin, name, &[]).await;
+        let fork_text = text_at(&r.fx, "main", PROTOCOL);
+        let branch_text = if branch_bumps {
+            format!(
+                "{}/// Version 11 adds the branch's change.\n",
+                fork_text.replace(
+                    "EXECUTOR_PROTOCOL_VERSION: u32 = 10;",
+                    "EXECUTOR_PROTOCOL_VERSION: u32 = 11;"
+                )
+            )
+        } else {
+            format!("{fork_text}pub const BRANCH_ONLY: u32 = 1;\n")
+        };
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(PROTOCOL, &branch_text)],
+            "branch",
+        );
+        bump_with_heading(&r.fx, &r.main_ws, 11);
+        let main_text = format!(
+            "{}pub const MAIN_ONLY: u32 = 1;\n",
+            std::fs::read_to_string(r.main_ws.join(PROTOCOL)).unwrap()
+        );
+        let d1 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(PROTOCOL, &main_text)],
+            "D1",
+        );
+        set_main(&r.fx, &d1);
+        automatic_advance(&r).await;
+        assert!(
+            open_session(&r).await.is_some(),
+            "both appends conflict and record a session"
+        );
+
+        // The resolution takes D1's whole file, main's 11 included, and adds
+        // the branch's own work: either nothing numbered, or a bump to 12 with
+        // its paragraph renumbered to match.
+        let resolved_text = if branch_bumps {
+            format!(
+                "{}/// Version 12 adds the branch's change.\n",
+                main_text.replace(
+                    "EXECUTOR_PROTOCOL_VERSION: u32 = 11;",
+                    "EXECUTOR_PROTOCOL_VERSION: u32 = 12;"
+                )
+            )
+        } else {
+            format!("{main_text}pub const BRANCH_ONLY: u32 = 1;\n")
+        };
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(PROTOCOL, &resolved_text)],
+            "resolve",
+        );
+        let d2 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[("unrelated.txt", "moved\n")],
+            "D2",
+        );
+        set_main(&r.fx, &d2);
+        request_take_committed_tip(&r).await;
+        assert!(
+            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &d2),
+            "the replay landed"
+        );
+        r
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_resolution_that_took_mains_protocol_number_bumps_nothing() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let r = protocol_resolution(&bin, "replay-4a.db", false).await;
+        assert_eq!(
+            protocol_value(&r.fx, BRANCH),
+            11,
+            "{}",
+            text_at(&r.fx, BRANCH, PROTOCOL)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_real_bump_resolved_against_mains_number_lands_one_above_it() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let r = protocol_resolution(&bin, "replay-4b.db", true).await;
+        let text = text_at(&r.fx, BRANCH, PROTOCOL);
+        assert_eq!(protocol_value(&r.fx, BRANCH), 12, "{text}");
+        assert!(
+            text.contains("/// Version 12 adds the branch's change.\n"),
+            "{text}"
+        );
+        assert!(!text.contains("Version 13"), "{text}");
     }
 
     #[test]

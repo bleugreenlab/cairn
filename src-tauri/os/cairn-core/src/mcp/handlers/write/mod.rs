@@ -26,8 +26,8 @@ use crate::resources::mutations::{
     blocking_append_kind, dispatch_resource_change, project_write_crossing_path,
     run_blocking_group, validate_blocking_group, PromotedMemoryRef,
 };
+use crate::stack::off_frame;
 use cairn_common::authorization::AuthorityRequest;
-use cairn_platform::stack::off_frame;
 
 /// A single-failure change report for an item refused before anything applied.
 fn deny_change(changes: &[crate::mcp::types::ChangeItem], index: usize, message: String) -> String {

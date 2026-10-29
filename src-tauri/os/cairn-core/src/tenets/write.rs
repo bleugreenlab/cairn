@@ -11,7 +11,7 @@ use cairn_db::turso::{params, Connection};
 use super::read::row_conn;
 use super::{
     emit_changed, successor_refusal, AnswerSource, TenetOrigin, TenetRow, TenetStatus, Verdict,
-    MAX_RATIONALE_CHARS, MAX_STATEMENT_CHARS, OVER_LENGTH_REFUSAL, RATIONALE_OVER_LENGTH_REFUSAL,
+    MAX_PROPOSAL_CHARS, OVER_LENGTH_REFUSAL,
 };
 use crate::execution::gates::sweep::notify_gate_evidence_changed;
 use crate::services::EventEmitter;
@@ -20,10 +20,8 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 /// What a thread proposes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proposal {
-    /// How the project does things, as the thread proposes it: one sentence.
+    /// How the project does things, as the thread proposes it.
     pub statement: String,
-    /// Why, the alternatives ruled out, and where it was argued.
-    pub rationale: Option<String>,
     /// An approved tenet this one replaces once it is itself approved.
     pub supersedes: Option<i64>,
     pub origin: TenetOrigin,
@@ -84,7 +82,6 @@ pub struct NewTenet {
     pub proposing_thread_id: String,
     pub slug: Option<String>,
     pub statement: String,
-    pub rationale: Option<String>,
     pub status: TenetStatus,
     pub verdict: Option<Verdict>,
     pub comment: Option<String>,
@@ -130,9 +127,9 @@ pub async fn insert_conn(conn: &Connection, tenet: &NewTenet) -> DbResult<(Strin
         "INSERT INTO tenets (
             id, project_id, number, proposing_thread_id, slug, statement, status, verdict,
             comment, answered_by_json, answer_source, answered_at, supersedes, origin,
-            legacy_json, proposer_principal_json, created_at, updated_at, rationale
+            legacy_json, proposer_principal_json, created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                   ?17, ?17, ?18)",
+                   ?17, ?17)",
         params![
             id.as_str(),
             tenet.project_id.as_str(),
@@ -150,8 +147,7 @@ pub async fn insert_conn(conn: &Connection, tenet: &NewTenet) -> DbResult<(Strin
             tenet.origin.as_str(),
             tenet.legacy.as_ref().map(encode).transpose()?,
             encode(&tenet.proposer)?,
-            tenet.now,
-            tenet.rationale.as_deref()
+            tenet.now
         ],
     )
     .await?;
@@ -164,47 +160,23 @@ fn encode<T: serde::Serialize>(value: &T) -> DbResult<String> {
     serde_json::to_string(value).map_err(|error| DbError::Row(error.to_string()))
 }
 
-/// A proposal's text as it is stored.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Validated {
-    pub statement: String,
-    pub rationale: Option<String>,
-}
-
-/// The proposal's statement and rationale, trimmed (a blank rationale is
-/// none), or the refusal naming what is wrong with them.
-pub(super) fn validate(proposal: &Proposal) -> Result<Validated, String> {
+/// The proposal's statement, trimmed, or the refusal naming what is wrong
+/// with it.
+pub(super) fn validate(proposal: &Proposal) -> Result<String, String> {
     let statement = proposal.statement.trim().to_string();
     if statement.is_empty() {
         return Err("a proposal needs a non-empty statement".into());
     }
     let chars = statement.chars().count();
-    if chars > MAX_STATEMENT_CHARS {
+    if chars > MAX_PROPOSAL_CHARS {
         return Err(format!(
-            "{OVER_LENGTH_REFUSAL} (this statement is {chars} characters; it may be at most {MAX_STATEMENT_CHARS})"
+            "{OVER_LENGTH_REFUSAL} (this statement is {chars} characters; it may be at most {MAX_PROPOSAL_CHARS})"
         ));
-    }
-    let rationale = proposal
-        .rationale
-        .as_deref()
-        .map(str::trim)
-        .filter(|rationale| !rationale.is_empty())
-        .map(str::to_string);
-    if let Some(rationale) = &rationale {
-        let chars = rationale.chars().count();
-        if chars > MAX_RATIONALE_CHARS {
-            return Err(format!(
-                "{RATIONALE_OVER_LENGTH_REFUSAL} (this rationale is {chars} characters)"
-            ));
-        }
     }
     if proposal.origin == TenetOrigin::MigratedRuling {
         return Err("migrated rulings are imported, never proposed".into());
     }
-    Ok(Validated {
-        statement,
-        rationale,
-    })
+    Ok(statement)
 }
 
 fn not_found(number: i64) -> String {
@@ -237,16 +209,12 @@ pub async fn propose(
     proposer: &Proposer,
     proposal: Proposal,
 ) -> Result<TenetRow, String> {
-    let Validated {
-        statement,
-        rationale,
-    } = validate(&proposal)?;
+    let statement = validate(&proposal)?;
     let new = NewTenet {
         project_id: proposer.project_id.clone(),
         proposing_thread_id: proposer.thread_id.clone(),
         slug: None,
         statement,
-        rationale,
         status: TenetStatus::Proposed,
         verdict: None,
         comment: None,
@@ -277,7 +245,7 @@ pub async fn propose(
         })
         .await
         .map_err(|error| format!("Failed to propose tenet: {error}"))??;
-    emit_changed(emitter, &proposer.project_id, "insert");
+    emit_changed(emitter, "insert");
     Ok(outcome)
 }
 
@@ -324,7 +292,7 @@ pub async fn withdraw(
         })
         .await
         .map_err(|error| format!("Failed to withdraw tenet: {error}"))??;
-    emit_changed(emitter, &project_id, "update");
+    emit_changed(emitter, "update");
     notify_gate_evidence_changed();
     Ok(outcome)
 }
@@ -453,7 +421,7 @@ pub async fn answer(
         .await
         .map_err(|error| format!("Failed to record the verdict: {error}"))??;
     let (outcome, comments) = outcome;
-    emit_changed(emitter, &project_id, "update");
+    emit_changed(emitter, "update");
     if comments > 0 {
         if let Err(error) = emitter.emit(
             "db-change",
@@ -481,7 +449,7 @@ pub(crate) async fn release_deleted_thread_conn(
 ) -> DbResult<ReleasedTenets> {
     let mut rows = conn
         .query(
-            "SELECT number, status, project_id FROM tenets WHERE proposing_thread_id = ?1 ORDER BY number",
+            "SELECT number, status FROM tenets WHERE proposing_thread_id = ?1 ORDER BY number",
             params![thread_id],
         )
         .await?;
@@ -490,7 +458,6 @@ pub(crate) async fn release_deleted_thread_conn(
     while let Some(row) = rows.next().await? {
         let number = row.i64(0)?;
         let status = TenetStatus::parse(&row.text(1)?);
-        released.project_id = Some(row.text(2)?);
         if status.is_some_and(TenetStatus::has_verdict) {
             held.push(format!("#{number}"));
         }
@@ -515,21 +482,19 @@ pub(crate) async fn release_deleted_thread_conn(
 }
 
 /// What a thread deletion took from the tenets table.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ReleasedTenets {
     /// Every row removed, unanswered and withdrawn alike.
     pub removed: usize,
     /// The unanswered ones, each of which a gate may have named.
     pub pending: usize,
-    /// The project the removed rows belonged to; set whenever `removed > 0`.
-    pub project_id: Option<String>,
 }
 
 impl ReleasedTenets {
     /// Announce the removal, after the deleting transaction has committed.
     pub(crate) fn announce(self, emitter: &dyn EventEmitter) {
-        if let Some(project_id) = self.project_id.as_deref() {
-            emit_changed(emitter, project_id, "delete");
+        if self.removed > 0 {
+            emit_changed(emitter, "delete");
         }
         if self.pending > 0 {
             // A gate naming one of those proposals now names nothing.

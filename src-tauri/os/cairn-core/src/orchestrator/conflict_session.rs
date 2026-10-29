@@ -304,16 +304,16 @@ impl ConflictSession {
         })
     }
 
-    /// The basis once the branch's tip has resolved `resolved` against this
-    /// session's sides: each of this session's conflicting paths among them
-    /// takes those sides, and every other path keeps what it had. Pure, so the
-    /// per-path rule is provable without a store.
-    pub(crate) fn basis_after(&self, resolved: &BTreeSet<String>) -> ResolutionBasis {
+    /// The basis after the branch re-resolved `changed` while this session was
+    /// open: each of this session's conflicting paths among them was resolved
+    /// against this session's sides, and every other path keeps what it had.
+    /// Pure, so the per-path rule is provable without a store.
+    pub(crate) fn basis_after(&self, changed: &BTreeSet<String>) -> ResolutionBasis {
         let mut basis = self.resolution_basis.clone();
         if let (Some(base), Some(theirs)) = (self.base.as_ref(), self.theirs.as_ref()) {
             for file in self
                 .conflicting()
-                .filter(|file| resolved.contains(&file.path))
+                .filter(|file| changed.contains(&file.path))
             {
                 basis.insert(
                     file.path.clone(),
@@ -329,19 +329,10 @@ impl ConflictSession {
 
     /// What each path of `tip` was resolved against.
     ///
-    /// Two kinds of evidence resolve a conflicting path against this session's
-    /// sides. Its content changed between this session's `ours` and `tip`: it
-    /// was re-resolved while this session was open. Or its content at `tip`
-    /// already holds both sides of this session's merge: it was resolved
-    /// before the session was recorded, in a commit jj's line merge still
-    /// reports as conflicting, and requiring a further edit to it would demand
-    /// a cosmetic change to prove what the content already shows. Any other
-    /// path — including every path of a commit that only touched unrelated
-    /// files — keeps the basis this session inherited.
-    ///
-    /// This is the one answer the replay guard, the replay's carry, and the
-    /// rebase page all read, so none of them can count a resolution another
-    /// refuses.
+    /// A conflicting path whose content changed between this session's `ours`
+    /// and `tip` was re-resolved while this session was open, so against this
+    /// session's sides. Any other path — including every path of a commit that
+    /// only touched unrelated files — keeps the basis this session inherited.
     pub(crate) fn resolution_basis_at(
         &self,
         jj: &JjEnv,
@@ -352,23 +343,8 @@ impl ConflictSession {
             return Ok(self.resolution_basis.clone());
         };
         let paths: Vec<String> = self.conflicting().map(|file| file.path.clone()).collect();
-        let mut resolved = crate::jj::paths_changed_between(jj, store, ours, tip, &paths)?;
-        // Base drift has nothing to resolve: its sides already agree.
-        if let (false, Some(base), Some(theirs)) = (
-            self.is_base_drift(),
-            self.base.as_deref(),
-            self.theirs.as_deref(),
-        ) {
-            let unchanged: Vec<String> = paths
-                .iter()
-                .filter(|path| !resolved.contains(*path))
-                .cloned()
-                .collect();
-            resolved.extend(crate::jj::paths_holding_incoming_side(
-                jj, store, base, tip, theirs, &unchanged,
-            ));
-        }
-        Ok(self.basis_after(&resolved))
+        let changed = crate::jj::paths_changed_between(jj, store, ours, tip, &paths)?;
+        Ok(self.basis_after(&changed))
     }
 
     /// Every path a take-committed-tip replay has to place: the paths this
@@ -521,29 +497,6 @@ pub(crate) struct TipAssessment {
     /// exhaustive assessment, which is the only kind the mutation boundary may
     /// decide on.
     pub(crate) truncated: usize,
-    /// This session's conflicting paths the tip has not resolved against any
-    /// side: unchanged since the session was recorded, holding only the
-    /// branch's side, and covered by no earlier resolution. Never capped — it
-    /// comes from the resolution basis, which covers every conflicting path.
-    pub(crate) unresolved: Vec<String>,
-    /// How many conflicting paths this session has.
-    pub(crate) conflicting: usize,
-    /// What a resolution is measured from, so both the page and the refusal
-    /// can say what would count as one.
-    pub(crate) recorded: RecordedConflict,
-}
-
-/// The session coordinates that define what counts as a resolution.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct RecordedConflict {
-    /// The branch tip when the conflict was recorded. A commit on top of it
-    /// that changes a conflicting file resolves that file.
-    pub(crate) ours: Option<String>,
-    /// The incoming side a file's content must already hold to count as
-    /// resolved without such a commit.
-    pub(crate) theirs: String,
-    /// When the session was recorded.
-    pub(crate) at: i64,
 }
 
 /// Why a path's whole-file restore could not be PROVEN lossless.
@@ -585,49 +538,11 @@ impl TipAssessment {
     /// answer about the session.
     pub(crate) fn every_path_is_resolved(&self) -> bool {
         self.truncated == 0
-            && self.unresolved.is_empty()
             && !self.paths.is_empty()
             && self
                 .paths
                 .iter()
                 .all(|assessment| assessment.verdict == RestoreVerdict::Lossless)
-    }
-
-    /// Whether the tip resolves none of this session's conflicting files, so a
-    /// take-committed-tip replay has nothing to take. No stated reason changes
-    /// this: it cannot supply a resolution that does not exist.
-    pub(crate) fn resolves_nothing(&self) -> bool {
-        self.unresolved.len() == self.conflicting
-    }
-
-    /// What would count as resolving each unresolved file, and where to get
-    /// the content. The ONE wording behind both the rebase page and the
-    /// replay's refusal, so they cannot describe different requirements.
-    /// `rebase` is the rebase resource's URI as the reader would address it.
-    pub(crate) fn what_resolves(&self, rebase: &str) -> String {
-        let recorded = crate::clock::stamp(self.recorded.at)
-            .map(|at| format!(" (recorded {at})"))
-            .unwrap_or_default();
-        let commit = match self.recorded.ours.as_deref() {
-            Some(ours) => format!(
-                "a commit that changes it on top of `{ours}`, your branch's tip when this \
-                 conflict was recorded{recorded}"
-            ),
-            None => format!("a commit that changes it after this conflict was recorded{recorded}"),
-        };
-        let mut out = format!(
-            "A conflicting file counts as resolved once your branch has {commit}, or once its \
-             committed content already holds both sides — the incoming `{theirs}` inside every \
-             conflicting region as well as outside it. Not yet resolved:\n\n",
-            theirs = self.recorded.theirs,
-        );
-        for path in &self.unresolved {
-            out.push_str(&format!(
-                "- `{path}` — commit `{rebase}?view=merged&file={path}`, the complete merged \
-                 file, or your own resolution of it.\n"
-            ));
-        }
-        out
     }
 }
 
@@ -668,6 +583,10 @@ pub(crate) enum RestoreProof {
     /// unresolvable bookmark, a store that would not answer. Carries the reason,
     /// written for the requester.
     Unavailable(String),
+    /// None of this session's conflicting files has changed since the conflict
+    /// was recorded, and no earlier session recorded a resolution of any of
+    /// them. There is no resolution to take, so a stated reason cannot make one.
+    NothingResolved { theirs: String },
 }
 
 /// The same assessment over EVERY conflicting path, for the replay guard.
@@ -685,7 +604,7 @@ pub(crate) fn assess_session_tip_exhaustively(
     if session.is_base_drift() {
         return RestoreProof::NothingToProve;
     }
-    let (Some(base), Some(_)) = (session.base.as_deref(), session.theirs.as_deref()) else {
+    let (Some(base), Some(theirs)) = (session.base.as_deref(), session.theirs.as_deref()) else {
         return RestoreProof::Unavailable(
             "this session did not record both outer coordinates of the merge, so the restore \
              cannot be checked against what arrived"
@@ -708,6 +627,14 @@ pub(crate) fn assess_session_tip_exhaustively(
             ))
         }
     };
+    if !session
+        .conflicting()
+        .any(|file| basis.contains_key(&file.path))
+    {
+        return RestoreProof::NothingResolved {
+            theirs: theirs.to_string(),
+        };
+    }
     RestoreProof::Assessed(assess_against_basis(
         jj, store, session, base, &basis, tip, None,
     ))
@@ -768,11 +695,6 @@ fn assess_against_basis(
         .map(|assessment| (assessment.path.clone(), assessment))
         .collect();
 
-    let unresolved: Vec<String> = session
-        .conflicting()
-        .filter(|file| !basis.contains_key(&file.path))
-        .map(|file| file.path.clone())
-        .collect();
     TipAssessment {
         moved: session.ours.as_deref() != Some(tip.as_str()),
         paths: assessed
@@ -781,13 +703,6 @@ fn assess_against_basis(
             .collect(),
         truncated,
         tip,
-        unresolved,
-        conflicting: session.conflicting().count(),
-        recorded: RecordedConflict {
-            ours: session.ours.clone(),
-            theirs: session_side.theirs.clone(),
-            at: session.updated_at,
-        },
     }
 }
 
@@ -810,23 +725,18 @@ pub(crate) enum ReplayDecision {
 /// a database, or a fixture. Every arm that is not a completed proof of safety
 /// refuses unless the requester states a reason — except a tip with nothing
 /// resolved, where no reason can supply a resolution that does not exist.
-///
-/// That arm reads the same [`TipAssessment`] the rebase page renders, so the
-/// page cannot recommend a request this refuses.
 pub(crate) fn decide_replay(proof: &RestoreProof, stated_reason: Option<&str>) -> ReplayDecision {
     let blocker = match proof {
         RestoreProof::NothingToProve => return ReplayDecision::Proceed,
-        RestoreProof::Assessed(assessment) if assessment.resolves_nothing() => {
+        RestoreProof::NothingResolved { theirs } => {
             return ReplayDecision::Refuse(format!(
-                "Refusing this replay: your committed tip `{tip}` resolves none of this \
-                 conflict's files against `{theirs}`, so there is no resolution to take. \
-                 `resolution:\"take-committed-tip\"` would land each conflicting file as simply \
-                 your side of the conflict.\n\n{what}\nCommit those and request again. To move the \
-                 branch without taking content from either side, request a plain \
-                 `{{action:\"replay\"}}` instead.",
-                tip = assessment.tip,
-                theirs = assessment.recorded.theirs,
-                what = assessment.what_resolves("cairn:~/rebase"),
+                "Refusing this replay: you have committed nothing since this conflict was recorded \
+                 against `{theirs}`, so there is no resolution to take. \
+                 `resolution:\"take-committed-tip\"` lands the conflicting files as your branch \
+                 last committed them, which here is simply your side of the conflict.\n\nWrite the \
+                 merged files, commit them, and request again — `cairn:~/rebase?view=merged` hands \
+                 you each complete merged file. To move the branch without taking content from \
+                 either side, request a plain `{{action:\"replay\"}}` instead."
             ))
         }
         RestoreProof::Unavailable(why) => format!(
@@ -1363,13 +1273,6 @@ mod tests {
             tip: "tip".to_string(),
             moved: true,
             truncated,
-            unresolved: Vec::new(),
-            conflicting: verdicts.len() + truncated,
-            recorded: RecordedConflict {
-                ours: Some("c1".to_string()),
-                theirs: "d1".to_string(),
-                at: 0,
-            },
             paths: verdicts
                 .into_iter()
                 .map(|(path, verdict)| PathAssessment {
@@ -1682,71 +1585,20 @@ mod tests {
         assert!(decode_basis(Some("not json")).is_empty());
     }
 
-    /// A tip whose every conflicting file is still one-sided has nothing to
-    /// take, and a stated reason cannot conjure a resolution. Even though each
-    /// file is LOSSLESS — the incoming change lives entirely inside the
-    /// conflict, which the loss invariant takes from ours — the refusal names
-    /// each file and exactly what would count as resolving it.
+    /// Nothing committed since the conflict means nothing to take, and a stated
+    /// reason cannot conjure a resolution.
     #[test]
-    fn a_one_sided_tip_is_refused_by_name_even_with_a_stated_reason() {
-        let mut one_sided = assessment(
-            vec![
-                ("list.txt", RestoreVerdict::Lossless),
-                ("other.txt", RestoreVerdict::Lossless),
-            ],
-            0,
-        );
-        one_sided.unresolved = vec!["list.txt".to_string(), "other.txt".to_string()];
-        assert!(one_sided.resolves_nothing());
-        assert!(!one_sided.every_path_is_resolved());
-        let proof = RestoreProof::Assessed(one_sided);
+    fn a_tip_with_nothing_resolved_is_refused_even_with_a_stated_reason() {
+        let proof = RestoreProof::NothingResolved {
+            theirs: "d1".to_string(),
+        };
         for reason in [None, Some("trust me")] {
             let ReplayDecision::Refuse(refusal) = decide_replay(&proof, reason) else {
                 panic!("nothing resolved must refuse with {reason:?}");
             };
-            assert!(refusal.contains("resolves none"), "{refusal}");
+            assert!(refusal.contains("committed nothing"), "{refusal}");
             assert!(refusal.contains("`d1`"), "{refusal}");
-            for path in ["list.txt", "other.txt"] {
-                assert!(refusal.contains(&format!("- `{path}`")), "{refusal}");
-                assert!(
-                    refusal.contains(&format!("cairn:~/rebase?view=merged&file={path}")),
-                    "{refusal}"
-                );
-            }
-            assert!(
-                refusal.contains("changes it on top of `c1`"),
-                "the refusal says which commit qualifies: {refusal}"
-            );
-            assert!(
-                refusal.contains("already holds both sides"),
-                "and that content already holding both sides qualifies too: {refusal}"
-            );
         }
-    }
-
-    /// One resolved file is a resolution to take: the request is judged by the
-    /// loss invariant like any other, and the still-unresolved file is named on
-    /// the page rather than refused here, because the base's declared
-    /// structural merge may yet settle it when the replay carries it.
-    #[test]
-    fn a_partly_resolved_tip_is_judged_by_the_loss_invariant() {
-        let mut partly = assessment(
-            vec![
-                ("list.txt", RestoreVerdict::Lossless),
-                ("other.txt", RestoreVerdict::Lossless),
-            ],
-            0,
-        );
-        partly.unresolved = vec!["other.txt".to_string()];
-        assert!(!partly.resolves_nothing());
-        assert!(
-            !partly.every_path_is_resolved(),
-            "the page must not claim both sides while a file is one-sided"
-        );
-        assert_eq!(
-            decide_replay(&RestoreProof::Assessed(partly), None),
-            ReplayDecision::Proceed
-        );
     }
 
     /// The intent a session was recorded under can be superseded while the

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use super::{DbError, DbResult, LocalDb, RowExt};
 use turso::Connection;
@@ -268,32 +268,9 @@ pub(crate) const fn name_from_stem(stem: &'static str) -> &'static str {
 
 /// Splits `NNNN_name` into its version and name, rejecting anything else.
 ///
-/// A provisional stem, `NEXT_name` or `NEXT<k>_name`, is a migration the landing
-/// has not numbered yet (see `storage/migration_files.rs`). Its version is the
-/// whole stem: unique, never a real number, and replaced by the bound number
-/// when the landing renames the file. [`MigrationRunner::run`] adopts a row
-/// recorded under it once that happens.
-///
 /// Const so that every rejection is a compile error at the registration site.
 const fn split_stem(stem: &'static str) -> (&'static str, &'static str) {
     let bytes = stem.as_bytes();
-    if is_provisional_bytes(bytes) {
-        let separator = if bytes.len() > 4 && bytes[4] == b'_' {
-            4
-        } else {
-            assert!(
-                bytes.len() > 5 && bytes[4].is_ascii_digit() && bytes[5] == b'_',
-                "a provisional migration stem is NEXT_name or NEXT<k>_name, for example NEXT_wake_schedules"
-            );
-            5
-        };
-        assert!(
-            bytes.len() > separator + 1,
-            "a provisional migration stem must name the migration, for example NEXT_wake_schedules"
-        );
-        let (_, name) = bytes.split_at(separator + 1);
-        return (stem, as_str(name));
-    }
     assert!(
         bytes.len() > VERSION_DIGITS + 1,
         "migration stem must be NNNN_name, for example 0205_wake_schedules"
@@ -316,17 +293,6 @@ const fn split_stem(stem: &'static str) -> (&'static str, &'static str) {
     // `rest` opens with the `_` separator asserted above.
     let (_, name) = rest.split_at(1);
     (as_str(version), as_str(name))
-}
-
-/// Whether `stem` opens with the provisional `NEXT` prefix.
-const fn is_provisional_bytes(bytes: &[u8]) -> bool {
-    bytes.len() >= 4 && bytes[0] == b'N' && bytes[1] == b'E' && bytes[2] == b'X' && bytes[3] == b'T'
-}
-
-/// Whether a recorded or registered version is a provisional stem rather than a
-/// bound number.
-pub(crate) fn is_provisional_version(version: &str) -> bool {
-    is_provisional_bytes(version.as_bytes())
 }
 
 /// Reinterprets a stem slice as `str`. Both slices are cut at ASCII boundaries
@@ -454,24 +420,12 @@ impl MigrationRunner {
         // Read the ledger once, up front, rather than re-asking it per migration.
         // The chain is well over a hundred entries long and every one of those
         // lookups put the same single-row question to the same table.
-        let (mut recorded, mut provisional) = self.applied_versions(db).await?;
+        let mut recorded = self.applied_versions(db).await?;
 
         let mut applied = Vec::new();
         for migration in &self.migrations {
             if recorded.contains(migration.version) {
                 continue;
-            }
-            // A database that applied a migration while it was still `NEXT_name`
-            // (a dev database on its branch) meets it again under the number the
-            // landing bound. Same name, same SQL: re-key the row rather than run
-            // the migration a second time.
-            if !is_provisional_version(migration.version) {
-                if let Some(provisional_version) = provisional.remove(migration.name) {
-                    self.adopt(db, &provisional_version, migration).await?;
-                    recorded.remove(&provisional_version);
-                    recorded.insert(migration.version.to_string());
-                    continue;
-                }
             }
 
             if migration.fk_off {
@@ -622,55 +576,15 @@ impl MigrationRunner {
         }
     }
 
-    /// Re-key a row recorded under a provisional stem to the version the landing
-    /// bound for the same migration.
-    async fn adopt(
-        &self,
-        db: &LocalDb,
-        provisional_version: &str,
-        migration: &Migration,
-    ) -> DbResult<()> {
-        db.execute(
-            "UPDATE cairn_schema_migrations SET version = ?1 WHERE version = ?2 AND name = ?3",
-            (migration.version, provisional_version, migration.name),
-        )
-        .await
-        .map_err(|error| {
-            DbError::Migration(format!(
-                "adopting {provisional_version} as {}_{} failed: {error}",
-                migration.version, migration.name
-            ))
-        })?;
-        log::info!(
-            "migration ledger: {provisional_version} landed as {}_{}; adopted without re-applying",
-            migration.version,
-            migration.name
-        );
-        Ok(())
-    }
-
-    /// Every migration version the ledger already records, and the provisional
-    /// ones among them by migration name.
-    async fn applied_versions(
-        &self,
-        db: &LocalDb,
-    ) -> DbResult<(HashSet<String>, HashMap<String, String>)> {
-        let rows = db
-            .query_all(
-                "SELECT version, name FROM cairn_schema_migrations",
-                (),
-                |row| Ok((row.text(0)?, row.text(1)?)),
-            )
-            .await?;
-        let provisional = rows
-            .iter()
-            .filter(|(version, _)| is_provisional_version(version))
-            .map(|(version, name)| (name.clone(), version.clone()))
-            .collect();
-        Ok((
-            rows.into_iter().map(|(version, _)| version).collect(),
-            provisional,
-        ))
+    /// Every migration version the ledger already records.
+    async fn applied_versions(&self, db: &LocalDb) -> DbResult<HashSet<String>> {
+        Ok(db
+            .query_all("SELECT version FROM cairn_schema_migrations", (), |row| {
+                row.text(0)
+            })
+            .await?
+            .into_iter()
+            .collect())
     }
 }
 
@@ -730,76 +644,6 @@ mod tests {
     #[should_panic(expected = "NNNN_name")]
     fn stem_with_no_name_is_rejected() {
         let _ = name_from_stem("0205_");
-    }
-
-    #[test]
-    fn a_provisional_stem_is_its_own_version() {
-        assert_eq!(
-            version_from_stem("NEXT_wake_schedules"),
-            "NEXT_wake_schedules"
-        );
-        assert_eq!(name_from_stem("NEXT_wake_schedules"), "wake_schedules");
-        assert_eq!(version_from_stem("NEXT2_second"), "NEXT2_second");
-        assert_eq!(name_from_stem("NEXT2_second"), "second");
-        assert!(is_provisional_version("NEXT2_second"));
-        assert!(!is_provisional_version("0205"));
-    }
-
-    #[test]
-    #[should_panic(expected = "NEXT_name or NEXT<k>_name")]
-    fn a_provisional_stem_with_a_long_index_is_rejected() {
-        let _ = version_from_stem("NEXT12_second");
-    }
-
-    #[test]
-    #[should_panic(expected = "must name the migration")]
-    fn a_provisional_stem_with_no_name_is_rejected() {
-        let _ = name_from_stem("NEXT_");
-    }
-
-    /// A dev database that applied `NEXT_items` on its branch meets the same
-    /// migration as `9002_items` once the landing binds it: the row is re-keyed
-    /// and the SQL, which would fail a second time, is not run again.
-    #[tokio::test]
-    async fn a_provisional_row_is_adopted_by_name_and_not_re_applied() {
-        let db = test_db("adopt-provisional.db").await;
-        const SQL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY);";
-        let applied = MigrationRunner::new(vec![Migration::new("NEXT_items", "items", SQL)])
-            .run(&db)
-            .await
-            .unwrap();
-        assert_eq!(applied, vec!["NEXT_items_items".to_string()]);
-
-        let applied = MigrationRunner::new(vec![Migration::new("9002", "items", SQL)])
-            .run(&db)
-            .await
-            .unwrap();
-        assert!(applied.is_empty(), "adopted, not re-applied: {applied:?}");
-        assert_eq!(recorded_versions(&db).await, vec!["9002".to_string()]);
-
-        // An unrelated provisional row is left alone.
-        let other = MigrationRunner::new(vec![Migration::new(
-            "NEXT_other",
-            "other",
-            "CREATE TABLE other (id INTEGER PRIMARY KEY);",
-        )]);
-        other.run(&db).await.unwrap();
-        MigrationRunner::new(vec![Migration::new(
-            "9003",
-            "third",
-            "CREATE TABLE third (id INTEGER PRIMARY KEY);",
-        )])
-        .run(&db)
-        .await
-        .unwrap();
-        assert_eq!(
-            recorded_versions(&db).await,
-            vec![
-                "9002".to_string(),
-                "9003".to_string(),
-                "NEXT_other".to_string()
-            ]
-        );
     }
 
     #[test]

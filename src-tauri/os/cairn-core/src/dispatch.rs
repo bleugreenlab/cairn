@@ -8,7 +8,7 @@
 //! error, refusal, duplicate stub, reminder — can skip sanitization.
 
 use crate::security::{CheckedInvocation, Crossing, ObservedSafe, Sanitize};
-use cairn_platform::stack::off_frame;
+use crate::stack::off_frame;
 
 /// A dispatched tool call's result: the handler's `content` plus any
 /// system-reminder bodies the augmentation layer collected for this run.

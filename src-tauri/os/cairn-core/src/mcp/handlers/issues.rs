@@ -160,9 +160,6 @@ pub struct CreatedIssueOutcome {
     pub(crate) project_key: String,
     pub number: i32,
     pub(crate) uri: String,
-    /// The tenet the commissioning gate proposed for the create's execution,
-    /// when it proposed one.
-    pub(crate) proposed_tenet: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -226,8 +223,8 @@ pub async fn create_issue_in_project(
     let project_key = ctx.project_key.clone();
     let number = issue.number;
 
-    let (summary, proposed_tenet) = match execution {
-        None => (summary, None),
+    let summary = match execution {
+        None => summary,
         // Create+start is "create then start", not one transaction: the issue is
         // already durable here. Reuse the executions-collection start path so the
         // recipe/backend resolution, `initiated_via="external"` stamp, and watcher
@@ -251,10 +248,7 @@ pub async fn create_issue_in_project(
         )
         .await
         {
-            Ok(started) => (
-                format!("{summary}\n{}", started.summary),
-                started.proposed_tenet,
-            ),
+            Ok(start_msg) => format!("{summary}\n{start_msg}"),
             Err(error) => {
                 return Err(format!(
                     "{summary}\nIssue created, but starting the execution failed: {error} \
@@ -271,7 +265,6 @@ pub async fn create_issue_in_project(
         project_key,
         number,
         uri,
-        proposed_tenet,
     })
 }
 

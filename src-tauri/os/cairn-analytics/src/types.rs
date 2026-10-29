@@ -319,15 +319,14 @@ pub struct ToolMixPoint {
     pub(crate) count: i64,
 }
 
-/// Agent-time composition for one time bucket. `active_s` is minutes in which a
-/// run emitted model output; `tool_s` is tool execution within those minutes;
-/// `model_overhead_s` is the rest of them (generation plus orchestration).
-/// Parked and waiting time is in none of the three.
+/// Run wall-time composition for one time bucket. `model_overhead_s` is the
+/// completed run wall time that is not accounted for by tool calls; it includes
+/// model generation plus orchestration overhead and any in-run waiting.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeCompositionPoint {
     pub(crate) bucket_start: i64,
-    pub(crate) active_s: i64,
+    pub(crate) wall_s: i64,
     pub(crate) tool_s: i64,
     pub(crate) model_overhead_s: i64,
     pub(crate) run_count: i64,
@@ -358,8 +357,9 @@ pub struct CommandDurationRow {
     pub(crate) error_count: i64,
 }
 
-/// Average agent time per session for one time bucket: a session's minutes with
-/// model output, not its lifetime.
+/// Average completed run wall time per session for one time bucket. A session's
+/// duration is the sum of its completed runs' wall time rather than
+/// first-to-last idle span.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionDurationPoint {

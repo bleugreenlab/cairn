@@ -413,7 +413,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     delete_only("pack_catalog_references", "project_id = ?1"),
     delete_only("posts", "project_id = ?1"),
     delete_only("post_comments", "post_id IN (SELECT id FROM posts WHERE project_id = ?1)"),
-    delete_only("landing_allocations", "project_id = ?1"),
+    delete_only("contended_identifier_obligations", "project_id = ?1"),
 ];
 
 pub(super) const fn spec(table: &'static str, where_sql: &'static str) -> TableCopySpec {
@@ -1542,8 +1542,8 @@ pub(super) mod tests {
             INSERT INTO wake_conditions(id, home_kind, home_id, sql, reason, created_by)
               VALUES ('condition-delete', 'thread', 'thread-delete', 'SELECT 1', 'reason', 'user');
             INSERT INTO feed_cursors(home_kind, home_id) VALUES ('thread', 'thread-delete');
-            INSERT INTO landing_allocations(id, project_id, kind, value, name, provisional, branch, allocated_at)
-              VALUES ('allocation-delete', 'project-delete', 'migration', 2, '0002_x', 'NEXT_x', 'agent/delete', 1);
+            INSERT INTO contended_identifier_obligations(project_id, store_path, bookmark, identifier, delta, basis_fork_value, basis_branch_value, basis_base_value, created_at, updated_at)
+              VALUES ('project-delete', '/store', 'bookmark', 'issue', 1, 0, 1, 0, 1, 1);
             "#,
         )
         .await

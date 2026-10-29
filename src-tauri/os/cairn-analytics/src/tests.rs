@@ -2,7 +2,7 @@ use super::*;
 use crate::subscriptions::{
     plan_periods, reconcile_periods, HeldSubscription, PlanCount, UnpricedAccount,
 };
-use cairn_db::storage::{LocalDb, RowExt};
+use cairn_db::storage::{LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
 use cairn_db::turso::params;
 use std::time::Instant;
 use tempfile::tempdir;
@@ -652,25 +652,21 @@ async fn duration_queries_aggregate_tool_and_session_time() {
         .iter()
         .find(|p| p.bucket_start == 86400)
         .expect("first duration bucket");
-    // One active minute (90000) each for run-claude, run-codex (fixture) and
-    // run-duration-a; run-duration-b emitted no model output, so its wall time
-    // counts for nothing.
-    assert_eq!(first.active_s, 180);
-    // run-duration-a's two concurrent calls (30s + 40s) overlap its one active
-    // minute; per-minute tool time caps at the minute, so tool time can never
-    // exceed agent time. Per-verb and command-duration queries below still
-    // report raw per-call durations.
-    assert_eq!(first.tool_s, 60);
-    assert_eq!(first.model_overhead_s, 120);
-    assert_eq!(first.run_count, 3);
-    let overrun = composition
+    assert_eq!(first.wall_s, 120);
+    assert_eq!(first.tool_s, 70);
+    assert_eq!(first.model_overhead_s, 50);
+    assert_eq!(first.run_count, 2);
+    let clamped = composition
         .iter()
         .find(|p| p.bucket_start == 172800)
         .expect("overrun bucket");
-    // Output at 200000 marks minute 199980; the 20s call overlaps 20s of it.
-    assert_eq!(overrun.active_s, 60);
-    assert_eq!(overrun.tool_s, 20);
-    assert_eq!(overrun.model_overhead_s, 40);
+    assert_eq!(clamped.wall_s, 10);
+    // Composition caps summed tool-call time to the completed run wall time,
+    // so concurrent or late result spans cannot make the headline chart
+    // exceed 100%. Per-verb and command-duration queries below still report
+    // raw per-call durations.
+    assert_eq!(clamped.tool_s, 10);
+    assert_eq!(clamped.model_overhead_s, 0);
 
     let mix = tool_time_mix(&db, &Scope::default(), &TimeRange::default(), Bucket::Day)
         .await
@@ -706,104 +702,8 @@ async fn duration_queries_aggregate_tool_and_session_time() {
         .iter()
         .find(|p| p.bucket_start == 86400)
         .expect("session duration bucket");
-    // sess-claude, sess-codex and sess-duration-a, one active minute each;
-    // sess-duration-b has no model output.
-    assert_eq!(first_sessions.session_count, 3);
+    assert_eq!(first_sessions.session_count, 2);
     assert!((first_sessions.avg_s - 60.0).abs() < 1e-9);
-}
-
-/// A run that works for ten minutes and then sits parked for ten hours inside
-/// one tool wait reports ten minutes of agent time, not its eleven-hour life.
-#[tokio::test]
-async fn agent_time_counts_minutes_with_model_output_not_session_lifetime() {
-    let db = fixture_db().await;
-    const T0: i64 = 864_000;
-    const PARKED_S: i64 = 36_000;
-    let mut sql = format!(
-        "INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
-          VALUES ('sess-parked', 'job-claude', 'claude', 'open', 20, 1, 1);
-         INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, started_at, exited_at, updated_at)
-          VALUES ('run-parked', 'proj', 'job-claude', 'exited', 'sess-parked', 1, {T0}, {exit}, {exit});",
-        exit = T0 + 600 + PARKED_S,
-    );
-    let mut seq = 0;
-    let mut event = |id: &str, kind: &str, data: &str, parent: &str, at: i64| {
-        seq += 1;
-        sql.push_str(&format!(
-            "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, parent_tool_use_id, created_at)
-              VALUES ('{id}', 'run-parked', 'sess-parked', {seq}, {seq}, '{kind}', '{data}', {parent}, {at});"
-        ));
-    };
-    // Model output once a minute for ten minutes. Minute 0 opens a 60s read
-    // (55s in minute 0, 5s in minute 1); minute 9 opens a wait that only
-    // returns ten hours later.
-    for i in 0..10 {
-        let at = T0 + i * 60 + 5;
-        let data = match i {
-            0 => {
-                r#"{"eventType":"assistant","isError":false,"toolUses":[{"id":"park-read","name":"read","input":{"paths":["file:src/lib.rs"]}}]}"#
-            }
-            9 => {
-                r#"{"eventType":"assistant","isError":false,"toolUses":[{"id":"park-wait","name":"run","input":{"commands":[{"command":"sleep 36000"}]}}]}"#
-            }
-            _ => r#"{"eventType":"assistant","isError":false,"toolUses":[]}"#,
-        };
-        event(&format!("park-a{i}"), "assistant", data, "NULL", at);
-    }
-    event(
-        "park-r-read",
-        "tool_result",
-        r#"{"eventType":"tool_result","toolUseId":"park-read","toolName":"read","toolResult":"ok","isError":false}"#,
-        "'park-read'",
-        T0 + 65,
-    );
-    event(
-        "park-r-wait",
-        "tool_result",
-        r#"{"eventType":"tool_result","toolUseId":"park-wait","toolName":"run","toolResult":"ok","isError":false}"#,
-        "'park-wait'",
-        T0 + 545 + PARKED_S,
-    );
-    db.execute_script(&sql).await.unwrap();
-    backfill_tool_invocations(&db).await.unwrap();
-
-    let window = TimeRange::new(Some(T0), Some(T0 + 2 * 86_400));
-    let composition = time_composition(&db, &Scope::default(), &window, Bucket::Day)
-        .await
-        .unwrap();
-    let active: i64 = composition.iter().map(|p| p.active_s).sum();
-    let tool: i64 = composition.iter().map(|p| p.tool_s).sum();
-    let overhead: i64 = composition.iter().map(|p| p.model_overhead_s).sum();
-    assert_eq!(active, 600, "ten active minutes, not {}s", 600 + PARKED_S);
-    // read: 55 + 5; the ten-hour wait: only its 55s inside active minute 9.
-    assert_eq!(tool, 115);
-    assert_eq!(overhead, active - tool);
-    assert_eq!(composition.iter().map(|p| p.run_count).sum::<i64>(), 1);
-
-    // The parked stretch alone holds no agent time at all.
-    let parked = TimeRange::new(Some(T0 + 3_600), Some(T0 + PARKED_S));
-    let idle = time_composition(&db, &Scope::default(), &parked, Bucket::Hour)
-        .await
-        .unwrap();
-    assert_eq!(idle.iter().map(|p| p.active_s).sum::<i64>(), 0);
-    assert_eq!(idle.iter().map(|p| p.tool_s).sum::<i64>(), 0);
-
-    let sessions = session_durations(&db, &Scope::default(), &window, Bucket::Day)
-        .await
-        .unwrap();
-    assert_eq!(sessions.iter().map(|p| p.session_count).sum::<i64>(), 1);
-    assert!((sessions[0].avg_s - 600.0).abs() < 1e-9);
-
-    // A foreign project scope sees none of it.
-    let other = time_composition(
-        &db,
-        &Scope::new(Some("other-project".into())),
-        &window,
-        Bucket::Day,
-    )
-    .await
-    .unwrap();
-    assert!(other.is_empty());
 }
 
 #[tokio::test]

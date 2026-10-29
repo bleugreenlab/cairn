@@ -123,44 +123,10 @@ pub fn merge_into_bookmark(
     integration_branch: &str,
     child_branch: &str,
 ) -> Result<(), String> {
+    let child_rev = format!("bookmarks(exact:{child_branch:?})");
     if let Some(refusal) = landing_parse_refusal(jj, store, integration_branch, child_branch) {
         return Err(refusal);
     }
-    fold_into_bookmark(jj, store, integration_branch, child_branch)
-}
-
-/// [`merge_into_bookmark`] for a tree that was already judged off the store
-/// lock: the parse gate (and the landing's identifier invariants) ran against
-/// a prospective commit with tree `expected_tree`, so under the lock the fold
-/// only proves it is folding that very tree and moves the bookmark. A tree that
-/// differs is refused unmoved, and the caller judges again.
-pub fn fold_validated_into_bookmark(
-    jj: &JjEnv,
-    store: &Path,
-    integration_branch: &str,
-    child_branch: &str,
-    expected_tree: &str,
-) -> Result<(), String> {
-    let child = bookmark_commit(jj, store, child_branch)
-        .ok_or_else(|| format!("bookmark `{child_branch}` did not resolve to one commit"))?;
-    let tree = sealed_tree_hash_via_git(jj, store, &child)?;
-    if tree != expected_tree {
-        return Err(format!(
-            "Refusing to fold `{child_branch}` into `{integration_branch}`: its tree {tree} is not \
-             the tree {expected_tree} that was judged for this landing. Merge again so the tree \
-             that lands is the one judged."
-        ));
-    }
-    fold_into_bookmark(jj, store, integration_branch, child_branch)
-}
-
-fn fold_into_bookmark(
-    jj: &JjEnv,
-    store: &Path,
-    integration_branch: &str,
-    child_branch: &str,
-) -> Result<(), String> {
-    let child_rev = format!("bookmarks(exact:{child_branch:?})");
     if let Err(e) = jj.run(
         store,
         &[

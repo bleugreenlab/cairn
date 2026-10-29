@@ -325,20 +325,6 @@ pub fn enter_with(label: &'static str, detail: Arc<str>) -> RegionGuard {
     push_region(label, Some(detail))
 }
 
-/// Replace the detail of the current thread's innermost region, if that region
-/// is `label`. For a region entered once per poll whose subject changes inside
-/// the poll: a database call starts a new statement mid-poll, and that
-/// statement may then step for hours without the poll ever ending.
-pub fn set_innermost_detail(label: &'static str, detail: Arc<str>) {
-    with_slot(|slot| {
-        if let Ok(mut regions) = slot.regions.lock() {
-            if let Some(region) = regions.last_mut().filter(|region| region.label == label) {
-                region.detail = Some(detail);
-            }
-        }
-    });
-}
-
 fn push_region(label: &'static str, detail: Option<Arc<str>>) -> RegionGuard {
     let depth = with_slot(|slot| {
         let mut regions = slot.regions.lock().ok()?;

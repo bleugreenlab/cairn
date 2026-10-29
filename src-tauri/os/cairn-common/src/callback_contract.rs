@@ -281,7 +281,6 @@ mod tests {
             command: "git push".into(),
             cwd: "/w".into(),
             denial: SandboxDenial::Command,
-            reported_denial: None,
         }
     }
 

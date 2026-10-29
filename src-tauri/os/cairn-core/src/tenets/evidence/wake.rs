@@ -203,11 +203,11 @@ pub async fn fire(
         })
         .await
         .map_err(|error| error.to_string())?;
-    let Some((job_id, project_id)) = recipient else {
+    let Some(job_id) = recipient else {
         return Ok(false);
     };
     deps.nudge(&job_id);
-    crate::tenets::emit_changed(deps.emitter(), &project_id, "update");
+    crate::tenets::emit_changed(deps.emitter(), "update");
     Ok(true)
 }
 
@@ -216,7 +216,7 @@ async fn fire_conn(
     tenet_id: &str,
     device: &str,
     now: i64,
-) -> DbResult<Option<(String, String)>> {
+) -> DbResult<Option<String>> {
     let mut rows = conn
         .query(
             &crate::tenets::read::select_sql("t.id = ?1"),
@@ -307,7 +307,7 @@ async fn fire_conn(
         &message_id,
     )
     .await?;
-    Ok(Some((job_id, tenet.project_id)))
+    Ok(Some(job_id))
 }
 
 /// The wake's text. It lists exactly the rows the wake consumes: on a later

@@ -31,7 +31,6 @@ pub mod macos;
 mod nested;
 pub mod operator_credential;
 mod setuid_refusal;
-mod write_refusal;
 
 pub use nested::check_lane_nested_sandbox_evidence;
 pub use operator_credential::{
@@ -39,7 +38,6 @@ pub use operator_credential::{
     OperatorCredentialFloor, OPERATOR_CREDENTIAL_REFUSAL,
 };
 pub use setuid_refusal::setuid_refusal_note;
-pub use write_refusal::out_of_bounds_write_note;
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -133,41 +131,6 @@ pub struct SandboxPolicy {
     /// worktree is always in [`readable_paths`](Self::readable_paths) regardless;
     /// this flag only gates the write-allow.
     pub worktree_writable: bool,
-    /// The marker this spawn's denials carry into the macOS violation log.
-    pub violation_tag: ViolationTag,
-}
-
-/// A marker the macOS profile attaches to each fence deny rule with SBPL's
-/// `(with message ...)`, so every violation the kernel logs for this spawn's
-/// process tree carries it.
-///
-/// The kernel logs a Seatbelt violation under the process that made the denied
-/// call, and that is usually a descendant of the spawned process (the tool an
-/// inline script or `sh -c` started), never the spawned pid itself. The profile
-/// is inherited across fork and exec, so the tag reaches every descendant
-/// without tracking a process tree that has mostly exited by the time anyone
-/// looks. A fresh tag per policy keeps a concurrent spawn's denials apart.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ViolationTag(String);
-
-impl ViolationTag {
-    /// What every tag begins with, which is what the violation stream filters
-    /// the log by.
-    pub(crate) const PREFIX: &'static str = "cairn-fence-";
-
-    pub fn fresh() -> Self {
-        Self(format!("{}{}", Self::PREFIX, uuid::Uuid::new_v4().simple()))
-    }
-
-    /// A tag that never changes, for a profile whose text is a fingerprint
-    /// rather than one that confines a spawn.
-    fn canonical() -> Self {
-        Self("cairn-fence-canonical".into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 fn paths_overlap(a: &Path, b: &Path) -> bool {
@@ -202,7 +165,6 @@ impl SandboxPolicy {
             deny_read,
             writable_regex: Vec::new(),
             worktree_writable: true,
-            violation_tag: ViolationTag::fresh(),
         }
     }
 
@@ -244,7 +206,6 @@ impl SandboxPolicy {
             deny_read,
             writable_regex: Vec::new(),
             worktree_writable: false,
-            violation_tag: ViolationTag::fresh(),
         }
     }
 
@@ -277,7 +238,6 @@ impl SandboxPolicy {
             deny_read,
             writable_regex: writable_globs.iter().map(|g| glob_to_regex(g)).collect(),
             worktree_writable: true,
-            violation_tag: ViolationTag::fresh(),
         }
     }
 
@@ -452,8 +412,7 @@ pub fn enforcement_description() -> Option<String> {
     // A canonical policy, not a live one: the question this answers is "what
     // shape of rule does this build install", and pinning the paths keeps the
     // digest stable across cells while still moving when the generator does.
-    let mut policy = SandboxPolicy::for_run(Path::new("/cairn/containment/probe"), &[], Vec::new());
-    policy.violation_tag = ViolationTag::canonical();
+    let policy = SandboxPolicy::for_run(Path::new("/cairn/containment/probe"), &[], Vec::new());
     #[cfg(target_os = "macos")]
     {
         let floor = OperatorCredentialFloor::new(
@@ -497,10 +456,7 @@ pub enum SandboxDenial {
 /// command-scoped fallback for Deny agents, but not for Ask agents: shells can
 /// mask an earlier sandbox denial with `;`, `||`, traps, or harness cleanup. On
 /// macOS the precise denied path is recovered from the unified log (best-effort),
-/// upgrading a command-scoped denial to a path-scoped one. `violations` is the
-/// tag of the policy the spawn ran under (see [`ViolationTag`]): the lookup
-/// finds a violation made anywhere in the spawn's process tree and none made
-/// outside it, and without a tag there is nothing to look up.
+/// upgrading a command-scoped denial to a path-scoped one.
 /// `command_scoped_fallback` lets Ask agents raise a recoverable prompt when
 /// macOS path recovery misses while Deny agents keep the raw command failure.
 /// Only call this when the sandbox was actually applied (worktree agent with
@@ -508,7 +464,7 @@ pub enum SandboxDenial {
 pub fn detect_denial(
     exit_code: Option<i32>,
     combined_output: &str,
-    violations: Option<&ViolationTag>,
+    pid: Option<u32>,
     since: SystemTime,
     command_scoped_fallback: bool,
 ) -> Option<SandboxDenial> {
@@ -532,8 +488,8 @@ pub fn detect_denial(
         // agents, fall back to a recoverable command-scoped crossing if the log
         // lookup misses; for Deny agents, preserve the historical fail-fast raw
         // command output rather than synthesizing a denial.
-        match violations {
-            Some(tag) => match macos::detect_violation(tag, since) {
+        match pid {
+            Some(pid) => match macos::detect_violation(pid, since) {
                 Some(violation) => Some(SandboxDenial::Path {
                     path: violation.path,
                     operation: Some(violation.operation),
@@ -553,27 +509,9 @@ pub fn detect_denial(
         // permission error, from a C tool or a Go one, which raises an
         // answerable command-scoped crossing for a fenced spawn
         // (docs/worktree-fence.md, "Permission decisions").
-        let _ = (violations, since, command_scoped_fallback);
+        let _ = (pid, since, command_scoped_fallback);
         Some(SandboxDenial::Command)
     }
-}
-
-/// The first line of `output` that reads as a permission denial, bounded, for a
-/// prompt that could not recover the denied path to quote.
-///
-/// The command wrote this text, so it is a clue for whoever answers the prompt
-/// and never evidence: it must not become a crossing's scope.
-pub fn reported_denial_line(output: &str) -> Option<String> {
-    const MAX_CHARS: usize = 240;
-    let line = output
-        .lines()
-        .map(str::trim)
-        .find(|line| line_has_denial_signature(line))?;
-    let mut bounded: String = line.chars().take(MAX_CHARS).collect();
-    if bounded.len() < line.len() {
-        bounded.push('…');
-    }
-    Some(bounded)
 }
 
 /// Whether output carries a permission-denial signature.
@@ -646,36 +584,9 @@ pub fn default_writable_extra() -> Vec<PathBuf> {
     // first spawn of a fresh install writes there, and an absent path is inert
     // in the generated rules.
     dirs.push(cairn_common::scratch::scratch_root());
-    // The executor's tool cache, where a project's setup caches the tools it
-    // builds for itself (the pinned `tursodb`). Existence-filtered like the uv
-    // cache: the executor creates it before every spawn.
-    dirs.extend(tool_cache_grant());
     // Cairn's own log directory is deliberately absent; see
     // `the_cairn_log_dir_is_never_writable`.
     dirs
-}
-
-/// The executor's tool cache, when this process was handed one and it exists.
-///
-/// The executor exports `CAIRN_TOOL_CACHE` at bootstrap
-/// (`cairn_common::executor_paths::ExecutorPaths::tool_cache`). Only a
-/// directory carrying that layout's leaf name is accepted, because the grant is
-/// recursive and this function also runs in processes the executor did not
-/// start: a desktop app launched from a shell that happens to export
-/// `CAIRN_TOOL_CACHE=$HOME` must not hand every fenced spawn the home directory.
-pub(crate) fn tool_cache_grant() -> Option<PathBuf> {
-    tool_cache_grant_from(std::env::var_os(
-        cairn_common::executor_paths::TOOL_CACHE_ENV,
-    ))
-}
-
-fn tool_cache_grant_from(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    let cache = PathBuf::from(value?);
-    let named = cache.file_name()
-        == Some(std::ffi::OsStr::new(
-            cairn_common::executor_paths::TOOL_CACHE_DIR,
-        ));
-    (named && cache.is_absolute() && cache.is_dir()).then_some(cache)
 }
 
 /// Standard temp directories that must stay writable so the toolchain (cargo,
@@ -1138,43 +1049,6 @@ mod tests {
     }
 
     #[test]
-    fn only_an_existing_absolute_tool_cache_is_granted() {
-        let temp = tempfile::tempdir().unwrap();
-        let cache = temp
-            .path()
-            .join(cairn_common::executor_paths::TOOL_CACHE_DIR);
-        assert_eq!(
-            tool_cache_grant_from(Some(cache.clone().into())),
-            None,
-            "a cache that does not exist yet grants nothing"
-        );
-        std::fs::create_dir(&cache).unwrap();
-        assert_eq!(
-            tool_cache_grant_from(Some(cache.clone().into())),
-            Some(cache)
-        );
-        assert_eq!(tool_cache_grant_from(None), None);
-        assert_eq!(
-            tool_cache_grant_from(Some("tool-cache".into())),
-            None,
-            "a relative value would resolve against each spawn's cwd"
-        );
-    }
-
-    #[test]
-    fn a_tool_cache_variable_naming_another_directory_grants_nothing() {
-        // The variable is read from this process's own environment, which a
-        // desktop app inherits from whatever shell launched it. A home
-        // directory is the case that matters: granting it would hand every
-        // fenced spawn the whole home.
-        let home = tempfile::tempdir().unwrap();
-        assert_eq!(
-            tool_cache_grant_from(Some(home.path().as_os_str().to_owned())),
-            None
-        );
-    }
-
-    #[test]
     fn for_run_keeps_cwd_writable_and_readable() {
         let wt = PathBuf::from("/work/wt");
         let policy = SandboxPolicy::for_run(&wt, &[], vec![]);
@@ -1302,7 +1176,7 @@ mod tests {
     fn macos_signature_without_logged_violation_is_ask_fallback_only() {
         let t = SystemTime::now();
         // Ask agents get a recoverable command-scoped crossing when the unified
-        // log path lookup misses (represented here by an untagged spawn).
+        // log path lookup misses (represented here by pid=None).
         assert_eq!(
             detect_denial(
                 Some(1),
@@ -1324,39 +1198,6 @@ mod tests {
             ),
             None
         );
-    }
-
-    #[test]
-    fn the_reported_denial_line_is_the_first_signature_line_bounded() {
-        let output = "fetching\nerror: cannot open .git/FETCH_HEAD: Permission denied\nfatal: later: Operation not permitted";
-        assert_eq!(
-            reported_denial_line(output).as_deref(),
-            Some("error: cannot open .git/FETCH_HEAD: Permission denied")
-        );
-        assert_eq!(reported_denial_line("all good\n"), None);
-        let long = format!("{}: Permission denied", "x".repeat(400));
-        let bounded = reported_denial_line(&long).unwrap();
-        assert_eq!(bounded.chars().count(), 241);
-        assert!(bounded.ends_with('…'));
-    }
-
-    #[test]
-    fn every_policy_gets_its_own_violation_tag() {
-        let wt = Path::new("/work/wt");
-        let a = SandboxPolicy::for_run(wt, &[], vec![]);
-        let b = SandboxPolicy::for_run(wt, &[], vec![]);
-        assert_ne!(a.violation_tag, b.violation_tag);
-        // SBPL embeds the tag in a string literal; it must need no escaping.
-        assert!(a
-            .violation_tag
-            .as_str()
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-'));
-    }
-
-    #[test]
-    fn the_enforcement_fingerprint_is_stable_across_reads() {
-        assert_eq!(enforcement_description(), enforcement_description());
     }
 
     #[test]

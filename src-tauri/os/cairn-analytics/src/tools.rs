@@ -123,8 +123,9 @@ pub async fn tool_mix(
         .collect())
 }
 
-/// Agent-time composition: minutes with model output, split into tool execution
-/// and the remainder (model generation plus orchestration overhead).
+/// Completed run wall-time composition: tool execution vs model generation plus
+/// orchestration overhead. The remainder deliberately includes permission waits
+/// and other in-run overhead, so callers should label it "model + overhead".
 pub async fn time_composition(
     db: &LocalDb,
     scope: &Scope,
@@ -136,9 +137,9 @@ pub async fn time_composition(
         .into_iter()
         .map(|r| TimeCompositionPoint {
             bucket_start: r.bucket_start,
-            active_s: r.active_s,
+            wall_s: r.wall_s,
             tool_s: r.tool_s,
-            model_overhead_s: (r.active_s - r.tool_s).max(0),
+            model_overhead_s: r.model_overhead_s,
             run_count: r.run_count,
         })
         .collect())
@@ -187,8 +188,8 @@ pub async fn command_durations(
         .collect())
 }
 
-/// Average agent time per session over time: minutes with model output, not
-/// session lifetime.
+/// Average active work time per session over time. Session duration is the sum
+/// of completed run wall time in the selected range.
 pub async fn session_durations(
     db: &LocalDb,
     scope: &Scope,

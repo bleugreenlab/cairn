@@ -5,12 +5,7 @@ use super::types::*;
 const TENET_STATEMENT: KeySpec = KeySpec::new(
     "statement",
     KeyType::Str,
-    "one sentence of how the project does things, as the project's handbook would put it, for the operator to answer yes or no at a glance; no URIs and no reasoning; at most 200 characters",
-);
-const TENET_RATIONALE: KeySpec = KeySpec::new(
-    "rationale",
-    KeyType::Str,
-    "what the statement rests on, shown collapsed beneath it: why, in the terms it was argued; the alternatives ruled out, so a yes records the rejection; and the canonical cairn://p/... URIs where it was argued; at most 1500 characters",
+    "how the project does things, written for the operator to answer yes or no; alternatives you ruled out belong in its own words; at most 1500 characters",
 );
 const TENET_SUPERSEDES: KeySpec = KeySpec::new(
     "supersedes",
@@ -54,9 +49,9 @@ pub(crate) const PROJECT_TENETS_CONTRACT: ResourceContract = ResourceContract {
     mutations: &[MutationSpec {
         mode: ChangeMode::Append,
         required: &[TENET_STATEMENT],
-        optional: &[TENET_RATIONALE, TENET_SUPERSEDES],
+        optional: &[TENET_SUPERSEDES],
         label: "propose a tenet (threads only)",
-        example: "write({changes:[{target:\"cairn:@/tenets\",mode:\"append\",payload:{statement:\"Releases ship from main only.\",rationale:\"Why: ... Rejected: release branches, because ... Argued at cairn://p/PROJECT/N.\"}}]})",
+        example: "write({changes:[{target:\"cairn:@/tenets\",mode:\"append\",payload:{statement:\"X is done via Y, not Z: ...\"}}]})",
     }],
 };
 
@@ -64,7 +59,7 @@ pub(crate) const PROJECT_TENET_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectTenet,
     uri_template: "cairn://p/{project}/tenets/{number}",
     name: "Tenet",
-    description: "One tenet by number (a migrated ruling's slug is an alias): its statement and rationale, the verdict and who gave it, what it supersedes or was superseded by, and what it gates. Immutable: withdraw and propose again, or propose a successor with supersedes",
+    description: "One tenet by number (a migrated ruling's slug is an alias): its statement, the verdict and who gave it, what it supersedes or was superseded by, and what it gates. Immutable: withdraw and propose again, or propose a successor with supersedes",
     read_projections: &[ProjectionSpec { key: "format", values: "json for the full projection" }],
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,

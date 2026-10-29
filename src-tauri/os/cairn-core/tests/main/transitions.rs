@@ -586,81 +586,52 @@ async fn cascade_failure_sets_completed_at_on_downstream_jobs() {
     assert!(completed_at(&ctx.db, "job-ca-b").await.is_some());
 }
 
-/// Fail the head of a three-job chain and return the project id and every
-/// `db-change` frame the cascade emitted.
-async fn cascade_db_changes(
-    ctx: &TransitionContext,
-    issue_id: Option<&str>,
-) -> (String, Vec<Value>) {
+#[tokio::test]
+async fn cascade_failure_emits_core_db_change_events() {
+    let ctx = transition_context().await;
     let project_id = common::create_project(&ctx.db, "tcde").await;
-    if let Some(issue_id) = issue_id {
-        insert_issue(&ctx.db, issue_id, &project_id).await;
-    }
     let snapshot = build_snapshot(vec![("1", "node-a", "node-b"), ("2", "node-b", "node-c")]);
-    insert_execution_with_snapshot(&ctx.db, "exec-cascade-ev", issue_id, &snapshot).await;
-    for (job_id, status, node_id) in [
-        ("job-ev-a", "running", "node-a"),
-        ("job-ev-b", "pending", "node-b"),
-        ("job-ev-c", "pending", "node-c"),
-    ] {
-        insert_job(
-            &ctx.db,
-            job_id,
-            status,
-            &project_id,
-            Some("exec-cascade-ev"),
-            Some(node_id),
-        )
-        .await;
-    }
+    insert_execution_with_snapshot(&ctx.db, "exec-cascade-ev", None, &snapshot).await;
+    insert_job(
+        &ctx.db,
+        "job-ev-a",
+        "running",
+        &project_id,
+        Some("exec-cascade-ev"),
+        Some("node-a"),
+    )
+    .await;
+    insert_job(
+        &ctx.db,
+        "job-ev-b",
+        "pending",
+        &project_id,
+        Some("exec-cascade-ev"),
+        Some("node-b"),
+    )
+    .await;
+    insert_job(
+        &ctx.db,
+        "job-ev-c",
+        "pending",
+        &project_id,
+        Some("exec-cascade-ev"),
+        Some("node-c"),
+    )
+    .await;
 
     apply_failure(&ctx.orch, "job-ev-a");
 
-    (project_id, ctx.emitter.events_named("db-change"))
-}
-
-fn frames_for<'a>(db_changes: &'a [Value], table: &str) -> Vec<&'a Value> {
-    db_changes
+    let db_changes = ctx.emitter.events_named("db-change");
+    assert!(db_changes
         .iter()
-        .filter(|payload| payload["table"].as_str() == Some(table))
-        .collect()
-}
-
-/// The sidebar projections are backend snapshots keyed by project, so a cascade
-/// announces the job and execution rows it moved scoped to their project. An
-/// execution outside any issue moved no issue row, so it owes no `issues`
-/// frame: a project-less one would cold every project's issue-list and
-/// issue-status snapshot for a write that changed none of them.
-#[tokio::test]
-async fn cascade_failure_outside_an_issue_emits_scoped_job_and_execution_changes_only() {
-    let ctx = transition_context().await;
-    let (project_id, db_changes) = cascade_db_changes(&ctx, None).await;
-
-    assert!(frames_for(&db_changes, "jobs")
+        .any(|payload| payload.get("table").and_then(|value| value.as_str()) == Some("jobs")));
+    assert!(db_changes.iter().any(
+        |payload| payload.get("table").and_then(|value| value.as_str()) == Some("executions")
+    ));
+    assert!(db_changes
         .iter()
-        .any(|payload| payload["projectId"] == project_id.as_str()));
-    assert!(frames_for(&db_changes, "executions").iter().any(|payload| {
-        payload["executionId"] == "exec-cascade-ev" && payload["projectId"] == project_id.as_str()
-    }));
-    assert_eq!(frames_for(&db_changes, "issues"), Vec::<&Value>::new());
-}
-
-/// When the execution belongs to an issue, the cascade recomputes that issue's
-/// status and announces it, naming both the issue and its project.
-#[tokio::test]
-async fn cascade_failure_in_an_issue_emits_a_scoped_issue_change() {
-    let ctx = transition_context().await;
-    let (project_id, db_changes) = cascade_db_changes(&ctx, Some("issue-ev")).await;
-
-    let issue_frames = frames_for(&db_changes, "issues");
-    assert!(!issue_frames.is_empty());
-    for payload in issue_frames {
-        assert_eq!(payload["issueId"], "issue-ev");
-        assert_eq!(payload["projectId"], project_id.as_str());
-    }
-    assert!(frames_for(&db_changes, "executions").iter().any(|payload| {
-        payload["executionId"] == "exec-cascade-ev" && payload["issueId"] == "issue-ev"
-    }));
+        .any(|payload| payload.get("table").and_then(|value| value.as_str()) == Some("issues")));
 }
 
 #[tokio::test]

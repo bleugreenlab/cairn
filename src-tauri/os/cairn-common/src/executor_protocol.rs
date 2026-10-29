@@ -4874,19 +4874,6 @@ pub struct LearnedResourceEstimate {
 /// log and never cross the link. What a runner gets wrong talking to an older
 /// executor: nothing; it is sent the longer list it already ignores.
 ///
-/// cairn/5443 does not move the number. An executor now keeps a tool cache
-/// under its build root (`ExecutorPaths::tool_cache`), exports it to the
-/// commands it runs as `CAIRN_TOOL_CACHE`, creates it before each spawn, and
-/// grants it to the confined policy it builds for that spawn. When a fenced
-/// command fails on a write outside every scope its cell may write, the
-/// executor appends an explanation naming that scope to the item's output,
-/// beside the setuid note it already appended. The variable and directory are
-/// local to the executor's host and the note is text inside the output field
-/// that already crosses; no frame, field or value changes. What a runner gets
-/// wrong talking to an older executor: nothing it decodes; that executor's
-/// confined cells still cannot write a tool cache, and `ensure-tursodb` says
-/// so by name instead of failing with cargo's bare `Permission denied`.
-///
 /// cairn/5189 moves where an executor's derived state lives behind
 /// `executor_paths::ExecutorPaths`, without a bump. With nothing configured
 /// every path is the one it was, and no frame, field or value changes: the
@@ -4899,15 +4886,6 @@ pub struct LearnedResourceEstimate {
 /// runner's retirement walks cells through the same layout, which for every
 /// runner today is the default. What a runner gets wrong talking to an older
 /// executor: nothing, because nothing it reads has changed.
-///
-/// cairn/5423 does not move the number. The runner-only `fleet/mod.rs` now
-/// releases a job's idle environment on a drained machine at the job's next
-/// acquisition, with the `ResidencyOperation::Release` it already sends when a
-/// home cannot prepare its project, and counts what a drain keeps from the
-/// `occupancy` every snapshot already carries. No frame gains, loses, or
-/// reinterprets a field. What a runner gets wrong talking to an older
-/// executor: nothing, because the older executor is sent only a release it
-/// already handles.
 ///
 /// cairn/5427 does not move the number. It removes the landing compile gate,
 /// the one runner caller that shortened a review check request's
@@ -5131,87 +5109,7 @@ pub struct LearnedResourceEstimate {
 /// nothing it would decode differently; that executor runs a tiered lane cold,
 /// rebuilding its dependencies from source, until the update directive brings
 /// it a build carrying this.
-///
-/// cairn/5416 does not move the number. A kernel out-of-memory kill now teaches
-/// the runner's resource profile a demand floor, read from the `OomKilled`
-/// stop and the load context every executor already sends. The new
-/// [`MemoryKill`], [`MemoryCeiling::killed_here`],
-/// [`ReservationRationale::memory_kill`] and the `killedHere` field of
-/// [`PlacementRejectionReason::ExceedsMemoryCeiling`] are runner placement
-/// vocabulary under the same argument as cairn/4931's: the runner alone
-/// constructs and reads them, and nothing it sends an executor carries them.
-/// The reservation a request carries keeps its shape; only its number can be
-/// larger and its source stays `unmeasured` when the floor set it, which every
-/// executor version already holds against its available memory while the
-/// work is resident. What a runner gets wrong talking to an older executor:
-/// nothing.
-///
-/// cairn/5222 does not move the number, and makes it the ledger's: `build.rs`
-/// derives the version from this block, its highest `Version N` heading plus
-/// one while a `/// Version NEXT` heading is present (see
-/// [`crate::executor_protocol_ledger`]), and the build fails if the constant
-/// below reads anything else. The store binds the number when a branch lands
-/// on the default branch: the one heading the branch authored, NEXT or a
-/// number chosen by hand, takes the destination's version plus one, and the
-/// constant moves with it, so two branches that both change the protocol land
-/// as consecutive versions and neither renumbers by hand. No frame, field or
-/// value changes. What a runner gets wrong talking to an older executor:
-/// nothing; the number is the same.
-///
-/// cairn/5453 does not move the number. The executor's storage reclamation
-/// changes only on its own disk: a tree entering quarantine loses its build
-/// output first, a retirement whose stage-aside a full volume refuses deletes
-/// build output in place and retries, and the quarantine-target rung reaches
-/// expired quarantines and cells fenced in place. Those strips are reported
-/// through the existing `QuarantineTargets` rung and `QuarantineTargetStrip`
-/// entries, whose shapes are unchanged; a strip's `path` can now name a live
-/// slot path rather than only a renamed quarantine, which the runner renders
-/// as the opaque string it already was. The runner's storage page adds a
-/// "Next action" line derived from the `CachesOwnerRetained` entry it already
-/// receives. What a runner gets wrong talking to an older executor: nothing;
-/// that executor reclaims less, and reports what it did in the same fields.
-///
-/// cairn/5441 does not move the number. The fleet gains a runner-side read of
-/// the instant this runner began stopping, which the main cadence uses to
-/// announce a lane the restart ended as cancelled rather than dead. Nothing is
-/// sent, and no frame, field or value an executor decodes changes. What a
-/// runner gets wrong talking to an older executor: nothing.
-///
-/// cairn/5328 does not move the number. A macOS executor now recovers the path
-/// of a Seatbelt denial made by any descendant of a fenced item, by a tag its
-/// profile attaches to each deny rule, so it sends `SandboxDenial::Path` where
-/// it used to send `SandboxDenial::Command`: both existing values with
-/// unchanged meaning. `RunnerCallback::SandboxDenied`
-/// gains one defaulted field, `reported_denial`, the item's own denial line for
-/// a command-scoped prompt to quote as unverified. What a runner gets wrong
-/// talking to an older executor: nothing; the field is absent and the prompt
-/// quotes no line, and the older executor's pathless denials raise the same
-/// command-scoped crossing they always did. An older runner ignores the field.
-///
-/// cairn/5428 does not move the number. The executor now sets
-/// `CAIRN_CHECK_STARTED_AT_UNIX_MS` in each process item's environment, beside
-/// `CAIRN_CHECK_RESULT_PATH`, so the rust-tests runner can start its phase
-/// timeline at the spawn the executor's duration is measured from. It is a
-/// local environment variable handed to the child, never a frame or field, and
-/// the phases themselves travel inside the check result the executor already
-/// relays verbatim. What a runner gets wrong talking to an older executor:
-/// nothing; that executor's lanes report phases whose `origin` is `process`,
-/// timed from the runner script's own start, so their setup omits the
-/// command's prelude and says so.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 157;
-
-/// The version `build.rs` derived from the paragraphs above
-/// [`EXECUTOR_PROTOCOL_VERSION`].
-mod derived {
-    include!(concat!(env!("OUT_DIR"), "/executor_protocol_version.rs"));
-}
-
-// The constant is written as a literal only so a runner that predates the
-// derivation can still read it; its value is the ledger's, held here.
-const _: () = assert!(
-    EXECUTOR_PROTOCOL_VERSION == derived::EXECUTOR_PROTOCOL_VERSION,
-    "EXECUTOR_PROTOCOL_VERSION must equal what its paragraphs derive: the highest `/// Version N` heading above it, plus one for a `/// Version NEXT` heading"
-);
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -12483,10 +12381,6 @@ pub struct ReservationRationale {
     /// Why no learned value was used, when none was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<ReservationFallback>,
-    /// An out-of-memory kill of this command on this machine context, whose
-    /// victim floors the memory reservation whatever the profile says.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_kill: Option<MemoryKill>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -13289,9 +13183,7 @@ pub struct PlacementRejection {
 /// Only a measurement sets it, never a class prior, and never a quarantined
 /// peak: a peak near the whole budget measured the machine's saturation rather
 /// than the command, and treating it as demand would refuse that machine the
-/// work forever. A kill is the exception the quarantine cannot see past: when
-/// the kernel killed the command here for memory, [`Self::killed_here`] says so
-/// and the estimate is the floor that kill proved.
+/// work forever.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryCeiling {
@@ -13299,60 +13191,16 @@ pub struct MemoryCeiling {
     pub estimate_bytes: u64,
     /// The most this machine will ever reserve for one request.
     pub ceiling_bytes: u64,
-    /// The out-of-memory kill on this machine that set the estimate, when one
-    /// did rather than a completed run's peak.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub killed_here: Option<MemoryKill>,
 }
 
 impl MemoryCeiling {
-    /// The two numbers in the units a person reads them in, and the kill behind
-    /// them when there was one.
+    /// The two numbers in the units a person reads them in.
     pub fn describe(&self) -> String {
-        let ceiling = describe_gib(self.ceiling_bytes);
-        match self.killed_here {
-            Some(kill) => kill.describe(&ceiling),
-            None => format!(
-                "its measured memory demand {} exceeds what this machine can ever hold ({ceiling})",
-                describe_gib(self.estimate_bytes),
-            ),
-        }
-    }
-}
-
-/// The kernel's out-of-memory killer ended this command on one machine.
-///
-/// The victim's resident size at death is a floor on what the command needs,
-/// never its peak: the process was still growing when it was killed. It is one
-/// process's own number, which nothing else on the machine can inflate, so it
-/// is not subject to the saturation quarantine that a process tree's peak is.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct MemoryKill {
-    /// The largest victim resident size any kill of this command here saw.
-    pub victim_resident_bytes: u64,
-    /// When the most recent kill happened.
-    pub killed_at_unix_ms: u64,
-    /// The machine's memory, when a kill happened while nothing else of
-    /// Cairn's ran there and no run has succeeded here since. Such a kill is
-    /// the machine's answer that it cannot run the command at all, not a
-    /// crowding fact.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub alone_on_machine_bytes: Option<u64>,
-}
-
-impl MemoryKill {
-    fn describe(&self, ceiling: &str) -> String {
-        let resident = describe_gib(self.victim_resident_bytes);
-        match self.alone_on_machine_bytes {
-            Some(machine) => format!(
-                "the kernel killed it here for memory at {resident} resident while it ran alone on this {} machine, which can hold at most {ceiling} for one request",
-                describe_gib(machine)
-            ),
-            None => format!(
-                "the kernel killed it here for memory at {resident} resident, more than this machine can ever hold ({ceiling})"
-            ),
-        }
+        format!(
+            "its measured memory demand {} exceeds what this machine can ever hold ({})",
+            describe_gib(self.estimate_bytes),
+            describe_gib(self.ceiling_bytes)
+        )
     }
 }
 
@@ -13429,8 +13277,6 @@ pub enum PlacementRejectionReason {
     ExceedsMemoryCeiling {
         estimate_bytes: u64,
         ceiling_bytes: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        killed_here: Option<MemoryKill>,
     },
     /// Usable, measured, and simply beaten by the machine that won.
     OutrankedBy { executor_name: String },
@@ -13581,11 +13427,9 @@ impl PlacementRejectionReason {
             Self::ExceedsMemoryCeiling {
                 estimate_bytes,
                 ceiling_bytes,
-                killed_here,
             } => MemoryCeiling {
                 estimate_bytes: *estimate_bytes,
                 ceiling_bytes: *ceiling_bytes,
-                killed_here: *killed_here,
             }
             .describe(),
             Self::OutrankedBy { executor_name } => format!("outranked by {executor_name}"),
@@ -14911,11 +14755,6 @@ pub enum RunnerCallback {
         command: String,
         cwd: String,
         denial: SandboxDenial,
-        /// For a command-scoped denial, the item's own first denial line, so
-        /// the prompt can quote it. Written by the command: a clue for the
-        /// approver, never a grant's scope.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reported_denial: Option<String>,
     },
     CacheCheckpoint {
         runner_context_id: String,
@@ -14970,31 +14809,6 @@ pub enum RunnerCallbackResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The derived constant took over from a literal 157 (cairn/5222). It can
-    /// only grow from there, it is the ledger's own reading of this file, and
-    /// the heading it switched over at is still in the block.
-    #[test]
-    fn the_derived_protocol_version_is_the_ledgers_and_never_below_the_cutover() {
-        const CUTOVER: u32 = 157;
-        const SOURCE: &str = include_str!("executor_protocol.rs");
-        const { assert!(EXECUTOR_PROTOCOL_VERSION >= CUTOVER) };
-        assert_eq!(
-            crate::executor_protocol_ledger::derive_version(
-                SOURCE,
-                crate::executor_protocol_ledger::ANCHOR
-            ),
-            Ok(u64::from(EXECUTOR_PROTOCOL_VERSION))
-        );
-        assert!(crate::executor_protocol_ledger::block_headings(
-            SOURCE,
-            crate::executor_protocol_ledger::ANCHOR
-        )
-        .unwrap()
-        .iter()
-        .any(|heading| heading.version
-            == crate::executor_protocol_ledger::HeadingVersion::Bound(u64::from(CUTOVER))));
-    }
 
     #[test]
     fn five_state_lifecycle_wire_vocabulary_is_strict() {
@@ -15578,7 +15392,6 @@ mod tests {
                     command: "touch /outside".into(),
                     cwd: "/tmp/worktree".into(),
                     denial: SandboxDenial::Path("/outside".into()),
-                    reported_denial: None,
                 },
             },
             ExecutorMessage::CallbackRequest {
@@ -16178,7 +15991,6 @@ mod tests {
                     prior: ResourceReservation::default(),
                     headroom_percent: 25,
                     fallback: None,
-                    memory_kill: None,
                 },
                 sync_cost: PlacementSyncCost::Known { bytes: 12_345 },
                 object_transfer: None,

@@ -10,8 +10,6 @@
 //! normalization happen in the parent module so the price table stays in one
 //! place.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-
 use cairn_db::turso::{params, Connection, Value};
 
 use super::tool_extract::{self, ToolInvocation};
@@ -1607,150 +1605,74 @@ pub(crate) async fn tool_mix(
     .await
 }
 
-/// Seconds of one `run_activity_minutes` row.
-const ACTIVITY_MINUTE_S: i64 = 60;
-
-/// How far before the window a tool call may start and still have its overlap
-/// with in-window active minutes counted. Bounding it keeps the tool side a
-/// range seek on `tool_invocations.ts` proportional to the window; a call that
-/// opened more than a day before the window loses only its in-window overlap.
-const TOOL_SPAN_LOOKBACK_S: i64 = 86_400;
-
-/// `?1` project scope, `?2`/`?3` the half-open window as concrete bounds (an
-/// open side becomes the integer extreme), so the activity readers range-seek
-/// `minute_start` instead of guarding each bound with `IS NULL OR`.
-fn activity_params(scope: &Scope, range: &TimeRange) -> Vec<Value> {
-    vec![
-        scope.project_id.clone().map_or(Value::Null, Value::Text),
-        Value::Integer(range.start.unwrap_or(i64::MIN)),
-        Value::Integer(range.end.unwrap_or(i64::MAX)),
-    ]
-}
-
-/// Agent time vs tool-execution time for one time bucket.
-///
-/// Agent time is minutes in which a run emitted model output
-/// (`run_activity_minutes`), bucketed by when the work happened. Session
-/// lifetime is deliberately absent: a parked or waiting run emits nothing, so
-/// it adds nothing. Tool time is the part of each tool-call span that overlaps
-/// an active minute of the same run, capped at the minute per (run, minute), so
-/// a multi-hour question or watch counts only where the run was also producing
-/// output and tool time can never exceed agent time.
+/// Completed run wall time vs tool-execution time for one time bucket. Tool-call
+/// spans are summed per run, then capped to that run's wall time before bucket
+/// aggregation so concurrent or out-of-bound result events cannot make the
+/// headline composition exceed 100%.
 #[derive(Debug, Clone)]
 pub(crate) struct TimeCompositionRow {
     pub bucket_start: i64,
-    pub active_s: i64,
+    pub wall_s: i64,
     pub tool_s: i64,
+    pub model_overhead_s: i64,
     pub run_count: i64,
 }
 
-/// Reads the window's active minutes and its tool spans as two range reads and
-/// intersects them here. Expressed as one SQL interval join, the engine paired
-/// spans with minutes far beyond the run they share (tens of seconds for a day
-/// at live scale); walking each span's minutes against a hash of the active
-/// ones is linear in rows plus spanned minutes whatever the plan.
 pub(crate) async fn time_composition(
     db: &LocalDb,
     scope: &Scope,
     range: &TimeRange,
     bucket: Bucket,
 ) -> DbResult<Vec<TimeCompositionRow>> {
-    let bucket_expr = bucket.bucket_expr("a.minute_start");
-    // The run/job join only resolves the project, so an unscoped read skips it.
-    let active_sql = if scope.project_id.is_some() {
-        format!(
-            "SELECT a.run_id, a.minute_start, {bucket_expr}
-             FROM run_activity_minutes a
-             LEFT JOIN runs r ON r.id = a.run_id
-             LEFT JOIN jobs j ON j.id = r.job_id
-             WHERE a.minute_start >= ?2 AND a.minute_start < ?3
-               AND COALESCE(r.project_id, j.project_id) = ?1"
+    let bucket_expr = bucket.bucket_expr("run_ts");
+    let sql = format!(
+        "WITH completed_runs AS (
+            SELECT r.id AS run_id,
+                   r.started_at AS run_ts,
+                   (r.exited_at - r.started_at) AS wall_s
+            FROM runs r
+            LEFT JOIN jobs j ON j.id = r.job_id
+            WHERE r.started_at IS NOT NULL
+              AND r.exited_at IS NOT NULL
+              AND r.exited_at >= r.started_at
+              AND (?1 IS NULL OR COALESCE(r.project_id, j.project_id) = ?1)
+              AND (?2 IS NULL OR r.started_at >= ?2)
+              AND (?3 IS NULL OR r.started_at < ?3)
+        ),
+        tool_by_run AS (
+            SELECT cr.run_id AS run_id,
+                   SUM(ta.duration_sum_s) AS raw_tool_s
+            FROM completed_runs cr
+            LEFT JOIN tool_analytics_hourly ta ON ta.run_id = cr.run_id
+            GROUP BY cr.run_id
+        ),
+        run_parts AS (
+            SELECT cr.run_id,
+                   cr.run_ts,
+                   cr.wall_s,
+                   MIN(cr.wall_s, COALESCE(rtbr.raw_tool_s, 0)) AS tool_s
+            FROM completed_runs cr
+            LEFT JOIN tool_by_run rtbr ON rtbr.run_id = cr.run_id
         )
-    } else {
-        format!(
-            "SELECT a.run_id, a.minute_start, {bucket_expr}
-             FROM run_activity_minutes a
-             WHERE ?1 IS NULL AND a.minute_start >= ?2 AND a.minute_start < ?3"
-        )
-    };
-    let active = db
-        .query_all(active_sql, activity_params(scope, range), |row| {
-            Ok((row.text(0)?, row.i64(1)?, row.i64(2)?))
+        SELECT {bucket_expr} AS bucket_start,
+               SUM(wall_s) AS wall_s,
+               SUM(tool_s) AS tool_s,
+               SUM(wall_s - tool_s) AS model_overhead_s,
+               COUNT(*) AS run_count
+        FROM run_parts
+        GROUP BY bucket_start
+        ORDER BY bucket_start"
+    );
+    db.query_all(sql, scope_range_params(scope, range), |row| {
+        Ok(TimeCompositionRow {
+            bucket_start: row.i64(0)?,
+            wall_s: row.opt_i64(1)?.unwrap_or(0),
+            tool_s: row.opt_i64(2)?.unwrap_or(0),
+            model_overhead_s: row.opt_i64(3)?.unwrap_or(0),
+            run_count: row.i64(4)?,
         })
-        .await?;
-    if active.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Intern run ids so the per-minute index keys on integers.
-    let mut run_index: HashMap<String, usize> = HashMap::new();
-    // (run, minute_start) -> slot in `minutes`: (bucket_start, tool seconds).
-    let mut minute_slot: HashMap<(usize, i64), usize> = HashMap::with_capacity(active.len());
-    let mut minutes: Vec<(i64, i64)> = Vec::with_capacity(active.len());
-    let mut runs_per_bucket: BTreeMap<i64, HashSet<usize>> = BTreeMap::new();
-    for (run_id, minute_start, bucket_start) in active {
-        let next = run_index.len();
-        let run = *run_index.entry(run_id).or_insert(next);
-        minute_slot.insert((run, minute_start), minutes.len());
-        minutes.push((bucket_start, 0));
-        runs_per_bucket.entry(bucket_start).or_default().insert(run);
-    }
-
-    // No scope join: a span counts only against minutes of a run already in
-    // `run_index`, which the active read scoped.
-    let spans = db
-        .query_all(
-            "SELECT run_id, ts, result_ts
-             FROM tool_invocations
-             WHERE ts >= ?2 AND ts < ?1 AND result_ts > ts",
-            vec![
-                Value::Integer(range.end.unwrap_or(i64::MAX)),
-                Value::Integer(
-                    range
-                        .start
-                        .map_or(i64::MIN, |start| start.saturating_sub(TOOL_SPAN_LOOKBACK_S)),
-                ),
-            ],
-            |row| Ok((row.text(0)?, row.i64(1)?, row.i64(2)?)),
-        )
-        .await?;
-    let first_window_minute = range.start.map_or(i64::MIN, |start| {
-        start.div_euclid(ACTIVITY_MINUTE_S) * ACTIVITY_MINUTE_S
-    });
-    let window_end = range.end.unwrap_or(i64::MAX);
-    for (run_id, ts, result_ts) in spans {
-        let Some(&run) = run_index.get(&run_id) else {
-            continue;
-        };
-        let mut minute =
-            (ts.div_euclid(ACTIVITY_MINUTE_S) * ACTIVITY_MINUTE_S).max(first_window_minute);
-        while minute < result_ts && minute < window_end {
-            if let Some(&slot) = minute_slot.get(&(run, minute)) {
-                let overlap = result_ts.min(minute + ACTIVITY_MINUTE_S) - ts.max(minute);
-                let tool_s = &mut minutes[slot].1;
-                *tool_s = (*tool_s + overlap).min(ACTIVITY_MINUTE_S);
-            }
-            minute += ACTIVITY_MINUTE_S;
-        }
-    }
-
-    let mut totals: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
-    for (bucket_start, tool_s) in minutes {
-        let total = totals.entry(bucket_start).or_default();
-        total.0 += ACTIVITY_MINUTE_S;
-        total.1 += tool_s;
-    }
-    Ok(totals
-        .into_iter()
-        .map(|(bucket_start, (active_s, tool_s))| TimeCompositionRow {
-            bucket_start,
-            active_s,
-            tool_s,
-            run_count: runs_per_bucket
-                .get(&bucket_start)
-                .map_or(0, |runs| runs.len() as i64),
-        })
-        .collect())
+    })
+    .await
 }
 
 /// Tool-execution seconds by verb over time.
@@ -1882,9 +1804,9 @@ pub(crate) async fn command_durations(
     .await
 }
 
-/// Average agent time per session: a session's minutes with model output
-/// (`run_activity_minutes`, across its runs) in the selected range, bucketed by
-/// its first active minute. Sessions with no model output in range are absent.
+/// Average active work time per session, where session duration is the sum of
+/// completed run wall time in the selected range rather than first-to-last idle
+/// span.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionDurationRow {
     pub bucket_start: i64,
@@ -1900,27 +1822,29 @@ pub(crate) async fn session_durations(
 ) -> DbResult<Vec<SessionDurationRow>> {
     let bucket_expr = bucket.bucket_expr("session_ts");
     let sql = format!(
-        "WITH session_active AS (
+        "WITH session_runs AS (
             SELECT r.session_id AS session_id,
-                   MIN(a.minute_start) AS session_ts,
-                   COUNT(DISTINCT a.minute_start) * {minute} AS active_s
-            FROM run_activity_minutes a
-            JOIN runs r ON r.id = a.run_id
+                   MIN(r.started_at) AS session_ts,
+                   SUM(r.exited_at - r.started_at) AS duration_s
+            FROM runs r
             LEFT JOIN jobs j ON j.id = r.job_id
             WHERE r.session_id IS NOT NULL
-              AND a.minute_start >= ?2 AND a.minute_start < ?3
+              AND r.started_at IS NOT NULL
+              AND r.exited_at IS NOT NULL
+              AND r.exited_at >= r.started_at
               AND (?1 IS NULL OR COALESCE(r.project_id, j.project_id) = ?1)
+              AND (?2 IS NULL OR r.started_at >= ?2)
+              AND (?3 IS NULL OR r.started_at < ?3)
             GROUP BY r.session_id
         )
         SELECT {bucket_expr} AS bucket_start,
                COUNT(*) AS session_count,
-               AVG(active_s) AS avg_s
-        FROM session_active
-        GROUP BY 1
-        ORDER BY 1",
-        minute = ACTIVITY_MINUTE_S,
+               AVG(duration_s) AS avg_s
+        FROM session_runs
+        GROUP BY bucket_start
+        ORDER BY bucket_start"
     );
-    db.query_all(sql, activity_params(scope, range), |row| {
+    db.query_all(sql, scope_range_params(scope, range), |row| {
         Ok(SessionDurationRow {
             bucket_start: row.i64(0)?,
             session_count: row.i64(1)?,

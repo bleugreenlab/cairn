@@ -110,11 +110,6 @@ const ISSUE_STATUS_INPUT_TABLES: &[&str] = &[
 /// whole-project statement on every sidebar poll, which cost more than the
 /// rebuild it was avoiding.
 ///
-/// `tenets` is here because a thread row badges the proposals it has awaiting
-/// the operator's verdict, and an answer given anywhere must clear that badge.
-/// Every tenets frame carries `projectId` (`tenets::emit_changed`), so an answer
-/// rebuilds only its own project's rollup.
-///
 /// Membership here only says a table CAN move the projection. Which individual
 /// writes actually can is a second question, answered per frame by
 /// [`ProjectionInvalidatingEmitter::touches_a_thread`].
@@ -126,7 +121,6 @@ const THREAD_STATUS_INPUT_TABLES: &[&str] = &[
     "permission_requests",
     "runs",
     "events",
-    "tenets",
 ];
 
 /// The tables `list_issues` reads: the issue rows themselves, their labels, and
@@ -293,9 +287,7 @@ impl ProjectionInvalidatingEmitter {
     /// has to fall on the side of rebuilding.
     fn touches_a_thread(&self, project_id: &str, table: &str, payload: &Value) -> bool {
         match table {
-            // A tenet hangs off its proposing thread, not a job, so there is no
-            // job set to place it against.
-            "threads" | "tenets" => true,
+            "threads" => true,
             // A job frame names its owner outright, and does so before the job
             // can produce any rows of its own, which is what lets a job that has
             // never appeared in a snapshot still cold it the moment it joins a
@@ -2411,7 +2403,6 @@ mod tests {
         let expected = [
             ("threads", (true, false, false)),
             ("events", (true, false, false)),
-            ("tenets", (true, false, false)),
             ("turns", (true, true, false)),
             ("jobs", (false, false, false)),
             ("prompts", (true, true, false)),

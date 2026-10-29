@@ -48,16 +48,6 @@ async fn resolve_project_and_issue(
     resolved.ok_or_else(|| format!("Issue {}/{} not found", key, number))
 }
 
-/// What a launch from an executions-collection append reports.
-pub(crate) struct StartedExecution {
-    /// The caller-facing account of what the launch did.
-    pub(crate) summary: String,
-    /// The canonical URI of the tenet the commissioning gate proposed for this
-    /// filing, when it proposed one. A filing that names an existing tenet
-    /// leaves this empty: its tenet was proposed, and answered, elsewhere.
-    pub(crate) proposed_tenet: Option<String>,
-}
-
 /// Start a new execution for an issue from an append to its executions collection.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_execution_from_collection(
@@ -72,7 +62,7 @@ pub(crate) async fn start_execution_from_collection(
     intent: crate::execution::recipe::LaunchIntent,
     after: Vec<crate::routes::TriggerClause>,
     tenet: crate::tenets::filing::TenetFiling,
-) -> Result<StartedExecution, String> {
+) -> Result<String, String> {
     // Route the issue lookup to the database that OWNS the project: a team
     // project's issue rows live wholly in its synced replica (CAIRN-2181), so
     // resolving against the private DB would never find a team issue and the
@@ -168,25 +158,18 @@ pub(crate) async fn start_execution_from_collection(
 
     let issue_uri = cairn_common::uri::build_issue_uri(&key, number);
     let seq = execution.seq.unwrap_or(0);
-    let proposed_tenet = tenet_gate
-        .as_ref()
-        .and_then(crate::tenets::filing::FilingGate::proposed_uri)
-        .map(str::to_string);
     if let Some(evaluation) = evaluation.filter(|evaluation| !evaluation.released) {
-        return Ok(StartedExecution {
-            summary: held_filing_summary(
-                &key,
-                number,
-                seq,
-                &execution.recipe_id,
-                &issue_uri,
-                &evaluation,
-                matches!(intent, crate::execution::recipe::LaunchIntent::NewAttempt)
-                    .then_some(superseded),
-                tenet_gate.as_ref(),
-            ),
-            proposed_tenet,
-        });
+        return Ok(held_filing_summary(
+            &key,
+            number,
+            seq,
+            &execution.recipe_id,
+            &issue_uri,
+            &evaluation,
+            matches!(intent, crate::execution::recipe::LaunchIntent::NewAttempt)
+                .then_some(superseded),
+            tenet_gate.as_ref(),
+        ));
     }
     let tenet_phrase = tenet_gate
         .as_ref()
@@ -212,13 +195,10 @@ pub(crate) async fn start_execution_from_collection(
         }
         None => String::new(),
     };
-    Ok(StartedExecution {
-        summary: format!(
-            "Started execution {} for {}-{} (recipe '{}').{}{} Watch {} for attention.",
-            seq, key, number, execution.recipe_id, tenet_phrase, standing, issue_uri
-        ),
-        proposed_tenet,
-    })
+    Ok(format!(
+        "Started execution {} for {}-{} (recipe '{}').{}{} Watch {} for attention.",
+        seq, key, number, execution.recipe_id, tenet_phrase, standing, issue_uri
+    ))
 }
 
 /// What filing a held execution reports: that it is held, what it waits on and

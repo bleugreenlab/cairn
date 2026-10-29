@@ -21,19 +21,15 @@
 //! ## Parser selection
 //!
 //! A structured result file (`CAIRN_CHECK_RESULT_JSON=`, folded into the output
-//! by the executor) names its own parser, so it wins for ANY command: a
-//! per-test result from any test runner in [`TEST_RUNNER_PARSERS`]
-//! (scripts/test-rust-nextest.ts writes `nextest`, scripts/test-frontend.ts
-//! writes `vitest`) or a `rust-lint` verdict (scripts/check-rust.ts). Without
-//! one, the runner family is detected from the COMMAND STRING, not a config
-//! field, so the `checks` schema stays unextended and no new field can drift
-//! across its four consumers (`config/project_settings.rs`, the TS
-//! `CheckCommand`, the editor, and docs). The repo's Rust entry points
-//! (`test:rust`, `nextest`, and `cargo test`) route to the rust parser,
-//! `vitest` to the vitest parser, `bun test` to the bun parser, and `tsc` to the
-//! tsc parser. A command that names none of them (`bun run test:api`) is still
-//! read when its output carries a runner's own closing summary: bun's
-//! `Ran N tests across M files.` or vitest's `Tests  … (N)`.
+//! by the executor) names its own parser, so it wins for ANY command: today
+//! `nextest` (scripts/test-rust-nextest.ts) and `rust-lint`
+//! (scripts/check-rust.ts). Without one, the runner family is detected from the
+//! COMMAND STRING, not a config field, so the `checks` schema stays unextended
+//! and no new field can drift across its four consumers
+//! (`config/project_settings.rs`, the TS `CheckCommand`, the editor, and docs).
+//! The repo's Rust entry points (`test:rust`, `nextest`, and `cargo test`)
+//! route to the rust parser, `vitest` to the vitest parser, and `tsc` to the tsc
+//! parser.
 //!
 //! ## The persisted shape (`target_results_json`)
 //!
@@ -69,20 +65,6 @@ const REPORT_CHARS: usize = 1_500;
 /// verdict, not a test enumeration.
 pub(crate) const RUST_LINT_PARSER: &str = "rust-lint";
 
-/// The `parser` a `bun test` run is recorded under.
-pub(crate) const BUN_TEST_PARSER: &str = "bun-test";
-
-/// Every `parser` whose counts are real tests, as opposed to `tsc`'s type-error
-/// tally or `rust-lint`'s gating sites. The one list every verdict, reuse, and
-/// rendering decision consults, and the set of result-file parsers accepted as
-/// per-test results.
-const TEST_RUNNER_PARSERS: [&str; 3] = ["nextest", "vitest", BUN_TEST_PARSER];
-
-/// Whether `parser` names a test runner (see [`TEST_RUNNER_PARSERS`]).
-pub(crate) fn is_test_runner_parser(parser: &str) -> bool {
-    TEST_RUNNER_PARSERS.contains(&parser)
-}
-
 /// Structured result of parsing one check's output. Serializes (camelCase) into
 /// the `check_result_cache.target_results_json` column. Enrichment only — the
 /// authoritative pass/fail verdict is the exit code, stored separately.
@@ -104,8 +86,7 @@ pub struct ParsedCheckResult {
     /// Self-skips lacking manifest or environment authority.
     #[serde(default)]
     pub(crate) undeclared_skips: usize,
-    /// Which runner produced this: a [`TEST_RUNNER_PARSERS`] entry, `"tsc"`,
-    /// or [`RUST_LINT_PARSER`].
+    /// Which runner produced this: `"nextest"`, `"vitest"`, or `"tsc"`.
     pub(crate) parser: String,
     /// Passing test count. `0` for tsc, which has no test concept.
     pub(crate) passed: usize,
@@ -135,91 +116,6 @@ pub struct ParsedCheckResult {
     /// red's cause survives however much chatter the run printed after it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) report: Option<String>,
-    /// Where the lane's wall clock went, when its runner measured it (the
-    /// rust-tests runner does; see `scripts/lib/lane-phases.ts`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) phases: Option<CheckPhases>,
-    /// The run's own statement that its exit vouches for nothing, and why: the
-    /// producer judged the environment it ran in unfit to answer for the change
-    /// (`runtime bun 1.3.13 ≠ pinned 1.4.4`). Taken from the structured result
-    /// whichever parser produced the rest, and a green carrying it is
-    /// unverified however complete the rest of the result is.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) unverified: Option<String>,
-}
-
-/// A lane's duration divided into phases on one timeline, so they sum to the
-/// command's wall clock: `setup` (the command's prelude, probes, planning, and
-/// the fast tier's fixture run), `compile` (each cargo pass up to its `Finished`
-/// line), `test` (each pass after it), `doctest`, and `publish` (result
-/// assembly between and after passes).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CheckPhases {
-    /// `executor` when the timeline starts at the executor's spawn stamp,
-    /// `process` when it starts at the runner script, missing the prelude.
-    pub(crate) origin: String,
-    pub(crate) setup_ms: u64,
-    pub(crate) compile_ms: u64,
-    pub(crate) test_ms: u64,
-    #[serde(default)]
-    pub(crate) doctest_ms: u64,
-    pub(crate) publish_ms: u64,
-    /// Crates cargo compiled across every pass. Zero means nothing was stale.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) compiled_units: Option<u64>,
-    #[serde(default)]
-    pub(crate) passes: Vec<CheckPhasePass>,
-}
-
-/// One cargo invocation of a lane: `full`, `related`, `targeted`, the fast
-/// tier's `local`, `warmup`, and `global`, or `doctest`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CheckPhasePass {
-    pub(crate) name: String,
-    pub(crate) wall_ms: u64,
-    pub(crate) compile_ms: u64,
-    pub(crate) test_ms: u64,
-    #[serde(default)]
-    pub(crate) compiled_units: u64,
-    /// nextest's own `Summary [ Xs ]` for the pass, when it printed one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) summary_ms: Option<u64>,
-}
-
-/// More passes than any lane runs; a result claiming more is not a lane's.
-const MAX_PHASE_PASSES: usize = 16;
-
-impl CheckPhases {
-    /// The `phases` a result file carries, when it is one this core can store.
-    /// The file is the runner's input, so a malformed or implausible object is
-    /// dropped rather than trusted; the rest of the result still parses.
-    fn from_artifact(value: &serde_json::Value) -> Option<Self> {
-        let phases: Self = serde_json::from_value(value.get("phases")?.clone()).ok()?;
-        let representable = [
-            phases.setup_ms,
-            phases.compile_ms,
-            phases.test_ms,
-            phases.doctest_ms,
-            phases.publish_ms,
-        ]
-        .into_iter()
-        .chain(phases.compiled_units)
-        .chain(phases.passes.iter().flat_map(|pass| {
-            [
-                pass.wall_ms,
-                pass.compile_ms,
-                pass.test_ms,
-                pass.compiled_units,
-            ]
-        }))
-        .all(|value| i64::try_from(value).is_ok());
-        (matches!(phases.origin.as_str(), "executor" | "process")
-            && phases.passes.len() <= MAX_PHASE_PASSES
-            && representable)
-            .then_some(phases)
-    }
 }
 
 fn current_result_schema_version() -> u32 {
@@ -286,7 +182,6 @@ impl ParsedCheckResult {
             passed: self.passed,
             failed: self.failed,
             skipped: self.skipped,
-            unverified: self.unverified.as_deref().map(Cow::Borrowed),
         }
     }
 
@@ -322,8 +217,6 @@ pub(crate) struct VerdictFacts<'a> {
     pub(crate) passed: usize,
     pub(crate) failed: usize,
     pub(crate) skipped: usize,
-    /// See [`ParsedCheckResult::unverified`].
-    pub(crate) unverified: Option<Cow<'a, str>>,
 }
 
 /// Projects `target_results_json` onto the [`VerdictFacts`] fields as one small
@@ -332,14 +225,14 @@ pub(crate) struct VerdictFacts<'a> {
 /// does, instead of failing the whole query.
 pub(crate) const VERDICT_FACTS_SQL: &str = "CASE WHEN json_valid(target_results_json) \
      THEN json_extract(target_results_json,'$.parser','$.selection','$.complete',\
-     '$.passed','$.failed','$.skipped','$.unverified') END";
+     '$.passed','$.failed','$.skipped') END";
 
 impl VerdictFacts<'_> {
-    /// Whether these facts came from a TEST RUNNER ([`TEST_RUNNER_PARSERS`]),
-    /// whose pass/fail counts denote real tests, rather than `tsc`, whose
-    /// `failed` is a type-error tally with no "test count" meaning.
+    /// Whether these facts came from a TEST RUNNER (`nextest`/`vitest`), whose
+    /// pass/fail counts denote real tests, rather than `tsc`, whose `failed` is a
+    /// type-error tally with no "test count" meaning.
     pub(crate) fn is_test_runner(&self) -> bool {
-        is_test_runner_parser(&self.parser)
+        self.parser == "nextest" || self.parser == "vitest"
     }
 
     /// A `rust-lint` result whose lint did not run to completion: cargo was not
@@ -374,9 +267,8 @@ impl VerdictFacts<'static> {
             Option<usize>,
             Option<usize>,
             Option<usize>,
-            Option<String>,
         );
-        let (parser, selection, complete, passed, failed, skipped, unverified): Projection =
+        let (parser, selection, complete, passed, failed, skipped): Projection =
             serde_json::from_str(projection).ok()?;
         Some(Self {
             parser: Cow::Owned(parser?),
@@ -385,7 +277,6 @@ impl VerdictFacts<'static> {
             passed: passed?,
             failed: failed?,
             skipped: skipped?,
-            unverified: unverified.map(Cow::Owned),
         })
     }
 }
@@ -424,28 +315,16 @@ enum ParserKind {
     /// `cargo nextest` (primary) or `cargo test` (fallback) output.
     Rust,
     Vitest,
-    BunTest,
     Tsc,
 }
 
-/// Whether `command` names Vitest itself.
+/// Detect the runner family from the command string. Returns `None` for a
+/// command with no recognized runner, so the check degrades to exit-code +
+/// raw-tail behavior.
 pub(crate) fn is_vitest_command(command: &str) -> bool {
     detect_parser(command) == Some(ParserKind::Vitest)
 }
 
-/// Whether `command` names a test runner, so a run of it that produced no
-/// structured result measured nothing a verdict can rest on.
-pub(crate) fn is_test_runner_command(command: &str) -> bool {
-    matches!(
-        detect_parser(command),
-        Some(ParserKind::Rust | ParserKind::Vitest | ParserKind::BunTest)
-    )
-}
-
-/// Detect the runner family from the command string. Returns `None` for a
-/// command with no recognized runner; [`parse_check_output`] then looks for a
-/// runner's closing summary in the output before degrading to exit code + raw
-/// tail.
 fn detect_parser(command: &str) -> Option<ParserKind> {
     if command.contains("nextest")
         || command.contains("cargo test")
@@ -456,9 +335,6 @@ fn detect_parser(command: &str) -> Option<ParserKind> {
     if command.contains("vitest") {
         return Some(ParserKind::Vitest);
     }
-    if command.contains("bun test") {
-        return Some(ParserKind::BunTest);
-    }
     if command.contains("tsc") {
         return Some(ParserKind::Tsc);
     }
@@ -467,67 +343,20 @@ fn detect_parser(command: &str) -> Option<ParserKind> {
 
 /// Parse one check's combined output into a [`ParsedCheckResult`]. A structured
 /// result file wins regardless of the command; otherwise the parser is selected
-/// from `command`, and for a command that names no runner (a package script such
-/// as `bun run test:api`), from the runner summary its output closes with.
-/// Returns `None` when none of these yields anything — the caller then degrades
-/// to the raw output tail. A recognized runner that simply found no failures
-/// still returns `Some` (a zero-failure result), which is a valid "green at this
-/// tree" record for future baseline work.
-///
-/// A structured result's `unverified` declaration rides on whichever parse wins,
-/// and stands alone (a result with no counts) for a runner Cairn has no parser
-/// for, so a lane can disown its green without first growing a parser.
+/// from `command`. Returns `None` when neither yields anything — the caller then
+/// degrades to the raw output tail. A recognized runner that simply found no
+/// failures still returns `Some` (a zero-failure result), which is a valid
+/// "green at this tree" record for future baseline work.
 pub(crate) fn parse_check_output(command: &str, output: &str) -> Option<ParsedCheckResult> {
     let clean = strip_ansi(output);
-    let parsed = parse_structured_artifact(&clean).or_else(|| match detect_parser(command) {
-        Some(ParserKind::Rust) => parse_rust(&clean),
-        Some(ParserKind::Vitest) => parse_vitest(&clean),
-        Some(ParserKind::BunTest) => parse_bun_test(&clean),
-        Some(ParserKind::Tsc) => parse_tsc(&clean),
-        None => parse_bun_test(&clean).or_else(|| parse_vitest_summary(&clean)),
-    });
-    let Some((declaring_parser, reason)) = declared_unverified(&clean) else {
-        return parsed;
-    };
-    Some(match parsed {
-        Some(parsed) => ParsedCheckResult {
-            unverified: Some(reason),
-            ..parsed
-        },
-        None => ParsedCheckResult {
-            schema_version: 1,
-            complete: false,
-            selection: unknown_selection(),
-            tests: vec![],
-            undeclared_skips: 0,
-            parser: declaring_parser,
-            passed: 0,
-            failed: 0,
-            suite_failures: 0,
-            skipped: 0,
-            deferred: 0,
-            failures: vec![],
-            report: None,
-            phases: None,
-            unverified: Some(reason),
-        },
-    })
-}
-
-/// The runner a structured result names and its `unverified` declaration, when
-/// it makes one: a non-blank string, capped like any other excerpt because the
-/// file is the command's input.
-fn declared_unverified(clean: &str) -> Option<(String, String)> {
-    let value = structured_artifact(clean)?;
-    let reason = value.get("unverified")?.as_str()?.trim();
-    if reason.is_empty() {
-        return None;
+    if let Some(parsed) = parse_structured_artifact(&clean) {
+        return Some(parsed);
     }
-    let parser = value
-        .get("parser")
-        .and_then(|parser| parser.as_str())
-        .unwrap_or("unknown");
-    Some((parser.to_string(), cap_chars(reason, MESSAGE_CHARS)))
+    match detect_parser(command)? {
+        ParserKind::Rust => parse_rust(&clean),
+        ParserKind::Vitest => parse_vitest(&clean),
+        ParserKind::Tsc => parse_tsc(&clean),
+    }
 }
 
 /// The line prefix the executor writes a check's result file under.
@@ -564,22 +393,19 @@ pub(crate) fn declared_empty_selection(output: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Parse the result file. Only parsers this core understands are accepted: a
-/// per-test result from any [`TEST_RUNNER_PARSERS`] runner, or a `rust-lint`
-/// verdict. Anything else (an unknown parser, malformed JSON) returns `None` so
-/// command detection still gets its turn.
+/// Parse the result file. Only parsers this core understands are accepted;
+/// anything else (a vitest result, an unknown parser, malformed JSON) returns
+/// `None` so command detection still gets its turn.
 fn parse_structured_artifact(clean: &str) -> Option<ParsedCheckResult> {
     let value = structured_artifact(clean)?;
     match value.get("parser")?.as_str()? {
+        "nextest" => parse_nextest_artifact(&value),
         RUST_LINT_PARSER => parse_rust_lint_artifact(&value),
-        parser if is_test_runner_parser(parser) => parse_test_artifact(&value, parser),
         _ => None,
     }
 }
 
-/// A canonical per-test result. Every count is derived from the rows, so a
-/// writer cannot claim a tally its rows do not carry.
-fn parse_test_artifact(value: &serde_json::Value, parser: &str) -> Option<ParsedCheckResult> {
+fn parse_nextest_artifact(value: &serde_json::Value) -> Option<ParsedCheckResult> {
     let tests: Vec<CheckTestResult> = serde_json::from_value(value.get("tests")?.clone()).ok()?;
     let passed = tests.iter().filter(|test| test.status == "passed").count();
     let failed = tests.iter().filter(|test| test.status == "failed").count();
@@ -617,16 +443,14 @@ fn parse_test_artifact(value: &serde_json::Value, parser: &str) -> Option<Parsed
             .get("undeclaredSkips")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize,
-        parser: parser.to_string(),
+        parser: "nextest".to_string(),
         passed,
         failed,
         skipped,
         suite_failures: 0,
         deferred,
         report: None,
-        phases: CheckPhases::from_artifact(value),
         failures,
-        unverified: None,
     })
 }
 
@@ -671,11 +495,9 @@ fn parse_rust_lint_artifact(value: &serde_json::Value) -> Option<ParsedCheckResu
         failed: failures.len(),
         skipped: 0,
         suite_failures: 0,
-        phases: None,
         deferred: 0,
         failures,
         report,
-        unverified: None,
     })
 }
 
@@ -715,11 +537,9 @@ fn parse_tsc(clean: &str) -> Option<ParsedCheckResult> {
         failed: failures.len(),
         skipped: 0,
         suite_failures: 0,
-        phases: None,
         deferred: 0,
         report: None,
         failures,
-        unverified: None,
     })
 }
 
@@ -728,10 +548,6 @@ fn parse_tsc(clean: &str) -> Option<ParsedCheckResult> {
 // ---------------------------------------------------------------------------
 
 fn parse_vitest(clean: &str) -> Option<ParsedCheckResult> {
-    parse_vitest_json(clean).or_else(|| parse_vitest_summary(clean))
-}
-
-fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
     // The JSON reporter emits one JSON object identified by its leading key. With
     // the dual `--reporter=default --reporter=json` the object trails the human
     // output, and combined capture may append stderr after it — so locate the
@@ -845,299 +661,8 @@ fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
         suite_failures,
         deferred: 0,
         report: None,
-        phases: None,
         failures,
-        unverified: None,
     })
-}
-
-// ---------------------------------------------------------------------------
-// vitest (printed report, when no JSON reporter ran)
-// ---------------------------------------------------------------------------
-
-static VITEST_ROW: LazyLock<Regex> = LazyLock::new(|| {
-    // ` ✓ src/a.test.ts > suite > name 3ms`. Only a TEST row carries ` > `: the
-    // default reporter's per-file line (` ✓ src/a.test.ts (11 tests) 5ms`) does
-    // not, so it is never counted as a test.
-    Regex::new(r"^\s*([✓×↓])\s+(.+? > .+?)(?:\s+(\d+(?:\.\d+)?)ms)?$").unwrap()
-});
-
-static VITEST_TESTS_SUMMARY: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*Tests\s+(.+?)\s*\((\d+)\)$").unwrap());
-
-static VITEST_TALLY: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(\d+)\s+(passed|failed|skipped|todo)\s*$").unwrap());
-
-/// Vitest's printed report: the `Tests  1 failed | 10 passed (11)` summary each
-/// vitest process closes with (summed, so a sharded run reads as one), and the
-/// verbose reporter's per-test `✓`/`×`/`↓` rows. Complete only when those rows
-/// account for every test the summaries count; the default reporter prints no
-/// passing rows, so it yields counts and an incomplete enumeration.
-fn parse_vitest_summary(clean: &str) -> Option<ParsedCheckResult> {
-    let (mut total, mut passed, mut failed, mut skipped) = (0usize, 0usize, 0usize, 0usize);
-    let mut summaries = 0usize;
-    let mut tests: Vec<CheckTestResult> = Vec::new();
-    let mut failures: Vec<CheckFailure> = Vec::new();
-    let mut awaiting_message = false;
-    for line in clean.lines() {
-        let line = line.trim_end();
-        if let Some(cap) = VITEST_TESTS_SUMMARY.captures(line) {
-            summaries += 1;
-            total += cap[2].parse::<usize>().unwrap_or(0);
-            for part in cap[1].split('|') {
-                let Some(tally) = VITEST_TALLY.captures(part) else {
-                    continue;
-                };
-                let n = tally[1].parse::<usize>().unwrap_or(0);
-                match &tally[2] {
-                    "passed" => passed += n,
-                    "failed" => failed += n,
-                    _ => skipped += n,
-                }
-            }
-            awaiting_message = false;
-            continue;
-        }
-        if let Some(cap) = VITEST_ROW.captures(line) {
-            let status = match &cap[1] {
-                "✓" => "passed",
-                "×" => "failed",
-                _ => "skipped",
-            };
-            let id = cap[2].to_string();
-            if status == "failed" {
-                failures.push(CheckFailure {
-                    name: id.clone(),
-                    message: None,
-                });
-            }
-            awaiting_message = status == "failed";
-            tests.push(test_row(id, status, millis(cap.get(3), false)));
-            continue;
-        }
-        // The verbose reporter prints a failed row's assertion on the next line
-        // as `   → expected 1 to be 2`.
-        if awaiting_message {
-            awaiting_message = false;
-            if let Some(message) = line.trim_start().strip_prefix("→ ") {
-                let message = cap_chars(message.trim(), MESSAGE_CHARS);
-                if let Some(test) = tests.last_mut() {
-                    test.failure_message = Some(message.clone());
-                }
-                if let Some(failure) = failures.last_mut() {
-                    failure.message = Some(message);
-                }
-            }
-        }
-    }
-    if summaries == 0 {
-        return None;
-    }
-    let complete = rows_account_for(&tests, total, passed, failed, skipped);
-    Some(ParsedCheckResult {
-        schema_version: 1,
-        complete,
-        selection: if total == 0 { "empty" } else { "unknown" }.to_string(),
-        tests: if complete { tests } else { vec![] },
-        undeclared_skips: 0,
-        parser: "vitest".to_string(),
-        passed,
-        failed,
-        skipped,
-        suite_failures: 0,
-        deferred: 0,
-        report: None,
-        phases: None,
-        failures,
-        unverified: None,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// bun test
-// ---------------------------------------------------------------------------
-
-static BUN_RAN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^Ran (\d+) tests? across (\d+) files?\.").unwrap());
-
-static BUN_TALLY: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(\d+) (pass|fail|skip|todo|errors?)$").unwrap());
-
-static BUN_ROW: LazyLock<Regex> = LazyLock::new(|| {
-    // `(pass) suite > name [0.48ms]` when piped; the glyph form when bun was
-    // told to color its output.
-    Regex::new(
-        r"^\s*(?:\((pass|fail|skip|todo)\)|([✓✗»✎]))\s+(.+?)(?:\s+\[(\d+(?:\.\d+)?)(ms|s)\])?$",
-    )
-    .unwrap()
-});
-
-static BUN_FILE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\S.*\.[cm]?[jt]sx?):$").unwrap());
-
-static BUN_RECAP: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\d+ tests? (?:skipped|failed|todo):$").unwrap());
-
-/// `bun test`'s report. Bun prints a `path/to/file.test.ts:` header before each
-/// file's rows, one `(pass)`/`(fail)`/`(skip)`/`(todo)` row per test, then a
-/// recap that repeats the skipped and failed rows without their file, then the
-/// tallies (` 799 pass`, ` 24 skip`, ` 0 fail`, ` 10 errors`) and
-/// `Ran 823 tests across 58 files.`, the line that identifies bun output.
-///
-/// Row ids are `<file> > <test>`, so the recap is skipped rather than deduped:
-/// its rows have no file. The run is complete when its rows account for every
-/// test the tallies count. `errors` are failures bun could not attribute to a
-/// test (an error thrown between tests), so they count as suite failures.
-fn parse_bun_test(clean: &str) -> Option<ParsedCheckResult> {
-    #[derive(Default)]
-    struct Tally {
-        pass: usize,
-        fail: usize,
-        skip: usize,
-        errors: usize,
-    }
-    let mut totals = Tally::default();
-    let mut pending = Tally::default();
-    let mut ran = 0usize;
-    let mut summaries = 0usize;
-    let mut file: Option<String> = None;
-    let mut in_recap = false;
-    let mut last_error: Option<String> = None;
-    let mut tests: Vec<CheckTestResult> = Vec::new();
-    let mut failures: Vec<CheckFailure> = Vec::new();
-    for line in clean.lines() {
-        let line = line.trim_end();
-        if let Some(cap) = BUN_RAN.captures(line) {
-            ran += cap[1].parse::<usize>().unwrap_or(0);
-            summaries += 1;
-            totals.pass += pending.pass;
-            totals.fail += pending.fail;
-            totals.skip += pending.skip;
-            totals.errors += pending.errors;
-            pending = Tally::default();
-            in_recap = false;
-            file = None;
-            continue;
-        }
-        if let Some(cap) = BUN_TALLY.captures(line) {
-            let n = cap[1].parse::<usize>().unwrap_or(0);
-            match &cap[2] {
-                "pass" => pending.pass += n,
-                "fail" => pending.fail += n,
-                "skip" | "todo" => pending.skip += n,
-                _ => pending.errors += n,
-            }
-            continue;
-        }
-        if line.trim().is_empty() || line.ends_with("expect() calls") || line.ends_with("snapshots")
-        {
-            continue;
-        }
-        // Tallies are only the lines directly above `Ran …`.
-        pending = Tally::default();
-        if BUN_RECAP.is_match(line) {
-            in_recap = true;
-            continue;
-        }
-        if in_recap {
-            continue;
-        }
-        if let Some(cap) = BUN_ROW.captures(line) {
-            let status = match cap.get(1).or(cap.get(2)).map(|m| m.as_str()) {
-                Some("pass" | "✓") => "passed",
-                Some("fail" | "✗") => "failed",
-                _ => "skipped",
-            };
-            let id = match &file {
-                Some(file) => format!("{file} > {}", &cap[3]),
-                None => cap[3].to_string(),
-            };
-            let duration = millis(
-                cap.get(4),
-                cap.get(5).is_some_and(|unit| unit.as_str() == "s"),
-            );
-            let mut row = test_row(id.clone(), status, duration);
-            if status == "failed" {
-                // Bun prints a failing test's error ABOVE its row.
-                let message = last_error.take();
-                row.failure_message = message.clone();
-                failures.push(CheckFailure { name: id, message });
-            }
-            last_error = None;
-            tests.push(row);
-            continue;
-        }
-        if let Some(cap) = BUN_FILE.captures(line) {
-            file = Some(cap[1].to_string());
-            last_error = None;
-            continue;
-        }
-        if last_error.is_none() {
-            if let Some(error) = line.trim_start().strip_prefix("error:") {
-                last_error = Some(cap_chars(error.trim(), MESSAGE_CHARS));
-            }
-        }
-    }
-    if summaries == 0 {
-        return None;
-    }
-    let complete = rows_account_for(&tests, ran, totals.pass, totals.fail, totals.skip);
-    Some(ParsedCheckResult {
-        schema_version: 1,
-        complete,
-        selection: if ran == 0 { "empty" } else { "unknown" }.to_string(),
-        tests: if complete { tests } else { vec![] },
-        undeclared_skips: 0,
-        parser: BUN_TEST_PARSER.to_string(),
-        passed: totals.pass,
-        failed: totals.fail,
-        skipped: totals.skip,
-        suite_failures: totals.errors,
-        deferred: 0,
-        report: None,
-        phases: None,
-        failures,
-        unverified: None,
-    })
-}
-
-/// Whether per-test rows read from printed output account for exactly the tests
-/// the runner's own summary counts, status by status. Only then are the rows an
-/// enumeration of the selection rather than whatever survived the capture.
-fn rows_account_for(
-    tests: &[CheckTestResult],
-    total: usize,
-    passed: usize,
-    failed: usize,
-    skipped: usize,
-) -> bool {
-    let count = |status: &str| tests.iter().filter(|test| test.status == status).count();
-    total == passed + failed + skipped
-        && tests.len() == total
-        && count("passed") == passed
-        && count("failed") == failed
-        && count("skipped") == skipped
-}
-
-/// A printed duration in milliseconds (`seconds` when the unit was `s`).
-fn millis(value: Option<regex::Match<'_>>, seconds: bool) -> Option<u64> {
-    let value: f64 = value?.as_str().parse().ok()?;
-    Some((if seconds { value * 1000.0 } else { value }).round() as u64)
-}
-
-fn test_row(id: String, status: &str, duration_ms: Option<u64>) -> CheckTestResult {
-    CheckTestResult {
-        id,
-        status: status.to_string(),
-        duration_ms,
-        attempts: 1,
-        retried: false,
-        flaky: false,
-        failure_message: None,
-        skip_reason: None,
-        skip_declaration: None,
-        skip_declaration_source: None,
-    }
 }
 
 /// The deepest directory shared by every path in `paths`, without a trailing
@@ -1261,11 +786,9 @@ fn parse_nextest(clean: &str) -> Option<ParsedCheckResult> {
         failed: grab(&COUNT_FAILED),
         skipped: grab(&COUNT_SKIPPED),
         suite_failures: 0,
-        phases: None,
         deferred: 0,
         report: None,
         failures,
-        unverified: None,
     })
 }
 
@@ -1360,11 +883,9 @@ fn parse_cargo_test(clean: &str) -> Option<ParsedCheckResult> {
         failed,
         skipped: ignored,
         suite_failures: 0,
-        phases: None,
         deferred: 0,
         report: None,
         failures,
-        unverified: None,
     })
 }
 
@@ -1416,7 +937,7 @@ pub(crate) fn format_failure_excerpt(parsed: Option<&ParsedCheckResult>, raw_tai
             return head_chars(&composed.join("\n"), FAILURE_EXCERPT_CHARS);
         }
     }
-    anchored_tail(raw_tail, FAILURE_EXCERPT_CHARS)
+    error_anchored_tail(raw_tail, FAILURE_EXCERPT_CHARS)
 }
 
 /// A check's `report` as a renderer shows it: led by whatever the stored
@@ -1473,22 +994,16 @@ pub(crate) fn tail_chars(s: &str, max: usize) -> String {
 /// What stands between an anchored error and the tail it leads.
 const ANCHOR_ELISION: &str = "\n…\n";
 
-/// The trailing `max` chars of `s`, led by the lines a reader needs most when
-/// the cut would drop them: the first build error and nextest's `Summary`
-/// lines.
+/// The trailing `max` chars of `s`, led by its first error when the cut would
+/// drop it.
 ///
 /// A build prints its error once and then however many warnings and footers
 /// follow, so an end-anchored window alone can keep `could not compile … due
 /// to 1 previous error` while losing the one error it counts, and a reader
-/// takes the last warning for the cause. A fast-tier pass prints its Summary
-/// and then one `TIMEOUT` line per deferred test, thousands of them, so the
-/// window keeps the deferrals and loses the one line saying how many tests ran
-/// and for how long.
-///
-/// Each anchor the window misses (the first `error[`/`error:` line with its
-/// `-->` location, and every `Summary [` line) leads verbatim in output order,
-/// within half of `max`, then an elision mark, then the end-anchored remainder.
-pub(crate) fn anchored_tail(s: &str, max: usize) -> String {
+/// takes the last warning for the cause. When the window misses it, the first
+/// `error[`/`error:` line and its `-->` location lead verbatim, then an
+/// elision mark, then the end-anchored remainder.
+pub(crate) fn error_anchored_tail(s: &str, max: usize) -> String {
     let total = s.chars().count();
     if total <= max {
         return s.to_string();
@@ -1497,61 +1012,12 @@ pub(crate) fn anchored_tail(s: &str, max: usize) -> String {
         .char_indices()
         .nth(total - max)
         .map_or(s.len(), |(at, _)| at);
-    let mut anchors: Vec<(usize, usize)> = first_error_span(s)
-        .into_iter()
-        .chain(summary_spans(s))
-        .filter(|(start, _)| *start < window)
-        .collect();
-    if anchors.is_empty() {
+    let Some((start, end)) = first_error_span(s).filter(|(start, _)| *start < window) else {
         return tail_chars(s, max);
-    }
-    anchors.sort_unstable();
-    let lead_budget = max / 2;
-    let mut lead = String::new();
-    let mut lead_end = 0;
-    for (start, end) in anchors {
-        if start < lead_end {
-            continue;
-        }
-        let piece = s[start..end].trim_end();
-        if lead.is_empty() {
-            lead = head_chars(piece, lead_budget);
-        } else {
-            let joint = if start == lead_end {
-                "\n"
-            } else {
-                ANCHOR_ELISION
-            };
-            if lead.chars().count() + joint.chars().count() + piece.chars().count() > lead_budget {
-                break;
-            }
-            lead.push_str(joint);
-            lead.push_str(piece);
-        }
-        lead_end = end;
-    }
+    };
+    let lead = head_chars(s[start..end].trim_end(), max / 2);
     let budget = max.saturating_sub(lead.chars().count() + ANCHOR_ELISION.chars().count());
-    format!(
-        "{lead}{ANCHOR_ELISION}{}",
-        tail_chars(&s[lead_end..], budget)
-    )
-}
-
-static NEXTEST_SUMMARY_LINE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*Summary\s+\[\s*[\d.]+s\]").unwrap());
-
-/// The byte spans of every nextest `Summary [ Xs ]` line in `s`.
-fn summary_spans(s: &str) -> Vec<(usize, usize)> {
-    let mut offset = 0;
-    s.split_inclusive('\n')
-        .filter_map(|line| {
-            let at = offset;
-            offset += line.len();
-            NEXTEST_SUMMARY_LINE
-                .is_match(&strip_ansi(line))
-                .then_some((at, at + line.len()))
-        })
-        .collect()
+    format!("{lead}{ANCHOR_ELISION}{}", tail_chars(&s[end..], budget))
 }
 
 /// The byte span of `s`'s first error line, through its `-->` location when
@@ -1674,11 +1140,6 @@ test result: FAILED. 2 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; 
             Some(ParserKind::Vitest)
         );
         assert_eq!(detect_parser("bunx tsc --noEmit"), Some(ParserKind::Tsc));
-        assert_eq!(
-            detect_parser("cd api && bun test --isolate"),
-            Some(ParserKind::BunTest)
-        );
-        assert_eq!(detect_parser("bun run test:frontend:scoped"), None);
         assert_eq!(detect_parser("bun run test:api"), None);
         assert_eq!(detect_parser("bun run check:web"), None);
     }
@@ -1800,64 +1261,6 @@ test result: FAILED. 2 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; 
         // A vitest command whose output carries no JSON object (reporter absent)
         // parses to nothing — the caller degrades to the raw tail, never a pass.
         assert!(parse_check_output("bunx vitest run", " FAIL  a.test.ts\n").is_none());
-    }
-
-    /// The bytes `scripts/test-api.ts` writes for an off-pin green, pinned by
-    /// `scripts/lib/bun-runtime-pin.test.ts` on the other side.
-    const OFF_PIN_DECLARATION: &str = r#"{"schemaVersion":1,"parser":"bun-test","unverified":"runtime bun 1.3.13 ≠ pinned 1.4.4"}"#;
-
-    #[test]
-    fn a_declared_unverified_result_stands_alone_for_an_unparsed_runner() {
-        let json =
-            r#"{"schemaVersion":1,"parser":"custom-runner","unverified":"ran on the wrong host"}"#;
-        let output = format!("custom runner finished\n{RESULT_ARTIFACT_JSON_MARKER}{json}\n");
-        let parsed = parse_check_output("bun run check:custom", &output).unwrap();
-        assert_eq!(parsed.parser, "custom-runner");
-        assert_eq!(parsed.unverified.as_deref(), Some("ran on the wrong host"));
-        assert!(!parsed.is_test_runner(), "no test counts are invented");
-        assert_eq!((parsed.passed, parsed.failed, parsed.skipped), (0, 0, 0));
-        let stored = serde_json::to_string(&parsed).unwrap();
-        let restored: ParsedCheckResult = serde_json::from_str(&stored).unwrap();
-        assert_eq!(restored, parsed, "the declaration survives storage");
-    }
-
-    #[test]
-    fn a_declared_unverified_result_keeps_the_api_lanes_bun_counts() {
-        // The tail of an off-pin `bun run test:api` green: bun's own summary,
-        // then the declaration the wrapper wrote, which has no per-test rows.
-        let output = format!(
-            " 801 pass\n 24 skip\n 0 fail\n 2408 expect() calls\nRan 825 tests across 58 files. [5.99s]\n{RESULT_ARTIFACT_JSON_MARKER}{OFF_PIN_DECLARATION}\n"
-        );
-        let parsed = parse_check_output("bun run test:api", &output).unwrap();
-        assert_eq!(
-            parsed.parser, BUN_TEST_PARSER,
-            "bun's summary is still read"
-        );
-        assert_eq!((parsed.passed, parsed.skipped), (801, 24));
-        assert_eq!(
-            parsed.unverified.as_deref(),
-            Some("runtime bun 1.3.13 ≠ pinned 1.4.4")
-        );
-    }
-
-    #[test]
-    fn a_declared_unverified_result_rides_on_the_winning_parse() {
-        let json = r#"{"schemaVersion":1,"parser":"nextest","complete":true,"selection":"full","undeclaredSkips":0,"tests":[{"id":"c t::ok","status":"passed","attempts":1,"retried":false,"flaky":false}],"unverified":"runtime differs"}"#;
-        let output = format!("{RESULT_ARTIFACT_JSON_MARKER}{json}\n");
-        let parsed = parse_check_output("bun run test:rust", &output).unwrap();
-        assert_eq!((parsed.parser.as_str(), parsed.passed), ("nextest", 1));
-        assert_eq!(parsed.unverified.as_deref(), Some("runtime differs"));
-    }
-
-    #[test]
-    fn a_blank_or_absent_declaration_is_no_declaration() {
-        for json in [
-            r#"{"schemaVersion":1,"parser":"bun-test","unverified":"  "}"#,
-            r#"{"schemaVersion":1,"parser":"bun-test"}"#,
-        ] {
-            let output = format!("{RESULT_ARTIFACT_JSON_MARKER}{json}\n");
-            assert_eq!(parse_check_output("bun run test:api", &output), None);
-        }
     }
 
     #[test]
@@ -2105,12 +1508,12 @@ real work
 
     #[test]
     fn an_unrecognized_result_file_falls_through_to_command_detection() {
-        let jest = r#"{"schemaVersion":1,"parser":"jest","complete":true,"tests":[]}"#;
-        let output = format!("{TSC_FIXTURE}\n{}", result_line(jest));
+        let vitest = r#"{"schemaVersion":1,"parser":"vitest","complete":true,"tests":[]}"#;
+        let output = format!("{TSC_FIXTURE}\n{}", result_line(vitest));
         let parsed = parse_check_output("bunx tsc --noEmit", &output).unwrap();
         assert_eq!(
             parsed.parser, "tsc",
-            "a result from a parser this core does not know is not consulted"
+            "a vitest result is still not consulted"
         );
         assert_eq!(parsed.failed, 3);
 
@@ -2222,10 +1625,8 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             failed: 8,
             skipped: 0,
             suite_failures: 0,
-            phases: None,
             deferred: 0,
             report: None,
-            unverified: None,
             failures: (0..8)
                 .map(|i| CheckFailure {
                     name: format!("f{i}"),
@@ -2252,11 +1653,9 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             failed: 0,
             skipped: 0,
             suite_failures: 0,
-            phases: None,
             deferred: 0,
             report: None,
             failures: vec![],
-            unverified: None,
         };
         assert!(format_failure_names(&parsed).is_none());
     }
@@ -2282,7 +1681,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             !tail_chars(&output, 1_500).contains("error[E0425]"),
             "the plain tail loses the error, which is the defect"
         );
-        let excerpt = anchored_tail(&output, 1_500);
+        let excerpt = error_anchored_tail(&output, 1_500);
         assert!(excerpt.chars().count() <= 1_500, "{excerpt}");
         assert!(
             excerpt.starts_with(
@@ -2297,122 +1696,11 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
 
         // An untruncated output, a window that already holds the error, and an
         // output with no error are plain tails.
-        assert_eq!(anchored_tail(&output, 100_000), output);
+        assert_eq!(error_anchored_tail(&output, 100_000), output);
         let late = format!("{}error[E0308]: mismatched types\n", "noise\n".repeat(400));
-        assert_eq!(anchored_tail(&late, 300), tail_chars(&late, 300));
+        assert_eq!(error_anchored_tail(&late, 300), tail_chars(&late, 300));
         let quiet = "warning: unused\n".repeat(400);
-        assert_eq!(anchored_tail(&quiet, 300), tail_chars(&quiet, 300));
-    }
-
-    /// One TIMEOUT line per deferral, as nextest reprints them after a fast-tier
-    /// pass's Summary (specimen c505b3fe deferred 1,029).
-    fn timeout_lines(count: usize) -> String {
-        (0..count)
-            .map(|n| {
-                format!(
-                    "     TIMEOUT [   1.002s] ({n:>5}/13327) cairn-vcs jj::tests::deferred_{n}\n"
-                )
-            })
-            .collect()
-    }
-
-    /// Every rust-tests fast-tier row on the ledger lost nextest's Summary:
-    /// the global pass's deferral list fills the window behind it.
-    #[test]
-    fn a_deferral_heavy_tail_keeps_every_nextest_summary() {
-        let output = format!(
-            "ℹ️  fast tier, local pass (no budget): cargo nextest run -p cairn-core\n\nstderr:\n\
-             \x1b[1;32m     Summary\x1b[0m [  63.900s] 412 tests run: 412 passed, 0 skipped\n\
-             {}     Summary [   5.400s] 3 tests run: 3 passed, 0 skipped\n\
-             {}     Summary [ 312.004s] 9811 tests run: 8782 passed, 1029 timed out, 41 skipped\n\
-             {}error: test run failed\nerror: script \"test:rust:tiered\" exited with code 100\n\n\nExit code: 100",
-            "        PASS [   0.004s] crate::passes\n".repeat(200),
-            "        PASS [   0.004s] crate::passes\n".repeat(200),
-            timeout_lines(1_029),
-        );
-        assert!(
-            !tail_chars(&output, 4_000).contains("Summary"),
-            "the plain tail loses every Summary, which is the defect"
-        );
-        let excerpt = anchored_tail(&output, 4_000);
-        assert!(excerpt.chars().count() <= 4_000, "{excerpt}");
-        assert!(
-            excerpt.starts_with(
-                "\x1b[1;32m     Summary\x1b[0m [  63.900s] 412 tests run: 412 passed, 0 skipped\n…\n     Summary [   5.400s] 3 tests run"
-            ),
-            "{excerpt}"
-        );
-        assert!(
-            excerpt.contains("     Summary [ 312.004s] 9811 tests run: 8782 passed, 1029 timed out, 41 skipped\n…\n"),
-            "{excerpt}"
-        );
-        assert!(excerpt.ends_with("Exit code: 100"), "{excerpt}");
-
-        // A build error and a Summary both above the window lead in output order.
-        let both = format!(
-            "error[E0425]: cannot find value `x`\n   --> os/cairn-core/src/lib.rs:1:1\n{}     Summary [   1.000s] 1 test run: 1 passed\n{}",
-            "noise\n".repeat(400),
-            timeout_lines(100),
-        );
-        let excerpt = anchored_tail(&both, 2_000);
-        assert!(
-            excerpt.starts_with(
-                "error[E0425]: cannot find value `x`\n   --> os/cairn-core/src/lib.rs:1:1\n…\n     Summary [   1.000s] 1 test run: 1 passed\n…\n"
-            ),
-            "{excerpt}"
-        );
-        assert!(excerpt.chars().count() <= 2_000);
-    }
-
-    /// c47874ea's Summary sits inside the window already, behind a short
-    /// failure list, so its tail is the plain one.
-    #[test]
-    fn a_summary_inside_the_window_is_not_repeated() {
-        let output = format!(
-            "{}     Summary [ 144.635s] 13117 tests run: 13116 passed (2 slow), 1 failed, 46 skipped\n        FAIL [   2.148s] ( 4648/13117) cairn-core mcp::auth::tests::the_operator_credential_has_no_unexpected_exposure_sites\nerror: test run failed\nerror: script \"test:rust:full\" exited with code 100\n\n\nExit code: 100",
-            "        PASS [   0.081s] (13090/13117) cairn-workflow transitions::outcome::tests::idle\n".repeat(300),
-        );
-        assert_eq!(anchored_tail(&output, 4_000), tail_chars(&output, 4_000));
-    }
-
-    #[test]
-    fn lane_phases_parse_from_the_result_file_and_implausible_ones_are_dropped() {
-        let with = |phases: &str| {
-            format!(
-                r#"{RESULT_ARTIFACT_JSON_MARKER}{{"schemaVersion":1,"parser":"nextest","complete":true,"selection":"full","undeclaredSkips":0,"tests":[],"phases":{phases}}}"#
-            )
-        };
-        let phases = r#"{"origin":"executor","setupMs":12000,"compileMs":408000,"testMs":149735,"doctestMs":0,"publishMs":1479,"compiledUnits":1,"passes":[{"name":"full","wallMs":557735,"compileMs":408000,"testMs":149735,"compiledUnits":1,"summaryMs":144635}]}"#;
-        let parsed = parse_check_output("bun run test:rust:full", &with(phases)).unwrap();
-        let measured = parsed
-            .phases
-            .as_ref()
-            .expect("the runner's phases are kept");
-        assert_eq!(
-            (
-                measured.setup_ms,
-                measured.compile_ms,
-                measured.test_ms,
-                measured.publish_ms
-            ),
-            (12_000, 408_000, 149_735, 1_479)
-        );
-        assert_eq!(measured.passes[0].summary_ms, Some(144_635));
-        // They ride into the stored result and back.
-        let stored = serde_json::to_string(&parsed).unwrap();
-        let back: ParsedCheckResult = serde_json::from_str(&stored).unwrap();
-        assert_eq!(back.phases, parsed.phases);
-
-        for bad in [
-            r#"{"origin":"guess","setupMs":1,"compileMs":1,"testMs":1,"publishMs":1}"#,
-            r#"{"origin":"process","setupMs":-1,"compileMs":1,"testMs":1,"publishMs":1}"#,
-            r#"{"origin":"process","setupMs":18446744073709551615,"compileMs":1,"testMs":1,"publishMs":1}"#,
-            r#""twelve minutes""#,
-        ] {
-            let parsed = parse_check_output("bun run test:rust", &with(bad)).unwrap();
-            assert_eq!(parsed.phases, None, "{bad}");
-            assert!(parsed.complete, "the rest of the result still parses");
-        }
+        assert_eq!(error_anchored_tail(&quiet, 300), tail_chars(&quiet, 300));
     }
 
     #[test]
@@ -2429,14 +1717,12 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             failed: 1,
             skipped: 0,
             suite_failures: 0,
-            phases: None,
             deferred: 0,
             report: None,
             failures: vec![CheckFailure {
                 name: "suite test".to_string(),
                 message: Some("AssertionError: boom".to_string()),
             }],
-            unverified: None,
         };
         let e = format_failure_excerpt(Some(&with_msgs), "RAW TAIL");
         assert_eq!(e, "suite test: AssertionError: boom");
@@ -2453,14 +1739,12 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             failed: 1,
             skipped: 0,
             suite_failures: 0,
-            phases: None,
             deferred: 0,
             report: None,
             failures: vec![CheckFailure {
                 name: "crate test::x".to_string(),
                 message: None,
             }],
-            unverified: None,
         };
         assert_eq!(
             format_failure_excerpt(Some(&no_msgs), "panic at src/lib.rs"),
@@ -2472,240 +1756,6 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             format_failure_excerpt(None, "exit 101 tail"),
             "exit 101 tail"
         );
-    }
-
-    // `bun run test:api` as the executor composes it: bun writes its whole
-    // report to stderr. Rows, a recap that repeats the skip without its file,
-    // then the tallies and the `Ran` line.
-    const BUN_PASS_FIXTURE: &str = "\
-stderr:
-$ cd api && bun test --isolate
-bun test v1.3.13 (bf2e2cec)
-
-src/routes/sync.test.ts:
-{\"msg\":\"sync-enable seed failed\",\"teamId\":\"org1\",\"error\":\"Error: db down\"}
-(pass) POST /sync-enable > seed failure (DB error) → 500 [1.00ms]
-(pass) POST /object-grants > non-member is denied before minting [1.00ms]
-(skip) teams sync broker ↔ real tursodb (/v2/pipeline) > serves a read-only SELECT
-
-src/routes/relay-query.test.ts:
-(pass) relay payload byte measurement compiles for PostgreSQL [84.00ms]
-
-1 tests skipped:
-(skip) teams sync broker ↔ real tursodb (/v2/pipeline) > serves a read-only SELECT
-
- 3 pass
- 1 skip
- 0 fail
- 9 expect() calls
-Ran 4 tests across 2 files. [6.53s]
-";
-
-    // A red: the failing test's error precedes its row, an error thrown between
-    // tests is tallied as `errors`, and the failed recap repeats the row.
-    const BUN_RED_FIXTURE: &str = "\
-stderr:
-src/auth.test.ts:
-(pass) bearer > accepts its own token [0.20ms]
-1 | test(\"refuses another token\", () => {
-2 |   expect(verify(other)).toBe(false);
-                            ^
-error: expect(received).toBe(expected)
-
-Expected: false
-Received: true
-
-      at <anonymous> (/slot/api/src/auth.test.ts:2:25)
-(fail) bearer > refuses another token [0.48ms]
-
-# Unhandled error between tests
--------------------------------
-error: socket closed
--------------------------------
-
-
-1 tests failed:
-(fail) bearer > refuses another token [0.48ms]
-
- 1 pass
- 1 fail
- 1 error
- 3 expect() calls
-Ran 2 tests across 1 file. [1.20s]
-error: script \"test:api\" exited with code 1
-
-Exit code: 1";
-
-    #[test]
-    fn a_bun_test_run_is_a_complete_per_test_enumeration() {
-        let parsed = parse_check_output("bun run test:api", BUN_PASS_FIXTURE).unwrap();
-        assert_eq!(parsed.parser, BUN_TEST_PARSER);
-        assert!(parsed.is_test_runner());
-        assert!(parsed.complete, "every tallied test has its row");
-        assert_eq!((parsed.passed, parsed.failed, parsed.skipped), (3, 0, 1));
-        assert_eq!(parsed.suite_failures, 0);
-        let ids: Vec<&str> = parsed.tests.iter().map(|test| test.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            [
-                "src/routes/sync.test.ts > POST /sync-enable > seed failure (DB error) → 500",
-                "src/routes/sync.test.ts > POST /object-grants > non-member is denied before minting",
-                "src/routes/sync.test.ts > teams sync broker ↔ real tursodb (/v2/pipeline) > serves a read-only SELECT",
-                "src/routes/relay-query.test.ts > relay payload byte measurement compiles for PostgreSQL",
-            ],
-            "the recap's file-less repeat is not a second row"
-        );
-        assert_eq!(parsed.tests[3].duration_ms, Some(84));
-        assert_eq!(
-            crate::execution::checks_status::verdict_evidence(true, Some(&parsed)),
-            crate::execution::checks_status::VerdictEvidence::Verified
-        );
-        // The command names `bun test` itself: the same parse.
-        assert_eq!(
-            parse_check_output("cd api && bun test --isolate", BUN_PASS_FIXTURE),
-            Some(parsed)
-        );
-    }
-
-    #[test]
-    fn a_red_bun_run_names_its_failure_with_the_error_above_it() {
-        let parsed = parse_check_output("bun run test:api", BUN_RED_FIXTURE).unwrap();
-        assert!(parsed.complete);
-        assert_eq!((parsed.passed, parsed.failed, parsed.skipped), (1, 1, 0));
-        assert_eq!(parsed.suite_failures, 1, "an error between tests");
-        assert_eq!(
-            parsed.failures,
-            vec![CheckFailure {
-                name: "src/auth.test.ts > bearer > refuses another token".to_string(),
-                message: Some("expect(received).toBe(expected)".to_string()),
-            }]
-        );
-        assert_eq!(
-            parsed.tests[1].failure_message.as_deref(),
-            Some("expect(received).toBe(expected)")
-        );
-    }
-
-    /// The stored tail of ledger observation 948e2911 (an `api` red): the
-    /// tallies survived the capture but most rows did not, so the counts are
-    /// read and the enumeration is not claimed.
-    #[test]
-    fn a_bun_tail_that_lost_its_rows_keeps_the_counts_but_not_completeness() {
-        let tail = "rejects when membership is revoked [0.28ms]
-(pass) POST /refresh > rejects missing Authorization header [0.07ms]
-(pass) DELETE /device/:deviceId > deletes device and returns deactivated id [0.14ms]
-
-17 tests skipped:
-(skip) teams sync broker ↔ real tursodb (/v2/pipeline) > serves an arbitrary read-only SELECT through the broker
-(skip) approval state machine on migrated PostgreSQL > concurrent claims consume one approval exactly once
-
-
-8 tests failed:
-(fail) bearer > refuses another token [0.48ms]
-
- 575 pass
- 17 skip
- 8 fail
- 10 errors
- 1326 expect() calls
-Ran 600 tests across 58 files. [5.72s]
-error: script \"test:api\" exited with code 1
-
-
-Exit code: 1";
-        let parsed = parse_check_output("bun run test:api", tail).unwrap();
-        assert_eq!(parsed.parser, BUN_TEST_PARSER);
-        assert_eq!((parsed.passed, parsed.failed, parsed.skipped), (575, 8, 17));
-        assert_eq!(parsed.suite_failures, 10);
-        assert!(!parsed.complete);
-        assert!(parsed.tests.is_empty(), "no partial enumeration is stored");
-    }
-
-    #[test]
-    fn output_without_a_runner_summary_is_still_unparsed() {
-        assert!(parse_check_output("bun run check:dead", "no dead code\n").is_none());
-        assert!(parse_check_output("bun run test:api", " 3 pass\n 0 fail\n").is_none());
-    }
-
-    #[test]
-    fn a_vitest_result_file_is_a_per_test_result_for_any_command() {
-        let json = r#"{"schemaVersion":1,"parser":"vitest","complete":true,"selection":"filtered","undeclaredSkips":0,"tests":[{"id":"src/a.test.ts > a > works","status":"passed","durationMs":3,"attempts":1,"retried":false,"flaky":false},{"id":"src/a.test.ts > a > breaks","status":"failed","attempts":1,"retried":false,"flaky":false,"failureMessage":"AssertionError: expected 1 to be 2\n    at a.test.ts:4"}]}"#;
-        let output = format!("ok\n\nstderr:\nnoise\n{}", result_line(json));
-        let parsed = parse_check_output("bun run test:frontend:scoped", &output).unwrap();
-        assert_eq!(parsed.parser, "vitest");
-        assert!(parsed.complete);
-        assert_eq!(parsed.selection, "filtered");
-        assert_eq!((parsed.passed, parsed.failed), (1, 1));
-        assert_eq!(
-            parsed.failures,
-            vec![CheckFailure {
-                name: "src/a.test.ts > a > breaks".to_string(),
-                message: Some("AssertionError: expected 1 to be 2".to_string()),
-            }]
-        );
-    }
-
-    // Two vitest processes' verbose reports, as a sharded run prints them.
-    const VITEST_VERBOSE_FIXTURE: &str = "\
- RUN  v4.0.17 /slot
-
- ✓ scripts/lib/a.test.ts > scan > reads an uncolored FAIL line 0ms
- × scripts/lib/a.test.ts > scan > breaks 2ms
-   → expected 1 to be 2
- ↓ scripts/lib/a.test.ts > scan > later
-
- Test Files  1 failed (1)
-      Tests  1 failed | 1 passed | 1 skipped (3)
-   Start at  14:20:34
-   Duration  569ms (transform 35ms, setup 167ms)
-
- ✓ src/b.test.ts > b > works 1ms
-
- Test Files  1 passed (1)
-      Tests  1 passed (1)
-";
-
-    #[test]
-    fn a_verbose_vitest_report_without_json_is_a_complete_enumeration() {
-        let parsed = parse_check_output("bunx vitest run", VITEST_VERBOSE_FIXTURE).unwrap();
-        assert_eq!(parsed.parser, "vitest");
-        assert!(parsed.complete);
-        assert_eq!((parsed.passed, parsed.failed, parsed.skipped), (2, 1, 1));
-        assert_eq!(parsed.tests.len(), 4);
-        assert_eq!(
-            parsed.failures,
-            vec![CheckFailure {
-                name: "scripts/lib/a.test.ts > scan > breaks".to_string(),
-                message: Some("expected 1 to be 2".to_string()),
-            }]
-        );
-        // A package script that runs vitest is read from the same summary.
-        assert_eq!(
-            parse_check_output("npm test", VITEST_VERBOSE_FIXTURE),
-            Some(parsed)
-        );
-    }
-
-    #[test]
-    fn the_default_vitest_reporter_yields_counts_but_no_enumeration() {
-        let output = " ✓ src/b.test.ts (11 tests) 5ms\n\n Test Files  1 passed (1)\n      Tests  11 passed (11)\n";
-        let parsed = parse_check_output("bunx vitest run", output).unwrap();
-        assert_eq!(parsed.passed, 11);
-        assert!(!parsed.complete, "a per-file line is not a test row");
-        assert!(parsed.tests.is_empty());
-    }
-
-    #[test]
-    fn every_test_runner_parser_is_one_list() {
-        for parser in ["nextest", "vitest", BUN_TEST_PARSER] {
-            assert!(is_test_runner_parser(parser), "{parser}");
-        }
-        for parser in ["tsc", RUST_LINT_PARSER, "jest"] {
-            assert!(!is_test_runner_parser(parser), "{parser}");
-        }
-        assert!(is_test_runner_command("cd api && bun test"));
-        assert!(is_test_runner_command("bun run test:rust"));
-        assert!(!is_test_runner_command("bunx tsc --noEmit"));
     }
 
     #[test]

@@ -67,24 +67,9 @@ fn proposal(
             build_failure(
                 index,
                 item,
-                "payload.statement must be a string: one sentence of how the project does things, for the operator to answer yes or no",
+                "payload.statement must be a string: how the project does things, for the operator to answer yes or no",
             )
         })?;
-    let rationale = match payload.get("rationale") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(value) => Some(
-            value
-                .as_str()
-                .ok_or_else(|| {
-                    build_failure(
-                        index,
-                        item,
-                        "payload.rationale must be a string: why, the alternatives ruled out, and the canonical URIs where it was argued",
-                    )
-                })?
-                .to_string(),
-        ),
-    };
     let supersedes = match payload.get("supersedes") {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => Some(value.as_i64().filter(|number| *number > 0).ok_or_else(|| {
@@ -93,7 +78,6 @@ fn proposal(
     };
     Ok(Proposal {
         statement: statement.to_string(),
-        rationale,
         supersedes,
         origin: TenetOrigin::Standing,
     })
@@ -169,7 +153,6 @@ pub(super) async fn dispatch(
     item: &ChangeItem,
     dry_run: bool,
     resource: &CairnResource,
-    applied_data: &mut Option<serde_json::Value>,
 ) -> ResourceMutationResult<Option<String>> {
     let summary = match (resource, item.mode) {
         (CairnResource::ProjectTenets { project }, ChangeMode::Append) => {
@@ -188,10 +171,9 @@ pub(super) async fn dispatch(
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-                let uri = crate::tenets::tenet_uri(project, tenet.number);
-                *applied_data = Some(serde_json::json!({ "tenet": uri }));
                 format!(
-                    "Proposed tenet {uri}: it awaits the operator's verdict. A pending proposal blocks only what it gates."
+                    "Proposed tenet {}: it awaits the operator's verdict. A pending proposal blocks only what it gates.",
+                    crate::tenets::tenet_uri(project, tenet.number)
                 )
             }
         }

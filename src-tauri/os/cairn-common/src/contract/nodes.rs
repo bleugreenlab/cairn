@@ -257,9 +257,11 @@ pub(crate) const NODE_REBASE_CONTRACT: ResourceContract = ResourceContract {
             REBASE_FINGERPRINT,
             REBASE_RESOLUTION,
             REBASE_DROP_INCOMING_REASON,
+            CONTENDED_IDENTIFIER,
+            DISCHARGE_REASON,
             REBASE_FAST_FORWARD_BRANCH,
         ],
-        label: "replay this branch, or take origin's fast-forward of it or its base",
+        label: "replay this branch, take origin's fast-forward of it or its base, or discharge an incorrect identifier obligation",
         example: "write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"replay\",resolution:\"take-committed-tip\"}}]})",
     }],
 };

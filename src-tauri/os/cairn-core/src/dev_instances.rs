@@ -1241,7 +1241,16 @@ pub async fn run_launch_session(
         }
     });
 
-    let args = runtime_args(&resolution.selector, &request);
+    let mut args = vec![
+        RUNTIME_ENTRYPOINT.into(),
+        "--branch".into(),
+        resolution.selector.clone(),
+        "--seed".into(),
+        request.seed.clone(),
+    ];
+    if request.force_copy {
+        args.push("--force-copy".into());
+    }
     let _ = events.send(DevInstanceLaunchEvent::Starting);
     let started = orch
         .fleet
@@ -1398,28 +1407,6 @@ pub async fn run_launch_session(
             DevInstanceLaunchFailure::ReleaseFailure { diagnostic },
         ),
     }
-}
-
-/// The runtime command line for a launch. Caller overrides travel as arguments
-/// rather than in the process environment: the runtime must apply them after it
-/// computes the instance environment, and refuse the ones it owns, and it can
-/// only do either if it can tell them apart from what it inherited.
-fn runtime_args(selector: &str, request: &DevInstanceLaunchRequest) -> Vec<String> {
-    let mut args = vec![
-        RUNTIME_ENTRYPOINT.into(),
-        "--branch".into(),
-        selector.to_string(),
-        "--seed".into(),
-        request.seed.clone(),
-    ];
-    if request.force_copy {
-        args.push("--force-copy".into());
-    }
-    for (name, value) in &request.env {
-        args.push("--env".into());
-        args.push(format!("{name}={value}"));
-    }
-    args
 }
 
 async fn wait_for_stopped_process(
@@ -1708,39 +1695,7 @@ mod tests {
             source_terminal_session_id: None,
             seed: "empty".into(),
             force_copy: false,
-            env: Default::default(),
         }
-    }
-
-    #[test]
-    fn caller_overrides_reach_the_runtime_command_line() {
-        let mut request = launch(Some("feature/drill"));
-        assert_eq!(
-            runtime_args("feature/drill", &request),
-            [
-                RUNTIME_ENTRYPOINT,
-                "--branch",
-                "feature/drill",
-                "--seed",
-                "empty"
-            ],
-            "a launch without overrides keeps its command line"
-        );
-        request.force_copy = true;
-        request.env = std::collections::BTreeMap::from([
-            ("CAIRN_API_URL".into(), "http://10.255.255.1:1".into()),
-            ("RUST_LOG".into(), "cairn=debug,a=b".into()),
-        ]);
-        assert_eq!(
-            runtime_args("feature/drill", &request)[5..],
-            [
-                "--force-copy",
-                "--env",
-                "CAIRN_API_URL=http://10.255.255.1:1",
-                "--env",
-                "RUST_LOG=cairn=debug,a=b"
-            ]
-        );
     }
 
     fn resolution(selector: &str) -> DevInstanceResolution {

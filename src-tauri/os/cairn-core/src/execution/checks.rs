@@ -4976,7 +4976,7 @@ impl From<String> for CheckExecutionFailure {
     }
 }
 use crate::execution::check_parsers::{
-    anchored_tail, extract_running_tests, format_failure_excerpt, format_failure_names,
+    error_anchored_tail, extract_running_tests, format_failure_excerpt, format_failure_names,
     parse_check_output, ParsedCheckResult, MAX_FAILURE_NAMES, RESULT_ARTIFACT_JSON_MARKER,
     RUST_LINT_PARSER,
 };
@@ -5499,7 +5499,7 @@ fn termination_signal(exit_code: i32) -> Option<&'static str> {
 /// Compose the `output_tail` a check row stores, within [`OUTPUT_TAIL_CHARS`]:
 /// the classification and its evidence (when the death was classified), then
 /// the check's own `report` (when its result file carried one), then as much of
-/// the output's tail as still fits. The tail is [`anchored_tail`], so a
+/// the output's tail as still fits. The tail is [`error_anchored_tail`], so a
 /// build error printed above a long run of warnings survives the cut.
 ///
 /// The report has to lead because the tail cannot be trusted to hold it. A
@@ -5519,7 +5519,7 @@ fn classified_output_excerpt(
         .and_then(|result| result.report.as_deref())
         .filter(|report| !report.trim().is_empty());
     if classification.is_none() && report.is_none() {
-        return anchored_tail(&chatter, OUTPUT_TAIL_CHARS);
+        return error_anchored_tail(&chatter, OUTPUT_TAIL_CHARS);
     }
     let mut prefix = String::new();
     if let Some(classification) = classification {
@@ -5544,7 +5544,7 @@ fn classified_output_excerpt(
     }
     prefix.push_str("\n\nFinal output:\n");
     let remaining = OUTPUT_TAIL_CHARS.saturating_sub(prefix.chars().count());
-    prefix.push_str(&anchored_tail(&chatter, remaining));
+    prefix.push_str(&error_anchored_tail(&chatter, remaining));
     prefix.chars().take(OUTPUT_TAIL_CHARS).collect()
 }
 
@@ -7570,15 +7570,12 @@ fn check_reuse_decision(
     if failure_kind.is_some() {
         return reject("check ended with an infrastructure or process failure");
     }
-    // Never served again, even on a host whose environment fingerprint still
-    // matches: an executor stamps its toolchain identity once per process, so a
-    // host whose Bun was replaced under it would otherwise keep reusing the
-    // disowned green instead of running on the runtime it now has.
-    if parsed.is_some_and(|parsed| parsed.unverified.is_some()) {
-        return reject("the run declared its own result unverified");
-    }
+    let configured_test_runner = command.contains("test:rust")
+        || command.contains("cargo test")
+        || command.contains("nextest")
+        || command.contains("vitest");
     let Some(parsed) = parsed else {
-        return if crate::execution::check_parsers::is_test_runner_command(command) {
+        return if configured_test_runner {
             reject("test runner did not produce a structured result")
         } else {
             CheckReuseDecision {
@@ -7846,13 +7843,6 @@ fn fresh_observation_write(
         target_results_json: parsed.and_then(|result| serde_json::to_string(result).ok()),
         selection: parsed.map(|result| result.selection.clone()),
         deferred_count: parsed.map(|result| result.deferred as i64).unwrap_or(0),
-        phases: parsed.and_then(|result| result.phases.clone()),
-        execution_warmth: provenance
-            .and_then(|meta| meta.warmth)
-            .map(|warmth| warmth.as_str().to_string()),
-        cell_origin: provenance
-            .and_then(|meta| meta.cell_origin.as_ref())
-            .map(crate::execution::cache::ObservedCellOrigin::from_executor),
         tests,
         infra_reset_scopes,
     }
@@ -9300,13 +9290,8 @@ pub(crate) fn format_check_summary(results: &[CheckOutcome]) -> String {
                 '\u{26a0}'
             } else if !o.passed {
                 '\u{2717}'
-            } else if o
-                .parsed
-                .as_ref()
-                .is_some_and(|p| p.is_incomplete_lint() || p.unverified.is_some())
-            {
-                // An exit zero that measured nothing, or that its own run
-                // disowned, is not a green.
+            } else if o.parsed.as_ref().is_some_and(|p| p.is_incomplete_lint()) {
+                // An exit zero that measured nothing is not a green.
                 '\u{26a0}'
             } else {
                 '\u{2713}'
@@ -9361,12 +9346,7 @@ fn summary_annotation(o: &CheckOutcome) -> Option<String> {
     }
     let test_parse = o.parsed.as_ref().filter(|p| p.is_test_runner());
     let mut parts: Vec<String> = Vec::new();
-    let declared = o.parsed.as_ref().and_then(|p| p.unverified.as_deref());
-    if let (true, Some(reason)) = (o.passed, declared) {
-        // Same wording as `/checks`: the run's own reason, never a count that
-        // would read as the green it disowned.
-        parts.push(format!("unverified \u{2014} {reason}"));
-    } else if o.passed {
+    if o.passed {
         match test_parse {
             // A fast-tier green names its population instead of a bare count.
             Some(p) if p.is_fast_tier() && p.tests_run() > 0 => parts.extend(p.fast_tier_label()),
@@ -13498,27 +13478,6 @@ cairn-common = { path = "../cairn-common" }
         }
     }
 
-    #[test]
-    fn an_off_pin_green_reads_unverified_inline_and_is_never_reused() {
-        let output = "Ran 716 tests across 56 files.\nCAIRN_CHECK_RESULT_JSON={\"schemaVersion\":1,\"parser\":\"bun-test\",\"unverified\":\"runtime bun 1.3.13 ≠ pinned 1.4.4\"}\n";
-        let mut off_pin = outcome("api", true, Some(0));
-        off_pin.parsed =
-            crate::execution::check_parsers::parse_check_output("bun run test:api", output);
-        assert_eq!(
-            summary_annotation(&off_pin).as_deref(),
-            Some("unverified — runtime bun 1.3.13 ≠ pinned 1.4.4")
-        );
-        let summary = format_check_summary(std::slice::from_ref(&off_pin));
-        assert!(summary.starts_with("⚠ api (unverified"), "{summary}");
-        assert!(!check_reuse_decision("bun run test:api", None, off_pin.parsed.as_ref()).reusable);
-
-        // On the pinned runtime the lane declares nothing: the exit code stands.
-        let pinned = outcome("api", true, Some(0));
-        let summary = format_check_summary(std::slice::from_ref(&pinned));
-        assert!(summary.starts_with("✓ api"), "{summary}");
-        assert!(check_reuse_decision("bun run test:api", None, None).reusable);
-    }
-
     /// A test-runner parse with explicit pass/fail counts, so the summary's
     /// count-bearing annotations are exercised without a real runner.
     fn runner_parse(parser: &str, passed: usize, failed: usize) -> ParsedCheckResult {
@@ -13533,10 +13492,8 @@ cairn-common = { path = "../cairn-common" }
             failed,
             skipped: 0,
             suite_failures: 0,
-            phases: None,
             deferred: 0,
             report: None,
-            unverified: None,
             failures: (0..failed)
                 .map(|i| crate::execution::check_parsers::CheckFailure {
                     name: format!("t{i}"),
@@ -16581,9 +16538,6 @@ cairn-common = { path = "../cairn-common" }
             infra_reset_scopes: Vec::new(),
             selection: None,
             deferred_count: 0,
-            phases: None,
-            execution_warmth: None,
-            cell_origin: None,
             project_id: "project-a".to_string(),
             commit_sha: "commit-source".to_string(),
             defined_by_commit_sha: "commit-source".to_string(),
@@ -19554,11 +19508,9 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             failed,
             skipped: 0,
             suite_failures: 0,
-            phases: None,
             deferred: 0,
             report: None,
             failures: Vec::new(),
-            unverified: None,
         }
     }
 
@@ -20307,12 +20259,10 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             passed: 1,
             failed: 0,
             suite_failures: 0,
-            phases: None,
             deferred: 0,
             report: None,
             skipped: 0,
             failures: Vec::new(),
-            unverified: None,
         }
     }
 
@@ -20552,12 +20502,8 @@ mod manual_transport_tests {
         git_stdout(repo, &["rev-parse", "HEAD"])
     }
 
-    /// A protocol source at `version`, in the shape the ledger derives it from:
-    /// a heading for the version above the constant that reads it.
     fn protocol(version: u32) -> String {
-        format!(
-            "/// Version {version} changes the test wire.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = {version};\n"
-        )
+        format!("pub const EXECUTOR_PROTOCOL_VERSION: u32 = {version};\n")
     }
 
     fn value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {

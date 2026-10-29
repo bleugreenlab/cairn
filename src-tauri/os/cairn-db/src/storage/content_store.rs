@@ -22,7 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-use crate::storage::local_db::{ConnectionGate, DbHandle, Holder, HolderKind, TrackedConnection};
+use crate::storage::local_db::{ConnectionGate, DbHandle, TrackedConnection};
 use crate::storage::LocalDb;
 use crate::storage::TeamId;
 use crate::turso::Value;
@@ -79,15 +79,7 @@ impl PrivateContentStore {
     /// MVCC transaction like any other, so it registers with the
     /// [`ConnectionGate`] exactly as a pooled connection does.
     async fn connect(&self) -> Result<TrackedConnection, String> {
-        // Not the caller: an `#[async_trait]` method cannot be
-        // `#[track_caller]`, so every content-store connection is recorded at
-        // this line. That still names the content store, and the statement
-        // label each `query`/`execute` records says which operation it is.
-        let caller = std::panic::Location::caller();
-        let slot = self
-            .gate
-            .admit(caller, HolderKind::Connect, Holder::new(caller, None))
-            .await;
+        let slot = self.gate.admit("content-store").await;
         let conn = match self.database.as_ref() {
             DbHandle::Local(db) => db.connect().map_err(|error| error.to_string())?,
             DbHandle::Synced(db) => db.connect().await.map_err(|error| error.to_string())?,

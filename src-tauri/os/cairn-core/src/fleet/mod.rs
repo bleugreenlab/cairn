@@ -1306,12 +1306,6 @@ pub struct Fleet {
     /// request to read them from: whether a job's home can still prepare its
     /// project, and what the executors page shows.
     known_project_requirements: Arc<Mutex<HashMap<String, ProjectPlacementRequirements>>>,
-    /// Projects whose most recent preparation populates cells from the
-    /// runner's live checkout, which binds their cells to the colocated
-    /// executor. Learned where `known_project_requirements` is, for the same
-    /// synchronous reason: route resolution has to know whether an environment
-    /// could be acquired anywhere else before it gives one up.
-    colocated_population_projects: Arc<Mutex<HashSet<String>>>,
     residency_routes: Arc<Mutex<HashMap<(String, String), ResidencyRoute>>>,
     residency_route_path: Arc<Option<PathBuf>>,
     residency_route_store_error: Arc<Mutex<Option<String>>>,
@@ -1760,11 +1754,6 @@ pub(crate) enum EvictionCause {
     /// batch pinned there would fail before running. `detail` is the
     /// placement rejection that says why.
     CannotPrepareProject { project_id: String, detail: String },
-    /// An operator drained the machine holding it, and nothing live held it
-    /// there: no terminal, no REPL, no batch in flight. A job's next batch is
-    /// new work, which a drain refuses, so the idle environment is released
-    /// and acquired on a machine that is not draining.
-    Drained,
 }
 
 /// Whether the machine a residency route names is answering.
@@ -1878,162 +1867,6 @@ fn resident_process_label(kind: &cairn_common::executor_protocol::ResidentProces
         ResidentProcessKind::Service { .. } => "a service process".into(),
         ResidentProcessKind::DevInstance { .. } => "a dev instance".into(),
         ResidentProcessKind::WorkflowRuntime { workflow } => format!("workflow `{workflow}`"),
-    }
-}
-
-/// The live work holding one cell on its machine, named the way an agent
-/// addresses it: its live resident processes, and a run batch in flight (a
-/// prior epoch's batch still draining counts as one). Empty means nothing binds
-/// the environment to the machine it is on.
-fn cell_live_work(occupancy: &cairn_common::executor_protocol::CellOccupancy) -> Vec<String> {
-    let mut held: Vec<String> = occupancy
-        .live_processes()
-        .map(|(_, process)| resident_process_label(&process.kind))
-        .collect();
-    if occupancy.command.is_some() || occupancy.draining.is_some() {
-        held.push("a run batch in flight".into());
-    }
-    held
-}
-
-/// The live work holding an owner's environment on one machine, as that
-/// machine last reported it.
-fn environment_live_work(entry: &ExecutorConnectionState, holder: &ResidencyHolder) -> Vec<String> {
-    entry
-        .snapshot
-        .cells
-        .iter()
-        .filter(|cell| {
-            cell.residency
-                .as_ref()
-                .is_some_and(|residency| residency.holder == *holder)
-        })
-        .flat_map(|cell| cell_live_work(&cell.occupancy))
-        .collect()
-}
-
-/// What a drain leaves on a machine: the execution environments resident
-/// there, and which of them live work holds in place.
-///
-/// A drain refuses new work, and a job's next batch is new work even when the
-/// job's environment is already on the machine. Only what is live inside an
-/// environment (a terminal, a REPL, a batch in flight) is the resident work a
-/// drain leaves alone. So an idle environment is released at its job's next
-/// batch and acquired elsewhere, and a held one stays until its work stops.
-/// These counts say how far from empty a drained machine is, and why.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DrainResidents {
-    /// Execution environments resident on the machine.
-    pub environments: usize,
-    /// The environments live work holds there, by owner.
-    pub held: Vec<HeldEnvironment>,
-}
-
-/// One environment a drained machine keeps because live work holds it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HeldEnvironment {
-    /// The owner, as the executors page names it (`job ...`).
-    pub owner: String,
-    /// What holds it, the way an agent addresses it (``terminal `dev` ``).
-    pub held_by: Vec<String>,
-}
-
-impl DrainResidents {
-    /// Count what one machine's snapshot reports.
-    pub fn of(snapshot: &FleetSnapshot) -> Self {
-        let mut residents = Self::default();
-        for cell in &snapshot.cells {
-            let Some(residency) = cell.residency.as_ref() else {
-                continue;
-            };
-            residents.environments += 1;
-            let held_by = cell_live_work(&cell.occupancy);
-            if !held_by.is_empty() {
-                residents.held.push(HeldEnvironment {
-                    owner: describe_holder(&residency.holder),
-                    held_by,
-                });
-            }
-        }
-        // Prose an agent reads; the snapshot's cell order means nothing.
-        residents.held.sort_by(|a, b| a.owner.cmp(&b.owner));
-        residents
-    }
-
-    /// `refusing new work; N resident environments, M held by live processes`.
-    pub fn headline(&self) -> String {
-        format!(
-            "refusing new work; {} resident environment{}, {} held by live processes",
-            self.environments,
-            if self.environments == 1 { "" } else { "s" },
-            self.held.len()
-        )
-    }
-
-    /// Who holds what: ``job a, by terminal `dev`; job b, by a run batch in flight``.
-    pub fn holders(&self) -> String {
-        self.held
-            .iter()
-            .map(|held| format!("{}, by {}", held.owner, held.held_by.join(", ")))
-            .collect::<Vec<_>>()
-            .join("; ")
-    }
-
-    /// What a drain write keeps, in one or two sentences.
-    pub fn account(&self) -> String {
-        if self.environments == 0 {
-            return "Nothing is resident there.".into();
-        }
-        let idle = self.environments.saturating_sub(self.held.len());
-        let mut text = format!(
-            "It keeps {} resident environment{}, {} held by live processes",
-            self.environments,
-            if self.environments == 1 { "" } else { "s" },
-            self.held.len()
-        );
-        if !self.held.is_empty() {
-            text.push_str(&format!(
-                " and left alone until that work stops ({})",
-                self.holders()
-            ));
-        }
-        match idle {
-            0 => {}
-            1 => text.push_str("; the idle one is released at its job's next batch and acquired on a machine that is not draining"),
-            _ => text.push_str("; each idle one is released at its job's next batch and acquired on a machine that is not draining"),
-        }
-        text.push('.');
-        text
-    }
-}
-
-/// A job's environment that stays on a drained machine, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DrainedHome {
-    /// The drained machine, by public name.
-    pub(crate) machine: String,
-    /// The live work holding the environment there. Empty when nothing live
-    /// holds it and it stays only because no other machine can take it.
-    pub(crate) held_by: Vec<String>,
-}
-
-impl DrainedHome {
-    /// The sentence a batch placed there carries, beside its "Ran on" line.
-    pub(crate) fn sentence(&self) -> String {
-        match self.held_by.as_slice() {
-            [] => format!(
-                "**{}** is draining, and this batch was placed there because no other machine can take this job's environment.",
-                self.machine
-            ),
-            held => format!(
-                "**{}** is draining, and this batch was placed there because {} {} this job's environment there. Once nothing live holds it, the next batch moves to a machine that is not draining.",
-                self.machine,
-                held.join(", "),
-                if held.len() == 1 { "holds" } else { "hold" }
-            ),
-        }
     }
 }
 
@@ -3125,7 +2958,6 @@ fn home_cannot_hold(
         reason: PlacementRejectionReason::ExceedsMemoryCeiling {
             estimate_bytes: ceiling.estimate_bytes,
             ceiling_bytes: ceiling.ceiling_bytes,
-            killed_here: ceiling.killed_here,
         },
     }];
     rejected.extend(survey.rejected.iter().cloned());
@@ -3170,7 +3002,6 @@ fn above_memory_ceiling(
             rejection.reason = PlacementRejectionReason::ExceedsMemoryCeiling {
                 estimate_bytes: other.estimate_bytes,
                 ceiling_bytes: other.ceiling_bytes,
-                killed_here: other.killed_here,
             };
         }
     }
@@ -7702,12 +7533,6 @@ impl Fleet {
         }
     }
 
-    /// When this runner began shutting down, if it has. Work that ends after
-    /// this instant was ended by the stop, whatever shape its ending took.
-    pub(crate) fn runner_stopping_since(&self) -> Option<u64> {
-        self.runner_stop.at()
-    }
-
     /// Whether `key` owes anything right now.
     pub(crate) fn purpose_owes(&self, key: &purpose::PurposeKey) -> bool {
         self.purposes.lock().unwrap().pending_retirements(key) > 0
@@ -8298,21 +8123,6 @@ impl Fleet {
                 executor_id: selected.executor_id.clone(),
                 pending: true,
             };
-            let moved_off_drain = self
-                .environment_evictions
-                .lock()
-                .unwrap()
-                .get(&acquisition.holder.storage_key())
-                .filter(|eviction| eviction.cause == EvictionCause::Drained)
-                .map(|eviction| eviction.executor.clone());
-            if let Some(from) = moved_off_drain {
-                tracing::info!(
-                    holder = %acquisition.holder,
-                    %from,
-                    to = %self.executor_name_for_text(&selected.executor_id),
-                    "an idle execution environment left a drained machine and is acquired on another"
-                );
-            }
             let correlation_id = uuid::Uuid::new_v4().to_string();
             let mut dispatch = ResidencyDispatchGuard {
                 pool: self.clone(),
@@ -9351,22 +9161,7 @@ impl Fleet {
         if let Some(reason) =
             self.home_preparation_rejection(&selected.executor_id, &route.repository, &project_id)
         {
-            self.evict_home(
-                &request.holder,
-                &selected,
-                EvictionCause::CannotPrepareProject {
-                    project_id,
-                    detail: reason.describe(),
-                },
-            )?;
-            return Ok(None);
-        }
-        // The route is consulted before placement, and a batch pinned to its
-        // home passes a drain by design so resident work can finish. Without
-        // this the drain never saw a resident job's batches at all, and every
-        // one of them landed on the machine the operator had drained.
-        if self.drained_home_is_idle(&selected.executor_id, request) {
-            self.evict_home(&request.holder, &selected, EvictionCause::Drained)?;
+            self.evict_unpreparable_home(&request.holder, &selected, &project_id, &reason)?;
             return Ok(None);
         }
         // One live session answers for this environment, so a route left over
@@ -9608,23 +9403,23 @@ impl Fleet {
             })
     }
 
-    /// Give up an environment whose live machine will not serve its next
-    /// batch (it cannot prepare the project, or an operator drained it): forget
-    /// the route, release the cell, and record why, so the acquisition falls
-    /// through to placement and the agent is told what happened.
+    /// Give up an environment whose live machine cannot prepare its project:
+    /// forget the route, release the cell, and record why, so the acquisition
+    /// falls through to placement and the agent is told what happened.
     #[allow(clippy::result_large_err)]
-    fn evict_home(
+    fn evict_unpreparable_home(
         &self,
         holder: &ResidencyHolder,
         selected: &SelectedExecutor,
-        cause: EvictionCause,
+        project_id: &str,
+        reason: &PlacementRejectionReason,
     ) -> Result<(), ResidencyResult> {
         if let Err(error) = self.update_residency_routes(|routes| {
             routes.retain(|_, route| route.holder != *holder);
         }) {
             return Err(residency_core_failure(
                 ResidencyFailureKind::Persistence,
-                format!("release the evicted execution environment route: {error}"),
+                format!("release the unpreparable execution environment route: {error}"),
                 None,
             ));
         }
@@ -9654,117 +9449,25 @@ impl Fleet {
             self.release_residency_on(&selected.executor_id, selected.generation, fence);
         }
         let executor = self.executor_name_for_text(&selected.executor_id);
+        let detail = reason.describe();
         tracing::warn!(
             %holder,
             %executor,
-            ?cause,
-            "execution environment's machine will not serve its next batch; rebuilding it through placement"
+            %detail,
+            "execution environment's machine cannot prepare its project; rebuilding it through placement"
         );
         self.environment_evictions.lock().unwrap().insert(
             holder.storage_key(),
             EnvironmentEviction {
                 executor,
-                cause,
+                cause: EvictionCause::CannotPrepareProject {
+                    project_id: project_id.to_string(),
+                    detail,
+                },
                 lost_processes,
             },
         );
         Ok(())
-    }
-
-    /// Whether an environment sits on a drained machine with nothing live
-    /// holding it there, and another machine could take it.
-    ///
-    /// The same decision a terminal that names another machine makes
-    /// ([`residency::decide_resident_placement`]), with the operator as the one
-    /// who refused this machine: idle moves, live stays. An environment no
-    /// other machine could take stays too, because releasing it would only
-    /// rebuild it on this same machine and lose its state for nothing.
-    fn drained_home_is_idle(
-        &self,
-        executor_id: &str,
-        acquisition: &ResidencyAcquireRequest,
-    ) -> bool {
-        let idle_on_drain = self
-            .lock_connections()
-            .get(executor_id)
-            .is_some_and(|entry| {
-                entry.drained && environment_live_work(entry, &acquisition.holder).is_empty()
-            });
-        idle_on_drain && self.environment_could_move(acquisition, executor_id)
-    }
-
-    /// Whether some machine other than `home` would take this acquisition now,
-    /// by THE eligibility relation placement uses.
-    ///
-    /// The acquisition is judged as placement will judge it after preparation:
-    /// holding the project's known setup requirements, and pinned to the
-    /// colocated executor when the project populates cells from the live
-    /// checkout. Approximate only where preparation has not run on this runner
-    /// yet, and then it errs toward moving, which placement still bounds.
-    fn environment_could_move(&self, acquisition: &ResidencyAcquireRequest, home: &str) -> bool {
-        if !repository_is_transferable(&acquisition.repository) {
-            return false;
-        }
-        let mut request = residency_placement_request(acquisition);
-        if runs_project_setup(&request.repository) {
-            if let Some(known) = self
-                .known_project_requirements
-                .lock()
-                .unwrap()
-                .get(&request.project_id)
-            {
-                *request.project_requirements = known.clone();
-            }
-        }
-        if !matches!(request.repository, RepositoryLocator::ScratchOnly { .. })
-            && self
-                .colocated_population_projects
-                .lock()
-                .unwrap()
-                .contains(&request.project_id)
-        {
-            request.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
-        }
-        let now = unix_time_ms();
-        self.lock_connections().iter().any(|(executor_id, entry)| {
-            executor_id != home
-                && candidate_rejection(entry, PlacementScope::of(&request), now).is_none()
-        })
-    }
-
-    /// The drained machine an owner's environment stays on, and what keeps it
-    /// there, or `None` when its home is not drained. A batch that runs there
-    /// says so rather than leaving `Draining: yes` to contradict where it ran.
-    pub(crate) fn drained_home_holding(&self, holder: &ResidencyHolder) -> Option<DrainedHome> {
-        let executor_id = self.live_residency_route_executor(holder)?;
-        let connections = self.lock_connections();
-        let entry = connections
-            .get(&executor_id)
-            .filter(|entry| entry.drained)?;
-        Some(DrainedHome {
-            machine: executor_public_name(entry),
-            held_by: environment_live_work(entry, holder),
-        })
-    }
-
-    /// What a drain on this machine keeps, from its last snapshot. `None` for a
-    /// machine that is not attached, which reports nothing to count.
-    pub fn drain_residents(&self, executor_id: &str) -> Option<DrainResidents> {
-        self.lock_connections()
-            .get(executor_id)
-            .map(|entry| DrainResidents::of(&entry.snapshot))
-    }
-
-    /// Remember whether a project populates its cells from the live checkout.
-    /// Out of line for the reason [`Self::stamp_project_requirements`] is.
-    #[inline(never)]
-    fn note_colocated_population(&self, project_id: &str, populates: bool) {
-        let mut projects = self.colocated_population_projects.lock().unwrap();
-        if populates {
-            projects.insert(project_id.to_string());
-        } else {
-            projects.remove(project_id);
-        }
     }
 
     /// The live processes an owner's environment holds on machines that are
@@ -10763,10 +10466,7 @@ impl Fleet {
                 RunnerCallbackResult::Completed
             }
             RunnerCallback::SandboxDenied {
-                command,
-                denial,
-                reported_denial,
-                ..
+                command, denial, ..
             } => {
                 // An executor refuses its own operator credential denials
                 // without calling back; this catches a path only this runner
@@ -10807,10 +10507,9 @@ impl Fleet {
                         fence::Crossing::shell_path(&path, &path.display().to_string())
                     }
                     cairn_common::executor_protocol::SandboxDenial::Command => {
-                        fence::Crossing::unattributed_denial(
+                        fence::Crossing::shell_command(
+                            format!("command blocked by the executor worktree sandbox: {command}"),
                             &command,
-                            &command,
-                            reported_denial.as_deref(),
                         )
                     }
                 };
@@ -10938,7 +10637,6 @@ impl Fleet {
                     diagnostic: project_config_refusal(&error),
                 })?;
         self.stamp_project_requirements(request, &project_policy.setup_commands, project_path);
-        self.note_colocated_population(&request.project_id, !project_policy.populate.is_empty());
         Ok(PreparedExecution {
             cell_client_env: cell_build_service_env(orch, &request.repository),
             placement_policy: ActivePlacementPolicy {
@@ -11114,7 +10812,6 @@ impl Fleet {
             .into();
         }
         let batch_profile_identities = plan.batch_identities.clone();
-        let batch_items_share_the_machine = plan.parallel_width > 1;
         let profile_identity = request.command_resource_identity.clone();
         // One entry stands for this work from here until it settles. Placement
         // may offer it to several machines in turn; the entry, the waiter behind
@@ -11552,15 +11249,6 @@ impl Fleet {
                     )
                     .await;
                 }
-                resource_profiles::observe_memory_kill(
-                    db.clone(),
-                    profile_identity.as_ref(),
-                    &profile_context,
-                    metadata,
-                    false,
-                    selected.capabilities.memory_budget_bytes,
-                )
-                .await;
                 resource_profiles::observe_completed(
                     db,
                     profile_identity.as_ref(),
@@ -11603,15 +11291,6 @@ impl Fleet {
                         item.succeeded && !item.timed_out && !item.suspended,
                         &item.body,
                     );
-                    resource_profiles::observe_memory_kill(
-                        db.clone(),
-                        Some(identity),
-                        &profile_context,
-                        &item_meta,
-                        batch_items_share_the_machine,
-                        selected.capabilities.memory_budget_bytes,
-                    )
-                    .await;
                     resource_profiles::observe_completed(
                         db.clone(),
                         Some(identity),
@@ -13327,10 +13006,9 @@ fn candidate_rejection(
         })
     } else if entry.drained && !pinned_here {
         // The runner owns this refusal rather than asking the machine. A
-        // residency pin is the exception: a batch reaches a drained home only
-        // when live work holds its environment there (route resolution moves
-        // an idle one off first), and that resident work is left alone.
-        // Selectors and unpinned requests are new placement and remain refused.
+        // residency pin is the exception: that work is already on the machine
+        // and must be allowed to finish so the drain can empty it. Selectors and
+        // unpinned requests are new placement and remain refused.
         Some(PlacementRejectionReason::Drained)
     } else if entry.update_hold && !pinned_here {
         // The self-update rollout's hold, with a drain's exemption for the same
@@ -14146,7 +13824,6 @@ impl<'a> ScoredCandidate<'a> {
             .map(|ceiling| PlacementRejectionReason::ExceedsMemoryCeiling {
                 estimate_bytes: ceiling.estimate_bytes,
                 ceiling_bytes: ceiling.ceiling_bytes,
-                killed_here: ceiling.killed_here,
             });
         Self {
             entry,
@@ -15249,7 +14926,6 @@ fn unresolved_rationale(stated: &ResourceReservation) -> ReservationRationale {
         prior: stated.clone(),
         headroom_percent: 0,
         fallback: Some(ReservationFallback::CallerDeclared),
-        memory_kill: None,
     }
 }
 
@@ -22852,139 +22528,6 @@ mod tests {
             "{note}"
         );
         assert!(!note.contains("no executor can hold"), "{note}");
-    }
-
-    /// bgsrv-ub, freshly killed for memory, beside fedora, which has never run
-    /// the command. Placement after the kill is the question.
-    async fn killed_fleet(
-        db_name: &str,
-        ub_available: u64,
-        co_resident_compile_jobs: u32,
-    ) -> (Fleet, Arc<cairn_db::storage::LocalDb>, CellRequest) {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        const UB_BUDGET: u64 = 11_042_782_208;
-        let db = Arc::new(crate::storage::migrated_test_db(db_name).await);
-        let identity = CommandResourceIdentity {
-            version: 1,
-            key: "test:rust".into(),
-        };
-        let pool = Fleet::default();
-        let now = unix_time_ms();
-        let mut connections = HashMap::new();
-        for (id, budget, available) in [
-            ("bgsrv-ub", UB_BUDGET, ub_available),
-            ("fedora", 100 * GIB, 60 * GIB),
-        ] {
-            let (id, mut entry) = fleet_entry_at(id, "linux", 0, &[], now);
-            entry.advertisement.capabilities.memory_budget_bytes = Some(budget);
-            measured_at(&mut entry, 0.01, available, 500 * GIB, now);
-            connections.insert(id, entry);
-        }
-        let ub = &connections["bgsrv-ub"];
-        resource_profiles::observe_memory_kill(
-            db.clone(),
-            Some(&identity),
-            &ReservationPlan::context_for(
-                &ub.identity.device_id,
-                &ub.identity.executor_id,
-                &ub.advertisement.capabilities,
-            ),
-            &resource_profiles::oom_killed_for_test(
-                3_650_722_201,
-                Some(13_000_000_000),
-                co_resident_compile_jobs,
-                now,
-            ),
-            false,
-            Some(UB_BUDGET),
-        )
-        .await;
-        *pool.lock_connections() = connections;
-        let mut request = spillable_request();
-        request.command_class = cairn_common::executor_protocol::CellCommandClass::CargoTest;
-        request.command_resource_identity = Some(identity);
-        request.repository = RepositoryLocator::ManagedObjects {
-            project_id: "p".into(),
-            repository_id: "repo".into(),
-            object_format: GitObjectFormat::Sha1,
-        };
-        (pool, db, request)
-    }
-
-    async fn place_once(
-        pool: &Fleet,
-        db: Arc<cairn_db::storage::LocalDb>,
-        request: &CellRequest,
-    ) -> Placement {
-        let plan = ReservationPlan::new(db, request, None);
-        pool.select_executor_once_with(
-            request,
-            Some(&plan),
-            &ActivePlacementPolicy::default_profile(),
-            &HashMap::new(),
-            &AdmissionView::default(),
-            |_, _| SyncCost::Known(0),
-        )
-        .await
-        .unwrap()
-        .placed()
-        .unwrap()
-    }
-
-    /// cairn/5416's specimen: a `rustc` killed at 3.4 GiB beside another
-    /// compile on a 12.1 GiB machine now showing 2.5 GiB free. The re-armed
-    /// lane is charged the kill, not the 2 GiB class prior that fit, so it goes
-    /// to the machine that can take it, and the record says why with both
-    /// numbers.
-    #[tokio::test]
-    async fn a_command_killed_for_memory_is_not_placed_back_where_it_does_not_fit() {
-        let available = 2_684_354_560;
-        let (pool, db, request) = killed_fleet("oom-floor-placement.db", available, 1).await;
-        let placement = place_once(&pool, db, &request).await;
-        assert_eq!(placement.selected.executor_id, "fedora");
-        let refused = placement
-            .decision
-            .rejected
-            .iter()
-            .find(|rejection| rejection.executor_id == "bgsrv-ub")
-            .expect("the killed machine is on the record");
-        assert_eq!(
-            refused.reason,
-            PlacementRejectionReason::InsufficientMemory {
-                required_bytes: 3_650_722_201,
-                available_bytes: available,
-            }
-        );
-    }
-
-    /// Killed while it ran alone, the command is excluded from that machine
-    /// however idle it is now, and the exclusion names the kill.
-    #[tokio::test]
-    async fn a_command_killed_alone_is_placed_elsewhere_however_idle_its_machine_is() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        let (pool, db, request) = killed_fleet("oom-alone-placement.db", 10 * GIB, 0).await;
-        let placement = place_once(&pool, db, &request).await;
-        assert_eq!(placement.selected.executor_id, "fedora");
-        assert!(placement.above_ceiling.is_none());
-        let refused = placement
-            .decision
-            .rejected
-            .iter()
-            .find(|rejection| rejection.executor_id == "bgsrv-ub")
-            .expect("the killed machine is on the record");
-        let PlacementRejectionReason::ExceedsMemoryCeiling {
-            killed_here: Some(kill),
-            ..
-        } = &refused.reason
-        else {
-            panic!(
-                "expected a ceiling naming the kill, got {:?}",
-                refused.reason
-            );
-        };
-        assert_eq!(kill.alone_on_machine_bytes, Some(13_000_000_000));
-        let said = refused.reason.describe();
-        assert!(said.contains("while it ran alone"), "{said}");
     }
 
     /// A big machine that is busy right now queues the work in its own
@@ -34672,215 +34215,6 @@ mod tests {
         }
     }
 
-    /// cairn/5423's specimen: fedora is drained and holds the main cadence
-    /// job's environment, and bbs is a machine that could take it. `live` is
-    /// what runs inside the environment, if anything.
-    fn pool_with_a_drained_home(
-        live: Option<cairn_common::executor_protocol::ResidentProcessKind>,
-        another_machine: bool,
-    ) -> (
-        Fleet,
-        ResidencyAcquireRequest,
-        mpsc::UnboundedReceiver<ExecutorMessage>,
-    ) {
-        let pool = Fleet::default();
-        let (sender, inbox) = mpsc::unbounded_channel();
-        let (id, mut entry) = answering_fleet_entry("fedora", "linux", 0, &[]);
-        entry.sender = sender;
-        entry.drained = true;
-        let mut cell = materialization_read_cell("fedora-home", "cadence");
-        if let Some(kind) = live {
-            cell.occupancy.processes.insert(
-                "live".into(),
-                cairn_common::executor_protocol::ResidentProcess {
-                    generation: 1,
-                    kind,
-                    spec: None,
-                    status: cairn_common::executor_protocol::ResidentProcessStatus::Starting,
-                    reservation: None,
-                },
-            );
-        }
-        Arc::make_mut(&mut entry.snapshot).cells = vec![cell];
-        pool.lock_connections().insert(id.clone(), entry);
-        if another_machine {
-            pool.lock_connections()
-                .extend([answering_fleet_entry("bbs", "linux", 0, &[])]);
-        }
-        let request = fleet_residency_request(ResidencyHolder::Job {
-            job_id: "cadence".into(),
-        });
-        home_route(&pool, &id, &request);
-        (pool, request, inbox)
-    }
-
-    /// An idle environment on a drained machine is not resident work: its
-    /// job's next batch is new work. The route is forgotten, the cell is
-    /// released on fedora, and the acquisition falls through to placement,
-    /// which passes fedora over for the drain and takes bbs. The agent is told
-    /// the environment was rebuilt because of the drain.
-    #[test]
-    fn an_idle_environment_on_a_drained_machine_is_released_and_acquired_elsewhere() {
-        let (pool, mut request, mut inbox) = pool_with_a_drained_home(None, true);
-
-        assert!(pool
-            .resolve_residency_acquire_route(&mut request)
-            .unwrap()
-            .is_none());
-        assert!(pool.residency_routes.lock().unwrap().is_empty());
-        assert!(matches!(
-            inbox.try_recv(),
-            Ok(ExecutorMessage::ResidencyRequest {
-                operation: ResidencyOperation::Release { .. },
-                ..
-            })
-        ));
-        let eviction = pool
-            .take_environment_eviction(&request.holder)
-            .expect("the move is reported");
-        assert_eq!(eviction.executor, "fedora");
-        assert_eq!(eviction.cause, EvictionCause::Drained);
-        assert!(eviction.lost_processes.is_empty());
-
-        let placement = residency_placement_request(&request);
-        let now = unix_time_ms();
-        let connections = pool.lock_connections();
-        assert_eq!(
-            candidate_rejection(&connections["fedora"], PlacementScope::of(&placement), now),
-            Some(PlacementRejectionReason::Drained)
-        );
-        assert_eq!(
-            candidate_rejection(&connections["bbs"], PlacementScope::of(&placement), now),
-            None
-        );
-        drop(connections);
-        assert!(pool.drained_home_holding(&request.holder).is_none());
-    }
-
-    /// A terminal in the environment is resident work, which a drain leaves
-    /// alone: the batch goes home, past the drain, and says why.
-    #[test]
-    fn a_live_terminal_keeps_its_environment_on_a_drained_machine_and_says_so() {
-        let (pool, mut request, mut inbox) = pool_with_a_drained_home(
-            Some(
-                cairn_common::executor_protocol::ResidentProcessKind::Terminal {
-                    slug: "dev".into(),
-                },
-            ),
-            true,
-        );
-
-        assert_eq!(
-            pool.resolve_residency_acquire_route(&mut request)
-                .unwrap()
-                .map(|selected| selected.executor_id),
-            Some("fedora".to_string())
-        );
-        assert_eq!(pool.residency_routes.lock().unwrap().len(), 1);
-        assert!(inbox.try_recv().is_err(), "nothing is released");
-        assert!(pool.take_environment_eviction(&request.holder).is_none());
-
-        let home = pool
-            .drained_home_holding(&request.holder)
-            .expect("the batch is told it is on a drained machine");
-        assert_eq!(
-            home.sentence(),
-            "**fedora** is draining, and this batch was placed there because terminal `dev` holds this job's environment there. Once nothing live holds it, the next batch moves to a machine that is not draining."
-        );
-        // The pin it carries is the one exemption a drain makes.
-        let mut pinned = residency_placement_request(&request);
-        pinned.pinned_executor_id = Some("fedora".into());
-        assert_eq!(
-            candidate_rejection(
-                &pool.lock_connections()["fedora"],
-                PlacementScope::of(&pinned),
-                unix_time_ms()
-            ),
-            None
-        );
-    }
-
-    /// Releasing an environment no other machine could take would only
-    /// rebuild it on the drained machine and lose its state at every batch.
-    /// Alone on the fleet, or a live checkout that exists only where it is,
-    /// it stays, and the batch says why.
-    #[test]
-    fn an_environment_nothing_else_can_take_stays_on_a_drained_machine() {
-        for case in ["alone", "live-checkout"] {
-            let (pool, mut request, mut inbox) = pool_with_a_drained_home(None, case != "alone");
-            if case == "live-checkout" {
-                request.repository = live_checkout();
-                pool.residency_routes.lock().unwrap().clear();
-                home_route(&pool, "fedora", &request);
-            }
-            assert_eq!(
-                pool.resolve_residency_acquire_route(&mut request)
-                    .unwrap()
-                    .map(|selected| selected.executor_id),
-                Some("fedora".to_string()),
-                "{case}"
-            );
-            assert!(inbox.try_recv().is_err(), "{case}");
-            assert!(
-                pool.take_environment_eviction(&request.holder).is_none(),
-                "{case}"
-            );
-            assert_eq!(
-                pool.drained_home_holding(&request.holder)
-                    .map(|home| home.sentence()),
-                Some("**fedora** is draining, and this batch was placed there because no other machine can take this job's environment.".to_string()),
-                "{case}"
-            );
-        }
-    }
-
-    /// What a drain keeps: every resident environment, and by name the ones
-    /// live work holds, which is what the drain write and the executors page
-    /// both say.
-    #[test]
-    fn drain_residents_count_every_environment_and_name_the_held_ones() {
-        let mut snapshot = FleetSnapshot::default();
-        let idle = materialization_read_cell("idle", "cadence");
-        let mut terminal = materialization_read_cell("terminal", "builder");
-        terminal.occupancy.processes.insert(
-            "terminal:dev".into(),
-            cairn_common::executor_protocol::ResidentProcess {
-                generation: 1,
-                kind: cairn_common::executor_protocol::ResidentProcessKind::Terminal {
-                    slug: "dev".into(),
-                },
-                spec: None,
-                status: cairn_common::executor_protocol::ResidentProcessStatus::Starting,
-                reservation: None,
-            },
-        );
-        let mut unowned = materialization_read_cell("unowned", "nobody");
-        unowned.residency = None;
-        snapshot.cells = vec![idle, terminal, unowned];
-
-        let residents = DrainResidents::of(&snapshot);
-        assert_eq!(residents.environments, 2);
-        assert_eq!(
-            residents.held,
-            vec![HeldEnvironment {
-                owner: "job builder".into(),
-                held_by: vec!["terminal `dev`".into()],
-            }]
-        );
-        assert_eq!(
-            residents.headline(),
-            "refusing new work; 2 resident environments, 1 held by live processes"
-        );
-        assert_eq!(
-            residents.account(),
-            "It keeps 2 resident environments, 1 held by live processes and left alone until that work stops (job builder, by terminal `dev`); the idle one is released at its job's next batch and acquired on a machine that is not draining."
-        );
-        assert_eq!(
-            DrainResidents::default().account(),
-            "Nothing is resident there."
-        );
-    }
-
     /// A refusal describes the setup it failed under. Once the project runs a
     /// different setup it is forgotten on every machine, not left standing.
     #[test]
@@ -35257,7 +34591,6 @@ mod handoff_tests {
                             command: "cat /etc/hosts".into(),
                             cwd: "/tmp/worktree".into(),
                             denial: SandboxDenial::Path("/etc/hosts".into()),
-                            reported_denial: None,
                         },
                     )
                     .await
@@ -35378,7 +34711,6 @@ mod handoff_tests {
                     command: " git mv src-tauri/a src-tauri/b && git status --short".into(),
                     cwd: "/tmp/worktree".into(),
                     denial: SandboxDenial::Command,
-                    reported_denial: None,
                 },
             )
             .await;
@@ -35406,7 +34738,6 @@ mod handoff_tests {
                             command: " sh -c 'git mv a b'".into(),
                             cwd: "/tmp/worktree".into(),
                             denial: SandboxDenial::Command,
-                            reported_denial: None,
                         },
                     )
                     .await

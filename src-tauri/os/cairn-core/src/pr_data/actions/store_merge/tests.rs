@@ -274,7 +274,7 @@ async fn source_conflict_refusal_leaves_target_unwedged_on_origin() {
 
     let source_before = crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.source_branch);
 
-    let err = store_merge_child_inner(&fx.orch, &fx.ctx, "squash", true, None)
+    let err = store_merge_child(&fx.orch, &fx.ctx, "squash")
         .await
         .expect_err("the source conflict must refuse the merge");
     assert!(
@@ -327,7 +327,7 @@ async fn target_repair_push_failure_rolls_the_whole_merge_back() {
     // Break origin so the preflight's publish of the target repair fails.
     std::fs::remove_dir_all(&fx.origin_path).unwrap();
 
-    let err = store_merge_child_inner(&fx.orch, &fx.ctx, "squash", true, None)
+    let err = store_merge_child(&fx.orch, &fx.ctx, "squash")
         .await
         .expect_err("a failed target-repair publish must refuse the merge");
     assert!(

@@ -151,7 +151,6 @@ async fn propose_tenet(db: &LocalDb, thread_id: &str, statement: &str) {
         },
         Proposal {
             statement: statement.into(),
-            rationale: None,
             supersedes: None,
             origin: TenetOrigin::Standing,
         },
@@ -180,7 +179,6 @@ fn answered(thread_id: &str, status: TenetStatus, statement: &str) -> NewTenet {
         proposing_thread_id: thread_id.into(),
         slug: None,
         statement: statement.into(),
-        rationale: None,
         status,
         verdict: Some(if approved {
             cairn_core::tenets::Verdict::Yes

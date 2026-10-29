@@ -29,8 +29,7 @@ use cairn_common::executor_protocol::{
 use cairn_common::executor_protocol::{
     DiskDecline, DiskReliefOutlook, OccupancyLineageReport, OccupancyRule, OccupiedTreeSkip,
     QuarantineTargetStrip, RetiredHomeAccounting, RetiredHomeState, SkippedEntry,
-    StoragePressureOutcome, StoragePressureReport, StorageReclaimRung, StorageRungReclaim,
-    StorageWithheld, StorageWithheldReason,
+    StorageReclaimRung, StorageRungReclaim, StorageWithheld, StorageWithheldReason,
 };
 
 /// Questions held back from their next answer because an earlier answer may
@@ -407,10 +406,7 @@ pub(crate) fn render_executors(
             out.push_str(&machine_role_line(executor.health.role));
         }
         if executor.health.drain_mode {
-            out.push_str(&format!(
-                "- Draining: yes ({})\n",
-                crate::fleet::DrainResidents::of(&executor.occupancy).headline()
-            ));
+            out.push_str("- Draining: yes (refusing new work)\n");
         }
         out.push_str(&format!(
             "- Running now: {} (queued {})\n",
@@ -511,27 +507,6 @@ pub(crate) fn render_enrollment(
         "This machine is being enrolled. No load, admission, or occupancy is reported: those are measured on the machine, and it is not reporting yet.\n"
     });
     out
-}
-
-/// The `Draining:` value on one attached machine's page.
-///
-/// The counts are what make it true. A resident job's next batch is new work,
-/// so the drain moves an idle environment off at that batch; only live work (a
-/// terminal, a REPL, a batch in flight) keeps one here, and that is the work
-/// the machine is still waiting on before it is empty.
-fn drain_line(executor: &ExecutorInspection) -> String {
-    if !executor.health.drain_mode {
-        return "no".to_string();
-    }
-    let residents = crate::fleet::DrainResidents::of(&executor.occupancy);
-    let holders = match residents.held.is_empty() {
-        true => String::new(),
-        false => format!(" ({})", residents.holders()),
-    };
-    format!(
-        "yes — {}{holders}. An idle environment is released at its job's next batch and acquired on a machine that is not draining; one held by live work stays until that work stops. It holds across reconnects and runner restarts until it is cleared",
-        residents.headline()
-    )
 }
 
 /// Render one enrolled machine that is not attached.
@@ -960,7 +935,14 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         executor.last_update.as_ref(),
         executor.captured_at_unix_ms,
     ));
-    out.push_str(&format!("- Draining: {}\n", drain_line(executor)));
+    out.push_str(&format!(
+        "- Draining: {}\n",
+        if health.drain_mode {
+            "yes — the runner refuses new work here and leaves resident work alone. It holds across reconnects and runner restarts until it is cleared"
+        } else {
+            "no"
+        }
+    ));
     out.push_str(&format!("- Build: {}\n", render_build(executor)));
     if let Some(status) = &executor.self_update {
         out.push_str(&format!(
@@ -1893,9 +1875,6 @@ fn render_storage_pressure(executor: &ExecutorInspection) -> String {
             for withheld in &pressure.withheld {
                 out.push_str(&format!("- Not reclaimed: {}\n", withheld_line(withheld)));
             }
-            if let Some(lever) = external_cache_lever(pressure) {
-                out.push_str(&lever);
-            }
             for skip in &pressure.occupied_skips {
                 out.push_str(&format!(
                     "- Skipped: `{}` {}\n",
@@ -1925,28 +1904,6 @@ fn render_storage_pressure(executor: &ExecutorInspection) -> String {
         out.push_str(&occupancy_lineage_line(lineage));
     }
     out
-}
-
-/// The operator's next action after a pass that took every rung it may and
-/// still fell short: the external caches the executor accounts but never
-/// deletes. Named with their size, because "held by policy" alone left the
-/// reader with nothing to do while a machine stayed wedged.
-fn external_cache_lever(pressure: &StoragePressureReport) -> Option<String> {
-    if pressure.outcome != StoragePressureOutcome::Unrelieved {
-        return None;
-    }
-    let caches = pressure.withheld.iter().find(|withheld| {
-        withheld.reason == StorageWithheldReason::CachesOwnerRetained
-            && (withheld.bytes > 0 || withheld.unmeasured)
-    })?;
-    let size = if caches.unmeasured {
-        format!("at least {}", bytes(caches.bytes))
-    } else {
-        bytes(caches.bytes)
-    };
-    Some(format!(
-        "- Next action: {size} in external caches (CI targets, the asset cache, the sccache store) is the lever left; the executor never deletes them, so trimming them is the operator's\n"
-    ))
 }
 
 /// One class of bytes a pressure pass left in place, naming why and what
@@ -2491,21 +2448,8 @@ fn describe_rationale(rationale: &ReservationRationale) -> String {
         .fallback
         .map(|fallback| format!(", fell back because {}", fallback.as_str()))
         .unwrap_or_default();
-    let killed = rationale
-        .memory_kill
-        .map(|kill| {
-            let alone = kill
-                .alone_on_machine_bytes
-                .map(|machine| format!(" while it ran alone on {}", bytes(machine)))
-                .unwrap_or_default();
-            format!(
-                "; memory floored at {} by an out-of-memory kill here{alone}",
-                bytes(kill.victim_resident_bytes)
-            )
-        })
-        .unwrap_or_default();
     let learned = format!(
-        "memory/disk learned from {evidence}{confidence} of `{key}` on {} with {}% headroom over a {} prior{fallback}{killed}",
+        "memory/disk learned from {evidence}{confidence} of `{key}` on {} with {}% headroom over a {} prior{fallback}",
         rationale.profile_context,
         rationale.headroom_percent,
         bytes(rationale.prior.memory_bytes)
@@ -2534,7 +2478,6 @@ mod rationale_tests {
             headroom_percent: 25,
             fallback: (sample_count < MIN_CONFIDENT_RESERVATION_SAMPLES)
                 .then_some(ReservationFallback::BelowConfidenceFloor),
-            memory_kill: None,
         }
     }
 
@@ -4430,7 +4373,6 @@ mod storage_section_tests {
             "- Not reclaimed: 31.0 GiB in 1 cell fenced behind processes from an ended epoch, which the executor will not signal",
             "- Not reclaimed: 3.0 GiB in 1 managed cache in use",
             "- Not reclaimed: 0 B in 0 managed caches the pass did not take",
-            "- Next action: 1.0 GiB in external caches (CI targets, the asset cache, the sccache store) is the lever left",
         ] {
             assert!(rendered.contains(expected), "missing {expected:?} in {rendered}");
         }
@@ -7813,7 +7755,6 @@ mod tests {
                     prior: ResourceReservation::default(),
                     headroom_percent: 25,
                     fallback: None,
-                    memory_kill: None,
                 },
                 sync_cost: PlacementSyncCost::Known { bytes: 12_345 },
                 object_transfer: None,

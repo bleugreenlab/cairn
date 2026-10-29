@@ -25,6 +25,16 @@ pub(crate) const ESCALATE: KeySpec = KeySpec::new(
     KeyType::Bool,
     "interrupt the recipient's active turn instead of queueing for its next one",
 );
+pub(crate) const CONTENDED_IDENTIFIER: KeySpec = KeySpec::new(
+    "identifier",
+    KeyType::Str,
+    "registered contended identifier label to discharge explicitly",
+);
+pub(crate) const DISCHARGE_REASON: KeySpec = KeySpec::new(
+    "reason",
+    KeyType::Str,
+    "why the durable resolution obligation is incorrect and may be released",
+);
 pub(crate) const PROGRESS_KIND: KeySpec = KeySpec::new("kind", KeyType::Str, "phase | log");
 pub(crate) const PROGRESS_TEXT: KeySpec = KeySpec::new(
     "text",
@@ -239,7 +249,7 @@ pub(crate) const EXECUTION: KeySpec = KeySpec::new(
 pub(crate) const TENET_PROPOSAL: KeySpec = KeySpec::new(
     "proposal",
     KeyType::Object,
-    "{statement, rationale?}: `statement` is one sentence of how the project does things for the operator to answer yes or no (at most 200 characters, no URIs or reasoning); `rationale` carries why, the alternatives ruled out, and the canonical URIs where it was argued (at most 1500 characters). A thread filing a tenet-gated recipe (planbuild, coordinator, PlanCoord by default) proposes this tenet to the operator and the execution is filed HELD on its verdict. Send exactly one of proposal or tenet on such a filing; `build` stays ungated for repair",
+    "{statement} (how the project does things, for the operator to answer yes or no): a thread filing a tenet-gated recipe (planbuild, coordinator, PlanCoord by default) proposes this tenet to the operator and the execution is filed HELD on its verdict. Send exactly one of proposal or tenet on such a filing; `build` stays ungated for repair",
 );
 pub(crate) const TENET_NUMBER: KeySpec = KeySpec::new(
     "tenet",
@@ -303,7 +313,7 @@ pub(crate) const ATTACHMENT_ACTION: KeySpec = KeySpec::new(
 pub(crate) const REBASE_ACTION: KeySpec = KeySpec::new(
     "action",
     KeyType::Str,
-    "replay — replay onto the base; fast-forward-from-origin — take origin's copy of the branch (or of its base, with branch:\"base\") now, only when it is a pure fast-forward",
+    "replay — replay onto the base; discharge-contended-identifier — explicitly release an incorrect durable identifier obligation; fast-forward-from-origin — take origin's copy of the branch (or of its base, with branch:\"base\") now, only when it is a pure fast-forward",
 );
 pub(crate) const REBASE_FINGERPRINT: KeySpec = KeySpec::new(
     "fingerprint",

@@ -361,7 +361,6 @@ mod tests {
             deny_read: vec![],
             writable_regex: vec![],
             worktree_writable: true,
-            violation_tag: sandbox::ViolationTag::fresh(),
         };
         apply_safe_jj_workspace_refresh_status_carveout(
             &mut policy,
@@ -391,7 +390,6 @@ mod tests {
             deny_read: vec![],
             writable_regex: vec![],
             worktree_writable: true,
-            violation_tag: sandbox::ViolationTag::fresh(),
         };
         apply_safe_jj_workspace_refresh_status_carveout(
             &mut policy,

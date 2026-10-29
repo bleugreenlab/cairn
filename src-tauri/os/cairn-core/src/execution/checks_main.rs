@@ -9,19 +9,12 @@
 //! the tests that turned red or green since the lane's previous complete row,
 //! and the merges between the two rows.
 //!
-//! Scheduling is coalesced per lane and never preemptive. A whole-suite run
+//! Scheduling is coalesced per project and never preemptive. A whole-suite run
 //! takes most of an hour while merges land every few minutes, so a newer tip
-//! never cancels the run in flight; it queues at most one more run of that
-//! lane, on the newest tip an arm resolved. Lanes never wait for each other: a
-//! lane parked for hours on one platform does not hold back another platform's
-//! next row, and a lane's own re-arm runs only that lane. The runner arms every
-//! project at boot ([`arm_at_boot`]), and a heartbeat re-arms every project on
-//! a fixed interval, so a tip that never got a complete row is retried and a
-//! lane that has gone quiet says so.
-//!
-//! A pass the runner's own restart cuts short is neither a death nor a failure:
-//! it is announced as **cancelled by restart**, recorded, and cited by the pass
-//! the next boot arms, so a restart never leaves main with no pass at all.
+//! never cancels the run in flight; it queues at most one more pass, which
+//! attests whatever the tip is when that pass starts. A heartbeat re-arms every
+//! project on a fixed interval, so a tip that never got a complete row is
+//! retried and a lane that has gone quiet says so.
 //!
 //! A lane that does not produce a complete per-test verdict is announced louder
 //! than any red, with its cause class: **death** (the lane died: placement,
@@ -38,7 +31,7 @@
 //! the hosts as movement. Only when the executor has no complete row does the
 //! platform's newest row stand in, and the message says so (see [`Comparison`]).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,12 +50,6 @@ use crate::storage::{LocalDb, RowExt};
 
 /// A burst of merges settles into one pass.
 const SETTLE_WINDOW: Duration = Duration::from_secs(10);
-/// How long a boot pass waits before its first lane: the runner's boot grace.
-/// A restart closes every executor link, and placement refuses a lane outright
-/// when no machine for its platform is attached and none is known to be
-/// restoring, so a pass that started sooner would announce a death for a
-/// machine that was only reconnecting.
-const BOOT_SETTLE_WINDOW: Duration = Duration::from_secs(60);
 /// How often every project is re-armed without a merge.
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(6 * 60 * 60);
 /// The name cadence messages are sent under.
@@ -104,150 +91,22 @@ pub(crate) enum Trigger {
     Merge,
 }
 
-/// A lane within a project: its check and platform.
-type LaneKey = (String, String);
-
-/// Which of a tip's lanes an arm runs.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum LaneScope {
-    /// Every lane the tip declares: a merge, a launch, the heartbeat.
-    All,
-    /// Only these lanes. A lane's own re-arm names only itself, so one
-    /// platform's settled debt never re-runs another platform's lane.
-    Only(BTreeSet<LaneKey>),
-}
-
-impl LaneScope {
-    fn lane(lane: &CadenceLane) -> Self {
-        LaneScope::Only(BTreeSet::from([lane.key()]))
-    }
-
-    /// The scope of one arm that absorbed both requests.
-    fn union(self, other: LaneScope) -> LaneScope {
-        match (self, other) {
-            (LaneScope::Only(mut lanes), LaneScope::Only(more)) => {
-                lanes.extend(more);
-                LaneScope::Only(lanes)
-            }
-            _ => LaneScope::All,
-        }
-    }
-
-    fn includes(&self, lane: &CadenceLane) -> bool {
-        match self {
-            LaneScope::All => true,
-            LaneScope::Only(lanes) => lanes.contains(&lane.key()),
-        }
-    }
-}
-
-/// The tip an arm resolved, which its lanes attest. Plain data, so a busy
-/// lane's queued successor carries the newest tip any arm resolved for it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Tip {
-    project_id: String,
-    project_key: String,
-    repo_path: String,
-    default_branch: String,
-    repository: PathBuf,
-    commit: String,
-}
-
-impl Tip {
-    fn context(&self, trigger: Trigger) -> PassContext<'_> {
-        PassContext {
-            project_id: &self.project_id,
-            project_key: &self.project_key,
-            repo_path: &self.repo_path,
-            default_branch: &self.default_branch,
-            repository: &self.repository,
-            commit: &self.commit,
-            trigger,
-        }
-    }
-}
-
-/// A project's arm: settling, refreshing origin, and resolving the tip and
-/// its lanes. It ends as soon as the lanes are handed to their slots.
-struct Arming {
+struct CadencePass {
     branch: String,
     armed_at_unix_ms: i64,
-    queued: Option<(Trigger, LaneScope)>,
+    queued: Option<Trigger>,
 }
 
-/// One lane's run in flight, and at most one successor.
-struct LaneRun {
-    commit: String,
-    armed_at_unix_ms: i64,
-    queued: Option<(Trigger, Tip)>,
-}
-
-/// A lane pass the runner's own restart cancelled: recorded as the runner
-/// stops, read back at boot, and cited by the pass that re-arms the lane.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Interruption {
-    pub(crate) check: String,
-    pub(crate) platform: String,
-    /// The tip the cancelled pass was attesting.
-    pub(crate) commit: String,
-    pub(crate) stopped_at_unix_ms: i64,
-}
-
-impl Interruption {
-    /// The lane and what happened to it, as a clause.
-    pub(crate) fn describe(&self) -> String {
-        format!(
-            "{} on {}, whose pass on `{}` the runner restart at {} cancelled",
-            self.check,
-            self.platform,
-            short_commit(&self.commit),
-            stamp(self.stopped_at_unix_ms)
-        )
-    }
-}
-
-/// The cadence work armed for a project right now.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct InFlight {
-    /// The arm still resolving the tip, if one is: its branch and when it was
-    /// armed.
-    pub(crate) resolving: Option<(String, i64)>,
-    /// Each lane's run, in lane order.
-    pub(crate) lanes: Vec<LaneInFlight>,
-    /// The lanes whose passes the last restart cancelled and which the armed
-    /// work re-arms, until each lane reports.
-    pub(crate) rearming: Vec<Interruption>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LaneInFlight {
-    pub(crate) check: String,
-    pub(crate) platform: String,
-    /// The tip the running attempt attests.
-    pub(crate) commit: String,
-    pub(crate) armed_at_unix_ms: i64,
-    /// Whether a successor on a newer tip is owed when it ends.
-    pub(crate) queued: bool,
-}
-
-/// The cadence slots: per project, one arm in flight and at most one queued;
-/// per lane, one run in flight and at most one queued.
+/// The per-project cadence slot: one pass in flight, at most one queued.
 #[derive(Default)]
 pub(crate) struct CadenceSlots {
-    arming: HashMap<String, Arming>,
-    lanes: HashMap<(String, LaneKey), LaneRun>,
+    passes: HashMap<String, CadencePass>,
     /// Questions a refused lane is waiting on to settle, so a lane refused by
     /// every pass against one debt gets one waiter, not one per pass.
     debts: HashSet<crate::fleet::purpose::PurposeKey>,
     /// Per project, the tip whose checks contract could not be read: one
     /// outcome per tip, announced once and not read again until the tip moves.
     unreadable_contracts: HashMap<String, String>,
-    /// Per project, the lanes the last restart cancelled that no pass has
-    /// reported on since; see [`arm_at_boot`].
-    interrupted: HashMap<String, Vec<Interruption>>,
-    /// Whether the startup default-advance catch-up has observed origin. Until
-    /// it has, a pass must not fetch; see [`run_pass`].
-    origin_observed: bool,
 }
 
 impl CadenceSlots {
@@ -278,70 +137,18 @@ impl CadenceSlots {
         }
     }
 
-    /// Hold `interruption` for the next pass to cite. A lane holds one: a later
-    /// cancel replaces an earlier one nothing cited.
-    fn interrupted(&mut self, project_id: &str, interruption: Interruption) {
-        let lanes = self.interrupted.entry(project_id.to_string()).or_default();
-        lanes.retain(|held| {
-            held.check != interruption.check || held.platform != interruption.platform
-        });
-        lanes.push(interruption);
-    }
-
-    /// Take the restart citation `lane` holds, once.
-    fn take_interruption(&mut self, project_id: &str, lane: &CadenceLane) -> Option<Interruption> {
-        let lanes = self.interrupted.get_mut(project_id)?;
-        let index = lanes
-            .iter()
-            .position(|held| held.check == lane.check && held.platform == lane.platform)?;
-        let taken = lanes.remove(index);
-        if lanes.is_empty() {
-            self.interrupted.remove(project_id);
-        }
-        Some(taken)
-    }
-
-    /// Drop the restart citations of lanes the tip no longer declares: no lane
-    /// will report on them, so they would otherwise be re-armed forever.
-    fn forget_undeclared_interruptions(&mut self, project_id: &str, declared: &[CadenceLane]) {
-        let Some(lanes) = self.interrupted.get_mut(project_id) else {
-            return;
-        };
-        lanes.retain(|held| {
-            declared
-                .iter()
-                .any(|lane| lane.check == held.check && lane.platform == held.platform)
-        });
-        if lanes.is_empty() {
-            self.interrupted.remove(project_id);
-        }
-    }
-
-    /// Ask for an arm. Returns `true` when the caller must start one;
-    /// otherwise the request was folded into the single queued successor,
-    /// which runs every lane either request named.
-    fn request(
-        &mut self,
-        project_id: &str,
-        branch: &str,
-        trigger: Trigger,
-        scope: LaneScope,
-        now: i64,
-    ) -> bool {
-        match self.arming.get_mut(project_id) {
-            Some(arming) => {
-                arming.queued = Some(match arming.queued.take() {
-                    Some((queued, queued_scope)) => {
-                        (queued.max(trigger), queued_scope.union(scope))
-                    }
-                    None => (trigger, scope),
-                });
+    /// Ask for a pass. Returns `true` when the caller must start one; otherwise
+    /// the request was folded into the single queued successor.
+    fn request(&mut self, project_id: &str, branch: &str, trigger: Trigger, now: i64) -> bool {
+        match self.passes.get_mut(project_id) {
+            Some(pass) => {
+                pass.queued = Some(pass.queued.map_or(trigger, |queued| queued.max(trigger)));
                 false
             }
             None => {
-                self.arming.insert(
+                self.passes.insert(
                     project_id.to_string(),
-                    Arming {
+                    CadencePass {
                         branch: branch.to_string(),
                         armed_at_unix_ms: now,
                         queued: None,
@@ -352,115 +159,39 @@ impl CadenceSlots {
         }
     }
 
-    /// An arm ended. Returns the queued successor's trigger and scope, keeping
-    /// the slot held for it, or releases the slot when nothing queued.
-    fn finish(&mut self, project_id: &str, now: i64) -> Option<(Trigger, LaneScope)> {
-        let arming = self.arming.get_mut(project_id)?;
-        match arming.queued.take() {
+    /// A pass ended. Returns the queued successor's trigger, keeping the slot
+    /// held for it, or releases the slot when nothing queued.
+    fn finish(&mut self, project_id: &str, now: i64) -> Option<Trigger> {
+        let pass = self.passes.get_mut(project_id)?;
+        match pass.queued.take() {
             Some(next) => {
-                arming.armed_at_unix_ms = now;
+                pass.armed_at_unix_ms = now;
                 Some(next)
             }
             None => {
-                self.arming.remove(project_id);
+                self.passes.remove(project_id);
                 None
             }
         }
     }
 
-    /// Offer `tip` to `lane`. Returns `true` when the caller must start the
-    /// lane's run; otherwise the lane is busy and `tip` becomes its one queued
-    /// successor, replacing an older queued tip. Another lane's run never
-    /// enters into it.
-    fn offer(&mut self, lane: &CadenceLane, tip: &Tip, trigger: Trigger, now: i64) -> bool {
-        let key = (tip.project_id.clone(), lane.key());
-        match self.lanes.get_mut(&key) {
-            Some(run) => {
-                let trigger = run
-                    .queued
-                    .as_ref()
-                    .map_or(trigger, |(queued, _)| (*queued).max(trigger));
-                run.queued = Some((trigger, tip.clone()));
-                false
-            }
-            None => {
-                self.lanes.insert(
-                    key,
-                    LaneRun {
-                        commit: tip.commit.clone(),
-                        armed_at_unix_ms: now,
-                        queued: None,
-                    },
-                );
-                true
-            }
-        }
-    }
-
-    /// A lane's run ended. Returns its queued successor, keeping the slot held
-    /// for it, or releases the slot when nothing queued.
-    fn lane_finished(
-        &mut self,
-        project_id: &str,
-        lane: &CadenceLane,
-        now: i64,
-    ) -> Option<(Trigger, Tip)> {
-        let key = (project_id.to_string(), lane.key());
-        let run = self.lanes.get_mut(&key)?;
-        match run.queued.take() {
-            Some((trigger, tip)) => {
-                run.commit = tip.commit.clone();
-                run.armed_at_unix_ms = now;
-                Some((trigger, tip))
-            }
-            None => {
-                self.lanes.remove(&key);
-                None
-            }
-        }
-    }
-
-    fn in_flight(&self, project_id: &str) -> Option<InFlight> {
-        let resolving = self
-            .arming
+    fn in_flight(&self, project_id: &str) -> Option<(String, i64)> {
+        self.passes
             .get(project_id)
-            .map(|arming| (arming.branch.clone(), arming.armed_at_unix_ms));
-        let mut lanes: Vec<LaneInFlight> = self
-            .lanes
-            .iter()
-            .filter(|((project, _), _)| project == project_id)
-            .map(|((_, (check, platform)), run)| LaneInFlight {
-                check: check.clone(),
-                platform: platform.clone(),
-                commit: run.commit.clone(),
-                armed_at_unix_ms: run.armed_at_unix_ms,
-                queued: run.queued.is_some(),
-            })
-            .collect();
-        lanes.sort_by(|a, b| (&a.check, &a.platform).cmp(&(&b.check, &b.platform)));
-        (resolving.is_some() || !lanes.is_empty()).then(|| InFlight {
-            resolving,
-            lanes,
-            rearming: self
-                .interrupted
-                .get(project_id)
-                .cloned()
-                .unwrap_or_default(),
-        })
+            .map(|pass| (pass.branch.clone(), pass.armed_at_unix_ms))
     }
 }
 
-/// The cadence work armed for `project_id` right now, if any: an arm resolving
-/// the tip, each lane's run, and the restart-cancelled passes they re-arm.
-/// While a lane runs the store holds no row of its for the new tip, so this is
-/// what tells "pending" from "never ran" (CAIRN-3823).
-pub(crate) fn in_flight(orch: &Orchestrator, project_id: &str) -> Option<InFlight> {
+/// The cadence pass running for `project_id` right now, if any: the branch it
+/// attests and when it was armed. While it runs the store holds no row for the
+/// new tip, so this is what tells "pending" from "never ran" (CAIRN-3823).
+pub(crate) fn in_flight(orch: &Orchestrator, project_id: &str) -> Option<(String, i64)> {
     orch.main_cadence.lock().unwrap().in_flight(project_id)
 }
 
-/// Arm every lane for the project's default branch. Calling this on every
-/// observed advance is intended: requests coalesce into the running arm's one
-/// queued successor, and each lane folds the tip into its own.
+/// Arm a cadence pass for the project's default branch. Calling this on every
+/// observed advance is intended: requests coalesce into the running pass's one
+/// queued successor.
 pub(crate) fn spawn(
     orch: &Orchestrator,
     project_id: String,
@@ -468,65 +199,32 @@ pub(crate) fn spawn(
     default_branch: String,
     trigger: Trigger,
 ) {
-    arm(
-        orch,
-        project_id,
-        repo_path,
-        default_branch,
-        trigger,
-        LaneScope::All,
-    );
-}
-
-fn arm(
-    orch: &Orchestrator,
-    project_id: String,
-    repo_path: String,
-    default_branch: String,
-    trigger: Trigger,
-    scope: LaneScope,
-) {
-    let start = orch.main_cadence.lock().unwrap().request(
-        &project_id,
-        &default_branch,
-        trigger,
-        scope.clone(),
-        now_ms(),
-    );
+    let start =
+        orch.main_cadence
+            .lock()
+            .unwrap()
+            .request(&project_id, &default_branch, trigger, now_ms());
     if !start {
         return;
     }
     let orch = orch.clone();
     tokio::spawn(async move {
-        let (mut trigger, mut scope) = (trigger, scope);
+        let mut trigger = trigger;
         loop {
-            let settle = if trigger == Trigger::Startup {
-                BOOT_SETTLE_WINDOW
-            } else {
-                SETTLE_WINDOW
-            };
-            tokio::time::sleep(settle).await;
-            // Supervised, so a panicking arm still releases the slot and is
+            tokio::time::sleep(SETTLE_WINDOW).await;
+            // Supervised, so a panicking pass still releases the slot and is
             // announced rather than holding the project's cadence forever.
-            let pass = tokio::spawn({
-                let orch = orch.clone();
-                let project_id = project_id.clone();
-                let repo_path = repo_path.clone();
-                let default_branch = default_branch.clone();
-                let scope = scope.clone();
-                async move {
-                    run_pass(
-                        &orch,
-                        &project_id,
-                        &repo_path,
-                        &default_branch,
-                        trigger,
-                        &scope,
-                    )
-                    .await
-                }
-            })
-            .await;
+            let pass =
+                tokio::spawn({
+                    let orch = orch.clone();
+                    let project_id = project_id.clone();
+                    let repo_path = repo_path.clone();
+                    let default_branch = default_branch.clone();
+                    async move {
+                        run_pass(&orch, &project_id, &repo_path, &default_branch, trigger).await
+                    }
+                })
+                .await;
             let failure = match pass {
                 Ok(Ok(())) => None,
                 Ok(Err(error)) => Some(error),
@@ -534,7 +232,7 @@ fn arm(
             };
             if let Some(cause) = failure {
                 log::error!("main cadence pass for project {project_id} failed: {cause}");
-                announce_pass_failure(&orch, &project_id, &repo_path, &scope, &cause).await;
+                announce_pass_failure(&orch, &project_id, &repo_path, &cause).await;
             }
             let next = orch
                 .main_cadence
@@ -542,45 +240,7 @@ fn arm(
                 .unwrap()
                 .finish(&project_id, now_ms());
             match next {
-                Some((next, next_scope)) => (trigger, scope) = (next, next_scope),
-                None => break,
-            }
-        }
-    });
-}
-
-/// Run `lane` on `tip`, then on each successor queued for it while it ran.
-fn start_lane(orch: &Orchestrator, tip: Tip, lane: CadenceLane, trigger: Trigger) {
-    let orch = orch.clone();
-    tokio::spawn(async move {
-        let (mut tip, mut trigger) = (tip, trigger);
-        loop {
-            // Supervised, so a panicking run still releases the lane's slot
-            // and is announced rather than holding the lane forever.
-            let run = tokio::spawn({
-                let orch = orch.clone();
-                let tip = tip.clone();
-                let lane = lane.clone();
-                async move { run_lane(&orch, &tip, &lane, trigger).await }
-            })
-            .await;
-            if let Err(join) = run {
-                let cause = format!("the cadence lane panicked: {join}");
-                log::error!(
-                    "main cadence {} on {} for project {}: {cause}",
-                    lane.check,
-                    lane.platform,
-                    tip.project_id
-                );
-                announce_lane_death(&orch, &tip, &lane, cause).await;
-            }
-            let next =
-                orch.main_cadence
-                    .lock()
-                    .unwrap()
-                    .lane_finished(&tip.project_id, &lane, now_ms());
-            match next {
-                Some((next, next_tip)) => (trigger, tip) = (next, next_tip),
+                Some(next) => trigger = next,
                 None => break,
             }
         }
@@ -609,48 +269,8 @@ pub(crate) async fn spawn_all_current(orch: &Orchestrator, trigger: Trigger) {
     }
 }
 
-/// The boot repair edge: arm every project at once and start the heartbeat.
-///
-/// Runs as the runner comes up, not behind its gated maintenance. Behind it,
-/// the arm waited on the startup default-advance catch-up, which rebases every
-/// in-flight branch and took 11.6 minutes after the 10-28 restart: for that
-/// whole window main had no pass in flight or queued, and the pass the restart
-/// cancelled had no successor (cairn/5441). Arming is idempotent: requests
-/// during a pass fold into its one queued successor, and a lane whose inputs a
-/// complete row already covers is not re-run. A hand baseline already running
-/// on the same inputs is joined by the fleet's coalescing, not run twice.
-pub(crate) async fn arm_at_boot(orch: &Orchestrator) {
-    match take_interruptions(&orch.db.local).await {
-        Ok(interrupted) => {
-            let mut slots = orch.main_cadence.lock().unwrap();
-            for (project_id, interruption) in interrupted {
-                log::info!(
-                    "main cadence for project {project_id}: re-arming {}",
-                    interruption.describe()
-                );
-                slots.interrupted(&project_id, interruption);
-            }
-        }
-        Err(error) => log::warn!(
-            "main cadence: could not read back the passes the last restart cancelled, so the boot pass will not cite them: {error}"
-        ),
-    }
-    spawn_all_current(orch, Trigger::Startup).await;
-    spawn_heartbeat(orch);
-}
-
-/// The startup default-advance catch-up has observed origin and reconciled any
-/// advance that landed while the runner was down. From here a pass may fetch,
-/// and every project is armed again for the tip the catch-up saw: a pass
-/// already armed takes it as its queued successor, which finds its lanes
-/// covered unless the tip moved.
-pub(crate) async fn origin_observed(orch: &Orchestrator) {
-    orch.main_cadence.lock().unwrap().origin_observed = true;
-    spawn_all_current(orch, Trigger::Startup).await;
-}
-
 /// Re-arm every project every [`HEARTBEAT`]. The first tick waits a full
-/// interval: boot already armed every project.
+/// interval: launch already armed every project.
 pub(crate) fn spawn_heartbeat(orch: &Orchestrator) {
     let orch = orch.clone();
     tokio::spawn(async move {
@@ -674,12 +294,6 @@ pub(crate) struct CadenceLane {
     pub(crate) check: String,
     pub(crate) platform: String,
     pub(crate) notify: String,
-}
-
-impl CadenceLane {
-    fn key(&self) -> LaneKey {
-        (self.check.clone(), self.platform.clone())
-    }
 }
 
 /// Every lane a checks contract declares, in a stable order.
@@ -716,28 +330,14 @@ async fn run_pass(
     repo_path: &str,
     default_branch: &str,
     trigger: Trigger,
-    scope: &LaneScope,
 ) -> Result<(), String> {
     let db = crate::execution::routing::owning_db_for_project(&orch.db, project_id)
         .await
         .map_err(|error| error.to_string())?;
     let repo_root = PathBuf::from(repo_path);
-    // Until the startup catch-up has observed origin, a fetch here would move
-    // `<branch>@origin` under it. The catch-up reads that ref before and after
-    // its own fetch to find an advance that landed while the runner was down,
-    // and would read the moved ref as no advance, leaving every in-flight
-    // branch on the old base. So an early pass attests the store's current
-    // head, and the catch-up re-arms the cadence once it has looked.
-    let may_fetch = orch.main_cadence.lock().unwrap().origin_observed;
     // A stale store attests a stale tip, which its row names honestly; a pass
     // that gave up here would attest nothing at all.
-    if !may_fetch {
-        log::info!(
-            "main cadence for project {project_id}: the startup catch-up has not observed origin yet; attesting the store's current {default_branch} without fetching"
-        );
-    } else if let Err(error) =
-        refresh_default_branch(orch, project_id, &repo_root, default_branch).await
-    {
+    if let Err(error) = refresh_default_branch(orch, project_id, &repo_root, default_branch).await {
         log::warn!(
             "main cadence for project {project_id}: {error}; attesting the store's current {default_branch}"
         );
@@ -756,46 +356,29 @@ async fn run_pass(
     let commit = cairn_vcs::resolve_coordinate(&repository, default_branch)
         .await
         .map_err(|error| format!("default head '{default_branch}' is unresolvable: {error}"))?;
-    let declared = tip_lanes(&orch.main_cadence, project_id, &commit, || {
+    let lanes = tip_lanes(&orch.main_cadence, project_id, &commit, || {
         load_checks_contract_at_commit_detailed(&repo_root, &commit)
     })
     .await?;
-    if declared.is_empty() {
-        return Ok(());
-    }
-    orch.main_cadence
-        .lock()
-        .unwrap()
-        .forget_undeclared_interruptions(project_id, &declared);
-    let lanes: Vec<CadenceLane> = declared
-        .into_iter()
-        .filter(|lane| scope.includes(lane))
-        .collect();
     if lanes.is_empty() {
         return Ok(());
     }
-    let tip = Tip {
-        project_id: project_id.to_string(),
-        project_key: project_key(&db, project_id).await?,
-        repo_path: repo_path.to_string(),
-        default_branch: default_branch.to_string(),
-        repository,
-        commit,
+    let project_key = project_key(&db, project_id).await?;
+    let context = PassContext {
+        project_id,
+        project_key: &project_key,
+        repo_path,
+        default_branch,
+        repository: &repository,
+        commit: &commit,
+        trigger,
     };
-    // Each lane runs on its own slot, so the arm ends here: a lane still
-    // running from an earlier tip takes this one as its queued successor and
-    // holds back no other lane.
-    let now = now_ms();
-    for lane in lanes {
-        let start = orch
-            .main_cadence
-            .lock()
-            .unwrap()
-            .offer(&lane, &tip, trigger, now);
-        if start {
-            start_lane(orch, tip.clone(), lane, trigger);
-        }
-    }
+    futures_util::future::join_all(
+        lanes
+            .iter()
+            .map(|lane| run_lane(orch, db.clone(), &context, lane)),
+    )
+    .await;
     Ok(())
 }
 
@@ -901,42 +484,19 @@ enum LaneAttempt {
     Verdict(CadenceVerdict),
 }
 
-async fn run_lane(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, trigger: Trigger) {
-    let db = match crate::execution::routing::owning_db_for_project(&orch.db, &tip.project_id).await
-    {
-        Ok(db) => db,
-        Err(error) => {
-            log::error!(
-                "main cadence {} on {} for project {}: the project's database is unreachable, so this lane can neither run nor report: {error}",
-                lane.check,
-                lane.platform,
-                tip.project_id
-            );
-            return;
-        }
-    };
-    let context = &tip.context(trigger);
+async fn run_lane(
+    orch: &Orchestrator,
+    db: Arc<LocalDb>,
+    context: &PassContext<'_>,
+    lane: &CadenceLane,
+) {
     match attempt_lane(orch, db.clone(), context, lane).await {
         LaneAttempt::Covered(row) => {
-            let rearmed = orch
-                .main_cadence
-                .lock()
-                .unwrap()
-                .take_interruption(context.project_id, lane);
-            if let Some(interruption) = rearmed {
-                log::info!(
-                    "main cadence: {} is answered by {}, which already covers `{}`",
-                    interruption.describe(),
-                    row.reference,
-                    short_commit(context.commit)
-                );
-            }
             if context.trigger == Trigger::Heartbeat {
                 announce_quiet_lane(orch, &db, context, lane, &row).await;
             }
         }
         LaneAttempt::Verdict(verdict) => {
-            let verdict = cancelled_by_restart(verdict, orch.fleet.runner_stopping_since());
             if matches!(verdict, CadenceVerdict::Death { .. }) {
                 rearm_on_debt_settlement(orch, context, lane);
             }
@@ -956,8 +516,7 @@ async fn run_lane(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, trigger: T
 }
 
 /// If this lane died because its question still owes a displaced answer's
-/// death, arm this lane again the moment that debt settles. Only this lane:
-/// another platform's lane is not re-run because this one's debt settled.
+/// death, arm the project again the moment that debt settles.
 ///
 /// The wait has no bound of its own: it lasts as long as the evidence takes,
 /// and settling is the only thing that ends it. One waiter per question, so a
@@ -975,20 +534,18 @@ fn rearm_on_debt_settlement(orch: &Orchestrator, context: &PassContext<'_>, lane
     let project_id = context.project_id.to_string();
     let repo_path = context.repo_path.to_string();
     let default_branch = context.default_branch.to_string();
-    let scope = LaneScope::lane(lane);
     tokio::spawn(async move {
         orch.fleet.purpose_debt_cleared(&key).await;
         orch.main_cadence.lock().unwrap().debt_settled(&key);
         log::info!(
-            "purpose {key} owes nothing now; re-arming its main cadence lane for project {project_id}"
+            "purpose {key} owes nothing now; re-arming the main cadence for project {project_id}"
         );
-        arm(
+        spawn(
             &orch,
             project_id,
             repo_path,
             default_branch,
             Trigger::DebtSettled,
-            scope,
         );
     });
 }
@@ -1126,32 +683,12 @@ async fn report_lane(
     verdict: CadenceVerdict,
 ) {
     let names = |executor: &str| orch.fleet.executor_name_for_text(executor);
-    // Without the chain (a pass that failed before resolving the tip, or an
-    // unreadable log), only the cadence's own rows can be placed on main.
-    let chain = match (repository, commit) {
-        (Some(repository), Some(commit)) => main_chain(orch, repository, commit)
-            .map_err(|error| {
-                log::warn!(
-                    "main cadence first-parent walk failed; comparing cadence rows only: {error}"
-                )
-            })
-            .ok(),
-        _ => None,
-    };
-    let comparison = comparison_for(
-        db,
-        project_id,
-        project_key,
-        lane,
-        verdict.row(),
-        chain.as_ref(),
-        &names,
-    )
-    .await
-    .unwrap_or_else(|error| {
-        log::warn!("main cadence previous-row lookup failed: {error}");
-        Comparison::Baseline
-    });
+    let comparison = comparison_for(db, project_id, project_key, lane, verdict.row(), &names)
+        .await
+        .unwrap_or_else(|error| {
+            log::warn!("main cadence previous-row lookup failed: {error}");
+            Comparison::Baseline
+        });
     let bracket = match (bracket_base(&verdict, &comparison), repository, commit) {
         (Some(previous), Some(repository), Some(commit)) => {
             merge_bracket(
@@ -1167,32 +704,6 @@ async fn report_lane(
         }
         _ => Bracket::default(),
     };
-    let rearmed = orch
-        .main_cadence
-        .lock()
-        .unwrap()
-        .take_interruption(project_id, lane);
-    if let (
-        CadenceVerdict::Cancelled {
-            stopped_at_unix_ms, ..
-        },
-        Some(commit),
-    ) = (&verdict, commit)
-    {
-        let interruption = Interruption {
-            check: lane.check.clone(),
-            platform: lane.platform.clone(),
-            commit: commit.to_string(),
-            stopped_at_unix_ms: *stopped_at_unix_ms,
-        };
-        if let Err(error) = record_interruption(&orch.db.local, project_id, &interruption).await {
-            log::warn!(
-                "main cadence {} on {}: could not record that the restart cancelled this lane, so the boot pass will not cite it: {error}",
-                lane.check,
-                lane.platform
-            );
-        }
-    }
     let content = render_report(&CadenceReport {
         check: &lane.check,
         platform: &lane.platform,
@@ -1201,18 +712,15 @@ async fn report_lane(
         comparison: &comparison,
         bracket: &bracket,
         now_ms: now_ms(),
-        rearmed: rearmed.as_ref(),
     });
-    match &verdict {
-        CadenceVerdict::Complete(_) => log::info!(
+    if verdict.is_complete() {
+        log::info!(
             "main cadence {} on {}: row recorded",
             lane.check,
             lane.platform
-        ),
-        CadenceVerdict::Cancelled { .. } => log::info!("{content}"),
-        CadenceVerdict::NoVerdict { .. } | CadenceVerdict::Death { .. } => {
-            log::error!("{content}")
-        }
+        );
+    } else {
+        log::error!("{content}");
     }
     deliver(orch, db, project_id, &lane.notify, &content).await;
 }
@@ -1248,46 +756,19 @@ async fn announce_quiet_lane(
     deliver(orch, db, context.project_id, &lane.notify, &content).await;
 }
 
-/// A lane run that ended without reaching its report (it panicked) still owes
-/// its lane the loudest message.
-async fn announce_lane_death(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, cause: String) {
-    let Ok(db) = crate::execution::routing::owning_db_for_project(&orch.db, &tip.project_id).await
-    else {
-        return;
-    };
-    report_lane(
-        orch,
-        &db,
-        &tip.project_id,
-        &tip.project_key,
-        Some(&tip.repository),
-        lane,
-        Some(&tip.commit),
-        cancelled_by_restart(
-            CadenceVerdict::Death { cause },
-            orch.fleet.runner_stopping_since(),
-        ),
-    )
-    .await;
-}
-
-/// A pass that failed before reaching its lanes still owes each lane in its
-/// scope its loudest message. The tip's contract was unreadable, so the lanes
-/// come from the project checkout's configuration.
+/// A pass that failed before reaching its lanes still owes each lane its
+/// loudest message. The tip's contract was unreadable, so the lanes come from
+/// the project checkout's configuration.
 async fn announce_pass_failure(
     orch: &Orchestrator,
     project_id: &str,
     repo_path: &str,
-    scope: &LaneScope,
     cause: &str,
 ) {
     let Some(checks) = crate::config::project_settings::load_checks(Path::new(repo_path)) else {
         return;
     };
-    let lanes: Vec<CadenceLane> = cadence_lanes(&checks)
-        .into_iter()
-        .filter(|lane| scope.includes(lane))
-        .collect();
+    let lanes = cadence_lanes(&checks);
     if lanes.is_empty() {
         return;
     }
@@ -1307,12 +788,9 @@ async fn announce_pass_failure(
             None,
             &lane,
             None,
-            cancelled_by_restart(
-                CadenceVerdict::Death {
-                    cause: format!("the cadence pass failed before this lane could run: {cause}"),
-                },
-                orch.fleet.runner_stopping_since(),
-            ),
+            CadenceVerdict::Death {
+                cause: format!("the cadence pass failed before this lane could run: {cause}"),
+            },
         )
         .await;
     }
@@ -1380,17 +858,13 @@ impl Failure {
     }
 }
 
-/// One whole-suite observation, read back from the store: the cadence's own
-/// attempt, or a row of any cadence it is compared with or covered by.
+/// One cadence observation, read back from the store.
 #[derive(Clone, Debug)]
 pub(crate) struct CadenceRow {
     pub(crate) id: String,
     /// Canonical citation: `cairn://p/{key}/check-observations/{handle}`.
     pub(crate) reference: String,
     pub(crate) commit: String,
-    /// How the row was armed: `main` for the cadence's own, otherwise the
-    /// producer's cadence (`manual`, `review`, `write`).
-    pub(crate) cadence: String,
     pub(crate) platform: String,
     /// The executor identity the row recorded: what previous rows are keyed by.
     pub(crate) executor_id: Option<String>,
@@ -1437,12 +911,6 @@ pub(crate) enum CadenceVerdict {
     },
     /// The lane died before producing a result.
     Death { cause: String },
-    /// The runner began stopping while the lane ran, and the lane ended
-    /// without a result: see [`cancelled_by_restart`].
-    Cancelled {
-        cause: String,
-        stopped_at_unix_ms: i64,
-    },
 }
 
 impl CadenceVerdict {
@@ -1450,7 +918,7 @@ impl CadenceVerdict {
         match self {
             CadenceVerdict::Complete(row) => Some(row),
             CadenceVerdict::NoVerdict { row, .. } => row.as_ref(),
-            CadenceVerdict::Death { .. } | CadenceVerdict::Cancelled { .. } => None,
+            CadenceVerdict::Death { .. } => None,
         }
     }
     fn is_complete(&self) -> bool {
@@ -1490,79 +958,6 @@ fn classify_row(row: CadenceRow) -> CadenceVerdict {
     }
 }
 
-/// A lane that ended without a result while this runner was stopping was
-/// ended by the restart, whatever shape the ending took on the way out: the
-/// fleet answers a claim the stop interrupted as cancelled, and a pass cut
-/// short fails before its lanes. Neither judged the tree or a machine, and
-/// announcing one as a death sent readers looking for a machine fault that was
-/// a deploy. A result with a row is the tree's answer, stop or no stop.
-fn cancelled_by_restart(verdict: CadenceVerdict, stopping_since: Option<u64>) -> CadenceVerdict {
-    let Some(stopped_at) = stopping_since else {
-        return verdict;
-    };
-    match verdict {
-        CadenceVerdict::Death { cause } | CadenceVerdict::NoVerdict { row: None, cause } => {
-            CadenceVerdict::Cancelled {
-                cause,
-                stopped_at_unix_ms: i64::try_from(stopped_at).unwrap_or(i64::MAX),
-            }
-        }
-        other => other,
-    }
-}
-
-/// Record a lane pass the restart cancelled, for the next boot to cite.
-async fn record_interruption(
-    db: &LocalDb,
-    project_id: &str,
-    interruption: &Interruption,
-) -> Result<(), String> {
-    db.execute(
-        "INSERT OR REPLACE INTO main_cadence_interruptions
-           (project_id, check_name, platform, commit_sha, stopped_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        (
-            project_id,
-            interruption.check.as_str(),
-            interruption.platform.as_str(),
-            interruption.commit.as_str(),
-            interruption.stopped_at_unix_ms,
-        ),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|error| error.to_string())
-}
-
-/// Every recorded restart cancel, removed as it is read: one boot cites each.
-async fn take_interruptions(db: &LocalDb) -> Result<Vec<(String, Interruption)>, String> {
-    let interrupted = db
-        .query_all(
-            "SELECT project_id, check_name, platform, commit_sha, stopped_at
-               FROM main_cadence_interruptions",
-            (),
-            |row| {
-                Ok((
-                    row.text(0)?,
-                    Interruption {
-                        check: row.text(1)?,
-                        platform: row.text(2)?,
-                        commit: row.text(3)?,
-                        stopped_at_unix_ms: row.i64(4)?,
-                    },
-                ))
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    if !interrupted.is_empty() {
-        db.execute("DELETE FROM main_cadence_interruptions", ())
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(interrupted)
-}
-
 /// Resolves a recorded executor identity to its public name.
 type ExecutorNames<'a> = &'a (dyn Fn(&str) -> String + Sync);
 
@@ -1575,7 +970,7 @@ async fn load_row(
     let head = db
         .query_opt(
             "SELECT id, COALESCE(public_handle, id), commit_sha, COALESCE(verdict_platform, ''),
-                    executor_id, ran_at, verdict, exit_code, complete, output_tail, cadence
+                    executor_id, ran_at, verdict, exit_code, complete, output_tail
                FROM check_result_observations WHERE id = ?1",
             (observation_id.to_string(),),
             |row| {
@@ -1590,26 +985,14 @@ async fn load_row(
                     row.i64(7)?,
                     row.i64(8)?,
                     row.text(9)?,
-                    row.text(10)?,
                 ))
             },
         )
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("observation {observation_id} does not exist"))?;
-    let (
-        id,
-        handle,
-        commit,
-        platform,
-        executor_id,
-        ran_at,
-        verdict,
-        exit_code,
-        complete,
-        tail,
-        cadence,
-    ) = head;
+    let (id, handle, commit, platform, executor_id, ran_at, verdict, exit_code, complete, tail) =
+        head;
     let tests = db
         .query_all(
             "SELECT test_id, status, failure_excerpt FROM check_test_results WHERE observation_id = ?1",
@@ -1632,7 +1015,6 @@ async fn load_row(
         reference: format!("cairn://p/{project_key}/check-observations/{handle}"),
         id,
         commit,
-        cadence,
         platform,
         executor: executor_id.as_deref().map(names),
         executor_id,
@@ -1645,67 +1027,6 @@ async fn load_row(
     })
 }
 
-/// The default head's first-parent chain, tip first: the trees main has held,
-/// back [`BRACKET_SCAN`] landings. A whole-suite row on one of these commits
-/// observed a tree main held, whoever armed it (tenet 687: a measurement is
-/// keyed to the commit it measured, not to how it was armed).
-#[derive(Debug, Default)]
-pub(crate) struct MainChain {
-    depth: HashMap<String, usize>,
-}
-
-impl MainChain {
-    /// One commit per line, tip first.
-    fn from_log(output: &str) -> Self {
-        Self {
-            depth: output
-                .lines()
-                .map(str::trim)
-                .filter(|commit| !commit.is_empty())
-                .enumerate()
-                .map(|(depth, commit)| (commit.to_string(), depth))
-                .collect(),
-        }
-    }
-
-    /// How many landings behind the tip `commit` sits; `None` off the chain.
-    fn depth(&self, commit: &str) -> Option<usize> {
-        self.depth.get(commit).copied()
-    }
-}
-
-fn main_chain(orch: &Orchestrator, repository: &Path, tip: &str) -> Result<MainChain, String> {
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let revset = format!("first_ancestors({tip}, {BRACKET_SCAN})");
-    jj.run(
-        repository,
-        &[
-            "log",
-            "--ignore-working-copy",
-            "--no-graph",
-            "-r",
-            &revset,
-            "-T",
-            r#"commit_id ++ "\n""#,
-        ],
-        "jj log (main cadence first-parent chain)",
-    )
-    .map(|output| MainChain::from_log(&output))
-}
-
-/// Where a row sits relative to main's tip, nearest first: the tree it
-/// observed, then how recently it finished. A row's `ran_at` is its finish, so
-/// a long run armed on an older tip can finish after a short one on a newer
-/// tip; the tree decides. Without a chain, or off it, only the finish orders.
-fn tree_order(chain: Option<&MainChain>, row: &CadenceRow) -> (usize, std::cmp::Reverse<i64>) {
-    (
-        chain
-            .and_then(|chain| chain.depth(&row.commit))
-            .unwrap_or(usize::MAX),
-        std::cmp::Reverse(row.ran_at_ms),
-    )
-}
-
 /// Narrows [`latest_complete_row`]'s candidates; every field is optional.
 #[derive(Clone, Copy, Default)]
 struct RowFilter<'a> {
@@ -1715,27 +1036,10 @@ struct RowFilter<'a> {
     executor_id: Option<&'a str>,
     /// Never this row.
     excluding: Option<&'a str>,
-    /// Main's first-parent chain. A row of any cadence on it qualifies, and
-    /// the nearest tree wins. Without it only the cadence's own rows qualify,
-    /// newest finish first.
-    main_chain: Option<&'a MainChain>,
 }
 
-/// How many recorded rows [`latest_complete_row`] reads before placing them on
-/// main's chain: rows on agent branches and narrowed selections share the
-/// table, so the newest few by finish time are not enough.
-const CANDIDATE_SCAN: i64 = 64;
-
-/// The newest whole-suite row for `lane` that classifies as complete and
-/// passes `filter`.
-///
-/// A row qualifies when it observed the whole suite: `selection = 'full'` (a
-/// fast, filtered, or empty selection is not the suite, tenet 695), nothing
-/// deferred (a tiered run's deferred tests are unobserved), and no failure kind
-/// (an infrastructure or killed run observed nothing). Its cadence is how it
-/// was armed, not what it observed, so with a chain any cadence's row on main's
-/// first-parent chain qualifies; the cadence's own rows qualify regardless,
-/// having been armed on main's tip.
+/// The newest cadence row for `lane` that classifies as complete and passes
+/// `filter`.
 async fn latest_complete_row(
     db: &LocalDb,
     project_id: &str,
@@ -1746,14 +1050,12 @@ async fn latest_complete_row(
 ) -> Result<Option<CadenceRow>, String> {
     let candidates = db
         .query_all(
-            "SELECT id, commit_sha, cadence FROM check_result_observations
-              WHERE project_id = ?1 AND check_name = ?2 AND verdict_platform = ?3
-                AND complete = 1 AND failure_kind IS NULL
-                AND selection = 'full' AND deferred_count = 0 AND id != ?4
+            "SELECT id FROM check_result_observations
+              WHERE project_id = ?1 AND check_name = ?2 AND cadence = 'main'
+                AND verdict_platform = ?3 AND complete = 1 AND id != ?4
                 AND (?5 = '' OR input_hash = ?5)
                 AND (?6 = '' OR executor_id = ?6)
-                AND (?7 = 1 OR cadence = 'main')
-              ORDER BY ran_at DESC LIMIT ?8",
+              ORDER BY ran_at DESC LIMIT 8",
             (
                 project_id.to_string(),
                 lane.check.clone(),
@@ -1761,26 +1063,12 @@ async fn latest_complete_row(
                 filter.excluding.unwrap_or("").to_string(),
                 filter.input_hash.unwrap_or("").to_string(),
                 filter.executor_id.unwrap_or("").to_string(),
-                i64::from(filter.main_chain.is_some()),
-                CANDIDATE_SCAN,
             ),
-            |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
+            |row| row.text(0),
         )
         .await
         .map_err(|error| error.to_string())?;
-    let mut candidates: Vec<(String, usize)> = candidates
-        .into_iter()
-        .filter_map(|(id, commit, cadence)| {
-            let depth = filter.main_chain.and_then(|chain| chain.depth(&commit));
-            if depth.is_none() && cadence != "main" {
-                return None;
-            }
-            Some((id, depth.unwrap_or(usize::MAX)))
-        })
-        .collect();
-    // Stable, so rows on one tree keep the query's newest-finish-first order.
-    candidates.sort_by_key(|(_, depth)| *depth);
-    for (id, _) in candidates {
+    for id in candidates {
         if let CadenceVerdict::Complete(row) =
             classify_row(load_row(db, project_key, &id, names).await?)
         {
@@ -1858,13 +1146,11 @@ fn bracket_base<'a>(
 }
 
 /// Choose the comparison for an attempt on `executor_id` from that executor's
-/// newest complete row and the platform's newest complete row on any executor,
-/// "newest" in [`tree_order`].
+/// newest complete row and the platform's newest complete row on any executor.
 fn select_comparison(
     executor_id: Option<&str>,
     same_executor: Option<CadenceRow>,
     newest: Option<CadenceRow>,
-    chain: Option<&MainChain>,
 ) -> Comparison {
     let Some(executor_id) = executor_id else {
         return newest.map_or(Comparison::Baseline, |previous| Comparison::AnyExecutor {
@@ -1875,7 +1161,7 @@ fn select_comparison(
         Some(previous) => {
             let neighbour = newest.filter(|row| {
                 row.executor_id.as_deref() != Some(executor_id)
-                    && tree_order(chain, row) < tree_order(chain, &previous)
+                    && row.ran_at_ms > previous.ran_at_ms
             });
             Comparison::SameExecutor {
                 previous,
@@ -1889,14 +1175,13 @@ fn select_comparison(
 }
 
 /// What `current` (the attempt's own row, when it recorded one) is measured
-/// against: whole-suite rows of any cadence on `chain`, when it is known.
+/// against.
 async fn comparison_for(
     db: &LocalDb,
     project_id: &str,
     project_key: &str,
     lane: &CadenceLane,
     current: Option<&CadenceRow>,
-    chain: Option<&MainChain>,
     names: ExecutorNames<'_>,
 ) -> Result<Comparison, String> {
     let excluding = current.map(|row| row.id.as_str());
@@ -1911,7 +1196,6 @@ async fn comparison_for(
                 RowFilter {
                     executor_id: Some(executor_id),
                     excluding,
-                    main_chain: chain,
                     ..RowFilter::default()
                 },
                 names,
@@ -1927,13 +1211,12 @@ async fn comparison_for(
         lane,
         RowFilter {
             excluding,
-            main_chain: chain,
             ..RowFilter::default()
         },
         names,
     )
     .await?;
-    Ok(select_comparison(executor_id, same_executor, newest, chain))
+    Ok(select_comparison(executor_id, same_executor, newest))
 }
 
 /// The line of a failure excerpt that says what went wrong. A Rust panic opens
@@ -2191,17 +1474,10 @@ pub(crate) struct CadenceReport<'a> {
     pub(crate) comparison: &'a Comparison,
     pub(crate) bracket: &'a Bracket,
     pub(crate) now_ms: i64,
-    /// The pass the runner's restart cancelled on this lane, when this one is
-    /// the boot re-arm that succeeds it.
-    pub(crate) rearmed: Option<&'a Interruption>,
 }
 
 fn short_commit(commit: &str) -> &str {
     commit.get(..12).unwrap_or(commit)
-}
-
-fn stamp(unix_ms: i64) -> String {
-    crate::fleet::purpose::stamp(u64::try_from(unix_ms).unwrap_or(0))
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -2234,18 +1510,6 @@ fn plural(count: usize) -> &'static str {
 
 fn host(row: &CadenceRow) -> &str {
     row.executor.as_deref().unwrap_or("unknown")
-}
-
-/// A compared or covering row as the message names it: how it was armed and
-/// where it ran ("the manual row on `bbs`"), so a hand-armed baseline reads
-/// apart from a cadence pass.
-fn armed(row: &CadenceRow) -> String {
-    let cadence = if row.cadence == "main" {
-        "cadence"
-    } else {
-        row.cadence.as_str()
-    };
-    format!("{cadence} row on `{}`", host(row))
 }
 
 fn age(now_ms: i64, then_ms: i64) -> String {
@@ -2595,28 +1859,28 @@ fn render_host_conditions(
 fn render_basis(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow) {
     let line = match report.comparison {
         Comparison::Baseline => format!(
-            "nothing. No earlier complete whole-suite row on main exists for {} on {}, so this row is the baseline and every failure is listed as newly red.",
+            "nothing. No earlier complete cadence row exists for {} on {}, so this row is the baseline and every failure is listed as newly red.",
             report.check, report.platform
         ),
         Comparison::SameExecutor { previous, .. } => format!(
-            "{}, the previous {} (commit `{}`, ran {} earlier)",
+            "{}, the previous row on `{}` (commit `{}`, ran {} earlier)",
             previous.reference,
-            armed(previous),
+            host(previous),
             short_commit(&previous.commit),
             age(row.ran_at_ms, previous.ran_at_ms)
         ),
         Comparison::OtherExecutor { previous } => format!(
-            "{}, the {} (commit `{}`, ran {} earlier). No earlier complete row exists on `{}`, so this is a **cross-host comparison**: what differs below may be the two hosts (provisioning, load, toolchain) rather than the tree, and none of it is reported as newly red or green.",
+            "{} on `{}` (commit `{}`, ran {} earlier). No earlier complete row exists on `{}`, so this is a **cross-host comparison**: what differs below may be the two hosts (provisioning, load, toolchain) rather than the tree, and none of it is reported as newly red or green.",
             previous.reference,
-            armed(previous),
+            host(previous),
             short_commit(&previous.commit),
             age(row.ran_at_ms, previous.ran_at_ms),
             host(row)
         ),
         Comparison::AnyExecutor { previous } => format!(
-            "{}, the {} (commit `{}`, ran {} earlier). This row names no executor, so the comparison may cross hosts.",
+            "{} on `{}` (commit `{}`, ran {} earlier). This row names no executor, so the comparison may cross hosts.",
             previous.reference,
-            armed(previous),
+            host(previous),
             short_commit(&previous.commit),
             age(row.ran_at_ms, previous.ran_at_ms)
         ),
@@ -2790,50 +2054,26 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
     }
 }
 
-/// Why a lane posted no complete row.
-#[derive(Clone, Copy)]
-enum Unobserved {
-    Death,
-    NoVerdict,
-    Restart { stopped_at_unix_ms: i64 },
-}
-
 fn render_incomplete(
     out: &mut String,
     report: &CadenceReport<'_>,
     row: Option<&CadenceRow>,
     cause: &str,
-    class: Unobserved,
+    death: bool,
 ) {
     let tip = report
         .commit
         .or(row.map(|row| row.commit.as_str()))
         .map(|commit| format!(" · `{}`", short_commit(commit)))
         .unwrap_or_default();
-    match class {
-        Unobserved::Restart { stopped_at_unix_ms } => {
-            out.push_str(&format!(
-                "⏸️ **MAIN CADENCE PASS CANCELLED BY RESTART · {} · {}{tip}** — the runner began stopping at {} while this lane ran. Main stays unobserved for {} on {} until the pass the runner arms at boot completes.\n\n",
-                report.check,
-                report.platform,
-                stamp(stopped_at_unix_ms),
-                report.check,
-                report.platform
-            ));
-            out.push_str("- Cause class: **cancelled by restart** — Cairn's own runner stopped mid-pass. Nothing died and nothing failed: neither the tree nor a machine was judged, and no row was recorded.\n");
-            out.push_str("- Re-arm: at boot the runner arms this lane again for whatever main is then, and that pass's report cites this one.\n");
-        }
-        Unobserved::Death | Unobserved::NoVerdict => {
-            out.push_str(&format!(
-                "🚨 **MAIN CADENCE DID NOT COMPLETE · {} · {}{tip}** — main is unobserved for {} on {} until a cadence row completes.\n\n",
-                report.check, report.platform, report.check, report.platform
-            ));
-            if matches!(class, Unobserved::Death) {
-                out.push_str("- Cause class: **death** — the lane died before it produced a result (the execution side of the seam: no machine, capacity, infrastructure, a stalled or killed run).\n");
-            } else {
-                out.push_str("- Cause class: **no-verdict** — the lane ran to an exit, but its result is not a per-test verdict (the testing side of the seam: a test target that did not compile, zero tests, an incomplete enumeration). It is not green.\n");
-            }
-        }
+    out.push_str(&format!(
+        "🚨 **MAIN CADENCE DID NOT COMPLETE · {} · {}{tip}** — main is unobserved for {} on {} until a cadence row completes.\n\n",
+        report.check, report.platform, report.check, report.platform
+    ));
+    if death {
+        out.push_str("- Cause class: **death** — the lane died before it produced a result (the execution side of the seam: no machine, capacity, infrastructure, a stalled or killed run).\n");
+    } else {
+        out.push_str("- Cause class: **no-verdict** — the lane ran to an exit, but its result is not a per-test verdict (the testing side of the seam: a test target that did not compile, zero tests, an incomplete enumeration). It is not green.\n");
     }
     out.push_str(&format!("- Cause: {cause}\n"));
     if let Some(row) = row {
@@ -2842,7 +2082,7 @@ fn render_incomplete(
         if !tail.is_empty() {
             out.push_str(&format!(
                 "\nOutput tail:\n```\n{}\n```\n",
-                crate::execution::check_parsers::anchored_tail(tail, MAX_CAUSE_CHARS)
+                crate::execution::check_parsers::error_anchored_tail(tail, MAX_CAUSE_CHARS)
                     .replace("```", "'''")
             ));
         }
@@ -2856,27 +2096,27 @@ fn render_incomplete(
     };
     match report.comparison {
         Comparison::Baseline => out.push_str(&format!(
-            "- Last complete row: none. No complete whole-suite row on main has ever been recorded for {} on {}.\n",
+            "- Last complete row: none. No complete cadence row has ever been recorded for {} on {}.\n",
             report.check, report.platform
         )),
         Comparison::SameExecutor { previous, .. } => out.push_str(&format!(
-            "- Last complete row: {}, the previous {}, at {}.\n",
+            "- Last complete row: {}, the previous row on `{}`, at {}.\n",
             previous.reference,
-            armed(previous),
+            host(previous),
             since(previous)
         )),
         Comparison::OtherExecutor { previous } => out.push_str(&format!(
-            "- Last complete row: none on `{}`. The newest complete row on {} is {}, the {}, at {}.\n",
+            "- Last complete row: none on `{}`. The newest complete row on {} is {} on `{}`, at {}.\n",
             row.map_or("this executor", host),
             report.platform,
             previous.reference,
-            armed(previous),
+            host(previous),
             since(previous)
         )),
         Comparison::AnyExecutor { previous } => out.push_str(&format!(
-            "- Last complete row: {}, the {} (the newest on {}, any executor), at {}.\n",
+            "- Last complete row: {} on `{}` (the newest on {}, any executor), at {}.\n",
             previous.reference,
-            armed(previous),
+            host(previous),
             report.platform,
             since(previous)
         )),
@@ -2886,9 +2126,9 @@ fn render_incomplete(
     {
         if covering.id != previous.id {
             out.push_str(&format!(
-                "- Covered through: {}, the {}, at {}, the newest complete row on {} on any executor. A merge is covered when any host's complete whole-suite row includes it, whoever armed the run, so the list below starts there.\n",
+                "- Covered through: {} on `{}`, at {}, the newest complete row on {} on any executor. A merge is covered when any host's complete row includes it, so the list below starts there.\n",
                 covering.reference,
-                armed(covering),
+                host(covering),
                 since(covering),
                 report.platform
             ));
@@ -2913,33 +2153,15 @@ pub(crate) fn render_report(report: &CadenceReport<'_>) -> String {
             report,
             row.as_ref(),
             &truncate(cause, MAX_CAUSE_CHARS),
-            Unobserved::NoVerdict,
+            false,
         ),
         CadenceVerdict::Death { cause } => render_incomplete(
             &mut out,
             report,
             None,
             &truncate(cause, MAX_CAUSE_CHARS),
-            Unobserved::Death,
+            true,
         ),
-        CadenceVerdict::Cancelled {
-            cause,
-            stopped_at_unix_ms,
-        } => render_incomplete(
-            &mut out,
-            report,
-            None,
-            &truncate(cause, MAX_CAUSE_CHARS),
-            Unobserved::Restart {
-                stopped_at_unix_ms: *stopped_at_unix_ms,
-            },
-        ),
-    }
-    if let Some(interruption) = report.rearmed {
-        out.push_str(&format!(
-            "\n- Re-armed at boot: this pass succeeds {}.\n",
-            interruption.describe()
-        ));
     }
     out
 }
@@ -2972,7 +2194,6 @@ mod tests {
             id: id.to_string(),
             reference: format!("cairn://p/cairn/check-observations/{id}"),
             commit: commit.to_string(),
-            cadence: "main".to_string(),
             platform: "linux".to_string(),
             executor_id: Some("bbs".to_string()),
             executor: Some("bbs".to_string()),
@@ -3026,53 +2247,26 @@ mod tests {
             comparison,
             bracket,
             now_ms: 10 * HOUR,
-            rearmed: None,
         })
     }
 
-    fn macos_lane() -> CadenceLane {
-        CadenceLane {
-            platform: "macos".into(),
-            ..linux_lane()
-        }
-    }
-
-    fn tip(project_id: &str, commit: &str) -> Tip {
-        Tip {
-            project_id: project_id.into(),
-            project_key: "cairn".into(),
-            repo_path: "/tmp/repo".into(),
-            default_branch: "main".into(),
-            repository: PathBuf::from("/tmp/store"),
-            commit: commit.into(),
-        }
-    }
-
-    /// The arm resolving the tip: its branch and arming instant.
-    fn resolving(slots: &CadenceSlots, project_id: &str) -> Option<(String, i64)> {
-        slots
-            .in_flight(project_id)
-            .and_then(|in_flight| in_flight.resolving)
-    }
-
     #[test]
-    fn requests_during_an_arm_coalesce_into_one_queued_successor() {
-        let all = || LaneScope::All;
+    fn requests_during_a_pass_coalesce_into_one_queued_successor() {
         let mut slots = CadenceSlots::default();
-        assert!(slots.request("p", "main", Trigger::Startup, all(), 1));
-        assert_eq!(resolving(&slots, "p"), Some(("main".to_string(), 1)));
-        // Three merges and a heartbeat while the first arm runs: no second
-        // arm starts, and exactly one successor is owed.
-        assert!(!slots.request("p", "main", Trigger::Heartbeat, all(), 2));
-        assert!(!slots.request("p", "main", Trigger::Merge, all(), 3));
-        assert!(!slots.request("p", "main", Trigger::Merge, all(), 4));
-        assert!(!slots.request("p", "main", Trigger::Heartbeat, all(), 5));
+        assert!(slots.request("p", "main", Trigger::Startup, 1));
+        assert_eq!(slots.in_flight("p"), Some(("main".to_string(), 1)));
+        // Three merges and a heartbeat while the first pass runs: no second
+        // pass starts, and exactly one successor is owed.
+        assert!(!slots.request("p", "main", Trigger::Heartbeat, 2));
+        assert!(!slots.request("p", "main", Trigger::Merge, 3));
+        assert!(!slots.request("p", "main", Trigger::Merge, 4));
+        assert!(!slots.request("p", "main", Trigger::Heartbeat, 5));
         assert_eq!(
             slots.finish("p", 6),
-            Some((Trigger::Merge, LaneScope::All)),
+            Some(Trigger::Merge),
             "the strongest reason is kept"
         );
-        assert_eq!(resolving(&slots, "p"), Some(("main".to_string(), 6)));
+        assert_eq!(slots.in_flight("p"), Some(("main".to_string(), 6)));
         assert_eq!(
             slots.finish("p", 7),
             None,
@@ -3080,117 +2274,13 @@ mod tests {
         );
         assert_eq!(slots.in_flight("p"), None);
         assert!(
-            slots.request("p", "main", Trigger::Merge, all(), 8),
+            slots.request("p", "main", Trigger::Merge, 8),
             "a released slot starts afresh"
         );
         assert!(
-            slots.request("q", "trunk", Trigger::Merge, all(), 8),
+            slots.request("q", "trunk", Trigger::Merge, 8),
             "projects are independent"
         );
-    }
-
-    /// cairn/5270: every lane of a pass used to be joined, so the next pass
-    /// (and the Linux row it would record) waited for the slowest lane, and a
-    /// macOS lane parked for its whole four-hour placement bound would have
-    /// held Linux for four hours. Each lane now holds only its own slot.
-    #[test]
-    fn a_busy_lane_never_delays_another_lanes_successor() {
-        let (linux, macos) = (linux_lane(), macos_lane());
-        let mut slots = CadenceSlots::default();
-        assert!(slots.offer(&linux, &tip("p", "t1"), Trigger::Merge, 1));
-        assert!(slots.offer(&macos, &tip("p", "t1"), Trigger::Merge, 1));
-        // Two more tips while both run: each lane owes one successor, on the
-        // newest tip, with the strongest reason.
-        assert!(!slots.offer(&linux, &tip("p", "t2"), Trigger::Merge, 2));
-        assert!(!slots.offer(&macos, &tip("p", "t2"), Trigger::Merge, 2));
-        assert!(!slots.offer(&linux, &tip("p", "t3"), Trigger::Heartbeat, 3));
-        assert!(!slots.offer(&macos, &tip("p", "t3"), Trigger::Heartbeat, 3));
-
-        // Linux finishes while macOS is still parked, and starts its successor
-        // at once.
-        assert_eq!(
-            slots.lane_finished("p", &linux, 4),
-            Some((Trigger::Merge, tip("p", "t3")))
-        );
-        assert_eq!(slots.lane_finished("p", &linux, 5), None);
-        // The next merge, macOS still parked: idle Linux starts, macOS folds.
-        assert!(slots.offer(&linux, &tip("p", "t4"), Trigger::Merge, 6));
-        assert!(!slots.offer(&macos, &tip("p", "t4"), Trigger::Merge, 6));
-        assert_eq!(
-            slots.in_flight("p"),
-            Some(InFlight {
-                resolving: None,
-                lanes: vec![
-                    LaneInFlight {
-                        check: "rust-tests".into(),
-                        platform: "linux".into(),
-                        commit: "t4".into(),
-                        armed_at_unix_ms: 6,
-                        queued: false,
-                    },
-                    LaneInFlight {
-                        check: "rust-tests".into(),
-                        platform: "macos".into(),
-                        commit: "t1".into(),
-                        armed_at_unix_ms: 1,
-                        queued: true,
-                    },
-                ],
-                rearming: Vec::new(),
-            })
-        );
-
-        // macOS owes exactly one successor, on the newest tip.
-        assert_eq!(
-            slots.lane_finished("p", &macos, 7),
-            Some((Trigger::Merge, tip("p", "t4")))
-        );
-        assert_eq!(slots.lane_finished("p", &macos, 8), None);
-        assert!(
-            slots.offer(&macos, &tip("q", "t1"), Trigger::Merge, 8),
-            "projects are independent"
-        );
-    }
-
-    /// A lane's own re-arm (its settled debt) names only that lane, so the
-    /// macOS lane's debt never re-runs the Linux lane. A merge folded into the
-    /// same arm is what widens it to every lane.
-    #[test]
-    fn a_lane_rearm_runs_only_that_lane_unless_a_merge_widens_it() {
-        let (linux, macos) = (linux_lane(), macos_lane());
-        let only_macos = LaneScope::lane(&macos);
-        assert!(only_macos.includes(&macos));
-        assert!(!only_macos.includes(&linux));
-        assert!(LaneScope::All.includes(&linux));
-
-        let mut slots = CadenceSlots::default();
-        assert!(slots.request("p", "main", Trigger::Merge, LaneScope::All, 1));
-        assert!(!slots.request("p", "main", Trigger::DebtSettled, only_macos.clone(), 2));
-        assert_eq!(
-            slots.finish("p", 3),
-            Some((Trigger::DebtSettled, only_macos.clone())),
-            "a queued lane re-arm stays that lane's"
-        );
-        assert!(!slots.request(
-            "p",
-            "main",
-            Trigger::DebtSettled,
-            LaneScope::lane(&linux),
-            4
-        ));
-        assert!(!slots.request("p", "main", Trigger::DebtSettled, only_macos.clone(), 5));
-        assert_eq!(
-            slots.finish("p", 6),
-            Some((
-                Trigger::DebtSettled,
-                LaneScope::Only(BTreeSet::from([linux.key(), macos.key()]))
-            )),
-            "two lanes' re-arms are one arm for both"
-        );
-        assert!(!slots.request("p", "main", Trigger::Merge, LaneScope::All, 7));
-        assert!(!slots.request("p", "main", Trigger::DebtSettled, only_macos, 8));
-        assert_eq!(slots.finish("p", 9), Some((Trigger::Merge, LaneScope::All)));
-        assert_eq!(slots.finish("p", 10), None);
     }
 
     /// A settled debt outranks the routine re-arms, so a pass queued behind it
@@ -3201,13 +2291,10 @@ mod tests {
         assert!(Trigger::DebtSettled > Trigger::Startup);
         assert!(Trigger::DebtSettled < Trigger::Merge);
         let mut slots = CadenceSlots::default();
-        assert!(slots.request("p", "main", Trigger::Startup, LaneScope::All, 1));
-        assert!(!slots.request("p", "main", Trigger::Heartbeat, LaneScope::All, 2));
-        assert!(!slots.request("p", "main", Trigger::DebtSettled, LaneScope::All, 3));
-        assert_eq!(
-            slots.finish("p", 4),
-            Some((Trigger::DebtSettled, LaneScope::All))
-        );
+        assert!(slots.request("p", "main", Trigger::Startup, 1));
+        assert!(!slots.request("p", "main", Trigger::Heartbeat, 2));
+        assert!(!slots.request("p", "main", Trigger::DebtSettled, 3));
+        assert_eq!(slots.finish("p", 4), Some(Trigger::DebtSettled));
     }
 
     /// One debt, one waiter, however many passes it refuses.
@@ -3303,179 +2390,6 @@ mod tests {
         assert_eq!(
             tip_lanes(&slots, "rs", "tip-1", no_config).await,
             Ok(Vec::new())
-        );
-    }
-
-    /// Testing's specimen (cairn/5441): the 15:48 rebuild cancelled the pass on
-    /// 5027f547 while merges had moved main to 7e1b2a9a, and after boot nothing
-    /// was armed. A pass binds no tip and resolves main only when it starts, so
-    /// the boot pass attests wherever main moved to. What must hold is that the
-    /// restart leaves exactly one armed pass, citing the cancelled one, however
-    /// many arms the boot, its catch-up, and the merges around them make.
-    #[tokio::test]
-    async fn a_pass_the_restart_cancelled_is_rearmed_exactly_once_at_boot_and_cited() {
-        let temp = tempfile::tempdir().unwrap();
-        let db = LocalDb::open_migrated_for_test(temp.path().join("cadence.db"))
-            .await
-            .unwrap();
-        let lane = CadenceLane {
-            check: "rust-tests".into(),
-            platform: "linux".into(),
-            notify: "testing".into(),
-        };
-
-        // Before the restart: a pass on the old tip, a merge queued behind it,
-        // and the stop ending its lane.
-        let mut before = CadenceSlots::default();
-        assert!(before.offer(&lane, &tip("p", "5027f5473a57a1b2"), Trigger::Merge, 1));
-        assert!(!before.offer(&lane, &tip("p", "later"), Trigger::Merge, 2));
-        let stopped_at = 3 * HOUR;
-        let ended = cancelled_by_restart(
-            CadenceVerdict::Death {
-                cause: "infrastructure: Cairn cancelled this check before it produced a verdict: Cairn's runner is stopping.".into(),
-            },
-            Some(stopped_at as u64),
-        );
-        assert!(
-            matches!(ended, CadenceVerdict::Cancelled { stopped_at_unix_ms, .. } if stopped_at_unix_ms == stopped_at),
-            "{ended:?}"
-        );
-        let cancelled = Interruption {
-            check: lane.check.clone(),
-            platform: lane.platform.clone(),
-            commit: "5027f5473a57a1b2".into(),
-            stopped_at_unix_ms: stopped_at,
-        };
-        record_interruption(&db, "p", &cancelled).await.unwrap();
-        // The process ends, and its slots, queued successor included, with it.
-        drop(before);
-
-        // Boot: a fresh process reads back what the restart cancelled, and arms.
-        let mut slots = CadenceSlots::default();
-        assert!(
-            slots.in_flight("p").is_none(),
-            "no pass survives the restart in memory"
-        );
-        for (project_id, interruption) in take_interruptions(&db).await.unwrap() {
-            slots.interrupted(&project_id, interruption);
-        }
-        assert!(
-            slots.request("p", "main", Trigger::Startup, LaneScope::All, 4),
-            "the boot arm starts a pass"
-        );
-        // The catch-up's re-arm and a merge seen during the boot pass are one
-        // queued successor, not more passes.
-        assert!(!slots.request("p", "main", Trigger::Startup, LaneScope::All, 5));
-        assert!(!slots.request("p", "main", Trigger::Merge, LaneScope::All, 6));
-        let armed = slots
-            .in_flight("p")
-            .expect("main has a pass armed after boot");
-        assert_eq!(armed.resolving, Some(("main".to_string(), 4)));
-        assert_eq!(
-            armed.rearming,
-            vec![cancelled.clone()],
-            "the armed pass names the pass it re-arms"
-        );
-        assert!(
-            take_interruptions(&db).await.unwrap().is_empty(),
-            "one boot cites a cancel, not every boot"
-        );
-
-        // The lane's report on the moved tip cites the cancelled pass, once.
-        let cited = slots
-            .take_interruption("p", &lane)
-            .expect("the lane's first report takes the citation");
-        assert!(slots.take_interruption("p", &lane).is_none());
-        let moved = row(
-            "r",
-            "7e1b2a9a1d6bc3d4",
-            5 * HOUR,
-            &[("t", TestOutcome::Passed)],
-        );
-        let message = render_report(&CadenceReport {
-            check: "rust-tests",
-            platform: "linux",
-            commit: Some("7e1b2a9a1d6bc3d4"),
-            verdict: &CadenceVerdict::Complete(moved),
-            comparison: &Comparison::Baseline,
-            bracket: &Bracket::default(),
-            now_ms: 10 * HOUR,
-            rearmed: Some(&cited),
-        });
-        assert!(
-            message.contains("Re-armed at boot") && message.contains("`5027f5473a57`"),
-            "{message}"
-        );
-
-        assert_eq!(slots.finish("p", 7), Some((Trigger::Merge, LaneScope::All)));
-        assert_eq!(slots.finish("p", 8), None);
-        assert!(slots.in_flight("p").is_none());
-    }
-
-    #[test]
-    fn a_lane_ended_by_the_restart_reads_as_cancelled_never_as_a_death() {
-        let death = CadenceVerdict::Death {
-            cause: "infrastructure: Cairn cancelled this check before it produced a verdict: Cairn's runner is stopping.".into(),
-        };
-        assert!(
-            matches!(
-                cancelled_by_restart(death.clone(), None),
-                CadenceVerdict::Death { .. }
-            ),
-            "without a stop, a death is a death"
-        );
-        assert!(matches!(
-            cancelled_by_restart(
-                CadenceVerdict::NoVerdict {
-                    row: None,
-                    cause: "lost".into()
-                },
-                Some(1)
-            ),
-            CadenceVerdict::Cancelled { .. }
-        ));
-        let complete = CadenceVerdict::Complete(row("r", "c", HOUR, &[("t", TestOutcome::Passed)]));
-        assert!(
-            matches!(
-                cancelled_by_restart(complete, Some(1)),
-                CadenceVerdict::Complete(_)
-            ),
-            "a row is the tree's answer, stop or no stop"
-        );
-
-        let cancelled = cancelled_by_restart(death, Some(9 * HOUR as u64));
-        let message = report(&cancelled, &Comparison::Baseline, &Bracket::default());
-        assert!(message.contains("CANCELLED BY RESTART"), "{message}");
-        assert!(message.contains("**cancelled by restart**"), "{message}");
-        assert!(
-            !message.contains("DID NOT COMPLETE") && !message.contains("**death**"),
-            "{message}"
-        );
-    }
-
-    /// Lanes report on their own slots after the arm has ended, so a citation
-    /// is dropped when the tip no longer declares its lane, not when an arm
-    /// ends: a citation for a lane still running must survive the arm.
-    #[test]
-    fn a_citation_for_a_lane_the_tip_no_longer_declares_is_dropped() {
-        let interruption = |check: &str| Interruption {
-            check: check.into(),
-            platform: "linux".into(),
-            commit: "c".into(),
-            stopped_at_unix_ms: 1,
-        };
-        let mut slots = CadenceSlots::default();
-        slots.interrupted("p", interruption("retired-check"));
-        slots.interrupted("p", interruption("rust-tests"));
-        assert!(slots.request("p", "main", Trigger::Startup, LaneScope::All, 2));
-        assert_eq!(slots.in_flight("p").unwrap().rearming.len(), 2);
-        slots.forget_undeclared_interruptions("p", &[linux_lane(), macos_lane()]);
-        assert_eq!(slots.finish("p", 3), None);
-        assert!(slots.offer(&linux_lane(), &tip("p", "t"), Trigger::Startup, 3));
-        assert_eq!(
-            slots.in_flight("p").unwrap().rearming,
-            vec![interruption("rust-tests")],
-            "the running lane keeps its citation; the retired one is not re-armed forever"
         );
     }
 
@@ -3577,7 +2491,7 @@ mod tests {
         assert!(text.contains("4 newly red, 1 newly green"), "{text}");
         assert!(
             text.contains(
-                "Compared with: cairn://p/cairn/check-observations/prev, the previous cadence row on `bbs`"
+                "Compared with: cairn://p/cairn/check-observations/prev, the previous row on `bbs`"
             ),
             "the comparison names its host: {text}"
         );
@@ -3923,7 +2837,7 @@ mod tests {
             "the compile error is quoted: {text}"
         );
         assert!(
-            text.contains("No complete whole-suite row on main has ever been recorded"),
+            text.contains("No complete cadence row has ever been recorded"),
             "{text}"
         );
         assert!(
@@ -4001,7 +2915,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("check-observations/prev, the cadence row on `bbs`")
+            text.contains("check-observations/prev on `bbs`")
                 && text.contains("No earlier complete row exists on `fedora`"),
             "the basis names both hosts: {text}"
         );
@@ -4078,10 +2992,7 @@ mod tests {
         );
         // Movement is measured on fedora's own history only.
         assert!(text.contains("2 newly red, 1 newly green"), "{text}");
-        assert!(
-            text.contains("the previous cadence row on `fedora`"),
-            "{text}"
-        );
+        assert!(text.contains("the previous row on `fedora`"), "{text}");
         assert!(
             text.contains("**1 test** · **one host**: passed on `bbs` — `left == right`"),
             "a red the other host's newer row passed is flagged: {text}"
@@ -4167,11 +3078,11 @@ mod tests {
 
         let text = report(&no_verdict, &comparison, &Bracket::default());
         assert!(
-            text.contains("Last complete row: cairn://p/cairn/check-observations/prev, the previous cadence row on `bbs`"),
+            text.contains("Last complete row: cairn://p/cairn/check-observations/prev, the previous row on `bbs`"),
             "{text}"
         );
         assert!(
-            text.contains("Covered through: cairn://p/cairn/check-observations/other, the cadence row on `fedora`"),
+            text.contains("Covered through: cairn://p/cairn/check-observations/other on `fedora`"),
             "{text}"
         );
         assert!(
@@ -4206,7 +3117,7 @@ mod tests {
         let comparison = Comparison::OtherExecutor { previous };
         let text = report(&classify_row(partial), &comparison, &Bracket::default());
         assert!(
-            text.contains("Last complete row: none on `fedora`. The newest complete row on linux is cairn://p/cairn/check-observations/prev, the cadence row on `bbs`"),
+            text.contains("Last complete row: none on `fedora`. The newest complete row on linux is cairn://p/cairn/check-observations/prev on `bbs`"),
             "{text}"
         );
         assert!(
@@ -4215,19 +3126,6 @@ mod tests {
         );
     }
 
-    /// One observation to store; [`insert_observation`] fills the usual shape.
-    struct Stored<'a> {
-        id: &'a str,
-        executor: &'a str,
-        ran_at: i64,
-        cadence: &'a str,
-        commit: &'a str,
-        selection: &'a str,
-        failure_kind: Option<&'a str>,
-        tests: &'a [(&'a str, &'a str)],
-    }
-
-    /// A complete whole-suite row on commit `c-{id}`.
     async fn insert_observation(
         db: &LocalDb,
         id: &str,
@@ -4236,35 +3134,6 @@ mod tests {
         cadence: &str,
         tests: &[(&str, &str)],
     ) {
-        let commit = format!("c-{id}");
-        store(
-            db,
-            Stored {
-                id,
-                executor,
-                ran_at,
-                cadence,
-                commit: &commit,
-                selection: "full",
-                failure_kind: None,
-                tests,
-            },
-        )
-        .await;
-    }
-
-    async fn store(db: &LocalDb, row: Stored<'_>) {
-        let Stored {
-            id,
-            executor,
-            ran_at,
-            cadence,
-            commit,
-            selection,
-            failure_kind,
-            tests,
-        } = row;
-        let failure_kind = failure_kind.map_or("NULL".to_string(), |kind| format!("'{kind}'"));
         // A failing exit with no failing test is not a verdict, so a row's
         // verdict follows its tests; a row with no tests is a compile failure.
         let (exit_code, verdict) = if tests.is_empty() {
@@ -4279,11 +3148,9 @@ mod tests {
                (id, project_id, commit_sha, tree_hash, check_name, input_hash,
                 environment_fingerprint, exit_code, verdict, complete, reusable,
                 parser_version, result_schema_version, ran_at, duration_ms, job_id,
-                cadence, output_tail, executor_id, verdict_platform, public_handle,
-                selection, failure_kind)
-             VALUES('{id}','p','{commit}','t','rust-tests','i-{id}','env',{exit_code},'{verdict}',1,0,
-                    1,1,{ran_at},5,'main:p','{cadence}','','{executor}','linux','h-{id}',
-                    '{selection}',{failure_kind});"
+                cadence, output_tail, executor_id, verdict_platform, public_handle)
+             VALUES('{id}','p','c-{id}','t','rust-tests','i-{id}','env',{exit_code},'{verdict}',1,0,
+                    1,1,{ran_at},5,'main:p','{cadence}','','{executor}','linux','h-{id}');"
         );
         for (test, status) in tests {
             script.push_str(&format!(
@@ -4294,7 +3161,9 @@ mod tests {
         db.execute_script(script).await.unwrap();
     }
 
-    async fn cadence_db(temp: &tempfile::TempDir) -> LocalDb {
+    #[tokio::test]
+    async fn the_previous_row_is_the_same_executors_with_a_platform_fallback() {
+        let temp = tempfile::tempdir().unwrap();
         let db = LocalDb::open_migrated_for_test(temp.path().join("cadence.db"))
             .await
             .unwrap();
@@ -4305,29 +3174,17 @@ mod tests {
         )
         .await
         .unwrap();
-        db
-    }
-
-    fn linux_lane() -> CadenceLane {
-        CadenceLane {
+        let lane = CadenceLane {
             check: "rust-tests".into(),
             platform: "linux".into(),
             notify: "testing".into(),
-        }
-    }
-
-    #[tokio::test]
-    async fn the_previous_row_is_the_same_executors_with_a_platform_fallback() {
-        let temp = tempfile::tempdir().unwrap();
-        let db = cadence_db(&temp).await;
-        let lane = linux_lane();
+        };
         let names = |executor: &str| format!("{executor}-host");
-        // No first-parent chain is known here, so only cadence rows qualify.
         let comparison = |current: Option<CadenceRow>| {
             let db = &db;
             let lane = &lane;
             async move {
-                comparison_for(db, "p", "cairn", lane, current.as_ref(), None, &names)
+                comparison_for(db, "p", "cairn", lane, current.as_ref(), &names)
                     .await
                     .unwrap()
             }
@@ -4339,8 +3196,7 @@ mod tests {
         let id_of = |row: Option<&CadenceRow>| row.map(|row| row.id.clone());
 
         // Interleaved hosts, plus rows the lookup must never pick: a complete
-        // flag with no tests (a compile failure), and a manual run that no
-        // chain places on main.
+        // flag with no tests (a compile failure), a manual run, another platform.
         insert_observation(&db, "b1", "bbs", 1, "main", &[("a", "failed")]).await;
         insert_observation(&db, "f1", "fedora", 2, "main", &[("a", "passed")]).await;
         insert_observation(&db, "b2", "bbs", 3, "main", &[("a", "failed")]).await;
@@ -4401,148 +3257,6 @@ mod tests {
             Comparison::AnyExecutor { previous } => assert_eq!(previous.id, "n1"),
             other => panic!("expected the platform's newest, got {other:?}"),
         }
-    }
-
-    /// cairn/5431: a hand-armed whole-suite row on main observed main's tree,
-    /// so it covers the merges up to it and is a nearer comparison than an
-    /// older cadence row. Narrowed selections, failed runs, rows off main's
-    /// first-parent chain, and a longer run that finished later on an older
-    /// tree never take its place.
-    #[tokio::test]
-    async fn a_whole_suite_row_of_any_cadence_on_main_covers_and_compares() {
-        let temp = tempfile::tempdir().unwrap();
-        let db = cadence_db(&temp).await;
-        let lane = linux_lane();
-        let names = |executor: &str| executor.to_string();
-        // Main's first-parent chain, tip first.
-        let chain = MainChain::from_log("tip\nx\nb\nq\na\n");
-        let comparison = |current: Option<CadenceRow>, with_chain: bool| {
-            let db = &db;
-            let lane = &lane;
-            let chain = with_chain.then_some(&chain);
-            async move {
-                comparison_for(db, "p", "cairn", lane, current.as_ref(), chain, &names)
-                    .await
-                    .unwrap()
-            }
-        };
-        let passed: &[(&str, &str)] = &[("a", "passed")];
-        let shaped = |id, executor, ran_at, cadence, commit, selection, failure_kind| Stored {
-            id,
-            executor,
-            ran_at,
-            cadence,
-            commit,
-            selection,
-            failure_kind,
-            tests: passed,
-        };
-        for row in [
-            // The cadence's last row, on A.
-            shaped("cad-a", "fedora", 1, "main", "a", "full", None),
-            // `cairn check run rust-tests --branch main` on B.
-            shaped("man-b", "bbs", 2, "manual", "b", "full", None),
-            // Nearer the tip than B, but none of them observed the suite.
-            shaped("fast-x", "bbs", 4, "manual", "x", "fast", None),
-            shaped("filtered-x", "bbs", 5, "review", "x", "filtered", None),
-            shaped(
-                "infra-x",
-                "bbs",
-                6,
-                "manual",
-                "x",
-                "full",
-                Some("infrastructure"),
-            ),
-            // A whole-suite row on an agent branch never observed main.
-            shaped("side", "bbs", 7, "review", "side", "full", None),
-            // A long run armed on an older tip, finishing after B's.
-            shaped("man-q", "bbs", 8, "manual", "q", "full", None),
-        ] {
-            store(&db, row).await;
-        }
-
-        // The cadence dies on the tip: B's manual row is the newest tree any
-        // complete whole-suite row observed, so the uncovered list starts at B.
-        let death = CadenceVerdict::Death {
-            cause: "no machine".into(),
-        };
-        let covered = comparison(None, true).await;
-        match &covered {
-            Comparison::AnyExecutor { previous } => {
-                assert_eq!(previous.id, "man-b");
-                assert_eq!(previous.cadence, "manual");
-            }
-            other => panic!("expected the platform's nearest row, got {other:?}"),
-        }
-        assert_eq!(
-            bracket_base(&death, &covered).map(|row| row.commit.as_str()),
-            Some("b"),
-            "merges up to and including B are covered"
-        );
-        let text = report(&death, &covered, &Bracket::default());
-        assert!(
-            text.contains("Last complete row: cairn://p/cairn/check-observations/h-man-b, the manual row on `bbs`"),
-            "{text}"
-        );
-
-        // Without the chain nothing places a manual row on main: the
-        // cadence's own row is all that qualifies.
-        match comparison(None, false).await {
-            Comparison::AnyExecutor { previous } => assert_eq!(previous.id, "cad-a"),
-            other => panic!("expected the cadence's own row, got {other:?}"),
-        }
-
-        // A cadence row on the tip compares with its own host's nearest row
-        // of any cadence, and the other host's nearer row is the neighbour
-        // and the coverage.
-        store(
-            &db,
-            shaped("man-f", "fedora", 3, "manual", "q", "full", None),
-        )
-        .await;
-        store(
-            &db,
-            shaped("cad-tip", "fedora", 10, "main", "tip", "full", None),
-        )
-        .await;
-        let tip = load_row(&db, "cairn", "cad-tip", &names).await.unwrap();
-        let compared = comparison(Some(tip.clone()), true).await;
-        match &compared {
-            Comparison::SameExecutor {
-                previous,
-                neighbour,
-            } => {
-                assert_eq!(previous.id, "man-f", "q is nearer the tip than A");
-                assert_eq!(
-                    neighbour.as_deref().map(|row| row.id.as_str()),
-                    Some("man-b")
-                );
-            }
-            other => panic!("expected a same-executor comparison, got {other:?}"),
-        }
-        assert_eq!(
-            compared.coverage().map(|row| row.id.as_str()),
-            Some("man-b")
-        );
-        let text = report(
-            &CadenceVerdict::Complete(tip),
-            &compared,
-            &Bracket::default(),
-        );
-        assert!(
-            text.contains("Compared with: cairn://p/cairn/check-observations/h-man-f, the previous manual row on `fedora`"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn the_first_parent_chain_reads_tip_first() {
-        let chain = MainChain::from_log("tip\n  mid \n\nroot\n");
-        assert_eq!(chain.depth("tip"), Some(0));
-        assert_eq!(chain.depth("mid"), Some(1));
-        assert_eq!(chain.depth("root"), Some(2));
-        assert_eq!(chain.depth("side"), None);
     }
 
     #[test]

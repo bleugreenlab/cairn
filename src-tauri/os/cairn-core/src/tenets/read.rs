@@ -19,7 +19,7 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 const COLUMNS: &str = "t.id, t.project_id, t.number, t.proposing_thread_id, t.slug, t.statement,
     t.status, t.verdict, t.comment, t.answered_by_json, t.answer_source, t.answered_at,
     t.supersedes, t.origin, t.legacy_json, t.contradiction_alerted_at,
-    t.proposer_principal_json, t.created_at, t.updated_at, t.rationale";
+    t.proposer_principal_json, t.created_at, t.updated_at";
 
 /// A `SELECT` of every stored column from `tenets t` under `filter`.
 pub(super) fn select_sql(filter: &str) -> String {
@@ -50,7 +50,6 @@ pub(super) fn decode(row: &cairn_db::turso::Row) -> DbResult<TenetRow> {
         proposing_thread_id: row.text(3)?,
         slug: row.opt_text(4)?,
         statement: row.text(5)?,
-        rationale: row.opt_text(19)?,
         status: TenetStatus::parse(&status)
             .ok_or_else(|| DbError::Row(format!("tenets.status: unknown {status}")))?,
         verdict: match row.opt_text(7)? {

@@ -239,9 +239,6 @@ fn render_entity(view: &TenetView) -> String {
         row.status.as_str(),
         row.statement,
     );
-    if let Some(rationale) = &row.rationale {
-        out.push_str(&format!("## Rationale\n\n{rationale}\n\n"));
-    }
     out.push_str("## Verdict\n\n");
     if let Some(line) = verdict_line(view) {
         out.push_str(&format!("- {line}\n"));

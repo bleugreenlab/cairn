@@ -62,9 +62,9 @@ use super::{
 };
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
+use crate::stack::off_frame;
 use cairn_common::contract::{contract_for, MutationSpec, ResourceKind};
 use cairn_common::uri::CairnResource;
-use cairn_platform::stack::off_frame;
 
 fn append_payload(index: usize, item: &ChangeItem) -> ResourceMutationResult<&serde_json::Value> {
     item.payload
@@ -298,10 +298,7 @@ pub(crate) async fn dispatch_resource_change(
     gate_resource_change(index, item, &resource)?;
 
     // Optional structured echo of the post-mutation state, surfaced to UI
-    // renderers via the change result. Set by the issue, todos, and pack arms,
-    // and as `{tenet: <uri>}` by every door that proposes a tenet (a tenets
-    // append, an executions append, an issue create's execution block) so the
-    // transcript finds the proposal without parsing the summary.
+    // renderers via the change result. Set by the issue, todos, and pack arms.
     let mut applied_data: Option<serde_json::Value> = None;
     let mut promoted_memory = None;
 
@@ -309,13 +306,8 @@ pub(crate) async fn dispatch_resource_change(
         off_frame(|| posts::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
-    } else if let Some(summary) = {
-        let (resource, applied_data) = (&resource, &mut applied_data);
-        off_frame(move || {
-            tenets::dispatch(orch, request, index, item, dry_run, resource, applied_data)
-        })
-    }
-    .await?
+    } else if let Some(summary) =
+        off_frame(|| tenets::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
@@ -363,13 +355,8 @@ pub(crate) async fn dispatch_resource_change(
         off_frame(|| browsers::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
-    } else if let Some(summary) = {
-        let (resource, applied_data) = (&resource, &mut applied_data);
-        off_frame(move || {
-            executions::dispatch(orch, request, index, item, dry_run, resource, applied_data)
-        })
-    }
-    .await?
+    } else if let Some(summary) =
+        off_frame(|| executions::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =

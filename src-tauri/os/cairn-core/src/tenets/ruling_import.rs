@@ -283,7 +283,7 @@ async fn import_project(
                 db_store::mark_rulings_imported(path);
             }
             if inserted > 0 {
-                emit_changed(emitter, project_id, "insert");
+                emit_changed(emitter, "insert");
             }
             report.projects.push(ProjectImport {
                 project_key: project_key.to_string(),
@@ -419,9 +419,6 @@ fn new_tenet(
         proposing_thread_id: candidate.thread_id.clone(),
         slug: Some(slug),
         statement: candidate.text.clone(),
-        // A ruling's rationale is kept verbatim in `legacy` with its
-        // provenance, as every earlier import kept it.
-        rationale: None,
         status,
         verdict: Some(verdict),
         comment: None,

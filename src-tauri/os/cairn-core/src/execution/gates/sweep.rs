@@ -1009,7 +1009,6 @@ mod tests {
             crate::tenets::filing::TenetFiling::unattributed(),
         )
         .await
-        .map(|started| started.summary)
     }
 
     async fn resolve_issue(env: &Env, number: i32, status: &str) {

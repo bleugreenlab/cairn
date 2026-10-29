@@ -3,7 +3,6 @@
 //! Caching system for command results at checkpoint nodes to avoid
 //! re-executing expensive operations.
 
-use crate::execution::check_parsers::CheckPhases;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_db::turso::{params, Connection, Value};
@@ -1960,13 +1959,6 @@ pub(crate) struct FreshCheckObservationWrite {
     /// Tests the fast tier terminated at its per-test budget. Each one is also a
     /// `deferred` row in `tests`, persisted to `check_deferred_tests`.
     pub deferred_count: i64,
-    /// Where the lane's wall clock went, when its runner measured it.
-    pub phases: Option<CheckPhases>,
-    /// The executor's `ExecutionWarmth`: what the cell held when the command
-    /// started (`ExecutionWarmth::as_str`); `None` when it made no claim.
-    pub execution_warmth: Option<String>,
-    /// The executor's `CellOrigin` for the cell the command ran in.
-    pub cell_origin: Option<ObservedCellOrigin>,
     pub tests: Vec<CheckTestResultRow>,
     /// The suppression scopes this verdict is evidence ABOUT, and the only ones
     /// a genuine verdict clears. A pass on one machine says nothing about a
@@ -2041,109 +2033,9 @@ pub(crate) struct CheckResultObservationProjection {
     /// column existed.
     pub selection: Option<String>,
     pub deferred_count: i64,
-    /// The source observation's phase timings; `None` on rows recorded before
-    /// they existed and on lanes whose runner does not measure them.
-    pub phases: Option<CheckPhases>,
-    pub execution_warmth: Option<String>,
-    pub cell_origin: Option<ObservedCellOrigin>,
     pub tests: Vec<CheckTestResultRow>,
     pub test_total: usize,
     pub test_offset: usize,
-}
-
-/// Where the cell a command ran in came from, as the executor's `CellOrigin`
-/// reported it: the seed on the cell's first occupancy (`clone`, `catalog`,
-/// `cold`) or `reused` after it, and the `CacheDistance` from its tree to the
-/// command's commit when the executor measured one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ObservedCellOrigin {
-    pub kind: String,
-    pub distance_files: Option<i64>,
-    pub distance_crates: Option<i64>,
-}
-
-impl ObservedCellOrigin {
-    pub(crate) fn from_executor(origin: &cairn_common::executor_protocol::CellOrigin) -> Self {
-        use cairn_common::executor_protocol::{CellProvenance, CellSeed};
-        let (kind, distance) = match &origin.provenance {
-            CellProvenance::Seeded {
-                seed: CellSeed::Clone { distance, .. },
-            } => ("clone", distance.as_ref()),
-            CellProvenance::Seeded {
-                seed: CellSeed::Catalog { .. },
-            } => ("catalog", None),
-            CellProvenance::Seeded {
-                seed: CellSeed::Cold,
-            } => ("cold", None),
-            CellProvenance::Reused { distance } => ("reused", distance.as_ref()),
-        };
-        Self {
-            kind: kind.to_string(),
-            distance_files: distance.map(|distance| i64::from(distance.files)),
-            distance_crates: distance.map(|distance| i64::from(distance.crates)),
-        }
-    }
-}
-
-/// The observation columns [`observation_phases`] decodes, in its order.
-const OBSERVATION_PHASE_COLUMNS: &str = "o.phase_setup_ms,o.phase_compile_ms,o.phase_test_ms,\
-     o.phase_doctest_ms,o.phase_publish_ms,o.phase_origin,o.compiled_units,\
-     o.phase_passes_json,o.execution_warmth,o.cell_origin_kind,\
-     o.cell_origin_distance_files,o.cell_origin_distance_crates";
-
-/// What [`observation_phases`] decodes: the phases when the row carries them,
-/// and the executor's warmth and cell origin either way.
-type ObservationMeasurements = (
-    Option<CheckPhases>,
-    Option<String>,
-    Option<ObservedCellOrigin>,
-);
-
-/// Decode [`OBSERVATION_PHASE_COLUMNS`] starting at column `at`.
-fn observation_phases(row: &cairn_db::turso::Row, at: usize) -> DbResult<ObservationMeasurements> {
-    let millis = |offset: usize| -> DbResult<Option<u64>> {
-        Ok(row
-            .opt_i64(at + offset)?
-            .and_then(|value| u64::try_from(value).ok()))
-    };
-    let phases = match (
-        millis(0)?,
-        millis(1)?,
-        millis(2)?,
-        millis(3)?,
-        millis(4)?,
-        row.opt_text(at + 5)?,
-    ) {
-        (
-            Some(setup_ms),
-            Some(compile_ms),
-            Some(test_ms),
-            doctest_ms,
-            Some(publish_ms),
-            Some(origin),
-        ) => Some(CheckPhases {
-            origin,
-            setup_ms,
-            compile_ms,
-            test_ms,
-            doctest_ms: doctest_ms.unwrap_or(0),
-            publish_ms,
-            compiled_units: millis(6)?,
-            passes: row
-                .opt_text(at + 7)?
-                .and_then(|passes| serde_json::from_str(&passes).ok())
-                .unwrap_or_default(),
-        }),
-        _ => None,
-    };
-    let cell_origin = row.opt_text(at + 9)?.map(|kind| -> DbResult<_> {
-        Ok(ObservedCellOrigin {
-            kind,
-            distance_files: row.opt_i64(at + 10)?,
-            distance_crates: row.opt_i64(at + 11)?,
-        })
-    });
-    Ok((phases, row.opt_text(at + 8)?, cell_origin.transpose()?))
 }
 
 /// Every per-test outcome of one observation, read through the
@@ -2194,152 +2086,8 @@ fn observation_test_page_sql() -> String {
     )
 }
 
-/// Whether a recorded result answers its lane
-/// ([`crate::execution::checks_status::LaneExistence::answers_the_lane`]),
-/// classified by the rule every lane reader applies: from its exit verdict, its
-/// stored failure kind, and its structured result when one was kept.
-fn result_answers_the_lane(
-    passed: bool,
-    failure_kind: Option<&str>,
-    target_results_json: Option<&str>,
-) -> bool {
-    let parsed = target_results_json.and_then(|json| {
-        serde_json::from_str::<crate::execution::check_parsers::ParsedCheckResult>(json).ok()
-    });
-    crate::execution::checks_status::row_existence(
-        passed,
-        failure_kind,
-        None,
-        parsed
-            .as_ref()
-            .map(|parsed| parsed.verdict_facts())
-            .as_ref(),
-    )
-    .answers_the_lane()
-}
-
-/// The verdict row at one projection key `(project, check, input hash,
-/// environment, schema)`, seeking the table's primary key.
-fn projected_verdict_row_sql() -> String {
-    format!(
-        "SELECT source_observation_id, passed, failure_kind, target_results_json
-           FROM check_result_cache INDEXED BY {CHECK_RESULT_CACHE_KEY_INDEX}
-          WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-            AND environment_fingerprint = ?4 AND result_schema_version = ?5
-            AND {}",
-        RowFamily::Verdict.predicate("row_family"),
-    )
-}
-
-/// The observation one commit alias names: its verdict, failure kind, and the
-/// input hash it judged.
-const ALIASED_OBSERVATION_SQL: &str = "SELECT o.id, o.verdict, o.failure_kind, o.input_hash
-       FROM check_result_commit_aliases a
-       JOIN check_result_observations o ON o.id = a.source_observation_id
-      WHERE a.project_id = ?1 AND a.commit_sha = ?2 AND a.check_name = ?3
-        AND a.environment_fingerprint = ?4 AND a.result_schema_version = ?5";
-
-/// The verdict row at one projection key, when it exists.
-struct ProjectedVerdict {
-    source_observation_id: Option<String>,
-    passed: bool,
-    failure_kind: Option<String>,
-    target_results_json: Option<String>,
-}
-
-async fn projected_verdict(
-    conn: &Connection,
-    observation: &FreshCheckObservationWrite,
-    input_hash: &str,
-) -> DbResult<Option<ProjectedVerdict>> {
-    let mut rows = conn
-        .query(
-            &projected_verdict_row_sql(),
-            params![
-                observation.project_id.as_str(),
-                observation.check_name.as_str(),
-                input_hash,
-                observation.environment_fingerprint.as_str(),
-                observation.result_schema_version
-            ],
-        )
-        .await?;
-    let Some(row) = rows.next().await? else {
-        return Ok(None);
-    };
-    Ok(Some(ProjectedVerdict {
-        source_observation_id: row.opt_text(0)?,
-        passed: row.i64(1)? != 0,
-        failure_kind: row.opt_text(2)?,
-        target_results_json: row.opt_text(3)?,
-    }))
-}
-
-/// Whether the hot projection row `observation` would replace holds an answer.
-async fn projection_holds_an_answer(
-    conn: &Connection,
-    observation: &FreshCheckObservationWrite,
-) -> DbResult<bool> {
-    Ok(
-        projected_verdict(conn, observation, &observation.input_hash)
-            .await?
-            .is_some_and(|row| {
-                result_answers_the_lane(
-                    row.passed,
-                    row.failure_kind.as_deref(),
-                    row.target_results_json.as_deref(),
-                )
-            }),
-    )
-}
-
-/// Whether the commit alias `observation` would replace names an answer. The
-/// aliased observation's structured result is read from the verdict row that
-/// still projects it; one a later observation has since displaced there is
-/// classified by its exit verdict and failure kind alone.
-async fn alias_names_an_answer(
-    conn: &Connection,
-    observation: &FreshCheckObservationWrite,
-) -> DbResult<bool> {
-    let mut rows = conn
-        .query(
-            ALIASED_OBSERVATION_SQL,
-            params![
-                observation.project_id.as_str(),
-                observation.commit_sha.as_str(),
-                observation.check_name.as_str(),
-                observation.environment_fingerprint.as_str(),
-                observation.result_schema_version
-            ],
-        )
-        .await?;
-    let Some(row) = rows.next().await? else {
-        return Ok(false);
-    };
-    let (id, verdict, failure_kind, input_hash) =
-        (row.text(0)?, row.text(1)?, row.opt_text(2)?, row.text(3)?);
-    drop(rows);
-    let target_results_json = projected_verdict(conn, observation, &input_hash)
-        .await?
-        .filter(|row| row.source_observation_id.as_deref() == Some(id.as_str()))
-        .and_then(|row| row.target_results_json);
-    Ok(result_answers_the_lane(
-        verdict == "passed",
-        failure_kind.as_deref(),
-        target_results_json.as_deref(),
-    ))
-}
-
 /// Atomically persist an immutable fresh observation, its test manifest, commit
 /// alias, and hot projection. Reuse remains gated by the immutable observation.
-///
-/// The alias and the projection are latest-evaluation pointers, and an attempt
-/// that produced no verdict (an infrastructure death, a killed run, an empty or
-/// incomplete selection) never moves one off an answer: it says nothing about
-/// inputs another run already judged. Such an attempt is still recorded as its
-/// own immutable observation; an infrastructure death also writes its
-/// head-scoped infrastructure row, which lane readers choose between with the
-/// answer it did not displace.
 #[allow(dead_code)]
 pub(crate) fn record_fresh_check_observation(
     db: Arc<LocalDb>,
@@ -2356,7 +2104,6 @@ pub(crate) fn record_fresh_check_observation(
             Box::pin(async move {
                 // Keep immutable equality and insertion under Turso's positional
                 // bind limit by carrying the trailing provenance as one value.
-                let phases = observation.phases.as_ref();
                 let trailing_provenance = serde_json::json!({
                     "definedByCommitSha": observation.defined_by_commit_sha,
                     "publicHandle": observation.public_handle,
@@ -2365,19 +2112,6 @@ pub(crate) fn record_fresh_check_observation(
                     "verdictEnvironmentHash": observation.verdict_environment_hash,
                     "selection": observation.selection,
                     "deferredCount": observation.deferred_count,
-                    "phaseSetupMs": phases.map(|p| p.setup_ms),
-                    "phaseCompileMs": phases.map(|p| p.compile_ms),
-                    "phaseTestMs": phases.map(|p| p.test_ms),
-                    "phaseDoctestMs": phases.map(|p| p.doctest_ms),
-                    "phasePublishMs": phases.map(|p| p.publish_ms),
-                    "phaseOrigin": phases.map(|p| p.origin.as_str()),
-                    "compiledUnits": phases.and_then(|p| p.compiled_units),
-                    "phasePassesJson": phases
-                        .map(|p| serde_json::to_string(&p.passes).unwrap_or_else(|_| "[]".to_string())),
-                    "executionWarmth": observation.execution_warmth,
-                    "cellOriginKind": observation.cell_origin.as_ref().map(|o| o.kind.as_str()),
-                    "cellOriginDistanceFiles": observation.cell_origin.as_ref().and_then(|o| o.distance_files),
-                    "cellOriginDistanceCrates": observation.cell_origin.as_ref().and_then(|o| o.distance_crates),
                 })
                 .to_string();
                 let mut existing = conn
@@ -2400,19 +2134,7 @@ pub(crate) fn record_fresh_check_observation(
                            AND verdict_arch IS json_extract(?31,'$.verdictArch')
                            AND verdict_environment_hash IS json_extract(?31,'$.verdictEnvironmentHash')
                            AND selection IS json_extract(?31,'$.selection')
-                           AND deferred_count = json_extract(?31,'$.deferredCount')
-                           AND phase_setup_ms IS json_extract(?31,'$.phaseSetupMs')
-                           AND phase_compile_ms IS json_extract(?31,'$.phaseCompileMs')
-                           AND phase_test_ms IS json_extract(?31,'$.phaseTestMs')
-                           AND phase_doctest_ms IS json_extract(?31,'$.phaseDoctestMs')
-                           AND phase_publish_ms IS json_extract(?31,'$.phasePublishMs')
-                           AND phase_origin IS json_extract(?31,'$.phaseOrigin')
-                           AND compiled_units IS json_extract(?31,'$.compiledUnits')
-                           AND phase_passes_json IS json_extract(?31,'$.phasePassesJson')
-                           AND execution_warmth IS json_extract(?31,'$.executionWarmth')
-                           AND cell_origin_kind IS json_extract(?31,'$.cellOriginKind')
-                           AND cell_origin_distance_files IS json_extract(?31,'$.cellOriginDistanceFiles')
-                           AND cell_origin_distance_crates IS json_extract(?31,'$.cellOriginDistanceCrates')",
+                           AND deferred_count = json_extract(?31,'$.deferredCount')",
                         params![observation.id.as_str(), observation.project_id.as_str(),
                             observation.commit_sha.as_str(), observation.tree_hash.as_str(),
                             observation.check_name.as_str(), observation.input_hash.as_str(),
@@ -2476,11 +2198,7 @@ pub(crate) fn record_fresh_check_observation(
                         executor_lease_epoch, executor_started_at_unix_ms,
                         executor_finished_at_unix_ms, runner_build_id, toolchain_fingerprint,
                         output_tail, defined_by_commit_sha, public_handle, verdict_platform,
-                        verdict_arch, verdict_environment_hash, selection, deferred_count,
-                        phase_setup_ms, phase_compile_ms, phase_test_ms, phase_doctest_ms,
-                        phase_publish_ms, phase_origin, compiled_units, phase_passes_json,
-                        execution_warmth, cell_origin_kind, cell_origin_distance_files,
-                        cell_origin_distance_crates
+                        verdict_arch, verdict_environment_hash, selection, deferred_count
                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
                               ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,
                               json_extract(?31,'$.definedByCommitSha'),
@@ -2489,19 +2207,7 @@ pub(crate) fn record_fresh_check_observation(
                               json_extract(?31,'$.verdictArch'),
                               json_extract(?31,'$.verdictEnvironmentHash'),
                               json_extract(?31,'$.selection'),
-                              json_extract(?31,'$.deferredCount'),
-                              json_extract(?31,'$.phaseSetupMs'),
-                              json_extract(?31,'$.phaseCompileMs'),
-                              json_extract(?31,'$.phaseTestMs'),
-                              json_extract(?31,'$.phaseDoctestMs'),
-                              json_extract(?31,'$.phasePublishMs'),
-                              json_extract(?31,'$.phaseOrigin'),
-                              json_extract(?31,'$.compiledUnits'),
-                              json_extract(?31,'$.phasePassesJson'),
-                              json_extract(?31,'$.executionWarmth'),
-                              json_extract(?31,'$.cellOriginKind'),
-                              json_extract(?31,'$.cellOriginDistanceFiles'),
-                              json_extract(?31,'$.cellOriginDistanceCrates'))
+                              json_extract(?31,'$.deferredCount'))
                        ON CONFLICT(id) DO NOTHING",
                     Vec::<cairn_db::turso::Value>::from([
                         observation.id.as_str().into(), observation.project_id.as_str().into(),
@@ -2548,17 +2254,10 @@ pub(crate) fn record_fresh_check_observation(
                             i64::from(test.flaky)],
                     ).await?;
                 }
-                let answers = result_answers_the_lane(
-                    observation.verdict == "passed",
-                    observation.failure_kind.as_deref(),
-                    observation.target_results_json.as_deref(),
-                );
                 // A commit coordinate names the latest evaluation, not the
                 // immutable evidence itself. An explicit retry at the same
                 // coordinate supersedes this pointer while both source
-                // observations remain immutable and independently citable,
-                // unless the retry produced no verdict and the pointer holds one.
-                if answers || !alias_names_an_answer(conn, &observation).await? {
+                // observations remain immutable and independently citable.
                 conn.execute(
                     "DELETE FROM check_result_commit_aliases
                       WHERE project_id=?1 AND commit_sha=?2 AND check_name=?3
@@ -2586,8 +2285,6 @@ pub(crate) fn record_fresh_check_observation(
                         "fresh observation could not establish its commit alias",
                     ));
                 }
-                }
-                if answers || !projection_holds_an_answer(conn, &observation).await? {
                 conn.execute(
                         "INSERT INTO check_result_cache (
                             project_id, tree_hash, input_hash, check_name, environment_fingerprint,
@@ -2646,7 +2343,6 @@ pub(crate) fn record_fresh_check_observation(
                             observation.environment_fingerprint.as_str(), observation.result_schema_version,
                             observation.id.as_str()],
                     ).await?;
-                }
                 let infrastructure = observation
                     .failure_kind
                     .as_deref()
@@ -2749,7 +2445,7 @@ pub(crate) fn get_check_result_observation(
             let keys = keys.clone();
             Box::pin(async move {
                 let mut rows = conn.query(
-                    format!("SELECT a.disposition,a.tree_hash,a.input_hash,a.evaluated_at,
+                    "SELECT a.disposition,a.tree_hash,a.input_hash,a.evaluated_at,
                             o.id,o.project_id,o.commit_sha,o.tree_hash,o.check_name,o.input_hash,
                             o.environment_fingerprint,o.exit_code,o.verdict,o.failure_kind,o.complete,
                             o.reusable,o.non_reusable_reason,o.parser_version,o.result_schema_version,
@@ -2758,17 +2454,15 @@ pub(crate) fn get_check_result_observation(
                             o.executor_lease_epoch,o.executor_started_at_unix_ms,
                             o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
                             o.output_tail,a.defined_by_commit_sha,o.defined_by_commit_sha,
-                            o.verdict_platform,o.verdict_arch,o.selection,o.deferred_count,
-                            {OBSERVATION_PHASE_COLUMNS}
+                            o.verdict_platform,o.verdict_arch,o.selection,o.deferred_count
                        FROM check_result_commit_aliases a
                        JOIN check_result_observations o ON o.id=a.source_observation_id
                       WHERE a.project_id=?1 AND a.commit_sha=?2 AND a.check_name=?3
-                        AND a.environment_fingerprint=?4 AND a.result_schema_version=?5"),
+                        AND a.environment_fingerprint=?4 AND a.result_schema_version=?5",
                     params![keys.0.as_str(),keys.1.as_str(),keys.2.as_str(),keys.3.as_str(),result_schema_version]
                 ).await?;
                 let Some(row) = rows.next().await? else { return Ok(None); };
                 let observation_id = row.text(4)?;
-                let (phases, execution_warmth, cell_origin) = observation_phases(&row, 40)?;
                 let mut projection = CheckResultObservationProjection {
                     disposition: row.text(0)?,
                     defined_by_commit_sha: row.opt_text(34)?,
@@ -2792,8 +2486,7 @@ pub(crate) fn get_check_result_observation(
                     toolchain_fingerprint: row.opt_text(32)?,
                     verdict_platform: row.opt_text(36)?, verdict_arch: row.opt_text(37)?,
                     output_tail: row.text(33)?,
-                    selection: row.opt_text(38)?, deferred_count: row.i64(39)?,
-                    phases, execution_warmth, cell_origin, tests: Vec::new(),
+                    selection: row.opt_text(38)?, deferred_count: row.i64(39)?, tests: Vec::new(),
                     test_total: 0, test_offset: offset,
                 };
                 let mut totals = conn.query(
@@ -2830,7 +2523,7 @@ fn observation_by_handle_sql() -> String {
                 o.executor_lease_epoch,o.executor_started_at_unix_ms,
                 o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
                 o.output_tail,o.defined_by_commit_sha,o.verdict_platform,o.verdict_arch,
-                o.selection,o.deferred_count,{OBSERVATION_PHASE_COLUMNS}
+                o.selection,o.deferred_count
            FROM check_result_observations o INDEXED BY {CHECK_OBSERVATION_HANDLE_INDEX}
           WHERE o.project_id=?1 AND o.public_handle=?2 AND o.public_handle IS NOT NULL"
     )
@@ -2858,7 +2551,6 @@ pub(crate) fn get_check_result_observation_by_handle(
                     return Ok(None);
                 };
                 let id = row.text(0)?;
-                let (phases, execution_warmth, cell_origin) = observation_phases(&row, 35)?;
                 let mut projection = CheckResultObservationProjection {
                     disposition: "fresh".into(),
                     defined_by_commit_sha: row.opt_text(30)?,
@@ -2900,9 +2592,6 @@ pub(crate) fn get_check_result_observation_by_handle(
                     output_tail: row.text(29)?,
                     selection: row.opt_text(33)?,
                     deferred_count: row.i64(34)?,
-                    phases,
-                    execution_warmth,
-                    cell_origin,
                     tests: Vec::new(),
                     test_total: 0,
                     test_offset: 0,
@@ -3304,7 +2993,6 @@ mod tests {
             ("claim escalation", claim_escalation_sql(), 6),
             ("charge streak", charge_streak_sql(2), 6),
             ("reset streak", reset_streak_sql(2), 5),
-            ("projected verdict row", projected_verdict_row_sql(), 5),
         ] {
             let plan = query_plan(&db, sql, binds).await;
             assert!(
@@ -3433,9 +3121,6 @@ mod tests {
             infra_reset_scopes: Vec::new(),
             selection: None,
             deferred_count: 0,
-            phases: None,
-            execution_warmth: None,
-            cell_origin: None,
             project_id: "project-a".to_string(),
             commit_sha: commit.to_string(),
             defined_by_commit_sha: commit.to_string(),
@@ -3499,100 +3184,6 @@ mod tests {
         let error = record_fresh_check_observation(db, write)
             .expect_err("mixed sealed and loose coordinates must not become reusable evidence");
         assert!(error.contains("sealed check coordinate"), "{error}");
-    }
-
-    /// A lane's phases land in their own columns, so one SQL query can divide
-    /// minutes by phase; they read back on both observation paths, and a
-    /// re-record that disagrees about them is refused like any other field.
-    #[tokio::test]
-    async fn an_observation_keeps_where_its_minutes_went() {
-        use crate::execution::check_parsers::CheckPhasePass;
-        let db = cache_db().await;
-        let mut write = observation("obs-phases", "commit-phases", "env-phases");
-        write.duration_ms = 571_214;
-        write.execution_warmth = Some("repositoryOnly".to_string());
-        write.cell_origin = Some(ObservedCellOrigin {
-            kind: "clone".to_string(),
-            distance_files: Some(12),
-            distance_crates: Some(3),
-        });
-        write.phases = Some(CheckPhases {
-            origin: "executor".to_string(),
-            setup_ms: 12_000,
-            compile_ms: 408_000,
-            test_ms: 149_735,
-            doctest_ms: 0,
-            publish_ms: 1_479,
-            compiled_units: Some(37),
-            passes: vec![CheckPhasePass {
-                name: "full".to_string(),
-                wall_ms: 557_735,
-                compile_ms: 408_000,
-                test_ms: 149_735,
-                compiled_units: 37,
-                summary_ms: Some(144_635),
-            }],
-        });
-        record_fresh_check_observation(db.clone(), write.clone()).unwrap();
-        record_fresh_check_observation(db.clone(), write.clone()).unwrap();
-
-        let mut divergent = write.clone();
-        divergent.phases.as_mut().unwrap().test_ms += 1;
-        let error = record_fresh_check_observation(db.clone(), divergent).unwrap_err();
-        assert!(error.contains("different immutable fields"), "{error}");
-
-        let compile_share = db
-            .query_opt_i64(
-                "SELECT 100 * SUM(phase_compile_ms) / SUM(duration_ms)
-                   FROM check_result_observations
-                  WHERE phase_compile_ms IS NOT NULL AND executor_id = 'executor-1'",
-                (),
-            )
-            .await
-            .unwrap();
-        assert_eq!(compile_share, Some(71));
-
-        let by_handle =
-            get_check_result_observation_by_handle(db.clone(), "project-a", &write.public_handle)
-                .unwrap()
-                .unwrap();
-        assert_eq!(by_handle.phases, write.phases);
-        assert_eq!(
-            by_handle.execution_warmth.as_deref(),
-            Some("repositoryOnly")
-        );
-        assert_eq!(by_handle.cell_origin, write.cell_origin);
-        let mut moved_cell = write.clone();
-        moved_cell.cell_origin.as_mut().unwrap().distance_files = Some(13);
-        let error = record_fresh_check_observation(db.clone(), moved_cell).unwrap_err();
-        assert!(error.contains("different immutable fields"), "{error}");
-        let by_commit = get_check_result_observation(
-            db.clone(),
-            "project-a",
-            "commit-phases",
-            "rust",
-            "env-phases",
-            1,
-            None,
-            None,
-            10,
-            0,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(by_commit.phases, write.phases);
-
-        // A lane whose runner measured nothing stores NULLs and reads `None`.
-        let unmeasured = observation("obs-unmeasured", "commit-unmeasured", "env-phases");
-        record_fresh_check_observation(db.clone(), unmeasured.clone()).unwrap();
-        let read =
-            get_check_result_observation_by_handle(db, "project-a", &unmeasured.public_handle)
-                .unwrap()
-                .unwrap();
-        assert_eq!(
-            (read.phases, read.execution_warmth, read.cell_origin),
-            (None, None, None)
-        );
     }
 
     /// A fast-tier observation persists its deferrals beside, never inside,
@@ -5797,228 +5388,6 @@ mod tests {
         assert_eq!(observation_count, 2, "both immutable observations remain");
         assert_eq!(alias_source, "obs-2");
         assert_eq!(hot_source, "obs-2");
-    }
-
-    /// An attempt at `commit` in `environment` that ended without a verdict,
-    /// written the way the run path writes an infrastructure death: its
-    /// immutable observation, and its head-scoped infrastructure row.
-    fn record_infrastructure_death(db: &Arc<LocalDb>, id: &str, environment: &str, ran_at: i64) {
-        let mut died = observation(id, "commit-1", environment);
-        died.ran_at = ran_at;
-        died.exit_code = 75;
-        died.verdict = "failed".to_string();
-        died.failure_kind = Some("infrastructure".to_string());
-        died.reusable = false;
-        died.non_reusable_reason = Some("infrastructure failure".to_string());
-        died.output_tail = "cloud catalog lookup returned HTTP 404".to_string();
-        died.tests.clear();
-        record_fresh_check_observation(db.clone(), died).unwrap();
-        store_check_result(
-            db.clone(),
-            CheckResultCacheWrite {
-                input_hash: "input-rust".to_string(),
-                environment_fingerprint: infra_suppression_scope("job-1", "commit-1"),
-                ..failing_result("project-a", "tree-commit-1", "rust", Some("infrastructure"))
-            },
-        )
-        .unwrap();
-    }
-
-    /// Which observation `commit-1`'s alias and the hot projection name in
-    /// `environment`.
-    async fn pointers(db: &LocalDb, environment: &str) -> (String, String) {
-        let alias = db
-            .query_one(
-                "SELECT source_observation_id FROM check_result_commit_aliases
-                  WHERE project_id='project-a' AND commit_sha='commit-1' AND check_name='rust'
-                    AND environment_fingerprint=?1",
-                (environment.to_string(),),
-                |row| row.text(0),
-            )
-            .await
-            .unwrap();
-        let hot = db
-            .query_one(
-                "SELECT source_observation_id FROM check_result_cache
-                  WHERE project_id='project-a' AND check_name='rust' AND input_hash='input-rust'
-                    AND environment_fingerprint=?1 AND row_family='verdict'",
-                (environment.to_string(),),
-                |row| row.text(0),
-            )
-            .await
-            .unwrap();
-        (alias, hot)
-    }
-
-    /// A lane that judged its inputs and then died re-running them on the same
-    /// machine keeps its verdict. Before, the death's observation took both the
-    /// commit alias and the hot projection row, so a red became `died` to the
-    /// merge gate (spending the operator's waiver on a head known red), a green
-    /// stopped being reusable, and no reader could prefer the answer because
-    /// it no longer existed.
-    async fn assert_an_infrastructure_death_keeps(verdict: &str) {
-        let db = cache_db().await;
-        let mut answer = observation("obs-answer", "commit-1", "env-a");
-        if verdict == "failed" {
-            answer.exit_code = 1;
-            answer.verdict = "failed".to_string();
-            answer.tests[0].status = "failed".to_string();
-            answer.output_tail = "assertion failed".to_string();
-        }
-        record_fresh_check_observation(db.clone(), answer).unwrap();
-        record_infrastructure_death(&db, "obs-died", "env-a", 200);
-
-        assert_eq!(
-            db.query_one(
-                "SELECT COUNT(*) FROM check_result_observations
-                  WHERE id IN ('obs-answer','obs-died')",
-                (),
-                |row| row.i64(0),
-            )
-            .await
-            .unwrap(),
-            2,
-            "{verdict}: both attempts stay recorded and citable"
-        );
-        assert_eq!(
-            pointers(&db, "env-a").await,
-            ("obs-answer".to_string(), "obs-answer".to_string()),
-            "{verdict}: the attempt without a verdict must not displace the answer"
-        );
-        let sibling = db
-            .query_one(
-                "SELECT failure_kind FROM check_result_cache
-                  WHERE project_id='project-a' AND check_name='rust' AND input_hash='input-rust'
-                    AND environment_fingerprint=?1 AND row_family='infra_suppression'",
-                (infra_suppression_scope("job-1", "commit-1"),),
-                |row| row.opt_text(0),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            sibling.as_deref(),
-            Some("infrastructure"),
-            "{verdict}: the death is still recorded beside the answer, for the head that hit it"
-        );
-        // With both rows standing, the lane readers have something to choose
-        // between: the answer is shown and the death is noted beside it.
-        let head = OwnedHeadVerdictKeys {
-            tree_hash: "tree-commit-1".to_string(),
-            input_hashes: [("rust".to_string(), "input-rust".to_string())].into(),
-            job_id: "job-1".to_string(),
-            commit_sha: "commit-1".to_string(),
-        };
-        let reader = db.clone();
-        let lanes = run_checkpoint_cache_db(async move {
-            reader
-                .read(move |conn| {
-                    Box::pin(async move {
-                        list_check_results_for_inputs_conn(conn, "project-a", head.keys()).await
-                    })
-                })
-                .await
-                .map_err(|error| error.to_string())
-        })
-        .unwrap();
-        assert_eq!(lanes.len(), 1, "{verdict}: one lane, one state");
-        assert_eq!(lanes[0].row.passed, verdict == "passed");
-        assert_eq!(
-            lanes[0].row.failure_kind, None,
-            "{verdict}: select_lane_row shows the answer"
-        );
-        let attempt = lanes[0]
-            .newer_attempt
-            .as_ref()
-            .expect("the death is noted beside the answer");
-        assert_eq!(attempt.failure_kind.as_deref(), Some("infrastructure"));
-        let note = crate::execution::checks_status::newer_attempt_note(&lanes[0]).unwrap();
-        assert!(
-            note.contains(&format!("last verdict: {verdict}")),
-            "{verdict}: {note}"
-        );
-        let reused =
-            get_exact_reusable_check_result(db, "project-a", "rust", "input-rust", "env-a", 1)
-                .unwrap()
-                .expect("the answer stays reusable for these inputs");
-        assert_eq!(reused.passed, verdict == "passed");
-    }
-
-    #[tokio::test]
-    async fn an_infrastructure_death_keeps_the_red_it_did_not_judge() {
-        assert_an_infrastructure_death_keeps("failed").await;
-    }
-
-    #[tokio::test]
-    async fn an_infrastructure_death_keeps_the_green_it_did_not_judge() {
-        assert_an_infrastructure_death_keeps("passed").await;
-    }
-
-    /// The rule is about verdicts, not infrastructure: a killed run says no
-    /// more about the inputs than a lost fetch.
-    #[tokio::test]
-    async fn a_killed_run_keeps_the_answer_it_did_not_judge() {
-        let db = cache_db().await;
-        record_fresh_check_observation(db.clone(), observation("obs-green", "commit-1", "env-a"))
-            .unwrap();
-        let mut killed = observation("obs-killed", "commit-1", "env-a");
-        killed.ran_at = 200;
-        killed.exit_code = 143;
-        killed.verdict = "failed".to_string();
-        killed.failure_kind = Some("killed".to_string());
-        killed.reusable = false;
-        killed.tests.clear();
-        record_fresh_check_observation(db.clone(), killed).unwrap();
-
-        assert_eq!(
-            pointers(&db, "env-a").await,
-            ("obs-green".to_string(), "obs-green".to_string())
-        );
-    }
-
-    /// An answer still replaces an attempt that had none, and the newest of
-    /// several attempts without one still stands for the lane until an answer
-    /// arrives.
-    #[tokio::test]
-    async fn attempts_without_a_verdict_advance_until_an_answer_arrives() {
-        let db = cache_db().await;
-        record_infrastructure_death(&db, "obs-died-1", "env-a", 100);
-        record_infrastructure_death(&db, "obs-died-2", "env-a", 200);
-        assert_eq!(
-            pointers(&db, "env-a").await,
-            ("obs-died-2".to_string(), "obs-died-2".to_string()),
-            "with no answer, the newest attempt stands alone"
-        );
-
-        let mut red = observation("obs-red", "commit-1", "env-a");
-        red.ran_at = 300;
-        red.exit_code = 1;
-        red.verdict = "failed".to_string();
-        red.tests[0].status = "failed".to_string();
-        record_fresh_check_observation(db.clone(), red).unwrap();
-        assert_eq!(
-            pointers(&db, "env-a").await,
-            ("obs-red".to_string(), "obs-red".to_string()),
-            "an answer replaces the attempts before it"
-        );
-    }
-
-    /// Each environment keeps its own pointers: a death on one machine neither
-    /// displaces nor is displaced by another machine's answer.
-    #[tokio::test]
-    async fn a_death_in_another_environment_leaves_this_environments_answer_alone() {
-        let db = cache_db().await;
-        record_fresh_check_observation(db.clone(), observation("obs-green", "commit-1", "env-a"))
-            .unwrap();
-        record_infrastructure_death(&db, "obs-died", "env-b", 200);
-
-        assert_eq!(
-            pointers(&db, "env-a").await,
-            ("obs-green".to_string(), "obs-green".to_string())
-        );
-        assert_eq!(
-            pointers(&db, "env-b").await,
-            ("obs-died".to_string(), "obs-died".to_string())
-        );
     }
 
     #[tokio::test]

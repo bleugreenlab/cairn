@@ -12,32 +12,45 @@ use super::context::MergeMrContext;
 #[cfg(test)]
 mod tests;
 
-/// [`store_merge_child_inner`] for a default-branch landing whose tree was already
-/// validated and judged off the store lock: under the lock the fold proves it
-/// is folding `validated_tree` rather than re-reading every changed file for
-/// the parse gate. The caller holds the store lock.
-pub(super) async fn land_validated_default(
+/// Perform a jj source-to-target merge entirely in the shared store: fold the
+/// source's commit into the target bookmark, then (for a project with a
+/// remote) push the target to origin. The push advances the target branch and —
+/// because the source's head commit is now an ancestor of the target —
+/// GitHub's out-of-band "merged outside GitHub" detection marks the source PR
+/// Merged (the way `git merge feature; git push` does). Returns the new
+/// target-tip commit id to persist as `merge_requests.merged_commit`. For a
+/// no-remote project the push is skipped and the fold is purely local.
+///
+/// Two fold shapes, discriminated by whether the target IS the project default
+/// branch:
+///
+/// - target ≠ default (a child PR into a Coordinator integration branch): the
+///   integration tip advances within Cairn's local fold chain as earlier
+///   siblings merge in, and downstream sibling reconciliation now runs deferred
+///   off the synchronous merge path — so the source may lag the live tip. Rebase
+///   the source onto the current integration tip before the forward-only fold
+///   (materializing any conflict and failing closed, as the default path does),
+///   then — because the rebase rewrites the source's commit id — push the rebased
+///   source's PR head before advancing the target on origin so GitHub still marks
+///   the child PR Merged.
+/// - target == default: the default branch advances OUTSIDE Cairn's fold chain
+///   (another PR merged into it, or an external push), so the source's fork
+///   point may now lag the live tip and a bare FF would be refused. Fetch the
+///   live tip and rebase the source onto it, then FF. For the default `squash`
+///   method the rebased chain is first collapsed to a single commit on the live
+///   tip (`squash_branch_onto`) so the default branch gains exactly one commit
+///   per PR; the `merge` method (workspace PRs) keeps the real per-commit fold
+///   via `rebase_then_fold_into`. Either way the rebase/squash
+///   rewrites the source's commit id, so origin's PR head SHA is no longer
+///   reachable from the new target; push the rewritten source first so its PR
+///   head matches the commit that lands on the default branch, then advance the
+///   target to mark the PR Merged out of band.
+pub(super) async fn store_merge_child(
     orch: &Orchestrator,
     merge_context: &MergeMrContext,
     method: &str,
-    validated_tree: &str,
 ) -> Result<String, String> {
-    store_merge_child_inner(orch, merge_context, method, true, Some(validated_tree)).await
-}
-
-/// Push a landing's source branch to origin, so the pull request's head is the
-/// commit the landing judged. The caller holds the store lock.
-pub(super) fn publish_landing_source(
-    jj: &crate::jj::JjEnv,
-    store: &Path,
-    target_branch: &str,
-    source_branch: &str,
-) -> Result<(), String> {
-    validate_source_publishability(jj, store, target_branch, source_branch)?;
-    if let Err(error) = crate::jj::track_bookmark(jj, store, source_branch) {
-        log::debug!("landing: track {source_branch} (continuing): {error}");
-    }
-    crate::jj::push_store_bookmark(jj, store, source_branch)
+    store_merge_child_inner(orch, merge_context, method, true).await
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +94,7 @@ pub(super) async fn prospective_store_merge_child(
         })?;
     let mut local = merge_context.clone();
     local.mr.is_local = true;
-    let transformed = store_merge_child_inner(orch, &local, method, false, None).await;
+    let transformed = store_merge_child_inner(orch, &local, method, false).await;
     let result = transformed.and_then(|commit_id| {
         let tree_hash = crate::jj::sealed_tree_hash_via_git(&jj, &store, &commit_id)?;
         let tree_entries = crate::jj::tree_entries(&jj, &store, &commit_id)?;
@@ -120,131 +133,6 @@ pub(super) async fn prospective_store_merge_child(
     }
 }
 
-/// The commit a landing on the project DEFAULT branch would produce right now,
-/// built in the store and then undone, so the landing can validate the merge
-/// result before anything moves.
-///
-/// Unlike [`prospective_store_merge_child`], this fetches origin's live tip for
-/// a project with a remote and builds onto it, because the default branch
-/// advances outside Cairn's fold chain (another PR merged through GitHub, an
-/// external push) and a merge result built on the store's last-seen tip would
-/// be a tree that never lands. `target_tip` is the tip it was built on.
-/// The caller holds the store lock.
-pub(super) async fn prospective_default_landing(
-    orch: &Orchestrator,
-    merge_context: &MergeMrContext,
-    method: &str,
-) -> Result<ProspectiveMerge, String> {
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let store =
-        crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
-    let operation = crate::jj::operation_id(&jj, &store)?;
-    let source_tip = crate::jj::bookmark_commit(&jj, &store, &merge_context.source_branch)
-        .ok_or_else(|| {
-            format!(
-                "source bookmark `{}` did not resolve",
-                merge_context.source_branch
-            )
-        })?;
-    // A local fold advances the target bookmark itself, so its base is read
-    // before the fold; read after, it would name the prospective result.
-    let local_target_tip = if merge_context.mr.is_local {
-        Some(
-            crate::jj::bookmark_commit(&jj, &store, &merge_context.target_branch).ok_or_else(
-                || {
-                    format!(
-                        "target bookmark `{}` did not resolve",
-                        merge_context.target_branch
-                    )
-                },
-            )?,
-        )
-    } else {
-        None
-    };
-    let transformed = store_merge_child_inner(orch, merge_context, method, false, None).await;
-    let result = transformed.and_then(|commit_id| {
-        // A remote fold fetched and built onto `main@origin`, which a
-        // prospective fold never moves because nothing is pushed.
-        let target_tip = match local_target_tip {
-            Some(tip) => tip,
-            None => {
-                let base_revision = format!("{}@origin", merge_context.target_branch);
-                crate::jj::revset_commit(&jj, &store, &base_revision)
-                    .ok_or_else(|| format!("landing base `{base_revision}` did not resolve"))?
-            }
-        };
-        let tree_hash = crate::jj::sealed_tree_hash_via_git(&jj, &store, &commit_id)?;
-        let tree_entries = crate::jj::tree_entries(&jj, &store, &commit_id)?;
-        let patch = jj.run(
-            &store,
-            &[
-                "diff",
-                "--ignore-working-copy",
-                "--git",
-                "--from",
-                &target_tip,
-                "--to",
-                &commit_id,
-            ],
-            "jj diff prospective landing",
-        )?;
-        Ok(ProspectiveMerge {
-            source_tip: source_tip.clone(),
-            target_tip,
-            commit_id,
-            tree_hash,
-            tree_entries,
-            changed_files: crate::jj::parse_git_diff(&patch),
-        })
-    });
-    let restore = crate::jj::restore_operation(&jj, &store, &operation);
-    match (result, restore) {
-        (Ok(plan), Ok(())) => Ok(plan),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(format!(
-            "failed to restore prospective landing operation: {error}"
-        )),
-        (Err(error), Err(restore_error)) => Err(format!(
-            "{error} (also failed to restore prospective landing operation: {restore_error})"
-        )),
-    }
-}
-
-/// The live tips a landing on the default branch would use now: the source
-/// bookmark, and the target as origin holds it (fetched) or as the store
-/// holds it for a project with no remote. The caller holds the store lock.
-pub(super) async fn live_default_landing_tips(
-    orch: &Orchestrator,
-    merge_context: &MergeMrContext,
-) -> Result<(String, String), String> {
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let store =
-        crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
-    let target = merge_context.target_branch.as_str();
-    let source =
-        crate::jj::bookmark_commit(&jj, &store, &merge_context.source_branch).ok_or_else(|| {
-            format!(
-                "source bookmark `{}` did not resolve",
-                merge_context.source_branch
-            )
-        })?;
-    let target_revision = if merge_context.mr.is_local {
-        target.to_string()
-    } else {
-        let _ = crate::jj::track_bookmark(&jj, &store, target);
-        crate::orchestrator::base_branch_sync::with_fetch_lock(orch, &store, || async {
-            crate::jj::fetch_remote_branch(&jj, &store, "origin", target)
-        })
-        .await
-        .map_err(|error| format!("fetch origin's `{target}`: {error}"))?;
-        format!("{target}@origin")
-    };
-    let target_tip = crate::jj::revset_commit(&jj, &store, &target_revision)
-        .ok_or_else(|| format!("`{target_revision}` did not resolve"))?;
-    Ok((source, target_tip))
-}
-
 pub(super) async fn land_verified_store_merge_child(
     orch: &Orchestrator,
     merge_context: &MergeMrContext,
@@ -268,7 +156,7 @@ pub(super) async fn land_verified_store_merge_child(
     let mut local = merge_context.clone();
     local.mr.is_local = true;
     let folding = trace.phase("fold");
-    let commit = match store_merge_child_inner(orch, &local, method, false, None).await {
+    let commit = match store_merge_child_inner(orch, &local, method, false).await {
         Ok(commit) => commit,
         Err(error) => return Err(error),
     };
@@ -319,55 +207,12 @@ fn publish_integration_merge(
     reflect_child_merge_on_github(jj, store, target_branch)
 }
 
-/// Perform a jj source-to-target merge entirely in the shared store: fold the
-/// source's commit into the target bookmark, then (for a project with a
-/// remote, when `publish`) push the target to origin. The push advances the
-/// target branch and — because the source's head commit is now an ancestor of
-/// the target — GitHub's out-of-band "merged outside GitHub" detection marks
-/// the source PR Merged (the way `git merge feature; git push` does). Returns
-/// the new target-tip commit id to persist as `merge_requests.merged_commit`.
-/// For a no-remote project the push is skipped and the fold is purely local.
-///
-/// Two fold shapes, discriminated by whether the target IS the project default
-/// branch:
-///
-/// - target ≠ default (a child PR into a Coordinator integration branch): the
-///   integration tip advances within Cairn's local fold chain as earlier
-///   siblings merge in, and downstream sibling reconciliation now runs deferred
-///   off the synchronous merge path — so the source may lag the live tip. Rebase
-///   the source onto the current integration tip before the forward-only fold
-///   (materializing any conflict and failing closed, as the default path does),
-///   then — because the rebase rewrites the source's commit id — push the rebased
-///   source's PR head before advancing the target on origin so GitHub still marks
-///   the child PR Merged.
-/// - target == default: the default branch advances OUTSIDE Cairn's fold chain
-///   (another PR merged into it, or an external push), so the source's fork
-///   point may now lag the live tip and a bare FF would be refused. Fetch the
-///   live tip and rebase the source onto it, then FF. For the default `squash`
-///   method the rebased chain is first collapsed to a single commit on the live
-///   tip (`squash_branch_onto`) so the default branch gains exactly one commit
-///   per PR; the `merge` method (workspace PRs) keeps the real per-commit fold
-///   via `rebase_then_fold_into`. Either way the rebase/squash
-///   rewrites the source's commit id, so origin's PR head SHA is no longer
-///   reachable from the new target; push the rewritten source first so its PR
-///   head matches the commit that lands on the default branch, then advance the
-///   target to mark the PR Merged out of band. The fold onto the default branch
-///   parse-gates what it folds, or, given `validated_tree`, proves it folds
-///   that already-judged tree.
 async fn store_merge_child_inner(
     orch: &Orchestrator,
     merge_context: &MergeMrContext,
     method: &str,
     publish: bool,
-    validated_tree: Option<&str>,
 ) -> Result<String, String> {
-    // A default-branch fold either parse-gates what it folds, or, when the
-    // landing already validated a tree off the lock, proves it is that tree.
-    let fold_onto_default =
-        |jj: &crate::jj::JjEnv, store: &Path, target: &str, source: &str| match validated_tree {
-            Some(tree) => crate::jj::fold_validated_into_bookmark(jj, store, target, source, tree),
-            None => crate::jj::merge_into_bookmark(jj, store, target, source),
-        };
     let repo_path = merge_context.mr.repo_path.as_str();
     let target_branch = merge_context.target_branch.as_str();
     let source_branch = merge_context.source_branch.as_str();
@@ -485,7 +330,9 @@ async fn store_merge_child_inner(
                     )
                     .await);
                 }
-                if let Err(e) = fold_onto_default(&jj, &store, target_branch, source_branch) {
+                if let Err(e) =
+                    crate::jj::merge_into_bookmark(&jj, &store, target_branch, source_branch)
+                {
                     return Err(rollback_merge(
                         orch,
                         project_id,
@@ -559,7 +406,9 @@ async fn store_merge_child_inner(
             }
             // Clean: the source now descends from the advanced default tip, so this
             // FF can never go backwards.
-            if let Err(e) = fold_onto_default(&jj, &store, target_branch, source_branch) {
+            if let Err(e) =
+                crate::jj::merge_into_bookmark(&jj, &store, target_branch, source_branch)
+            {
                 return Err(rollback_merge(
                     orch,
                     project_id,

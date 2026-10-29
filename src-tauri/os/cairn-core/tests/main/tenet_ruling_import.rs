@@ -230,11 +230,9 @@ async fn rulings_from_both_sources_become_numbered_migrated_tenets_exactly_once(
     assert_eq!(report.projects.len(), 1);
     assert_eq!(report.projects[0].threads, 5);
     assert_eq!(report.projects[0].slug_collisions, 1);
-    // One frame for the project that gained rows, scoped so only its thread
-    // rollup rebuilds.
     assert_eq!(
         *emitter.0.lock().unwrap(),
-        [json!({"table": "tenets", "projectId": "p-imp", "action": "insert"})]
+        [json!({"table": "tenets", "action": "insert"})]
     );
 
     let rows = imported(&fx.db).await;

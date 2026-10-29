@@ -1,5 +1,3 @@
-use std::panic::Location;
-use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -33,21 +31,6 @@ pub enum DbError {
         source: Box<DbError>,
     },
 
-    /// A pooled read ran past the read bound and was interrupted or dropped;
-    /// see `local_db::READ_STATEMENT_BOUND`.
-    #[error(
-        "pooled read at {}:{} exceeded the {bound:?} read bound after {elapsed:.1?}: {statement}",
-        .caller.file(),
-        .caller.line()
-    )]
-    ReadBoundExceeded {
-        caller: &'static Location<'static>,
-        bound: Duration,
-        elapsed: Duration,
-        /// `<file>:<line> <sql head>` of the statement the read last issued.
-        statement: Arc<str>,
-    },
-
     #[error("{0}")]
     Internal(String),
 }
@@ -68,12 +51,6 @@ const ABORTED_TRANSACTION: &str = "cannot commit - no transaction is active";
 impl DbError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
-    }
-
-    /// Whether the engine interrupted the statement: the per-statement
-    /// deadline expired or someone called `Connection::interrupt`.
-    pub(crate) fn is_interrupt(&self) -> bool {
-        matches!(self, Self::Turso(turso::Error::Interrupt(_)))
     }
 
     pub(crate) fn is_retryable(&self) -> bool {

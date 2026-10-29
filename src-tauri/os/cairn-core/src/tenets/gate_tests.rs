@@ -132,14 +132,6 @@ async fn env(name: &str) -> Env {
 fn proposal() -> TenetClaim {
     TenetClaim::Proposal {
         statement: "Plan the memory triage now, not after the release.".into(),
-        rationale: None,
-    }
-}
-
-fn proposal_with_rationale() -> TenetClaim {
-    TenetClaim::Proposal {
-        statement: "Plan the memory triage now, not after the release.".into(),
-        rationale: Some("Rejected: waiting, because the backlog doubles by then.".into()),
     }
 }
 
@@ -179,7 +171,6 @@ async fn file_in(
         },
     )
     .await
-    .map(|started| started.summary)
 }
 
 async fn file(
@@ -309,7 +300,6 @@ async fn standing_tenet_of(env: &Env, project: &str, thread: &str, node: &str, r
         },
         Proposal {
             statement: "The whole plan.".into(),
-            rationale: None,
             supersedes: None,
             origin: TenetOrigin::Standing,
         },
@@ -484,18 +474,13 @@ async fn both_doors_gate_a_thread_filing() {
         &env,
         THREAD_RUN,
         "cairn://p/prj/1/executions",
-        json!({"recipe": RECIPE, "proposal": {"statement": "Plan it.", "rationale": "Why: now."}}),
+        json!({"recipe": RECIPE, "proposal": {"statement": "Plan it."}}),
     )
     .await
     .unwrap();
     assert!(
         appended.contains("HELD") && appended.contains(TENET_1),
         "{appended}"
-    );
-    assert_eq!(
-        texts(&env, "SELECT rationale FROM tenets WHERE number = 1").await,
-        vec!["Why: now.".to_string()],
-        "the filing door persists the proposal's rationale"
     );
 
     let created = write(
@@ -520,77 +505,6 @@ async fn both_doors_gate_a_thread_filing() {
         "one tenet holds a whole plan's filings"
     );
     assert_eq!(count(&env, "SELECT COUNT(*) FROM tenets").await, 1);
-}
-
-/// The change data a successful append reports, for the transcript.
-async fn applied_data(env: &Env, target: &str, payload: Value) -> Option<Value> {
-    crate::resources::mutations::dispatch_resource_change(
-        &env.orch,
-        &request(Some(THREAD_RUN)),
-        0,
-        &ChangeItem {
-            target: target.to_string(),
-            mode: ChangeMode::Append,
-            payload: Some(payload),
-        },
-        false,
-    )
-    .await
-    .unwrap_or_else(|failure| panic!("{}", failure.error))
-    .data
-}
-
-/// Every door that proposes a tenet names it as `data.tenet`, so the
-/// transcript puts the tenet's card under the row that proposed it. A filing
-/// that names an existing tenet proposed nothing, and names none.
-#[tokio::test]
-async fn every_door_that_proposes_a_tenet_reports_it_as_change_data() {
-    let env = env("tenet-gate-data.db").await;
-    let appended = applied_data(
-        &env,
-        "cairn://p/prj/1/executions",
-        json!({"recipe": RECIPE, "proposal": {"statement": "Plan it."}}),
-    )
-    .await;
-    assert_eq!(appended, Some(json!({"tenet": TENET_1})));
-
-    let created = applied_data(
-        &env,
-        "cairn://p/prj/issues",
-        json!({"title": "Second plan", "execution": {"recipe": RECIPE, "proposal": {"statement": "Plan more."}}}),
-    )
-    .await
-    .unwrap();
-    assert_eq!(created["tenet"], json!("cairn://p/prj/tenets/2"));
-    assert_eq!(
-        created["number"],
-        json!(10),
-        "the issue identity stays: {created}"
-    );
-
-    let direct = applied_data(
-        &env,
-        "cairn://p/prj/tenets",
-        json!({"statement": "Standing."}),
-    )
-    .await;
-    assert_eq!(direct, Some(json!({"tenet": "cairn://p/prj/tenets/3"})));
-
-    let named = applied_data(
-        &env,
-        "cairn://p/prj/2/executions",
-        json!({"recipe": RECIPE, "tenet": 1}),
-    )
-    .await;
-    assert_eq!(named, None, "naming a tenet proposes nothing");
-    let created_named = applied_data(
-        &env,
-        "cairn://p/prj/issues",
-        json!({"title": "Third plan", "execution": {"recipe": RECIPE, "tenet": 1}}),
-    )
-    .await
-    .unwrap();
-    assert!(created_named.get("tenet").is_none(), "{created_named}");
 }
 
 /// The gate checks the recipe the launch resolves, not the caller's spelling:
@@ -870,7 +784,7 @@ async fn a_failed_launch_withdraws_the_tenet_its_filing_proposed() {
 #[tokio::test]
 async fn a_yes_releases_and_comments_on_the_gated_issue() {
     let env = env("tenet-gate-yes.db").await;
-    file(&env, 1, Some(THREAD_RUN), Some(proposal_with_rationale()))
+    file(&env, 1, Some(THREAD_RUN), Some(proposal()))
         .await
         .unwrap();
     let answered = answer(&env, 1, Verdict::Yes, Some("after the release")).await;
@@ -886,8 +800,7 @@ async fn a_yes_releases_and_comments_on_the_gated_issue() {
         comments,
         vec![
             "Tenet #1 approved by the operator (signed in as alice): Plan the memory triage \
-             now, not after the release.\nRationale: Rejected: waiting, because the backlog \
-             doubles by then.\nComment: after the release."
+             now, not after the release.\nComment: after the release."
                 .to_string()
         ]
     );
@@ -897,11 +810,8 @@ async fn a_yes_releases_and_comments_on_the_gated_issue() {
     let message = &messages[0];
     assert!(message.contains("approved it: yes"), "{message}");
     assert!(
-        message.contains(
-            "Statement: Plan the memory triage now, not after the release.\nRationale: \
-             Rejected: waiting, because the backlog doubles by then.\n"
-        ),
-        "the rationale sits beneath the statement: {message}"
+        message.contains("Statement: Plan the memory triage now, not after the release."),
+        "{message}"
     );
     assert!(message.contains("Comment: after the release"), "{message}");
     assert!(
