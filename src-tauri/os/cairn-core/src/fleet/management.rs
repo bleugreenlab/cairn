@@ -1342,6 +1342,11 @@ pub async fn set_drain_mode(
         name: public_name(orch, &executor_id),
         enabled,
         application,
+        residents: if enabled {
+            orch.fleet.drain_residents(&executor_id)
+        } else {
+            None
+        },
     })
 }
 
@@ -1354,15 +1359,20 @@ pub struct DrainOutcome {
     pub enabled: bool,
     #[serde(flatten)]
     pub application: crate::fleet::DrainApplication,
+    /// What the drain keeps on the machine, from its last snapshot. Present
+    /// for a drain enabled on an attached machine; an unattached one reports
+    /// nothing to count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residents: Option<crate::fleet::DrainResidents>,
 }
 
 impl DrainOutcome {
-    /// One sentence for a person or an agent: what now holds, and what the
-    /// machine knows about it.
+    /// A few sentences for a person or an agent: what now holds, what the
+    /// machine knows about it, and what the drain keeps there.
     pub fn summary(&self) -> String {
         let held = if self.enabled {
             format!(
-                "{} is draining: new work is refused and resident work is left alone. It stays drained across reconnects and runner restarts until it is cleared",
+                "{} is draining: new work is refused, including the next batch of a job whose environment is already there, and live resident work is left alone. It stays drained across reconnects and runner restarts until it is cleared",
                 self.name
             )
         } else {
@@ -1371,12 +1381,17 @@ impl DrainOutcome {
                 self.name
             )
         };
-        match &self.application {
+        let mut text = match &self.application {
             crate::fleet::DrainApplication::Applied => format!("{held}."),
             crate::fleet::DrainApplication::HeldWithoutMachine { reason } => format!(
                 "{held}. The machine was not told because {reason}; the runner is holding this itself and will tell it when it attaches."
             ),
+        };
+        if let Some(residents) = self.residents.as_ref().filter(|_| self.enabled) {
+            text.push(' ');
+            text.push_str(&residents.account());
         }
+        text
     }
 }
 
@@ -2393,5 +2408,41 @@ mod tests {
         let adopted = super::prepare_build_root(&volume, &home).unwrap();
         assert_eq!(adopted.id, "this-drive");
         assert_eq!(adopted.path, std::fs::canonicalize(&volume).unwrap());
+    }
+
+    /// The drain's reply says what it keeps: how many environments are
+    /// resident, and which of them live processes hold.
+    #[test]
+    fn the_drain_reply_lists_what_it_keeps() {
+        let residents = crate::fleet::DrainResidents {
+            environments: 3,
+            held: vec![crate::fleet::HeldEnvironment {
+                owner: "job builder".into(),
+                held_by: vec!["terminal `dev`".into()],
+            }],
+        };
+        let drained = DrainOutcome {
+            name: "fedora".into(),
+            enabled: true,
+            application: crate::fleet::DrainApplication::Applied,
+            residents: Some(residents.clone()),
+        };
+        let summary = drained.summary();
+        assert!(
+            summary
+                .contains("including the next batch of a job whose environment is already there"),
+            "{summary}"
+        );
+        assert!(
+            summary.ends_with("It keeps 3 resident environments, 1 held by live processes and left alone until that work stops (job builder, by terminal `dev`); each idle one is released at its job's next batch and acquired on a machine that is not draining."),
+            "{summary}"
+        );
+
+        let cleared = DrainOutcome {
+            enabled: false,
+            residents: Some(residents),
+            ..drained
+        };
+        assert!(!cleared.summary().contains("It keeps"));
     }
 }

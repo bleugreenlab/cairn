@@ -4887,6 +4887,15 @@ pub struct LearnedResourceEstimate {
 /// runner today is the default. What a runner gets wrong talking to an older
 /// executor: nothing, because nothing it reads has changed.
 ///
+/// cairn/5423 does not move the number. The runner-only `fleet/mod.rs` now
+/// releases a job's idle environment on a drained machine at the job's next
+/// acquisition, with the `ResidencyOperation::Release` it already sends when a
+/// home cannot prepare its project, and counts what a drain keeps from the
+/// `occupancy` every snapshot already carries. No frame gains, loses, or
+/// reinterprets a field. What a runner gets wrong talking to an older
+/// executor: nothing, because the older executor is sent only a release it
+/// already handles.
+///
 /// cairn/5427 does not move the number. It removes the landing compile gate,
 /// the one runner caller that shortened a review check request's
 /// `waitHorizonUnixMs` to its own admission budget; every review check request

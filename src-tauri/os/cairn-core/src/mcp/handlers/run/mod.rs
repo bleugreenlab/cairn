@@ -5282,20 +5282,33 @@ struct PlacementNotes {
     /// and it must survive a failure: that is the case that ends in an
     /// out-of-memory kill, and the one an operator most needs explained.
     above_ceiling: Option<String>,
+    /// The job's environment is on a machine an operator drained, and the
+    /// batch was placed there anyway because live work holds the environment
+    /// (or nowhere else can take it). True of the placement, so it rides on
+    /// every outcome: the batch that dies on a drained machine is the one an
+    /// operator most needs explained.
+    drained_home: Option<String>,
 }
 
 impl PlacementNotes {
     /// Everything, for an outcome that executed.
     fn executed(&self) -> Option<String> {
-        [self.ran_elsewhere.clone(), self.above_ceiling.clone()]
-            .into_iter()
-            .flatten()
-            .reduce(|left, right| format!("{left}\n\n{right}"))
+        [
+            self.drained_home.clone(),
+            self.ran_elsewhere.clone(),
+            self.above_ceiling.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(|left, right| format!("{left}\n\n{right}"))
     }
 
     /// Only what a claim makes true, for an outcome that may not have run.
     fn claimed(&self) -> Option<String> {
-        self.above_ceiling.clone()
+        [self.drained_home.clone(), self.above_ceiling.clone()]
+            .into_iter()
+            .flatten()
+            .reduce(|left, right| format!("{left}\n\n{right}"))
     }
 }
 
@@ -5560,6 +5573,13 @@ async fn place_and_run_attempts(
             Ok(residence) => residence,
             Err(refusal) => return PlacedBatch::Refused(refusal),
         };
+        let drained_home = match residence {
+            BatchResidence::Home => fence
+                .as_ref()
+                .and_then(|fence| orch.fleet.drained_home_holding(&fence.holder))
+                .map(|home| home.sentence()),
+            BatchResidence::Detached => None,
+        };
         let mut request = placement.attempt(home.as_ref(), fence.is_some(), residence);
         // A batch detached because its home cannot hold it goes where placement
         // said it can be held, by pin. A pin rather than spill mobility keeps a
@@ -5605,6 +5625,7 @@ async fn place_and_run_attempts(
                     cannot_hold.ran_elsewhere_note(home_name.as_deref().unwrap_or("its home"))
                 }),
                 above_ceiling: above_ceiling.map(|above| above.note()),
+                drained_home,
             };
             return PlacedBatch::Cell(Box::new(outcome), residence, notes);
         }
@@ -6113,13 +6134,28 @@ fn environment_rebuild_text(eviction: &crate::fleet::EnvironmentEviction) -> Str
         crate::fleet::EvictionCause::CannotPrepareProject { project_id, detail } => {
             format!("cannot prepare cells for {project_id} ({detail})")
         }
+        crate::fleet::EvictionCause::Drained => {
+            "is drained by an operator and nothing live held the environment there".to_string()
+        }
     };
-    let processes = match eviction.lost_processes.as_slice() {
-        [] => "terminals or REPLs from earlier batches".to_string(),
-        processes => processes.join(", "),
+    let lost = match (&eviction.cause, eviction.lost_processes.as_slice()) {
+        // Released only because nothing was live in it, so there were no
+        // processes to lose, and saying "terminals or REPLs" would send the
+        // agent looking for ones that never existed.
+        (crate::fleet::EvictionCause::Drained, []) => {
+            "uncommitted files and installed packages".to_string()
+        }
+        (_, []) => {
+            "uncommitted files, installed packages, and terminals or REPLs from earlier batches"
+                .to_string()
+        }
+        (_, processes) => format!(
+            "uncommitted files, installed packages, and {}",
+            processes.join(", ")
+        ),
     };
     format!(
-        "Note: this job's execution environment was rebuilt. The machine holding the previous one (**{}**) {why}, so a fresh checkout of your branch was materialized. Committed work is intact; uncommitted files, installed packages, and {processes} did not survive.",
+        "Note: this job's execution environment was rebuilt. The machine holding the previous one (**{}**) {why}, so a fresh checkout of your branch was materialized. Committed work is intact; {lost} did not survive.",
         eviction.executor
     )
 }
@@ -6792,6 +6828,50 @@ mod tests {
             note.contains("terminals or REPLs from earlier batches did not survive"),
             "{note}"
         );
+
+        // Moved off a drain only because nothing was live in it, so it names
+        // no processes it never had.
+        let drained = crate::fleet::EnvironmentEviction {
+            executor: "fedora".into(),
+            cause: crate::fleet::EvictionCause::Drained,
+            lost_processes: Vec::new(),
+        };
+        let note = environment_rebuild_text(&drained);
+        assert!(
+            note.contains("(**fedora**) is drained by an operator and nothing live held the environment there"),
+            "{note}"
+        );
+        assert!(
+            note.ends_with("uncommitted files and installed packages did not survive."),
+            "{note}"
+        );
+    }
+
+    /// A batch placed on a drained machine says so whether or not it ran: the
+    /// one that dies there is the one an operator most needs explained.
+    #[test]
+    fn a_batch_placed_on_a_drained_home_says_so_on_every_outcome() {
+        let sentence = "**fedora** is draining, and this batch was placed there because terminal `dev` holds this job's environment there.";
+        let notes = PlacementNotes {
+            ran_on: Some("Ran on **fedora** (linux).".into()),
+            drained_home: Some(sentence.into()),
+            ..PlacementNotes::default()
+        };
+        assert_eq!(notes.executed().as_deref(), Some(sentence));
+        assert_eq!(notes.claimed().as_deref(), Some(sentence));
+        let unavailable = settled_failure_text(
+            &CellOutcome::Unavailable {
+                reason: cairn_common::executor_protocol::CellUnavailableReason::Preparation,
+                diagnostic: "could not materialize commit 276e9702".into(),
+            },
+            None,
+            false,
+            None,
+            &notes,
+        )
+        .expect("a failure has text");
+        assert!(unavailable.contains(sentence), "{unavailable}");
+        assert!(!unavailable.contains("Ran on"), "{unavailable}");
     }
 
     /// Every executed batch names its machine, selector or not; a detached one
@@ -7082,6 +7162,7 @@ mod tests {
             ran_on: Some("Ran on **bglab-mac** (macos).".to_string()),
             ran_elsewhere: detached.then(|| "It ran on **bglab-mac** because this batch's measured memory (~9.6 GiB) exceeds what bgsrv-ub can ever hold (7.7 GiB). Your execution environment there is unchanged.".to_string()),
             above_ceiling: Some("Note: no executor can hold this batch's measured ~9.6 GiB (largest ceiling 7.7 GiB on bgsrv-ub); it was placed on **bgsrv-ub** at the clamp.".into()),
+            drained_home: None,
         }
     }
 

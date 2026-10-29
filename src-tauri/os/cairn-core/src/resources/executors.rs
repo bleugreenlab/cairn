@@ -407,7 +407,10 @@ pub(crate) fn render_executors(
             out.push_str(&machine_role_line(executor.health.role));
         }
         if executor.health.drain_mode {
-            out.push_str("- Draining: yes (refusing new work)\n");
+            out.push_str(&format!(
+                "- Draining: yes ({})\n",
+                crate::fleet::DrainResidents::of(&executor.occupancy).headline()
+            ));
         }
         out.push_str(&format!(
             "- Running now: {} (queued {})\n",
@@ -508,6 +511,27 @@ pub(crate) fn render_enrollment(
         "This machine is being enrolled. No load, admission, or occupancy is reported: those are measured on the machine, and it is not reporting yet.\n"
     });
     out
+}
+
+/// The `Draining:` value on one attached machine's page.
+///
+/// The counts are what make it true. A resident job's next batch is new work,
+/// so the drain moves an idle environment off at that batch; only live work (a
+/// terminal, a REPL, a batch in flight) keeps one here, and that is the work
+/// the machine is still waiting on before it is empty.
+fn drain_line(executor: &ExecutorInspection) -> String {
+    if !executor.health.drain_mode {
+        return "no".to_string();
+    }
+    let residents = crate::fleet::DrainResidents::of(&executor.occupancy);
+    let holders = match residents.held.is_empty() {
+        true => String::new(),
+        false => format!(" ({})", residents.holders()),
+    };
+    format!(
+        "yes — {}{holders}. An idle environment is released at its job's next batch and acquired on a machine that is not draining; one held by live work stays until that work stops. It holds across reconnects and runner restarts until it is cleared",
+        residents.headline()
+    )
 }
 
 /// Render one enrolled machine that is not attached.
@@ -936,14 +960,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         executor.last_update.as_ref(),
         executor.captured_at_unix_ms,
     ));
-    out.push_str(&format!(
-        "- Draining: {}\n",
-        if health.drain_mode {
-            "yes — the runner refuses new work here and leaves resident work alone. It holds across reconnects and runner restarts until it is cleared"
-        } else {
-            "no"
-        }
-    ));
+    out.push_str(&format!("- Draining: {}\n", drain_line(executor)));
     out.push_str(&format!("- Build: {}\n", render_build(executor)));
     if let Some(status) = &executor.self_update {
         out.push_str(&format!(
