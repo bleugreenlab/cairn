@@ -147,5 +147,20 @@
         "reason": "only a DER SEQUENCE is an ECDSA signature"
       }
     ]
+  },
+  "serviceTimestamps": {
+    "note": "Every value parses to its epochMilliseconds. service_milliseconds is exactly what the approvals service emits.",
+    "vectors": [
+      {
+        "label": "service_milliseconds",
+        "value": "2026-10-28T23:51:42.559Z",
+        "epochMilliseconds": 1793231502559
+      },
+      {
+        "label": "whole_seconds",
+        "value": "2026-10-28T23:51:42Z",
+        "epochMilliseconds": 1793231502000
+      }
+    ]
   }
 }
