@@ -214,6 +214,25 @@ impl Crossing {
         }
     }
 
+    /// A kernel denial whose path was not recovered, inside the item that ran
+    /// `command` (shown to the approver as `label`).
+    ///
+    /// Says only what is known: something the item ran was denied. The denial is
+    /// usually a descendant's (the tool a script or `sh -c` started), so naming
+    /// the item as what was blocked would blame a wrapper that started fine.
+    /// `reported` is the output's own denial line, quoted for whoever answers;
+    /// the command wrote it, so it stays in the summary and never reaches the
+    /// descriptor a grant is scoped by.
+    pub(crate) fn unattributed_denial(label: &str, command: &str, reported: Option<&str>) -> Self {
+        let mut summary = format!(
+            "the sandbox denied an access made inside this item, and the denied path could not be recovered: {label}"
+        );
+        if let Some(line) = reported {
+            summary.push_str(&format!("\nthe item's output reports (unverified): {line}"));
+        }
+        Self::shell_command(summary, command)
+    }
+
     /// The exact `tool_input` [`raise_fence`] would store for this crossing.
     ///
     /// Exists so a resolution test can seed a REAL stored prompt rather than a
@@ -480,6 +499,30 @@ mod tests {
             c.descriptor,
             normalize_command_for_descriptor("sudo rm -rf /")
         );
+    }
+
+    #[test]
+    fn an_unattributed_denial_names_no_blocked_command_and_quotes_output_unverified() {
+        let reported = "error: cannot open '/Users/x/.ssh/known_hosts': Permission denied";
+        let c = Crossing::unattributed_denial("uv run -", "uv run -", Some(reported));
+        assert_eq!(c.kind, CrossingKind::ShellCommandEscape);
+        assert!(!c.summary.contains("blocked"), "{}", c.summary);
+        assert!(
+            c.summary.contains("could not be recovered: uv run -"),
+            "{}",
+            c.summary
+        );
+        assert!(
+            c.summary.contains(&format!("(unverified): {reported}")),
+            "{}",
+            c.summary
+        );
+        // Output text never scopes a grant.
+        assert_eq!(c.descriptor, normalize_command_for_descriptor("uv run -"));
+        assert!(c.host_path().is_none());
+
+        let bare = Crossing::unattributed_denial("bun -e", "bun -e", None);
+        assert!(!bare.summary.contains("unverified"), "{}", bare.summary);
     }
 
     async fn permission_rows(orch: &Orchestrator) -> i64 {

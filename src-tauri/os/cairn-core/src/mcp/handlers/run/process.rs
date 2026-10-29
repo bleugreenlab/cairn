@@ -486,9 +486,11 @@ pub(crate) async fn run_one(
                     sandbox::SandboxDenial::Path { path, .. } => {
                         fence::Crossing::shell_path(path.as_path(), &path.display().to_string())
                     }
-                    sandbox::SandboxDenial::Command => fence::Crossing::shell_command(
-                        format!("command blocked by the executor sandbox: {header}"),
+                    sandbox::SandboxDenial::Command => fence::Crossing::unattributed_denial(
+                        &header,
                         shell_command.as_deref().unwrap_or(&program),
+                        sandbox::reported_denial_line(&format!("{}\n{}", exec.stdout, exec.stderr))
+                            .as_deref(),
                     ),
                 };
                 match fence::raise_fence(orch, &run_id, fence_mode, request, crossing).await {
@@ -1200,17 +1202,12 @@ async fn execute_process(
         Err(e) => return Err(format!("Failed to spawn command: {}", e)),
     };
 
-    let (stdout, stderr, stdin_writer, child_pid) = {
+    let (stdout, stderr, stdin_writer) = {
         let mut guard = match child.lock() {
             Ok(guard) => guard,
             Err(e) => return Err(format!("Failed to access command process: {}", e)),
         };
-        (
-            guard.take_stdout(),
-            guard.take_stderr(),
-            guard.take_stdin(),
-            Some(guard.id()),
-        )
+        (guard.take_stdout(), guard.take_stderr(), guard.take_stdin())
     };
 
     if let Some(ctx) = run_context {
@@ -1333,10 +1330,9 @@ async fn execute_process(
                     }
                 };
                 classify_host_denial(
-                    sandboxed,
+                    &applied_confinement,
                     None,
                     &partial,
-                    child_pid,
                     spawn_started,
                     command_scoped_fallback,
                     cwd,
@@ -1428,10 +1424,9 @@ async fn execute_process(
             combined.push_str("\nPermission denied while reading SSH credentials");
         }
         classify_host_denial(
-            sandboxed,
+            &applied_confinement,
             exit_code,
             &combined,
-            child_pid,
             spawn_started,
             command_scoped_fallback,
             cwd,
@@ -1471,20 +1466,25 @@ enum HostDenial {
 /// boundary's refusal even when the log lookup misses. A spawn carrying only
 /// the floor reports nothing else: the floor refuses nothing else.
 fn classify_host_denial(
-    fenced: bool,
+    confinement: &sandbox::Confinement,
     exit_code: Option<i32>,
     output: &str,
-    pid: Option<u32>,
     since: std::time::SystemTime,
     command_scoped_fallback: bool,
     cwd: &str,
 ) -> Option<HostDenial> {
     let cwd = Some(std::path::Path::new(cwd));
-    if !fenced {
-        return sandbox::detect_credential_floor_denial(exit_code, output, pid, since, cwd)
+    let Some(policy) = confinement.policy() else {
+        return sandbox::detect_credential_floor_denial(output, cwd)
             .map(|_| HostDenial::OperatorCredential);
-    }
-    let detected = sandbox::detect_denial(exit_code, output, pid, since, command_scoped_fallback)?;
+    };
+    let detected = sandbox::detect_denial(
+        exit_code,
+        output,
+        Some(&policy.violation_tag),
+        since,
+        command_scoped_fallback,
+    )?;
     if sandbox::credential_denial(output, cwd, Some(&detected)).is_some() {
         return Some(HostDenial::OperatorCredential);
     }

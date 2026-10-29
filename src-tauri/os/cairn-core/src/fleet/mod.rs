@@ -10763,7 +10763,10 @@ impl Fleet {
                 RunnerCallbackResult::Completed
             }
             RunnerCallback::SandboxDenied {
-                command, denial, ..
+                command,
+                denial,
+                reported_denial,
+                ..
             } => {
                 // An executor refuses its own operator credential denials
                 // without calling back; this catches a path only this runner
@@ -10804,9 +10807,10 @@ impl Fleet {
                         fence::Crossing::shell_path(&path, &path.display().to_string())
                     }
                     cairn_common::executor_protocol::SandboxDenial::Command => {
-                        fence::Crossing::shell_command(
-                            format!("command blocked by the executor worktree sandbox: {command}"),
+                        fence::Crossing::unattributed_denial(
                             &command,
+                            &command,
+                            reported_denial.as_deref(),
                         )
                     }
                 };
@@ -35253,6 +35257,7 @@ mod handoff_tests {
                             command: "cat /etc/hosts".into(),
                             cwd: "/tmp/worktree".into(),
                             denial: SandboxDenial::Path("/etc/hosts".into()),
+                            reported_denial: None,
                         },
                     )
                     .await
@@ -35373,6 +35378,7 @@ mod handoff_tests {
                     command: " git mv src-tauri/a src-tauri/b && git status --short".into(),
                     cwd: "/tmp/worktree".into(),
                     denial: SandboxDenial::Command,
+                    reported_denial: None,
                 },
             )
             .await;
@@ -35400,6 +35406,7 @@ mod handoff_tests {
                             command: " sh -c 'git mv a b'".into(),
                             cwd: "/tmp/worktree".into(),
                             denial: SandboxDenial::Command,
+                            reported_denial: None,
                         },
                     )
                     .await

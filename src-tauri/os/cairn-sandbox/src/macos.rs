@@ -10,9 +10,14 @@
 use super::{
     escape_sbpl, Confinement, NestedSandboxWriteProbe, OperatorCredentialFloor, SandboxPolicy,
 };
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 pub(crate) fn current_process_is_confined() -> bool {
     process_confinement().unwrap_or(true)
@@ -100,7 +105,6 @@ pub(crate) fn probe_nested_sandbox_write_under(outer: &Confinement) -> NestedSan
         detail: format!("could not create nested Seatbelt probe directory: {error}"),
     })
 }
-use std::time::SystemTime;
 
 /// Generate the SBPL profile string for a policy, closed by the operator
 /// credential boundary `floor` describes.
@@ -108,8 +112,11 @@ pub(crate) fn sbpl_profile(policy: &SandboxPolicy, floor: &OperatorCredentialFlo
     let mut out = String::new();
     out.push_str("(version 1)\n");
     out.push_str("(allow default)\n");
+    // Every fence deny carries the spawn's tag into the violation log, which is
+    // how a denial made by any descendant is found again (see `ViolationTag`).
+    let report = format!("(with message \"{}\")", policy.violation_tag.as_str());
     // Confine writes: deny everything, then re-allow the writable set.
-    out.push_str("(deny file-write* (subpath \"/\"))\n");
+    out.push_str(&format!("(deny file-write* (subpath \"/\") {report})\n"));
 
     let mut writable: Vec<PathBuf> = policy.writable_paths();
     // /dev is I/O plumbing (tty, null, fd) and must stay writable.
@@ -129,7 +136,7 @@ pub(crate) fn sbpl_profile(policy: &SandboxPolicy, floor: &OperatorCredentialFlo
     // Hard-deny reads of the sensitive denylist.
     let deny_rules = subpath_rules(&policy.deny_read);
     if !deny_rules.is_empty() {
-        out.push_str(&format!("(deny file-read* {})\n", deny_rules));
+        out.push_str(&format!("(deny file-read* {deny_rules} {report})\n"));
     }
 
     // Re-allow reads of the readable set LAST (last-match-wins) so a denylist
@@ -181,11 +188,15 @@ fn regex_rules(patterns: &[String]) -> String {
 }
 
 /// Rewrite argv to run under `sandbox-exec` with the generated profile.
+///
+/// Also makes sure the violation stream is watching, since it can only report
+/// a denial made while it was running (see [`detect_violation`]).
 pub(crate) fn wrap_argv(
     program: &str,
     args: &[String],
     policy: &SandboxPolicy,
 ) -> (String, Vec<String>) {
+    let _ = ViolationStream::watching();
     wrap_argv_with_profile(
         program,
         args,
@@ -230,95 +241,293 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Recover the denied path for a sandbox violation by `pid` from the unified
-/// log. Best-effort: returns `None` if the log query fails or no violation is
-/// found (the caller then falls back to a command-scoped denial).
+/// A sandbox violation recovered from the unified log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxViolation {
     pub(crate) operation: String,
     pub(crate) path: PathBuf,
 }
 
-pub(crate) fn detect_violation(pid: u32, since: SystemTime) -> Option<SandboxViolation> {
-    let start = format_log_start(since)?;
-    const ATTEMPTS: usize = 3;
-    const DELAY: std::time::Duration = std::time::Duration::from_millis(150);
-    for attempt in 0..ATTEMPTS {
-        if attempt > 0 {
-            std::thread::sleep(DELAY);
-        }
-        if let Some(violation) = query_violation(pid, &start) {
-            return Some(violation);
-        }
-    }
-    None
+/// Recover the denied path for a violation that carries `tag`, made since
+/// `since`. Best-effort: `None` when no violation stream is running or none
+/// arrives in time (the caller then falls back to a command-scoped denial).
+///
+/// The kernel logs a violation as process 0, naming the process that made the
+/// denied call only inside the message, so the spawned pid cannot select it;
+/// the tag the spawn's profile attached to its deny rules does. `since` keeps
+/// apart spawns that share one policy, and so one tag.
+pub(crate) fn detect_violation(
+    tag: &crate::ViolationTag,
+    since: SystemTime,
+) -> Option<SandboxViolation> {
+    // A stream started now could not have seen the denial, so only one that
+    // was already watching is asked.
+    let stream = ViolationStream::current()?;
+    stream.await_tagged(tag.as_str(), since, VIOLATION_ARRIVAL_WAIT)
 }
 
-/// One `log show` query + parse for a sandbox-deny operation and path by `pid`.
-fn query_violation(pid: u32, start_str: &str) -> Option<SandboxViolation> {
-    let output = std::process::Command::new("/usr/bin/log")
-        .args([
-            "show",
+/// How long a denial waits for its violation to arrive on the stream. The
+/// kernel's entry normally lands well inside this; waiting is paid only by a
+/// failed command whose output already reads as a permission denial.
+const VIOLATION_ARRIVAL_WAIT: Duration = Duration::from_millis(1500);
+
+/// What the kernel's Seatbelt extension is logged as sending from.
+const KERNEL_SANDBOX_SENDER: &str = "/Sandbox";
+
+/// A command that runs `argv` and stops it when this process exits.
+///
+/// macOS has no parent-death signal, so a long-lived child such as `log stream`
+/// would outlive this process until its next matching entry. The wrapper ties
+/// it to this process's lifetime instead: a background reader blocks on the
+/// wrapper's stdin, which the caller must keep open and never write, and kills
+/// the command when that pipe closes. The command's own stdout is the
+/// wrapper's, and its stderr goes to /dev/null, so a command that exits on its
+/// own still closes the caller's end.
+fn tied_to_this_process(argv: &[&str]) -> Command {
+    const WRAPPER: &str = r#"exec 3<&0
+"$@" </dev/null &
+l=$!
+{ read -r _ <&3; kill "$l"; } >/dev/null 2>&1 &
+wait "$l""#;
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", WRAPPER, "sh"])
+        .args(argv)
+        .stdin(Stdio::piped());
+    command
+}
+
+/// One process-wide `log stream` of tagged kernel Seatbelt violations.
+///
+/// A stream rather than a `log show` query afterwards: the persisted log does
+/// not hold these entries. Asked for a spawn's denials moments later, `log
+/// show` returns nothing, top-level process or descendant alike, while a live
+/// stream receives them as the kernel emits them.
+pub(crate) struct ViolationStream {
+    seen: Mutex<Seen>,
+    arrived: Condvar,
+    alive: AtomicBool,
+    /// Held, never written: when this process exits the pipe closes, and the
+    /// wrapper in [`ViolationStream::start`] stops `log stream` in response.
+    _lifeline: Mutex<std::process::ChildStdin>,
+}
+
+#[derive(Default)]
+struct Seen {
+    violations: VecDeque<(SystemTime, String, SandboxViolation)>,
+    /// Tagged lines that were not kernel violations, kept for a failing live
+    /// test to show.
+    #[cfg(test)]
+    rejected: VecDeque<String>,
+}
+
+/// The running stream, or when it last failed to start, so a process that
+/// cannot stream (a sandboxed one: `log` refuses to run there) does not pay a
+/// spawn attempt for every fenced command.
+static VIOLATION_STREAM: Mutex<Option<Result<Arc<ViolationStream>, Instant>>> = Mutex::new(None);
+
+const STREAM_RETRY_AFTER: Duration = Duration::from_secs(60);
+const STREAM_READY_WAIT: Duration = Duration::from_secs(2);
+const KEPT_VIOLATIONS: usize = 1024;
+const VIOLATION_RETENTION: Duration = Duration::from_secs(600);
+
+impl ViolationStream {
+    /// The running stream, starting one when there is none.
+    pub(crate) fn watching() -> Option<Arc<Self>> {
+        let mut slot = VIOLATION_STREAM.lock().ok()?;
+        match slot.as_ref() {
+            Some(Ok(stream)) if stream.alive.load(Ordering::Acquire) => {
+                return Some(stream.clone())
+            }
+            Some(Err(failed)) if failed.elapsed() < STREAM_RETRY_AFTER => return None,
+            _ => {}
+        }
+        let started = Self::start();
+        *slot = Some(started.clone().ok_or_else(Instant::now));
+        started
+    }
+
+    fn current() -> Option<Arc<Self>> {
+        match VIOLATION_STREAM.lock().ok()?.as_ref()? {
+            Ok(stream) => Some(stream.clone()),
+            Err(_) => None,
+        }
+    }
+
+    fn start() -> Option<Arc<Self>> {
+        let predicate = format!("eventMessage CONTAINS \"{}\"", crate::ViolationTag::PREFIX);
+        let mut child = tied_to_this_process(&[
+            "/usr/bin/log",
+            "stream",
             "--style",
             "ndjson",
-            "--start",
-            start_str,
             "--predicate",
-            &format!("processID == {pid}"),
+            &predicate,
         ])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+        let lifeline = child.stdin.take()?;
+        let stdout = child.stdout.take()?;
+        let stream = Arc::new(Self {
+            seen: Mutex::new(Seen::default()),
+            arrived: Condvar::new(),
+            alive: AtomicBool::new(true),
+            _lifeline: Mutex::new(lifeline),
+        });
+        let (ready, first_line) = std::sync::mpsc::channel();
+        let reader = stream.clone();
+        std::thread::Builder::new()
+            .name("cairn-sandbox-violations".into())
+            .spawn(move || {
+                let mut ready = Some(ready);
+                for line in BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    // `log stream` announces its filter before any entry.
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(());
+                    }
+                    reader.record(&line);
+                }
+                reader.alive.store(false, Ordering::Release);
+                reader.arrived.notify_all();
+                let _ = child.wait();
+            })
+            .ok()?;
+        match first_line.recv_timeout(STREAM_READY_WAIT) {
+            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+        stream.alive.load(Ordering::Acquire).then_some(stream)
+    }
+
+    fn record(&self, line: &str) {
+        let Ok(mut seen) = self.seen.lock() else {
+            return;
+        };
+        match parse_violation_entry(line) {
+            Some((tag, violation)) => {
+                let now = SystemTime::now();
+                let violations = &mut seen.violations;
+                while violations.len() >= KEPT_VIOLATIONS
+                    || violations.front().is_some_and(|(at, ..)| {
+                        now.duration_since(*at).unwrap_or_default() > VIOLATION_RETENTION
+                    })
+                {
+                    violations.pop_front();
+                }
+                violations.push_back((now, tag, violation));
+                self.arrived.notify_all();
+            }
+            #[cfg(test)]
+            None => {
+                if seen.rejected.len() >= 16 {
+                    seen.rejected.pop_front();
+                }
+                seen.rejected.push_back(line.to_string());
+            }
+            #[cfg(not(test))]
+            None => {}
+        }
+    }
+
+    fn await_tagged(
+        &self,
+        tag: &str,
+        since: SystemTime,
+        wait: Duration,
+    ) -> Option<SandboxViolation> {
+        let deadline = Instant::now() + wait;
+        let mut seen = self.seen.lock().ok()?;
+        loop {
+            if let Some((.., violation)) = seen
+                .violations
+                .iter()
+                .find(|(at, seen_tag, _)| seen_tag == tag && *at >= since)
+            {
+                return Some(violation.clone());
+            }
+            let left = deadline.checked_duration_since(Instant::now())?;
+            if left.is_zero() || !self.alive.load(Ordering::Acquire) {
+                return None;
+            }
+            seen = self.arrived.wait_timeout(seen, left).ok()?.0;
+        }
+    }
+
+    #[cfg(test)]
+    fn describe(&self, tag: &str) -> String {
+        let Ok(seen) = self.seen.lock() else {
+            return "violation stream state poisoned".into();
+        };
+        let ours: Vec<_> = seen
+            .violations
+            .iter()
+            .filter(|(_, t, _)| t == tag)
+            .collect();
+        format!(
+            "stream alive={}, {} violation(s) recorded, ours {ours:?}, rejected tagged lines {:?}",
+            self.alive.load(Ordering::Acquire),
+            seen.violations.len(),
+            seen.rejected
+        )
+    }
+}
+
+/// Parse one `log stream --style ndjson` entry into the spawn tag it carries
+/// and the violation it reports, if it is a tagged kernel Seatbelt violation.
+///
+/// A tagged violation message is the kernel's line with the rule's message
+/// after it, on the same line or the next:
+///   `Sandbox: touch(1234) deny(1) file-write-create /Users/x/escape.txt`
+///   `cairn-fence-…`
+/// The path is what follows the `deny(N) <operation>` prefix on the first line.
+///
+/// Only the kernel's own entries count. Any process in the tree can log text
+/// shaped like a violation, tag included, but not as process 0 from the
+/// Seatbelt extension, and the path parsed here becomes a crossing's scope.
+/// The tag is the message's last one, because the rule's message is appended
+/// after the path and a path can itself be named to look like a tag.
+fn parse_violation_entry(line: &str) -> Option<(String, SandboxViolation)> {
+    static DENY: OnceLock<regex::Regex> = OnceLock::new();
+    static TAG: OnceLock<regex::Regex> = OnceLock::new();
+    let deny = DENY.get_or_init(|| regex::Regex::new(r"deny\(\d+\)\s+(\S+)\s+(/.+)$").unwrap());
+    let tag_re = TAG.get_or_init(|| {
+        regex::Regex::new(&format!(
+            "{}[0-9a-z]+",
+            regex::escape(crate::ViolationTag::PREFIX)
+        ))
+        .unwrap()
+    });
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    // The field is numeric in ndjson output.
+    if value.get("processID")?.as_u64()? != 0 {
         return None;
     }
-    let ndjson = String::from_utf8_lossy(&output.stdout);
-    parse_violation(&ndjson, pid)
-}
-
-/// Format a `SystemTime` as a local `YYYY-MM-DD HH:MM:SS` string for
-/// `log show --start`.
-fn format_log_start(t: SystemTime) -> Option<String> {
-    let secs = t.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
-    let dt = chrono::DateTime::<chrono::Local>::from(
-        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
-    );
-    Some(dt.format("%Y-%m-%d %H:%M:%S").to_string())
-}
-
-/// Parse the first sandbox-deny path for `pid` out of `log show` ndjson output.
-///
-/// Sandbox violation messages look like:
-///   `Sandbox: bash(1234) deny(1) file-write-create /Users/x/escape.txt`
-/// We extract the path that follows the `deny(N) <operation>` prefix.
-fn parse_violation(ndjson: &str, pid: u32) -> Option<SandboxViolation> {
-    let re = regex::Regex::new(r"deny\(\d+\)\s+(\S+)\s+(/.+)$").ok()?;
-    for line in ndjson.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let value: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        // Match the offending pid; the field is numeric in ndjson output.
-        if value.get("processID").and_then(|v| v.as_u64()) != Some(pid as u64) {
-            continue;
-        }
-        let msg = match value.get("eventMessage").and_then(|v| v.as_str()) {
-            Some(m) => m,
-            None => continue,
-        };
-        if let Some(caps) = re.captures(msg.trim()) {
-            if let (Some(operation), Some(path)) = (caps.get(1), caps.get(2)) {
-                return Some(SandboxViolation {
-                    operation: operation.as_str().to_string(),
-                    path: PathBuf::from(path.as_str().trim()),
-                });
-            }
-        }
+    if !value
+        .get("senderImagePath")?
+        .as_str()?
+        .contains(KERNEL_SANDBOX_SENDER)
+    {
+        return None;
     }
-    None
+    let msg = value.get("eventMessage")?.as_str()?;
+    let tag = tag_re.find_iter(msg).last()?;
+    let first = msg.lines().next()?;
+    let violation = if tag.end() <= first.len() {
+        &first[..tag.start()]
+    } else {
+        first
+    };
+    let caps = deny.captures(violation.trim())?;
+    Some((
+        tag.as_str().to_string(),
+        SandboxViolation {
+            operation: caps.get(1)?.as_str().to_string(),
+            path: PathBuf::from(caps.get(2)?.as_str().trim()),
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -335,10 +544,16 @@ mod tests {
             deny_read: vec![PathBuf::from("/home/x/.aws")],
             writable_regex: vec![],
             worktree_writable: true,
+            violation_tag: crate::ViolationTag::fresh(),
         };
         let profile = sbpl_profile(&policy, &test_floor());
         assert!(profile.starts_with("(version 1)\n(allow default)\n"));
-        assert!(profile.contains("(deny file-write* (subpath \"/\"))"));
+        let report = format!("(with message \"{}\")", policy.violation_tag.as_str());
+        assert!(profile.contains(&format!("(deny file-write* (subpath \"/\") {report})")));
+        assert!(
+            profile.contains(&format!("(subpath \"/home/x/.aws\") {report})")),
+            "the read denylist reports the spawn's tag too:\n{profile}"
+        );
         assert!(profile.contains("(allow file-write*"));
         assert!(profile.contains("(subpath \"/dev\")"));
         // deny-read appears after the writable allow (last-match-wins ordering),
@@ -389,6 +604,7 @@ mod tests {
             deny_read: vec![],
             writable_regex: vec![],
             worktree_writable: true,
+            violation_tag: crate::ViolationTag::fresh(),
         };
         let (program, args) = wrap_argv("bash", &["-c".into(), "echo hi".into()], &policy);
         assert_eq!(program, "/usr/bin/sandbox-exec");
@@ -398,11 +614,43 @@ mod tests {
         assert_eq!(args[4], "echo hi");
     }
 
+    const TAG: &str = "cairn-fence-0123abcd";
+    const KERNEL: &str = r#""processID":0,"senderImagePath":"/System/Library/Extensions/Sandbox.kext/Contents/MacOS/Sandbox""#;
+
+    /// The first violation tagged `tag` among `ndjson`'s stream entries, the
+    /// way [`ViolationStream`] selects it.
+    fn parse_violation(ndjson: &str, tag: &str) -> Option<SandboxViolation> {
+        ndjson
+            .lines()
+            .filter_map(super::parse_violation_entry)
+            .find(|(seen, _)| seen == tag)
+            .map(|(_, violation)| violation)
+    }
+
+    /// A path named to look like another spawn's tag cannot claim that spawn:
+    /// the kernel appends the rule's message after the path, so the last tag
+    /// is the one the profile attached.
+    #[test]
+    fn parse_violation_takes_the_rule_tag_not_a_tag_shaped_path() {
+        let ndjson = format!(
+            r#"{{{KERNEL},"eventMessage":"Sandbox: touch(5) deny(1) file-write-create /x/cairn-fence-victim\n{TAG}"}}"#
+        );
+        assert_eq!(
+            super::parse_violation_entry(ndjson.trim()).map(|(tag, v)| (tag, v.path)),
+            Some((TAG.to_string(), PathBuf::from("/x/cairn-fence-victim")))
+        );
+        assert_eq!(parse_violation(&ndjson, "cairn-fence-victim"), None);
+    }
+
     #[test]
     fn parse_violation_path_extracts_denied_path() {
-        let ndjson = r#"{"processID":1234,"eventMessage":"Sandbox: bash(1234) deny(1) file-write-create /Users/x/escape.txt"}
-{"processID":1234,"eventMessage":"some unrelated log line"}"#;
-        let violation = super::parse_violation(ndjson, 1234);
+        // The rule's message follows the kernel's line; the process named in
+        // the message is a child of the spawn, which no pid filter could find.
+        let ndjson = format!(
+            r#"{{{KERNEL},"eventMessage":"Sandbox: touch(1235) deny(1) file-write-create /Users/x/escape.txt\n{TAG}"}}
+{{{KERNEL},"eventMessage":"some unrelated log line"}}"#
+        );
+        let violation = parse_violation(&ndjson, TAG);
         assert_eq!(
             violation,
             Some(SandboxViolation {
@@ -413,18 +661,45 @@ mod tests {
     }
 
     #[test]
-    fn parse_violation_path_ignores_other_pids_and_non_deny() {
-        let ndjson = r#"{"processID":9999,"eventMessage":"deny(1) file-read-data /Users/x/.aws/credentials"}
-{"processID":1234,"eventMessage":"allow file-read-data /Users/x/ok"}"#;
-        assert_eq!(super::parse_violation(ndjson, 1234), None);
+    fn parse_violation_path_accepts_the_tag_on_the_violation_line() {
+        let ndjson = format!(
+            r#"{{{KERNEL},"eventMessage":"Sandbox: git(77) deny(1) file-write-create /repo/.git/FETCH_HEAD {TAG}"}}"#
+        );
+        assert_eq!(
+            parse_violation(&ndjson, TAG).map(|v| v.path),
+            Some(PathBuf::from("/repo/.git/FETCH_HEAD"))
+        );
+    }
+
+    #[test]
+    fn parse_violation_path_ignores_other_spawns_and_non_deny() {
+        let ndjson = format!(
+            r#"{{{KERNEL},"eventMessage":"Sandbox: cat(9) deny(1) file-read-data /Users/x/.aws/credentials\ncairn-fence-ffff"}}
+{{{KERNEL},"eventMessage":"Sandbox: cat(9) deny(1) file-read-data /Users/x/.aws/config"}}
+{{{KERNEL},"eventMessage":"allow file-read-data /Users/x/ok\n{TAG}"}}"#
+        );
+        assert_eq!(parse_violation(&ndjson, TAG), None);
+    }
+
+    /// The parsed path becomes a crossing's scope, and a process in the tree
+    /// can log a line shaped like a violation, tag and all.
+    #[test]
+    fn parse_violation_path_ignores_entries_the_kernel_did_not_write() {
+        let ndjson = format!(
+            r#"{{"processID":1235,"senderImagePath":"/usr/bin/logger","eventMessage":"Sandbox: touch(1) deny(1) file-write-create /Users/x/.ssh\n{TAG}"}}
+{{"processID":0,"senderImagePath":"/usr/lib/libSystem.B.dylib","eventMessage":"Sandbox: touch(1) deny(1) file-write-create /Users/x/.ssh\n{TAG}"}}
+{{"processID":1235,"senderImagePath":"/System/Library/Extensions/Sandbox.kext/Contents/MacOS/Sandbox","eventMessage":"Sandbox: touch(1) deny(1) file-write-create /Users/x/.ssh\n{TAG}"}}"#
+        );
+        assert_eq!(parse_violation(&ndjson, TAG), None);
     }
 
     #[test]
     fn parse_violation_path_handles_read_denials() {
-        let ndjson =
-            r#"{"processID":42,"eventMessage":"deny(1) file-read-data /home/u/.ssh/id_rsa"}"#;
+        let ndjson = format!(
+            r#"{{{KERNEL},"eventMessage":"Sandbox: cat(42) deny(1) file-read-data /home/u/.ssh/id_rsa\n{TAG}"}}"#
+        );
         assert_eq!(
-            super::parse_violation(ndjson, 42),
+            parse_violation(&ndjson, TAG),
             Some(SandboxViolation {
                 operation: "file-read-data".into(),
                 path: PathBuf::from("/home/u/.ssh/id_rsa"),
@@ -468,6 +743,7 @@ mod tests {
                 deny_read: vec![],
                 writable_regex: vec![],
                 worktree_writable: true,
+                violation_tag: crate::ViolationTag::fresh(),
             };
             let probe = dir.path().join("probe");
             let (program, args) = wrap_argv(
@@ -512,6 +788,7 @@ mod tests {
             deny_read: vec![secret.clone()],
             writable_regex: vec![],
             worktree_writable: true,
+            violation_tag: crate::ViolationTag::fresh(),
         };
 
         let run = |cmd: &str| -> std::process::Output {
@@ -569,6 +846,7 @@ mod tests {
             deny_read: vec![base.path().to_path_buf()], // a broad denylist entry
             writable_regex: vec![],
             worktree_writable: true,
+            violation_tag: crate::ViolationTag::fresh(),
         };
         let run = |cmd: &str| -> std::process::Output {
             let (program, args) = wrap_argv("/bin/bash", &["-c".into(), cmd.into()], &policy);
@@ -614,6 +892,7 @@ mod tests {
             deny_read: vec![],
             writable_regex: vec![],
             worktree_writable: true,
+            violation_tag: crate::ViolationTag::fresh(),
         };
         let run = |cmd: &str| -> std::process::Output {
             let (program, args) = wrap_argv("/bin/bash", &["-c".into(), cmd.into()], &policy);
@@ -725,6 +1004,150 @@ mod tests {
         }
     }
 
+    /// Run `script` under `policy` and recover its denial the way a fenced
+    /// spawn's caller does, with what the violation stream saw attached for a
+    /// failure to show.
+    fn denial_under(
+        policy: &SandboxPolicy,
+        script: String,
+    ) -> (Option<crate::SandboxDenial>, String) {
+        let since = SystemTime::now();
+        let (program, args) = wrap_argv("/bin/sh", &["-c".into(), script], policy);
+        let out = Command::new(program).args(args).output().unwrap();
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let denial = crate::detect_denial(
+            out.status.code(),
+            &output,
+            Some(&policy.violation_tag),
+            since,
+            true,
+        );
+        let stream = ViolationStream::current().map_or_else(
+            || "no violation stream is running (`log stream` did not start)".to_string(),
+            |stream| stream.describe(policy.violation_tag.as_str()),
+        );
+        (
+            denial,
+            format!("exit {:?}, output {output:?}; {stream}", out.status.code()),
+        )
+    }
+
+    fn outside_write_policy(worktree: &Path) -> SandboxPolicy {
+        // Empty writable_extra so a sibling temp dir is genuinely outside the
+        // writable set.
+        SandboxPolicy {
+            worktree: worktree.to_path_buf(),
+            writable_extra: vec![],
+            deny_read: vec![],
+            writable_regex: vec![],
+            worktree_writable: true,
+            violation_tag: crate::ViolationTag::fresh(),
+        }
+    }
+
+    /// The kernel logs a violation under the process that made the denied
+    /// call. Here that is `touch`, a child of the spawned `sh` (the trailing
+    /// `; true` stops sh from exec-ing it in place), so a lookup keyed on the
+    /// spawned pid finds nothing and the prompt would blame `sh -c`.
+    #[test]
+    fn a_denial_made_by_a_child_process_is_recovered_by_path_live() {
+        if skip_without_nested_sandbox_exec(
+            "a_denial_made_by_a_child_process_is_recovered_by_path_live",
+        ) {
+            return;
+        }
+        let wt = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+        let policy = outside_write_policy(wt.path());
+        let target = outside.join("x");
+        let (denial, evidence) = denial_under(&policy, format!("touch {}; true", target.display()));
+        assert!(!target.exists(), "the write must have been refused");
+        assert!(
+            matches!(&denial, Some(crate::SandboxDenial::Path { path, .. }) if *path == target),
+            "expected a path-scoped denial of {}, got {denial:?}; {evidence}",
+            target.display()
+        );
+    }
+
+    /// Two spawns denied in the same window each recover their own path, never
+    /// the other's: the tag, not the time window, is what attributes a denial.
+    #[test]
+    fn concurrent_spawns_recover_only_their_own_denials_live() {
+        if skip_without_nested_sandbox_exec("concurrent_spawns_recover_only_their_own_denials_live")
+        {
+            return;
+        }
+        let wt = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+        let (first, second) = (outside.join("first"), outside.join("second"));
+        let first_policy = outside_write_policy(wt.path());
+        let second_policy = outside_write_policy(wt.path());
+        let first_script = format!("exec touch {}", first.display());
+        let second_script = format!("touch {}; true", second.display());
+        let (first_denial, first_evidence) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| denial_under(&first_policy, first_script));
+            let (second_denial, second_evidence) = denial_under(&second_policy, second_script);
+            assert!(
+                matches!(&second_denial, Some(crate::SandboxDenial::Path { path, .. }) if *path == second),
+                "got {second_denial:?}; {second_evidence}"
+            );
+            first.join().unwrap()
+        });
+        assert!(
+            matches!(&first_denial, Some(crate::SandboxDenial::Path { path, .. }) if *path == first),
+            "got {first_denial:?}; {first_evidence}"
+        );
+    }
+
+    /// The stream must not outlive the process that started it. Closing the
+    /// lifeline is what this process's exit does to it, so a stand-in command
+    /// that would otherwise run for ten minutes has to stop within moments, and
+    /// the wrapper only exits once its command has.
+    #[test]
+    fn a_tied_command_stops_when_its_lifeline_closes() {
+        let mut child = tied_to_this_process(&["/bin/sleep", "600"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let lifeline = child.stdin.take().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the command must keep running while its lifeline is open"
+        );
+        drop(lifeline);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("the tied command outlived its lifeline");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Every fenced spawn asks for the stream, and only the first starts one:
+    /// a stream per spawn would cost a `log` process each and would miss
+    /// violations made before it was ready.
+    #[test]
+    fn a_second_spawn_reuses_the_running_violation_stream_live() {
+        if skip_without_nested_sandbox_exec(
+            "a_second_spawn_reuses_the_running_violation_stream_live",
+        ) {
+            return;
+        }
+        let first = ViolationStream::watching().expect("an unconfined process can stream the log");
+        let second = ViolationStream::watching().expect("the stream is still running");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
     #[test]
     fn nested_write_probe_is_authoritative_when_allow_default_false_negatives() {
         let allow_default_claims_unconfined = !current_process_is_confined();
@@ -760,6 +1183,7 @@ mod tests {
             deny_read: vec![],
             writable_regex: vec![],
             worktree_writable: true,
+            violation_tag: crate::ViolationTag::fresh(),
         };
         let run = |cmd: &str| -> std::process::Output {
             let (program, args) = wrap_argv("/bin/bash", &["-c".into(), cmd.into()], &policy);
@@ -1097,6 +1521,7 @@ mod tests {
             deny_read: vec![],
             writable_regex: vec![],
             worktree_writable: true,
+            violation_tag: crate::ViolationTag::fresh(),
         };
         let profile = sbpl_profile(&policy, &fixture.floor);
         let out = fixture.run(&profile, &format!("cat {}", fixture.dev_secret().display()));
@@ -1137,6 +1562,7 @@ mod tests {
             deny_read: vec![],
             writable_regex: vec![super::super::glob_to_regex(&glob)],
             worktree_writable: true,
+            violation_tag: crate::ViolationTag::fresh(),
         };
         let run = |cmd: &str| -> std::process::Output {
             let (program, args) = wrap_argv("/bin/bash", &["-c".into(), cmd.into()], &policy);

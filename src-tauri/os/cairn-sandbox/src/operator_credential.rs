@@ -489,20 +489,16 @@ fn credential_denial_on(
 }
 
 /// A denial on a spawn that carries only the boundary, which can only be the
-/// boundary refusing it. The log lookup is paid only when the output carries a
-/// permission-denial signature.
-pub fn detect_credential_floor_denial(
-    exit_code: Option<i32>,
-    output: &str,
-    pid: Option<u32>,
-    since: std::time::SystemTime,
-    cwd: Option<&Path>,
-) -> Option<PathBuf> {
+/// boundary refusing it.
+///
+/// Recognized from the attempted path the output names. The floor-only profile
+/// carries no [`crate::ViolationTag`], so the violation log has nothing to
+/// select this spawn's denials by.
+pub fn detect_credential_floor_denial(output: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     if !crate::has_denial_signature(output) {
         return None;
     }
-    let logged = crate::detect_denial(exit_code, output, pid, since, false);
-    credential_denial(output, cwd, logged.as_ref())
+    credential_denial(output, cwd, None)
 }
 
 /// The substrings of one output line a tool could have named a path with.

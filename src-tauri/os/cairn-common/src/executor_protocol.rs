@@ -5176,6 +5176,17 @@ pub struct LearnedResourceEstimate {
 /// announce a lane the restart ended as cancelled rather than dead. Nothing is
 /// sent, and no frame, field or value an executor decodes changes. What a
 /// runner gets wrong talking to an older executor: nothing.
+///
+/// cairn/5328 does not move the number. A macOS executor now recovers the path
+/// of a Seatbelt denial made by any descendant of a fenced item, by a tag its
+/// profile attaches to each deny rule, so it sends `SandboxDenial::Path` where
+/// it used to send `SandboxDenial::Command`: both existing values with
+/// unchanged meaning. `RunnerCallback::SandboxDenied`
+/// gains one defaulted field, `reported_denial`, the item's own denial line for
+/// a command-scoped prompt to quote as unverified. What a runner gets wrong
+/// talking to an older executor: nothing; the field is absent and the prompt
+/// quotes no line, and the older executor's pathless denials raise the same
+/// command-scoped crossing they always did. An older runner ignores the field.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 157;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -14889,6 +14900,11 @@ pub enum RunnerCallback {
         command: String,
         cwd: String,
         denial: SandboxDenial,
+        /// For a command-scoped denial, the item's own first denial line, so
+        /// the prompt can quote it. Written by the command: a clue for the
+        /// approver, never a grant's scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reported_denial: Option<String>,
     },
     CacheCheckpoint {
         runner_context_id: String,
@@ -15551,6 +15567,7 @@ mod tests {
                     command: "touch /outside".into(),
                     cwd: "/tmp/worktree".into(),
                     denial: SandboxDenial::Path("/outside".into()),
+                    reported_denial: None,
                 },
             },
             ExecutorMessage::CallbackRequest {
