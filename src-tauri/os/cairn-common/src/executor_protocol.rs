@@ -5123,7 +5123,32 @@ pub struct LearnedResourceEstimate {
 /// executor version already holds against its available memory while the
 /// work is resident. What a runner gets wrong talking to an older executor:
 /// nothing.
+///
+/// cairn/5222 does not move the number, and makes it the ledger's: `build.rs`
+/// derives the version from this block, its highest `Version N` heading plus
+/// one while a `/// Version NEXT` heading is present (see
+/// [`crate::executor_protocol_ledger`]), and the build fails if the constant
+/// below reads anything else. The store binds the number when a branch lands
+/// on the default branch: the one heading the branch authored, NEXT or a
+/// number chosen by hand, takes the destination's version plus one, and the
+/// constant moves with it, so two branches that both change the protocol land
+/// as consecutive versions and neither renumbers by hand. No frame, field or
+/// value changes. What a runner gets wrong talking to an older executor:
+/// nothing; the number is the same.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 157;
+
+/// The version `build.rs` derived from the paragraphs above
+/// [`EXECUTOR_PROTOCOL_VERSION`].
+mod derived {
+    include!(concat!(env!("OUT_DIR"), "/executor_protocol_version.rs"));
+}
+
+// The constant is written as a literal only so a runner that predates the
+// derivation can still read it; its value is the ledger's, held here.
+const _: () = assert!(
+    EXECUTOR_PROTOCOL_VERSION == derived::EXECUTOR_PROTOCOL_VERSION,
+    "EXECUTOR_PROTOCOL_VERSION must equal what its paragraphs derive: the highest `/// Version N` heading above it, plus one for a `/// Version NEXT` heading"
+);
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -14877,6 +14902,31 @@ pub enum RunnerCallbackResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The derived constant took over from a literal 157 (cairn/5222). It can
+    /// only grow from there, it is the ledger's own reading of this file, and
+    /// the heading it switched over at is still in the block.
+    #[test]
+    fn the_derived_protocol_version_is_the_ledgers_and_never_below_the_cutover() {
+        const CUTOVER: u32 = 157;
+        const SOURCE: &str = include_str!("executor_protocol.rs");
+        const { assert!(EXECUTOR_PROTOCOL_VERSION >= CUTOVER) };
+        assert_eq!(
+            crate::executor_protocol_ledger::derive_version(
+                SOURCE,
+                crate::executor_protocol_ledger::ANCHOR
+            ),
+            Ok(u64::from(EXECUTOR_PROTOCOL_VERSION))
+        );
+        assert!(crate::executor_protocol_ledger::block_headings(
+            SOURCE,
+            crate::executor_protocol_ledger::ANCHOR
+        )
+        .unwrap()
+        .iter()
+        .any(|heading| heading.version
+            == crate::executor_protocol_ledger::HeadingVersion::Bound(u64::from(CUTOVER))));
+    }
 
     #[test]
     fn five_state_lifecycle_wire_vocabulary_is_strict() {

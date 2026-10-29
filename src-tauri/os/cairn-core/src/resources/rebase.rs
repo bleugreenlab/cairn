@@ -196,33 +196,7 @@ pub(super) async fn read_node_rebase(
     if !matches!(request.view, RebaseView::Summary) {
         return rendered;
     }
-    let rendered = format!("{name_section}{rendered}");
-    let obligations =
-        match crate::mcp::handlers::run_context::project_id_by_key(&orch.db.local, project).await {
-            Ok(project_id) => {
-                crate::orchestrator::contended_identifiers::outstanding_obligation_labels(
-                    &orch.db.local,
-                    &project_id,
-                    &branch,
-                )
-                .await
-                .unwrap_or_default()
-            }
-            Err(_) => Vec::new(),
-        };
-    if obligations.is_empty() {
-        rendered
-    } else {
-        let rows = obligations
-            .iter()
-            .map(|identifier| format!("- `{identifier}`"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let example = obligations.first().expect("non-empty");
-        format!(
-            "# Outstanding contended identifier obligation\n\nThis branch is held by the in-app merge gate until Cairn applies or automatically discharges the following durable recovery floor(s):\n\n{rows}\n\nIf an obligation itself is wrong, release it explicitly and say why; the actor and reason are retained:\n\n```\nwrite({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",payload:{{action:\"discharge-contended-identifier\",identifier:\"{example}\",reason:\"…\"}}}}]}})\n```\n\n{rendered}"
-        )
-    }
+    format!("{name_section}{rendered}")
 }
 
 /// The page for a branch with no OPEN session.
@@ -1641,18 +1615,56 @@ fn collision_section(
     if collisions.is_empty() {
         return String::new();
     }
+    // The directories whose numbers the landing binds, as the destination
+    // declares them.
+    let bound: BTreeSet<String> = crate::orchestrator::landing::identifier_rules(
+        &crate::orchestrator::landing::landing_settings_at(jj, store, theirs),
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .filter_map(|(_, rule)| match rule {
+        crate::config::project_settings::IdentifierRule::NumberedFile { directory, .. } => {
+            Some(directory)
+        }
+        crate::config::project_settings::IdentifierRule::VersionHeading { .. } => None,
+    })
+    .collect();
+    render_collisions(&collisions, &bound)
+}
+
+/// The collision section. A directory the landing binds (`landing.identifiers`
+/// in the destination's config) needs nothing from the agent: the landing
+/// numbers the branch's file against the tip it lands on. Only a numbering
+/// convention nobody declared is renumbered by hand.
+fn render_collisions(collisions: &[NumberCollision], bound: &BTreeSet<String>) -> String {
     let mut out = String::from("\n## Numbered-file collisions\n\n");
-    for collision in &collisions {
-        out.push_str(&format!(
-            "`{}/` — incoming claims `{}`; your branch adds `{}`. Renumber yours to **{}** and \
-             update wherever it is registered.\n",
-            collision.directory, collision.incoming, collision.ours, collision.suggested
-        ));
+    let mut by_hand = false;
+    for collision in collisions {
+        if bound.contains(&collision.directory) {
+            out.push_str(&format!(
+                "`{}/` — incoming claims `{}`; your branch adds `{}`. Leave it as it is: this \
+                 directory's numbers are bound when a branch lands on the default branch, so \
+                 yours takes the next free number then and its name is rewritten wherever your \
+                 branch uses it. Name a new file here `NEXT_<name>`, and never renumber one by \
+                 hand.\n",
+                collision.directory, collision.incoming, collision.ours
+            ));
+        } else {
+            by_hand = true;
+            out.push_str(&format!(
+                "`{}/` — incoming claims `{}`; your branch adds `{}`. Renumber yours to **{}** and \
+                 update wherever it is registered.\n",
+                collision.directory, collision.incoming, collision.ours, collision.suggested
+            ));
+        }
     }
-    out.push_str(
-        "\nBoth files will exist after the replay, so this is not something the merge resolves for \
-         you: two files claiming one number is a conflict of meaning, not of text.\n",
-    );
+    if by_hand {
+        out.push_str(
+            "\nBoth files will exist after the replay, and nothing binds this directory's numbers, \
+             so this is not something the merge resolves for you: two files claiming one number \
+             is a conflict of meaning, not of text.\n",
+        );
+    }
     out
 }
 
@@ -2482,6 +2494,32 @@ mod tests {
         assert_eq!(
             collisions[0].suggested, "0151",
             "0150 is taken by this branch"
+        );
+    }
+
+    /// A directory the landing binds tells the agent to leave its number alone;
+    /// one nobody declared still says to renumber. The page never offers both
+    /// for one directory.
+    #[test]
+    fn a_bound_directory_is_left_to_the_landing_and_an_undeclared_one_is_renumbered() {
+        let collision = |directory: &str| NumberCollision {
+            directory: directory.to_string(),
+            incoming: "0284_theirs.sql".to_string(),
+            ours: "0284_ours.sql".to_string(),
+            suggested: "0285".to_string(),
+        };
+        let bound = BTreeSet::from(["src-tauri/turso_migrations".to_string()]);
+        let page = render_collisions(&[collision("src-tauri/turso_migrations")], &bound);
+        assert!(page.contains("Leave it as it is"), "{page}");
+        assert!(page.contains("NEXT_<name>"), "{page}");
+        assert!(!page.contains("Renumber yours"), "{page}");
+        assert!(!page.contains("not something the merge resolves"), "{page}");
+
+        let page = render_collisions(&[collision("docs/numbered")], &bound);
+        assert!(page.contains("Renumber yours to **0285**"), "{page}");
+        assert!(
+            page.contains("nothing binds this directory's numbers"),
+            "{page}"
         );
     }
 

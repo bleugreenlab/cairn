@@ -886,27 +886,12 @@ fn classify_reconciled_sibling(
 /// so recording it as terminal was the exact shape this system must not have —
 /// runner-owned state failing into a dead end no agent can reach. It is retried
 /// instead, and the next base advance repairs the bookmark on its way through.
-///
-/// [`CONTENDED_PREFLIGHT`] is permanent for the tip it failed on: the preflight
-/// reads only the branch graph, so the same tip and base fail the same way
-/// every time, and retrying them forever only hides the refusal behind a
-/// "retried automatically" status.
 pub fn reconcile_failure_is_permanent(kind: &str) -> bool {
     matches!(
         kind,
-        "immutable_commit" | "ambiguous_divergence" | "missing_bookmark" | CONTENDED_PREFLIGHT
+        "immutable_commit" | "ambiguous_divergence" | "missing_bookmark"
     )
 }
-
-/// The prefix of a contended-identifier preflight refusal: the branch graph
-/// could not be read the way the preflight needs, so nothing was moved. The
-/// base-advance worker composes the diagnostic with it, and
-/// [`reconcile_failure_kind`] classifies by it.
-pub const CONTENDED_PREFLIGHT_REFUSAL: &str =
-    "contended identifier preflight refused before graph mutation:";
-
-/// The failure kind of a [`CONTENDED_PREFLIGHT_REFUSAL`].
-pub const CONTENDED_PREFLIGHT: &str = "contended_preflight";
 
 ///
 /// A lost `packed-refs.lock` is checked first, because the lock error's own
@@ -926,12 +911,6 @@ pub fn reconcile_failure_kind(error: &str) -> &'static str {
     }
     if error.contains(CONTENTION_DIAGNOSIS) || packed_refs_lock_error(error) {
         return REF_LOCK_CONTENTION;
-    }
-    // Ahead of the keyword arms, because a preflight diagnostic quotes jj and
-    // the revisions it read, either of which can carry their words. A read
-    // that timed out is load, not the branch, and stays retryable.
-    if error.contains(CONTENDED_PREFLIGHT_REFUSAL) && !error.contains(" timed out after ") {
-        return CONTENDED_PREFLIGHT;
     }
     let error = error.to_ascii_lowercase();
     if error.contains("immutable") {

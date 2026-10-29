@@ -18,7 +18,6 @@ pub mod build_services;
 mod claude_credentials;
 pub mod config_resource;
 pub mod conflict_session;
-pub mod contended_identifiers;
 pub mod custom_providers;
 mod decide;
 mod subscription_periods;

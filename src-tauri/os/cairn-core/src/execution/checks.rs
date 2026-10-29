@@ -20498,8 +20498,12 @@ mod manual_transport_tests {
         git_stdout(repo, &["rev-parse", "HEAD"])
     }
 
+    /// A protocol source at `version`, in the shape the ledger derives it from:
+    /// a heading for the version above the constant that reads it.
     fn protocol(version: u32) -> String {
-        format!("pub const EXECUTOR_PROTOCOL_VERSION: u32 = {version};\n")
+        format!(
+            "/// Version {version} changes the test wire.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = {version};\n"
+        )
     }
 
     fn value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {

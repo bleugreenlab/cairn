@@ -15,6 +15,7 @@ pub mod dev_instance_protocol;
 pub mod executor_generation;
 pub mod executor_paths;
 pub mod executor_protocol;
+pub mod executor_protocol_ledger;
 pub mod identity;
 pub mod ids;
 pub mod imports;

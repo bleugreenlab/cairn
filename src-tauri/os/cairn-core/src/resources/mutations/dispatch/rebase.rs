@@ -36,15 +36,12 @@ pub(super) async fn dispatch(
                 .ok_or_else(|| build_failure(index, item, "mode=patch requires payload"))?;
             let action = payload_non_empty_str(payload, "action", &[])
                 .ok_or_else(|| build_failure(index, item, "payload.action is required"))?;
-            if !matches!(
-                action,
-                "replay" | "discharge-contended-identifier" | "fast-forward-from-origin"
-            ) {
+            if !matches!(action, "replay" | "fast-forward-from-origin") {
                 return Err(build_failure(
                     index,
                     item,
                     format!(
-                        "payload.action must be 'replay', 'fast-forward-from-origin' or 'discharge-contended-identifier', got '{action}'"
+                        "payload.action must be 'replay' or 'fast-forward-from-origin', got '{action}'"
                     ),
                 ));
             }
@@ -61,24 +58,6 @@ pub(super) async fn dispatch(
                     index,
                     item,
                     "payload.branch must be 'base' when provided: fast-forward-from-origin acts on this node's branch, or with branch:'base' on the branch it is cut from",
-                ));
-            }
-            let identifier = payload_non_empty_str(payload, "identifier", &[]);
-            let discharge_reason = payload_non_empty_str(payload, "reason", &[]);
-            if action == "discharge-contended-identifier"
-                && (identifier.is_none() || discharge_reason.is_none())
-            {
-                return Err(build_failure(
-                    index,
-                    item,
-                    "discharge-contended-identifier requires non-empty payload.identifier and payload.reason",
-                ));
-            }
-            if action == "replay" && (identifier.is_some() || discharge_reason.is_some()) {
-                return Err(build_failure(
-                    index,
-                    item,
-                    "payload.identifier and payload.reason apply only to discharge-contended-identifier",
                 ));
             }
             let fingerprint = payload_non_empty_str(payload, "fingerprint", &[]);
@@ -146,64 +125,6 @@ pub(super) async fn dispatch(
                     )
                     .await
                     .map_err(|error| build_failure(index, item, error))?
-                }
-            } else if action == "discharge-contended-identifier" {
-                let identifier = identifier.expect("validated above");
-                let reason = discharge_reason.expect("validated above");
-                if dry_run {
-                    format!("Would explicitly discharge `{identifier}` for `{branch}`")
-                } else {
-                    let local_project_id = crate::mcp::handlers::run_context::project_id_by_key(
-                        &orch.db.local,
-                        project,
-                    )
-                    .await
-                    .map_err(|error| build_failure(index, item, error))?;
-                    let actor_identity = if _request
-                        .payload
-                        .get("_cairn_origin")
-                        .and_then(|value| value.as_str())
-                        == Some("cli")
-                    {
-                        None
-                    } else {
-                        crate::mcp::handlers::run_context::lookup_home_uri_routed(
-                            &orch.db, _request,
-                        )
-                        .await
-                        .ok()
-                    };
-                    let (actor_kind, surface) = if actor_identity.is_some() {
-                        ("agent", "agent-resource-write")
-                    } else {
-                        ("operator-cli", "operator-cli")
-                    };
-                    let changed = crate::orchestrator::contended_identifiers::explicitly_discharge_obligation(
-                        &orch.db.local,
-                        &local_project_id,
-                        &branch,
-                        identifier,
-                        reason,
-                        crate::orchestrator::contended_identifiers::DischargeAttribution {
-                            actor_kind,
-                            actor_identity: actor_identity.as_deref(),
-                            surface,
-                        },
-                    )
-                    .await
-                    .map_err(|error| build_failure(index, item, error))?;
-                    if !changed {
-                        return Err(build_failure(
-                            index,
-                            item,
-                            format!(
-                                "No outstanding `{identifier}` obligation exists for `{branch}`. Re-read cairn:~/rebase before releasing anything."
-                            ),
-                        ));
-                    }
-                    format!(
-                        "Explicitly discharged `{identifier}` for `{branch}`. Attribution and reason were recorded; the merge gate will no longer hold for this obligation."
-                    )
                 }
             } else if dry_run {
                 format!("Would request a store-side replay of `{branch}`")

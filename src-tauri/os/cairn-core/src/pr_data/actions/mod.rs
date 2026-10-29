@@ -12,6 +12,7 @@ mod config_preflight;
 mod conflict;
 mod context;
 mod create_pr;
+mod default_landing;
 mod merge;
 mod pin_bump;
 pub(crate) mod refresh;

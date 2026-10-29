@@ -190,8 +190,7 @@ use super::context::{
 use super::refresh::refresh_pr_for_job;
 use super::resolution::{persist_merged_commit, resolve_pr_node};
 use super::store_merge::{
-    land_verified_store_merge_child, prospective_store_merge_child, store_merge_child,
-    VerifiedLanding,
+    land_verified_store_merge_child, prospective_store_merge_child, VerifiedLanding,
 };
 
 /// Resolve a PR owner id to the `jobs.id` used by `file_changes.job_id`.
@@ -504,7 +503,7 @@ fn effective_merge_method(merge_context: &MergeMrContext, merge_method: Option<S
 }
 
 /// The merge method a DEFAULT-BRANCH landing will actually use, resolved per
-/// route: the GitHub route (`merge_remote_pr_via_github`) passes the caller's
+/// route: the GitHub route (`default_landing`'s GitHub merge) passes the caller's
 /// method straight through (defaulting to squash), while the local fold applies
 /// the workspace forcing (`effective_merge_method`). Only
 /// meaningful when the target IS the default branch. The merge gate uses this to
@@ -571,7 +570,11 @@ fn should_merge_via_github(ctx: &MergeMrContext) -> bool {
 /// cleanly — which is exactly what happened when one wake produced two agent
 /// contexts and both tried to merge the same PR (CAIRN-3283). So the body text
 /// GitHub returned, carried verbatim in `error`, decides the message.
-fn map_github_merge_error(source_branch: &str, target_branch: &str, error: String) -> String {
+pub(super) fn map_github_merge_error(
+    source_branch: &str,
+    target_branch: &str,
+    error: String,
+) -> String {
     let refused = error.contains("PR: 405") || error.contains("PR: 409");
     if !refused {
         return format!(
@@ -598,90 +601,30 @@ fn map_github_merge_error(source_branch: &str, target_branch: &str, error: Strin
     )
 }
 
-/// Merge a remote PR through GitHub's merge API, then reconcile locally.
+/// After GitHub merged a remote PR (`default_landing`), resolve it and
+/// reconcile locally.
 ///
-/// GitHub performs the squash-merge, closes the PR, and advances the base branch
-/// on origin. The ordering is fail-closed: the GitHub call is the load-bearing
-/// step, and only once it succeeds do we mark the merge request merged / resolve
-/// the issue locally (`resolve_pr_node`). Local reconciliation is then proactive
-/// and best-effort — origin is already authoritative, the GitHub `push` webhook
-/// and the local sweep also perform this work, and the before/after commit-id
-/// guards in `base_advance` make the double-fire a no-op.
-#[allow(clippy::too_many_arguments)]
-async fn merge_remote_pr_via_github(
+/// GitHub performed the squash-merge, closed the PR, and advanced the base
+/// branch on origin. The ordering is fail-closed: the GitHub call was the
+/// load-bearing step, and only once it succeeded do we mark the merge request
+/// merged / resolve the issue locally (`resolve_pr_node`). Local reconciliation
+/// is then proactive and best-effort — origin is already authoritative, the
+/// GitHub `push` webhook and the local sweep also perform this work, and the
+/// before/after commit-id guards in `base_advance` make the double-fire a no-op.
+async fn after_github_merge(
     orch: &Orchestrator,
     db: Arc<LocalDb>,
     job_id: &str,
     merge_context: MergeMrContext,
-    merge_method: Option<String>,
     merge_started: std::time::Instant,
     attribution: Option<super::PrResolutionAttribution>,
-    expected_head_sha: Option<&str>,
 ) -> Result<String, String> {
     let repo_path = merge_context.mr.repo_path.clone();
     let source_branch = merge_context.source_branch.clone();
     let target_branch = merge_context.target_branch.clone();
-    let pr_number = merge_context
-        .mr
-        .github_pr_number
-        .ok_or_else(|| "GitHub merge requires a PR number".to_string())?;
-
-    // Squash is the default landing shape (one commit per PR on the default
-    // branch). The workspace forcing in `effective_merge_method` does not apply
-    // here — workspace PRs never take this branch.
-    let method = merge_method.unwrap_or_else(|| "squash".to_string());
-
     let (owner, repo) = get_owner_repo(&repo_path)?;
     let auth = installation_authority(&orch.db.local, &owner).await?;
     let http = &*orch.services.http;
-
-    // The default branch must never receive a file that stops parsing. GitHub
-    // merges outside the store, so the branch head is judged here, before the
-    // request: a file the branch changed that parsed at its fork and on the
-    // target, and does not parse at its head, refuses the merge.
-    let parse_refusal = {
-        let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-        let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
-        let (target, source) = (target_branch.clone(), source_branch.clone());
-        tokio::task::spawn_blocking(move || {
-            crate::jj::branch_parse_refusal(&jj, &store, &target, &source)
-        })
-        .await
-        .ok()
-        .flatten()
-    };
-    if let Some(refusal) = parse_refusal {
-        return Err(refusal);
-    }
-
-    // FAIL-CLOSED: on any failure, surface it and mark/advance NOTHING locally.
-    let github_started = std::time::Instant::now();
-    let merge_commit = api::merge_pr(
-        http,
-        &auth,
-        &owner,
-        &repo,
-        pr_number,
-        &method,
-        expected_head_sha,
-    )
-    .await
-    .map_err(|e| map_github_merge_error(&source_branch, &target_branch, e))?;
-    // Origin moved the moment GitHub answered. Record it before anything else
-    // so a default-branch read between now and the store import says it is
-    // behind instead of passing the pre-merge tree off as current.
-    if let Some(merge_commit) = merge_commit.as_deref() {
-        orch.base_branch_sync.record_tip(
-            &merge_context.project_id,
-            &target_branch,
-            merge_commit,
-            crate::orchestrator::base_branch_sync::Source::Merge,
-        );
-    }
-    log::info!(
-        "merge_pr_for_job[{job_id}]: GitHub merge_pr took {:?}",
-        github_started.elapsed()
-    );
 
     // GitHub merged: mark the merge request merged, then resolve the issue
     // through the terminal cascade (live work stopped, sessions closed, warm
@@ -896,48 +839,6 @@ async fn merge_pr_for_job_past_barrier(
     let pin_bump_detail = pin_bump.as_ref().map(ToString::to_string);
     policy_result?;
 
-    let outstanding = crate::orchestrator::contended_identifiers::outstanding_obligation_labels(
-        &orch.db.local,
-        &merge_context.project_id,
-        &merge_context.source_branch,
-    )
-    .await?;
-    if !outstanding.is_empty() {
-        return Err(format!(
-            "Refusing to merge `{}`: its contended identifier resolution is still outstanding for {}. Let base-advance retry the resolution, or inspect `cairn:~/rebase` and explicitly discharge an incorrect obligation in-product. Merging outside Cairn bypasses this gate and will require a fix-forward on the base branch.",
-            merge_context.source_branch,
-            outstanding
-                .iter()
-                .map(|identifier| format!("`{identifier}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-
-    // Every version of the executor protocol is a published release that
-    // strands the remote fleet until it is built, so a branch may only land one
-    // that a paragraph describes. Read from the store, not from a check
-    // verdict, so a stale verdict or a branch base-advance never reached cannot
-    // carry an undocumented number through.
-    let ledger_refusal = crate::orchestrator::contended_identifiers::protocol_ledger_refusal(
-        &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
-        &crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(&repo_path)),
-        &merge_context.source_branch,
-        &merge_context.target_branch,
-    )
-    .map_err(|error| {
-        format!(
-            "Refusing to merge `{}`: the executor protocol version ledger could not be checked: {error}",
-            merge_context.source_branch
-        )
-    })?;
-    if let Some(violation) = ledger_refusal {
-        return Err(format!(
-            "Refusing to merge `{}` into `{}`: {violation}",
-            merge_context.source_branch, merge_context.target_branch
-        ));
-    }
-
     let journal_project_id = merge_context.project_id.clone();
     let journal_merge_request_id = merge_context.mr.mr_id.clone();
     let journal_target_ref = merge_context.target_branch.clone();
@@ -974,7 +875,7 @@ async fn merge_pr_for_job_past_barrier(
         // landing (which flattens). A preserve-every-commit landing on the default
         // branch cannot flatten, so it must refuse — and the refusal must cover BOTH
         // routes: the local non-squash fold (`store_merge_child`) AND the remote
-        // GitHub `merge` route (`merge_remote_pr_via_github`), which passes the
+        // GitHub `merge` route (`default_landing`), which passes the
         // method straight to GitHub and would otherwise carry the conflicted
         // intermediate onto the default branch as a merge commit, bypassing the
         // local refusal. The two routes resolve the method differently, so mirror
@@ -1008,73 +909,59 @@ async fn merge_pr_for_job_past_barrier(
         config_notice =
             super::config_preflight::preflight_landing_config(orch, &merge_context).await?;
     }
-    log::info!(
-        "merge_pr_for_job[{job_id}]: merge gates took {:?}",
-        gate_started.elapsed()
-    );
-
-    // Route a real remote PR landing on the project default branch through
-    // GitHub's merge API (GitHub squash-merges, closes the PR, and advances the
-    // base on origin; Cairn then reconciles locally). The local jj fold below is
-    // kept only where there is no GitHub PR to merge through: local-only projects
-    // and Coordinator child→integration PRs, plus workspace PRs that deliberately
-    // preserve every commit. The conflict gate above has
-    // already run for both paths.
-    if should_merge_via_github(&merge_context) {
-        let notice = config_notice.clone();
-        return merge_remote_pr_via_github(
-            orch,
-            db,
-            job_id,
-            merge_context,
-            merge_method,
-            merge_started,
-            attribution,
-            verified_head.as_deref(),
-        )
-        .await
-        .map(|reply| with_merge_notice(reply, notice.as_deref()));
-    }
-
-    // The shared jj store owns the merge: fold the child's commit into the
-    // integration bookmark and (for a remote project) push it, which advances
-    // origin and marks the child PR Merged out-of-band. A no-remote jj project
-    // folds locally and skips the push. The method selects the *shape* that lands
-    // on the default branch: `squash` (the default) collapses the source to one
-    // commit before the fold; `merge` (forced for workspace PRs) keeps every
-    // sealed commit.
-    let method = effective_merge_method(&merge_context, merge_method);
     let fold_started = std::time::Instant::now();
-    // Serialize the fold behind the per-store mutex so a merge fold and a
+    // Serialize every fold behind the per-store mutex so a merge fold and a
     // base-advance reconcile on the same shared store never run jj ops
     // concurrently (which would mint divergent conflicted copies). The detached
     // downstream reconcile spawned later inside `resolve_pr_node` acquires the
     // same lock, after this guard drops — no nested acquisition.
     let merge_store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
+    let mut landed_on_default = None;
     let merged_commit = if merge_context.target_branch == resolved_default {
-        let _store_guard = orch
-            .acquire_jj_store_lock(
-                &merge_store, crate::orchestrator::StoreLockClass::Foreground,
-                format!("merge fold for {}", merge_context.source_branch),
-            )
-            .await;
-        if let Some(verified) = verified_head.as_deref() {
-            let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-            let current = crate::jj::bookmark_commit_checked(
-                &jj,
-                &merge_store,
-                &merge_context.source_branch,
-            )?;
-            if current.as_deref() != Some(verified) {
-                return Err(format!(
-                    "Refusing to merge `{source}` as a pin bump: the branch moved from the verified head {verified} to {current} before the fold; merge again so the new head is verified.",
-                    source = merge_context.source_branch,
-                    current = current.as_deref().unwrap_or("nothing"),
-                ));
-            }
+        // The default branch takes only a merge result that was bound and
+        // validated, and only if neither tip moved since
+        // (`default_landing`). A real remote PR lands through GitHub's merge
+        // API, bound to the judged head (GitHub squash-merges, closes the PR,
+        // and advances origin; Cairn then reconciles locally). Everything else
+        // lands by the store fold: local-only projects, and workspace PRs that
+        // deliberately preserve every commit. The method selects the shape:
+        // `squash` collapses the source to one commit; `merge` keeps every
+        // sealed commit.
+        let via_github = should_merge_via_github(&merge_context);
+        let method =
+            default_landing_method(&merge_context, &resolved_default, merge_method.clone());
+        let landed = super::default_landing::land_on_default(
+            orch,
+            job_id,
+            &merge_context,
+            &method,
+            via_github,
+            verified_head.as_deref(),
+        )
+        .await?;
+        log::info!(
+            "merge_pr_for_job[{job_id}]: merge gates and the default-branch landing took {:?}",
+            gate_started.elapsed()
+        );
+        if via_github {
+            super::default_landing::record_allocations(orch, &db, &merge_context, &landed).await;
+            let notice = config_notice.clone();
+            return after_github_merge(orch, db, job_id, merge_context, merge_started, attribution)
+                .await
+                .map(|reply| with_merge_notice(reply, notice.as_deref()));
         }
-        store_merge_child(orch, &merge_context, &method).await?
+        let commit = landed
+            .landed_commit
+            .clone()
+            .ok_or_else(|| "the store fold reported no landed commit".to_string())?;
+        landed_on_default = Some(landed);
+        commit
     } else {
+        log::info!(
+            "merge_pr_for_job[{job_id}]: merge gates took {:?}",
+            gate_started.elapsed()
+        );
+        let method = effective_merge_method(&merge_context, merge_method);
         const MAX_VERIFY_ATTEMPTS: usize = 8;
         let mut landed = None;
         for _attempt in 0..MAX_VERIFY_ATTEMPTS {
@@ -1175,6 +1062,9 @@ async fn merge_pr_for_job_past_barrier(
                 target = merge_context.target_branch,
             ));
         }
+    }
+    if let Some(landed) = landed_on_default.as_ref() {
+        super::default_landing::record_allocations(orch, &db, &merge_context, landed).await;
     }
 
     let resolve_started = std::time::Instant::now();

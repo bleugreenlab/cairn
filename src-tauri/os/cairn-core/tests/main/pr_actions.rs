@@ -1411,62 +1411,298 @@ async fn merge_pr_for_job_remote_merge_failure_leaves_unmarked() {
     );
 }
 
-/// The executor protocol ledger gate guards the GitHub route too, and fires
-/// before GitHub is asked: `feature` moves `EXECUTOR_PROTOCOL_VERSION` with no
-/// `/// Version N` paragraph, so the merge is refused even though GitHub would
-/// accept it, and nothing is marked.
-#[tokio::test]
-async fn merge_pr_for_job_remote_refuses_undocumented_protocol_bump_before_github() {
-    let Some(bin) = common::jj_bin() else {
-        eprintln!("skipping merge_pr_for_job_remote_refuses_undocumented_protocol_bump_before_github: jj not resolvable");
-        return;
-    };
-    const PROTOCOL_FILE: &str = "src-tauri/os/cairn-common/src/executor_protocol.rs";
-    let (_temp, db) = common::migrated_db().await;
+/// The landing rules a project declares for the binder tests: one numbered
+/// directory, one version heading, and the version-paragraphs merge that
+/// keeps two branches' protocol paragraphs.
+const LANDING_CONFIG: &str = "landing:
+  identifiers:
+    migration:
+      kind: numbered-file
+      directory: migrations
+      width: 4
+    executor-protocol:
+      kind: version-heading
+      file: protocol.rs
+      anchor: EXECUTOR_PROTOCOL_VERSION
+  merge:
+  - paths: [protocol.rs]
+    kind: version-paragraphs
+    anchor: EXECUTOR_PROTOCOL_VERSION
+";
+
+const PROTOCOL_AT_7: &str =
+    "/// Version 7 adds the base.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 7;\n";
+
+/// A project whose `main` declares [`LANDING_CONFIG`] and holds migration
+/// 0001 and protocol version 7.
+fn binding_project() -> TempDir {
     let repo = temp_jj_project();
-    add_github_origin(repo.path());
+    commit_to_project(repo.path(), ".cairn/config.yaml", LANDING_CONFIG);
     commit_to_project(
         repo.path(),
-        PROTOCOL_FILE,
-        "/// Version 7 adds the thing.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 7;\n",
+        "migrations/0001_base.sql",
+        "-- lineage: shared\nSELECT 1;\n",
     );
-    insert_github_app(&db).await;
-    let project = create_project(&db, "ghl", repo.path().to_str().unwrap()).await;
-    let issue = create_issue(&db, &project, 1).await;
-    let job = create_job(&db, &project, &issue).await;
-    let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
+    commit_to_project(repo.path(), "protocol.rs", PROTOCOL_AT_7);
+    repo
+}
 
-    // GitHub would merge it: only the gate can stop this.
-    let http = MockHttpClient::new()
-        .respond_to("access_tokens", token_response())
-        .respond_to("/pulls/5/merge", merge_response(200));
-    let (cfg, orch) = orchestrator_with_http(db, http).await;
+/// A producing job on `branch` with its own issue and execution, and a local
+/// merge request from `branch` into `main`.
+async fn branch_merge_request(
+    db: &LocalDb,
+    project_id: &str,
+    number: i64,
+    branch: &str,
+) -> (String, String, String) {
+    let issue = create_issue(db, project_id, number).await;
+    let execution = format!("exec-{branch}");
+    insert_execution(db, &execution, project_id, &issue).await;
+    let job = uuid::Uuid::new_v4().to_string();
+    let mr = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().timestamp();
+    db.execute(
+        "INSERT INTO jobs (id, project_id, issue_id, execution_id, status, branch, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'complete', ?5, ?6, ?6)",
+        params![job.as_str(), project_id, issue.as_str(), execution.as_str(), branch, now],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO merge_requests (
+            id, job_id, project_id, issue_id, title, source_branch, target_branch,
+            status, merge_method, opened_at, updated_at, is_local
+         ) VALUES (?1, ?2, ?3, ?4, 'PR', ?5, 'main', 'open', 'squash', ?6, ?6, 1)",
+        params![
+            mr.as_str(),
+            job.as_str(),
+            project_id,
+            issue.as_str(),
+            branch,
+            now
+        ],
+    )
+    .await
+    .unwrap();
+    (issue, job, mr)
+}
+
+/// Cut `branch` from `main` and seal `files` on it.
+fn seal_branch(config_dir: &Path, repo: &Path, branch: &str, files: &[(&str, &str)]) {
+    let ws = config_dir.join(format!("{}-ws", branch.replace('/', "-")));
+    common::provision_jj_workspace(config_dir, repo, &ws, branch);
+    for (path, content) in files {
+        let target = ws.join(path);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, content).unwrap();
+    }
+    jj::seal(&jj::environment("jj", config_dir), &ws, branch, None).unwrap();
+}
+
+fn file_at(bin: &str, config_dir: &Path, repo: &Path, revision: &str, path: &str) -> String {
+    let store = jj::project_store_dir(config_dir, repo);
+    String::from_utf8(
+        jj::file_show(&jj::environment(bin, config_dir), &store, revision, path).unwrap(),
+    )
+    .unwrap()
+}
+
+/// cairn/5222's acceptance: two branches cut from one tip each add a `NEXT`
+/// migration and a `/// Version NEXT` paragraph, and land back to back. Neither
+/// is renumbered by anyone but the landing: the first lands as migration 0002
+/// and protocol 8, the second, replayed onto the first, as 0003 and 9, with
+/// both paragraphs kept and every reference to a stem rewritten. Each landing
+/// is recorded in `landing_allocations` and on its issue.
+#[tokio::test]
+async fn two_next_branches_landing_back_to_back_take_consecutive_numbers() {
+    let Some(bin) = common::jj_bin() else {
+        eprintln!("skipping two_next_branches_landing_back_to_back_take_consecutive_numbers: jj not resolvable");
+        return;
+    };
+    let (_temp, db) = common::migrated_db().await;
+    let repo = binding_project();
+    let project = create_project(&db, "bind", repo.path().to_str().unwrap()).await;
+    let (issue_a, job_a, mr_a) = branch_merge_request(&db, &project, 1, "agent/alpha").await;
+    let (issue_b, job_b, mr_b) = branch_merge_request(&db, &project, 2, "agent/beta").await;
+
+    let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
     let config_dir = cfg.path().join("config");
-    let ws = config_dir.join("feature-ws");
-    common::provision_jj_workspace(&config_dir, repo.path(), &ws, "feature");
-    std::fs::write(
-        ws.join(PROTOCOL_FILE),
-        "/// Version 7 adds the thing.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 8;\n",
-    )
-    .unwrap();
-    jj::seal(
-        &jj::environment(&bin, &config_dir),
-        &ws,
-        "bump without a paragraph",
-        None,
-    )
-    .unwrap();
+    let protocol = |name: &str, cairn: u32| {
+        format!(
+            "/// Version 7 adds the base.\n///\n/// Version NEXT (cairn/{cairn}) adds {name}.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 8;\n"
+        )
+    };
+    let alpha_protocol = protocol("alpha", 1);
+    let beta_protocol = protocol("beta", 2);
+    seal_branch(
+        &config_dir,
+        repo.path(),
+        "agent/alpha",
+        &[
+            (
+                "migrations/NEXT_alpha.sql",
+                "-- lineage: shared\nCREATE TABLE alpha (id INTEGER);\n",
+            ),
+            ("notes-alpha.md", "alpha adds NEXT_alpha.sql\n"),
+            ("protocol.rs", &alpha_protocol),
+        ],
+    );
+    seal_branch(
+        &config_dir,
+        repo.path(),
+        "agent/beta",
+        &[
+            (
+                "migrations/NEXT_beta.sql",
+                "-- lineage: shared\nCREATE TABLE beta (id INTEGER);\n",
+            ),
+            ("notes-beta.md", "beta adds NEXT_beta.sql\n"),
+            ("protocol.rs", &beta_protocol),
+        ],
+    );
+
+    actions::merge_pr_for_job(&orch, &job_a, None, None, None)
+        .await
+        .unwrap();
+    actions::merge_pr_for_job(&orch, &job_b, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(mr_status(&orch.db.local, &mr_a).await, "merged");
+    assert_eq!(mr_status(&orch.db.local, &mr_b).await, "merged");
+
+    let files = jj_files(&bin, &config_dir, repo.path(), "main");
+    for landed in [
+        "migrations/0001_base.sql",
+        "migrations/0002_alpha.sql",
+        "migrations/0003_beta.sql",
+    ] {
+        assert!(files.contains(landed), "{landed} on main: {files}");
+    }
+    assert!(!files.contains("NEXT_"), "nothing unbound lands: {files}");
+    assert_eq!(
+        file_at(&bin, &config_dir, repo.path(), "main", "notes-beta.md"),
+        "beta adds 0003_beta.sql\n"
+    );
+    assert_eq!(
+        file_at(&bin, &config_dir, repo.path(), "main", "protocol.rs"),
+        "/// Version 7 adds the base.\n///\n/// Version 8 (cairn/1) adds alpha.\n///\n/// Version 9 (cairn/2) adds beta.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 9;\n"
+    );
+
+    let allocations = orch
+        .db
+        .local
+        .query_all(
+            "SELECT kind, value, name, provisional, issue_id FROM landing_allocations
+             ORDER BY allocated_at, kind, value",
+            (),
+            |row| {
+                Ok((
+                    row.text(0)?,
+                    row.i64(1)?,
+                    row.text(2)?,
+                    row.text(3)?,
+                    row.text(4)?,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+    let mut allocations: Vec<_> = allocations
+        .into_iter()
+        .map(|(kind, value, name, provisional, issue)| {
+            (kind, value, name, provisional, issue == issue_b)
+        })
+        .collect();
+    allocations.sort();
+    assert_eq!(
+        allocations,
+        vec![
+            (
+                "executor-protocol".into(),
+                8,
+                "Version 8".into(),
+                "Version NEXT".into(),
+                false
+            ),
+            (
+                "executor-protocol".into(),
+                9,
+                "Version 9".into(),
+                "Version NEXT".into(),
+                true
+            ),
+            (
+                "migration".into(),
+                2,
+                "0002_alpha".into(),
+                "NEXT_alpha".into(),
+                false
+            ),
+            (
+                "migration".into(),
+                3,
+                "0003_beta".into(),
+                "NEXT_beta".into(),
+                true
+            ),
+        ]
+    );
+    let comment = |issue: String| {
+        let db = orch.db.local.clone();
+        async move {
+            db.query_opt_text(
+                "SELECT content FROM comments WHERE issue_id = ?1 AND content LIKE 'Landed as %'",
+                params![issue],
+            )
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(
+        comment(issue_a).await.as_deref(),
+        Some("Landed as migration 0002_alpha, executor-protocol 8.")
+    );
+    assert_eq!(
+        comment(issue_b).await.as_deref(),
+        Some("Landed as migration 0003_beta, executor-protocol 9.")
+    );
+}
+
+/// One change takes one version: a branch that heads two protocol versions is
+/// refused when it would land, and nothing moves.
+#[tokio::test]
+async fn a_branch_heading_two_protocol_versions_is_refused_before_it_lands() {
+    let Some(bin) = common::jj_bin() else {
+        eprintln!("skipping a_branch_heading_two_protocol_versions_is_refused_before_it_lands: jj not resolvable");
+        return;
+    };
+    let (_temp, db) = common::migrated_db().await;
+    let repo = binding_project();
+    let project = create_project(&db, "bind2", repo.path().to_str().unwrap()).await;
+    let (issue, job, mr) = branch_merge_request(&db, &project, 1, "agent/twice").await;
+    let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
+    let config_dir = cfg.path().join("config");
+    seal_branch(
+        &config_dir,
+        repo.path(),
+        "agent/twice",
+        &[(
+            "protocol.rs",
+            "/// Version 7 adds the base.\n///\n/// Version NEXT a.\n///\n/// Version 8 b.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 9;\n",
+        )],
+    );
+    let main_before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
     let err = actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
-        .expect_err("an undocumented protocol version must not land");
-    assert!(
-        err.contains("Refusing to merge `feature` into `main`")
-            && err.contains("EXECUTOR_PROTOCOL_VERSION"),
-        "names the ledger violation: {err}"
-    );
+        .expect_err("two versions for one change must not land");
+    assert!(err.contains("one change takes one version"), "{err}");
     assert_eq!(mr_status(&orch.db.local, &mr).await, "open");
     assert_eq!(issue_status(&orch.db.local, &issue).await, "active");
+    assert_eq!(
+        jj_bookmark_commit(&bin, &config_dir, repo.path(), "main"),
+        main_before
+    );
 }
 
 /// A jj-conflicted source must be refused BEFORE the fold, and the refusal must

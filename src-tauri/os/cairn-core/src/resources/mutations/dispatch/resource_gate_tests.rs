@@ -36,7 +36,7 @@ fn gate_accepts_the_rebase_replay_action() {
     assert_eq!(spec.label, REBASE_LABEL);
 }
 
-const REBASE_LABEL: &str = "replay this branch, take origin's fast-forward of it or its base, or discharge an incorrect identifier obligation";
+const REBASE_LABEL: &str = "replay this branch, or take origin's fast-forward of it or its base";
 
 /// The sanctioned repair for a branch the store holds behind origin (cairn/5038)
 /// has to reach dispatch, for the node's own branch and for its base.
@@ -54,21 +54,6 @@ fn gate_accepts_fast_forward_from_origin() {
         let spec = gate(&it).expect("the fast-forward mutation is gated in");
         assert_eq!(spec.label, REBASE_LABEL);
     }
-}
-
-#[test]
-fn gate_accepts_identifier_obligation_discharge() {
-    let it = item(
-        "cairn://p/cairn/1/1/builder/rebase",
-        ChangeMode::Patch,
-        Some(serde_json::json!({
-            "action": "discharge-contended-identifier",
-            "identifier": "migration:private:0228",
-            "reason": "the migration was removed before publication"
-        })),
-    );
-    let spec = gate(&it).expect("the explicit discharge mutation is gated in");
-    assert_eq!(spec.label, REBASE_LABEL);
 }
 
 /// A rebase session is read and replayed, never created or deleted by hand.

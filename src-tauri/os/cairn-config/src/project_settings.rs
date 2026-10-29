@@ -127,9 +127,71 @@ pub struct PinBumpSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LandingSettings {
+    /// Sequential identifiers a branch authors provisionally and the store
+    /// binds when the branch lands on the default branch, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub identifiers: BTreeMap<String, LandingIdentifier>,
     /// Paths whose conflicts the store settles structurally, first match wins.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge: Vec<LandingMergeRule>,
+}
+
+/// One declared sequential identifier: a binding rule and where it applies.
+/// The rules are code; this instantiates one. Fields are kept as written so a
+/// kind this build does not know survives a settings round trip;
+/// [`LandingIdentifier::rule`] is the typed reading.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LandingIdentifier {
+    pub kind: String,
+    /// `numbered-file`: the repo-relative directory of `NNNN_name.ext` files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<String>,
+    /// `numbered-file`: digits in a bound number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<usize>,
+    /// `version-heading`: the repo-relative file declaring the constant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// `version-heading`: the constant whose doc block holds the headings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+}
+
+/// The binding rules the landing knows how to apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentifierRule {
+    /// Files named `NNNN_name.ext` (or provisionally `NEXT_name.ext`) in one
+    /// directory: every file a branch adds takes the destination's next free
+    /// numbers, its stem rewritten wherever the branch names it.
+    NumberedFile { directory: String, width: usize },
+    /// `/// Version N` headings above a constant: the one heading a branch
+    /// authors takes the destination's version plus one.
+    VersionHeading { file: String, anchor: String },
+}
+
+impl LandingIdentifier {
+    /// The rule this declaration instantiates: `Ok(None)` for a kind this
+    /// build does not know, an error for a known kind missing what it needs.
+    pub fn rule(&self) -> Result<Option<IdentifierRule>, String> {
+        match self.kind.as_str() {
+            "numbered-file" => match (&self.directory, self.width) {
+                (Some(directory), width) => Ok(Some(IdentifierRule::NumberedFile {
+                    directory: directory.trim_end_matches('/').to_string(),
+                    width: width.unwrap_or(4),
+                })),
+                (None, _) => Err("a `numbered-file` identifier names its `directory`".into()),
+            },
+            "version-heading" => match (&self.file, &self.anchor) {
+                (Some(file), Some(anchor)) => Ok(Some(IdentifierRule::VersionHeading {
+                    file: file.clone(),
+                    anchor: anchor.clone(),
+                })),
+                _ => Err("a `version-heading` identifier names its `file` and `anchor`".into()),
+            },
+            _ => Ok(None),
+        }
+    }
 }
 
 /// One declared structural merge: a merge kind and the path globs it covers.
@@ -143,6 +205,9 @@ pub struct LandingMergeRule {
     /// not know survives a settings round trip; [`LandingMergeRule::merge_kind`]
     /// is the typed reading.
     pub kind: String,
+    /// `version-paragraphs`: the constant whose doc block is merged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
 }
 
 /// The structural merges the store knows how to perform.
@@ -151,6 +216,10 @@ pub enum LandingMergeKind {
     /// The elements of a list merge as a set in base order: both sides'
     /// insertions are kept, an identical insertion once.
     OrderedSet,
+    /// The paragraphs of one constant's doc block merge as an ordered set,
+    /// the same way: two branches each adding a `/// Version` paragraph keep
+    /// both, the landed side's first.
+    VersionParagraphs,
 }
 
 impl LandingMergeRule {
@@ -159,6 +228,7 @@ impl LandingMergeRule {
     pub fn merge_kind(&self) -> Option<LandingMergeKind> {
         match self.kind.as_str() {
             "ordered-set" => Some(LandingMergeKind::OrderedSet),
+            "version-paragraphs" => Some(LandingMergeKind::VersionParagraphs),
             _ => None,
         }
     }

@@ -8937,27 +8937,6 @@ fn a_conflicted_bookmark_is_a_retryable_reconcile_failure() {
     assert!(reconcile_failure_is_permanent("missing_bookmark"));
 }
 
-/// A preflight refusal is deterministic for its tip, so it is quarantined and
-/// reported rather than retried forever as `transient_process`, even when the
-/// jj message it quotes carries another arm's keyword. A read that timed out
-/// is the machine's load and stays retryable.
-#[test]
-fn a_contended_preflight_refusal_is_permanent_unless_it_timed_out() {
-    let refusal = format!(
-        "{CONTENDED_PREFLIGHT_REFUSAL} could not read logical changes from `a` to `b`: \
-         jj diff --git (logical range) failed: Error: Cannot diff revsets with gaps in.\n\
-         Hint: Revision 9de678e301e1 would need to be in the set of the bookmark"
-    );
-    assert_eq!(reconcile_failure_kind(&refusal), CONTENDED_PREFLIGHT);
-    assert!(reconcile_failure_is_permanent(CONTENDED_PREFLIGHT));
-
-    let timeout = format!(
-        "{CONTENDED_PREFLIGHT_REFUSAL} could not read logical changes from `a` to `b`: \
-         jj diff --git (logical range) timed out after 60s and was killed"
-    );
-    assert_eq!(reconcile_failure_kind(&timeout), "transient_process");
-}
-
 /// THE EXPORT FREEZE. A `refs/heads/*` ref moved outside jj — which Cairn itself
 /// does, via HEAD re-attachment, executor resets, and worktree operations — makes
 /// every later `jj git export` refuse that one ref, report it on stderr, and EXIT
