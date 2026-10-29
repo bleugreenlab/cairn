@@ -8,7 +8,7 @@ use crate::identity::{
     VerificationStatus,
 };
 
-const BASE_MERGE_DOMAIN_V1: &[u8] = b"cairn.approval.base_merge.v1\0";
+const BASE_MERGE_DOMAIN_V2: &[u8] = b"cairn.approval.base_merge.v2\0";
 const PHONE_ASSERTION_DOMAIN_V1: &[u8] = b"cairn.approval.phone_assertion.v1\0";
 /// Enrollment-lifecycle domains. The binding is what App Attest attests; the
 /// possession and succession domains wrap those same bytes so the two approval-
@@ -19,6 +19,15 @@ const KEY_POSSESSION_DOMAIN_V1: &[u8] = b"cairn.approval.key_possession.v1\0";
 const ENROLLMENT_SUCCESSION_DOMAIN_V1: &[u8] = b"cairn.approval.enrollment_succession.v1\0";
 const ENROLLMENT_REVOCATION_DOMAIN_V1: &[u8] = b"cairn.approval.enrollment_revocation.v1\0";
 const MAX_FIELD_LEN: usize = 4096;
+const MAX_BRANCH_NAME_LEN: usize = 255;
+const MAX_REPOSITORY_NAME_LEN: usize = 200;
+const MAX_COMMIT_SUBJECT_LEN: usize = 300;
+const REFS_HEADS: &str = "refs/heads/";
+
+#[path = "approvals_display_ranges.rs"]
+mod display_ranges;
+pub use display_ranges::DISPLAY_TABLE_UNICODE_VERSION;
+use display_ranges::FORBIDDEN_DISPLAY_RANGES;
 /// The order of the P-256 base point. A scalar outside `1..n` is not a signature
 /// component, whatever else it decodes to.
 const P256_ORDER: [u8; 32] = [
@@ -29,7 +38,7 @@ const P256_ORDER: [u8; 32] = [
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalIntent {
-    BaseMergeV1(BaseMergeIntentV1),
+    BaseMergeV2(BaseMergeIntentV2),
 }
 
 /// Claims carried by the separately signed approvals-service assertion.
@@ -213,7 +222,7 @@ impl ApprovalChallenge {
 impl ApprovalIntent {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ApprovalContractError> {
         match self {
-            Self::BaseMergeV1(intent) => intent.canonical_bytes(),
+            Self::BaseMergeV2(intent) => intent.canonical_bytes(),
         }
     }
 
@@ -222,20 +231,41 @@ impl ApprovalIntent {
     }
 }
 
+/// One base merge, described so a person can recognise it and a runner can
+/// re-derive every byte of it.
+///
+/// `repository_name`, `source_ref`, `source_commit_subject`, and
+/// `source_commit_count` exist so the phone can say "Merge feature/zeta into
+/// main" from signed bytes alone. The runner reads each from the provider and
+/// Git, never from the request, and reads them again immediately before
+/// executing; a mismatch is the same `stale_ref` outcome as a moved branch,
+/// because it is the same fact: the act shown is no longer the act available.
+///
+/// What the runner attests differs by field. `repository_name` and
+/// `source_commit_count` are provider and Git facts. `source_ref` is the name
+/// the requester gave the branch, and `source_commit_subject` is text the
+/// commit's author wrote: the runner attests only that the commit at
+/// `source_oid` carries it. Binding prevents either from being swapped; it does
+/// not make the subject a true description of the change, which is why the phone
+/// shows it as quoted author text and never in the act's headline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BaseMergeIntentV1 {
+pub struct BaseMergeIntentV2 {
     pub installation_id: String,
     pub project_id: String,
     pub repository_id: String,
+    pub repository_name: String,
     pub target_ref: String,
     pub target_oid: String,
+    pub source_ref: String,
     pub source_oid: String,
+    pub source_commit_subject: String,
+    pub source_commit_count: u32,
     pub merge_base_oid: Option<String>,
     pub candidate_oid: Option<String>,
-    pub merge_strategy: String,
-    pub provider_flags: Vec<String>,
-    pub action: String,
+    pub merge_strategy: ApprovalMergeStrategy,
+    pub provider_flags: Vec<ApprovalProviderFlag>,
+    pub action: ApprovalMergeAction,
     pub policy_id: String,
     pub policy_version: u32,
     pub merge_plan_id: String,
@@ -245,22 +275,31 @@ pub struct BaseMergeIntentV1 {
     pub audience: String,
 }
 
-impl BaseMergeIntentV1 {
+impl BaseMergeIntentV2 {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ApprovalContractError> {
         self.validate()?;
-        let mut out = Vec::with_capacity(512);
-        out.extend_from_slice(BASE_MERGE_DOMAIN_V1);
+        let mut out = Vec::with_capacity(640);
+        out.extend_from_slice(BASE_MERGE_DOMAIN_V2);
         put_text(&mut out, &self.installation_id)?;
         put_text(&mut out, &self.project_id)?;
         put_text(&mut out, &self.repository_id)?;
+        put_text(&mut out, &self.repository_name)?;
         put_text(&mut out, &self.target_ref)?;
         put_text(&mut out, &self.target_oid)?;
+        put_text(&mut out, &self.source_ref)?;
         put_text(&mut out, &self.source_oid)?;
+        put_text(&mut out, &self.source_commit_subject)?;
+        out.extend_from_slice(&self.source_commit_count.to_be_bytes());
         put_optional_text(&mut out, self.merge_base_oid.as_deref())?;
         put_optional_text(&mut out, self.candidate_oid.as_deref())?;
-        put_text(&mut out, &self.merge_strategy)?;
-        put_text_list(&mut out, &self.provider_flags)?;
-        put_text(&mut out, &self.action)?;
+        put_text(&mut out, self.merge_strategy.as_str())?;
+        let flags = u32::try_from(self.provider_flags.len())
+            .map_err(|_| ApprovalContractError::LengthOverflow)?;
+        out.extend_from_slice(&flags.to_be_bytes());
+        for flag in &self.provider_flags {
+            put_text(&mut out, flag.as_str())?;
+        }
+        put_text(&mut out, self.action.as_str())?;
         put_text(&mut out, &self.policy_id)?;
         out.extend_from_slice(&self.policy_version.to_be_bytes());
         put_text(&mut out, &self.merge_plan_id)?;
@@ -271,16 +310,13 @@ impl BaseMergeIntentV1 {
         Ok(out)
     }
 
-    fn validate(&self) -> Result<(), ApprovalContractError> {
+    pub fn validate(&self) -> Result<(), ApprovalContractError> {
         for (name, value) in [
             ("installation_id", self.installation_id.as_str()),
             ("project_id", self.project_id.as_str()),
             ("repository_id", self.repository_id.as_str()),
-            ("target_ref", self.target_ref.as_str()),
             ("target_oid", self.target_oid.as_str()),
             ("source_oid", self.source_oid.as_str()),
-            ("merge_strategy", self.merge_strategy.as_str()),
-            ("action", self.action.as_str()),
             ("policy_id", self.policy_id.as_str()),
             ("merge_plan_id", self.merge_plan_id.as_str()),
             ("initiating_request_id", self.initiating_request_id.as_str()),
@@ -288,8 +324,26 @@ impl BaseMergeIntentV1 {
         ] {
             validate_text(name, value)?;
         }
-        if !self.target_ref.starts_with("refs/heads/") {
-            return Err(ApprovalContractError::NonCanonicalTargetRef);
+        if !is_repository_name(&self.repository_name) {
+            return Err(ApprovalContractError::InvalidRepositoryName);
+        }
+        if !is_safe_head_ref(&self.target_ref) {
+            return Err(ApprovalContractError::NonCanonicalRef("target_ref"));
+        }
+        if !is_safe_head_ref(&self.source_ref) {
+            return Err(ApprovalContractError::NonCanonicalRef("source_ref"));
+        }
+        if self.source_ref == self.target_ref {
+            return Err(ApprovalContractError::SourceIsTarget);
+        }
+        validate_display_text(
+            "source_commit_subject",
+            &self.source_commit_subject,
+            MAX_COMMIT_SUBJECT_LEN,
+            false,
+        )?;
+        if self.source_commit_count == 0 {
+            return Err(ApprovalContractError::InvalidCommitCount);
         }
         for (name, oid) in [
             ("target_oid", Some(self.target_oid.as_str())),
@@ -303,16 +357,69 @@ impl BaseMergeIntentV1 {
                 validate_oid(name, oid)?;
             }
         }
-        let mut previous: Option<&str> = None;
-        for flag in &self.provider_flags {
-            validate_text("provider_flags", flag)?;
-            if previous.is_some_and(|value| value >= flag.as_str()) {
-                return Err(ApprovalContractError::NonCanonicalProviderFlags);
-            }
-            previous = Some(flag);
+        if self
+            .provider_flags
+            .windows(2)
+            .any(|pair| pair[0].as_str() >= pair[1].as_str())
+        {
+            return Err(ApprovalContractError::NonCanonicalProviderFlags);
         }
         Ok(())
     }
+}
+
+/// The commit label a producer signs, derived from a commit message.
+///
+/// The runner calls this when it issues an intent and again when it revalidates
+/// one, so both sides derive the same label from the same commit. It keeps the
+/// first line (without a CRLF's carriage return) and turns tabs into spaces.
+/// Every other run of code points the display-text rule refuses becomes one
+/// visible U+FFFD rather than vanishing: deleting a right-to-left override would
+/// show logical order where the provider shows the text reversed, and deleting a
+/// zero-width space would join words with no sign that anything was there. It
+/// then trims and truncates on a character boundary to the 300-byte bound with a
+/// trailing ellipsis. A commit with no visible first line gets a fixed label,
+/// because an empty field is not encodable.
+pub fn derive_commit_subject(message: &str) -> String {
+    const ELLIPSIS: char = '…';
+    let first_line = message.split('\n').next().unwrap_or_default();
+    let first_line = first_line.strip_suffix('\r').unwrap_or(first_line);
+    let mut cleaned = String::with_capacity(first_line.len());
+    let mut hiding = false;
+    for c in first_line.chars() {
+        if c == '\t' {
+            cleaned.push(' ');
+            hiding = false;
+        } else if is_forbidden_display_char(c, false) {
+            if !hiding {
+                cleaned.push(char::REPLACEMENT_CHARACTER);
+            }
+            hiding = true;
+        } else {
+            cleaned.push(c);
+            hiding = false;
+        }
+    }
+    let trimmed = cleaned.trim_matches(is_edge_whitespace);
+    if !trimmed.chars().any(|c| !is_display_exempt(c)) {
+        return "(no commit message)".to_string();
+    }
+    if trimmed.len() <= MAX_COMMIT_SUBJECT_LEN {
+        return trimmed.to_string();
+    }
+    let budget = MAX_COMMIT_SUBJECT_LEN - ELLIPSIS.len_utf8();
+    let mut end = 0;
+    for (index, c) in trimmed.char_indices() {
+        if index + c.len_utf8() > budget {
+            break;
+        }
+        end = index + c.len_utf8();
+    }
+    let mut subject = trimmed[..end]
+        .trim_end_matches(is_edge_whitespace)
+        .to_string();
+    subject.push(ELLIPSIS);
+    subject
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -388,7 +495,63 @@ pub enum ApprovalEnrollmentRetirement {
     Revoked,
     Reset,
 }
+
+/// How the provider combines the source branch into the target.
+///
+/// Closed so the phone can describe every value in words; an unknown strategy
+/// is a ceremony the app could not honestly render, so it fails decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMergeStrategy {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+/// Provider-side options the merge is performed with. Declared in canonical
+/// (byte-sorted) order, which is the order the digest requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalProviderFlag {
+    DeleteBranch,
+    RequireChecks,
+}
+
+/// The act a base-merge intent authorizes. One value today; a second is a
+/// contract change the phone must learn to describe before it can appear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMergeAction {
+    MergePullRequest,
+}
 // PHONE_CONTRACT_VOCABULARY_END
+
+impl ApprovalMergeStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Squash => "squash",
+            Self::Rebase => "rebase",
+        }
+    }
+}
+
+impl ApprovalProviderFlag {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DeleteBranch => "delete_branch",
+            Self::RequireChecks => "require_checks",
+        }
+    }
+}
+
+impl ApprovalMergeAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MergePullRequest => "merge_pull_request",
+        }
+    }
+}
 
 /// Everything an enrollment or reset request binds, in one canonical encoding.
 ///
@@ -638,8 +801,16 @@ pub enum ApprovalContractError {
     NonPrintable(&'static str),
     #[error("{0} is not a canonical Git object id")]
     InvalidOid(&'static str),
-    #[error("target_ref must be a fully-qualified refs/heads ref")]
-    NonCanonicalTargetRef,
+    #[error("{0} must be refs/heads/ followed by a safe branch name")]
+    NonCanonicalRef(&'static str),
+    #[error("source_ref must name a different branch than target_ref")]
+    SourceIsTarget,
+    #[error("repository_name must be an ASCII owner/name path")]
+    InvalidRepositoryName,
+    #[error("{0} is not display-safe text")]
+    UnsafeDisplayText(&'static str),
+    #[error("source_commit_count must be at least 1")]
+    InvalidCommitCount,
     #[error("provider_flags must be sorted and unique")]
     NonCanonicalProviderFlags,
     #[error("too many values to encode canonically")]
@@ -691,6 +862,97 @@ fn validate_oid(name: &'static str, value: &str) -> Result<(), ApprovalContractE
     Ok(())
 }
 
+/// `refs/heads/` followed by a branch name a person can read unambiguously.
+///
+/// A strict subset of `git check-ref-format`: printable ASCII only, so no two
+/// distinct names can look alike, and none of the sequences Git itself refuses.
+pub fn is_safe_head_ref(value: &str) -> bool {
+    let Some(name) = value.strip_prefix(REFS_HEADS) else {
+        return false;
+    };
+    !name.is_empty()
+        && name.len() <= MAX_BRANCH_NAME_LEN
+        && name
+            .bytes()
+            .all(|byte| (0x21..=0x7e).contains(&byte) && !b"~^:?*[\\".contains(&byte))
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.contains("//")
+        && !name.starts_with(['/', '-'])
+        && !name.ends_with(['/', '.'])
+        && name != "@"
+        && name
+            .split('/')
+            .all(|component| !component.starts_with('.') && !component.ends_with(".lock"))
+}
+
+fn is_repository_name(value: &str) -> bool {
+    let segment = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    };
+    value.len() <= MAX_REPOSITORY_NAME_LEN
+        && value.split('/').count() >= 2
+        && value.split('/').all(segment)
+}
+
+/// Whitespace that may not open or close display text. Spelled out rather than
+/// borrowed from a standard library so all three implementations agree exactly.
+fn is_edge_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | ' ' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+    )
+}
+
+/// Code points that render as nothing or reorder what surrounds them, so a
+/// label containing one could show a person something other than its bytes:
+/// controls, plus the generated Default_Ignorable table, which leaves out the
+/// three code points emoji need.
+fn is_forbidden_display_char(c: char, allow_newline: bool) -> bool {
+    let point = u32::from(c);
+    match c {
+        '\n' => !allow_newline,
+        '\u{0000}'..='\u{001F}' | '\u{007F}'..='\u{009F}' => true,
+        _ => FORBIDDEN_DISPLAY_RANGES
+            .iter()
+            .any(|&(low, high)| (low..=high).contains(&point)),
+    }
+}
+
+/// The invisible code points the rule admits because emoji need them: the
+/// zero-width joiner and the text and emoji presentation selectors. They may
+/// appear, but never alone.
+fn is_display_exempt(c: char) -> bool {
+    matches!(c, '\u{200D}' | '\u{FE0E}' | '\u{FE0F}')
+}
+
+/// The rule for any text the phone renders as a fact: bounded in UTF-8 bytes,
+/// no edge whitespace, no control, invisible, or bidirectional-format code
+/// point, and at least one character that is not an admitted invisible one.
+pub fn validate_display_text(
+    name: &'static str,
+    value: &str,
+    max_bytes: usize,
+    allow_newline: bool,
+) -> Result<(), ApprovalContractError> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value.starts_with(is_edge_whitespace)
+        || value.ends_with(is_edge_whitespace)
+        || value
+            .chars()
+            .any(|c| is_forbidden_display_char(c, allow_newline))
+        || value.chars().all(is_display_exempt)
+    {
+        return Err(ApprovalContractError::UnsafeDisplayText(name));
+    }
+    Ok(())
+}
+
 fn put_text(out: &mut Vec<u8>, value: &str) -> Result<(), ApprovalContractError> {
     let len = u32::try_from(value.len()).map_err(|_| ApprovalContractError::LengthOverflow)?;
     out.extend_from_slice(&len.to_be_bytes());
@@ -711,32 +973,30 @@ fn put_optional_text(out: &mut Vec<u8>, value: Option<&str>) -> Result<(), Appro
     }
 }
 
-fn put_text_list(out: &mut Vec<u8>, values: &[String]) -> Result<(), ApprovalContractError> {
-    let len = u32::try_from(values.len()).map_err(|_| ApprovalContractError::LengthOverflow)?;
-    out.extend_from_slice(&len.to_be_bytes());
-    for value in values {
-        put_text(out, value)?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn intent() -> BaseMergeIntentV1 {
-        BaseMergeIntentV1 {
+    fn intent() -> BaseMergeIntentV2 {
+        BaseMergeIntentV2 {
             installation_id: "installation-1".into(),
             project_id: "project-1".into(),
             repository_id: "repository-1".into(),
+            repository_name: "bleugreen/cairn".into(),
             target_ref: "refs/heads/main".into(),
             target_oid: "11".repeat(20),
+            source_ref: "refs/heads/feature/zeta".into(),
             source_oid: "22".repeat(20),
+            source_commit_subject: "Fix parser crash on empty input".into(),
+            source_commit_count: 3,
             merge_base_oid: Some("33".repeat(20)),
             candidate_oid: Some("44".repeat(20)),
-            merge_strategy: "squash".into(),
-            provider_flags: vec!["delete_branch".into(), "require_checks".into()],
-            action: "merge_base".into(),
+            merge_strategy: ApprovalMergeStrategy::Squash,
+            provider_flags: vec![
+                ApprovalProviderFlag::DeleteBranch,
+                ApprovalProviderFlag::RequireChecks,
+            ],
+            action: ApprovalMergeAction::MergePullRequest,
             policy_id: "human-base-merge".into(),
             policy_version: 1,
             merge_plan_id: "plan-1".into(),
@@ -749,9 +1009,9 @@ mod tests {
 
     #[test]
     fn canonical_encoding_is_domain_separated_and_deterministic() {
-        let approval = ApprovalIntent::BaseMergeV1(intent());
+        let approval = ApprovalIntent::BaseMergeV2(intent());
         let first = approval.canonical_bytes().unwrap();
-        assert!(first.starts_with(BASE_MERGE_DOMAIN_V1));
+        assert!(first.starts_with(BASE_MERGE_DOMAIN_V2));
         assert_eq!(first, approval.canonical_bytes().unwrap());
         let digest = approval.digest_sha256().unwrap();
         assert_eq!(digest, Sha256::digest(first).as_slice());
@@ -760,35 +1020,48 @@ mod tests {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>(),
-            "2421b29da1f2789936a4d25809110576ad21c23cbe793ebc799178cd12ab7391"
+            "a54a99f0b6c670a011d3596d2986748e7dd116ae03dd705f8583a2172cc459b3"
+        );
+        // The serde discriminator is the kind the service stores and filters on.
+        assert_eq!(
+            serde_json::to_value(&approval).unwrap()["kind"],
+            "base_merge_v2"
         );
     }
 
     #[test]
     fn every_bound_field_changes_the_digest() {
         let original = intent();
-        let baseline = ApprovalIntent::BaseMergeV1(original.clone())
+        let baseline = ApprovalIntent::BaseMergeV2(original.clone())
             .digest_sha256()
             .unwrap();
-        let mut variants = Vec::new();
+        let mut variants: Vec<(&str, BaseMergeIntentV2)> = Vec::new();
         macro_rules! changed {
             ($field:ident, $value:expr) => {{
                 let mut value = original.clone();
                 value.$field = $value;
-                variants.push(value);
+                variants.push((stringify!($field), value));
             }};
         }
         changed!(installation_id, "installation-2".into());
         changed!(project_id, "project-2".into());
         changed!(repository_id, "repository-2".into());
+        changed!(repository_name, "bleugreen/other".into());
         changed!(target_ref, "refs/heads/trunk".into());
         changed!(target_oid, "aa".repeat(20));
+        changed!(source_ref, "refs/heads/feature/eta".into());
         changed!(source_oid, "bb".repeat(20));
+        changed!(
+            source_commit_subject,
+            "Fix parser crash on empty file".into()
+        );
+        changed!(source_commit_count, 4);
         changed!(merge_base_oid, None);
         changed!(candidate_oid, None);
-        changed!(merge_strategy, "merge".into());
-        changed!(provider_flags, vec!["require_checks".into()]);
-        changed!(action, "merge_queue".into());
+        changed!(merge_strategy, ApprovalMergeStrategy::Merge);
+        changed!(provider_flags, vec![ApprovalProviderFlag::RequireChecks]);
+        // `action` has exactly one admissible value, so no variant exists to
+        // compare. Its bytes are still bound, which the assertion below checks.
         changed!(policy_id, "other-policy".into());
         changed!(policy_version, 2);
         changed!(merge_plan_id, "plan-2".into());
@@ -796,12 +1069,19 @@ mod tests {
         changed!(result_commit_oid, None);
         changed!(result_tree_oid, None);
         changed!(audience, "cairn-runner:runner-2".into());
-        for variant in variants {
+        // Every field but the single-valued `action` has a variant.
+        assert_eq!(variants.len(), 21);
+        let canonical = original.canonical_bytes().unwrap();
+        assert!(canonical
+            .windows(b"merge_pull_request".len())
+            .any(|window| window == b"merge_pull_request"));
+        for (field, variant) in variants {
             assert_ne!(
-                ApprovalIntent::BaseMergeV1(variant)
+                ApprovalIntent::BaseMergeV2(variant)
                     .digest_sha256()
                     .unwrap(),
-                baseline
+                baseline,
+                "{field}"
             );
         }
     }
@@ -878,7 +1158,7 @@ mod tests {
             signature: vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
         };
         assertion.validate().unwrap();
-        let intent = ApprovalIntent::BaseMergeV1(intent());
+        let intent = ApprovalIntent::BaseMergeV2(intent());
         let baseline = assertion.canonical_signing_bytes(&intent).unwrap();
         let mut changed = assertion.clone();
         changed.challenge_id = "challenge-2".into();
@@ -910,7 +1190,7 @@ mod tests {
 
     #[test]
     fn service_assertion_accepts_only_canonical_human_appearance() {
-        let digest = ApprovalIntent::BaseMergeV1(intent())
+        let digest = ApprovalIntent::BaseMergeV2(intent())
             .digest_sha256()
             .unwrap();
         let value = serde_json::json!({
@@ -1004,16 +1284,206 @@ mod tests {
             Err(ApprovalContractError::NonCanonicalProviderFlags)
         );
         let mut value = intent();
-        value.target_ref = "main".into();
-        assert_eq!(
-            value.canonical_bytes(),
-            Err(ApprovalContractError::NonCanonicalTargetRef)
-        );
-        let mut value = intent();
         value.target_oid = "ABC".into();
         assert_eq!(
             value.canonical_bytes(),
             Err(ApprovalContractError::InvalidOid("target_oid"))
         );
+
+        for bad in [
+            "main",
+            "refs/heads/",
+            "refs/tags/v1",
+            "refs/heads/feature zeta",
+            "refs/heads/feature..zeta",
+            "refs/heads/feature@{1}",
+            "refs/heads/feature//zeta",
+            "refs/heads//zeta",
+            "refs/heads/-zeta",
+            "refs/heads/zeta/",
+            "refs/heads/zeta.",
+            "refs/heads/zeta.lock",
+            "refs/heads/zeta.lock/x",
+            "refs/heads/feature/.hidden",
+            "refs/heads/@",
+            "refs/heads/fe~ature",
+            "refs/heads/fe^ature",
+            "refs/heads/fe:ature",
+            "refs/heads/fe?ature",
+            "refs/heads/fe*ature",
+            "refs/heads/fe[ature",
+            "refs/heads/fe\\ature",
+            "refs/heads/féature",
+        ] {
+            let mut value = intent();
+            value.source_ref = bad.into();
+            assert_eq!(
+                value.canonical_bytes(),
+                Err(ApprovalContractError::NonCanonicalRef("source_ref")),
+                "{bad}"
+            );
+            let mut value = intent();
+            value.target_ref = bad.into();
+            assert_eq!(
+                value.canonical_bytes(),
+                Err(ApprovalContractError::NonCanonicalRef("target_ref")),
+                "{bad}"
+            );
+        }
+        let mut long = intent();
+        long.source_ref = format!("refs/heads/{}", "a".repeat(256));
+        assert!(long.canonical_bytes().is_err());
+        for good in [
+            "refs/heads/feature/zeta",
+            "refs/heads/release-1.2",
+            "refs/heads/a@b",
+        ] {
+            let mut value = intent();
+            value.source_ref = good.into();
+            value.canonical_bytes().unwrap();
+        }
+
+        let mut value = intent();
+        value.source_ref = value.target_ref.clone();
+        assert_eq!(
+            value.canonical_bytes(),
+            Err(ApprovalContractError::SourceIsTarget)
+        );
+
+        let mut value = intent();
+        value.source_commit_count = 0;
+        assert_eq!(
+            value.canonical_bytes(),
+            Err(ApprovalContractError::InvalidCommitCount)
+        );
+
+        for bad in [
+            "cairn",
+            "bleugreen/",
+            "/cairn",
+            "bleu green/cairn",
+            "bleugreen/caïrn",
+        ] {
+            let mut value = intent();
+            value.repository_name = bad.into();
+            assert_eq!(
+                value.canonical_bytes(),
+                Err(ApprovalContractError::InvalidRepositoryName),
+                "{bad}"
+            );
+        }
+        let mut value = intent();
+        value.repository_name = "group/subgroup/project".into();
+        value.canonical_bytes().unwrap();
+
+        for bad in [
+            "",
+            " leading",
+            "trailing ",
+            "tab\tinside",
+            "line\nbreak",
+            "rtl \u{202E}override",
+            "zero\u{200B}width",
+            "soft\u{00AD}hyphen",
+            "bom\u{FEFF}",
+            "tag\u{E0041}",
+            "c1\u{0085}",
+            "hangul filler\u{3164}",
+            "Fix\u{115F}parser",
+            "Fix\u{034F}parser",
+            "Fix\u{FE00}parser",
+            "Fix\u{E0100}parser",
+            "Fix\u{2065}parser",
+            "\u{200D}",
+            "\u{FE0F}",
+        ] {
+            let mut value = intent();
+            value.source_commit_subject = bad.into();
+            assert_eq!(
+                value.canonical_bytes(),
+                Err(ApprovalContractError::UnsafeDisplayText(
+                    "source_commit_subject"
+                )),
+                "{bad:?}"
+            );
+        }
+        let mut value = intent();
+        value.source_commit_subject = "Add family emoji 👨\u{200D}👩\u{200D}👧 support".into();
+        value.canonical_bytes().unwrap();
+        value.source_commit_subject = "x".repeat(301);
+        assert!(value.canonical_bytes().is_err());
+    }
+
+    #[test]
+    fn unknown_vocabulary_fails_decoding() {
+        let valid = serde_json::to_value(intent()).unwrap();
+        serde_json::from_value::<BaseMergeIntentV2>(valid.clone()).unwrap();
+        for (field, value) in [
+            ("merge_strategy", serde_json::json!("fast_forward")),
+            ("provider_flags", serde_json::json!(["auto_merge"])),
+            ("action", serde_json::json!("merge_base")),
+        ] {
+            let mut altered = valid.clone();
+            altered[field] = value;
+            assert!(
+                serde_json::from_value::<BaseMergeIntentV2>(altered).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn derived_commit_subjects_are_always_display_safe() {
+        assert_eq!(
+            derive_commit_subject("Fix parser crash\n\nLonger body"),
+            "Fix parser crash"
+        );
+        assert_eq!(
+            derive_commit_subject("  Fix\tparser\u{202E} crash \r\nbody"),
+            "Fix parser\u{FFFD} crash"
+        );
+        assert_eq!(derive_commit_subject("Fix parser\r\nbody"), "Fix parser");
+        // A run of hidden code points leaves one visible mark, not a silent join.
+        assert_eq!(
+            derive_commit_subject("Fix\u{200B}\u{200C}\u{2060}parser"),
+            "Fix\u{FFFD}parser"
+        );
+        assert_eq!(
+            derive_commit_subject("Fix parser\u{3164}"),
+            "Fix parser\u{FFFD}"
+        );
+        assert_eq!(
+            derive_commit_subject("Fix\u{1160}\u{FFA0}parser"),
+            "Fix\u{FFFD}parser"
+        );
+        assert_eq!(derive_commit_subject(" \u{200B}\n"), "\u{FFFD}");
+        assert_eq!(derive_commit_subject(""), "(no commit message)");
+        assert_eq!(
+            derive_commit_subject("\u{200D}\u{FE0F}"),
+            "(no commit message)"
+        );
+        let long = format!("{}ééé", "a".repeat(296));
+        let subject = derive_commit_subject(&long);
+        assert!(subject.len() <= MAX_COMMIT_SUBJECT_LEN, "{}", subject.len());
+        assert!(subject.ends_with('…'));
+        assert!(subject.starts_with(&"a".repeat(296)));
+        let spaced = format!("{} tail", "b".repeat(296));
+        assert_eq!(
+            derive_commit_subject(&spaced),
+            format!("{}…", "b".repeat(296))
+        );
+        for message in [
+            "Add family emoji 👨\u{200D}👩\u{200D}👧 support",
+            "\u{FEFF}\u{2066}isolated\u{2069}",
+            &"漢".repeat(200),
+            "\u{0007}bell",
+            "Fix parser\u{3164}",
+            "\u{034F}\u{FE00}\u{E0100}",
+            "Ship it \u{2764}\u{FE0F}",
+        ] {
+            let subject = derive_commit_subject(message);
+            validate_display_text("subject", &subject, MAX_COMMIT_SUBJECT_LEN, false)
+                .unwrap_or_else(|error| panic!("{message:?} -> {subject:?}: {error}"));
+        }
     }
 }

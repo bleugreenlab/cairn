@@ -8,7 +8,7 @@ fn main() {
         .expect("read canonical identity owner");
 
     for marker in [
-        "cairn.approval.base_merge.v1",
+        "cairn.approval.base_merge.v2",
         "cairn.approval.phone_assertion.v1",
         "cairn.approval.enrollment_binding.v1",
         "cairn.approval.key_possession.v1",
