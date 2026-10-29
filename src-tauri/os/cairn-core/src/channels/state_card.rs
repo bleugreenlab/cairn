@@ -494,6 +494,7 @@ mod tests {
             report: None,
             skipped: 0,
             failures: vec![],
+            unverified: None,
         };
         assert_eq!(
             card_check_verdict(true, Some(&empty.verdict_facts())),
@@ -931,6 +932,7 @@ mod tests {
                 report: None,
                 skipped,
                 failures: vec![],
+                unverified: None,
             };
             Some(serde_json::to_string(&parsed).unwrap())
         };
@@ -1008,6 +1010,16 @@ mod tests {
                 true,
                 None,
                 unverified(UnverifiedReason::NoStructuredResult),
+            ),
+            (
+                "m-declared",
+                true,
+                raw(
+                    r#"{"parser":"bun-test","passed":0,"failed":0,"skipped":0,"failures":[],"unverified":"runtime bun 1.3.13 ≠ pinned 1.4.4"}"#,
+                ),
+                unverified(UnverifiedReason::Declared(
+                    "runtime bun 1.3.13 ≠ pinned 1.4.4".to_string(),
+                )),
             ),
         ];
 

@@ -2731,6 +2731,7 @@ mod tests {
             executor: None,
             verified_on: None,
             notice: None,
+            declared_unverified: None,
         }
     }
 

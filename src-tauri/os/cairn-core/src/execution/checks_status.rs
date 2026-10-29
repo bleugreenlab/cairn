@@ -81,7 +81,7 @@ const SLOW_STATUS_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 /// manual check reply, the channel state card, and the `pinBump` merge
 /// precondition all classify through [`verdict_evidence`], so a lane can never
 /// count as passed on one surface and unverified on another.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum VerdictEvidence {
     Failed,
     Verified,
@@ -89,7 +89,7 @@ pub(crate) enum VerdictEvidence {
 }
 
 /// Why a successful exit vouches for nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UnverifiedReason {
     /// The lint never ran to completion (nothing selected, cargo missing,
     /// clippy died without a verdict).
@@ -99,6 +99,10 @@ pub(crate) enum UnverifiedReason {
     IncompleteEnumeration,
     NoTestsRan,
     NoStructuredResult,
+    /// The run disowned its own green in its structured result: it ran in an
+    /// environment it judged unfit to answer for the change (a Bun other than
+    /// the pinned one). Carries the run's own wording.
+    Declared(String),
 }
 
 impl std::fmt::Display for UnverifiedReason {
@@ -112,14 +116,16 @@ impl std::fmt::Display for UnverifiedReason {
             Self::NoStructuredResult => {
                 f.write_str("the command produced no structured coverage result")
             }
+            Self::Declared(reason) => f.write_str(reason),
         }
     }
 }
 
 /// Classify a recorded exit. Exit zero establishes only that nothing
 /// contradicted the command: a test runner that ran nothing, an incomplete
-/// enumeration, or no canonical artifact at all establishes no verified green.
-/// A non-test parse (tsc, a complete lint) vouches for itself.
+/// enumeration, or no canonical artifact at all establishes no verified green,
+/// and neither does a run whose own result declares it unverified. A non-test
+/// parse (tsc, a complete lint) vouches for itself.
 pub(crate) fn verdict_evidence(
     passed: bool,
     parsed: Option<&ParsedCheckResult>,
@@ -142,6 +148,9 @@ pub(crate) fn verdict_evidence_from_facts(
     let Some(parsed) = parsed else {
         return VerdictEvidence::Unverified(UnverifiedReason::NoStructuredResult);
     };
+    if let Some(reason) = &parsed.unverified {
+        return VerdictEvidence::Unverified(UnverifiedReason::Declared(reason.to_string()));
+    }
     let reason = if parsed.is_incomplete_lint() {
         UnverifiedReason::IncompleteLint
     } else if !parsed.is_test_runner() {
@@ -221,6 +230,10 @@ pub(crate) enum LaneExistence {
     Empty,
     /// The run started judging and did not finish.
     Incomplete(UnverifiedReason),
+    /// The run finished green and disowned it: its own result declared that
+    /// it ran where it could not vouch for the change (always
+    /// [`UnverifiedReason::Declared`]).
+    Unverified(UnverifiedReason),
     /// A static check found nothing in its domain in this change: not
     /// applicable by content.
     NoSelectableWork,
@@ -238,6 +251,7 @@ impl LaneExistence {
             Self::Breaker { .. } => "breaker",
             Self::Empty => "empty",
             Self::Incomplete(_) => "incomplete",
+            Self::Unverified(_) => "unverified",
             Self::NoSelectableWork => "not applicable",
         }
     }
@@ -259,6 +273,7 @@ impl LaneExistence {
             }
             Self::Empty => "the selection matched no tests".to_string(),
             Self::Incomplete(reason) => reason.to_string(),
+            Self::Unverified(reason) => format!("unverified: {reason}"),
             other => other.label().to_string(),
         }
     }
@@ -302,6 +317,9 @@ pub(crate) fn row_existence(
         VerdictEvidence::Unverified(
             reason @ (UnverifiedReason::IncompleteEnumeration | UnverifiedReason::IncompleteLint),
         ) => LaneExistence::Incomplete(reason),
+        VerdictEvidence::Unverified(reason @ UnverifiedReason::Declared(_)) => {
+            LaneExistence::Unverified(reason)
+        }
     }
 }
 
@@ -424,6 +442,10 @@ pub(crate) fn lane_existence(
                 passed: status.passed.unwrap_or(0),
                 failed: status.failed.unwrap_or(0),
                 skipped: status.skipped.unwrap_or(0),
+                unverified: status
+                    .declared_unverified
+                    .as_deref()
+                    .map(std::borrow::Cow::Borrowed),
             });
             Some(row_existence(
                 status.state != NodeCheckState::Failed,
@@ -624,6 +646,7 @@ pub(crate) fn test_status(
         executor: None,
         verified_on: None,
         notice: None,
+        declared_unverified: None,
     }
 }
 
@@ -737,6 +760,10 @@ pub struct NodeCheckStatus {
     /// shown is the one recorded before it ([`newer_attempt_note`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) notice: Option<String>,
+    /// The run's own reason for disowning its green
+    /// ([`ParsedCheckResult::unverified`]), worded as every surface shows it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) declared_unverified: Option<String>,
 }
 
 /// The head, and the fork point it was on, that a lane's verdict was recorded
@@ -805,6 +832,7 @@ fn unsupported_lanes<'a>(
             executor: None,
             verified_on: None,
             notice: Some(check.notice.clone()),
+            declared_unverified: None,
         }
     })
 }
@@ -1421,6 +1449,7 @@ fn assemble_statuses(
                 executor: None,
                 verified_on: None,
                 notice: None,
+                declared_unverified: None,
             }
         })
         .collect()
@@ -1613,6 +1642,7 @@ fn status_from_row(
         executor,
         verified_on: None,
         notice: None,
+        declared_unverified: parsed.and_then(|p| p.unverified),
     }
 }
 
@@ -1654,6 +1684,9 @@ pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<Strin
                 status.complete,
                 status.skipped.unwrap_or(0),
             ) {
+                _ if status.declared_unverified.is_some() => {
+                    status.declared_unverified.clone().unwrap_or_default()
+                }
                 _ if status.parser.as_deref() == Some(RUST_LINT_PARSER) => {
                     "the lint did not run to completion".to_string()
                 }
@@ -2139,6 +2172,7 @@ pub(crate) fn formatted_failure_names(status: &NodeCheckStatus) -> Option<String
                 message: None,
             })
             .collect(),
+        unverified: None,
     };
     format_failure_names(&parsed)
 }
@@ -2554,6 +2588,7 @@ mod tests {
                     message: None,
                 })
                 .collect(),
+            unverified: None,
         })
         .unwrap()
     }
@@ -2952,6 +2987,51 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_unverified_green_is_its_own_non_verdict_and_a_red_stays_red() {
+        let declared = "runtime bun 1.3.13 ≠ pinned 1.4.4";
+        let reason = || UnverifiedReason::Declared(declared.to_string());
+        let parsed: ParsedCheckResult = serde_json::from_str(&format!(
+            r#"{{"parser":"bun-test","passed":0,"failed":0,"skipped":0,"failures":[],"unverified":"{declared}"}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            verdict_evidence(true, Some(&parsed)),
+            VerdictEvidence::Unverified(reason())
+        );
+        assert_eq!(
+            verdict_evidence(false, Some(&parsed)),
+            VerdictEvidence::Failed
+        );
+        let existence = row_existence(true, None, None, Some(&parsed.verdict_facts()));
+        assert_eq!(existence, LaneExistence::Unverified(reason()));
+        assert_eq!(existence.describe(), format!("unverified: {declared}"));
+
+        let mut row = verdict_row("api", true);
+        row.target_results_json = Some(serde_json::to_string(&parsed).unwrap());
+        let status = status_from_row(
+            "job",
+            None,
+            "api",
+            CheckPolicy::Advisory,
+            CheckWhen::Write,
+            &row,
+            None,
+        );
+        assert_eq!(status.state, NodeCheckState::Unverified);
+        assert_eq!(status.declared_unverified.as_deref(), Some(declared));
+        let annotation = format_status_annotation(&status).unwrap();
+        assert!(
+            annotation.starts_with(&format!("unverified — {declared}")),
+            "{annotation}"
+        );
+        assert_eq!(
+            lane_existence(&status, WaveCadence::default()),
+            Some(LaneExistence::Unverified(reason())),
+            "the lane projection keeps the declaration"
+        );
+    }
+
+    #[test]
     fn a_success_without_a_canonical_result_is_unverified_but_tsc_is_verified() {
         let row = verdict_row("lint", true);
         let status = status_from_row(
@@ -2980,6 +3060,7 @@ mod tests {
             report: None,
             skipped: 0,
             failures: vec![],
+            unverified: None,
         };
         tsc.target_results_json = Some(serde_json::to_string(&parsed).unwrap());
         let status = status_from_row(
@@ -3017,6 +3098,7 @@ mod tests {
                         message: None,
                     })
                     .collect(),
+                unverified: None,
             })
             .unwrap(),
         );
@@ -3194,6 +3276,7 @@ mod tests {
             executor: None,
             verified_on: None,
             notice: None,
+            declared_unverified: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3259,6 +3342,7 @@ mod tests {
             executor: None,
             verified_on: None,
             notice: None,
+            declared_unverified: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3352,6 +3436,7 @@ mod tests {
             executor: None,
             verified_on: None,
             notice: None,
+            declared_unverified: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3394,6 +3479,7 @@ mod tests {
             executor: None,
             verified_on: None,
             notice: None,
+            declared_unverified: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3445,6 +3531,7 @@ mod tests {
             executor: None,
             verified_on: None,
             notice: None,
+            declared_unverified: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3527,6 +3614,7 @@ mod tests {
             executor: None,
             verified_on: None,
             notice: None,
+            declared_unverified: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3627,6 +3715,7 @@ mod tests {
             executor: None,
             verified_on: None,
             notice: None,
+            declared_unverified: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),

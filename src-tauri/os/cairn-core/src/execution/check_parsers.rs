@@ -135,6 +135,13 @@ pub struct ParsedCheckResult {
     /// red's cause survives however much chatter the run printed after it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) report: Option<String>,
+    /// The run's own statement that its exit vouches for nothing, and why: the
+    /// producer judged the environment it ran in unfit to answer for the change
+    /// (`runtime bun 1.3.13 ≠ pinned 1.4.4`). Taken from the structured result
+    /// whichever parser produced the rest, and a green carrying it is
+    /// unverified however complete the rest of the result is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) unverified: Option<String>,
 }
 
 fn current_result_schema_version() -> u32 {
@@ -201,6 +208,7 @@ impl ParsedCheckResult {
             passed: self.passed,
             failed: self.failed,
             skipped: self.skipped,
+            unverified: self.unverified.as_deref().map(Cow::Borrowed),
         }
     }
 
@@ -236,6 +244,8 @@ pub(crate) struct VerdictFacts<'a> {
     pub(crate) passed: usize,
     pub(crate) failed: usize,
     pub(crate) skipped: usize,
+    /// See [`ParsedCheckResult::unverified`].
+    pub(crate) unverified: Option<Cow<'a, str>>,
 }
 
 /// Projects `target_results_json` onto the [`VerdictFacts`] fields as one small
@@ -244,7 +254,7 @@ pub(crate) struct VerdictFacts<'a> {
 /// does, instead of failing the whole query.
 pub(crate) const VERDICT_FACTS_SQL: &str = "CASE WHEN json_valid(target_results_json) \
      THEN json_extract(target_results_json,'$.parser','$.selection','$.complete',\
-     '$.passed','$.failed','$.skipped') END";
+     '$.passed','$.failed','$.skipped','$.unverified') END";
 
 impl VerdictFacts<'_> {
     /// Whether these facts came from a TEST RUNNER ([`TEST_RUNNER_PARSERS`]),
@@ -286,8 +296,9 @@ impl VerdictFacts<'static> {
             Option<usize>,
             Option<usize>,
             Option<usize>,
+            Option<String>,
         );
-        let (parser, selection, complete, passed, failed, skipped): Projection =
+        let (parser, selection, complete, passed, failed, skipped, unverified): Projection =
             serde_json::from_str(projection).ok()?;
         Some(Self {
             parser: Cow::Owned(parser?),
@@ -296,6 +307,7 @@ impl VerdictFacts<'static> {
             passed: passed?,
             failed: failed?,
             skipped: skipped?,
+            unverified: unverified.map(Cow::Owned),
         })
     }
 }
@@ -383,18 +395,60 @@ fn detect_parser(command: &str) -> Option<ParserKind> {
 /// to the raw output tail. A recognized runner that simply found no failures
 /// still returns `Some` (a zero-failure result), which is a valid "green at this
 /// tree" record for future baseline work.
+///
+/// A structured result's `unverified` declaration rides on whichever parse wins,
+/// and stands alone (a result with no counts) for a runner Cairn has no parser
+/// for, so a lane can disown its green without first growing a parser.
 pub(crate) fn parse_check_output(command: &str, output: &str) -> Option<ParsedCheckResult> {
     let clean = strip_ansi(output);
-    if let Some(parsed) = parse_structured_artifact(&clean) {
-        return Some(parsed);
-    }
-    match detect_parser(command) {
+    let parsed = parse_structured_artifact(&clean).or_else(|| match detect_parser(command) {
         Some(ParserKind::Rust) => parse_rust(&clean),
         Some(ParserKind::Vitest) => parse_vitest(&clean),
         Some(ParserKind::BunTest) => parse_bun_test(&clean),
         Some(ParserKind::Tsc) => parse_tsc(&clean),
         None => parse_bun_test(&clean).or_else(|| parse_vitest_summary(&clean)),
+    });
+    let Some((declaring_parser, reason)) = declared_unverified(&clean) else {
+        return parsed;
+    };
+    Some(match parsed {
+        Some(parsed) => ParsedCheckResult {
+            unverified: Some(reason),
+            ..parsed
+        },
+        None => ParsedCheckResult {
+            schema_version: 1,
+            complete: false,
+            selection: unknown_selection(),
+            tests: vec![],
+            undeclared_skips: 0,
+            parser: declaring_parser,
+            passed: 0,
+            failed: 0,
+            suite_failures: 0,
+            skipped: 0,
+            deferred: 0,
+            failures: vec![],
+            report: None,
+            unverified: Some(reason),
+        },
+    })
+}
+
+/// The runner a structured result names and its `unverified` declaration, when
+/// it makes one: a non-blank string, capped like any other excerpt because the
+/// file is the command's input.
+fn declared_unverified(clean: &str) -> Option<(String, String)> {
+    let value = structured_artifact(clean)?;
+    let reason = value.get("unverified")?.as_str()?.trim();
+    if reason.is_empty() {
+        return None;
     }
+    let parser = value
+        .get("parser")
+        .and_then(|parser| parser.as_str())
+        .unwrap_or("unknown");
+    Some((parser.to_string(), cap_chars(reason, MESSAGE_CHARS)))
 }
 
 /// The line prefix the executor writes a check's result file under.
@@ -492,6 +546,7 @@ fn parse_test_artifact(value: &serde_json::Value, parser: &str) -> Option<Parsed
         deferred,
         report: None,
         failures,
+        unverified: None,
     })
 }
 
@@ -539,6 +594,7 @@ fn parse_rust_lint_artifact(value: &serde_json::Value) -> Option<ParsedCheckResu
         deferred: 0,
         failures,
         report,
+        unverified: None,
     })
 }
 
@@ -581,6 +637,7 @@ fn parse_tsc(clean: &str) -> Option<ParsedCheckResult> {
         deferred: 0,
         report: None,
         failures,
+        unverified: None,
     })
 }
 
@@ -707,6 +764,7 @@ fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
         deferred: 0,
         report: None,
         failures,
+        unverified: None,
     })
 }
 
@@ -807,6 +865,7 @@ fn parse_vitest_summary(clean: &str) -> Option<ParsedCheckResult> {
         deferred: 0,
         report: None,
         failures,
+        unverified: None,
     })
 }
 
@@ -953,6 +1012,7 @@ fn parse_bun_test(clean: &str) -> Option<ParsedCheckResult> {
         deferred: 0,
         report: None,
         failures,
+        unverified: None,
     })
 }
 
@@ -1119,6 +1179,7 @@ fn parse_nextest(clean: &str) -> Option<ParsedCheckResult> {
         deferred: 0,
         report: None,
         failures,
+        unverified: None,
     })
 }
 
@@ -1216,6 +1277,7 @@ fn parse_cargo_test(clean: &str) -> Option<ParsedCheckResult> {
         deferred: 0,
         report: None,
         failures,
+        unverified: None,
     })
 }
 
@@ -1598,6 +1660,64 @@ test result: FAILED. 2 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; 
         assert!(parse_check_output("bunx vitest run", " FAIL  a.test.ts\n").is_none());
     }
 
+    /// The bytes `scripts/test-api.ts` writes for an off-pin green, pinned by
+    /// `scripts/lib/bun-runtime-pin.test.ts` on the other side.
+    const OFF_PIN_DECLARATION: &str = r#"{"schemaVersion":1,"parser":"bun-test","unverified":"runtime bun 1.3.13 ≠ pinned 1.4.4"}"#;
+
+    #[test]
+    fn a_declared_unverified_result_stands_alone_for_an_unparsed_runner() {
+        let json =
+            r#"{"schemaVersion":1,"parser":"custom-runner","unverified":"ran on the wrong host"}"#;
+        let output = format!("custom runner finished\n{RESULT_ARTIFACT_JSON_MARKER}{json}\n");
+        let parsed = parse_check_output("bun run check:custom", &output).unwrap();
+        assert_eq!(parsed.parser, "custom-runner");
+        assert_eq!(parsed.unverified.as_deref(), Some("ran on the wrong host"));
+        assert!(!parsed.is_test_runner(), "no test counts are invented");
+        assert_eq!((parsed.passed, parsed.failed, parsed.skipped), (0, 0, 0));
+        let stored = serde_json::to_string(&parsed).unwrap();
+        let restored: ParsedCheckResult = serde_json::from_str(&stored).unwrap();
+        assert_eq!(restored, parsed, "the declaration survives storage");
+    }
+
+    #[test]
+    fn a_declared_unverified_result_keeps_the_api_lanes_bun_counts() {
+        // The tail of an off-pin `bun run test:api` green: bun's own summary,
+        // then the declaration the wrapper wrote, which has no per-test rows.
+        let output = format!(
+            " 801 pass\n 24 skip\n 0 fail\n 2408 expect() calls\nRan 825 tests across 58 files. [5.99s]\n{RESULT_ARTIFACT_JSON_MARKER}{OFF_PIN_DECLARATION}\n"
+        );
+        let parsed = parse_check_output("bun run test:api", &output).unwrap();
+        assert_eq!(
+            parsed.parser, BUN_TEST_PARSER,
+            "bun's summary is still read"
+        );
+        assert_eq!((parsed.passed, parsed.skipped), (801, 24));
+        assert_eq!(
+            parsed.unverified.as_deref(),
+            Some("runtime bun 1.3.13 ≠ pinned 1.4.4")
+        );
+    }
+
+    #[test]
+    fn a_declared_unverified_result_rides_on_the_winning_parse() {
+        let json = r#"{"schemaVersion":1,"parser":"nextest","complete":true,"selection":"full","undeclaredSkips":0,"tests":[{"id":"c t::ok","status":"passed","attempts":1,"retried":false,"flaky":false}],"unverified":"runtime differs"}"#;
+        let output = format!("{RESULT_ARTIFACT_JSON_MARKER}{json}\n");
+        let parsed = parse_check_output("bun run test:rust", &output).unwrap();
+        assert_eq!((parsed.parser.as_str(), parsed.passed), ("nextest", 1));
+        assert_eq!(parsed.unverified.as_deref(), Some("runtime differs"));
+    }
+
+    #[test]
+    fn a_blank_or_absent_declaration_is_no_declaration() {
+        for json in [
+            r#"{"schemaVersion":1,"parser":"bun-test","unverified":"  "}"#,
+            r#"{"schemaVersion":1,"parser":"bun-test"}"#,
+        ] {
+            let output = format!("{RESULT_ARTIFACT_JSON_MARKER}{json}\n");
+            assert_eq!(parse_check_output("bun run test:api", &output), None);
+        }
+    }
+
     #[test]
     fn parses_versioned_nextest_artifact_as_canonical_per_test_result() {
         let json = r#"{"schemaVersion":1,"parser":"nextest","complete":true,"selection":"full","undeclaredSkips":1,"tests":[{"id":"crate test::passes","status":"passed","durationMs":12,"attempts":1,"retried":false,"flaky":false},{"id":"crate test::flaky","status":"passed","attempts":2,"retried":true,"flaky":true},{"id":"crate test::fails","status":"failed","attempts":1,"retried":false,"flaky":false,"failureMessage":"panic: expected true"},{"id":"crate test::skip","status":"skipped","attempts":1,"retried":false,"flaky":false,"skipReason":"worktree-fence","skipDeclaration":"undeclared"}]}"#;
@@ -1962,6 +2082,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             suite_failures: 0,
             deferred: 0,
             report: None,
+            unverified: None,
             failures: (0..8)
                 .map(|i| CheckFailure {
                     name: format!("f{i}"),
@@ -1991,6 +2112,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             deferred: 0,
             report: None,
             failures: vec![],
+            unverified: None,
         };
         assert!(format_failure_names(&parsed).is_none());
     }
@@ -2058,6 +2180,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
                 name: "suite test".to_string(),
                 message: Some("AssertionError: boom".to_string()),
             }],
+            unverified: None,
         };
         let e = format_failure_excerpt(Some(&with_msgs), "RAW TAIL");
         assert_eq!(e, "suite test: AssertionError: boom");
@@ -2080,6 +2203,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
                 name: "crate test::x".to_string(),
                 message: None,
             }],
+            unverified: None,
         };
         assert_eq!(
             format_failure_excerpt(Some(&no_msgs), "panic at src/lib.rs"),
