@@ -3,6 +3,8 @@
 //! Lease authority stays inside the runner. In particular, none of these types
 //! contain a `ResidencyFence` or permit clients to issue lease operations.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::executor_protocol::{
@@ -33,6 +35,40 @@ pub struct DevInstanceLaunchRequest {
     pub seed: String,
     #[serde(default)]
     pub force_copy: bool,
+    /// Environment overrides the caller names for this launch. The runner starts
+    /// the runtime with its own environment, not the caller's shell, so these
+    /// are the only caller variables that reach the instance. The runner
+    /// forwards them verbatim as runtime `--env KEY=VALUE` arguments; the
+    /// runtime applies them last and is the authority that refuses the
+    /// variables it owns for isolation (`scripts/dev-instance-env.ts`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+
+impl DevInstanceLaunchRequest {
+    /// Check that every override can cross to the runtime exactly as named: a
+    /// portable variable name (so `KEY=VALUE` splits back at the first `=`) and
+    /// no NUL byte, which no process argument can carry.
+    pub fn validate_env(&self) -> Result<(), String> {
+        for (name, value) in &self.env {
+            let mut chars = name.chars();
+            let portable = chars
+                .next()
+                .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+                && chars.all(|rest| rest == '_' || rest.is_ascii_alphanumeric());
+            if !portable {
+                return Err(format!(
+                    "env override '{name}' is not an environment variable name (letters, digits, and _; not starting with a digit)"
+                ));
+            }
+            if value.contains('\0') {
+                return Err(format!(
+                    "env override '{name}' has a value containing a NUL byte"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -277,6 +313,7 @@ mod tests {
             source_terminal_session_id: Some("terminal-session".into()),
             seed: "empty".into(),
             force_copy: true,
+            env: BTreeMap::from([("CAIRN_API_URL".into(), "http://10.255.255.1:1".into())]),
         });
         round_trip(DevInstanceLaunchControl::Terminate);
         round_trip(DevInstanceLaunchControl::ConnectionClosing);
@@ -357,6 +394,7 @@ mod tests {
             source_terminal_session_id: None,
             seed: "empty".into(),
             force_copy: true,
+            env: BTreeMap::new(),
         })
         .unwrap();
         assert_eq!(
@@ -374,6 +412,31 @@ mod tests {
             serde_json::json!({"event":"resolved","selector":"main","commitId":"abc"})
         );
         assert!(!serde_json::to_string(&resolved).unwrap().contains("lease"));
+    }
+
+    #[test]
+    fn env_overrides_must_survive_the_argument_hop() {
+        let with = |name: &str, value: &str| DevInstanceLaunchRequest {
+            project_id: "p".into(),
+            selector: None,
+            checkout: None,
+            source_terminal_session_id: None,
+            seed: "empty".into(),
+            force_copy: false,
+            env: BTreeMap::from([(name.to_string(), value.to_string())]),
+        };
+        assert!(with("CAIRN_API_URL", "http://10.255.255.1:1")
+            .validate_env()
+            .is_ok());
+        assert!(with("_PRIVATE2", "").validate_env().is_ok());
+        assert!(with("VALUE_WITH_EQUALS", "a=b").validate_env().is_ok());
+        for name in ["", "1ST", "A=B", "WITH SPACE", "--seed"] {
+            assert!(
+                with(name, "x").validate_env().is_err(),
+                "'{name}' must be refused"
+            );
+        }
+        assert!(with("OK", "nul\0byte").validate_env().is_err());
     }
 
     #[test]
