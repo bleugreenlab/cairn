@@ -9775,6 +9775,126 @@ mod real_store_collision_tests {
         assert!(open_session(&r).await.is_none());
     }
 
+    /// cairn/5222 and cairn/5328: the branch commits D1's line beside its own
+    /// BEFORE the advance records a session. jj's line merge still conflicts at
+    /// the shared insertion point, so the session is recorded with that
+    /// resolution as `ours` and no basis, and later commits touch only other
+    /// files. The tip already holds both sides, so the request is accepted and
+    /// the replay lands it — no cosmetic edit to the file is needed.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_resolution_committed_before_the_session_was_recorded_is_taken() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let r = replay_harness(&bin, "replay-pre-resolved.db", &[(LIST, "head\n")]).await;
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(LIST, "head\nX\n")],
+            "branch appends X",
+        );
+        let d1 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(LIST, "head\nA\n")],
+            "D1 appends A",
+        );
+        set_main(&r.fx, &d1);
+        let resolved = commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(LIST, "head\nA\nX\n")],
+            "carry D1's line ahead of the advance",
+        );
+        automatic_advance(&r).await;
+        let session = open_session(&r)
+            .await
+            .expect("the line merge still conflicts at the shared insertion point");
+        assert_eq!(session.ours.as_deref(), Some(resolved.as_str()));
+        assert_eq!(
+            resolved_against(&session, LIST),
+            None,
+            "no session existed when the resolution was committed, so none is recorded"
+        );
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[("other.txt", "unrelated\n")],
+            "an unrelated follow-up",
+        );
+
+        request_take_committed_tip(&r).await;
+        assert!(
+            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &d1),
+            "the replay landed: {:?}",
+            open_session(&r).await.map(|session| session.fingerprint())
+        );
+        assert_eq!(text_at(&r.fx, BRANCH, LIST), "head\nA\nX\n");
+        assert_eq!(text_at(&r.fx, BRANCH, "other.txt"), "unrelated\n");
+        assert!(open_session(&r).await.is_none());
+    }
+
+    /// The arm the fall-through must not open: a tip whose conflicting file is
+    /// still only the branch's side is refused, by name, even after commits to
+    /// other files have moved it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_one_sided_tip_is_still_refused_by_name() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let r = replay_harness(&bin, "replay-one-sided.db", &[(LIST, "head\n")]).await;
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(LIST, "head\nX\n")],
+            "branch appends X",
+        );
+        let d1 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(LIST, "head\nA\n")],
+            "D1 appends A",
+        );
+        set_main(&r.fx, &d1);
+        automatic_advance(&r).await;
+        let session = open_session(&r).await.expect("D1 conflicts");
+        let ours = session.ours.clone().expect("the session records ours");
+        let moved = commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[("other.txt", "unrelated\n")],
+            "an unrelated change",
+        );
+
+        let refusal = request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, None)
+            .await
+            .expect_err("a one-sided tip has no resolution to take");
+        assert!(refusal.contains("resolves none"), "{refusal}");
+        assert!(refusal.contains(&format!("- `{LIST}`")), "{refusal}");
+        assert!(
+            refusal.contains(&format!("changes it on top of `{ours}`")),
+            "{refusal}"
+        );
+        let refused_with_reason =
+            request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, Some("trust me"))
+                .await
+                .expect_err("a stated reason cannot supply a resolution");
+        assert!(
+            refused_with_reason.contains("resolves none"),
+            "{refused_with_reason}"
+        );
+        assert_eq!(branch_tip(&r), moved, "a refused request moves nothing");
+    }
+
     /// Scenario 2, the specimen's own file: the branch resolved D1's migration
     /// registration and renumbered its own, then D2 registered a migration at
     /// the number the branch took. The replayed registry holds every entry

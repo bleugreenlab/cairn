@@ -1775,11 +1775,25 @@ fn status_line(
 /// are all true at once, and naming the distinction is the whole point of this
 /// section — content resolution and ancestry replay are separate facts, and only
 /// the second is what GitHub is looking at.
+///
+/// It reads the same [`TipAssessment`] the replay guard decides on, and words
+/// what would count as a resolution with the same
+/// [`TipAssessment::what_resolves`] the guard's refusal carries, so the page
+/// never recommends a request the guard refuses.
 fn resolution_section(assessment: Option<&TipAssessment>, base: &str) -> String {
-    let Some(assessment) = assessment.filter(|assessment| assessment.moved) else {
+    let Some(assessment) = assessment else {
         return String::new();
     };
     let mut out = String::from("\n## Resolution assessment\n\n");
+    if assessment.resolves_nothing() {
+        out.push_str(&format!(
+            "Your committed tip `{}` does not resolve any conflicting file yet, so a \
+             `take-committed-tip` replay requested now is REFUSED.\n\n{}",
+            assessment.tip,
+            assessment.what_resolves(base)
+        ));
+        return out;
+    }
     if assessment.every_path_is_resolved() {
         out.push_str(&format!(
             "Your committed tip `{}` contains BOTH sides of every conflicting file. **Content \
@@ -1791,18 +1805,30 @@ fn resolution_section(assessment: Option<&TipAssessment>, base: &str) -> String 
         ));
         return out;
     }
-    let unresolved: Vec<&str> = assessment
+    out.push_str(&format!(
+        "Your committed tip `{}` resolves some conflicting files, but it does not yet contain \
+         both sides of every one.\n\n",
+        assessment.tip
+    ));
+    if !assessment.unresolved.is_empty() {
+        out.push_str(&assessment.what_resolves(base));
+        out.push_str(
+            "\nA replay requested now merges each of these from your branch's fork point, which \
+             is the conflict this page records, so it is refused again unless the base declares \
+             a structural merge that settles it.\n\n",
+        );
+    }
+    let lossy: Vec<&str> = assessment
         .paths
         .iter()
         .filter(|path| path.verdict != crate::jj::RestoreVerdict::Lossless)
         .map(|path| path.path.as_str())
+        .filter(|path| !assessment.unresolved.iter().any(|open| open == path))
         .collect();
-    out.push_str(&format!(
-        "Your committed tip `{}` has moved since the conflict was recorded, but it does not yet \
-         contain both sides of every conflicting file.\n\n",
-        assessment.tip
-    ));
-    for path in &unresolved {
+    if !lossy.is_empty() {
+        out.push_str("Resolved, but missing incoming work:\n\n");
+    }
+    for path in &lossy {
         out.push_str(&format!(
             "- `{path}` — read `{base}?view=merged&file={path}` for the complete merged file.\n"
         ));
@@ -2000,6 +2026,65 @@ mod tests {
         assert!(
             standing(None).superseded_note().is_empty(),
             "a branch whose recorded base is alive has nothing to explain"
+        );
+    }
+
+    fn tip_assessment(moved: bool, unresolved: &[&str]) -> TipAssessment {
+        TipAssessment {
+            tip: "tip00000".to_string(),
+            moved,
+            paths: vec![crate::jj::PathAssessment {
+                path: "migrations.rs".to_string(),
+                verdict: crate::jj::RestoreVerdict::Lossless,
+            }],
+            truncated: 0,
+            unresolved: unresolved.iter().map(|path| path.to_string()).collect(),
+            conflicting: 1,
+            recorded: crate::orchestrator::conflict_session::RecordedConflict {
+                ours: Some("c9bcf33c".to_string()),
+                theirs: "a337fa4d".to_string(),
+                at: 0,
+            },
+        }
+    }
+
+    /// The cairn/5222 disagreement: the tip had moved (commits to other
+    /// files), `migrations.rs` was untouched and one-sided, the page said the
+    /// tip contained BOTH sides and recommended the request, and the guard
+    /// refused it. Now both read one assessment and carry one wording.
+    #[test]
+    fn a_one_sided_tip_is_refused_on_the_page_in_the_guards_own_words() {
+        use crate::orchestrator::conflict_session::{decide_replay, ReplayDecision, RestoreProof};
+        let one_sided = tip_assessment(true, &["migrations.rs"]);
+        let section = resolution_section(Some(&one_sided), "cairn:~/rebase");
+        assert!(!section.contains("BOTH sides"), "{section}");
+        assert!(section.contains("REFUSED"), "{section}");
+        let requirement = one_sided.what_resolves("cairn:~/rebase");
+        assert!(section.contains(&requirement), "{section}");
+        let ReplayDecision::Refuse(refusal) =
+            decide_replay(&RestoreProof::Assessed(one_sided), None)
+        else {
+            panic!("a one-sided tip is refused");
+        };
+        assert!(refusal.contains(&requirement), "{refusal}");
+        assert!(
+            requirement.contains("`migrations.rs`") && requirement.contains("on top of `c9bcf33c`"),
+            "{requirement}"
+        );
+    }
+
+    /// The cairn/5328 shape: the session was recorded over a tip that already
+    /// holds both sides, so the tip has not moved. It still reads as resolved,
+    /// and the guard agrees.
+    #[test]
+    fn a_resolution_that_predates_the_session_reads_as_resolved_without_a_further_commit() {
+        use crate::orchestrator::conflict_session::{decide_replay, ReplayDecision, RestoreProof};
+        let held = tip_assessment(false, &[]);
+        let section = resolution_section(Some(&held), "cairn:~/rebase");
+        assert!(section.contains("BOTH sides"), "{section}");
+        assert_eq!(
+            decide_replay(&RestoreProof::Assessed(held), None),
+            ReplayDecision::Proceed
         );
     }
 
