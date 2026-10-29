@@ -33,7 +33,7 @@ const FIXED_ORPHAN: &str = "SELECT j.id FROM jobs j WHERE j.status = 'running'
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.job_id = j.id AND r.status IN ('starting', 'live'))";
 
 const FIXED_WARM: &str = "SELECT j.id FROM jobs j WHERE j.status = 'running'
-  AND (SELECT latest.state FROM turns latest WHERE latest.job_id = j.id AND latest.start_reason != 'memory_review'
+  AND (SELECT latest.state FROM turns latest WHERE latest.job_id = j.id
        ORDER BY latest.created_at DESC, latest.sequence DESC LIMIT 1) IN ('complete', 'failed')";
 
 const RESOLVED_ISSUE: &str = "SELECT j.id FROM jobs j
@@ -41,8 +41,7 @@ const RESOLVED_ISSUE: &str = "SELECT j.id FROM jobs j
   AND EXISTS (SELECT 1 FROM issues i WHERE i.id = j.issue_id AND i.status IN ('merged', 'closed'))
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.job_id = j.id AND r.status IN ('starting', 'live'))";
 
-const PER_JOB: &str =
-    "SELECT state, end_reason FROM turns WHERE job_id = ?1 AND start_reason != 'memory_review'
+const PER_JOB: &str = "SELECT state, end_reason FROM turns WHERE job_id = ?1
     ORDER BY created_at DESC, sequence DESC LIMIT 1";
 
 #[tokio::main(flavor = "current_thread")]

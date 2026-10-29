@@ -1431,12 +1431,17 @@ async fn reconcile_stale_runs_db(
 
             // Upgrade repair: a release in which a warm provider run counted as
             // work liveness left artifact producers cached `running` after their
-            // work turn had already completed, so the DAG never advanced past a
+            // turn had already settled, so the DAG never advanced past a
             // confirmed Plan or create-PR. Those jobs receive no further turn-end
             // recompute once their session goes quiet, so reconsider the same
             // facts at boot. Like the orphan repair above, this is a
             // re-derivation and not an assertion: a job whose facts still say
             // Running is written Running.
+            //
+            // The ABSOLUTE latest turn is the one asked, memory review included,
+            // mirroring `TurnFacts::work_live`. Keying on the latest *work* turn
+            // instead would select a job whose trailing review is merely paused
+            // mid-resume, on the strength of an older turn's outcome.
             let mut rows = conn
                 .query(
                     "SELECT j.id
@@ -1445,7 +1450,6 @@ async fn reconcile_stale_runs_db(
                        AND (
                            SELECT latest.state FROM turns latest
                            WHERE latest.job_id = j.id
-                             AND latest.start_reason != 'memory_review'
                            ORDER BY latest.created_at DESC, latest.sequence DESC
                            LIMIT 1
                        ) IN ('complete', 'failed')",

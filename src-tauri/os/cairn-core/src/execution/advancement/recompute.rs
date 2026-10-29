@@ -1351,8 +1351,8 @@ mod warm_provider_run_tests {
         .unwrap();
     }
 
-    /// A turn on `job`'s session. `end_reason` is the handoff evidence the wedge
-    /// hinged on: `complete` + `artifact_handoff` is a finished producer.
+    /// A work turn on `job`'s session. `end_reason` is the handoff evidence the
+    /// wedge hinged on: `complete` + `artifact_handoff` is a finished producer.
     async fn add_turn(
         db: &LocalDb,
         job: &str,
@@ -1361,24 +1361,60 @@ mod warm_provider_run_tests {
         end_reason: Option<&str>,
         created_at: i64,
     ) {
+        insert_turn(db, job, id, state, "initial", end_reason, created_at).await;
+    }
+
+    /// A post-completion memory-review turn: the one `start_reason` the work
+    /// outcome skips and liveness does not.
+    async fn add_review_turn(db: &LocalDb, job: &str, id: &str, state: &str, created_at: i64) {
+        insert_turn(db, job, id, state, "memory_review", None, created_at).await;
+    }
+
+    async fn insert_turn(
+        db: &LocalDb,
+        job: &str,
+        id: &str,
+        state: &str,
+        start_reason: &str,
+        end_reason: Option<&str>,
+        created_at: i64,
+    ) {
         let (job, id) = (job.to_string(), id.to_string());
-        let state = state.to_string();
+        let (state, start_reason) = (state.to_string(), start_reason.to_string());
         let end_reason = end_reason.map(str::to_string);
         db.write(move |conn| {
             let (job, id, state) = (job.clone(), id.clone(), state.clone());
-            let end_reason = end_reason.clone();
+            let (start_reason, end_reason) = (start_reason.clone(), end_reason.clone());
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, end_reason, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'initial', ?6, ?4, ?4)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?4, ?4)",
                     params![
                         id.as_str(),
                         format!("s-{}", job.trim_start_matches("j-")).as_str(),
                         job.as_str(),
                         created_at,
                         state.as_str(),
+                        start_reason.as_str(),
                         end_reason.as_deref()
                     ],
+                )
+                .await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn set_turn_state(db: &LocalDb, turn: &str, state: &str) {
+        let (turn, state) = (turn.to_string(), state.to_string());
+        db.write(move |conn| {
+            let (turn, state) = (turn.clone(), state.clone());
+            Box::pin(async move {
+                conn.execute(
+                    "UPDATE turns SET state = ?1 WHERE id = ?2",
+                    params![state.as_str(), turn.as_str()],
                 )
                 .await?;
                 Ok::<_, DbError>(())
@@ -1672,6 +1708,49 @@ mod warm_provider_run_tests {
         add_turn(&db, "j-builder", "t-build", "pending", None, 3).await;
         add_run(&db, "j-builder", "r-builder", "starting").await;
         assert_eq!(derived(&db, "j-builder").await, JobStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn a_resuming_memory_review_is_not_settled_by_the_work_turn_beneath_it() {
+        // The two turn facts are scoped differently: the work-turn outcome skips
+        // memory-review turns, liveness does not. So a completed work turn sits
+        // beneath a trailing review turn, and asking the WORK turn whether
+        // anything is settled would call a review that is mid-resume "finished"
+        // on the strength of the older turn underneath it — completing the job
+        // and firing DAG effects while review work is still coming back.
+        let temp = tempfile::tempdir().unwrap();
+        let fx = fixture();
+        let db = test_db(temp.path()).await;
+        seed(&db, &fx).await;
+        add_turn(
+            &db,
+            "j-planner",
+            "t-plan",
+            "complete",
+            Some("artifact_handoff"),
+            2,
+        )
+        .await;
+        add_artifact(&db, "j-planner", "a-plan", "plan", 1).await;
+        // The review turn was interrupted; its successor row does not exist yet,
+        // and the run admitted to resume it is the only evidence of that work.
+        add_review_turn(&db, "j-planner", "t-review", "interrupted", 4).await;
+        add_run(&db, "j-planner", "r-planner", "starting").await;
+
+        assert_eq!(
+            derived(&db, "j-planner").await,
+            JobStatus::Running,
+            "a paused memory review resuming under an active run is still work in flight"
+        );
+
+        // Once that review turn settles, the warm run stops standing for it and
+        // the confirmed plan completes as it should.
+        set_turn_state(&db, "t-review", "complete").await;
+        assert_eq!(
+            derived(&db, "j-planner").await,
+            JobStatus::Complete,
+            "a settled review leaves the warm run with nothing to stand for"
+        );
     }
 
     #[tokio::test]

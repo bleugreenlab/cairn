@@ -222,20 +222,31 @@ pub struct TurnFacts {
     /// cancelled turn; its recorded outcome is still the completion, and the
     /// settlement must say Complete rather than Cancelled.
     pub outcome_state: Option<TurnState>,
-    /// Whether the absolute latest turn — memory review included — is live
-    /// (Running/Pending/Yielded).
-    pub live: bool,
+    /// State of the absolute latest turn — memory review included — or `None`
+    /// when the job has run none. Every liveness question is asked of this one
+    /// state rather than of a pre-reduced flag, so the two questions below can
+    /// never disagree about which turn they are describing.
+    pub latest_state: Option<TurnState>,
 }
 
 impl TurnFacts {
-    /// Whether the latest work turn reached an authoritative outcome — the two
-    /// states the projection derives a verdict from. `Yielded` is live work and
-    /// `Interrupted`/`Cancelled` are user-initiated pauses that leave the job
-    /// resumable, so neither counts (this is deliberately narrower than
-    /// `TurnState::is_terminal`).
-    fn has_work_outcome(&self) -> bool {
+    /// Whether the absolute latest turn is live (Running/Pending/Yielded). Host
+    /// waits (Yielded) read live, so a job waiting on one stays Running.
+    pub fn live(&self) -> bool {
         matches!(
-            self.work_state,
+            self.latest_state,
+            Some(TurnState::Running | TurnState::Pending | TurnState::Yielded)
+        )
+    }
+
+    /// Whether the absolute latest turn ended in an authoritative outcome — the
+    /// two states after which nothing is owed until something new starts.
+    /// `Yielded` is live work, and `Interrupted`/`Cancelled` are user-initiated
+    /// pauses that leave the job resumable, so neither settles it (deliberately
+    /// narrower than `TurnState::is_terminal`).
+    fn latest_turn_settled(&self) -> bool {
+        matches!(
+            self.latest_state,
             Some(TurnState::Complete | TurnState::Failed)
         )
     }
@@ -245,16 +256,21 @@ impl TurnFacts {
     ///
     /// An active run is **session availability, not work**. A provider process
     /// stays warm past a terminal artifact handoff on purpose — the session is
-    /// held open for a reply — so a warm run must never stand in for a work turn
-    /// that already reached its outcome. Letting it pins an artifact producer
-    /// Running forever and the DAG never advances past a confirmed Plan or
-    /// create-PR (CAIRN-4742).
+    /// held open for a reply — so a warm run must never stand in for a turn that
+    /// already reached its outcome. Letting it pins an artifact producer Running
+    /// forever and the DAG never advances past a confirmed Plan or create-PR
+    /// (CAIRN-4742).
     ///
     /// It therefore supplies liveness only where there is no outcome to mask:
     /// the real start/resume gap, where a run is admitted before its turn row
     /// exists, or resumes past an interrupted/cancelled turn.
+    ///
+    /// This asks the ABSOLUTE latest turn, not the latest work turn. The two
+    /// diverge exactly when a memory-review turn trails a completed work turn,
+    /// and reading the work turn there would call a review that is mid-resume
+    /// "settled" on the strength of an older turn's outcome.
     pub fn work_live(&self, active_run: bool) -> bool {
-        self.live || (active_run && !self.has_work_outcome())
+        self.live() || (active_run && !self.latest_turn_settled())
     }
 }
 
@@ -301,10 +317,7 @@ pub async fn turn_facts(conn: &cairn_db::turso::Connection, job_id: &str) -> DbR
     Ok(TurnFacts {
         work_state,
         outcome_state,
-        live: matches!(
-            latest_state,
-            Some(TurnState::Running | TurnState::Pending | TurnState::Yielded)
-        ),
+        latest_state,
     })
 }
 
@@ -1692,7 +1705,7 @@ pub async fn reduce_delegated_child_job_conn(
         JobFacts {
             dag_ready: true,
             upstream_failed: false,
-            live_turn: turn.live,
+            live_turn: turn.live(),
             turn_failed: matches!(turn.work_state, Some(TurnState::Failed)),
             turn_complete: matches!(turn.work_state, Some(TurnState::Complete)),
             checkpoint: CheckpointGate::None,
@@ -2055,10 +2068,10 @@ mod gate_tests {
     fn provider_yield_is_live_work_without_an_authoritative_outcome() {
         let turn = TurnFacts {
             work_state: Some(TurnState::Yielded),
-            live: true,
+            latest_state: Some(TurnState::Yielded),
             ..Default::default()
         };
-        assert!(!turn.has_work_outcome());
+        assert!(!turn.latest_turn_settled());
         for active_run in [false, true] {
             let facts = JobFacts {
                 dag_ready: true,
