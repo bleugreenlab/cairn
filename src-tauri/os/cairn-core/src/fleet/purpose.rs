@@ -689,6 +689,17 @@ impl PurposeRegistry {
             .is_some_and(|live| &live.request == request)
     }
 
+    /// The question `request` is the live answer to, if it answers one.
+    pub(crate) fn live_key_of(&self, request: &RequestIdentity) -> Option<&PurposeKey> {
+        self.items.iter().find_map(|(key, state)| {
+            state
+                .live
+                .as_ref()
+                .filter(|live| &live.request == request)
+                .map(|_| key)
+        })
+    }
+
     /// How many displaced items this question is still waiting on.
     ///
     /// Zero is the only state in which a newly admitted item may dispatch. This

@@ -63,7 +63,7 @@ impl AdmissionView {
 
     /// Whether the executor will judge this work as provisioning on `machine`,
     /// by the executor's own predicate, against the cells the machine posted.
-    fn provisions(&self, request: &CellRequest, machine: PostedState<'_>) -> bool {
+    pub(crate) fn provisions(&self, request: &CellRequest, machine: PostedState<'_>) -> bool {
         let repository = offered_repository(request, machine.colocated);
         let resident_here = self.execution_residency.as_ref().is_some_and(|fence| {
             fence.is_active_among(&request.project_id, &machine.snapshot.cells)

@@ -5802,21 +5802,18 @@ impl Fleet {
             health,
             colocated,
         };
-        let superseded =
-            self.queue
-                .supersede_declines_for(executor_id, |request, view, decline| {
-                    decline.condition.as_ref().is_some_and(|recorded| {
-                        recorded.still_holds(
-                            decline_condition::posted_condition(
-                                decline.reason,
-                                view,
-                                request,
-                                machine,
-                            )
+        let superseded = self.queue.supersede_declines_for(
+            executor_id,
+            unix_time_ms(),
+            |request, view, decline| {
+                decline.condition.as_ref().is_some_and(|recorded| {
+                    recorded.still_holds(
+                        decline_condition::posted_condition(decline.reason, view, request, machine)
                             .as_ref(),
-                        )
-                    })
-                });
+                    )
+                })
+            },
+        );
         if superseded {
             self.connection_ready.notify_waiters();
         }
@@ -8650,6 +8647,7 @@ impl Fleet {
                     // An acquisition is what provisions the environment, so
                     // it never names one to run inside.
                     execution_residency: None,
+                    standing: false,
                 },
                 unix_time_ms(),
             ) else {
@@ -11632,6 +11630,7 @@ impl Fleet {
         let batch_profile_identities = plan.batch_identities.clone();
         let batch_items_share_the_machine = plan.parallel_width > 1;
         let profile_identity = request.command_resource_identity.clone();
+        let standing = self.purposes.lock().unwrap().live_key_of(&key).is_some();
         // One entry stands for this work from here until it settles. Placement
         // may offer it to several machines in turn; the entry, the waiter behind
         // it, and its binding chain outlive every one of those attempts.
@@ -11643,6 +11642,7 @@ impl Fleet {
                 execution_residency: batch
                     .as_ref()
                     .and_then(|batch| batch.execution_residency.clone()),
+                standing,
             },
             unix_time_ms(),
         ) else {
@@ -12734,7 +12734,8 @@ impl Fleet {
         // actual survey's refusal while the shadow is ranked independently: an
         // unavailable home is the most important case for the counterfactual.
         let actual_survey =
-            survey_candidates(&connections, &unattached, request, now, declined, view);
+            survey_candidates(&connections, &unattached, request, now, declined, view)
+                .map(|survey| self.defer_to_provisioning_lines(survey, request, now));
         let shadow_request = hermetic_shadow_request(request);
         let shadow_survey = shadow_request.as_ref().and_then(|shadow| {
             survey_candidates(&connections, &unattached, shadow, now, declined, view).ok()
@@ -12983,6 +12984,63 @@ impl Fleet {
             decision,
             above_ceiling,
         })))
+    }
+
+    /// Pass over every usable machine where this entry would provision a cell
+    /// while an older request is ahead of it in that machine's line for the
+    /// project's provisioning hold (see
+    /// [`queue::ExecutionQueue::ahead_in_provisioning_line`]).
+    ///
+    /// When a hold clears, the machine posts state and every request parked
+    /// behind it wakes on the same broadcast. Without this the first placement
+    /// pass to reach an offer took the hold, however recently its request
+    /// arrived, and one that had waited its whole horizon could lose every
+    /// race until it was refused. Passing a machine over here is not a
+    /// refusal: work free to go elsewhere does, and work that cannot waits for
+    /// its turn. Work that runs inside a live residency or a checkout it
+    /// already has provisions nothing there and never stands in the line.
+    fn defer_to_provisioning_lines<'a>(
+        &self,
+        mut survey: CandidateSurvey<'a>,
+        request: &CellRequest,
+        now_unix_ms: u64,
+    ) -> CandidateSurvey<'a> {
+        let Some(entry_id) = survey.view.entry_id.clone() else {
+            return survey;
+        };
+        let view = survey.view.clone();
+        let mut deferred = Vec::new();
+        survey.usable.retain(|machine| {
+            let posted = decline_condition::PostedState {
+                snapshot: &machine.snapshot,
+                health: &machine.health,
+                colocated: machine.colocated,
+            };
+            if !view.provisions(request, posted) {
+                return true;
+            }
+            let Some(ahead) = self.queue.ahead_in_provisioning_line(
+                &entry_id,
+                &machine.identity.executor_id,
+                machine.generation,
+                now_unix_ms,
+            ) else {
+                return true;
+            };
+            deferred.push(PlacementRejection {
+                prediction: None,
+                executor_name: executor_public_name(machine),
+                executor_id: machine.identity.executor_id.clone(),
+                reason: PlacementRejectionReason::ProvisioningTurn {
+                    project_id: request.project_id.clone(),
+                    ahead_request_id: ahead.request_id,
+                    ahead_waiting_since_unix_ms: ahead.waiting_since_unix_ms,
+                },
+            });
+            false
+        });
+        survey.rejected.extend(deferred);
+        survey
     }
 
     #[cfg(test)]
@@ -14184,7 +14242,9 @@ fn survey_candidates<'a>(
 fn waits_on_machine(reason: &PlacementRejectionReason) -> bool {
     matches!(
         reason,
-        PlacementRejectionReason::Declined { .. } | PlacementRejectionReason::Held { .. }
+        PlacementRejectionReason::Declined { .. }
+            | PlacementRejectionReason::Held { .. }
+            | PlacementRejectionReason::ProvisioningTurn { .. }
     )
 }
 
@@ -14316,6 +14376,7 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
         PlacementRejectionReason::Held { evidence } => {
             return format!("held:{}", evidence.as_str())
         }
+        PlacementRejectionReason::ProvisioningTurn { .. } => "provisioningTurn",
         PlacementRejectionReason::PreparationToolchainMissing { .. } => {
             "preparationToolchainMissing"
         }
@@ -14337,9 +14398,9 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
 /// every pass for as long as the condition lasts.
 fn placement_rejection_log_level(rejection: &PlacementRejection) -> log::Level {
     match rejection.reason {
-        PlacementRejectionReason::Declined { .. } | PlacementRejectionReason::Held { .. } => {
-            log::Level::Debug
-        }
+        PlacementRejectionReason::Declined { .. }
+        | PlacementRejectionReason::Held { .. }
+        | PlacementRejectionReason::ProvisioningTurn { .. } => log::Level::Debug,
         // A standing fact about the machine and the project, restated on every
         // placement for as long as it holds; the refusal itself was logged
         // at WARN when it was recorded, and the placement record keeps it.
@@ -20442,6 +20503,7 @@ mod tests {
             admission_kind: CellAdmissionKind::Residency,
             interactive: true,
             execution_residency: None,
+            standing: false,
         };
         let (entry_id, _rx) = pool.queue.enqueue(new_entry(), unix_time_ms()).unwrap();
         assert!(pool.queue.enqueue(new_entry(), unix_time_ms()).is_err());
@@ -20479,6 +20541,7 @@ mod tests {
                     admission_kind: CellAdmissionKind::Residency,
                     interactive: true,
                     execution_residency: None,
+                    standing: false,
                 },
                 unix_time_ms(),
             )
@@ -20974,6 +21037,7 @@ mod tests {
                     admission_kind: CellAdmissionKind::Command,
                     interactive: false,
                     execution_residency: None,
+                    standing: false,
                 },
                 unix_time_ms(),
             )
@@ -21031,6 +21095,7 @@ mod tests {
                     admission_kind: CellAdmissionKind::Command,
                     interactive: false,
                     execution_residency: None,
+                    standing: false,
                 },
                 unix_time_ms(),
             )
@@ -23801,6 +23866,133 @@ mod tests {
         );
     }
 
+    /// One placement pass for a queued entry, reading its declines and view
+    /// from the queue the way `select_executor` does.
+    async fn select_entry(pool: &Fleet, request: &CellRequest, entry: &str) -> Selection {
+        let (declined, view) = pool
+            .queue
+            .with_entry(entry, |held| (held.declined.clone(), held.admission_view()))
+            .unwrap();
+        pool.select_executor_once_with(
+            request,
+            None,
+            &ActivePlacementPolicy::default_profile(),
+            &declined,
+            &view,
+            |_, _| SyncCost::Known(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// cairn/5035 at placement: fedora refused two requests for its
+    /// provisioning hold on the project, and the hold has cleared. The junior
+    /// is passed over there, naming the senior it waits behind, and the
+    /// senior is placed; once the senior has claimed, the junior's turn comes.
+    #[tokio::test]
+    async fn a_cleared_provisioning_hold_is_offered_to_the_senior_request_first() {
+        let pool = Fleet::default();
+        let now = unix_time_ms();
+        let (fedora_id, mut fedora) = fleet_entry_at("fedora", "linux", 0, &[], now);
+        measured_at(&mut fedora, 0.01, 8_000_000_000, 8_000_000_000, now);
+        let generation = fedora.generation;
+        *pool.lock_connections() = HashMap::from([(fedora_id, fedora)]);
+        let request = |request_id: &str, waited_ms: u64| {
+            let mut request = spillable_request();
+            request.request_id = request_id.into();
+            request.project_id = "p".into();
+            request.repository = RepositoryLocator::ManagedObjects {
+                project_id: "p".into(),
+                repository_id: "repo".into(),
+                object_format: GitObjectFormat::Sha1,
+            };
+            request.waiting_since_unix_ms = now - waited_ms;
+            request.wait_horizon_unix_ms = now + 600_000;
+            request
+        };
+        let senior = request("senior", 300_000);
+        let junior = request("junior", 5_000);
+        let mut entries = Vec::new();
+        for request in [&senior, &junior] {
+            let (entry, _waiter) = pool
+                .queue
+                .enqueue(
+                    queue::NewEntry {
+                        request: request.clone(),
+                        admission_kind: CellAdmissionKind::Command,
+                        interactive: false,
+                        execution_residency: None,
+                        standing: false,
+                    },
+                    now,
+                )
+                .unwrap();
+            assert!(pool
+                .queue
+                .offer(&entry, "fedora", "fedora", generation, now));
+            pool.queue.decline(
+                &entry,
+                "fedora",
+                generation,
+                DeclineReason::ProjectProvisioning,
+                Some("project p is provisioning for request holder".into()),
+                None,
+                Some(decline_condition::PostedCondition::ProjectProvisioning {
+                    owner_request_id: "holder".into(),
+                    entry_id: None,
+                    since_unix_ms: now - 60_000,
+                }),
+                now,
+            );
+            entries.push(entry);
+        }
+        assert!(pool
+            .queue
+            .supersede_declines_for("fedora", now, |_, _, _| false));
+
+        let Selection::Waiting { rejected } = select_entry(&pool, &junior, &entries[1]).await
+        else {
+            panic!("the junior took the hold ahead of the senior");
+        };
+        let row = rejected
+            .iter()
+            .find(|row| row.executor_id == "fedora")
+            .expect("fedora is on the record");
+        assert!(
+            matches!(
+                &row.reason,
+                PlacementRejectionReason::ProvisioningTurn { ahead_request_id, .. }
+                    if ahead_request_id == "senior"
+            ),
+            "{:?}",
+            row.reason
+        );
+        assert!(
+            row.reason.describe().contains("request senior"),
+            "{}",
+            row.reason.describe()
+        );
+        assert!(waits_on_machine(&row.reason));
+
+        let placed = select_entry(&pool, &senior, &entries[0])
+            .await
+            .placed()
+            .expect("the senior is placed");
+        assert_eq!(placed.selected.executor_id, "fedora");
+        assert!(pool
+            .queue
+            .offer(&entries[0], "fedora", "fedora", generation, now + 1));
+        assert_eq!(
+            pool.queue.claim(&entries[0], "fedora", generation, now + 1),
+            queue::ClaimVerdict::Granted
+        );
+        let placed = select_entry(&pool, &junior, &entries[1])
+            .await
+            .placed()
+            .expect("the junior's turn");
+        assert_eq!(placed.selected.executor_id, "fedora");
+    }
+
     /// cairn/4931 specimen B, as placement sees it: a ~12 GiB home whose
     /// reservation cap is exactly the 8,282,086,656 bytes it once reported as a
     /// cargo test's requirement, a measured demand above that cap, and a second
@@ -24358,7 +24550,7 @@ mod tests {
                 condition: None,
                 backoff_ms: 0,
                 retry_after_unix_ms: 0,
-                superseded: false,
+                superseded_at_unix_ms: None,
             },
         )]);
         let plan = ReservationPlan::new(db, &request, None);
@@ -26410,7 +26602,7 @@ mod tests {
                 condition: None,
                 backoff_ms: 0,
                 retry_after_unix_ms: 0,
-                superseded: true,
+                superseded_at_unix_ms: Some(NOW - 1_000),
             },
         )]);
         let draft = place_entry(&connections, &request, &declined, &view).unwrap();
@@ -27235,7 +27427,7 @@ mod tests {
             retry_after_unix_ms: 0,
             // Superseded and past backoff: neither decline keeps its machine
             // out of ranking, which is where the staleness is read.
-            superseded: true,
+            superseded_at_unix_ms: Some(at_unix_ms),
         };
         let declined = HashMap::from([
             (
@@ -35737,6 +35929,7 @@ mod tests {
                     admission_kind: CellAdmissionKind::Command,
                     interactive: false,
                     execution_residency: None,
+                    standing: false,
                 },
                 unix_time_ms(),
             )

@@ -44,8 +44,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use cairn_common::executor_protocol::{
-    BindingEvent, CellAdmissionKind, CellOutcome, CellRequest, DeclineReason, DiskDecline,
-    DiskReliefOutlook, OfferSummary, QueuedCellRequest, ResidencyFence,
+    queue_rank, BindingEvent, CellAdmissionKind, CellOutcome, CellRequest, DeclineReason,
+    DiskDecline, DiskReliefOutlook, OfferSummary, QueueRank, QueuedCellRequest, ResidencyFence,
 };
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -66,6 +66,13 @@ const REOFFER_BACKOFF_MAX_MS: u64 = 30_000;
 /// residency footprint, a memory hold). Long against any posting cadence,
 /// short against a horizon.
 const DECLINE_RECHECK_MS: u64 = 120_000;
+/// How long an entry keeps its place at the front of a machine's line for a
+/// provisioning hold once it may be offered that machine again. Its placement
+/// pass re-reads the fleet at least every quarter second, so an entry that has
+/// had this long and still has not been offered the machine is going somewhere
+/// else, or cannot go there now, and the next one in line goes instead. Long
+/// against a placement pass, short against a provisioning.
+const PROVISIONING_TURN_GRACE_MS: u64 = 10_000;
 
 /// A queue entry's own identity, minted fresh per entry.
 ///
@@ -184,6 +191,15 @@ pub(crate) struct QueueEntry {
     /// future cannot report a wait that has not happened. The same rule the
     /// executor's own queue applies, so a row reads the same wherever it waits.
     queued_at_unix_ms: u64,
+    /// This entry's place in arrival order, the last tiebreak of
+    /// [`queue_rank`].
+    sequence: u64,
+    /// Whether this work is the live answer to a standing question (a
+    /// main-cadence attestation of a project's default branch). It goes ahead
+    /// of one-off work in a line for a machine's provisioning hold: the base
+    /// branch's own observation is what every branch verdict is compared
+    /// against, and a burst of branch lanes must not keep it unobserved.
+    standing: bool,
     pub(crate) state: EntryState,
     /// The latest answer each machine that declined gave, keyed by executor id.
     ///
@@ -229,6 +245,41 @@ impl QueueEntry {
     /// When this entry's request began waiting; see the field.
     pub(crate) fn queued_at_unix_ms(&self) -> u64 {
         self.queued_at_unix_ms
+    }
+
+    /// Where this entry stands in a line for something one machine does for
+    /// one request at a time. Larger is earlier: standing work first, then the
+    /// executor's own admission order.
+    fn line_rank(&self, now_unix_ms: u64) -> (bool, QueueRank) {
+        (
+            self.standing,
+            queue_rank(
+                self.request.priority,
+                self.queued_at_unix_ms,
+                self.sequence,
+                now_unix_ms,
+            ),
+        )
+    }
+
+    /// Whether this entry holds a place in `executor_id`'s line for its
+    /// project's provisioning hold on `generation`. See
+    /// [`ExecutionQueue::ahead_in_provisioning_line`].
+    fn in_provisioning_line(&self, executor_id: &str, generation: u64, now_unix_ms: u64) -> bool {
+        let Some(decline) = self.declined.get(executor_id).filter(|decline| {
+            decline.generation == generation && decline.reason == DeclineReason::ProjectProvisioning
+        }) else {
+            return false;
+        };
+        match &self.state {
+            EntryState::Queued => decline.keeps_place_in_line(now_unix_ms),
+            EntryState::Offered {
+                executor_id: offered,
+                generation: offered_generation,
+                ..
+            } => offered == executor_id && *offered_generation == generation,
+            EntryState::Claimed { .. } => false,
+        }
     }
 
     /// What this entry tells a machine it is being offered.
@@ -339,11 +390,11 @@ pub(crate) struct EntryDecline {
     pub(crate) backoff_ms: u64,
     /// `at_unix_ms + backoff_ms`: no offer to this machine before it.
     pub(crate) retry_after_unix_ms: u64,
-    /// The posted condition behind the reason has changed since. A superseded
-    /// decline no longer keeps the machine from being offered this entry once
-    /// its backoff has run, but it is still the last thing that machine said
-    /// about it.
-    pub(crate) superseded: bool,
+    /// When the posted condition behind the reason was seen to change. A
+    /// superseded decline no longer keeps the machine from being offered this
+    /// entry once its backoff has run, but it is still the last thing that
+    /// machine said about it.
+    pub(crate) superseded_at_unix_ms: Option<u64>,
 }
 
 impl EntryDecline {
@@ -356,12 +407,36 @@ impl EntryDecline {
         if self.generation != generation {
             return false;
         }
-        if self.superseded {
-            now_unix_ms < self.retry_after_unix_ms
-        } else {
-            now_unix_ms < self.at_unix_ms.saturating_add(DECLINE_RECHECK_MS)
+        now_unix_ms < self.offerable_from_unix_ms()
+    }
+
+    /// The instant from which this decline no longer keeps its machine from
+    /// being offered the entry, on the generation it was given on.
+    fn offerable_from_unix_ms(&self) -> u64 {
+        match self.superseded_at_unix_ms {
+            Some(_) => self.retry_after_unix_ms,
+            None => self.at_unix_ms.saturating_add(DECLINE_RECHECK_MS),
         }
     }
+
+    /// Whether a queued entry refused for a provisioning hold is still waiting
+    /// for that hold at `now_unix_ms`: the refusal stands, or the entry has not
+    /// yet had [`PROVISIONING_TURN_GRACE_MS`] to take the machine since it
+    /// became offerable again.
+    fn keeps_place_in_line(&self, now_unix_ms: u64) -> bool {
+        let offerable_from = self
+            .offerable_from_unix_ms()
+            .max(self.superseded_at_unix_ms.unwrap_or(0));
+        now_unix_ms < offerable_from.saturating_add(PROVISIONING_TURN_GRACE_MS)
+    }
+}
+
+/// The request at the front of a machine's line for a provisioning hold, as a
+/// placement rejection names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AheadInLine {
+    pub(crate) request_id: String,
+    pub(crate) waiting_since_unix_ms: u64,
 }
 
 struct PendingReoffer {
@@ -540,6 +615,9 @@ pub(crate) struct NewEntry {
     pub(crate) admission_kind: CellAdmissionKind,
     pub(crate) interactive: bool,
     pub(crate) execution_residency: Option<ResidencyFence>,
+    /// Whether the work answers a standing question; see
+    /// [`QueueEntry::standing`].
+    pub(crate) standing: bool,
 }
 
 impl ExecutionQueue {
@@ -577,6 +655,8 @@ impl ExecutionQueue {
                 0 => now_unix_ms,
                 stated => stated.min(now_unix_ms),
             },
+            sequence,
+            standing: new.standing,
             requesting_job_id: new.request.requesting_job_id.clone(),
             request: new.request,
             admission_kind: new.admission_kind,
@@ -817,7 +897,7 @@ impl ExecutionQueue {
                 condition,
                 backoff_ms,
                 retry_after_unix_ms: now_unix_ms.saturating_add(backoff_ms),
-                superseded: false,
+                superseded_at_unix_ms: None,
             },
         );
         let tail = entry.chain.len().saturating_sub(2);
@@ -889,9 +969,19 @@ impl ExecutionQueue {
     /// `false` for is superseded; the rest stand. The decline's facts stay on
     /// the entry as that machine's last answer either way. Returns whether
     /// anything was superseded, which is worth a placement wake.
+    ///
+    /// A provisioning refusal tied to the hold the machine posted is
+    /// superseded by that hold ending or changing hands, which is an event and
+    /// not a reading that flaps, so its backoff ends with it. Left running,
+    /// the backoff would order a machine's line backwards: the entries that
+    /// have been refused most often, the ones that have waited longest, carry
+    /// the longest backoffs, and one that arrived a moment ago would be asked
+    /// first. A refusal nothing posted explains keeps its backoff, because any
+    /// post supersedes it and the backoff is all that bounds how often.
     pub(crate) fn supersede_declines_for(
         &self,
         executor_id: &str,
+        now_unix_ms: u64,
         still_posted: impl Fn(&CellRequest, &AdmissionView, &EntryDecline) -> bool,
     ) -> bool {
         let mut state = self.entries.lock().unwrap();
@@ -902,15 +992,66 @@ impl ExecutionQueue {
             if let Some(decline) = entry
                 .declined
                 .get_mut(executor_id)
-                .filter(|decline| !decline.superseded)
+                .filter(|decline| decline.superseded_at_unix_ms.is_none())
             {
                 if !still_posted(request, &view, decline) {
-                    decline.superseded = true;
+                    decline.superseded_at_unix_ms = Some(now_unix_ms);
+                    if decline.reason == DeclineReason::ProjectProvisioning
+                        && decline.condition.is_some()
+                    {
+                        decline.retry_after_unix_ms = decline.retry_after_unix_ms.min(now_unix_ms);
+                    }
                     superseded = true;
                 }
             }
         }
         superseded
+    }
+
+    /// The request ahead of this entry in line for `executor_id`'s
+    /// provisioning hold on the entry's project, when there is one.
+    ///
+    /// A machine provisions one cell per project at a time, and every request
+    /// it refused for that wakes together when the hold clears, so something
+    /// has to say whose turn it is. The line is every other live entry of the
+    /// project that this machine, on `generation`, refused for the hold and
+    /// that is still waiting for it: offered there now, or queued without
+    /// having let its turn pass (see [`EntryDecline::keeps_place_in_line`]).
+    /// Claimed work has had its turn, and work offered to another machine is
+    /// not waiting for this one. A place rests on the machine's own refusal
+    /// because that is the evidence that the entry can run there and would
+    /// provision there; an entry it never refused holds no place, and when it
+    /// asks it is ranked against the line like anyone else.
+    ///
+    /// The order is [`QueueEntry::line_rank`]: standing work first, then the
+    /// executor's admission order, so seniority is the requester's own wait.
+    /// The answer is the front of the line when it ranks ahead of this entry,
+    /// so a refusal can name who the work waited behind.
+    pub(crate) fn ahead_in_provisioning_line(
+        &self,
+        entry_id: &str,
+        executor_id: &str,
+        generation: u64,
+        now_unix_ms: u64,
+    ) -> Option<AheadInLine> {
+        let state = self.entries.lock().unwrap();
+        let asker = state.entries.get(entry_id)?;
+        let mine = asker.line_rank(now_unix_ms);
+        state
+            .entries
+            .values()
+            .filter(|other| {
+                other.id != asker.id
+                    && other.request.project_id == asker.request.project_id
+                    && other.in_provisioning_line(executor_id, generation, now_unix_ms)
+            })
+            .map(|other| (other.line_rank(now_unix_ms), other))
+            .filter(|(rank, _)| *rank > mine)
+            .max_by(|(left, _), (right, _)| left.cmp(right))
+            .map(|(_, front)| AheadInLine {
+                request_id: front.request.request_id.clone(),
+                waiting_since_unix_ms: front.queued_at_unix_ms,
+            })
     }
 }
 
@@ -1108,7 +1249,7 @@ impl ExecutionQueue {
                             condition: None,
                             backoff_ms: 0,
                             retry_after_unix_ms: 0,
-                            superseded: false,
+                            superseded_at_unix_ms: None,
                         },
                     );
                     rows.push(journal_row(
@@ -1820,6 +1961,7 @@ impl super::Fleet {
                     admission_kind: super::CellAdmissionKind::Command,
                     interactive: false,
                     execution_residency: None,
+                    standing: false,
                 },
                 now,
             )
@@ -2278,6 +2420,7 @@ pub(super) mod tests {
                     admission_kind: CellAdmissionKind::Command,
                     interactive: false,
                     execution_residency: None,
+                    standing: false,
                 },
                 1,
             )
@@ -2298,6 +2441,7 @@ pub(super) mod tests {
             admission_kind: CellAdmissionKind::Command,
             interactive: false,
             execution_residency: None,
+            standing: false,
         };
         let _re_presented = queue.enqueue(stated("re-presented", 40), 100).unwrap();
         let _skewed = queue.enqueue(stated("skewed", 500), 100).unwrap();
@@ -2537,6 +2681,7 @@ pub(super) mod tests {
                     admission_kind: CellAdmissionKind::Command,
                     interactive: false,
                     execution_residency: None,
+                    standing: false,
                 },
                 1,
             )
@@ -2557,6 +2702,7 @@ pub(super) mod tests {
                     admission_kind: CellAdmissionKind::Command,
                     interactive: false,
                     execution_residency: None,
+                    standing: false,
                 },
                 3,
             )
@@ -2837,7 +2983,7 @@ pub(super) mod tests {
     /// what a decline's reason depends on, and still the rule for a reason
     /// nothing posted explains.
     fn supersede_all(queue: &ExecutionQueue, executor_id: &str) -> bool {
-        queue.supersede_declines_for(executor_id, |_, _, _| false)
+        queue.supersede_declines_for(executor_id, 0, |_, _, _| false)
     }
 
     fn cpu_pressured() -> PostedCondition {
@@ -2873,7 +3019,7 @@ pub(super) mod tests {
             decline.condition.as_ref() == Some(&*posted.borrow())
         };
         for _ in 0..1_000 {
-            assert!(!queue.supersede_declines_for("machine", still_posted));
+            assert!(!queue.supersede_declines_for("machine", 50_000, still_posted));
         }
         assert!(
             !queue.offer(&entry, "machine", "machine", 1, 100_000),
@@ -2884,7 +3030,7 @@ pub(super) mod tests {
             cpu_pressured: false,
             memory_short: false,
         };
-        assert!(queue.supersede_declines_for("machine", still_posted));
+        assert!(queue.supersede_declines_for("machine", 100_000, still_posted));
         assert!(queue.offer(&entry, "machine", "machine", 1, 100_001));
     }
 
@@ -2974,5 +3120,238 @@ pub(super) mod tests {
             ClaimVerdict::Granted
         );
         assert_eq!(backoff(&queue), 0);
+    }
+
+    /// An entry whose requester began waiting at `waiting_since`, enqueued
+    /// at 100 s.
+    fn waiting(
+        queue: &ExecutionQueue,
+        request_id: &str,
+        waiting_since_unix_ms: u64,
+        standing: bool,
+    ) -> EntryId {
+        let (entry, _waiter) = queue
+            .enqueue(
+                NewEntry {
+                    request: CellRequest {
+                        waiting_since_unix_ms,
+                        ..request(request_id, PlacementMobility::SpillEligible)
+                    },
+                    admission_kind: CellAdmissionKind::Command,
+                    interactive: false,
+                    execution_residency: None,
+                    standing,
+                },
+                100_000,
+            )
+            .expect("a fresh identity enqueues");
+        entry
+    }
+
+    fn held_by(owner: &str) -> PostedCondition {
+        PostedCondition::ProjectProvisioning {
+            owner_request_id: owner.into(),
+            entry_id: None,
+            since_unix_ms: 1,
+        }
+    }
+
+    /// The machine refuses `entry` for the provisioning hold `holder` took.
+    fn refused_for_hold(queue: &ExecutionQueue, entry: &str, at: u64) {
+        assert!(queue.offer(entry, "machine", "machine", 1, at));
+        assert!(queue
+            .decline(
+                entry,
+                "machine",
+                1,
+                DeclineReason::ProjectProvisioning,
+                Some("project p is provisioning for request holder".into()),
+                None,
+                Some(held_by("holder")),
+                at,
+            )
+            .applied());
+    }
+
+    /// The machine posts that its hold on the project has cleared.
+    fn hold_clears(queue: &ExecutionQueue, at: u64) -> bool {
+        queue.supersede_declines_for("machine", at, |_, _, decline| {
+            decline.reason != DeclineReason::ProjectProvisioning
+        })
+    }
+
+    fn ahead(queue: &ExecutionQueue, entry: &str, at: u64) -> Option<String> {
+        queue
+            .ahead_in_provisioning_line(entry, "machine", 1, at)
+            .map(|ahead| ahead.request_id)
+    }
+
+    /// cairn/5035: every request a machine refused for its provisioning hold
+    /// wakes together when the hold clears. The one whose requester has waited
+    /// longest goes first, whatever order the refusals came in; its claim
+    /// passes the turn to the next; and a request that arrives during the
+    /// clear, refused by nobody, stands behind the line rather than beating it.
+    #[test]
+    fn a_cleared_provisioning_hold_goes_to_the_request_that_has_waited_longest() {
+        let queue = ExecutionQueue::default();
+        let oldest = waiting(&queue, "oldest", 10_000, false);
+        let middle = waiting(&queue, "middle", 50_000, false);
+        let newest = waiting(&queue, "newest", 90_000, false);
+        refused_for_hold(&queue, &newest, 100_001);
+        refused_for_hold(&queue, &middle, 100_002);
+        refused_for_hold(&queue, &oldest, 100_003);
+        assert_eq!(ahead(&queue, &newest, 100_004).as_deref(), Some("oldest"));
+        assert_eq!(ahead(&queue, &oldest, 100_004), None);
+
+        assert!(hold_clears(&queue, 160_000));
+        assert_eq!(ahead(&queue, &newest, 160_000).as_deref(), Some("oldest"));
+        assert_eq!(ahead(&queue, &middle, 160_000).as_deref(), Some("oldest"));
+        assert_eq!(ahead(&queue, &oldest, 160_000), None);
+        let arrival = waiting(&queue, "arrival", 95_000, false);
+        assert_eq!(ahead(&queue, &arrival, 160_000).as_deref(), Some("oldest"));
+
+        assert!(queue.offer(&oldest, "machine", "machine", 1, 160_001));
+        assert_eq!(
+            ahead(&queue, &newest, 160_001).as_deref(),
+            Some("oldest"),
+            "an entry offered the machine is still at the front"
+        );
+        assert_eq!(
+            queue.claim(&oldest, "machine", 1, 160_002),
+            ClaimVerdict::Granted
+        );
+        assert_eq!(ahead(&queue, &newest, 160_002).as_deref(), Some("middle"));
+        assert_eq!(ahead(&queue, &middle, 160_002), None);
+    }
+
+    /// The testing thread's rule: the base branch's own observation goes
+    /// ahead of branch lanes for the hold, however long they have waited.
+    #[test]
+    fn standing_work_goes_ahead_of_older_one_off_work_in_the_line() {
+        let queue = ExecutionQueue::default();
+        let branch = waiting(&queue, "branch", 10_000, false);
+        let cadence = waiting(&queue, "cadence", 90_000, true);
+        refused_for_hold(&queue, &branch, 100_001);
+        refused_for_hold(&queue, &cadence, 100_002);
+        assert!(hold_clears(&queue, 160_000));
+        assert_eq!(ahead(&queue, &branch, 160_000).as_deref(), Some("cadence"));
+        assert_eq!(ahead(&queue, &cadence, 160_000), None);
+    }
+
+    /// The front of the line holds it only while it is taking its turn. Offered
+    /// to another machine, it is not waiting for this one; left unoffered past
+    /// the grace, it cannot go there now, and the next request goes instead.
+    /// A request of another project was never in this line.
+    #[test]
+    fn a_request_that_lets_its_turn_pass_leaves_the_line() {
+        let queue = ExecutionQueue::default();
+        let senior = waiting(&queue, "senior", 10_000, false);
+        let junior = waiting(&queue, "junior", 90_000, false);
+        let (other_project, _waiter) = queue
+            .enqueue(
+                NewEntry {
+                    request: CellRequest {
+                        project_id: "q".into(),
+                        waiting_since_unix_ms: 1,
+                        ..request("other", PlacementMobility::SpillEligible)
+                    },
+                    admission_kind: CellAdmissionKind::Command,
+                    interactive: false,
+                    execution_residency: None,
+                    standing: true,
+                },
+                100_000,
+            )
+            .unwrap();
+        refused_for_hold(&queue, &other_project, 100_000);
+        refused_for_hold(&queue, &senior, 100_001);
+        refused_for_hold(&queue, &junior, 100_002);
+        assert!(hold_clears(&queue, 160_000));
+
+        assert!(queue.offer(&senior, "elsewhere", "elsewhere", 1, 160_001));
+        assert_eq!(ahead(&queue, &junior, 160_001), None, "offered elsewhere");
+        assert!(queue
+            .decline(
+                &senior,
+                "elsewhere",
+                1,
+                DeclineReason::Capacity,
+                None,
+                None,
+                None,
+                160_002,
+            )
+            .applied());
+        let last_moment = 160_000 + PROVISIONING_TURN_GRACE_MS - 1;
+        assert_eq!(
+            ahead(&queue, &junior, last_moment).as_deref(),
+            Some("senior")
+        );
+        assert_eq!(
+            ahead(&queue, &junior, last_moment + 1),
+            None,
+            "its turn passed"
+        );
+    }
+
+    /// The entries a machine has refused most often carry the longest
+    /// backoffs. A refusal tied to the hold the machine posted ends with that
+    /// hold, so the oldest request is not made to wait out a backoff while a
+    /// newer one takes its turn; a refusal nothing posted explains keeps the
+    /// backoff that bounds how often it is asked.
+    #[test]
+    fn a_cleared_hold_ends_the_backoff_of_the_refusals_it_explained() {
+        let queue = ExecutionQueue::default();
+        let typed = waiting(&queue, "typed", 1, false);
+        let unexplained = waiting(&queue, "unexplained", 1, false);
+        let backoff = |entry: &str| {
+            queue
+                .with_entry(entry, |held| held.declined["machine"].backoff_ms)
+                .unwrap()
+        };
+        let mut at = 100_000;
+        for _ in 0..6 {
+            for (entry, condition) in [(&typed, Some(held_by("holder"))), (&unexplained, None)] {
+                assert!(queue.offer(entry, "machine", "machine", 1, at));
+                queue.decline(
+                    entry,
+                    "machine",
+                    1,
+                    DeclineReason::ProjectProvisioning,
+                    None,
+                    None,
+                    condition,
+                    at,
+                );
+            }
+            at += 100_000;
+            assert!(hold_clears(&queue, at));
+        }
+        assert_eq!(backoff(&typed), REOFFER_BACKOFF_MAX_MS);
+        assert_eq!(backoff(&unexplained), REOFFER_BACKOFF_MAX_MS);
+
+        for entry in [&typed, &unexplained] {
+            assert!(queue.offer(entry, "machine", "machine", 1, at));
+            queue.decline(
+                entry,
+                "machine",
+                1,
+                DeclineReason::ProjectProvisioning,
+                None,
+                None,
+                (entry == &typed).then(|| held_by("holder")),
+                at,
+            );
+        }
+        assert!(hold_clears(&queue, at + 10));
+        assert!(queue.offer(&typed, "machine", "machine", 1, at + 11));
+        assert!(!queue.offer(&unexplained, "machine", "machine", 1, at + 11));
+        assert!(queue.offer(
+            &unexplained,
+            "machine",
+            "machine",
+            1,
+            at + REOFFER_BACKOFF_MAX_MS
+        ));
     }
 }

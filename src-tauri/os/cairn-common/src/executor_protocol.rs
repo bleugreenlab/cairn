@@ -6013,6 +6013,16 @@ pub struct LearnedResourceEstimate {
 /// decode the command, so a start would wait out its whole bound for a report
 /// that never comes while the gang's machines stay reserved. That reads
 /// fail-open, so the number moves (tenet 541).
+///
+/// cairn/5035 does not move the number. [`queue_rank`] is the executor's
+/// admission ordering lifted into this file unchanged, so the runner's line
+/// for a machine's provisioning hold ranks by the same rule; the executor's
+/// queue orders exactly as before. [`PlacementRejectionReason::ProvisioningTurn`]
+/// is a runner-side placement record that never crosses to an executor: the
+/// runner now withholds an offer that would provision while an older request
+/// is ahead in that machine's line for the project, and the offers it does
+/// send carry the same fields as before. What a runner gets wrong talking to
+/// an older executor: nothing.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 160;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -7566,6 +7576,37 @@ pub fn aged_priority(priority: CellPriority, queued_at_unix_ms: u64, now_unix_ms
         .unwrap_or(0);
     base.saturating_add(promotions).min(2)
 }
+
+/// Where one waiting request stands against the others waiting for the same
+/// thing. Larger is earlier.
+///
+/// Its aged priority, then when its requester began waiting, then arrival
+/// order. Aging saturates at the top tier within two intervals, so among work
+/// that has waited longer than that the middle term is the fairness rule, and
+/// keying it on when the requester began waiting rather than on when this
+/// particular enqueue happened is what lets seniority survive a
+/// re-presentation. `arrival` is the queue's own sequence, the deterministic
+/// order for waits that began in the same millisecond.
+///
+/// One rule for every line waiting work stands in: the executor's admission
+/// queue ranks by it, and so does the runner's line for a machine's
+/// provisioning hold on a project, so a request is never ahead in one and
+/// behind in the other.
+pub fn queue_rank(
+    priority: CellPriority,
+    waiting_since_unix_ms: u64,
+    arrival: u64,
+    now_unix_ms: u64,
+) -> QueueRank {
+    (
+        aged_priority(priority, waiting_since_unix_ms, now_unix_ms),
+        std::cmp::Reverse(waiting_since_unix_ms),
+        std::cmp::Reverse(arrival),
+    )
+}
+
+/// See [`queue_rank`].
+pub type QueueRank = (u64, std::cmp::Reverse<u64>, std::cmp::Reverse<u64>);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -15125,6 +15166,17 @@ pub enum PlacementRejectionReason {
     /// that is free to go elsewhere; like a decline, it is something to wait
     /// for rather than a reason to refuse.
     Held { evidence: AdmissionHoldEvidence },
+    /// This work would provision a cell here, and an older request is ahead of
+    /// it in line for this machine's provisioning hold on the project: the
+    /// machine provisions one cell per project at a time, and when the hold
+    /// clears the request that has waited longest takes it. The runner's own
+    /// rule, not the machine's answer. Waited for like a decline; the machine
+    /// is offered this work once the requests ahead of it have had their turn.
+    ProvisioningTurn {
+        project_id: String,
+        ahead_request_id: String,
+        ahead_waiting_since_unix_ms: u64,
+    },
     /// The project's setup commands, which every cell for the project runs
     /// before its first command, invoke a toolchain this machine does not
     /// advertise. A fact about the machine and the project, not the batch: a
@@ -15274,6 +15326,14 @@ impl PlacementRejectionReason {
                 declined_at_unix_ms,
             } => describe_decline(*reason, detail.as_deref(), *declined_at_unix_ms),
             Self::Held { evidence } => evidence.describe(),
+            Self::ProvisioningTurn {
+                project_id,
+                ahead_request_id,
+                ahead_waiting_since_unix_ms,
+            } => format!(
+                "in line: this machine provisions one cell of project {project_id} at a time, and request {ahead_request_id}, waiting since {}, is ahead of this one for it",
+                describe_age(*ahead_waiting_since_unix_ms)
+            ),
             Self::PreparationToolchainMissing {
                 project_id,
                 missing,
