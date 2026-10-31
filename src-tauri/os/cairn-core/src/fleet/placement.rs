@@ -109,7 +109,10 @@ pub(crate) fn substrate_is_working(state: ExecutorSubstrateState) -> bool {
         | ExecutorSubstrateState::StorageAccounting
         | ExecutorSubstrateState::DispatchPreparing
         | ExecutorSubstrateState::SlotAdoption
-        | ExecutorSubstrateState::CapacityBusy => true,
+        | ExecutorSubstrateState::CapacityBusy
+        // The host's storage is working on the executor's behalf, and the wait
+        // ends when it returns, with nothing further asked of anyone.
+        | ExecutorSubstrateState::KernelWait => true,
         ExecutorSubstrateState::ExecutionRunning
         | ExecutorSubstrateState::PermanentRefusal
         | ExecutorSubstrateState::ConnectedStalled

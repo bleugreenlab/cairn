@@ -2923,7 +2923,15 @@ pub(crate) fn render_colocated_supervision(
         )
     };
     let mut lines = Vec::new();
-    if let Some(hold) = &supervision.generation_hold {
+    // First: while the kernel holds a thread of the executor, nothing else the
+    // supervisor could be doing is what decides when `local` comes back.
+    if let Some(wait) = &supervision.kernel_wait {
+        lines.push(format!(
+            "- Supervisor: since {}, {}",
+            since(wait.since_unix_ms),
+            crate::fleet::kernel_wait_diagnostic(wait, captured_at_unix_ms)
+        ));
+    } else if let Some(hold) = &supervision.generation_hold {
         lines.push(format!(
             "- Supervisor: waiting since {}: {}",
             since(hold.observed_since_unix_ms),
@@ -3253,6 +3261,10 @@ fn describe_retirement(retirement: &ExecutorRetirementSummary) -> String {
             retirement.pid,
             phase.label()
         ),
+        (RetirementOutcome::AwaitingKernel, _) => format!(
+            "pid {} ({whose}) was SIGKILLed and is waiting on the kernel: a thread of it is in uninterruptible sleep, and it exits when that wait returns",
+            retirement.pid
+        ),
     };
     if workload.reaped > 0 {
         described.push_str(&format!(
@@ -3284,6 +3296,7 @@ fn substrate_state_label(state: ExecutorSubstrateState) -> &'static str {
         ExecutorSubstrateState::ConnectedStalled => "stalled",
         ExecutorSubstrateState::Draining => "draining",
         ExecutorSubstrateState::GenerationHeld => "generation held by another process",
+        ExecutorSubstrateState::KernelWait => "waiting on the kernel",
     }
 }
 
@@ -3303,6 +3316,7 @@ fn link_summary(executor: &ExecutorInspection) -> String {
                             | ExecutorSubstrateState::Draining
                             | ExecutorSubstrateState::PermanentRefusal
                             | ExecutorSubstrateState::GenerationHeld
+                            | ExecutorSubstrateState::KernelWait
                     )
                 }) {
                 Some(evidence) => format!(
@@ -8822,6 +8836,68 @@ mod supervision_tests {
             ),
             "{rendered}"
         );
+    }
+
+    /// A starting executor the kernel holds is named on the page as a wait, not
+    /// as a failure, with the thread and the kernel function it waits in, and
+    /// it reads above any hold or failure streak.
+    #[test]
+    fn a_kernel_wait_names_the_thread_and_where_it_waits() {
+        use cairn_common::executor_protocol::{ColocatedKernelWait, KernelWaitStage};
+        use cairn_common::process_identity::KernelThreadStates;
+        let supervision = ColocatedSupervision {
+            kernel_wait: Some(ColocatedKernelWait {
+                pid: 4242,
+                stage: KernelWaitStage::Starting,
+                since_unix_ms: NOW - 14_000,
+                kernel: KernelThreadStates {
+                    leader: Some('S'),
+                    threads: 7,
+                    uninterruptible: vec![(4243, Some("ext4_sync_file".into()))],
+                },
+                last_read_unix_ms: NOW - 500,
+            }),
+            failing_since_unix_ms: Some(NOW - 600_000),
+            failed_attempts: 2,
+            last_cause: Some("an earlier failure".into()),
+            ..held(GenerationHoldReason::Unidentified)
+        };
+        let rendered = render_colocated_supervision(None, &supervision, false, NOW);
+        assert!(
+            rendered.contains("waiting on the kernel: the starting local executor pid 4242 has 1 of 7 thread(s) in uninterruptible sleep, which no signal interrupts (4243 in ext4_sync_file) for 14s"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("(14s ago)"), "{rendered}");
+        assert!(!rendered.contains("successor failing"), "{rendered}");
+        assert!(!rendered.contains("will not signal"), "{rendered}");
+    }
+
+    /// A SIGKILLed executor the kernel has not let go of is said to be killed
+    /// and waiting, never "still alive after retirement reached SIGKILL".
+    #[test]
+    fn a_killed_executor_waiting_on_the_kernel_is_not_read_as_surviving_sigkill() {
+        let supervision = ColocatedSupervision {
+            last_retirement: Some(ExecutorRetirementSummary {
+                pid: 3446667,
+                origin: RetirementOrigin::OwnChild,
+                escalated_to: Some(RetirementPhase::Force),
+                graceful_ms: 7_000,
+                force_ms: Some(3_000),
+                total_ms: 10_001,
+                outcome: RetirementOutcome::AwaitingKernel,
+                completed_at_unix_ms: NOW - 2_000,
+                workload: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let rendered = render_colocated_supervision(None, &supervision, false, NOW);
+        assert!(
+            rendered.contains(
+                "pid 3446667 (this runner's executor) was SIGKILLed and is waiting on the kernel"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("still alive"), "{rendered}");
     }
 
     #[test]

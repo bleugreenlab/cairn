@@ -4993,7 +4993,8 @@ fn stalled_substrate_shape(
         | State::StorageAccounting
         | State::DispatchPreparing
         | State::SlotAdoption
-        | State::CapacityBusy => SubstrateFailureShape::Capacity,
+        | State::CapacityBusy
+        | State::KernelWait => SubstrateFailureShape::Capacity,
     }
 }
 

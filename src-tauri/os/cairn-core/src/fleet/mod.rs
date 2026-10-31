@@ -295,6 +295,27 @@ fn generation_hold_diagnostic(
     }
 }
 
+/// The sentence the colocated substrate carries while the supervisor waits on
+/// the kernel: which process, at which stage, for how long, and what its
+/// threads are waiting in.
+pub(crate) fn kernel_wait_diagnostic(
+    wait: &cairn_common::executor_protocol::ColocatedKernelWait,
+    now_unix_ms: u64,
+) -> String {
+    use cairn_common::executor_protocol::KernelWaitStage;
+    let waited = compact_duration(now_unix_ms.saturating_sub(wait.since_unix_ms));
+    match wait.stage {
+        KernelWaitStage::Starting => format!(
+            "waiting on the kernel: the starting local executor pid {} has {} for {waited}; its startup budget is paused, and it is neither retired nor replaced until the wait returns",
+            wait.pid, wait.kernel
+        ),
+        KernelWaitStage::Killed => format!(
+            "killed, waiting on the kernel: the outgoing local executor pid {} was SIGKILLed and has {} for {waited}; the kernel ends it when that wait returns, and no successor starts until then",
+            wait.pid, wait.kernel
+        ),
+    }
+}
+
 /// `5h57m`, `3m12s`, `41s`: a duration read at a glance in a diagnostic.
 pub(crate) fn compact_duration(ms: u64) -> String {
     let seconds = ms / 1_000;
@@ -4743,6 +4764,7 @@ impl Fleet {
             supervision.failed_attempts = 0;
             supervision.last_cause = None;
             supervision.generation_hold = None;
+            supervision.kernel_wait = None;
         }
         self.connection_ready.notify_waiters();
     }
@@ -4809,6 +4831,53 @@ impl Fleet {
         self.colocated_supervision.lock().unwrap().generation_hold = None;
     }
 
+    /// The supervisor read `pid`'s threads and found one in uninterruptible
+    /// sleep, so it is waiting for the kernel rather than acting on the
+    /// process. Declared again at every read: the same process at the same
+    /// stage keeps the moment it was first found, so the rendering reads how
+    /// long the wait has lasted, and each read refreshes the declaration's
+    /// progress, because the reading is the supervisor's evidence that the wait
+    /// is still the host's and not its own.
+    pub fn declare_colocated_kernel_wait(
+        &self,
+        pid: u32,
+        stage: cairn_common::executor_protocol::KernelWaitStage,
+        kernel: cairn_common::process_identity::KernelThreadStates,
+    ) {
+        let now = unix_time_ms();
+        let wait = {
+            let mut supervision = self.colocated_supervision.lock().unwrap();
+            let since_unix_ms = match &supervision.kernel_wait {
+                Some(prior) if prior.pid == pid && prior.stage == stage => prior.since_unix_ms,
+                _ => now,
+            };
+            let wait = cairn_common::executor_protocol::ColocatedKernelWait {
+                pid,
+                stage,
+                since_unix_ms,
+                kernel,
+                last_read_unix_ms: now,
+            };
+            supervision.kernel_wait = Some(wait.clone());
+            wait
+        };
+        let mut evidence = ExecutorSubstrateEvidence::without_queue(
+            ExecutorSubstrateState::KernelWait,
+            wait.since_unix_ms,
+            now,
+        );
+        evidence.diagnostic = Some(kernel_wait_diagnostic(&wait, now));
+        *self.colocated_substrate_state.lock().unwrap() = Some(evidence);
+        self.connection_ready.notify_waiters();
+    }
+
+    /// No thread of the process the supervisor was waiting on is in the kernel
+    /// any longer. The substrate declaration is the caller's to replace with
+    /// whatever the supervisor does next.
+    pub fn release_colocated_kernel_wait(&self) {
+        self.colocated_supervision.lock().unwrap().kernel_wait = None;
+    }
+
     pub fn record_colocated_retirement(
         &self,
         summary: cairn_common::executor_protocol::ExecutorRetirementSummary,
@@ -4867,19 +4936,25 @@ impl Fleet {
     /// own (a recovery that is failing has a diagnostic, and that diagnostic is
     /// the actionable thing to tell the caller), and it must be fresh by the same
     /// progress rule every other substrate hold is judged by.
+    ///
+    /// A kernel wait is a recovery whose diagnostic is not a failure: it says
+    /// what the host is doing, and it ends when the host's storage returns,
+    /// with no further act of the runner's. The supervisor re-declares it at
+    /// every read, so it stays fresh only while the supervisor is watching.
     pub(crate) fn link_restoration(&self) -> placement::LinkRestoration {
         let Some(evidence) = self.colocated_substrate() else {
             return placement::LinkRestoration::NotRestoring;
         };
-        let recovering = matches!(
-            evidence.state,
+        let recovering = match evidence.state {
             ExecutorSubstrateState::SupervisorSpawning
-                | ExecutorSubstrateState::SupervisorRespawning
-                | ExecutorSubstrateState::ProtocolAttaching
-        );
+            | ExecutorSubstrateState::SupervisorRespawning
+            | ExecutorSubstrateState::ProtocolAttaching => evidence.diagnostic.is_none(),
+            ExecutorSubstrateState::KernelWait => true,
+            _ => false,
+        };
         let fresh = unix_time_ms().saturating_sub(evidence.last_progress_unix_ms)
             <= EXECUTOR_PROGRESS_FRESHNESS_MS;
-        if recovering && fresh && evidence.diagnostic.is_none() {
+        if recovering && fresh {
             placement::LinkRestoration::Restoring
         } else {
             placement::LinkRestoration::NotRestoring
@@ -35887,6 +35962,70 @@ mod tests {
             fleet.link_restoration(),
             placement::LinkRestoration::NotRestoring
         );
+    }
+
+    /// A kernel wait is named with the process, its stage and its threads, keeps
+    /// the moment it was first found while the stage is unchanged, and reads as
+    /// a recovery a caller may wait on: it ends when the host's storage
+    /// returns, with nothing further asked of the runner.
+    #[test]
+    fn a_kernel_wait_names_its_threads_and_is_a_recovery_in_progress() {
+        use cairn_common::executor_protocol::KernelWaitStage;
+        use cairn_common::process_identity::KernelThreadStates;
+        let syncing = KernelThreadStates {
+            leader: Some('S'),
+            threads: 7,
+            uninterruptible: vec![(4243, Some("ext4_sync_file".into()))],
+        };
+        let fleet = Fleet::default();
+        fleet.declare_colocated_kernel_wait(4242, KernelWaitStage::Starting, syncing.clone());
+        let first = fleet.colocated_supervision().kernel_wait.unwrap();
+        fleet.declare_colocated_kernel_wait(4242, KernelWaitStage::Starting, syncing.clone());
+        assert_eq!(
+            fleet
+                .colocated_supervision()
+                .kernel_wait
+                .map(|wait| wait.since_unix_ms),
+            Some(first.since_unix_ms)
+        );
+        let evidence = fleet.colocated_substrate().unwrap();
+        assert_eq!(evidence.state, ExecutorSubstrateState::KernelWait);
+        let diagnostic = evidence.diagnostic.unwrap();
+        assert!(
+            diagnostic.starts_with("waiting on the kernel: the starting local executor pid 4242 has 1 of 7 thread(s) in uninterruptible sleep"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("4243 in ext4_sync_file"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("budget is paused"), "{diagnostic}");
+        assert_eq!(
+            fleet.link_restoration(),
+            placement::LinkRestoration::Restoring
+        );
+
+        fleet.declare_colocated_kernel_wait(4242, KernelWaitStage::Killed, syncing);
+        let diagnostic = fleet.colocated_substrate().unwrap().diagnostic.unwrap();
+        assert!(
+            diagnostic.starts_with("killed, waiting on the kernel: "),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("no successor starts"), "{diagnostic}");
+
+        fleet.release_colocated_kernel_wait();
+        assert_eq!(fleet.colocated_supervision().kernel_wait, None);
+        fleet.declare_colocated_kernel_wait(
+            4242,
+            KernelWaitStage::Killed,
+            KernelThreadStates {
+                leader: Some('Z'),
+                threads: 2,
+                uninterruptible: vec![(4243, None)],
+            },
+        );
+        fleet.clear_colocated_substrate();
+        assert_eq!(fleet.colocated_supervision().kernel_wait, None);
     }
 
     /// A held generation refuses local placement at once, naming the holder,

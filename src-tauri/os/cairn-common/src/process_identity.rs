@@ -187,7 +187,8 @@ pub fn process_group_is_alive(process_group_id: u32) -> bool {
 /// Until then the leader can read as a zombie that `waitpid` does not report,
 /// and the group's open files, its locks among them, stay open. Telling that
 /// apart from a zombie nobody reaped is what this is for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct KernelThreadStates {
     /// The thread-group leader's state letter (`R`, `S`, `D`, `Z`, ...).
     pub leader: Option<char>,
@@ -196,6 +197,15 @@ pub struct KernelThreadStates {
     /// The threads in uninterruptible sleep, each with the kernel function it
     /// is waiting in where the kernel will say.
     pub uninterruptible: Vec<(u32, Option<String>)>,
+}
+
+impl KernelThreadStates {
+    /// Whether any thread is in uninterruptible sleep: the process is in the
+    /// kernel's hands, and nothing sent to it, SIGKILL included, acts until
+    /// that wait returns.
+    pub fn waiting_in_kernel(&self) -> bool {
+        !self.uninterruptible.is_empty()
+    }
 }
 
 impl std::fmt::Display for KernelThreadStates {
@@ -292,6 +302,38 @@ fn thread_state(stat: &str) -> Option<char> {
         .next()?
         .chars()
         .next()
+}
+
+/// How long, in total since boot, every non-idle task on this host was stalled
+/// on I/O at once: the `full` line of `/proc/pressure/io`, whose `total` the
+/// kernel keeps in microseconds. `None` where the kernel keeps no pressure
+/// accounting (built without PSI, or booted with it off) or the platform has
+/// none.
+///
+/// `full` rather than `some` because only `full` is time in which nothing on
+/// the host could have run: a process that was runnable during a `some` stall
+/// was runnable, and a host where something always waits on its disk would
+/// otherwise read as permanently stalled.
+#[cfg(target_os = "linux")]
+pub fn host_io_full_stall() -> Option<std::time::Duration> {
+    io_full_stall_total(&std::fs::read_to_string("/proc/pressure/io").ok()?)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn host_io_full_stall() -> Option<std::time::Duration> {
+    None
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn io_full_stall_total(pressure: &str) -> Option<std::time::Duration> {
+    let micros = pressure
+        .lines()
+        .find(|line| line.starts_with("full "))?
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("total="))?
+        .parse::<u64>()
+        .ok()?;
+    Some(std::time::Duration::from_micros(micros))
 }
 
 /// An identifier the kernel mints once per boot, or `None` where this platform
@@ -541,6 +583,38 @@ mod tests {
             states.to_string(),
             "its main thread has exited; 1 of 2 thread(s) in uninterruptible sleep, which no signal interrupts (4242 in btrfs_sync_file)"
         );
+    }
+
+    #[test]
+    fn the_host_io_stall_is_the_full_lines_cumulative_total() {
+        let pressure = "some avg10=41.20 avg60=38.00 avg300=12.00 total=93000000\n\
+                        full avg10=22.50 avg60=19.00 avg300=6.00 total=51000000\n";
+        assert_eq!(
+            io_full_stall_total(pressure),
+            Some(std::time::Duration::from_secs(51))
+        );
+        // A kernel that keeps only `some` (memory pressure on old kernels,
+        // for one) has no answer here, which is not a zero.
+        assert_eq!(
+            io_full_stall_total("some avg10=0.00 avg60=0.00 avg300=0.00 total=12\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn only_a_thread_in_uninterruptible_sleep_puts_a_process_in_the_kernels_hands() {
+        let zombie = KernelThreadStates {
+            leader: Some('Z'),
+            threads: 1,
+            uninterruptible: Vec::new(),
+        };
+        assert!(!zombie.waiting_in_kernel());
+        let syncing = KernelThreadStates {
+            leader: Some('S'),
+            threads: 7,
+            uninterruptible: vec![(4243, Some("ext4_sync_file".into()))],
+        };
+        assert!(syncing.waiting_in_kernel());
     }
 
     #[cfg(target_os = "linux")]

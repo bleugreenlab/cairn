@@ -5314,6 +5314,18 @@ pub struct LearnedResourceEstimate {
 /// without fsync, a file only it reads. No frame, variant, field or serialized
 /// form changes, and a runner talking to an older executor gets nothing wrong.
 ///
+/// cairn/5681 does not move the number. The runner stops retiring a colocated
+/// executor whose thread is in uninterruptible sleep, and says so: it gains
+/// [`ExecutorSubstrateState::KernelWait`], [`RetirementOutcome::AwaitingKernel`]
+/// and [`ColocatedSupervision::kernel_wait`], and `KernelThreadStates` becomes
+/// serializable to carry the reading. All three are declared by the runner
+/// about its own child and read only by its own surfaces (the executors page,
+/// the desktop's fleet pane); no executor sends or receives any of them, and
+/// the new field is a serde-defaulted optional. The startup silence budget now
+/// discounts time the host spent fully stalled on I/O, which is a runner-side
+/// reading of `/proc/pressure/io`; the constant itself does not change. A
+/// runner talking to an older executor gets nothing wrong.
+///
 /// cairn/5661 does not move the number. The runner reads, for the inference
 /// pool controller, how many batches the machines of a pool are executing and
 /// at which submitted priority (from the snapshots they already post), and how
@@ -6437,6 +6449,17 @@ pub const EXECUTOR_ADOPTION_HANDOFF_BUDGET_MS: u64 = 8_000;
 /// handoff wait on a contended authority, so this still has to contain that
 /// wait with room to spare. Sized below it, the supervisor would kill a
 /// successor for patiently doing the right thing.
+///
+/// The silence it bounds is the executor's, not the host's (cairn/5681). No
+/// constant contains a disk that takes 50 s to complete one fsync, and a bound
+/// that fires on disk latency turns a slow host into a retirement storm. So
+/// the supervisor does not count time the host spent fully stalled on I/O,
+/// where the kernel reports it (`full` in `/proc/pressure/io`), and when the
+/// budget does run out with a thread of the executor in uninterruptible sleep
+/// it waits for the kernel to return that thread instead of retiring a process
+/// SIGKILL could not end anyway. Where neither can be read the wall-clock bound
+/// stands: an instrument that is missing disables the allowance, it never
+/// shortens the bound.
 pub const EXECUTOR_STARTUP_PROGRESS_BUDGET_MS: u64 = 12_000;
 
 // The three budgets above are one chain, and each link must clear the next: an
@@ -8948,6 +8971,13 @@ pub enum ExecutorSubstrateState {
     /// supervisor is deliberately not starting a successor. Not a recovery in
     /// progress: it ends when that process exits, and the diagnostic names it.
     GenerationHeld,
+    /// A thread of the local executor is in uninterruptible sleep, almost
+    /// always waiting on storage, so nothing the supervisor could send it would
+    /// act until that wait returns: a starting generation is neither retired
+    /// nor replaced, and a SIGKILLed one holds its successor. Declared only by
+    /// the runner for its own colocated executor; the diagnostic names the
+    /// threads and the kernel function they wait in.
+    KernelWait,
 }
 
 /// What the runner knows about supervising its colocated executor across
@@ -8974,6 +9004,10 @@ pub struct ColocatedSupervision {
     /// generation lock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation_hold: Option<ColocatedGenerationHold>,
+    /// Set while the supervisor is waiting on the kernel to hand back a thread
+    /// of its executor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_wait: Option<ColocatedKernelWait>,
     /// The most recent retirement of an outgoing colocated executor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_retirement: Option<ExecutorRetirementSummary>,
@@ -9074,6 +9108,38 @@ pub struct UnresolvedCell {
     pub next_verification_unix_ms: u64,
 }
 
+/// The local executor has a thread in uninterruptible sleep, and the supervisor
+/// is waiting for the kernel to return it rather than acting on the process.
+///
+/// Retiring such a process frees nothing: SIGKILL is deferred until the sleep
+/// ends, and its files, the generation lock among them, stay open until then.
+/// So a starting generation in this state keeps its startup budget paused, and
+/// a killed one holds its successor, and the thread states are read again on
+/// the supervisor's own cadence until no thread is in the kernel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ColocatedKernelWait {
+    pub pid: u32,
+    pub stage: KernelWaitStage,
+    /// When the supervisor first found this process in the kernel at this
+    /// stage.
+    pub since_unix_ms: u64,
+    /// What the kernel said at the latest read.
+    pub kernel: crate::process_identity::KernelThreadStates,
+    pub last_read_unix_ms: u64,
+}
+
+/// Which process the supervisor is waiting on the kernel for.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelWaitStage {
+    /// A generation that has not reached readiness, whose silence ran past its
+    /// startup budget while a thread of it was in the kernel.
+    Starting,
+    /// A retired generation that was SIGKILLed and has not finished exiting.
+    Killed,
+}
+
 /// A live process the supervisor found holding the generation lock it needs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -9144,6 +9210,11 @@ pub enum RetirementOutcome {
     Retired,
     /// The process outlived the phase named.
     Stuck { phase: RetirementPhase },
+    /// The process was SIGKILLed and has a thread in uninterruptible sleep:
+    /// the kernel ends it when that wait returns, and nothing the runner
+    /// sends shortens it. Not stuck in any phase the runner could escalate
+    /// past; the successor waits on the kernel, not on another attempt.
+    AwaitingKernel,
 }
 
 /// One retirement of an outgoing colocated executor, as it is reported.
