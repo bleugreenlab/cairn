@@ -466,7 +466,12 @@ fn sealed_coordinates(
 }
 
 fn substrate_failure_kind(failure: &SubstrateFailure) -> CheckFailureKind {
-    if failure.shape() == SubstrateFailureShape::Capacity {
+    // A preempted check is re-armed like one that found no room: the machine
+    // was taken for a model, which says nothing against the infrastructure.
+    if matches!(
+        failure.shape(),
+        SubstrateFailureShape::Capacity | SubstrateFailureShape::CommandPreempted
+    ) {
         CheckFailureKind::Capacity
     } else {
         CheckFailureKind::Infrastructure
@@ -3843,6 +3848,7 @@ fn capacity_retry_decision(outcome: &PlannedCheckBatchOutcome) -> CapacityRetry 
                         failure.shape(),
                         SubstrateFailureShape::Capacity
                             | SubstrateFailureShape::EnvironmentRetired
+                            | SubstrateFailureShape::CommandPreempted
                     )
             )
         });
@@ -4525,6 +4531,13 @@ pub(crate) enum SubstrateFailureShape {
     /// the tree was decided: a wedged test says where to look, not whether
     /// the change is good.
     CommandStalled,
+    /// The check was running on a machine an inference deployment is loading
+    /// onto, its measured memory was in the deployment's way once the drain's
+    /// bound passed, and Cairn stopped it to make room. A named non-verdict
+    /// beside `CommandStalled`: nothing about the tree was decided, and the
+    /// check is restartable, so it is presented again at once and placement
+    /// keeps it off the machine the deployment holds.
+    CommandPreempted,
     /// The kernel's out-of-memory killer killed part of the check's process
     /// tree while it ran. Whatever exit the command chose afterwards is the
     /// consequence of that, so this is the machine's capacity rather than a
@@ -4580,6 +4593,9 @@ impl SubstrateFailureShape {
             Self::CommandStalled => {
                 "This check stopped making progress, so Cairn stopped it before it produced a verdict."
             }
+            Self::CommandPreempted => {
+                "Cairn stopped this check before it produced a verdict to make room for an inference model loading on its machine. It is run again elsewhere; this is not a verdict on the code."
+            }
             Self::CommandOomKilled => {
                 "The machine ran out of memory while this check ran, and the kernel killed part of it. That is the machine's capacity, not a verdict on the code."
             }
@@ -4607,7 +4623,10 @@ impl SubstrateFailureShape {
     /// only spend the machine twice for the same answer.
     #[cfg(test)]
     fn is_transient(self) -> bool {
-        matches!(self, Self::Capacity | Self::EnvironmentRetired)
+        matches!(
+            self,
+            Self::Capacity | Self::EnvironmentRetired | Self::CommandPreempted
+        )
     }
 }
 
@@ -4711,7 +4730,7 @@ fn tail_lines(text: &str, budget: usize) -> String {
 }
 
 /// What an executor's refusal to start a cell says about the check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum NoStart {
     /// A substrate condition, in the shape an agent is told.
     Substrate(SubstrateFailureShape),
@@ -4830,6 +4849,10 @@ fn infra_repair_domain(
             | SubstrateFailureShape::OutcomeUnknown
             | SubstrateFailureShape::Storage
             | SubstrateFailureShape::RunnerFault => InfraRepairDomain::Head,
+            // A machine taken for an inference load: nothing about the suite,
+            // the head or the machine's health, and the very next placement
+            // goes elsewhere. Narrow, like capacity.
+            SubstrateFailureShape::CommandPreempted => InfraRepairDomain::Head,
             // A stalled command is the suite's own: some test or step in it
             // waited on something that never came. That is a defect in the
             // command at this head, owned by whoever owns the suite, and no
@@ -10199,9 +10222,14 @@ fn stopped_command_failure(
             ),
         ),
         // Cairn ended the command itself: a cancellation, not a substrate
-        // failure, so nothing is charged to the platform it ran on.
+        // failure, so nothing is charged to the platform it ran on. A
+        // preemption for an inference load is the one cancellation that is
+        // presented again, and it names the machine it was taken from.
         cairn_common::executor_protocol::CommandStop::Cancelled => {
-            return CheckExecutionFailure::Cancelled(cancel_cause(account));
+            match cancelled_check(cancel_cause(account)) {
+                CheckExecutionFailure::Substrate(failure) => failure,
+                cancelled => return cancelled,
+            }
         }
         cairn_common::executor_protocol::CommandStop::OomKilled { .. } => SubstrateFailure::new(
             SubstrateFailureShape::CommandOomKilled,
@@ -10225,7 +10253,24 @@ fn capitalized(text: &str) -> String {
 fn cancel_cause(account: &crate::fleet::CellAccount) -> crate::fleet::CancelCause {
     account
         .cancel_cause
+        .clone()
         .unwrap_or(crate::fleet::CancelCause::Unrecorded)
+}
+
+/// A cancellation the runner recorded, as a check's result. Preempted for an
+/// inference load is `CommandPreempted`, naming the model and the measured
+/// memory it needed, which the capacity loop presents again at once; every
+/// other cause is the cancellation it is, and is never stored.
+fn cancelled_check(cause: crate::fleet::CancelCause) -> CheckExecutionFailure {
+    match cause {
+        crate::fleet::CancelCause::Preempted(preemption) => {
+            CheckExecutionFailure::Substrate(SubstrateFailure::new(
+                SubstrateFailureShape::CommandPreempted,
+                format!("{}.", capitalized(&preemption.sentence())),
+            ))
+        }
+        cause => CheckExecutionFailure::Cancelled(cause),
+    }
 }
 
 /// What a coalesced wait delivered, as a check result.
@@ -10242,7 +10287,7 @@ fn check_result_from_delivery(
         Err(CoalescedWaitError::Refused(outcome)) => {
             check_result_from_cell_outcome(*outcome, &crate::fleet::CellAccount::default(), None)
         }
-        Err(CoalescedWaitError::Cancelled(cause)) => Err(CheckExecutionFailure::Cancelled(cause)),
+        Err(CoalescedWaitError::Cancelled(cause)) => Err(cancelled_check(cause)),
         Err(CoalescedWaitError::LeaderVanished) => Err(CheckExecutionFailure::substrate(
             SubstrateFailureShape::RunnerFault,
             "the shared execution's leader ended without publishing a terminal outcome",
@@ -10401,9 +10446,7 @@ fn outcome_result(
             SubstrateFailureShape::Storage,
             format!("storage failure ({stage:?}/{kind:?}): {diagnostic}"),
         )),
-        CellOutcome::Cancelled { .. } => {
-            Err(CheckExecutionFailure::Cancelled(cancel_cause(account)))
-        }
+        CellOutcome::Cancelled { .. } => Err(cancelled_check(cancel_cause(account))),
     }
 }
 
@@ -16316,6 +16359,74 @@ cairn-common = { path = "../cairn-common" }
     /// Capacity and retirement of the selected environment are the two
     /// conditions a fresh placement can relieve. Everything else is
     /// re-presented unchanged and would only spend the machine twice.
+    /// A check preempted for an inference load is the named non-verdict: not
+    /// red, re-armable like capacity, charged to no machine or fleet, presented
+    /// again at once, and its record names the model and the measured memory.
+    #[test]
+    fn a_preempted_check_is_a_named_non_verdict_presented_again() {
+        use crate::fleet::{inference::Preemption, CancelCause, CellAccount};
+        let preemption = Preemption {
+            deployment: "dsv4f-tp2".into(),
+            model: "DeepSeek-V4-Flash".into(),
+            executor: "bginf-sp1".into(),
+            need_bytes: 100 << 30,
+            free_bytes: 60 << 30,
+            resident_bytes: 35 << 30,
+        };
+        let account = CellAccount {
+            cancel_cause: Some(CancelCause::Preempted(std::sync::Arc::new(preemption))),
+            ..CellAccount::default()
+        };
+        let cancelled = CellOutcome::Cancelled {
+            request_id: "r".into(),
+            attempt_id: "a".into(),
+        };
+        let Err(CheckExecutionFailure::Substrate(failure)) =
+            check_result_from_cell_outcome(cancelled, &account, None)
+        else {
+            panic!("a preemption is a substrate non-verdict, not a cancellation");
+        };
+        assert_eq!(failure.shape(), SubstrateFailureShape::CommandPreempted);
+        let message = failure.agent_message();
+        assert!(
+            message.contains("this is not a verdict on the code"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Preempted to load DeepSeek-V4-Flash (inference deployment dsv4f-tp2) on bginf-sp1, which needed 100.0 GiB there with 60.0 GiB free while this work held 35.0 GiB, measured."),
+            "{message}"
+        );
+        let kind = substrate_failure_kind(&failure);
+        assert_eq!(kind, CheckFailureKind::Capacity);
+        assert!(!kind.is_verdict_about_the_code(), "never red");
+        assert_eq!(
+            infra_repair_domain(Some(failure.shape()), Some(kind)),
+            InfraRepairDomain::Head
+        );
+
+        let stopped = stopped_command_failure(
+            &cairn_common::executor_protocol::CommandStop::Cancelled,
+            "",
+            serde_json::from_value(serde_json::json!({
+                "executorId": "e-1", "slotId": "slot", "cellEpoch": 1,
+                "startedAtUnixMs": 1, "finishedAtUnixMs": 2,
+            }))
+            .unwrap(),
+            &account,
+        );
+        let CheckExecutionFailure::Substrate(stopped) = stopped else {
+            panic!("a stopped preempted command is the same non-verdict");
+        };
+        assert_eq!(stopped.shape(), SubstrateFailureShape::CommandPreempted);
+        assert!(stopped.provenance().is_some(), "it names where it ran");
+
+        let outcome = PlannedCheckBatchOutcome::failed(vec![0, 1], failure);
+        assert!(matches!(
+            capacity_retry_decision(&outcome),
+            CapacityRetry::Again { .. }
+        ));
+    }
+
     #[test]
     fn only_a_capacity_refusal_is_worth_asking_again() {
         assert!(SubstrateFailureShape::Capacity.is_transient());
@@ -16991,7 +17102,7 @@ cairn-common = { path = "../cairn-common" }
     /// against whichever one a specimen happens to use. The match below makes
     /// the list exhaustive by construction: a new shape stops compiling here
     /// until it is added.
-    const ALL_SUBSTRATE_SHAPES: [SubstrateFailureShape; 17] = [
+    const ALL_SUBSTRATE_SHAPES: [SubstrateFailureShape; 18] = [
         SubstrateFailureShape::Dispatch,
         SubstrateFailureShape::Capacity,
         SubstrateFailureShape::MachineUnreachable,
@@ -17005,6 +17116,7 @@ cairn-common = { path = "../cairn-common" }
         SubstrateFailureShape::Storage,
         SubstrateFailureShape::RunnerFault,
         SubstrateFailureShape::CommandStalled,
+        SubstrateFailureShape::CommandPreempted,
         SubstrateFailureShape::CommandOomKilled,
         SubstrateFailureShape::BuildVolumeAbsent,
         SubstrateFailureShape::BuildVolumeLost,
@@ -17035,6 +17147,7 @@ cairn-common = { path = "../cairn-common" }
                 | SubstrateFailureShape::Storage
                 | SubstrateFailureShape::RunnerFault
                 | SubstrateFailureShape::CommandStalled
+                | SubstrateFailureShape::CommandPreempted
                 | SubstrateFailureShape::CommandOomKilled
                 | SubstrateFailureShape::BuildVolumeAbsent
                 | SubstrateFailureShape::BuildVolumeLost

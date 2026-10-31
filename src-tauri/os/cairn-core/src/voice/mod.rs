@@ -74,7 +74,19 @@ pub struct VoiceStatus {
     pub preferred_dictation_model: VoiceModel,
     pub dictation_mode: DictationMode,
     pub input_device_id: Option<String>,
-    pub detail: Option<String>,
+    /// Why the engine this app needs could not be installed, while it is not.
+    /// Without it a stale engine can only report that it is incompatible, which
+    /// says nothing about whether downloading again can help.
+    pub engine_failure: Option<VoiceFailure>,
+}
+
+/// A failed engine install, as the settings surface renders it: `code` is the
+/// stable [`VoiceError::code`] its copy keys on, `message` the error itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceFailure {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +198,30 @@ pub enum VoiceError {
     Transport(String),
     #[error("voice installation failed: {0}")]
     Install(String),
+    /// The release has no engine for this exact app version and target. The
+    /// handshake is exact-version, so no other release's engine can stand in.
+    #[error("exact-version voice engine release asset is unavailable: {0}")]
+    ReleaseAssetMissing(String),
+}
+
+impl VoiceError {
+    /// The stable name a surface keys its copy on; the display text is for
+    /// people and may change.
+    pub fn code(&self) -> &'static str {
+        match self {
+            VoiceError::UnsupportedTarget => "unsupported_target",
+            VoiceError::NotInstalled => "not_installed",
+            VoiceError::Corrupt(_) => "corrupt_component",
+            VoiceError::Incompatible(_) => "protocol_mismatch",
+            VoiceError::Busy => "busy",
+            VoiceError::Backpressure => "backpressure",
+            VoiceError::InvalidInput(_) => "invalid_input",
+            VoiceError::Request { .. } => "request_failed",
+            VoiceError::Transport(_) => "transport_failed",
+            VoiceError::Install(_) => "install_failed",
+            VoiceError::ReleaseAssetMissing(_) => "release_asset_missing",
+        }
+    }
 }
 
 pub type VoiceResult<T> = Result<T, VoiceError>;

@@ -2629,37 +2629,46 @@ async fn tree_bound_item_without_resolvable_context_fails_before_execution() {
     );
 }
 
-/// How long the setsid escapee holds the stdout pipe before exiting on its own.
-/// A call that waited for the pipe to close would take at least this long.
-const SETSID_ESCAPEE_LIFETIME: Duration = Duration::from_secs(60);
+/// How long the call may run while a process outside the command holds its
+/// stdout. A call that waited for that pipe to close would never return on its
+/// own, because the test keeps the pipe open until after this bound.
+const HELD_STDOUT_BOUND: Duration = Duration::from_secs(60);
 
-// A child that calls setsid leaves the command's process group and keeps the
-// stdout pipe write end open after the command itself has exited, so an
-// unbounded reader join would hang until the escapee chose to exit. The call
-// must return while the escapee is still alive and holding the pipe, with the
-// output written before the command exited.
+// A process outside the command can keep the command's stdout write end open
+// after the command itself has exited, so an unbounded reader join would hang
+// for as long as that process chose. The call must return with the output the
+// command wrote, while the pipe is still held.
 //
-// Every ordering here is causal rather than raced against a clock:
+// The holder is this test. The command hands its stdout descriptor over a unix
+// socket (SCM_RIGHTS) and exits, so the pipe stays open from the command's
+// first instruction until the descriptor is dropped below: first through the
+// command, then in the kernel's in-flight message, then here. No holder inside
+// the command's tree can promise that. A setsid escapee is one on Linux, but
+// macOS teardown signals the group of every descendant its sampler recorded
+// while the escapee was still linked to its parent, so the escapee survives
+// only when the sample happens to miss it.
+//
 // - A warm-up batch acquires the job's execution home first, so environment
-//   acquisition is not inside the measured call.
-// - The escapee batch declares no `timeout`. A declared timeout also bounds
+//   acquisition is not inside the bounded call.
+// - The handoff batch declares no `timeout`. A declared timeout also bounds
 //   how long placement may wait, and an item that exits at once never needs
 //   one; a short one only lets acquisition refuse the batch.
-// - The parent perl exits only after the child has called setsid and printed,
-//   so the output is in the pipe before the command exits and the escape has
-//   definitely happened.
-// (Uses perl for setsid so it works on macOS, which lacks the binary.)
+// - The connection completes into the listener's backlog and the message is
+//   buffered with it, so accepting after the call returns loses nothing.
 #[tokio::test]
-async fn setsid_escapee_does_not_hang_the_call() {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::{getsid, Pid};
+async fn stdout_held_outside_the_command_does_not_hang_the_call() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixListener;
 
-    let (_temp, _db, orch, cwd) = setup("run-setsid").await;
+    use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, UnixAddr};
+
+    let (_temp, _db, orch, cwd) = setup("run-held-stdout").await;
     let warm = handle_run(
         &orch,
         &request(
             &cwd,
-            Some("run-setsid"),
+            Some("run-held-stdout"),
             json!({ "commands": [{ "command": "true" }] }),
         ),
     )
@@ -2669,39 +2678,76 @@ async fn setsid_escapee_does_not_hang_the_call() {
         "the warm-up batch must acquire the job's execution home and run: {warm}"
     );
 
-    let escapee = format!(
-        r#"perl -e 'pipe(my $r, my $w) or die "pipe: $!"; defined(my $pid = fork()) or die "fork: $!"; if ($pid) {{ close $w; <$r>; exit 0 }} close $r; require POSIX; POSIX::setsid() or die "setsid: $!"; $| = 1; print "escaped $$\n"; close $w; sleep {}'"#,
-        SETSID_ESCAPEE_LIFETIME.as_secs()
+    // Directly under /tmp so the socket path fits a unix socket address on
+    // macOS, whose per-user temp root is already long.
+    let socket_dir = tempfile::Builder::new()
+        .prefix("cairn-")
+        .tempdir_in("/tmp")
+        .expect("create a short socket directory");
+    let socket_path = socket_dir.path().join("held");
+    let listener = UnixListener::bind(&socket_path).expect("bind the holder's socket");
+
+    let handoff = format!(
+        r#"python3 -c 'import array, socket, sys; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(sys.argv[1]); s.sendmsg([b"x"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [1]))]); print("handed off", flush=True)' {}"#,
+        socket_path.display()
     );
-    let payload = json!({ "commands": [{ "command": escapee }] });
+    let payload = json!({ "commands": [{ "command": handoff }] });
     let start = Instant::now();
-    let result = handle_run(&orch, &request(&cwd, Some("run-setsid"), payload)).await;
+    let result = tokio::time::timeout(
+        HELD_STDOUT_BOUND,
+        handle_run(&orch, &request(&cwd, Some("run-held-stdout"), payload)),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the call must return while a process outside the command holds its stdout; still waiting after {HELD_STDOUT_BOUND:?}"
+        )
+    });
     let elapsed = start.elapsed();
 
-    let pid = result
-        .split("escaped ")
-        .nth(1)
-        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
-        .and_then(|digits| digits.parse::<i32>().ok())
-        .map(Pid::from_raw)
-        .unwrap_or_else(|| {
-            panic!("output written before the command exited must be captured: {result}")
-        });
-    let escapee_alive = kill(pid, None).is_ok();
-    // Only the escapee is the leader of its own session; anything else at this
-    // pid is not ours to signal.
-    if getsid(Some(pid)) == Ok(pid) {
-        let _ = kill(pid, Signal::SIGKILL);
-    }
-
     assert!(
-        escapee_alive,
-        "the escapee must still hold the pipe when the call returns, or this test proves nothing: {result}"
+        result.contains("handed off"),
+        "output written before the command exited must be captured: {result}"
+    );
+    listener
+        .set_nonblocking(true)
+        .expect("accept without waiting");
+    let (connection, _) = listener.accept().unwrap_or_else(|error| {
+        panic!("the command must hand its stdout to the test, or this test proves nothing ({error}): {result}")
+    });
+    let mut byte = [0u8; 1];
+    let mut iov = [std::io::IoSliceMut::new(&mut byte)];
+    let mut space = nix::cmsg_space!([std::os::fd::RawFd; 1]);
+    let message = recvmsg::<UnixAddr>(
+        connection.as_raw_fd(),
+        &mut iov,
+        Some(&mut space),
+        MsgFlags::empty(),
+    )
+    .expect("receive the handed-off descriptor");
+    let held: OwnedFd = message
+        .cmsgs()
+        .expect("read the handoff's control messages")
+        .find_map(|control| match control {
+            ControlMessageOwned::ScmRights(fds) => fds.first().copied(),
+            _ => None,
+        })
+        // SAFETY: SCM_RIGHTS installed this descriptor in this process for us.
+        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+        .unwrap_or_else(|| panic!("the handoff must carry a descriptor: {result}"));
+    let held = std::fs::File::from(held);
+    assert!(
+        held.metadata()
+            .expect("stat the held descriptor")
+            .file_type()
+            .is_fifo(),
+        "the held descriptor must be the command's stdout pipe, or this test proves nothing: {result}"
     );
     assert!(
-        elapsed < SETSID_ESCAPEE_LIFETIME,
-        "the call must return without waiting for the escapee to release the pipe; took {elapsed:?}"
+        elapsed < HELD_STDOUT_BOUND,
+        "the call must return without waiting for the held stdout to close; took {elapsed:?}"
     );
+    drop(held);
 }
 
 /// Whether an interpreter binary resolves on the test PATH, so a minimal CI

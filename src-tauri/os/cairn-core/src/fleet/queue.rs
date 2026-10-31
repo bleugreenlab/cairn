@@ -212,6 +212,12 @@ pub(crate) struct QueueEntry {
     /// kept rather than erased, so a request that reaches its horizon can still
     /// say who refused it and why.
     pub(crate) declined: HashMap<String, EntryDecline>,
+    /// The machines the latest placement pass passed over only because an
+    /// inference deployment holds them, by executor id. A held machine is
+    /// never offered the work, so it never declines; this is how the queue
+    /// still knows the entry is waiting for it. Restated on every pass, so a
+    /// released hold leaves it.
+    pub(crate) held_for_inference: HashSet<String>,
     /// Offer, claim, decline, in order, for the placement record.
     pub(crate) chain: Vec<BindingEvent>,
     /// A re-offer to the machine whose decline is this entry's latest binding
@@ -664,6 +670,7 @@ impl ExecutionQueue {
             execution_residency: new.execution_residency,
             state: EntryState::Queued,
             declined: HashMap::new(),
+            held_for_inference: HashSet::new(),
             chain: Vec::new(),
             reoffer: None,
             journaled_rows: 0,
@@ -710,6 +717,15 @@ impl ExecutionQueue {
         let state = self.entries.lock().unwrap();
         let id = state.by_identity.get(identity)?;
         state.entries.get(id).map(read)
+    }
+
+    /// Restate which machines this entry's latest placement pass passed over
+    /// only for an inference hold.
+    pub(crate) fn note_inference_holds(&self, id: &str, executor_ids: HashSet<String>) {
+        let mut state = self.entries.lock().unwrap();
+        if let Some(entry) = state.entries.get_mut(id) {
+            entry.held_for_inference = executor_ids;
+        }
     }
 
     pub(crate) fn state_of(&self, id: &str) -> Option<EntryState> {
@@ -1431,17 +1447,17 @@ fn journal_row(
     }
 }
 
-/// A typed disk refusal in one clause: the floor it hit and whether
-/// reclamation can still relieve it.
 /// Whether unloading an inference deployment from the machine that declined
 /// would relieve the decline. Counting one it would not (the disk floor, the
 /// CPU brake, a toolchain, project eligibility) would unload a model for
 /// nothing and reload it on the next request, a multi-minute load each way.
 ///
-/// No reason recorded today qualifies: a reserved machine's refusal (the
-/// inference drain reason) and a memory-fit refusal whose shortfall is the
-/// resident footprint do, and neither exists yet. Exhaustive on purpose, so a
-/// new reason is classified where it is introduced.
+/// No machine-side decline qualifies. A machine a deployment holds is never
+/// offered batch work, so it never declines any: the queue learns that an
+/// entry waits for it from [`QueueEntry::held_for_inference`] instead. A
+/// memory decline does not qualify either, because the machine cannot say
+/// whose memory it is short of. Exhaustive on purpose, so a new reason is
+/// classified where it is introduced.
 fn relieved_by_unload(reason: DeclineReason) -> bool {
     match reason {
         DeclineReason::Capacity
@@ -1617,9 +1633,11 @@ impl ExecutionQueue {
             .collect()
     }
 
-    /// How many unclaimed entries any of `executor_ids` declined for a reason
-    /// unloading a model from that machine would relieve: the build pressure
-    /// that lets the inference pool controller unload an idle model.
+    /// How many unclaimed entries would be relieved by unloading a model from
+    /// any of `executor_ids`: entries placement is holding off one of them for
+    /// an inference hold, or that one declined for a reason an unload
+    /// relieves. The build pressure that lets the inference pool controller
+    /// unload an idle model.
     pub(crate) fn waiting_relieved_by_unload(&self, executor_ids: &HashSet<String>) -> u32 {
         if executor_ids.is_empty() {
             return 0;
@@ -1630,9 +1648,10 @@ impl ExecutionQueue {
             .values()
             .filter(|entry| !matches!(entry.state, EntryState::Claimed { .. }))
             .filter(|entry| {
-                entry.declined.iter().any(|(id, decline)| {
-                    executor_ids.contains(id) && relieved_by_unload(decline.reason)
-                })
+                !entry.held_for_inference.is_disjoint(executor_ids)
+                    || entry.declined.iter().any(|(id, decline)| {
+                        executor_ids.contains(id) && relieved_by_unload(decline.reason)
+                    })
             })
             .count();
         u32::try_from(count).unwrap_or(u32::MAX)

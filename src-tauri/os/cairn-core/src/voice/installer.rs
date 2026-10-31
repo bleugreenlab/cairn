@@ -404,12 +404,27 @@ impl ComponentInstaller {
         component.kind == "engine" && component.id == engine_asset_name(&self.app_version, target)
     }
 
+    /// Install a catalogued model, reusing the installed one when it still
+    /// verifies against the catalogue's digest: those are already the bytes a
+    /// download would fetch, and a model is hundreds of megabytes.
     pub async fn install_model(&self, artifact: &ModelArtifact) -> VoiceResult<ManagedComponent> {
         let _guard = self.install_lock.lock().await;
+        let kind = format!("model:{:?}", artifact.model).to_lowercase();
+        if let Some(installed) = self
+            .manifest()
+            .await?
+            .components
+            .into_iter()
+            .find(|component| component.kind == kind && component.sha256 == artifact.sha256)
+        {
+            if self.verify(&installed).await.is_ok() {
+                return Ok(installed);
+            }
+        }
         let destination = self.root.join("models").join(artifact.file_name);
         let component = self
             .download_verified(
-                &format!("model:{:?}", artifact.model).to_lowercase(),
+                &kind,
                 artifact.url,
                 &destination,
                 Some(artifact.size_bytes),
@@ -470,13 +485,18 @@ impl ComponentInstaller {
             .get(url)
             .send()
             .await
-            .map_err(|error| VoiceError::Install(format!("download failed: {error}")))?
-            .error_for_status()
-            .map_err(|error| {
-                VoiceError::Install(format!(
-                    "exact-version release asset is unavailable: {error}"
-                ))
-            })?;
+            .map_err(|error| VoiceError::Install(format!("download failed: {error}")))?;
+        // A release whose assets are not uploaded yet (a draft) answers 404.
+        // That is the one failure no retry can fix, so it is named apart from
+        // the transient ones.
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(VoiceError::ReleaseAssetMissing(format!(
+                "{url} returned 404 Not Found"
+            )));
+        }
+        let response = response.error_for_status().map_err(|error| {
+            VoiceError::Install(format!("release asset request failed: {error}"))
+        })?;
         if response
             .content_length()
             .is_some_and(|length| length > limit)
@@ -1283,6 +1303,65 @@ mod tests {
             .components
             .iter()
             .any(|component| component.id == model.id));
+    }
+
+    /// A second install of a model that still verifies is a no-op. The
+    /// artifact's URL is unreachable, so any request would fail the install.
+    #[tokio::test]
+    async fn installing_a_verified_model_again_makes_no_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let bytes = b"a verified model";
+        let sha256: &'static str =
+            Box::leak(format!("{:x}", Sha256::digest(bytes)).into_boxed_str());
+        let artifact = ModelArtifact {
+            model: super::super::VoiceModel::Fast,
+            file_name: "model-fast.bin",
+            url: "http://127.0.0.1:1/model-fast.bin",
+            size_bytes: bytes.len() as u64,
+            sha256,
+        };
+        let path = root.join("models").join(artifact.file_name);
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, bytes).await.unwrap();
+        let (events, recorded) = recording_sink();
+        let installer = ComponentInstaller::new(
+            root.to_path_buf(),
+            "http://127.0.0.1:1",
+            "1.2.3",
+            "test-build",
+            move |event| events(event),
+        );
+        installer
+            .publish(ManagedComponent {
+                kind: "model:fast".into(),
+                id: artifact.file_name.into(),
+                target: None,
+                size_bytes: artifact.size_bytes,
+                sha256: sha256.into(),
+                path: path.clone(),
+            })
+            .await
+            .unwrap();
+
+        let reinstalled = installer
+            .install_model(&artifact)
+            .await
+            .expect("a verified model installs without a request");
+        assert_eq!(reinstalled.path, path);
+        assert!(recorded.lock().unwrap().is_empty(), "no download started");
+
+        tokio::fs::write(&path, b"a corrupted model").await.unwrap();
+        let error = installer
+            .install_model(&artifact)
+            .await
+            .expect_err("a model that no longer verifies is downloaded again");
+        assert!(
+            matches!(&error, VoiceError::Install(message) if message.starts_with("download failed")),
+            "{error}"
+        );
     }
 
     /// The cross-language contract: exactly what `handOffVoiceEngine` in

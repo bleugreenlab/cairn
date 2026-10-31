@@ -920,7 +920,7 @@ impl From<CellOutcome> for LeaderSettlement {
 /// than being synthesized into an outcome a reader takes for a lost machine.
 /// Distinct from [`WithdrawalCause`], which is the runner abandoning one queue
 /// entry for reasons of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CancelCause {
     /// An operator, or a merge's resolution cascade, stopped the job.
     JobStopped,
@@ -934,21 +934,25 @@ pub(crate) enum CancelCause {
     Superseded,
     /// This runner began shutting down.
     RunnerStopping,
+    /// An inference deployment loading on its machine needed the memory this
+    /// work held, measured, and the work is restartable elsewhere.
+    Preempted(Arc<inference::Preemption>),
     /// A cancellation came back with no cause on record.
     Unrecorded,
 }
 
 impl CancelCause {
     /// The cause as the clause a requester reads after "cancelled: ".
-    pub(crate) fn sentence(self) -> &'static str {
+    pub(crate) fn sentence(&self) -> String {
         match self {
-            Self::JobStopped => "job stopped",
-            Self::SessionClosed => "its issue resolved and closed the job's session",
-            Self::OperatorCompact => "the operator compacted the job",
-            Self::OperatorRetracted => "the operator cancelled this request",
-            Self::Superseded => "a newer request for the same answer replaced it",
-            Self::RunnerStopping => "Cairn's runner is stopping",
-            Self::Unrecorded => "cause not recorded",
+            Self::JobStopped => "job stopped".into(),
+            Self::SessionClosed => "its issue resolved and closed the job's session".into(),
+            Self::OperatorCompact => "the operator compacted the job".into(),
+            Self::OperatorRetracted => "the operator cancelled this request".into(),
+            Self::Superseded => "a newer request for the same answer replaced it".into(),
+            Self::RunnerStopping => "Cairn's runner is stopping".into(),
+            Self::Preempted(preemption) => preemption.sentence(),
+            Self::Unrecorded => "cause not recorded".into(),
         }
     }
 }
@@ -1061,6 +1065,11 @@ impl CancelCauses {
         let cause = self.causes.remove(identity)?;
         self.order.retain(|recorded| recorded != identity);
         Some(cause)
+    }
+
+    /// Whether this request was preempted and has not ended yet.
+    fn preempted(&self, identity: &RequestIdentity) -> bool {
+        matches!(self.causes.get(identity), Some(CancelCause::Preempted(_)))
     }
 }
 
@@ -7240,10 +7249,13 @@ impl Fleet {
             .lock()
             .unwrap()
             .advance(&candidates, &artifacts, now_unix_ms);
+        let mut released = false;
         let delivered = {
             let mut connections = self.lock_connections();
             for (executor_id, entry) in connections.iter_mut() {
-                entry.update_hold = step.hold.as_deref() == Some(executor_id.as_str());
+                let held = step.hold.as_deref() == Some(executor_id.as_str());
+                released |= entry.update_hold && !held;
+                entry.update_hold = held;
             }
             step.direct.as_ref().map(|directive| {
                 connections
@@ -7262,6 +7274,11 @@ impl Fleet {
                     })
             })
         };
+        // Placement waits on a machine being emptied for its update, so the
+        // hold's end is what offers it the waiting work.
+        if released {
+            self.connection_ready.notify_waiters();
+        }
         if let (Some(directive), Some(false)) = (&step.direct, delivered) {
             log::info!(
                 "self-update directive for executor_id={} did not reach generation {}; draining it again",
@@ -8024,7 +8041,7 @@ impl Fleet {
         self.cancel_causes
             .lock()
             .unwrap()
-            .record(request.clone(), cause);
+            .record(request.clone(), cause.clone());
         self.retirements.notify_waiters();
         self.detach_purpose_joiner(request, cause);
         if let Some((executor_id, generation)) = self.queue.binding_of(request) {
@@ -8072,7 +8089,7 @@ impl Fleet {
             .unwrap_or(purpose::RetirementCause::Retracted);
         for subscriber in subscribers {
             if let Detachment::Retired { leader: joined } =
-                self.detach_coalesced_subscriber(&subscriber, Some(cause))
+                self.detach_coalesced_subscriber(&subscriber, Some(cause.clone()))
             {
                 let placement =
                     self.queue
@@ -8486,7 +8503,7 @@ impl Fleet {
                 None
             }
         };
-        if let (Some(cause), Some(subscriber)) = (on_behalf, removed) {
+        if let (Some(cause), Some(subscriber)) = (on_behalf.clone(), removed) {
             let _ = subscriber
                 .waiter
                 .send(Err(CoalescedWaitError::Cancelled(cause)));
@@ -8542,7 +8559,7 @@ impl Fleet {
             .collect();
         let subscriber_count = subscribers.len();
         for identity in subscribers {
-            self.detach_coalesced_subscriber(&identity, Some(cause));
+            self.detach_coalesced_subscriber(&identity, Some(cause.clone()));
         }
 
         let coalesced_leaders = self.coalesced_leaders.lock().unwrap().clone();
@@ -8562,7 +8579,7 @@ impl Fleet {
                     self.cancel_causes
                         .lock()
                         .unwrap()
-                        .record((request_id.clone(), attempt_id.clone()), cause);
+                        .record((request_id.clone(), attempt_id.clone()), cause.clone());
                     self.send_to(
                         executor_id,
                         *generation,
@@ -12833,6 +12850,25 @@ impl Fleet {
                 }
                 Ok(Selection::Waiting { rejected }) => rejected,
             };
+            // A held machine is never offered the work, so it never declines
+            // it; the queue learns from this pass that the entry waits for
+            // one, which is the build pressure the inference pool controller
+            // weighs against a loaded model.
+            if let Some(entry_id) = entry_id {
+                self.queue.note_inference_holds(
+                    entry_id,
+                    rejected
+                        .iter()
+                        .filter(|rejection| {
+                            matches!(
+                                rejection.reason,
+                                PlacementRejectionReason::InferenceReserved { .. }
+                            )
+                        })
+                        .map(|rejection| rejection.executor_id.clone())
+                        .collect(),
+                );
+            }
             // Work kept off the machines it cannot run on is pending for a
             // reason the queue view owes its reader, and nothing else records a
             // pass that placed nothing.
@@ -14430,14 +14466,23 @@ fn survey_candidates<'a>(
     })
 }
 
-/// Whether a rejection is a capable machine's "not yet": its own decline, or
-/// a posted condition its admission would decline on. Either is something to
-/// wait for rather than a reason to refuse.
+/// Whether a rejection is something to wait for rather than a reason to
+/// refuse: a capable machine's "not yet" (its own decline, or a posted
+/// condition its admission would decline on), or a drain the runner holds that
+/// ends without anyone acting on the work (the self-update rollout's hold ends
+/// when the machine returns on the runner's build; an inference deployment's
+/// hold ends when the deployment stops, which the pool controller does when
+/// batches wait for its machines).
+///
+/// An operator's drain is not one. Only an operator ends it, so work it refuses
+/// is told so at once rather than parked on a decision nobody is making.
 fn waits_on_machine(reason: &PlacementRejectionReason) -> bool {
     matches!(
         reason,
         PlacementRejectionReason::Declined { .. }
             | PlacementRejectionReason::Held { .. }
+            | PlacementRejectionReason::UpdatePending
+            | PlacementRejectionReason::InferenceReserved { .. }
             | PlacementRejectionReason::ProvisioningTurn { .. }
     )
 }
@@ -14861,11 +14906,12 @@ fn rank_survey(
                 policy: policy_evidence(request, policy, false),
             });
         }
-        // A machine held on a condition it posted is something to wait for,
-        // like a decline, so the blind rest are not a reason to refuse.
+        // A machine that will take work once its condition or its hold ends
+        // is something to wait for, so the blind rest are not a reason to
+        // refuse.
         if rejected
             .iter()
-            .any(|rejection| matches!(rejection.reason, PlacementRejectionReason::Held { .. }))
+            .any(|rejection| waits_on_machine(&rejection.reason))
         {
             return Ok(PlacementDraft {
                 selected: None,
@@ -28435,10 +28481,12 @@ mod tests {
     }
 
     /// A machine an inference deployment holds is passed over for every class
-    /// of work and by an explicit selector, and the refusal names the
-    /// deployment; releasing the hold re-admits it.
+    /// of work and by an explicit selector. The hold ends on its own when the
+    /// deployment stops, so work that could go nowhere else waits on it, the
+    /// wait naming the deployment, instead of being refused; releasing the
+    /// hold re-admits it.
     #[test]
-    fn placement_passes_over_a_machine_held_for_inference() {
+    fn placement_waits_on_a_machine_held_for_inference() {
         let mut connections = HashMap::from([
             fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]),
             fleet_entry("bginf-sp1", "linux", 0, &[]),
@@ -28450,6 +28498,7 @@ mod tests {
         connections.get_mut("bginf-sp1").unwrap().inference_hold = Some(InferenceHold {
             deployment: "dsv4f-tp2".into(),
             phase: "starting".into(),
+            waiting_on: None,
         });
         let mut request = targeted_request("linux");
         request.executor = Some(ExecutorSelector {
@@ -28464,12 +28513,25 @@ mod tests {
             PlacementWorkClass::Services,
         ] {
             request.placement_work_class = work_class;
-            let refusal = place(&connections, &request)
-                .expect_err("a machine held for inference takes no batch work");
+            let draft = place(&connections, &request)
+                .expect("a machine held for inference is waited on, not refused");
             assert!(
-                refusal.contains("reserved for inference deployment dsv4f-tp2 (starting)"),
-                "{work_class:?}: {refusal}"
+                draft.selected.is_none(),
+                "{work_class:?}: a held machine takes no batch work"
             );
+            let held = draft
+                .rejected
+                .iter()
+                .find(|rejection| rejection.executor_name == "bginf-sp1")
+                .expect("the held machine is named in the wait");
+            assert!(
+                held.reason
+                    .describe()
+                    .contains("reserved for inference deployment dsv4f-tp2 (starting)"),
+                "{work_class:?}: {}",
+                held.reason.describe()
+            );
+            assert!(waits_on_machine(&held.reason));
         }
 
         connections.get_mut("bginf-sp1").unwrap().inference_hold = None;
@@ -28494,6 +28556,7 @@ mod tests {
         let hold = InferenceHold {
             deployment: "dsv4f-tp2".into(),
             phase: "healthy".into(),
+            waiting_on: None,
         };
         fleet.set_inference_holds(HashMap::from([("bginf-sp2".to_string(), hold.clone())]));
         assert_eq!(
@@ -29562,8 +29625,10 @@ mod tests {
         );
     }
 
+    /// Being emptied for an update ends on its own, so work only that machine
+    /// could take waits for it rather than dying for want of a machine.
     #[test]
-    fn placement_passes_over_a_machine_emptied_for_its_update() {
+    fn placement_waits_on_a_machine_emptied_for_its_update() {
         let mut connections = HashMap::from([
             fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]),
             fleet_entry("bbs", "linux", 0, &[]),
@@ -29578,11 +29643,24 @@ mod tests {
             name: Some("bbs".into()),
             ..ExecutorSelector::default()
         });
-        let refusal = place(&connections, &request)
-            .expect_err("a machine being emptied for its update takes no new work");
+        let draft = place(&connections, &request)
+            .expect("a machine being emptied for its update is waited on, not refused");
+        assert!(draft.selected.is_none(), "it takes no new work meanwhile");
         assert!(
-            refusal.contains("bbs is being emptied for an executor update"),
-            "{refusal}"
+            draft
+                .rejected
+                .iter()
+                .any(|rejection| rejection.executor_name == "bbs"
+                    && rejection.reason == PlacementRejectionReason::UpdatePending),
+            "{:?}",
+            draft.rejected
+        );
+        // What the requester reads if its horizon arrives first.
+        assert!(
+            describe_declines(&draft.rejected)
+                .contains("Waited on: bbs being emptied for an executor update"),
+            "{}",
+            describe_declines(&draft.rejected)
         );
 
         connections.get_mut("bbs").unwrap().update_hold = false;
@@ -29601,7 +29679,8 @@ mod tests {
     /// update. The other Mac with rust was excluded because its check lanes
     /// cannot apply a nested Seatbelt profile under the operator credential
     /// floor, and the refusal says so, along with the machines that are simply
-    /// not macOS.
+    /// not macOS. While the capable Mac is only being emptied the lane waits
+    /// for it; under an operator's drain it is refused with the whole account.
     #[test]
     fn a_macos_refusal_names_the_excluded_mac_and_the_capability_it_lacks() {
         let context = cairn_common::executor_protocol::NestedSandboxProbeContext {
@@ -29654,14 +29733,30 @@ mod tests {
             requires_macos_nested_sandbox_write: true,
             ..ExecutorSelector::default()
         });
+        let draft = place(&connections, &request)
+            .expect("the lane waits for the Mac being emptied for its update");
+        assert!(draft.selected.is_none());
+        assert!(
+            draft
+                .rejected
+                .iter()
+                .any(|rejection| rejection.executor_name == "bgsrv-mac"
+                    && rejection.reason == PlacementRejectionReason::UpdatePending),
+            "{:?}",
+            draft.rejected
+        );
+
+        let mac = connections.get_mut("bgsrv-mac").unwrap();
+        mac.update_hold = false;
+        mac.drained = true;
         let refusal = place(&connections, &request)
             .expect_err("no macOS machine can take a nested-Seatbelt check lane now");
         assert!(
-            refusal.contains("bgsrv-mac is being emptied for an executor update"),
+            refusal.contains("bgsrv-mac is drained by an operator"),
             "{refusal}"
         );
         assert!(
-            refusal.contains("bgsrv-mac: being emptied for an executor update"),
+            refusal.contains("bgsrv-mac: drained by an operator"),
             "{refusal}"
         );
         assert!(
@@ -36157,6 +36252,88 @@ mod tests {
                 health,
             },
         );
+    }
+
+    /// Work that only a machine held for inference could take waits on the
+    /// hold rather than being refused, the pool controller reads it as build
+    /// pressure on that machine (and only that machine), and releasing the hold
+    /// places it there.
+    #[tokio::test]
+    async fn work_waiting_on_an_inference_hold_is_build_pressure_and_places_on_release() {
+        let pool = Fleet::default();
+        let (sender, _colocated) = mpsc::unbounded_channel();
+        pool.attach_executor(sender);
+        let (_generation, _remote) = residency_queue_attach(&pool, "remote");
+        let remote_name = pool.executor_public_name("remote").unwrap();
+        let mut request = spillable_request();
+        request.repository = RepositoryLocator::ScratchOnly {
+            owner_id: request.project_id.clone(),
+        };
+        let mut policy = ActivePlacementPolicy::default_profile();
+        policy
+            .profile
+            .routes
+            .insert(request.placement_work_class, PlacementStance::RemoteOnly);
+        pool.set_inference_holds(HashMap::from([(
+            remote_name.clone(),
+            InferenceHold {
+                deployment: "dsv4f-tp2".into(),
+                phase: "reserving".into(),
+                waiting_on: Some("memory: bginf-sp1 has 60.0 GiB free and needs 100.0 GiB".into()),
+            },
+        )]));
+        let (entry, _waiter) = pool
+            .queue
+            .enqueue(
+                queue::NewEntry {
+                    request: request.clone(),
+                    admission_kind: CellAdmissionKind::Command,
+                    interactive: false,
+                    execution_residency: None,
+                    standing: false,
+                },
+                unix_time_ms(),
+            )
+            .unwrap();
+
+        let waiting = pool.clone();
+        let placing = tokio::spawn({
+            let request = request.clone();
+            let entry = entry.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    waiting.select_executor(&request, None, &policy, Some(&entry)),
+                )
+                .await
+            }
+        });
+        let names = std::collections::BTreeSet::from([remote_name.clone()]);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pool.machine_set_pressure(&names).waiting == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a request held off the reserved machine counts as waiting for it"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!placing.is_finished(), "held, not refused");
+        assert_eq!(
+            pool.machine_set_pressure(&std::collections::BTreeSet::from([
+                "some-other-machine".to_string()
+            ]))
+            .waiting,
+            0,
+            "pressure is counted only against the machines that hold it off"
+        );
+
+        pool.set_inference_holds(HashMap::new());
+        let placement = placing
+            .await
+            .unwrap()
+            .expect("releasing the hold wakes the wait")
+            .expect("the released machine takes the work");
+        assert_eq!(placement.selected.executor_id, "remote");
     }
 
     /// A decline from the one machine policy allows must park the request even

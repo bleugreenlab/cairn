@@ -170,6 +170,8 @@ tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
 cairn-core = { path = ".", features = ["test-utils"] }
 cairn-codec = { path = "../cairn-codec", features = ["test-utils"] }
 cairn-db = { path = "../cairn-db", features = ["test-utils"] }
+# SCM_RIGHTS, so a run test can hold a command's stdout from outside its tree.
+nix = { version = "0.29", features = ["signal", "socket", "uio"] }
 
 [features]
 internal-api = []

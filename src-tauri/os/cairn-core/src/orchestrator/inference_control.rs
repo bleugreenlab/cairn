@@ -18,7 +18,7 @@
 //! running them, and Cairn takes no machine away from builds for a model it did
 //! not load or stop.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,13 +28,14 @@ use cairn_common::executor_protocol::{
 };
 use cairn_db::turso::params;
 use cairn_inference::control::{
-    self, Fit, LoadOutcome, Observation, Phase, Report, Request, Room, START_TIMEOUT_SECS,
-    STOPPED_HEALTH_WAIT_SECS, STOP_TIMEOUT_SECS,
+    self, Drain, GangMachine, LoadOutcome, Observation, Phase, Report, Request, Room, RunningBatch,
+    START_TIMEOUT_SECS, STOPPED_HEALTH_WAIT_SECS, STOP_TIMEOUT_SECS,
 };
 use cairn_inference::{Deployment, DeploymentId, Inventory};
 
 use super::inference::load_inventory;
 use super::Orchestrator;
+use crate::fleet::inference::Preemption;
 use crate::fleet::{DeploymentReportReceived, Fleet};
 use crate::storage::{LocalDb, RowExt};
 
@@ -67,6 +68,10 @@ pub struct MachineReading {
     /// Memory a deployment could take: free VRAM on discrete cards, otherwise
     /// the host's available memory.
     pub free_bytes: Option<u64>,
+    /// Whether `free_bytes` is the host's memory, the memory batch work uses
+    /// (a unified-memory machine, or one with no discrete card), rather than
+    /// VRAM no batch touches.
+    pub free_is_host_memory: bool,
 }
 
 impl MachineReading {
@@ -108,6 +113,7 @@ impl MachineReading {
         };
         Self {
             gpu_allocated_bytes: allocated,
+            free_is_host_memory: discrete_free.is_none(),
             free_bytes: discrete_free.or(host_free),
         }
     }
@@ -126,6 +132,10 @@ pub(crate) trait Heads: Send + Sync {
     /// Every attached machine's readings, by public name.
     fn readings(&self) -> BTreeMap<String, MachineReading>;
     fn hold(&self, holds: HashMap<String, InferenceHold>);
+    /// The batches running on these machines, by public name.
+    fn running(&self, machines: &BTreeSet<String>) -> BTreeMap<String, Vec<RunningBatch>>;
+    /// Stop one running batch to make room; false when it has already ended.
+    fn preempt(&self, request_id: &str, attempt_id: &str, preemption: Preemption) -> bool;
 }
 
 impl Heads for Fleet {
@@ -148,6 +158,18 @@ impl Heads for Fleet {
 
     fn hold(&self, holds: HashMap<String, InferenceHold>) {
         self.set_inference_holds(holds);
+    }
+
+    fn running(&self, machines: &BTreeSet<String>) -> BTreeMap<String, Vec<RunningBatch>> {
+        self.running_batches(machines)
+    }
+
+    fn preempt(&self, request_id: &str, attempt_id: &str, preemption: Preemption) -> bool {
+        Fleet::preempt(
+            self,
+            (request_id.to_string(), attempt_id.to_string()),
+            preemption,
+        )
     }
 }
 
@@ -396,11 +418,16 @@ pub fn holds_of(
     control::reservations(inventory, &phases_of(states))
         .into_iter()
         .map(|(machine, held)| {
+            let waiting_on = match states.get(&held.deployment).map(|row| &row.phase) {
+                Some(Phase::Reserving { waiting_on, .. }) => waiting_on.clone(),
+                _ => None,
+            };
             (
                 machine.as_str().to_string(),
                 InferenceHold {
                     deployment: held.deployment.to_string(),
                     phase: held.phase.to_string(),
+                    waiting_on,
                 },
             )
         })
@@ -820,9 +847,10 @@ pub(crate) async fn tick(
             }
         };
         match &row.phase {
-            Phase::Reserving { .. } => {
+            Phase::Reserving { since_ms, .. } => {
                 dispatch(
-                    db, heads, &inventory, deployment, &plan, &readings, &history, probes, now_ms,
+                    db, heads, &inventory, deployment, &plan, &readings, &history, probes,
+                    *since_ms, now_ms,
                 )
                 .await?;
             }
@@ -860,7 +888,11 @@ pub(crate) async fn tick(
     refresh_holds(db, heads).await
 }
 
-/// Send a reserving start once its head is attached and the gang fits.
+/// Send a reserving start once its head is attached and the gang fits,
+/// draining its machines meanwhile: they take no new batch work (the hold),
+/// the work already there may finish until the drain's bound, and past it the
+/// checks whose measured memory is in the way are preempted
+/// ([`control::drain`]).
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     db: &LocalDb,
@@ -871,6 +903,7 @@ async fn dispatch(
     readings: &BTreeMap<String, MachineReading>,
     history: &BTreeMap<DeploymentId, Vec<LoadRow>>,
     probes: &mut Probes,
+    reserving_since_ms: i64,
     now_ms: i64,
 ) -> Result<(), String> {
     let id = &deployment.id;
@@ -890,31 +923,63 @@ async fn dispatch(
         return Ok(());
     }
     let footprint = last_footprint(history.get(id));
-    let stated = inventory
-        .recipes
-        .get(&deployment.recipe)
-        .and_then(control::stated_need);
-    let rooms: BTreeMap<_, _> = deployment
+    let recipe = inventory.recipes.get(&deployment.recipe);
+    let stated = recipe.and_then(control::stated_need);
+    let names: BTreeSet<String> = deployment
+        .machines
+        .iter()
+        .map(|machine| machine.as_str().to_string())
+        .collect();
+    let mut running = heads.running(&names);
+    let gang: BTreeMap<_, _> = deployment
         .machines
         .iter()
         .map(|machine| {
+            let reading = readings.get(machine.as_str());
             (
                 machine.clone(),
-                Room {
-                    free_bytes: readings.get(machine.as_str()).and_then(|r| r.free_bytes),
-                    need_bytes: footprint.get(machine.as_str()).copied().or(stated),
+                GangMachine {
+                    room: Room {
+                        free_bytes: reading.and_then(|r| r.free_bytes),
+                        need_bytes: footprint.get(machine.as_str()).copied().or(stated),
+                    },
+                    shared_with_batches: reading.is_some_and(|r| r.free_is_host_memory),
+                    batches: running.remove(machine.as_str()).unwrap_or_default(),
                 },
             )
         })
         .collect();
-    let fit = control::fit(&rooms);
-    if let Fit::Short(_) = fit {
+    let on = match control::drain(&gang, reserving_since_ms, now_ms) {
+        Drain::Start => None,
+        Drain::Wait(on) => Some(on),
+        Drain::Preempt { batches, waiting } => {
+            let model = recipe
+                .map(|recipe| recipe.model.name.to_string())
+                .unwrap_or_else(|| deployment.recipe.to_string());
+            for batch in batches {
+                heads.preempt(
+                    &batch.request_id,
+                    &batch.attempt_id,
+                    Preemption {
+                        deployment: id.to_string(),
+                        model: model.clone(),
+                        executor: batch.machine.as_str().to_string(),
+                        need_bytes: batch.need_bytes,
+                        free_bytes: batch.free_bytes,
+                        resident_bytes: batch.resident_bytes,
+                    },
+                );
+            }
+            Some(waiting)
+        }
+    };
+    if let Some(on) = on {
         apply(
             db,
             heads,
             inventory,
             id,
-            waiting(format!("memory: {}", fit.describe())),
+            waiting(on),
             Matching::Any,
             None,
             now_ms,
@@ -940,11 +1005,7 @@ async fn dispatch(
     if sent.is_none() {
         return Ok(());
     }
-    log::info!(
-        "inference: starting {id} on {} ({})",
-        deployment.head,
-        fit.describe()
-    );
+    log::info!("inference: starting {id} on {}", deployment.head);
     if let Err(why) = heads.send(
         deployment.head.as_str(),
         &command,
@@ -1037,6 +1098,8 @@ mod tests {
         readings: Mutex<BTreeMap<String, MachineReading>>,
         holds: Mutex<HashMap<String, InferenceHold>>,
         refuse: Mutex<Option<String>>,
+        running: Mutex<BTreeMap<String, Vec<RunningBatch>>>,
+        preempted: Mutex<Vec<(String, Preemption)>>,
     }
 
     impl Heads for FakeHeads {
@@ -1064,6 +1127,27 @@ mod tests {
         fn hold(&self, holds: HashMap<String, InferenceHold>) {
             *self.holds.lock().unwrap() = holds;
         }
+        fn running(&self, machines: &BTreeSet<String>) -> BTreeMap<String, Vec<RunningBatch>> {
+            self.running
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| machines.contains(*name))
+                .map(|(name, batches)| (name.clone(), batches.clone()))
+                .collect()
+        }
+        fn preempt(&self, request_id: &str, _attempt_id: &str, preemption: Preemption) -> bool {
+            for batches in self.running.lock().unwrap().values_mut() {
+                for batch in batches.iter_mut().filter(|b| b.request_id == request_id) {
+                    batch.preempted = true;
+                }
+            }
+            self.preempted
+                .lock()
+                .unwrap()
+                .push((request_id.to_string(), preemption));
+            true
+        }
     }
 
     impl FakeHeads {
@@ -1073,8 +1157,23 @@ mod tests {
                 MachineReading {
                     gpu_allocated_bytes: Some(allocated_gib << 30),
                     free_bytes: Some(free_gib << 30),
+                    free_is_host_memory: true,
                 },
             );
+        }
+        fn run(&self, name: &str, request_id: &str, restartable: bool, resident_gib: u64) {
+            self.running
+                .lock()
+                .unwrap()
+                .entry(name.into())
+                .or_default()
+                .push(RunningBatch {
+                    request_id: request_id.into(),
+                    attempt_id: format!("{request_id}-a"),
+                    restartable,
+                    resident_bytes: Some(resident_gib << 30),
+                    preempted: false,
+                });
         }
         fn last_sent(&self) -> (String, String, String, DeploymentOperation) {
             self.sent
@@ -1428,9 +1527,10 @@ mod tests {
         let Phase::Reserving { waiting_on, .. } = phase(&db, DSV4F).await else {
             panic!("still reserving");
         };
-        assert_eq!(
-            waiting_on.as_deref(),
-            Some("memory: bginf-sp2 has 20.0 GiB free and needs 100.0 GiB")
+        let waiting_on = waiting_on.unwrap_or_default();
+        assert!(
+            waiting_on.starts_with("memory: bginf-sp2 has 20.0 GiB free and needs 100.0 GiB; "),
+            "{waiting_on}"
         );
         let (_, probe_id, _, operation) = heads.last_sent();
         assert!(
@@ -1445,10 +1545,110 @@ mod tests {
             panic!("a start that never fits fails");
         };
         assert!(
-            reason.ends_with("memory: bginf-sp2 has 20.0 GiB free and needs 100.0 GiB"),
+            reason.contains("memory: bginf-sp2 has 20.0 GiB free and needs 100.0 GiB"),
             "{reason}"
         );
         assert!(heads.held().is_empty());
+    }
+
+    /// The load order on machines with batch work: hold (no new work), let
+    /// the work finish until the drain's bound, then preempt only the checks
+    /// whose measured memory is in the way, never the agent turn, naming the
+    /// model and the memory; the start goes once the gang fits.
+    #[tokio::test]
+    async fn a_start_drains_its_machines_then_preempts_only_the_checks_in_its_way() {
+        let db = sparks_db("inference-control-drain").await;
+        let heads = FakeHeads::default();
+        let mut probes = Probes::default();
+        db.execute(
+            "INSERT INTO inference_deployment_loads
+               (deployment_id, recipe_id, requested_at, finished_at, outcome, load_ms, footprint_json)
+             VALUES (?1, ?1, 0, 1, 'healthy', 1, ?2)",
+            params![DSV4F, format!("{{\"{SP1}\":{},\"{SP2}\":{}}}", 100u64 << 30, 100u64 << 30)],
+        )
+        .await
+        .unwrap();
+        heads.attach(SP1, 60, 0);
+        heads.attach(SP2, 110, 0);
+        heads.run(SP1, "check-big", true, 45);
+        heads.run(SP1, "check-small", true, 5);
+        heads.run(SP1, "turn", false, 30);
+        heads.run(SP2, "check-resident", true, 8);
+        request(&db, &heads, DSV4F, Request::Start, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            heads.held(),
+            [SP1, SP2],
+            "no new work from the moment it is asked for"
+        );
+
+        tick(&db, &heads, &mut probes, 2_000).await.unwrap();
+        assert!(
+            heads.preempted.lock().unwrap().is_empty(),
+            "inside the bound"
+        );
+        let Phase::Reserving { waiting_on, .. } = phase(&db, DSV4F).await else {
+            panic!("still reserving");
+        };
+        assert!(
+            waiting_on
+                .unwrap_or_default()
+                .contains("may finish for 5 min more"),
+            "the wait names the bound"
+        );
+
+        let past = 1_000 + (control::DRAIN_BOUND_SECS as i64) * 1_000;
+        tick(&db, &heads, &mut probes, past).await.unwrap();
+        let preempted = heads.preempted.lock().unwrap().clone();
+        assert_eq!(
+            preempted.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["check-big"],
+            "40 GiB short on sp1: the one check that covers it; never the turn, never sp2's resident that fits"
+        );
+        let (_, why) = &preempted[0];
+        assert_eq!(
+            (
+                why.deployment.as_str(),
+                why.model.as_str(),
+                why.executor.as_str()
+            ),
+            (DSV4F, DSV4F, SP1)
+        );
+        assert_eq!(
+            (why.need_bytes, why.free_bytes, why.resident_bytes),
+            (100 << 30, 60 << 30, 45 << 30)
+        );
+        assert!(
+            heads
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, _, _, op)| !matches!(op, DeploymentOperation::Start { .. })),
+            "the start waits for the memory to come back"
+        );
+
+        // Its memory came back: the gang fits beside the turn and the
+        // resident, and the start goes.
+        heads
+            .running
+            .lock()
+            .unwrap()
+            .get_mut(SP1)
+            .unwrap()
+            .retain(|b| !b.preempted);
+        heads.attach(SP1, 105, 0);
+        tick(&db, &heads, &mut probes, past + 5_000).await.unwrap();
+        assert!(matches!(
+            heads.last_sent().3,
+            DeploymentOperation::Start { .. }
+        ));
+        assert_eq!(
+            heads.preempted.lock().unwrap().len(),
+            1,
+            "nothing else was stopped"
+        );
     }
 
     #[tokio::test]

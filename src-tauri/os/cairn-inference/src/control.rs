@@ -35,6 +35,11 @@ pub const STOPPED_HEALTH_WAIT_SECS: u64 = 120;
 /// How long a start waits, with its machines reserved, for every gang machine
 /// to have the memory the deployment needs before it is called failed.
 pub const FIT_WAIT_SECS: u64 = 900;
+/// How long a reserving start lets the restartable batch work already on its
+/// machines run before it preempts the checks whose measured memory is in its
+/// way. Well inside [`FIT_WAIT_SECS`], so preempted work has time to end and
+/// its memory to be measured free before the start gives up.
+pub const DRAIN_BOUND_SECS: u64 = 300;
 /// Slack on the executor's own bounds before the orch stops waiting for its
 /// report and calls the command failed: the head may have died with it.
 pub const REPORT_SLACK_SECS: u64 = 120;
@@ -434,7 +439,8 @@ pub struct Room {
 pub enum Fit {
     Fits,
     /// The deployment has never been measured and its recipe states no
-    /// memory, so nothing can be compared. The start proceeds and its load
+    /// memory, so nothing can be compared. The start waits for its machines
+    /// to run no batch work, preempting none (see [`drain`]), and its load
     /// measures the footprint for next time.
     Unknown,
     /// These machines lack room, with what each has and needs.
@@ -497,6 +503,235 @@ pub fn stated_need(recipe: &Recipe) -> Option<u64> {
     match recipe.requirements.memory? {
         MemoryPerMachine::Unified { system } => Some(system.0),
         MemoryPerMachine::Discrete { vram, .. } => Some(vram.0),
+    }
+}
+
+/// One batch running on a gang machine, as the fleet measures it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningBatch {
+    pub request_id: String,
+    pub attempt_id: String,
+    /// Whether Cairn may stop it to make room: a check lane, which is run
+    /// again elsewhere. An agent turn never is, nor is work that states no
+    /// check's priority.
+    pub restartable: bool,
+    /// The memory its whole process tree holds, as last measured. `None` is
+    /// unmeasured, which is never read as a conflict.
+    pub resident_bytes: Option<u64>,
+    /// Already stopped for this start, so its memory is on its way back.
+    pub preempted: bool,
+}
+
+/// One gang machine as the drain sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GangMachine {
+    pub room: Room,
+    /// Whether the memory the deployment needs here is the memory batch work
+    /// uses: system RAM, as on a unified-memory machine. False for a discrete
+    /// card, whose VRAM no batch touches, so stopping a batch frees none of
+    /// what the deployment is short of.
+    pub shared_with_batches: bool,
+    pub batches: Vec<RunningBatch>,
+}
+
+/// A batch to stop so the deployment fits, with the readings behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preemption {
+    pub machine: MachineName,
+    pub request_id: String,
+    pub attempt_id: String,
+    /// What the batch held when it was chosen.
+    pub resident_bytes: u64,
+    /// What the deployment needs on the machine, and what was free there.
+    pub need_bytes: u64,
+    pub free_bytes: u64,
+}
+
+/// What a reserving start does next about the batch work on its machines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Drain {
+    /// Send the start: every gang machine has the room, or nothing could be
+    /// compared and no batch work is left on them.
+    Start,
+    /// Keep waiting, with what it waits on.
+    Wait(String),
+    /// Stop these batches, then keep waiting for their memory.
+    Preempt {
+        batches: Vec<Preemption>,
+        waiting: String,
+    },
+}
+
+/// Drain a reserving start's machines: the machines already take no new batch
+/// work (the hold is a drain), so this decides only about the work on them.
+///
+/// The start goes on FIT, not on empty: once every gang machine's measured free
+/// memory covers the deployment's need, work still running there is no reason
+/// to wait, so residents that fit never block. A footprint nothing can be
+/// compared with waits for the machines to run no batch work, and preempts
+/// nothing, since no conflict can be measured. Short of room, restartable work
+/// is left to finish for [`DRAIN_BOUND_SECS`]; past that, only checks whose
+/// measured memory is in the way are preempted, the fewest that cover each
+/// short machine's shortfall, largest first. Agent turns and unmeasured batches
+/// are never preempted. All or nothing across the gang: when any short machine
+/// cannot be covered that way, nothing is preempted anywhere, because the start
+/// could not be sent anyway.
+pub fn drain(
+    gang: &BTreeMap<MachineName, GangMachine>,
+    reserving_since_ms: i64,
+    now_ms: i64,
+) -> Drain {
+    let rooms: BTreeMap<MachineName, Room> = gang
+        .iter()
+        .map(|(machine, state)| (machine.clone(), state.room))
+        .collect();
+    let short = match fit(&rooms) {
+        Fit::Fits => return Drain::Start,
+        Fit::Unknown => {
+            let running: usize = gang.values().map(|machine| machine.batches.len()).sum();
+            return if running == 0 {
+                Drain::Start
+            } else {
+                Drain::Wait(format!(
+                    "its footprint is unmeasured, so it waits for the {} on its machines to finish and preempts none",
+                    batches(running)
+                ))
+            };
+        }
+        Fit::Short(short) => short,
+    };
+    let memory = format!("memory: {}", Fit::Short(short.clone()).describe());
+    let elapsed_ms = now_ms.saturating_sub(reserving_since_ms).max(0) as u64;
+    let bound_ms = DRAIN_BOUND_SECS * 1_000;
+    if elapsed_ms < bound_ms {
+        let left_secs = (bound_ms - elapsed_ms).div_ceil(1_000);
+        return Drain::Wait(format!(
+            "{memory}; the work on its machines may finish for {} more before checks whose measured memory is in the way are preempted",
+            duration(left_secs)
+        ));
+    }
+
+    let mut chosen = Vec::new();
+    let mut blocked = Vec::new();
+    let mut returning = 0usize;
+    for (machine, free, need) in &short {
+        let Some(state) = gang.get(machine) else {
+            continue;
+        };
+        let Some(free) = *free else {
+            blocked.push(format!("{machine}'s free memory is unmeasured"));
+            continue;
+        };
+        if !state.shared_with_batches {
+            blocked.push(format!(
+                "{machine}'s batch work uses none of the memory it is short of"
+            ));
+            continue;
+        }
+        let shortfall = need.saturating_sub(free);
+        let stopped: Vec<&RunningBatch> = state
+            .batches
+            .iter()
+            .filter(|batch| batch.preempted)
+            .collect();
+        let coming_back: u64 = stopped
+            .iter()
+            .filter_map(|batch| batch.resident_bytes)
+            .sum();
+        if coming_back >= shortfall {
+            returning += stopped.len();
+            continue;
+        }
+        let remaining = shortfall - coming_back;
+        let mut candidates: Vec<(&RunningBatch, u64)> = state
+            .batches
+            .iter()
+            .filter(|batch| batch.restartable && !batch.preempted)
+            .filter_map(|batch| Some((batch, batch.resident_bytes.filter(|bytes| *bytes > 0)?)))
+            .collect();
+        candidates.sort_by(|(a, a_bytes), (b, b_bytes)| {
+            b_bytes
+                .cmp(a_bytes)
+                .then_with(|| a.request_id.cmp(&b.request_id))
+        });
+        let mut covered = 0u64;
+        let mut here = Vec::new();
+        for (batch, bytes) in candidates {
+            if covered >= remaining {
+                break;
+            }
+            covered += bytes;
+            here.push(Preemption {
+                machine: machine.clone(),
+                request_id: batch.request_id.clone(),
+                attempt_id: batch.attempt_id.clone(),
+                resident_bytes: bytes,
+                need_bytes: *need,
+                free_bytes: free,
+            });
+        }
+        if covered < remaining {
+            let turns = state
+                .batches
+                .iter()
+                .filter(|batch| !batch.restartable)
+                .count();
+            let unmeasured = state
+                .batches
+                .iter()
+                .filter(|batch| batch.restartable && batch.resident_bytes.is_none())
+                .count();
+            blocked.push(format!(
+                "{machine} is {} short and the checks measured there hold {}; the rest is held by work that is never preempted ({} and {} unmeasured) or by memory outside batch work",
+                gib(remaining),
+                gib(covered),
+                plural(turns, "agent turn"),
+                batches(unmeasured)
+            ));
+            continue;
+        }
+        chosen.extend(here);
+    }
+    if !blocked.is_empty() {
+        return Drain::Wait(format!(
+            "{memory}; nothing is preempted, because {}",
+            blocked.join("; ")
+        ));
+    }
+    if chosen.is_empty() {
+        return Drain::Wait(format!(
+            "{memory}; waiting for the memory of the {} already preempted",
+            batches(returning)
+        ));
+    }
+    let total: u64 = chosen.iter().map(|batch| batch.resident_bytes).sum();
+    Drain::Preempt {
+        waiting: format!(
+            "{memory}; preempted {} measured at {} to make room",
+            plural(chosen.len(), "check"),
+            gib(total)
+        ),
+        batches: chosen,
+    }
+}
+
+fn counted(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    counted(count, noun, &format!("{noun}s"))
+}
+
+fn batches(count: usize) -> String {
+    counted(count, "batch", "batches")
+}
+
+fn duration(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{} min", secs.div_ceil(60))
+    } else {
+        format!("{secs} s")
     }
 }
 
@@ -857,6 +1092,191 @@ mod tests {
         assert!(matches!(fit(&rooms), Fit::Short(_)));
         let unknown: BTreeMap<_, _> = [(MachineName::from("sp1"), room(Some(1), None))].into();
         assert_eq!(fit(&unknown), Fit::Unknown);
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    fn batch(id: &str, restartable: bool, resident_gib: Option<u64>) -> RunningBatch {
+        RunningBatch {
+            request_id: id.into(),
+            attempt_id: format!("{id}-a"),
+            restartable,
+            resident_bytes: resident_gib.map(|gib| gib * GIB),
+            preempted: false,
+        }
+    }
+
+    fn machine(free_gib: u64, need_gib: Option<u64>, batches: Vec<RunningBatch>) -> GangMachine {
+        GangMachine {
+            room: Room {
+                free_bytes: Some(free_gib * GIB),
+                need_bytes: need_gib.map(|gib| gib * GIB),
+            },
+            shared_with_batches: true,
+            batches,
+        }
+    }
+
+    fn gang(machines: Vec<(&str, GangMachine)>) -> BTreeMap<MachineName, GangMachine> {
+        machines
+            .into_iter()
+            .map(|(name, state)| (MachineName::from(name), state))
+            .collect()
+    }
+
+    const PAST_BOUND: i64 = T0 + (DRAIN_BOUND_SECS as i64) * 1_000;
+
+    #[test]
+    fn a_gang_that_fits_starts_beside_the_work_already_there() {
+        let gang = gang(vec![
+            (
+                "sp1",
+                machine(110, Some(100), vec![batch("check", true, Some(8))]),
+            ),
+            (
+                "sp2",
+                machine(105, Some(100), vec![batch("turn", false, Some(4))]),
+            ),
+        ]);
+        assert_eq!(drain(&gang, T0, T0), Drain::Start, "fit, not empty");
+    }
+
+    #[test]
+    fn an_unmeasured_footprint_waits_for_empty_machines_and_preempts_nothing() {
+        let busy = gang(vec![(
+            "sp1",
+            machine(10, None, vec![batch("check", true, Some(90))]),
+        )]);
+        let Drain::Wait(why) = drain(&busy, T0, PAST_BOUND * 10) else {
+            panic!("an unmeasured footprint never preempts");
+        };
+        assert!(why.contains("footprint is unmeasured"), "{why}");
+        assert!(why.contains("1 batch on its machines"), "{why}");
+        let empty = gang(vec![("sp1", machine(10, None, Vec::new()))]);
+        assert_eq!(drain(&empty, T0, T0), Drain::Start);
+    }
+
+    #[test]
+    fn restartable_work_may_finish_until_the_bound() {
+        let gang = gang(vec![(
+            "sp1",
+            machine(60, Some(100), vec![batch("check", true, Some(50))]),
+        )]);
+        let Drain::Wait(why) = drain(&gang, T0, T0 + 60_000) else {
+            panic!("inside the bound nothing is preempted");
+        };
+        assert!(
+            why.starts_with("memory: sp1 has 60.0 GiB free and needs 100.0 GiB"),
+            "{why}"
+        );
+        assert!(why.contains("may finish for 4 min more"), "{why}");
+        assert!(matches!(
+            drain(&gang, T0, PAST_BOUND),
+            Drain::Preempt { .. }
+        ));
+    }
+
+    #[test]
+    fn past_the_bound_only_the_fewest_measured_checks_in_the_way_are_preempted() {
+        let gang = gang(vec![
+            (
+                "sp1",
+                machine(
+                    60,
+                    Some(100),
+                    vec![
+                        batch("small", true, Some(10)),
+                        batch("large", true, Some(35)),
+                        batch("medium", true, Some(20)),
+                        batch("turn", false, Some(60)),
+                        batch("unmeasured", true, None),
+                    ],
+                ),
+            ),
+            (
+                "sp2",
+                machine(105, Some(100), vec![batch("fits", true, Some(30))]),
+            ),
+        ]);
+        let Drain::Preempt { batches, waiting } = drain(&gang, T0, PAST_BOUND) else {
+            panic!("a coverable shortfall preempts");
+        };
+        let stopped: Vec<&str> = batches.iter().map(|b| b.request_id.as_str()).collect();
+        assert_eq!(
+            stopped,
+            ["large", "medium"],
+            "40 GiB short: the two largest measured checks cover it; the turn, the unmeasured batch and the machine that fits are untouched"
+        );
+        assert_eq!(batches[0].machine, MachineName::from("sp1"));
+        assert_eq!(batches[0].need_bytes, 100 * GIB);
+        assert_eq!(batches[0].free_bytes, 60 * GIB);
+        assert_eq!(batches[0].resident_bytes, 35 * GIB);
+        assert!(
+            waiting.contains("preempted 2 checks measured at 55.0 GiB"),
+            "{waiting}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_preempted_when_any_short_machine_cannot_be_covered() {
+        let gang = gang(vec![
+            (
+                "sp1",
+                machine(60, Some(100), vec![batch("check", true, Some(50))]),
+            ),
+            (
+                "sp2",
+                machine(
+                    60,
+                    Some(100),
+                    vec![
+                        batch("turn", false, Some(40)),
+                        batch("check2", true, Some(5)),
+                    ],
+                ),
+            ),
+        ]);
+        let Drain::Wait(why) = drain(&gang, T0, PAST_BOUND) else {
+            panic!("preempting on sp1 alone would not let the start go");
+        };
+        assert!(
+            why.contains("sp2 is 40.0 GiB short and the checks measured there hold 5.0 GiB; the rest is held by work that is never preempted (1 agent turn and 0 batches unmeasured)"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn memory_batches_do_not_use_or_cannot_measure_is_no_reason_to_preempt() {
+        let mut discrete = machine(4, Some(20), vec![batch("check", true, Some(30))]);
+        discrete.shared_with_batches = false;
+        let Drain::Wait(why) = drain(&gang(vec![("bbs", discrete)]), T0, PAST_BOUND) else {
+            panic!("a VRAM shortfall is not a batch's");
+        };
+        assert!(
+            why.contains("uses none of the memory it is short of"),
+            "{why}"
+        );
+
+        let mut blind = machine(0, Some(20), vec![batch("check", true, Some(30))]);
+        blind.room.free_bytes = None;
+        let Drain::Wait(why) = drain(&gang(vec![("sp1", blind)]), T0, PAST_BOUND) else {
+            panic!("an unmeasured free reading preempts nothing");
+        };
+        assert!(why.contains("sp1's free memory is unmeasured"), "{why}");
+    }
+
+    #[test]
+    fn memory_already_coming_back_is_waited_for_not_preempted_again() {
+        let mut stopped = batch("stopped", true, Some(45));
+        stopped.preempted = true;
+        let gang = gang(vec![(
+            "sp1",
+            machine(60, Some(100), vec![stopped, batch("other", true, Some(30))]),
+        )]);
+        let Drain::Wait(why) = drain(&gang, T0, PAST_BOUND) else {
+            panic!("the stopped check's memory covers the shortfall");
+        };
+        assert!(why.contains("the 1 batch already preempted"), "{why}");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use super::{
     current_target, model_catalog, ComponentInstaller, ComponentState, DictationMode, EngineState,
-    InstallEvent, ModelPurpose, ProtocolCommand, ProtocolEvent, Transcript, VoiceError, VoiceEvent,
-    VoiceModel, VoiceProcess, VoiceResult, VoiceStatus,
+    InstallEvent, ManagedComponent, ModelPurpose, ProtocolCommand, ProtocolEvent, Transcript,
+    VoiceError, VoiceEvent, VoiceFailure, VoiceModel, VoiceProcess, VoiceResult, VoiceStatus,
 };
 use crate::services::EventEmitter;
 use serde_json::Value;
@@ -89,6 +89,9 @@ struct VoiceServiceInner {
     file_transcription_cancellations: Mutex<HashMap<String, Arc<Notify>>>,
     stream_feed_admission: Arc<Semaphore>,
     engine_state: Mutex<EngineState>,
+    /// The most recent engine install's failure, cleared by the next install
+    /// that succeeds. See [`VoiceServiceHandle::install_engine`].
+    engine_failure: Mutex<Option<VoiceFailure>>,
     restart_attempts: AtomicU32,
     emitter: Arc<dyn EventEmitter>,
 }
@@ -121,11 +124,13 @@ impl VoiceService {
             app_version,
             build_identity,
             emitter,
+            RELEASE_BASE,
             engine_override,
         )
     }
 
-    /// The same service with its engine binary named directly.
+    /// The same service with its release server and engine binary named
+    /// directly.
     ///
     /// A test drives a scripted engine through this rather than through the
     /// environment variable, which is shared by every test in the binary and so
@@ -135,6 +140,7 @@ impl VoiceService {
         app_version: impl Into<String>,
         build_identity: impl Into<String>,
         emitter: Arc<dyn EventEmitter>,
+        release_base: &str,
         engine_override: Option<PathBuf>,
     ) -> Self {
         let app_version = app_version.into();
@@ -142,7 +148,7 @@ impl VoiceService {
         let install_emitter = emitter.clone();
         let installer = ComponentInstaller::new(
             data_dir.clone(),
-            RELEASE_BASE,
+            release_base,
             app_version.clone(),
             build_identity,
             move |event| {
@@ -196,6 +202,7 @@ impl VoiceService {
                 file_transcription_cancellations: Mutex::new(HashMap::new()),
                 stream_feed_admission: Arc::new(Semaphore::new(8)),
                 engine_state: Mutex::new(EngineState::Stopped),
+                engine_failure: Mutex::new(None),
                 restart_attempts: AtomicU32::new(0),
                 emitter,
             })),
@@ -254,10 +261,41 @@ impl VoiceServiceHandle {
             }
         };
         if stale || self.0.installer.local_engine_pending().await {
-            if let Err(error) = self.0.installer.install_engine(target).await {
+            if let Err(error) = self.install_engine(target).await {
                 log::warn!("Could not refresh voice engine during startup: {error}");
             }
         }
+    }
+
+    /// Install the engine this app needs, remembering why when it cannot be.
+    ///
+    /// Every engine install goes through here — the startup refresh, Enable,
+    /// and the lazy install before a request — so status reports the cause of
+    /// the last failure whichever of them hit it. A change is announced as an
+    /// `engineChanged` event, so a settings page already open learns of a
+    /// failure from a refresh that finished after it loaded.
+    async fn install_engine(&self, target: &str) -> VoiceResult<ManagedComponent> {
+        let result = self.0.installer.install_engine(target).await;
+        let failure = result.as_ref().err().map(|error| VoiceFailure {
+            code: error.code().into(),
+            message: error.to_string(),
+        });
+        let changed = {
+            let mut recorded = self.0.engine_failure.lock().await;
+            let changed = *recorded != failure;
+            recorded.clone_from(&failure);
+            changed
+        };
+        if changed {
+            emit_voice_event(
+                self.0.emitter.as_ref(),
+                VoiceEvent::EngineChanged {
+                    state: self.0.engine_state.lock().await.clone(),
+                    detail: failure.map(|failure| failure.message),
+                },
+            );
+        }
+        result
     }
 
     /// Warm the dictation model in the background. See
@@ -382,6 +420,13 @@ impl VoiceServiceHandle {
         } else {
             engine_component_state(&self.0.installer, &manifest.components).await
         };
+        // Only while the engine is not usable: a refused handoff leaves the
+        // current engine in place, and nothing would ever clear its failure.
+        let engine_failure = if engine == ComponentState::Installed {
+            None
+        } else {
+            self.0.engine_failure.lock().await.clone()
+        };
         let fast_model =
             component_state(&self.0.installer, &manifest.components, "model:fast").await;
         let accurate_model =
@@ -400,7 +445,7 @@ impl VoiceServiceHandle {
             preferred_dictation_model: *self.0.preferred_dictation_model.lock().await,
             dictation_mode: *self.0.dictation_mode.lock().await,
             input_device_id: self.0.input_device_id.lock().await.clone(),
-            detail: None,
+            engine_failure,
         })
     }
 
@@ -410,13 +455,39 @@ impl VoiceServiceHandle {
         if let Some(path) = &self.0.engine_override {
             super::installer::probe_engine(path, &self.0.app_version).await?;
         } else {
-            self.0.installer.install_engine(target).await?;
+            self.install_engine(target).await?;
         }
-        self.0.installer.install_model(&model_catalog()[0]).await?;
+        // Fast is the opt-in default, owed only when a model the preferences
+        // name is absent. A re-enable that has them needs only the engine.
+        if !self.preferred_models_installed().await {
+            self.0.installer.install_model(&model_catalog()[0]).await?;
+        }
         self.persist_preferences(self.preferences(true).await)?;
         self.0.enabled.store(true, Ordering::Release);
         self.prewarm_dictation();
         self.status().await
+    }
+
+    /// Whether every model the saved preferences name is installed and verifies.
+    async fn preferred_models_installed(&self) -> bool {
+        let Ok(manifest) = self.0.installer.manifest().await else {
+            return false;
+        };
+        let dictation = self.preferred_dictation_model().await;
+        let file = self.preferred_file_model().await;
+        let mut preferred = vec![dictation];
+        if file != dictation {
+            preferred.push(file);
+        }
+        for model in preferred {
+            let Ok(component) = find_component(&manifest.components, model_kind(model)) else {
+                return false;
+            };
+            if self.0.installer.verify(component).await.is_err() {
+                return false;
+            }
+        }
+        true
     }
 
     /// Choose the model one kind of work uses, refusing a model that is not
@@ -472,6 +543,8 @@ impl VoiceServiceHandle {
     pub async fn remove(&self) -> VoiceResult<VoiceStatus> {
         self.disable().await?;
         self.0.installer.remove_managed().await?;
+        // It described an engine that is gone; the next Enable reports afresh.
+        *self.0.engine_failure.lock().await = None;
         self.status().await
     }
 
@@ -817,7 +890,7 @@ impl VoiceServiceHandle {
                 {
                     engine.clone()
                 } else {
-                    self.0.installer.install_engine(target).await?
+                    self.install_engine(target).await?
                 };
                 self.0.installer.verify(&engine).await?;
                 engine.path
@@ -1016,11 +1089,13 @@ mod tests {
 
     const APP_VERSION: &str = "0.0.0-test";
     const BUILD_IDENTITY: &str = "content-v2:test-build";
+    /// Nothing listens here: a test that never downloads must not reach the
+    /// real release server either.
+    const OFFLINE_RELEASES: &str = "http://127.0.0.1:1";
 
-    #[tokio::test]
-    async fn stale_engine_is_incompatible_while_models_remain_installed() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
+    /// A managed install whose engine belongs to an earlier app version, beside
+    /// models that are still valid — what an app update leaves behind.
+    fn write_stale_install(root: &Path) -> Vec<super::super::ManagedComponent> {
         let target = current_target().expect("voice tests run on a supported target");
         let make_component = |kind: &str, id: &str, bytes: &[u8]| {
             let path = root.join(id);
@@ -1051,11 +1126,53 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        components
+    }
+
+    /// A release server with nothing published on it: every request is a 404,
+    /// the way GitHub answers for an asset of a draft release. Returns its base
+    /// URL and the paths it was asked for.
+    async fn unpublished_release_server() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requested = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = requested.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match socket.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                if let Some(path) = String::from_utf8_lossy(&request).split_whitespace().nth(1) {
+                    log.lock().unwrap().push(path.to_owned());
+                }
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{address}"), requested)
+    }
+
+    #[tokio::test]
+    async fn stale_engine_is_incompatible_while_models_remain_installed() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write_stale_install(root);
         let service = VoiceService::with_engine(
             root.to_path_buf(),
             APP_VERSION,
             BUILD_IDENTITY,
             Arc::new(CapturingEmitter::new()),
+            OFFLINE_RELEASES,
             None,
         );
         let status = service.handle().status().await.unwrap();
@@ -1075,6 +1192,80 @@ mod tests {
             ComponentState::Installed,
             "a Parakeet model is as version-independent as a whisper one"
         );
+        assert_eq!(
+            status.engine_failure, None,
+            "nothing has tried to replace the engine yet, so there is no cause to report"
+        );
+    }
+
+    /// An app updated without a self-rebuild, to a version whose release is not
+    /// published, keeps its earlier engine. What status reports is the missing
+    /// release asset — after the startup refresh and after a retried Enable
+    /// alike — never a protocol mismatch, and the models stay where they are.
+    #[tokio::test]
+    async fn a_stale_engine_whose_release_is_unpublished_reports_the_missing_asset() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let installed = write_stale_install(root);
+        let (release_base, requested) = unpublished_release_server().await;
+        let emitter = Arc::new(CapturingEmitter::new());
+        let service = VoiceService::with_engine(
+            root.to_path_buf(),
+            APP_VERSION,
+            BUILD_IDENTITY,
+            emitter.clone(),
+            &release_base,
+            None,
+        );
+        let voice = service.handle();
+        let target = current_target().expect("voice tests run on a supported target");
+        let asset = super::super::engine_asset_name(APP_VERSION, target);
+
+        voice.refresh_engine().await;
+
+        assert_eq!(
+            requested.lock().unwrap().as_slice(),
+            [format!("/v{APP_VERSION}/{asset}.sha256")],
+            "the refresh asks for this exact version's engine and nothing else"
+        );
+        let status = voice.status().await.unwrap();
+        assert_eq!(status.engine, ComponentState::Incompatible);
+        let failure = status
+            .engine_failure
+            .expect("the refresh's failure reaches status");
+        assert_eq!(failure.code, "release_asset_missing");
+        assert!(failure.message.contains(&asset), "{}", failure.message);
+        assert!(
+            emitter
+                .events_named(VOICE_EVENT_NAME)
+                .iter()
+                .any(|event| event["type"] == "engineChanged"
+                    && event["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains(&asset))),
+            "a settings page already open learns of the failure"
+        );
+
+        let error = voice
+            .enable()
+            .await
+            .expect_err("Enable cannot install an engine that was never published");
+        assert_eq!(error.code(), "release_asset_missing");
+        let status = voice.status().await.unwrap();
+        assert_eq!(
+            status.engine_failure.map(|failure| failure.code).as_deref(),
+            Some("release_asset_missing"),
+            "a retried Enable reports the same cause"
+        );
+        assert_eq!(status.fast_model, ComponentState::Installed);
+        assert_eq!(status.realtime_model, ComponentState::Installed);
+        for component in &installed {
+            assert!(
+                component.path.exists(),
+                "{} survives a failed refresh",
+                component.id
+            );
+        }
     }
 
     /// The engine every script starts from: it identifies itself, greets, logs
@@ -1239,6 +1430,7 @@ done
                     APP_VERSION,
                     BUILD_IDENTITY,
                     Arc::new(CapturingEmitter::new()),
+                    OFFLINE_RELEASES,
                     engine_override,
                 ),
                 directory,
@@ -1815,6 +2007,36 @@ done
             "a failed close must recycle the process, not just drop the handle: {:?}",
             harness.commands()
         );
+    }
+
+    /// Enable owes the default model only for a preference that names a missing
+    /// one: a user who dictates and transcribes with Accurate does not get Fast
+    /// downloaded back.
+    #[tokio::test]
+    async fn a_re_enable_whose_preferred_models_are_present_ensures_only_the_engine() {
+        let harness = Harness::managed(COOPERATIVE);
+        let voice = harness.voice();
+        let fast = harness.directory.path().join("models/model-fast");
+        voice
+            .set_preferred_model(ModelPurpose::Dictation, VoiceModel::Accurate)
+            .await
+            .unwrap();
+        voice
+            .set_preferred_model(ModelPurpose::File, VoiceModel::Accurate)
+            .await
+            .unwrap();
+        std::fs::remove_file(&fast).unwrap();
+        assert!(voice.preferred_models_installed().await);
+        voice
+            .set_preferred_model(ModelPurpose::File, VoiceModel::Fast)
+            .await
+            .expect_err("a missing model cannot be chosen");
+
+        voice
+            .enable()
+            .await
+            .expect("a re-enable whose models are present ensures only the engine");
+        assert!(!fast.exists(), "Fast was not downloaded back");
     }
 
     /// A self-rebuild hands off the engine built from the same revision as the

@@ -5306,6 +5306,16 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/5662 does not move the number. Placement waits on a machine the
+/// self-update rollout or an inference deployment holds rather than refusing
+/// work for want of a machine, a waiting queue entry records the inference
+/// holds it is parked on, and a reserving deployment's drain preempts checks
+/// with the existing `Cancel` frame, the runner recording the cause as it does
+/// for every cancellation. `InferenceHold` gains an optional `waiting_on` that
+/// the runner alone writes into the health snapshot it serves the desktop; a
+/// machine is never told of a hold. No frame or variant changes, and a runner
+/// talking to an older executor gets nothing wrong.
+///
 /// cairn/5674 does not move the number. `process_identity` gains
 /// `kernel_thread_states`, a local read of `/proc/<pid>/task` that the runner
 /// appends to its own log lines and failure diagnostics when a colocated
@@ -15436,6 +15446,7 @@ impl PlacementRejectionReason {
             Self::InferenceReserved { deployment, phase } => InferenceHold {
                 deployment: deployment.clone(),
                 phase: phase.clone(),
+                waiting_on: None,
             }
             .describe(),
             Self::BuildVolumeAbsent { path } => format!(
@@ -17037,13 +17048,22 @@ pub struct InferenceHold {
     pub deployment: String,
     /// The deployment's phase, as the cairn-inference facet labels it.
     pub phase: String,
+    /// What a reserving start is waiting on before it loads: its head, or
+    /// the memory the work on its machines holds while they drain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
 }
 
 impl InferenceHold {
     pub fn describe(&self) -> String {
         format!(
-            "reserved for inference deployment {} ({}), refusing new work until it stops",
-            self.deployment, self.phase
+            "reserved for inference deployment {} ({}), refusing new work until it stops{}",
+            self.deployment,
+            self.phase,
+            self.waiting_on
+                .as_deref()
+                .map(|on| format!("; its load waits on {on}"))
+                .unwrap_or_default()
         )
     }
 }

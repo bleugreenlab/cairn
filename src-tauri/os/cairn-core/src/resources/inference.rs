@@ -1247,6 +1247,7 @@ mod tests {
             MachineReading {
                 gpu_allocated_bytes: Some(100 << 30),
                 free_bytes: Some(20 << 30),
+                free_is_host_memory: true,
             },
         );
         view.deployment_control.loads.insert(
