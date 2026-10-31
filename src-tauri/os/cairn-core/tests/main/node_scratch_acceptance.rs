@@ -344,12 +344,12 @@ fn agent_snapshot() -> AgentSnapshot {
 
 /// An issue node (`cairn://p/nsc/1/1/builder`) with a live run, on a branch
 /// provisioned the way production provisions one.
-struct Node {
-    machines: TwoMachines,
+pub(crate) struct Node {
+    pub(crate) machines: TwoMachines,
     cwd: String,
 }
 
-async fn node() -> Node {
+pub(crate) async fn node() -> Node {
     node_with(None).await
 }
 
@@ -479,7 +479,7 @@ impl Node {
     }
 
     /// One shell item, on `machine` when one is named.
-    async fn shell(&self, run_id: &str, machine: Option<&str>, command: &str) -> String {
+    pub(crate) async fn shell(&self, run_id: &str, machine: Option<&str>, command: &str) -> String {
         let mut payload = json!({ "commands": [{ "command": command }] });
         if let Some(machine) = machine {
             payload["executor"] = json!({ "name": machine });
@@ -487,7 +487,7 @@ impl Node {
         self.run(run_id, payload).await
     }
 
-    async fn drain(&self, machine: &str, drained: bool) {
+    pub(crate) async fn drain(&self, machine: &str, drained: bool) {
         self.orch()
             .fleet
             .set_executor_drain_mode(machine, drained)
@@ -528,7 +528,7 @@ impl Node {
         .unwrap_or_default()
     }
 
-    async fn start_terminal(&self, slug: &str, script: &str) -> String {
+    pub(crate) async fn start_terminal(&self, slug: &str, script: &str) -> String {
         assert!(!script.contains('\''), "terminal scripts are single-quoted");
         handle_write(
             self.orch(),
@@ -564,7 +564,7 @@ impl Node {
 }
 
 /// Wait for `done`, which watches effects a background teardown produces.
-async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+pub(crate) async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     for _ in 0..200 {
         if done() {
             return;

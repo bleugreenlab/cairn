@@ -747,6 +747,172 @@ impl ResidentLanding {
     }
 }
 
+/// Where a resident process's callbacks to this runner go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResidentCallback {
+    /// The process shares this runner's machine and calls its loopback.
+    Direct { url: String },
+    /// The process is on another machine and calls its executor's relay.
+    Relayed { executor_id: String },
+}
+
+impl ResidentCallback {
+    /// The audience a run bearer is minted for when its holder calls back
+    /// this way.
+    pub(crate) fn audience(&self) -> Result<crate::security::LeaseAudience, String> {
+        match self {
+            Self::Direct { url } => crate::mcp::run_bearer::audience_for_url(url),
+            Self::Relayed { executor_id } => {
+                Ok(crate::mcp::run_bearer::relay_audience(executor_id))
+            }
+        }
+    }
+}
+
+/// This runner's own callback endpoint, as a process on its machine reaches it.
+pub(crate) fn runner_callback_url(orch: &Orchestrator) -> String {
+    format!("http://127.0.0.1:{}/api/mcp", orch.mcp_callback_port)
+}
+
+/// The one decision every resident launch makes about its callback, from the
+/// executor it is placed on.
+///
+/// Only this runner's own colocated executor, or no placement at all (an
+/// unrouted job home, which `Fleet::job_home_executor` answers with the
+/// colocated machine), calls back directly. A placed machine this runner is not
+/// connected to at this instant is relayed: it may reattach before the start
+/// goes out, and answering it as colocated would ship the machine secret to a
+/// remote. A colocated executor serves the relay too, so the cost of guessing
+/// wrong this way is a relay where the loopback would have done.
+pub(crate) fn resident_callback(
+    orch: &Orchestrator,
+    placed_executor: Option<&str>,
+) -> ResidentCallback {
+    match placed_executor {
+        Some(executor_id) if orch.fleet.executor_is_colocated(executor_id) != Some(true) => {
+            ResidentCallback::Relayed {
+                executor_id: executor_id.to_string(),
+            }
+        }
+        _ => ResidentCallback::Direct {
+            url: runner_callback_url(orch),
+        },
+    }
+}
+
+const CALLBACK_URL_ENV: &str = "CAIRN_CALLBACK_URL";
+const MCP_SECRET_ENV: &str = "CAIRN_MCP_SECRET";
+
+/// Route a terminal's or REPL's callbacks for the machine its environment is
+/// on. `env` is composed for this machine; for a process on another one, its
+/// callback address and this runner's secret are taken out, a capability for
+/// this one process speaking for `run_id` is put in, and the grant the
+/// executor relays it under is returned.
+pub(crate) fn route_resident_callbacks(
+    orch: &Orchestrator,
+    holder: &ResidencyHolder,
+    process_key: &str,
+    run_id: Option<&str>,
+    env: Vec<(String, String)>,
+) -> Result<RoutedResidentEnv, String> {
+    let placed = orch.fleet.residency_route_executor(holder);
+    route_resident_callbacks_on(orch, placed.as_deref(), holder, process_key, run_id, env)
+}
+
+/// [`route_resident_callbacks`] for a process placed on `placed`.
+fn route_resident_callbacks_on(
+    orch: &Orchestrator,
+    placed: Option<&str>,
+    holder: &ResidencyHolder,
+    process_key: &str,
+    run_id: Option<&str>,
+    mut env: Vec<(String, String)>,
+) -> Result<RoutedResidentEnv, String> {
+    let ResidentCallback::Relayed { executor_id } = resident_callback(orch, placed) else {
+        return Ok(RoutedResidentEnv { env, relay: None });
+    };
+    env.retain(|(name, _)| name != CALLBACK_URL_ENV && name != MCP_SECRET_ENV);
+    let minted = orch.fleet.resident_relays().register(
+        &executor_id,
+        holder,
+        process_key,
+        crate::fleet::resident_relay::RegisteredAuthority::Run {
+            run_id: run_id.map(str::to_string),
+        },
+    );
+    if let Some(capability) = minted.capability {
+        env.push((MCP_SECRET_ENV.to_string(), capability));
+    }
+    if let Err(refusal) = refuse_runner_credentials(orch, &env) {
+        orch.fleet.resident_relays().revoke(&minted.grant.relay_id);
+        return Err(refusal);
+    }
+    Ok(RoutedResidentEnv {
+        env,
+        relay: Some(minted.grant),
+    })
+}
+
+/// A terminal's or REPL's environment once its callbacks are routed, and the
+/// relay grant its start carries when it runs on another machine.
+pub(crate) struct RoutedResidentEnv {
+    pub env: Vec<(String, String)>,
+    pub relay: Option<cairn_common::executor_protocol::ResidentRelayGrant>,
+}
+
+/// Refuse an environment bound for another machine that still carries this
+/// runner's machine secret or names its loopback callback. The relay's whole
+/// point is that neither leaves this machine; a composition that let one
+/// through is a bug worth failing the start over rather than shipping.
+pub(crate) fn refuse_runner_credentials(
+    orch: &Orchestrator,
+    env: &[(String, String)],
+) -> Result<(), String> {
+    let secret = orch.mcp_auth.get_secret_for_mcp().ok();
+    let runner_url = runner_callback_url(orch);
+    for (name, value) in env {
+        if secret.as_deref().is_some_and(|secret| secret == value) {
+            return Err(format!(
+                "refusing to start a process on another machine with this runner's MCP secret in `{name}`"
+            ));
+        }
+        if name == CALLBACK_URL_ENV || *value == runner_url {
+            return Err(format!(
+                "refusing to start a process on another machine with a callback address in `{name}`; its executor provides one"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The last check before a resident start leaves for its machine: one bound for
+/// any machine but this runner's own may not carry the runner's MCP secret,
+/// whichever path composed its environment.
+///
+/// `resident_callback` already keeps the secret out of the environments it
+/// routes; this holds the property for every resident kind at the one place
+/// the frame is sent, against the connection actually selected, so a launch
+/// that composed its own environment, or a machine that turned out remote
+/// after the decision, cannot carry it there.
+pub(crate) fn refuse_unrelayed_runner_secret(
+    colocated: bool,
+    process: &cairn_common::executor_protocol::ResidentProcessSpec,
+    secret: Option<&str>,
+) -> Result<(), String> {
+    let Some(secret) = secret else {
+        return Ok(());
+    };
+    if colocated {
+        return Ok(());
+    }
+    match process.env.iter().find(|(_, value)| value == secret) {
+        Some((name, _)) => Err(format!(
+            "refusing to start a process on another machine with this runner's MCP secret in `{name}`; start it again so it is given a relay of its own"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Parse the `executor` a terminal or REPL create carries: the same selector
 /// `run` takes (`{name}` or `{os}`, optionally with `requiredToolchains`), and
 /// nothing a create cannot honour.
@@ -856,6 +1022,206 @@ pub(crate) async fn job_live_processes(
                 .map(|slug| format!("REPL `{slug}`")),
         )
         .collect()
+}
+
+#[cfg(test)]
+mod resident_callback_tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::SearchIndex;
+    use cairn_common::executor_protocol::{
+        ExecutorAdvertisement, ExecutorCapabilities, ExecutorIdentity, ResidentProcessCwdRoot,
+        ResidentProcessIoMode, ResidentProcessSpec,
+    };
+    use std::sync::Arc;
+
+    async fn orchestrator() -> Orchestrator {
+        let db = crate::storage::migrated_test_db("resident-callback.db").await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
+        OrchestratorBuilder::new(
+            db_state,
+            Arc::new(TestServicesBuilder::new().build()),
+            config_dir,
+        )
+        .build()
+    }
+
+    fn attach(orch: &Orchestrator, executor_id: &str, colocated: bool) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        std::mem::forget(receiver);
+        orch.fleet
+            .attach_advertised_executor(
+                ExecutorAdvertisement {
+                    identity: ExecutorIdentity {
+                        device_id: format!("{executor_id}-device"),
+                        executor_id: executor_id.into(),
+                        display_name: executor_id.into(),
+                    },
+                    capabilities: ExecutorCapabilities {
+                        os: std::env::consts::OS.into(),
+                        arch: std::env::consts::ARCH.into(),
+                        logical_cores: 8,
+                        concurrency_capacity: None,
+                        toolchains: Vec::new(),
+                        projects_served: Vec::new(),
+                        disk_budget_bytes: None,
+                        memory_budget_bytes: None,
+                        sandbox: None,
+                        toolchain_detection: None,
+                        build_prerequisites: None,
+                        containment: None,
+                    },
+                    current_load: 0,
+                    warm_roots: Vec::new(),
+                    observed_at_unix_ms: chrono::Utc::now().timestamp_millis() as u64,
+                    liveness_observed_at_unix_ms: None,
+                    facts_stale_refresh_blocked: None,
+                    last_refresh: None,
+                    node_scratches: Vec::new(),
+                },
+                sender,
+                colocated,
+                None,
+                None,
+            )
+            .unwrap();
+    }
+
+    fn holder() -> ResidencyHolder {
+        ResidencyHolder::Job {
+            job_id: "job-1".into(),
+        }
+    }
+
+    fn secret(orch: &Orchestrator) -> String {
+        orch.mcp_auth.get_secret_for_mcp().unwrap()
+    }
+
+    /// What a terminal or REPL launch composes for this machine.
+    fn runner_env(orch: &Orchestrator) -> Vec<(String, String)> {
+        vec![
+            ("CAIRN_RUN_ID".into(), "r-1".into()),
+            (CALLBACK_URL_ENV.into(), runner_callback_url(orch)),
+            (MCP_SECRET_ENV.into(), secret(orch)),
+        ]
+    }
+
+    fn spec(env: Vec<(String, String)>) -> ResidentProcessSpec {
+        ResidentProcessSpec {
+            runtime_packages: Vec::new(),
+            program: "/bin/sh".into(),
+            args: Vec::new(),
+            launch_command: None,
+            cwd: String::new(),
+            cwd_root: ResidentProcessCwdRoot::Checkout,
+            env,
+            sandbox_mode: Default::default(),
+            sandbox_policy: None,
+            runtime_assets: Vec::new(),
+            io: ResidentProcessIoMode::Pipe,
+            node_scratch: None,
+            relay: None,
+        }
+    }
+
+    /// A resident on the runner's own machine, or one with no placement yet,
+    /// starts with exactly what was composed for it and no relay.
+    #[tokio::test]
+    async fn a_colocated_or_unplaced_resident_keeps_its_environment_and_gets_no_relay() {
+        let orch = orchestrator().await;
+        attach(&orch, "local", true);
+        for placed in [Some("local"), None] {
+            let routed = route_resident_callbacks_on(
+                &orch,
+                placed,
+                &holder(),
+                "shell",
+                Some("r-1"),
+                runner_env(&orch),
+            )
+            .unwrap();
+            assert_eq!(routed.env, runner_env(&orch), "placed on {placed:?}");
+            assert!(routed.relay.is_none(), "placed on {placed:?}");
+        }
+        assert_eq!(orch.fleet.resident_relays().len(), 0);
+    }
+
+    /// A resident on another machine, connected or not at this instant, holds
+    /// neither the machine secret nor the runner's URL: a capability of its own
+    /// instead, with a relay context registered for it.
+    #[tokio::test]
+    async fn a_remote_or_unconnected_resident_gets_a_capability_and_a_relay_never_the_secret() {
+        let orch = orchestrator().await;
+        attach(&orch, "machine-b", false);
+        for (index, placed) in ["machine-b", "machine-away"].into_iter().enumerate() {
+            let routed = route_resident_callbacks_on(
+                &orch,
+                Some(placed),
+                &holder(),
+                &format!("shell-{index}"),
+                Some("r-1"),
+                runner_env(&orch),
+            )
+            .unwrap();
+            assert!(routed.relay.is_some(), "placed on {placed}");
+            assert!(
+                routed
+                    .env
+                    .iter()
+                    .all(|(name, value)| name != CALLBACK_URL_ENV
+                        && *value != secret(&orch)
+                        && *value != runner_callback_url(&orch)),
+                "placed on {placed}: {:?}",
+                routed.env.iter().map(|(name, _)| name).collect::<Vec<_>>()
+            );
+            let capability = routed
+                .env
+                .iter()
+                .find(|(name, _)| name == MCP_SECRET_ENV)
+                .map(|(_, value)| value.clone())
+                .expect("a capability of its own");
+            assert!(!capability.is_empty());
+            assert!(routed.env.contains(&("CAIRN_RUN_ID".into(), "r-1".into())));
+            assert_eq!(orch.fleet.resident_relays().len(), index + 1);
+        }
+    }
+
+    /// An environment bound for another machine is refused if the machine
+    /// secret or the runner's callback is still in it, under any name.
+    #[tokio::test]
+    async fn an_environment_for_another_machine_is_refused_with_the_runners_credentials() {
+        let orch = orchestrator().await;
+        let with_secret = vec![("SOMETHING_ELSE".to_string(), secret(&orch))];
+        assert!(refuse_runner_credentials(&orch, &with_secret)
+            .unwrap_err()
+            .contains("`SOMETHING_ELSE`"));
+        let with_url = vec![("OTHER_URL".to_string(), runner_callback_url(&orch))];
+        assert!(refuse_runner_credentials(&orch, &with_url).is_err());
+        let clean = vec![("CAIRN_RUN_ID".to_string(), "r-1".to_string())];
+        assert!(refuse_runner_credentials(&orch, &clean).is_ok());
+    }
+
+    /// Where the start frame leaves: a machine other than the runner's own
+    /// never receives the secret, relayed or not, and the runner's own does.
+    #[test]
+    fn a_start_for_another_machine_carrying_the_secret_is_refused_where_it_leaves() {
+        let carrying = spec(vec![(MCP_SECRET_ENV.into(), "machine-secret".into())]);
+        assert!(
+            refuse_unrelayed_runner_secret(false, &carrying, Some("machine-secret"))
+                .unwrap_err()
+                .contains("`CAIRN_MCP_SECRET`")
+        );
+        assert!(refuse_unrelayed_runner_secret(true, &carrying, Some("machine-secret")).is_ok());
+        let capability = spec(vec![(MCP_SECRET_ENV.into(), "per-process".into())]);
+        assert!(refuse_unrelayed_runner_secret(false, &capability, Some("machine-secret")).is_ok());
+        assert!(refuse_unrelayed_runner_secret(false, &carrying, None).is_ok());
+    }
 }
 
 #[cfg(test)]

@@ -719,7 +719,7 @@ pub async fn process_spec(
         run_context.map(|ctx| ctx.run_id.as_str()),
         home_uri.as_deref(),
         managed_branch,
-        format!("http://127.0.0.1:{}/api/mcp", orch.mcp_callback_port),
+        crate::fleet::residency::runner_callback_url(orch),
         orch.mcp_auth.get_secret_for_mcp().ok(),
     );
     // A REPL makes its node's scratch its `$TMPDIR` and, while it lives, holds
@@ -769,6 +769,7 @@ pub async fn process_spec(
         }],
         io: ResidentProcessIoMode::Pipe,
         node_scratch,
+        relay: None,
     })
 }
 
@@ -787,7 +788,9 @@ pub async fn process_spec(
 ///
 /// The route is the terminal's, for the terminal's reason: a REPL has no
 /// per-batch relay capability, and `@cairn/sdk` and an in-REPL `cairn` call
-/// reach the runner through the callback address and secret.
+/// reach the runner through the callback address and secret. Composed for this
+/// runner's machine; a REPL placed elsewhere has both replaced by its
+/// executor's resident relay when it starts.
 fn repl_process_env(
     run_id: Option<&str>,
     home_uri: Option<&str>,
@@ -836,7 +839,7 @@ pub async fn spawn_session(
     // one environment.
     let managed_branch = branch.or(base_branch);
 
-    let process = process_spec(
+    let mut process = process_spec(
         orch,
         job_id,
         project_id,
@@ -941,6 +944,26 @@ pub async fn spawn_session(
     // Process keys are unique within the home, so a REPL names itself by slug
     // rather than claiming the one generic key.
     let key = format!("repl:{slug}");
+    // An interpreter on another machine reaches this runner through its
+    // executor's relay, with a capability for this one process.
+    match crate::fleet::residency::route_resident_callbacks(
+        orch,
+        &fence.holder,
+        &key,
+        run_context.map(|ctx| ctx.run_id.as_str()),
+        std::mem::take(&mut process.env),
+    ) {
+        Ok(crate::fleet::residency::RoutedResidentEnv { env, relay }) => {
+            process.env = env;
+            process.relay = relay;
+        }
+        Err(error) => {
+            let _ = crate::fleet::residency::release(orch, &fence).await;
+            return Err(format!(
+                "Could not start {surface}: {error}. Nothing was started."
+            ));
+        }
+    }
     let (tx, rx) = mpsc::sync_channel(2);
     let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
     let early_alive = Arc::new(AtomicBool::new(true));

@@ -143,6 +143,18 @@ pub(crate) struct HostProcess {
 /// Places service processes and carries their pipes.
 #[async_trait]
 pub(crate) trait ServiceHost: Send + Sync {
+    /// Where the service `spec` names will call back from, decided by placing
+    /// it, so its bearers can be bound there before they are minted. A host
+    /// that places nothing elsewhere answers this runner's loopback.
+    async fn callback(
+        &self,
+        orch: &Orchestrator,
+        _spec: &LaunchSpec,
+    ) -> Result<crate::fleet::residency::ResidentCallback, String> {
+        Ok(crate::fleet::residency::ResidentCallback::Direct {
+            url: crate::fleet::residency::runner_callback_url(orch),
+        })
+    }
     async fn launch(&self, orch: &Orchestrator, spec: &LaunchSpec) -> Result<HostProcess, String>;
     /// The service has stopped; give back whatever its placement holds.
     async fn release(
@@ -210,6 +222,9 @@ struct Incarnation {
     source_hash: String,
     declaration: ServiceDeclaration,
     executor: String,
+    /// Where this process calls back, as the audience its bearers are bound
+    /// to: each call's delegated bearer is minted for it too.
+    callback_audience: crate::security::LeaseAudience,
     input: Arc<dyn HostInput>,
     pending: StdMutex<HashMap<String, Reply>>,
     phase: watch::Sender<Phase>,
@@ -531,10 +546,6 @@ async fn lifecycle(orch: &Orchestrator, cell: &Cell, generation: u64, text: &str
     .await;
 }
 
-fn callback_url(orch: &Orchestrator) -> String {
-    format!("http://127.0.0.1:{}/api/mcp", orch.mcp_callback_port)
-}
-
 /// Mint a bearer for `run_id` acting as `home`, presentable at the callback.
 ///
 /// Returned as the lease, never its value: the value is taken through
@@ -545,9 +556,8 @@ fn mint_bearer(
     run_id: &str,
     home: &str,
     lifetime: Option<Duration>,
+    audience: &crate::security::LeaseAudience,
 ) -> Result<crate::mcp::run_bearer::RunBearer, CallError> {
-    let audience = crate::mcp::run_bearer::audience_for_url(&callback_url(orch))
-        .map_err(|error| CallError::new("start_failed", error))?;
     let minted = match lifetime {
         Some(lifetime) => orch
             .run_bearers
@@ -670,9 +680,41 @@ async fn boot_incarnation(
         .await
         .map_err(|error| CallError::new("start_failed", error))?;
     let home = cell.home();
+    let mut spec = LaunchSpec {
+        project_id: cell.project_id.clone(),
+        project_key: cell.project_key.clone(),
+        owner: cell.owner.clone(),
+        service: cell.service.clone(),
+        generation,
+        declaration: package.declaration.clone(),
+        files: package.files.clone(),
+        env: Vec::new(),
+    };
+    // Placed before any bearer exists, because where the service calls back
+    // from is what its bearers are bound to: this runner's loopback, or the
+    // relay of the one executor it runs on.
+    let callback = match supervisor(orch).host().callback(orch, &spec).await {
+        Ok(callback) => callback,
+        Err(error) => {
+            end_run(orch, &cell.project_id, &run_id, "start failed").await;
+            let error = CallError::new(
+                "start_failed",
+                format!("could not place the service: {error}"),
+            );
+            lifecycle(orch, cell, generation, &error.message, actor).await;
+            return Err(error);
+        }
+    };
+    let audience = match callback.audience() {
+        Ok(audience) => audience,
+        Err(error) => {
+            end_run(orch, &cell.project_id, &run_id, "start failed").await;
+            return Err(CallError::new("start_failed", error));
+        }
+    };
     // Presented here because it is written into the launch environment below.
-    let token = match mint_bearer(orch, &run_id, &home, None).and_then(|bearer| {
-        crate::mcp::run_bearer::service_credential(&bearer, &callback_url(orch))
+    let token = match mint_bearer(orch, &run_id, &home, None, &audience).and_then(|bearer| {
+        crate::mcp::run_bearer::service_credential(&bearer, &audience)
             .map_err(|error| CallError::new("start_failed", error))
     }) {
         Ok(token) => token,
@@ -705,23 +747,17 @@ async fn boot_incarnation(
         // A run bearer, never the machine secret: it speaks for this run alone
         // and is revoked when the incarnation ends.
         ("CAIRN_MCP_SECRET".to_string(), token),
-        ("CAIRN_CALLBACK_URL".to_string(), callback_url(orch)),
         (
             "CAIRN_ENV".to_string(),
             cairn_common::paths::env_str().to_string(),
         ),
         ("CAIRN_SERVICE".to_string(), cell.service.clone()),
     ]);
-    let spec = LaunchSpec {
-        project_id: cell.project_id.clone(),
-        project_key: cell.project_key.clone(),
-        owner: cell.owner.clone(),
-        service: cell.service.clone(),
-        generation,
-        declaration: package.declaration.clone(),
-        files: package.files.clone(),
-        env,
-    };
+    // A service elsewhere is told its callback by the executor that relays it.
+    if let crate::fleet::residency::ResidentCallback::Direct { url } = &callback {
+        env.push(("CAIRN_CALLBACK_URL".to_string(), url.clone()));
+    }
+    spec.env = env;
 
     let process = match supervisor(orch).host().launch(orch, &spec).await {
         Ok(process) => process,
@@ -744,6 +780,7 @@ async fn boot_incarnation(
         source_hash: package.source_hash.clone(),
         declaration: package.declaration.clone(),
         executor: process.executor.clone(),
+        callback_audience: audience,
         input: process.input.clone(),
         pending: StdMutex::default(),
         phase,
@@ -2037,8 +2074,19 @@ async fn call_body(
     let deadline = Instant::now() + timeout;
 
     // Everything slow about a call happens before an incarnation is chosen, so
-    // nothing stands between choosing the serving one and sending to it.
-    let delegation = match delegate(orch, &cell, &request, first.generation, timeout).await {
+    // nothing stands between choosing the serving one and sending to it. The
+    // delegation is minted for the first incarnation's audience; a retry that
+    // lands on one whose lease was re-placed is minted a bearer for its own.
+    let mut delegation = match delegate(
+        orch,
+        &cell,
+        &request,
+        first.generation,
+        timeout,
+        &first.callback_audience,
+    )
+    .await
+    {
         Ok(delegation) => delegation,
         Err(error) => {
             let result = Err(error);
@@ -2061,6 +2109,29 @@ async fn call_body(
             }
         };
         served_by = incarnation.clone();
+        // A recovered lease moves the service to another machine, whose relay
+        // refuses a bearer bound to the old one. The call's run is the same;
+        // only where its credential may be presented changes, and every bearer
+        // of the run dies with it at `end_run`.
+        if incarnation.callback_audience != delegation.audience {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match mint_bearer(
+                orch,
+                &delegation.run_id,
+                &cell.home(),
+                Some(remaining + BEARER_GRACE),
+                &incarnation.callback_audience,
+            ) {
+                Ok(bearer) => {
+                    delegation.bearer = bearer;
+                    delegation.audience = incarnation.callback_audience.clone();
+                }
+                Err(error) => {
+                    result = Err(CallError::new("service_unavailable", error.message));
+                    break;
+                }
+            }
+        }
         let permit = match admit(&cell, &incarnation).await {
             Ok(permit) => permit,
             Err(error) => {
@@ -2128,7 +2199,7 @@ impl Drop for InFlight {
 struct Delegation {
     run_id: String,
     bearer: crate::mcp::run_bearer::RunBearer,
-    callback_url: String,
+    audience: crate::security::LeaseAudience,
 }
 
 async fn delegate(
@@ -2137,6 +2208,7 @@ async fn delegate(
     request: &CallRequest,
     generation: u64,
     timeout: Duration,
+    audience: &crate::security::LeaseAudience,
 ) -> Result<Delegation, CallError> {
     let db = crate::execution::routing::owning_db_for_project(&orch.db, &cell.project_id)
         .await
@@ -2148,7 +2220,7 @@ async fn delegate(
         .await
         .map_err(|error| CallError::new("service_unavailable", error))?;
     let home = cell.home();
-    let bearer = match mint_bearer(orch, &run_id, &home, Some(timeout + BEARER_GRACE)) {
+    let bearer = match mint_bearer(orch, &run_id, &home, Some(timeout + BEARER_GRACE), audience) {
         Ok(bearer) => bearer,
         Err(error) => {
             end_run(orch, &cell.project_id, &run_id, "call ended").await;
@@ -2174,7 +2246,7 @@ async fn delegate(
     Ok(Delegation {
         run_id,
         bearer,
-        callback_url: callback_url(orch),
+        audience: audience.clone(),
     })
 }
 
@@ -2237,7 +2309,7 @@ async fn send_call(
     }
     // Presented as the frame that carries it is built, once per frame sent.
     let token =
-        crate::mcp::run_bearer::service_credential(&delegation.bearer, &delegation.callback_url)
+        crate::mcp::run_bearer::service_credential(&delegation.bearer, &delegation.audience)
             .map_err(|error| CallError::new("service_unavailable", error))?;
     let run_id = delegation.run_id.clone();
     let id = format!("c-{}", uuid::Uuid::new_v4().simple());

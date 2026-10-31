@@ -65,6 +65,7 @@ mod prompt_resume_event;
 mod provider_limit_holds;
 mod queued_direct_messages;
 mod read_fence_grep_parity;
+mod resident_relay_acceptance;
 mod run_fence_suspend_resume;
 mod run_ownership_fence;
 mod runs;

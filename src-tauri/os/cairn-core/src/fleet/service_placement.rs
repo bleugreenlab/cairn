@@ -78,6 +78,8 @@ pub(crate) struct ResidentLaunch {
     pub runtime_packages: Vec<ResidentRuntimeAsset>,
     pub sandbox_mode: ProcessSandboxMode,
     pub cwd_root: ResidentProcessCwdRoot,
+    /// The relay a process on another machine calls this runner through.
+    pub relay: Option<cairn_common::executor_protocol::ResidentRelayGrant>,
 }
 
 impl ResidentLaunch {
@@ -90,6 +92,7 @@ impl ResidentLaunch {
             runtime_packages: Vec::new(),
             sandbox_mode: ProcessSandboxMode::Unconfined,
             cwd_root: ResidentProcessCwdRoot::ResidencyScratch,
+            relay: None,
         }
     }
 
@@ -107,6 +110,7 @@ impl ResidentLaunch {
             runtime_assets: self.runtime_assets.clone(),
             io: ResidentProcessIoMode::Pipe,
             node_scratch: None,
+            relay: self.relay.clone(),
         }
     }
 }
@@ -396,6 +400,13 @@ impl ServiceLease {
 impl LeaseCore {
     pub(crate) fn executor_name(&self) -> String {
         self.executor_name.lock().unwrap().clone()
+    }
+
+    /// The executor the residency is on now, by id, as the fleet routes it.
+    pub(crate) fn executor_id(&self) -> Option<String> {
+        self.orch
+            .fleet
+            .residency_route_executor(&self.current_fence().holder)
     }
 
     pub(crate) fn health(&self) -> ServicePlacementHealth {

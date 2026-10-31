@@ -2063,6 +2063,9 @@ pub const CONTAINMENT_EDGE_DEFINITIONS: [EdgeDefinition; EdgeId::COUNT] = [
         claim_revision: 1,
         supported_probe_versions: PROBE_VERSIONS,
     },
+    // Colocated residents only. One placed on another machine reaches the
+    // runner through its executor's per-process relay (cairn/5562), whose
+    // typed edges arrive with their probe in cairn/5690.
     EdgeDefinition {
         id: EdgeId::McpRelayResidentRunnerWide,
         key: EdgeKey {
@@ -6023,6 +6026,20 @@ pub struct LearnedResourceEstimate {
 /// is ahead in that machine's line for the project, and the offers it does
 /// send carry the same fields as before. What a runner gets wrong talking to
 /// an older executor: nothing.
+///
+/// cairn/5562 does not move the number. [`ResidentProcessSpec`] gains an
+/// optional, defaulted `relay` ([`ResidentRelayGrant`]) the runner sets on a
+/// resident process it places on a machine other than its own, and the
+/// executor gains two frames it sends: [`ExecutorMessage::ResidentRelayRequest`],
+/// one call a resident process made through the executor's local relay, and
+/// [`ExecutorMessage::RelayReattach`], the live relays it still serves, first
+/// on every link. The runner answers a resident call with the existing
+/// [`ExecutorMessage::McpRelayResponse`]. What a runner gets wrong talking to
+/// an older executor: nothing it decodes differently. That executor ignores the
+/// grant, so its remote resident keeps the loopback callback it had before,
+/// which reaches nothing, until it runs a build carrying this. An older runner
+/// never mints a grant, so a newer executor never relays a resident call to it,
+/// and it logs the reattach frame, which then lists nothing, as unrecognised.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 160;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -9636,6 +9653,49 @@ pub struct ResidentProcessSpec {
     /// advertises `inUse` and the node's batches are placed beside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_scratch: Option<NodeScratchGrant>,
+    /// Present when this process runs on a machine other than the runner's:
+    /// the executor points its `CAIRN_CALLBACK_URL` at its own relay for this
+    /// one process, and forwards what arrives there to the runner over the
+    /// link. Absent for a colocated process, whose callback the runner set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<ResidentRelayGrant>,
+}
+
+/// The runner's routing name for one resident process's relay.
+///
+/// Random and minted fresh for every start, so it names one incarnation of one
+/// process and nothing else. It is not the credential the process presents,
+/// but it is the path that process's calls arrive on, so it is kept out of
+/// `Debug` output and the logs built from it.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ResidentRelayId(pub String);
+
+impl std::fmt::Debug for ResidentRelayId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ResidentRelayId(<redacted>)")
+    }
+}
+
+impl ResidentRelayId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The runner's instruction to relay one resident process's callbacks.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentRelayGrant {
+    pub relay_id: ResidentRelayId,
+}
+
+impl std::fmt::Debug for ResidentRelayGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResidentRelayGrant")
+            .field("relay_id", &self.relay_id)
+            .finish()
+    }
 }
 
 pub const MAX_RESIDENT_RUNTIME_ASSET_BYTES: usize = 4 * 1024 * 1024;
@@ -16917,6 +16977,55 @@ impl InferenceHold {
     }
 }
 
+/// The `Authorization` value a resident process presented at its executor's
+/// relay, forwarded verbatim.
+///
+/// The executor cannot judge it: a service's bearers change with every call
+/// and only the runner minted them. What the executor vouches for is which
+/// process sent it, and the runner decides what that process may do with it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RelayAuthorization(pub String);
+
+impl std::fmt::Debug for RelayAuthorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RelayAuthorization(<redacted>)")
+    }
+}
+
+impl RelayAuthorization {
+    /// The bearer token, when the value is a `Bearer <token>` credential.
+    pub fn bearer_token(&self) -> Option<&str> {
+        self.0
+            .strip_prefix("Bearer ")
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+    }
+}
+
+/// One relay an executor still serves, as it names it to a runner on a new
+/// link so the runner can bind it to that link again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RelayIdentity {
+    /// A live resident process at the generation it is running as.
+    #[serde(rename_all = "camelCase")]
+    Resident {
+        relay_id: ResidentRelayId,
+        holder: ResidencyHolder,
+        process_key: String,
+        process_generation: u64,
+    },
+    /// A running batch's relay context. Declared so one frame serves both
+    /// kinds; no executor sends it yet and a runner ignores it (cairn/5631).
+    #[serde(rename_all = "camelCase")]
+    Batch {
+        runner_context_id: String,
+        request_id: String,
+        attempt_id: String,
+    },
+}
+
 // The protocol keeps request payloads inline so serde preserves the established
 // wire shape; boxing would be an in-memory optimization with a broad API cost.
 #[allow(clippy::large_enum_variant)]
@@ -17226,6 +17335,26 @@ pub enum ExecutorMessage {
     McpRelayResponse {
         correlation_id: String,
         result: McpRelayResult,
+    },
+    /// Executor → runner: one call a resident process made at this executor's
+    /// relay, with the identity of the process it arrived from and the
+    /// credential it presented. Answered with [`Self::McpRelayResponse`].
+    ///
+    /// Which executor carried it is the link's to say, never the frame's.
+    ResidentRelayRequest {
+        correlation_id: String,
+        relay_id: ResidentRelayId,
+        holder: ResidencyHolder,
+        process_key: String,
+        process_generation: u64,
+        authorization: RelayAuthorization,
+        request: CallbackRequest,
+    },
+    /// Executor → runner, first on every link: every relay this executor still
+    /// serves. A relay a runner holds for this executor and does not find here
+    /// is gone, and the runner revokes it.
+    RelayReattach {
+        relays: Vec<RelayIdentity>,
     },
     InfrastructureDiagnostic {
         diagnostic: String,
@@ -18092,6 +18221,37 @@ mod tests {
                     diagnostic: "context expired".into(),
                 },
             },
+            ExecutorMessage::ResidentRelayRequest {
+                correlation_id: "resident-request".into(),
+                relay_id: ResidentRelayId("relay".into()),
+                holder: sample_holder(),
+                process_key: "shell".into(),
+                process_generation: 3,
+                authorization: RelayAuthorization("Bearer capability".into()),
+                request: CallbackRequest {
+                    cwd: "/tmp/worktree".into(),
+                    run_id: Some("run".into()),
+                    tool: "read".into(),
+                    payload: serde_json::json!({"paths": ["cairn:~"]}),
+                    ..CallbackRequest::default()
+                },
+            },
+            ExecutorMessage::RelayReattach {
+                relays: vec![
+                    RelayIdentity::Resident {
+                        relay_id: ResidentRelayId("relay".into()),
+                        holder: sample_holder(),
+                        process_key: "shell".into(),
+                        process_generation: 3,
+                    },
+                    RelayIdentity::Batch {
+                        runner_context_id: "ctx".into(),
+                        request_id: "request".into(),
+                        attempt_id: "attempt".into(),
+                    },
+                ],
+            },
+            ExecutorMessage::RelayReattach { relays: Vec::new() },
             ExecutorMessage::InfrastructureDiagnostic {
                 diagnostic: "lost".into(),
             },
@@ -19131,6 +19291,7 @@ mod tests {
                     },
                 },
                 node_scratch: None,
+                relay: None,
             }),
             status: ResidentProcessStatus::Running {
                 started_at_unix_ms: 1_785_185_750_222,
@@ -21453,6 +21614,7 @@ mod tests {
             }],
             io: ResidentProcessIoMode::Pipe,
             node_scratch: None,
+            relay: None,
         };
         let value = serde_json::to_value(&process).unwrap();
         assert_eq!(value["cwdRoot"], "residencyScratch");

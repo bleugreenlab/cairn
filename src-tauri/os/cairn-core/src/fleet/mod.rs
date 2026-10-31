@@ -20,6 +20,7 @@ pub(crate) mod queue;
 mod reliability;
 pub(crate) mod repair;
 pub(crate) mod residency;
+pub mod resident_relay;
 mod resource_profiles;
 pub(crate) mod rollout;
 pub use rollout::ArtifactUnavailable;
@@ -1472,6 +1473,9 @@ pub struct Fleet {
     preparing_leaders: Arc<Mutex<HashMap<RequestIdentity, LeaderPreparation>>>,
     in_flight: Arc<Mutex<InFlightRegistry>>,
     runner_contexts: Arc<Mutex<HashMap<String, RunnerContextEntry>>>,
+    /// The callback relays of resident processes on machines other than this
+    /// runner's. See [`resident_relay`].
+    resident_relays: Arc<Mutex<resident_relay::ResidentRelays>>,
     /// Streaming scrubbers for resident-process output, one per live stream.
     ///
     /// Terminals, REPLs, workflows, and dev instances all reach their consumers
@@ -2265,6 +2269,36 @@ impl Fleet {
         }
     }
 
+    pub(crate) fn resident_relays(&self) -> MutexGuard<'_, resident_relay::ResidentRelays> {
+        lock_through_poison(&self.resident_relays)
+    }
+
+    /// A link closed: its resident relays wait for the executor to announce
+    /// them on its next one. Unlike a batch's context, a resident process
+    /// outlives the link that started it.
+    pub fn detach_resident_relays(&self, executor_id: &str, generation: u64) {
+        self.resident_relays().detach(executor_id, generation);
+    }
+
+    /// The executor opened link `generation` naming the relays it still serves.
+    pub fn reattach_resident_relays(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        relays: &[cairn_common::executor_protocol::RelayIdentity],
+    ) {
+        self.resident_relays()
+            .reattach(executor_id, generation, relays);
+    }
+
+    /// Whether `executor_id` is this runner's own colocated executor, as its
+    /// live connection says. `None` when it is not connected.
+    pub(crate) fn executor_is_colocated(&self, executor_id: &str) -> Option<bool> {
+        self.lock_connections()
+            .get(executor_id)
+            .map(|connection| connection.colocated)
+    }
+
     pub fn revoke_mcp_relay_contexts_for_executor(
         &self,
         executor_id: &str,
@@ -2360,6 +2394,22 @@ impl Fleet {
                 settled
             }
             ResidentProcessEventKind::State { .. } => vec![event],
+        }
+    }
+
+    fn end_relay_of_exited_process(&self, executor_id: &str, event: &ResidentProcessEvent) {
+        if matches!(
+            event.event,
+            ResidentProcessEventKind::State {
+                status: cairn_common::executor_protocol::ResidentProcessStatus::Exited { .. }
+            }
+        ) {
+            self.resident_relays().process_exited(
+                executor_id,
+                &event.holder,
+                &event.process_key,
+                event.process_generation,
+            );
         }
     }
 
@@ -5614,6 +5664,7 @@ impl Fleet {
             }
             ExecutorMessage::ResidentProcessEvent { event } => {
                 if self.resident_event_is_current(executor_id, generation, &event) {
+                    self.end_relay_of_exited_process(executor_id, &event);
                     for event in self.settle_resident_event(executor_id, event) {
                         for subscriber in self.resident_process_subscribers.lock().unwrap().iter() {
                             subscriber(event.clone());
@@ -5985,6 +6036,7 @@ impl Fleet {
             self.release_residency_on(executor_id, generation, fence);
         }
         for event in reconciled_process_events {
+            self.end_relay_of_exited_process(executor_id, &event);
             for subscriber in self.resident_process_subscribers.lock().unwrap().iter() {
                 subscriber(event.clone());
             }
@@ -9224,6 +9276,19 @@ impl Fleet {
         if let Some(diagnostic) = dispatch_error {
             return residency_core_failure(ResidencyFailureKind::Admission, diagnostic, None);
         }
+        if let ResidencyOperation::StartProcess { process, .. } = &operation {
+            if let Err(diagnostic) = crate::fleet::residency::refuse_unrelayed_runner_secret(
+                selected.colocated,
+                process,
+                orch.mcp_auth.get_secret_for_mcp().ok().as_deref(),
+            ) {
+                return residency_core_failure(
+                    ResidencyFailureKind::InvalidState,
+                    diagnostic,
+                    None,
+                );
+            }
+        }
         let correlation_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         self.pending_residency.lock().unwrap().insert(
@@ -9265,6 +9330,45 @@ impl Fleet {
                 );
             }
         }
+        // A relayed process's context is bound to the link its start goes out
+        // on; a stop or a release ends the contexts it ends the processes of.
+        let relayed_start = match &operation {
+            ResidencyOperation::StartProcess {
+                process_key,
+                process:
+                    cairn_common::executor_protocol::ResidentProcessSpec {
+                        relay: Some(grant), ..
+                    },
+                ..
+            } => {
+                if let Err(diagnostic) = self.resident_relays().bind(
+                    &grant.relay_id,
+                    &selected.executor_id,
+                    selected.generation,
+                ) {
+                    self.pending_residency
+                        .lock()
+                        .unwrap()
+                        .remove(&correlation_id);
+                    return residency_core_failure(
+                        ResidencyFailureKind::InvalidState,
+                        diagnostic,
+                        None,
+                    );
+                }
+                Some((grant.relay_id.clone(), process_key.clone()))
+            }
+            ResidencyOperation::StopProcess { fence, process_key } => {
+                self.resident_relays()
+                    .revoke_process(&fence.holder, process_key);
+                None
+            }
+            ResidencyOperation::Release { fence } => {
+                self.resident_relays().revoke_holder(&fence.holder);
+                None
+            }
+            _ => None,
+        };
         let sent = selected
             .sender
             .send(ExecutorMessage::ResidencyRequest {
@@ -9324,6 +9428,21 @@ impl Fleet {
             }
         };
         self.record_residency_result(&selected.executor_id, &result);
+        if let Some((relay_id, process_key)) = relayed_start {
+            let started = match &result {
+                ResidencyResult::State { cell } => cell
+                    .occupancy
+                    .processes
+                    .get(&process_key)
+                    .map(|process| process.generation),
+                _ => None,
+            };
+            let mut relays = self.resident_relays();
+            match started {
+                Some(generation) => relays.learn_generation(&relay_id, generation),
+                None => relays.revoke(&relay_id),
+            }
+        }
         drop(dispatch);
         result
     }

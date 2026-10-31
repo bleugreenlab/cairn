@@ -2965,9 +2965,24 @@ async fn spawn_terminal_session(
         home_uri.as_deref(),
         target.branch.as_deref(),
         &session_id,
-        format!("http://127.0.0.1:{}/api/mcp", orch.mcp_callback_port),
+        crate::fleet::residency::runner_callback_url(orch),
         orch.mcp_auth.get_secret_for_mcp().ok(),
     );
+    // A PTY on another machine reaches this runner through its executor's
+    // relay, with a capability for this one process in place of the secret.
+    let (env, relay) = match crate::fleet::residency::route_resident_callbacks(
+        orch,
+        &fence.holder,
+        &session_id,
+        target.run_id.as_deref(),
+        env,
+    ) {
+        Ok(routed) => (routed.env, routed.relay),
+        Err(error) => {
+            rollback_terminal_creation(orch, &session_id, &fence).await;
+            return Err(error);
+        }
+    };
     // A job terminal is a process in its job's execution home — the agent's own
     // writable checkout, however little a detached cell looks like one on disk.
     // A project terminal runs in the project's live checkout, read-only.
@@ -3089,6 +3104,7 @@ async fn spawn_terminal_session(
                     runtime_assets: Vec::new(),
                     io: ResidentProcessIoMode::Pty { size },
                     node_scratch,
+                    relay,
                 },
             },
         )
@@ -3165,9 +3181,11 @@ async fn spawn_terminal_session(
 /// executor elsewhere does not have.
 ///
 /// Transport is where a terminal differs from a batch. A batch reaches the
-/// runner through a per-batch relay capability its executor injects; a terminal
-/// has none, so it carries this runner's callback address and secret, and the
-/// fleet scrubs that secret from relayed terminal output.
+/// runner through a per-batch relay capability its executor injects. A
+/// terminal on this runner's machine carries this runner's callback address
+/// and secret, and the fleet scrubs that secret from relayed terminal output;
+/// one on another machine has both replaced by its executor's resident relay
+/// ([`crate::fleet::residency::route_resident_callbacks`]).
 fn terminal_process_env(
     run_id: Option<&str>,
     home_uri: Option<&str>,

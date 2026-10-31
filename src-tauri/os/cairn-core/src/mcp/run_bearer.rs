@@ -102,19 +102,62 @@ pub fn mcp_credential_env(
     }
 }
 
-/// The value a project service process presents at `callback_url`: its
-/// standing run's bearer, set in its environment at launch, or a call's
-/// delegated bearer, written into that call's frame on its stdin.
+/// The value a project service process presents to `audience`, where it
+/// carries its callbacks: its standing run's bearer, set in its environment at
+/// launch, or a call's delegated bearer, written into that call's frame on its
+/// stdin.
 ///
 /// The service counterpart of [`mcp_credential_env`]. The supervisor holds each
 /// bearer as a lease and calls this as it builds what it writes to the
-/// process, so the value is materialised for that write and no earlier, and is
-/// presented to the audience derived from where the service will carry it.
-pub fn service_credential(bearer: &RunBearer, callback_url: &str) -> Result<String, String> {
+/// process, so the value is materialised for that write and no earlier. The
+/// audience is this runner's loopback for a service on its machine, or
+/// [`relay_audience`] of the executor a service elsewhere is relayed through.
+pub fn service_credential(bearer: &RunBearer, audience: &LeaseAudience) -> Result<String, String> {
     let presented = bearer
-        .present(&audience_for_url(callback_url)?)
+        .present(audience)
         .map_err(|denied| format!("run bearer not presentable: {denied}"))?;
     Ok(presented.expose().to_string())
+}
+
+/// The audience of a bearer a project service on executor `executor_id`
+/// presents at that executor's resident relay.
+///
+/// A role of its own, never the loopback role: the relay's URL is loopback on
+/// the executor's machine, and a bearer bound to the runner's loopback would
+/// otherwise be presentable at every relay, and a relay's at the runner.
+pub fn relay_audience(executor_id: &str) -> LeaseAudience {
+    LeaseAudience::process(format!("executor-relay:{executor_id}"))
+}
+
+/// Hold a callback request to the one run its credential speaks for: a
+/// request may not name a pooled thread, which would re-attribute it to
+/// whichever run holds that thread, and a run it names must be this one. An
+/// absent run is filled with it.
+///
+/// The rule every per-run credential gets, whether it arrived as a bearer at
+/// `/api/mcp` or through an executor's resident relay.
+pub fn bind_request_to_run(
+    request: &mut crate::mcp::types::McpCallbackRequest,
+    run_id: &str,
+) -> Result<(), String> {
+    if request.thread_id.is_some() {
+        return Err(format!(
+            "this credential speaks for run {run_id} alone and cannot name a pooled thread"
+        ));
+    }
+    match request
+        .run_id
+        .as_deref()
+        .filter(|claimed| !claimed.is_empty())
+    {
+        Some(claimed) if claimed != run_id => Err(format!(
+            "this credential speaks for run {run_id}, and the request claims run {claimed}"
+        )),
+        _ => {
+            request.run_id = Some(run_id.to_string());
+            Ok(())
+        }
+    }
 }
 
 /// The consumer role a bearer is bound to when the endpoint is reached over
@@ -331,7 +374,7 @@ fn digest(token: &str) -> [u8; 32] {
     Sha256::digest(token.as_bytes()).into()
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }
@@ -673,15 +716,66 @@ mod tests {
         let bearer = book
             .mint("run-s", NODE, audience_for_url(callback).unwrap())
             .unwrap();
-        let token = service_credential(&bearer, callback).unwrap();
+        let token = service_credential(&bearer, &local()).unwrap();
         assert_eq!(book.verify(&token, &local()).unwrap().run_id, "run-s");
-        assert!(service_credential(&bearer, "https://elsewhere.example/mcp").is_err());
+        assert!(service_credential(&bearer, &audience_for_host("elsewhere.example")).is_err());
 
         book.revoke_run("run-s", "call ended");
         assert!(
-            service_credential(&bearer, callback).is_err(),
+            service_credential(&bearer, &local()).is_err(),
             "a revoked bearer must not be handed to a service"
         );
+    }
+
+    /// A remote service's bearers are bound to its executor's relay. They are
+    /// refused at this runner's loopback, where the HTTP callback verifies, and
+    /// at any other executor's relay; a loopback bearer is refused at a relay.
+    #[test]
+    fn a_relay_bearer_and_a_loopback_bearer_are_each_refused_at_the_other() {
+        let book = RunBearerBook::default();
+        let relayed = book
+            .mint("run-r", NODE, relay_audience("machine-b"))
+            .unwrap();
+        let token = service_credential(&relayed, &relay_audience("machine-b")).unwrap();
+        assert_eq!(
+            book.verify(&token, &relay_audience("machine-b"))
+                .unwrap()
+                .run_id,
+            "run-r"
+        );
+        assert!(matches!(
+            book.verify(&token, &local()),
+            Err(BearerRefusal::Audience { .. })
+        ));
+        assert!(matches!(
+            book.verify(&token, &relay_audience("machine-c")),
+            Err(BearerRefusal::Audience { .. })
+        ));
+        assert!(service_credential(&relayed, &local()).is_err());
+
+        let looped = book.mint("run-l", NODE, local()).unwrap();
+        let token = service_credential(&looped, &local()).unwrap();
+        assert!(matches!(
+            book.verify(&token, &relay_audience("machine-b")),
+            Err(BearerRefusal::Audience { .. })
+        ));
+    }
+
+    #[test]
+    fn a_bound_request_names_its_run_alone() {
+        let mut request = crate::mcp::types::McpCallbackRequest::default();
+        bind_request_to_run(&mut request, "run-a").unwrap();
+        assert_eq!(request.run_id.as_deref(), Some("run-a"));
+        let mut claimed = crate::mcp::types::McpCallbackRequest {
+            run_id: Some("run-b".into()),
+            ..Default::default()
+        };
+        assert!(bind_request_to_run(&mut claimed, "run-a").is_err());
+        let mut threaded = crate::mcp::types::McpCallbackRequest {
+            thread_id: Some("t".into()),
+            ..Default::default()
+        };
+        assert!(bind_request_to_run(&mut threaded, "run-a").is_err());
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -19,7 +19,7 @@ use axum::{Json, Router};
 use cairn_common::executor_protocol::{
     CpuPressure, DeclineReason, ExecutorAdvertisement, ExecutorCapabilities, ExecutorIdentity,
     ExecutorMessage, MachineMemory, Measurement, MeasurementGap, ObjectChannelCredential,
-    OfferSummary, ResidencyRuntimeConfig,
+    OfferSummary, RelayAuthorization, RelayIdentity, ResidencyRuntimeConfig, ResidentRelayId,
 };
 use cairn_core::internal::db::DbState;
 use cairn_core::internal::dispatch::{dispatch_tool, DispatchOutput};
@@ -424,6 +424,10 @@ pub fn forget_lost_claim(pool: &ExecutorPool, entry_id: &str) {
 /// dispatches it. The test executor has no link to carry frames over, so this
 /// does both halves in one place, with the same checks in the same order.
 ///
+/// It serves resident processes the same way: a process the runner placed here
+/// with a relay grant calls `/resident/<relay id>/api/mcp`, and the call is
+/// authorized by the runner's own `authorize_resident_relay` before dispatch.
+///
 /// Unlike a real executor it rewrites `CAIRN_CALLBACK_URL` on every batch, not
 /// only those with a context. A colocated test executor's children inherit the
 /// test process's environment, and a test run from an agent shell carries the
@@ -432,7 +436,9 @@ pub fn forget_lost_claim(pool: &ExecutorPool, entry_id: &str) {
 #[derive(Clone)]
 struct TestMcpRelay {
     url: String,
+    origin: String,
     live_contexts: Arc<Mutex<HashSet<String>>>,
+    residents: Arc<Mutex<HashMap<ResidentRelayId, RelayIdentity>>>,
     orch: Orchestrator,
     executor_id: &'static str,
     generation: Arc<AtomicU64>,
@@ -451,6 +457,18 @@ impl Drop for LiveContext {
     }
 }
 
+/// Ends a resident process's relay on the executor side when it exits.
+struct LiveResident {
+    relay_id: ResidentRelayId,
+    residents: Arc<Mutex<HashMap<ResidentRelayId, RelayIdentity>>>,
+}
+
+impl Drop for LiveResident {
+    fn drop(&mut self) {
+        self.residents.lock().unwrap().remove(&self.relay_id);
+    }
+}
+
 impl TestMcpRelay {
     fn start(orch: &Orchestrator, executor_id: &'static str, generation: Arc<AtomicU64>) -> Self {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -463,7 +481,9 @@ impl TestMcpRelay {
             .expect("read the callback relay address");
         let relay = Self {
             url: format!("http://{address}/api/mcp"),
+            origin: format!("http://{address}"),
             live_contexts: Arc::default(),
+            residents: Arc::default(),
             orch: orch.clone(),
             executor_id,
             generation,
@@ -471,6 +491,10 @@ impl TestMcpRelay {
         };
         let router = Router::new()
             .route("/api/mcp", post(relay_test_callback))
+            .route(
+                "/resident/{relay_id}/api/mcp",
+                post(relay_test_resident_callback),
+            )
             .layer(DefaultBodyLimit::max(
                 cairn_common::paths::MCP_CALLBACK_MAX_BODY_BYTES,
             ))
@@ -508,6 +532,87 @@ impl TestMcpRelay {
             live_contexts: self.live_contexts.clone(),
         })
     }
+
+    /// What the executor binary's relay does for a resident process: serve it
+    /// a URL of its own for as long as it lives.
+    fn register_resident(&self, identity: RelayIdentity) -> cairn_exec::ResidentRelayLease {
+        let RelayIdentity::Resident { relay_id, .. } = &identity else {
+            unreachable!("the runtime opens resident relays only")
+        };
+        let relay_id = relay_id.clone();
+        let callback_url = format!("{}/resident/{}/api/mcp", self.origin, relay_id.as_str());
+        self.residents
+            .lock()
+            .unwrap()
+            .insert(relay_id.clone(), identity);
+        cairn_exec::ResidentRelayLease {
+            callback_url,
+            registration: Box::new(LiveResident {
+                relay_id,
+                residents: self.residents.clone(),
+            }),
+        }
+    }
+}
+
+async fn relay_test_resident_callback(
+    State(relay): State<TestMcpRelay>,
+    UrlPath(relay_id): UrlPath<String>,
+    headers: HeaderMap,
+    Json(mut request): Json<McpCallbackRequest>,
+) -> Response {
+    let relay_id = ResidentRelayId(relay_id);
+    let Some(RelayIdentity::Resident {
+        holder,
+        process_key,
+        process_generation,
+        ..
+    }) = relay.residents.lock().unwrap().get(&relay_id).cloned()
+    else {
+        return (
+            StatusCode::GONE,
+            "this resident relay is gone: the process exited or was restarted",
+        )
+            .into_response();
+    };
+    let Some(authorization) = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "invalid or expired callback context",
+        )
+            .into_response();
+    };
+    let authorization = RelayAuthorization(authorization.to_owned());
+    let call = cairn_core::internal::fleet::resident_relay::ResidentRelayCall {
+        relay_id: &relay_id,
+        holder: &holder,
+        process_key: &process_key,
+        process_generation,
+        authorization: &authorization,
+    };
+    if let Err(diagnostic) = cairn_core::internal::fleet::resident_relay::authorize_resident_relay(
+        &relay.orch,
+        relay.executor_id,
+        relay.generation.load(Ordering::Acquire),
+        &call,
+        &mut request,
+    ) {
+        return (StatusCode::FORBIDDEN, diagnostic).into_response();
+    }
+    let DispatchOutput { content, reminders } =
+        dispatch_tool(&relay.orch, &request, &relay.read_cursors)
+            .await
+            .into_inner();
+    Json(McpCallbackResponse {
+        result: content,
+        artifact_uri: None,
+        reminders,
+    })
+    .into_response()
 }
 
 async fn relay_test_callback(
@@ -620,7 +725,10 @@ fn attach_executor(
     let callback_orch = orch.clone();
     let resident_event_pool = core_pool.clone();
     let resident_event_generation = generation.clone();
+    let relay = TestMcpRelay::start(orch, executor_id, generation.clone());
+    let resident_relay = relay.clone();
     let runtime = ExecutorRuntime::new(executor_home)
+        .with_resident_relay(move |identity| resident_relay.register_resident(identity))
         .with_snapshot_callback(move |_reason, snapshot, health| {
             snapshot_pool.handle_executor_message(
                 executor_id,
@@ -659,7 +767,6 @@ fn attach_executor(
         .attach_advertised_executor(hello, tx, colocated, None, None)
         .expect("attach the test executor");
     generation.store(attached_generation, Ordering::Release);
-    let relay = TestMcpRelay::start(orch, executor_id, generation.clone());
     // Every machine reaches the node scratch routes over an object channel, a
     // colocated one included, as in production. A machine given no object
     // server gets one that serves only those routes.

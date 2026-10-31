@@ -1275,6 +1275,7 @@ pub async fn run_launch_session(
                     runtime_assets: Vec::new(),
                     io: ResidentProcessIoMode::Pipe,
                     node_scratch: None,
+                    relay: None,
                 },
             },
         )

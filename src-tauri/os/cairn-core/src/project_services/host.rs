@@ -88,42 +88,33 @@ fn process_for(spec: &LaunchSpec) -> ResidentLaunch {
         runtime_packages: Vec::new(),
         sandbox_mode: ProcessSandboxMode::Confined,
         cwd_root: ResidentProcessCwdRoot::ResidencyScratch,
+        relay: None,
     }
 }
 
-/// Where a service may run today: the runner's own machine.
+/// Where a service runs: where its declaration's `executor` says, by machine
+/// name, platform, and toolchains, exactly as a `run` selector would place it.
+/// A declaration that names neither a machine nor a platform runs on the
+/// runner's own machine, refined by any toolchains it asks for.
 ///
-/// A service reaches Cairn at the runner's loopback callback, and only batches
-/// are relayed from a remote executor, not resident processes. A service on
-/// another machine would send its bearer to whatever listens on that port
-/// there. So placement is pinned to the colocated executor, refined by any
-/// toolchains the declaration asks for, and a declaration that names another
-/// machine or a platform refuses to start rather than run unreachable.
-fn runner_local_selector(
-    spec: &LaunchSpec,
-) -> Result<cairn_common::executor_protocol::ExecutorSelector, String> {
+/// A service elsewhere reaches Cairn through its executor's resident relay,
+/// with bearers bound to that relay, so placement is a choice and not a pin.
+fn service_selector(spec: &LaunchSpec) -> cairn_common::executor_protocol::ExecutorSelector {
     use cairn_common::executor_protocol::{ExecutorSelector, LOCAL_EXECUTOR_NAME};
     let declared = spec.declaration.executor.clone().unwrap_or_default();
-    let elsewhere = declared
-        .name
-        .as_deref()
-        .is_some_and(|name| name != LOCAL_EXECUTOR_NAME)
-        || declared.os.is_some();
-    if elsewhere {
-        return Err(format!(
-            "service `{}` asks to run on another machine or platform; services run on the \
-             runner's own machine until resident processes reach the callback relay \
-             (cairn/5562). Remove `executor.name`/`executor.os` from its declaration, and run \
-             the heavy part of a method as a `ctx.cairn.run` batch with an `executor` selector \
-             (`{{os}}` or `{{name}}`), which runs anywhere today",
-            spec.service
-        ));
+    if declared.name.is_none() && declared.os.is_none() {
+        return ExecutorSelector {
+            name: Some(LOCAL_EXECUTOR_NAME.to_string()),
+            required_toolchains: declared.required_toolchains,
+            ..ExecutorSelector::default()
+        };
     }
-    Ok(ExecutorSelector {
-        name: Some(LOCAL_EXECUTOR_NAME.to_string()),
+    ExecutorSelector {
+        name: declared.name,
+        os: declared.os,
         required_toolchains: declared.required_toolchains,
         ..ExecutorSelector::default()
-    })
+    }
 }
 
 impl LeaseHost {
@@ -138,7 +129,7 @@ impl LeaseHost {
             return Ok(lease.clone());
         }
         let label = holder_label(spec);
-        let selector = runner_local_selector(spec)?;
+        let selector = service_selector(spec);
         let lease = Arc::new(
             acquire_service_lease(
                 orch,
@@ -167,12 +158,48 @@ impl LeaseHost {
 
 #[async_trait]
 impl ServiceHost for LeaseHost {
+    async fn callback(
+        &self,
+        orch: &Orchestrator,
+        spec: &LaunchSpec,
+    ) -> Result<crate::fleet::residency::ResidentCallback, String> {
+        let lease = self.lease(orch, spec).await?;
+        Ok(crate::fleet::residency::resident_callback(
+            orch,
+            lease.executor_id().as_deref(),
+        ))
+    }
+
     async fn launch(&self, orch: &Orchestrator, spec: &LaunchSpec) -> Result<HostProcess, String> {
-        let launch = launch_for(spec)?;
+        let mut launch = launch_for(spec)?;
         let lease = self.lease(orch, spec).await?;
         // Generation-keyed, so a replacement starts beside the generation it
         // replaces rather than over it.
         let key = format!("svc-{}", spec.generation);
+        // On another machine the service calls back through its executor's
+        // relay, which accepts only bearers of this incarnation's runs.
+        if let crate::fleet::residency::ResidentCallback::Relayed { executor_id } =
+            crate::fleet::residency::resident_callback(orch, lease.executor_id().as_deref())
+        {
+            crate::fleet::residency::refuse_runner_credentials(orch, &launch.env)?;
+            let holder = cairn_common::executor_protocol::ResidencyHolder::Service {
+                service_id: holder_id(&spec.project_id, &spec.owner, &spec.service),
+            };
+            let minted = orch.fleet.resident_relays().register(
+                &executor_id,
+                &holder,
+                &key,
+                crate::fleet::resident_relay::RegisteredAuthority::Service(
+                    crate::fleet::resident_relay::ServiceIncarnation {
+                        project_id: spec.project_id.clone(),
+                        owner_key: spec.owner.key().to_string(),
+                        service: spec.service.clone(),
+                        generation: spec.generation,
+                    },
+                ),
+            );
+            launch.relay = Some(minted.grant);
+        }
         let mut subscription = lease
             .start_resident(&key, SERVICE_ROLE, &launch)
             .await
@@ -401,17 +428,27 @@ mod tests {
             files: package.files,
             env: vec![("CAIRN_SERVICE".into(), "echo".into())],
         };
-        let selector = runner_local_selector(&spec).unwrap();
+        let selector = service_selector(&spec);
         assert_eq!(
             selector.name.as_deref(),
-            Some(cairn_common::executor_protocol::LOCAL_EXECUTOR_NAME)
+            Some(cairn_common::executor_protocol::LOCAL_EXECUTOR_NAME),
+            "a declaration that names no machine runs on the runner's"
         );
         let mut remote = spec.clone();
         remote.declaration.executor = Some(cairn_common::executor_protocol::ExecutorSelector {
             os: Some("linux".into()),
+            required_toolchains: vec!["uv".into()],
             ..Default::default()
         });
-        assert!(runner_local_selector(&remote).is_err());
+        let selector = service_selector(&remote);
+        assert_eq!(selector.name, None);
+        assert_eq!(selector.os.as_deref(), Some("linux"));
+        assert_eq!(selector.required_toolchains, vec!["uv".to_string()]);
+        remote.declaration.executor = Some(cairn_common::executor_protocol::ExecutorSelector {
+            name: Some("machine-b".into()),
+            ..Default::default()
+        });
+        assert_eq!(service_selector(&remote).name.as_deref(), Some("machine-b"));
         let launch = process_for(&spec);
         assert_eq!(launch.program, "bun");
         assert_eq!(launch.sandbox_mode, ProcessSandboxMode::Confined);
@@ -422,8 +459,7 @@ mod tests {
     }
 
     /// A thread's service is launched by the same path as a project's: the
-    /// same confined pipe, the same runner-local pin, whatever its payload
-    /// asks for. It holds a lease of its own, never its project namesake's.
+    /// same confined pipe and the same placement rule. It holds a lease of its own, never its project namesake's.
     #[test]
     fn a_thread_service_process_is_the_same_confined_pipe_on_its_own_lease() {
         let uri = "cairn://p/cairn/spanish/services/echo";
@@ -452,7 +488,7 @@ mod tests {
         assert_eq!(launch.spec().io, ResidentProcessIoMode::Pipe);
         assert!(launch.spec().sandbox_policy.is_none());
         assert_eq!(
-            runner_local_selector(&spec).unwrap().name.as_deref(),
+            service_selector(&spec).name.as_deref(),
             Some(cairn_common::executor_protocol::LOCAL_EXECUTOR_NAME)
         );
         let elsewhere = crate::project_services::thread_store::package(
@@ -463,7 +499,7 @@ mod tests {
         .unwrap();
         let mut remote = spec.clone();
         remote.declaration = elsewhere.declaration;
-        assert!(runner_local_selector(&remote).is_err());
+        assert_eq!(service_selector(&remote).os.as_deref(), Some("linux"));
         assert_ne!(
             holder_id("p", &owner, "echo"),
             holder_id("p", &ServiceOwner::Project, "echo")
