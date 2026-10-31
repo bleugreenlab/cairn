@@ -929,16 +929,15 @@ pub(crate) const GATE_TENET_OUTCOMES: &[&str] = &["answered", "ratified"];
 
 /// `{fact: "tenet_verdict", tenet: "cairn://p/CAIRN/tenets/12", outcome: "answered"}`
 ///
-/// The operator's verdict on a tenet. The commissioning gate stamps this on a
-/// thread's gated filing with `outcome` set to the project's release policy at
-/// filing time, so the gate says what it waits for instead of reading a policy
-/// that may have changed since.
+/// The operator's verdict on a tenet. A filing holds on a tenet only by
+/// naming this clause in its own `after`, so the clause says what it waits
+/// for instead of reading a policy that may have changed since.
 ///
 /// `answered` is satisfied by an approval, including one later superseded:
 /// the approval was given, and the filing it released was released on it.
 /// `ratified` is never satisfied today. No verified authenticator path
-/// exists, so the policy setter refuses it and no filing is stamped with it;
-/// a clause written by hand with it simply waits.
+/// exists, so the policy setter refuses it; a clause written with it simply
+/// waits.
 #[derive(Debug, Clone, Copy)]
 pub struct TenetVerdictFact;
 
@@ -1449,6 +1448,7 @@ pub(crate) mod test_support {
             phases: None,
             execution_warmth: None,
             cell_origin: None,
+            build_jobs: None,
             project_id: project_id.to_string(),
             commit_sha: "commit-gated".to_string(),
             defined_by_commit_sha: "commit-gated".to_string(),

@@ -5,7 +5,7 @@ use cairn_common::executor_protocol::{
     ResidencyAcquireRequest, ResidencyFailureKind, ResidencyFence, ResidencyFootprint,
     ResidencyHolder, ResidencyOperation, ResidencyResult, ResidentProcessCwdRoot,
     ResidentProcessEvent, ResidentProcessEventKind, ResidentProcessIoMode, ResidentProcessKind,
-    ResidentProcessSpec, ResidentProcessStatus, ResidentProcessStream,
+    ResidentProcessSpec, ResidentProcessStatus, ResidentProcessStream, ResidentRuntimeAsset,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +18,7 @@ const ONE_SHOT_KEY: &str = "service-one-shot";
 /// What a one-shot calls itself while it is live. It is short and generic on
 /// purpose: the lease runs whatever command the service asks of it, so the only
 /// honest thing this process can claim is that it is one.
-const ONE_SHOT_ROLE: &str = "command";
+pub(super) const ONE_SHOT_ROLE: &str = "command";
 const ACQUIRE_WAIT: Duration = Duration::from_secs(30);
 const RENEW_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -61,6 +61,56 @@ pub(crate) struct ResidentSubscription {
     events: mpsc::UnboundedReceiver<ResidentProcessEvent>,
 }
 
+/// What a placed process is started as: the command, and the environment the
+/// executor builds around it.
+///
+/// [`ResidentLaunch::command`] is the shape every helper process a lease ran
+/// before project services had: scratch cwd, no environment, no assets, and
+/// unconfined, because those helpers are Cairn's own binaries. A project
+/// service is the one caller that sets the rest, and it always asks for
+/// [`ProcessSandboxMode::Confined`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResidentLaunch {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub runtime_assets: Vec<ResidentRuntimeAsset>,
+    pub runtime_packages: Vec<ResidentRuntimeAsset>,
+    pub sandbox_mode: ProcessSandboxMode,
+    pub cwd_root: ResidentProcessCwdRoot,
+}
+
+impl ResidentLaunch {
+    pub(crate) fn command(program: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            program: program.into(),
+            args,
+            env: Vec::new(),
+            runtime_assets: Vec::new(),
+            runtime_packages: Vec::new(),
+            sandbox_mode: ProcessSandboxMode::Unconfined,
+            cwd_root: ResidentProcessCwdRoot::ResidencyScratch,
+        }
+    }
+
+    pub(crate) fn spec(&self) -> ResidentProcessSpec {
+        ResidentProcessSpec {
+            runtime_packages: self.runtime_packages.clone(),
+            program: self.program.clone(),
+            args: self.args.clone(),
+            launch_command: None,
+            cwd: String::new(),
+            cwd_root: self.cwd_root,
+            env: self.env.clone(),
+            sandbox_mode: self.sandbox_mode,
+            sandbox_policy: None,
+            runtime_assets: self.runtime_assets.clone(),
+            io: ResidentProcessIoMode::Pipe,
+            node_scratch: None,
+        }
+    }
+}
+
 /// Where one process key's events go, and which start they belong to.
 ///
 /// Generation zero means the start is still in flight: the executor has not
@@ -76,6 +126,9 @@ struct ProcessRoute {
 type ProcessRoutes = Arc<StdMutex<HashMap<String, ProcessRoute>>>;
 
 impl ResidentSubscription {
+    /// The next event of this start, or `None` once its stream is closed —
+    /// including when the lease reacquires its residency, because a process
+    /// started under the old fence is not running under the new one.
     pub(crate) async fn recv(&mut self) -> Option<ResidentProcessEvent> {
         while let Some(event) = self.events.recv().await {
             if event.process_generation == self.process_generation {
@@ -111,7 +164,13 @@ pub(crate) struct LeaseCore {
     orch: Orchestrator,
     fence: Arc<RwLock<ResidencyFence>>,
     acquire_request: ResidencyAcquireRequest,
-    executor_name: String,
+    /// The selector names a machine (`name`) or only a kind of machine. A
+    /// pinned lease waits out an outage for that one machine; an unpinned one
+    /// is re-placed by the fleet and may come back somewhere else.
+    pinned_executor: Option<String>,
+    /// Where the residency is placed now. Unpinned leases learn this after
+    /// each acquisition, so it is state rather than configuration.
+    executor_name: StdMutex<String>,
     service_label: String,
     one_shot: Mutex<()>,
     recovery: Mutex<()>,
@@ -155,26 +214,37 @@ impl std::ops::Deref for ServiceLease {
     }
 }
 
+/// The selector for a service pinned to one machine by its public name, which
+/// is how every helper service that predates project services is placed.
+pub(crate) fn named_executor(executor_name: &str) -> ExecutorSelector {
+    ExecutorSelector {
+        name: Some(executor_name.to_string()),
+        ..ExecutorSelector::default()
+    }
+}
+
 pub(crate) async fn acquire_service_lease(
     orch: &Orchestrator,
     service: ServiceIdentity<'_>,
-    executor_name: &str,
+    selector: ExecutorSelector,
     footprint: ResidencyFootprint,
     death_policy: OwnerDeathPolicy,
 ) -> Result<ServiceLease, ServicePlacementError> {
     validate_service_identity(service)?;
-    let selector = ExecutorSelector {
-        name: Some(executor_name.to_string()),
-        ..ExecutorSelector::default()
-    };
-    selector
-        .validate()
-        .map_err(ServicePlacementError::InvalidRequest)?;
+    // An empty selector lets the fleet choose; anything else must be a
+    // selector the protocol accepts.
+    if !selector.is_empty() {
+        selector
+            .validate()
+            .map_err(ServicePlacementError::InvalidRequest)?;
+    }
+    let pinned_executor = selector.name.clone();
 
     let acquire_request = service_acquire_request(service.id, selector, footprint, death_policy);
     let fence = super::residency::acquire_quietly(orch, acquire_request.clone())
         .await
         .map_err(|error| ServicePlacementError::Unavailable(error.to_string()))?;
+    let executor_name = placed_executor_name(orch, &fence, pinned_executor.as_deref());
 
     let fence = Arc::new(RwLock::new(fence));
     let routes = ProcessRoutes::default();
@@ -184,7 +254,8 @@ pub(crate) async fn acquire_service_lease(
             orch: orch.clone(),
             fence,
             acquire_request,
-            executor_name: executor_name.to_string(),
+            pinned_executor,
+            executor_name: StdMutex::new(executor_name),
             service_label: service.label.trim().to_string(),
             one_shot: Mutex::new(()),
             recovery: Mutex::new(()),
@@ -194,6 +265,19 @@ pub(crate) async fn acquire_service_lease(
             routes,
         }),
     })
+}
+
+/// The machine a residency landed on, as a person would name it. A pinned
+/// lease already knows; an unpinned one asks the fleet's residency route.
+fn placed_executor_name(
+    orch: &Orchestrator,
+    fence: &ResidencyFence,
+    pinned: Option<&str>,
+) -> String {
+    pinned
+        .map(str::to_string)
+        .or_else(|| super::residency::residency_machine_name(orch, &fence.holder))
+        .unwrap_or_else(|| "an unnamed executor".to_string())
 }
 
 /// Install the lease's single subscription on the fleet's resident-process
@@ -249,7 +333,7 @@ fn service_acquire_request(
         repository: RepositoryLocator::ScratchOnly {
             owner_id: service_id.to_string(),
         },
-        executor: Some(selector),
+        executor: (!selector.is_empty()).then_some(selector),
         owner_ref: None,
         selector: None,
         initial_base_commit: String::new(),
@@ -301,7 +385,7 @@ impl ServiceLease {
                     if core.released.load(Ordering::Acquire) {
                         return;
                     }
-                    tracing::warn!(%error, executor = %core.executor_name, "service residency reacquisition failed");
+                    tracing::warn!(%error, executor = %core.executor_name(), "service residency reacquisition failed");
                     tokio::time::sleep(RENEW_INTERVAL).await;
                 }
             }
@@ -310,8 +394,8 @@ impl ServiceLease {
 }
 
 impl LeaseCore {
-    pub(crate) fn executor_name(&self) -> &str {
-        &self.executor_name
+    pub(crate) fn executor_name(&self) -> String {
+        self.executor_name.lock().unwrap().clone()
     }
 
     pub(crate) fn health(&self) -> ServicePlacementHealth {
@@ -339,16 +423,21 @@ impl LeaseCore {
         if matches!(self.health(), ServicePlacementHealth::Ready) {
             return Ok(self.current_fence());
         }
-        if !wait_for_recovery_or_release(
-            self.orch.fleet.wait_for_named_executor(&self.executor_name),
-            &self.released,
-            &self.release_notify,
-        )
-        .await
-        {
-            return Err(ServicePlacementError::Operation(
-                "service residency has been released".into(),
-            ));
+        // Only a pinned lease has one machine worth waiting for. An unpinned
+        // one asks the fleet again at once, and the renewal loop's interval
+        // paces the retries while no machine fits.
+        if let Some(pinned) = self.pinned_executor.as_deref() {
+            if !wait_for_recovery_or_release(
+                self.orch.fleet.wait_for_named_executor(pinned),
+                &self.released,
+                &self.release_notify,
+            )
+            .await
+            {
+                return Err(ServicePlacementError::Operation(
+                    "service residency has been released".into(),
+                ));
+            }
         }
         let mut request = self.acquire_request.clone();
         let now = unix_time_ms();
@@ -363,7 +452,18 @@ impl LeaseCore {
                 "service residency was released during reacquisition".into(),
             ));
         }
+        *self.executor_name.lock().unwrap() =
+            placed_executor_name(&self.orch, &fence, self.pinned_executor.as_deref());
         *self.fence.write().unwrap() = fence.clone();
+        // Nothing routed under the old fence survives it. A readmitted cell
+        // keeps only its processes' executor-lost exits, which reach their
+        // subscribers whenever a later snapshot happens to re-send them; a
+        // fresh cell has a new incarnation no old event will ever match, so a
+        // subscriber left routed would park forever. Dropping the routes ends
+        // every subscription now, and its owner restarts on the new fence. A
+        // start that triggered this recovery routes its process only after
+        // recovery returns, so it is not swept here.
+        drop(std::mem::take(&mut *self.routes.lock().unwrap()));
         *self.health.lock().unwrap() = ServicePlacementHealth::Ready;
         Ok(fence)
     }
@@ -391,7 +491,11 @@ impl LeaseCore {
         // permanently.
         let attempt = async {
             let mut subscription = self
-                .start_process(ONE_SHOT_KEY, ONE_SHOT_ROLE, program, args)
+                .start_process(
+                    ONE_SHOT_KEY,
+                    ONE_SHOT_ROLE,
+                    &ResidentLaunch::command(program, args),
+                )
                 .await?;
             let generation = subscription.process_generation;
             let mut output = OneShotOutput {
@@ -420,7 +524,7 @@ impl LeaseCore {
                             *self.health.lock().unwrap() = ServicePlacementHealth::ExecutorOffline;
                             return Err(ServicePlacementError::Unavailable(format!(
                                 "executor {} disconnected while `{program}` was running",
-                                self.executor_name
+                                self.executor_name()
                             )));
                         }
                         output.exit_code = exit_code;
@@ -455,21 +559,19 @@ impl LeaseCore {
         &self,
         key: &str,
         role: &str,
-        program: &str,
-        args: Vec<String>,
+        launch: &ResidentLaunch,
     ) -> Result<ResidentSubscription, ServicePlacementError> {
         validate_resident_process(key, role)?;
-        self.start_process(key, role, program, args).await
+        self.start_process(key, role, launch).await
     }
 
     async fn start_process(
         &self,
         key: &str,
         role: &str,
-        program: &str,
-        args: Vec<String>,
+        launch: &ResidentLaunch,
     ) -> Result<ResidentSubscription, ServicePlacementError> {
-        if program.is_empty() {
+        if launch.program.is_empty() {
             return Err(ServicePlacementError::InvalidRequest(
                 "process program must not be empty".into(),
             ));
@@ -505,19 +607,7 @@ impl LeaseCore {
                         role: role.trim().to_string(),
                     },
                     reservation: None,
-                    process: ResidentProcessSpec {
-                        runtime_packages: Vec::new(),
-                        program: program.to_string(),
-                        args,
-                        launch_command: None,
-                        cwd: String::new(),
-                        cwd_root: ResidentProcessCwdRoot::ResidencyScratch,
-                        env: Vec::new(),
-                        sandbox_mode: ProcessSandboxMode::Unconfined,
-                        sandbox_policy: None,
-                        runtime_assets: Vec::new(),
-                        io: ResidentProcessIoMode::Pipe,
-                    },
+                    process: launch.spec(),
                 },
             )
             .await;
@@ -539,7 +629,6 @@ impl LeaseCore {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn write_input(
         &self,
         key: &str,
@@ -554,8 +643,8 @@ impl LeaseCore {
             .filter(|generation| *generation != 0)
             .ok_or_else(|| {
                 ServicePlacementError::Operation(format!(
-                    "desktop process `{key}` is not running on {}",
-                    self.executor_name
+                    "process `{key}` is not running on {}",
+                    self.executor_name()
                 ))
             })?;
         let result = self
@@ -580,19 +669,19 @@ impl LeaseCore {
             } => {
                 self.mark_process_down(key, None);
                 Err(ServicePlacementError::Operation(format!(
-                    "desktop process `{key}` on {} changed generation: {diagnostic}",
-                    self.executor_name
+                    "process `{key}` on {} changed generation: {diagnostic}",
+                    self.executor_name()
                 )))
             }
             ResidencyResult::Failed { diagnostic, .. } => {
                 Err(ServicePlacementError::Operation(format!(
-                    "could not write to desktop process `{key}` on {}: {diagnostic}",
-                    self.executor_name
+                    "could not write to process `{key}` on {}: {diagnostic}",
+                    self.executor_name()
                 )))
             }
             other => Err(ServicePlacementError::Operation(format!(
-                "unexpected input-write result for desktop process `{key}` on {}: {other:?}",
-                self.executor_name
+                "unexpected input-write result for process `{key}` on {}: {other:?}",
+                self.executor_name()
             ))),
         }
     }
@@ -862,7 +951,7 @@ pub(crate) mod tests {
                 id: "channel-imessage",
                 label: "iMessage channel",
             },
-            LOCAL_EXECUTOR_NAME,
+            named_executor(LOCAL_EXECUTOR_NAME),
             ResidencyFootprint {
                 memory_bytes: 0,
                 disk_growth_bytes: 0,
@@ -910,7 +999,7 @@ pub(crate) mod tests {
                 id: "desktop-automation",
                 label: "desktop automation",
             },
-            LOCAL_EXECUTOR_NAME,
+            named_executor(LOCAL_EXECUTOR_NAME),
             ResidencyFootprint {
                 memory_bytes: 0,
                 disk_growth_bytes: 0,
@@ -926,8 +1015,10 @@ pub(crate) mod tests {
             .start_resident(
                 "facade",
                 "facade",
-                "/bin/sh",
-                vec!["-c".into(), "read line; printf '%s' \"$line\"".into()],
+                &ResidentLaunch::command(
+                    "/bin/sh",
+                    vec!["-c".into(), "read line; printf '%s' \"$line\"".into()],
+                ),
             )
             .await
             .unwrap();
@@ -951,6 +1042,114 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(stdout, b"generation-fenced");
+        lease.release().await.unwrap();
+    }
+
+    async fn placed_watch(orch: &Orchestrator) -> (ServiceLease, ResidentSubscription) {
+        let lease = acquire_service_lease(
+            orch,
+            ServiceIdentity {
+                id: "channel-imessage",
+                label: "iMessage channel",
+            },
+            named_executor(LOCAL_EXECUTOR_NAME),
+            ResidencyFootprint {
+                memory_bytes: 0,
+                disk_growth_bytes: 0,
+            },
+            OwnerDeathPolicy {
+                heartbeat_timeout_ms: 30_000,
+                reclaim_grace_ms: 10_000,
+            },
+        )
+        .await
+        .expect("a named colocated executor must place a service residency");
+        let watch = lease
+            .start_resident(
+                "imsg-watch",
+                "watch",
+                &ResidentLaunch::command("/bin/sh", vec!["-c".into(), "exec sleep 600".into()]),
+            )
+            .await
+            .expect("a resident watch must start on a placed lease");
+        (lease, watch)
+    }
+
+    /// Whether a subscription ends on its own, draining whatever it already
+    /// holds, rather than parking for events that are never coming.
+    async fn closes_promptly(subscription: &mut ResidentSubscription) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while subscription.recv().await.is_some() {}
+        })
+        .await
+        .is_ok()
+    }
+
+    /// An executor that stays away past its reclaim grace discards the cell,
+    /// and the lease comes back to a fresh one under a new incarnation. No
+    /// event will ever match the old watch's fence again, so unless the lease
+    /// closes the watch's stream, the watch parks forever while every one-shot
+    /// on the new cell reports the channel healthy.
+    #[tokio::test]
+    async fn reacquiring_a_fresh_cell_closes_the_discarded_cells_subscriptions() {
+        let (orch, _config) = attached_orchestrator().await;
+        let (lease, mut watch) = placed_watch(&orch).await;
+        let discarded = lease.current_fence();
+
+        // The executor's reaper, done by hand: the cell is gone while the
+        // lease still holds its fence.
+        super::super::residency::release(&orch, &discarded)
+            .await
+            .expect("the placed residency must release");
+        *lease.health.lock().unwrap() = ServicePlacementHealth::ExecutorOffline;
+        let reacquired = lease
+            .recover()
+            .await
+            .expect("a lease whose cell was discarded must reacquire a fresh one");
+
+        assert_ne!(
+            reacquired.incarnation_id, discarded.incarnation_id,
+            "a discarded cell comes back as a new incarnation"
+        );
+        assert!(
+            closes_promptly(&mut watch).await,
+            "a watch started on a discarded cell must be told its stream is over"
+        );
+        lease.release().await.unwrap();
+    }
+
+    /// An executor that comes back in time readmits the same cell under a
+    /// bumped epoch, and its processes are all exited. Closing on this
+    /// reacquisition too means the watch restarts now, not whenever a later
+    /// snapshot re-sends the executor-lost exit.
+    #[tokio::test]
+    async fn reacquiring_a_readmitted_cell_closes_its_subscriptions() {
+        let (orch, _config) = attached_orchestrator().await;
+        let (lease, mut watch) = placed_watch(&orch).await;
+        let current = lease.current_fence();
+
+        // Readmission bumps the cell's epoch under the same incarnation, so
+        // the fence the lease held before the restart trails the cell's by one.
+        let before_restart = ResidencyFence {
+            cell_epoch: current
+                .cell_epoch
+                .checked_sub(1)
+                .expect("a placed cell has been through at least one epoch"),
+            ..current.clone()
+        };
+        *lease.fence.write().unwrap() = before_restart.clone();
+        *lease.health.lock().unwrap() = ServicePlacementHealth::ExecutorOffline;
+        let reacquired = lease
+            .recover()
+            .await
+            .expect("a lease whose cell is still held must reacquire it");
+
+        assert_eq!(reacquired.incarnation_id, before_restart.incarnation_id);
+        assert!(reacquired.cell_epoch > before_restart.cell_epoch);
+        assert!(
+            closes_promptly(&mut watch).await,
+            "a watch started before readmission must be told its stream is over"
+        );
         lease.release().await.unwrap();
     }
 
@@ -1000,7 +1199,7 @@ pub(crate) mod tests {
                     id: "desktop-automation",
                     label: "desktop automation",
                 },
-                LOCAL_EXECUTOR_NAME,
+                named_executor(LOCAL_EXECUTOR_NAME),
                 ResidencyFootprint {
                     memory_bytes: 0,
                     disk_growth_bytes: 0,

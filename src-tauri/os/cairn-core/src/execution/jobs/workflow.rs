@@ -952,7 +952,7 @@ pub async fn launch_standalone_workflow(
             initiated_via: Some("workflow".to_string()),
         },
         presets: None,
-        delegated_packets: vec![],
+        inline_delegated_packets: vec![],
         created_at: now as i64,
     };
     let snapshot_json = snapshot.to_json()?;
@@ -1203,7 +1203,7 @@ mod redispatch_tests {
         let job = format!("job-{tag}");
         if with_run {
             db.execute(
-                &format!(
+                format!(
                     "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, agent_config_id, created_at, updated_at) VALUES ('{job}','e','i','p','running','{tag}','{tag}','workflow',1,1)"
                 ),
                 (),
@@ -1211,14 +1211,14 @@ mod redispatch_tests {
             .await
             .unwrap();
             db.execute(
-                &format!("INSERT INTO sessions (id, job_id, created_at, updated_at) VALUES ('sess-{tag}','{job}',1,1)"),
+                format!("INSERT INTO sessions (id, job_id, created_at, updated_at) VALUES ('sess-{tag}','{job}',1,1)"),
                 (),
             )
             .await
             .unwrap();
             let er = exit_reason.map_or("NULL".to_string(), |r| format!("'{r}'"));
             db.execute(
-                &format!("INSERT INTO runs (id, job_id, issue_id, status, exit_reason, created_at, updated_at) VALUES ('{tag}','{job}','i','{status}',{er},1,1)"),
+                format!("INSERT INTO runs (id, job_id, issue_id, status, exit_reason, created_at, updated_at) VALUES ('{tag}','{job}','i','{status}',{er},1,1)"),
                 (),
             )
             .await
@@ -1416,7 +1416,7 @@ mod redispatch_tests {
         .await
         .unwrap();
         db.execute(
-            &format!("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES ('t','s','j-wf',1,'{turn}','initial',1,1)"),
+            format!("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES ('t','s','j-wf',1,'{turn}','initial',1,1)"),
             (),
         )
         .await

@@ -270,6 +270,7 @@ pub(crate) async fn spawn_workflow_process(
                     sandbox_policy: None,
                     runtime_assets: assets,
                     io: ResidentProcessIoMode::Pipe,
+                    node_scratch: None,
                 },
             },
         )

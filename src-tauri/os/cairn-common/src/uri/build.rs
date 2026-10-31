@@ -28,6 +28,35 @@ pub fn canonicalize_uri_identity(value: &str) -> String {
     )
 }
 
+/// Percent-encode one path segment that carries caller data (a database table
+/// name or a primary-key value). Everything outside the RFC 3986 unreserved set
+/// is escaped, so `/`, `?`, `%` and spaces can never change the address's shape.
+/// [`decode_path_segment`] is its exact inverse.
+pub fn encode_path_segment(segment: &str) -> String {
+    crate::query::encode_query_component(segment)
+}
+
+/// Decode a segment written by [`encode_path_segment`]. A malformed escape or
+/// non-UTF-8 result is an error naming the segment.
+pub fn decode_path_segment(segment: &str) -> Result<String, String> {
+    crate::query::decode_query_component(segment)
+}
+
+/// `{db_root}/{table}`: one table's row collection under a database root,
+/// `cairn://db` or a thread's `cairn://p/P/NAME/db`.
+pub fn build_db_table_uri(db_root: &str, table: &str) -> String {
+    format!("{db_root}/{}", encode_path_segment(table))
+}
+
+/// `{db_root}/{table}/{pk}`: one row, by single-column primary key.
+pub fn build_db_row_uri(db_root: &str, table: &str, pk: &str) -> String {
+    format!(
+        "{}/{}",
+        build_db_table_uri(db_root, table),
+        encode_path_segment(pk)
+    )
+}
+
 pub fn build_project_check_observation_uri(project: &str, handle: &str) -> String {
     format!("{}/check-observations/{handle}", build_project_uri(project))
 }
@@ -173,6 +202,11 @@ pub fn build_project_tenets_uri(project: &str) -> String {
 /// One tenet, by number (canonical) or migrated slug (alias).
 pub fn build_project_tenet_uri(project: &str, key: &str) -> String {
     format!("{}/{key}", build_project_tenets_uri(project))
+}
+
+/// A project's page index: every promoted thread-owned page.
+pub fn build_project_pages_uri(project: &str) -> String {
+    format!("{}/pages", build_project_uri(project))
 }
 
 /// One project's code map — the data source the workspace map surface lays out.
@@ -820,6 +854,40 @@ pub fn build_node_era_uri(
     )
 }
 
+/// The pages a node or thread owns (`.../{node}/pages`, `.../{thread}/pages`).
+pub fn build_node_pages_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+    build_node_subresource_uri(project, number, exec_seq, node_id, "pages")
+}
+
+/// One page's canonical address. On a thread this is
+/// `cairn://p/{project}/{thread}/pages/{name}`.
+pub fn build_node_page_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    name: &str,
+) -> String {
+    format!(
+        "{}/{name}",
+        build_node_pages_uri(project, number, exec_seq, node_id)
+    )
+}
+
+/// One page's call log.
+pub fn build_node_page_log_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    name: &str,
+) -> String {
+    format!(
+        "{}/log",
+        build_node_page_uri(project, number, exec_seq, node_id, name)
+    )
+}
+
 fn build_recipes_uri() -> String {
     "cairn://recipes".to_string()
 }
@@ -850,6 +918,43 @@ fn build_project_workflows_uri(project: &str) -> String {
 
 pub fn build_project_workflow_uri(project: &str, workflow_id: &str) -> String {
     format!("{}/workflows/{}", build_project_uri(project), workflow_id)
+}
+
+pub fn build_project_services_uri(project: &str) -> String {
+    format!("{}/services", build_project_uri(project))
+}
+
+pub fn build_project_service_uri(project: &str, service: &str) -> String {
+    format!("{}/{service}", build_project_services_uri(project))
+}
+
+pub fn build_project_service_status_uri(project: &str, service: &str) -> String {
+    format!("{}/status", build_project_service_uri(project, service))
+}
+
+pub fn build_project_service_log_uri(project: &str, service: &str) -> String {
+    format!("{}/log", build_project_service_uri(project, service))
+}
+
+/// The services a thread owns (`cairn://p/{project}/{thread}/services`).
+pub fn build_thread_services_uri(project: &str, thread: &str) -> String {
+    format!("{}/services", build_thread_uri(project, thread))
+}
+
+/// One thread-owned service, and the home its runs act under.
+pub fn build_thread_service_uri(project: &str, thread: &str, service: &str) -> String {
+    format!("{}/{service}", build_thread_services_uri(project, thread))
+}
+
+pub fn build_thread_service_status_uri(project: &str, thread: &str, service: &str) -> String {
+    format!(
+        "{}/status",
+        build_thread_service_uri(project, thread, service)
+    )
+}
+
+pub fn build_thread_service_log_uri(project: &str, thread: &str, service: &str) -> String {
+    format!("{}/log", build_thread_service_uri(project, thread, service))
 }
 
 pub fn build_routes_uri() -> String {
@@ -998,6 +1103,7 @@ impl CairnResource {
             Self::ProjectPosts { project } => build_project_posts_uri(project),
             Self::ProjectTenets { project } => build_project_tenets_uri(project),
             Self::ProjectTenet { project, key } => build_project_tenet_uri(project, key),
+            Self::ProjectPages { project } => build_project_pages_uri(project),
             Self::ProjectCodemap { project } => build_project_codemap_uri(project),
             Self::ProjectMap { project } => build_project_map_uri(project),
             Self::ProjectHome { project } => build_project_home_uri(project),
@@ -1047,22 +1153,37 @@ impl CairnResource {
             Self::ThreadDbSchema { project, name } => {
                 format!("{}/db/schema", build_thread_uri(project, name))
             }
-            Self::ThreadProcedures { project, name } => {
-                format!("{}/procedures", build_thread_uri(project, name))
-            }
-            Self::ThreadProcedure {
+            Self::ThreadDbTable {
                 project,
                 name,
-                procedure,
-            } => {
-                format!("{}/procedures/{procedure}", build_thread_uri(project, name))
-            }
-            Self::ThreadAutomations { project, name } => {
-                format!("{}/automations", build_thread_uri(project, name))
-            }
-            Self::ThreadAutomation { project, name, id } => {
-                format!("{}/automations/{id}", build_thread_uri(project, name))
-            }
+                table,
+            } => build_db_table_uri(&format!("{}/db", build_thread_uri(project, name)), table),
+            Self::ThreadDbRow {
+                project,
+                name,
+                table,
+                pk,
+            } => build_db_row_uri(
+                &format!("{}/db", build_thread_uri(project, name)),
+                table,
+                pk,
+            ),
+            Self::ThreadServices { project, name } => build_thread_services_uri(project, name),
+            Self::ThreadService {
+                project,
+                name,
+                service,
+            } => build_thread_service_uri(project, name, service),
+            Self::ThreadServiceStatus {
+                project,
+                name,
+                service,
+            } => build_thread_service_status_uri(project, name, service),
+            Self::ThreadServiceLog {
+                project,
+                name,
+                service,
+            } => build_thread_service_log_uri(project, name, service),
             Self::Node {
                 project,
                 number,
@@ -1388,6 +1509,8 @@ impl CairnResource {
                 build_project_symbols_uri(project, symbol.as_deref())
             }
             Self::Db => "cairn://db".to_string(),
+            Self::DbTable { table } => build_db_table_uri("cairn://db", table),
+            Self::DbRow { table, pk } => build_db_row_uri("cairn://db", table, pk),
             Self::Dev => "cairn://dev".to_string(),
             Self::DevDb => "cairn://dev/db".to_string(),
             Self::DevPid => "cairn://dev/pid".to_string(),
@@ -1408,7 +1531,9 @@ impl CairnResource {
             Self::Inference => "cairn://inference".to_string(),
             Self::InferenceRecipes => "cairn://inference/recipes".to_string(),
             Self::InferenceDeployments => "cairn://inference/deployments".to_string(),
+            Self::InferenceDeployment { id } => format!("cairn://inference/deployments/{id}"),
             Self::InferencePools => "cairn://inference/pools".to_string(),
+            Self::InferenceRequests => "cairn://inference/requests".to_string(),
             Self::Executor { name } => format!("cairn://executors/{name}"),
             Self::ExecutorAction { name, action } => {
                 format!("cairn://executors/{name}/{action}")
@@ -1468,6 +1593,26 @@ impl CairnResource {
                 node_id,
                 era_seq,
             } => build_node_era_uri(project, *number, *exec_seq, node_id, *era_seq),
+            Self::NodePages {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_pages_uri(project, *number, *exec_seq, node_id),
+            Self::NodePage {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                name,
+            } => build_node_page_uri(project, *number, *exec_seq, node_id, name),
+            Self::NodePageLog {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                name,
+            } => build_node_page_log_uri(project, *number, *exec_seq, node_id, name),
             Self::Recipes => build_recipes_uri(),
             Self::Recipe { recipe_id } => build_recipe_uri(recipe_id),
             Self::ProjectRecipes { project } => build_project_recipes_uri(project),
@@ -1481,6 +1626,16 @@ impl CairnResource {
                 project,
                 workflow_id,
             } => build_project_workflow_uri(project, workflow_id),
+            Self::ProjectServices { project } => build_project_services_uri(project),
+            Self::ProjectService { project, service } => {
+                build_project_service_uri(project, service)
+            }
+            Self::ProjectServiceStatus { project, service } => {
+                build_project_service_status_uri(project, service)
+            }
+            Self::ProjectServiceLog { project, service } => {
+                build_project_service_log_uri(project, service)
+            }
             Self::Routes => build_routes_uri(),
             Self::Route { route_id } => build_route_uri(route_id),
             Self::RouteHistory { route_id } => build_route_history_uri(route_id),

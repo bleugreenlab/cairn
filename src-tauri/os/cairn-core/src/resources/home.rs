@@ -1,4 +1,4 @@
-use super::common::{connect_for_read, lookup_project_by_key};
+use super::common::{lookup_project_by_key, read_resource};
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::query::QueryParam;
 use serde::Serialize;
@@ -29,27 +29,22 @@ pub(crate) async fn read_project_home(db: &LocalDb, key: &str, params: &[QueryPa
         Ok(v) => v,
         Err(e) => return e,
     };
-    let conn = match connect_for_read(db).await {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let project = match lookup_project_by_key(&conn, key).await {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let payload = match query_project_home(
-        &conn,
-        &project.project_id,
-        key,
-        query.limit,
-        query.before,
-    )
+    let (requested_key, limit, before, json) =
+        (key.to_owned(), query.limit, query.before, query.json);
+    let payload = match read_resource(db, move |conn| {
+        Box::pin(async move {
+            let project = lookup_project_by_key(conn, &requested_key).await?;
+            query_project_home(conn, &project.project_id, &requested_key, limit, before)
+                .await
+                .map_err(|e| format!("Failed to read project home: {e}"))
+        })
+    })
     .await
     {
         Ok(v) => v,
-        Err(e) => return format!("Failed to read project home: {e}"),
+        Err(e) => return e,
     };
-    if query.json {
+    if json {
         serde_json::to_string(&payload)
             .unwrap_or_else(|e| format!("Failed to render project home: {e}"))
     } else {

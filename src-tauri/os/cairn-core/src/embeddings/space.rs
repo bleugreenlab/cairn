@@ -15,12 +15,17 @@
 //! sweeps then re-embed history into the new space; until they do, search and
 //! recall simply have fewer vectors to answer from.
 //!
-//! Three things are deliberately left alone:
+//! A vibe-axes sample of another model (`vibe_axis_samples`) goes with the
+//! other vectors.
+//!
+//! Four things are deliberately left alone:
 //!
 //! - Rows with `dims <= 0` are turn tombstones, deferral markers and empty
 //!   resource markers. They record what the TEXT held, which no model changes.
 //! - Vibe colours (`event_vibes`) stay: the vectors behind them are long gone,
 //!   and the colours are still right for what they described.
+//! - Learned vibe axes (`vibe_axes`) stay: they are keyed by their space, so
+//!   switching back to a model finds its axes rather than learning them again.
 //! - A selection that does not resolve (the provider is offline, a token is
 //!   missing) purges nothing and falls back to nothing. That is an outage or
 //!   an unconfigured install, not a switch.
@@ -38,6 +43,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::embedder::{Embed, EmbedSpace, VectorKey};
 use super::turns::TurnProgress;
+use super::vibe_recompute::VibeAxesProgress;
 use super::EmbedJob;
 use crate::storage::{DbResult, LocalDb, RowExt};
 
@@ -183,6 +189,11 @@ async fn purge_and_record(db: &LocalDb, space: &EmbedSpace) -> DbResult<Purged> 
                 )
                 .await?;
             conn.execute(
+                "DELETE FROM vibe_axis_samples WHERE model != ?1",
+                params![model.as_str()],
+            )
+            .await?;
+            conn.execute(
                 "UPDATE embedding_state
                     SET provider = ?1, model = ?2, turn_dims = ?3, resource_dims = ?4
                   WHERE id = 1",
@@ -216,6 +227,9 @@ pub struct SpaceState {
     /// The last turn count, reused for [`TURN_COUNT_TTL`]: the Settings page
     /// polls every few seconds and the count reads every turn ever recorded.
     turns: Mutex<Option<CachedTurns>>,
+    /// Where learning the active space's vibe axes stands, `None` until the
+    /// recompute has looked at this space.
+    vibes: Mutex<Option<VibeAxesProgress>>,
 }
 
 /// How long a turn count is reused.
@@ -315,6 +329,7 @@ impl SpaceKeeper {
             .resources
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+        *self.state.vibes.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.embedder.reset_health();
         if let Ok(worker) = self.worker.lock() {
             if let Some(worker) = worker.as_ref() {
@@ -404,6 +419,22 @@ impl SpaceKeeper {
         }
     }
 
+    /// Where learning the active space's vibe axes stands.
+    pub fn vibe_progress(&self) -> Option<VibeAxesProgress> {
+        self.state
+            .vibes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Record the recompute's progress, unless the space changed under it.
+    pub(crate) fn set_vibe_progress(&self, generation: u64, progress: VibeAxesProgress) {
+        if self.generation() == generation {
+            *self.state.vibes.lock().unwrap_or_else(|e| e.into_inner()) = Some(progress);
+        }
+    }
+
     /// Count `embedded` more resources as done, unless the space changed.
     pub(crate) fn note_resources_embedded(&self, generation: u64, embedded: u64) {
         if self.generation() != generation {
@@ -465,7 +496,22 @@ pub(crate) mod tests {
         db.execute(
             "INSERT INTO session_positions(session_id, embedding, model, dims, updated_at)
              VALUES (?1, ?2, ?3, ?4, 1)",
-            params![format!("session-{tag}"), blob, model, dims as i64],
+            params![format!("session-{tag}"), blob.clone(), model, dims as i64],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO vibe_axis_samples(model, event_id, run_progress, in_distribution,
+                                           embedding, dims)
+             VALUES (?1, ?2, 0.5, 1, ?3, ?4)",
+            params![model, format!("event-{tag}"), blob, dims as i64],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT OR REPLACE INTO vibe_axes(model, dims, axes, counts, created_at)
+             VALUES (?1, ?2, '{}', '{}', 1)",
+            params![model, dims as i64],
         )
         .await
         .unwrap();
@@ -530,6 +576,7 @@ pub(crate) mod tests {
         );
         stub.set_paused(true);
         let generation = keeper.generation();
+        keeper.set_vibe_progress(generation, VibeAxesProgress::Ready);
 
         stub.set_space("b", "m2", 1536);
         assert_eq!(
@@ -556,12 +603,27 @@ pub(crate) mod tests {
             0
         );
         assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM vibe_axis_samples").await,
+            0,
+            "the old model's vibe sample goes with its vectors"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM vibe_axes WHERE model = 'm1'").await,
+            1,
+            "learned axes stay, keyed by their space"
+        );
+        assert_eq!(
             recorded_space(&db).await.unwrap().unwrap().model,
             "m2".to_string()
         );
         assert!(stub.health().retry_at.is_none(), "the gate is reset");
         assert_eq!(worker.try_recv(), Ok(EmbedJob::ResetSpace));
         assert_eq!(keeper.resource_progress(), None);
+        assert_eq!(
+            keeper.vibe_progress(),
+            None,
+            "the new space has not been looked at"
+        );
         assert!(keeper.generation() > generation);
 
         let logged: Vec<String> = captured_log(SPACE_TARGET)

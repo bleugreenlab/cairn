@@ -726,10 +726,9 @@ mod tests {
     /// operator's vectors on first start.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_upgraded_gateway_install_reconciles_unchanged_and_keeps_every_vector() {
-        use crate::embeddings::space::{recorded_space, SPACE_TARGET};
+        use crate::embeddings::space::recorded_space;
         use crate::embeddings::{EmbedSpace, Reconciled, Trigger};
         use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
-        use crate::test_support::{capture_log, captured_log};
         use cairn_models::types::embedding::CAIRN_GATEWAY_EMBED_MODEL;
 
         let migration = include_str!("../../../../turso_migrations/0285_embedding_space.sql");
@@ -737,7 +736,6 @@ mod tests {
         assert!(migration.contains(&format!("model = '{CAIRN_GATEWAY_EMBED_MODEL}'")));
         assert!(migration.contains(&format!("current_pos, '{CAIRN_GATEWAY_EMBED_MODEL}'")));
 
-        capture_log(SPACE_TARGET);
         cairn_common::scratch::testing::pin_private_root();
         let root = tempfile::tempdir().unwrap().keep();
         let config_dir = root.join("config");
@@ -816,6 +814,9 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(counts().await, (2, 1, 1));
+        // `Unchanged` is returned before any purge or purge log can happen, so
+        // it is the whole proof here. The test binary's captured log is shared
+        // by every test in the process and cannot be attributed to this one.
         let keeper = orch.space_keeper();
         for trigger in [Trigger::Startup, Trigger::Sweep] {
             assert_eq!(
@@ -824,12 +825,6 @@ mod tests {
             );
         }
         assert_eq!(counts().await, (2, 1, 1), "nothing re-embeds");
-        assert!(
-            !captured_log(SPACE_TARGET)
-                .iter()
-                .any(|line| line.contains("cairn/cohere-embed-v4")),
-            "no purge was logged"
-        );
     }
 
     #[test]

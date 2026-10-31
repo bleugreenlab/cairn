@@ -69,7 +69,7 @@ pub(super) async fn resolve_run_item(
                 Ok(RunSpec::Shell {
                     command,
                     timeout: item.timeout,
-                    args: item.procedure_args.clone(),
+                    args: Vec::new(),
                 }),
             )
         }
@@ -150,11 +150,6 @@ fn resolve_executor_action(
     action: String,
     item: &RunItem,
 ) -> Result<RunSpec, String> {
-    if !item.procedure_args.is_empty() {
-        return Err(format!(
-            "Executor action procedure item '{executor_name}/{action}' cannot accept positional args; put named arguments in the stored `payload.args_json`."
-        ));
-    }
     let args = match item.payload.as_ref().and_then(|payload| payload.args_json.clone()) {
         None | Some(serde_json::Value::Null) => serde_json::json!({}),
         Some(value @ serde_json::Value::Object(_)) => value,
@@ -340,7 +335,7 @@ fn resolve_code_spec(item: &RunItem) -> (String, Result<RunSpec, String>) {
         }
     };
 
-    let (program, mut args, stdin) = match interpreter.trim().to_ascii_lowercase().as_str() {
+    let (program, args, stdin) = match interpreter.trim().to_ascii_lowercase().as_str() {
         // bun runs TypeScript and JavaScript identically; the ts/js split only
         // matters to the presentation-layer syntax highlighter.
         "typescript" | "ts" | "javascript" | "js" => (
@@ -352,9 +347,6 @@ fn resolve_code_spec(item: &RunItem) -> (String, Result<RunSpec, String>) {
         // The env probe is isolated from the pure ladder so the decision logic
         // stays hermetically testable.
         "python" | "py" => resolve_python_spec(code, uv_on_agent_path()),
-        "matlab" if !item.procedure_args.is_empty() => {
-            return (header, Err("MATLAB procedure items do not accept positional args; MATLAB -batch has no argv".to_string()))
-        }
         "matlab" => match resolve_matlab_spec(code, discover_matlab_binary()) {
             Ok(spec) => spec,
             Err(error) => return (header, Err(error)),
@@ -368,7 +360,6 @@ fn resolve_code_spec(item: &RunItem) -> (String, Result<RunSpec, String>) {
             )
         }
     };
-    args.extend(item.procedure_args.iter().cloned());
 
     (
         header,
@@ -553,7 +544,6 @@ async fn resolve_script_spec(
     if let Some(payload) = &item.payload {
         args.extend(payload.args.iter().cloned());
     }
-    args.extend(item.procedure_args.iter().cloned());
     Ok(RunSpec::Script {
         program,
         args,
@@ -704,7 +694,6 @@ mod tests {
         RunItem {
             command: None,
             description: None,
-            procedure_args: Vec::new(),
             timeout: None,
             target: None,
             payload: None,

@@ -415,7 +415,6 @@ async fn fire_issue_sink(
             // A freshly dispatched issue has no prior attempt to supersede.
             crate::execution::recipe::LaunchIntent::NewAttempt,
             Vec::new(),
-            crate::tenets::filing::TenetFiling::unattributed(),
         )
         .await
         .map_err(|error| {
@@ -932,10 +931,11 @@ mod tests {
         presence: Presence,
         context: RouteContext<'_>,
     ) -> Result<Vec<ChannelSubmission>, String> {
-        let routes = orch
-            .fact_log
-            .index
-            .routes(&orch.config_dir, context.project_path)?;
+        let routes = orch.fact_log.index.routes(
+            &orch.config_dir,
+            context.project_path,
+            orch.services.clock.now(),
+        )?;
         let mut submissions = Vec::new();
         dispatch_row(
             orch,

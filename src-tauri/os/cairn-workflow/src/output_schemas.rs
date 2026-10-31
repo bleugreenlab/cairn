@@ -17,6 +17,8 @@ fn embedded_preset_schema(schema_name: &str) -> Option<&'static str> {
         )),
         "return" => Some(include_str!("../../../resources/schemas/return.json")),
         "arc" => Some(include_str!("../../../resources/schemas/arc.json")),
+        // Embedded but deliberately NOT a preset: see `page_is_a_shape_not_an_output_contract`.
+        "page" => Some(include_str!("../../../resources/schemas/page.json")),
         _ => None,
     }
 }
@@ -121,6 +123,24 @@ mod tests {
         assert!(is_preset_schema("arc"));
         assert!(!is_preset_schema("custom"));
         assert!(!is_preset_schema(""));
+    }
+
+    /// A page is written only through the page store (`cairn-core` `pages`),
+    /// which layers the rules a JSON Schema cannot state on top of this shape,
+    /// and the generic artifact path refuses the `page` type. Offered as an
+    /// output contract, it would be one no node could ever satisfy, so it is
+    /// embedded for the store's validation and kept off the preset list the run
+    /// dialog offers.
+    #[test]
+    fn page_is_a_shape_not_an_output_contract() {
+        assert!(!is_preset_schema("page"));
+        let schema = load_embedded_preset_schema("page").expect("the page shape is embedded");
+        assert!(schema["properties"]["files"].is_object());
+        assert!(resolve_output_schema(
+            None,
+            &crate::models::OutputSchema::Preset("page".to_string())
+        )
+        .is_err());
     }
 
     #[test]

@@ -23,6 +23,8 @@ schemars = "1.0"
 regex = "1"
 url = "2"
 tracing = "0.1"
+# Progress heartbeats on held-open tool calls (src/heartbeat.rs).
+tokio = { version = "1", features = ["time", "macros"] }
 cairn-common = { path = "../cairn-common" }
 
 [dev-dependencies]
@@ -32,5 +34,5 @@ rmcp = { version = "3", features = [
     "transport-streamable-http-client-reqwest",
     "reqwest",
 ] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 axum = "0.8"

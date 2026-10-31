@@ -41,6 +41,14 @@ impl Deployment {
     pub fn health_url(&self, address: &str) -> String {
         format!("{}{}", origin(address, self.api_port), self.health_path)
     }
+
+    /// The engine's Prometheus metrics, given the head machine's address.
+    /// vLLM, SGLang and llama.cpp all serve them at the API origin's
+    /// `/metrics`; an engine that doesn't answers there with an error, which
+    /// reads as nothing measured.
+    pub fn metrics_url(&self, address: &str) -> String {
+        format!("{}/metrics", origin(address, self.api_port))
+    }
 }
 
 fn origin(address: &str, port: u16) -> String {

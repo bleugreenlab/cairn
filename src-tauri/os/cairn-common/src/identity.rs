@@ -108,6 +108,9 @@ enum AddressWire {
     Invoke {
         origin: Option<String>,
     },
+    Ingress {
+        source_id: String,
+    },
     None,
 }
 impl TryFrom<AddressWire> for Address {
@@ -137,6 +140,7 @@ impl TryFrom<AddressWire> for Address {
             AddressWire::Desktop { device_id } => Self::Desktop { device_id },
             AddressWire::Resource { node } => Self::Resource { node },
             AddressWire::Invoke { origin } => Self::Invoke { origin },
+            AddressWire::Ingress { source_id } => Self::Ingress { source_id },
             AddressWire::None => Self::None,
         };
         address.validate()?;
@@ -248,10 +252,16 @@ pub enum PrincipalRef {
 
 fn is_canonical_agent_home(node: &str) -> bool {
     match parse_uri(node) {
-        Some(CairnResource::Node { .. } | CairnResource::Task { .. }) => true,
+        Some(
+            CairnResource::Node { .. }
+            | CairnResource::Task { .. }
+            | CairnResource::ProjectService { .. },
+        ) => true,
+        // The thread itself, one of its tasks, or a service the thread owns.
         Some(CairnResource::Thread { path, .. }) => {
             path.is_empty()
                 || matches!(path.as_slice(), [task, name] if task == "task" && !name.is_empty())
+                || matches!(path.as_slice(), [services, name] if services == "services" && !name.is_empty())
         }
         _ => false,
     }
@@ -314,6 +324,9 @@ pub enum AppearanceTransport {
     LocalInvoke,
     AuthenticatedOperator,
     AuthenticatedDesktop,
+    /// An event an external system delivered through an ingress endpoint,
+    /// authenticated by that endpoint's credential.
+    Ingress,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,6 +356,10 @@ pub enum Address {
     },
     Invoke {
         origin: Option<String>,
+    },
+    /// The ingress endpoint (`src_…`) an event arrived through.
+    Ingress {
+        source_id: String,
     },
     None,
 }
@@ -384,6 +401,7 @@ impl Address {
                     metadata(v, "origin")?;
                 }
             }
+            Self::Ingress { source_id } => metadata(source_id, "source_id")?,
             Self::None => {}
         }
         Ok(())
@@ -398,6 +416,14 @@ pub enum VerificationMethod {
     SecureEnclaveUserPresence,
     ChannelAllowlist,
     NodeSession,
+    /// A source's credential checked the delivery: a provider signature, an
+    /// HMAC, or a bearer token. `issuer` names the scheme, `subject` the
+    /// endpoint, and `credential_ref` where its secret is kept. What every
+    /// scheme authenticates is the delivery boundary: the sender held the
+    /// endpoint's credential when it submitted. A provider signature or an
+    /// HMAC additionally binds the payload bytes; a bearer token does not.
+    /// None of them vouches for the person behind the account.
+    SourceCredential,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -598,6 +624,12 @@ impl VerificationRecord {
                         && subject.is_none()
                         && session.is_some()
                         && credential_ref.is_none()
+                }
+                VerificationMethod::SourceCredential => {
+                    issuer.is_some()
+                        && subject.is_some()
+                        && session.is_none()
+                        && credential_ref.is_some()
                 }
             },
         };
@@ -921,6 +953,9 @@ mod tests {
             Address::Invoke {
                 origin: Some("loopback".into()),
             },
+            Address::Ingress {
+                source_id: "src_0123456789abcdefghijkl".into(),
+            },
             Address::None,
         ] {
             let decoded: Address =
@@ -941,6 +976,7 @@ mod tests {
             AppearanceTransport::LocalInvoke,
             AppearanceTransport::AuthenticatedOperator,
             AppearanceTransport::AuthenticatedDesktop,
+            AppearanceTransport::Ingress,
         ] {
             assert_eq!(
                 serde_json::from_str::<AppearanceTransport>(
@@ -956,6 +992,7 @@ mod tests {
             VerificationMethod::SecureEnclaveUserPresence,
             VerificationMethod::ChannelAllowlist,
             VerificationMethod::NodeSession,
+            VerificationMethod::SourceCredential,
         ] {
             assert_eq!(
                 serde_json::from_str::<VerificationMethod>(&serde_json::to_string(&value).unwrap())
@@ -970,6 +1007,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&VerificationMethod::SecureEnclaveUserPresence).unwrap(),
             "\"secure_enclave_user_presence\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AppearanceTransport::Ingress).unwrap(),
+            "\"ingress\""
         );
         assert!(serde_json::from_str::<AppearanceTransport>("\"carrier_pigeon\"").is_err());
         assert!(serde_json::from_str::<VerificationMethod>("\"remote_intent\"").is_err());
@@ -1071,6 +1112,44 @@ mod tests {
             .is_err());
         }
     }
+    #[test]
+    fn source_credential_needs_issuer_subject_and_a_safe_credential_ref() {
+        let strength = || VerificationStrength::new("hmac_signature").unwrap();
+        let verified = |credential_ref: Option<CredentialRef>, session: Option<String>| {
+            VerificationRecord::new(
+                VerificationMethod::SourceCredential,
+                VerificationStatus::Verified,
+                Some("cairn-hmac".into()),
+                Some("src_hook".into()),
+                session,
+                credential_ref,
+                strength(),
+                1,
+            )
+        };
+        verified(
+            Some(CredentialRef::new("ingress-endpoint:src_hook").unwrap()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            verified(None, None).unwrap_err(),
+            IdentityValidationError::InvalidVerification
+        );
+        assert_eq!(
+            verified(
+                Some(CredentialRef::new("ingress-endpoint:src_hook").unwrap()),
+                Some("session".into())
+            )
+            .unwrap_err(),
+            IdentityValidationError::InvalidVerification
+        );
+        assert_eq!(
+            CredentialRef::new("ingress-endpoint:sha256:abcd").unwrap_err(),
+            IdentityValidationError::UnsafeCredentialRef
+        );
+    }
+
     #[test]
     fn credential_refs_reject_secrets_and_oracles() {
         assert!(CredentialRef::new("desktop-key-slot-2").is_ok());
@@ -1221,5 +1300,47 @@ mod tests {
                 .is_err()
         );
         assert!(serde_json::from_value::<AppearanceEvidence>(json!({"transport":"local_invoke","address":{"kind":"none"},"verification":{"method":"channel_allowlist","status":"verified","issuer":null,"subject":null,"session":null,"credential_ref":null,"strength":"allowlisted","verified_at":1},"at":-1,"sequence":null})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod service_home_tests {
+    use super::*;
+
+    /// A project service acts under its own home, accepted as a canonical
+    /// agent home (identity thread ruling on cairn/5518); its status and log
+    /// are resources, not homes.
+    #[test]
+    fn a_project_service_is_a_canonical_agent_home() {
+        assert!(is_canonical_agent_home("cairn://p/cairn/services/echo"));
+        assert!(!is_canonical_agent_home(
+            "cairn://p/cairn/services/echo/log"
+        ));
+        assert!(!is_canonical_agent_home("cairn://p/cairn/services"));
+        assert!(PrincipalRef::Agent {
+            node: "cairn://p/cairn/services/echo".into(),
+            run_id: Some("run-1".into()),
+        }
+        .validate_at(PrincipalPosition::AppearancePrincipal)
+        .is_ok());
+    }
+
+    /// A thread-owned service is its own Agent home beneath its thread, the
+    /// same ruling as for a project service.
+    #[test]
+    fn a_thread_owned_service_is_a_canonical_agent_home() {
+        assert!(is_canonical_agent_home(
+            "cairn://p/cairn/spanish/services/tutor"
+        ));
+        assert!(!is_canonical_agent_home(
+            "cairn://p/cairn/spanish/services/tutor/status"
+        ));
+        assert!(!is_canonical_agent_home("cairn://p/cairn/spanish/services"));
+        assert!(PrincipalRef::Agent {
+            node: "cairn://p/cairn/spanish/services/tutor".into(),
+            run_id: Some("run-1".into()),
+        }
+        .validate_at(PrincipalPosition::AppearancePrincipal)
+        .is_ok());
     }
 }

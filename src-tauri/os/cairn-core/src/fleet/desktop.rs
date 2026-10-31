@@ -2,8 +2,8 @@
 #![allow(dead_code)]
 
 use super::service_placement::{
-    acquire_service_lease, ResidentSubscription, ServiceIdentity, ServiceLease,
-    ServicePlacementHealth,
+    acquire_service_lease, named_executor, ResidentLaunch, ResidentSubscription, ServiceIdentity,
+    ServiceLease, ServicePlacementHealth,
 };
 use crate::mcp::gateway::{DuplexIo, PlacedFacade};
 use crate::orchestrator::Orchestrator;
@@ -118,7 +118,7 @@ impl DesktopFacade {
                             id: &service_id,
                             label: "desktop automation",
                         },
-                        &self.executor_name,
+                        named_executor(&self.executor_name),
                         ResidencyFootprint {
                             memory_bytes: 0,
                             disk_growth_bytes: 0,
@@ -292,8 +292,7 @@ impl PlacedFacade for DesktopFacade {
             .start_resident(
                 FACADE_PROCESS_KEY,
                 "desktop automation",
-                &self.binary,
-                vec!["mcp".to_string()],
+                &ResidentLaunch::command(self.binary.clone(), vec!["mcp".to_string()]),
             )
             .await
             .map_err(|error| {
@@ -474,7 +473,7 @@ mod tests {
                 id: "desktop-automation",
                 label: "desktop automation",
             },
-            cairn_common::executor_protocol::LOCAL_EXECUTOR_NAME,
+            named_executor(cairn_common::executor_protocol::LOCAL_EXECUTOR_NAME),
             ResidencyFootprint {
                 memory_bytes: 0,
                 disk_growth_bytes: 0,
@@ -525,7 +524,7 @@ mod tests {
                 id: "desktop-automation",
                 label: "desktop automation",
             },
-            cairn_common::executor_protocol::LOCAL_EXECUTOR_NAME,
+            named_executor(cairn_common::executor_protocol::LOCAL_EXECUTOR_NAME),
             ResidencyFootprint {
                 memory_bytes: 0,
                 disk_growth_bytes: 0,

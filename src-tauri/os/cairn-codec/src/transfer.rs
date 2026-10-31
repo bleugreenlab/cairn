@@ -183,6 +183,26 @@ pub fn build_reachable_pack(
     build_pack_from_oids(repository, &object_ids).map(Some)
 }
 
+/// Build a complete, non-thin pack of exactly `object_ids`, which must all be
+/// present in `repository`. The node scratch asks for objects by identity
+/// (blob-level want lists) rather than by reachability, so a transfer that was
+/// cut off resumes by asking only for what is still missing.
+pub fn build_pack_of_objects(
+    repository: &Path,
+    object_ids: &[String],
+) -> Result<ExecutionPack, String> {
+    if object_ids.is_empty() {
+        return Err("at least one object is required".into());
+    }
+    validate_oids(object_ids.iter())?;
+    let mut listed = String::with_capacity(object_ids.len() * (SHA1_HEX_LEN + 1));
+    for oid in object_ids {
+        listed.push_str(oid);
+        listed.push('\n');
+    }
+    build_pack_from_oids(repository, &listed)
+}
+
 /// The commits among `candidates` that `repository` holds, in their order.
 ///
 /// A have the store does not know cannot narrow a pack, and handed to
@@ -238,6 +258,8 @@ pub fn validate_pack(pack: &[u8], limits: PackLimits) -> Result<ValidatedPack, S
     }
     let scratch = tempfile::tempdir().map_err(|e| format!("creating pack quarantine: {e}"))?;
     let git_dir = scratch.path().join("repository.git");
+    // host-default-branch: a throwaway quarantine that validates a pack's
+    // objects; no ref in it is ever read.
     let init = Command::new("git")
         .args(["init", "--bare", "--quiet"])
         .arg(&git_dir)
@@ -682,6 +704,8 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 fn plumbing_repository() -> Result<tempfile::TempDir, String> {
     let repo = tempfile::tempdir().map_err(|e| format!("creating plumbing repository: {e}"))?;
+    // host-default-branch: a throwaway repository for object plumbing; no ref
+    // in it is ever read.
     let output = Command::new("git")
         .args(["init", "--bare", "--quiet"])
         .arg(repo.path())
@@ -901,7 +925,7 @@ mod tests {
         let tip = commit_all(source.path(), "tip");
 
         let target = tempfile::tempdir().unwrap();
-        git(target.path(), &["init", "-q", "--bare"]);
+        git(target.path(), &["init", "-b", "main", "-q", "--bare"]);
         let delta = build_delta_pack(source.path(), &tip, &base)
             .unwrap()
             .unwrap();
@@ -1015,7 +1039,7 @@ mod tests {
         // A receiver: an empty bare repository that is sent the child's
         // closure, which stops at the clone's boundary.
         let receiver = tempfile::tempdir().unwrap();
-        git(receiver.path(), &["init", "-q", "--bare"]);
+        git(receiver.path(), &["init", "-b", "main", "-q", "--bare"]);
         let (pack, _) = build_reachable_pack(&clone, std::slice::from_ref(&child), &[])
             .unwrap()
             .unwrap();

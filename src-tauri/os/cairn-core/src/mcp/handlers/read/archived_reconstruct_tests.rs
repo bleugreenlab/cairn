@@ -15,12 +15,11 @@ use std::sync::Arc;
 use super::register_archived_file_renderer;
 use crate::storage::event_fixture::render_targets as expected_read;
 use crate::storage::events::reconstruct::{
-    reconstruct_events, reconstruct_events_with_conn_and_routes, STUB_PREFIX,
+    reconstruct_events, reconstruct_events_with_routes, STUB_PREFIX,
 };
 use crate::storage::events::reconstruct_fixture::{
     build_fixture, migrated_db, read_event, seed_chain, seed_team_chain, tool_result,
 };
-use crate::storage::DbResult;
 
 #[tokio::test]
 async fn gitcoord_reads_are_byte_identical() {
@@ -87,24 +86,9 @@ async fn team_gitcoord_read_stubs_until_private_local_repo_path_is_set() {
         .unwrap();
 
     let event = read_event(&fx.tip, &["file:a.txt"]);
-    let without_clone = team_db
-        .read(|conn| {
-            let event = event.clone();
-            let private_db = private_db.clone();
-            Box::pin(async move {
-                DbResult::Ok(
-                    reconstruct_events_with_conn_and_routes(
-                        conn,
-                        vec![event],
-                        None,
-                        Some(private_db.as_ref()),
-                    )
-                    .await,
-                )
-            })
-        })
-        .await
-        .unwrap();
+    let without_clone =
+        reconstruct_events_with_routes(&team_db, vec![event], None, Some(private_db.as_ref()))
+            .await;
     assert!(tool_result(&without_clone[0]).contains(STUB_PREFIX));
 
     private_db
@@ -115,24 +99,9 @@ async fn team_gitcoord_read_stubs_until_private_local_repo_path_is_set() {
         .await
         .unwrap();
     let event = read_event(&fx.tip, &["file:a.txt"]);
-    let with_clone = team_db
-        .read(|conn| {
-            let event = event.clone();
-            let private_db = private_db.clone();
-            Box::pin(async move {
-                DbResult::Ok(
-                    reconstruct_events_with_conn_and_routes(
-                        conn,
-                        vec![event],
-                        None,
-                        Some(private_db.as_ref()),
-                    )
-                    .await,
-                )
-            })
-        })
-        .await
-        .unwrap();
+    let with_clone =
+        reconstruct_events_with_routes(&team_db, vec![event], None, Some(private_db.as_ref()))
+            .await;
     assert_eq!(
         tool_result(&with_clone[0]),
         expected_read(&[(

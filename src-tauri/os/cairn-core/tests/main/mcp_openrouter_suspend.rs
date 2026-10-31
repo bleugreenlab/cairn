@@ -107,6 +107,7 @@ async fn owned_loop_question_suspends_without_inline_wait() {
     register_owned_loop_run(&orch);
 
     let request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: temp.path().display().to_string(),
         run_id: Some("run-1".to_string()),
@@ -126,6 +127,7 @@ async fn owned_loop_question_suspends_without_inline_wait() {
             }]
         }),
         tool_use_id: Some("toolu-or-write".to_string()),
+        origin: None,
     };
 
     // Returns promptly with the suspend marker (no 45s inline wait).

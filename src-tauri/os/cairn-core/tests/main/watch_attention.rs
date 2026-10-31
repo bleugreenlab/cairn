@@ -68,12 +68,14 @@ fn watch_request(issue_uri: &str, since: Option<i64>) -> McpCallbackRequest {
         None => json!({ "issue_uri": issue_uri }),
     };
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: String::new(),
         run_id: None,
         tool: "watch".to_string(),
         payload,
         tool_use_id: None,
+        origin: None,
     }
 }
 
@@ -597,12 +599,14 @@ async fn ask_questions_handler_emits_typed_question_event() {
         }],
     };
     let request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: String::new(),
         run_id: Some(run_id.clone()),
         tool: "ask_user".to_string(),
         payload: serde_json::to_value(&payload).unwrap(),
         tool_use_id: Some("tool-1".to_string()),
+        origin: None,
     };
 
     // Background=true so the handler stores the prompt + emits the typed event

@@ -1,64 +1,18 @@
 //! GitHub credential management — DB operations with transparent at-rest
 //! encryption.
 //!
-//! `private_key`, `webhook_secret`, and `relay_secret` are encrypted at rest
-//! (see [`crypto`]). [`get_github_credentials`] returns them decrypted, and
+//! `private_key` and `webhook_secret` are encrypted at rest (see [`crypto`]).
+//! [`get_github_credentials`] returns them decrypted, and
 //! [`update_github_credentials`] re-encrypts on write, so callers always work
 //! with plaintext. Legacy plaintext values migrate to ciphertext on the next
-//! write. The `relay_private_key_encrypted` field is encrypted separately by the
-//! relay manager and is stored as-is here.
+//! write.
+//!
+//! The relay channel the App's webhooks arrive on is the install's, not the
+//! App's: it lives in [`crate::ingress::channel`].
 
 use super::crypto;
 use crate::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    OnceLock,
-};
-use tokio::sync::{Mutex, Notify};
-
-static RELAY_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static RELAY_REPAIR_NOTIFY: OnceLock<Notify> = OnceLock::new();
-static RELAY_REPAIR_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-/// Serializes relay polling and key rotation for the lifetime of this process.
-pub fn relay_operation_lock() -> &'static Mutex<()> {
-    RELAY_OPERATION_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-pub fn relay_repair_generation() -> u64 {
-    RELAY_REPAIR_GENERATION.load(Ordering::Acquire)
-}
-
-pub async fn relay_repair_notified() {
-    RELAY_REPAIR_NOTIFY
-        .get_or_init(Notify::new)
-        .notified()
-        .await;
-}
-
-pub fn notify_relay_repaired() {
-    RELAY_REPAIR_GENERATION.fetch_add(1, Ordering::AcqRel);
-    // There is one relay poller. `notify_one` retains a permit when repair lands
-    // between its generation check and registration of the next waiter.
-    RELAY_REPAIR_NOTIFY.get_or_init(Notify::new).notify_one();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn repair_notification_is_retained_for_a_late_poller_waiter() {
-        notify_relay_repaired();
-        tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            relay_repair_notified(),
-        )
-        .await
-        .expect("repair notification should retain a permit");
-    }
-}
 
 /// GitHub credentials stored in DB.
 #[derive(Debug, Clone, Default)]
@@ -69,29 +23,11 @@ pub struct GitHubCredentials {
     pub private_key: Option<String>,
     pub webhook_secret: Option<String>,
     pub installation_id: Option<i64>,
-    pub relay_channel_id: Option<String>,
-    pub relay_secret: Option<String>,
-    pub last_event_sync: Option<String>,
-    pub relay_public_key: Option<String>,
-    pub relay_private_key_encrypted: Option<String>,
-    pub relay_key_rotated_at: Option<String>,
-    pub relay_pending_public_key: Option<String>,
-    pub relay_pending_private_key_encrypted: Option<String>,
-    pub relay_health_state: Option<String>,
-    pub relay_health_reason: Option<String>,
-    pub relay_first_failure_at: Option<String>,
-    pub relay_last_failure_at: Option<String>,
-    pub relay_consecutive_failures: Option<i64>,
-    pub relay_failing_event_id: Option<String>,
-    pub relay_failing_event_at: Option<String>,
-    pub relay_last_successful_delivery_at: Option<String>,
+    /// App mentions from repositories that map to no project.
     pub relay_unmapped_mention_count: i64,
     pub relay_last_unmapped_event_id: Option<String>,
     pub relay_last_unmapped_repository: Option<String>,
     pub relay_last_unmapped_at: Option<String>,
-    /// Events the relay consumer recorded and skipped since its last
-    /// successful delivery. Non-zero means the feed is `skipping`.
-    pub relay_undeliverable_since_healthy: i64,
 }
 
 /// Get GitHub credentials from DB.
@@ -101,16 +37,9 @@ pub async fn get_github_credentials(db: &LocalDb) -> Result<GitHubCredentials, S
             let mut rows = conn
                 .query(
                     "SELECT app_id, app_name, app_slug, private_key, webhook_secret,
-                            installation_id, relay_channel_id, relay_secret, last_event_sync,
-                            relay_public_key, relay_private_key_encrypted,
-                            relay_health_state, relay_health_reason, relay_first_failure_at,
-                            relay_last_failure_at, relay_consecutive_failures,
-                            relay_failing_event_id, relay_failing_event_at,
-                            relay_last_successful_delivery_at,
-                            relay_pending_public_key, relay_pending_private_key_encrypted,
-                            relay_key_rotated_at, relay_unmapped_mention_count,
+                            installation_id, relay_unmapped_mention_count,
                             relay_last_unmapped_event_id, relay_last_unmapped_repository,
-                            relay_last_unmapped_at, relay_undeliverable_since_healthy
+                            relay_last_unmapped_at
                      FROM github_app
                      WHERE id = 'default'",
                     (),
@@ -128,27 +57,10 @@ pub async fn get_github_credentials(db: &LocalDb) -> Result<GitHubCredentials, S
                 private_key: row.opt_text(3)?,
                 webhook_secret: row.opt_text(4)?,
                 installation_id: row.opt_i64(5)?,
-                relay_channel_id: row.opt_text(6)?,
-                relay_secret: row.opt_text(7)?,
-                last_event_sync: row.opt_text(8)?,
-                relay_public_key: row.opt_text(9)?,
-                relay_private_key_encrypted: row.opt_text(10)?,
-                relay_health_state: row.opt_text(11)?,
-                relay_health_reason: row.opt_text(12)?,
-                relay_first_failure_at: row.opt_text(13)?,
-                relay_last_failure_at: row.opt_text(14)?,
-                relay_consecutive_failures: row.opt_i64(15)?,
-                relay_failing_event_id: row.opt_text(16)?,
-                relay_failing_event_at: row.opt_text(17)?,
-                relay_last_successful_delivery_at: row.opt_text(18)?,
-                relay_pending_public_key: row.opt_text(19)?,
-                relay_pending_private_key_encrypted: row.opt_text(20)?,
-                relay_key_rotated_at: row.opt_text(21)?,
-                relay_unmapped_mention_count: row.opt_i64(22)?.unwrap_or(0),
-                relay_last_unmapped_event_id: row.opt_text(23)?,
-                relay_last_unmapped_repository: row.opt_text(24)?,
-                relay_last_unmapped_at: row.opt_text(25)?,
-                relay_undeliverable_since_healthy: row.opt_i64(26)?.unwrap_or(0),
+                relay_unmapped_mention_count: row.opt_i64(6)?.unwrap_or(0),
+                relay_last_unmapped_event_id: row.opt_text(7)?,
+                relay_last_unmapped_repository: row.opt_text(8)?,
+                relay_last_unmapped_at: row.opt_text(9)?,
             })
         })
     })
@@ -177,12 +89,6 @@ fn decrypt_at_rest_fields(creds: &mut GitHubCredentials) {
         &machine_id,
         crypto::WEBHOOK_SECRET_DOMAIN,
         "webhook_secret",
-    );
-    creds.relay_secret = decrypt_field(
-        creds.relay_secret.take(),
-        &machine_id,
-        crypto::RELAY_SECRET_DOMAIN,
-        "relay_secret",
     );
 }
 
@@ -215,8 +121,8 @@ fn encrypt_field(
 /// Read-modify-write the single `github_app` row, encrypting the at-rest fields.
 ///
 /// `update_fn` operates on the decrypted (plaintext) credentials. On write,
-/// `private_key`, `webhook_secret`, and `relay_secret` are re-encrypted, which
-/// also migrates any legacy plaintext values to ciphertext.
+/// `private_key` and `webhook_secret` are re-encrypted, which also migrates any
+/// legacy plaintext values to ciphertext.
 pub async fn update_github_credentials<F>(db: &LocalDb, update_fn: F) -> Result<(), String>
 where
     F: FnOnce(&mut GitHubCredentials),
@@ -235,35 +141,21 @@ where
         &machine_id,
         crypto::WEBHOOK_SECRET_DOMAIN,
     )?;
-    let relay_secret = encrypt_field(
-        creds.relay_secret.as_deref(),
-        &machine_id,
-        crypto::RELAY_SECRET_DOMAIN,
-    )?;
 
     let now = chrono::Utc::now().timestamp();
     db.write(|conn| {
         let creds = creds.clone();
         let private_key = private_key.clone();
         let webhook_secret = webhook_secret.clone();
-        let relay_secret = relay_secret.clone();
         Box::pin(async move {
             conn.execute(
                 "INSERT INTO github_app (
                     id, app_id, app_name, app_slug, private_key, webhook_secret,
-                    installation_id, relay_channel_id, relay_secret, last_event_sync,
-                    created_at, updated_at, relay_public_key, relay_private_key_encrypted,
-                    relay_health_state, relay_health_reason, relay_first_failure_at,
-                    relay_last_failure_at, relay_consecutive_failures, relay_failing_event_id,
-                    relay_failing_event_at, relay_last_successful_delivery_at,
-                    relay_pending_public_key, relay_pending_private_key_encrypted,
-                    relay_key_rotated_at, relay_unmapped_mention_count,
+                    installation_id, created_at, updated_at, relay_unmapped_mention_count,
                     relay_last_unmapped_event_id, relay_last_unmapped_repository,
-                    relay_last_unmapped_at, relay_undeliverable_since_healthy
+                    relay_last_unmapped_at
                  )
-                 VALUES ('default', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12,
-                         ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                         ?26, ?27, ?28)
+                 VALUES ('default', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(id) DO UPDATE SET
                     app_id = excluded.app_id,
                     app_name = excluded.app_name,
@@ -271,28 +163,11 @@ where
                     private_key = excluded.private_key,
                     webhook_secret = excluded.webhook_secret,
                     installation_id = excluded.installation_id,
-                    relay_channel_id = excluded.relay_channel_id,
-                    relay_secret = excluded.relay_secret,
-                    last_event_sync = excluded.last_event_sync,
                     updated_at = excluded.updated_at,
-                    relay_public_key = excluded.relay_public_key,
-                    relay_private_key_encrypted = excluded.relay_private_key_encrypted,
-                    relay_health_state = excluded.relay_health_state,
-                    relay_health_reason = excluded.relay_health_reason,
-                    relay_first_failure_at = excluded.relay_first_failure_at,
-                    relay_last_failure_at = excluded.relay_last_failure_at,
-                    relay_consecutive_failures = excluded.relay_consecutive_failures,
-                    relay_failing_event_id = excluded.relay_failing_event_id,
-                    relay_failing_event_at = excluded.relay_failing_event_at,
-                    relay_last_successful_delivery_at = excluded.relay_last_successful_delivery_at,
-                    relay_pending_public_key = excluded.relay_pending_public_key,
-                    relay_pending_private_key_encrypted = excluded.relay_pending_private_key_encrypted,
-                    relay_key_rotated_at = excluded.relay_key_rotated_at,
                     relay_unmapped_mention_count = excluded.relay_unmapped_mention_count,
                     relay_last_unmapped_event_id = excluded.relay_last_unmapped_event_id,
                     relay_last_unmapped_repository = excluded.relay_last_unmapped_repository,
-                    relay_last_unmapped_at = excluded.relay_last_unmapped_at,
-                    relay_undeliverable_since_healthy = excluded.relay_undeliverable_since_healthy",
+                    relay_last_unmapped_at = excluded.relay_last_unmapped_at",
                 params![
                     creds.app_id,
                     creds.app_name,
@@ -300,28 +175,11 @@ where
                     private_key,
                     webhook_secret,
                     creds.installation_id,
-                    creds.relay_channel_id,
-                    relay_secret,
-                    creds.last_event_sync,
                     now,
-                    creds.relay_public_key,
-                    creds.relay_private_key_encrypted,
-                    creds.relay_health_state,
-                    creds.relay_health_reason,
-                    creds.relay_first_failure_at,
-                    creds.relay_last_failure_at,
-                    creds.relay_consecutive_failures,
-                    creds.relay_failing_event_id,
-                    creds.relay_failing_event_at,
-                    creds.relay_last_successful_delivery_at,
-                    creds.relay_pending_public_key,
-                    creds.relay_pending_private_key_encrypted,
-                    creds.relay_key_rotated_at,
                     creds.relay_unmapped_mention_count,
                     creds.relay_last_unmapped_event_id,
                     creds.relay_last_unmapped_repository,
                     creds.relay_last_unmapped_at,
-                    creds.relay_undeliverable_since_healthy,
                 ],
             )
             .await?;

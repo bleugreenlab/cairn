@@ -6,6 +6,9 @@
 //! an async worker, used to assign a vibe color (persisted in `event_vibes`),
 //! then discarded. Corpus resources (issues, skills, memories, artifacts)
 //! persist their vectors in `resource_embeddings` for in-engine recall.
+//! Colouring needs axes learned in the active model's space: Cohere v4's ship
+//! bundled, and any other model's are learned from history by
+//! [`vibe_recompute`].
 
 pub mod embedder;
 pub mod position;
@@ -16,6 +19,8 @@ pub mod space;
 pub mod status;
 pub mod turns;
 pub mod vector;
+pub mod vibe_axes;
+pub mod vibe_recompute;
 pub mod vibes;
 mod worker;
 
@@ -27,7 +32,8 @@ pub use embedder::{
 pub use position::{PositionConfig, PositionKind, PositionMeta};
 pub(crate) use resource_text::artifact_embed_text;
 pub use space::{Reconciled, ResourceProgress, SpaceKeeper, SpaceState, Trigger};
-pub use vibes::VibeState;
+pub use vibe_recompute::VibeAxesProgress;
+pub use vibes::{AxisSet, VibeState};
 pub use worker::{spawn_embed_worker, EmbedJob};
 
 /// The most any one text sends, in bytes, whatever its kind: a turn, an event,

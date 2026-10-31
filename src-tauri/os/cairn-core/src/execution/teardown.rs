@@ -141,6 +141,9 @@ pub(crate) async fn cleanup_issue_jobs(
     for job_id in &job_ids {
         crate::scratch::remove_job_scratch_dir(job_id);
     }
+    // Each of the issue's nodes owned a portable scratch; it ends with them,
+    // on the runner and on every machine that held a replica.
+    crate::node_scratch::lifecycle::close_for_issue(orch, &issue_id).await;
 
     // The issue's agents were stopped before teardown, so its transcripts are
     // now immutable. Archive them while their branches still resolve; the
@@ -436,6 +439,7 @@ pub async fn cleanup_project_jobs(orch: &Orchestrator, project_id: &str) -> Resu
     for job_id in &job_ids {
         crate::scratch::remove_job_scratch_dir(job_id);
     }
+    crate::node_scratch::lifecycle::close_for_project(orch, project_id).await;
     Ok(())
 }
 

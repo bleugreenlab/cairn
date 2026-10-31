@@ -423,12 +423,14 @@ async fn drive_inner(
     if let Some(requests) = state.pending_input_requests.clone() {
         let payload = input_prompt(requests);
         let request = cairn_common::protocol::CallbackRequest {
+            answer_bound_ms: None,
             cwd: ".".into(),
             run_id: Some(record.run_id.clone()),
             tool: "run".into(),
             payload: serde_json::Value::Null,
             tool_use_id: None,
             thread_id: None,
+            origin: None,
         };
         let _ = super::planning::ask_mcp_questions(orch, &request, payload, &record.id).await;
         let prompt_id = latest_prompt(db, &record.id)

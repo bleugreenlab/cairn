@@ -102,11 +102,28 @@ fn bounded_uri_label(uri: &str) -> String {
     format!("{}…", &uri[..end])
 }
 
-#[cfg(any(test, feature = "test-utils"))]
-pub(crate) struct TestByteMeter;
+/// How much of each target a composed read may carry, chosen by whoever the
+/// read is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadBudget {
+    /// The read lands in a model's context window: one
+    /// [`READ_BATCH_TOKEN_BUDGET`] shared fairly across the batch's targets,
+    /// under [`CLIENT_TOOL_RESULT_BYTE_CEILING`], with a continue footer for
+    /// whatever did not fit.
+    Context,
+    /// The read lands in code that parses it, with no context window to
+    /// protect and no agent to follow a footer. Every target renders whole; a
+    /// target whose section would exceed `byte_ceiling` bytes is refused in
+    /// place rather than cut, because a structured body cut mid-document is not
+    /// a structured answer.
+    Whole { byte_ceiling: usize },
+}
 
-#[cfg(any(test, feature = "test-utils"))]
-impl TokenMeter for TestByteMeter {
+/// Counts bytes as tokens. The whole-read composer's meter, where nothing is
+/// cut and counting only has to be cheap, and the tests' deterministic one.
+pub(crate) struct ByteMeter;
+
+impl TokenMeter for ByteMeter {
     fn count(&self, text: &str) -> u32 {
         text.len().try_into().unwrap_or(u32::MAX)
     }
@@ -324,14 +341,24 @@ fn line_footer(
 }
 
 /// Continue footer for a `Record` page: advance `offset` by the items already
-/// emitted. Only called when a further page exists and the total is known.
-fn record_footer(uri: &str, offset: usize, shown: usize, total: usize, noun: &str) -> String {
+/// emitted, in the resource's own unit. Only called when a further page exists;
+/// `total` is omitted when the producer cannot count the collection.
+fn record_footer(
+    uri: &str,
+    offset: usize,
+    shown: usize,
+    total: Option<usize>,
+    noun: &str,
+) -> String {
+    let of_total = total
+        .map(|total| format!(" of {total}"))
+        .unwrap_or_default();
     format!(
-        "[{} {}\u{2013}{} of {} — continue: {}]",
+        "[{} {}\u{2013}{}{} — continue: {}]",
         noun,
         offset + 1,
         offset + shown,
-        total,
+        of_total,
         target_with_query_param(uri, "offset", offset + shown),
     )
 }
@@ -373,9 +400,12 @@ fn segment_suffix(meta: &SegmentMeta, shown: usize) -> Option<String> {
     // unit. When the total is not cheaply knowable (messages), the suffix is
     // omitted and the header stays bare.
     if matches!(meta.natural_unit, NaturalUnit::Record | NaturalUnit::Turn) {
-        let total = meta.total_units?;
         let noun = meta.unit_noun.as_deref()?;
-        return Some(format!("{shown} of {total} {noun}"));
+        return match meta.total_units {
+            Some(total) => Some(format!("{shown} of {total} {noun}")),
+            None if meta.more_records => Some(format!("{shown} {noun}; more follow")),
+            None => None,
+        };
     }
     match meta.kind {
         SegmentKind::File | SegmentKind::Web | SegmentKind::Resource => {
@@ -826,9 +856,12 @@ fn render_record_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) 
     // mechanical follower its own URI back forever.
     let more = !blocked_oversized_record
         && shown > 0
-        && meta
-            .total_units
-            .is_some_and(|total| meta.offset + shown < total);
+        && match meta.total_units {
+            Some(total) => meta.offset + shown < total,
+            // An uncounted collection continues when its producer saw records
+            // past this page, or when the budget cut records the page carried.
+            None => meta.more_records || shown < produced_shown,
+        };
     let truncated = cut.budget_truncated || more;
 
     meta.shown_units = shown;
@@ -850,9 +883,15 @@ fn render_record_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) 
     };
 
     if more {
-        if let (Some(total), Some(noun)) = (meta.total_units, meta.unit_noun.as_deref()) {
+        if let Some(noun) = meta.unit_noun.as_deref() {
             text.push('\n');
-            text.push_str(&record_footer(&meta.uri, meta.offset, shown, total, noun));
+            text.push_str(&record_footer(
+                &meta.uri,
+                meta.offset,
+                shown,
+                meta.total_units,
+                noun,
+            ));
         }
     }
     text.push_str(&image_trailer);
@@ -950,8 +989,12 @@ fn estimate_len(segment: &ReadSegment, meter: &dyn TokenMeter) -> u32 {
 /// reconstruction ([`crate::storage::events::reconstruct`]): both feed a `Vec<ReadSegment>`
 /// through this one composer so a reconstructed read reproduces the live envelope
 /// byte-for-byte.
-pub fn assemble(segments: Vec<ReadSegment>, meter: &dyn TokenMeter) -> ReadBatchEnvelope {
-    assemble_inner(segments, false, meter)
+pub fn assemble(
+    segments: Vec<ReadSegment>,
+    budget: ReadBudget,
+    meter: &dyn TokenMeter,
+) -> ReadBatchEnvelope {
+    assemble_inner(segments, false, budget, meter)
 }
 
 /// Compose a batch while retaining each final, post-budget segment body in the
@@ -959,9 +1002,10 @@ pub fn assemble(segments: Vec<ReadSegment>, meter: &dyn TokenMeter) -> ReadBatch
 /// include continuation footers and history exactly as rendered in `text`.
 pub fn assemble_with_bodies(
     segments: Vec<ReadSegment>,
+    budget: ReadBudget,
     meter: &dyn TokenMeter,
 ) -> ReadBatchEnvelope {
-    assemble_inner(segments, true, meter)
+    assemble_inner(segments, true, budget, meter)
 }
 
 /// Recompose archived reads written under the former character budget.
@@ -975,8 +1019,12 @@ pub fn assemble_legacy_chars(
 fn assemble_inner(
     segments: Vec<ReadSegment>,
     include_bodies: bool,
+    budget: ReadBudget,
     meter: &dyn TokenMeter,
 ) -> ReadBatchEnvelope {
+    if let ReadBudget::Whole { byte_ceiling } = budget {
+        return assemble_whole(segments, include_bodies, byte_ceiling);
+    }
     if let Some(envelope) = assemble_fitting(&segments, include_bodies, meter, None) {
         return envelope;
     }
@@ -1103,20 +1151,7 @@ fn assemble_at_budget(
         .map(|segment| estimate_len(segment, meter))
         .collect();
     let separator_budget = meter.count(&"\n".repeat(segments.len().saturating_sub(1)));
-    let structured_affordances: Vec<Affordance> = segments
-        .iter()
-        .filter_map(|segment| segment.affordance.clone())
-        .collect();
-    let mut affordances: Vec<Affordance> = Vec::new();
-    for segment in &segments {
-        if let Some(affordance) = &segment.affordance {
-            if !affordances.iter().any(|existing| {
-                existing.kind == affordance.kind && existing.block == affordance.block
-            }) {
-                affordances.push(affordance.clone());
-            }
-        }
-    }
+    let affordances = distinct_affordances(&segments);
     let affordance_budget: u32 = affordances
         .iter()
         .map(|affordance| meter.count(&format!("\n\n{}", affordance.block)))
@@ -1125,13 +1160,75 @@ fn assemble_at_budget(
         .saturating_sub(separator_budget)
         .saturating_sub(affordance_budget);
     let budgets = fair_share_budgets(&lengths, total_budget);
+    compose(segments, include_bodies, affordances, |segment, index| {
+        render_segment(segment, budgets[index], meter)
+    })
+}
 
+/// Compose a batch with every target whole: no token budget and no client
+/// byte ceiling, which both exist for a model's context. A target whose section
+/// exceeds `byte_ceiling` becomes an error segment naming its size and the
+/// ceiling, so the reader gets a refusal it can act on instead of a body cut
+/// partway through.
+fn assemble_whole(
+    segments: Vec<ReadSegment>,
+    include_bodies: bool,
+    byte_ceiling: usize,
+) -> ReadBatchEnvelope {
+    let affordances = distinct_affordances(&segments);
+    compose(segments, include_bodies, affordances, |segment, _| {
+        let rendered = render_segment(segment, u32::MAX, &ByteMeter);
+        if rendered.text.len() <= byte_ceiling {
+            return rendered;
+        }
+        let refusal = format!(
+            "{} renders {} bytes, more than the {byte_ceiling}-byte ceiling a whole read carries for one target. It is refused rather than cut, because a cut body is not the answer it claims to be (cut JSON does not parse). Narrow the read, for example with a smaller `limit`, a `path`, or a line range, and read it in parts.",
+            bounded_uri_label(&rendered.meta.uri),
+            rendered.text.len(),
+        );
+        render_segment(
+            error_segment(rendered.meta.uri, refusal),
+            u32::MAX,
+            &ByteMeter,
+        )
+    })
+}
+
+/// The batch's affordance blocks, deduped by `(kind, block)` in first-seen
+/// order: what the composed text appends once after all content.
+fn distinct_affordances(segments: &[ReadSegment]) -> Vec<Affordance> {
+    let mut affordances: Vec<Affordance> = Vec::new();
+    for segment in segments {
+        if let Some(affordance) = &segment.affordance {
+            if !affordances.iter().any(|existing| {
+                existing.kind == affordance.kind && existing.block == affordance.block
+            }) {
+                affordances.push(affordance.clone());
+            }
+        }
+    }
+    affordances
+}
+
+/// Join rendered segments into one envelope: sections in input order, then
+/// the deduped affordance blocks. `render` turns the segment at an index into
+/// its final section; how much of it survives is the caller's budget.
+fn compose(
+    segments: Vec<ReadSegment>,
+    include_bodies: bool,
+    affordances: Vec<Affordance>,
+    mut render: impl FnMut(ReadSegment, usize) -> RenderedSegment,
+) -> ReadBatchEnvelope {
+    let structured_affordances: Vec<Affordance> = segments
+        .iter()
+        .filter_map(|segment| segment.affordance.clone())
+        .collect();
     let mut text = String::new();
     let mut images = Vec::new();
     let mut metas: Vec<SegmentMeta> = Vec::new();
     let mut bodies = include_bodies.then(|| Vec::with_capacity(segments.len()));
-    for (segment, budget) in segments.into_iter().zip(budgets) {
-        let rendered = render_segment(segment, budget, meter);
+    for (index, segment) in segments.into_iter().enumerate() {
+        let rendered = render(segment, index);
         if !text.is_empty() {
             text.push('\n');
         }
@@ -1167,7 +1264,7 @@ mod tests {
     use super::*;
     use cairn_common::token_meter::Cut;
 
-    static BYTE_METER: TestByteMeter = TestByteMeter;
+    static BYTE_METER: ByteMeter = ByteMeter;
 
     fn render_segment(seg: ReadSegment, budget: usize) -> RenderedSegment {
         super::render_segment(seg, budget.try_into().unwrap(), &BYTE_METER)
@@ -1873,6 +1970,141 @@ mod tests {
     }
 
     #[test]
+    fn uncounted_record_segment_with_more_continues_in_records() {
+        // A store log knows another page exists but not how many commits
+        // remain: the page still continues, in commits.
+        let mut r = record_seg(
+            "cairn://p/CAIRN/vcs/log?to=main&limit=2",
+            "| `a` |\n| `b` |",
+            None,
+            2,
+            Some("commits"),
+            0,
+        );
+        r.meta.more_records = true;
+        r.meta.limit = Some(2);
+        let out = render_segment(r, 10_000);
+        assert!(
+            out.text.starts_with(
+                "=== cairn://p/CAIRN/vcs/log?to=main&limit=2 [2 commits; more follow] ==="
+            ),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.ends_with(
+                "[commits 1\u{2013}2 — continue: cairn://p/CAIRN/vcs/log?to=main&limit=2&offset=2]"
+            ),
+            "{}",
+            out.text
+        );
+    }
+
+    /// A collection of `total` records behind a two-line prelude, paged the way
+    /// a self-paging renderer pages it: `offset` skips records and `limit` caps
+    /// the page. `counted` reports the total or only whether more remain;
+    /// `framed` renders one line per record, otherwise each record spans two.
+    fn paged_records(uri: &str, total: usize, counted: bool, framed: bool) -> ReadSegment {
+        let split = split_target_query(uri).unwrap();
+        let value = |key: &str| {
+            split
+                .params
+                .iter()
+                .rev()
+                .find(|param| param.key == key)
+                .and_then(|param| param.value.parse::<usize>().ok())
+        };
+        let offset = value("offset").unwrap_or(0);
+        let limit = value("limit").unwrap_or(40);
+        let end = (offset + limit).min(total);
+        let records: Vec<String> = (offset..end)
+            .map(|n| {
+                let filler = "x".repeat(60);
+                if framed {
+                    format!("record-{n:04} {filler}")
+                } else {
+                    format!("record-{n:04}\n  {filler}")
+                }
+            })
+            .collect();
+        let body = format!("# Collection\n\n{}", records.join("\n"));
+        let mut meta = SegmentMeta::new(uri, SegmentKind::Resource, NaturalUnit::Record);
+        meta.total_units = counted.then_some(total);
+        meta.more_records = !counted && end < total;
+        meta.shown_units = end - offset;
+        meta.unit_noun = Some("records".to_string());
+        meta.offset = offset;
+        meta.limit = Some(limit);
+        meta.record_prelude_lines = framed.then_some(2);
+        ReadSegment::text(body, meta)
+    }
+
+    fn continuation(text: &str) -> Option<String> {
+        let start = text.rfind("continue: ")? + "continue: ".len();
+        let end = start + text[start..].find(']')?;
+        Some(text[start..end].to_string())
+    }
+
+    /// Following every `continue:` a record page hands out, starting from a
+    /// read the budget cuts, delivers every record in order: never a gap, and
+    /// never a repeat when the page can be recounted through its framing. A
+    /// continuation that advanced `offset` by rendered lines instead of
+    /// records skips most of the collection here.
+    #[test]
+    fn following_every_record_continuation_delivers_every_record_in_order() {
+        const TOTAL: usize = 100;
+        for (counted, framed) in [(true, true), (false, true), (true, false), (false, false)] {
+            let mut uri = "cairn://p/X/vcs/log?to=main".to_string();
+            let mut seen: Vec<usize> = Vec::new();
+            let mut reads = 0;
+            loop {
+                reads += 1;
+                assert!(
+                    reads < 500,
+                    "continuations never converged ({counted}, {framed})"
+                );
+                let out = render_segment(paged_records(&uri, TOTAL, counted, framed), 1_200);
+                for line in out.text.lines() {
+                    let Some(number) = line
+                        .strip_prefix("record-")
+                        .and_then(|rest| rest.get(..4))
+                        .and_then(|digits| digits.parse::<usize>().ok())
+                    else {
+                        continue;
+                    };
+                    let next = seen.iter().max().map_or(0, |max| max + 1);
+                    assert!(
+                        number <= next,
+                        "record {number} delivered before record {next} ({counted}, {framed}): {}",
+                        out.text
+                    );
+                    seen.push(number);
+                }
+                match continuation(&out.text) {
+                    Some(next) => uri = next,
+                    None => break,
+                }
+            }
+            let mut distinct = seen.clone();
+            distinct.dedup();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(
+                distinct,
+                (0..TOTAL).collect::<Vec<_>>(),
+                "({counted}, {framed}) did not deliver every record"
+            );
+            if framed {
+                assert_eq!(seen.len(), TOTAL, "a recountable page repeated records");
+            }
+            assert!(
+                reads > 1,
+                "the first page was meant to be cut by the budget"
+            );
+        }
+    }
+
+    #[test]
     fn turn_segment_emits_turn_suffix_and_paging_footer() {
         let mut meta = SegmentMeta::new(
             "cairn://p/CAIRN/1/1/builder/chat?offset=1&limit=1",
@@ -2000,7 +2232,7 @@ mod tests {
             spec: None,
         });
 
-        let envelope = assemble(vec![segment], &BYTE_METER);
+        let envelope = assemble(vec![segment], ReadBudget::Context, &BYTE_METER);
 
         assert!(envelope.text.contains("output truncated to fit budget"));
         assert!(envelope.text.contains("continue: file:large?offset="));
@@ -2031,7 +2263,7 @@ mod tests {
                 spec: None,
             });
 
-            let envelope = assemble(vec![segment], &DensityMeter);
+            let envelope = assemble(vec![segment], ReadBudget::Context, &DensityMeter);
 
             assert!(
                 envelope.text.len() <= CLIENT_TOOL_RESULT_BYTE_CEILING,
@@ -2074,7 +2306,7 @@ mod tests {
             &uncapped.text[..safe_char_boundary(&uncapped.text, CLIENT_TOOL_RESULT_BYTE_CEILING)];
         assert!(!naive.contains("=== file:large-2.txt"));
 
-        let envelope = assemble(segments, &DensityMeter);
+        let envelope = assemble(segments, ReadBudget::Context, &DensityMeter);
         assert!(envelope.text.len() <= CLIENT_TOOL_RESULT_BYTE_CEILING);
         for index in 0..3 {
             let header = format!("=== file:large-{index}.txt");
@@ -2101,7 +2333,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let envelope = assemble(segments, &BYTE_METER);
+        let envelope = assemble(segments, ReadBudget::Context, &BYTE_METER);
 
         assert!(envelope.text.len() <= CLIENT_TOOL_RESULT_BYTE_CEILING);
         assert_eq!(envelope.segments.len(), 20);
@@ -2155,7 +2387,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let envelope = assemble_with_bodies(segments, &BYTE_METER);
+        let envelope = assemble_with_bodies(segments, ReadBudget::Context, &BYTE_METER);
 
         assert!(envelope.text.len() <= CLIENT_TOOL_RESULT_BYTE_CEILING);
         assert_eq!(
@@ -2169,5 +2401,88 @@ mod tests {
         assert!(bodies[1..].iter().all(String::is_empty));
         assert!(envelope.images.is_empty());
         assert!(envelope.segments.iter().all(|meta| meta.truncated));
+    }
+
+    /// A pretty-printed JSON resource body well past both the context budget
+    /// and the client byte ceiling, as a resource producer hands it over.
+    fn large_json_segment(uri: &str) -> (ReadSegment, String) {
+        let commits: Vec<serde_json::Value> = (0..400)
+            .map(|index| {
+                serde_json::json!({
+                    "commit": format!("{index:040}"),
+                    "description": format!("commit {index}\n\n{}", "body text ".repeat(40)),
+                })
+            })
+            .collect();
+        let json = serde_json::to_string_pretty(&serde_json::json!({
+            "more": false,
+            "commits": commits,
+        }))
+        .unwrap();
+        let mut meta = SegmentMeta::new(uri, SegmentKind::Resource, NaturalUnit::Line);
+        meta.total_units = Some(json.lines().count());
+        (ReadSegment::text(json.clone(), meta), json)
+    }
+
+    #[test]
+    fn a_whole_read_carries_a_body_the_context_budget_would_cut() {
+        let (segment, json) = large_json_segment("cairn://p/X/vcs/log?format=json");
+        assert!(json.len() > 3 * CLIENT_TOOL_RESULT_BYTE_CEILING);
+
+        // Read for a model, the same body is cut mid-document.
+        let context = assemble_with_bodies(vec![segment.clone()], ReadBudget::Context, &BYTE_METER);
+        assert!(context.segments[0].truncated);
+        assert!(serde_json::from_str::<serde_json::Value>(
+            context.bodies.as_ref().unwrap()[0].as_str()
+        )
+        .is_err());
+
+        let whole = assemble_with_bodies(
+            vec![segment],
+            ReadBudget::Whole {
+                byte_ceiling: 8 << 20,
+            },
+            &BYTE_METER,
+        );
+        let meta = &whole.segments[0];
+        assert_eq!(meta.kind, SegmentKind::Resource);
+        assert!(!meta.truncated);
+        assert!(!meta.char_continuation);
+        assert!(!whole.text.contains("continue:"));
+        let body = &whole.bodies.as_ref().unwrap()[0];
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_whole_read_refuses_a_target_past_its_ceiling_and_keeps_the_rest() {
+        let (big, json) = large_json_segment("cairn://p/X/vcs/log?format=json");
+        let mut small_meta =
+            SegmentMeta::new("cairn://p/X/1", SegmentKind::Resource, NaturalUnit::Line);
+        small_meta.total_units = Some(1);
+        let small = ReadSegment::text("small body", small_meta);
+        let byte_ceiling = json.len() / 2;
+
+        let envelope = assemble_with_bodies(
+            vec![big, small],
+            ReadBudget::Whole { byte_ceiling },
+            &BYTE_METER,
+        );
+
+        let refused = &envelope.segments[0];
+        assert_eq!(refused.kind, SegmentKind::Error);
+        assert!(!refused.truncated);
+        let bodies = envelope.bodies.as_ref().unwrap();
+        assert!(
+            bodies[0].contains("refused rather than cut"),
+            "{}",
+            bodies[0]
+        );
+        assert!(bodies[0].contains(&format!("{byte_ceiling}-byte ceiling")));
+        assert!(!envelope.text.contains("body text"));
+        assert_eq!(envelope.segments[1].kind, SegmentKind::Resource);
+        assert_eq!(bodies[1], "small body");
     }
 }

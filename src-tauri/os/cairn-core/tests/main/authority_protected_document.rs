@@ -16,12 +16,14 @@ use serde_json::json;
 
 fn write_request(changes: serde_json::Value) -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: String::new(),
         run_id: None,
         tool: "write".to_string(),
         payload: json!({"changes": changes, "commit_msg": "edit settings"}),
         tool_use_id: None,
+        origin: None,
     }
 }
 

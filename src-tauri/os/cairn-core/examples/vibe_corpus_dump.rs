@@ -14,6 +14,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 
 use cairn_core::internal::embeddings::extract_embeddable_text;
+use cairn_core::internal::embeddings::vibe_axes::run_positions;
 use cairn_core::internal::storage::{LocalDb, RowExt};
 use serde::Serialize;
 
@@ -175,36 +176,20 @@ async fn main() {
 /// Compute error distances for one run and write the embeddable (assistant/user
 /// with text) events as JSONL.
 fn flush_run(writer: &mut impl Write, run_id: &str, buf: &[RunEvent], emitted: &mut u64) {
-    let n = buf.len();
-    if n == 0 {
+    if buf.is_empty() {
         return;
     }
-    // Positions of errored tool_results within this run.
-    let error_pos: Vec<usize> = buf
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.is_error)
-        .map(|(i, _)| i)
-        .collect();
+    // The same labels the app learns axes from.
+    let errors: Vec<bool> = buf.iter().map(|e| e.is_error).collect();
+    let positions = run_positions(&errors);
 
-    for (i, e) in buf.iter().enumerate() {
+    for (e, position) in buf.iter().zip(positions) {
         let Some(text) = e.text.as_deref() else {
             continue; // only emit events that carry embeddable prose
         };
         if text.is_empty() {
             continue;
         }
-
-        let dist_next_error = error_pos
-            .iter()
-            .filter(|&&p| p > i)
-            .map(|&p| (p - i) as i64)
-            .min();
-        let dist_prev_error = error_pos
-            .iter()
-            .filter(|&&p| p < i)
-            .map(|&p| (i - p) as i64)
-            .min();
 
         let row = OutRow {
             id: &e.id,
@@ -218,13 +203,9 @@ fn flush_run(writer: &mut impl Write, run_id: &str, buf: &[RunEvent], emitted: &
             thinking: e.thinking.as_deref(),
             is_subagent: e.parent_tool_use_id.is_some(),
             output_tokens: e.output_tokens,
-            dist_next_error,
-            dist_prev_error,
-            run_progress: if n > 1 {
-                i as f64 / (n - 1) as f64
-            } else {
-                0.0
-            },
+            dist_next_error: position.dist_next_error,
+            dist_prev_error: position.dist_prev_error,
+            run_progress: position.run_progress,
         };
         serde_json::to_writer(&mut *writer, &row).expect("serialize row");
         writer.write_all(b"\n").expect("newline");

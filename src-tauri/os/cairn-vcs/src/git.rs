@@ -71,7 +71,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let worktree = temp.path();
         cairn_platform::env::git()
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .current_dir(worktree)
             .output()
             .unwrap();

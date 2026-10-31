@@ -10,6 +10,7 @@ use cairn_common::contract::{
 use cairn_common::query::QueryParam;
 use cairn_common::read::{ActionSpec, AffordanceSpec, FilterSpec, KeyInfo, LinkSpec};
 use cairn_common::uri::CairnResource;
+use futures_util::future::BoxFuture;
 
 #[derive(Debug)]
 pub(super) struct ProjectContext {
@@ -208,39 +209,33 @@ fn resolve_home_suffix(home_uri: &str, suffix: &str) -> String {
     format!("{}/{}", home_uri.trim_end_matches('/'), suffix)
 }
 
-/// Open one read transaction for a resource render, on a connection of its own.
+/// Run `f` in one bounded pooled read, the way every resource reader reads.
 ///
-/// The transaction ends when the returned connection drops at the end of the
-/// read — nothing here issues a `ROLLBACK`, and it does not need to: the engine
-/// rolls an active MVCC transaction back when its connection is dropped,
-/// precisely so its entries cannot leak and block a checkpoint.
+/// `f` runs database statements and nothing else, and returns owned data:
+/// rendering, jj, git, the network, the content store, a lock, a wait, or a
+/// nested call on a `LocalDb` all happen after this returns, with no
+/// transaction open. A reader that needs more rows after that work opens a
+/// second `read_resource` rather than holding the first. That is the whole
+/// contract, and it is what lets the pool's read bound cut a read that parks:
+/// a parked out-of-pool transaction cannot be cut at all (the engine's
+/// interrupt is a no-op with no statement running), and on 10-29 one held
+/// every checkpoint off for 13 minutes, twice (cairn/5502).
 ///
-/// It is a [`TrackedConnection`], so the transaction counts toward the quiet
-/// instant `LocalDb`'s connection gate waits for. That matters more here than
-/// anywhere else in the codebase: these reads back the desktop UI's status
-/// polling, which is the bulk of the database traffic on an idle machine, and
-/// they are out of the pool. A quiesce that did not see them would drain to zero
-/// and still lose the checkpoint lock (CAIRN-4167).
-///
-/// `#[track_caller]` so the gate records the reader that called this, not this
-/// helper: a drain report or a gate-watch warning naming `common.rs` for every
-/// resource read would name nothing.
+/// A failure to read is `Database error: <error>`; `f`'s own `Err` passes
+/// through untouched. `#[track_caller]` so the gate names the reader that
+/// called this rather than this helper.
 #[track_caller]
-pub(super) fn connect_for_read(
-    db: &LocalDb,
-) -> impl std::future::Future<Output = Result<TrackedConnection, String>> + '_ {
-    let connecting = db.connect();
+pub(crate) fn read_resource<'s, T: Send + 'static>(
+    db: &'s LocalDb,
+    f: impl for<'a> FnOnce(&'a TrackedConnection) -> BoxFuture<'a, Result<T, String>> + Send + 's,
+) -> impl std::future::Future<Output = Result<T, String>> + 's {
+    let read = db.read(move |conn| {
+        let body = f(conn);
+        Box::pin(async move { DbResult::Ok(body.await) })
+    });
     async move {
-        let conn = connecting
-            .await
-            .map_err(|error| storage_error("Database error", error))?;
-        // Backend-aware: a synced (non-MVCC) replica cannot run `BEGIN CONCURRENT`,
-        // so route through the one source of truth for the begin statement on this
-        // handle (plain `BEGIN` on synced, `BEGIN CONCURRENT` on local).
-        conn.execute(db.concurrent_begin(), ())
-            .await
-            .map_err(|error| storage_error("Database error", error.into()))?;
-        Ok(conn)
+        read.await
+            .map_err(|error| storage_error("Database error", error))?
     }
 }
 
@@ -367,7 +362,7 @@ pub(super) async fn visible_job_node_segment(
 /// per-resource feature. Documents the modifiers, the line-number-prefixed match
 /// contract, and the tree-only limits in one place (resolving the prior
 /// `-A`/`-B`/`-C` documentation gap).
-const UNIVERSAL_GREP_FILTER: &str = "- `grep=REGEX` (universal) · `-i` · `-A`/`-B`/`-C`/`context=N` · `head_limit=N` (caps MATCHES, not lines; a capped read reports the full total and marks itself partial) — line-number-prefixed matches over the rendered body; `offset` not allowed with grep; `files_with_matches`/`count` need a tree\n";
+const UNIVERSAL_GREP_FILTER: &str = "- `grep=REGEX` (universal) · `-i` · `-A`/`-B`/`-C`/`context=N` · `head_limit=N` (caps MATCHES, not lines; a capped read reports the full total and marks itself partial) — line-number-prefixed matches over the rendered body; `offset` not allowed with grep unless a filter above makes it this resource's own record paging, which then chooses the page grep searches; `files_with_matches`/`count` need a tree\n";
 
 pub(super) fn affordance_spec_for_kind(
     kind: ResourceKind,
@@ -890,20 +885,58 @@ pub(super) async fn find_job_by_id(
     resource_job_from_row(&rows.next().await.ok()??).ok()
 }
 
-/// The job a node coordinate names, loaded read-only.
+/// The job a node coordinate names, in its own short read.
+#[track_caller]
+pub(crate) fn load_node_job<'s>(
+    db: &'s LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+) -> impl std::future::Future<Output = Result<ResourceJob, String>> + 's {
+    let (project_key, node_name) = (project_key.to_owned(), node_name.to_owned());
+    read_resource(db, move |conn| {
+        Box::pin(
+            async move { find_node_job(conn, &project_key, number, exec_seq, &node_name).await },
+        )
+    })
+}
+
+/// A task's parent job and the task's own job, in one short read.
+#[track_caller]
+pub(super) fn load_task_job<'s>(
+    db: &'s LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: &str,
+) -> impl std::future::Future<Output = Result<(ResourceJob, ResourceJob), String>> + 's {
+    let (project_key, node_name, task_name) = (
+        project_key.to_owned(),
+        node_name.to_owned(),
+        task_name.to_owned(),
+    );
+    read_resource(db, move |conn| {
+        Box::pin(async move {
+            find_task_job(conn, &project_key, number, exec_seq, &node_name, &task_name).await
+        })
+    })
+}
+
+/// The job a node coordinate names. Statements only, for use inside a read.
 ///
 /// Owner-aware through `job_id_for_node_coordinate_conn`, so this resolves an
 /// execution node under an issue and a thread's session job through one call —
 /// and every collection built on it (tasks, questions, todos) works from a
 /// thread without knowing a thread exists.
-pub(crate) async fn connect_and_find_node_job(
-    db: &LocalDb,
+pub(crate) async fn find_node_job(
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
     number: i32,
     exec_seq: i32,
     node_name: &str,
-) -> Result<(TrackedConnection, ResourceJob), String> {
-    let conn = connect_for_read(db).await?;
+) -> Result<ResourceJob, String> {
     // A node coordinate names an issue, so an unknown project key or a
     // nonexistent issue is reported as itself rather than collapsed into "node
     // not found", which would be false for the first and misleading for the
@@ -911,10 +944,10 @@ pub(crate) async fn connect_and_find_node_job(
     if let cairn_common::uri::NodeAddress::Node { .. } =
         cairn_common::uri::NodeAddress::new(number, exec_seq, node_name)
     {
-        resolve_issue_id(&conn, project_key, number).await?;
+        resolve_issue_id(conn, project_key, number).await?;
     }
     let job_id = crate::jobs::queries::job_id_for_node_coordinate_conn(
-        &conn,
+        conn,
         project_key,
         number,
         exec_seq,
@@ -924,10 +957,9 @@ pub(crate) async fn connect_and_find_node_job(
     .await
     .map_err(|error| error.to_string())?
     .ok_or_else(|| node_job_not_found_message(project_key, number, exec_seq, node_name))?;
-    let job = find_job_by_id(&conn, &job_id)
+    find_job_by_id(conn, &job_id)
         .await
-        .ok_or_else(|| node_job_not_found_message(project_key, number, exec_seq, node_name))?;
-    Ok((conn, job))
+        .ok_or_else(|| node_job_not_found_message(project_key, number, exec_seq, node_name))
 }
 
 /// The bookmark a node's work lives on, or `None` when it has no branch yet.
@@ -953,21 +985,21 @@ pub(crate) async fn node_branch(
         .filter(|value| !value.is_empty()))
 }
 
-pub(super) async fn connect_and_find_task_job(
-    db: &LocalDb,
+/// A task's parent job and the task's own job. Statements only.
+pub(super) async fn find_task_job(
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
     number: i32,
     exec_seq: i32,
     node_name: &str,
     task_name: &str,
-) -> Result<(TrackedConnection, ResourceJob, ResourceJob), String> {
+) -> Result<(ResourceJob, ResourceJob), String> {
     // The parent resolves first so a thread with no session reports that rather
     // than reporting a missing task; from there a task is a child job by segment
     // whichever kind of parent owns it.
-    let (conn, parent_job) =
-        connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await?;
-    let task_job = find_task_by_name(&conn, &parent_job.id, task_name).await?;
-    Ok((conn, parent_job, task_job))
+    let parent_job = find_node_job(conn, project_key, number, exec_seq, node_name).await?;
+    let task_job = find_task_by_name(conn, &parent_job.id, task_name).await?;
+    Ok((parent_job, task_job))
 }
 
 /// Check if a job or any of its child jobs have an artifact
@@ -1289,20 +1321,25 @@ pub(crate) async fn resolve_node_owner_id(
     exec_seq: i32,
     node_name: &str,
 ) -> Result<String, String> {
-    let conn = connect_for_read(db).await?;
-    let (_, issue_id) = resolve_issue_id(&conn, project_key, number).await?;
-    if let Some(job) = find_job_by_node_name(&conn, &issue_id, node_name, exec_seq).await {
-        return Ok(job.id);
-    }
-    if let Some(action_run) =
-        find_action_run_by_node_name(&conn, &issue_id, node_name, exec_seq).await
-    {
-        return Ok(action_run.id);
-    }
-    Err(format!(
-        "Node '{}' not found for issue {}/{}",
-        node_name, project_key, number
-    ))
+    let (project_key, node_name) = (project_key.to_owned(), node_name.to_owned());
+    read_resource(db, move |conn| {
+        Box::pin(async move {
+            let (_, issue_id) = resolve_issue_id(conn, &project_key, number).await?;
+            if let Some(job) = find_job_by_node_name(conn, &issue_id, &node_name, exec_seq).await {
+                return Ok(job.id);
+            }
+            if let Some(action_run) =
+                find_action_run_by_node_name(conn, &issue_id, &node_name, exec_seq).await
+            {
+                return Ok(action_run.id);
+            }
+            Err(format!(
+                "Node '{}' not found for issue {}/{}",
+                node_name, project_key, number
+            ))
+        })
+    })
+    .await
 }
 
 pub(super) fn find_query_value<'a>(params: &'a [QueryParam], key: &str) -> Option<&'a str> {
@@ -1357,14 +1394,18 @@ pub(super) fn parse_optional_usize_param(
 mod tests {
     use super::*;
 
-    /// The gate names the resource reader that opened the transaction, so a
-    /// drain report or a held-too-long warning points at the reader rather than
-    /// at this shared helper.
+    /// The gate names the resource reader that opened the read, so a drain
+    /// report or a held-too-long warning points at the reader rather than at
+    /// this shared helper.
     #[tokio::test]
-    async fn connect_for_read_is_attributed_to_its_caller() {
-        let db = crate::storage::migrated_test_db("connect-for-read-caller.db").await;
+    async fn read_resource_is_attributed_to_its_caller() {
+        let db = crate::storage::migrated_test_db("read-resource-caller.db").await;
         let line = line!() + 1;
-        let conn = connect_for_read(&db).await.unwrap();
+        let read = read_resource(&db, |_conn| {
+            Box::pin(std::future::pending::<Result<(), String>>())
+        });
+        let mut read = std::pin::pin!(read);
+        assert!(futures_util::poll!(read.as_mut()).is_pending());
         let held = db.overdue_holders(
             std::time::Duration::ZERO,
             std::time::Duration::from_secs(60),
@@ -1374,7 +1415,21 @@ mod tests {
             (held[0].caller.file(), held[0].caller.line()),
             (file!(), line)
         );
-        drop(conn);
+    }
+
+    /// The node and task loaders return owned jobs and hold nothing after.
+    #[tokio::test]
+    async fn job_loaders_return_with_no_connection_live() {
+        let db = crate::storage::migrated_test_db("job-loaders-release.db").await;
+        let error = load_node_job(&db, "nope", 1, 1, "builder")
+            .await
+            .unwrap_err();
+        assert!(error.contains("nope"), "{error}");
+        assert_eq!(db.live_connections(), 0);
+        let error = load_task_job(&db, "nope", 1, 1, "builder", "review")
+            .await
+            .unwrap_err();
+        assert!(error.contains("nope"), "{error}");
         assert_eq!(db.live_connections(), 0);
     }
 
@@ -1759,15 +1814,13 @@ mod tests {
         assert!(index.contains("(cairn://models/decide)"), "{index}");
     }
 
-    /// Every `cairn://inference` page is read-only, and the index offers its
-    /// YAML export as a projection.
+    /// The mirrored records are read-only, the index offers its YAML export as
+    /// a projection, and the pool controller's two surfaces carry its writes.
     #[test]
-    fn affordance_for_inference_kinds_is_read_only() {
+    fn affordance_for_inference_kinds() {
         for kind in [
-            ResourceKind::Inference,
             ResourceKind::InferenceRecipes,
             ResourceKind::InferenceDeployments,
-            ResourceKind::InferencePools,
         ] {
             let output = affordance_for_kind(kind);
             assert!(!output.contains("### actions"), "{kind:?}:\n{output}");
@@ -1776,6 +1829,27 @@ mod tests {
         let index = affordance_for_kind(ResourceKind::Inference);
         assert!(index.contains("format"), "{index}");
         assert!(index.contains("cairn://inference/pools"), "{index}");
+        assert!(index.contains("cairn://inference/requests"), "{index}");
+
+        let pools = affordance_for_kind(ResourceKind::InferencePools);
+        assert!(pools.contains("control a pool"), "{pools}");
+        assert!(pools.contains("`pool(str)`"), "{pools}");
+        let requests = affordance_for_kind(ResourceKind::InferenceRequests);
+        assert!(requests.contains("request a model"), "{requests}");
+        assert!(requests.contains("cancel a waiting request"), "{requests}");
+    }
+
+    /// One deployment is the act side: a patch starts or stops it, and nothing
+    /// else is offered.
+    #[test]
+    fn affordance_for_one_inference_deployment_offers_start_and_stop() {
+        let output = affordance_for_kind(ResourceKind::InferenceDeployment);
+        assert!(output.contains("### actions"), "{output}");
+        assert!(output.contains("start|stop"), "{output}");
+        assert!(
+            output.contains(r#"target:"cairn://inference/deployments/dsv4f-tp2",mode:"patch",payload:{action:"start"}"#),
+            "{output}"
+        );
     }
 
     /// The accounts list starts a sign-in and re-measures a provider; one

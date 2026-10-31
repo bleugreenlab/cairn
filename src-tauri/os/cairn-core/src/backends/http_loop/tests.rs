@@ -337,7 +337,7 @@ fn prepare_tool_call_unrecoverable_truncated_gives_split_guidance() {
 /// the streamed reasoning lands as one finalized assistant event (sequence
 /// S), and the tool call lands as a SEPARATE assistant event carrying
 /// `tool_uses` at the next sequence (S+1). Both must survive and be returned
-/// by the same `list_events_for_session_delta` query the transcript reads, so
+/// by the session's transcript load (`list_events_for_session`), so
 /// the read renders alongside the reasoning — the transcript bug (CAIRN-1909)
 /// is reasoning surfacing while the tool call vanishes. The neutral persist
 /// layer takes the adapter's backend key explicitly (here `"openrouter"`).
@@ -442,15 +442,10 @@ async fn streamed_reasoning_then_tool_call_persists_both_events() {
     )
     .unwrap();
 
-    // Load through the exact query the transcript UI consumes.
-    let delta = crate::runs::queries::list_events_for_session_delta(
-        orch.db.local.clone(),
-        "session-1",
-        None,
-    )
-    .unwrap();
-    let parsed: Vec<TranscriptEvent> = delta
-        .events
+    // Load the session's stored transcript in transcript order.
+    let events =
+        crate::runs::queries::list_events_for_session(orch.db.local.clone(), "session-1").unwrap();
+    let parsed: Vec<TranscriptEvent> = events
         .iter()
         .map(|event| serde_json::from_str(&event.data).unwrap())
         .collect();
@@ -685,14 +680,8 @@ async fn run_seam(mode: SeamMode) -> (Orchestrator, usize, tempfile::TempDir) {
 }
 
 fn seam_events(orch: &Orchestrator, session_id: &str) -> Vec<TranscriptEvent> {
-    let delta = crate::runs::queries::list_events_for_session_delta(
-        orch.db.local.clone(),
-        session_id,
-        None,
-    )
-    .unwrap();
-    delta
-        .events
+    crate::runs::queries::list_events_for_session(orch.db.local.clone(), session_id)
+        .unwrap()
         .iter()
         .map(|event| serde_json::from_str(&event.data).unwrap())
         .collect()
@@ -989,29 +978,24 @@ async fn each_familys_usage_persists_as_its_golden() {
         )
         .unwrap();
 
-        let delta = crate::runs::queries::list_events_for_session_delta(
-            orch.db.local.clone(),
-            &session_id,
-            None,
-        )
-        .unwrap();
-        let events: Vec<serde_json::Value> = delta
-            .events
-            .iter()
-            .map(|event| {
-                let data: serde_json::Value = serde_json::from_str(&event.data).unwrap();
-                json!({
-                    "eventType": event.event_type,
-                    "inputTokens": event.input_tokens,
-                    "cacheReadTokens": event.cache_read_tokens,
-                    "cacheCreateTokens": event.cache_create_tokens,
-                    "outputTokens": event.output_tokens,
-                    "thinkingTokens": event.thinking_tokens,
-                    "costUsd": event.cost_usd,
-                    "raw": data["raw"],
+        let events: Vec<serde_json::Value> =
+            crate::runs::queries::list_events_for_session(orch.db.local.clone(), &session_id)
+                .unwrap()
+                .iter()
+                .map(|event| {
+                    let data: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+                    json!({
+                        "eventType": event.event_type,
+                        "inputTokens": event.input_tokens,
+                        "cacheReadTokens": event.cache_read_tokens,
+                        "cacheCreateTokens": event.cache_create_tokens,
+                        "outputTokens": event.output_tokens,
+                        "thinkingTokens": event.thinking_tokens,
+                        "costUsd": event.cost_usd,
+                        "raw": data["raw"],
+                    })
                 })
-            })
-            .collect();
+                .collect();
         golden.push(json!({"family": family, "events": events}));
     }
     crate::backends::assert_golden_file(

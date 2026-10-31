@@ -169,7 +169,7 @@ impl EnrollmentPhase {
     /// The phase in the words a surface renders.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Queued => "waiting for another enrollment of this machine to finish",
+            Self::Queued => "waiting for another enrollment or removal of this machine to finish",
             Self::AwaitingRunnerListener => "waiting for this runner's executor listener",
             Self::Validating => "validating the request",
             Self::ProbingHost => "probing the host and its platform",

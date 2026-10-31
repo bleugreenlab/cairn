@@ -420,8 +420,8 @@ pub fn reconcile_static_witness(server: &str) -> Result<CredentialGeneration, St
 // keyed by (service, account). `set_default_credential_builder` is process-wide
 // and effectively one-shot, so every module that needs a mock keychain must go
 // through this single installer rather than registering its own builder.
-#[cfg(test)]
-pub(crate) mod mock_keychain {
+#[cfg(any(test, feature = "test-utils"))]
+pub mod mock_keychain {
     use keyring::credential::{Credential, CredentialApi, CredentialBuilder, CredentialBuilderApi};
     use std::any::Any;
     use std::collections::HashMap;
@@ -488,7 +488,7 @@ pub(crate) mod mock_keychain {
     /// Install the persistent in-memory backend once for the whole test process.
     /// keyring stores the override in an `RwLock`, so this safely redirects every
     /// subsequent `Entry::new` regardless of which module calls it first.
-    pub(crate) fn install() {
+    pub fn install() {
         static INSTALLED: OnceLock<()> = OnceLock::new();
         INSTALLED.get_or_init(|| {
             let store: Store = Arc::new(Mutex::new(HashMap::new()));

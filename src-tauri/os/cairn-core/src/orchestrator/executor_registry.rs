@@ -121,6 +121,7 @@ mod tests {
             liveness_observed_at_unix_ms: None,
             facts_stale_refresh_blocked: None,
             last_refresh: None,
+            node_scratches: Vec::new(),
         };
         upsert_executor(&db, &advertisement, 3, "online").await;
         upsert_executor(&db, &advertisement, 3, "offline").await;

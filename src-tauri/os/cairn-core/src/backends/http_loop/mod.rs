@@ -101,6 +101,27 @@ pub(in crate::backends) trait WireAdapter {
     /// Resolve provider connection details and own any missing-configuration error.
     fn connection(&self, orch: &Orchestrator) -> Result<Connection, String>;
 
+    /// Make this turn's requests possible before the first is sent, on the
+    /// turn's own thread: a provider whose model may have to load first waits
+    /// for it here, watching `cancel`. An error fails the turn with its text,
+    /// unless `cancel` was set, which ends the turn as interrupted.
+    fn prepare_turn(
+        &mut self,
+        _orch: &Orchestrator,
+        _config: &SessionConfig,
+        _session_id: &str,
+        _cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// The id this turn's requests name for `model` on the wire. A provider
+    /// that serves one model under several names sends the one its engine
+    /// answers to; the transcript and usage keep the name the run chose.
+    fn wire_model(&self, model: &str) -> String {
+        model.to_string()
+    }
+
     /// The protocol family this turn's requests go through, on `connection`.
     fn family(&self, connection: &Connection) -> Result<Self::Family, String>;
 
@@ -315,8 +336,14 @@ fn run_http_turn<A: WireAdapter>(
     turn_id: Option<String>,
     cancel: Arc<AtomicBool>,
     system_prompt: String,
-    adapter: A,
+    mut adapter: A,
 ) -> Result<TurnExit, String> {
+    if let Err(error) = adapter.prepare_turn(orch, &config, &session_id, &cancel) {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(TurnExit::Cancelled);
+        }
+        return Err(error);
+    }
     let backend_key = adapter.backend_key().to_string();
     let backend_name = adapter.backend_name().to_string();
     let model = config
@@ -324,6 +351,7 @@ fn run_http_turn<A: WireAdapter>(
         .as_ref()
         .map(ToString::to_string)
         .unwrap_or_else(|| adapter.default_model().to_string());
+    let wire_model = adapter.wire_model(&model);
     let conversation = adapter.build_conversation(orch, &config, &session_id, &system_prompt)?;
     let context_window = adapter.context_window(orch, &model);
     let family = adapter.family(&connection)?;
@@ -331,7 +359,7 @@ fn run_http_turn<A: WireAdapter>(
     let complete = orch.models_runtime().complete.clone();
     let mut turn = FamilyTurn {
         family,
-        model: model.clone(),
+        model: wire_model,
         config: generation_config,
         context_window,
         conversation,

@@ -5,20 +5,75 @@ use std::collections::HashMap;
 use cairn_db::turso::params;
 
 use super::common::{
-    connect_and_find_node_job, connect_and_find_task_job, connect_for_read,
-    find_action_run_by_node_name, find_job_by_node_name, find_query_value, get_artifact_for_job,
-    get_direct_artifact_for_job, get_named_artifact_for_job, has_artifact_for_job,
-    list_named_artifacts_for_job, reject_query_params, resolve_issue_id, visible_job_node_segment,
-    ResourceActionRun,
+    find_action_run_by_node_name, find_job_by_node_name, find_node_job, find_query_value,
+    find_task_job, get_artifact_for_job, get_direct_artifact_for_job, get_named_artifact_for_job,
+    has_artifact_for_job, list_named_artifacts_for_job, load_node_job, load_task_job,
+    read_resource, reject_query_params, resolve_issue_id, visible_job_node_segment,
+    ResourceActionRun, ResourceArtifact, ResourceJob,
 };
 use super::transcript::{
-    format_raw_transcript, format_transcript_digest_with, get_nth_run_id, get_single_event,
-    load_job_events_ordered, load_turn_events, parse_raw_transcript_format, transcript_from_rows,
-    DigestCoordinate, DigestMeta, RawTranscriptFormat,
+    format_raw_transcript, format_transcript_digest_with, get_nth_run_id, load_job_events_ordered,
+    parse_raw_transcript_format, read_single_event, reconstruct_turn_events, render_single_event,
+    transcript_from_rows, turn_event_rows, DigestCoordinate, DigestMeta, RawTranscriptFormat,
+    StoredEvent,
 };
 use cairn_models::continuation::DigestOptions;
+use futures_util::future::BoxFuture;
 
-use crate::storage::{LocalDb, RowExt};
+use crate::storage::{LocalDb, RowExt, TrackedConnection};
+
+/// One short read that resolves a node's job and runs `rows`' statements
+/// against it on the same connection, returning the job and what `rows` read.
+/// `rows` is a read closure like any other: statements only, owned results.
+#[track_caller]
+fn read_node_rows<'s, T: Send + 'static>(
+    db: &'s LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    rows: impl for<'a> FnOnce(&'a TrackedConnection, &'a ResourceJob) -> BoxFuture<'a, T>
+        + Send
+        + 'static,
+) -> impl std::future::Future<Output = Result<(ResourceJob, T), String>> + 's {
+    let (project_key, node_name) = (project_key.to_owned(), node_name.to_owned());
+    read_resource(db, move |conn| {
+        Box::pin(async move {
+            let job = find_node_job(conn, &project_key, number, exec_seq, &node_name).await?;
+            let found = rows(conn, &job).await;
+            Ok((job, found))
+        })
+    })
+}
+
+/// [`read_node_rows`] for a delegated task: resolves the parent and task jobs,
+/// then runs `rows` with both.
+#[track_caller]
+fn read_task_rows<'s, T: Send + 'static>(
+    db: &'s LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: &str,
+    rows: impl for<'a> FnOnce(&'a TrackedConnection, &'a ResourceJob, &'a ResourceJob) -> BoxFuture<'a, T>
+        + Send
+        + 'static,
+) -> impl std::future::Future<Output = Result<(ResourceJob, ResourceJob, T), String>> + 's {
+    let (project_key, node_name, task_name) = (
+        project_key.to_owned(),
+        node_name.to_owned(),
+        task_name.to_owned(),
+    );
+    read_resource(db, move |conn| {
+        Box::pin(async move {
+            let (parent_job, task_job) =
+                find_task_job(conn, &project_key, number, exec_seq, &node_name, &task_name).await?;
+            let found = rows(conn, &parent_job, &task_job).await;
+            Ok((parent_job, task_job, found))
+        })
+    })
+}
 use cairn_common::query::QueryParam;
 use cairn_common::uri::{
     build_job_todos_uri, build_node_artifact_uri_named, build_node_chat_uri, build_node_checks_uri,
@@ -292,12 +347,24 @@ async fn latest_assistant_preview(
     None
 }
 
-/// Render the node summary's `## Activity` section: turn/run/event counts, the
-/// last-activity timestamp, and the latest assistant line. Returns `None` when
-/// the node has no events yet (nothing to summarize beyond the header), so a
-/// just-started node stays terse. Counts and timing come from one cheap
-/// aggregate that needs no event-body reconstruction.
-async fn render_node_activity(conn: &cairn_db::turso::Connection, job_id: &str) -> Option<String> {
+/// What the node summary's `## Activity` section says.
+struct NodeActivity {
+    runs: i64,
+    turns: i64,
+    events: i64,
+    last_activity: Option<i64>,
+    latest: Option<String>,
+}
+
+/// Read the node summary's activity: turn/run/event counts, the last-activity
+/// timestamp, and the latest assistant line. Returns `None` when the node has
+/// no events yet (nothing to summarize beyond the header), so a just-started
+/// node stays terse. Counts and timing come from one cheap aggregate that needs
+/// no event-body reconstruction.
+async fn load_node_activity(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> Option<NodeActivity> {
     let mut rows = conn
         .query(
             "
@@ -319,14 +386,24 @@ async fn render_node_activity(conn: &cairn_db::turso::Connection, job_id: &str) 
     if events == 0 {
         return None;
     }
+    Some(NodeActivity {
+        runs,
+        turns,
+        events,
+        last_activity,
+        latest: latest_assistant_preview(conn, job_id).await,
+    })
+}
 
+/// Render the node summary's `## Activity` section.
+fn render_node_activity(activity: &NodeActivity) -> String {
     let mut summary = format!(
         "{} \u{b7} {} \u{b7} {}",
-        count_phrase(turns, "turn"),
-        count_phrase(runs, "run"),
-        count_phrase(events, "event"),
+        count_phrase(activity.turns, "turn"),
+        count_phrase(activity.runs, "run"),
+        count_phrase(activity.events, "event"),
     );
-    if let Some(ts) = last_activity {
+    if let Some(ts) = activity.last_activity {
         summary.push_str(&format!(
             " \u{b7} last active {}",
             format_node_timestamp(ts)
@@ -334,10 +411,10 @@ async fn render_node_activity(conn: &cairn_db::turso::Connection, job_id: &str) 
     }
 
     let mut output = format!("## Activity\n\n{}\n", summary);
-    if let Some(preview) = latest_assistant_preview(conn, job_id).await {
+    if let Some(preview) = &activity.latest {
         output.push_str(&format!("\nLatest: {}\n", preview));
     }
-    Some(output)
+    output
 }
 
 fn format_job_todos(
@@ -584,13 +661,10 @@ pub(super) async fn read_node_checks(
     exec_seq: i32,
     node_name: &str,
 ) -> String {
-    let (_conn, job) =
-        match connect_and_find_node_job(&orch.db.local, project_key, number, exec_seq, node_name)
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
+    let job = match load_node_job(&orch.db.local, project_key, number, exec_seq, node_name).await {
+        Ok(job) => job,
+        Err(error) => return error,
+    };
     let uri = build_node_checks_uri(project_key, number, exec_seq, node_name);
     let mut out = format!("# Checks \u{2014} {node_name}\n\n`{uri}`\n");
     match crate::execution::checks_turn_end::render_turn_end_checks_section(orch, &job.id).await {
@@ -612,7 +686,7 @@ pub(super) async fn read_task_checks(
     node_name: &str,
     task_name: &str,
 ) -> String {
-    let (_conn, _parent_job, task_job) = match connect_and_find_task_job(
+    let (_parent_job, task_job) = match load_task_job(
         &orch.db.local,
         project_key,
         number,
@@ -649,38 +723,41 @@ pub(super) async fn read_node_calls(
     exec_seq: i32,
     node_name: &str,
 ) -> String {
-    let (conn, job) =
-        match connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
-
-    let mut calls: Vec<(String, Option<String>, Option<String>, String)> = Vec::new();
-    if let Ok(mut rows) = conn
-        .query(
-            "
-            SELECT uri_segment, agent_config_id, task_description, status
-            FROM jobs
-            WHERE parent_job_id = ?1 AND output_contract IS NOT NULL
-            ORDER BY task_index ASC, created_at ASC
-            ",
-            (job.id.as_str(),),
-        )
-        .await
-    {
-        while let Ok(Some(row)) = rows.next().await {
-            let (Ok(segment), Ok(agent), Ok(description), Ok(status)) = (
-                row.opt_text(0),
-                row.opt_text(1),
-                row.opt_text(2),
-                row.text(3),
-            ) else {
-                continue;
-            };
-            let segment = segment.unwrap_or_else(|| "call".to_string());
-            calls.push((segment, agent, description, status));
-        }
-    }
+    let read = read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
+        Box::pin(async move {
+            let mut calls: Vec<(String, Option<String>, Option<String>, String)> = Vec::new();
+            if let Ok(mut rows) = conn
+                .query(
+                    "
+                    SELECT uri_segment, agent_config_id, task_description, status
+                    FROM jobs
+                    WHERE parent_job_id = ?1 AND output_contract IS NOT NULL
+                    ORDER BY task_index ASC, created_at ASC
+                    ",
+                    (job.id.as_str(),),
+                )
+                .await
+            {
+                while let Ok(Some(row)) = rows.next().await {
+                    let (Ok(segment), Ok(agent), Ok(description), Ok(status)) = (
+                        row.opt_text(0),
+                        row.opt_text(1),
+                        row.opt_text(2),
+                        row.text(3),
+                    ) else {
+                        continue;
+                    };
+                    let segment = segment.unwrap_or_else(|| "call".to_string());
+                    calls.push((segment, agent, description, status));
+                }
+            }
+            calls
+        })
+    });
+    let calls = match read.await {
+        Ok((_, calls)) => calls,
+        Err(error) => return error,
+    };
 
     let mut output = format!("# Calls — {}\n\n", node_name);
     if calls.is_empty() {
@@ -708,11 +785,11 @@ pub(super) async fn read_node_calls(
 }
 
 struct TaskListItem {
-    job_id: String,
     segment: String,
     agent: Option<String>,
     description: Option<String>,
     status: String,
+    has_artifact: bool,
 }
 
 pub(super) async fn read_node_tasks(
@@ -722,45 +799,56 @@ pub(super) async fn read_node_tasks(
     exec_seq: i32,
     node_name: &str,
 ) -> String {
-    let (conn, job) =
-        match connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
-
-    let mut tasks: Vec<TaskListItem> = Vec::new();
-    if let Ok(mut rows) = conn
-        .query(
-            "
-            SELECT id, uri_segment, agent_config_id, task_description, status
-            FROM jobs
-            WHERE parent_job_id = ?1
-            ORDER BY task_index ASC, created_at ASC
-            ",
-            (job.id.as_str(),),
-        )
-        .await
-    {
-        while let Ok(Some(row)) = rows.next().await {
-            let (Ok(task_id), Ok(segment), Ok(agent), Ok(description), Ok(status)) = (
-                row.text(0),
-                row.opt_text(1),
-                row.opt_text(2),
-                row.opt_text(3),
-                row.text(4),
-            ) else {
-                continue;
-            };
-            let segment = segment.unwrap_or_else(|| "task".to_string());
-            tasks.push(TaskListItem {
-                job_id: task_id,
-                segment,
-                agent,
-                description,
-                status,
-            });
-        }
-    }
+    let read = read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
+        Box::pin(async move {
+            let mut listed: Vec<(String, TaskListItem)> = Vec::new();
+            if let Ok(mut rows) = conn
+                .query(
+                    "
+                    SELECT id, uri_segment, agent_config_id, task_description, status
+                    FROM jobs
+                    WHERE parent_job_id = ?1
+                    ORDER BY task_index ASC, created_at ASC
+                    ",
+                    (job.id.as_str(),),
+                )
+                .await
+            {
+                while let Ok(Some(row)) = rows.next().await {
+                    let (Ok(task_id), Ok(segment), Ok(agent), Ok(description), Ok(status)) = (
+                        row.text(0),
+                        row.opt_text(1),
+                        row.opt_text(2),
+                        row.opt_text(3),
+                        row.text(4),
+                    ) else {
+                        continue;
+                    };
+                    let segment = segment.unwrap_or_else(|| "task".to_string());
+                    listed.push((
+                        task_id,
+                        TaskListItem {
+                            segment,
+                            agent,
+                            description,
+                            status,
+                            has_artifact: false,
+                        },
+                    ));
+                }
+            }
+            let mut tasks = Vec::with_capacity(listed.len());
+            for (task_id, mut task) in listed {
+                task.has_artifact = has_artifact_for_job(conn, &task_id).await;
+                tasks.push(task);
+            }
+            tasks
+        })
+    });
+    let tasks = match read.await {
+        Ok((_, tasks)) => tasks,
+        Err(error) => return error,
+    };
 
     let mut output = format!("# Tasks — {}\n\n", node_name);
     if tasks.is_empty() {
@@ -769,11 +857,11 @@ pub(super) async fn read_node_tasks(
         output.push_str(&format!("{} task(s)\n\n", tasks.len()));
         for task in &tasks {
             let TaskListItem {
-                job_id,
                 segment,
                 agent,
                 description,
                 status,
+                has_artifact,
             } = task;
             let icon = match status.as_str() {
                 "complete" => "✓",
@@ -800,7 +888,7 @@ pub(super) async fn read_node_tasks(
                 },
                 chat_uri,
             );
-            if has_artifact_for_job(&conn, job_id).await {
+            if *has_artifact {
                 detail.push_str(&format!(
                     " · artifact: {}",
                     build_task_artifact_uri(project_key, number, exec_seq, node_name, segment),
@@ -900,13 +988,13 @@ pub(super) async fn read_node_questions(
     exec_seq: i32,
     node_name: &str,
 ) -> String {
-    let (conn, job) =
-        match connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
-
-    let questions = load_node_questions(&conn, &job.id).await;
+    let read = read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
+        Box::pin(async move { load_node_questions(conn, &job.id).await })
+    });
+    let questions = match read.await {
+        Ok((_, questions)) => questions,
+        Err(error) => return error,
+    };
 
     let mut output = format!("# Questions — {}\n\n", node_name);
     if questions.is_empty() {
@@ -948,13 +1036,13 @@ pub(super) async fn read_node_question(
     node_name: &str,
     segment: &str,
 ) -> String {
-    let (conn, job) =
-        match connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
-
-    let questions = load_node_questions(&conn, &job.id).await;
+    let read = read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
+        Box::pin(async move { load_node_questions(conn, &job.id).await })
+    });
+    let questions = match read.await {
+        Ok((_, questions)) => questions,
+        Err(error) => return error,
+    };
     let Some(question) = questions.into_iter().find(|q| q.segment == segment) else {
         return format!(
             "Question '{}' not found for node '{}' in issue {}/{}",
@@ -1113,13 +1201,13 @@ pub(super) async fn read_node_permissions(
     exec_seq: i32,
     node_name: &str,
 ) -> String {
-    let (conn, job) =
-        match connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
-
-    let requests = load_node_permissions(&conn, &job.id).await;
+    let read = read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
+        Box::pin(async move { load_node_permissions(conn, &job.id).await })
+    });
+    let requests = match read.await {
+        Ok((_, requests)) => requests,
+        Err(error) => return error,
+    };
 
     let mut output = format!("# Permissions — {}\n\n", node_name);
     if requests.is_empty() {
@@ -1171,13 +1259,13 @@ pub(super) async fn read_node_permission(
     node_name: &str,
     segment: &str,
 ) -> String {
-    let (conn, job) =
-        match connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
-
-    let requests = load_node_permissions(&conn, &job.id).await;
+    let read = read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
+        Box::pin(async move { load_node_permissions(conn, &job.id).await })
+    });
+    let requests = match read.await {
+        Ok((_, requests)) => requests,
+        Err(error) => return error,
+    };
     let Some(request) = requests.into_iter().find(|r| r.segment == segment) else {
         return format!(
             "Permission '{}' not found for node '{}' in issue {}/{}",
@@ -1236,15 +1324,21 @@ pub(super) async fn read_task_permissions(
     node_name: &str,
     task_name: &str,
 ) -> String {
-    let (conn, _parent_job, task_job) =
-        match connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
-
-    let requests = load_node_permissions(&conn, &task_job.id).await;
+    let read = read_task_rows(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        task_name,
+        |conn, _parent_job, task_job| {
+            Box::pin(async move { load_node_permissions(conn, &task_job.id).await })
+        },
+    );
+    let requests = match read.await {
+        Ok((_, _, requests)) => requests,
+        Err(error) => return error,
+    };
 
     let mut output = format!("# Permissions — {}/{}\n\n", node_name, task_name);
     if requests.is_empty() {
@@ -1295,15 +1389,21 @@ pub(super) async fn read_task_permission(
     task_name: &str,
     segment: &str,
 ) -> String {
-    let (conn, _parent_job, task_job) =
-        match connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
-
-    let requests = load_node_permissions(&conn, &task_job.id).await;
+    let read = read_task_rows(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        task_name,
+        |conn, _parent_job, task_job| {
+            Box::pin(async move { load_node_permissions(conn, &task_job.id).await })
+        },
+    );
+    let requests = match read.await {
+        Ok((_, _, requests)) => requests,
+        Err(error) => return error,
+    };
     let Some(request) = requests.into_iter().find(|r| r.segment == segment) else {
         return format!(
             "Permission '{}' not found for task '{}' in node '{}' of issue {}/{}",
@@ -1341,6 +1441,71 @@ mod withdrawn_permission_rendering_tests {
     }
 }
 
+/// Everything a node summary reads from the database, owned, so the network,
+/// jj and admission work the summary also does runs after the read releases.
+enum NodeSummaryRows {
+    Job(Box<JobSummaryRows>),
+    /// No agent job matches the segment, but an action node (e.g. a `pr`
+    /// node) does: an action_run, not a job (CAIRN-1222).
+    Action(ResourceActionRun),
+    NotFound,
+}
+
+struct JobSummaryRows {
+    job: ResourceJob,
+    visible_node_segment: String,
+    activity: Option<NodeActivity>,
+    named_artifacts: Vec<ResourceArtifact>,
+    pr: Option<NodePrRow>,
+}
+
+/// The `merge_requests` row a node summary reports on.
+struct NodePrRow {
+    number: Option<i32>,
+    url: Option<String>,
+    status: String,
+    review_decision: Option<String>,
+    mergeable: Option<String>,
+    checks_status: Option<String>,
+    additions: Option<i32>,
+    deletions: Option<i32>,
+    source_branch: String,
+    target_branch: String,
+    repo_path: String,
+}
+
+async fn load_node_pr_row(conn: &cairn_db::turso::Connection, job_id: &str) -> Option<NodePrRow> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT mr.github_pr_number, mr.github_pr_url, mr.status, mr.github_review,
+                   mr.github_mergeable, mr.checks_status, mr.additions, mr.deletions,
+                   mr.source_branch, mr.target_branch, p.repo_path
+            FROM merge_requests mr
+            JOIN projects p ON mr.project_id = p.id
+            WHERE mr.job_id = ?1
+            LIMIT 1
+            ",
+            (job_id,),
+        )
+        .await
+        .ok()?;
+    let row = rows.next().await.ok().flatten()?;
+    Some(NodePrRow {
+        number: row.opt_i64(0).ok()?.map(|value| value as i32),
+        url: row.opt_text(1).ok()?,
+        status: row.text(2).ok()?,
+        review_decision: row.opt_text(3).ok()?,
+        mergeable: row.opt_text(4).ok()?,
+        checks_status: row.opt_text(5).ok()?,
+        additions: row.opt_i64(6).ok()?.map(|value| value as i32),
+        deletions: row.opt_i64(7).ok()?.map(|value| value as i32),
+        source_branch: row.text(8).ok()?,
+        target_branch: row.text(9).ok()?,
+        repo_path: row.text(10).ok()?,
+    })
+}
+
 pub(super) async fn read_node(
     orch: &crate::orchestrator::Orchestrator,
     project_key: &str,
@@ -1351,46 +1516,66 @@ pub(super) async fn read_node(
 ) -> String {
     let routed_db = orch.db.for_project(project_key).await;
     let db = &*routed_db;
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
-
-    // Get project and issue
-    let (_, issue_id) = match resolve_issue_id(&conn, project_key, number).await {
-        Ok(resolved) => resolved,
-        Err(e) => return e,
-    };
-
-    // Find job by node name (looks up name in execution snapshot)
-    let job = match find_job_by_node_name(&conn, &issue_id, node_name, exec_seq).await {
-        Some(j) => j,
-        None => {
-            // No agent job matches this segment. It may be an action node (e.g.
-            // a `pr` node), which is an action_run, not a job. Resolve and
-            // render that instead (CAIRN-1222).
-            if let Some(action_run) =
-                find_action_run_by_node_name(&conn, &issue_id, node_name, exec_seq).await
-            {
-                return render_action_node(
-                    orch,
-                    project_key,
-                    number,
-                    exec_seq,
-                    node_name,
-                    &action_run,
-                    diff_full,
-                )
-                .await;
+    let (key, segment) = (project_key.to_owned(), node_name.to_owned());
+    let read = read_resource(db, move |conn| {
+        Box::pin(async move {
+            let (_, issue_id) = resolve_issue_id(conn, &key, number).await?;
+            // Find job by node name (looks up name in execution snapshot)
+            let Some(job) = find_job_by_node_name(conn, &issue_id, &segment, exec_seq).await else {
+                return Ok(
+                    match find_action_run_by_node_name(conn, &issue_id, &segment, exec_seq).await {
+                        Some(action_run) => NodeSummaryRows::Action(action_run),
+                        None => NodeSummaryRows::NotFound,
+                    },
+                );
+            };
+            let visible_node_segment = visible_job_node_segment(conn, &job).await;
+            let activity = load_node_activity(conn, &job.id).await;
+            let mut named_artifacts = list_named_artifacts_for_job(conn, &job.id).await;
+            if named_artifacts.is_empty() {
+                // The node's own artifact may live on a child job (a delegated
+                // task); fall back to the child-inclusive lookup so it still
+                // surfaces.
+                named_artifacts.extend(get_artifact_for_job(conn, &job.id).await);
             }
+            let pr = load_node_pr_row(conn, &job.id).await;
+            Ok(NodeSummaryRows::Job(Box::new(JobSummaryRows {
+                job,
+                visible_node_segment,
+                activity,
+                named_artifacts,
+                pr,
+            })))
+        })
+    });
+    let JobSummaryRows {
+        job,
+        visible_node_segment,
+        activity,
+        named_artifacts,
+        pr,
+    } = match read.await {
+        Ok(NodeSummaryRows::Job(rows)) => *rows,
+        Ok(NodeSummaryRows::Action(action_run)) => {
+            return render_action_node(
+                orch,
+                project_key,
+                number,
+                exec_seq,
+                node_name,
+                &action_run,
+                diff_full,
+            )
+            .await;
+        }
+        Ok(NodeSummaryRows::NotFound) => {
             return format!(
                 "Node '{}' not found for issue {}/{}",
                 node_name, project_key, number
             );
         }
+        Err(error) => return error,
     };
-
-    let visible_node_segment = visible_job_node_segment(&conn, &job).await;
 
     let mut output = render_job_summary_header(
         node_name,
@@ -1422,8 +1607,8 @@ pub(super) async fn read_node(
     // Activity gives the summary something to decide on before an artifact
     // exists: how much has happened (turns/runs/events), when it last moved, and
     // the latest assistant line. Skipped entirely for a node with no events yet.
-    if let Some(activity) = render_node_activity(&conn, &job.id).await {
-        output.push_str(&activity);
+    if let Some(activity) = &activity {
+        output.push_str(&render_node_activity(activity));
         output.push('\n');
     }
 
@@ -1437,12 +1622,6 @@ pub(super) async fn read_node(
     // `/artifact` alias (CAIRN-1219). Each distinct addressed name owns its own
     // version chain, so a node may surface several; a single-artifact node lists
     // exactly one, rendered identically to before.
-    let mut named_artifacts = list_named_artifacts_for_job(&conn, &job.id).await;
-    if named_artifacts.is_empty() {
-        // The node's own artifact may live on a child job (a delegated task);
-        // fall back to the child-inclusive lookup so it still surfaces.
-        named_artifacts.extend(get_artifact_for_job(&conn, &job.id).await);
-    }
     let artifact_uris: Vec<String> = named_artifacts
         .iter()
         .map(|artifact| {
@@ -1466,57 +1645,10 @@ pub(super) async fn read_node(
         }
     }
 
-    // Check for PR data via merge_requests
-    #[allow(clippy::type_complexity)]
-    let pr: Option<(
-        Option<i32>,
-        Option<String>,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i32>,
-        Option<i32>,
-        String,
-        String,
-        String,
-    )> = match conn
-        .query(
-            "
-            SELECT mr.github_pr_number, mr.github_pr_url, mr.status, mr.github_review,
-                   mr.github_mergeable, mr.checks_status, mr.additions, mr.deletions,
-                   mr.source_branch, mr.target_branch, p.repo_path
-            FROM merge_requests mr
-            JOIN projects p ON mr.project_id = p.id
-            WHERE mr.job_id = ?1
-            LIMIT 1
-            ",
-            (job.id.as_str(),),
-        )
-        .await
-    {
-        Ok(mut rows) => rows.next().await.ok().flatten().and_then(|row| {
-            Some((
-                row.opt_i64(0).ok()?.map(|value| value as i32),
-                row.opt_text(1).ok()?,
-                row.text(2).ok()?,
-                row.opt_text(3).ok()?,
-                row.opt_text(4).ok()?,
-                row.opt_text(5).ok()?,
-                row.opt_i64(6).ok()?.map(|value| value as i32),
-                row.opt_i64(7).ok()?.map(|value| value as i32),
-                row.text(8).ok()?,
-                row.text(9).ok()?,
-                row.text(10).ok()?,
-            ))
-        }),
-        Err(_) => None,
-    };
-
-    if let Some((
-        pr_number,
-        pr_url,
-        pr_status,
+    if let Some(NodePrRow {
+        number: pr_number,
+        url: pr_url,
+        status: pr_status,
         review_decision,
         mergeable,
         checks_status,
@@ -1525,7 +1657,7 @@ pub(super) async fn read_node(
         source_branch,
         target_branch,
         repo_path,
-    )) = pr
+    }) = pr
     {
         // A non-positive number is not a pull-request binding; see
         // `bound_pr_number` in `pr_data::actions::context`.
@@ -1851,20 +1983,20 @@ pub(super) async fn read_node_chat(
         return error;
     }
 
-    let (conn, job) =
-        match connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
+    let read = read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
+        Box::pin(async move {
+            (
+                visible_job_node_segment(conn, job).await,
+                load_primary_session_turn_sequences(conn, &job.id).await,
+            )
+        })
+    });
+    let (job, (visible_segment, turn_sequences)) = match read.await {
+        Ok(read) => read,
+        Err(error) => return error,
+    };
 
-    let base_uri = build_node_chat_uri(
-        project_key,
-        number,
-        exec_seq,
-        &visible_job_node_segment(&conn, &job).await,
-    );
-    let turn_sequences = load_primary_session_turn_sequences(&conn, &job.id).await;
-    drop(conn);
+    let base_uri = build_node_chat_uri(project_key, number, exec_seq, &visible_segment);
     let meta = DigestMeta {
         label: node_name,
         project: project_key,
@@ -1954,12 +2086,10 @@ pub(super) async fn read_node_chat_raw(
         Ok(format) => format,
         Err(error) => return error,
     };
-    let (conn, job) =
-        match connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
-    drop(conn);
+    let job = match load_node_job(db, project_key, number, exec_seq, node_name).await {
+        Ok(job) => job,
+        Err(error) => return error,
+    };
 
     render_job_chat_raw(db, &job.id, format).await
 }
@@ -1998,22 +2128,46 @@ pub(super) async fn read_node_chat_turn(
     node_name: &str,
     turn_seq: i32,
 ) -> String {
-    let (conn, job) =
-        match connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
+    let label = node_name.to_owned();
+    let read = read_node_rows(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        move |conn, job| {
+            Box::pin(async move { job_turn_rows(conn, &job.id, &label, turn_seq).await })
+        },
+    );
+    let events = match read.await {
+        Ok((_, Ok(events))) => events,
+        Ok((_, Err(missing))) => return missing,
+        Err(error) => return error,
+    };
 
-    render_job_chat_turn(db, &conn, &job.id, node_name, turn_seq).await
+    // Reconstruct after the read has released: it takes its own short read and
+    // may fetch from the content store.
+    let event_rows = reconstruct_turn_events(db, events).await;
+
+    if event_rows.is_empty() {
+        return format!(
+            "No events found for turn {} in node '{}'",
+            turn_seq, node_name
+        );
+    }
+
+    // Format as full transcript (no truncation for focused turn slices)
+    crate::transcripts::format_transcript_full(&event_rows)
 }
 
-pub(super) async fn render_job_chat_turn(
-    db: &LocalDb,
+/// The stored events of turn `turn_seq` in a job's primary session. Statements
+/// only. `Err` is the message for a job with no session or no such turn.
+async fn job_turn_rows(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
     label: &str,
     turn_seq: i32,
-) -> String {
+) -> Result<Vec<crate::models::Event>, String> {
     // Get session_id from the job's first run
     let session_id: Option<String> = match conn
         .query(
@@ -2039,7 +2193,7 @@ pub(super) async fn render_job_chat_turn(
 
     let session_id = match session_id {
         Some(id) => id,
-        None => return "No session found for this node.".to_string(),
+        None => return Err("No session found for this node.".to_string()),
     };
 
     // Find turn by (session_id, sequence = turn_seq)
@@ -2063,26 +2217,12 @@ pub(super) async fn render_job_chat_turn(
             .and_then(|row| row.text(0).ok())
         {
             Some(id) => id,
-            None => return format!("Turn {} not found for node '{}'", turn_seq, label),
+            None => return Err(format!("Turn {} not found for node '{}'", turn_seq, label)),
         },
-        Err(_) => return format!("Turn {} not found for node '{}'", turn_seq, label),
+        Err(_) => return Err(format!("Turn {} not found for node '{}'", turn_seq, label)),
     };
 
-    // Load events for this turn
-    let event_rows = load_turn_events(
-        conn,
-        &turn_id,
-        db.team_id().map(|_| db.content_store().as_ref()),
-        db.private_route_db().map(|db| db.as_ref()),
-    )
-    .await;
-
-    if event_rows.is_empty() {
-        return format!("No events found for turn {} in node '{}'", turn_seq, label);
-    }
-
-    // Format as full transcript (no truncation for focused turn slices)
-    crate::transcripts::format_transcript_full(&event_rows)
+    Ok(turn_event_rows(conn, &turn_id).await)
 }
 
 /// Render a stored artifact JSON payload as readable markdown.
@@ -2342,18 +2482,28 @@ pub(super) async fn read_node_artifact(
     } = coordinates;
     let routed_db = orch.db.for_project(project_key).await;
     let db = &*routed_db;
-    let (conn, job) =
-        match connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
-
     // A named read (`.../{node}/plan`) returns that name's own version chain; the
     // generic `/artifact` alias (name: None) keeps the latest-overall behavior
     // for back-compat reads.
-    let artifact = match artifact_name {
-        Some(name) => get_named_artifact_for_job(&conn, &job.id, name).await,
-        None => get_artifact_for_job(&conn, &job.id).await,
+    let wanted = artifact_name.map(str::to_owned);
+    let read = read_node_rows(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        move |conn, job| {
+            Box::pin(async move {
+                match wanted {
+                    Some(name) => get_named_artifact_for_job(conn, &job.id, &name).await,
+                    None => get_artifact_for_job(conn, &job.id).await,
+                }
+            })
+        },
+    );
+    let (job, artifact) = match read.await {
+        Ok(read) => read,
+        Err(error) => return error,
     };
     let body = match &artifact {
         Some(a)
@@ -2445,13 +2595,30 @@ pub(super) async fn read_task(
     node_name: &str,
     task_name: &str,
 ) -> String {
-    let (conn, parent_job, task_job) =
-        match connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
+    let read = read_task_rows(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        task_name,
+        |conn, parent_job, task_job| {
+            Box::pin(async move {
+                let parent_segment =
+                    if task_job.status == "pending" && task_job.started_at.is_none() {
+                        Some(visible_job_node_segment(conn, parent_job).await)
+                    } else {
+                        None
+                    };
+                let artifact = get_direct_artifact_for_job(conn, &task_job.id).await;
+                (parent_segment, artifact)
+            })
+        },
+    );
+    let (_, task_job, (parent_segment, artifact)) = match read.await {
+        Ok(read) => read,
+        Err(error) => return error,
+    };
 
     let mut output = render_job_summary_header(
         task_name,
@@ -2459,8 +2626,7 @@ pub(super) async fn read_task(
         task_job.started_at.map(i64::from),
         task_job.completed_at.map(i64::from),
     );
-    if task_job.status == "pending" && task_job.started_at.is_none() {
-        let parent_segment = visible_job_node_segment(&conn, &parent_job).await;
+    if let Some(parent_segment) = parent_segment {
         output.push_str(&crate::jobs::queries::pending_dispatch_description(Some(
             &parent_segment,
         )));
@@ -2472,7 +2638,7 @@ pub(super) async fn read_task(
     output.push_str(&format!("- Chat: `{}`\n", chat_uri));
     // Surface the task artifact at its canonical, schema-named URI rather than
     // the generic `/artifact` alias (CAIRN-1219).
-    if let Some(artifact) = get_direct_artifact_for_job(&conn, &task_job.id).await {
+    if let Some(artifact) = artifact {
         output.push_str(&format!(
             "- Artifact: `{}`\n",
             build_task_artifact_uri_named(
@@ -2521,23 +2687,28 @@ pub(super) async fn read_task_chat(
         return error;
     }
 
-    let (conn, parent_job, task_job) =
-        match connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
-
-    let base_uri = build_task_chat_uri(
+    let read = read_task_rows(
+        db,
         project_key,
         number,
         exec_seq,
-        &visible_job_node_segment(&conn, &parent_job).await,
+        node_name,
         task_name,
+        |conn, parent_job, task_job| {
+            Box::pin(async move {
+                (
+                    visible_job_node_segment(conn, parent_job).await,
+                    load_primary_session_turn_sequences(conn, &task_job.id).await,
+                )
+            })
+        },
     );
-    let turn_sequences = load_primary_session_turn_sequences(&conn, &task_job.id).await;
-    drop(conn);
+    let (_, task_job, (parent_segment, turn_sequences)) = match read.await {
+        Ok(read) => read,
+        Err(error) => return error,
+    };
+
+    let base_uri = build_task_chat_uri(project_key, number, exec_seq, &parent_segment, task_name);
 
     let event_rows = match load_job_events_ordered(db, &task_job.id).await {
         Ok(rows) => rows,
@@ -2581,14 +2752,11 @@ pub(super) async fn read_task_chat_raw(
         Ok(format) => format,
         Err(error) => return error,
     };
-    let (conn, _parent_job, task_job) =
-        match connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
-            .await
-        {
+    let (_parent_job, task_job) =
+        match load_task_job(db, project_key, number, exec_seq, node_name, task_name).await {
             Ok(resolved) => resolved,
             Err(error) => return error,
         };
-    drop(conn);
 
     let event_rows = match load_job_events_ordered(db, &task_job.id).await {
         Ok(rows) => rows,
@@ -2613,14 +2781,65 @@ pub(super) async fn read_task_chat_turn(
     task_name: &str,
     turn_seq: i32,
 ) -> String {
-    let (conn, _parent_job, task_job) =
-        match connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
+    let read = read_task_rows(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        task_name,
+        move |conn, _parent_job, task_job| {
+            Box::pin(async move { task_turn_rows(conn, &task_job.id, turn_seq).await })
+        },
+    );
+    let events = match read.await {
+        Ok((_, _, TaskTurnRows::Events(events))) => events,
+        Ok((_, _, TaskTurnRows::NoSession)) => return "No session found for this task.".to_string(),
+        Ok((_, _, TaskTurnRows::Ambiguous)) => {
+            return format!(
+                "Task turn URI is ambiguous for task '{}' in node '{}' of issue {}/{} because runs span multiple sessions",
+                task_name, node_name, project_key, number
+            )
+        }
+        Ok((_, _, TaskTurnRows::TurnMissing)) => {
+            return format!(
+                "Turn {} not found for task '{}' in node '{}' of issue {}/{}",
+                turn_seq, task_name, node_name, project_key, number
+            )
+        }
+        Err(error) => return error,
+    };
 
+    // Reconstruct after the read has released: it takes its own short read and
+    // may fetch from the content store.
+    let event_rows = reconstruct_turn_events(db, events).await;
+
+    if event_rows.is_empty() {
+        return format!(
+            "No events found for turn {} in task '{}' of node '{}' for issue {}/{}",
+            turn_seq, task_name, node_name, project_key, number
+        );
+    }
+
+    crate::transcripts::format_transcript_full(&event_rows)
+}
+
+/// What a task turn URI resolves to.
+enum TaskTurnRows {
+    NoSession,
+    /// The task's runs span more than one session, so a turn number names no
+    /// single turn.
+    Ambiguous,
+    TurnMissing,
+    Events(Vec<crate::models::Event>),
+}
+
+/// The stored events of turn `turn_seq` in a task's session. Statements only.
+async fn task_turn_rows(
+    conn: &cairn_db::turso::Connection,
+    task_job_id: &str,
+    turn_seq: i32,
+) -> TaskTurnRows {
     // Task turn URIs are only unambiguous when all runs share one session.
     let mut run_session_ids: Vec<Option<String>> = Vec::new();
     if let Ok(mut rows) = conn
@@ -2631,7 +2850,7 @@ pub(super) async fn read_task_chat_turn(
             WHERE job_id = ?1
             ORDER BY created_at ASC
             ",
-            (task_job.id.as_str(),),
+            (task_job_id,),
         )
         .await
     {
@@ -2643,16 +2862,11 @@ pub(super) async fn read_task_chat_turn(
     }
 
     let mut session_ids = run_session_ids.into_iter().flatten();
-    let session_id = match session_ids.next() {
-        Some(id) => id,
-        None => return "No session found for this task.".to_string(),
+    let Some(session_id) = session_ids.next() else {
+        return TaskTurnRows::NoSession;
     };
-
     if session_ids.any(|id| id != session_id) {
-        return format!(
-            "Task turn URI is ambiguous for task '{}' in node '{}' of issue {}/{} because runs span multiple sessions",
-            task_name, node_name, project_key, number
-        );
+        return TaskTurnRows::Ambiguous;
     }
 
     // Find turn by (session_id, sequence = turn_seq)
@@ -2668,46 +2882,18 @@ pub(super) async fn read_task_chat_turn(
         )
         .await
     {
-        Ok(mut rows) => match rows
+        Ok(mut rows) => rows
             .next()
             .await
             .ok()
             .flatten()
-            .and_then(|row| row.text(0).ok())
-        {
-            Some(id) => id,
-            None => {
-                return format!(
-                    "Turn {} not found for task '{}' in node '{}' of issue {}/{}",
-                    turn_seq, task_name, node_name, project_key, number
-                )
-            }
-        },
-        Err(_) => {
-            return format!(
-                "Turn {} not found for task '{}' in node '{}' of issue {}/{}",
-                turn_seq, task_name, node_name, project_key, number
-            )
-        }
+            .and_then(|row| row.text(0).ok()),
+        Err(_) => None,
     };
-
-    // Load events for this turn
-    let event_rows = load_turn_events(
-        &conn,
-        &turn_id,
-        db.team_id().map(|_| db.content_store().as_ref()),
-        db.private_route_db().map(|db| db.as_ref()),
-    )
-    .await;
-
-    if event_rows.is_empty() {
-        return format!(
-            "No events found for turn {} in task '{}' of node '{}' for issue {}/{}",
-            turn_seq, task_name, node_name, project_key, number
-        );
+    match turn_id {
+        Some(turn_id) => TaskTurnRows::Events(turn_event_rows(conn, &turn_id).await),
+        None => TaskTurnRows::TurnMissing,
     }
-
-    crate::transcripts::format_transcript_full(&event_rows)
 }
 
 pub(super) async fn read_task_artifact(
@@ -2723,19 +2909,28 @@ pub(super) async fn read_task_artifact(
         exec_seq,
         node_name,
     } = coordinates;
-    let (conn, _parent_job, task_job) =
-        match connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
-
     // Named task reads follow that artifact's version chain. The generic alias
     // retains latest-overall behavior.
-    let artifact = match artifact_name {
-        Some(name) => get_named_artifact_for_job(&conn, &task_job.id, name).await,
-        None => get_direct_artifact_for_job(&conn, &task_job.id).await,
+    let wanted = artifact_name.map(str::to_owned);
+    let read = read_task_rows(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        task_name,
+        move |conn, _parent_job, task_job| {
+            Box::pin(async move {
+                match wanted {
+                    Some(name) => get_named_artifact_for_job(conn, &task_job.id, &name).await,
+                    None => get_direct_artifact_for_job(conn, &task_job.id).await,
+                }
+            })
+        },
+    );
+    let artifact = match read.await {
+        Ok((_, _, artifact)) => artifact,
+        Err(error) => return error,
     };
     match artifact {
         Some(artifact) if format == ArtifactFormat::Json => artifact.data,
@@ -2774,17 +2969,15 @@ pub(super) async fn wait_for_task_artifact(
     node_name: &str,
     task_name: &str,
 ) -> String {
-    // Resolve the call job once, then DROP the resolution transaction: it opened
-    // with `BEGIN` (a pinned snapshot), so re-reading status through it would
-    // never observe the call's completion. Each terminal check below opens a
-    // fresh read instead.
-    let job_id =
-        match connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
-            .await
-        {
-            Ok((_conn, _parent_job, task_job)) => task_job.id,
-            Err(error) => return error,
-        };
+    // Resolve the call job once in its own short read. The loop below holds no
+    // connection: a read pins a snapshot, so re-reading status through one would
+    // never observe the call's completion. Each terminal check opens a fresh
+    // read instead.
+    let job_id = match load_task_job(db, project_key, number, exec_seq, node_name, task_name).await
+    {
+        Ok((_parent_job, task_job)) => task_job.id,
+        Err(error) => return error,
+    };
 
     // Subscribe BEFORE the first status read so a completion that fires between
     // the check and the wait is not missed (subscribe-then-check ordering).
@@ -2876,38 +3069,39 @@ pub(super) async fn read_node_chat_event(
     run_seq: i32,
     event_seq: i32,
 ) -> String {
-    let (conn, job) =
-        match connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
-
-    render_job_chat_event(db, &conn, &job.id, node_name, run_seq, event_seq).await
-}
-
-pub(super) async fn render_job_chat_event(
-    db: &LocalDb,
-    conn: &cairn_db::turso::Connection,
-    job_id: &str,
-    label: &str,
-    run_seq: i32,
-    event_seq: i32,
-) -> String {
-    // Get the Nth run (1-indexed run_seq)
-    let run_id = match get_nth_run_id(conn, job_id, run_seq).await {
-        Some(id) => id,
-        None => return format!("Run {} not found for node '{}'", run_seq, label),
+    let read = read_node_rows(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        move |conn, job| {
+            Box::pin(async move { job_event_row(conn, &job.id, run_seq, event_seq).await })
+        },
+    );
+    let stored = match read.await {
+        Ok((_, Some(Ok(stored)))) => stored,
+        Ok((_, Some(Err(missing)))) => return missing,
+        Ok((_, None)) => return format!("Run {} not found for node '{}'", run_seq, node_name),
+        Err(error) => return error,
     };
 
-    // Get the specific event
-    get_single_event(
-        conn,
-        &run_id,
-        event_seq,
-        db.team_id().map(|_| db.content_store().as_ref()),
-        db.private_route_db().map(|db| db.as_ref()),
-    )
-    .await
+    // Rendered after the read has released: reconstruction takes its own short
+    // read and may fetch from the content store.
+    render_single_event(db, stored).await
+}
+
+/// The stored event `event_seq` of a job's `run_seq`th run (1-indexed).
+/// Statements only. `None` when the job has no such run; `Some(Err)` is the
+/// event's not-found message.
+async fn job_event_row(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    run_seq: i32,
+    event_seq: i32,
+) -> Option<Result<StoredEvent, String>> {
+    let run_id = get_nth_run_id(conn, job_id, run_seq).await?;
+    Some(read_single_event(conn, &run_id, event_seq).await)
 }
 
 #[cfg(test)]
@@ -3441,34 +3635,30 @@ pub(super) async fn read_task_chat_event(
     run_seq: i32,
     event_seq: i32,
 ) -> String {
-    let (conn, _parent_job, task_job) =
-        match connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(error) => return error,
-        };
-
-    // Get the Nth run (1-indexed run_seq)
-    let run_id = match get_nth_run_id(&conn, &task_job.id, run_seq).await {
-        Some(id) => id,
-        None => {
+    let read = read_task_rows(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        task_name,
+        move |conn, _parent_job, task_job| {
+            Box::pin(async move { job_event_row(conn, &task_job.id, run_seq, event_seq).await })
+        },
+    );
+    let stored = match read.await {
+        Ok((_, _, Some(Ok(stored)))) => stored,
+        Ok((_, _, Some(Err(missing)))) => return missing,
+        Ok((_, _, None)) => {
             return format!(
                 "Run {} not found for task '{}' in node '{}'",
                 run_seq, task_name, node_name
             )
         }
+        Err(error) => return error,
     };
 
-    // Get the specific event
-    get_single_event(
-        &conn,
-        &run_id,
-        event_seq,
-        db.team_id().map(|_| db.content_store().as_ref()),
-        db.private_route_db().map(|db| db.as_ref()),
-    )
-    .await
+    render_single_event(db, stored).await
 }
 
 #[cfg(test)]

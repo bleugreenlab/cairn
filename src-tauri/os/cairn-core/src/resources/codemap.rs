@@ -16,7 +16,7 @@ use crate::projects::codemap::{self, CodeMap, CHURN_WINDOW_DAYS};
 use crate::storage::LocalDb;
 use cairn_common::query::QueryParam;
 
-use super::common::{connect_for_read, lookup_project_by_key};
+use super::common::{lookup_project_by_key, read_resource};
 
 /// How many files each summary table lists.
 const SUMMARY_ROWS: usize = 10;
@@ -46,15 +46,15 @@ pub(crate) async fn read_codemap(
         },
     };
 
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
-    let project = match lookup_project_by_key(&conn, project_key).await {
+    let key = project_key.to_owned();
+    let project = match read_resource(db, move |conn| {
+        Box::pin(async move { lookup_project_by_key(conn, &key).await })
+    })
+    .await
+    {
         Ok(project) => project,
         Err(error) => return error,
     };
-    drop(conn);
 
     let view = match codemap::current(orch, db, &project.project_id).await {
         Ok(view) => view,

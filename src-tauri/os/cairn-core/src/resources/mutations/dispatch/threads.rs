@@ -8,6 +8,11 @@ use cairn_common::thread_name::validate_thread_name;
 use cairn_common::uri::CairnResource;
 use cairn_db::models::CreateThread;
 
+use crate::resources::db_rows::{self, PayloadUse, TableShape};
+use crate::threads::db_store::{
+    apply_write, police, split_write_sql, RowAction, RowKey, RowTarget, WriteScope, WriteStatement,
+};
+
 fn thread_db_refusal(project: &str, name: &str) -> String {
     format!(
         "cairn://p/{project}/{name}/db is thread '{name}'s own store, writable only by that thread and the tasks it spawns. You can read it with `?sql=`."
@@ -61,25 +66,7 @@ fn statement_params(
 }
 
 fn sql_param(value: &serde_json::Value) -> Result<cairn_db::turso::Value, String> {
-    Ok(match value {
-        serde_json::Value::Null => cairn_db::turso::Value::Null,
-        serde_json::Value::Bool(value) => cairn_db::turso::Value::Integer(i64::from(*value)),
-        serde_json::Value::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                cairn_db::turso::Value::Integer(value)
-            } else if let Some(value) = value.as_u64().and_then(|value| i64::try_from(value).ok()) {
-                cairn_db::turso::Value::Integer(value)
-            } else if let Some(value) = value.as_f64() {
-                cairn_db::turso::Value::Real(value)
-            } else {
-                return Err("payload.params contains a number SQLite cannot represent".into());
-            }
-        }
-        serde_json::Value::String(value) => cairn_db::turso::Value::Text(value.clone()),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            return Err("payload.params values must be null, booleans, numbers, or strings".into());
-        }
-    })
+    crate::resources::db_rows::sql_param(value).map_err(|error| format!("payload.params: {error}"))
 }
 
 async fn owning_thread_id(
@@ -92,6 +79,96 @@ async fn owning_thread_id(
     )
     .await
     .map_err(|error| error.to_string())
+}
+
+/// The write scope of a thread's database, once the writer is shown to own it:
+/// the writing run belongs to that thread's session or to a task it spawned,
+/// or the write is a page's, made through a page that thread owns. The one
+/// ownership rule for SQL and structured writes alike.
+///
+/// A page write's owner comes from its typed origin, which only Rust sets; it
+/// never looks for a run, so it cannot borrow one.
+async fn owned_thread_scope(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project: &str,
+    name: &str,
+) -> Result<WriteScope, String> {
+    let (db, project_id) = project_id(orch, project).await?;
+    let thread = thread_by_name(&db, &project_id, name).await?;
+    let acting = acting_thread_id(orch, request, project, &db, &project_id).await;
+    if acting.as_deref() != Some(thread.id.as_str()) {
+        return Err(thread_db_refusal(project, name));
+    }
+    Ok(WriteScope {
+        thread_id: thread.id,
+        project_id,
+        project: cairn_common::uri::canonical_project(project),
+        thread_name: thread.name,
+    })
+}
+
+/// The thread a write acts in, from exactly one source: a page write acts for
+/// the thread that owns the page (its typed origin, which only Rust sets and
+/// which never looks for a run), a project service's call acts for the thread
+/// its delegation names (a service's own standing run acts for none), and any
+/// other run acts in its own thread.
+async fn acting_thread_id(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project: &str,
+    db: &cairn_db::storage::LocalDb,
+    project_id: &str,
+) -> Option<String> {
+    use crate::project_services::authority::ServiceRunRole;
+    if let Some(origin) = request.page_write_origin() {
+        return Some(origin.owner_thread_id.clone());
+    }
+    let run_id = request.run_id.as_deref()?;
+    if let Some(service) = orch.project_services.runs.get(run_id) {
+        let ServiceRunRole::Delegated { scope, .. } = &service.role else {
+            return None;
+        };
+        if service.project_key != cairn_common::uri::canonical_project(project) {
+            return None;
+        }
+        let name = scope.writable_thread()?;
+        return thread_by_name(db, project_id, name)
+            .await
+            .ok()
+            .map(|thread| thread.id);
+    }
+    let (context, context_db) =
+        crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request)
+            .await
+            .ok()?;
+    owning_thread_id(&context_db, &context.job_id)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// A structured row write's payload: a column map, absent meaning empty.
+fn row_payload(item: &ChangeItem) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    match item.payload.as_ref() {
+        None | Some(serde_json::Value::Null) => Ok(serde_json::Map::new()),
+        Some(serde_json::Value::Object(map)) => Ok(map.clone()),
+        Some(_) => Err("the payload is a column map: {column: value, ...}".to_string()),
+    }
+}
+
+/// The live shape of the table a structured write names, from the owning
+/// thread's store.
+async fn write_target_shape(scope: &WriteScope, table: &str) -> Result<TableShape, String> {
+    let root = scope.db_root();
+    if table == db_rows::RESERVED_TABLE_SEGMENT {
+        return Err(db_rows::reserved_table_segment_refusal(&root));
+    }
+    let db = crate::threads::db_store::open(&scope.thread_id).await?;
+    db_rows::load_shape(&db, table)
+        .await
+        .map_err(crate::threads::db_store::sanitize_error)?
+        .ok_or_else(|| db_rows::no_table(&root, table))
 }
 
 async fn project_id(
@@ -127,6 +204,7 @@ pub(super) async fn dispatch(
     item: &ChangeItem,
     dry_run: bool,
     resource: &CairnResource,
+    applied_data: &mut Option<serde_json::Value>,
 ) -> ResourceMutationResult<Option<String>> {
     let summary = match (resource, item.mode) {
         (CairnResource::ThreadBranches { project, thread }, ChangeMode::Append) => {
@@ -143,26 +221,18 @@ pub(super) async fn dispatch(
                 let thread_row = thread_by_name(&db, &project_id, thread)
                     .await
                     .map_err(|e| build_failure(index, item, e))?;
-                let conn = db
-                    .connect()
+                let (number, git_ref, stage) = db
+                    .query_opt(
+                        "SELECT number, git_ref, stage FROM thread_branches WHERE thread_id = ?1 ORDER BY number DESC LIMIT 1",
+                        cairn_db::turso::params![thread_row.id.clone()],
+                        |row| {
+                            use cairn_db::storage::RowExt;
+                            Ok((row.i64(0)?, row.text(1)?, row.text(2)?))
+                        },
+                    )
                     .await
-                    .map_err(|e| build_failure(index, item, e.to_string()))?;
-                let mut rows = conn.query(
-                    "SELECT number, git_ref, stage FROM thread_branches WHERE thread_id = ?1 ORDER BY number DESC LIMIT 1",
-                    cairn_db::turso::params![thread_row.id.as_str()],
-                ).await.map_err(|e| build_failure(index, item, e.to_string()))?;
-                let row = rows.next().await.map_err(|e| build_failure(index, item, e.to_string()))?
+                    .map_err(|e| build_failure(index, item, e.to_string()))?
                     .ok_or_else(|| build_failure(index, item, "No pre-created thread branch was found; branch minting must run before resource mutation dispatch"))?;
-                use cairn_db::storage::RowExt;
-                let number = row
-                    .i64(0)
-                    .map_err(|e| build_failure(index, item, e.to_string()))?;
-                let git_ref = row
-                    .text(1)
-                    .map_err(|e| build_failure(index, item, e.to_string()))?;
-                let stage = row
-                    .text(2)
-                    .map_err(|e| build_failure(index, item, e.to_string()))?;
                 format!(
                     "Minted cairn://p/{project}/{thread}/branches/{number} ({git_ref}, {stage})"
                 )
@@ -278,13 +348,17 @@ pub(super) async fn dispatch(
                         "{result}: cairn://p/{project}/{thread}/branches/{number}"
                     )));
                 }
-                let conn = db
-                    .connect()
-                    .await
-                    .map_err(|e| build_failure(index, item, e.to_string()))?;
-                let changed = conn.execute(
+                let title = payload
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let stage = payload
+                    .get("stage")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let changed = db.execute(
                     "UPDATE thread_branches SET title = CASE WHEN ?1 IS NULL THEN title ELSE ?1 END, stage = CASE WHEN ?2 IS NULL THEN stage ELSE ?2 END, moved_at = CASE WHEN ?2 IS NULL THEN moved_at ELSE unixepoch() END WHERE thread_id = ?3 AND number = ?4",
-                    cairn_db::turso::params![payload.get("title").and_then(|v| v.as_str()), payload.get("stage").and_then(|v| v.as_str()), thread_row.id.as_str(), *number],
+                    cairn_db::turso::params![title, stage, thread_row.id.clone(), *number],
                 ).await.map_err(|e| build_failure(index, item, e.to_string()))?;
                 if changed == 0 {
                     return Err(build_failure(
@@ -294,296 +368,6 @@ pub(super) async fn dispatch(
                     ));
                 }
                 format!("Patched cairn://p/{project}/{thread}/branches/{number}")
-            }
-        }
-        (CairnResource::ThreadProcedures { project, name }, ChangeMode::Create) => {
-            let payload = item
-                .payload
-                .as_ref()
-                .and_then(serde_json::Value::as_object)
-                .ok_or_else(|| {
-                    build_failure(index, item, "mode=create requires an object payload")
-                })?;
-            let procedure_name = payload
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| build_failure(index, item, "payload.name is required"))?;
-            let body = payload
-                .get("body")
-                .cloned()
-                .ok_or_else(|| build_failure(index, item, "payload.body is required"))?;
-            let description = payload
-                .get("description")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-            let (db, project_id) = project_id(orch, project)
-                .await
-                .map_err(|e| build_failure(index, item, e))?;
-            let thread = thread_by_name(&db, &project_id, name)
-                .await
-                .map_err(|e| build_failure(index, item, e))?;
-            if dry_run {
-                crate::threads::procedures::validate_name(procedure_name)
-                    .map_err(|e| build_failure(index, item, e))?;
-                crate::threads::procedures::validate_body(&body)
-                    .map_err(|e| build_failure(index, item, e))?;
-                format!("Would create procedure {procedure_name} in {project}/{name}")
-            } else {
-                crate::threads::procedures::create(&thread.id, procedure_name, description, body)
-                    .await
-                    .map_err(|e| build_failure(index, item, e))?;
-                format!("Created procedure cairn://p/{project}/{name}/procedures/{procedure_name}")
-            }
-        }
-        (
-            CairnResource::ThreadProcedure {
-                project,
-                name,
-                procedure,
-            },
-            mode @ (ChangeMode::Patch | ChangeMode::Delete),
-        ) => {
-            let (db, project_id) = project_id(orch, project)
-                .await
-                .map_err(|e| build_failure(index, item, e))?;
-            let thread = thread_by_name(&db, &project_id, name)
-                .await
-                .map_err(|e| build_failure(index, item, e))?;
-            match mode {
-                ChangeMode::Patch => {
-                    let payload = item
-                        .payload
-                        .as_ref()
-                        .and_then(serde_json::Value::as_object)
-                        .ok_or_else(|| {
-                            build_failure(index, item, "mode=patch requires an object payload")
-                        })?;
-                    let body = payload.get("body").cloned();
-                    let description = payload
-                        .get("description")
-                        .map(|value| {
-                            if value.is_null() {
-                                Ok(None)
-                            } else {
-                                value.as_str().map(|v| Some(v.to_string())).ok_or_else(|| {
-                                    "payload.description must be a string or null".to_string()
-                                })
-                            }
-                        })
-                        .transpose()
-                        .map_err(|e| build_failure(index, item, e))?;
-                    if body.is_none() && description.is_none() {
-                        return Err(build_failure(
-                            index,
-                            item,
-                            "procedure patch requires body or description",
-                        ));
-                    }
-                    if dry_run {
-                        if let Some(body) = &body {
-                            crate::threads::procedures::validate_body(body)
-                                .map_err(|e| build_failure(index, item, e))?;
-                        }
-                        format!("Would patch procedure {procedure} in {project}/{name}")
-                    } else {
-                        crate::threads::procedures::update(
-                            &thread.id,
-                            procedure,
-                            body,
-                            description,
-                        )
-                        .await
-                        .map_err(|e| build_failure(index, item, e))?
-                        .ok_or_else(|| {
-                            build_failure(index, item, format!("Procedure `{procedure}` not found"))
-                        })?;
-                        format!(
-                            "Patched procedure cairn://p/{project}/{name}/procedures/{procedure}"
-                        )
-                    }
-                }
-                ChangeMode::Delete => {
-                    let referenced =
-                        crate::orchestrator::automations::list_thread_automations(&db, &thread.id)
-                            .await
-                            .map_err(|e| build_failure(index, item, e))?
-                            .into_iter()
-                            .any(|automation| automation.procedure_name == *procedure);
-                    if referenced {
-                        return Err(build_failure(index, item, format!("Cannot delete procedure `{procedure}` while automations reference it; delete those automations first")));
-                    }
-                    if dry_run {
-                        format!("Would delete procedure {procedure} from {project}/{name}")
-                    } else {
-                        if !crate::threads::procedures::delete(&thread.id, procedure)
-                            .await
-                            .map_err(|e| build_failure(index, item, e))?
-                        {
-                            return Err(build_failure(
-                                index,
-                                item,
-                                format!("Procedure `{procedure}` not found"),
-                            ));
-                        }
-                        format!("Deleted procedure {procedure} from {project}/{name}")
-                    }
-                }
-                _ => unreachable!(),
-            }
-        }
-        (CairnResource::ThreadAutomations { project, name }, ChangeMode::Create) => {
-            let payload = item
-                .payload
-                .as_ref()
-                .and_then(serde_json::Value::as_object)
-                .ok_or_else(|| {
-                    build_failure(index, item, "mode=create requires an object payload")
-                })?;
-            let procedure = payload
-                .get("procedure")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| build_failure(index, item, "payload.procedure must be a string"))?;
-            let every = payload
-                .get("every")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    build_failure(index, item, "payload.every must be a duration string")
-                })?;
-            let every_ms = crate::duration::parse_duration_ms(every)
-                .and_then(|v| i64::try_from(v).map_err(|_| "duration too large".into()))
-                .map_err(|e| {
-                    build_failure(index, item, format!("invalid automation every: {e}"))
-                })?;
-            let args = payload
-                .get("args")
-                .map(|value| {
-                    value
-                        .as_array()
-                        .ok_or_else(|| "payload.args must be an array".to_string())?
-                        .iter()
-                        .map(|v| {
-                            v.as_str()
-                                .map(str::to_string)
-                                .ok_or_else(|| "payload.args values must be strings".to_string())
-                        })
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .transpose()
-                .map_err(|e| build_failure(index, item, e))?
-                .unwrap_or_default();
-            let (db, project_id) = project_id(orch, project)
-                .await
-                .map_err(|e| build_failure(index, item, e))?;
-            let thread = thread_by_name(&db, &project_id, name)
-                .await
-                .map_err(|e| build_failure(index, item, e))?;
-            if crate::threads::procedures::get(&thread.id, procedure)
-                .await
-                .map_err(|e| build_failure(index, item, e))?
-                .is_none()
-            {
-                return Err(build_failure(
-                    index,
-                    item,
-                    format!("Procedure `{procedure}` not found"),
-                ));
-            }
-            if dry_run {
-                format!("Would create automation for {procedure} in {project}/{name}")
-            } else {
-                let automation = crate::orchestrator::automations::create_thread_automation(
-                    &db, &thread.id, procedure, args, every_ms, "agent",
-                )
-                .await
-                .map_err(|e| build_failure(index, item, e))?;
-                format!(
-                    "Created automation cairn://p/{project}/{name}/automations/{}",
-                    automation.id
-                )
-            }
-        }
-        (
-            CairnResource::ThreadAutomation { project, name, id },
-            mode @ (ChangeMode::Patch | ChangeMode::Delete),
-        ) => {
-            let (db, project_id) = project_id(orch, project)
-                .await
-                .map_err(|e| build_failure(index, item, e))?;
-            let thread = thread_by_name(&db, &project_id, name)
-                .await
-                .map_err(|e| build_failure(index, item, e))?;
-            match mode {
-                ChangeMode::Patch => {
-                    let payload = item
-                        .payload
-                        .as_ref()
-                        .and_then(serde_json::Value::as_object)
-                        .ok_or_else(|| {
-                            build_failure(index, item, "mode=patch requires an object payload")
-                        })?;
-                    let every_ms = payload
-                        .get("every")
-                        .map(|v| {
-                            v.as_str()
-                                .ok_or_else(|| "payload.every must be a string".to_string())
-                                .and_then(crate::duration::parse_duration_ms)
-                                .and_then(|v| {
-                                    i64::try_from(v).map_err(|_| "duration too large".into())
-                                })
-                        })
-                        .transpose()
-                        .map_err(|e| build_failure(index, item, e))?;
-                    let args = payload
-                        .get("args")
-                        .map(|value| {
-                            value
-                                .as_array()
-                                .ok_or_else(|| "payload.args must be an array".to_string())?
-                                .iter()
-                                .map(|v| {
-                                    v.as_str().map(str::to_string).ok_or_else(|| {
-                                        "payload.args values must be strings".to_string()
-                                    })
-                                })
-                                .collect::<Result<Vec<_>, _>>()
-                        })
-                        .transpose()
-                        .map_err(|e| build_failure(index, item, e))?;
-                    let state = payload.get("state").and_then(serde_json::Value::as_str);
-                    if dry_run {
-                        format!("Would patch automation {id} in {project}/{name}")
-                    } else {
-                        crate::orchestrator::automations::update_thread_automation(
-                            &db, &thread.id, id, every_ms, args, state,
-                        )
-                        .await
-                        .map_err(|e| build_failure(index, item, e))?
-                        .ok_or_else(|| {
-                            build_failure(index, item, format!("Automation `{id}` not found"))
-                        })?;
-                        format!("Patched automation cairn://p/{project}/{name}/automations/{id}")
-                    }
-                }
-                ChangeMode::Delete => {
-                    if dry_run {
-                        format!("Would delete automation {id} from {project}/{name}")
-                    } else {
-                        if !crate::orchestrator::automations::delete_thread_automation(
-                            &db, &thread.id, id,
-                        )
-                        .await
-                        .map_err(|e| build_failure(index, item, e))?
-                        {
-                            return Err(build_failure(
-                                index,
-                                item,
-                                format!("Automation `{id}` not found"),
-                            ));
-                        }
-                        format!("Deleted automation {id} from {project}/{name}")
-                    }
-                }
-                _ => unreachable!(),
             }
         }
         (CairnResource::ThreadDb { project, name }, ChangeMode::Patch) => {
@@ -599,35 +383,154 @@ pub(super) async fn dispatch(
                 .get("sql")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| build_failure(index, item, "payload.sql is required"))?;
-            let statements = crate::threads::db_store::validate_write_sql(sql)
-                .map_err(|error| build_failure(index, item, error))?;
+            let statements =
+                split_write_sql(sql).map_err(|error| build_failure(index, item, error))?;
             let params = statement_params(payload.get("params"), statements.len())
                 .map_err(|error| build_failure(index, item, error))?;
+            let statements: Vec<WriteStatement> = statements
+                .into_iter()
+                .zip(params)
+                .map(|(sql, params)| WriteStatement {
+                    sql,
+                    params,
+                    row: None,
+                })
+                .collect();
+            police(&statements).map_err(|error| build_failure(index, item, error))?;
 
-            let (db, project_id) = project_id(orch, project)
+            let scope = owned_thread_scope(orch, request, project, name)
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-            let thread = thread_by_name(&db, &project_id, name)
-                .await
-                .map_err(|error| build_failure(index, item, error))?;
-            let (context, context_db) =
-                crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request)
-                    .await
-                    .map_err(|_| build_failure(index, item, thread_db_refusal(project, name)))?;
-            let owner = owning_thread_id(&context_db, &context.job_id)
-                .await
-                .map_err(|_| build_failure(index, item, thread_db_refusal(project, name)))?;
-            if owner.as_deref() != Some(thread.id.as_str()) {
-                return Err(build_failure(index, item, thread_db_refusal(project, name)));
-            }
             if dry_run {
                 format!("Would apply {} statements to {uri}", statements.len())
             } else {
                 let statement_count = statements.len();
-                let changed = crate::threads::db_store::apply_write(&thread.id, statements, params)
+                let outcome = apply_write(&scope, statements, orch.services.emitter.as_ref())
                     .await
                     .map_err(|error| build_failure(index, item, error))?;
-                format!("Applied {statement_count} statements to {uri} ({changed} rows changed)")
+                format!(
+                    "Applied {statement_count} statements to {uri} ({} rows changed)",
+                    outcome.changed
+                )
+            }
+        }
+        (
+            CairnResource::ThreadDbTable {
+                project,
+                name,
+                table,
+            },
+            ChangeMode::Append,
+        ) => {
+            let payload = row_payload(item).map_err(|error| build_failure(index, item, error))?;
+            let scope = owned_thread_scope(orch, request, project, name)
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+            let shape = write_target_shape(&scope, table)
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+            let columns = db_rows::payload_columns(&shape, &payload, PayloadUse::Insert)
+                .map_err(|error| build_failure(index, item, error))?;
+            let (sql, params) = db_rows::insert_sql(&shape, &columns);
+            let statement = WriteStatement {
+                sql,
+                params,
+                row: Some(RowTarget {
+                    table: shape.table.clone(),
+                    action: RowAction::Insert,
+                    key: if shape.primary_key().is_some() {
+                        RowKey::Returned
+                    } else {
+                        RowKey::Unaddressed
+                    },
+                }),
+            };
+            police(std::slice::from_ref(&statement))
+                .map_err(|error| build_failure(index, item, error))?;
+            let collection = cairn_common::uri::build_db_table_uri(&scope.db_root(), table);
+            if dry_run {
+                format!("Would insert one row into {collection}")
+            } else {
+                let outcome = apply_write(&scope, vec![statement], orch.services.emitter.as_ref())
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+                match outcome.changes.into_iter().find_map(|change| change.uri) {
+                    Some(row) => {
+                        let summary = format!("Inserted {row}");
+                        *applied_data = Some(serde_json::json!({ "uri": row }));
+                        summary
+                    }
+                    None => format!(
+                        "Inserted one row into {collection}; `{table}` has a composite (or no) primary key, so the row has no URI"
+                    ),
+                }
+            }
+        }
+        (
+            CairnResource::ThreadDbRow {
+                project,
+                name,
+                table,
+                pk,
+            },
+            mode @ (ChangeMode::Patch | ChangeMode::Delete),
+        ) => {
+            let payload = row_payload(item).map_err(|error| build_failure(index, item, error))?;
+            if mode == ChangeMode::Patch && payload.is_empty() {
+                return Err(build_failure(
+                    index,
+                    item,
+                    "patch needs the columns to change: payload:{column: value, ...}",
+                ));
+            }
+            if mode == ChangeMode::Delete && !payload.is_empty() {
+                return Err(build_failure(index, item, "delete takes no payload"));
+            }
+            let scope = owned_thread_scope(orch, request, project, name)
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+            let root = scope.db_root();
+            let row_uri = cairn_common::uri::build_db_row_uri(&root, table, pk);
+            let shape = write_target_shape(&scope, table)
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+            let key = shape.primary_key().ok_or_else(|| {
+                build_failure(index, item, db_rows::rows_have_no_uri(&root, table))
+            })?;
+            let (sql, params, action) = if mode == ChangeMode::Patch {
+                let columns = db_rows::payload_columns(&shape, &payload, PayloadUse::Update)
+                    .map_err(|error| build_failure(index, item, error))?;
+                let (sql, params) = db_rows::update_sql(&shape, key, pk, &columns);
+                (sql, params, RowAction::Update)
+            } else {
+                let (sql, params) = db_rows::delete_sql(&shape, key, pk);
+                (sql, params, RowAction::Delete)
+            };
+            let statement = WriteStatement {
+                sql,
+                params,
+                row: Some(RowTarget {
+                    table: shape.table.clone(),
+                    action,
+                    key: RowKey::Known(pk.clone()),
+                }),
+            };
+            police(std::slice::from_ref(&statement))
+                .map_err(|error| build_failure(index, item, error))?;
+            let verb = if action == RowAction::Update {
+                "Updated"
+            } else {
+                "Deleted"
+            };
+            if dry_run {
+                format!("Would have {} {row_uri}", verb.to_ascii_lowercase())
+            } else {
+                apply_write(&scope, vec![statement], orch.services.emitter.as_ref())
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+                let summary = format!("{verb} {row_uri}");
+                *applied_data = Some(serde_json::json!({ "uri": row_uri }));
+                summary
             }
         }
         (CairnResource::ProjectThreads { project }, ChangeMode::Append) => {

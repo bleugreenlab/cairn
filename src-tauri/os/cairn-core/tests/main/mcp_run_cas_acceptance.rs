@@ -440,7 +440,7 @@ fn git(repo: &Path, args: &[&str]) -> String {
 
 fn init_repo(repo: &Path) -> String {
     std::fs::create_dir_all(repo).unwrap();
-    git(repo, &["init"]);
+    git(repo, &["init", "-b", "main"]);
     git(repo, &["config", "user.email", "acceptance@example.com"]);
     git(repo, &["config", "user.name", "Acceptance"]);
     std::fs::write(repo.join("README.md"), "cold objects\n").unwrap();
@@ -580,6 +580,7 @@ fn request_at(
         command_resource_identity: None,
         resource_reservation: Default::default(),
         learned_estimate: None,
+        scratch_sync: None,
     }
 }
 

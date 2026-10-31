@@ -442,15 +442,28 @@ pub(super) async fn apply_settings_patch(
         summary.push(format!("build services ({count} op(s))"));
     }
 
-    // --- Inference link (replaces the section) ---
+    // --- Inference link and recipe declarations (replaces the section) ---
     if let Some(section) = obj.get("inference") {
         let inference = parse_inference(section)?;
         if !dry_run {
             settings::set_inference(&orch.config_dir, &inference)?;
         }
-        summary.push(match &inference.bginf {
+        let link = match &inference.bginf {
             Some(link) => format!("inference (bginf link {})", link.url),
             None => "inference (bginf link removed)".to_string(),
+        };
+        summary.push(if inference.recipes.is_empty() {
+            format!("{link}; no recipe declarations")
+        } else {
+            format!(
+                "{link}; recipes declared: {}",
+                inference
+                    .recipes
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         });
     }
 

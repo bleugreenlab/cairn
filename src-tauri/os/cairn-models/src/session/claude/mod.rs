@@ -7,6 +7,7 @@ pub mod args;
 
 use std::io::Write;
 
+use cairn_common::callback_contract::AGENT_MCP_TOOL_TIMEOUT;
 use cairn_platform::services::process::SpawnConfig;
 use serde_json::json;
 
@@ -23,14 +24,27 @@ use args::{build_claude_args, ClaudeArgsConfig};
 /// The environment every Claude session runs with, whoever launches it.
 ///
 /// Tool search and the CLI's own task list are off because Cairn owns tool
-/// discovery and delegation. The MCP tool timeout is seven days: a blocking
-/// `write` append (a sub-agent, a user question) has no host-side deadline, and
-/// the CLI's default would abandon the call while the host keeps working.
-pub const CLAUDE_SESSION_ENV: [(&str, &str); 3] = [
-    ("ENABLE_TOOL_SEARCH", "false"),
-    ("CLAUDE_CODE_ENABLE_TASKS", "false"),
-    ("MCP_TOOL_TIMEOUT", "604800000"),
-];
+/// discovery and delegation.
+///
+/// The CLI bounds an MCP tool call twice. `MCP_TOOL_TIMEOUT` caps its length;
+/// `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` abandons a call that has neither
+/// answered nor reported progress for that long (by default 300 s over HTTP
+/// and 1800 s over stdio). A Cairn call can be held open far longer: a blocking
+/// `write` append awaits a sub-agent or a user with no host-side deadline. So
+/// both are [`AGENT_MCP_TOOL_TIMEOUT`], and Cairn rather than the client
+/// decides when a call ends. Cairn's MCP server sends progress heartbeats on
+/// every held call, which is what keeps the idle bound from firing; the idle
+/// setting is the backstop for a CLI build that stops honoring them. It is not
+/// 0, which would disable the bound even for a wedged socket.
+pub fn claude_session_env() -> [(&'static str, String); 4] {
+    let tool_timeout_ms = AGENT_MCP_TOOL_TIMEOUT.as_millis().to_string();
+    [
+        ("ENABLE_TOOL_SEARCH", "false".to_string()),
+        ("CLAUDE_CODE_ENABLE_TASKS", "false".to_string()),
+        ("MCP_TOOL_TIMEOUT", tool_timeout_ms.clone()),
+        ("CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT", tool_timeout_ms),
+    ]
+}
 
 /// Every way a Claude CLI can be handed a credential through its environment.
 /// A launch carries exactly the ones its own secrets set; any other value
@@ -106,8 +120,8 @@ impl ClaudeCli {
             .args(&args)
             .cwd(&spec.cwd)
             .stdin(true);
-        for (name, value) in CLAUDE_SESSION_ENV {
-            config = config.env(name, value);
+        for (name, value) in claude_session_env() {
+            config = config.env(name, &value);
         }
         for (name, value) in &spec.env {
             config = config.env(name, value);
@@ -373,6 +387,12 @@ mod tests {
         assert!(!config
             .args
             .contains(&"--no-session-persistence".to_string()));
+
+        // Both of the CLI's tool-call bounds are Cairn's shared one.
+        let tool_timeout_ms = AGENT_MCP_TOOL_TIMEOUT.as_millis().to_string();
+        for name in ["MCP_TOOL_TIMEOUT", "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT"] {
+            assert_eq!(config.env.get(name), Some(&tool_timeout_ms), "{name}");
+        }
     }
 
     /// A tool-free one-shot: an empty strict MCP config, no built-in tools,

@@ -20,7 +20,6 @@
 //! gate reads, nudges the gate sweep.
 
 pub mod evidence;
-pub(crate) mod filing;
 mod policy;
 mod read;
 mod ruling_import;
@@ -38,14 +37,14 @@ use serde::{Deserialize, Serialize};
 use crate::services::EventEmitter;
 
 pub use policy::{
-    load_policy, operator_only_policy_refusal, release_label, set_gated_recipes, set_release,
-    TenetPolicy, TenetRelease, OPERATOR_ONLY_POLICY_REFUSAL, RATIFIED_REFUSAL,
+    load_policy, operator_only_policy_refusal, release_label, set_release, TenetPolicy,
+    TenetRelease, OPERATOR_ONLY_POLICY_REFUSAL, RATIFIED_REFUSAL,
 };
 pub use read::{
     for_thread, get, list, pending_count, resolve_number, status_filter, thread_named,
     TenetEvidence, TenetFilter, TenetGate, TenetView,
 };
-pub(crate) use read::{lookup_conn, row_conn, TenetLookup};
+pub(crate) use read::{lookup_conn, TenetLookup};
 pub use ruling_import::{import_database, import_thread_rulings, ImportReport, ProjectImport};
 pub(crate) use verdict::ensure_decision_comment;
 pub(crate) use write::release_deleted_thread_conn;
@@ -64,13 +63,17 @@ pub const TENET_GATE_FACT: &str = "tenet_verdict";
 /// operator answers at a glance.
 pub const MAX_STATEMENT_CHARS: usize = 200;
 
-/// The ceiling on a proposal's rationale, in characters. Detail beyond it
-/// belongs in the issue or chat turn the rationale cites.
-pub const MAX_RATIONALE_CHARS: usize = 1500;
+/// An abuse bound on a proposal's rationale, in characters, not a prose limit:
+/// the rationale is where the argument behind a tenet survives whole, and it is
+/// as long as that argument needs. The glance surfaces collapse it; storage
+/// does not cut it. The bound exists because the rationale is copied whole into
+/// the verdict message and every released issue's approval comment, so a
+/// runaway payload (a pasted file) would multiply.
+pub const MAX_RATIONALE_CHARS: usize = 32 * 1024;
 
 pub const OVER_LENGTH_REFUSAL: &str = "a tenet statement is one sentence the operator answers at a glance (≤200 chars); put the reasoning, rejected alternatives, and provenance links in `rationale`";
 
-pub const RATIONALE_OVER_LENGTH_REFUSAL: &str = "a tenet's rationale is at most 1500 characters; cite the issue or chat turn where it was argued instead of restating it";
+pub const RATIONALE_OVER_LENGTH_REFUSAL: &str = "a tenet's rationale is the argument behind it, not an attached document; this one is past the 32768-character bound, which exists only to stop a runaway payload";
 
 /// The refusal for any attempt to change a tenet's content.
 pub const IMMUTABLE_REFUSAL: &str = "tenets are immutable; withdraw and propose again";
@@ -80,14 +83,40 @@ pub const AGENT_VERDICT_REFUSAL: &str =
     "verdicts belong to the operator: a tenet is answered in the desktop app, from the proposing thread's Tenets facet, the proposal's card in the chat, or the project Tenets tab, never by an agent";
 
 /// The refusal for a proposal in the retired question-with-options shape,
-/// with `prefix` naming where the proposal sits in the payload (`payload.`,
-/// `payload.execution.proposal.`).
+/// with `prefix` naming where the proposal sits in the payload (`payload.`).
 pub fn retired_proposal_shape_refusal(prefix: &str) -> String {
     format!(
         "a tenet is one statement the operator answers yes or no: send {prefix}statement, \
          \"this is how we do things\", in place of `question` and `options`, which are retired. \
          Alternatives you ruled out belong in {prefix}rationale."
     )
+}
+
+/// The refusal for a filing (an executions-collection append, or the
+/// `execution` block of an issue create, at `prefix`) that carries `proposal`
+/// or `tenet`. A filing neither proposes nor names a tenet: proposing is the
+/// tenets collection's append, and a filing holds on a tenet only through a
+/// `tenet_verdict` clause in its own `after`. `None` when neither key is there.
+pub fn filing_tenet_keys_refusal(
+    object: Option<&serde_json::Value>,
+    prefix: &str,
+) -> Option<String> {
+    let map = object?.as_object()?;
+    let named: Vec<String> = ["proposal", "tenet"]
+        .into_iter()
+        .filter(|key| map.contains_key(*key))
+        .map(|key| format!("`{prefix}{key}`"))
+        .collect();
+    if named.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Unknown payload key(s): {}. A filing neither proposes nor names a tenet: propose one \
+         with an append to cairn://p/PROJECT/tenets, and to hold this filing on its verdict, \
+         name it in `{prefix}after` as {{fact:\"tenet_verdict\", \
+         tenet:\"cairn://p/PROJECT/tenets/N\", outcome:\"answered\"}}.",
+        named.join(", ")
+    ))
 }
 
 /// The refusal for changing a tenet that already has a verdict: the change is
@@ -145,7 +174,8 @@ impl TenetStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TenetOrigin {
-    /// Proposed as the condition of a gated filing.
+    /// Proposed by a filing's own `proposal` key, which no filing takes any
+    /// more. Nothing produces this origin now; it stays so existing rows read.
     #[serde(rename = "filing-gate")]
     FilingGate,
     /// Proposed on its own through the tenets collection.
@@ -298,8 +328,8 @@ pub struct TenetRow {
 }
 
 /// Record the operator's verdict ([`answer`]) and rouse the proposing thread
-/// when the verdict wants it awake. This is the operator's answering act for
-/// any caller holding an orchestrator.
+/// the verdict was delivered to. This is the operator's answering act for any
+/// caller holding an orchestrator.
 pub async fn answer_and_wake(
     orch: &crate::orchestrator::Orchestrator,
     db: &crate::storage::LocalDb,

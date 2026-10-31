@@ -326,6 +326,13 @@ export const actionManifest = [
     defaultSequence: keySequence(keybind("c")),
   },
   {
+    id: "notifications.toggle",
+    label: "Open notifications",
+    category: "actions",
+    contexts: ["global"],
+    defaultSequence: keySequence(keybind("n")),
+  },
+  {
     id: "palette.open",
     label: "Open command palette",
     category: "actions",
@@ -352,6 +359,38 @@ export const actionManifest = [
     category: "actions",
     contexts: ["global"],
     defaultSequence: keySequence(keybind("a", "meta", "shift")),
+  },
+
+  // ============================================================================
+  // NOTIFICATION CENTER (while its panel is open)
+  // ============================================================================
+  {
+    id: "notifications.next",
+    label: "Next notification",
+    category: "navigation",
+    contexts: ["notificationCenter"],
+    defaultSequence: keySequence(keybind("ArrowDown")),
+  },
+  {
+    id: "notifications.previous",
+    label: "Previous notification",
+    category: "navigation",
+    contexts: ["notificationCenter"],
+    defaultSequence: keySequence(keybind("ArrowUp")),
+  },
+  {
+    id: "notifications.openEntry",
+    label: "Go to the highlighted notification's source",
+    category: "navigation",
+    contexts: ["notificationCenter"],
+    defaultSequence: keySequence(keybind("Enter")),
+  },
+  {
+    id: "notifications.close",
+    label: "Close notifications",
+    category: "actions",
+    contexts: ["notificationCenter"],
+    defaultSequence: keySequence(keybind("Escape")),
   },
 
 ] as const satisfies readonly ActionDefinition[];

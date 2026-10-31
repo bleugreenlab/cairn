@@ -12,6 +12,8 @@ use crate::mcp::handlers::run_context::project_id_by_key;
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
 use cairn_common::query::{encode_query_params, QueryParam};
+
+use super::paging::RecordPage;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 const RESULT_SCHEMA_VERSION: i64 =
@@ -161,21 +163,27 @@ pub(super) async fn read_project_check_results(
     revision: &str,
     params: &[QueryParam],
 ) -> String {
-    let query = match parse_query(params) {
-        Ok(query) => query,
-        Err(error) => return error,
-    };
+    read_project_check_results_page(orch, request, project, revision, params)
+        .await
+        .map_or_else(|error| error, |page| page.body)
+}
+
+/// [`read_project_check_results`] as a page the read view continues in tests.
+pub(super) async fn read_project_check_results_page(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project: &str,
+    revision: &str,
+    params: &[QueryParam],
+) -> Result<RecordPage, String> {
+    let query = parse_query(params)?;
     let db = orch.db.for_project(project).await;
-    let project_id = match project_id_by_key(&db, project).await {
-        Ok(project_id) => project_id,
-        Err(error) => return error,
-    };
-    let resolution = match resolve_for_read(orch, request, revision).await {
-        Ok(resolution) => resolution,
-        Err(error) => return format!("Unable to resolve requested revision '{revision}': {error}"),
-    };
+    let project_id = project_id_by_key(&db, project).await?;
+    let resolution = resolve_for_read(orch, request, revision)
+        .await
+        .map_err(|error| format!("Unable to resolve requested revision '{revision}': {error}"))?;
     if resolution.project_id != project_id {
-        return format!("Requested revision '{revision}' resolved in a different project; refusing to substitute that commit");
+        return Err(format!("Requested revision '{revision}' resolved in a different project; refusing to substitute that commit"));
     }
     let mut query = query;
     if query.environment == "current" {
@@ -185,19 +193,19 @@ pub(super) async fn read_project_check_results(
             ".cairn/config.yaml",
         ) {
             Ok(Some(bytes)) => bytes,
-            Ok(None) => return format!("Unable to resolve suite '{}' at requested revision '{revision}': .cairn/config.yaml is unavailable", query.suite),
-            Err(error) => return format!("Unable to resolve suite '{}' at requested revision '{revision}': {error}", query.suite),
+            Ok(None) => return Err(format!("Unable to resolve suite '{}' at requested revision '{revision}': .cairn/config.yaml is unavailable", query.suite)),
+            Err(error) => return Err(format!("Unable to resolve suite '{}' at requested revision '{revision}': {error}", query.suite)),
         };
         let settings: crate::config::project_settings::ProjectSettingsFile = match serde_yaml::from_slice(&config) {
             Ok(settings) => settings,
-            Err(error) => return format!("Unable to resolve suite '{}' at requested revision '{revision}': invalid .cairn/config.yaml: {error}", query.suite),
+            Err(error) => return Err(format!("Unable to resolve suite '{}' at requested revision '{revision}': invalid .cairn/config.yaml: {error}", query.suite)),
         };
         let Some(check) = settings
             .checks
             .as_ref()
             .and_then(|checks| checks.get(&query.suite))
         else {
-            return format!("Unable to resolve suite '{}' at requested revision '{revision}': suite is not configured", query.suite);
+            return Err(format!("Unable to resolve suite '{}' at requested revision '{revision}': suite is not configured", query.suite));
         };
         query.environment_fingerprint =
             crate::execution::check_identity::local_environment_identity(
@@ -219,7 +227,7 @@ pub(super) async fn read_project_check_results(
         query.limit,
         query.offset,
     ) {
-        Ok(Some(observation)) => render_observation(
+        Ok(Some(observation)) => Ok(render_observation_page(
             project,
             revision,
             &resolution.commit_id,
@@ -227,15 +235,24 @@ pub(super) async fn read_project_check_results(
             &observation,
             None,
             ran_on(orch, &observation).as_deref(),
-        ),
-        Ok(None) => render_miss(
-            project,
-            revision,
-            &resolution.commit_id,
-            &query.suite,
-            &query.environment_fingerprint,
-        ),
-        Err(error) => format!("Unable to read check observation: {error}"),
+        )),
+        Ok(None) => Ok(RecordPage {
+            body: render_miss(
+                project,
+                revision,
+                &resolution.commit_id,
+                &query.suite,
+                &query.environment_fingerprint,
+            ),
+            noun: "tests",
+            offset: query.offset,
+            limit: query.limit,
+            shown: 0,
+            total: None,
+            more: false,
+            prelude_lines: None,
+        }),
+        Err(error) => Err(format!("Unable to read check observation: {error}")),
     }
 }
 
@@ -289,6 +306,29 @@ fn render_observation(
     permalink: Option<&str>,
     ran_on: Option<&str>,
 ) -> String {
+    render_observation_page(
+        project,
+        revision,
+        commit,
+        query,
+        observation,
+        permalink,
+        ran_on,
+    )
+    .body
+}
+
+/// An observation as a page of its tests: the observation's facts, then one
+/// line per test on this page, then the retained output tail.
+fn render_observation_page(
+    project: &str,
+    revision: &str,
+    commit: &str,
+    query: &CheckResultsQuery,
+    observation: &CheckResultObservationProjection,
+    permalink: Option<&str>,
+    ran_on: Option<&str>,
+) -> RecordPage {
     let short_commit = commit.get(..12).unwrap_or(commit);
     let handle = format!("{}@{short_commit}", observation.check_name);
     let params = encode_query_params(&[
@@ -381,6 +421,9 @@ fn render_observation(
         observation.cell_origin.as_ref(),
     ) {
         body.push(line);
+    }
+    if let Some(build_jobs) = observation.build_jobs {
+        body.push(format!("- Build jobs: {}", build_jobs.describe()));
     }
     if let Some(generation) = observation.executor_connection_generation {
         body.push(format!("- Executor generation: {generation}"));
@@ -493,6 +536,8 @@ fn render_observation(
     } else {
         body.push("- Next: none".to_string());
     }
+    // An element may itself hold several lines; count what the join renders.
+    let prelude_lines = body.iter().map(|line| line.split('\n').count()).sum();
     for test in &observation.tests {
         let mut line = format!("- [{}] {}", test.status, test.test_id);
         if let Some(duration) = test.duration_ms {
@@ -529,7 +574,16 @@ fn render_observation(
             fence,
         ]);
     }
-    body.join("\n")
+    RecordPage {
+        body: body.join("\n"),
+        noun: "tests",
+        offset: observation.test_offset,
+        limit: query.limit,
+        shown: observation.tests.len(),
+        total: Some(observation.test_total),
+        more: false,
+        prelude_lines: Some(prelude_lines),
+    }
 }
 
 /// A backtick fence longer than any backtick run inside the output, so tool
@@ -636,7 +690,12 @@ fn phase_lines(
             .passes
             .iter()
             .map(|pass| {
-                let run = if pass.name == "warmup" { "run" } else { "test" };
+                // Passes that run no test to a verdict (see lane-phases.ts).
+                let run = if matches!(pass.name.as_str(), "warmup" | "build") {
+                    "run"
+                } else {
+                    "test"
+                };
                 let summary = pass
                     .summary_ms
                     .map(|ms| format!(" (nextest {})", phase_span(ms)))
@@ -680,6 +739,22 @@ mod tests {
             param("environment", "fingerprint")
         ])
         .is_ok());
+    }
+
+    /// The parser's other tests hand it pre-split params; this one starts from
+    /// the target string an agent writes, so a grammar that folds
+    /// `&environment=` into the suite value fails here as "Missing environment".
+    #[test]
+    fn query_parses_from_the_raw_target_in_either_order() {
+        for target in [
+            "cairn://p/cairn/check-results/main?suite=rust-tests&environment=current",
+            "cairn://p/cairn/check-results/main?environment=current&suite=rust-tests",
+        ] {
+            let split = cairn_common::query::split_target_query(target).unwrap();
+            let query = parse_query(&split.params).unwrap();
+            assert_eq!(query.suite, "rust-tests", "{target}");
+            assert_eq!(query.environment, "current", "{target}");
+        }
     }
 
     #[test]
@@ -818,6 +893,7 @@ mod tests {
             phases: None,
             execution_warmth: None,
             cell_origin: None,
+            build_jobs: None,
             test_total: 3,
             test_offset: 0,
         }
@@ -910,6 +986,7 @@ mod tests {
             compile_ms,
             test_ms,
             compiled_units: 0,
+            compiled_crates: Vec::new(),
             summary_ms,
         };
         let mut observation = cached_observation();
@@ -959,6 +1036,24 @@ mod tests {
         assert!(
             !body.contains("- Passes:"),
             "one pass needs no breakdown: {body}"
+        );
+        assert!(!body.contains("- Build jobs:"), "{body}");
+        const GIB: u64 = 1 << 30;
+        observation.build_jobs = Some(cairn_common::executor_protocol::BuildJobs::new(
+            8,
+            Some(cairn_common::executor_protocol::MemoryJobBound::new(
+                12 * GIB,
+                0,
+                5 * GIB / 2,
+                1,
+            )),
+        ));
+        let body = render(&observation);
+        assert!(
+            body.contains(
+                "- Build jobs: 4 build jobs, held below the CPU width of 8 by memory: 12.0 GiB available at start / 2.5 GiB per job\n"
+            ),
+            "{body}"
         );
 
         observation.duration_ms = 836_000;

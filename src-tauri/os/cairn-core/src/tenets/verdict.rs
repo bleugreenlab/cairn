@@ -5,8 +5,9 @@
 //!
 //! - the proposing thread gets one system direct message, keyed
 //!   `tenet-verdict:<id>`: the verdict, the statement and its rationale, the
-//!   comment, and what it gated. A decline steers the
-//!   thread awake; an approval rides along quietly with its next turn.
+//!   comment, and what it gated. Every verdict steers the thread awake: the
+//!   thread proposed the rule and is the one that must act on the answer,
+//!   and an approval of a tenet that gates nothing has no other signal.
 //! - every issue an approved tenet releases gets a comment naming the decision,
 //!   so the planner that starts on release reads what the operator decided
 //!   from the issue it works. The comment's id is derived from the tenet and
@@ -26,8 +27,8 @@ use crate::storage::{DbResult, RowExt};
 /// What delivering a verdict wrote.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Delivered {
-    /// The proposing thread's session job, when the message reached it and
-    /// its urgency wants an idle session roused.
+    /// The proposing thread's session job, to rouse when the message reached
+    /// it.
     pub wake: Option<String>,
     /// How many gated issues got the approval comment.
     pub comments: usize,
@@ -314,23 +315,16 @@ pub(super) async fn deliver_conn(
         );
         return Ok(delivered);
     };
-    let urgency = if tenet.status == TenetStatus::Declined {
-        DeliveryUrgency::Steer
-    } else {
-        DeliveryUrgency::Passive
-    };
     cairn_attention::direct::insert_system_direct_push_with_message_id_conn(
         conn,
         &session,
         &run,
         &verdict_message(tenet, &uri, &label, superseded, &gated),
-        urgency,
+        DeliveryUrgency::Steer,
         Some(&verdict_key(&tenet.id)),
         &message_id,
     )
     .await?;
-    if urgency.wakes_idle() {
-        delivered.wake = Some(session);
-    }
+    delivered.wake = Some(session);
     Ok(delivered)
 }

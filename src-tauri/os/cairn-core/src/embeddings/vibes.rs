@@ -13,11 +13,18 @@
 //! distribution — the embedding cone makes absolute cosine useless for saturation
 //! — into `[0,1]`, then mapped to an OKLCH color: PHASE drives the base hue
 //! (indigo → green) and FRICTION bends the hue toward red while raising chroma and
-//! darkening lightness, so tool-use friction *pops* in the skyline. The axes and
-//! their percentile tables are computed offline and bundled as `vibe_axes.json`
-//! (regenerate with `examples/compute_vibe_axes.rs`).
+//! darkening lightness, so tool-use friction *pops* in the skyline.
+//!
+//! Axes are directions in one model's space at one width. The Cohere v4 set
+//! is bundled as `vibe_axes.json` (regenerate with
+//! `examples/compute_vibe_axes.rs`); every other model's set is learned from
+//! the workspace's own history ([`super::vibe_recompute`]) and stored in
+//! `vibe_axes`. [`VibeState`] holds every set it knows, and an event is
+//! coloured only by the set of the space its vector came from.
 
-use serde::Deserialize;
+use std::sync::RwLock;
+
+use serde::{Deserialize, Serialize};
 
 use super::vector::cosine_similarity;
 
@@ -36,15 +43,47 @@ const L_HOT: f32 = 0.62; // lightness at friction01 = 1 (slightly darker/alarmin
 
 /// A behaviorally-grounded contrast axis: a unit direction in embedding space
 /// plus the empirical percentile breakpoints of corpus projections onto it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VibeAxis {
     /// Axis name (`"phase"` | `"friction"`).
-    name: String,
-    /// 1536-d unit contrast vector (`norm(mean(pos) - mean(neg))`).
-    vector: Vec<f32>,
+    pub name: String,
+    /// Unit contrast vector (`norm(mean(pos) - mean(neg))`), as wide as the
+    /// space it was learned in.
+    pub vector: Vec<f32>,
     /// 101 sorted breakpoints `p0..=p100` of the empirical projection
     /// distribution, used to percentile-rank a new projection into `[0,1]`.
-    percentiles: Vec<f32>,
+    pub percentiles: Vec<f32>,
+}
+
+/// The axes of one space: the model and width they were learned in. The
+/// bundled file, a stored `vibe_axes` row and the offline regenerator's output
+/// all have this shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AxisSet {
+    pub model: String,
+    pub dims: u32,
+    pub axes: Vec<VibeAxis>,
+}
+
+impl AxisSet {
+    /// The bundled Cohere v4 set; `None` (logged) if it does not parse.
+    pub fn bundled() -> Option<Self> {
+        serde_json::from_str(BUNDLED_AXES)
+            .map_err(|e| log::error!("Failed to parse bundled vibe axes: {e}"))
+            .ok()
+    }
+
+    /// An axis by name.
+    pub fn axis(&self, name: &str) -> Option<&VibeAxis> {
+        self.axes.iter().find(|a| a.name == name)
+    }
+
+    /// Whether this set colours vectors stored under `model` at `dims`. An
+    /// unknown width (an offer that does not state it before asking) matches
+    /// on the model alone.
+    pub fn covers(&self, model: &str, dims: Option<u32>) -> bool {
+        self.model == model && dims.is_none_or(|dims| dims == self.dims)
+    }
 }
 
 /// The result of assigning a vibe to an event: a CSS color plus the two
@@ -61,30 +100,15 @@ pub struct VibeAssignment {
     pub(crate) friction: f32,
 }
 
-/// Holds the loaded contrast axes, ready for assignment. Expects a `phase` and a
-/// `friction` axis; an empty set assigns no color (callers fall back to neutral).
+/// Every axis set known, ready for assignment: the bundled one, those stored
+/// in `vibe_axes`, and any the recompute adds while the app runs. A set is
+/// expected to hold a `phase` and a `friction` axis.
 ///
 /// The axes are directions in one model's space at one width, the ones they
-/// were learned in. A vector from any other space projects onto them as
-/// noise, so it is not coloured at all.
+/// were learned in. A vector from a space with no set projects onto any other
+/// set as noise, so it is not coloured at all (callers fall back to neutral).
 pub struct VibeState {
-    axes: Vec<VibeAxis>,
-    model: String,
-    dims: u32,
-}
-
-#[derive(Deserialize)]
-struct BundledAxes {
-    model: String,
-    dims: u32,
-    axes: Vec<BundledAxis>,
-}
-
-#[derive(Deserialize)]
-struct BundledAxis {
-    name: String,
-    vector: Vec<f32>,
-    percentiles: Vec<f32>,
+    sets: RwLock<Vec<AxisSet>>,
 }
 
 /// Cohere-space contrast axes + percentile tables generated offline.
@@ -92,67 +116,64 @@ struct BundledAxis {
 const BUNDLED_AXES: &str = include_str!("vibe_axes.json");
 
 impl VibeState {
-    /// Load the bundled contrast axes. Returns an empty `VibeState` (which
-    /// assigns no colors — callers fall back to neutral) if the bundle can't be
-    /// parsed, so a bad bundle degrades gracefully rather than panicking.
-    pub fn from_bundled() -> Self {
-        match serde_json::from_str::<BundledAxes>(BUNDLED_AXES) {
-            Ok(bundle) => {
-                let axes = bundle
-                    .axes
-                    .into_iter()
-                    .map(|a| VibeAxis {
-                        name: a.name,
-                        vector: a.vector,
-                        percentiles: a.percentiles,
-                    })
-                    .collect::<Vec<_>>();
-                log::info!(
-                    "VibeState loaded {} contrast axes for {} at {}",
-                    axes.len(),
-                    bundle.model,
-                    bundle.dims
-                );
-                Self {
-                    axes,
-                    model: bundle.model,
-                    dims: bundle.dims,
-                }
-            }
-            Err(e) => {
-                log::error!("Failed to parse bundled vibe axes: {e}");
-                Self {
-                    axes: Vec::new(),
-                    model: String::new(),
-                    dims: 0,
-                }
-            }
+    /// No sets at all: nothing is coloured until one is inserted.
+    pub fn empty() -> Self {
+        Self {
+            sets: RwLock::new(Vec::new()),
         }
     }
 
-    /// Find a loaded axis by name.
-    fn axis(&self, name: &str) -> Option<&VibeAxis> {
-        self.axes.iter().find(|a| a.name == name)
+    /// Seeded with the bundled Cohere v4 set. A bundle that does not parse
+    /// leaves it empty, which colours nothing rather than panicking.
+    pub fn from_bundled() -> Self {
+        let state = Self::empty();
+        if let Some(bundle) = AxisSet::bundled() {
+            log::info!(
+                "VibeState loaded {} contrast axes for {} at {}",
+                bundle.axes.len(),
+                bundle.model,
+                bundle.dims
+            );
+            state.insert(bundle);
+        }
+        state
+    }
+
+    /// Add `set`, replacing any set of the same model and width.
+    pub fn insert(&self, set: AxisSet) {
+        let mut sets = self.sets.write().unwrap_or_else(|e| e.into_inner());
+        sets.retain(|held| !(held.model == set.model && held.dims == set.dims));
+        sets.push(set);
+    }
+
+    /// Whether a set colours vectors stored under `model` at `dims` (see
+    /// [`AxisSet::covers`]).
+    pub fn covers(&self, model: &str, dims: Option<u32>) -> bool {
+        self.sets
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|set| set.covers(model, dims))
     }
 
     /// Assign a vibe color to a single embedding stored under `key`. Returns
-    /// `None` when the `phase` or `friction` axis is missing, or when the
-    /// embedding is not of the space the axes were learned in (color falls
-    /// back to neutral upstream).
+    /// `None` when no set was learned in the embedding's space, or the set
+    /// lacks the `phase` or `friction` axis (color falls back to neutral
+    /// upstream).
     pub(crate) fn assign_one(
         &self,
         event_id: &str,
         key: &super::VectorKey,
         embedding: &[f32],
     ) -> Option<VibeAssignment> {
-        if key.model != self.model
-            || key.dims != Some(self.dims)
-            || embedding.len() != self.dims as usize
-        {
-            return None;
-        }
-        let phase_axis = self.axis("phase")?;
-        let friction_axis = self.axis("friction")?;
+        let sets = self.sets.read().unwrap_or_else(|e| e.into_inner());
+        let set = sets.iter().find(|set| {
+            key.model == set.model
+                && key.dims == Some(set.dims)
+                && embedding.len() == set.dims as usize
+        })?;
+        let phase_axis = set.axis("phase")?;
+        let friction_axis = set.axis("friction")?;
 
         // The axis is a unit vector and `cosine_similarity` normalizes the
         // embedding, so this is the normalized projection the percentile tables
@@ -229,26 +250,6 @@ fn color_for(phase01: f32, friction01: f32) -> String {
 fn shortarc_lerp(a: f32, b: f32, t: f32) -> f32 {
     let delta = ((b - a + 540.0) % 360.0) - 180.0;
     (a + delta * t).rem_euclid(360.0)
-}
-
-/// Compute the element-wise average of a set of vectors.
-/// Used by the offline axis generator.
-pub fn average_vectors(vectors: &[Vec<f32>]) -> Vec<f32> {
-    if vectors.is_empty() {
-        return vec![];
-    }
-    let dims = vectors[0].len();
-    let n = vectors.len() as f32;
-    let mut avg = vec![0.0_f32; dims];
-    for v in vectors {
-        for (i, val) in v.iter().enumerate() {
-            avg[i] += val;
-        }
-    }
-    for val in &mut avg {
-        *val /= n;
-    }
-    avg
 }
 
 #[cfg(test)]
@@ -360,25 +361,14 @@ mod tests {
     }
 
     #[test]
-    fn average_vectors_basic() {
-        let vecs = vec![vec![1.0, 2.0, 3.0], vec![3.0, 4.0, 5.0]];
-        assert_eq!(average_vectors(&vecs), vec![2.0, 3.0, 4.0]);
-    }
-
-    #[test]
-    fn average_vectors_empty() {
-        let vecs: Vec<Vec<f32>> = vec![];
-        assert!(average_vectors(&vecs).is_empty());
-    }
-
-    #[test]
     fn bundled_axes_load() {
-        let state = VibeState::from_bundled();
-        assert_eq!(state.axes.len(), 2, "expected phase + friction axes");
-        let names: Vec<&str> = state.axes.iter().map(|a| a.name.as_str()).collect();
+        let set = AxisSet::bundled().expect("the bundle parses");
+        assert_eq!(set.axes.len(), 2, "expected phase + friction axes");
+        let names: Vec<&str> = set.axes.iter().map(|a| a.name.as_str()).collect();
         assert!(names.contains(&"phase"));
         assert!(names.contains(&"friction"));
-        for axis in &state.axes {
+        assert!(VibeState::from_bundled().covers("cohere-embed-v4", Some(1536)));
+        for axis in &set.axes {
             assert_eq!(axis.vector.len(), 1536, "axis {} wrong dims", axis.name);
             assert_eq!(
                 axis.percentiles.len(),
@@ -393,8 +383,8 @@ mod tests {
     fn bundled_phase_percentiles_match_findings() {
         // The corpus-derived PHASE projection distribution should reproduce the
         // validated research endpoints (FINDINGS: p05~-0.17, p50~+0.03, p95~+0.21).
-        let state = VibeState::from_bundled();
-        let phase = state.axis("phase").expect("phase axis");
+        let set = AxisSet::bundled().unwrap();
+        let phase = set.axis("phase").expect("phase axis");
         assert!(
             (phase.percentiles[5] - (-0.173)).abs() < 0.01,
             "p05={}",
@@ -413,11 +403,13 @@ mod tests {
     }
 
     fn synthetic(axes: Vec<VibeAxis>) -> VibeState {
-        VibeState {
-            axes,
+        let state = VibeState::empty();
+        state.insert(AxisSet {
             model: "m".into(),
             dims: 2,
-        }
+            axes,
+        });
+        state
     }
 
     fn key(model: &str, dims: u32) -> crate::embeddings::VectorKey {
@@ -457,6 +449,46 @@ mod tests {
         assert!(state
             .assign_one("evt", &key("cohere-embed-v4", 256), &vector[..256])
             .is_none());
+    }
+
+    #[test]
+    fn each_space_is_coloured_by_its_own_set() {
+        let state = VibeState::from_bundled();
+        let qwen = |phase: Vec<f32>| AxisSet {
+            model: "qwen".into(),
+            dims: 2,
+            axes: vec![
+                VibeAxis {
+                    name: "phase".into(),
+                    vector: phase,
+                    percentiles: ramp(-1.0, 1.0),
+                },
+                VibeAxis {
+                    name: "friction".into(),
+                    vector: vec![0.0, 1.0],
+                    percentiles: ramp(-1.0, 1.0),
+                },
+            ],
+        };
+        assert!(!state.covers("qwen", Some(2)));
+        state.insert(qwen(vec![1.0, 0.0]));
+        assert!(state.covers("qwen", Some(2)));
+        assert!(
+            state.covers("qwen", None),
+            "an unknown width matches the model"
+        );
+        assert!(!state.covers("qwen", Some(3)));
+        assert!(
+            state.covers("cohere-embed-v4", Some(1536)),
+            "the bundled set stays"
+        );
+        let ship = state.assign_one("e", &key("qwen", 2), &[1.0, 0.0]).unwrap();
+        assert!((ship.phase - 1.0).abs() < 1e-3);
+
+        // Inserting the same space again replaces its set.
+        state.insert(qwen(vec![-1.0, 0.0]));
+        let flipped = state.assign_one("e", &key("qwen", 2), &[1.0, 0.0]).unwrap();
+        assert!(flipped.phase < 1e-3);
     }
 
     #[test]

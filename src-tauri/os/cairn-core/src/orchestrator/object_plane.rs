@@ -247,6 +247,9 @@ pub struct ObjectPlaneState {
     sessions: Arc<Mutex<HashMap<String, ObjectCredentialSession>>>,
     authorized: Arc<Mutex<HashMap<(String, String), AuthorizedTransfer>>>,
     staged: Arc<Mutex<HashMap<String, StagedDeltaUpload>>>,
+    /// The node scratch routes' grants and in-flight write-backs, revoked with
+    /// the connection that holds them.
+    pub scratch: crate::node_scratch::plane::ScratchPlaneState,
 }
 
 #[derive(Clone, Debug)]
@@ -299,6 +302,7 @@ impl ObjectPlaneState {
             .is_some_and(|session| session.generation == generation)
         {
             sessions.remove(executor_id);
+            self.scratch.revoke_connection(executor_id, generation);
             self.authorized.lock().unwrap().retain(|_, transfer| {
                 transfer.coordinate.executor_id != executor_id
                     || transfer.coordinate.connection_generation != generation
@@ -570,7 +574,7 @@ mod tests {
             );
             String::from_utf8(output.stdout).unwrap().trim().to_string()
         };
-        git(&["init", "-q"]);
+        git(&["init", "-b", "main", "-q"]);
         std::fs::write(repository.join("base"), "base\n").unwrap();
         git(&["add", "base"]);
         git(&["commit", "-qm", "base"]);
@@ -666,6 +670,7 @@ mod tests {
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
+            scratch_sync: None,
         };
         state.authorize_request(&request, "executor", 1);
         assert!(state.authorizes(&coordinate(1), &request.base_commit));

@@ -5,8 +5,8 @@ use crate::{
 };
 use cairn_common::uri::CairnResource;
 
-/// Mint (append on the collection) and revoke (delete on a member) ingress
-/// endpoints.
+/// Mint (append on the collection), rotate (patch on a member), and revoke
+/// (delete on a member) ingress endpoints.
 pub(super) async fn dispatch(
     o: &Orchestrator,
     _r: &McpCallbackRequest,
@@ -25,6 +25,16 @@ pub(super) async fn dispatch(
                 .as_ref()
                 .ok_or_else(|| build_failure(i, x, "payload required"))?;
             crate::resources::event_endpoints::mint(o, project, payload).await
+        }
+        (CairnResource::ProjectEventEndpoint { project, name }, ChangeMode::Patch) => {
+            if dry {
+                return Ok(Some(format!("Would rotate ingress endpoint {name}")));
+            }
+            let payload = x
+                .payload
+                .as_ref()
+                .ok_or_else(|| build_failure(i, x, "payload required"))?;
+            crate::resources::event_endpoints::patch(o, project, name, payload).await
         }
         (CairnResource::ProjectEventEndpoint { project, name }, ChangeMode::Delete) => {
             if dry {

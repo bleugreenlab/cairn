@@ -122,10 +122,10 @@ pub fn expand_delegated_packets(
     execution_id: &str,
 ) -> Result<HashSet<String>, String> {
     let mut snapshot = load_execution_snapshot(db.clone(), execution_id)?;
+    let mut packets = load_packets(db, execution_id)?;
     let project_path = load_project_repo_path(db.clone(), &snapshot.trigger_context.project_id)?
         .map(PathBuf::from);
-    let pending_packet_ids: Vec<String> = snapshot
-        .delegated_packets
+    let pending_packet_ids: Vec<String> = packets
         .iter()
         .filter(|packet| packet.status == DelegatedStatus::Pending)
         .map(|packet| packet.id.clone())
@@ -138,14 +138,14 @@ pub fn expand_delegated_packets(
     // Resolve-early: materialize against current effective presets (loud).
     let presets = load_effective_presets(&runtime.config_dir, project_path.as_deref());
     let mut new_agent_node_ids = HashSet::new();
+    let mut materialized = Vec::new();
 
     for packet_id in pending_packet_ids {
-        let packet_index = snapshot
-            .delegated_packets
+        let packet_index = packets
             .iter()
             .position(|packet| packet.id == packet_id)
-            .ok_or_else(|| format!("Delegated packet missing from snapshot: {packet_id}"))?;
-        let packet_view = snapshot.delegated_packets[packet_index].clone();
+            .ok_or_else(|| format!("Delegated packet missing: {packet_id}"))?;
+        let packet_view = packets[packet_index].clone();
 
         ensure_agent_snapshot(
             &mut snapshot,
@@ -218,7 +218,12 @@ pub fn expand_delegated_packets(
                 condition_config: None,
                 decision_config: None,
                 context_config: Some(ContextNodeConfig {
-                    content: format!("{}{}{}", packet_view.problem_statement, acceptance, policy),
+                    content: format!(
+                        "{}{}{}",
+                        packet_view.problem_statement.as_deref().unwrap_or_default(),
+                        acceptance,
+                        policy
+                    ),
                 }),
             });
         }
@@ -248,12 +253,13 @@ pub fn expand_delegated_packets(
             RecipeEdgeType::Context,
         );
 
-        let packet = &mut snapshot.delegated_packets[packet_index];
+        let packet = &mut packets[packet_index];
         packet.status = DelegatedStatus::Materialized;
         packet.materialized_node_ids = vec![trigger_id, context_id, agent_id];
+        materialized.push((packet.id.clone(), packet.materialized_node_ids.clone()));
     }
 
-    update_execution_snapshot(db.clone(), execution_id, &snapshot)?;
+    persist_expansion(db, execution_id, &snapshot, materialized)?;
 
     if new_agent_node_ids.is_empty() {
         return Ok(HashSet::new());
@@ -261,7 +267,7 @@ pub fn expand_delegated_packets(
 
     let created_jobs =
         create_jobs_for_new_nodes(db.clone(), execution_id, &new_agent_node_ids, &snapshot)?;
-    assign_delegated_job_metadata(db, &created_jobs, &snapshot)?;
+    assign_delegated_job_metadata(db, &created_jobs, &packets)?;
 
     let job_by_node: HashMap<String, String> = created_jobs
         .iter()
@@ -271,7 +277,8 @@ pub fn expand_delegated_packets(
                 .map(|node_id| (node_id.clone(), job.id.clone()))
         })
         .collect();
-    for packet in &mut snapshot.delegated_packets {
+    let mut links = Vec::new();
+    for packet in &packets {
         if packet.status != DelegatedStatus::Materialized || packet.result_artifact_job_id.is_some()
         {
             continue;
@@ -284,13 +291,16 @@ pub fn expand_delegated_packets(
         else {
             continue;
         };
-        packet.result_artifact_job_id = job_by_node.get(&agent_node_id).cloned().or_else(|| {
+        let job_id = job_by_node.get(&agent_node_id).cloned().or_else(|| {
             find_job_id_for_node(db, execution_id, &agent_node_id)
                 .ok()
                 .flatten()
         });
+        if let Some(job_id) = job_id {
+            links.push((packet.id.clone(), job_id));
+        }
     }
-    update_execution_snapshot(db.clone(), execution_id, &snapshot)?;
+    link_packets(db, execution_id, links)?;
 
     // One scoped jobs event per created delegated job (frontend dedupes).
     for job in &created_jobs {
@@ -300,6 +310,85 @@ pub fn expand_delegated_packets(
     }
 
     Ok(new_agent_node_ids)
+}
+
+fn load_packets(db: &Arc<LocalDb>, execution_id: &str) -> Result<Vec<DelegatedWorkPacket>, String> {
+    let (db, execution_id) = (db.clone(), execution_id.to_string());
+    run_advancement_db(async move {
+        crate::delegated_packets::list_db(&db, &execution_id)
+            .await
+            .map_err(|e| format!("Failed to load delegated packets: {e}"))
+    })
+}
+
+/// Write the expanded recipe and mark its packets materialized in one
+/// transaction, so no crash leaves nodes whose packet is still pending (a
+/// later expansion would skip their existing agent node and never create its
+/// job) or a materialized packet without its nodes.
+fn persist_expansion(
+    db: &Arc<LocalDb>,
+    execution_id: &str,
+    snapshot: &ExecutionSnapshot,
+    materialized: Vec<(String, Vec<String>)>,
+) -> Result<(), String> {
+    let snapshot_json = serde_json::to_string(snapshot)
+        .map_err(|e| format!("Failed to serialize snapshot: {e}"))?;
+    let (db, execution_id) = (db.clone(), execution_id.to_string());
+    run_advancement_db(async move {
+        db.write(|conn| {
+            let (execution_id, snapshot_json) = (execution_id.clone(), snapshot_json.clone());
+            let materialized = materialized.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "UPDATE executions SET snapshot = ?1 WHERE id = ?2",
+                    params![snapshot_json.as_str(), execution_id.as_str()],
+                )
+                .await?;
+                for (packet_id, node_ids) in materialized {
+                    let change = crate::delegated_packets::PacketChange {
+                        status: Some(DelegatedStatus::Materialized),
+                        materialized_node_ids: Some(node_ids),
+                        result_artifact_job_id: None,
+                    };
+                    crate::delegated_packets::update(conn, &execution_id, &packet_id, &change)
+                        .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to persist delegated expansion: {e}"))
+    })
+}
+
+/// Name each materialized packet's child job.
+fn link_packets(
+    db: &Arc<LocalDb>,
+    execution_id: &str,
+    links: Vec<(String, String)>,
+) -> Result<(), String> {
+    if links.is_empty() {
+        return Ok(());
+    }
+    let (db, execution_id) = (db.clone(), execution_id.to_string());
+    run_advancement_db(async move {
+        db.write(|conn| {
+            let (execution_id, links) = (execution_id.clone(), links.clone());
+            Box::pin(async move {
+                for (packet_id, job_id) in links {
+                    let change = crate::delegated_packets::PacketChange {
+                        result_artifact_job_id: Some(job_id),
+                        ..Default::default()
+                    };
+                    crate::delegated_packets::update(conn, &execution_id, &packet_id, &change)
+                        .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to link delegated packets: {e}"))
+    })
 }
 
 fn find_job_id_for_node(
@@ -337,11 +426,11 @@ fn find_job_id_for_node(
 fn assign_delegated_job_metadata(
     db: &Arc<LocalDb>,
     created_jobs: &[Job],
-    snapshot: &ExecutionSnapshot,
+    packets: &[DelegatedWorkPacket],
 ) -> Result<(), String> {
     let db = db.clone();
     let mut ordered_jobs: Vec<Job> = created_jobs.to_vec();
-    let packets = snapshot.delegated_packets.clone();
+    let packets = packets.to_vec();
     ordered_jobs.sort_by_key(|job| {
         job.recipe_node_id
             .as_deref()

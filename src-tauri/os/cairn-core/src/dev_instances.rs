@@ -1274,6 +1274,7 @@ pub async fn run_launch_session(
                     sandbox_policy: None,
                     runtime_assets: Vec::new(),
                     io: ResidentProcessIoMode::Pipe,
+                    node_scratch: None,
                 },
             },
         )
@@ -2053,6 +2054,7 @@ mod tests {
             liveness_observed_at_unix_ms: None,
             facts_stale_refresh_blocked: None,
             last_refresh: None,
+            node_scratches: Vec::new(),
         };
         let generation = orch
             .fleet

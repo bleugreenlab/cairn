@@ -1,0 +1,49 @@
+{
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The page's name as a reader sees it: the facet label's tooltip and the Pages index row"
+    },
+    "files": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "string" },
+      "description": "The page's source, path to UTF-8 text. Paths are segments of letters, digits, '.', '_' and '-' joined by '/', never '..'; 1 MiB in total"
+    },
+    "description": {
+      "type": "string",
+      "description": "One or two sentences on what the page shows, for the Pages index"
+    },
+    "entry": {
+      "type": "string",
+      "description": "The .js or .mjs file whose default export is the page's React component; defaults to index.js"
+    },
+    "manifest": {
+      "type": "object",
+      "properties": {
+        "writes": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^cairn:~/db/[^/?#]+$" },
+          "maxItems": 32,
+          "description": "The tables of the owning thread's database the page may write rows to, each 'cairn:~/db/<table>'. A write is made as the verified operator viewing the page, recorded with the page and version; a draft page declares none"
+        },
+        "services": {
+          "type": "array",
+          "items": { "type": "string" },
+          "maxItems": 16,
+          "description": "Services the page may call through the bridge's service verb: a project service by its id under .cairn/services/, or its own thread's service by canonical URI (cairn://p/PROJECT/THREAD/services/NAME); none by default"
+        }
+      },
+      "additionalProperties": false,
+      "description": "What the page may do beyond reading database rows: write rows of its own thread's tables, and call services"
+    },
+    "promoted": {
+      "type": "boolean",
+      "description": "True lists a thread's page in the project's Pages index; a draft on an issue node is never listed"
+    }
+  },
+  "required": ["title", "files"],
+  "additionalProperties": false
+}

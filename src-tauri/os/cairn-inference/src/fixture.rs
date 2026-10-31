@@ -21,6 +21,7 @@ pub(crate) fn command_recipe(id: &str, machines: u32) -> Recipe {
         served_name: id.into(),
         upstream_id: None,
         verbs: None,
+        modalities: None,
         engine: Engine::Command {
             start: "./start.sh".into(),
             stop: Some("./stop.sh".into()),

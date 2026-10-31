@@ -1,7 +1,7 @@
 //! Project and issue message resource readers.
 
 use super::common::{
-    connect_for_read, find_query_value, lookup_project_by_key, parse_optional_i64_param,
+    find_query_value, lookup_project_by_key, parse_optional_i64_param, read_resource,
 };
 
 use crate::storage::LocalDb;
@@ -74,14 +74,20 @@ pub(super) async fn read_project_messages(
     project_key: &str,
     params: &[QueryParam],
 ) -> String {
-    // Validate project exists
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
-    let project_ctx = match lookup_project_by_key(&conn, project_key).await {
+    // Validate project exists. The lookup's read releases before the channel
+    // query, which runs on a blocking worker of its own.
+    let key = project_key.to_owned();
+    let project_ctx = match read_resource(db, move |conn| {
+        Box::pin(async move {
+            lookup_project_by_key(conn, &key)
+                .await
+                .map_err(|_| format!("Project '{}' not found", key))
+        })
+    })
+    .await
+    {
         Ok(ctx) => ctx,
-        Err(_) => return format!("Project '{}' not found", project_key),
+        Err(error) => return error,
     };
 
     let (before, after, since, limit) = match parse_message_query_params(params) {
@@ -108,10 +114,38 @@ pub(super) async fn read_project_messages(
     }
 }
 
-/// Read the direct-message stream for a node or sub-agent task. Symmetric with
-/// the `/messages` append target: `task_name = None` reads a node's direct messages,
-/// `Some` reads a sub-task's. Returns every direct message where the resolved
-/// job is sender or recipient, oldest first.
+/// A direct message's line carries its delivery urgency: whether it woke its
+/// recipient or rode along is part of what was said. Rows written before
+/// system directs recorded urgency carry none and show none.
+fn format_direct_messages(messages: &[crate::models::Message]) -> String {
+    if messages.is_empty() {
+        return "(no messages)".to_string();
+    }
+
+    let mut out = String::new();
+    for msg in messages {
+        let ts = crate::clock::stamp_with_seconds(msg.created_at)
+            .unwrap_or_else(|| msg.created_at.to_string());
+        match msg.urgency {
+            Some(urgency) => out.push_str(&format!(
+                "[{}] {} ({}): {}\n",
+                ts,
+                msg.sender_name,
+                urgency.as_str(),
+                msg.content
+            )),
+            None => out.push_str(&format!("[{}] {}: {}\n", ts, msg.sender_name, msg.content)),
+        }
+    }
+    out
+}
+
+/// Read the direct-message stream for a node, thread, or sub-agent task.
+/// Symmetric with the `/messages` append target: `task_name = None` reads the
+/// home's own direct messages, `Some` reads a sub-task's. Returns the direct
+/// messages where the resolved job is sender or recipient across all of its
+/// runs, oldest first, windowed as [`crate::messages::db::query_directs_for_job`]
+/// describes.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn read_node_messages(
     db: &LocalDb,
@@ -143,16 +177,14 @@ pub(super) async fn read_node_messages(
 
     match crate::messages::db::query_directs_for_job(db, &job_id, since, limit) {
         Ok(messages) => {
+            let home = cairn_common::uri::build_node_uri(project_key, number, exec_seq, node_name);
             let label = match task_name {
-                Some(task) => format!(
-                    "{}/{}/{}/{}/task/{}",
-                    project_key, number, exec_seq, node_name, task
-                ),
-                None => format!("{}/{}/{}/{}", project_key, number, exec_seq, node_name),
+                Some(task) => format!("{home}/task/{task}"),
+                None => home,
             };
             let mut out = format!("# Messages \u{2014} {}\n\n", label);
             out.push_str(&format!("{} message(s)\n\n", messages.len()));
-            out.push_str(&format_messages(&messages));
+            out.push_str(&format_direct_messages(&messages));
             out
         }
         Err(e) => format!("Failed to query messages: {}", e),
@@ -189,5 +221,90 @@ pub(super) async fn read_issue_messages(
             out
         }
         Err(e) => format!("Failed to query messages: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_node_messages;
+
+    /// A thread's `/messages` is its session's direct stream across every run
+    /// the session has had, newest window first, each line with its urgency,
+    /// headed by the thread's own address.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_threads_messages_show_its_newest_directs_across_runs_with_urgency() {
+        let db = crate::storage::migrated_test_db("thread-node-messages.db").await;
+        let mut script = String::from(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO threads(id,project_id,name,created_at,updated_at) VALUES('t','p','ux',1,1);
+             INSERT INTO jobs(id,project_id,thread_id,status,uri_segment,created_at,updated_at) VALUES('j','p','t','running','thread',1,1);
+             INSERT INTO runs(id,job_id,project_id,status,created_at,updated_at) VALUES('r1','j','p','crashed',1,1);
+             INSERT INTO runs(id,job_id,project_id,status,created_at,updated_at) VALUES('r2','j','p','live',2,2);",
+        );
+        // Sixty older directs to the first run: more than one default page.
+        for i in 0..60 {
+            script.push_str(&format!(
+                "INSERT INTO messages(id,channel_type,sender_name,recipient_run_id,content,created_at,urgency) \
+                 VALUES('old-{i}','direct','cairn://p/p/peer','r1','history {i:02}',{},'steer');",
+                100 + i
+            ));
+        }
+        db.execute_script(&script).await.unwrap();
+        db.write(|conn| {
+            Box::pin(async move {
+                cairn_attention::direct::insert_system_direct_push_conn(
+                    conn,
+                    "j",
+                    "r1",
+                    "a passive verdict",
+                    crate::messages::queued::DeliveryUrgency::Passive,
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let read = read_node_messages(&db, "p", 0, 0, "ux", None, &[]).await;
+
+        assert!(
+            read.starts_with("# Messages \u{2014} cairn://p/p/ux\n"),
+            "{read}"
+        );
+        assert!(read.contains("50 message(s)"), "{read}");
+        assert!(
+            read.contains("system (passive): a passive verdict"),
+            "{read}"
+        );
+        assert!(read.contains("(steer): history 59"), "{read}");
+        assert!(
+            !read.contains("history 00"),
+            "the oldest fall outside the window: {read}"
+        );
+        let newest = read.find("a passive verdict").unwrap();
+        assert!(
+            read.find("history 59").unwrap() < newest,
+            "oldest first within the window"
+        );
+
+        let forward = read_node_messages(
+            &db,
+            "p",
+            0,
+            0,
+            "ux",
+            None,
+            &[cairn_common::query::QueryParam {
+                key: "since".into(),
+                value: "100".into(),
+            }],
+        )
+        .await;
+        assert!(
+            forward.contains("history 00"),
+            "`since` reads forward: {forward}"
+        );
     }
 }

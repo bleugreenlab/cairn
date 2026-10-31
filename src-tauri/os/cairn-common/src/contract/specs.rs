@@ -232,19 +232,7 @@ pub(crate) const TITLE: KeySpec = KeySpec::new("title", KeyType::Str, "");
 pub(crate) const EXECUTION: KeySpec = KeySpec::new(
     "execution",
     KeyType::Object,
-    "{recipe, backend?, overrides?, after?, proposal?, tenet?} to also start an execution once the issue is created (recipe required); omit to create only. `overrides` takes the same launch deltas the executions collection does, so a child can be created with review already off in one call. `after` takes the same gate clauses the executions collection does: the execution is filed HELD and starts only once every gate is satisfied. `proposal`/`tenet` are the executions collection's commissioning-gate keys: a thread filing a tenet-gated recipe sends exactly one, and the filing is refused before the issue is created when it sends neither",
-);
-/// The commissioning gate's two keys, shared verbatim by the executions-collection
-/// append and the issue-create `execution` block.
-pub(crate) const TENET_PROPOSAL: KeySpec = KeySpec::new(
-    "proposal",
-    KeyType::Object,
-    "{statement, rationale?}: `statement` is one sentence of how the project does things for the operator to answer yes or no (at most 200 characters, no URIs or reasoning); `rationale` carries why, the alternatives ruled out, and the canonical URIs where it was argued (at most 1500 characters). A thread filing a tenet-gated recipe (planbuild, coordinator, PlanCoord by default) proposes this tenet to the operator and the execution is filed HELD on its verdict. Send exactly one of proposal or tenet on such a filing; `build` stays ungated for repair",
-);
-pub(crate) const TENET_NUMBER: KeySpec = KeySpec::new(
-    "tenet",
-    KeyType::Int,
-    "number of one of your thread's proposed or approved tenets to hold this filing on instead of proposing one; one approval can release every filing of a plan, and an already-approved tenet starts the filing at once",
+    "{recipe, backend?, overrides?, after?} to also start an execution once the issue is created (recipe required); omit to create only. `overrides` takes the same launch deltas the executions collection does, so a child can be created with review already off in one call. `after` takes the same gate clauses the executions collection does: the execution is filed HELD and starts only once every gate is satisfied",
 );
 /// `after:` gates, shared verbatim by the executions-collection append, the
 /// issue-create `execution` block, and the execution patch — one grammar,
@@ -252,7 +240,7 @@ pub(crate) const TENET_NUMBER: KeySpec = KeySpec::new(
 pub(crate) const AFTER_GATES: KeySpec = KeySpec::new(
     "after",
     KeyType::Array,
-    "gate clause OBJECTS (never prose); the execution is filed HELD — no jobs, no slot — and starts by itself, exactly once, when every clause is satisfied. Facts: {fact:\"issue_resolution\",issue:URI,resolution?:\"merged\"|\"closed\"} · {fact:\"pr_state\",issue:URI,state?:\"open\"|\"merged\"|\"closed\"} · {fact:\"artifact_confirmed\",issue:URI,artifact?:TYPE} · {fact:\"check_verdict\",check:NAME,issue:URI,verdict?:\"passed\"|\"failed\"} · {fact:\"clock\",notBefore:RFC3339} · {fact:\"tenet_verdict\",tenet:\"cairn://p/PROJECT/tenets/N\",outcome:\"answered\"|\"ratified\"} (the operator's verdict; a thread's gated filing gets this from `proposal`/`tenet`). An omitted field means any; an array means any of. A clause that can never come true leaves the execution held and wakes its filer; a wait cycle across issues is refused",
+    "gate clause OBJECTS (never prose); the execution is filed HELD — no jobs, no slot — and starts by itself, exactly once, when every clause is satisfied. Facts: {fact:\"issue_resolution\",issue:URI,resolution?:\"merged\"|\"closed\"} · {fact:\"pr_state\",issue:URI,state?:\"open\"|\"merged\"|\"closed\"} · {fact:\"artifact_confirmed\",issue:URI,artifact?:TYPE} · {fact:\"check_verdict\",check:NAME,issue:URI,verdict?:\"passed\"|\"failed\"} · {fact:\"clock\",notBefore:RFC3339} · {fact:\"tenet_verdict\",tenet:\"cairn://p/PROJECT/tenets/N\",outcome:\"answered\"|\"ratified\"} (the operator's verdict on a tenet proposed through cairn://p/PROJECT/tenets; the only way to hold a filing on one). An omitted field means any; an array means any of. A clause that can never come true leaves the execution held and wakes its filer; a wait cycle across issues is refused",
 );
 /// Ad-hoc launch deltas, shared verbatim by the executions-collection append and
 /// the issue-create `execution` block — one grammar, described once.
@@ -712,6 +700,13 @@ pub(crate) const BROWSER_READ_PROJECTIONS: &[ProjectionSpec] = &[
         values: "N — line-window size for content (a buffer/element cap for ?console/?network/?interactive)",
     },
 ];
+/// Terminal reads (node, task, and project scoped) share one parser,
+/// `parse_terminal_uri` in cairn-core; the universal offset/limit/grep view
+/// grammar rides alongside.
+pub(crate) const TERMINAL_PROJECTIONS: &[ProjectionSpec] = &[ProjectionSpec {
+    key: "new",
+    values: "true — only the bytes appended since your last new=true read, advancing a cursor (default: the whole buffer, idempotent)",
+}];
 pub(crate) const NO_RELATED: &[RelatedSpec] = &[];
 pub(crate) const NO_CROSS_ACTIONS: &[CrossActionSpec] = &[];
 // Shared read-query projections for the symbol resources (node- and project-scoped).
@@ -892,7 +887,7 @@ pub(crate) const SETTINGS_BUILD_SERVICES: KeySpec = KeySpec::new(
 pub(crate) const SETTINGS_INFERENCE: KeySpec = KeySpec::new(
     "inference",
     KeyType::Object,
-    "{bginf:{url,machines?{node:machine}}|null} replaces the section; the bginf token is a `bginf` account, never a setting",
+    "{bginf:{url,machines?{node:machine}}|null, recipes?{recipeId:{verbs?[complete|session|decide|embed|image|speak], inputModalities?, outputModalities?}}} replaces the section (carry both keys); recipes declare what a recipe's model serves and takes, over every re-import; the bginf token is a `bginf` account, never a setting",
 );
 pub(crate) const SETTINGS_MAX_THINKING_TOKENS: KeySpec = KeySpec::new(
     "maxThinkingTokens",

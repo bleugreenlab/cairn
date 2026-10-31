@@ -574,13 +574,18 @@ mod tests {
             // typed address, target, and enabled arguments and returns only the
             // runner's payload.
             "src-tauri/src/commands/channels.rs",
-            // Tenet verdicts and tenet-gated recipe changes: both route through
+            // Tenet verdicts: they route through
             // `operator_target`, which refuses every webview but main before
             // choosing the local runner or a configured peer. `runner_client`
             // loads the token belonging to that exact target and carries it
             // only in the request header; the module forwards its arguments and
             // returns only the runner's payload.
             "src-tauri/src/commands/tenets.rs",
+            // Page writes: routed through `operator_target` like tenet
+            // verdicts, forwarding the page's input unchanged and returning
+            // only the runner's payload; the runner gates the input against
+            // the page's manifest.
+            "src-tauri/src/commands/pages.rs",
             // Test fixtures, which mint their own throwaway credentials.
             "src-tauri/cairn-orch/tests/transport.rs",
             "src-tauri/cairn-transport/src/routes/invoke/tests.rs",

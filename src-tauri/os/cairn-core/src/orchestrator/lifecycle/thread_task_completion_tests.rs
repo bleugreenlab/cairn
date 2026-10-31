@@ -187,7 +187,7 @@ fn host_snapshot(tasks: &[Task]) -> String {
             initiated_via: None,
         },
         presets: None,
-        delegated_packets: packets,
+        inline_delegated_packets: packets,
         created_at: 0,
     })
     .unwrap()
@@ -466,7 +466,7 @@ async fn child_thread_session_stays_liveness_only() {
             .db
             .local
             .query_opt_text(
-                &format!(
+                format!(
                     "SELECT j.id FROM jobs j WHERE j.thread_id = ?1 AND {}",
                     cairn_db::lineage::SESSION_JOB_SHAPE
                 ),
@@ -635,6 +635,98 @@ async fn repair_wakes_a_parent_still_parked_on_its_batch_exactly_once() {
     for job in ["j-quic", "j-tar", "j-jwt"] {
         assert_eq!(status(&orch, job).await, "complete", "{job}");
     }
+}
+
+/// A boot partway through the packet backfill (cairn/5597): one packet of the
+/// batch already in `delegated_packets`, the other two still inline in the host
+/// snapshot. The parent parked on the batch wakes exactly once, a backfill that
+/// then finishes the move changes nothing on the next boot, and a session
+/// parked beside it that owns none of these packets is never woken.
+#[tokio::test]
+async fn a_boot_mid_backfill_wakes_a_parked_parent_exactly_once() {
+    let db = test_db().await;
+    seed(
+        &db,
+        ParentHead::Parked,
+        &[
+            Task::delivered("j-quic", "pkt-quic", 1_757_000_000),
+            Task::delivered("j-tar", "pkt-tar", 1_757_000_600),
+            Task::delivered("j-jwt", "pkt-jwt", 1_757_001_200),
+        ],
+    )
+    .await;
+    db.execute_script(
+        "INSERT INTO jobs (id, execution_id, thread_id, project_id, status, node_name, uri_segment,
+                           created_at, updated_at)
+           VALUES ('j-bystander', 'e-host', 't-roadmap', 'p', 'running', 'bystander', 'bystander', 1, 1);
+         INSERT INTO turns (id, session_id, job_id, sequence, state, yield_reason, start_reason,
+                            created_at, ended_at, updated_at)
+           VALUES ('bystander-anchor', 's-bystander', 'j-bystander', 1, 'yielded', 'dependency_wait',
+                   'initial', 1, 1, 1);
+         UPDATE jobs SET current_turn_id = 'bystander-anchor' WHERE id = 'j-bystander';",
+    )
+    .await
+    .unwrap();
+    // Any change copies an inline packet into the table first; an empty one
+    // does only that, which is where an interrupted backfill leaves a packet.
+    assert!(cairn_workflow::delegated_packets::update_db(
+        &db,
+        EXECUTION,
+        "pkt-quic",
+        &cairn_workflow::delegated_packets::PacketChange::default(),
+    )
+    .await
+    .unwrap());
+    let orch = test_orchestrator(db);
+    assert_eq!(
+        count(&orch, "SELECT COUNT(*) FROM delegated_packets").await,
+        1
+    );
+    assert_eq!(
+        count(
+            &orch,
+            "SELECT json_array_length(snapshot, '$.delegatedPackets') FROM executions WHERE id = 'e-host'"
+        )
+        .await,
+        3,
+        "the snapshot still holds every packet"
+    );
+
+    reconcile(&orch);
+
+    for job in ["j-quic", "j-tar", "j-jwt"] {
+        assert_eq!(status(&orch, job).await, "complete", "{job}");
+    }
+    assert_eq!(unblock_turns(&orch).await, 1);
+
+    let report = cairn_workflow::delegated_packets::run_backfill(&orch.db.local)
+        .await
+        .unwrap();
+    assert!(report.completed, "{report:?}");
+    assert_eq!(
+        count(&orch, "SELECT COUNT(*) FROM delegated_packets").await,
+        3
+    );
+
+    reconcile(&orch);
+
+    assert_eq!(
+        unblock_turns(&orch).await,
+        1,
+        "the boot after the move changes nothing"
+    );
+    for job in ["j-quic", "j-tar", "j-jwt"] {
+        assert_eq!(status(&orch, job).await, "complete", "{job}");
+    }
+    assert_eq!(
+        count(
+            &orch,
+            "SELECT COUNT(*) FROM turns WHERE predecessor_id = 'bystander-anchor'"
+        )
+        .await,
+        0,
+        "no parent resumes on packets it never had"
+    );
 }
 
 /// (c) A background task settles, and its spawner is not pushed: nobody was

@@ -178,6 +178,58 @@ async fn assistant_events(db: &LocalDb, run_id: &str, turn_id: Option<&str>) -> 
     .unwrap_or_default()
 }
 
+/// The input a turn's assistant recorded for one provider tool invocation, by
+/// its id. `None` when no assistant event of the turn carries that id.
+pub(crate) async fn recorded_input(
+    db: &LocalDb,
+    run_id: &str,
+    turn_id: &str,
+    tool_use_id: &str,
+) -> Option<serde_json::Value> {
+    let (run_id, turn_id) = (run_id.to_string(), turn_id.to_string());
+    let events: Vec<String> = db
+        .read(|conn| {
+            let (run_id, turn_id) = (run_id.clone(), turn_id.clone());
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT data FROM events
+                         WHERE run_id = ?1 AND turn_id = ?2 AND event_type = 'assistant'
+                         ORDER BY sequence DESC",
+                        cairn_db::turso::params![run_id, turn_id],
+                    )
+                    .await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push(row.text(0)?);
+                }
+                Ok(out)
+            })
+        })
+        .await
+        .ok()?;
+    input_of(&events, tool_use_id)
+}
+
+/// The recorded input of the invocation `tool_use_id` among assistant event
+/// blobs.
+fn input_of(event_data: &[String], tool_use_id: &str) -> Option<serde_json::Value> {
+    event_data.iter().find_map(|data| {
+        let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
+        value
+            .get("toolUses")?
+            .as_array()?
+            .iter()
+            .find(|tool| {
+                tool.get("id")
+                    .or_else(|| tool.get("toolUseId"))
+                    .and_then(|value| value.as_str())
+                    == Some(tool_use_id)
+            })
+            .and_then(|tool| tool.get("input").cloned())
+    })
+}
+
 use crate::storage::RowExt;
 
 #[cfg(test)]
@@ -236,6 +288,23 @@ mod tests {
             (name == "run" || name.ends_with("__run"))
                 && input == &serde_json::json!({"commands": [{"command": command}]})
         }
+    }
+
+    #[test]
+    fn the_recorded_input_is_found_by_its_id_in_either_spelling() {
+        let events = vec![
+            event(vec![run_batch("toolu_b", "cargo test")]),
+            serde_json::json!({"toolUses":[{"toolUseId":"toolu_a","name":"run","input":{"commands":[{"command":"ls"}]}}]}).to_string(),
+        ];
+        assert_eq!(
+            input_of(&events, "toolu_a").unwrap()["commands"][0]["command"],
+            "ls"
+        );
+        assert_eq!(
+            input_of(&events, "toolu_b").unwrap()["commands"][0]["command"],
+            "cargo test"
+        );
+        assert_eq!(input_of(&events, "toolu_missing"), None);
     }
 
     fn event(tools: Vec<serde_json::Value>) -> String {

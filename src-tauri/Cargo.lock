@@ -164,9 +164,9 @@ dependencies = [
 
 [[package]]
 name = "antithesis_sdk"
-version = "0.2.9"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08410fcac93669a476c006cd6c4512ac1e2b30fd117231a5d55d8a2c76599b82"
+checksum = "a8ed6751597568a284314fd9e2db420665898600109dedc7d8d9b588f00ae9c4"
 dependencies = [
  "libc",
  "libloading",
@@ -620,7 +620,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "lazy_static",
  "lazycell",
  "log",
@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-analytics"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "cairn-db",
  "cairn-models-types",
@@ -884,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-attention"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "async-trait",
  "cairn-common",
@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-cell"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "globset",
  "serde",
@@ -914,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-channels"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "async-trait",
  "chrono",
@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-checkenv"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "cairn-common",
  "serde_json",
@@ -942,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-cmd"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-codec"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "gix-features",
  "gix-hash",
@@ -979,7 +979,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-common"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "base64 0.22.1",
  "cairn-cell",
@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-config"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "cairn-common",
  "cairn-domain",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-core"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "async-trait",
  "axum",
@@ -1095,6 +1095,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "toml",
  "tracing",
  "unigram",
@@ -1108,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-credentials"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "base64 0.22.1",
  "cairn-domain",
@@ -1133,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-db"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "async-trait",
  "cairn-codec",
@@ -1159,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-domain"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "cairn-cell",
  "cairn-common",
@@ -1174,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-image-wire"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "base64 0.22.1",
  "imagesize",
@@ -1187,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-inference"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "cairn-models-types",
  "reqwest 0.12.28",
@@ -1198,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-llm-wire"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "base64 0.22.1",
  "log",
@@ -1210,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-mcp-server"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "async-trait",
  "axum",
@@ -1228,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-models"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "base64 0.22.1",
  "cairn-common",
@@ -1257,7 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-models-types"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -1266,7 +1267,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-packs"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "cairn-common",
  "cairn-platform",
@@ -1283,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-platform"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "cairn-common",
  "cairn-sandbox",
@@ -1303,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-sandbox"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "cairn-common",
  "chrono",
@@ -1319,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-session"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "cairn-analytics",
  "cairn-attention",
@@ -1349,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-speech-wire"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "base64 0.22.1",
  "log",
@@ -1364,7 +1365,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-symbols"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "ast-grep-core",
  "ast-grep-language",
@@ -1379,7 +1380,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-tokenize"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -1389,7 +1390,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-toks"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "cairn-models",
  "serde",
@@ -1399,7 +1400,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-vcs"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "cairn-common",
  "cairn-platform",
@@ -1423,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-workflow"
-version = "0.13.3"
+version = "0.13.5"
 dependencies = [
  "async-trait",
  "cairn-attention",
@@ -1835,6 +1836,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16182b4f39a82ec8a6851155cc4c0cda3065bb1db33651726a29e1951de0f009"
 dependencies = [
  "aead",
+ "blake2",
  "crypto_secretbox",
  "curve25519-dalek",
  "salsa20",
@@ -4127,15 +4129,6 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
@@ -4368,9 +4361,9 @@ dependencies = [
 
 [[package]]
 name = "landlock"
-version = "0.4.5"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "635839550ae8b90d9fd2571460a6645dc0aec070225956ca7a2831ed31d2795d"
+checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
 dependencies = [
  "enumflags2",
  "libc",
@@ -6467,9 +6460,9 @@ dependencies = [
 
 [[package]]
 name = "semver"
-version = "1.0.27"
+version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"
@@ -7564,6 +7557,22 @@ dependencies = [
 
 [[package]]
 name = "tokio-tungstenite"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
+dependencies = [
+ "futures-util",
+ "log",
+ "rustls 0.23.46",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tungstenite 0.26.2",
+]
+
+[[package]]
+name = "tokio-tungstenite"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
@@ -8176,8 +8185,8 @@ dependencies = [
 
 [[package]]
 name = "turso"
-version = "0.8.0-pre.3"
-source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
+version = "0.9.0-pre.2"
+source = "git+https://github.com/tursodatabase/turso?rev=7b7f159537bec57ce461cb814d8c1ab07f5d5a7f#7b7f159537bec57ce461cb814d8c1ab07f5d5a7f"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -8195,8 +8204,8 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.8.0-pre.3"
-source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
+version = "0.9.0-pre.2"
+source = "git+https://github.com/tursodatabase/turso?rev=7b7f159537bec57ce461cb814d8c1ab07f5d5a7f#7b7f159537bec57ce461cb814d8c1ab07f5d5a7f"
 dependencies = [
  "aegis",
  "aes",
@@ -8267,8 +8276,8 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.8.0-pre.3"
-source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
+version = "0.9.0-pre.2"
+source = "git+https://github.com/tursodatabase/turso?rev=7b7f159537bec57ce461cb814d8c1ab07f5d5a7f#7b7f159537bec57ce461cb814d8c1ab07f5d5a7f"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",
@@ -8277,8 +8286,8 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.8.0-pre.3"
-source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
+version = "0.9.0-pre.2"
+source = "git+https://github.com/tursodatabase/turso?rev=7b7f159537bec57ce461cb814d8c1ab07f5d5a7f#7b7f159537bec57ce461cb814d8c1ab07f5d5a7f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8287,8 +8296,8 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.8.0-pre.3"
-source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
+version = "0.9.0-pre.2"
+source = "git+https://github.com/tursodatabase/turso?rev=7b7f159537bec57ce461cb814d8c1ab07f5d5a7f#7b7f159537bec57ce461cb814d8c1ab07f5d5a7f"
 dependencies = [
  "bitflags 2.10.0",
  "memchr",
@@ -8301,11 +8310,12 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.8.0-pre.3"
-source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
+version = "0.9.0-pre.2"
+source = "git+https://github.com/tursodatabase/turso?rev=7b7f159537bec57ce461cb814d8c1ab07f5d5a7f#7b7f159537bec57ce461cb814d8c1ab07f5d5a7f"
 dependencies = [
  "bindgen",
  "env_logger",
+ "find-msvc-tools",
  "parking_lot",
  "tracing",
  "tracing-appender",
@@ -8317,8 +8327,8 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.8.0-pre.3"
-source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
+version = "0.9.0-pre.2"
+source = "git+https://github.com/tursodatabase/turso?rev=7b7f159537bec57ce461cb814d8c1ab07f5d5a7f#7b7f159537bec57ce461cb814d8c1ab07f5d5a7f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8327,8 +8337,8 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.8.0-pre.3"
-source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
+version = "0.9.0-pre.2"
+source = "git+https://github.com/tursodatabase/turso?rev=7b7f159537bec57ce461cb814d8c1ab07f5d5a7f#7b7f159537bec57ce461cb814d8c1ab07f5d5a7f"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -8349,8 +8359,8 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_sdk_kit"
-version = "0.8.0-pre.3"
-source = "git+https://github.com/bleugreen/turso?rev=31b950246e8f93fa47ff0d1b78955ff3d1c69139#31b950246e8f93fa47ff0d1b78955ff3d1c69139"
+version = "0.9.0-pre.2"
+source = "git+https://github.com/tursodatabase/turso?rev=7b7f159537bec57ce461cb814d8c1ab07f5d5a7f#7b7f159537bec57ce461cb814d8c1ab07f5d5a7f"
 dependencies = [
  "bindgen",
  "env_logger",

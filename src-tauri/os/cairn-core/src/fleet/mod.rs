@@ -7,7 +7,9 @@
 mod coalescing;
 pub(crate) mod decline_condition;
 pub mod desktop;
+pub(crate) mod inference;
 pub mod link_clock;
+pub mod load;
 pub mod management;
 pub(crate) mod occupancy;
 pub(crate) mod output_guard;
@@ -20,6 +22,7 @@ pub(crate) mod repair;
 pub(crate) mod residency;
 mod resource_profiles;
 pub(crate) mod rollout;
+pub use rollout::ArtifactUnavailable;
 pub mod runner_events;
 pub(crate) mod service_placement;
 pub mod telemetry;
@@ -30,6 +33,7 @@ use crate::mcp::handlers::run::{ResolvedRunBatch, RunSpec};
 use crate::orchestrator::Orchestrator;
 use cairn_common::executor_protocol::needs_build_volume;
 use cairn_common::executor_protocol::DiskHealthStatus;
+use cairn_common::executor_protocol::MachineSample;
 use cairn_common::executor_protocol::SandboxCapabilityEvidence;
 use cairn_common::executor_protocol::{
     aged_priority, CacheWarmthEvidence, CellAdmissionKind, CellCheckoutKind, CellCommandClass,
@@ -58,7 +62,7 @@ use cairn_common::executor_protocol::{
 };
 use cairn_common::executor_protocol::{
     executor_names_match, normalize_executor_name, AdmissionHoldEvidence, ClaimedAttemptAccount,
-    PriorDecline,
+    InferenceHold, PriorDecline,
 };
 use decline_condition::{AdmissionView, PostedHold};
 use serde::{Deserialize, Serialize};
@@ -155,7 +159,7 @@ fn queued_placement_evidence(decision: &PlacementDecision) -> QueuedPlacementEvi
                 .map(|value| value.free_bytes),
             reservation: selection.reservation.clone(),
         }),
-        PlacementOutcome::Refused { .. } => None,
+        PlacementOutcome::Refused { .. } | PlacementOutcome::Waiting { .. } => None,
     };
     QueuedPlacementEvidence {
         decided_at_unix_ms: decision.decided_at_unix_ms,
@@ -938,6 +942,23 @@ pub(crate) struct CellAccount {
     pub placement: Option<CellPlacement>,
 }
 
+/// One eligible machine placement cannot decide on right now, because a
+/// reading it decides on is stale or missing. A condition that clears on its
+/// own when the machine reports again, unlike a machine that is gone or a
+/// fleet with nothing that matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MeasurementBlindness {
+    pub executor_id: String,
+    /// The machine as an operator names it.
+    pub name: String,
+    /// Placement's own words for the refusal, e.g. "cpu was measured 108276ms
+    /// ago, past the 90000ms bound".
+    pub reason: String,
+    /// How long the machine has been past its freshness bound. `None` when a
+    /// reading is missing outright, which carries no instant to measure from.
+    pub blind_for_ms: Option<u64>,
+}
+
 /// The machine a request was placed on: the one that claimed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CellPlacement {
@@ -1090,6 +1111,10 @@ impl Drop for PublicationGuard {
 
 type ResidentProcessSubscriber = Arc<dyn Fn(ResidentProcessEvent) + Send + Sync>;
 
+pub(crate) mod node_scratch;
+pub use inference::DeploymentReportReceived;
+pub(crate) use node_scratch::NodeScratchEvent;
+
 /// What the runner knows about an enrolled machine independently of whether it
 /// is attached: who it is, and the account of the last time the runner tried to
 /// bring it up.
@@ -1113,6 +1138,70 @@ struct EnrolledRemoteRecord {
     /// that has ended cannot describe how big it was when it ended, which is
     /// the one moment worth describing.
     last_process_report: Option<GenerationProcessReport>,
+    /// The run of protocol refusals this machine is in, if its last dial was
+    /// refused on protocol. Cleared when it attaches.
+    protocol_refusal: Option<ProtocolRefusalRun>,
+}
+
+/// Consecutive refusals of one machine on the same pair of protocols.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProtocolRefusalRun {
+    expected: u32,
+    received: u32,
+    first_unix_ms: u64,
+    last_unix_ms: u64,
+    count: u32,
+}
+
+impl ProtocolRefusalRun {
+    fn extended(previous: Option<Self>, expected: u32, received: u32, now_unix_ms: u64) -> Self {
+        match previous {
+            Some(run) if run.expected == expected && run.received == received => Self {
+                last_unix_ms: now_unix_ms,
+                count: run.count.saturating_add(1),
+                ..run
+            },
+            _ => Self {
+                expected,
+                received,
+                first_unix_ms: now_unix_ms,
+                last_unix_ms: now_unix_ms,
+                count: 1,
+            },
+        }
+    }
+
+    /// The stranding this run amounts to: a refusal is stranding exactly when
+    /// the runner has resolved the machine's target and has nothing to serve.
+    /// A target not yet resolved claims nothing either way.
+    fn stranding(
+        self,
+        target: &str,
+        artifacts: &HashMap<String, rollout::ArtifactBuild>,
+    ) -> Option<cairn_common::executor_protocol::StrandedExecutor> {
+        let rollout::ArtifactBuild::Unavailable(unavailable) = artifacts.get(target)? else {
+            return None;
+        };
+        Some(cairn_common::executor_protocol::StrandedExecutor {
+            target: target.to_string(),
+            expected_protocol: self.expected,
+            received_protocol: self.received,
+            newest_held_protocol: unavailable.newest_held_protocol,
+            reason: unavailable.reason.clone(),
+            refused_since_unix_ms: self.first_unix_ms,
+            last_refused_unix_ms: self.last_unix_ms,
+            refusals: self.count,
+        })
+    }
+}
+
+/// The artifact target an enrolled machine's platform runs.
+fn enrolled_artifact_target(os: &str, arch: &str) -> Option<&'static str> {
+    cairn_common::executor_protocol::RemotePlatform::from_os_arch(
+        &os.to_ascii_lowercase(),
+        &arch.to_ascii_lowercase(),
+    )
+    .map(cairn_common::executor_protocol::RemotePlatform::target)
 }
 
 /// See [`Fleet::predicted_job_home`].
@@ -1243,6 +1332,11 @@ pub struct Fleet {
     listener_rotation_control: Arc<Mutex<Option<Arc<dyn ListenerRotationControl>>>>,
     connections: Arc<Mutex<HashMap<String, ExecutorConnectionState>>>,
     connection_generations: Arc<Mutex<HashMap<String, u64>>>,
+    /// Each machine's recent load, by executor identity. Beside
+    /// `connections` rather than in them, so a link that drops and reattaches
+    /// keeps the machine's history: the ring is the runner's account of the
+    /// machine, not the link's.
+    load_rings: Arc<Mutex<HashMap<String, load::LoadRing>>>,
     disconnect_origins: Arc<Mutex<HashMap<(String, u64), ExecutorDisconnectOrigin>>>,
     connection_ready: Arc<tokio::sync::Notify>,
     /// Woken whenever a queue entry's binding changes, so a placement pass
@@ -1292,6 +1386,12 @@ pub struct Fleet {
     /// settings file does not. Attach stamps from it; the machine is never
     /// told.
     machine_roles: Arc<Mutex<HashMap<String, MachineRole>>>,
+    /// The machines held for inference deployments, by executor public name.
+    /// Replaced whole by [`Fleet::set_inference_holds`]; attach stamps from it.
+    inference_holds: Arc<Mutex<HashMap<String, InferenceHold>>>,
+    /// Where deployment reports go; see [`Fleet::subscribe_deployment_reports`].
+    deployment_reports:
+        Arc<Mutex<Option<mpsc::UnboundedSender<inference::DeploymentReportReceived>>>>,
     /// Every recorded preparation refusal, by executor id then project id.
     ///
     /// The in-memory face of `executor_preparation_refusals`, hydrated when the
@@ -1342,6 +1442,7 @@ pub struct Fleet {
     /// another machine's recovery would only extend the outage.
     last_telemetry_bounce_unix_ms: Arc<Mutex<u64>>,
     resident_process_subscribers: Arc<Mutex<Vec<ResidentProcessSubscriber>>>,
+    node_scratch_subscribers: Arc<Mutex<Vec<node_scratch::NodeScratchSubscriber>>>,
     /// At most one live work item per question. The single chokepoint fact that
     /// makes duplicate answers unrepresentable rather than merely suppressed;
     /// see [`purpose`].
@@ -2901,6 +3002,16 @@ struct ExecutorConnectionState {
     snapshots_received: u64,
     last_progress_unix_ms: u64,
     health: Arc<ExecutorSubstrateReport>,
+    /// Whether this executor publishes [`MachineSample`]s. Once it has, no
+    /// write of `health` moves a machine reading backwards: a snapshot or beat
+    /// built by a refresh pass that waited on pool state carries readings older
+    /// than the samples that arrived while it waited. An executor that has
+    /// never sent one has its health replaced exactly as it posts it.
+    publishes_machine_samples: bool,
+    /// What the executor's latest sample said its running work is using,
+    /// joined onto the rows of `snapshot` whenever the snapshot is read rather
+    /// than written into it, which would clone the whole snapshot every sample.
+    live_usage: load::LiveUsageIndex,
     executor_build_id: Option<String>,
     last_update: Option<UpdateReport>,
     colocated: bool,
@@ -2917,6 +3028,9 @@ struct ExecutorConnectionState {
     /// [`Fleet::machine_roles`] on attach and whenever the roles are
     /// re-adopted, for the same reason `drained` is.
     machine_role: MachineRole,
+    /// The inference deployment holding this machine, stamped from
+    /// [`Fleet::inference_holds`] on attach and whenever the holds change.
+    inference_hold: Option<InferenceHold>,
     /// Projects this machine recorded as unpreparable (a setup command not
     /// found), by project id. Stamped from [`Fleet::preparation_refusals`] on
     /// attach, keeping only refusals recorded against the environment this
@@ -2929,6 +3043,29 @@ struct ExecutorConnectionState {
     /// The network path this connection took, when the runner's executor
     /// listener accepted it.
     link_path: Option<cairn_common::executor_protocol::ExecutorLinkPath>,
+}
+
+impl ExecutorConnectionState {
+    /// The work this connection posted, with what each running command and
+    /// resident process is using joined on from its latest sample.
+    fn occupancy(&self) -> FleetSnapshot {
+        let mut snapshot = (*self.snapshot).clone();
+        self.live_usage.join_onto(&mut snapshot);
+        snapshot
+    }
+
+    /// `health` as this connection should hold it in place of what it holds
+    /// now: carrying forward every machine reading a sample already brought
+    /// that is newer than the one `health` measured.
+    fn carry_sampled_readings(
+        &self,
+        mut health: ExecutorSubstrateReport,
+    ) -> ExecutorSubstrateReport {
+        if self.publishes_machine_samples {
+            health.adopt_newer_readings(&MachineSample::of_report(&self.health));
+        }
+        health
+    }
 }
 
 /// One executor link's snapshot count, read by [`Fleet::snapshot_receipts`].
@@ -3516,6 +3653,7 @@ impl Fleet {
             liveness_observed_at_unix_ms: None,
             facts_stale_refresh_blocked: None,
             last_refresh: None,
+            node_scratches: Vec::new(),
         };
         // The colocated machine pins no listener certificate and places no
         // rotation hold, so the one failure a remote attach can report cannot
@@ -3590,6 +3728,7 @@ impl Fleet {
             generation
         };
         self.link_absence_since.lock().unwrap().remove(&executor_id);
+        let advertised_scratches = advertisement.node_scratches.clone();
         let mut connection = ExecutorConnectionState {
             identity: advertisement.identity.clone(),
             advertisement,
@@ -3599,6 +3738,8 @@ impl Fleet {
             snapshots_received: 0,
             last_progress_unix_ms: unix_time_ms(),
             health: Arc::default(),
+            publishes_machine_samples: false,
+            live_usage: load::LiveUsageIndex::default(),
             executor_build_id,
             last_update,
             colocated,
@@ -3606,6 +3747,7 @@ impl Fleet {
             update_hold,
             // Stamped below, under the table lock.
             machine_role: MachineRole::General,
+            inference_hold: None,
             preparation_refusals: HashMap::new(),
             link_clock: Arc::default(),
             link_path: None,
@@ -3634,6 +3776,10 @@ impl Fleet {
             // restore the role it replaced. Unlike a drain, the machine is not
             // told: only this runner's placement reads it.
             connection.machine_role = self.machine_role(&executor_id);
+            // Under the same lock `set_inference_holds` takes first, for the
+            // same reason as the role.
+            connection.inference_hold =
+                self.inference_hold_named(&executor_public_name(&connection));
             connections
                 .insert(executor_id.clone(), connection)
                 .map(|previous| previous.generation)
@@ -3669,6 +3815,13 @@ impl Fleet {
                 );
             }
         }
+        // Every attach is reconciled, even one advertising nothing: what a
+        // machine holds is decided against the authority, not remembered.
+        self.emit_node_scratch_event(NodeScratchEvent::Advertised {
+            executor_id: executor_id.clone(),
+            generation,
+            replicas: advertised_scratches,
+        });
         // After the insertion above and before this returns, which is the only
         // ordering that leaves no window. A rotation staged concurrently either
         // takes its snapshot after the insertion, in which case it sees this
@@ -3724,6 +3877,7 @@ impl Fleet {
                     generation,
                     since_unix_ms: unix_time_ms(),
                 };
+                record.protocol_refusal = None;
             }
         }
         self.connection_ready.notify_waiters();
@@ -4229,6 +4383,7 @@ impl Fleet {
                     last_seen_unix_ms: None,
                     connection_timeline: VecDeque::new(),
                     last_process_report: None,
+                    protocol_refusal: None,
                 });
         record.name = name.to_string();
         record.os = os.to_string();
@@ -4421,6 +4576,7 @@ impl Fleet {
         let attached: HashSet<String> = self.lock_connections().keys().cloned().collect();
         let drained: HashSet<String> = self.drained.lock().unwrap().clone();
         let roles = self.machine_roles.lock().unwrap().clone();
+        let artifacts = self.executor_artifact_builds.lock().unwrap().clone();
         let mut values: Vec<_> = self
             .enrolled_remotes
             .lock()
@@ -4428,6 +4584,12 @@ impl Fleet {
             .iter()
             .filter(|(executor_id, _)| !attached.contains(*executor_id))
             .map(|(executor_id, record)| EnrolledRemote {
+                stranded: record.protocol_refusal.and_then(|refusal| {
+                    refusal.stranding(
+                        enrolled_artifact_target(&record.os, &record.arch)?,
+                        &artifacts,
+                    )
+                }),
                 drained: drained.contains(executor_id),
                 role: roles.get(executor_id).copied().unwrap_or_default(),
                 executor_id: executor_id.clone(),
@@ -5063,18 +5225,111 @@ impl Fleet {
         executor_id: &str,
         generation: u64,
         advertisement: ExecutorAdvertisement,
-        health: ExecutorSubstrateReport,
+        mut health: ExecutorSubstrateReport,
         last_update: Option<UpdateReport>,
+        machine: Option<MachineSample>,
     ) -> bool {
         self.note_generation_process_telemetry(
             executor_id,
             generation,
             health.machine.process.clone(),
         );
+        // The beat's own sample is newer than the pass its health came from
+        // whenever that pass is waiting on pool state, which is exactly when
+        // the difference matters.
+        if let Some(sample) = &machine {
+            health.adopt_newer_readings(sample);
+        }
         self.update_advertisement_with(executor_id, generation, advertisement, |entry| {
-            entry.health = Arc::new(health);
+            entry.publishes_machine_samples |= machine.is_some();
+            if let Some(sample) = &machine {
+                entry.live_usage.adopt(&sample.live_usage);
+            }
+            entry.health = Arc::new(entry.carry_sampled_readings(health));
             entry.last_update = last_update;
         })
+    }
+
+    /// Every machine's recent load, for a surface opening onto the fleet.
+    pub fn fleet_load(&self) -> load::FleetLoad {
+        self.load_rings
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(executor_id, ring)| (executor_id.clone(), ring.series()))
+            .collect()
+    }
+
+    /// Take a machine sample from the executor's current link: adopt its
+    /// readings, its work's live usage, and its point on the machine's ring,
+    /// and answer the event that tells live surfaces. `None` for a frame from a
+    /// link that has since been replaced, which describes nothing current.
+    pub fn record_machine_sample(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        sample: MachineSample,
+    ) -> Option<load::FleetLoadSampleEvent> {
+        let point = load::FleetLoadPoint::of_sample(&sample);
+        let live_usage = sample.live_usage.clone();
+        if !self.apply_machine_sample(executor_id, generation, sample) {
+            return None;
+        }
+        let point = point.filter(|point| {
+            self.load_rings
+                .lock()
+                .unwrap()
+                .entry(executor_id.to_string())
+                .or_default()
+                .record(*point)
+        });
+        Some(load::FleetLoadSampleEvent {
+            executor_id: executor_id.to_string(),
+            point,
+            live_usage,
+        })
+    }
+
+    /// Adopt a machine sample into this connection's posted health.
+    ///
+    /// Only the readings in it move. Cells, queues, reservations, and the rest
+    /// of the posted health stay as the last snapshot or beat left them, and
+    /// may be minutes older; the executor page already says so when they are.
+    /// A reading that advanced is new posted state, so declines it no longer
+    /// bears out are superseded and placement is woken: that is how a machine
+    /// whose brake read blind becomes placeable again one sample after its
+    /// readings resume, rather than at the next beat.
+    ///
+    /// Link progress is deliberately not stamped. The beat stamps it, and what
+    /// reads it judges whether the machine is accounting for its work, which a
+    /// CPU reading says nothing about.
+    ///
+    /// Answers whether the sample came from the executor's current link.
+    fn apply_machine_sample(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        sample: MachineSample,
+    ) -> bool {
+        let posted = {
+            let mut connections = self.lock_connections();
+            let Some(entry) = connections
+                .get_mut(executor_id)
+                .filter(|entry| entry.generation == generation)
+            else {
+                return false;
+            };
+            entry.publishes_machine_samples = true;
+            entry.live_usage.adopt(&sample.live_usage);
+            if !Arc::make_mut(&mut entry.health).adopt_newer_readings(&sample) {
+                return true;
+            }
+            (entry.snapshot.clone(), entry.health.clone())
+        };
+        let (snapshot, health) = posted;
+        self.supersede_declines(executor_id, &snapshot, &health);
+        self.connection_ready.notify_waiters();
+        true
     }
 
     fn update_advertisement_with(
@@ -5096,9 +5351,19 @@ impl Fleet {
         {
             entry.link_clock.facts_recomputed();
         }
+        let scratches_changed = advertisement.node_scratches != entry.advertisement.node_scratches;
+        let replicas = scratches_changed.then(|| advertisement.node_scratches.clone());
         entry.advertisement = advertisement;
         entry.last_progress_unix_ms = unix_time_ms();
         update(entry);
+        drop(connections);
+        if let Some(replicas) = replicas {
+            self.emit_node_scratch_event(NodeScratchEvent::Advertised {
+                executor_id: executor_id.to_owned(),
+                generation,
+                replicas,
+            });
+        }
         self.connection_ready.notify_waiters();
         true
     }
@@ -5401,6 +5666,7 @@ impl Fleet {
                 advertisement,
                 health,
                 last_update,
+                machine,
             } => {
                 // Answer every beat with who is still waiting. Pacing the report
                 // off the executor's own beat rather than a runner-side timer is
@@ -5412,6 +5678,7 @@ impl Fleet {
                     advertisement,
                     health,
                     last_update,
+                    machine,
                 );
                 // A beat is posted state too, and the floor under a decline
                 // nothing posted explains: an executor whose release of a hold
@@ -5427,8 +5694,29 @@ impl Fleet {
             ExecutorMessage::AdvertisementUpdated { advertisement } => {
                 self.update_advertisement(executor_id, generation, advertisement)
             }
+            // Health only: the public fleet reading did not change shape, as
+            // the CPU snapshot this frame replaced almost never did either.
+            ExecutorMessage::MachineSampled { sample } => {
+                self.record_machine_sample(executor_id, generation, sample);
+                false
+            }
             ExecutorMessage::InfrastructureDiagnostic { diagnostic } => {
                 self.fail_for_executor(executor_id, &diagnostic);
+                false
+            }
+            ExecutorMessage::NodeScratchDeleted { scratch_id } => {
+                self.emit_node_scratch_event(NodeScratchEvent::Deleted {
+                    executor_id: executor_id.to_owned(),
+                    scratch_id,
+                });
+                false
+            }
+            ExecutorMessage::DeploymentReport {
+                command_id,
+                deployment,
+                phase,
+            } => {
+                self.deliver_deployment_report(executor_id, command_id, deployment, phase);
                 false
             }
             _ => false,
@@ -5659,6 +5947,7 @@ impl Fleet {
         if snapshot_changed {
             entry.last_progress_unix_ms = unix_time_ms();
         }
+        let health = entry.carry_sampled_readings(health);
         let replaced = (
             std::mem::replace(&mut entry.snapshot, Arc::new(snapshot)),
             std::mem::replace(&mut entry.health, Arc::new(health)),
@@ -5913,7 +6202,33 @@ impl Fleet {
             .0
             .rsplit_once(":check-")
             .is_some_and(|(request_id, _)| request_id == leader.0);
-        let queued = self.queue.with_entry_by_identity(&leader, |entry| {
+        let (phase, owner) = self.request_dispatch_state(&leader)?;
+        Some(CheckDispatch {
+            phase,
+            joined: (!own).then(|| owner.unwrap_or_else(|| "another request".to_string())),
+        })
+    }
+
+    /// Where one request's own execution stands, read by the identity it was
+    /// queued under: `(request_id, attempt_id)`. A write-check batch is never
+    /// coalesced, so it is read here directly rather than through a subscriber.
+    /// `None` while it is being prepared outside the preparation table, or once
+    /// it has left the queue.
+    pub(crate) fn request_dispatch_phase(
+        &self,
+        identity: &RequestIdentity,
+    ) -> Option<CheckDispatchPhase> {
+        self.request_dispatch_state(identity)
+            .map(|(phase, _)| phase)
+    }
+
+    /// The phase of the execution queued as `identity`, with the owner its
+    /// request names.
+    fn request_dispatch_state(
+        &self,
+        identity: &RequestIdentity,
+    ) -> Option<(CheckDispatchPhase, Option<String>)> {
+        let queued = self.queue.with_entry_by_identity(identity, |entry| {
             let declines: Vec<_> = entry
                 .declined
                 .iter()
@@ -5984,7 +6299,7 @@ impl Fleet {
                     .preparing_leaders
                     .lock()
                     .unwrap()
-                    .get(&leader)
+                    .get(identity)
                     .copied()?;
                 (
                     CheckDispatchPhase::Preparing {
@@ -5994,10 +6309,7 @@ impl Fleet {
                 )
             }
         };
-        Some(CheckDispatch {
-            phase,
-            joined: (!own).then(|| owner.unwrap_or_else(|| "another request".to_string())),
-        })
+        Some((phase, owner))
     }
 
     fn leader_substrate_hold(
@@ -6400,6 +6712,14 @@ impl Fleet {
     /// its own stable identity rather than none, which is what makes such a
     /// check converge, and what makes enrolling a matching machine re-arm it
     /// immediately.
+    ///
+    /// What it deliberately INCLUDES beyond the capabilities is whether each
+    /// eligible machine is measurement-blind ([`placement_blindness`]): a
+    /// machine whose readings placement cannot decide on is still eligible, so
+    /// without this a counter charged while it was blind would be the same
+    /// counter once its telemetry is fresh again, and a lane suppressed during
+    /// a blind window would outlive the window. With it, the machine's
+    /// recovery is itself the fleet change that re-arms the lane.
     pub(crate) fn capability_identity(&self, scope: PlacementScope<'_>) -> String {
         use sha2::Digest as _;
         let now_unix_ms = unix_time_ms();
@@ -6412,7 +6732,7 @@ impl Fleet {
                 let mut toolchains = capabilities.toolchains.clone();
                 toolchains.sort();
                 format!(
-                    "{}|{}|{}|{}|{}",
+                    "{}|{}|{}|{}|{}|{}",
                     executor_public_name(entry),
                     capabilities.os,
                     capabilities.arch,
@@ -6421,11 +6741,55 @@ impl Fleet {
                         .sandbox
                         .as_ref()
                         .is_some_and(SandboxCapabilityEvidence::check_lane_can_nest),
+                    if placement_blindness(&entry.health.machine, now_unix_ms).is_some() {
+                        "blind"
+                    } else {
+                        "seeing"
+                    },
                 )
             })
             .collect();
         rows.sort();
         format!("{:x}", sha2::Sha256::digest(rows.join("\n").as_bytes()))
+    }
+
+    /// The machines among `executor_ids` whose readings placement cannot decide
+    /// on right now, each with the reason placement gives and how long it has
+    /// been past its bound, sorted by name.
+    ///
+    /// Read through [`placement_blindness`], the judgement ranking itself
+    /// makes, so a check death called measurement-blind is one placement
+    /// refused for exactly that. A machine no longer attached is not blind: it
+    /// is gone, which is a different population with a different repair.
+    pub(crate) fn measurement_blindness(
+        &self,
+        executor_ids: &[String],
+    ) -> Vec<MeasurementBlindness> {
+        let now_unix_ms = unix_time_ms();
+        let connections = self.lock_connections();
+        let mut blind: Vec<MeasurementBlindness> = executor_ids
+            .iter()
+            .filter_map(|executor_id| {
+                let entry = connections.get(executor_id)?;
+                let reason = placement_blindness(&entry.health.machine, now_unix_ms)?;
+                let blind_for_ms = match &reason {
+                    PlacementRejectionReason::TelemetryStale {
+                        age_ms,
+                        stale_after_ms,
+                        ..
+                    } => Some(age_ms.saturating_sub(*stale_after_ms)),
+                    _ => None,
+                };
+                Some(MeasurementBlindness {
+                    executor_id: executor_id.clone(),
+                    name: executor_public_name(entry),
+                    reason: reason.describe(),
+                    blind_for_ms,
+                })
+            })
+            .collect();
+        blind.sort_by(|left, right| left.name.cmp(&right.name));
+        blind
     }
 
     /// `(executor_id, repair identity)` for every machine eligible to run this
@@ -6502,13 +6866,20 @@ impl Fleet {
         let mut aggregate = FleetSnapshot::default();
         for (id, connection) in entries {
             let snapshot = &connection.snapshot;
-            aggregate.cells.extend(snapshot.cells.clone());
+            let mut live = FleetSnapshot {
+                cells: snapshot.cells.clone(),
+                executing_requests: snapshot.executing_requests.clone(),
+                ..FleetSnapshot::default()
+            };
+            connection.live_usage.join_onto(&mut live);
+            aggregate.cells.extend(live.cells);
             aggregate
                 .queued_requests
                 .extend(snapshot.queued_requests.clone());
+            aggregate.executing_requests.extend(live.executing_requests);
             aggregate
-                .executing_requests
-                .extend(snapshot.executing_requests.clone());
+                .cell_transitions
+                .extend(snapshot.cell_transitions.clone());
             aggregate
                 .recent_completions
                 .extend(
@@ -6638,24 +7009,68 @@ impl Fleet {
     /// Record the executor build this runner serves for `target`, or why it
     /// has none. Written by the self-update driver, which resolves and hashes
     /// the artifact off the fleet's locks.
-    pub fn record_executor_artifact_build(&self, target: &str, build: Result<String, String>) {
+    pub fn record_executor_artifact_build(
+        &self,
+        target: &str,
+        build: Result<String, ArtifactUnavailable>,
+    ) {
         self.executor_artifact_builds.lock().unwrap().insert(
             target.to_string(),
             match build {
                 Ok(build_id) => rollout::ArtifactBuild::Resolved(build_id),
-                Err(reason) => rollout::ArtifactBuild::Unavailable(reason),
+                Err(unavailable) => rollout::ArtifactBuild::Unavailable(unavailable),
             },
         );
     }
 
-    /// The artifact targets the attached remotes run, which are the ones the
-    /// self-update driver has to resolve.
+    /// The artifact targets the self-update driver has to resolve: those the
+    /// attached remotes run, and those every enrolled machine runs whether or
+    /// not it is attached. The second half is what a machine refused at hello
+    /// needs, because a refused machine never attaches, and a runner that
+    /// only resolved attached targets could not say it had nothing to repair
+    /// that machine with.
     pub fn remote_executor_targets(&self) -> std::collections::BTreeSet<&'static str> {
-        self.lock_connections()
+        let mut targets: std::collections::BTreeSet<&'static str> = self
+            .lock_connections()
             .values()
             .filter(|entry| !entry.colocated)
             .filter_map(executor_artifact_target)
-            .collect()
+            .collect();
+        targets.extend(
+            self.enrolled_remotes
+                .lock()
+                .unwrap()
+                .values()
+                .filter_map(|record| enrolled_artifact_target(&record.os, &record.arch)),
+        );
+        targets
+    }
+
+    /// Record that an enrolled machine dialled in speaking `received` and was
+    /// refused for not speaking `expected`, and answer whether that leaves it
+    /// stranded: refused, and with no artifact this runner could repair it
+    /// with. `None` for a machine this runner has not enrolled, and for one a
+    /// self-update can still repair (or whose target is not yet resolved).
+    pub fn record_protocol_refusal(
+        &self,
+        executor_id: &str,
+        expected: u32,
+        received: u32,
+    ) -> Option<cairn_common::executor_protocol::StrandedExecutor> {
+        let (run, target) = {
+            let mut enrolled = self.enrolled_remotes.lock().unwrap();
+            let record = enrolled.get_mut(executor_id)?;
+            let run = ProtocolRefusalRun::extended(
+                record.protocol_refusal,
+                expected,
+                received,
+                unix_time_ms(),
+            );
+            record.protocol_refusal = Some(run);
+            (run, enrolled_artifact_target(&record.os, &record.arch))
+        };
+        let artifacts = self.executor_artifact_builds.lock().unwrap();
+        run.stranding(target?, &artifacts)
     }
 
     /// One pass of the rolling self-update (see [`rollout`]): stamp the hold
@@ -6668,30 +7083,34 @@ impl Fleet {
     /// held across another.
     pub fn advance_self_update_rollout(&self, now_unix_ms: u64) {
         let artifacts = self.executor_artifact_builds.lock().unwrap().clone();
-        let mut observed: Vec<(rollout::Candidate, ExecutorWork)> = self
+        let mut candidates: Vec<rollout::Candidate> = self
             .lock_connections()
             .values()
             .filter(|entry| !entry.colocated)
-            .map(|entry| (rollout_candidate(entry, now_unix_ms), executor_work(entry)))
+            .map(|entry| {
+                let mut candidate = rollout_candidate(entry, now_unix_ms);
+                (candidate.work, candidate.services) = snapshot_work(entry);
+                candidate
+            })
             .collect();
-        let mut pending_residency: HashMap<String, usize> = HashMap::new();
-        for pending in self.pending_residency.lock().unwrap().values() {
-            *pending_residency
+        let mut pending_residency: HashMap<String, Vec<String>> = HashMap::new();
+        for (correlation_id, pending) in self.pending_residency.lock().unwrap().iter() {
+            pending_residency
                 .entry(pending.executor_id.clone())
-                .or_default() += 1;
+                .or_default()
+                .push(correlation_id.clone());
         }
-        for (candidate, work) in &mut observed {
-            let bound = self.queue.identities_bound_to(&candidate.executor_id).len();
-            let residency = pending_residency
-                .get(&candidate.executor_id)
-                .copied()
-                .unwrap_or(0);
-            candidate.in_flight = work.in_flight(bound, residency);
+        for candidate in &mut candidates {
+            let bound = self.queue.identities_bound_to(&candidate.executor_id);
+            join_runner_work(
+                &mut candidate.work,
+                &bound,
+                pending_residency
+                    .get(&candidate.executor_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            );
         }
-        let candidates: Vec<rollout::Candidate> = observed
-            .into_iter()
-            .map(|(candidate, _)| candidate)
-            .collect();
         let step = self
             .self_update
             .lock()
@@ -6814,7 +7233,8 @@ impl Fleet {
                 } else {
                     self_update.status(&rollout_candidate(entry, captured_at_unix_ms), &artifacts)
                 },
-                occupancy: (*entry.snapshot).clone(),
+                occupancy: entry.occupancy(),
+                live_usage_gap: entry.live_usage.gap(),
                 slots: entry.health.slots.clone(),
                 captured_at_unix_ms,
                 connection_timeline: enrolled_remotes
@@ -6948,6 +7368,44 @@ impl Fleet {
             .map(executor_public_name)
     }
 
+    /// Batch work on, or waiting for, the machines publicly named `names`: the
+    /// build pressure the inference pool controller weighs against a loaded
+    /// model.
+    ///
+    /// Running work is what the attached machines report executing, split into
+    /// agent turns (submitted at `AgentInteractive` priority, never preempted)
+    /// and restartable checks. The submitted priority, not the effective one:
+    /// aging promotes a long-waiting check to the top tier, and it is still a
+    /// check. Waiting work is every unclaimed queue entry one of these machines
+    /// declined for a reason unloading a model would relieve; see
+    /// [`queue::ExecutionQueue::waiting_relieved_by_unload`].
+    pub fn machine_set_pressure(
+        &self,
+        names: &std::collections::BTreeSet<String>,
+    ) -> cairn_inference::pool_control::BuildPressure {
+        let connections = self.lock_connections();
+        let mut pressure = cairn_inference::pool_control::BuildPressure::default();
+        let mut executor_ids = HashSet::new();
+        for entry in connections.values() {
+            if !names.contains(&executor_public_name(entry)) {
+                continue;
+            }
+            executor_ids.insert(entry.identity.executor_id.clone());
+            for request in &entry.snapshot.executing_requests {
+                if request.priority
+                    == Some(cairn_common::executor_protocol::CellPriority::AgentInteractive)
+                {
+                    pressure.running_turns += 1;
+                } else {
+                    pressure.running_other += 1;
+                }
+            }
+        }
+        drop(connections);
+        pressure.waiting = self.queue.waiting_relieved_by_unload(&executor_ids);
+        pressure
+    }
+
     pub async fn set_executor_runtime_policy(
         &self,
         executor_id: &str,
@@ -7064,6 +7522,49 @@ impl Fleet {
                     reason: "it did not answer within ten seconds".into(),
                 }
             }
+        }
+    }
+
+    /// Stop placing new work on a machine for as long as a removal tears it
+    /// down, without recording a drain anywhere durable.
+    ///
+    /// Placement refuses the machine exactly as it refuses a drained one, so
+    /// an occupancy reading taken after this stays true until the fence is
+    /// lifted. Returns whether this call raised it: a machine an operator has
+    /// already drained is left to that drain, which lifting the fence after a
+    /// failed removal must not clear. The machine is told best effort, as
+    /// attaching tells it, without waiting for an answer: the runner's own
+    /// refusal is what holds.
+    pub fn fence_admission(&self, executor_id: &str) -> bool {
+        let raised = self.drained.lock().unwrap().insert(executor_id.to_string());
+        if raised {
+            self.state_drain(executor_id, true);
+        }
+        raised
+    }
+
+    /// Clear this runner's drain of a machine in memory: the fence a removal
+    /// raised, or the drain of a machine a removal has taken out of the fleet
+    /// settings, which would otherwise outlive it until the runner restarts.
+    pub fn lift_admission_fence(&self, executor_id: &str) {
+        let held = self.drained.lock().unwrap().remove(executor_id);
+        if held {
+            self.state_drain(executor_id, false);
+        }
+    }
+
+    /// Stamp a drain on the machine's live connection, if it has one, and tell
+    /// it without waiting for the answer.
+    fn state_drain(&self, executor_id: &str, drained: bool) {
+        let sender = self.lock_connections().get_mut(executor_id).map(|entry| {
+            entry.drained = drained;
+            entry.sender.clone()
+        });
+        if let Some(sender) = sender {
+            let _ = sender.send(ExecutorMessage::DrainModeRequest {
+                correlation_id: uuid::Uuid::new_v4().to_string(),
+                enabled: drained,
+            });
         }
     }
 
@@ -8755,6 +9256,17 @@ impl Fleet {
         if let (Some(request), Some(plane)) = (&object_request, &object_plane) {
             plane.authorize_request(request, &selected.executor_id, selected.generation);
         }
+        // A terminal or REPL that holds its node's scratch syncs it over this
+        // connection's object channel, at start and again when it exits.
+        if let ResidencyOperation::StartProcess { process, .. } = &operation {
+            if let Some(grant) = &process.node_scratch {
+                orch.object_plane.scratch.authorize(
+                    &selected.executor_id,
+                    selected.generation,
+                    &grant.scratch_id,
+                );
+            }
+        }
         let sent = selected
             .sender
             .send(ExecutorMessage::ResidencyRequest {
@@ -9688,7 +10200,8 @@ impl Fleet {
             .lock_connections()
             .get(executor_id)
             .is_some_and(|entry| {
-                entry.drained && environment_live_work(entry, &acquisition.holder).is_empty()
+                (entry.drained || entry.inference_hold.is_some())
+                    && environment_live_work(entry, &acquisition.holder).is_empty()
             });
         idle_on_drain && self.environment_could_move(acquisition, executor_id)
     }
@@ -10137,6 +10650,7 @@ impl Fleet {
             items,
             runner_context_id,
             execution_residency: None,
+            node_scratch: None,
         }
     }
 
@@ -10406,6 +10920,7 @@ impl Fleet {
                                         mutation_delta: None,
                                         sandbox_denials: result.sandbox_denials,
                                         tracked_modifications: result.tracked_modifications,
+                                        node_scratch: None,
                                     }),
                                 );
                             }
@@ -10537,7 +11052,8 @@ impl Fleet {
                 }
             };
         let sandbox_mode = Self::batch_sandbox_mode(resolved_fence, &request.repository);
-        let batch = match serialize_process_batch(
+        let node_scratch = batch.node_scratch.clone();
+        let mut batch = match serialize_process_batch(
             batch,
             &request.env,
             runner_context_id.clone(),
@@ -10556,6 +11072,7 @@ impl Fleet {
                 .into()
             }
         };
+        batch.node_scratch = node_scratch;
         // An agent's batch is the one submission whose requester reads the
         // outcome as a statement about whether its commands ran, so it is the
         // one that keeps the account of a grant without a result.
@@ -10803,8 +11320,7 @@ impl Fleet {
                 };
                 let crossing = match denial {
                     cairn_common::executor_protocol::SandboxDenial::Path(path) => {
-                        let path = std::path::PathBuf::from(path);
-                        fence::Crossing::shell_path(&path, &path.display().to_string())
+                        fence::Crossing::shell_path(std::path::Path::new(&path), &command)
                     }
                     cairn_common::executor_protocol::SandboxDenial::Command => {
                         fence::Crossing::unattributed_denial(
@@ -11344,6 +11860,15 @@ impl Fleet {
         // send below, which revokes on failure.
         if !selected.colocated {
             object_plane.authorize_request(&request, &selected.executor_id, selected.generation);
+        }
+        // A node scratch is reached over the object channel from every machine,
+        // colocated or not, and only by the connection this batch was granted to.
+        if let Some(grant) = batch.as_ref().and_then(|batch| batch.node_scratch.as_ref()) {
+            object_plane.scratch.authorize(
+                &selected.executor_id,
+                selected.generation,
+                &grant.scratch_id,
+            );
         }
         let project_id = request.project_id.clone();
         let setup_identity = request.project_requirements.setup_identity.clone();
@@ -11931,7 +12456,10 @@ impl Fleet {
         // likeliest reason nothing became usable, and the one an operator can
         // act on, so it is named whatever else the refusal says.
         let declines = format!(
-            "{}{}",
+            "{}{}{}",
+            describe_memory_rejections(declined)
+                .map(|memory| format!(" Not placed where it cannot run: {memory}."))
+                .unwrap_or_default(),
             describe_declines(declined),
             survey_candidates(
                 &connections,
@@ -11998,21 +12526,7 @@ impl Fleet {
         mut rejected: Vec<PlacementRejection>,
     ) -> CellOutcome {
         if let Some(entry_id) = entry_id {
-            for decline in self.recorded_declines(entry_id) {
-                match rejected
-                    .iter_mut()
-                    .find(|row| row.executor_id == decline.executor_id)
-                {
-                    Some(row)
-                        if matches!(row.reason, PlacementRejectionReason::Declined { .. }) =>
-                    {
-                        *row = decline
-                    }
-                    // A structural reason is the truer account of that machine.
-                    Some(_) => {}
-                    None => rejected.push(decline),
-                }
-            }
+            rejected = account_from_journal(rejected, &self.recorded_declines(entry_id));
         }
         let outcome = self.wait_horizon_outcome(request, &rejected);
         if let CellOutcome::Unavailable { diagnostic, .. } = &outcome {
@@ -12088,6 +12602,9 @@ impl Fleet {
         policy: &ActivePlacementPolicy,
         entry_id: Option<&str>,
     ) -> Result<Placement, CellOutcome> {
+        // The memory reasons the last recorded wait named, so a request parked
+        // on them is recorded once per change rather than on every pass.
+        let mut recorded_memory_wait: Option<Vec<(String, String)>> = None;
         loop {
             // A machine that posted new state may have become willing, so its
             // report wakes this wait as surely as a new connection does. That is
@@ -12122,9 +12639,37 @@ impl Fleet {
                 }
                 Ok(Selection::Waiting { rejected }) => rejected,
             };
+            // Work kept off the machines it cannot run on is pending for a
+            // reason the queue view owes its reader, and nothing else records a
+            // pass that placed nothing.
+            if let Some(mut waiting) = memory_wait_decision(request, policy, &rejected) {
+                let mut signature: Vec<(String, String)> = rejected
+                    .iter()
+                    .map(|rejection| {
+                        (
+                            rejection.executor_id.clone(),
+                            placement_rejection_signature(&rejection.reason),
+                        )
+                    })
+                    .collect();
+                signature.sort();
+                if recorded_memory_wait.as_ref() != Some(&signature) {
+                    if let Some(entry_id) = entry_id {
+                        self.record_binding_chain(&mut waiting, entry_id);
+                    }
+                    self.record_placement_decision(waiting);
+                    recorded_memory_wait = Some(signature);
+                }
+            }
+            // An exclusion is waited out like a decline: the work cannot go
+            // where it was killed, and another machine attaching or freeing up
+            // is what ends the wait.
             let parked_on: Vec<PlacementRejection> = rejected
                 .iter()
-                .filter(|rejection| waits_on_machine(&rejection.reason))
+                .filter(|rejection| {
+                    waits_on_machine(&rejection.reason)
+                        || excluded_by_memory_kill(&rejection.reason)
+                })
                 .cloned()
                 .collect();
             let now = unix_time_ms();
@@ -12273,7 +12818,7 @@ impl Fleet {
             let mut prediction = placement_prediction_with_contention(
                 entry, warmth, queue, run, contention, sync_cost,
             );
-            price_memory_pressure(&mut prediction, &entry.health.host, now);
+            price_host_stall(&mut prediction, &entry.health.host, now);
             if let Some(db) = &oracle.db {
                 let identities: Vec<&CommandResourceIdentity> = match plan {
                     Some(plan) if !plan.batch_identities.is_empty() => {
@@ -12478,6 +13023,7 @@ impl Fleet {
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
+            scratch_sync: None,
         };
         self.select_executor(
             &request,
@@ -12841,6 +13387,7 @@ fn residency_placement_request(acquisition: &ResidencyAcquireRequest) -> CellReq
         command_resource_identity: None,
         resource_reservation: acquisition.footprint.reservation(),
         learned_estimate: None,
+        scratch_sync: None,
     }
 }
 
@@ -12924,6 +13471,7 @@ fn restamp_outcome(outcome: &CellOutcome, identity: &RequestIdentity) -> CellOut
             mutation_delta: mutation_delta.clone(),
             sandbox_denials: sandbox_denials.clone(),
             tracked_modifications: tracked_modifications.clone(),
+            node_scratch: None,
         },
         CellOutcome::FailedAfterExecution { diagnostic, .. } => CellOutcome::FailedAfterExecution {
             request_id: identity.0.clone(),
@@ -13051,7 +13599,7 @@ fn prior_predictions(
             resource_profiles::contention_prior(&candidate_load(entry)),
             sync_cost,
         );
-        price_memory_pressure(&mut prediction, &entry.health.host, now_unix_ms);
+        price_host_stall(&mut prediction, &entry.health.host, now_unix_ms);
         predictions.insert(entry.identity.executor_id.clone(), prediction);
     }
     (predictions, sync_costs)
@@ -13155,6 +13703,11 @@ struct CandidateSurvey<'a> {
     view: AdmissionView,
     /// Each machine that has declined this entry, superseded or not.
     declined_here: HashMap<String, PriorDecline>,
+    /// The same declines as the rows a refusal renders: each machine's last
+    /// answer to this entry, with its own detail. A refusal composed here is
+    /// built from these through [`account_from_journal`], not from the
+    /// runner's reading of the machine at the moment it was composed.
+    journal: Vec<PlacementRejection>,
 }
 
 /// The facts about a piece of work that decide which machines could
@@ -13336,6 +13889,14 @@ fn candidate_rejection(
         // The self-update rollout's hold, with a drain's exemption for the same
         // reason: resident work has to finish for the machine to empty.
         Some(PlacementRejectionReason::UpdatePending)
+    } else if let Some(hold) = entry.inference_hold.as_ref().filter(|_| !pinned_here) {
+        // An inference deployment holds this machine: a named drain, with the
+        // drain's exemption. An idle environment here moves off at its next
+        // batch (`drained_home_is_idle`); live work holding one finishes.
+        Some(PlacementRejectionReason::InferenceReserved {
+            deployment: hold.deployment.clone(),
+            phase: hold.phase.clone(),
+        })
     } else if let Some(volume) = entry
         .health
         .build_volume
@@ -13528,6 +14089,19 @@ fn survey_candidates<'a>(
             )
         })
         .collect();
+    let mut journal: Vec<PlacementRejection> = declined
+        .iter()
+        .map(|(executor_id, decline)| PlacementRejection {
+            prediction: None,
+            executor_name: connections
+                .get(executor_id)
+                .map(executor_public_name)
+                .unwrap_or_else(|| executor_id.clone()),
+            executor_id: executor_id.clone(),
+            reason: declined_rejection(decline),
+        })
+        .collect();
+    journal.sort_by(|a, b| a.executor_id.cmp(&b.executor_id));
     // A capable machine that has said "not yet" is something to wait for, so
     // neither immediate refusal below applies while one stands.
     let awaiting_decliner = rejected
@@ -13542,7 +14116,7 @@ fn survey_candidates<'a>(
             connections,
             unattached,
             request,
-            &rejected,
+            &account_from_journal(rejected, &journal),
         ));
     }
     // Waiting is the right answer for a mobile request that trust left with
@@ -13600,6 +14174,7 @@ fn survey_candidates<'a>(
         rejected,
         view: view.clone(),
         declined_here,
+        journal,
     })
 }
 
@@ -13611,6 +14186,86 @@ fn waits_on_machine(reason: &PlacementRejectionReason) -> bool {
         reason,
         PlacementRejectionReason::Declined { .. } | PlacementRejectionReason::Held { .. }
     )
+}
+
+/// Whether a rejection is the kernel's own verdict that this machine cannot
+/// run the command. Nothing the machine posts will clear it, so the machine is
+/// never offered the work; the request waits for the rest of the fleet instead
+/// of being refused for want of a machine it was never going to get.
+fn excluded_by_memory_kill(reason: &PlacementRejectionReason) -> bool {
+    matches!(reason, PlacementRejectionReason::MemoryKillExcluded { .. })
+}
+
+/// The machines a pass passed over because the work cannot run there, each
+/// with its reason, or `None` when memory kept the work off no machine.
+fn describe_memory_rejections(rejected: &[PlacementRejection]) -> Option<String> {
+    let rows: Vec<String> = rejected
+        .iter()
+        .filter(|rejection| {
+            matches!(
+                rejection.reason,
+                PlacementRejectionReason::MemoryKillExcluded { .. }
+                    | PlacementRejectionReason::ExceedsMemoryCeiling { .. }
+            )
+        })
+        .map(|rejection| {
+            format!(
+                "{}: {}",
+                rejection.executor_name,
+                rejection.reason.describe()
+            )
+        })
+        .collect();
+    (!rows.is_empty()).then(|| rows.join("; "))
+}
+
+/// The record of a pass that kept work off the machines it cannot run on and
+/// placed it nowhere, so the queue view shows why the request is pending.
+fn memory_wait_decision(
+    request: &CellRequest,
+    policy: &ActivePlacementPolicy,
+    rejected: &[PlacementRejection],
+) -> Option<PlacementDecision> {
+    let memory = describe_memory_rejections(rejected)?;
+    Some(placement_decision(
+        request,
+        unix_time_ms(),
+        Some(policy_evidence(request, policy, false)),
+        None,
+        PlacementOutcome::Waiting {
+            diagnostic: format!(
+                "not placed where it cannot run: {memory}.{}",
+                describe_declines(rejected)
+            ),
+        },
+        rejected.to_vec(),
+    ))
+}
+
+/// How far past the size it had at the kill a machine's total memory must grow
+/// before a kill there while alone stops excluding it: a sixteenth. A margin
+/// rather than any change, so a kernel update that moves the reported total by
+/// a few megabytes does not read as a new machine.
+const MEMORY_KILL_GROWTH_DIVISOR: u64 = 16;
+
+/// The exclusion a kill while alone imposes on this machine, or `None` when the
+/// kill was crowded or the machine has since grown past the size it was killed
+/// at. An unread total keeps the exclusion: a command with a kill history here
+/// is not placed here on the strength of a reading that is missing.
+fn memory_kill_exclusion(
+    kill: &cairn_common::executor_protocol::MemoryKill,
+    machine: &cairn_common::executor_protocol::MachineTelemetry,
+) -> Option<PlacementRejectionReason> {
+    let machine_total_bytes = kill.alone_on_machine_bytes?;
+    let grown = machine.memory.value().is_some_and(|memory| {
+        memory.total_bytes
+            > machine_total_bytes.saturating_add(machine_total_bytes / MEMORY_KILL_GROWTH_DIVISOR)
+    });
+    (!grown).then_some(PlacementRejectionReason::MemoryKillExcluded {
+        victim_resident_bytes: kill.victim_resident_bytes,
+        machine_total_bytes,
+        killed_at_unix_ms: kill.killed_at_unix_ms,
+    })
 }
 
 /// Logged placement rejections, keyed by request and machine.
@@ -13648,10 +14303,12 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
         PlacementRejectionReason::InsufficientMemory { .. } => "insufficientMemory",
         PlacementRejectionReason::InsufficientVolume { .. } => "insufficientVolume",
         PlacementRejectionReason::ExceedsMemoryCeiling { .. } => "exceedsMemoryCeiling",
+        PlacementRejectionReason::MemoryKillExcluded { .. } => "memoryKillExcluded",
         PlacementRejectionReason::OutrankedBy { .. } => "outrankedBy",
         PlacementRejectionReason::UntrustedVerdictPlatform { .. } => "untrustedVerdictPlatform",
         PlacementRejectionReason::Drained => "drained",
         PlacementRejectionReason::UpdatePending => "updatePending",
+        PlacementRejectionReason::InferenceReserved { .. } => "inferenceReserved",
         PlacementRejectionReason::BuildVolumeAbsent { .. } => "buildVolumeAbsent",
         PlacementRejectionReason::RoleExcluded { .. } => "roleExcluded",
         PlacementRejectionReason::AvoidedInfrastructure => "avoidedInfrastructure",
@@ -13700,6 +14357,54 @@ fn declined_rejection(decline: &queue::EntryDecline) -> PlacementRejectionReason
         detail: decline.detail.clone(),
         declined_at_unix_ms: decline.at_unix_ms,
     }
+}
+
+/// Whether a rejection is the runner's own reading of a machine at the moment
+/// a refusal is composed — its link's silence, its telemetry's age or absence,
+/// a fit judged from those readings, a hold read off posted state — or an
+/// earlier decline. Any of these yields to the last decline the machine
+/// actually answered for this request. A structural reason (role, drain,
+/// selector, project, preparation) is a fact about the machine and the work
+/// that no answer changes, and it stands.
+fn answered_by_journal(reason: &PlacementRejectionReason) -> bool {
+    matches!(
+        reason,
+        PlacementRejectionReason::Declined { .. }
+            | PlacementRejectionReason::Held { .. }
+            | PlacementRejectionReason::ConnectionStale { .. }
+            | PlacementRejectionReason::RunnerNotListening { .. }
+            | PlacementRejectionReason::TelemetryGap { .. }
+            | PlacementRejectionReason::TelemetryStale { .. }
+            | PlacementRejectionReason::InsufficientMemory { .. }
+            | PlacementRejectionReason::InsufficientVolume { .. }
+    )
+}
+
+/// A refusal's per-machine rows with each machine's own last answer leading.
+///
+/// `journal` is the request's declines, one per machine, superseded ones
+/// included: a machine that declined, posted state, and then went quiet is
+/// still the machine that declined. Without this a refusal names whatever the
+/// admission view reads when it is composed (a link silent for two minutes, a
+/// CPU sample past its bound) while the placement journal for the same request
+/// says the machine declined on disk, and a reader chases a runner restart
+/// that never happened. A machine the journal names that the rows do not is
+/// appended, so a decliner that has since detached is still accounted for.
+fn account_from_journal(
+    mut rejected: Vec<PlacementRejection>,
+    journal: &[PlacementRejection],
+) -> Vec<PlacementRejection> {
+    for decline in journal {
+        match rejected
+            .iter_mut()
+            .find(|row| row.executor_id == decline.executor_id)
+        {
+            Some(row) if answered_by_journal(&row.reason) => row.reason = decline.reason.clone(),
+            Some(_) => {}
+            None => rejected.push(decline.clone()),
+        }
+    }
+    rejected
 }
 
 /// The decline rows of a refusal as one trailing sentence, or nothing.
@@ -13769,6 +14474,7 @@ fn rank_survey(
         mut rejected,
         view,
         declined_here,
+        journal,
     } = survey;
     // Each machine's posted state is read against the demand the offer to it
     // will name: the reservation resolved for that machine, which an ordinary
@@ -13859,6 +14565,10 @@ fn rank_survey(
                 now_unix_ms,
             );
             candidate.cache_distance = cache_distances.get(&entry.identity.executor_id).copied();
+            candidate.scratch_sync_ms = request
+                .scratch_sync
+                .as_ref()
+                .map_or(0, |estimate| estimate.ms_for(&entry.identity.executor_id));
             candidate
         })
         .collect();
@@ -13874,6 +14584,28 @@ fn rank_survey(
         );
     let Some(winner) = winner else {
         rejected.extend(ranked.into_iter().map(|candidate| candidate.rejection()));
+        // A machine the command was killed on while alone is never chosen, so
+        // when it is all there is the work waits for another machine, which is
+        // the whole of the remedy: placing it there repeats the death. Work the
+        // caller settled on that machine cannot wait for another, so it is
+        // refused at once with the kill named.
+        if let Some(excluded) = rejected
+            .iter()
+            .find(|rejection| excluded_by_memory_kill(&rejection.reason))
+        {
+            if settled {
+                return Err(format!(
+                    "{} cannot run this work: {}. Nothing was run; run it without the pin or selector that holds it there.",
+                    excluded.executor_name,
+                    excluded.reason.describe()
+                ));
+            }
+            return Ok(PlacementDraft {
+                selected: None,
+                rejected,
+                policy: policy_evidence(request, policy, false),
+            });
+        }
         // A machine held on a condition it posted is something to wait for,
         // like a decline, so the blind rest are not a reason to refuse.
         if rejected
@@ -13887,9 +14619,34 @@ fn rank_survey(
             });
         }
         // Every usable machine was measured-blind and none of them was a
-        // machine policy is allowed to spill onto. Say so with the evidence.
-        return Err(no_measurable_executor_diagnostic(request, &rejected));
+        // machine policy is allowed to spill onto. Say so with the evidence,
+        // and where a machine answered this request, with its answer.
+        return Err(no_measurable_executor_diagnostic(
+            request,
+            &account_from_journal(rejected, &journal),
+        ));
     };
+
+    // The clamp is for a fleet with nowhere bigger to go. A winner over its
+    // memory ceiling means every selectable machine is too small, and while a
+    // capable machine has only said "not yet" (a decline, a posted hold) the
+    // work can still go somewhere that holds it: placing it at the clamp now
+    // trades a wait for an out-of-memory kill hours in. So work free to move
+    // waits on the decliner instead, as it would if nothing else were usable.
+    // Work the caller settled stays at the clamp, as it always has.
+    if winner.over_ceiling.is_some()
+        && exercising_spill
+        && rejected
+            .iter()
+            .any(|rejection| waits_on_machine(&rejection.reason))
+    {
+        rejected.extend(ranked.into_iter().map(|candidate| candidate.rejection()));
+        return Ok(PlacementDraft {
+            selected: None,
+            rejected,
+            policy: policy_evidence(request, policy, false),
+        });
+    }
 
     // Blindness is named ahead of `OnlyCandidate` deliberately. A lone
     // measured-blind home winning by default is precisely the local-degradation
@@ -14000,6 +14757,10 @@ struct ScoredCandidate<'a> {
     /// will ever reserve. A fact about the machine's size rather than its
     /// readings, so it holds whether or not the machine is blind.
     over_ceiling: Option<PlacementRejectionReason>,
+    /// Set when the kernel killed this command for memory here while nothing
+    /// else of Cairn's ran beside it. Unlike `over_ceiling` it is a filter, not
+    /// a ranking key: such a machine is never selected, not even at the clamp.
+    excluded: Option<PlacementRejectionReason>,
     /// What this machine has posted that its admission would decline this
     /// request on now. A current fact, so it outranks everything below it.
     held: Option<AdmissionHoldEvidence>,
@@ -14020,6 +14781,10 @@ struct ScoredCandidate<'a> {
     /// ranking key, and the explanation, are the same object.
     prediction: PlacementPrediction,
     cache_distance: Option<cairn_common::cache_distance::CacheDistance>,
+    /// What bringing the batch's node scratch current here is predicted to
+    /// take. Added to the predicted verdict, never a filter: a machine where
+    /// the scratch is warm ranks ahead of an otherwise-equal cold one.
+    scratch_sync_ms: u64,
 }
 
 impl<'a> ScoredCandidate<'a> {
@@ -14127,7 +14892,7 @@ impl<'a> ScoredCandidate<'a> {
             prediction.predicted_verdict_ms = prediction
                 .adjusted_run_ms
                 .saturating_add(prediction.reliability_penalty_ms())
-                .saturating_add(prediction.memory_pressure_penalty_ms());
+                .saturating_add(prediction.host_stall_penalty_ms());
         }
         prediction.declined_here = declined_here;
         let admission_accepts = !cpu_blind
@@ -14141,13 +14906,14 @@ impl<'a> ScoredCandidate<'a> {
                     .saturating_add(demand.disk_growth_bytes)
                     <= capacity
             });
-        let over_ceiling = reservation
-            .and_then(|resolved| resolved.memory_fit.ceiling())
-            .map(|ceiling| PlacementRejectionReason::ExceedsMemoryCeiling {
-                estimate_bytes: ceiling.estimate_bytes,
-                ceiling_bytes: ceiling.ceiling_bytes,
-                killed_here: ceiling.killed_here,
-            });
+        let ceiling = reservation.and_then(|resolved| resolved.memory_fit.ceiling());
+        let excluded = ceiling
+            .and_then(|ceiling| memory_kill_exclusion(ceiling.killed_here.as_ref()?, machine));
+        let over_ceiling = ceiling.map(|ceiling| PlacementRejectionReason::ExceedsMemoryCeiling {
+            estimate_bytes: ceiling.estimate_bytes,
+            ceiling_bytes: ceiling.ceiling_bytes,
+            killed_here: ceiling.killed_here,
+        });
         Self {
             entry,
             sync_cost,
@@ -14155,6 +14921,7 @@ impl<'a> ScoredCandidate<'a> {
             blindness,
             misfit,
             over_ceiling,
+            excluded,
             held: hold.map(|hold| hold.evidence.clone()),
             admission_accepts,
             declined_here,
@@ -14162,6 +14929,7 @@ impl<'a> ScoredCandidate<'a> {
             cpu_headroom_risk,
             prediction,
             cache_distance: None,
+            scratch_sync_ms: 0,
         }
     }
 
@@ -14171,8 +14939,9 @@ impl<'a> ScoredCandidate<'a> {
             executor_name: executor_public_name(self.entry),
             executor_id: self.entry.identity.executor_id.clone(),
             reason: self
-                .blindness
+                .excluded
                 .clone()
+                .or_else(|| self.blindness.clone())
                 .or_else(|| self.over_ceiling.clone())
                 .or_else(|| self.misfit.clone())
                 .or_else(|| self.held_rejection())
@@ -14184,8 +14953,9 @@ impl<'a> ScoredCandidate<'a> {
         // A machine that could not be measured, or that measurably could not fit,
         // has a more useful thing to say than "it lost".
         let reason = self
-            .blindness
+            .excluded
             .clone()
+            .or_else(|| self.blindness.clone())
             .or_else(|| self.over_ceiling.clone())
             .or_else(|| self.misfit.clone())
             .or_else(|| self.held_rejection())
@@ -14217,7 +14987,11 @@ impl<'a> ScoredCandidate<'a> {
 /// ceiling comes before fit on purpose: a big machine that is busy right now
 /// queues the work in its own admission until it has room, while a small one
 /// that is idle right now runs it into its memory limit. Neither is a filter,
-/// so a fleet where nothing can hold the work still places it, at the clamp. Fit is a ranking key
+/// so a fleet where nothing can hold the work still places it, at the clamp
+/// (unless a capable machine has only declined for now; see [`rank_survey`]).
+/// The one memory fact that is a filter is a kill while the command ran alone
+/// (`excluded`): the machine has already answered that it cannot run the
+/// command, and no ranking may choose it. Fit is a ranking key
 /// rather than a hard filter on purpose: reserving capacity and queueing for it
 /// belong to the executor's admission, and placement refusing work the executor
 /// would have queued would be a second, quieter queue.
@@ -14265,9 +15039,10 @@ fn rank_candidates<'a, 'b>(
     Option<PlacementTieBreak>,
 ) {
     let hard_order = |a: &&ScoredCandidate<'a>, b: &&ScoredCandidate<'a>| {
-        a.blindness
+        a.excluded
             .is_some()
-            .cmp(&b.blindness.is_some())
+            .cmp(&b.excluded.is_some())
+            .then_with(|| a.blindness.is_some().cmp(&b.blindness.is_some()))
             .then_with(|| a.over_ceiling.is_some().cmp(&b.over_ceiling.is_some()))
             .then_with(|| a.misfit.is_some().cmp(&b.misfit.is_some()))
             .then_with(|| a.held.is_some().cmp(&b.held.is_some()))
@@ -14288,7 +15063,12 @@ fn rank_candidates<'a, 'b>(
     let forecast_order = |a: &&ScoredCandidate<'a>, b: &&ScoredCandidate<'a>| {
         a.prediction
             .predicted_verdict_ms
-            .cmp(&b.prediction.predicted_verdict_ms)
+            .saturating_add(a.scratch_sync_ms)
+            .cmp(
+                &b.prediction
+                    .predicted_verdict_ms
+                    .saturating_add(b.scratch_sync_ms),
+            )
             .then_with(|| {
                 a.cpu_headroom_risk
                     .partial_cmp(&b.cpu_headroom_risk)
@@ -14336,10 +15116,11 @@ fn rank_candidates<'a, 'b>(
         })
     };
     let selectable = |candidate: &&ScoredCandidate<'a>| {
-        (candidate.blindness.is_none()
-            || settled_by_caller
-            || candidate.entry.colocated
-            || !exercising_spill)
+        candidate.excluded.is_none()
+            && (candidate.blindness.is_none()
+                || settled_by_caller
+                || candidate.entry.colocated
+                || !exercising_spill)
             && !(exercising_spill
                 && matches!(
                     policy.profile.stance(request.placement_work_class),
@@ -15008,55 +15789,93 @@ fn placement_prediction_with_contention(
         declined_here: None,
         reliability: None,
         memory_pressure: None,
+        io_pressure: None,
     }
 }
 
-/// The largest memory-stall share priced. The multiplier `1/(1-f)` has no
-/// bound as the stall nears total, and a ranking needs a finite price; past
-/// nine-tenths stalled a machine is already priced at ten times its run.
-const MEMORY_STALL_PRICED_CEILING_MILLIS: u32 = 900;
+/// The largest stall share priced. The multiplier `1/(1-f)` has no bound as
+/// the stall nears total, and a ranking needs a finite price; past nine-tenths
+/// stalled a machine is already priced at ten times its run.
+const HOST_STALL_PRICED_CEILING_MILLIS: u32 = 900;
 
-/// Add a machine's memory stall to its time to a verdict: a run that would
-/// take `t` on a machine fully stalled on memory a fraction `f` of the time
+/// The stall share one reading prices, or the record of why it prices
+/// nothing: unmeasured is never zero, and a stale stall is not this machine
+/// now.
+fn priced_stall_share<T>(
+    reading: &cairn_common::executor_protocol::Measurement<T>,
+    now_unix_ms: u64,
+    share: impl Fn(&T) -> u32,
+) -> Result<u32, cairn_common::executor_protocol::HostStallPrice> {
+    use cairn_common::executor_protocol::{HostStallPrice, MeasurementGap};
+    match reading.value() {
+        None => Err(HostStallPrice::Unmeasured {
+            gap: reading.gap().unwrap_or(MeasurementGap::NotSampled),
+        }),
+        Some(_) if reading.age_ms(now_unix_ms) > EXECUTOR_TELEMETRY_STALE_AFTER_MS => {
+            Err(HostStallPrice::Stale {
+                age_ms: reading.age_ms(now_unix_ms),
+            })
+        }
+        Some(value) => Ok(share(value).min(HOST_STALL_PRICED_CEILING_MILLIS)),
+    }
+}
+
+/// `t * f/(1-f)`: what a stall share `f` adds to a run that takes `t`.
+fn stall_penalty_ms(run_ms: u64, full_millis: u32) -> u64 {
+    u64::try_from(u128::from(run_ms) * u128::from(full_millis) / u128::from(1_000 - full_millis))
+        .unwrap_or(u64::MAX)
+}
+
+/// Add a machine's memory and storage stalls to its time to a verdict: a run
+/// that would take `t` on a machine fully stalled a fraction `f` of the time
 /// takes `t/(1-f)`, so the price is `t * f/(1-f)` on the contention-adjusted
 /// run. A summand like the queue and the run, never an exclusion and never an
 /// admission gate (tenet 1139): an unmeasured or stale reading adds nothing
 /// and the record says why.
-fn price_memory_pressure(
+///
+/// The two stalls overlap: a task swapping a page in is stalled on memory and
+/// waiting on I/O at once, and PSI counts it in both. So the machine is priced
+/// at the worse of the two, memory first and storage for only what it adds
+/// beyond memory, and a thrashing host is never charged twice for one wait.
+fn price_host_stall(
     prediction: &mut PlacementPrediction,
     host: &cairn_common::executor_protocol::HostHealth,
     now_unix_ms: u64,
 ) {
-    use cairn_common::executor_protocol::{MeasurementGap, MemoryPressurePrice};
-    let reading = &host.memory_pressure;
-    let price = match reading.value() {
-        None => MemoryPressurePrice::Unmeasured {
-            gap: reading.gap().unwrap_or(MeasurementGap::NotSampled),
+    use cairn_common::executor_protocol::{HostStallPrice, IoPressure, MemoryPressure};
+    let run_ms = prediction.adjusted_run_ms;
+    let memory = priced_stall_share(
+        &host.memory_pressure,
+        now_unix_ms,
+        MemoryPressure::priced_full_millis,
+    );
+    let memory_millis = *memory.as_ref().unwrap_or(&0);
+    let memory_price = memory.map_or_else(
+        |unpriced| unpriced,
+        |full_millis| HostStallPrice::Priced {
+            full_millis,
+            penalty_ms: stall_penalty_ms(run_ms, full_millis),
         },
-        Some(_) if reading.age_ms(now_unix_ms) > EXECUTOR_TELEMETRY_STALE_AFTER_MS => {
-            MemoryPressurePrice::Stale {
-                age_ms: reading.age_ms(now_unix_ms),
-            }
-        }
-        Some(pressure) => {
-            let full_millis = pressure
-                .priced_full_millis()
-                .min(MEMORY_STALL_PRICED_CEILING_MILLIS);
-            let penalty_ms = u64::try_from(
-                u128::from(prediction.adjusted_run_ms) * u128::from(full_millis)
-                    / u128::from(1_000 - full_millis),
-            )
-            .unwrap_or(u64::MAX);
-            MemoryPressurePrice::Priced {
-                full_millis,
-                penalty_ms,
-            }
-        }
-    };
+    );
+    let io_price = priced_stall_share(
+        &host.io_pressure,
+        now_unix_ms,
+        IoPressure::priced_full_millis,
+    )
+    .map_or_else(
+        |unpriced| unpriced,
+        |full_millis| HostStallPrice::Priced {
+            full_millis,
+            penalty_ms: stall_penalty_ms(run_ms, full_millis.max(memory_millis))
+                .saturating_sub(stall_penalty_ms(run_ms, memory_millis)),
+        },
+    );
     prediction.predicted_verdict_ms = prediction
         .predicted_verdict_ms
-        .saturating_add(price.penalty_ms());
-    prediction.memory_pressure = Some(price);
+        .saturating_add(memory_price.penalty_ms())
+        .saturating_add(io_price.penalty_ms());
+    prediction.memory_pressure = Some(memory_price);
+    prediction.io_pressure = Some(io_price);
 }
 
 /// Add a machine's own same-signature failure history to its time to a
@@ -15815,8 +16634,9 @@ fn executor_artifact_target(entry: &ExecutorConnectionState) -> Option<&'static 
     .map(cairn_common::executor_protocol::RemotePlatform::target)
 }
 
-/// A remote as the self-update rollout reads it. `in_flight` is filled in by
-/// the caller, which alone can read the runner's queue for it.
+/// A remote as the self-update rollout reads it. `work` and `services` are
+/// filled in by the rollout pass, which alone can read the runner's queue for
+/// it; a status read needs neither.
 fn rollout_candidate(entry: &ExecutorConnectionState, now_unix_ms: u64) -> rollout::Candidate {
     rollout::Candidate {
         executor_id: entry.identity.executor_id.clone(),
@@ -15825,7 +16645,8 @@ fn rollout_candidate(entry: &ExecutorConnectionState, now_unix_ms: u64) -> rollo
         target: executor_artifact_target(entry),
         running_build: entry.executor_build_id.clone(),
         last_update: entry.last_update.clone(),
-        in_flight: 0,
+        work: Vec::new(),
+        services: Vec::new(),
         snapshots_received: entry.snapshots_received,
         reachable: !entry.sender.is_closed()
             && matches!(
@@ -15835,48 +16656,177 @@ fn rollout_candidate(entry: &ExecutorConnectionState, now_unix_ms: u64) -> rollo
     }
 }
 
-/// What a machine's own snapshot says is in flight on it: everything an
-/// executor restart would end.
-struct ExecutorWork {
-    /// Attempts it was granted and has not finished, and commands waiting in
-    /// its admission.
-    commands: usize,
-    residency_operations: usize,
-    /// Resident processes starting or running in its cells.
-    resident_processes: usize,
+/// The key a command holds a self-update drain under, shared by every witness
+/// to it (the machine's executing, queued, and granted lists, and the runner's
+/// queue binding), so one command is one piece of work however many report it.
+fn held_request_key(request_id: &str) -> String {
+    format!("request:{request_id}")
 }
 
-impl ExecutorWork {
-    /// The machine's account joined to the runner's: work the queue binds to
-    /// it (offered or claimed) and residency acquisitions it is waiting on.
-    /// Each pair is two witnesses to the same work, so the larger stands
-    /// rather than the sum.
-    fn in_flight(&self, bound: usize, pending_residency: usize) -> u32 {
-        let total = self.commands.max(bound)
-            + self.residency_operations.max(pending_residency)
-            + self.resident_processes;
-        u32::try_from(total).unwrap_or(u32::MAX)
+/// A command named the way an operator reads it: the first line of what it
+/// runs, and whose work it is.
+fn held_command_label(
+    command: &str,
+    owner: Option<&cairn_common::executor_protocol::CellOwnerRef>,
+) -> String {
+    let head: String = command
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(60)
+        .collect();
+    let head = if head.is_empty() {
+        "a command".to_string()
+    } else {
+        format!("`{head}`")
+    };
+    match owner {
+        Some(cairn_common::executor_protocol::CellOwnerRef {
+            project_key: Some(project),
+            issue_number: Some(issue),
+            ..
+        }) => format!("{head} for {project}/{issue}"),
+        Some(cairn_common::executor_protocol::CellOwnerRef {
+            job_id: Some(job_id),
+            ..
+        }) => format!("{head} for job {job_id}"),
+        _ => head,
     }
 }
 
-fn executor_work(entry: &ExecutorConnectionState) -> ExecutorWork {
+/// What a restart of this machine would end, one item per piece of work, as
+/// its own snapshot reports it; and, apart, the long-lived service instances
+/// the restart would cycle, which never finish and so are not waited on.
+fn snapshot_work(entry: &ExecutorConnectionState) -> (Vec<rollout::HeldWork>, Vec<String>) {
+    use cairn_common::executor_protocol::{ResidentProcessKind, ResidentProcessStatus};
+
     let snapshot = &entry.snapshot;
-    ExecutorWork {
-        commands: snapshot.granted_attempts.len() + snapshot.queued_requests.len(),
-        residency_operations: snapshot.in_flight_residency_operations.len(),
-        resident_processes: snapshot
-            .cells
-            .iter()
-            .flat_map(|cell| cell.occupancy.processes.values())
-            .filter(|process| {
-                matches!(
-                    process.status,
-                    cairn_common::executor_protocol::ResidentProcessStatus::Starting
-                        | cairn_common::executor_protocol::ResidentProcessStatus::Running { .. }
-                )
-            })
-            .count(),
+    let learned = |estimate: Option<&cairn_common::executor_protocol::LearnedResourceEstimate>| {
+        estimate.and_then(|estimate| estimate.upper_duration_ms)
+    };
+    // A granted attempt names no command; the cell it holds does.
+    let active: HashMap<&str, &cairn_common::executor_protocol::ActiveCellRequest> = snapshot
+        .cells
+        .iter()
+        .filter_map(|cell| cell.occupancy.command.as_ref())
+        .map(|command| (command.request_id.as_str(), command))
+        .collect();
+    // Richest witness first, so the dedup below keeps its label and timing.
+    let mut work: Vec<rollout::HeldWork> = Vec::new();
+    for request in &snapshot.executing_requests {
+        work.push(rollout::HeldWork {
+            key: held_request_key(&request.request_id),
+            label: held_command_label(&request.command, request.owner.as_ref()),
+            started_at_unix_ms: Some(request.started_at_unix_ms),
+            expected_ms: learned(request.learned_estimate.as_ref()),
+        });
     }
+    for granted in &snapshot.granted_attempts {
+        work.push(match active.get(granted.request_id.as_str()) {
+            Some(command) => rollout::HeldWork {
+                key: held_request_key(&granted.request_id),
+                label: held_command_label(&command.command, command.owner.as_ref()),
+                started_at_unix_ms: command.started_at_unix_ms,
+                expected_ms: learned(command.learned_estimate.as_ref()),
+            },
+            None => rollout::HeldWork {
+                key: held_request_key(&granted.request_id),
+                label: format!("request {} (preparing its cell)", granted.request_id),
+                started_at_unix_ms: None,
+                expected_ms: None,
+            },
+        });
+    }
+    for queued in &snapshot.queued_requests {
+        work.push(rollout::HeldWork {
+            key: held_request_key(&queued.request_id),
+            label: held_command_label(&queued.command, queued.owner.as_ref()),
+            started_at_unix_ms: None,
+            expected_ms: learned(queued.learned_estimate.as_ref()),
+        });
+    }
+    for request_id in snapshot.in_flight_residency_operations.keys() {
+        work.push(rollout::HeldWork {
+            key: format!("residency:{request_id}"),
+            label: format!("an environment being acquired (request {request_id})"),
+            started_at_unix_ms: None,
+            expected_ms: None,
+        });
+    }
+    let mut services = Vec::new();
+    for cell in &snapshot.cells {
+        for (process_key, process) in &cell.occupancy.processes {
+            let started_at_unix_ms = match &process.status {
+                ResidentProcessStatus::Starting => None,
+                ResidentProcessStatus::Running {
+                    started_at_unix_ms, ..
+                } => Some(*started_at_unix_ms),
+                _ => continue,
+            };
+            match &process.kind {
+                ResidentProcessKind::Service { role, .. }
+                    if role != service_placement::ONE_SHOT_ROLE =>
+                {
+                    services.push(resident_process_label(&process.kind));
+                }
+                kind => work.push(rollout::HeldWork {
+                    key: format!(
+                        "process:{}/{process_key}/{}",
+                        cell.cell_id, process.generation
+                    ),
+                    label: resident_process_label(kind),
+                    started_at_unix_ms,
+                    expected_ms: None,
+                }),
+            }
+        }
+    }
+    let mut keys = HashSet::new();
+    work.retain(|item| keys.insert(item.key.clone()));
+    services.sort();
+    services.dedup();
+    (work, services)
+}
+
+/// The runner's own account joined to the machine's: work its queue binds to
+/// the machine (offered or claimed) and residency acquisitions it is waiting
+/// on there, either of which the machine's last snapshot may not show yet.
+///
+/// A binding is keyed by the request the machine reports it under, so the two
+/// accounts union. A pending acquisition is keyed by the runner's own
+/// correlation id, which the machine never sees, so only the excess over what
+/// the machine reports is added: two witnesses to one acquisition count once.
+fn join_runner_work(
+    work: &mut Vec<rollout::HeldWork>,
+    bound: &[RequestIdentity],
+    pending_residency: &[String],
+) {
+    for (request_id, _) in bound {
+        work.push(rollout::HeldWork {
+            key: held_request_key(request_id),
+            label: format!("request {request_id} (bound here, not yet reported by the machine)"),
+            started_at_unix_ms: None,
+            expected_ms: None,
+        });
+    }
+    let reported = work
+        .iter()
+        .filter(|item| item.key.starts_with("residency:"))
+        .count();
+    let mut pending: Vec<&String> = pending_residency.iter().collect();
+    pending.sort();
+    for correlation_id in pending.into_iter().skip(reported) {
+        work.push(rollout::HeldWork {
+            key: format!("residency:{correlation_id}"),
+            label: "an environment being acquired".to_string(),
+            started_at_unix_ms: None,
+            expected_ms: None,
+        });
+    }
+    let mut keys = HashSet::new();
+    work.retain(|item| keys.insert(item.key.clone()));
 }
 
 fn executor_health_snapshot(
@@ -15911,6 +16861,7 @@ fn executor_health_snapshot(
         // about a drain is still drained, so the surfaces read the union.
         drain_mode: entry.drained || entry.health.drain_mode,
         role: entry.machine_role,
+        inference_hold: entry.inference_hold.clone(),
         resident_processes: entry.health.resident_processes.clone(),
         command_processes: entry.health.command_processes.clone(),
         evicted_cells: entry.health.evicted_cells.clone(),
@@ -16018,8 +16969,9 @@ fn setup_toolchain_deficiency(
 ///
 /// Rust work is whatever needs `rust`, by the work's own selector or by the
 /// project's setup. `Unchecked` and an absent verdict gate nothing, since
-/// nothing is known; a project that does not declare the script is described
-/// by nothing the probe measured.
+/// nothing is known, and that includes a `Missing` from a probe that could not
+/// run its script (`BuildPrerequisiteCheck::effective_status`); a project that
+/// does not declare the script is described by nothing the probe measured.
 fn build_prerequisite_deficiency(
     capabilities: &ExecutorCapabilities,
     project_id: &str,
@@ -16041,7 +16993,8 @@ fn build_prerequisite_deficiency(
         return None;
     }
     let check = capabilities.build_prerequisites.as_ref()?;
-    if check.status != cairn_common::executor_protocol::BuildPrerequisiteStatus::Missing {
+    if check.effective_status() != cairn_common::executor_protocol::BuildPrerequisiteStatus::Missing
+    {
         return None;
     }
     let script = cairn_common::toolchain_requirements::prerequisite_script_path(&check.script);
@@ -16230,24 +17183,128 @@ fn preparation_environment_identity(entry: &ExecutorConnectionState) -> String {
 }
 
 fn matches_selector(entry: &ExecutorConnectionState, selector: &ExecutorSelector) -> bool {
-    selector
+    selector_shortfall(entry, selector).is_none()
+}
+
+/// The part of a selector one machine fails.
+enum SelectorShortfall {
+    Name {
+        wanted: String,
+    },
+    Platform {
+        wanted: String,
+    },
+    Toolchains {
+        missing: Vec<String>,
+    },
+    /// The sentence [`nested_sandbox_shortfall`] states.
+    NestedSandbox(String),
+    /// The edge [`containment_deficiency`] names.
+    Containment(String),
+    /// The machine has sent no evidence at all for a capability the selector
+    /// needs measured. Distinct from evidence that reads absent: the colocated
+    /// executor runs its host probes after its first Ready, so for the first
+    /// seconds after every attach this is a wait, not a deficiency. An
+    /// executor too old to send the evidence reads the same way, which is why
+    /// the age is named: seconds is a probe in flight, hours is not.
+    Unreported {
+        capability: &'static str,
+        advertised_at_unix_ms: u64,
+    },
+}
+
+impl SelectorShortfall {
+    fn describe(&self) -> String {
+        match self {
+            Self::Name { wanted } | Self::Platform { wanted } => format!("not {wanted}"),
+            Self::Toolchains { missing } => format!("does not advertise {}", missing.join(", ")),
+            Self::NestedSandbox(sentence) => sentence.clone(),
+            Self::Containment(edge) => format!("containment: {edge}"),
+            Self::Unreported {
+                capability,
+                advertised_at_unix_ms,
+            } => format!(
+                "{capability} not yet reported since it advertised {}s ago",
+                unix_time_ms().saturating_sub(*advertised_at_unix_ms) / 1_000
+            ),
+        }
+    }
+}
+
+/// The first part of `selector` this machine fails, or `None` when it
+/// satisfies all of it. The one definition of a selector match:
+/// [`matches_selector`] is this being `None`, so a refusal's explanation of
+/// why a machine was passed over cannot disagree with the decision that
+/// passed it over.
+fn selector_shortfall(
+    entry: &ExecutorConnectionState,
+    selector: &ExecutorSelector,
+) -> Option<SelectorShortfall> {
+    let capabilities = &entry.advertisement.capabilities;
+    if let Some(wanted) = selector
         .name
         .as_deref()
-        .is_none_or(|value| executor_names_match(value, &executor_public_name(entry)))
-        && selector
-            .os
-            .as_ref()
-            .is_none_or(|value| value.eq_ignore_ascii_case(&entry.advertisement.capabilities.os))
-        && selector.required_toolchains.iter().all(|required| {
-            entry
-                .advertisement
-                .capabilities
+        .filter(|wanted| !executor_names_match(wanted, &executor_public_name(entry)))
+    {
+        return Some(SelectorShortfall::Name {
+            wanted: wanted.to_string(),
+        });
+    }
+    if let Some(wanted) = selector
+        .os
+        .as_deref()
+        .filter(|wanted| !wanted.eq_ignore_ascii_case(&capabilities.os))
+    {
+        return Some(SelectorShortfall::Platform {
+            wanted: wanted.to_string(),
+        });
+    }
+    let missing: Vec<String> = selector
+        .required_toolchains
+        .iter()
+        .filter(|required| {
+            !capabilities
                 .toolchains
                 .iter()
-                .any(|available| available == required)
+                .any(|available| available == *required)
         })
-        && matches_sandbox_capability(&entry.advertisement.capabilities, selector)
-        && containment_deficiency(&entry.advertisement.capabilities, selector).is_none()
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        return Some(SelectorShortfall::Toolchains { missing });
+    }
+    let unreported = |capability| SelectorShortfall::Unreported {
+        capability,
+        advertised_at_unix_ms: entry.advertisement.observed_at_unix_ms,
+    };
+    if !matches_sandbox_capability(capabilities, selector) {
+        return Some(match capabilities.sandbox.as_ref() {
+            None => unreported("check-lane nested Seatbelt probe"),
+            Some(evidence) => SelectorShortfall::NestedSandbox(nested_sandbox_shortfall(evidence)),
+        });
+    }
+    if selector.containment.is_some() && capabilities.containment.is_none() {
+        return Some(unreported("containment probes"));
+    }
+    containment_deficiency(capabilities, selector).map(SelectorShortfall::Containment)
+}
+
+/// Why a macOS machine whose sandbox evidence is in hand cannot take a check
+/// lane that applies its own nested Seatbelt profile, as one clause a refusal
+/// can name the machine with.
+fn nested_sandbox_shortfall(evidence: &SandboxCapabilityEvidence) -> String {
+    match evidence.nested_sandbox_write_context.as_ref() {
+        None => "check lanes need a nested Seatbelt write measured on the check-lane path, and this machine measured it only from the executor's own process (refused until the executor updates)".to_string(),
+        Some(context) => format!(
+            "check lanes need a nested Seatbelt write and this machine cannot apply one ({}{})",
+            evidence.nested_sandbox_write_detail.trim(),
+            if context.credential_floor_sha256.is_some() {
+                "; operator credential floor"
+            } else {
+                ""
+            }
+        ),
+    }
 }
 
 /// Why this machine cannot take a workload envelope, or `None` if it can.
@@ -16400,6 +17457,25 @@ fn environment_identity(entry: &ExecutorConnectionState, repair_epoch: i64) -> S
                     .unwrap_or("unfingerprinted"))
         )),
         None => facts.push("sandbox=unreported".to_string()),
+    }
+    // Whether recovery works, not its wording or time: installing the sudo
+    // rule is a repair, a re-measurement that finds the same refusal is not.
+    if let Some(recovery) = capabilities
+        .sandbox
+        .as_ref()
+        .and_then(|evidence| evidence.violation_recovery.as_ref())
+    {
+        facts.push(format!(
+            "violation-recovery={:?}|{}",
+            recovery.access,
+            match recovery.outcome {
+                cairn_common::executor_protocol::ViolationRecoveryOutcome::Measured { .. } =>
+                    "measured",
+                cairn_common::executor_protocol::ViolationRecoveryOutcome::Unmeasured {
+                    ..
+                } => "unmeasured",
+            }
+        ));
     }
     format!("{:x}", sha2::Sha256::digest(facts.join("\n").as_bytes()))
 }
@@ -16563,6 +17639,64 @@ fn containment_refusal_inventory(
     (!rows.is_empty()).then(|| rows.join("; "))
 }
 
+/// Every machine a refusal passed over, each with its own reason, as one
+/// `name: reason; ...` list, or nothing.
+///
+/// A refusal that names only the machine nearest to qualifying leaves the
+/// reader to ask why every other one was excluded, and role, capability and
+/// capacity send an operator to entirely different places. A selector
+/// mismatch is stated as the part of the selector that failed rather than the
+/// whole selector restated. Machines whose only shortfall is running another
+/// platform are counted rather than listed: the platform is the whole story
+/// for each of them.
+fn describe_exclusions(
+    connections: &HashMap<String, ExecutorConnectionState>,
+    request: &CellRequest,
+    rejected: &[PlacementRejection],
+) -> String {
+    let selector = request
+        .executor
+        .as_ref()
+        .filter(|selector| !selector.is_empty());
+    let mut rows = Vec::new();
+    let mut elsewhere: Vec<&str> = Vec::new();
+    let mut wanted_platform = String::new();
+    for rejection in rejected {
+        let shortfall = match (&rejection.reason, selector) {
+            (PlacementRejectionReason::SelectorMismatch { .. }, Some(selector)) => connections
+                .get(&rejection.executor_id)
+                .and_then(|entry| selector_shortfall(entry, selector)),
+            _ => None,
+        };
+        match shortfall {
+            Some(SelectorShortfall::Platform { wanted }) => {
+                wanted_platform = wanted;
+                elsewhere.push(&rejection.executor_name);
+            }
+            Some(shortfall) => rows.push(format!(
+                "{}: {}",
+                rejection.executor_name,
+                shortfall.describe()
+            )),
+            None => rows.push(format!(
+                "{}: {}",
+                rejection.executor_name,
+                rejection.reason.describe()
+            )),
+        }
+    }
+    match elsewhere.as_slice() {
+        [] => {}
+        [only] => rows.push(format!("{only}: not {wanted_platform}")),
+        many => rows.push(format!(
+            "{} {}machines: not {wanted_platform}",
+            many.len(),
+            if rows.is_empty() { "" } else { "other " }
+        )),
+    }
+    rows.join("; ")
+}
+
 /// Why nothing in the fleet can take this request, in the terms the caller used
 /// plus the terms it could have used instead.
 fn no_matching_executor_diagnostic(
@@ -16606,6 +17740,12 @@ fn no_matching_executor_diagnostic(
         );
     }
 
+    // Whichever machine the refusal leads with, every other one is named with
+    // what excluded it.
+    let account = match describe_exclusions(connections, request, rejected) {
+        rows if rows.is_empty() => String::new(),
+        rows => format!(" Per machine: {rows}."),
+    };
     let would_serve = |rejection: &&PlacementRejection| {
         connections
             .get(&rejection.executor_id)
@@ -16623,7 +17763,7 @@ fn no_matching_executor_diagnostic(
     });
     if let Some(rejection) = drained_target {
         return format!(
-            "{} is drained by an operator, so the runner is refusing new work there. Only an operator can clear the drain; read cairn://executors for live state.",
+            "{} is drained by an operator, so the runner is refusing new work there. Only an operator can clear the drain; read cairn://executors for live state.{account}",
             rejection.executor_name
         );
     }
@@ -16633,7 +17773,20 @@ fn no_matching_executor_diagnostic(
     });
     if let Some(rejection) = updating_target {
         return format!(
-            "{name} is being emptied for an executor update, so the runner is refusing new work there until it returns on the runner's build. This clears on its own; cairn://executors/{name} shows how far along it is.",
+            "{name} is being emptied for an executor update, so the runner is refusing new work there until it returns on the runner's build. This clears on its own; cairn://executors/{name} shows how far along it is.{account}",
+            name = rejection.executor_name
+        );
+    }
+    let inference_target = rejected.iter().find(|rejection| {
+        matches!(
+            rejection.reason,
+            PlacementRejectionReason::InferenceReserved { .. }
+        ) && would_serve(rejection)
+    });
+    if let Some(rejection) = inference_target {
+        return format!(
+            "{name} is {}. It clears when the deployment stops; cairn://inference/deployments shows it.{account}",
+            rejection.reason.describe(),
             name = rejection.executor_name
         );
     }
@@ -16686,11 +17839,10 @@ fn no_matching_executor_diagnostic(
         .map(|rows| format!(" Containment evidence: {rows}."))
         .unwrap_or_default();
     format!(
-        "no live enrolled executor satisfies {wanted} for project {}. Known executors: {}. {}{containment}{} Read cairn://executors for live state.",
+        "no live enrolled executor satisfies {wanted} for project {}.{account} Known executors: {}. {}{containment} Read cairn://executors for live state.",
         request.project_id,
         known_executor_inventory(connections),
         absent_enrolled_inventory(connections, unattached, request),
-        describe_preparation_rejections(rejected)
     )
 }
 
@@ -16815,6 +17967,7 @@ fn serialize_process_batch(
         items,
         runner_context_id: Some(runner_context_id),
         execution_residency: batch.execution_residency,
+        node_scratch: None,
     })
 }
 
@@ -18594,6 +19747,7 @@ mod tests {
             mutation_delta: None,
             sandbox_denials: Vec::new(),
             tracked_modifications: None,
+            node_scratch: None,
         };
         pool.handle_executor_message(
             "fedora",
@@ -18917,6 +20071,7 @@ mod tests {
                 stop_on_error: true,
                 originally_sequential: true,
                 execution_residency: None,
+                node_scratch: None,
             },
             &env,
             "runner-context".to_string(),
@@ -18955,6 +20110,7 @@ mod tests {
                 stop_on_error: true,
                 originally_sequential: true,
                 execution_residency: None,
+                node_scratch: None,
             },
             &[],
             "runner-context".to_string(),
@@ -19045,6 +20201,7 @@ mod tests {
                 runner_context_id: None,
                 execution_residency: None,
                 containment: None,
+                node_scratch: None,
             },
             &injected,
         );
@@ -19419,6 +20576,7 @@ mod tests {
             nested_sandbox_write_available: true,
             nested_sandbox_write_detail: "live probe succeeded".into(),
             nested_sandbox_write_context: None,
+            violation_recovery: None,
         };
         capabilities.sandbox = Some(evidence.clone());
         assert!(!matches_sandbox_capability(&capabilities, &selector));
@@ -19449,6 +20607,7 @@ mod tests {
                     ..context
                 },
             ),
+            violation_recovery: None,
         };
         capabilities.sandbox = Some(floored.clone());
         assert!(!matches_sandbox_capability(&capabilities, &selector));
@@ -19656,6 +20815,7 @@ mod tests {
             runner_context_id: None,
             execution_residency: None,
             containment: None,
+            node_scratch: None,
         };
         let units = |batch: ProcessBatch, capabilities: ExecutorCapabilities| {
             let (db, request) = (db.clone(), request.clone());
@@ -19965,6 +21125,56 @@ mod tests {
         );
     }
 
+    /// A write-check batch is queued under its own request identity and never
+    /// coalesced, so its phase is read by that identity: placing with each
+    /// machine's decline while held, then running on the machine that claimed
+    /// it.
+    #[test]
+    fn request_dispatch_phase_reads_a_write_check_batch_by_its_own_identity() {
+        let pool = Fleet::default();
+        let key = ("write-batch".to_string(), "write-attempt".to_string());
+        let entry = enqueue_owned_entry(&pool, &key);
+        assert!(pool.queue.offer(&entry, "local", "local", 3, 2_000));
+        pool.queue.decline(
+            &entry,
+            "local",
+            3,
+            DeclineReason::Pressure,
+            Some("cpu 97%".into()),
+            None,
+            None,
+            2_500,
+        );
+        assert_eq!(
+            pool.request_dispatch_phase(&key),
+            Some(CheckDispatchPhase::Placing {
+                since_unix_ms: 1_000,
+                declines: vec![CheckDispatchDecline {
+                    executor_name: "local".into(),
+                    reason: DeclineReason::Pressure,
+                    detail: Some("cpu 97%".into()),
+                    at_unix_ms: 2_500,
+                }],
+            })
+        );
+        assert!(pool.queue.offer(&entry, "fedora", "fedora", 4, 3_000));
+        assert_eq!(
+            pool.queue.claim(&entry, "fedora", 4, 3_100),
+            queue::ClaimVerdict::Granted
+        );
+        assert_eq!(
+            pool.request_dispatch_phase(&key),
+            Some(CheckDispatchPhase::Running {
+                executor_name: "fedora".into(),
+                since_unix_ms: 3_100,
+            })
+        );
+        assert_eq!(
+            pool.request_dispatch_phase(&("unknown".into(), "unknown".into())),
+            None
+        );
+    }
+
     #[test]
     fn check_dispatch_phase_is_none_once_the_execution_settles() {
         let pool = Fleet::default();
@@ -20026,6 +21236,7 @@ mod tests {
             }),
             resource_reservation: Default::default(),
             learned_estimate: None,
+            scratch_sync: None,
         }
     }
 
@@ -20061,12 +21272,14 @@ mod tests {
         ResolvedRunBatch {
             execution_residency: None,
             request: crate::mcp::types::McpCallbackRequest {
+                answer_bound_ms: None,
                 thread_id: None,
                 cwd: "/tmp".into(),
                 run_id: None,
                 tool: "run".into(),
                 payload: serde_json::Value::Null,
                 tool_use_id: None,
+                origin: None,
             },
             run_context: None,
             resolved: timeouts
@@ -20086,6 +21299,7 @@ mod tests {
             tool_use_id: "tool-use".into(),
             stop_on_error,
             originally_sequential: sequential,
+            node_scratch: None,
         }
     }
 
@@ -20282,6 +21496,8 @@ mod tests {
                     subscriber_count: followers,
                     resource_reservation: Default::default(),
                     learned_estimate: None,
+                    live_usage: None,
+                    build_jobs: None,
                 }],
                 ..FleetSnapshot::default()
             },
@@ -20968,6 +22184,7 @@ mod tests {
                     advertisement,
                     health: ExecutorSubstrateReport::default(),
                     last_update: None,
+                    machine: None,
                 },
             ));
         };
@@ -21164,7 +22381,7 @@ mod tests {
         let orch = Arc::new(test_orchestrator(temp.path()).await);
         orch.db
             .local
-            .execute_script(&format!(
+            .execute_script(format!(
                 "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) \
                  VALUES ('p', 'default', 'Project', 'p', '{}', 1, 1);",
                 repository.to_string_lossy()
@@ -21208,6 +22425,7 @@ mod tests {
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
+            scratch_sync: None,
         };
 
         let outcome = pool.submit_execution(&orch, request, None).await;
@@ -21284,6 +22502,7 @@ mod tests {
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
+            scratch_sync: None,
         };
         let config = ExecutorConfig {
             project_id: "p".into(),
@@ -21677,6 +22896,8 @@ mod tests {
                     learned_estimate: None,
                     started_at_unix_ms: now,
                     process_ids: vec![42],
+                    live_usage: None,
+                    build_jobs: None,
                 }],
                 ..FleetSnapshot::default()
             },
@@ -21961,6 +23182,7 @@ mod tests {
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
+            scratch_sync: None,
         };
         let started = Instant::now();
         let outcome = pool
@@ -22148,6 +23370,7 @@ mod tests {
                     rejected: vec![],
                     view: AdmissionView::default(),
                     declined_here: HashMap::new(),
+                    journal: vec![],
                 },
                 SurveyRankingContext {
                     reservations: &HashMap::new(),
@@ -22270,6 +23493,7 @@ mod tests {
                 drained: false,
                 update_hold: false,
                 machine_role: MachineRole::General,
+                inference_hold: None,
                 identity: identity.clone(),
                 advertisement: ExecutorAdvertisement {
                     identity,
@@ -22304,6 +23528,7 @@ mod tests {
                     liveness_observed_at_unix_ms: None,
                     facts_stale_refresh_blocked: None,
                     last_refresh: None,
+                    node_scratches: Vec::new(),
                 },
                 generation: 1,
                 sender,
@@ -22317,6 +23542,8 @@ mod tests {
                     },
                     ..Default::default()
                 }),
+                publishes_machine_samples: false,
+                live_usage: load::LiveUsageIndex::default(),
                 executor_build_id: None,
                 last_update: None,
                 colocated: id == COLOCATED_EXECUTOR_ID,
@@ -22861,9 +24088,23 @@ mod tests {
         ub_available: u64,
         co_resident_compile_jobs: u32,
     ) -> (Fleet, Arc<cairn_db::storage::LocalDb>, CellRequest) {
+        let db = Arc::new(crate::storage::migrated_test_db(db_name).await);
+        let (pool, request) =
+            killed_fleet_in(db.clone(), ub_available, co_resident_compile_jobs, true).await;
+        (pool, db, request)
+    }
+
+    /// [`killed_fleet`] over `db`. Without `record_kill` it is a runner booting
+    /// onto a ledger an earlier one wrote.
+    async fn killed_fleet_in(
+        db: Arc<cairn_db::storage::LocalDb>,
+        ub_available: u64,
+        co_resident_compile_jobs: u32,
+        record_kill: bool,
+    ) -> (Fleet, CellRequest) {
         const GIB: u64 = 1024 * 1024 * 1024;
         const UB_BUDGET: u64 = 11_042_782_208;
-        let db = Arc::new(crate::storage::migrated_test_db(db_name).await);
+        const UB_TOTAL: u64 = 13_000_000_000;
         let identity = CommandResourceIdentity {
             version: 1,
             key: "test:rust".into(),
@@ -22878,27 +24119,39 @@ mod tests {
             let (id, mut entry) = fleet_entry_at(id, "linux", 0, &[], now);
             entry.advertisement.capabilities.memory_budget_bytes = Some(budget);
             measured_at(&mut entry, 0.01, available, 500 * GIB, now);
+            if id == "bgsrv-ub" {
+                // The size it had when the kernel killed the command there.
+                Arc::make_mut(&mut entry.health).machine.memory = Measurement::measured(
+                    now,
+                    cairn_common::executor_protocol::MachineMemory {
+                        total_bytes: UB_TOTAL,
+                        available_bytes: available,
+                    },
+                );
+            }
             connections.insert(id, entry);
         }
         let ub = &connections["bgsrv-ub"];
-        resource_profiles::observe_memory_kill(
-            db.clone(),
-            Some(&identity),
-            &ReservationPlan::context_for(
-                &ub.identity.device_id,
-                &ub.identity.executor_id,
-                &ub.advertisement.capabilities,
-            ),
-            &resource_profiles::oom_killed_for_test(
-                3_650_722_201,
-                Some(13_000_000_000),
-                co_resident_compile_jobs,
-                now,
-            ),
-            false,
-            Some(UB_BUDGET),
-        )
-        .await;
+        if record_kill {
+            resource_profiles::observe_memory_kill(
+                db.clone(),
+                Some(&identity),
+                &ReservationPlan::context_for(
+                    &ub.identity.device_id,
+                    &ub.identity.executor_id,
+                    &ub.advertisement.capabilities,
+                ),
+                &resource_profiles::oom_killed_for_test(
+                    3_650_722_201,
+                    Some(UB_TOTAL),
+                    co_resident_compile_jobs,
+                    now,
+                ),
+                false,
+                Some(UB_BUDGET),
+            )
+            .await;
+        }
         *pool.lock_connections() = connections;
         let mut request = spillable_request();
         request.command_class = cairn_common::executor_protocol::CellCommandClass::CargoTest;
@@ -22908,7 +24161,7 @@ mod tests {
             repository_id: "repo".into(),
             object_format: GitObjectFormat::Sha1,
         };
-        (pool, db, request)
+        (pool, request)
     }
 
     async fn place_once(
@@ -22966,25 +24219,228 @@ mod tests {
         let placement = place_once(&pool, db, &request).await;
         assert_eq!(placement.selected.executor_id, "fedora");
         assert!(placement.above_ceiling.is_none());
-        let refused = placement
-            .decision
-            .rejected
+        assert_excluded_by_its_kill(&placement.decision.rejected);
+    }
+
+    fn assert_excluded_by_its_kill(rejected: &[PlacementRejection]) {
+        let refused = rejected
             .iter()
             .find(|rejection| rejection.executor_id == "bgsrv-ub")
             .expect("the killed machine is on the record");
-        let PlacementRejectionReason::ExceedsMemoryCeiling {
-            killed_here: Some(kill),
+        let PlacementRejectionReason::MemoryKillExcluded {
+            victim_resident_bytes,
+            machine_total_bytes,
             ..
         } = &refused.reason
         else {
             panic!(
-                "expected a ceiling naming the kill, got {:?}",
+                "expected the exclusion naming the kill, got {:?}",
                 refused.reason
             );
         };
-        assert_eq!(kill.alone_on_machine_bytes, Some(13_000_000_000));
+        assert_eq!(*victim_resident_bytes, 3_650_722_201);
+        assert_eq!(*machine_total_bytes, 13_000_000_000);
         let said = refused.reason.describe();
-        assert!(said.contains("while it ran alone"), "{said}");
+        assert!(said.starts_with("excluded:"), "{said}");
+        assert!(
+            said.contains("while it ran alone on this 12.1 GiB machine"),
+            "{said}"
+        );
+    }
+
+    /// cairn/5472: the kill ledger is the database the runner opens, read on
+    /// every decision, so a runner booting onto a ledger an earlier one wrote
+    /// refuses the machine on its very first placement. There is no warm-up in
+    /// which the machine the command died on alone is fair game.
+    #[tokio::test]
+    async fn a_runner_booting_onto_a_kill_ledger_refuses_the_machine_on_its_first_decision() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oom-boot.db");
+        {
+            let earlier = Arc::new(
+                cairn_db::storage::LocalDb::open_migrated_for_test(path.clone())
+                    .await
+                    .unwrap(),
+            );
+            killed_fleet_in(earlier, 10 * GIB, 0, true).await;
+        }
+        let db = Arc::new(
+            cairn_db::storage::LocalDb::open_migrated_for_test(path)
+                .await
+                .unwrap(),
+        );
+        let (pool, request) = killed_fleet_in(db.clone(), 10 * GIB, 0, false).await;
+        let placement = place_once(&pool, db, &request).await;
+        assert_eq!(placement.selected.executor_id, "fedora");
+        assert_excluded_by_its_kill(&placement.decision.rejected);
+    }
+
+    /// cairn/5472: when the only machine that could take the work is one the
+    /// command was killed on alone, the request waits rather than being placed
+    /// there; the queue view says why while it waits, and the horizon's
+    /// refusal names the exclusion.
+    #[tokio::test]
+    async fn a_request_whose_only_taker_is_an_excluded_machine_waits_and_says_why() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let (pool, db, mut request) = killed_fleet("oom-alone-only-taker.db", 10 * GIB, 0).await;
+        pool.lock_connections().remove("fedora");
+        let plan = ReservationPlan::new(db, &request, None);
+        let policy = ActivePlacementPolicy::default_profile();
+
+        let selection = pool
+            .select_executor_once_with(
+                &request,
+                Some(&plan),
+                &policy,
+                &HashMap::new(),
+                &AdmissionView::default(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .expect("an exclusion is waited out, not refused");
+        let Selection::Waiting { rejected } = selection else {
+            panic!("placed on the machine the command was killed on alone");
+        };
+        assert_excluded_by_its_kill(&rejected);
+
+        request.wait_horizon_unix_ms = unix_time_ms() + 400;
+        let refusal = pool
+            .select_executor(&request, Some(&plan), &policy, None)
+            .await
+            .expect_err("nothing else ever became usable");
+        let CellOutcome::Unavailable { diagnostic, .. } = refusal else {
+            panic!("expected a refusal at the horizon, got {refusal:?}");
+        };
+        assert!(diagnostic.contains("wait horizon"), "{diagnostic}");
+        assert!(diagnostic.contains("bgsrv-ub: excluded:"), "{diagnostic}");
+
+        let waits: Vec<String> = pool
+            .placements_naming("bgsrv-ub")
+            .into_iter()
+            .filter_map(|decision| match decision.outcome {
+                PlacementOutcome::Waiting { diagnostic } => Some(diagnostic),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(waits.len(), 1, "recorded once while unchanged: {waits:?}");
+        assert!(
+            waits[0].contains("bgsrv-ub: excluded:") && waits[0].contains("12.1 GiB machine"),
+            "{}",
+            waits[0]
+        );
+    }
+
+    /// cairn/5472's specimens: the capable machines had declined on provisioning
+    /// holds, leaving one too small for the command as the only usable machine,
+    /// and the pass placed it there at the clamp. The clamp is for a fleet with
+    /// nowhere bigger to go; this one has a machine that only said "not yet", so
+    /// the work waits for it.
+    #[tokio::test]
+    async fn work_too_big_for_the_only_usable_machine_waits_for_a_capable_one_that_declined() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let (pool, db, mut request) =
+            ceiling_fleet("ceiling-waits-on-decliner.db", 100 * GIB, 0.01, 60 * GIB).await;
+        request.repository = RepositoryLocator::ManagedObjects {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            object_format: GitObjectFormat::Sha1,
+        };
+        let generation = pool.lock_connections()["bglab-mac"].generation;
+        let declined = HashMap::from([(
+            "bglab-mac".to_string(),
+            queue::EntryDecline {
+                generation,
+                reason: DeclineReason::ProjectProvisioning,
+                detail: Some("provisioning project p".into()),
+                disk: None,
+                at_unix_ms: unix_time_ms(),
+                condition: None,
+                backoff_ms: 0,
+                retry_after_unix_ms: 0,
+                superseded: false,
+            },
+        )]);
+        let plan = ReservationPlan::new(db, &request, None);
+        let policy = ActivePlacementPolicy::default_profile();
+
+        let selection = pool
+            .select_executor_once_with(
+                &request,
+                Some(&plan),
+                &policy,
+                &declined,
+                &AdmissionView::default(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .unwrap();
+        let Selection::Waiting { rejected } = selection else {
+            panic!("placed at the clamp while a capable machine had only declined");
+        };
+        assert!(rejected.iter().any(|rejection| {
+            rejection.executor_id == "bgsrv-ub"
+                && matches!(
+                    rejection.reason,
+                    PlacementRejectionReason::ExceedsMemoryCeiling { .. }
+                )
+        }));
+        assert!(rejected.iter().any(|rejection| {
+            rejection.executor_id == "bglab-mac"
+                && matches!(rejection.reason, PlacementRejectionReason::Declined { .. })
+        }));
+        let waiting =
+            memory_wait_decision(&request, &policy, &rejected).expect("the wait is recorded");
+        let PlacementOutcome::Waiting { diagnostic } = waiting.outcome else {
+            unreachable!("a memory wait is a waiting decision");
+        };
+        assert!(
+            diagnostic.contains("bgsrv-ub: its measured memory demand"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("Waited on: bglab-mac"), "{diagnostic}");
+    }
+
+    /// The exclusion is the machine's answer at the size it was killed at.
+    /// Growth past it, by more than a reading's jitter, lifts it; an unread
+    /// total does not, and a crowded kill never excluded anything.
+    #[test]
+    fn a_kill_alone_stops_excluding_only_once_the_machine_has_grown() {
+        const TOTAL: u64 = 13_000_000_000;
+        let kill = cairn_common::executor_protocol::MemoryKill {
+            victim_resident_bytes: 6_871_947_673,
+            killed_at_unix_ms: 10,
+            alone_on_machine_bytes: Some(TOTAL),
+        };
+        let machine = |total_bytes: u64| cairn_common::executor_protocol::MachineTelemetry {
+            memory: Measurement::measured(
+                1,
+                cairn_common::executor_protocol::MachineMemory {
+                    total_bytes,
+                    available_bytes: total_bytes / 2,
+                },
+            ),
+            ..Default::default()
+        };
+        assert!(memory_kill_exclusion(&kill, &machine(TOTAL)).is_some());
+        assert!(
+            memory_kill_exclusion(&kill, &machine(TOTAL + TOTAL / 32)).is_some(),
+            "jitter in the reported total is not a new machine"
+        );
+        assert!(memory_kill_exclusion(&kill, &machine(2 * TOTAL)).is_none());
+        assert!(
+            memory_kill_exclusion(
+                &kill,
+                &cairn_common::executor_protocol::MachineTelemetry::default()
+            )
+            .is_some(),
+            "an unread total keeps the exclusion"
+        );
+        let crowded = cairn_common::executor_protocol::MemoryKill {
+            alone_on_machine_bytes: None,
+            ..kill
+        };
+        assert!(memory_kill_exclusion(&crowded, &machine(TOTAL)).is_none());
     }
 
     /// A big machine that is busy right now queues the work in its own
@@ -23507,9 +24963,7 @@ mod tests {
     /// thrashing: it adds nothing and says why.
     #[test]
     fn a_machine_thrashing_on_memory_ranks_behind_an_idle_one() {
-        use cairn_common::executor_protocol::{
-            MeasurementGap, MemoryPressure, MemoryPressurePrice,
-        };
+        use cairn_common::executor_protocol::{HostStallPrice, MeasurementGap, MemoryPressure};
         let (_, mut thrashing) = fleet_entry("bgsrv-ub", "linux", 0, &[]);
         let (_, mut idle) = fleet_entry("fedora", "linux", 0, &[]);
         let (_, unmeasured) = fleet_entry("mini", "linux", 0, &[]);
@@ -23556,7 +25010,7 @@ mod tests {
                 contention.clone(),
                 SyncCost::Known(0),
             );
-            price_memory_pressure(&mut prediction, &entry.health.host, NOW);
+            price_host_stall(&mut prediction, &entry.health.host, NOW);
             prediction
         };
         let thrashing_prediction = predict(&thrashing);
@@ -23565,7 +25019,7 @@ mod tests {
 
         assert_eq!(
             thrashing_prediction.memory_pressure,
-            Some(MemoryPressurePrice::Priced {
+            Some(HostStallPrice::Priced {
                 full_millis: 850,
                 penalty_ms: 3_400_000,
             })
@@ -23578,7 +25032,7 @@ mod tests {
         assert_eq!(unmeasured_prediction.predicted_verdict_ms, 600_000);
         assert!(matches!(
             unmeasured_prediction.memory_pressure,
-            Some(MemoryPressurePrice::Unmeasured {
+            Some(HostStallPrice::Unmeasured {
                 gap: MeasurementGap::NotSampled
             })
         ));
@@ -23628,8 +25082,169 @@ mod tests {
         assert_eq!(stale.predicted_verdict_ms, 600_000);
         assert!(matches!(
             stale.memory_pressure,
-            Some(MemoryPressurePrice::Stale { .. })
+            Some(HostStallPrice::Stale { .. })
         ));
+    }
+
+    /// bbs on 10-29 (cairn/5549): I/O fully stalled 58.8% of the last ten
+    /// seconds and 48.1% of the last minute. Its run is priced at the worse
+    /// window, `run * 0.588/0.412`, and it ranks behind an idle machine; it is
+    /// never refused. Memory and storage stalls overlap (a swap-in waits on
+    /// both), so storage is charged only for what it adds beyond memory, and a
+    /// machine that cannot measure I/O pressure adds nothing and says why.
+    #[test]
+    fn a_machine_stalled_on_storage_ranks_behind_an_idle_one() {
+        use cairn_common::executor_protocol::{
+            HostStallPrice, IoPressure, MeasurementGap, MemoryPressure,
+        };
+        let (_, mut stalled) = fleet_entry("bbs", "linux", 0, &[]);
+        let (_, mut idle) = fleet_entry("fedora", "linux", 0, &[]);
+        let (_, unmeasured) = fleet_entry("mini", "linux", 0, &[]);
+        for entry in [&mut stalled, &mut idle] {
+            measured(entry, 0.1, 8_000_000_000, 8_000_000_000);
+            Arc::make_mut(&mut entry.health).host.memory_pressure =
+                Measurement::measured(NOW, MemoryPressure::default());
+        }
+        let io = |full_avg10_millis, full_avg60_millis| {
+            Measurement::measured(
+                NOW,
+                IoPressure {
+                    full_avg10_millis,
+                    full_avg60_millis,
+                    slowest_device: None,
+                },
+            )
+        };
+        Arc::make_mut(&mut stalled.health).host.io_pressure = io(588, 481);
+        Arc::make_mut(&mut idle.health).host.io_pressure = io(0, 0);
+        let mut run = test_prior_duration();
+        run.predicted_ms = 600_000;
+        let predict = |entry: &ExecutorConnectionState| {
+            let mut prediction = placement_prediction_with_contention(
+                entry,
+                CacheWarmthEvidence::Observed {
+                    warmth: ExecutionWarmth::Cold,
+                    observed_at_unix_ms: NOW,
+                },
+                QueueForecast::Forecast {
+                    predicted_ms: 0,
+                    requests_ahead: 0,
+                    running_ahead: 0,
+                    fully_measured: true,
+                    observed_at_unix_ms: NOW,
+                    stalled_head_ms: None,
+                },
+                run.clone(),
+                ContentionEstimate {
+                    co_resident_compile_jobs: 0,
+                    co_resident_light_jobs: 0,
+                    multiplier_millis: 1_000,
+                    source: cairn_common::executor_protocol::ContentionEvidence::Machine,
+                    sample_count: 12,
+                    fallback: None,
+                },
+                SyncCost::Known(0),
+            );
+            price_host_stall(&mut prediction, &entry.health.host, NOW);
+            prediction
+        };
+
+        let stalled_prediction = predict(&stalled);
+        assert_eq!(
+            stalled_prediction.io_pressure,
+            Some(HostStallPrice::Priced {
+                full_millis: 588,
+                penalty_ms: 856_310,
+            })
+        );
+        assert_eq!(stalled_prediction.predicted_verdict_ms, 600_000 + 856_310);
+        assert!(
+            stalled_prediction
+                .describe()
+                .contains("I/O stalled 58.8% of the time, +14m"),
+            "{}",
+            stalled_prediction.describe()
+        );
+        let idle_prediction = predict(&idle);
+        assert_eq!(idle_prediction.predicted_verdict_ms, 600_000);
+        let unmeasured_prediction = predict(&unmeasured);
+        assert_eq!(unmeasured_prediction.predicted_verdict_ms, 600_000);
+        assert!(matches!(
+            unmeasured_prediction.io_pressure,
+            Some(HostStallPrice::Unmeasured {
+                gap: MeasurementGap::NotSampled
+            })
+        ));
+
+        let request = spillable_request();
+        let scored = [(&stalled, stalled_prediction), (&idle, idle_prediction)]
+            .into_iter()
+            .map(|(entry, prediction)| {
+                ScoredCandidate::new(
+                    entry,
+                    SyncCost::Known(0),
+                    None,
+                    &ResourceReservation::default(),
+                    prediction,
+                    None,
+                    None,
+                    NOW,
+                )
+            })
+            .collect::<Vec<_>>();
+        let (winner, _, _, _, _) = rank_candidates(
+            &scored,
+            false,
+            true,
+            &request,
+            &ActivePlacementPolicy::default_profile(),
+            &ExplorationState::default(),
+        );
+        assert_eq!(winner.unwrap().entry.identity.executor_id, "fedora");
+
+        // Swapping on top: memory 20% stalled is charged first, and storage
+        // only for the rest of its 58.8%, so the total is the 58.8% price.
+        Arc::make_mut(&mut stalled.health).host.memory_pressure = Measurement::measured(
+            NOW,
+            MemoryPressure {
+                full_avg10_millis: 200,
+                full_avg60_millis: 150,
+            },
+        );
+        let swapping = predict(&stalled);
+        assert_eq!(
+            swapping
+                .memory_pressure
+                .as_ref()
+                .map(HostStallPrice::penalty_ms),
+            Some(150_000)
+        );
+        assert_eq!(
+            swapping
+                .io_pressure
+                .as_ref()
+                .map(HostStallPrice::penalty_ms),
+            Some(706_310)
+        );
+        assert_eq!(swapping.predicted_verdict_ms, 600_000 + 856_310);
+
+        // Memory the worse of the two: storage adds nothing beyond it.
+        Arc::make_mut(&mut stalled.health).host.memory_pressure = Measurement::measured(
+            NOW,
+            MemoryPressure {
+                full_avg10_millis: 700,
+                full_avg60_millis: 700,
+            },
+        );
+        let thrashing = predict(&stalled);
+        assert_eq!(
+            thrashing
+                .io_pressure
+                .as_ref()
+                .map(HostStallPrice::penalty_ms),
+            Some(0)
+        );
+        assert_eq!(thrashing.predicted_verdict_ms, 600_000 + 1_400_000);
     }
 
     fn local_first() -> ActivePlacementPolicy {
@@ -23716,6 +25331,109 @@ mod tests {
             &ExplorationState::default(),
         );
         assert_eq!(winner.unwrap().entry.identity.executor_id, "fedora");
+    }
+
+    /// A check lane's verdict is reproducible against the branch alone, so the
+    /// batch every check submits carries no node scratch.
+    #[test]
+    fn a_check_lane_batch_carries_no_node_scratch() {
+        let batch = Fleet::check_process_batch(Vec::new(), Some("context".into()), None, 0);
+        assert!(batch.node_scratch.is_none());
+    }
+
+    /// A node scratch is affinity, not a pin: at equal predictions the machine
+    /// where it is already warm ranks first, and a cold machine that is the only
+    /// candidate still takes the work.
+    #[test]
+    fn a_warm_node_scratch_ranks_ahead_of_a_cold_one_and_never_excludes_it() {
+        let (_, mut warm) = fleet_entry("warm", "linux", 0, &[]);
+        let (_, mut cold) = fleet_entry("cold", "linux", 0, &[]);
+        measured(&mut warm, 0.1, 8_000_000_000, 8_000_000_000);
+        measured(&mut cold, 0.1, 8_000_000_000, 8_000_000_000);
+        let warmth = CacheWarmthEvidence::Observed {
+            warmth: ExecutionWarmth::Cold,
+            observed_at_unix_ms: NOW,
+        };
+        let queue = QueueForecast::Forecast {
+            predicted_ms: 0,
+            requests_ahead: 0,
+            running_ahead: 0,
+            fully_measured: true,
+            observed_at_unix_ms: NOW,
+            stalled_head_ms: None,
+        };
+        let mut learned = test_prior_duration();
+        learned.source = cairn_common::executor_protocol::DurationEvidence::Learned;
+        learned.sample_count = 20;
+        learned.fallback = None;
+        let warm_prediction = placement_prediction(
+            &warm,
+            warmth.clone(),
+            queue.clone(),
+            learned.clone(),
+            SyncCost::Known(0),
+        );
+        let cold_prediction =
+            placement_prediction(&cold, warmth, queue, learned, SyncCost::Known(0));
+        assert_eq!(
+            warm_prediction.predicted_verdict_ms,
+            cold_prediction.predicted_verdict_ms
+        );
+        let mut cold_candidate = ScoredCandidate::new(
+            &cold,
+            SyncCost::Known(0),
+            None,
+            &ResourceReservation::default(),
+            cold_prediction.clone(),
+            None,
+            None,
+            NOW,
+        );
+        // A 61 MB scratch over an unmeasured remote link.
+        cold_candidate.scratch_sync_ms = 6_100;
+        let warm_candidate = ScoredCandidate::new(
+            &warm,
+            SyncCost::Known(0),
+            None,
+            &ResourceReservation::default(),
+            warm_prediction,
+            None,
+            None,
+            NOW,
+        );
+        let request = spillable_request();
+        let policy = ActivePlacementPolicy::default_profile();
+        let history = ExplorationState {
+            decisions_since_exploration: 0,
+            ..Default::default()
+        };
+        let scored = vec![cold_candidate, warm_candidate];
+        let (winner, _, _, _, _) =
+            rank_candidates(&scored, false, true, &request, &policy, &history);
+        assert_eq!(winner.unwrap().entry.identity.executor_id, "warm");
+
+        let mut only_cold = ScoredCandidate::new(
+            &cold,
+            SyncCost::Known(0),
+            None,
+            &ResourceReservation::default(),
+            cold_prediction,
+            None,
+            None,
+            NOW,
+        );
+        only_cold.scratch_sync_ms = 6_100;
+        let scored = vec![only_cold];
+        let (winner, _, _, _, _) =
+            rank_candidates(&scored, false, true, &request, &policy, &history);
+        assert_eq!(
+            winner
+                .expect("a cold machine is priced, never excluded")
+                .entry
+                .identity
+                .executor_id,
+            "cold"
+        );
     }
 
     /// Priced, never excluded: a penalized machine that is the only candidate
@@ -25098,6 +26816,119 @@ mod tests {
         );
     }
 
+    /// cairn/5600: fedora and bbs were each running seven or eight commands on
+    /// a stalling disk, every refresh pass waited tens of seconds for pool
+    /// state, and every Linux lane was refused because both machines' CPU
+    /// reading was minutes old. A machine's readings now also arrive on its
+    /// beat and in their own frame, neither of which waits for pool state, and
+    /// a late snapshot from the stuck pass cannot drag them back. An executor
+    /// that sends no sample is read exactly as it posts itself, as before.
+    #[test]
+    fn sampled_readings_keep_a_machine_placeable_while_its_refresh_pass_is_minutes_old() {
+        let gib = 1024 * 1024 * 1024;
+        let pass_measured_at = NOW - 4 * 60 * 1_000;
+        let brake = |measured_at_unix_ms| cairn_common::executor_protocol::CpuAdmissionHealth {
+            state: CpuAdmissionState::Accepting,
+            utilization: Some(0.2),
+            state_since_unix_ms: Some(pass_measured_at),
+            measured_at_unix_ms: Some(measured_at_unix_ms),
+        };
+        let pool = Fleet::default();
+        let mut stuck_pass = HashMap::new();
+        for id in ["fedora", "bbs"] {
+            let (executor_id, mut connection) = fleet_entry(id, "linux", 0, &[]);
+            measured_at(&mut connection, 0.2, 48 * gib, 900 * gib, pass_measured_at);
+            Arc::make_mut(&mut connection.health).host.cpu_admission = brake(pass_measured_at);
+            stuck_pass.insert(id, (*connection.health).clone());
+            pool.lock_connections().insert(executor_id, connection);
+        }
+        let sample_at = |measured_at_unix_ms| {
+            let mut fresh = stuck_pass["fedora"].clone();
+            fresh.machine.cpu.measured_at_unix_ms = measured_at_unix_ms;
+            fresh.machine.memory.measured_at_unix_ms = measured_at_unix_ms;
+            fresh.machine.volume.measured_at_unix_ms = measured_at_unix_ms;
+            fresh.host.cpu_admission = brake(measured_at_unix_ms);
+            MachineSample::of_report(&fresh)
+        };
+        let beat = |id: &str, machine: Option<MachineSample>| {
+            let advertisement = pool.lock_connections()[id].advertisement.clone();
+            assert!(pool.handle_executor_message(
+                id,
+                1,
+                ExecutorMessage::Heartbeat {
+                    advertisement,
+                    health: stuck_pass[id].clone(),
+                    last_update: None,
+                    machine,
+                },
+            ));
+        };
+
+        // Both beat on time, carrying the stuck pass's health. fedora's beat
+        // also carries the sample its sampler took twenty seconds ago, inside
+        // the staleness bound but outside the brake's.
+        beat("fedora", Some(sample_at(NOW - 20_000)));
+        beat("bbs", None);
+        let fedora = pool.lock_connections()["fedora"].health.clone();
+        assert_eq!(fedora.machine.cpu.measured_at_unix_ms, NOW - 20_000);
+        assert_eq!(
+            fedora.host.cpu_admission.measured_at_unix_ms,
+            Some(NOW - 20_000)
+        );
+
+        // The sample frame brings the brake inside its bound between beats.
+        assert!(!pool.handle_executor_message(
+            "fedora",
+            1,
+            ExecutorMessage::MachineSampled {
+                sample: sample_at(NOW),
+            },
+        ));
+        // Then the stuck pass finally returns and publishes what it measured
+        // four minutes ago. Its cells and queues are the news; its readings
+        // are not, and they do not displace the newer ones.
+        pool.set_executor_snapshot(
+            "fedora",
+            1,
+            FleetSnapshot::default(),
+            stuck_pass["fedora"].clone(),
+        );
+        pool.set_executor_snapshot(
+            "bbs",
+            1,
+            FleetSnapshot::default(),
+            stuck_pass["bbs"].clone(),
+        );
+
+        let connections = pool.lock_connections().clone();
+        let fedora = &connections["fedora"].health;
+        assert_eq!(fedora.machine.cpu.measured_at_unix_ms, NOW);
+        assert_eq!(fedora.machine.memory.measured_at_unix_ms, NOW);
+        assert_eq!(fedora.machine.volume.measured_at_unix_ms, NOW);
+        assert_eq!(fedora.host.cpu_admission.measured_at_unix_ms, Some(NOW));
+        assert_eq!(
+            *connections["bbs"].health, stuck_pass["bbs"],
+            "an executor that sends no sample is held to exactly what it posted"
+        );
+
+        let draft = place(&connections, &spillable_request()).unwrap();
+        assert_eq!(
+            chosen(&draft).executor_id,
+            "fedora",
+            "a machine whose readings are fresh is placeable however old its pass is"
+        );
+        assert!(
+            matches!(
+                rejection_for(&draft, "bbs"),
+                PlacementRejectionReason::TelemetryStale {
+                    measurement: MachineMeasurement::Cpu,
+                    ..
+                }
+            ),
+            "the stale-telemetry bound still holds for a machine that cannot freshen its readings"
+        );
+    }
+
     /// A gap that describes the daemon rather than the machine says nothing
     /// about whether the machine can take work, and must not exclude it.
     #[test]
@@ -25378,6 +27209,103 @@ mod tests {
         let refusal = place(&connections, &spillable_request()).unwrap_err();
         assert!(refusal.contains("bglab-ub"), "{refusal}");
         assert!(refusal.contains("unavailable"), "{refusal}");
+    }
+
+    /// Both machines answered this request, one on disk and one on host
+    /// pressure, and by the time the refusal is composed the admission view
+    /// reads each of them as stale. The refusal is the journal's account: each
+    /// machine's own decline, not the staleness visible when the sentence is
+    /// written, which reads as a runner restart that never happened.
+    #[test]
+    fn a_refusal_names_each_machines_decline_not_the_staleness_read_when_it_is_composed() {
+        let (fedora_id, mut fedora) = fleet_entry("fedora", "linux", 0, &[]);
+        measured_at(&mut fedora, 0.05, 48 * GIB, 900 * GIB, NOW - 104_488);
+        let (ub_id, mut ub) = fleet_entry("bgsrv-ub", "linux", 0, &[]);
+        measured_at(&mut ub, 0.05, 48 * GIB, 900 * GIB, NOW - 200_000);
+        let connections = HashMap::from([(fedora_id, fedora), (ub_id, ub)]);
+        let request = spillable_request();
+        let decline = |reason, detail: &str, at_unix_ms| queue::EntryDecline {
+            generation: 1,
+            reason,
+            detail: Some(detail.into()),
+            disk: None,
+            at_unix_ms,
+            condition: None,
+            backoff_ms: 0,
+            retry_after_unix_ms: 0,
+            // Superseded and past backoff: neither decline keeps its machine
+            // out of ranking, which is where the staleness is read.
+            superseded: true,
+        };
+        let declined = HashMap::from([
+            (
+                "fedora".to_string(),
+                decline(DeclineReason::Disk, "disk, sweep in flight", NOW - 40_000),
+            ),
+            (
+                "bgsrv-ub".to_string(),
+                decline(DeclineReason::Pressure, "host pressure", NOW - 60_000),
+            ),
+        ]);
+        let refusal = place_entry(
+            &connections,
+            &request,
+            &declined,
+            &AdmissionView::of_request(&request),
+        )
+        .expect_err("a blind fleet with no home refuses");
+        assert!(
+            refusal.contains("fedora (declined this request (Disk): disk, sweep in flight"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("bgsrv-ub (declined this request (Pressure): host pressure"),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("was measured"), "{refusal}");
+    }
+
+    /// A machine's last decline replaces what the runner reads of it now, a
+    /// structural reason is kept, and a decliner the rows no longer name is
+    /// still accounted for.
+    #[test]
+    fn the_journal_replaces_readings_but_not_structural_reasons() {
+        let row = |id: &str, reason| PlacementRejection {
+            prediction: None,
+            executor_name: id.into(),
+            executor_id: id.into(),
+            reason,
+        };
+        let declined = |id: &str| {
+            row(
+                id,
+                PlacementRejectionReason::Declined {
+                    reason: DeclineReason::Disk,
+                    detail: Some("sweep in flight".into()),
+                    declined_at_unix_ms: NOW,
+                },
+            )
+        };
+        let rows = account_from_journal(
+            vec![
+                row(
+                    "stale",
+                    PlacementRejectionReason::ConnectionStale {
+                        silence_ms: 120_000,
+                        stale_after_ms: 30_000,
+                    },
+                ),
+                row("drained", PlacementRejectionReason::Drained),
+            ],
+            &[declined("stale"), declined("drained"), declined("gone")],
+        );
+        assert!(matches!(
+            rows[0].reason,
+            PlacementRejectionReason::Declined { .. }
+        ));
+        assert!(matches!(rows[1].reason, PlacementRejectionReason::Drained));
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].executor_id, "gone");
     }
 
     /// Fit is the first ranking key, so a machine that measurably cannot hold the
@@ -25762,6 +27690,96 @@ mod tests {
         );
     }
 
+    /// cairn/5510: a machine refused on protocol is stranded exactly while the
+    /// runner has resolved its target and holds nothing to repair it with, and
+    /// attaching ends the run of refusals.
+    #[tokio::test]
+    async fn a_refused_machine_is_stranded_only_while_the_runner_has_nothing_for_its_target() {
+        const LINUX: &str = "x86_64-unknown-linux-gnu";
+        let unpublished = || {
+            Err(ArtifactUnavailable {
+                reason: "no x86_64-unknown-linux-gnu executor artifact published for executor protocol v159".into(),
+                newest_held_protocol: Some(157),
+            })
+        };
+        let fleet = Fleet::default();
+        fleet.declare_enrolled_remote("fedora", "fedora", "linux", "x86_64");
+        fleet.declare_enrolled_remote("bgsrv-mac", "bgsrv-mac", "macos", "aarch64");
+        assert_eq!(
+            fleet
+                .remote_executor_targets()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["aarch64-apple-darwin", LINUX],
+            "a machine that never attached still has its target resolved"
+        );
+        let fedora = |fleet: &Fleet| {
+            fleet
+                .unattached_enrolled_remotes()
+                .into_iter()
+                .find(|remote| remote.name == "fedora")
+                .unwrap()
+                .stranded
+        };
+
+        assert_eq!(
+            fleet.record_protocol_refusal("fedora", 159, 157),
+            None,
+            "an unresolved target claims nothing either way"
+        );
+        assert_eq!(fedora(&fleet), None);
+
+        fleet.record_executor_artifact_build(LINUX, unpublished());
+        let stranded = fleet
+            .record_protocol_refusal("fedora", 159, 157)
+            .expect("refused with nothing to serve is stranded");
+        assert_eq!(
+            (
+                stranded.target.as_str(),
+                stranded.expected_protocol,
+                stranded.received_protocol,
+                stranded.newest_held_protocol,
+                stranded.refusals,
+            ),
+            (LINUX, 159, 157, Some(157), 2)
+        );
+        assert!(stranded.last_refused_unix_ms >= stranded.refused_since_unix_ms);
+        assert_eq!(
+            stranded.describe(),
+            "stranded: this runner has no x86_64-unknown-linux-gnu executor for protocol 159 (newest held: v157); publish one or roll the app back"
+        );
+        assert_eq!(fedora(&fleet), Some(stranded));
+        assert!(
+            fleet
+                .unattached_enrolled_remotes()
+                .iter()
+                .find(|remote| remote.name == "bgsrv-mac")
+                .unwrap()
+                .stranded
+                .is_none(),
+            "a machine never refused is not stranded"
+        );
+        assert_eq!(
+            fleet.record_protocol_refusal("stranger", 159, 157),
+            None,
+            "an identity this runner never enrolled records nothing"
+        );
+
+        // Published: the same refusal is now a self-update that can succeed.
+        fleet.record_executor_artifact_build(LINUX, Ok("build-159".into()));
+        assert_eq!(fleet.record_protocol_refusal("fedora", 159, 157), None);
+        assert_eq!(fedora(&fleet), None);
+
+        fleet.record_executor_artifact_build(LINUX, unpublished());
+        assert_eq!(fedora(&fleet).map(|stranded| stranded.refusals), Some(3));
+        let (_, entry) = fleet_entry("fedora", "linux", 0, &[]);
+        let generation = fleet
+            .attach_advertised_executor(entry.advertisement, entry.sender, false, None, None)
+            .expect("fedora attaches");
+        assert!(fleet.disconnect_advertised_executor("fedora", generation));
+        assert_eq!(fedora(&fleet), None, "attaching ends the run of refusals");
+    }
+
     /// The ceremony reports its own progress, and the distinction that survives
     /// is the one a person acts on differently: a bootstrap that failed needs
     /// someone, and a machine that was installed and has not dialled yet does
@@ -26028,6 +28046,77 @@ mod tests {
                 .executor_id,
             "bglab-sp1"
         );
+    }
+
+    /// A machine an inference deployment holds is passed over for every class
+    /// of work and by an explicit selector, and the refusal names the
+    /// deployment; releasing the hold re-admits it.
+    #[test]
+    fn placement_passes_over_a_machine_held_for_inference() {
+        let mut connections = HashMap::from([
+            fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]),
+            fleet_entry("bginf-sp1", "linux", 0, &[]),
+        ]);
+        connections
+            .get_mut(COLOCATED_EXECUTOR_ID)
+            .unwrap()
+            .colocated = true;
+        connections.get_mut("bginf-sp1").unwrap().inference_hold = Some(InferenceHold {
+            deployment: "dsv4f-tp2".into(),
+            phase: "starting".into(),
+        });
+        let mut request = targeted_request("linux");
+        request.executor = Some(ExecutorSelector {
+            name: Some("bginf-sp1".into()),
+            ..ExecutorSelector::default()
+        });
+        for work_class in [
+            PlacementWorkClass::ReviewChecks,
+            PlacementWorkClass::WriteChecks,
+            PlacementWorkClass::AgentSessions,
+            PlacementWorkClass::DevInstances,
+            PlacementWorkClass::Services,
+        ] {
+            request.placement_work_class = work_class;
+            let refusal = place(&connections, &request)
+                .expect_err("a machine held for inference takes no batch work");
+            assert!(
+                refusal.contains("reserved for inference deployment dsv4f-tp2 (starting)"),
+                "{work_class:?}: {refusal}"
+            );
+        }
+
+        connections.get_mut("bginf-sp1").unwrap().inference_hold = None;
+        assert_eq!(
+            place(&connections, &request)
+                .unwrap()
+                .selected
+                .expect("releasing the hold re-admits it")
+                .0
+                .executor_id,
+            "bginf-sp1"
+        );
+    }
+
+    /// Holds are stamped by public name on live connections and on attach,
+    /// and replaced whole.
+    #[test]
+    fn inference_holds_stamp_live_connections_by_name() {
+        let fleet = Fleet::default();
+        let (_name, entry) = fleet_entry("bginf-sp2", "linux", 0, &[]);
+        fleet.lock_connections().insert("bginf-sp2".into(), entry);
+        let hold = InferenceHold {
+            deployment: "dsv4f-tp2".into(),
+            phase: "healthy".into(),
+        };
+        fleet.set_inference_holds(HashMap::from([("bginf-sp2".to_string(), hold.clone())]));
+        assert_eq!(
+            fleet.lock_connections()["bginf-sp2"].inference_hold,
+            Some(hold.clone())
+        );
+        assert_eq!(fleet.inference_hold_named("bginf-sp2"), Some(hold));
+        fleet.set_inference_holds(HashMap::new());
+        assert_eq!(fleet.lock_connections()["bginf-sp2"].inference_hold, None);
     }
 
     /// A busy home and an idle, never-explored remote under a remote-first
@@ -26708,6 +28797,8 @@ mod tests {
             subscriber_count: 1,
             resource_reservation: ResourceReservation::default(),
             learned_estimate: None,
+            live_usage: None,
+            build_jobs: None,
         }];
         let mut remote = fleet_entry("remote-a", "linux", 0, &[]).1;
         remote.identity.display_name = "BGLab UB".into();
@@ -26764,6 +28855,8 @@ mod tests {
             subscriber_count: 1,
             resource_reservation: ResourceReservation::default(),
             learned_estimate: None,
+            live_usage: None,
+            build_jobs: None,
         }];
         Arc::make_mut(&mut busy.health).machine.memory =
             cairn_common::executor_protocol::Measurement::measured(
@@ -26937,6 +29030,7 @@ mod tests {
                 advertisement,
                 health,
                 last_update: None,
+                machine: None,
             },
         ));
 
@@ -27026,13 +29120,15 @@ mod tests {
                 .update_hold
         );
         let inspected = pool.inspect_executors(NOW);
-        assert_eq!(
-            inspected[0].self_update.as_ref().unwrap().phase,
+        assert!(matches!(
+            &inspected[0].self_update.as_ref().unwrap().phase,
             SelfUpdatePhase::Draining {
                 in_flight: 1,
-                since_unix_ms: NOW
-            }
-        );
+                since_unix_ms: NOW,
+                holds,
+                ..
+            } if holds[0].label == "request r (preparing its cell)"
+        ));
         assert_eq!(
             inspected[0]
                 .health
@@ -27115,6 +29211,98 @@ mod tests {
         );
     }
 
+    /// The macOS cadence's refusal named only the Mac being emptied for its
+    /// update. The other Mac with rust was excluded because its check lanes
+    /// cannot apply a nested Seatbelt profile under the operator credential
+    /// floor, and the refusal says so, along with the machines that are simply
+    /// not macOS.
+    #[test]
+    fn a_macos_refusal_names_the_excluded_mac_and_the_capability_it_lacks() {
+        let context = cairn_common::executor_protocol::NestedSandboxProbeContext {
+            launcher: cairn_common::executor_protocol::SandboxLauncherClass::Unconfined,
+            credential_floor_sha256: None,
+            outer_profile_sha256: None,
+            fingerprint: Some("f".into()),
+            measured_at_unix_ms: 1,
+        };
+        let capable = SandboxCapabilityEvidence {
+            cairn_sandboxed_marker: false,
+            nested_sandbox_write_available: true,
+            nested_sandbox_write_detail: "live probe succeeded".into(),
+            nested_sandbox_write_context: Some(context.clone()),
+            violation_recovery: None,
+        };
+        let floored = SandboxCapabilityEvidence {
+            nested_sandbox_write_available: false,
+            nested_sandbox_write_detail:
+                "outer profile inherited: a confined process cannot apply a second profile".into(),
+            nested_sandbox_write_context: Some(
+                cairn_common::executor_protocol::NestedSandboxProbeContext {
+                    credential_floor_sha256: Some("floor".into()),
+                    outer_profile_sha256: Some("outer".into()),
+                    ..context
+                },
+            ),
+            ..capable.clone()
+        };
+        let mut connections = HashMap::from([
+            fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]),
+            fleet_entry("bgsrv-mac", "macos", 0, &[]),
+            fleet_entry("fedora", "linux", 0, &[]),
+            fleet_entry("bgsrv-ub", "linux", 0, &[]),
+            fleet_entry("bglab-win", "windows", 0, &[]),
+        ]);
+        connections
+            .get_mut(COLOCATED_EXECUTOR_ID)
+            .unwrap()
+            .advertisement
+            .capabilities
+            .sandbox = Some(floored);
+        let mac = connections.get_mut("bgsrv-mac").unwrap();
+        mac.advertisement.capabilities.sandbox = Some(capable);
+        mac.update_hold = true;
+        let mut request = targeted_request("macos");
+        request.executor = Some(ExecutorSelector {
+            os: Some("macos".into()),
+            required_toolchains: vec!["rust".into()],
+            requires_macos_nested_sandbox_write: true,
+            ..ExecutorSelector::default()
+        });
+        let refusal = place(&connections, &request)
+            .expect_err("no macOS machine can take a nested-Seatbelt check lane now");
+        assert!(
+            refusal.contains("bgsrv-mac is being emptied for an executor update"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("bgsrv-mac: being emptied for an executor update"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains(
+                "local: check lanes need a nested Seatbelt write and this machine cannot apply one (outer profile inherited: a confined process cannot apply a second profile; operator credential floor)"
+            ),
+            "{refusal}"
+        );
+        assert!(refusal.contains("3 other machines: not macos"), "{refusal}");
+
+        // Just attached, before its first sandbox probe has reported: a wait
+        // with an age, not evidence that the capability is absent.
+        connections
+            .get_mut(COLOCATED_EXECUTOR_ID)
+            .unwrap()
+            .advertisement
+            .capabilities
+            .sandbox = None;
+        let refusal = place(&connections, &request).unwrap_err();
+        assert!(
+            refusal.contains(
+                "local: check-lane nested Seatbelt probe not yet reported since it advertised"
+            ),
+            "{refusal}"
+        );
+    }
+
     #[test]
     fn heartbeat_refreshes_live_executor_health_report() {
         let pool = Fleet::default();
@@ -27138,6 +29326,7 @@ mod tests {
                 advertisement: advertisement.clone(),
                 health: first,
                 last_update: None,
+                machine: None,
             },
         ));
         assert_eq!(
@@ -27167,6 +29356,7 @@ mod tests {
                 advertisement,
                 health: second,
                 last_update: None,
+                machine: None,
             },
         ));
         let health = pool.executor_health(2);
@@ -27205,6 +29395,7 @@ mod tests {
                 advertisement: advertisement.clone(),
                 health: ExecutorSubstrateReport::default(),
                 last_update: None,
+                machine: None,
             },
         ));
         let fresh = pool.executor_health(beat_at).remove(0);
@@ -27221,6 +29412,7 @@ mod tests {
                 advertisement,
                 health: ExecutorSubstrateReport::default(),
                 last_update: None,
+                machine: None,
             },
         ));
         let wedged = pool.executor_health(much_later).remove(0);
@@ -27263,6 +29455,7 @@ mod tests {
                 advertisement,
                 health: ExecutorSubstrateReport::default(),
                 last_update: None,
+                machine: None,
             },
         ));
         let health = pool.executor_health(beat_at).remove(0);
@@ -27382,6 +29575,8 @@ mod tests {
                 upper_peak_rss_bytes: None,
                 upper_disk_growth_bytes: None,
             }),
+            live_usage: None,
+            build_jobs: None,
         }
     }
 
@@ -27582,6 +29777,78 @@ mod tests {
         );
     }
 
+    /// cairn/5671. A machine whose telemetry goes stale stays eligible, so the
+    /// capability set alone cannot tell a blind window from its end, and a
+    /// lane suppressed during one outlived it. The identity names the
+    /// blindness: the counter a blind window charges is not the one the
+    /// recovered fleet reads, so the machine reporting again is itself the
+    /// fleet change that re-arms the lane, with no operator in the loop.
+    #[test]
+    fn a_machine_recovering_its_telemetry_moves_the_check_capability_identity() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let repository = forecast_repository();
+        let scope = forecast_scope(&repository, None, PlacementMobility::SpillEligible);
+        let now = unix_time_ms();
+        let pool = Fleet::default();
+        let (id, mut fedora) = fleet_entry_at("fedora", "linux", 0, &[], now);
+        measured_at(&mut fedora, 0.1, 16 * GIB, 512 * GIB, now);
+        pool.lock_connections().insert(id.clone(), fedora);
+        let seeing = pool.capability_identity(scope);
+        assert!(
+            pool.measurement_blindness(std::slice::from_ref(&id))
+                .is_empty(),
+            "fresh readings are not blind"
+        );
+
+        // The 10-31 specimen: the refresh pass wedged, so the last reading
+        // ages past its bound while the link stays up.
+        let stale_at = now - EXECUTOR_TELEMETRY_STALE_AFTER_MS - 18_000;
+        measured_at(
+            pool.lock_connections().get_mut(&id).unwrap(),
+            0.1,
+            16 * GIB,
+            512 * GIB,
+            stale_at,
+        );
+        let blind = pool.capability_identity(scope);
+        assert_ne!(
+            blind, seeing,
+            "a blind machine is a different fleet from the same machine seeing"
+        );
+        let blindness = pool.measurement_blindness(std::slice::from_ref(&id));
+        assert_eq!(blindness.len(), 1);
+        assert_eq!(blindness[0].name, "fedora");
+        assert!(
+            blindness[0].reason.contains("past the"),
+            "placement's own words: {}",
+            blindness[0].reason
+        );
+        let blind_for = blindness[0]
+            .blind_for_ms
+            .expect("a stale reading is dated, so its blindness has a length");
+        assert!(
+            (18_000..120_000).contains(&blind_for),
+            "measured from the bound, not from the reading: {blind_for}"
+        );
+        assert!(
+            pool.measurement_blindness(&["gone".to_string()]).is_empty(),
+            "a machine no longer attached is gone, not blind"
+        );
+
+        measured_at(
+            pool.lock_connections().get_mut(&id).unwrap(),
+            0.1,
+            16 * GIB,
+            512 * GIB,
+            unix_time_ms(),
+        );
+        assert_eq!(
+            pool.capability_identity(scope),
+            seeing,
+            "fresh telemetry returns the fleet to the identity it had before the window"
+        );
+    }
+
     #[test]
     fn a_forecast_reads_only_machines_placement_itself_would_keep() {
         let repository = forecast_repository();
@@ -27688,6 +29955,49 @@ mod tests {
         assert!(!pool.disconnect_advertised_executor(&executor_id, 2));
         assert!(pool.disconnect_advertised_executor(&executor_id, 1));
         assert!(!pool.disconnect_advertised_executor(&executor_id, 1));
+    }
+
+    /// A machine's load history is the runner's, kept by executor identity, so
+    /// a link that drops and comes back extends the graph rather than
+    /// restarting it, and a frame from the replaced link adds nothing.
+    #[test]
+    fn a_machines_load_ring_survives_its_link_reconnecting() {
+        let pool = Fleet::default();
+        let (executor_id, connection) = fleet_entry("reconnecting", "linux", 0, &[]);
+        pool.lock_connections()
+            .insert(executor_id.clone(), connection);
+        for tick in 1..=3 {
+            let event = pool
+                .record_machine_sample(&executor_id, 1, load::tests::sample_at(tick * 5_000, 0.2))
+                .expect("a sample from the current link");
+            assert_eq!(
+                event.point.map(|point| point.at_unix_ms),
+                Some(tick * 5_000)
+            );
+        }
+        assert!(pool.disconnect_advertised_executor(&executor_id, 1));
+        assert!(
+            pool.record_machine_sample(&executor_id, 1, load::tests::sample_at(20_000, 0.2))
+                .is_none(),
+            "a frame from the link that went away describes nothing current"
+        );
+
+        let (_, mut reconnected) = fleet_entry("reconnecting", "linux", 0, &[]);
+        reconnected.generation = 2;
+        pool.lock_connections()
+            .insert(executor_id.clone(), reconnected);
+        pool.record_machine_sample(&executor_id, 2, load::tests::sample_at(25_000, 0.6))
+            .expect("a sample from the new link");
+        let series = &pool.fleet_load()[&executor_id];
+        assert_eq!(
+            series
+                .points
+                .iter()
+                .map(|point| point.at_unix_ms)
+                .collect::<Vec<_>>(),
+            vec![5_000, 10_000, 15_000, 25_000],
+            "the history from before the reconnect is still there"
+        );
     }
 
     fn fleet_residency_request(holder: ResidencyHolder) -> ResidencyAcquireRequest {
@@ -27995,7 +30305,7 @@ mod tests {
         std::fs::create_dir_all(&repository_path).unwrap();
         orch.db
             .local
-            .execute_script(&format!(
+            .execute_script(format!(
                 "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) \
                  VALUES ('p', 'default', 'Project', 'p', '{}', 1, 1);",
                 repository_path.to_string_lossy()
@@ -28103,7 +30413,7 @@ mod tests {
         std::fs::create_dir_all(&repository_path).unwrap();
         orch.db
             .local
-            .execute_script(&format!(
+            .execute_script(format!(
                 "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) \
                  VALUES ('p', 'default', 'Project', 'p', '{}', 1, 1);",
                 repository_path.to_string_lossy()
@@ -28307,6 +30617,7 @@ mod tests {
             runner_context_id: Some("a context the runner does not hold".into()),
             execution_residency: None,
             containment: None,
+            node_scratch: None,
         };
 
         let submitting = {
@@ -28540,6 +30851,7 @@ mod tests {
             runner_context_id: None,
             execution_residency: None,
             containment: None,
+            node_scratch: None,
         };
         let prepared = orch
             .fleet
@@ -28887,6 +31199,8 @@ mod tests {
             resource_reservation: Default::default(),
             command_resource_identity: None,
             learned_estimate: None,
+            live_usage: None,
+            build_jobs: None,
         }
     }
 
@@ -29517,6 +31831,7 @@ mod tests {
                 spec: None,
                 status: cairn_common::executor_protocol::ResidentProcessStatus::Starting,
                 reservation: None,
+                live_usage: None,
             },
         );
         Arc::make_mut(&mut entry.snapshot).cells = vec![cell];
@@ -30066,6 +32381,7 @@ mod tests {
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
+            scratch_sync: None,
         }
     }
 
@@ -30086,6 +32402,7 @@ mod tests {
             last_seen_unix_ms: None,
             retired: Vec::new(),
             connection_timeline: Vec::new(),
+            stranded: None,
         };
         let diagnostic = no_matching_executor_diagnostic(&HashMap::new(), &[absent], &request, &[]);
         assert!(diagnostic.contains("bglab-win (windows/x86_64)"));
@@ -30110,6 +32427,7 @@ mod tests {
             last_seen_unix_ms: None,
             retired: Vec::new(),
             connection_timeline: Vec::new(),
+            stranded: None,
         };
         let diagnostic = no_matching_executor_diagnostic(&HashMap::new(), &[linux], &request, &[]);
         assert!(diagnostic.contains("No enrolled machine on windows exists."));
@@ -30140,6 +32458,7 @@ mod tests {
             last_seen_unix_ms: None,
             retired: Vec::new(),
             connection_timeline: Vec::new(),
+            stranded: None,
         };
         let bystander = EnrolledRemote {
             executor_id: "elsewhere".into(),
@@ -31448,6 +33767,7 @@ mod tests {
                         spec: None,
                         status,
                         reservation: None,
+                        live_usage: None,
                     },
                 )]),
                 clone_source: None,
@@ -31695,6 +34015,7 @@ mod tests {
             mutation_delta: None,
             sandbox_denials: Vec::new(),
             tracked_modifications: None,
+            node_scratch: None,
         };
         scrub_cell_outcome(&mut completed);
         match &completed {
@@ -32553,6 +34874,7 @@ mod tests {
             mutation_delta: None,
             sandbox_denials: Vec::new(),
             tracked_modifications: None,
+            node_scratch: None,
         }
     }
 
@@ -32626,6 +34948,7 @@ mod tests {
                         advertisement,
                         health: ExecutorSubstrateReport::default(),
                         last_update: None,
+                        machine: None,
                     },
                 );
             } else {
@@ -32823,6 +35146,7 @@ mod tests {
                 toolchain_fingerprint: None,
                 verdict_environment_hash: None,
                 stop: None,
+                build_jobs: None,
             }])
             .unwrap();
         }
@@ -32933,6 +35257,7 @@ mod tests {
                     toolchain_fingerprint: None,
                     verdict_environment_hash: None,
                     stop: None,
+                    build_jobs: None,
                 }
             };
             let marker = |selection: &str| {
@@ -32992,6 +35317,7 @@ mod tests {
             runner_context_id: None,
             execution_residency: None,
             containment: None,
+            node_scratch: None,
         };
         let outcome = tokio::time::timeout(
             Duration::from_secs(10),
@@ -34024,7 +36350,7 @@ mod tests {
                 orch.fleet = Arc::new(Fleet::with_residency_route_path(route_path));
                 let repository_path = temp.path().join("repository");
                 std::fs::create_dir_all(&repository_path).unwrap();
-                orch.db.local.execute_script(&format!(
+                orch.db.local.execute_script(format!(
                     "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p', 'default', 'Project', 'p', '{}', 1, 1);",
                     repository_path.to_string_lossy()
                 )).await.unwrap();
@@ -34291,7 +36617,7 @@ mod tests {
     /// that needs no Rust build keeps flowing there.
     #[test]
     fn a_missing_prerequisite_verdict_refuses_rust_work_for_projects_that_declare_the_script() {
-        use cairn_common::executor_protocol::BuildPrerequisiteStatus;
+        use cairn_common::executor_protocol::{BuildPrerequisiteCheck, BuildPrerequisiteStatus};
         let (_, mut bbs) = fleet_entry("bbs", "linux", 0, &[]);
         advertising(&mut bbs, &["bun", "rust"]);
         bbs.advertisement.capabilities.build_prerequisites =
@@ -34349,6 +36675,20 @@ mod tests {
                 None
             );
         }
+        // A MISSING from a probe whose script died on the shell's own error
+        // about its staged copy, as executors before the staging fix reported
+        // it, is not a verdict about the machine.
+        bbs.advertisement.capabilities.build_prerequisites = Some(BuildPrerequisiteCheck {
+            detail: "/var/folders/k1/T/cairn-prerequisite-b440083b/setup-self-hosted-runner-linux.sh: line 26: /var/folders/k1/T/cairn-prerequisite-b440083b/lib/runner-isolation.sh: No such file or directory".into(),
+            ..prerequisites(BuildPrerequisiteStatus::Missing)
+        });
+        assert_eq!(
+            verdict(
+                &bbs,
+                &rust_lane(&[LINUX_PREREQUISITES], &["bun", "rust"], &[])
+            ),
+            None
+        );
         // A re-attach whose verdict reads satisfied lifts it.
         bbs.advertisement.capabilities.build_prerequisites =
             Some(prerequisites(BuildPrerequisiteStatus::Satisfied));
@@ -34698,6 +37038,7 @@ mod tests {
                     spec: None,
                     status: cairn_common::executor_protocol::ResidentProcessStatus::Starting,
                     reservation: None,
+                    live_usage: None,
                 },
             );
         }
@@ -34852,6 +37193,7 @@ mod tests {
                 spec: None,
                 status: cairn_common::executor_protocol::ResidentProcessStatus::Starting,
                 reservation: None,
+                live_usage: None,
             },
         );
         let mut unowned = materialization_read_cell("unowned", "nobody");
@@ -35060,7 +37402,7 @@ mod tests {
         std::fs::create_dir_all(&repository_path).unwrap();
         orch.db
             .local
-            .execute_script(&format!(
+            .execute_script(format!(
                 "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) \
                  VALUES ('p', 'default', 'Project', 'p', '{}', 1, 1);",
                 repository_path.to_string_lossy()
@@ -35378,6 +37720,37 @@ mod handoff_tests {
                     command: " git mv src-tauri/a src-tauri/b && git status --short".into(),
                     cwd: "/tmp/worktree".into(),
                     denial: SandboxDenial::Command,
+                    reported_denial: None,
+                },
+            )
+            .await;
+        match result {
+            RunnerCallbackResult::Rejected { diagnostic } => {
+                assert!(diagnostic.contains("plain `mv`"), "{diagnostic}");
+            }
+            other => panic!("expected the instructive refusal, got {other:?}"),
+        }
+        assert_eq!(permission_rows(&orch).await, 0);
+        assert!(!orch.park_slots.armed(RUN));
+    }
+
+    /// The same refusal when the executor recovered the denied path, which on
+    /// macOS is the git index lock in the cell's shared repository.
+    #[tokio::test]
+    async fn a_relayed_git_index_write_with_a_recovered_path_is_refused() {
+        let orch = fence_orchestrator(true).await;
+        let result = orch
+            .fleet
+            .handle_runner_callback(
+                &orch,
+                RunnerCallback::SandboxDenied {
+                    runner_context_id: "ctx".into(),
+                    command: " git mv src-tauri/a src-tauri/b && git status --short | head".into(),
+                    cwd: "/tmp/worktree".into(),
+                    denial: SandboxDenial::Path(
+                        "/Users/dev/.cairn-exec/managed-objects/m/repository.git/worktrees/slot-652/index.lock"
+                            .into(),
+                    ),
                     reported_denial: None,
                 },
             )

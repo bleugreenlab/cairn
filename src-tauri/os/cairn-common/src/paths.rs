@@ -241,10 +241,43 @@ pub fn dev_instance_registry_path() -> Option<PathBuf> {
     os_home_dir().map(|home| home.join(DEV_INSTANCE_REGISTRY_FILENAME))
 }
 
+/// The nearest directory satisfying `holds` at or above where this process
+/// runs from: first the `CARGO_MANIFEST_DIR` that Cargo and nextest set for a
+/// test or `cargo run`, then the executable's own location.
+///
+/// For development code that reads files from its source checkout. A path
+/// baked in with `env!("CARGO_MANIFEST_DIR")` names the checkout that compiled
+/// the artifact, and Cargo does not track that variable: an artifact reused
+/// from another build cell (the executor's dependency catalog, a cloned cell)
+/// would read that other cell's tree, and the executor has to rebuild every
+/// unit that bakes one in.
+pub fn development_checkout_ancestor(holds: impl Fn(&std::path::Path) -> bool) -> Option<PathBuf> {
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    let executable = std::env::current_exe().ok();
+    manifest.into_iter().chain(executable).find_map(|start| {
+        start
+            .ancestors()
+            .find(|directory| holds(directory))
+            .map(std::path::Path::to_path_buf)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
+
+    /// Cargo and nextest run every test with its package's manifest directory
+    /// in the environment, so the walk finds the workspace from there.
+    #[test]
+    fn a_test_finds_its_checkout_from_the_runtime_manifest_dir() {
+        let found = development_checkout_ancestor(|directory| {
+            directory.join("os/cairn-common/Cargo.toml").is_file()
+        })
+        .expect("a test runs beneath its workspace");
+        assert!(found.join("Cargo.toml").is_file());
+        assert_eq!(development_checkout_ancestor(|_| false), None);
+    }
 
     /// Serialize env mutation across tests (mirrors the `env_lock` pattern in
     /// `commands/logs.rs`).

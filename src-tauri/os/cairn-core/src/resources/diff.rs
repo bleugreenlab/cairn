@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use cairn_common::query::QueryParam;
 use globset::GlobBuilder;
 
-use super::common::{connect_and_find_node_job, find_query_value};
+use super::common::{find_node_job, find_query_value, read_resource};
 use super::files::{
     dedupe_file_changes_by_path, load_job_file_changes, push_file_change_table, FileChangeRow,
 };
@@ -262,21 +262,28 @@ pub(super) async fn read_node_diff(
         Err(error) => return error,
     };
     let db = orch.db.for_project(project).await;
-    let (conn, job) = match connect_and_find_node_job(&db, project, number, exec_seq, node_id).await
+    let (project_key, node) = (project.to_owned(), node_id.to_owned());
+    let (job_id, coords) = match read_resource(&db, move |conn| {
+        Box::pin(async move {
+            let job = find_node_job(conn, &project_key, number, exec_seq, &node).await?;
+            let coords = load_diff_coords(conn, &job.id).await?;
+            Ok((job.id, coords))
+        })
+    })
+    .await
     {
         Ok(found) => found,
         Err(error) => return error,
     };
-    let coords = match load_diff_coords(&conn, &job.id).await {
-        Ok(coords) => coords,
-        Err(error) => return error,
-    };
 
+    // The live range is jj work and the archived one is an object-store diff;
+    // each source's rows are read in a short read of their own beforehand, so
+    // none of that runs inside a transaction.
     let mut data = match load_live_data(orch, &coords).await {
         Some(data) => data,
-        None => match load_archived_data(&conn, &coords, request.view == DiffView::Symbols).await {
+        None => match load_archived_data(&db, &coords, request.view == DiffView::Symbols).await {
             Some(data) => data,
-            None => load_cache_data(&conn, &job.id, &coords).await,
+            None => load_cache_data(&db, &job_id, &coords).await,
         },
     };
 
@@ -489,12 +496,17 @@ async fn load_live_data(orch: &Orchestrator, coords: &DiffCoords) -> Option<Diff
     })
 }
 
-async fn load_archived_data(
+/// An execution's archived range: its endpoints and, when non-empty, its pack.
+struct ArchivedRange {
+    base: String,
+    tip: String,
+    pack: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+async fn load_archived_range(
     conn: &cairn_db::turso::Connection,
-    coords: &DiffCoords,
-    retain_content_source: bool,
-) -> Option<DiffData> {
-    let execution_id = coords.execution_id.as_deref()?;
+    execution_id: &str,
+) -> Option<ArchivedRange> {
     let mut rows = conn
         .query(
             "SELECT base_sha, tip_sha, pack, pack_idx
@@ -504,8 +516,6 @@ async fn load_archived_data(
         .await
         .ok()?;
     let row = rows.next().await.ok()??;
-    let base = row.text(0).ok()?;
-    let tip = row.text(1).ok()?;
     let pack = match (
         row.opt_blob(2).ok().flatten(),
         row.opt_blob(3).ok().flatten(),
@@ -513,6 +523,24 @@ async fn load_archived_data(
         (Some(pack), Some(index)) => Some((pack, index)),
         _ => None,
     };
+    Some(ArchivedRange {
+        base: row.text(0).ok()?,
+        tip: row.text(1).ok()?,
+        pack,
+    })
+}
+
+async fn load_archived_data(
+    db: &crate::storage::LocalDb,
+    coords: &DiffCoords,
+    retain_content_source: bool,
+) -> Option<DiffData> {
+    let execution_id = coords.execution_id.clone()?;
+    let ArchivedRange { base, tip, pack } = read_resource(db, move |conn| {
+        Box::pin(async move { Ok(load_archived_range(conn, &execution_id).await) })
+    })
+    .await
+    .ok()??;
     let content_source =
         archived_content_source(&coords.repo_path, &tip, &pack, retain_content_source);
     let store = ObjectStore::new(Path::new(&coords.repo_path), pack).ok()?;
@@ -560,10 +588,16 @@ async fn load_archived_data(
 }
 
 async fn load_cache_data(
-    conn: &cairn_db::turso::Connection,
+    db: &crate::storage::LocalDb,
     job_id: &str,
     coords: &DiffCoords,
 ) -> DiffData {
+    let job_id = job_id.to_owned();
+    let rows = read_resource(db, move |conn| {
+        Box::pin(async move { Ok(load_job_file_changes(conn, &job_id).await) })
+    })
+    .await
+    .unwrap_or_default();
     DiffData {
         source_note: Some(
             "Legacy cache fallback: patch, commit, revision, conflict, whitespace, and structural symbol views are unavailable because this execution has no archived history."
@@ -578,7 +612,7 @@ async fn load_cache_data(
         current_revision: None,
         branch: coords.branch.clone(),
         commits_ahead: None,
-        rows: load_job_file_changes(conn, job_id).await,
+        rows,
         patch: None,
         commits: None,
         check: CheckData {

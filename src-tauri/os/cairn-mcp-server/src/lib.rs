@@ -12,6 +12,7 @@
 //! agent on any host, dispatching in process as the run whose bearer the
 //! request presented.
 
+mod heartbeat;
 mod lifecycle;
 pub mod output;
 mod resolve;

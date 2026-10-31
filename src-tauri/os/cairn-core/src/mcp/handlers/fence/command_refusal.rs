@@ -80,7 +80,7 @@ struct GitWrite {
 
 const RESTORE_ROUTE: &str = "To put a file back the way a revision has it, write it from that revision: `git show <rev>:<path> > <path>`. To look at another branch without changing anything, `read` `file:<path>?branch=<name>`.";
 
-const BRANCH_ROUTE: &str = "To look at another branch without changing anything, `read` `file:<path>?branch=<name>`. If an advance of your base left conflicts, read both versions and write the merged result. The git-workflow skill (cairn://skills/git-workflow) covers both.";
+const BRANCH_ROUTE: &str = "To look at another branch without changing anything, `read` `file:<path>?branch=<name>`. If an advance of your base left conflicts, open `cairn:~/rebase`, commit the merged files, and then request the replay there, because only the replay moves your branch onto the base. The git-workflow skill (cairn://skills/git-workflow) covers both.";
 
 /// Every recognized writer. Explicit on purpose: a subcommand earns a place
 /// here only once it is known to be blocked in a build slot and to have a
@@ -647,6 +647,7 @@ mod tests {
             "GIT_INDEX_FILE=$TMPDIR/index git add .",
             "export GIT_DIR=$TMPDIR/repo.git; git add .",
             // A cd that may leave the working directory.
+            // host-default-branch: a command string the fence classifies, never run.
             "cd $TMPDIR/scratch && git init -q && git add . && git commit -qm x",
             "cd /tmp/repo && git mv a b",
             "cd ../.. && git add .",
@@ -747,6 +748,19 @@ mod tests {
                 &refusal,
             );
         }
+    }
+
+    /// A blocked `git merge`/`rebase` is the moment an agent is reaching for the
+    /// wrong way to take an advanced base, so the route names the right one: the
+    /// session and its replay, not just the merge.
+    #[test]
+    fn the_branch_route_names_the_rebase_session_and_its_replay() {
+        assert!(BRANCH_ROUTE.contains("`cairn:~/rebase`"), "{BRANCH_ROUTE}");
+        assert!(
+            BRANCH_ROUTE.contains("request the replay"),
+            "{BRANCH_ROUTE}"
+        );
+        assert!(BRANCH_ROUTE.contains("?branch="), "{BRANCH_ROUTE}");
     }
 
     #[test]

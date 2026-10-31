@@ -17,8 +17,9 @@ use axum::routing::post;
 use axum::{Json, Router};
 
 use cairn_common::executor_protocol::{
-    DeclineReason, ExecutorAdvertisement, ExecutorCapabilities, ExecutorIdentity, ExecutorMessage,
-    ObjectChannelCredential, OfferSummary, ResidencyRuntimeConfig,
+    CpuPressure, DeclineReason, ExecutorAdvertisement, ExecutorCapabilities, ExecutorIdentity,
+    ExecutorMessage, MachineMemory, Measurement, MeasurementGap, ObjectChannelCredential,
+    OfferSummary, ResidencyRuntimeConfig,
 };
 use cairn_core::internal::db::DbState;
 use cairn_core::internal::dispatch::{dispatch_tool, DispatchOutput};
@@ -292,27 +293,87 @@ pub fn attach_isolated_test_executor(
     object_base_url: String,
     project_id: String,
 ) {
-    const EXECUTOR_ID: &str = "isolated-test-executor";
-    let (bearer_token, expires_at_unix_ms) = orch.object_plane.issue_credential(
-        EXECUTOR_ID,
-        "isolated-test-device",
-        "test-runner-device",
-        1,
-        unix_time_ms(),
+    attach_isolated_test_executor_as(
+        orch,
+        "isolated-test-executor",
+        executor_home,
+        object_base_url,
+        project_id,
     );
+}
+
+/// [`attach_isolated_test_executor`] under a caller-chosen identity, so one
+/// orchestrator can hold several physically separate, non-colocated machines.
+/// Each gets its own home, its own object-channel credential bound to its own
+/// connection generation, and a public name equal to `executor_id`, so a
+/// selector `{name: executor_id}` reaches it.
+pub fn attach_isolated_test_executor_as(
+    orch: &Orchestrator,
+    executor_id: &'static str,
+    executor_home: PathBuf,
+    object_base_url: String,
+    project_id: String,
+) -> ExecutorPool {
     attach_executor(
         orch,
         executor_home,
-        Some(ObjectChannelCredential {
-            base_url: object_base_url,
-            bearer_token,
-            expires_at_unix_ms,
-        }),
+        Some(object_base_url),
         false,
-        EXECUTOR_ID,
+        executor_id,
         vec![project_id],
         AdmissionLimits::default(),
-    );
+    )
+}
+
+/// The identity an attached test machine advertises. The colocated executor
+/// and the original isolated executor keep the names existing fixtures
+/// expect; any other isolated machine is named by its own id.
+fn test_executor_identity(executor_id: &str, colocated: bool) -> ExecutorIdentity {
+    let (device_id, display_name) = match (colocated, executor_id) {
+        (true, _) => ("test-device".to_owned(), "Test executor".to_owned()),
+        (false, "isolated-test-executor") => (
+            "isolated-test-device".to_owned(),
+            "Isolated test executor".to_owned(),
+        ),
+        (false, id) => (format!("{id}-device"), id.to_owned()),
+    };
+    ExecutorIdentity {
+        device_id,
+        executor_id: executor_id.into(),
+        display_name,
+    }
+}
+
+fn test_executor_advertisement(
+    executor_id: &str,
+    colocated: bool,
+    projects_served: &[String],
+    pool: Option<&ExecutorPool>,
+) -> ExecutorAdvertisement {
+    ExecutorAdvertisement {
+        identity: test_executor_identity(executor_id, colocated),
+        capabilities: ExecutorCapabilities {
+            os: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+            logical_cores: 1,
+            concurrency_capacity: None,
+            toolchains: Vec::new(),
+            projects_served: projects_served.to_vec(),
+            disk_budget_bytes: None,
+            memory_budget_bytes: None,
+            sandbox: None,
+            toolchain_detection: None,
+            build_prerequisites: None,
+            containment: None,
+        },
+        current_load: 0,
+        warm_roots: pool.map(ExecutorPool::warm_roots).unwrap_or_default(),
+        node_scratches: pool.map(ExecutorPool::node_scratches).unwrap_or_default(),
+        observed_at_unix_ms: if pool.is_some() { unix_time_ms() } else { 0 },
+        liveness_observed_at_unix_ms: None,
+        facts_stale_refresh_blocked: None,
+        last_refresh: None,
+    }
 }
 
 /// Answer an offer in the production link handler's order: claim first, then
@@ -486,10 +547,65 @@ async fn relay_test_callback(
     .into_response()
 }
 
+/// A machine whose readings are measured and unremarkable. Placement refuses a
+/// non-colocated machine it cannot see (cpu, memory, volume), so an isolated
+/// test machine reports these and publishes them on a short loop.
+struct MeasuredTestMachine;
+
+impl cairn_exec::machine::MachineProbe for MeasuredTestMachine {
+    fn cpu(&self, now: u64) -> Measurement<CpuPressure> {
+        Measurement::measured(
+            now,
+            CpuPressure {
+                utilization: 0.05,
+                user: 0.04,
+                system: 0.01,
+                logical_cores: 8,
+            },
+        )
+    }
+    fn memory(&self, now: u64) -> Measurement<MachineMemory> {
+        Measurement::measured(
+            now,
+            MachineMemory {
+                total_bytes: 64 << 30,
+                available_bytes: 48 << 30,
+            },
+        )
+    }
+    fn process_resident_bytes(&self, now: u64) -> Measurement<u64> {
+        Measurement::measured(now, 64 << 20)
+    }
+    fn process_physical_footprint_bytes(&self, now: u64) -> Measurement<u64> {
+        Measurement::unavailable(now, MeasurementGap::UnsupportedPlatform)
+    }
+    fn process_virtual_bytes(&self, now: u64) -> Measurement<u64> {
+        Measurement::measured(now, 1 << 30)
+    }
+    fn process_allocator(
+        &self,
+        now: u64,
+    ) -> Measurement<cairn_common::executor_protocol::AllocatorState> {
+        Measurement::unavailable(now, MeasurementGap::UnsupportedPlatform)
+    }
+    fn io_pressure(&self, now: u64) -> Measurement<cairn_common::executor_protocol::IoPressure> {
+        Measurement::unavailable(now, MeasurementGap::UnsupportedPlatform)
+    }
+    fn memory_pressure(
+        &self,
+        now: u64,
+    ) -> Measurement<cairn_common::executor_protocol::MemoryPressure> {
+        Measurement::unavailable(now, MeasurementGap::UnsupportedPlatform)
+    }
+    fn gpus(&self, now: u64) -> Measurement<Vec<cairn_common::executor_protocol::GpuDevice>> {
+        Measurement::unavailable(now, MeasurementGap::UnsupportedPlatform)
+    }
+}
+
 fn attach_executor(
     orch: &Orchestrator,
     executor_home: PathBuf,
-    object_channel: Option<ObjectChannelCredential>,
+    object_base_url: Option<String>,
     colocated: bool,
     executor_id: &'static str,
     projects_served: Vec<String>,
@@ -528,60 +644,59 @@ fn attach_executor(
                 );
             })
         });
+    let runtime = if colocated {
+        runtime
+    } else {
+        runtime.with_machine_probe(MeasuredTestMachine)
+    };
     let executor_pool = ExecutorPool::new(runtime.with_admission_limits(admission));
     let (tx, mut rx) = mpsc::unbounded_channel();
+    // What the machine's home already holds is part of how it arrives: a
+    // machine that was offline when a node closed is cleaned on attach.
+    let mut hello = test_executor_advertisement(executor_id, colocated, &projects_served, None);
+    hello.node_scratches = executor_pool.node_scratches();
     let attached_generation = core_pool
-        .attach_advertised_executor(
-            ExecutorAdvertisement {
-                identity: ExecutorIdentity {
-                    device_id: if colocated {
-                        "test-device"
-                    } else {
-                        "isolated-test-device"
-                    }
-                    .into(),
-                    executor_id: executor_id.into(),
-                    display_name: if colocated {
-                        "Test executor"
-                    } else {
-                        "Isolated test executor"
-                    }
-                    .into(),
-                },
-                capabilities: ExecutorCapabilities {
-                    os: std::env::consts::OS.into(),
-                    arch: std::env::consts::ARCH.into(),
-                    logical_cores: 1,
-                    concurrency_capacity: None,
-                    toolchains: Vec::new(),
-                    projects_served: projects_served.as_ref().clone(),
-                    disk_budget_bytes: None,
-                    memory_budget_bytes: None,
-                    sandbox: None,
-                    toolchain_detection: None,
-                    build_prerequisites: None,
-                    containment: None,
-                },
-                current_load: 0,
-                warm_roots: Vec::new(),
-                observed_at_unix_ms: 0,
-                liveness_observed_at_unix_ms: None,
-                facts_stale_refresh_blocked: None,
-                last_refresh: None,
-            },
-            tx,
-            colocated,
-            None,
-            None,
-        )
+        .attach_advertised_executor(hello, tx, colocated, None, None)
         .expect("attach the test executor");
     generation.store(attached_generation, Ordering::Release);
     let relay = TestMcpRelay::start(orch, executor_id, generation.clone());
+    // Every machine reaches the node scratch routes over an object channel, a
+    // colocated one included, as in production. A machine given no object
+    // server gets one that serves only those routes.
+    let object_base_url = object_base_url.or_else(|| Some(serve_scratch_routes(orch)));
+    // Issued after attaching, as the link issues it after `Ready`, so the
+    // credential is bound to the generation this machine actually holds.
+    let object_channel = object_base_url.map(|base_url| {
+        let identity = test_executor_identity(executor_id, colocated);
+        let (bearer_token, expires_at_unix_ms) = orch.object_plane.issue_credential(
+            executor_id,
+            &identity.device_id,
+            "test-runner-device",
+            attached_generation,
+            unix_time_ms(),
+        );
+        ObjectChannelCredential {
+            base_url,
+            bearer_token,
+            expires_at_unix_ms,
+        }
+    });
     executor_pool.configure_object_channel(
         object_channel,
         executor_id.to_owned(),
         attached_generation,
     );
+    if !colocated {
+        // What a real machine's liveness pass does on its own cadence: publish
+        // fresh telemetry, so placement can see this machine at all.
+        let pool = executor_pool.clone();
+        tokio::spawn(async move {
+            loop {
+                pool.refresh_liveness().await;
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    }
     let handle = executor_pool.clone();
 
     // Each frame's synchronous pool work runs on the blocking pool, awaited in
@@ -643,43 +758,12 @@ fn attach_executor(
                             executor_id,
                             attached_generation,
                             ExecutorMessage::AdvertisementUpdated {
-                                advertisement: ExecutorAdvertisement {
-                                    identity: ExecutorIdentity {
-                                        device_id: if colocated {
-                                            "test-device"
-                                        } else {
-                                            "isolated-test-device"
-                                        }
-                                        .into(),
-                                        executor_id: executor_id.into(),
-                                        display_name: if colocated {
-                                            "Test executor"
-                                        } else {
-                                            "Isolated test executor"
-                                        }
-                                        .into(),
-                                    },
-                                    capabilities: ExecutorCapabilities {
-                                        os: std::env::consts::OS.into(),
-                                        arch: std::env::consts::ARCH.into(),
-                                        logical_cores: 1,
-                                        concurrency_capacity: None,
-                                        toolchains: Vec::new(),
-                                        projects_served: projects_served.as_ref().clone(),
-                                        disk_budget_bytes: None,
-                                        memory_budget_bytes: None,
-                                        sandbox: None,
-                                        toolchain_detection: None,
-                                        build_prerequisites: None,
-                                        containment: None,
-                                    },
-                                    current_load: 0,
-                                    warm_roots: executor_pool.warm_roots(),
-                                    observed_at_unix_ms: unix_time_ms(),
-                                    liveness_observed_at_unix_ms: None,
-                                    facts_stale_refresh_blocked: None,
-                                    last_refresh: None,
-                                },
+                                advertisement: test_executor_advertisement(
+                                    executor_id,
+                                    colocated,
+                                    &projects_served,
+                                    Some(&executor_pool),
+                                ),
                             },
                         );
                     });
@@ -691,6 +775,19 @@ fn attach_executor(
                 ExecutorMessage::CancelJob { job_id } => {
                     let pool = executor_pool.clone();
                     offload(move || pool.cancel_job_requests(&job_id)).await;
+                }
+                ExecutorMessage::DeleteNodeScratch { scratch_id } => {
+                    let pool = executor_pool.clone();
+                    let core_pool = core_pool.clone();
+                    tokio::spawn(async move {
+                        if pool.delete_node_scratch(&scratch_id).await.is_ok() {
+                            core_pool.handle_executor_message(
+                                executor_id,
+                                attached_generation,
+                                ExecutorMessage::NodeScratchDeleted { scratch_id },
+                            );
+                        }
+                    });
                 }
                 ExecutorMessage::ResidencyRequest {
                     correlation_id,
@@ -740,6 +837,34 @@ fn attach_executor(
     handle
 }
 
+/// Serve the production node scratch routes on loopback, at `<base>/scratch`,
+/// and return the base.
+pub fn serve_scratch_routes(orch: &Orchestrator) -> String {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("bind the scratch route server");
+    listener
+        .set_nonblocking(true)
+        .expect("make the scratch route server non-blocking");
+    let address = listener
+        .local_addr()
+        .expect("read the scratch server address");
+    let router = scratch_routes(orch);
+    let listener = tokio::net::TcpListener::from_std(listener).expect("serve scratch routes");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    format!("http://{address}")
+}
+
+/// The production node scratch routes, mounted where an executor asks for them
+/// relative to its object-channel base.
+pub fn scratch_routes(orch: &Orchestrator) -> Router {
+    Router::new().nest_service(
+        "/scratch",
+        cairn_core::internal::node_scratch::plane::router(orch.clone()),
+    )
+}
+
 pub fn unix_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -787,12 +912,14 @@ pub async fn project_resource_fixture(
 
 pub async fn read_resource(orch: &Orchestrator, uri: impl AsRef<str>) -> String {
     let request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: String::new(),
         run_id: None,
         tool: "read_issue_resource".to_string(),
         payload: json!({ "uri": uri.as_ref() }),
         tool_use_id: None,
+        origin: None,
     };
     handle_read_issue_resource(orch, &request).await
 }
@@ -807,12 +934,14 @@ pub async fn change_resource_as_run(
     run_id: Option<&str>,
 ) -> String {
     let request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: String::new(),
         run_id: run_id.map(str::to_string),
         tool: "write".to_string(),
         payload: json!({ "changes": changes }),
         tool_use_id: None,
+        origin: None,
     };
     handle_write(orch, &request).await
 }
@@ -1029,6 +1158,20 @@ pub fn provision_jj_workspace(
 ) -> ProvisionedJjWorkspace {
     assert!(project_repo.join(".git").exists());
     assert!(!project_repo.join(".jj").exists());
+    // The base marker below names `main`. A project repo on any other branch
+    // (an unnamed `git init` on a host whose init.defaultBranch is `master`)
+    // hands the workspace a base its store has no bookmark for, and whatever
+    // the caller then exercises against that base quietly does nothing.
+    let project_branch = Command::new("git")
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .current_dir(project_repo)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&project_branch.stdout).trim(),
+        "main",
+        "provision_jj_workspace's project repo must be on `main`: `git init -b main`"
+    );
 
     let jj = jj::environment_with_binary(pinned_jj_bin().to_string_lossy(), config_dir);
     let store = jj::project_store_dir(config_dir, project_repo);

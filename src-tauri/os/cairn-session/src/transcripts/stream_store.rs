@@ -812,33 +812,45 @@ pub fn find_active_stream_for_session(
 ) -> Result<Option<ActiveMessageStream>, String> {
     let session_id = session_id.to_string();
     block_on_stream_db(async move {
-        db.read(|conn| {
-            let session_id = session_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT id, run_id, session_id, turn_id, backend, sequence, status,
-                                version, content_chars, thinking_chars, chunk_count,
-                                final_event_id, abort_reason, created_at, updated_at, finalized_at
-                         FROM message_streams
-                         WHERE session_id = ?1
-                           AND status IN ('open', 'finalizing')
-                         ORDER BY created_at DESC, rowid DESC
-                         LIMIT 1",
-                        params![session_id.as_str()],
-                    )
-                    .await?;
-                let Some(row) = rows.next().await? else {
-                    return Ok(None);
-                };
-                let stream = stream_from_row(&row)?;
-                let chunks = load_chunks_for_stream_conn(conn, &stream.id).await?;
-                Ok(Some(materialize_stream(stream, &chunks)))
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())
+        active_stream_for_session(&db, &session_id)
+            .await
+            .map_err(|e| e.to_string())
     })
+}
+
+/// The session's in-flight message, materialized from its chunks, read on the
+/// caller's runtime as one pooled read (the stream row and its chunks share a
+/// snapshot).
+pub async fn active_stream_for_session(
+    db: &LocalDb,
+    session_id: &str,
+) -> DbResult<Option<ActiveMessageStream>> {
+    let session_id = session_id.to_string();
+    db.read(|conn| {
+        let session_id = session_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id, run_id, session_id, turn_id, backend, sequence, status,
+                            version, content_chars, thinking_chars, chunk_count,
+                            final_event_id, abort_reason, created_at, updated_at, finalized_at
+                     FROM message_streams
+                     WHERE session_id = ?1
+                       AND status IN ('open', 'finalizing')
+                     ORDER BY created_at DESC, rowid DESC
+                     LIMIT 1",
+                    params![session_id.as_str()],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            let stream = stream_from_row(&row)?;
+            let chunks = load_chunks_for_stream_conn(conn, &stream.id).await?;
+            Ok(Some(materialize_stream(stream, &chunks)))
+        })
+    })
+    .await
 }
 
 async fn list_recoverable_streams_conn(conn: &Connection) -> DbResult<Vec<ActiveMessageStream>> {

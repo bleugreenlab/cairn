@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::panic::{AssertUnwindSafe, Location};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-#[cfg(any(test, feature = "test-utils"))]
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex, MutexGuard, Once,
@@ -203,6 +202,24 @@ const CHECKPOINT_THRESHOLD_DISABLED: i64 = -1;
 /// that within this pass.
 const CHECKPOINT_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// How long one checkpoint pass's TRUNCATE attempts may keep the connection
+/// gate shut once the drain has finished.
+///
+/// The pinned Turso runs an MVCC `PRAGMA wal_checkpoint(TRUNCATE)` to the end
+/// inside a single poll: `op_checkpoint` drives the checkpoint state machine in
+/// a loop and waits on each I/O completion inline, so the statement never
+/// yields to the runtime. An attempt that does not finish therefore blocks its
+/// thread rather than parking a future, and a timeout wrapped around that
+/// future would never be polled again. So each attempt runs on its own OS
+/// thread, and the pass waits for it at most this long. Past the bound the pass
+/// gives the attempt up, the gate reopens, and the thread is left to finish in
+/// the engine (see [`LocalDb::checkpoint`]).
+///
+/// Production folds take one to four seconds. The bound plus the drain ceiling
+/// must stay inside `db_maintenance`'s shortest retry, which that module
+/// asserts.
+pub const CHECKPOINT_ATTEMPTS_BOUND: Duration = Duration::from_secs(20);
+
 /// The source line that asked for a database connection: the caller of a
 /// public [`LocalDb`] entry point, captured with `#[track_caller]`.
 pub type Caller = &'static Location<'static>;
@@ -215,7 +232,9 @@ pub type Caller = &'static Location<'static>;
 /// statement held a pooled connection for 9.9 hours, blocking every checkpoint
 /// while the logical log grew to 8.5 GB (tenet #1271). Ten minutes is far past
 /// any read the orchestrator has recorded, so reaching it means a runaway
-/// statement. Writes, `exclusive`, and `connect` connections are not bounded.
+/// statement. Writes and `exclusive` are not bounded, and neither is `connect`,
+/// which is for writers, migrations and probes only: every reader goes through
+/// the pool, where this bound and [`PARKED_READ_SLACK`] apply.
 pub const READ_STATEMENT_BOUND: Duration = Duration::from_secs(600);
 
 /// How far past the bound a pooled read that PARKS between statements (and so
@@ -301,34 +320,75 @@ fn statement_label(at: Caller, sql: Option<&str>) -> Arc<str> {
     Arc::from(label)
 }
 
+/// `<file>:<line> (raw connection; sql not captured)`: the label for a
+/// statement issued through [`TrackedConnection`]'s `Deref`, which sees where
+/// the connection was borrowed but not what was run on it.
+fn raw_statement_label(at: Caller) -> Arc<str> {
+    Arc::from(format!(
+        "{}:{} (raw connection; sql not captured)",
+        at.file(),
+        at.line()
+    ))
+}
+
 /// What one database call is doing, shared by the call's future, its
 /// connection, and the connection's gate record: the statement it last issued,
-/// and for a pooled read a handle that can interrupt it.
+/// how many of its tracked statements are still running, and a handle on the
+/// connection itself.
 ///
 /// Per call rather than per gate, so recording a statement takes an
 /// uncontended lock and never the gate's.
 #[derive(Clone)]
-pub(super) struct Holder(Arc<Mutex<HolderState>>);
+pub(super) struct Holder(Arc<HolderShared>);
+
+struct HolderShared {
+    state: Mutex<HolderState>,
+    /// Tracked statements still running: an `execute` not yet resolved, or a
+    /// `query` whose [`TrackedRows`] are still alive. What tells a connection
+    /// that is executing apart from one parked between statements.
+    in_flight: AtomicUsize,
+}
 
 struct HolderState {
     statement: Arc<str>,
-    /// A clone of a pooled read's connection, so the gate sweep can interrupt
-    /// it. Taken out when the slot drops: a clone keeps the core connection
-    /// alive, and the engine rolls a transaction back only when the last one
-    /// drops, which must happen before the gate reports the slot released.
-    interrupt: Option<Connection>,
+    /// The raw-connection site `statement` names, when it names one, so a
+    /// helper that borrows the connection repeatedly from one line relabels
+    /// once rather than on every borrow.
+    raw_site: Option<Caller>,
+    /// A clone of the connection, for a pooled read (so the gate sweep can
+    /// interrupt it) and for a `connect` holder (so the sweep can see whether
+    /// it holds a transaction open). Taken out when the slot drops: a clone
+    /// keeps the core connection alive, and the engine rolls a transaction back
+    /// only when the last one drops, which must happen before the gate reports
+    /// the slot released.
+    handle: Option<Connection>,
+}
+
+/// What a holder's connection was doing when the gate sweep looked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HolderActivity {
+    /// A tracked statement was running on it.
+    pub executing: bool,
+    /// Whether a transaction was open, or `None` when the gate holds no handle
+    /// on the connection to ask (a pooled write).
+    pub in_transaction: Option<bool>,
 }
 
 impl Holder {
     pub(super) fn new(caller: Caller, sql: Option<&str>) -> Self {
-        Self(Arc::new(Mutex::new(HolderState {
-            statement: statement_label(caller, sql),
-            interrupt: None,
-        })))
+        Self(Arc::new(HolderShared {
+            state: Mutex::new(HolderState {
+                statement: statement_label(caller, sql),
+                raw_site: None,
+                handle: None,
+            }),
+            in_flight: AtomicUsize::new(0),
+        }))
     }
 
     fn lock(&self) -> MutexGuard<'_, HolderState> {
         self.0
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -339,7 +399,28 @@ impl Holder {
     /// so a statement over cached pages starts and runs inside that same poll.
     fn set_statement(&self, at: Caller, sql: &str) {
         let label = statement_label(at, Some(sql));
-        self.lock().statement = label.clone();
+        {
+            let mut state = self.lock();
+            state.statement = label.clone();
+            state.raw_site = None;
+        }
+        runtime_regions::set_innermost_detail(STATEMENT_REGION, label);
+    }
+
+    /// Record that the raw connection was borrowed at `at`, which is where
+    /// every statement a `&Connection` helper runs is attributed: the helper's
+    /// call site, rather than the last statement the wrapper saw.
+    fn set_raw_site(&self, at: Caller) {
+        let label = {
+            let mut state = self.lock();
+            if state.raw_site.is_some_and(|site| site == at) {
+                return;
+            }
+            let label = raw_statement_label(at);
+            state.raw_site = Some(at);
+            state.statement = label.clone();
+            label
+        };
         runtime_regions::set_innermost_detail(STATEMENT_REGION, label);
     }
 
@@ -347,21 +428,51 @@ impl Holder {
         self.lock().statement.clone()
     }
 
+    fn start_statement(&self) -> InFlight {
+        self.0.in_flight.fetch_add(1, Ordering::Relaxed);
+        InFlight(self.clone())
+    }
+
+    fn activity(&self) -> HolderActivity {
+        let executing = self.0.in_flight.load(Ordering::Relaxed) > 0;
+        let in_transaction = self
+            .lock()
+            .handle
+            .as_ref()
+            .and_then(|conn| conn.is_autocommit().ok())
+            .map(|autocommit| !autocommit);
+        HolderActivity {
+            executing,
+            in_transaction,
+        }
+    }
+
     fn arm(&self, conn: Connection) {
-        self.lock().interrupt = Some(conn);
+        self.lock().handle = Some(conn);
     }
 
     fn disarm(&self) {
-        let handle = self.lock().interrupt.take();
+        let handle = self.lock().handle.take();
         drop(handle);
     }
 
-    /// Interrupt the running statement, if this is a pooled read that has one.
+    /// Ask the engine to interrupt whatever is running on the connection.
+    /// `true` means the request was made, not that a statement was stopped:
+    /// the engine treats an interrupt with nothing running as a no-op.
     fn interrupt(&self) -> bool {
         self.lock()
-            .interrupt
+            .handle
             .as_ref()
             .is_some_and(|conn| conn.interrupt().is_ok())
+    }
+}
+
+/// One tracked statement counted as running on its holder until dropped.
+struct InFlight(Holder);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0 .0.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -422,8 +533,46 @@ pub struct OverdueHolder {
     pub caller: Caller,
     pub kind: HolderKind,
     pub age: Duration,
-    /// `<file>:<line> <sql head>` of the statement it last issued.
+    /// `<file>:<line> <sql head>` of the statement it last issued, or
+    /// `<file>:<line> (raw connection; sql not captured)` where it last
+    /// borrowed the raw connection.
     pub statement: Arc<str>,
+    pub activity: HolderActivity,
+}
+
+impl OverdueHolder {
+    /// What the holder is doing, for the gate watch's line.
+    ///
+    /// A `connect` holder is the one this has to spell out. It is never cut:
+    /// the engine's interrupt is a no-op with no statement running, so one
+    /// parked inside an open transaction lasts until its owner drops the
+    /// connection, and the line says so rather than implying a backstop.
+    pub fn describe(&self) -> String {
+        if self.kind != HolderKind::Connect {
+            return self.statement.to_string();
+        }
+        match self.activity {
+            HolderActivity {
+                executing: true, ..
+            } => format!("executing {}", self.statement),
+            HolderActivity {
+                in_transaction: Some(true),
+                ..
+            } => format!(
+                "parked in an open transaction since {}; a parked connect holder cannot be cut \
+                 and ends only when its owner drops it",
+                self.statement
+            ),
+            HolderActivity {
+                in_transaction: Some(false),
+                ..
+            } => format!("no transaction open (last: {})", self.statement),
+            HolderActivity {
+                in_transaction: None,
+                ..
+            } => self.statement.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -516,6 +665,12 @@ pub struct LocalDb {
     /// drop its hold and reopen the boolean gate while another is still draining
     /// or running TRUNCATE.
     checkpoint_lock: AsyncMutex<()>,
+    /// Set while a TRUNCATE attempt runs on its checkpoint thread, and cleared
+    /// by that thread when the engine returns. A pass that finds it set follows
+    /// one whose attempt outlived [`CHECKPOINT_ATTEMPTS_BOUND`], and must
+    /// neither start a second TRUNCATE beside it nor close the gate for an
+    /// attempt it cannot make.
+    checkpoint_in_engine: Arc<AtomicBool>,
     /// Read transactions opened over this handle's life. Lets a test assert
     /// that an operation's transaction count is a constant rather than a
     /// function of how much data it covers — a load-independent guard against
@@ -581,6 +736,7 @@ impl LocalDb {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
+            checkpoint_in_engine: Arc::new(AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-utils"))]
@@ -640,6 +796,7 @@ impl LocalDb {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
+            checkpoint_in_engine: Arc::new(AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-utils"))]
@@ -695,6 +852,7 @@ impl LocalDb {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
+            checkpoint_in_engine: Arc::new(AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-utils"))]
@@ -759,6 +917,15 @@ impl LocalDb {
         self.gate.lock().live.len()
     }
 
+    /// Connections resting on the free-list, for the pool probes.
+    #[cfg(test)]
+    pub(crate) fn idle_len(&self) -> usize {
+        self.idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
     /// A handle whose pooled reads are bounded at `bound` instead of
     /// [`READ_STATEMENT_BOUND`], so tests can exercise the bound in
     /// milliseconds.
@@ -787,6 +954,9 @@ impl LocalDb {
                 if age < threshold {
                     continue;
                 }
+                // Pooled reads only. A `connect` holder could be interrupted
+                // only while a statement runs, and one parked in a transaction
+                // is unaffected by an interrupt; it is named, not cut.
                 if live.kind == HolderKind::PooledRead && age >= backstop && !live.interrupted {
                     live.interrupted = true;
                     runaway.push((live.caller, age, live.holder.clone()));
@@ -803,18 +973,26 @@ impl LocalDb {
                     kind: live.kind,
                     age,
                     statement: live.holder.statement(),
+                    activity: live.holder.activity(),
                 });
             }
         }
         for (caller, age, holder) in runaway {
-            let interrupted = holder.interrupt();
+            let executing = holder.activity().executing;
+            let outcome = if holder.interrupt() {
+                format!(
+                    "interrupt requested (tracked statement in flight: {})",
+                    if executing { "yes" } else { "no" }
+                )
+            } else {
+                "had no handle".to_owned()
+            };
             log::warn!(
                 "pooled read at {} outlived the {:?} read bound and its timeout ({:?} held); \
-                 interrupt from the gate sweep {}: {}",
+                 gate sweep {outcome}: {}",
                 Site(caller),
                 self.read_bound,
                 age,
-                if interrupted { "sent" } else { "had no handle" },
                 holder.statement(),
             );
         }
@@ -895,26 +1073,33 @@ impl LocalDb {
 
     /// Open a brand-new connection, outside the free-list.
     ///
-    /// This is the raw escape hatch for the caller that needs a connection of
-    /// its own for longer than one pooled transaction: `MigrationRunner::run_fk_off`,
-    /// which toggles `PRAGMA foreign_keys` around a transaction and must not
-    /// have that pragma outlive its own use, and the resource layer's
-    /// `connect_for_read`, which opens one read transaction and holds it across
-    /// a whole resource render. Ordinary data access goes through
-    /// [`Self::checkout`] instead so it reuses a warm connection.
+    /// The escape hatch for writers that need a connection of their own for
+    /// longer than one pooled transaction (`MigrationRunner::run_fk_off`, which
+    /// toggles `PRAGMA foreign_keys` around a transaction and must not have that
+    /// pragma outlive its own use; the content store's `put`), and for probes.
+    /// Never for a read: a reader goes through [`Self::read`] or the `query_*`
+    /// helpers, which bound the statement and cut a read that parks. Nothing
+    /// can cut a `connect` holder parked in an open transaction: the engine's
+    /// interrupt is a no-op with no statement running, so it lasts until its
+    /// owner drops the connection.
     ///
     /// Out of the pool or not, the connection is registered with the
-    /// [`ConnectionGate`] for as long as it lives. That registration is what
-    /// makes the gate a statement about the whole process rather than about the
-    /// pool, and it is not optional: the resource readers on this path are the
-    /// bulk of the transactions a checkpoint has to wait out.
+    /// [`ConnectionGate`] for as long as it lives, which is what makes the gate
+    /// a statement about the whole process rather than about the pool. The
+    /// gate also keeps a handle on it, so the watch can report whether a
+    /// holder is executing or parked in a transaction.
     #[track_caller]
     pub fn connect(&self) -> DbCall<'_, TrackedConnection> {
         let caller = Location::caller();
         let holder = Holder::new(caller, None);
         DbCall::new(holder.clone(), move || async move {
-            let slot = self.gate.admit(caller, HolderKind::Connect, holder).await;
-            Ok(TrackedConnection::new(self.open_connection().await?, slot))
+            let slot = self
+                .gate
+                .admit(caller, HolderKind::Connect, holder.clone())
+                .await;
+            let conn = self.open_connection().await?;
+            holder.arm(conn.clone());
+            Ok(TrackedConnection::new(conn, slot))
         })
     }
 
@@ -1481,7 +1666,7 @@ impl LocalDb {
             let conn = self
                 .checkout(caller, HolderKind::PooledWrite, &holder)
                 .await?;
-            let result = consume_on(&conn, sql).await;
+            let result = consume_on(&conn.conn, sql).await;
             if result.is_ok() {
                 self.release(conn);
             }
@@ -1519,9 +1704,24 @@ impl LocalDb {
     /// the door while the ones already open finish, and only then attempts. The
     /// hold reopens the gate when it drops, on every path out of this function
     /// including a panic inside the engine, so a caller waiting at the gate waits
-    /// at most `drain.ceiling` plus this checkpoint. How long the drain waits
-    /// within that ceiling is [`DrainBudget::for_open`] of the number of
-    /// connections open at the moment the gate closed.
+    /// at most `drain.ceiling` plus [`CHECKPOINT_ATTEMPTS_BOUND`]. How long the
+    /// drain waits within that ceiling is [`DrainBudget::for_open`] of the number
+    /// of connections open at the moment the gate closed.
+    ///
+    /// Dropping the hold is only enough if this function gets to return, and an
+    /// engine call that never comes back would keep it from returning: the
+    /// TRUNCATE runs synchronously inside one poll (see
+    /// [`CHECKPOINT_ATTEMPTS_BOUND`]), so a stuck attempt on a runtime worker
+    /// shuts every database call in the process out for good. Each attempt
+    /// therefore runs on its own `cairn-checkpoint` thread with the private
+    /// connection moved onto it, and the pass waits for the result at most until
+    /// the bound. An attempt that has not returned by then is abandoned: the pass
+    /// reports `checkpoint attempt exceeded ...`, warns, and reopens the gate.
+    /// The engine's own checkpoint lock still keeps correctness, since a
+    /// transaction that begins while the abandoned attempt holds it gets
+    /// `database is locked` rather than a torn read. Until that thread returns,
+    /// later passes report the attempt still running and neither close the gate
+    /// nor issue a second TRUNCATE.
     ///
     /// The attempt is made whether or not the drain completed. A drain that
     /// expires means a long-lived transaction is still open and the attempt will
@@ -1549,6 +1749,26 @@ impl LocalDb {
         between_attempts: Duration,
         drain_budget: DrainBudget,
     ) -> DbResult<CheckpointReport> {
+        self.checkpoint_bounded(
+            max_attempts,
+            between_attempts,
+            drain_budget,
+            CHECKPOINT_ATTEMPTS_BOUND,
+            Arc::new(truncate_attempt),
+        )
+        .await
+    }
+
+    /// [`Self::checkpoint`] with the attempts' bound and the attempt itself
+    /// supplied, so a test can stand in an engine call that never returns.
+    async fn checkpoint_bounded(
+        &self,
+        max_attempts: usize,
+        between_attempts: Duration,
+        drain_budget: DrainBudget,
+        attempts_bound: Duration,
+        attempt: CheckpointAttempt,
+    ) -> DbResult<CheckpointReport> {
         // `checkpoint` is public and callers are not required to coordinate.
         // Keep this permit outside every other operation in the pass so a second
         // call cannot close the gate until the first call's GateHold has dropped.
@@ -1556,44 +1776,89 @@ impl LocalDb {
         let started = Instant::now();
         let log_bytes_before = self.logical_log_bytes();
 
+        if self.checkpoint_in_engine.load(Ordering::SeqCst) {
+            return Ok(CheckpointReport {
+                attempts: 0,
+                error: Some("an earlier checkpoint attempt is still running in the engine".into()),
+                log_bytes_before,
+                log_bytes_after: self.logical_log_bytes(),
+                duration: started.elapsed(),
+                drain: DrainReport::not_closed(),
+            });
+        }
+
         // Opened before the gate closes and deliberately NOT registered with it:
         // a tracked connection here would be counted among the transactions this
         // pass is waiting to drain, and the drain could never reach zero.
         let conn = self.open_connection().await?;
         conn.busy_timeout(CHECKPOINT_BUSY_TIMEOUT)?;
+        let mut conn = Some(conn);
 
-        let (_hold, drain) = self.gate.close(drain_budget).await;
+        let (hold, drain) = self.gate.close(drain_budget).await;
+        let deadline = Instant::now() + attempts_bound;
         let mut attempts = 0;
         let mut error = None;
+        let mut abandoned = false;
 
-        for attempt in 1..=max_attempts.max(1) {
-            if attempt > 1 && !between_attempts.is_zero() {
+        for attempt_number in 1..=max_attempts.max(1) {
+            if attempt_number > 1 && !between_attempts.is_zero() {
                 sleep(between_attempts).await;
             }
-            attempts = attempt;
-            match consume_on(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").await {
-                Ok(()) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Some(attempt_conn) = conn.take().filter(|_| !remaining.is_zero()) else {
+                break;
+            };
+            attempts = attempt_number;
+            match run_checkpoint_attempt(
+                attempt_conn,
+                attempt.clone(),
+                remaining,
+                &self.checkpoint_in_engine,
+                sidecar_path(&self.path, "-log"),
+            )
+            .await
+            {
+                AttemptOutcome::Returned(_, Ok(())) => {
                     error = None;
                     break;
                 }
-                Err(failure) => {
+                AttemptOutcome::Returned(returned, Err(failure)) => {
+                    conn = Some(returned);
                     let contended = failure.is_retryable();
                     error = Some(failure.to_string());
                     if !contended {
                         break;
                     }
                 }
+                AttemptOutcome::Exceeded => {
+                    error = Some(format!("checkpoint attempt exceeded {attempts_bound:?}"));
+                    abandoned = true;
+                    break;
+                }
+                AttemptOutcome::Lost(reason) => {
+                    error = Some(reason);
+                    break;
+                }
             }
         }
+        drop(hold);
 
-        Ok(CheckpointReport {
+        let report = CheckpointReport {
             attempts,
             error,
             log_bytes_before,
             log_bytes_after: self.logical_log_bytes(),
             duration: started.elapsed(),
             drain,
-        })
+        };
+        if abandoned {
+            log::warn!(
+                "Checkpoint pass abandoned its TRUNCATE attempt and reopened the connection \
+                 gate; the attempt's `cairn-checkpoint` thread is still inside the engine, and \
+                 its stack names what it waits on: {report}"
+            );
+        }
+        Ok(report)
     }
 
     /// Reclaim freelist space by writing a self-contained, compacted image of
@@ -1658,12 +1923,12 @@ impl LocalDb {
 /// close the gate, let the transactions already open finish, checkpoint, reopen.
 ///
 /// That only works if the gate sees every transaction, and gating
-/// [`LocalDb::checkout`] would not. The resource layer's `connect_for_read`
-/// opens a `BEGIN CONCURRENT` on an OUT-OF-POOL connection and holds it for a
-/// whole resource render, at some thirty call sites across ten readers, and
-/// those reads are what the desktop UI's status polling drives. A pool-only gate
-/// would have drained to zero, reported a quiet instant, and lost the lock
-/// anyway.
+/// [`LocalDb::checkout`] would not: [`LocalDb::connect`] hands out connections
+/// outside the pool, and a writer or migration on one can hold a transaction
+/// as long as it likes. When this gate was built, the resource layer also read
+/// on such connections, holding a `BEGIN CONCURRENT` across a whole render. A
+/// pool-only gate would have drained to zero, reported a quiet instant, and
+/// lost the lock anyway.
 ///
 /// Every MVCC transaction runs on a `turso::Connection`, so registering the
 /// CONNECTION is a superset of registering the transaction. That is the
@@ -1675,7 +1940,7 @@ impl LocalDb {
 /// [`Self::close`] returns a [`GateHold`] that reopens the gate in its `Drop`,
 /// so the gate reopens on every exit path — early return, error, panic — and the
 /// drain itself is bounded by a budget. A caller waiting at the gate therefore
-/// waits at most that budget plus one checkpoint. That property is what makes
+/// waits at most that budget plus [`CHECKPOINT_ATTEMPTS_BOUND`]. That property is what makes
 /// gating the whole process tractable: a call path this design failed to
 /// anticipate costs a bounded pause and a wasted maintenance pass, not a wedged
 /// application.
@@ -1897,16 +2162,18 @@ impl Drop for ConnectionSlot {
 /// A `turso::Connection` that counts toward the quiet instant maintenance waits
 /// for.
 ///
-/// Derefs to the connection, so callers use it exactly as they used a bare one
-/// and the resource layer's ~30 `connect_for_read` sites needed no edit at all.
-/// The wrapper's entire purpose is its `Drop`.
+/// Derefs to the connection, so a helper typed `&turso::Connection` takes one
+/// unchanged. The wrapper's first purpose is its `Drop`.
 ///
-/// Its own `query` and `execute` shadow the connection's, with the same
-/// signatures, to record each statement's call site and SQL head on the
-/// connection's gate record before running it. That label is what the gate
-/// watch, a read-bound error, and the runtime stall line name. Statements run
-/// through `prepare` are not intercepted and keep the label of the last
-/// statement that was.
+/// Its own `query` and `execute` shadow the connection's to record each
+/// statement's call site and SQL head on the connection's gate record before
+/// running it, and to count the statement as in flight until it finishes (for
+/// a query, until its [`TrackedRows`] drop). That label is what the gate
+/// watch, a read-bound error, and the runtime stall line name. Everything else
+/// reaches the connection through `Deref`, which is `#[track_caller]` and
+/// records the borrowing line as `(raw connection; sql not captured)`: a
+/// helper called with `&conn` is named by its call site, and so is a `prepare`.
+/// A statement run that way is not counted as in flight.
 pub struct TrackedConnection {
     conn: Connection,
     slot: ConnectionSlot,
@@ -1917,20 +2184,30 @@ impl TrackedConnection {
         Self { conn, slot }
     }
 
-    /// [`Connection::query`], recording the statement first.
+    /// [`Connection::query`], recording the statement first. The statement
+    /// counts as running until the returned rows drop.
     #[track_caller]
     pub fn query(
         &self,
         sql: impl AsRef<str>,
         params: impl IntoParams,
-    ) -> impl Future<Output = turso::Result<turso::Rows>> + Captures<&'_ ()> {
+    ) -> impl Future<Output = turso::Result<TrackedRows>> + Captures<&'_ ()> {
         self.slot
             .holder
             .set_statement(Location::caller(), sql.as_ref());
-        self.conn.query(sql, params)
+        let in_flight = self.slot.holder.start_statement();
+        let running = self.conn.query(sql, params);
+        async move {
+            let rows = running.await?;
+            Ok(TrackedRows {
+                rows,
+                _in_flight: in_flight,
+            })
+        }
     }
 
-    /// [`Connection::execute`], recording the statement first.
+    /// [`Connection::execute`], recording the statement first. The statement
+    /// counts as running until it resolves.
     #[track_caller]
     pub fn execute(
         &self,
@@ -1940,7 +2217,13 @@ impl TrackedConnection {
         self.slot
             .holder
             .set_statement(Location::caller(), sql.as_ref());
-        self.conn.execute(sql, params)
+        let in_flight = self.slot.holder.start_statement();
+        let running = self.conn.execute(sql, params);
+        async move {
+            let changed = running.await;
+            drop(in_flight);
+            changed
+        }
     }
 
     /// Take the bare connection back, ending its registration.
@@ -1958,8 +2241,39 @@ impl TrackedConnection {
 impl Deref for TrackedConnection {
     type Target = Connection;
 
+    #[track_caller]
     fn deref(&self) -> &Connection {
+        self.slot.holder.set_raw_site(Location::caller());
         &self.conn
+    }
+}
+
+/// [`turso::Rows`] from a [`TrackedConnection::query`], counting as a running
+/// statement on its connection until dropped. That mirrors the engine, which
+/// keeps a query's root statement active until its rows are reset, so a
+/// caller holding rows between `next` calls is still mid-statement.
+pub struct TrackedRows {
+    rows: turso::Rows,
+    _in_flight: InFlight,
+}
+
+impl Deref for TrackedRows {
+    type Target = turso::Rows;
+
+    fn deref(&self) -> &turso::Rows {
+        &self.rows
+    }
+}
+
+impl DerefMut for TrackedRows {
+    fn deref_mut(&mut self) -> &mut turso::Rows {
+        &mut self.rows
+    }
+}
+
+impl std::fmt::Debug for TrackedRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TrackedRows")
     }
 }
 
@@ -2049,6 +2363,20 @@ pub struct DrainReport {
     pub waited: Duration,
 }
 
+impl DrainReport {
+    /// The report of a pass that never closed the gate.
+    fn not_closed() -> Self {
+        Self {
+            drained: false,
+            open_at_close: 0,
+            budget: Duration::ZERO,
+            still_open: 0,
+            oldest: None,
+            waited: Duration::ZERO,
+        }
+    }
+}
+
 impl std::fmt::Display for DrainReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -2079,6 +2407,96 @@ async fn consume_on(conn: &Connection, sql: &str) -> DbResult<()> {
     let mut rows = conn.query(sql, ()).await?;
     while rows.next().await?.is_some() {}
     Ok(())
+}
+
+/// One checkpoint attempt, run to completion on the thread that calls it.
+type CheckpointAttempt = Arc<dyn Fn(&Connection) -> DbResult<()> + Send + Sync>;
+
+/// The production attempt: the TRUNCATE statement, driven on a runtime of its
+/// own so that nothing it blocks belongs to the application's runtime.
+fn truncate_attempt(conn: &Connection) -> DbResult<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|error| DbError::internal(format!("checkpoint thread runtime: {error}")))?;
+    runtime.block_on(consume_on(conn, "PRAGMA wal_checkpoint(TRUNCATE)"))
+}
+
+/// How one bounded attempt ended.
+enum AttemptOutcome {
+    /// The engine returned, handing the connection back for a retry.
+    Returned(Connection, DbResult<()>),
+    /// The bound passed first; the attempt is still running on its thread.
+    Exceeded,
+    /// The attempt ended without a result: its thread could not start, or it
+    /// panicked.
+    Lost(String),
+}
+
+/// Marks a checkpoint attempt as running in the engine for as long as it lives.
+struct InEngine(Arc<AtomicBool>);
+
+impl InEngine {
+    fn enter(flag: Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for InEngine {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Run `attempt` on `conn` on a dedicated `cairn-checkpoint` thread and wait
+/// for it at most `bound`.
+///
+/// The marker is cleared before the result is sent, so a pass that has its
+/// connection back never reads its own attempt as still running. A panic
+/// clears it by unwinding.
+///
+/// The pass drops the receiving end when it abandons the attempt, so a send
+/// that fails is exactly an attempt nobody waited for. That attempt reports
+/// its own end: how long it was inside the engine, how it came out, and the
+/// logical log (`log_path`) it left. The line says whether the condition that
+/// held it released once the gate reopened, which a wedge sample alone cannot.
+async fn run_checkpoint_attempt(
+    conn: Connection,
+    attempt: CheckpointAttempt,
+    bound: Duration,
+    in_engine: &Arc<AtomicBool>,
+    log_path: PathBuf,
+) -> AttemptOutcome {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let running = InEngine::enter(in_engine.clone());
+    let spawned = std::thread::Builder::new()
+        .name("cairn-checkpoint".to_string())
+        .spawn(move || {
+            let started = Instant::now();
+            let result = attempt(&conn);
+            drop(running);
+            if let Err((_, result)) = sender.send((conn, result)) {
+                let log_bytes = std::fs::metadata(&log_path).map_or(0, |meta| meta.len());
+                let outcome = match &result {
+                    Ok(()) => "checkpointed".to_string(),
+                    Err(error) => format!("failed error={error}"),
+                };
+                log::warn!(
+                    "Abandoned checkpoint attempt left the engine after {}ms: outcome={outcome} \
+                     log_mib_after={:.1}",
+                    started.elapsed().as_millis(),
+                    log_bytes as f64 / (1024.0 * 1024.0),
+                );
+            }
+        });
+    if let Err(error) = spawned {
+        return AttemptOutcome::Lost(format!("could not start the checkpoint thread: {error}"));
+    }
+    match timeout(bound, receiver).await {
+        Ok(Ok((conn, result))) => AttemptOutcome::Returned(conn, result),
+        Ok(Err(_)) => AttemptOutcome::Lost("the checkpoint attempt's thread panicked".to_string()),
+        Err(_) => AttemptOutcome::Exceeded,
+    }
 }
 
 /// What one [`LocalDb::checkpoint`] pass did: whether it won, what it cost, and
@@ -2248,13 +2666,13 @@ async fn run_tx<T>(
     }
 
     match f(conn).await {
-        Ok(value) => match end_tx(conn, "COMMIT").await {
+        Ok(value) => match end_tx(&conn.conn, "COMMIT").await {
             Ok(()) => TxAttempt {
                 result: Ok(value),
                 reusable: true,
             },
             Err(error) => {
-                let reusable = end_tx(conn, "ROLLBACK").await.is_ok();
+                let reusable = end_tx(&conn.conn, "ROLLBACK").await.is_ok();
                 TxAttempt {
                     result: Err(error),
                     reusable,
@@ -2262,7 +2680,7 @@ async fn run_tx<T>(
             }
         },
         Err(error) => {
-            let reusable = end_tx(conn, "ROLLBACK").await.is_ok();
+            let reusable = end_tx(&conn.conn, "ROLLBACK").await.is_ok();
             TxAttempt {
                 result: Err(error),
                 reusable,
@@ -2293,7 +2711,7 @@ async fn run_read_tx<T>(
             // produced is returned rather than thrown away with it. Reporting
             // the teardown instead would fail a read that had already
             // succeeded, on grounds the caller can neither see nor act on.
-            let outcome = end_tx(conn, "ROLLBACK").await;
+            let outcome = end_tx(&conn.conn, "ROLLBACK").await;
             if let Err(error) = &outcome {
                 log::warn!(
                     "read transaction completed but its ROLLBACK failed ({error}); returning the value and retiring this connection"
@@ -2305,7 +2723,7 @@ async fn run_read_tx<T>(
             }
         }
         Err(error) => {
-            let reusable = end_tx(conn, "ROLLBACK").await.is_ok();
+            let reusable = end_tx(&conn.conn, "ROLLBACK").await.is_ok();
             TxAttempt {
                 result: Err(error),
                 reusable,
@@ -2723,6 +3141,194 @@ mod tests {
         println!("statement_overhead_probe: query_one={best_one}ns/call read={best_read}ns/call");
     }
 
+    /// One resource read's statements, as the hot resource readers issue them:
+    /// a node coordinate resolved to its job, then the node's tasks and
+    /// artifacts, the project's recent issues, and its active threads.
+    #[derive(Clone)]
+    struct ProbeNode {
+        project_id: String,
+        project_key: String,
+        number: i64,
+        exec_seq: i64,
+        segment: String,
+        job_id: String,
+    }
+
+    async fn probe_mix(conn: &Connection, node: &ProbeNode) -> DbResult<()> {
+        let statements: [(&str, Vec<turso::Value>); 7] = [
+            (
+                "SELECT id FROM issues WHERE project_id = ?1 AND number = ?2 LIMIT 1",
+                vec![node.project_id.clone().into(), node.number.into()],
+            ),
+            (
+                "SELECT j.id FROM jobs j JOIN issues i ON j.issue_id = i.id \
+                 JOIN projects p ON i.project_id = p.id JOIN executions e ON j.execution_id = e.id \
+                 WHERE p.key = ?1 AND i.number = ?2 AND e.seq = ?3 AND j.parent_job_id IS NULL \
+                 AND j.uri_segment = ?4 LIMIT 1",
+                vec![
+                    node.project_key.clone().into(),
+                    node.number.into(),
+                    node.exec_seq.into(),
+                    node.segment.clone().into(),
+                ],
+            ),
+            (
+                "SELECT id, parent_job_id, status, completed_at, started_at, uri_segment \
+                 FROM jobs WHERE id = ?1 LIMIT 1",
+                vec![node.job_id.clone().into()],
+            ),
+            (
+                "SELECT id, uri_segment, agent_config_id, task_description, status FROM jobs \
+                 WHERE parent_job_id = ?1 ORDER BY task_index ASC, created_at ASC",
+                vec![node.job_id.clone().into()],
+            ),
+            (
+                "SELECT output_name FROM artifacts WHERE job_id = ?1",
+                vec![node.job_id.clone().into()],
+            ),
+            (
+                "SELECT id, number, title, status, updated_at FROM issues WHERE project_id = ?1 \
+                 ORDER BY updated_at DESC LIMIT 50",
+                vec![node.project_id.clone().into()],
+            ),
+            (
+                "SELECT name, jurisdiction, status, attention, updated_at FROM threads \
+                 WHERE project_id = ?1 AND status = 'active' ORDER BY name",
+                vec![node.project_id.clone().into()],
+            ),
+        ];
+        for (sql, params) in statements {
+            let mut rows = conn.query(sql, params).await?;
+            while rows.next().await?.is_some() {}
+        }
+        Ok(())
+    }
+
+    fn percentile(sorted: &[Duration], p: f64) -> Duration {
+        if sorted.is_empty() {
+            return Duration::ZERO;
+        }
+        sorted[((sorted.len() - 1) as f64 * p).round() as usize]
+    }
+
+    /// Today's resource reads against the pool they move into, under load.
+    ///
+    /// Mode A is the retired path: `connect()`, `BEGIN CONCURRENT`, the
+    /// statements, drop. Mode B is `read`. Same statement mix, same nodes, N
+    /// concurrent readers for D seconds each. Reports per-call p50/p99,
+    /// connections opened, the peak live count (sampled every 10 ms), and what
+    /// the free-list retains afterwards. Run against an APFS clone of a real
+    /// database, never the live file:
+    ///
+    /// ```text
+    /// cp -c ~/.cairn/cairn.db* /tmp/probe/
+    /// CAIRN_PROBE_DB=/tmp/probe/cairn.db cargo test --release -p cairn-db --lib \
+    ///   -- --ignored --nocapture pool_read_load_probe
+    /// ```
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "needs a real database copy via CAIRN_PROBE_DB; run in release"]
+    async fn pool_read_load_probe() {
+        let path = std::env::var("CAIRN_PROBE_DB").expect("set CAIRN_PROBE_DB to an APFS clone");
+        let secs: u64 = std::env::var("CAIRN_PROBE_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20);
+        let db = Arc::new(LocalDb::open(&path).await.unwrap());
+        let nodes: Arc<Vec<ProbeNode>> = Arc::new(
+            db.query_all(
+                "SELECT p.id, p.key, i.number, e.seq, j.uri_segment, j.id FROM jobs j \
+                 JOIN issues i ON j.issue_id = i.id JOIN projects p ON i.project_id = p.id \
+                 JOIN executions e ON j.execution_id = e.id \
+                 WHERE j.parent_job_id IS NULL AND j.uri_segment IS NOT NULL \
+                 ORDER BY j.created_at DESC LIMIT 64",
+                (),
+                |row| {
+                    Ok(ProbeNode {
+                        project_id: row.text(0)?,
+                        project_key: row.text(1)?,
+                        number: row.i64(2)?,
+                        exec_seq: row.i64(3)?,
+                        segment: row.text(4)?,
+                        job_id: row.text(5)?,
+                    })
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            !nodes.is_empty(),
+            "the database copy has no addressable nodes"
+        );
+        println!(
+            "pool_read_load_probe: {} nodes, {secs}s per run, idle cap {MAX_IDLE_CONNECTIONS}",
+            nodes.len()
+        );
+        println!("mode n calls p50_us p99_us connections_created peak_live idle_after");
+
+        for n in [8usize, 32, 64] {
+            for pooled in [false, true] {
+                let created_before = db.connections_created.load(Ordering::Relaxed);
+                let deadline = Instant::now() + Duration::from_secs(secs);
+                let peak = Arc::new(AtomicUsize::new(0));
+                let sampler = {
+                    let (db, peak) = (db.clone(), peak.clone());
+                    tokio::spawn(async move {
+                        while Instant::now() < deadline {
+                            peak.fetch_max(db.live_connections(), Ordering::Relaxed);
+                            sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                };
+                let mut readers = Vec::new();
+                for reader in 0..n {
+                    let (db, nodes) = (db.clone(), nodes.clone());
+                    readers.push(tokio::spawn(async move {
+                        let mut latencies = Vec::new();
+                        let mut index = reader;
+                        while Instant::now() < deadline {
+                            let node = nodes[index % nodes.len()].clone();
+                            index += n;
+                            let started = Instant::now();
+                            if pooled {
+                                db.read(move |conn| {
+                                    Box::pin(async move { probe_mix(conn, &node).await })
+                                })
+                                .await
+                                .unwrap();
+                            } else {
+                                let conn = db.connect().await.unwrap();
+                                conn.execute(db.concurrent_begin(), ()).await.unwrap();
+                                probe_mix(&conn, &node).await.unwrap();
+                                drop(conn);
+                            }
+                            latencies.push(started.elapsed());
+                        }
+                        latencies
+                    }));
+                }
+                let mut latencies = Vec::new();
+                for reader in readers {
+                    latencies.extend(reader.await.unwrap());
+                }
+                sampler.await.unwrap();
+                latencies.sort_unstable();
+                println!(
+                    "{} {n} {} {} {} {} {} {}",
+                    if pooled { "B(read)" } else { "A(connect)" },
+                    latencies.len(),
+                    percentile(&latencies, 0.50).as_micros(),
+                    percentile(&latencies, 0.99).as_micros(),
+                    db.connections_created.load(Ordering::Relaxed) - created_before,
+                    peak.load(Ordering::Relaxed),
+                    db.idle_len(),
+                );
+                assert!(db.idle_len() <= MAX_IDLE_CONNECTIONS);
+                assert_eq!(db.live_connections(), 0);
+            }
+        }
+    }
+
     /// Awaiting a database call costs the caller's frame and state the call's
     /// holder and a pointer to its body, however much the body grows. A served
     /// path awaits these at nearly every layer, and in an unoptimized build
@@ -3035,6 +3641,7 @@ mod tests {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
+            checkpoint_in_engine: Arc::new(AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-utils"))]
@@ -3842,14 +4449,14 @@ mod tests {
     /// The regression test for the mistake this change was nearly built on.
     ///
     /// The plan for CAIRN-4167 held that every transaction path funnels through
-    /// `checkout()`, so gating the pool would be enough. It is not: the resource
-    /// layer's `connect_for_read` opens `BEGIN CONCURRENT` on an OUT-OF-POOL
-    /// connection and holds it for a whole render, at ~30 call sites, and those
-    /// reads are what the desktop UI's status polling drives. A pool-only gate
-    /// would have drained to zero, declared a quiet instant, and lost the lock.
+    /// `checkout()`, so gating the pool would be enough. It is not: `connect()`
+    /// hands out OUT-OF-POOL connections, and a transaction opened on one can
+    /// be held as long as its owner likes (resource reads did exactly that
+    /// until cairn/5502 moved them into the pool). A pool-only gate would have
+    /// drained to zero, declared a quiet instant, and lost the lock.
     ///
-    /// So: a transaction shaped exactly like a resource read must be visible to
-    /// the drain, and must be NAMED when it outlasts the budget.
+    /// So: a transaction on an out-of-pool connection must be visible to the
+    /// drain, and must be NAMED when it outlasts the budget.
     #[tokio::test]
     async fn an_out_of_pool_read_transaction_is_visible_to_the_drain() {
         let db = test_db().await.unwrap();
@@ -3857,8 +4464,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Precisely what `connect_for_read` does: connect outside the pool, BEGIN,
-        // and hold it for the life of the read.
+        // Connect outside the pool, BEGIN, and hold it.
         let connect_line = line!() + 1;
         let reader = db.connect().await.unwrap();
         reader.execute(db.concurrent_begin(), ()).await.unwrap();
@@ -4163,6 +4769,165 @@ mod tests {
 
         drop(reader);
         assert!(db.overdue_holders(threshold, Duration::ZERO).is_empty());
+    }
+
+    /// A helper typed `&turso::Connection`, which every resource helper is.
+    async fn count_counters(conn: &Connection) -> i64 {
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM counters", ())
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().i64(0).unwrap()
+    }
+
+    /// `Deref` is `#[track_caller]`, and that reaches through the coercions
+    /// the compiler inserts: passing `&conn` to a `&Connection` helper, and
+    /// calling a `Connection` method on a `TrackedConnection`, both name the
+    /// line that did it rather than this file's `deref`.
+    #[tokio::test]
+    async fn deref_records_the_coercion_site() {
+        let db = test_db().await.unwrap();
+        let conn = db.connect().await.unwrap();
+
+        let line = line!() + 1;
+        count_counters(&conn).await;
+        assert_eq!(
+            &*conn.slot.holder.statement(),
+            format!("{}:{line} (raw connection; sql not captured)", file!())
+        );
+
+        let line = line!() + 1;
+        let _ = conn.is_autocommit();
+        assert_eq!(
+            &*conn.slot.holder.statement(),
+            format!("{}:{line} (raw connection; sql not captured)", file!())
+        );
+
+        // A tracked statement takes the label back, with its SQL.
+        let line = line!() + 1;
+        conn.execute("SELECT 1", ()).await.unwrap();
+        assert_eq!(
+            &*conn.slot.holder.statement(),
+            format!("{}:{line} SELECT 1", file!())
+        );
+    }
+
+    /// The 10-29 shape: a `connect` holder that began a transaction, ran its
+    /// statements through a `&Connection` helper, and then waited on something
+    /// else. The watch names the helper's line rather than the BEGIN, says the
+    /// holder is parked in a transaction, and does not touch it, because
+    /// nothing in the engine can.
+    #[tokio::test]
+    async fn a_parked_connect_holder_is_reported_parked_and_not_cut() {
+        let db = test_db().await.unwrap().with_read_bound(TEST_READ_BOUND);
+        db.execute("INSERT INTO counters(id, value) VALUES ('a', 1)", ())
+            .await
+            .unwrap();
+        let conn = db.connect().await.unwrap();
+        conn.execute(db.concurrent_begin(), ()).await.unwrap();
+        let line = line!() + 1;
+        assert_eq!(count_counters(&conn).await, 1);
+
+        sleep(TEST_READ_BOUND * 2).await;
+        let held = db.overdue_holders(Duration::ZERO, Duration::ZERO);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].kind, HolderKind::Connect);
+        assert_eq!(
+            held[0].activity,
+            HolderActivity {
+                executing: false,
+                in_transaction: Some(true),
+            }
+        );
+        let site = format!("{}:{line} (raw connection", file!());
+        assert!(held[0].statement.starts_with(&site), "{:?}", held[0]);
+        let described = held[0].describe();
+        assert!(
+            described.starts_with(&format!("parked in an open transaction since {site}")),
+            "{described}"
+        );
+        assert!(described.contains("cannot be cut"), "{described}");
+
+        assert_eq!(count_counters(&conn).await, 1, "the holder was cut");
+        conn.execute("ROLLBACK", ()).await.unwrap();
+        let held = db.overdue_holders(Duration::ZERO, Duration::ZERO);
+        assert_eq!(held[0].activity.in_transaction, Some(false), "{held:?}");
+        assert!(held[0].describe().starts_with("no transaction open"));
+
+        drop(conn);
+        assert_eq!(db.live_connections(), 0);
+        assert_checkpoint_wins(&db).await;
+    }
+
+    /// A `connect` holder whose statement is still stepping is reported as
+    /// executing it. Multi-threaded because the statement never yields.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_executing_connect_holder_is_reported_executing() {
+        let db = Arc::new(test_db().await.unwrap());
+        let conn = db.connect().await.unwrap();
+        // The engine deadline is what ends the runaway; a connect connection
+        // has none by default, and a statement that never yields cannot be
+        // stopped any other way the test can rely on.
+        conn.conn.set_query_timeout(Duration::from_secs(2)).unwrap();
+        let line = line!() + 3;
+        let runner = tokio::spawn(async move {
+            let outcome = async {
+                let mut rows = conn.query(RUNAWAY_COUNT, ()).await?;
+                rows.next().await?;
+                turso::Result::Ok(())
+            }
+            .await;
+            (conn, outcome)
+        });
+
+        let started = Instant::now();
+        let held = loop {
+            let held = db.overdue_holders(Duration::ZERO, Duration::ZERO);
+            if held.first().is_some_and(|holder| holder.activity.executing) {
+                break held;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "{held:?}");
+            sleep(Duration::from_millis(5)).await;
+        };
+        let described = held[0].describe();
+        assert!(
+            described.starts_with(&format!("executing {}:{line} WITH RECURSIVE", file!())),
+            "{described}"
+        );
+
+        let (conn, outcome) = runner.await.unwrap();
+        assert!(outcome.is_err(), "the runaway count ended on its own");
+        let held = db.overdue_holders(Duration::ZERO, Duration::ZERO);
+        assert!(!held[0].activity.executing, "{held:?}");
+        drop(conn);
+        assert_eq!(db.live_connections(), 0);
+    }
+
+    /// A pooled read parked after a `&Connection` helper is retired at the
+    /// bound naming the helper's line, not the BEGIN.
+    #[tokio::test]
+    async fn a_parked_pooled_read_names_its_last_raw_borrow() {
+        let db = test_db().await.unwrap().with_read_bound(TEST_READ_BOUND);
+        let borrowed_at = Arc::new(AtomicUsize::new(0));
+        let seen = borrowed_at.clone();
+        let error = db
+            .read(move |conn| {
+                Box::pin(async move {
+                    seen.store(line!() as usize + 1, Ordering::Relaxed);
+                    count_counters(conn).await;
+                    std::future::pending::<()>().await;
+                    Ok(())
+                })
+            })
+            .await;
+        let (_, _, statement) = read_bound_exceeded(&error.unwrap_err());
+        let line = borrowed_at.load(Ordering::Relaxed);
+        assert_eq!(
+            &*statement,
+            format!("{}:{line} (raw connection; sql not captured)", file!())
+        );
+        assert_eq!(db.live_connections(), 0);
+        assert_checkpoint_wins(&db).await;
     }
 
     /// A statement a closure starts mid-poll renames the region that poll
@@ -4610,6 +5375,94 @@ mod tests {
 
         holder.execute("ROLLBACK", ()).await.unwrap();
         drop(holder);
+        assert_eq!(db.live_connections(), 0);
+    }
+
+    /// An engine attempt that never returns must not keep the gate shut.
+    ///
+    /// The gate's other safety properties all rest on the checkpoint function
+    /// returning, which drops the hold. This pins the one path where it would
+    /// not: the attempt is stuck inside the engine, and a read that arrives
+    /// while it is stuck is still served inside the bound. Until the stuck
+    /// attempt returns, a later pass must not close the gate or start a second
+    /// TRUNCATE; once it returns, checkpointing resumes.
+    #[tokio::test]
+    async fn the_gate_reopens_when_a_checkpoint_attempt_never_returns() {
+        let db = Arc::new(test_db().await.unwrap());
+        let entered = Arc::new(Notify::new());
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Arc::new(Mutex::new(released));
+        let stuck: CheckpointAttempt = {
+            let entered = entered.clone();
+            Arc::new(move |_conn| {
+                entered.notify_one();
+                let _ = released.lock().unwrap().recv();
+                Ok(())
+            })
+        };
+
+        let checkpointing = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.checkpoint_bounded(
+                    3,
+                    Duration::ZERO,
+                    DrainBudget::fixed(Duration::from_millis(50)),
+                    Duration::from_millis(300),
+                    stuck,
+                )
+                .await
+                .unwrap()
+            })
+        };
+        entered.notified().await;
+
+        // Arrives with the gate shut and the attempt stuck, and must be served.
+        let served = tokio::time::timeout(
+            Duration::from_secs(10),
+            db.query_one("SELECT 1", (), |row| row.i64(0)),
+        )
+        .await
+        .expect("the gate never reopened: a caller blocked behind a stuck checkpoint attempt")
+        .unwrap();
+        assert_eq!(served, 1);
+
+        let report = checkpointing.await.unwrap();
+        assert_eq!(
+            report.attempts, 1,
+            "an abandoned attempt is not retried: {report}"
+        );
+        assert_eq!(
+            report.error.as_deref(),
+            Some("checkpoint attempt exceeded 300ms"),
+            "{report}"
+        );
+
+        let refused = db
+            .checkpoint(1, Duration::ZERO, DRAIN_BUDGET)
+            .await
+            .unwrap();
+        assert_eq!(refused.attempts, 0, "{refused}");
+        assert_eq!(
+            refused.drain.open_at_close, 0,
+            "a pass behind a stuck attempt must not close the gate: {refused}"
+        );
+        assert!(!refused.succeeded(), "{refused}");
+
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while db.checkpoint_in_engine.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the released attempt never left the engine"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+        let resumed = db
+            .checkpoint(1, Duration::ZERO, DRAIN_BUDGET)
+            .await
+            .unwrap();
+        assert!(resumed.succeeded(), "{resumed}");
         assert_eq!(db.live_connections(), 0);
     }
 

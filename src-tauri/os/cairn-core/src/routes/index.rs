@@ -8,8 +8,10 @@
 //!
 //! Route freshness has two inputs: every writer of route files calls
 //! [`invalidate_trigger_index`], and a cached route set expires after
-//! [`INDEX_TTL`] regardless, which bounds how long a hand edit of a route file
-//! goes unseen. Thread consumers are rebuilt deep inside thread session setup,
+//! [`INDEX_TTL_SECS`] regardless, which bounds how long a hand edit of a route
+//! file goes unseen. That expiry is measured on the clock the caller passes in
+//! (the orchestrator's `services.clock`), never on the wall clock directly, so
+//! a test's clock decides whether a slow run crosses it. Thread consumers are rebuilt deep inside thread session setup,
 //! where no orchestrator is at hand, so they validate themselves instead: each
 //! pass reads the live `fact` subscription rows and reuses the parsed
 //! consumers only when those rows are exactly the ones they were parsed from.
@@ -20,7 +22,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
@@ -29,7 +30,7 @@ use super::{Fact, TriggerClause};
 use crate::config::{routes::FileRoute, ConfigResult};
 use crate::orchestrator::Orchestrator;
 
-pub(crate) const INDEX_TTL: Duration = Duration::from_secs(30);
+pub(crate) const INDEX_TTL_SECS: i64 = 30;
 
 /// The orchestrator's handle on the fact log: the two lanes' wake signals and
 /// the trigger index both lanes read.
@@ -151,14 +152,18 @@ type CachedThreads = (SubscriptionFingerprint, Arc<ThreadConsumers>);
 
 struct Cached<T> {
     generation: u64,
-    loaded_at: Instant,
+    /// Unix seconds on the caller's clock when this value was loaded.
+    loaded_at: i64,
     value: Arc<T>,
 }
 
 impl<T> Cached<T> {
-    fn fresh(&self, generation: u64) -> Option<Arc<T>> {
-        (self.generation == generation && self.loaded_at.elapsed() < INDEX_TTL)
-            .then(|| self.value.clone())
+    /// A clock that stepped backwards counts as stale: reloading costs one
+    /// directory read, while trusting the entry could hide an edit past the TTL.
+    fn fresh(&self, generation: u64, now: i64) -> Option<Arc<T>> {
+        (self.generation == generation
+            && (0..INDEX_TTL_SECS).contains(&now.saturating_sub(self.loaded_at)))
+        .then(|| self.value.clone())
     }
 }
 
@@ -176,11 +181,13 @@ impl TriggerIndex {
 
     /// The route set for a fact's project (`None` for a project-less fact):
     /// project routes shadow workspace routes, exactly as
-    /// `config::routes::list_routes` decides.
+    /// `config::routes::list_routes` decides. `now` is unix seconds on the
+    /// orchestrator's clock and decides whether a cached set has expired.
     pub(crate) fn routes(
         &self,
         config_dir: &Path,
         project_path: Option<&Path>,
+        now: i64,
     ) -> Result<Arc<RouteSet>, String> {
         let generation = self.generation.load(Ordering::SeqCst);
         let key = project_path.map(Path::to_owned);
@@ -189,7 +196,7 @@ impl TriggerIndex {
             .lock()
             .expect("route index poisoned")
             .get(&key)
-            .and_then(|cached| cached.fresh(generation))
+            .and_then(|cached| cached.fresh(generation, now))
         {
             return Ok(set);
         }
@@ -201,7 +208,7 @@ impl TriggerIndex {
             key,
             Cached {
                 generation,
-                loaded_at: Instant::now(),
+                loaded_at: now,
                 value: set.clone(),
             },
         );
@@ -289,5 +296,42 @@ impl TriggerIndex {
         let consumers = Arc::new(consumers);
         *slot = Some((parsed, consumers.clone()));
         Ok(consumers)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cached_route_set_expires_on_the_given_clock_not_the_wall_clock() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("routes")).unwrap();
+        let index = TriggerIndex::default();
+        let reads = || crate::config::routes::ROUTE_DIR_READS.with(std::cell::Cell::get);
+        let before = reads();
+        let read_at = |now: i64| {
+            index.routes(temp.path(), None, now).unwrap();
+            reads() - before
+        };
+
+        assert_eq!(read_at(1_000), 1, "the first lookup reads the directory");
+        assert_eq!(
+            read_at(1_000 + INDEX_TTL_SECS - 1),
+            1,
+            "inside the TTL the cached set is reused"
+        );
+        assert_eq!(
+            read_at(1_000 + INDEX_TTL_SECS),
+            2,
+            "at the TTL the set is read again"
+        );
+        assert_eq!(
+            read_at(1_000),
+            3,
+            "a clock that stepped backwards reloads rather than trusting the entry"
+        );
+        index.invalidate();
+        assert_eq!(read_at(1_000), 4, "an invalidation reloads at once");
     }
 }

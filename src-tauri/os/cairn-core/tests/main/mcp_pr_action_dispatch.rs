@@ -132,6 +132,7 @@ async fn change_target(
 
 fn write_request(target: &str, payload: serde_json::Value, preview: bool) -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: std::env::temp_dir().to_string_lossy().to_string(),
         run_id: None,
@@ -145,6 +146,7 @@ fn write_request(target: &str, payload: serde_json::Value, preview: bool) -> Mcp
             }]
         }),
         tool_use_id: None,
+        origin: None,
     }
 }
 

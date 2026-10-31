@@ -109,15 +109,11 @@ pub(super) async fn dispatch(
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-                let mut data = serde_json::json!({
+                *applied_data = Some(serde_json::json!({
                     "projectKey": outcome.project_key,
                     "number": outcome.number,
                     "uri": outcome.uri,
-                });
-                if let Some(tenet) = outcome.proposed_tenet {
-                    data["tenet"] = serde_json::Value::String(tenet);
-                }
-                *applied_data = Some(data);
+                }));
                 outcome.summary
             }
         }
@@ -423,9 +419,14 @@ fn parse_create_execution_spec(
         build_failure(
             index,
             item,
-            "payload.execution must be an object {recipe, backend?, overrides?, after?, proposal?, tenet?}",
+            "payload.execution must be an object {recipe, backend?, overrides?, after?}",
         )
     })?;
+    if let Some(refusal) =
+        crate::tenets::filing_tenet_keys_refusal(Some(value), "payload.execution.")
+    {
+        return Err(build_failure(index, item, refusal));
+    }
     let str_field = |key: &str| -> ResourceMutationResult<Option<String>> {
         match obj.get(key) {
             None | Some(serde_json::Value::Null) => Ok(None),
@@ -457,13 +458,6 @@ fn parse_create_execution_spec(
             obj.get("after"),
             "payload.execution.after",
         )?,
-        tenet: crate::tenets::filing::TenetFiling::from_payload(
-            None,
-            Some(obj),
-            "payload.execution",
-        )
-        .map_err(|error| build_failure(index, item, error))?
-        .claim,
     }))
 }
 
@@ -527,12 +521,14 @@ mod tests {
             })),
         };
         let request = McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: "/tmp/repo".to_string(),
             run_id: Some("run-coordinator".to_string()),
             tool: "write".to_string(),
             payload: serde_json::Value::Null,
             tool_use_id: None,
+            origin: None,
         };
         let mut applied_data = None;
         dispatch(
@@ -589,12 +585,14 @@ mod tests {
         .unwrap();
         let orch = test_orchestrator(db);
         let request = McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: "/tmp/repo".to_string(),
             run_id: Some("run-thread-session".to_string()),
             tool: "write".to_string(),
             payload: serde_json::Value::Null,
             tool_use_id: None,
+            origin: None,
         };
 
         for (title, parent) in [

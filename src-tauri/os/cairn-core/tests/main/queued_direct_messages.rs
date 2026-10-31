@@ -37,12 +37,14 @@ fn insert_pending_direct(orch: &Orchestrator, recipient: &str, content: &str) ->
 
 fn callback_request(tool: &str, run_id: Option<&str>) -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: run_id.map(str::to_string),
         tool: tool.to_string(),
         payload: serde_json::json!({}),
         tool_use_id: None,
+        origin: None,
     }
 }
 
@@ -401,12 +403,14 @@ async fn pending_task_and_recipe_node_reads_name_their_dispatch_conditions() {
         ),
     ] {
         let request = McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: "/tmp".to_string(),
             run_id: None,
             tool: "read".to_string(),
             payload: serde_json::json!({ "uri": uri }),
             tool_use_id: None,
+            origin: None,
         };
         let result = handle_read_issue_resource(&orch, &request).await;
         assert!(
@@ -691,6 +695,7 @@ async fn node_messages_append_routes_like_bare_node() {
     insert_dm_recipient(&orch.db.local, "proj", "running").await;
 
     let request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: None,
@@ -703,6 +708,7 @@ async fn node_messages_append_routes_like_bare_node() {
             }]
         }),
         tool_use_id: None,
+        origin: None,
     };
 
     let result = handle_write(&orch, &request).await;
@@ -728,12 +734,14 @@ async fn node_messages_read_returns_directs() {
     let _ = insert_pending_direct(&orch, "run-1", "hello builder");
 
     let request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: None,
         tool: "read".to_string(),
         payload: serde_json::json!({ "uri": "cairn://p/proj/42/1/builder/messages" }),
         tool_use_id: None,
+        origin: None,
     };
 
     let result = handle_read_issue_resource(&orch, &request).await;

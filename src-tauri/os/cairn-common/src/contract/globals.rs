@@ -18,10 +18,44 @@ pub(crate) const DB_CONTRACT: ResourceContract =
             ProjectionSpec { key: "offset", values: "N rows to skip (default 0)" },
             ProjectionSpec { key: "limit", values: "N rows (default 100, max 1000)" },
         ],
-        related: NO_RELATED,
+        related: &[RelatedSpec {
+            label: "one table's rows, each addressed by primary key",
+            kind: ResourceKind::DbTable,
+            actions: false,
+        }],
         cross_actions: NO_CROSS_ACTIONS,
         mutations: NO_MUTATIONS,
     };
+
+pub(crate) const DB_TABLE_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::DbTable,
+    uri_template: "cairn://db/{table}",
+    name: "Live database table",
+    description: "The rows of one table in the running app's database, with the same read grammar as a thread database table. Structurally read-only: every mutation mode is refused. The affordance block lists the live columns, types, nullability, and primary key. The segment `schema` is reserved.",
+    read_projections: super::issues::DB_TABLE_PROJECTIONS,
+    related: &[RelatedSpec {
+        label: "database overview and SQL",
+        kind: ResourceKind::Db,
+        actions: false,
+    }],
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const DB_ROW_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::DbRow,
+    uri_template: "cairn://db/{table}/{pk}",
+    name: "Live database row",
+    description: "One row of an application database table, by single-column primary key. Structurally read-only: every mutation mode is refused.",
+    read_projections: super::issues::DB_ROW_PROJECTIONS,
+    related: &[RelatedSpec {
+        label: "database overview and SQL",
+        kind: ResourceKind::Db,
+        actions: false,
+    }],
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
 
 pub(crate) const CHANNELS_CONVERSATIONS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ChannelsConversations,

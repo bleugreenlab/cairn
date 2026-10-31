@@ -29,7 +29,8 @@ mod tests {
             parent_tool_use_id: Some("tool-1".into()),
             origin: DelegationOrigin::TaskTool,
             title: title.into(),
-            problem_statement: "Do the child task".into(),
+            problem_statement: Some("Do the child task".into()),
+            prompt_digest: None,
             agent_config_id: "build".into(),
             ownership: DelegatedOwnershipScope {
                 cwd: "/scratch".into(),

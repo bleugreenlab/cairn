@@ -586,7 +586,7 @@ mod tests {
 
     fn init_git_repo(path: &Path) {
         assert!(crate::env::git()
-            .args(["init", "-q"])
+            .args(["init", "-b", "main", "-q"])
             .current_dir(path)
             .status()
             .unwrap()
@@ -794,7 +794,7 @@ mod tests {
 
     fn init_bare_origin(path: &Path) {
         assert!(crate::env::git()
-            .args(["init", "--bare", "-q"])
+            .args(["init", "-b", "main", "--bare", "-q"])
             .current_dir(path)
             .status()
             .unwrap()

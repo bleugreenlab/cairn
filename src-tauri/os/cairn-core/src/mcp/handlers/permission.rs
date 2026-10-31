@@ -24,8 +24,6 @@ use cairn_common::identity::{
 use cairn_common::ids;
 use cairn_db::turso::params;
 
-use super::{emit_attention, AttentionEvent};
-
 /// The inline wait and every callback bound wrapping it: `cairn_common::callback_contract`.
 use cairn_common::callback_contract::INLINE_DURABLE_WAIT_BUDGET;
 
@@ -326,6 +324,20 @@ pub(crate) async fn await_permission_decision(
     tool_input: &serde_json::Value,
     mut handoff: Handoff,
 ) -> PermissionWait {
+    // A service run has no turn to yield and nobody to answer: a prompt one
+    // would raise is refused at once (fail closed), and its call fails with it.
+    if let Some(service) = orch.project_services.runs.get(run_id) {
+        let refusal = format!(
+            "service `{}` cannot raise a permission prompt for `{tool_name}`: a service call has \
+             no turn to answer it, so it is refused",
+            service.service
+        );
+        orch.project_services
+            .runs
+            .note_prompt_refusal(run_id, &refusal);
+        crate::project_services::note_refusal(orch, &service, tool_name, &refusal).await;
+        return PermissionWait::Unavailable(refusal);
+    }
     let services = &orch.services;
     // Intrinsic prefixing (CAIRN-2210): a team run's permission_request is FK'd to
     // a replica-resident run, so its id must carry the run's team prefix or the
@@ -939,7 +951,9 @@ fn hand_back_successor(hand_back: &HandBack) -> &PermissionSuccessor {
 }
 
 /// Whether some wait other than `request_id` still holds `turn_id` yielded: a
-/// pending permission, an unanswered question, or a durable wait.
+/// pending permission, an unanswered question, or a durable wait. A call held
+/// open on its socket (`agent_waits.hold`) keeps its turn running, not
+/// yielded, so it holds nothing here.
 async fn turn_held_by_another_wait(
     conn: &cairn_db::turso::Connection,
     turn_id: &str,
@@ -952,7 +966,8 @@ async fn turn_held_by_another_wait(
                  OR EXISTS(SELECT 1 FROM prompts WHERE turn_id = ?1 AND answered_at IS NULL AND withdrawn_at IS NULL \
                                     AND withdrawn_at IS NULL) \
                  OR EXISTS(SELECT 1 FROM agent_waits \
-                           WHERE predecessor_turn_id = ?1 AND state IN ('pending', 'resolving'))",
+                           WHERE predecessor_turn_id = ?1 AND state IN ('pending', 'resolving') \
+                           AND hold IS NULL)",
             params![turn_id, request_id],
         )
         .await?;
@@ -965,8 +980,8 @@ async fn turn_held_by_another_wait(
         != 0)
 }
 
-/// Emit the attention fact for a pending permission request so the UI toast and
-/// the `watch` long-poll learn it without a follow-up read. Best-effort: a
+/// Emit the attention fact for a pending permission request so the `watch`
+/// long-poll learns it without a follow-up read. Best-effort: a
 /// missing run context simply wakes the issue.
 async fn emit_permission_attention(
     orch: &Orchestrator,
@@ -977,30 +992,18 @@ async fn emit_permission_attention(
     perm_segment: Option<&str>,
 ) {
     let request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: String::new(),
         run_id: Some(run_id.to_string()),
         tool: String::new(),
         payload: serde_json::Value::Null,
         tool_use_id: Some(tool_use_id.to_string()),
+        origin: None,
     };
     let Ok(ctx) = super::run_context::lookup_run(&orch.db.local, &request).await else {
         return;
     };
-    let services = &orch.services;
-    let home_uri = crate::jobs::queries::home_uri_for_job(&orch.db.local, &ctx.job_id)
-        .await
-        .ok()
-        .flatten();
-    emit_attention(
-        &*services.emitter,
-        &AttentionEvent {
-            attention_type: "permission",
-            project_key: &ctx.project_key,
-            home_uri: home_uri.as_deref(),
-            tool_name: Some(tool_name),
-        },
-    );
     if let (Some(issue_id), Some(issue_number), Some(node)) = (
         ctx.issue_id.as_deref(),
         ctx.issue_number,
@@ -1052,8 +1055,8 @@ async fn emit_permission_attention(
             // Push the permission to the issue's watchers (CAIRN-1887): a `wake`
             // + `event` push keyed `permission:{issue}`, ref'd to the permission
             // row, excluding the requesting node (self-suspended on its own
-            // permission). The legacy emit below still drives `cairn watch` and
-            // the desktop toast.
+            // permission). The typed emit below drives `cairn watch`; the
+            // operator's notification center derives its entry from the row.
             let issue_uri = issue_ctx.issue_uri();
             match crate::orchestrator::attention_delivery::push_to_issue_watchers(
                 &orch.db.local,
@@ -1132,6 +1135,10 @@ pub(crate) async fn resolve_fence_policy(
     run_id: Option<&str>,
 ) -> Option<Fence> {
     let run_id = run_id?.to_string();
+    // A live service run is fenced before any lookup that could fail.
+    if orch.project_services.runs.get(&run_id).is_some() {
+        return Some(Fence::Deny);
+    }
     let owning_db = crate::execution::routing::routing_db_for_id(&orch.db, &run_id)
         .await
         .ok()?;
@@ -1161,6 +1168,13 @@ pub(crate) async fn resolve_fence_policy(
         .await
         .ok()
         .flatten()?;
+
+    // A project service runs merged code on behalf of whoever calls it, so its
+    // fence is fixed: never a prompt, never allowed. It has no execution
+    // snapshot to fall through to, and must not reach the `None` below.
+    if agent_config_id.as_deref() == Some(crate::project_services::SERVICE_AGENT_CONFIG) {
+        return Some(Fence::Deny);
+    }
 
     // Look up the agent snapshot from the execution
     let execution_id = execution_id?;
@@ -1276,6 +1290,9 @@ impl AnswerSurface {
             | AppearanceTransport::AuthenticatedDesktop => Err(format!(
                 "cannot reconstruct {transport:?} permission authority without verified operator approval"
             )),
+            AppearanceTransport::Ingress => {
+                Err("an ingress delivery never answers a permission".to_string())
+            }
         }
     }
 }
@@ -4825,7 +4842,7 @@ pub(crate) mod tests {
             &orch,
             super::super::fence::Crossing::shell_path(
                 std::path::Path::new("/tmp/outside.txt"),
-                "/tmp/outside.txt",
+                "touch /tmp/outside.txt",
             ),
         )
         .await;

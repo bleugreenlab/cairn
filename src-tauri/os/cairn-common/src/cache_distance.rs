@@ -797,7 +797,7 @@ mod tests {
     fn fixture() -> tempfile::TempDir {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        git(root, &["init"]);
+        git(root, &["init", "-b", "main"]);
         write(
             root,
             "src-tauri/Cargo.toml",
@@ -902,7 +902,7 @@ mod tests {
     fn js_only_changes_do_not_run_cargo_and_preserve_path_framing() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        git(root, &["init"]);
+        git(root, &["init", "-b", "main"]);
         write(
             root,
             "package.json",
@@ -1071,7 +1071,7 @@ mod tests {
     fn missing_committed_metadata_is_unknown_in_bare_repository() {
         for rust in [false, true] {
             let temp = tempfile::tempdir().unwrap();
-            git(temp.path(), &["init"]);
+            git(temp.path(), &["init", "-b", "main"]);
             write(temp.path(), "README", "fixture");
             let from = commit(temp.path());
             write(
@@ -1252,7 +1252,7 @@ mod tests {
     fn source_only_target_measurements_evict_old_trees_and_reload_on_demand() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        git(&root, &["init"]);
+        git(&root, &["init", "-b", "main"]);
         write(&root, "package.json", r#"{"workspaces":["web"]}"#);
         write(&root, "web/package.json", "{}");
         write(&root, "web/index.ts", "export const version = 0;\n");

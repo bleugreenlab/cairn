@@ -19,7 +19,6 @@ use super::permission::{
     emit_successor_turn_events, ensure_and_start_successor_turn, issue_id_for_run,
     recompute_issue_status_for_issue, yield_turn_for_host, WithdrawalCause,
 };
-use super::{emit_attention, AttentionEvent};
 
 /// What the agent reads for a question that outlived the inline budget.
 ///
@@ -138,7 +137,6 @@ async fn ask_questions_owned(
         node_segment,
         project_key,
         issue_number,
-        home_uri,
         exec_seq,
         current_turn_id,
         owns_turn_loop,
@@ -374,10 +372,6 @@ async fn ask_questions_owned(
             }
         }
 
-        let home_uri = crate::jobs::queries::home_uri_for_job(&owning_db, &ctx.job_id)
-            .await
-            .ok()
-            .flatten();
         if yielded_turn {
             if let Some(turn_id) = current_turn_id.as_deref() {
                 let change =
@@ -393,7 +387,6 @@ async fn ask_questions_owned(
             node_segment,
             ctx.project_key,
             ctx.issue_number,
-            home_uri,
             ctx.exec_seq,
             current_turn_id,
             owns_turn_loop,
@@ -432,17 +425,6 @@ async fn ask_questions_owned(
     let _ = services
         .emitter
         .emit("run-paused", serde_json::json!(&run_id));
-
-    // Emit attention event for toast notification
-    emit_attention(
-        &*services.emitter,
-        &AttentionEvent {
-            attention_type: "prompt",
-            project_key: &project_key,
-            home_uri: home_uri.as_deref(),
-            tool_name: None,
-        },
-    );
 
     // Owned-loop backends (OpenRouter) never inline-wait: there is no warm
     // process, so a resume cold-restarts the turn regardless. Suspend now and let

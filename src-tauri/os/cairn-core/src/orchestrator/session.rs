@@ -1165,15 +1165,14 @@ fn build_orientation_block(
         // advertised one the agent's own commands could not see, because commands
         // run in the run's environment rather than beside the CLI process.
         //
-        // The sharing claim is bounded by what placement provides. A job's
-        // batches, terminals, and REPLs share the scratch of its one execution
-        // home, but a batch whose selector detaches it runs in a disposable
-        // environment with a scratch of its own, and a home that is lost is
-        // rebuilt with an empty one (docs/execution-fabric.md). No directory
-        // reachable from every machine survives across batches, so this line
-        // promises sharing only within the home and never durability.
+        // `$TMPDIR` is the node's portable scratch (cairn/5253, tenet #1258):
+        // one per node, shared with its tasks, synced to whatever machine runs
+        // its work, and kept until the node closes. This line is the contract
+        // an agent works to, so it names the ceiling's default and the setting
+        // that moves it, what never travels, and that a host path is a fact
+        // about one machine.
         out.push_str(
-            "- Scratch: `$TMPDIR` \u{2014} temp space on the machine your commands run on, shared by your batches, terminals, and REPLs there, but not durable: a batch whose `executor` option sends it to another machine gets a separate `$TMPDIR` that does not carry over, and an environment that is lost comes back with an empty one. Check that a file an earlier batch left there still exists before relying on it\n",
+            "- Scratch: `$TMPDIR` \u{2014} this node's scratch and the one place for data you produce. It is shared with your sub-agent tasks (a task's scratch is its parent's), brought current on whichever machine a batch, terminal, or REPL lands on, written back when each batch ends (the run result reports bytes and seconds), and kept until this issue resolves (or this thread closes). It is working space, not a record: a write-back can be delayed or refused and the scratch ends with its node, so a task's results belong in what it returns. Up to the project's ceiling travels (512 MiB unless `.cairn/config.yaml` sets `scratch.ceilingMiB`); a write-back past it is refused by name and leaves your files where they are on that machine until you shrink the scratch. `node_modules`, `.venv`, `target` and nested git repositories inside it do not travel. A path outside the repository and `$TMPDIR` is a fact about one host that no other machine sees\n",
         );
     }
     out.push_str(
@@ -3055,13 +3054,22 @@ mod tests {
         // advertising an absolute path here could only be wrong.
         assert!(block.contains("Scratch: `$TMPDIR`"));
         assert!(!block.contains("/home/tester/.cairn/scratch/cairn.1288.1.builder"));
-        // Scratch is shared within the machine's environment but never promised
-        // across machines or as durable: a detached batch gets its own, and a
-        // lost environment returns with an empty one.
-        assert!(block.contains("not durable"));
-        assert!(block.contains("another machine gets a separate `$TMPDIR`"));
-        assert!(!block.contains("shared by every command"));
-        assert!(!block.contains("reclaimed at teardown"));
+        // Scratch is the node's portable scratch: shared with its tasks, synced
+        // to every machine, kept until the node closes, bounded by a ceiling
+        // that refuses by name, and the only home for a node's data.
+        assert!(block.contains("this node's scratch and the one place for data you produce"));
+        assert!(
+            block.contains("shared with your sub-agent tasks (a task's scratch is its parent's)")
+        );
+        assert!(block.contains("so a task's results belong in what it returns"));
+        assert!(block.contains("brought current on whichever machine"));
+        assert!(block.contains("kept until this issue resolves (or this thread closes)"));
+        assert!(block.contains("512 MiB unless `.cairn/config.yaml` sets `scratch.ceilingMiB`"));
+        assert!(block.contains("refused by name"));
+        assert!(block.contains("`node_modules`, `.venv`, `target` and nested git repositories"));
+        assert!(block.contains("a fact about one host"));
+        assert!(!block.contains("not durable"));
+        assert!(!block.contains("another machine gets a separate `$TMPDIR`"));
         // An authenticated virtual-residence run carries no ambient framing.
         assert!(!block.contains("## Capability tier"));
     }

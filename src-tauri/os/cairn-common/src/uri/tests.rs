@@ -957,10 +957,10 @@ fn parses_first_class_thread_resources() {
 /// resolver reads.
 ///
 /// They used to be the one thread sub-path this parser knew, which is what made
-/// the missing `procedures` arm look like an oversight in a complete vocabulary
-/// rather than the vocabulary being somewhere else entirely. Whether
-/// `branches/3` means a branch is settled in `delegate_thread_descendant`, next
-/// to `db`, `procedures`, and `automations`.
+/// a missing thread arm look like an oversight in a complete vocabulary rather
+/// than the vocabulary being somewhere else entirely. Whether `branches/3`
+/// means a branch is settled in `delegate_thread_descendant`, next to `db`,
+/// `pages`, and `services`.
 #[test]
 fn numbered_thread_branch_resources_build_and_identify() {
     let collection = CairnResource::ThreadBranches {
@@ -999,51 +999,10 @@ fn numbered_thread_branch_resources_build_and_identify() {
     }
 }
 
+/// Retired surfaces stay reserved, so the thread resolver can refuse them with
+/// the service shape rather than read them as artifact type-names.
 #[test]
-fn procedure_and_automation_resource_variants_build_and_identify() {
-    let resources = [
-        (
-            CairnResource::ThreadProcedures {
-                project: "cairn".into(),
-                name: "design-review".into(),
-            },
-            ResourceKind::ThreadProcedures,
-            "cairn://p/cairn/design-review/procedures",
-        ),
-        (
-            CairnResource::ThreadProcedure {
-                project: "cairn".into(),
-                name: "design-review".into(),
-                procedure: "collect".into(),
-            },
-            ResourceKind::ThreadProcedure,
-            "cairn://p/cairn/design-review/procedures/collect",
-        ),
-        (
-            CairnResource::ThreadAutomations {
-                project: "cairn".into(),
-                name: "design-review".into(),
-            },
-            ResourceKind::ThreadAutomations,
-            "cairn://p/cairn/design-review/automations",
-        ),
-        (
-            CairnResource::ThreadAutomation {
-                project: "cairn".into(),
-                name: "design-review".into(),
-                id: "auto-1".into(),
-            },
-            ResourceKind::ThreadAutomation,
-            "cairn://p/cairn/design-review/automations/auto-1",
-        ),
-    ];
-    for (resource, kind, uri) in resources {
-        assert_eq!(resource.kind(), kind);
-        assert_eq!(resource.to_uri(), uri);
-        assert_eq!(resource.project(), Some("cairn"));
-        assert_eq!(resource.issue_number(), None);
-        assert_eq!(resource.to_route(), None);
-    }
+fn retired_procedure_and_automation_segments_stay_reserved() {
     assert!(is_reserved_node_segment("procedures"));
     assert!(is_reserved_node_segment("automations"));
 }
@@ -1548,6 +1507,106 @@ fn workflow_resources_project_and_route() {
 }
 
 #[test]
+fn round_trips_service_resources() {
+    let service = || "echo".to_string();
+    let cases = [
+        (
+            "cairn://p/cairn/services",
+            CairnResource::ProjectServices {
+                project: "cairn".to_string(),
+            },
+            ResourceKind::ProjectServices,
+        ),
+        (
+            "cairn://p/cairn/services/echo",
+            CairnResource::ProjectService {
+                project: "cairn".to_string(),
+                service: service(),
+            },
+            ResourceKind::ProjectService,
+        ),
+        (
+            "cairn://p/cairn/services/echo/status",
+            CairnResource::ProjectServiceStatus {
+                project: "cairn".to_string(),
+                service: service(),
+            },
+            ResourceKind::ProjectServiceStatus,
+        ),
+        (
+            "cairn://p/cairn/services/echo/log",
+            CairnResource::ProjectServiceLog {
+                project: "cairn".to_string(),
+                service: service(),
+            },
+            ResourceKind::ProjectServiceLog,
+        ),
+    ];
+    for (uri, resource, kind) in cases {
+        assert_eq!(parse_uri(uri), Some(resource.clone()), "{uri}");
+        assert_eq!(resource.to_uri(), uri);
+        assert_eq!(resource.kind(), kind);
+        assert_eq!(resource.project(), Some("cairn"));
+        assert_eq!(resource.project_key(), Some("cairn"));
+        assert_eq!(resource.issue_number(), None);
+        assert_eq!(resource.node_id(), None);
+        assert_eq!(resource.to_route(), None);
+        assert!(crate::contract::contract_for(kind).is_some());
+    }
+    assert_eq!(
+        build_project_services_uri("cairn"),
+        "cairn://p/cairn/services"
+    );
+    assert_eq!(
+        build_project_service_uri("cairn", "echo"),
+        "cairn://p/cairn/services/echo"
+    );
+    assert_eq!(
+        build_project_service_status_uri("cairn", "echo"),
+        "cairn://p/cairn/services/echo/status"
+    );
+    assert_eq!(
+        build_project_service_log_uri("cairn", "echo"),
+        "cairn://p/cairn/services/echo/log"
+    );
+}
+
+/// A literal `services` in the issue-number position must reach the service
+/// arms, and the numeric node arm of the same length must keep working.
+#[test]
+fn service_arms_coexist_with_numeric_issue_and_node_arms() {
+    assert!(matches!(
+        parse_uri("cairn://p/cairn/services/echo/log"),
+        Some(CairnResource::ProjectServiceLog { .. })
+    ));
+    assert!(matches!(
+        parse_uri("cairn://p/cairn/12/1/builder"),
+        Some(CairnResource::Node {
+            number: 12,
+            exec_seq: 1,
+            ..
+        })
+    ));
+    assert!(matches!(
+        parse_uri("cairn://p/cairn/12"),
+        Some(CairnResource::Issue { number: 12, .. })
+    ));
+    // The project key canonicalizes like every other project family.
+    assert_eq!(
+        parse_uri("cairn://p/CAIRN/services/echo"),
+        Some(CairnResource::ProjectService {
+            project: "cairn".to_string(),
+            service: "echo".to_string(),
+        })
+    );
+    // No other sub-resource exists beneath a service, and an empty service
+    // segment is not a service.
+    assert_eq!(parse_uri("cairn://p/cairn/services/echo/calls"), None);
+    assert_eq!(parse_uri("cairn://p/cairn/services//log"), None);
+    assert_eq!(parse_uri("cairn://p/cairn/services/"), None);
+}
+
+#[test]
 fn project_reference_resources_report_project_and_kind() {
     let collection = parse_uri("cairn://p/cairn/references").unwrap();
     assert_eq!(collection.project(), Some("cairn"));
@@ -1997,6 +2056,7 @@ fn project_parser_literals_are_reserved_thread_names() {
         "references",
         "responses",
         "routes",
+        "services",
         "settings",
         "skills",
         "symbols",
@@ -2043,6 +2103,67 @@ fn tenet_uris_parse_build_and_keep_a_slug_alias_as_written() {
         crate::thread_name::validate_thread_name("tenets").is_err(),
         "a thread named `tenets` would shadow the collection"
     );
+}
+
+#[test]
+fn page_uris_parse_build_and_reserve_their_segment() {
+    let index = parse_uri("cairn://p/CAIRN/pages").unwrap();
+    assert_eq!(
+        index,
+        CairnResource::ProjectPages {
+            project: "cairn".into()
+        }
+    );
+    assert_eq!(index.to_uri(), "cairn://p/cairn/pages");
+    assert_eq!(index.kind(), ResourceKind::ProjectPages);
+    assert_eq!(index.to_route().as_deref(), Some("/p/cairn/pages"));
+    assert!(
+        crate::thread_name::validate_thread_name("pages").is_err(),
+        "a thread named `pages` would shadow the project's page index"
+    );
+
+    let draft = parse_uri("cairn://p/cairn/12/1/builder/pages/smoke").unwrap();
+    assert_eq!(
+        draft,
+        CairnResource::NodePage {
+            project: "cairn".into(),
+            number: 12,
+            exec_seq: 1,
+            node_id: "builder".into(),
+            name: "smoke".into(),
+        }
+    );
+    assert_eq!(draft.to_uri(), "cairn://p/cairn/12/1/builder/pages/smoke");
+    assert_eq!(draft.to_route(), None);
+
+    let log = parse_uri("cairn://p/cairn/12/1/builder/pages/smoke/log").unwrap();
+    assert_eq!(log.kind(), ResourceKind::NodePageLog);
+    assert_eq!(
+        parse_uri("cairn://p/cairn/12/1/builder/pages")
+            .unwrap()
+            .kind(),
+        ResourceKind::NodePages
+    );
+
+    // A thread's page renders at the thread's address and routes to its facet.
+    let thread_page = CairnResource::NodePage {
+        project: "cairn".into(),
+        number: 0,
+        exec_seq: 0,
+        node_id: "devops".into(),
+        name: "release-board".into(),
+    };
+    assert_eq!(
+        thread_page.to_uri(),
+        "cairn://p/cairn/devops/pages/release-board"
+    );
+    assert_eq!(
+        thread_page.to_route().as_deref(),
+        Some("/p/cairn/threads/devops/pages/release-board")
+    );
+
+    // `pages` is a sub-resource, never an artifact type-name.
+    assert!(crate::uri::is_reserved_node_segment("pages"));
 }
 
 #[test]

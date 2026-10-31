@@ -1278,7 +1278,7 @@ mod tests {
     async fn create_existing_empty_git_repo_creates_initial_commit() {
         let db = migrated_db().await;
         let repo = tempdir().unwrap();
-        run_git(&["init"], repo.path()).unwrap();
+        run_git(&["init", "-b", "main"], repo.path()).unwrap();
 
         create(
             &db,

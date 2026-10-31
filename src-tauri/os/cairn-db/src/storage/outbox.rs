@@ -1,7 +1,8 @@
 //! Durable effect outbox for crash-safe DAG advancement.
 //!
-//! Provides functions to drain pending outbox entries, mark them as
-//! done/failed, and garbage-collect old processed entries.
+//! Provides functions to drain pending outbox entries and mark them as
+//! done/failed. Done entries are deleted a day later by the retention evictor
+//! (`storage::retention`, rule `DoneOutbox`).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -227,35 +228,6 @@ pub async fn reset_running_to_pending_async(db: &LocalDb) -> DbResult<usize> {
     .await
 }
 
-/// Delete processed entries older than 24 hours.
-pub fn gc(db: Arc<LocalDb>) -> usize {
-    match block_on_outbox_db(async move { gc_async(&db).await.map_err(|e| e.to_string()) }) {
-        Ok(count) => count,
-        Err(error) => {
-            log::warn!("Failed to GC outbox entries: {}", error);
-            0
-        }
-    }
-}
-
-async fn gc_async(db: &LocalDb) -> DbResult<usize> {
-    db.write(|conn| {
-        Box::pin(async move {
-            let cutoff = chrono::Utc::now().timestamp() as i32 - 86400;
-            let count = conn
-                .execute(
-                    "DELETE FROM effect_outbox
-                     WHERE state = 'done'
-                       AND updated_at < ?1",
-                    params![cutoff],
-                )
-                .await?;
-            Ok(count as usize)
-        })
-    })
-    .await
-}
-
 fn block_on_outbox_db<T, Fut>(future: Fut) -> Result<T, String>
 where
     T: Send + 'static,
@@ -338,18 +310,6 @@ mod tests {
         .unwrap()
     }
 
-    async fn count_outbox(db: &LocalDb) -> i64 {
-        db.read(|conn| {
-            Box::pin(async move {
-                let mut rows = conn.query("SELECT COUNT(*) FROM effect_outbox", ()).await?;
-                let row = rows.next().await?.unwrap();
-                row.i64(0)
-            })
-        })
-        .await
-        .unwrap()
-    }
-
     async fn attempts_for(db: &LocalDb, id: &str) -> i64 {
         db.read(|conn| {
             let id = id.to_string();
@@ -362,23 +322,6 @@ mod tests {
                     .await?;
                 let row = rows.next().await?.unwrap();
                 row.i64(0)
-            })
-        })
-        .await
-        .unwrap()
-    }
-
-    async fn backdate(db: &LocalDb, id: &str) {
-        let old_time = chrono::Utc::now().timestamp() as i32 - 172800;
-        db.write(|conn| {
-            let id = id.to_string();
-            Box::pin(async move {
-                conn.execute(
-                    "UPDATE effect_outbox SET updated_at = ?1 WHERE id = ?2",
-                    params![old_time, id.as_str()],
-                )
-                .await?;
-                Ok(())
             })
         })
         .await
@@ -485,42 +428,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gc_removes_old_done_entries() {
-        let (_temp, db) = test_db().await;
-        insert_advance_dag(&db, "exec-1").await;
-
-        let entries = drain_pending_async(&db).await.unwrap();
-        mark_done_async(&db, &entries[0].id).await.unwrap();
-        backdate(&db, &entries[0].id).await;
-
-        let deleted = gc_async(&db).await.unwrap();
-        assert_eq!(deleted, 1);
-        assert_eq!(count_outbox(&db).await, 0);
-    }
-
-    #[tokio::test]
-    async fn test_gc_preserves_recent_done_entries() {
-        let (_temp, db) = test_db().await;
-        insert_advance_dag(&db, "exec-1").await;
-
-        let entries = drain_pending_async(&db).await.unwrap();
-        mark_done_async(&db, &entries[0].id).await.unwrap();
-
-        let deleted = gc_async(&db).await.unwrap();
-        assert_eq!(deleted, 0);
-    }
-
-    #[tokio::test]
-    async fn test_gc_preserves_pending_entries() {
-        let (_temp, db) = test_db().await;
-        let id = insert_advance_dag(&db, "exec-1").await;
-        backdate(&db, &id).await;
-
-        let deleted = gc_async(&db).await.unwrap();
-        assert_eq!(deleted, 0);
-    }
-
-    #[tokio::test]
     async fn test_mark_done_by_key_includes_pending_entries() {
         let (_temp, db) = test_db().await;
         insert_advance_dag(&db, "exec-x").await;
@@ -537,22 +444,6 @@ mod tests {
             "Both running and pending entries should be marked done, got: {:?}",
             states
         );
-    }
-
-    #[tokio::test]
-    async fn test_gc_preserves_failed_entries() {
-        let (_temp, db) = test_db().await;
-        insert_advance_dag(&db, "exec-1").await;
-
-        let entries = drain_pending_async(&db).await.unwrap();
-        mark_failed_async(&db, &entries[0].id, "something broke")
-            .await
-            .unwrap();
-        backdate(&db, &entries[0].id).await;
-
-        let deleted = gc_async(&db).await.unwrap();
-        assert_eq!(deleted, 0, "GC should not delete failed entries");
-        assert_eq!(count_outbox(&db).await, 1);
     }
 
     #[tokio::test]

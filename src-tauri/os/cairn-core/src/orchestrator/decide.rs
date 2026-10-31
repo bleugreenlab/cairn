@@ -350,9 +350,8 @@ impl Orchestrator {
         if let Some(unable) = self.decision_observations.get(offer) {
             return Ok(unable.is_none());
         }
-        let route = self.decision_route(project_id, offer)?;
+        let (route, model) = self.decision_route(project_id, offer)?;
         let complete = self.models_runtime.complete.clone();
-        let model = offer.model.clone();
         let outcome = std::thread::spawn(move || {
             cairn_models::decide::probe(complete.as_ref(), &route, &model, PROBE_TIMEOUT)
         })
@@ -376,14 +375,16 @@ impl Orchestrator {
         }
     }
 
-    /// The deployment `offer` is measured on, as its backend reaches it.
+    /// The deployment `offer` is measured on, as its backend reaches it, and
+    /// the id it is sent there.
     fn decision_route(
         &self,
         project_id: Option<&str>,
         offer: &SelectedOffer,
-    ) -> Result<DecisionRoute, String> {
-        crate::backends::backend_for_name(Some(&offer.provider))
-            .decision_route(self, project_id, offer)
+    ) -> Result<(DecisionRoute, String), String> {
+        let backend = crate::backends::backend_for_name(Some(&offer.provider));
+        let route = backend.decision_route(self, project_id, offer)?;
+        Ok((route, backend.sent_model(self, &offer.model)))
     }
 
     /// Where each decision node in `nodes` stands in `project_id`'s scope,
@@ -617,14 +618,14 @@ impl Orchestrator {
         input: &str,
     ) -> Result<(Decision, SelectedOffer), DecisionFailure> {
         let offer = self.decision_offer(project_id, query, questions)?;
-        let route = self
+        let (route, sent) = self
             .decision_route(project_id, &offer)
             .map_err(DecisionFailure::Failed)?;
         let result = cairn_models::decide::decide(
             self.models_runtime.complete.as_ref(),
             DecisionCall {
                 route: &route,
-                model: &offer.model,
+                model: &sent,
                 input,
                 questions,
                 timeout: DECISION_TIMEOUT,
@@ -1045,12 +1046,14 @@ pub(crate) mod tests {
         assert_eq!(sent_body["questions"]["is_bug"]["type"], "noul");
 
         let request = crate::mcp::types::McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: "/tmp".to_string(),
             run_id: None,
             tool: "read".to_string(),
             payload: json!({}),
             tool_use_id: None,
+            origin: None,
         };
         let read = |uri: &'static str| {
             let orch = orch.clone();

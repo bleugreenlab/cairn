@@ -46,8 +46,13 @@ pub const RESERVED_NODE_SEGMENTS: &[&str] = &[
     "symbols",
     "rebase",
     "db",
+    // Retired surfaces (tenet 1313): reserved so an address under them is
+    // refused with the service shape that replaced them, never read as an
+    // artifact type-name.
     "procedures",
     "automations",
+    "pages",
+    "services",
 ];
 
 /// True when `segment` is a reserved node/task sub-resource keyword (see
@@ -157,6 +162,11 @@ pub enum CairnResource {
         project: String,
         key: String,
     },
+    /// A project's promoted pages: the latest version of each thread-owned page
+    /// whose owning thread set `promoted`.
+    ProjectPages {
+        project: String,
+    },
     /// One project's code map: the base tree's source inventory, the import
     /// graph over it, and per-file churn.
     ProjectCodemap {
@@ -250,23 +260,44 @@ pub enum CairnResource {
         project: String,
         name: String,
     },
-    ThreadProcedures {
+    /// The rows of one table in a thread database. `table` is the decoded
+    /// path segment; `schema` is reserved and never names a table here.
+    ThreadDbTable {
+        project: String,
+        name: String,
+        table: String,
+    },
+    /// One row of a thread database table, addressed by its single-column
+    /// primary key. `pk` is the decoded text of the path segment.
+    ThreadDbRow {
+        project: String,
+        name: String,
+        table: String,
+        pk: String,
+    },
+    /// The services a thread owns: processes the runner supervises from
+    /// packages the thread wrote, rather than from the repository.
+    ThreadServices {
         project: String,
         name: String,
     },
-    ThreadProcedure {
+    /// One thread-owned service, which is also the acting home of its runs.
+    ThreadService {
         project: String,
         name: String,
-        procedure: String,
+        service: String,
     },
-    ThreadAutomations {
+    /// A thread-owned service's compact live status.
+    ThreadServiceStatus {
         project: String,
         name: String,
+        service: String,
     },
-    ThreadAutomation {
+    /// A thread-owned service's lifecycle, stderr, and call log.
+    ThreadServiceLog {
         project: String,
         name: String,
-        id: String,
+        service: String,
     },
     Node {
         project: String,
@@ -711,6 +742,30 @@ pub enum CairnResource {
         node_id: String,
         era_seq: i32,
     },
+    /// The pages a node or thread owns (collection). A thread's pages are its
+    /// own; a page on an issue node is a draft that never reaches the index.
+    NodePages {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+    },
+    /// One page by name: a versioned `page` artifact stored as `pages/<name>`.
+    NodePage {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        name: String,
+    },
+    /// A page's call log: what open frames of it read, refused, and reported.
+    NodePageLog {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        name: String,
+    },
     /// Contextual recipes collection (workspace + current project).
     Recipes,
     /// A single recipe addressed by id (resolves project-first, then workspace).
@@ -741,6 +796,26 @@ pub enum CairnResource {
     ProjectWorkflow {
         project: String,
         workflow_id: String,
+    },
+    /// The project's declared services: supervised processes whose packages
+    /// live under `.cairn/services/<name>/` on the base branch.
+    ProjectServices {
+        project: String,
+    },
+    /// One project service, which is also the acting home of its runs.
+    ProjectService {
+        project: String,
+        service: String,
+    },
+    /// A service's compact live status.
+    ProjectServiceStatus {
+        project: String,
+        service: String,
+    },
+    /// A service's lifecycle, stderr, and call log.
+    ProjectServiceLog {
+        project: String,
+        service: String,
     },
     /// Contextual routes collection (workspace + current project).
     Routes,
@@ -882,6 +957,16 @@ pub enum CairnResource {
     },
     /// Live local database read projection.
     Db,
+    /// The rows of one table in the application database (read-only).
+    DbTable {
+        table: String,
+    },
+    /// One row of an application database table, by single-column primary
+    /// key (read-only).
+    DbRow {
+        table: String,
+        pk: String,
+    },
     /// `cairn://dev` collection entrypoint: process-introspection tools for a
     /// running `dev:instance` you launched (lists running instances + sub-tools).
     Dev,
@@ -950,8 +1035,16 @@ pub enum CairnResource {
     InferenceRecipes,
     /// Recipes placed on named machines.
     InferenceDeployments,
-    /// Pools, their pin and default, and Cairn's resolution beside bginf's.
+    /// One deployment: its phase as Cairn controls it, its machines and their
+    /// holds, and its measured loads. Patched to start or stop it.
+    InferenceDeployment {
+        id: String,
+    },
+    /// Pools, their pin and default, Cairn's resolution beside bginf's, and
+    /// the pool controller's state for pools under Cairn's control.
     InferencePools,
+    /// The pool controller's queue of model requests.
+    InferenceRequests,
     /// Global bug report sink.
     Bug,
     /// Self-describing help page: URI grammar + read catalog + mutation matrix.
@@ -990,6 +1083,7 @@ impl CairnResource {
             Self::ProjectPosts { .. } => ResourceKind::ProjectPosts,
             Self::ProjectTenets { .. } => ResourceKind::ProjectTenets,
             Self::ProjectTenet { .. } => ResourceKind::ProjectTenet,
+            Self::ProjectPages { .. } => ResourceKind::ProjectPages,
             Self::ProjectCodemap { .. } => ResourceKind::ProjectCodemap,
             Self::ProjectMap { .. } => ResourceKind::ProjectMap,
             Self::ProjectHome { .. } => ResourceKind::ProjectHome,
@@ -1014,10 +1108,12 @@ impl CairnResource {
             Self::ThreadBranch { .. } => ResourceKind::ThreadBranch,
             Self::ThreadDb { .. } => ResourceKind::ThreadDb,
             Self::ThreadDbSchema { .. } => ResourceKind::ThreadDbSchema,
-            Self::ThreadProcedures { .. } => ResourceKind::ThreadProcedures,
-            Self::ThreadProcedure { .. } => ResourceKind::ThreadProcedure,
-            Self::ThreadAutomations { .. } => ResourceKind::ThreadAutomations,
-            Self::ThreadAutomation { .. } => ResourceKind::ThreadAutomation,
+            Self::ThreadDbTable { .. } => ResourceKind::ThreadDbTable,
+            Self::ThreadDbRow { .. } => ResourceKind::ThreadDbRow,
+            Self::ThreadServices { .. } => ResourceKind::ThreadServices,
+            Self::ThreadService { .. } => ResourceKind::ThreadService,
+            Self::ThreadServiceStatus { .. } => ResourceKind::ThreadServiceStatus,
+            Self::ThreadServiceLog { .. } => ResourceKind::ThreadServiceLog,
             Self::Changed { .. } => ResourceKind::Changed,
             Self::IssueExecutions { .. } => ResourceKind::IssueExecutions,
             Self::IssueExecution { .. } => ResourceKind::IssueExecution,
@@ -1062,6 +1158,8 @@ impl CairnResource {
             Self::TaskPermissions { .. } => ResourceKind::TaskPermissions,
             Self::TaskPermission { .. } => ResourceKind::TaskPermission,
             Self::Db => ResourceKind::Db,
+            Self::DbTable { .. } => ResourceKind::DbTable,
+            Self::DbRow { .. } => ResourceKind::DbRow,
             Self::Dev => ResourceKind::Dev,
             Self::DevDb => ResourceKind::DevDb,
             Self::DevPid => ResourceKind::DevPid,
@@ -1084,7 +1182,9 @@ impl CairnResource {
             Self::Inference => ResourceKind::Inference,
             Self::InferenceRecipes => ResourceKind::InferenceRecipes,
             Self::InferenceDeployments => ResourceKind::InferenceDeployments,
+            Self::InferenceDeployment { .. } => ResourceKind::InferenceDeployment,
             Self::InferencePools => ResourceKind::InferencePools,
+            Self::InferenceRequests => ResourceKind::InferenceRequests,
             Self::Bug => ResourceKind::Bug,
             Self::Help => ResourceKind::Help,
             Self::WebSearch => ResourceKind::WebSearch,
@@ -1103,6 +1203,9 @@ impl CairnResource {
             Self::NodeMemory { .. } => ResourceKind::NodeMemory,
             Self::NodeEras { .. } => ResourceKind::NodeEras,
             Self::NodeEra { .. } => ResourceKind::NodeEra,
+            Self::NodePages { .. } => ResourceKind::NodePages,
+            Self::NodePage { .. } => ResourceKind::NodePage,
+            Self::NodePageLog { .. } => ResourceKind::NodePageLog,
             Self::Recipes => ResourceKind::Recipes,
             Self::Recipe { .. } => ResourceKind::Recipe,
             Self::ProjectRecipes { .. } => ResourceKind::ProjectRecipes,
@@ -1111,6 +1214,10 @@ impl CairnResource {
             Self::Workflow { .. } => ResourceKind::Workflow,
             Self::ProjectWorkflows { .. } => ResourceKind::ProjectWorkflows,
             Self::ProjectWorkflow { .. } => ResourceKind::ProjectWorkflow,
+            Self::ProjectServices { .. } => ResourceKind::ProjectServices,
+            Self::ProjectService { .. } => ResourceKind::ProjectService,
+            Self::ProjectServiceStatus { .. } => ResourceKind::ProjectServiceStatus,
+            Self::ProjectServiceLog { .. } => ResourceKind::ProjectServiceLog,
             Self::Routes => ResourceKind::Routes,
             Self::Route { .. } => ResourceKind::Route,
             Self::RouteHistory { .. } => ResourceKind::RouteHistory,

@@ -455,8 +455,10 @@ pub(super) fn make_room_for_head(orch: &Orchestrator, lane: &str, shortfall: &La
             };
             orch.evict_one_warm_unit(&holders).into_iter().collect()
         }
-        // Evicting frees memory or a unit, never a warm-up slot.
-        LaneShortfall::Streams { .. } | LaneShortfall::Ramp { .. } => Vec::new(),
+        // Evicting frees memory or a unit, never a warm-up slot or readiness.
+        LaneShortfall::Streams { .. }
+        | LaneShortfall::Ramp { .. }
+        | LaneShortfall::StartupRecovery => Vec::new(),
     };
     if !evicted.is_empty() {
         log::info!(
@@ -611,6 +613,9 @@ pub(crate) fn describe_shortfall(shortfall: &LaneShortfall) -> String {
         LaneShortfall::Ramp { warming, window } => format!(
             "the boot ramp starts background launches only while fewer than {window} spawns are warming up ({warming} are)"
         ),
+        LaneShortfall::StartupRecovery => {
+            "the host is still finishing startup recovery, and its agent callback gateway refuses calls until it does".to_string()
+        }
     }
 }
 
@@ -635,7 +640,13 @@ pub(crate) fn render_launch_line(
             line.push_str(".\n");
             if let Some(budget) = lane {
                 line.push_str(&format!("Lane: {}.\n", describe_lane(budget, now)));
-                if let (Some(1), Some(shortfall)) = (projection.position, &budget.shortfall) {
+                // Most shortfalls describe the head; startup recovery holds the
+                // whole queue, so every position names it.
+                let applies = |shortfall: &LaneShortfall| {
+                    projection.position == Some(1)
+                        || matches!(shortfall, LaneShortfall::StartupRecovery)
+                };
+                if let Some(shortfall) = budget.shortfall.as_ref().filter(|s| applies(s)) {
                     line.push_str(&format!(
                         "Waiting because {}.\n",
                         describe_shortfall(shortfall)

@@ -10,7 +10,7 @@ const TENET_STATEMENT: KeySpec = KeySpec::new(
 const TENET_RATIONALE: KeySpec = KeySpec::new(
     "rationale",
     KeyType::Str,
-    "what the statement rests on, shown collapsed beneath it: why, in the terms it was argued; the alternatives ruled out, so a yes records the rejection; and the canonical cairn://p/... URIs where it was argued; at most 1500 characters",
+    "what the statement rests on, shown collapsed beneath it: why, in the terms it was argued; the alternatives ruled out, so a yes records the rejection; and the canonical cairn://p/... URIs where it was argued; as long as the argument needs",
 );
 const TENET_SUPERSEDES: KeySpec = KeySpec::new(
     "supersedes",

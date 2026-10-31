@@ -165,7 +165,8 @@ async fn a_proposal_is_refused_when_its_statement_is_blank_or_too_long() {
         "the refusal says where the essay goes: {over}"
     );
     assert!(over.contains("this statement is 201 characters"), "{over}");
-    assert_eq!(MAX_RATIONALE_CHARS, 1500);
+    // The rationale's bound is for abuse, not prose.
+    assert_eq!(MAX_RATIONALE_CHARS, 32_768);
     let long_rationale = refuse(with_rationale(
         "Short.",
         &"y".repeat(MAX_RATIONALE_CHARS + 1),
@@ -183,7 +184,29 @@ async fn a_proposal_is_refused_when_its_statement_is_blank_or_too_long() {
     assert_eq!(pending_count(&db, PROJECT).await.unwrap(), 0);
 }
 
-/// A statement at the cap with a rationale at its cap is accepted, and both
+/// A rationale is as long as the argument needs: one far past the statement's
+/// glance length, carrying the live case, the rejected alternatives, and
+/// provenance, is stored and read back whole.
+#[tokio::test]
+async fn a_long_rationale_is_stored_whole() {
+    let db = fixture("tenets-long-rationale.db").await;
+    let paragraph = "Rejected: a config.yaml key, because a branch could ungate itself; argued at cairn://p/prj/7.\n";
+    let rationale: String = paragraph.repeat(60).chars().take(5_000).collect();
+    assert_eq!(rationale.chars().count(), 5_000);
+    let rationale = rationale.trim().to_string();
+
+    let tenet = propose_ok(
+        &db,
+        &design(),
+        with_rationale("The gate lives on the project row.", &rationale),
+    )
+    .await;
+    assert_eq!(tenet.rationale.as_deref(), Some(rationale.as_str()));
+    let read = view(&db, tenet.number).await;
+    assert_eq!(read.row.rationale.as_deref(), Some(rationale.as_str()));
+}
+
+/// A statement at the cap with a rationale at its bound is accepted, and both
 /// read back; a blank rationale is no rationale.
 #[tokio::test]
 async fn a_statement_and_rationale_at_their_caps_are_proposed_and_read_back() {
@@ -770,8 +793,6 @@ async fn the_release_policy_refuses_ratified_and_is_operator_only() {
     let emitter = CapturingEmitter::new();
     let policy = load_policy(&db, PROJECT).await.unwrap();
     assert_eq!(policy.release, TenetRelease::Answered);
-    assert!(policy.gates_recipe("planbuild") && policy.gates_recipe("plancoord"));
-    assert!(!policy.gates_recipe("build"));
     assert_eq!(
         policy.label(),
         "Releases on: answered (unverified desktop answer)"
@@ -787,28 +808,8 @@ async fn the_release_policy_refuses_ratified_and_is_operator_only() {
             .unwrap(),
         TenetRelease::Answered
     );
-    assert_eq!(
-        set_gated_recipes(
-            &db,
-            &emitter,
-            PROJECT,
-            &["planbuild".into(), "PlanBuild".into(), "coordinator".into()]
-        )
-        .await
-        .unwrap(),
-        vec!["planbuild", "coordinator"]
-    );
-    assert!(!load_policy(&db, PROJECT)
-        .await
-        .unwrap()
-        .gates_recipe("PlanCoord"));
 
-    for key in [
-        "tenetRelease",
-        "tenet_release",
-        "tenetGatedRecipes",
-        "tenet_gated_recipes",
-    ] {
+    for key in ["tenetRelease", "tenet_release"] {
         let payload = serde_json::json!({ key: "answered" });
         assert_eq!(
             operator_only_policy_refusal(Some(&payload)),
@@ -819,4 +820,15 @@ async fn the_release_policy_refuses_ratified_and_is_operator_only() {
         operator_only_policy_refusal(Some(&serde_json::json!({"name": "x"}))),
         None
     );
+}
+
+/// Nothing proposes a `filing-gate` tenet any more, but tenets proposed that
+/// way before the filing keys were removed still read as what they were.
+#[test]
+fn a_filing_gate_origin_still_reads() {
+    assert_eq!(
+        TenetOrigin::parse("filing-gate"),
+        Some(TenetOrigin::FilingGate)
+    );
+    assert_eq!(TenetOrigin::FilingGate.as_str(), "filing-gate");
 }

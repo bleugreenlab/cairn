@@ -94,10 +94,6 @@ pub struct RunItem {
     /// the sole item in its batch and cannot carry batch execution options.
     #[serde(default, rename = "waitFor")]
     pub(crate) wait_for: Option<WaitFor>,
-    /// Positional argv supplied when expanding a stored procedure. This is
-    /// runtime-only state and can never be authored in a run item directly.
-    #[serde(skip)]
-    pub(crate) procedure_args: Vec<String>,
 }
 
 /// Ad-hoc, one-shot wait condition owned by the originating `run` tool call.
@@ -437,6 +433,7 @@ mod tests {
             verdict_environment_hash: None,
             toolchain_fingerprint: None,
             stop: None,
+            build_jobs: None,
         };
 
         let encoded = serde_json::to_string(&vec![wire]).unwrap();

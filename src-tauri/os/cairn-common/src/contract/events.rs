@@ -90,45 +90,79 @@ const ENDPOINT_NAME: KeySpec = KeySpec::new(
 const ENDPOINT_PROVIDER: KeySpec = KeySpec::new(
     "provider",
     KeyType::Str,
-    "first-party (the only provider available so far)",
+    "first-party, cairn-hmac, bearer, or github. The api generates an external endpoint's secret and this machine's keychain keeps it; linear is minted by its integration",
 );
 const ENDPOINT_TOPIC: KeySpec = KeySpec::new(
     "topic",
     KeyType::Str,
-    "the first-party topic to receive: cairn.bugs (bug.reported from the public bug sink)",
+    "first-party only, and required there: cairn.bugs (bug.reported from the public bug sink)",
+);
+const ENDPOINT_TYPE_FROM: KeySpec = KeySpec::new(
+    "type_from",
+    KeyType::Any,
+    "external only: where each event's type comes from, as the api's type_from takes it (default: the provider's own)",
+);
+const ENDPOINT_MAX_BODY_BYTES: KeySpec = KeySpec::new(
+    "max_body_bytes",
+    KeyType::Int,
+    "external only: the largest body the api accepts",
+);
+const ENDPOINT_RATE_PER_MIN: KeySpec = KeySpec::new(
+    "rate_per_min",
+    KeyType::Int,
+    "external only: deliveries per minute before the api refuses",
+);
+const ENDPOINT_ROTATE: KeySpec = KeySpec::new(
+    "rotate",
+    KeyType::Bool,
+    "true: replace the secret; the new one goes to this machine's keychain",
 );
 
 pub(crate) const PROJECT_EVENT_ENDPOINTS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectEventEndpoints,
     uri_template: "cairn://p/{project}/events/endpoints",
     name: "Project event endpoints",
-    description: "The ingress endpoints this install minted for the project: their topic, operator grant, health, and undelivered count. Their events become `ingress` rows in the project's events",
+    description: "The ingress endpoints this install minted for the project: their provider, URL, grant, health, and undelivered and rejected counts. Their events become `ingress` rows in the project's events. A secret never passes through here",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
     mutations: &[MutationSpec {
         mode: ChangeMode::Append,
-        required: &[ENDPOINT_NAME, ENDPOINT_PROVIDER, ENDPOINT_TOPIC],
-        optional: &[],
+        required: &[ENDPOINT_NAME, ENDPOINT_PROVIDER],
+        optional: &[
+            ENDPOINT_TOPIC,
+            ENDPOINT_TYPE_FROM,
+            ENDPOINT_MAX_BODY_BYTES,
+            ENDPOINT_RATE_PER_MIN,
+        ],
         label: "mint endpoint",
-        example: "write({changes:[{target:\"cairn://p/PROJECT/events/endpoints\",mode:\"append\",payload:{name:\"bugs\",provider:\"first-party\",topic:\"cairn.bugs\"}}]})",
+        example: "write({changes:[{target:\"cairn://p/PROJECT/events/endpoints\",mode:\"append\",payload:{name:\"ci\",provider:\"cairn-hmac\"}}]})",
     }],
 };
 pub(crate) const PROJECT_EVENT_ENDPOINT_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectEventEndpoint,
     uri_template: "cairn://p/{project}/events/endpoints/{name}",
     name: "Project event endpoint",
-    description: "One ingress endpoint: its topic, grant, and recent deliveries",
+    description: "One ingress endpoint: its provider, URL, grant, where its secret is kept, and recent deliveries",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
-    mutations: &[MutationSpec {
-        mode: ChangeMode::Delete,
-        required: &[],
-        optional: &[],
-        label: "revoke endpoint",
-        example: "write({changes:[{target:\"cairn://p/PROJECT/events/endpoints/NAME\",mode:\"delete\"}]})",
-    }],
+    mutations: &[
+        MutationSpec {
+            mode: ChangeMode::Patch,
+            required: &[ENDPOINT_ROTATE],
+            optional: &[],
+            label: "rotate endpoint secret",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/events/endpoints/NAME\",mode:\"patch\",payload:{rotate:true}}]})",
+        },
+        MutationSpec {
+            mode: ChangeMode::Delete,
+            required: &[],
+            optional: &[],
+            label: "revoke endpoint",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/events/endpoints/NAME\",mode:\"delete\"}]})",
+        },
+    ],
 };
 pub(crate) const PROJECT_EVENT_DELIVERY_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectEventDelivery,

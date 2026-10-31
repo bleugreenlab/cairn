@@ -166,6 +166,11 @@ pub enum SecretCategory {
     /// the Cairn API. Everything the account can do, it authorizes. Rotating
     /// means signing out and back in on this machine.
     AccountToken,
+    /// The secret an ingress endpoint's sender signs or authenticates with
+    /// (`cairn-hmac`, `bearer`, or a provider's webhook secret). Whoever holds
+    /// it can deliver events that wake threads. Rotating means rotating the
+    /// endpoint and handing the sender the new value.
+    IngressEndpointSecret,
 }
 
 impl SecretCategory {
@@ -181,6 +186,7 @@ impl SecretCategory {
             Self::ProviderToken => "provider-token",
             Self::ModelBackendKey => "model-backend-key",
             Self::AccountToken => "account-token",
+            Self::IngressEndpointSecret => "ingress-endpoint-secret",
         }
     }
 }

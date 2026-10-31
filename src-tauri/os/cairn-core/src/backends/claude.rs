@@ -2145,12 +2145,19 @@ mod launch_contract_tests {
 
     /// The environment every Claude launch has spawned with, byte for byte.
     fn expected_env(credential: (&str, &str)) -> HashMap<String, String> {
+        let tool_timeout_ms = cairn_common::callback_contract::AGENT_MCP_TOOL_TIMEOUT
+            .as_millis()
+            .to_string();
         [
             ("CAIRN_RUN_ID", "run-1"),
             ("CAIRN_MCP_SECRET", "mcp-secret"),
             ("ENABLE_TOOL_SEARCH", "false"),
             ("CLAUDE_CODE_ENABLE_TASKS", "false"),
-            ("MCP_TOOL_TIMEOUT", "604800000"),
+            ("MCP_TOOL_TIMEOUT", tool_timeout_ms.as_str()),
+            (
+                "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT",
+                tool_timeout_ms.as_str(),
+            ),
             ("GIT_AUTHOR_NAME", "Cairn Agent"),
             ("GIT_AUTHOR_EMAIL", "agent@example.com"),
             ("GIT_COMMITTER_NAME", "Cairn Agent"),

@@ -9,7 +9,7 @@
 //! The workflow engine resolves stored snapshots using `cairn-config` provider
 //! and preset rules. All workflow snapshot loads use this migration path.
 
-use crate::models::{ExecutionSnapshot, Fence, Model, ModelSelection};
+use crate::models::{DelegatedWorkPacket, ExecutionSnapshot, Fence, Model, ModelSelection};
 use cairn_config::presets::{resolve_selection_with_provenance, PresetsConfig};
 use cairn_models_types::catalog as providers;
 
@@ -90,6 +90,20 @@ fn migrate_ai_conditions(snapshot: &mut serde_json::Value) {
     }
 }
 
+/// Fold a packet's legacy `sandbox`/`onEscape` pair into its `fence`.
+pub fn migrate_packet_on_read(packet: &mut DelegatedWorkPacket) {
+    if packet.ownership.fence.is_none()
+        && (packet.ownership.sandbox.is_some() || packet.ownership.on_escape.is_some())
+    {
+        packet.ownership.fence = Some(Fence::from_legacy(
+            packet.ownership.sandbox,
+            packet.ownership.on_escape,
+        ));
+    }
+    packet.ownership.sandbox = None;
+    packet.ownership.on_escape = None;
+}
+
 /// Fold legacy per-agent flat `model`/`resolved_backend` (and frozen `presets`)
 /// into the atomic `selection` + `extras` representation, once.
 ///
@@ -109,17 +123,8 @@ fn migrate_ai_conditions(snapshot: &mut serde_json::Value) {
 /// elsewhere.
 fn migrate_on_read(snapshot: &mut ExecutionSnapshot) {
     let frozen = snapshot.presets.as_ref().map(PresetsConfig::from);
-    for packet in &mut snapshot.delegated_packets {
-        if packet.ownership.fence.is_none()
-            && (packet.ownership.sandbox.is_some() || packet.ownership.on_escape.is_some())
-        {
-            packet.ownership.fence = Some(Fence::from_legacy(
-                packet.ownership.sandbox,
-                packet.ownership.on_escape,
-            ));
-        }
-        packet.ownership.sandbox = None;
-        packet.ownership.on_escape = None;
+    for packet in &mut snapshot.inline_delegated_packets {
+        migrate_packet_on_read(packet);
     }
 
     for agent in snapshot.agents.values_mut() {

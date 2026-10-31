@@ -424,7 +424,7 @@ async fn follow_enrollment(
 /// failure.
 fn phase_label(phase: &str) -> &str {
     match phase {
-        "queued" => "waiting for another enrollment of this machine to finish",
+        "queued" => "waiting for another enrollment or removal of this machine to finish",
         "awaitingRunnerListener" => "waiting for this runner's executor listener",
         "validating" => "validating the request",
         "probingHost" => "probing the host and its platform",

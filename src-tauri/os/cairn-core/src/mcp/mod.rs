@@ -4,6 +4,7 @@
 //! types, and framework-agnostic handler logic used by the MCP callback server.
 //! Both Tauri and cairn-server dispatch to handlers in this module.
 
+pub mod answer_timeline;
 pub mod auth;
 pub mod diff;
 pub mod file_targets;

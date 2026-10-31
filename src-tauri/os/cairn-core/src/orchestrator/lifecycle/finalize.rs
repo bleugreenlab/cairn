@@ -3,10 +3,9 @@
 
 use crate::agent_process::process::JobPauseState;
 use crate::execution::jobs::GoalReconciliation;
-use crate::mcp::handlers::{emit_attention, AttentionEvent};
 use crate::models::{RunStatus, TurnEndReason, TurnState};
 use crate::orchestrator::Orchestrator;
-use crate::storage::{run_db_blocking, DbError, RowExt};
+use crate::storage::{run_db_blocking, RowExt};
 
 use super::common::*;
 use super::review_push::{emit_for_turn_end, spawn_checks_settled_edge, spawn_turn_end_checks};
@@ -97,16 +96,7 @@ pub fn transition_to_warm_state(
             // in-flight `watch` learns the issue is actionable (or resolved)
             // without depending on the recompute sweep poke that this work
             // is replacing.
-            let needs_attention = emit_for_turn_end(orch, &job_id);
-            // Raise the desktop "completed" toast only when that idle left
-            // something for the driver/user to act on — a plan awaiting
-            // confirmation, a PR awaiting merge, a pending question, or a
-            // terminal status. A bare turn-end with no work left (e.g. a planner
-            // that just spawned child tasks and is now waiting on them) is not a
-            // completion worth pinging about (CAIRN-1625).
-            if needs_attention {
-                emit_agent_terminal_attention_once(orch, run_id, "completed");
-            }
+            emit_for_turn_end(orch, &job_id);
             // Flush any directs/side-channel notices queued mid-turn for this
             // run. If this turn was the run's last, no further prompt boundary
             // fires, so without this they would sit unclaimed (CAIRN-1297).
@@ -758,11 +748,8 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
 /// Which of finalization's side effects a terminal run gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FinalizeEffects {
-    /// Everything, including the failed-agent alarm for a crash.
+    /// Everything.
     Ordinary,
-    /// Everything except the failed-agent alarm: an automatic successor is
-    /// already planned for the crashed turn.
-    Recovery,
     /// Terminalize the run and release what it held, and nothing else. An
     /// operator Compact owns this job's continuation: it settled the turns
     /// itself, re-derives the job itself, and launches the successor session
@@ -773,16 +760,17 @@ enum FinalizeEffects {
     OperatorCompact,
 }
 
-/// Finalize a crashed turn that already has an automatic successor planned.
-/// The old turn is still interrupted and the run terminalized, but publishing a
-/// failed-agent attention between those two turns would turn recovery into a
-/// false operator alarm.
+/// Finalize a crashed turn whose automatic successor the caller is about to
+/// launch, reporting a failure rather than logging it. The operator's
+/// "agent failed" entry is derived from the job's current turn, so the
+/// successor turn resolves it on its own; a successor that never launches
+/// leaves it open, which is the truth.
 pub(crate) fn finalize_run_for_recovery(
     orch: &Orchestrator,
     run_id: &str,
     status: RunStatus,
 ) -> Result<(), String> {
-    finalize_run_inner(orch, run_id, status, FinalizeEffects::Recovery)
+    finalize_run_inner(orch, run_id, status, FinalizeEffects::Ordinary)
 }
 
 /// Finalize a run an operator Compact killed. See
@@ -795,28 +783,12 @@ pub(crate) fn finalize_run_for_operator_compact(
     finalize_run_inner(orch, run_id, status, FinalizeEffects::OperatorCompact)
 }
 
-/// Restore the failure signal when successor launch fails after recovery-aware
-/// finalization suppressed it.
-pub(crate) fn report_recovery_launch_failure(orch: &Orchestrator, run_id: &str) {
-    emit_agent_terminal_attention_once(orch, run_id, "failed");
-}
-
-fn should_emit_terminal_failure_attention(
-    requested: bool,
-    had_active_turn: bool,
-    status: &RunStatus,
-    has_reseed_fallback: bool,
-) -> bool {
-    requested && had_active_turn && *status == RunStatus::Crashed && !has_reseed_fallback
-}
-
 fn finalize_run_inner(
     orch: &Orchestrator,
     run_id: &str,
     status: RunStatus,
     effects: FinalizeEffects,
 ) -> Result<(), String> {
-    let emit_terminal_failure_attention = effects == FinalizeEffects::Ordinary;
     let mut first_error = None;
     // A finalized run's agent must not keep acting through the HTTP MCP
     // endpoint. First, so every terminal path below (the already-finalized
@@ -1086,26 +1058,12 @@ fn finalize_run_inner(
     let _ = orch.run_completions.send(run_id.to_string());
 
     // Crash observability, and the decision to self-heal a native resume the
-    // backend reported unresolvable. Computed here — before the terminal
-    // attention toast — so a planned fallback suppresses the failure alarm.
+    // backend reported unresolvable.
     let reseed_fallback = if status == RunStatus::Crashed {
         handle_session_crash(orch, run_id)
     } else {
         None
     };
-
-    // Completion attention fires when the agent goes idle/warm. Finalization is
-    // only a legacy toast source for genuine crash paths that terminalize an
-    // in-flight turn without reaching the idle boundary first. A crash we are
-    // about to recover from is a self-healing event, not a failure to report.
-    if should_emit_terminal_failure_attention(
-        emit_terminal_failure_attention,
-        had_active_turn,
-        &status,
-        reseed_fallback.is_some(),
-    ) {
-        emit_agent_terminal_attention_once(orch, run_id, "failed");
-    }
 
     // Last statement: the fallback opens a NEW turn on this job, so the job's
     // derived state (recompute, DAG advance, turn-end emits above) must have
@@ -1322,79 +1280,6 @@ pub(crate) fn run_digest_reseed_fallback(orch: &Orchestrator, plan: &DigestResee
     }
 }
 
-/// Emit legacy `agent-attention` terminal toast once per run, but only for top-level jobs.
-fn emit_agent_terminal_attention_once(
-    orch: &Orchestrator,
-    run_id: &str,
-    attention_type: &'static str,
-) {
-    let inserted = {
-        let mut seen = orch.agent_completion_attention_dedupe.lock().unwrap();
-        seen.insert(run_id.to_string())
-    };
-    if !inserted {
-        log::debug!(
-            "Suppressing duplicate legacy agent-attention terminal event for run {} ({})",
-            run_id,
-            attention_type
-        );
-        return;
-    }
-
-    let dbs = orch.db.clone();
-    let run_id = run_id.to_string();
-    let row = run_db_blocking(move || async move {
-        let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        db.read(|conn| {
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT projects.key, jobs.id
-                         FROM runs
-                         JOIN jobs ON runs.job_id = jobs.id
-                         JOIN projects ON jobs.project_id = projects.id
-                         WHERE runs.id = ?1
-                           AND jobs.parent_job_id IS NULL
-                           AND runs.job_id IS NOT NULL",
-                        (run_id.as_str(),),
-                    )
-                    .await?;
-                let row = rows
-                    .next()
-                    .await?
-                    .map(|row| Ok::<_, DbError>((row.text(0)?, row.text(1)?)))
-                    .transpose()?;
-                drop(rows);
-                let Some((project_key, job_id)) = row else {
-                    return Ok(None);
-                };
-                let home_uri = crate::jobs::queries::home_uri_for_job_conn(conn, &job_id).await?;
-                Ok(Some((project_key, home_uri)))
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())
-    })
-    .ok()
-    .flatten();
-
-    let Some((project_key, home_uri)) = row else {
-        return;
-    };
-
-    emit_attention(
-        &*orch.services.emitter,
-        &AttentionEvent {
-            attention_type,
-            project_key: &project_key,
-            home_uri: home_uri.as_deref(),
-            tool_name: None,
-        },
-    );
-}
-
 #[cfg(test)]
 mod session_reseed_fallback_tests {
     use super::{claim_reseed_fallback, should_fall_back_to_digest_reseed};
@@ -1468,54 +1353,6 @@ mod session_reseed_fallback_tests {
         // A distinct session identity — including the one a reseed rotates to —
         // gets its own attempt.
         assert!(claim_reseed_fallback(&attempted, "session-b"));
-    }
-}
-
-#[cfg(test)]
-mod recovery_finalization_tests {
-    use super::should_emit_terminal_failure_attention;
-    use crate::models::RunStatus;
-
-    #[test]
-    fn planned_recovery_suppresses_intermediate_failure_attention() {
-        assert!(!should_emit_terminal_failure_attention(
-            false,
-            true,
-            &RunStatus::Crashed,
-            false,
-        ));
-    }
-
-    #[test]
-    fn ordinary_or_failed_recovery_publishes_failure_attention() {
-        assert!(should_emit_terminal_failure_attention(
-            true,
-            true,
-            &RunStatus::Crashed,
-            false,
-        ));
-    }
-
-    #[test]
-    fn inactive_clean_or_reseeded_runs_do_not_publish_failure_attention() {
-        assert!(!should_emit_terminal_failure_attention(
-            true,
-            false,
-            &RunStatus::Crashed,
-            false,
-        ));
-        assert!(!should_emit_terminal_failure_attention(
-            true,
-            true,
-            &RunStatus::Exited,
-            false,
-        ));
-        assert!(!should_emit_terminal_failure_attention(
-            true,
-            true,
-            &RunStatus::Crashed,
-            true,
-        ));
     }
 }
 

@@ -29,6 +29,66 @@ use crate::resources::mutations::{
 use cairn_common::authorization::AuthorityRequest;
 use cairn_platform::stack::off_frame;
 
+/// The first item that addresses a node's `rebase` resource. Both of its
+/// actions (`replay`, `fast-forward-from-origin`) take the project store lock
+/// inline, which a batch carrying file edits already holds for its whole
+/// logical transaction, and that lock is not reentrant.
+fn rebase_item_index(changes: &[crate::mcp::types::ChangeItem]) -> Option<usize> {
+    changes.iter().position(|item| {
+        cairn_common::uri::parse_uri(&item.target)
+            .and_then(|parsed| crate::resources::delegate_thread_descendant(parsed).ok())
+            .is_some_and(|resource| {
+                matches!(
+                    resource,
+                    cairn_common::uri::CairnResource::NodeRebase { .. }
+                )
+            })
+    })
+}
+
+/// What a page-origin batch may not be: anything but structured row writes to
+/// canonical thread-database targets, with no batch-level coordinate.
+///
+/// The page bridge (`pages::write`) checks the page's manifest before it
+/// dispatches; this is the write path's own floor under it, so a request
+/// carrying a page origin reaches nothing else here however it was built: not
+/// a file, not an operator-only resource such as a tenet verdict or a
+/// settings section, and not a `cairn:~/` shorthand that would need a run to
+/// resolve. Ownership of the named thread is then `owned_thread_scope`'s, which
+/// takes the owner from the same origin.
+fn page_origin_refusal(payload: &ChangePayload) -> Option<(usize, String)> {
+    if payload.commit_msg.is_some() || payload.branch.is_some() || payload.preview.is_some() {
+        return Some((
+            0,
+            "a page write carries only changes and atomic: commit_msg, branch and preview are refused"
+                .to_string(),
+        ));
+    }
+    payload.changes.iter().enumerate().find_map(|(index, item)| {
+        let resource = cairn_common::uri::parse_uri(&item.target)
+            .and_then(|parsed| crate::resources::delegate_thread_descendant(parsed).ok());
+        let allowed = matches!(
+            (resource, item.mode),
+            (
+                Some(cairn_common::uri::CairnResource::ThreadDbTable { .. }),
+                ChangeMode::Append
+            ) | (
+                Some(cairn_common::uri::CairnResource::ThreadDbRow { .. }),
+                ChangeMode::Patch | ChangeMode::Delete
+            )
+        );
+        (!allowed).then(|| {
+            (
+                index,
+                format!(
+                    "{}: a page writes only rows of its owning thread's tables (append to .../db/<table>, patch or delete .../db/<table>/<pk>)",
+                    item.target
+                ),
+            )
+        })
+    })
+}
+
 /// A single-failure change report for an item refused before anything applied.
 fn deny_change(changes: &[crate::mcp::types::ChangeItem], index: usize, message: String) -> String {
     let IndexedFailure { failure, .. } = *build_failure(index, &changes[index], message);
@@ -609,6 +669,11 @@ async fn handle_write_attempt(
         Ok(payload) => payload,
         Err(error) => return error,
     };
+    if request.page_write_origin().is_some() && !payload.changes.is_empty() {
+        if let Some((index, message)) = page_origin_refusal(&payload) {
+            return deny_change(&payload.changes, index, message);
+        }
+    }
 
     // Resolve home-relative (`cairn:~/...`) targets to canonical up front, so
     // blocking-append classification — which runs on the raw target before the
@@ -688,6 +753,21 @@ async fn handle_write_attempt(
                 &payload.changes,
                 memory_index,
                 "Refusing memory promotion in a minted-branch batch: crash recovery cannot reconstruct the promotion bookkeeping after the commit is sealed. Promote the memory in a separate write; ordinary resource mutations remain supported alongside minting.".to_string(),
+            );
+        }
+    }
+
+    // A file-bearing batch holds the store lock from head resolution through the
+    // seal, and dispatches its resource items inside that hold. A rebase action
+    // dispatched there would queue on the lock its own batch holds and never be
+    // served. Refused here, before preview or any acquisition, so the preview
+    // answers exactly what the apply would.
+    if has_file_targets {
+        if let Some(index) = rebase_item_index(&payload.changes) {
+            return deny_change(
+                &payload.changes,
+                index,
+                "Refusing cairn:~/rebase in a batch with file edits: its replay and fast-forward-from-origin actions take the project's version-control store lock, which this batch's file commit holds until it seals. Nothing in this batch was applied. Send the file edits with their commit_msg as one write, then the cairn:~/rebase patch as its own write.".to_string(),
             );
         }
     }
@@ -904,6 +984,15 @@ async fn handle_write_attempt(
         use crate::mcp::handlers::authority::{self, AuthorityGate};
         let deny =
             |index: usize, msg: String| -> String { deny_change(&payload.changes, index, msg) };
+        // A page has no one to ask and holds no grant: an approval boundary is
+        // closed to it rather than raised.
+        if request.page_write_origin().is_some() {
+            let index = authority_requests[0].0;
+            return deny(
+                index,
+                "Refused: a page write never crosses an approval boundary".to_string(),
+            );
+        }
         // An authenticated principal is the one hard requirement: a grant has to
         // be attributable to someone, so a request with no resolvable run is
         // refused rather than written.

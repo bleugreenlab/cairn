@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use cairn_models_types::catalog::VerbKind;
+use cairn_models_types::catalog::{Modalities, VerbKind};
 use serde::{Deserialize, Serialize};
 
 use crate::inventory::ValidationError;
@@ -31,6 +31,11 @@ pub struct Recipe {
     /// engine's flags.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verbs: Option<BTreeSet<VerbKind>>,
+    /// What the model takes in and gives out. `None` is unknown, for the same
+    /// reason as `verbs`; what is served for an unknown recipe is
+    /// [`crate::served::modalities`]'s to say, never a guess from its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modalities: Option<Modalities>,
     pub engine: Engine,
     pub requirements: Requirements,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -268,6 +273,7 @@ mod tests {
             served_name: "m".into(),
             upstream_id: None,
             verbs: None,
+            modalities: None,
             engine,
             requirements: Requirements {
                 machines: 1,

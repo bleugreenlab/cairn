@@ -1,6 +1,6 @@
 //! Parsing of cairn:// URIs into `CairnResource` / `CairnResourceUri`.
 
-use super::build::canonical_project;
+use super::build::{canonical_project, decode_path_segment};
 use super::types::{
     is_reserved_node_segment, AttachmentRef, AttachmentScopeRef, CairnResource, CairnResourceUri,
     DEFAULT_BROWSER_SLUG, PROJECT_SCOPE,
@@ -98,6 +98,16 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
 
     match parts.as_slice() {
         ["db"] => Some(CairnResource::Db),
+        // `cairn://db/schema` parses as a table named `schema` so the read can
+        // refuse it with the reserved-segment reason, rather than becoming an
+        // unknown URI.
+        ["db", table] => Some(CairnResource::DbTable {
+            table: decode_path_segment(table).ok()?,
+        }),
+        ["db", table, pk] => Some(CairnResource::DbRow {
+            table: decode_path_segment(table).ok()?,
+            pk: decode_path_segment(pk).ok()?,
+        }),
         ["dev"] => Some(CairnResource::Dev),
         ["dev", "db"] => Some(CairnResource::DevDb),
         ["dev", "pid"] => Some(CairnResource::DevPid),
@@ -120,7 +130,11 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["inference"] => Some(CairnResource::Inference),
         ["inference", "recipes"] => Some(CairnResource::InferenceRecipes),
         ["inference", "deployments"] => Some(CairnResource::InferenceDeployments),
+        ["inference", "deployments", id] => Some(CairnResource::InferenceDeployment {
+            id: (*id).to_string(),
+        }),
         ["inference", "pools"] => Some(CairnResource::InferencePools),
+        ["inference", "requests"] => Some(CairnResource::InferenceRequests),
         ["models", "sessions"] => Some(CairnResource::ModelsSessions),
         ["models", "sessions", id] => Some(CairnResource::ModelsSession {
             id: (*id).to_string(),
@@ -272,6 +286,32 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 era_seq: parse_positive_i32(era_seq)?,
             })
         }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "pages"] => {
+            Some(CairnResource::NodePages {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "pages", name] => {
+            Some(CairnResource::NodePage {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                name: (*name).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "pages", name, "log"] => {
+            Some(CairnResource::NodePageLog {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                name: (*name).to_string(),
+            })
+        }
         ["recipes"] => Some(CairnResource::Recipes),
         ["recipes", recipe_id] => Some(CairnResource::Recipe {
             recipe_id: (*recipe_id).to_string(),
@@ -294,6 +334,30 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
             Some(CairnResource::ProjectWorkflow {
                 project: canonical_project(project),
                 workflow_id: (*workflow_id).to_string(),
+            })
+        }
+        // `services` is a reserved project segment. These precede the thread
+        // arm and every `[p, project, <number>, ...]` arm, whose
+        // `parse_positive_i32("services")?` would abort the whole parse. The
+        // service id's own grammar is validated where services are declared,
+        // not here.
+        [PROJECT_SCOPE, project, "services"] => Some(CairnResource::ProjectServices {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "services", service] => Some(CairnResource::ProjectService {
+            project: canonical_project(project),
+            service: (*service).to_string(),
+        }),
+        [PROJECT_SCOPE, project, "services", service, "status"] => {
+            Some(CairnResource::ProjectServiceStatus {
+                project: canonical_project(project),
+                service: (*service).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, "services", service, "log"] => {
+            Some(CairnResource::ProjectServiceLog {
+                project: canonical_project(project),
+                service: (*service).to_string(),
             })
         }
         // The fact log. `events` is a reserved route id and a reserved project
@@ -448,6 +512,11 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 key: (*key).to_string(),
             })
         }
+        // Must precede the thread arm below: a literal `pages` segment names
+        // the project's page index, not a thread of that name.
+        [PROJECT_SCOPE, project, "pages"] => Some(CairnResource::ProjectPages {
+            project: canonical_project(project),
+        }),
         // Must precede the thread arm below: a literal `codemap` segment names
         // this projection, not a thread of that name.
         [PROJECT_SCOPE, project, "codemap"] => Some(CairnResource::ProjectCodemap {
@@ -532,7 +601,7 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         // Every thread sub-path stops here, as an anonymous `Thread { path }`.
         //
         // This parser deliberately owns NONE of the thread sub-path vocabulary:
-        // what `db`, `procedures/<name>`, `automations/<id>`, `branches/<n>`,
+        // what `db`, `services/<name>`, `pages/<name>`, `branches/<n>`,
         // `chat/turn/<n>`, or `task/<name>/...` MEAN under a thread is decided
         // in exactly one place, cairn-core's `delegate_thread_descendant`, which
         // read dispatch, write dispatch, and run-target expansion all call. A

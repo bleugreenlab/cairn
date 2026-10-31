@@ -1153,7 +1153,7 @@ mod tests {
             ws.orch
                 .fact_log
                 .index
-                .routes(&ws.orch.config_dir, None)
+                .routes(&ws.orch.config_dir, None, ws.orch.services.clock.now())
                 .unwrap()
                 .routes_for("github_comment")
                 .count()
@@ -1173,12 +1173,14 @@ mod tests {
     async fn a_resource_delete_of_a_shipped_item_survives_the_next_sync() {
         let ws = workspace().await;
         let request = crate::mcp::types::McpCallbackRequest {
+            answer_bound_ms: None,
             cwd: "/empty/scratch".to_string(),
             run_id: None,
             tool: "write".to_string(),
             payload: serde_json::Value::Null,
             tool_use_id: None,
             thread_id: None,
+            origin: None,
         };
         let events_before = pack_events(&ws);
         super::super::routes::delete(&ws.orch, &request, "ping", None, false)

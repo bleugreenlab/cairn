@@ -1,5 +1,6 @@
 //! Shared `#[cfg(test)]` helpers used across the module test suites.
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use cairn_common::protocol::CallbackRequest;
@@ -14,13 +15,21 @@ use crate::sink::CallbackSink;
 /// request it was handed.
 pub(crate) struct RecordingSink {
     outcome: CallbackOutcome,
+    /// How long each call is held before it answers, as a host holds a long
+    /// `run` or a blocking append.
+    hold: Duration,
     requests: Mutex<Vec<CallbackRequest>>,
 }
 
 impl RecordingSink {
     pub(crate) fn answering(outcome: CallbackOutcome) -> Arc<Self> {
+        Self::answering_after(outcome, Duration::ZERO)
+    }
+
+    pub(crate) fn answering_after(outcome: CallbackOutcome, hold: Duration) -> Arc<Self> {
         Arc::new(Self {
             outcome,
+            hold,
             requests: Mutex::new(Vec::new()),
         })
     }
@@ -34,6 +43,9 @@ impl RecordingSink {
 impl CallbackSink for RecordingSink {
     async fn call(&self, request: &CallbackRequest) -> CallbackOutcome {
         self.requests.lock().unwrap().push(request.clone());
+        if !self.hold.is_zero() {
+            tokio::time::sleep(self.hold).await;
+        }
         self.outcome.clone()
     }
 

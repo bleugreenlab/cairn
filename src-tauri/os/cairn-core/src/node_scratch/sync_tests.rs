@@ -1,0 +1,314 @@
+//! The scratch sync end to end, without execution cells: two replicas (two
+//! machines' worth of `cairn_exec::node_scratch`, each with its own root and
+//! object-channel credential) against the runner's own `scratch/*` router over
+//! loopback HTTP, folding into the authority row and store.
+//!
+//! What a batch adds around this (placement, `$TMPDIR`, the run-result line)
+//! is covered by the two-machine acceptance suite; this is the transfer, the
+//! merge, and the ceiling, with nothing simulated.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use cairn_common::executor_protocol::{
+    NodeScratchGrant, ScratchSyncReport, ScratchWriteBackOutcome,
+};
+use cairn_exec::node_scratch::{self as replica, Replicas, ScratchTransport};
+
+use super::owner::{self, NodeScratch, ScratchOwner};
+use crate::db::DbState;
+use crate::orchestrator::Orchestrator;
+use crate::services::testing::TestServicesBuilder;
+use crate::storage::{LocalDb, SearchIndex};
+
+struct Machine {
+    replicas: Replicas,
+    transport: ScratchTransport,
+    writer: &'static str,
+}
+
+struct World {
+    _temp: tempfile::TempDir,
+    orch: Orchestrator,
+    scratch_id: String,
+    a: Machine,
+    b: Machine,
+}
+
+impl World {
+    async fn scratch(&self) -> NodeScratch {
+        owner::load(&self.orch.db.local, &self.scratch_id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// A grant as the runner would issue it now.
+    async fn grant(&self) -> NodeScratchGrant {
+        let scratch = self.scratch().await;
+        let ceiling = owner::ceiling_bytes(&self.orch, &scratch.project_id).await;
+        scratch.grant(ceiling)
+    }
+}
+
+impl Machine {
+    async fn prepare(&self, grant: &NodeScratchGrant) -> replica::Prepared {
+        replica::prepare(&self.replicas, Some(&self.transport), grant, self.writer)
+            .await
+            .expect("prepare the scratch")
+    }
+
+    async fn finish(&self, prepared: replica::Prepared) -> ScratchSyncReport {
+        replica::finish(&self.replicas, Some(&self.transport), prepared, self.writer).await
+    }
+}
+
+/// A project whose repository carries `config` as its `.cairn/config.yaml`.
+async fn world(config: Option<&str>) -> World {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".cairn")).unwrap();
+    if let Some(config) = config {
+        std::fs::write(repo.join(".cairn/config.yaml"), config).unwrap();
+    }
+    let config_dir = temp.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let local = LocalDb::open_migrated_for_test(config_dir.join("sync.db"))
+        .await
+        .unwrap();
+    local
+        .execute(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p', 'default', 'P', 'nsc', ?1, 1, 1)",
+            (repo.display().to_string(),),
+        )
+        .await
+        .unwrap();
+    let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
+    let orch = Orchestrator::builder(
+        Arc::new(DbState::new(Arc::new(local), search)),
+        Arc::new(TestServicesBuilder::new().build()),
+        config_dir,
+    )
+    .build();
+    let scratch = owner::open_for_owner(
+        &orch.db.local,
+        &ScratchOwner {
+            job_id: "job".into(),
+            uri: "cairn://p/nsc/1/1/builder".into(),
+            project_id: "p".into(),
+            thread_id: None,
+            issue_id: Some("issue".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = axum::Router::new().nest_service("/scratch", super::plane::router(orch.clone()));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let machine = |id: &'static str, writer: &'static str, root: PathBuf| {
+        let (token, _) = orch.object_plane.issue_credential(
+            id,
+            &format!("{id}-device"),
+            "runner",
+            1,
+            chrono::Utc::now().timestamp_millis() as u64,
+        );
+        orch.object_plane.scratch.authorize(id, 1, &scratch.id);
+        Machine {
+            replicas: Replicas::new(root),
+            transport: ScratchTransport::new(format!("http://{address}"), token),
+            writer,
+        }
+    };
+    let a = machine("machine-a", "wa", temp.path().join("a/node-scratch"));
+    let b = machine("machine-b", "wb", temp.path().join("b/node-scratch"));
+    World {
+        scratch_id: scratch.id,
+        _temp: temp,
+        orch,
+        a,
+        b,
+    }
+}
+
+fn applied(report: &ScratchSyncReport) -> &ScratchWriteBackOutcome {
+    &report.write_back.as_ref().expect("a write-back").outcome
+}
+
+fn read(tree: &Path, path: &str) -> Option<String> {
+    std::fs::read_to_string(tree.join(path)).ok()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_written_on_one_machine_is_read_on_another() {
+    let world = world(None).await;
+    let on_a = world.a.prepare(&world.grant().await).await;
+    std::fs::create_dir_all(on_a.tree.join("extract/pilot")).unwrap();
+    std::fs::write(on_a.tree.join("extract/pilot/rows.csv"), "id,value\n1,2\n").unwrap();
+    let report = world.a.finish(on_a).await;
+    assert!(
+        matches!(applied(&report), ScratchWriteBackOutcome::Applied { conflicts, .. } if conflicts.is_empty()),
+        "{report:?}"
+    );
+    assert!(report.write_back.as_ref().unwrap().bytes > 0);
+    assert!(!report.dirty);
+
+    let scratch = world.scratch().await;
+    assert_eq!(scratch.head_commit, report.synced_commit);
+    assert_eq!(scratch.head_executor_id.as_deref(), Some("machine-a"));
+    assert_eq!(scratch.head_seq, 1);
+
+    let on_b = world.b.prepare(&world.grant().await).await;
+    assert_eq!(
+        read(&on_b.tree, "extract/pilot/rows.csv").as_deref(),
+        Some("id,value\n1,2\n"),
+        "the second machine's first batch reads what the first machine wrote"
+    );
+    let report = world.b.finish(on_b).await;
+    let materialized = report.materialize.expect("brought current");
+    assert!(materialized.bytes > 0, "{materialized:?}");
+    assert_eq!(materialized.to_commit, scratch.head_commit);
+    assert!(materialized.deferred_reason.is_none());
+    assert!(report.write_back.is_none(), "nothing changed on b");
+
+    // Unchanged bytes never move twice: a again, already at the head.
+    let again = world.a.prepare(&world.grant().await).await;
+    let report = world.a.finish(again).await;
+    assert!(report.materialize.is_none(), "{report:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_writers_to_one_path_both_survive_and_the_conflict_is_named() {
+    let world = world(None).await;
+    let seed = world.a.prepare(&world.grant().await).await;
+    std::fs::write(seed.tree.join("report.md"), "draft\n").unwrap();
+    world.a.finish(seed).await;
+
+    // Both machines start from the same head, as two task batches would.
+    let grant = world.grant().await;
+    let on_a = world.a.prepare(&grant).await;
+    let on_b = world.b.prepare(&grant).await;
+    std::fs::write(on_a.tree.join("report.md"), "from a\n").unwrap();
+    std::fs::write(on_b.tree.join("report.md"), "from b\n").unwrap();
+    std::fs::write(on_b.tree.join("only-b"), "b\n").unwrap();
+    let first = world.a.finish(on_a).await;
+    assert!(matches!(
+        applied(&first),
+        ScratchWriteBackOutcome::Applied { .. }
+    ));
+    let second = world.b.finish(on_b).await;
+    let ScratchWriteBackOutcome::Applied { conflicts, .. } = applied(&second) else {
+        panic!("the second writer folds in: {second:?}");
+    };
+    assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+    assert_eq!(conflicts[0].path.display(), "report.md");
+    assert_eq!(conflicts[0].written_as.display(), "report.md~conflict-wb");
+    assert!(!second.dirty, "b was brought to the merged head");
+
+    for machine in [&world.a, &world.b] {
+        let prepared = machine.prepare(&world.grant().await).await;
+        assert_eq!(
+            read(&prepared.tree, "report.md").as_deref(),
+            Some("from a\n")
+        );
+        assert_eq!(
+            read(&prepared.tree, "report.md~conflict-wb").as_deref(),
+            Some("from b\n")
+        );
+        assert_eq!(read(&prepared.tree, "only-b").as_deref(), Some("b\n"));
+        machine.finish(prepared).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_back_past_the_ceiling_is_refused_by_name_and_moves_nothing() {
+    let world = world(Some("scratch:\n  ceilingMiB: 1\n")).await;
+    let grant = world.grant().await;
+    assert_eq!(grant.ceiling_bytes, 1024 * 1024);
+    let seed = world.a.prepare(&grant).await;
+    std::fs::write(seed.tree.join("small"), "kept\n").unwrap();
+    world.a.finish(seed).await;
+    let head = world.scratch().await.head_commit;
+
+    let on_a = world.a.prepare(&world.grant().await).await;
+    let big = vec![7u8; 2 * 1024 * 1024];
+    std::fs::write(on_a.tree.join("export.bin"), &big).unwrap();
+    let tree = on_a.tree.clone();
+    let report = world.a.finish(on_a).await;
+    let ScratchWriteBackOutcome::Refused(refusal) = applied(&report) else {
+        panic!("past the ceiling must be refused: {report:?}");
+    };
+    assert_eq!(refusal.owner_uri, "cairn://p/nsc/1/1/builder");
+    assert_eq!(refusal.ceiling_bytes, 1024 * 1024);
+    assert_eq!(refusal.merged_bytes, big.len() as u64 + 5);
+    assert_eq!(refusal.largest[0].path, "export.bin");
+    assert!(report.dirty);
+    assert_eq!(
+        std::fs::read(tree.join("export.bin")).unwrap(),
+        big,
+        "a refusal leaves the files exactly where they were"
+    );
+    assert_eq!(world.scratch().await.head_commit, head, "nothing moved");
+    let replicas = owner::replicas(&world.orch.db.local, &world.scratch_id)
+        .await
+        .unwrap();
+    let a = replicas
+        .iter()
+        .find(|replica| replica.executor_id == "machine-a")
+        .unwrap();
+    assert!(a.dirty);
+    assert_eq!(a.refused_bytes, Some(big.len() as u64 + 5));
+
+    // Another machine meanwhile runs against the head as last synced.
+    let on_b = world.b.prepare(&world.grant().await).await;
+    assert!(!on_b.tree.join("export.bin").exists());
+    assert_eq!(read(&on_b.tree, "small").as_deref(), Some("kept\n"));
+    world.b.finish(on_b).await;
+
+    // The next batch on a sees its files and is refused again by name...
+    let again = world.a.prepare(&world.grant().await).await;
+    assert!(again.tree.join("export.bin").exists());
+    let report = world.a.finish(again).await;
+    assert!(matches!(
+        applied(&report),
+        ScratchWriteBackOutcome::Refused(_)
+    ));
+    // ...until it shrinks the scratch, when it syncs.
+    let shrunk = world.a.prepare(&world.grant().await).await;
+    std::fs::remove_file(shrunk.tree.join("export.bin")).unwrap();
+    std::fs::write(shrunk.tree.join("summary"), "2 MiB of sevens\n").unwrap();
+    let report = world.a.finish(shrunk).await;
+    assert!(
+        matches!(applied(&report), ScratchWriteBackOutcome::Applied { .. }),
+        "{report:?}"
+    );
+    assert!(!report.dirty);
+    let on_b = world.b.prepare(&world.grant().await).await;
+    assert_eq!(
+        read(&on_b.tree, "summary").as_deref(),
+        Some("2 MiB of sevens\n")
+    );
+    world.b.finish(on_b).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_is_never_moved_back_to_an_older_head() {
+    let world = world(None).await;
+    let first = world.a.prepare(&world.grant().await).await;
+    std::fs::write(first.tree.join("state"), "one\n").unwrap();
+    world.a.finish(first).await;
+    // A grant built before a's next write-back lands...
+    let stale = world.grant().await;
+    let second = world.a.prepare(&stale).await;
+    std::fs::write(second.tree.join("state"), "two\n").unwrap();
+    world.a.finish(second).await;
+    // ...must not take a back to the head it names.
+    let late = world.a.prepare(&stale).await;
+    assert_eq!(read(&late.tree, "state").as_deref(), Some("two\n"));
+    let report = world.a.finish(late).await;
+    assert!(report.materialize.is_none(), "{report:?}");
+}

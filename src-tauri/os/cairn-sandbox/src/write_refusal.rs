@@ -213,6 +213,7 @@ mod tests {
             deny_read: Vec::new(),
             writable_regex: Vec::new(),
             worktree_writable: true,
+            socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
         })
     }

@@ -24,13 +24,18 @@ const BOOT_AT: i64 = 1_000_000;
 const RESTART_NOTE: &str = "Cairn restarted while your previous turn was in progress";
 const ORPHAN_NOTE: &str = "Cairn restarted before your queued turn started";
 
-fn test_orchestrator(db: LocalDb) -> Orchestrator {
+fn test_orchestrator(db: LocalDb, recovery_pending: bool) -> Orchestrator {
     let root = tempfile::tempdir().unwrap().keep();
     let state = Arc::new(DbState::new(
         Arc::new(db),
         Arc::new(SearchIndex::open_or_create(root.join("search.db")).unwrap()),
     ));
-    Orchestrator::builder(state, Arc::new(TestServicesBuilder::new().build()), root).build()
+    let builder = Orchestrator::builder(state, Arc::new(TestServicesBuilder::new().build()), root);
+    if recovery_pending {
+        builder.startup_recovery_pending().build()
+    } else {
+        builder.build()
+    }
 }
 
 /// A provider that records the prompt each launch carried and registers a
@@ -98,7 +103,20 @@ async fn host(
     Arc<Mutex<Vec<String>>>,
     crate::orchestrator::session::OrchestratorTestSessionBackend,
 ) {
-    let orch = test_orchestrator(migrated_test_db(name).await);
+    host_with(name, false).await
+}
+
+/// [`host`], optionally still inside startup recovery.
+async fn host_with(
+    name: &str,
+    recovery_pending: bool,
+) -> (
+    Orchestrator,
+    Arc<LocalDb>,
+    Arc<Mutex<Vec<String>>>,
+    crate::orchestrator::session::OrchestratorTestSessionBackend,
+) {
+    let orch = test_orchestrator(migrated_test_db(name).await, recovery_pending);
     let db = orch.db.local.clone();
     db.execute_script(
         "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
@@ -433,6 +451,253 @@ async fn restart_interrupted_job_is_reprojected_and_resumed_once() {
         "the DAG must not claim a job the boot resume already launched: {claimed:?}"
     );
     assert_eq!(launched_runs(&db, "j").await, 1);
+}
+
+/// Wait for the provider to have received `count` prompts. Promotion after
+/// readiness runs in the background.
+async fn await_prompts(prompts: &Mutex<Vec<String>>, count: usize) {
+    for _ in 0..500 {
+        if prompts.lock().unwrap().len() >= count {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!(
+        "the provider received {} prompt(s), expected {count}",
+        prompts.lock().unwrap().len()
+    );
+}
+
+/// cairn/4758 (a, b): before startup recovery is ready the boot resume starts
+/// nothing and spends nothing, because the agent's callbacks would be refused.
+/// Once readiness opens it resumes the job exactly once, and a further pass
+/// resumes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_resume_waits_for_readiness_then_resumes_once() {
+    let (orch, db, prompts, _backend) = host_with("restart-resume-readiness", true).await;
+    seed_node_job(&db, "j", 1, "active").await;
+    seed_turn(
+        &db,
+        "turn-j",
+        "j",
+        Some("r-j"),
+        1,
+        "running",
+        "initial",
+        None,
+    )
+    .await;
+    reconcile(&orch).await;
+
+    assert_eq!(resume(&orch).await, super::RestartResumeSummary::default());
+    assert!(launched_turns(&db, "j").await.is_empty());
+    assert_eq!(launched_runs(&db, "j").await, 0);
+    assert_eq!(settlement(&db, "turn-j").await, "interrupted/host_restart");
+
+    orch.mark_startup_recovery_ready();
+    let summary = resume(&orch).await;
+    assert_eq!((summary.selected, summary.admitted), (1, 1), "{summary:?}");
+    await_prompts(&prompts, 1).await;
+    assert_eq!(launched_runs(&db, "j").await, 1);
+
+    assert_eq!(resume(&orch).await, super::RestartResumeSummary::default());
+    assert_eq!(launched_runs(&db, "j").await, 1);
+    assert_eq!(prompts.lock().unwrap().len(), 1);
+}
+
+/// cairn/4758 (c), the 10-30 specimen: a check-results nudge reached a
+/// restart-interrupted job inside the recovery window. Its launch is held in
+/// admission rather than handed to a process the gateway would refuse, starts
+/// once readiness opens, and is the job's single automatic resume: the boot
+/// resume then stands down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wake_inside_the_recovery_window_is_held_and_becomes_the_one_resume() {
+    let (orch, db, prompts, _backend) = host_with("restart-resume-held-wake", true).await;
+    seed_node_job(&db, "j", 1, "active").await;
+    seed_turn(
+        &db,
+        "turn-j",
+        "j",
+        Some("r-j"),
+        1,
+        "running",
+        "initial",
+        None,
+    )
+    .await;
+    reconcile(&orch).await;
+
+    let woken = orch.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::execution::jobs::continue_job_impl(
+            &woken,
+            "j",
+            Some("check results landed"),
+            None,
+            None,
+        )
+    })
+    .await
+    .unwrap()
+    .expect("the wake is accepted and held");
+
+    // Held: a durable queued launch, its run starting and its turn pending, and
+    // nothing handed to the provider.
+    assert_eq!(launched_runs(&db, "j").await, 1);
+    assert_eq!(
+        db.query_opt_text(
+            "SELECT r.state FROM runtime_admission_requests r JOIN prepared_ordinary_launches p ON p.request_id = r.request_id WHERE p.job_id = 'j'",
+            (),
+        )
+        .await
+        .unwrap()
+        .as_deref(),
+        Some("queued")
+    );
+    let turns = launched_turns(&db, "j").await;
+    assert_eq!(turns.len(), 1, "{turns:?}");
+    assert_eq!(settlement(&db, &turns[0].0).await, "pending/-");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        prompts.lock().unwrap().is_empty(),
+        "no turn may reach a process before readiness"
+    );
+
+    orch.mark_startup_recovery_ready();
+    await_prompts(&prompts, 1).await;
+    let summary = resume(&orch).await;
+    assert_eq!(summary.admitted, 0, "{summary:?}");
+    assert_eq!(launched_runs(&db, "j").await, 1);
+    assert_eq!(launched_turns(&db, "j").await.len(), 1);
+    assert_eq!(prompts.lock().unwrap().len(), 1);
+}
+
+/// A `run` call held open on its socket past grace (cairn/4887), as a host
+/// leaves it when it dies: the turn still `running`, and a pending
+/// `hold='inline'` run-batch row bound to the call.
+async fn seed_held_run_call(db: &LocalDb, job: &str, turn: &str) {
+    let condition = serde_json::json!({
+        "kind": "run_batch",
+        "request_id": "req-held",
+        "commits": true,
+        "label": "cargo test",
+        "host": false
+    })
+    .to_string();
+    db.execute(
+        "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,state,created_at,hold)
+         VALUES('wait-' || ?1, ?1, 'r-' || ?1, 's-' || ?1, ?2, 'toolu-held', ?3, NULL, 'pending', 1, 'inline')",
+        params![job, turn, condition],
+    )
+    .await
+    .unwrap();
+}
+
+async fn held_tool_results(db: &LocalDb) -> Vec<String> {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT data FROM events WHERE event_type = 'tool_result' AND data LIKE '%toolu-held%'",
+                    (),
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push(row.get::<String>(0)?);
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .unwrap()
+}
+
+/// The host died while a `run` call was held open on its socket. Exactly one
+/// thing may resume the turn: the held row's own reconciler, which gives it
+/// the typed lost-to-restart result. The stale-run sweep settles the turn as
+/// the park it becomes, so cairn/5143's boot resume never selects it as well.
+/// Both orders of the two sweeps hold that.
+async fn a_held_call_resumes_once_after_restart(name: &str, stale_sweep_first: bool) {
+    let (orch, db, _prompts, _backend) = host(name).await;
+    seed_node_job(&db, "jh", 1, "active").await;
+    seed_turn(
+        &db,
+        "turn-jh",
+        "jh",
+        Some("r-jh"),
+        1,
+        "running",
+        "initial",
+        None,
+    )
+    .await;
+    seed_held_run_call(&db, "jh", "turn-jh").await;
+
+    if stale_sweep_first {
+        reconcile(&orch).await;
+        assert_eq!(
+            settlement(&db, "turn-jh").await,
+            "yielded/-",
+            "a turn holding a call open settles as the park it becomes"
+        );
+        crate::mcp::handlers::durable_suspend::reconcile(&orch).await;
+    } else {
+        crate::mcp::handlers::durable_suspend::reconcile(&orch).await;
+        reconcile(&orch).await;
+    }
+
+    let mut resolved = None;
+    for _ in 0..200 {
+        resolved = text(
+            &db,
+            "SELECT state FROM agent_waits WHERE id = ?1",
+            "wait-jh",
+        )
+        .await;
+        if resolved.as_deref() == Some("resolved") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(resolved.as_deref(), Some("resolved"));
+    assert_eq!(settlement(&db, "turn-jh").await, "yielded/-");
+    let results = held_tool_results(&db).await;
+    assert_eq!(
+        results.len(),
+        1,
+        "one answer for the held call: {results:?}"
+    );
+    assert!(
+        results[0].contains("restarted while the batch was still running"),
+        "{}",
+        results[0]
+    );
+
+    let summary = resume(&orch).await;
+    assert_eq!(
+        summary.selected, 0,
+        "the boot resume must not resume a turn its wait already resumes: {summary:?}"
+    );
+    let successors: i64 = db
+        .query_opt_i64(
+            "SELECT COUNT(*) FROM turns WHERE predecessor_id = ?1",
+            params!["turn-jh"],
+        )
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert_eq!(successors, 1, "exactly one successor");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_call_resumes_once_after_restart_in_boot_order() {
+    a_held_call_resumes_once_after_restart("restart-held-boot-order", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_call_resumes_once_after_restart_in_either_order() {
+    a_held_call_resumes_once_after_restart("restart-held-reverse-order", false).await;
 }
 
 /// The restart cut a `run` call off between its `tool_use` and its result. The
@@ -960,4 +1225,47 @@ async fn the_reaper_settlement_is_unchanged() {
     assert_eq!(settled.map(|turns| turns.len()), Some(2));
     assert_eq!(settlement(&db, "t-run").await, "interrupted/-");
     assert_eq!(settlement(&db, "t-pend").await, "failed/-");
+}
+
+/// The reaper settles a turn that held a `run` call open with the ordinary
+/// crash shape, not as a park: the host is alive, so nothing restarts the
+/// call. Its held row is cancelled, so the next boot cannot resume the
+/// crashed turn from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_reaper_cancels_a_held_call_and_keeps_the_crash_shape() {
+    let (_orch, db, _prompts, _backend) = host("restart-reaper-held-call").await;
+    seed_node_job(&db, "jr", 1, "active").await;
+    seed_turn(
+        &db,
+        "t-run",
+        "jr",
+        Some("r-jr"),
+        1,
+        "running",
+        "initial",
+        None,
+    )
+    .await;
+    seed_held_run_call(&db, "jr", "t-run").await;
+
+    db.write(|conn| {
+        Box::pin(async move {
+            super::settle_stale_run(conn, "r-jr", "stale", super::StaleRunSettlement::Reaped, 5)
+                .await
+        })
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(settlement(&db, "t-run").await, "interrupted/-");
+    assert_eq!(
+        text(
+            &db,
+            "SELECT state FROM agent_waits WHERE id = ?1",
+            "wait-jr"
+        )
+        .await
+        .as_deref(),
+        Some("cancelled")
+    );
 }

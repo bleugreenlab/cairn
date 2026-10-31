@@ -1,3 +1,20 @@
+//! The `?key=value&...` grammar shared by every read and write target.
+//!
+//! A `&` separates params only when the token after it is a query key, so a
+//! literal `&` inside a value (`grep=&mut self`) stays whole. The split set is
+//! derived: every key a resource contract declares in `read_projections`, plus
+//! [`STATIC_QUERY_KEYS`] for the filesystem and universal read-view modifiers no
+//! contract owns. Adding a resource query key therefore means declaring it on
+//! that resource's contract; nothing here changes.
+//!
+//! The set is global, so a value containing `&` followed by any key's exact
+//! name (e.g. `grep=a&state`) splits there. Every target rejects keys it does
+//! not accept by name, so such a collision fails loudly as an unsupported
+//! parameter instead of silently corrupting the preceding value. The escape for
+//! a literal `&` immediately before a key token is `%26`.
+
+use crate::contract::RESOURCE_CONTRACTS;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryParam {
     pub key: String,
@@ -29,22 +46,17 @@ pub fn split_target_query(target: &str) -> Result<SplitTargetQuery, String> {
     })
 }
 
-/// Every query key any read/change target accepts. The query grammar splits a
-/// segment on `&` only when the token immediately following the `&` is one of
-/// these — so a literal `&` inside a value (e.g. `grep=&mut self`) stays whole
-/// while `&limit=5` still separates. Keep this exhaustive: a key omitted here
-/// folds into the preceding value, which fails visibly (a bad pattern or an
-/// "unsupported parameter" error) rather than silently. The escape for a literal
-/// `&` that immediately precedes a recognized key token is `%26`.
-const KNOWN_QUERY_KEYS: &[&str] = &[
-    "view",
-    "projection",
-    "request",
-    "file",
+/// Query keys no resource contract can own: the filesystem-target projections
+/// and the universal read-view modifiers every target shares. Every other split
+/// key comes from a contract's `read_projections` (see [`is_query_key`]), so a
+/// resource's new query key is declared there, never here.
+/// `static_keys_are_a_true_remainder` keeps this list from regrowing into a
+/// mirror of the contracts.
+const STATIC_QUERY_KEYS: &[&str] = &[
+    // Universal body grep (file targets, and any rendered target via the batch
+    // view layer) and its ripgrep-style modifiers.
     "grep",
-    "glob",
     "type",
-    "output_mode",
     "context",
     "-A",
     "-B",
@@ -52,92 +64,61 @@ const KNOWN_QUERY_KEYS: &[&str] = &[
     "-i",
     "-n",
     "head_limit",
-    "offset",
-    "limit",
-    // Shared read-view continuation for a single line larger than the batch
-    // budget. Producers consume it together with offset to resume within a line.
-    "char_offset",
     "multiline",
+    // Shared read-view continuation for a single line larger than the batch
+    // budget, consumed together with `offset` to resume within a line.
+    "char_offset",
+    // File targets: issues that touched the file, a read at another revision,
+    // and the structural projections.
     "issue_history",
-    "search",
-    "path",
-    "status",
-    "provider",
-    "deliverability",
-    "name",
-    "sort",
-    "ready",
-    "before",
-    "after",
-    "since",
-    "full",
-    "label",
-    "content_types",
-    // Project ?search= facets: author role + issue-scoped history search.
-    "role",
-    "issue",
     "branch",
-    // Live-database (cairn://db) read-only SQL projection keys.
-    "sql",
-    // Dev-instance selector (cairn://dev/db?at=..., cairn://dev/pid?at=...).
-    "at",
-    // Symbol-resource keys (op/in) + structural file-projection keys (ast/outline).
-    "op",
-    "in",
     "ast",
     "outline",
-    // Blocking long-poll on a call/task-artifact URI (`?wait`): the workflow
-    // harness `agent()` await. Bare key (no value).
+    // Blocking long-poll on a call/task-artifact URI: the workflow harness
+    // `agent()` await. A machine protocol whose body the harness parses, so the
+    // task-artifact contract deliberately does not advertise it to agents.
     "wait",
-    // Content representation shared by browser reads, structured raw
-    // transcript reads, and the cairn://db JSON projection.
-    "format",
-    // Node/task transcript digest projections: turn ordering (latest) and the
-    // opt-in reseed-fidelity knobs (messages=full, diffs=true).
-    "latest",
-    "messages",
-    "diffs",
-    // Per-kind affordance help projection selector (cairn://help?kind=<slug>):
-    // the target of the session-scoped affordance-collapse pointer line.
-    "kind",
-    // cairn://models/catalog: add the providers this workspace has not
-    // installed, and narrow to the models that serve one verb.
-    "installed",
-    "serves",
-    // Fact log reads (cairn://p/{project}/events): filter rows by fact source,
-    // and on one row, explain a thread's standing triggers against it.
-    "source",
-    "explain",
-    // Store-served source control (cairn://p/{project}/vcs/...): revision
-    // endpoints, single-commit diffs, the diff base mode, blame's revision and
-    // line window. `path`, `view`, `file`, `glob`, `limit`, `offset` and
-    // `format` are shared with other resources above.
-    "from",
-    "to",
-    "commit",
-    "base",
-    "rev",
-    "lines",
+    // Accepted and ignored by terminal reads (`full`) and by terminal and file
+    // reads (`annotations`); kept splitting so old URIs still parse, but not
+    // advertised because neither changes what a read returns.
+    "full",
+    "annotations",
+    // Retired project-issues filter: the reader refuses it with a message
+    // naming its replacement, which only reaches the caller if it splits.
+    "ready",
 ];
 
 /// Keys whose value is a free-text payload taken verbatim: the value is NOT
 /// percent-decoded, so a literal `%` — a SQL `LIKE '%x%'` wildcard, a
 /// `%`-carrying search query — rides through as-is instead of tripping the
 /// percent-escape validation (`Invalid percent escape in query component`).
-/// Segment splitting on `&`-before-known-key still applies to these values, so
+/// Segment splitting on `&`-before-a-query-key still applies to these values, so
 /// `?sql=...&limit=N` continues to separate in either order; only the decode
 /// step is skipped. These keys are unique to `cairn://db` / `cairn://dev/db`
 /// (`sql`) and `cairn://websearch` (`q`), so treating them as raw wherever they
 /// appear is unambiguous.
 const RAW_VALUE_KEYS: &[&str] = &["sql", "q"];
 
+/// Whether `token` is a query key the grammar splits on: a key some resource
+/// contract declares in its `read_projections`, or one of
+/// [`STATIC_QUERY_KEYS`]. The set is global rather than scoped to the target's
+/// kind, so a `cairn:~/` or `cairn:@/` target parses before it resolves.
+fn is_query_key(token: &str) -> bool {
+    STATIC_QUERY_KEYS.contains(&token)
+        || RESOURCE_CONTRACTS
+            .iter()
+            .flat_map(|contract| contract.read_projections)
+            .any(|projection| projection.key == token)
+}
+
 /// Return true when the start of `rest` (the text immediately after a `&`) is a
-/// recognized query key — i.e. the chars up to the next `=`, `&`, or end form a
-/// member of `KNOWN_QUERY_KEYS`. This is the test that decides whether a `&`
-/// separates params or is literal content within a value.
-fn next_token_is_known_key(rest: &str) -> bool {
+/// query key: the chars up to the next `=`, `&`, or end of string are exactly a
+/// key. This decides whether a `&` separates params or is literal value
+/// content, so `&mut self`, `&new(` and `&state.x)` stay inside a grep pattern
+/// while `&limit=5`, `&-i&` and a trailing `&full` split.
+fn next_token_is_query_key(rest: &str) -> bool {
     let token = rest.split(['=', '&']).next().unwrap_or("");
-    KNOWN_QUERY_KEYS.contains(&token)
+    is_query_key(token)
 }
 
 pub fn parse_query_params(query: &str) -> Result<Vec<QueryParam>, String> {
@@ -152,7 +133,7 @@ pub fn parse_query_params(query: &str) -> Result<Vec<QueryParam>, String> {
     let mut segment_start = 0;
     let bytes = query.as_bytes();
     for index in 0..bytes.len() {
-        if bytes[index] == b'&' && next_token_is_known_key(&query[index + 1..]) {
+        if bytes[index] == b'&' && next_token_is_query_key(&query[index + 1..]) {
             segments.push(&query[segment_start..index]);
             segment_start = index + 1;
         }
@@ -192,7 +173,7 @@ pub fn encode_query_params(params: &[QueryParam]) -> String {
         .join("&")
 }
 
-fn encode_query_component(value: &str) -> String {
+pub(crate) fn encode_query_component(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
         match byte {
@@ -205,7 +186,7 @@ fn encode_query_component(value: &str) -> String {
     encoded
 }
 
-fn decode_query_component(value: &str) -> Result<String, String> {
+pub(crate) fn decode_query_component(value: &str) -> Result<String, String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -285,7 +266,7 @@ mod tests {
     fn known_key_splits_when_not_leading() {
         // A recognized key that appears after the first param must still split.
         // Regression guard: `label` and `content_types` are live resource keys;
-        // if either is missing from KNOWN_QUERY_KEYS, the `&` before it would be
+        // if either stopped being a split key, the `&` before it would be
         // treated as literal content and corrupt the preceding value.
         let split = split_target_query("cairn://p/CAIRN/issues?status=active&label=bug").unwrap();
         assert_eq!(
@@ -453,6 +434,28 @@ mod tests {
     }
 
     #[test]
+    fn repeated_where_keys_split_and_survive_in_order() {
+        let split = split_target_query(
+            "cairn:~/db/attempts?where=problem=two-sum&where=lang=rust&order=-created_at&limit=5",
+        )
+        .unwrap();
+        let pairs: Vec<(&str, &str)> = split
+            .params
+            .iter()
+            .map(|p| (p.key.as_str(), p.value.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("where", "problem=two-sum"),
+                ("where", "lang=rust"),
+                ("order", "-created_at"),
+                ("limit", "5"),
+            ]
+        );
+    }
+
+    #[test]
     fn split_target_query_rejects_invalid_percent_encoding() {
         let err = split_target_query("src?grep=%ZZ").unwrap_err();
         assert!(err.contains("Invalid percent escape"));
@@ -544,6 +547,182 @@ mod tests {
         let encoded = encode_query_params(&websearch);
         assert_eq!(encoded, "q=100% uptime claims");
         assert_eq!(parse_query_params(&encoded).unwrap(), websearch);
+    }
+
+    fn pairs(target: &str) -> Vec<(String, String)> {
+        split_target_query(target)
+            .unwrap_or_else(|error| panic!("{target}: {error}"))
+            .params
+            .into_iter()
+            .map(|param| (param.key, param.value))
+            .collect()
+    }
+
+    fn owned(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        expected
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// A concrete target for a contract's URI template: every `{placeholder}`
+    /// becomes `x`, so the grammar sees the resource's real path shape.
+    fn instantiate(template: &str) -> String {
+        let mut out = String::new();
+        let mut in_placeholder = false;
+        for c in template.split('?').next().unwrap_or(template).chars() {
+            match c {
+                '{' => in_placeholder = true,
+                '}' => {
+                    in_placeholder = false;
+                    out.push('x');
+                }
+                _ if !in_placeholder => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn neighbour(key: &str) -> &'static str {
+        if key == "limit" {
+            "offset"
+        } else {
+            "limit"
+        }
+    }
+
+    #[test]
+    fn every_contract_projection_key_splits_when_not_leading() {
+        for contract in RESOURCE_CONTRACTS {
+            let base = instantiate(contract.uri_template);
+            for projection in contract.read_projections {
+                let key = projection.key;
+                let other = neighbour(key);
+                assert_eq!(
+                    pairs(&format!("{base}?{other}=a&{key}=b")),
+                    owned(&[(other, "a"), (key, "b")]),
+                    "{:?} declares `{key}`, which must split after another param",
+                    contract.kind
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_static_key_splits_when_not_leading() {
+        for key in STATIC_QUERY_KEYS {
+            let other = neighbour(key);
+            assert_eq!(
+                pairs(&format!("file:src/lib.rs?{other}=a&{key}=b")),
+                owned(&[(other, "a"), (key, "b")]),
+                "static key `{key}` must split after another param"
+            );
+        }
+    }
+
+    #[test]
+    fn static_keys_are_a_true_remainder() {
+        for key in STATIC_QUERY_KEYS {
+            let owner = RESOURCE_CONTRACTS.iter().find(|contract| {
+                contract
+                    .read_projections
+                    .iter()
+                    .any(|projection| projection.key == *key)
+            });
+            assert!(
+                owner.is_none(),
+                "`{key}` is declared by the {:?} contract; drop it from STATIC_QUERY_KEYS",
+                owner.map(|contract| contract.kind)
+            );
+        }
+    }
+
+    #[test]
+    fn split_keys_are_plain_tokens() {
+        let plain = |key: &str| {
+            !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        };
+        let contract_keys = RESOURCE_CONTRACTS
+            .iter()
+            .flat_map(|contract| contract.read_projections)
+            .map(|projection| projection.key);
+        for key in STATIC_QUERY_KEYS.iter().copied().chain(contract_keys) {
+            assert!(
+                plain(key),
+                "split key `{key}` must be [A-Za-z0-9_-]+ or it breaks the tokenizer"
+            );
+        }
+        for key in RAW_VALUE_KEYS {
+            assert!(is_query_key(key), "raw-value key `{key}` must also split");
+        }
+    }
+
+    #[test]
+    fn check_results_suite_and_environment_split_in_either_order() {
+        let forward = owned(&[("suite", "rust-tests"), ("environment", "current")]);
+        let swapped = owned(&[("environment", "current"), ("suite", "rust-tests")]);
+        for base in [
+            "cairn://p/cairn/check-results/main",
+            "cairn:@/check-results/main",
+        ] {
+            assert_eq!(
+                pairs(&format!("{base}?suite=rust-tests&environment=current")),
+                forward
+            );
+            assert_eq!(
+                pairs(&format!("{base}?environment=current&suite=rust-tests")),
+                swapped
+            );
+        }
+    }
+
+    #[test]
+    fn literal_ampersand_before_a_space_stays_in_the_value() {
+        assert_eq!(
+            pairs("file:lib.rs?grep=&mut self&limit=5"),
+            owned(&[("grep", "&mut self"), ("limit", "5")])
+        );
+    }
+
+    /// Several contract keys are everyday identifiers (`new`, `state`, `table`,
+    /// `match`, `diff`, `process`). A token after `&` is a key only when the key
+    /// is followed by `=`, `&`, or the end of the query, so code-shaped text
+    /// that merely starts with one stays inside the grep value.
+    #[test]
+    fn code_shaped_ampersands_do_not_split() {
+        for pattern in [
+            "&new(",
+            "Foo::new(&state.x)",
+            "(&table)",
+            "&match_arm",
+            "&diff[0]",
+            "&process_id",
+        ] {
+            assert_eq!(
+                pairs(&format!("file:src/lib.rs?grep={pattern}")),
+                owned(&[("grep", pattern)]),
+                "`{pattern}` must stay one grep value"
+            );
+        }
+    }
+
+    /// The one ambiguous shape: a key name ending the query. It splits as a
+    /// bare flag, which the file target then rejects by name (`%26full` keeps
+    /// it literal).
+    #[test]
+    fn a_trailing_bare_key_splits_as_a_flag() {
+        assert_eq!(
+            pairs("file:src/lib.rs?grep=x&full"),
+            owned(&[("grep", "x"), ("full", "")])
+        );
+        assert_eq!(
+            pairs("file:src/lib.rs?grep=x%26full"),
+            owned(&[("grep", "x&full")])
+        );
     }
 
     #[test]

@@ -443,7 +443,11 @@ impl IMessageExecutor for PlacedProcessExecutor {
         let _ = self.lease.stop_resident(PLACED_WATCH_KEY).await;
         let mut subscription = self
             .lease
-            .start_resident(PLACED_WATCH_KEY, PLACED_WATCH_ROLE, "imsg", args)
+            .start_resident(
+                PLACED_WATCH_KEY,
+                PLACED_WATCH_ROLE,
+                &crate::fleet::service_placement::ResidentLaunch::command("imsg", args),
+            )
             .await
             .map_err(|error| error.to_string())?;
         let _ = started.send(());

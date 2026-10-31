@@ -2,11 +2,12 @@ use crate::agent_process::stream::TranscriptEvent as StoredTranscriptEvent;
 use crate::runs::read_tokens::ReadSegmentTokens;
 use crate::transcripts::stream_store::ActiveMessageStream;
 use crate::transcripts::stream_store::{
-    find_active_stream_for_run, find_active_stream_for_session, read_active_stream,
+    active_stream_for_session, find_active_stream_for_run, find_active_stream_for_session,
+    read_active_stream,
 };
 use cairn_db::error::CairnError;
 use cairn_db::storage::{DbResult, LocalDb, RowExt};
-use cairn_db::turso::{params, Connection, Row};
+use cairn_db::turso::{params, Connection, Row, Value};
 use cairn_domain::{Event, Prompt, Run, RunStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -26,13 +27,84 @@ pub struct LastEventDigest {
 pub async fn list_runs_for_job_async(db: &LocalDb, job_id: &str) -> Result<Vec<Run>, CairnError> {
     load_runs_by_sql(
         db,
-        format!("SELECT {RUN_COLUMNS} FROM runs WHERE job_id = ?1 ORDER BY created_at DESC"),
+        format!(
+            "SELECT {RUN_COLUMNS} FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, rowid DESC"
+        ),
         job_id.to_string(),
     )
     .await
 }
 
-/// Incremental transcript loader for application views, keyed by the NODE.
+/// Page size for [`TranscriptWindow::Tail`] and [`TranscriptWindow::Before`]
+/// when the caller does not name one.
+pub const TRANSCRIPT_PAGE_LIMIT: usize = 500;
+
+/// The largest page a caller may ask for. A page is one reconstruct-and-project
+/// pass over its events, so the bound keeps a single request from becoming the
+/// whole-lineage load windowing exists to avoid.
+const TRANSCRIPT_PAGE_LIMIT_MAX: usize = 2_000;
+
+/// Where an event sits in its job's transcript.
+///
+/// `run_seq` is the 1-based position of the event's run among the job's runs,
+/// ordered by creation: the same numbering a `chat/{runSeq}/{eventSeq}` URI
+/// resolves, so a row's address and its position never disagree. `sequence` is
+/// the per-run ordinal, unique within a run (`idx_events_run_sequence`) and
+/// reserved when a message starts streaming, so a streamed message keeps its
+/// place even though its row is inserted at finalize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptPosition {
+    pub run_seq: i64,
+    pub sequence: i64,
+}
+
+/// Which slice of a job's transcript a read asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum TranscriptWindow {
+    /// The newest `limit` events, plus the forward cursor and a backward one.
+    Tail { limit: usize },
+    /// The `limit` events immediately older than `position`.
+    Before {
+        position: TranscriptPosition,
+        limit: usize,
+    },
+    /// Every event inserted after the forward cursor `rowid`, in insertion order.
+    After { rowid: i64 },
+}
+
+/// One window of a job's transcript.
+///
+/// `Tail` and `Before` pages are contiguous runs of the transcript in position
+/// order, oldest first; stitched newest-to-oldest they reproduce
+/// [`list_events_for_session`]'s order exactly. `After` returns what was
+/// inserted since the cursor in insertion order, which can differ from position
+/// order (a streamed message is inserted at finalize but positioned at its
+/// start), so the caller places each delta event by its position.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobTranscriptWindow {
+    /// Bodies the transcript list never renders are withheld; see
+    /// [`withhold_unrendered_bodies`].
+    pub events: Vec<Event>,
+    /// The run ordinal of every run present in `events` or `streaming`.
+    pub run_ordinals: std::collections::HashMap<String, i64>,
+    /// Forward cursor: the newest event rowid across the lineage, read before
+    /// the page so anything inserted after it arrives through `After`. Echoes
+    /// the cursor on an empty `After`; `None` on a `Before` page, which does not
+    /// move the forward cursor.
+    pub last_rowid: Option<i64>,
+    /// Backward cursor: the position of the oldest event returned, to pass to
+    /// the next `Before`. `None` once the head of the transcript is reached, and
+    /// always `None` on `After`.
+    pub older: Option<TranscriptPosition>,
+    /// The active-stream placeholder, kept out of `events`. Only `Tail` and
+    /// `After` read it; an older page leaves the caller's placeholder alone.
+    pub streaming: Option<Event>,
+}
+
+/// Windowed transcript loader for application views, keyed by the NODE.
 ///
 /// A displayed transcript's identity is the job, never the session instance
 /// under it. Sessions are mortal: a cold-resume reseed, a prompt edit, or a
@@ -46,27 +118,265 @@ pub async fn list_runs_for_job_async(db: &LocalDb, job_id: &str) -> Result<Vec<R
 /// Resolving from the job also makes cross-job leakage structural instead of
 /// validated: the session comes from the requested job's own row, so no client
 /// pointer can address another job's transcript at all.
-pub fn list_events_for_job_delta(
-    db: Arc<LocalDb>,
+///
+/// Every step is one pooled statement on the caller's runtime, so the read
+/// bound can cut any one of them and a stall names the statement it stalled on.
+pub async fn list_job_transcript_window(
+    db: &LocalDb,
     job_id: &str,
-    after_rowid: Option<i64>,
-) -> Result<SessionEventsDelta, CairnError> {
-    let job_id = job_id.to_string();
-    let resolve_db = db.clone();
-    let session_id =
-        run_query_db(async move { resolve_job_transcript_session(&resolve_db, job_id).await })?;
-
-    let Some(session_id) = session_id else {
+    window: TranscriptWindow,
+) -> Result<JobTranscriptWindow, CairnError> {
+    let echoed_cursor = match window {
+        TranscriptWindow::After { rowid } => Some(rowid),
+        _ => None,
+    };
+    let Some(session_id) = resolve_job_transcript_session(db, job_id.to_string()).await? else {
         // A node that has never opened a session has an empty transcript, not an
         // error; echo the cursor so the caller holds position.
-        return Ok(SessionEventsDelta {
+        return Ok(JobTranscriptWindow {
             events: Vec::new(),
-            last_rowid: after_rowid,
+            run_ordinals: std::collections::HashMap::new(),
+            last_rowid: echoed_cursor,
+            older: None,
             streaming: None,
         });
     };
 
-    list_events_for_session_delta(db, &session_id, after_rowid)
+    let job_runs = load_job_run_ordinals(db, job_id).await?;
+    let (events, last_rowid, older, read_stream) = match window {
+        TranscriptWindow::Tail { limit } => {
+            let lineage = load_session_lineage_ids(db, &session_id).await?;
+            let last_rowid = max_event_rowid_for_lineage(db, &lineage).await?;
+            let runs = lineage_runs(&job_runs, &lineage);
+            let (events, older) = load_transcript_page(db, &runs, None, limit).await?;
+            (events, last_rowid, older, true)
+        }
+        TranscriptWindow::Before { position, limit } => {
+            let lineage = load_session_lineage_ids(db, &session_id).await?;
+            let runs = lineage_runs(&job_runs, &lineage);
+            let (events, older) = load_transcript_page(db, &runs, Some(position), limit).await?;
+            (events, None, older, false)
+        }
+        TranscriptWindow::After { rowid } => {
+            let (events, last_rowid) = load_session_events_after(db, &session_id, rowid).await?;
+            (events, last_rowid, None, true)
+        }
+    };
+
+    let events = project_list_events(db, events).await?;
+    let streaming = if read_stream {
+        active_stream_event_for_session(db, &session_id).await?
+    } else {
+        None
+    };
+
+    let ordinal_of: std::collections::HashMap<&str, i64> = job_runs
+        .iter()
+        .map(|run| (run.id.as_str(), run.ordinal))
+        .collect();
+    let run_ordinals = events
+        .iter()
+        .chain(streaming.iter())
+        .filter_map(|event| {
+            ordinal_of
+                .get(event.run_id.as_str())
+                .map(|ordinal| (event.run_id.clone(), *ordinal))
+        })
+        .collect();
+
+    Ok(JobTranscriptWindow {
+        events,
+        run_ordinals,
+        last_rowid,
+        older,
+        streaming,
+    })
+}
+
+/// The session's in-flight message as a transcript placeholder event.
+pub async fn active_stream_event_for_session(
+    db: &LocalDb,
+    session_id: &str,
+) -> Result<Option<Event>, CairnError> {
+    Ok(active_stream_for_session(db, session_id)
+        .await
+        .map_err(CairnError::from)?
+        .map(active_stream_to_event))
+}
+
+/// One of a job's runs, numbered by its position among them.
+struct JobRun {
+    id: String,
+    session_id: Option<String>,
+    ordinal: i64,
+}
+
+/// Every run of the job, numbered 1.. in creation order — the numbering
+/// `transcript::get_nth_run_id` resolves `chat/{runSeq}/...` URIs by.
+const JOB_RUN_ORDINALS_SQL: &str = "SELECT id, session_id
+     FROM runs
+     WHERE job_id = ?1
+     ORDER BY created_at ASC, rowid ASC";
+
+/// One run's events below a sequence, newest first: the transcript page step.
+/// Served by `idx_events_run_sequence` with no sort.
+fn run_page_sql() -> String {
+    format!(
+        "SELECT {}
+         FROM events
+         WHERE run_id = ?1 AND sequence < ?2 AND sequence >= ?3
+         ORDER BY sequence DESC
+         LIMIT ?4",
+        list_event_columns()
+    )
+}
+
+const TURN_START_SQL: &str = "SELECT MIN(sequence) FROM events WHERE turn_id = ?1 AND run_id = ?2";
+
+async fn load_job_run_ordinals(db: &LocalDb, job_id: &str) -> Result<Vec<JobRun>, CairnError> {
+    let rows = db
+        .query_all(JOB_RUN_ORDINALS_SQL, params![job_id], |row| {
+            Ok((row.text(0)?, row.opt_text(1)?))
+        })
+        .await
+        .map_err(CairnError::from)?;
+    Ok(rows
+        .into_iter()
+        .zip(1..)
+        .map(|((id, session_id), ordinal)| JobRun {
+            id,
+            session_id,
+            ordinal,
+        })
+        .collect())
+}
+
+/// The job's runs that belong to the transcript's rotation lineage, oldest
+/// first, as `(run_id, ordinal)`. A run of a session outside the lineage (a
+/// session the job started fresh rather than rotated into) keeps its ordinal —
+/// URIs count it — but contributes no events.
+fn lineage_runs<'a>(job_runs: &'a [JobRun], lineage: &[String]) -> Vec<(&'a str, i64)> {
+    let lineage: HashSet<&str> = lineage.iter().map(String::as_str).collect();
+    job_runs
+        .iter()
+        .filter(|run| {
+            run.session_id
+                .as_deref()
+                .is_some_and(|session| lineage.contains(session))
+        })
+        .map(|run| (run.id.as_str(), run.ordinal))
+        .collect()
+}
+
+/// One backward page of the transcript, oldest first, with the backward cursor
+/// for the page after it.
+///
+/// Walks the lineage's runs newest to oldest and pages each one on
+/// `idx_events_run_sequence` (`run_id = ? AND sequence < ? ORDER BY sequence
+/// DESC LIMIT ?`), so a page costs what it returns rather than what precedes
+/// it. Runs are long (hundreds of events), so a page usually cuts inside one.
+///
+/// The page then snaps back to the start of the turn its oldest event belongs
+/// to, up to twice `limit`, so a page boundary does not split a tool call from
+/// its result or break up a lifecycle group.
+async fn load_transcript_page(
+    db: &LocalDb,
+    runs: &[(&str, i64)],
+    before: Option<TranscriptPosition>,
+    limit: usize,
+) -> Result<(Vec<Event>, Option<TranscriptPosition>), CairnError> {
+    let limit = limit.clamp(1, TRANSCRIPT_PAGE_LIMIT_MAX);
+    // Newest first while walking: (run ordinal, event).
+    let mut page: Vec<(i64, Event)> = Vec::new();
+    let mut reached_head = true;
+    for (run_id, ordinal) in runs.iter().rev() {
+        let below = match before {
+            Some(position) if *ordinal > position.run_seq => continue,
+            Some(position) if *ordinal == position.run_seq => position.sequence,
+            _ => i64::MAX,
+        };
+        let remaining = limit - page.len();
+        let rows = load_run_events_before(db, run_id, below, None, remaining).await?;
+        page.extend(rows.into_iter().map(|event| (*ordinal, event)));
+        if page.len() >= limit {
+            reached_head = false;
+            break;
+        }
+    }
+
+    if !reached_head {
+        snap_page_to_turn_start(db, runs, &mut page, limit * 2).await?;
+    }
+
+    let older = if reached_head {
+        None
+    } else {
+        page.last().map(|(ordinal, event)| TranscriptPosition {
+            run_seq: *ordinal,
+            sequence: i64::from(event.sequence),
+        })
+    };
+    page.reverse();
+    Ok((page.into_iter().map(|(_, event)| event).collect(), older))
+}
+
+/// A run's events with `floor <= sequence < below`, newest first.
+async fn load_run_events_before(
+    db: &LocalDb,
+    run_id: &str,
+    below: i64,
+    floor: Option<i64>,
+    limit: usize,
+) -> Result<Vec<Event>, CairnError> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    db.query_all(
+        run_page_sql(),
+        params![run_id, below, floor.unwrap_or(i64::MIN), limit],
+        event_from_row,
+    )
+    .await
+    .map_err(CairnError::from)
+}
+
+/// Extend a newest-first `page` back to the first event of the turn its oldest
+/// event belongs to, without growing it past `cap` events.
+async fn snap_page_to_turn_start(
+    db: &LocalDb,
+    runs: &[(&str, i64)],
+    page: &mut Vec<(i64, Event)>,
+    cap: usize,
+) -> Result<(), CairnError> {
+    let Some((ordinal, oldest)) = page.last() else {
+        return Ok(());
+    };
+    let Some(turn_id) = oldest.turn_id.clone() else {
+        return Ok(());
+    };
+    let room = cap.saturating_sub(page.len());
+    if room == 0 {
+        return Ok(());
+    }
+    let ordinal = *ordinal;
+    let oldest_sequence = i64::from(oldest.sequence);
+    let Some(run_id) = runs
+        .iter()
+        .find(|(_, run_ordinal)| *run_ordinal == ordinal)
+        .map(|(run_id, _)| *run_id)
+    else {
+        return Ok(());
+    };
+    let turn_start = db
+        .query_one(TURN_START_SQL, params![turn_id.as_str(), run_id], |row| {
+            row.opt_i64(0)
+        })
+        .await
+        .map_err(CairnError::from)?;
+    let Some(turn_start) = turn_start.filter(|start| *start < oldest_sequence) else {
+        return Ok(());
+    };
+    let rows = load_run_events_before(db, run_id, oldest_sequence, Some(turn_start), room).await?;
+    page.extend(rows.into_iter().map(|event| (ordinal, event)));
+    Ok(())
 }
 
 /// The session whose rotation lineage is this job's transcript.
@@ -104,25 +414,6 @@ async fn resolve_job_transcript_session(
     .await
     .map_err(CairnError::from)
     .map(Option::flatten)
-}
-
-/// Incremental session-event delta. Durable events insert monotonically per
-/// session (runs execute sequentially; once a new run starts, older runs never
-/// insert), so `WHERE session_id = ? AND rowid > ?` is a sound append-only
-/// delta even across run boundaries.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionEventsDelta {
-    /// New durable events. On the initial load (no cursor) these are
-    /// run-ordered; on a delta they are in insertion (rowid) order.
-    pub events: Vec<Event>,
-    /// Newest durable event rowid across the session's whole rotation lineage;
-    /// echoes the cursor when the delta is empty so the caller can keep its
-    /// position. `None` only when the lineage has no durable events at all.
-    pub last_rowid: Option<i64>,
-    /// Active-stream placeholder, returned separately rather than spliced into
-    /// `events` so the frontend merge stays append-only.
-    pub streaming: Option<Event>,
 }
 
 fn active_stream_to_event(active: ActiveMessageStream) -> Event {
@@ -253,12 +544,17 @@ pub fn list_runs(db: Arc<LocalDb>, issue_id: &str) -> Result<Vec<Run>, CairnErro
     })
 }
 
+/// The job's runs, newest first. `created_at` has one-second resolution, so
+/// `rowid` breaks its ties — the same rule `list_job_transcript_window` and
+/// `chat/{runSeq}/...` URIs number runs by, reversed.
 pub fn list_runs_for_job(db: Arc<LocalDb>, job_id: &str) -> Result<Vec<Run>, CairnError> {
     let job_id = job_id.to_string();
     run_query_db(async move {
         load_runs_by_sql(
             &db,
-            format!("SELECT {RUN_COLUMNS} FROM runs WHERE job_id = ?1 ORDER BY created_at DESC"),
+            format!(
+                "SELECT {RUN_COLUMNS} FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, rowid DESC"
+            ),
             job_id,
         )
         .await
@@ -276,9 +572,7 @@ pub fn list_events(db: Arc<LocalDb>, run_id: &str) -> Result<Vec<Event>, CairnEr
     let query_run_id = run_id.clone();
     let mut events = run_query_db(async move {
         let events = load_events_for_run(&query_db, query_run_id).await?;
-        let mut events = cairn_db::storage::reconstruct_events(&query_db, events).await;
-        apply_lean_read_projection(&query_db, &mut events).await?;
-        Ok(events)
+        project_list_events(&query_db, events).await
     })?;
 
     if let Some(active) = find_active_stream_for_run(db, &run_id).map_err(CairnError::Internal)? {
@@ -326,8 +620,8 @@ pub fn list_events_for_session(
 /// Load full-body durable session events after the caller's cached event count.
 ///
 /// Session events append monotonically in rowid order while a session is active,
-/// which is the same invariant used by `list_events_for_session_delta`. Unlike
-/// that transcript-facing delta, this keeps read result bodies intact so skyline
+/// which is the same invariant the transcript window's `After` delta relies on.
+/// Unlike that transcript-facing read, this keeps read result bodies intact so skyline
 /// bar widths can be computed without re-reading and re-parsing the whole session.
 pub fn list_events_for_session_after_count(
     db: Arc<LocalDb>,
@@ -355,37 +649,6 @@ pub fn list_events_for_turn(db: Arc<LocalDb>, turn_id: &str) -> Result<Vec<Event
         insert_active_stream_by_created_at(&mut events, active);
     }
     Ok(events)
-}
-
-/// Incremental session-event loader. `after_rowid = None` returns the full
-/// run-ordered history plus a cursor; `after_rowid = Some(r)` returns only
-/// events inserted after the cursor, in append order. The active-stream
-/// placeholder is returned in its own field rather than spliced into `events`.
-pub fn list_events_for_session_delta(
-    db: Arc<LocalDb>,
-    session_id: &str,
-    after_rowid: Option<i64>,
-) -> Result<SessionEventsDelta, CairnError> {
-    let session_id = session_id.to_string();
-    let query_db = db.clone();
-    let query_session_id = session_id.clone();
-    let (events, last_rowid) = run_query_db(async move {
-        let (events, last_rowid) =
-            load_session_events_delta(&query_db, query_session_id, after_rowid).await?;
-        let mut events = cairn_db::storage::reconstruct_events(&query_db, events).await;
-        apply_lean_read_projection(&query_db, &mut events).await?;
-        Ok((events, last_rowid))
-    })?;
-
-    let streaming = find_active_stream_for_session(db, &session_id)
-        .map_err(CairnError::Internal)?
-        .map(active_stream_to_event);
-
-    Ok(SessionEventsDelta {
-        events,
-        last_rowid,
-        streaming,
-    })
 }
 
 pub fn last_event_for_session(
@@ -753,19 +1016,22 @@ async fn load_events_for_session(
 
 /// The newest event rowid anywhere in a rotation lineage.
 ///
-/// The delta cursor must span the whole lineage, not just the session named in
-/// the request. A session that was just rotated to has no events of its own yet
-/// while its lineage carries the entire prior transcript, so a session-scoped
-/// `MAX(rowid)` would hand back a null cursor after returning that history —
-/// and the caller's append-only merge would re-append the whole transcript on
-/// its next (again cursor-less) fetch.
+/// The forward cursor must span the whole lineage, not just the session named
+/// in the request. A session that was just rotated to has no events of its own
+/// yet while its lineage carries the entire prior transcript, so a
+/// session-scoped `MAX(rowid)` would hand back a null cursor after returning
+/// that history.
+///
+/// Sessions in a lineage are written strictly one after another, so the newest
+/// rowid belongs to the newest session that has any events: the walk runs from
+/// the current session backwards and stops at the first one that answers,
+/// usually after one seek rather than one per session.
 async fn max_event_rowid_for_lineage(
     db: &LocalDb,
     lineage: &[String],
 ) -> Result<Option<i64>, CairnError> {
-    let mut newest: Option<i64> = None;
-    for session_id in lineage {
-        let candidate = db
+    for session_id in lineage.iter().rev() {
+        let newest = db
             .query_one(
                 "SELECT MAX(rowid) FROM events WHERE session_id = ?1",
                 params![session_id.as_str()],
@@ -773,37 +1039,45 @@ async fn max_event_rowid_for_lineage(
             )
             .await
             .map_err(CairnError::from)?;
-        if let Some(rowid) = candidate {
-            newest = Some(newest.map_or(rowid, |current: i64| current.max(rowid)));
+        if newest.is_some() {
+            return Ok(newest);
         }
     }
-    Ok(newest)
+    Ok(None)
+}
+
+/// `?, ?, ...` and the matching text parameters, for a bound `IN` list.
+fn text_in_list(values: &[String]) -> (String, Vec<Value>) {
+    let placeholders = vec!["?"; values.len()].join(", ");
+    let params = values
+        .iter()
+        .map(|value| Value::Text(value.clone()))
+        .collect();
+    (placeholders, params)
 }
 
 async fn load_events_for_lineage(
     db: &LocalDb,
     lineage: &[String],
 ) -> Result<(Vec<Event>, std::collections::HashMap<String, usize>), CairnError> {
-    // Runs across the whole rotation lineage, in creation order. Sessions rotate
-    // strictly sequentially, so per-session `created_at` order concatenated across
-    // the lineage is global chronological order — the position map the event sort
-    // below keys on. For an un-rotated session the lineage is `[session_id]`, so
-    // this is identical to a single-session load.
-    let mut ordered_run_ids: Vec<String> = Vec::new();
-    for sid in lineage {
-        let ids = db
-            .query_all(
+    // Runs across the whole rotation lineage, in creation order — the same order
+    // the job's run ordinals follow, so this load and the windowed one
+    // (`list_job_transcript_window`) agree. For an un-rotated session the
+    // lineage is `[session_id]`, so this is identical to a single-session load.
+    let (placeholders, run_params) = text_in_list(lineage);
+    let ordered_run_ids: Vec<String> = db
+        .query_all(
+            format!(
                 "SELECT id
                  FROM runs
-                 WHERE session_id = ?1
-                 ORDER BY created_at ASC",
-                params![sid.as_str()],
-                |row| row.text(0),
-            )
-            .await
-            .map_err(CairnError::from)?;
-        ordered_run_ids.extend(ids);
-    }
+                 WHERE session_id IN ({placeholders})
+                 ORDER BY created_at ASC, rowid ASC"
+            ),
+            run_params,
+            |row| row.text(0),
+        )
+        .await
+        .map_err(CairnError::from)?;
 
     let run_position: std::collections::HashMap<String, usize> = ordered_run_ids
         .iter()
@@ -830,12 +1104,16 @@ async fn load_events_for_lineage(
     }
     let mut indexed: Vec<(usize, Event)> = db_events.into_iter().enumerate().collect();
 
+    // Within a run, `sequence` is the order: it is unique per run and reserved
+    // when a message starts streaming, whereas the row (and its rowid) lands at
+    // finalize. `created_at` has one-second resolution, so it cannot break the
+    // ties that interleave makes.
     indexed.sort_by(|(idx_a, a), (idx_b, b)| {
         let pos_a = run_position.get(&a.run_id).copied().unwrap_or(usize::MAX);
         let pos_b = run_position.get(&b.run_id).copied().unwrap_or(usize::MAX);
         pos_a
             .cmp(&pos_b)
-            .then(a.created_at.cmp(&b.created_at))
+            .then(a.sequence.cmp(&b.sequence))
             .then(idx_a.cmp(idx_b))
     });
 
@@ -910,6 +1188,131 @@ pub fn load_event_by_id(db: Arc<LocalDb>, event_id: &str) -> Result<Option<Event
     })
 }
 
+/// Shape stored events for a transcript list: withhold the bodies the list never
+/// renders, reconstruct whatever archived bodies remain, then strip read
+/// results (CAIRN-1593). Detail and raw surfaces fetch a full body through
+/// [`load_event_by_id`].
+async fn project_list_events(db: &LocalDb, events: Vec<Event>) -> Result<Vec<Event>, CairnError> {
+    let events = withhold_unrendered_bodies(events);
+    let mut events = cairn_db::storage::reconstruct_events(db, events).await;
+    apply_lean_read_projection(db, &mut events).await?;
+    Ok(events)
+}
+
+/// Whether the transcript list renders nothing from an event type's body.
+///
+/// Kept in step with `RENDERED_SYSTEM_EVENTS` and `isMainAgentTranscriptEvent`
+/// in `src/components/chat/flattenTranscript.tsx`: `result:*`, `system:init`
+/// and `system:status` are dropped there outright, and a `user:seed` renders as
+/// a body-less divider. These are also the heaviest rows a transcript carries —
+/// a seed holds a whole prior-context digest — so withholding them is most of
+/// what keeps a page small. The flatten parity test in `flattenTranscript.test`
+/// fails if a renderer starts reading one of these bodies.
+fn body_is_unrendered(event_type: &str) -> bool {
+    UNRENDERED_EVENT_TYPES.contains(&event_type)
+        || UNRENDERED_EVENT_TYPE_PREFIXES
+            .iter()
+            .any(|prefix| event_type.starts_with(prefix))
+}
+
+const UNRENDERED_EVENT_TYPES: &[&str] = &["user:seed", "system:init", "system:status"];
+const UNRENDERED_EVENT_TYPE_PREFIXES: &[&str] = &["result:"];
+
+/// [`body_is_unrendered`] as a SQL predicate over `event_type`, built from the
+/// same lists so the two cannot drift.
+fn unrendered_sql_predicate() -> String {
+    UNRENDERED_EVENT_TYPES
+        .iter()
+        .map(|event_type| format!("event_type = '{event_type}'"))
+        .chain(
+            UNRENDERED_EVENT_TYPE_PREFIXES
+                .iter()
+                .map(|prefix| format!("event_type LIKE '{prefix}%'")),
+        )
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// [`EVENT_COLUMNS`] for a transcript list: an unrendered event's `data` and
+/// `data_blob` are projected as empty, so the engine never reads their pages.
+/// Those bodies are the heaviest rows a transcript holds (a single seed digest
+/// runs to megabytes), and a page that read them only to drop them would pay
+/// for the whole payload the list withholds. The row parses as an ordinary
+/// event; [`withhold_unrendered_bodies`] then writes its envelope.
+fn list_event_columns() -> &'static str {
+    static COLUMNS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    COLUMNS.get_or_init(|| {
+        let unrendered = unrendered_sql_predicate();
+        EVENT_COLUMNS
+            .split(',')
+            .map(str::trim)
+            .map(|column| match column {
+                "data" => format!("CASE WHEN {unrendered} THEN '' ELSE data END"),
+                "data_blob" => format!("CASE WHEN {unrendered} THEN NULL ELSE data_blob END"),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
+}
+
+/// Replace each unrendered body with an envelope of what the list does read
+/// (type, session, parent tool use) and `bodyWithheld: true`. Decided from the
+/// `event_type` column, so a withheld body is never parsed, and an archived one
+/// never decompressed or fetched: the row is handed to reconstruction as a
+/// plain stored row.
+fn withhold_unrendered_bodies(mut events: Vec<Event>) -> Vec<Event> {
+    for event in events.iter_mut() {
+        if !body_is_unrendered(&event.event_type) {
+            continue;
+        }
+        event.data = serde_json::json!({
+            "eventType": event.event_type,
+            "sessionId": event.session_id,
+            "parentToolUseId": event.parent_tool_use_id,
+            "bodyWithheld": true,
+        })
+        .to_string();
+        event.storage_mode = None;
+        event.content_commit = None;
+        event.content_change_id = None;
+        event.content_render_sha = None;
+        event.data_blob = None;
+        event.codec = None;
+    }
+    events
+}
+
+/// `event_read_tokens` rows for `event_ids`, keyed by event id. One statement
+/// per chunk of ids rather than one per tool result.
+async fn load_read_segments(
+    db: &LocalDb,
+    event_ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<ReadSegmentTokens>>, CairnError> {
+    const CHUNK: usize = 400;
+    let mut found = std::collections::HashMap::new();
+    for chunk in event_ids.chunks(CHUNK) {
+        let (placeholders, ids) = text_in_list(chunk);
+        let rows = db
+            .query_all(
+                format!(
+                    "SELECT event_id, segments_json
+                     FROM event_read_tokens
+                     WHERE event_id IN ({placeholders})"
+                ),
+                ids,
+                |row| Ok((row.text(0)?, row.text(1)?)),
+            )
+            .await
+            .map_err(CairnError::from)?;
+        for (event_id, json) in rows {
+            let segments: Vec<ReadSegmentTokens> = serde_json::from_str(&json).unwrap_or_default();
+            found.insert(event_id, segments);
+        }
+    }
+    Ok(found)
+}
+
 /// Strip cached read tool-result bodies from `events` and attach per-segment
 /// token counts (CAIRN-1593). A row in `event_read_tokens` both carries the
 /// counts and signals "this event is a read result", so any event with a cache
@@ -932,6 +1335,9 @@ async fn apply_lean_read_projection(db: &LocalDb, events: &mut [Event]) -> Resul
     let mut read_tool_paths: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     for event in events.iter() {
+        if body_is_unrendered(&event.event_type) {
+            continue;
+        }
         let Ok(parsed) = serde_json::from_str::<StoredTranscriptEvent>(&event.data) else {
             continue;
         };
@@ -987,31 +1393,7 @@ async fn apply_lean_read_projection(db: &LocalDb, events: &mut [Event]) -> Resul
     // Phase 1 (hot path): read existing cache rows. The common live case — a
     // freshly-streamed read whose row ingest already wrote — stays read-only.
     let candidate_ids: Vec<String> = candidates.iter().map(|c| c.event_id.clone()).collect();
-    let mut segments_by_event: std::collections::HashMap<String, Vec<ReadSegmentTokens>> = db
-        .read(move |conn| {
-            let candidate_ids = candidate_ids.clone();
-            Box::pin(async move {
-                let mut found: std::collections::HashMap<String, Vec<ReadSegmentTokens>> =
-                    std::collections::HashMap::new();
-                for id in candidate_ids {
-                    let mut rows = conn
-                        .query(
-                            "SELECT segments_json FROM event_read_tokens WHERE event_id = ?1",
-                            params![id.as_str()],
-                        )
-                        .await?;
-                    if let Some(row) = rows.next().await? {
-                        let json = row.text(0)?;
-                        let segs: Vec<ReadSegmentTokens> =
-                            serde_json::from_str(&json).unwrap_or_default();
-                        found.insert(id, segs);
-                    }
-                }
-                Ok(found)
-            })
-        })
-        .await
-        .map_err(CairnError::from)?;
+    let mut segments_by_event = load_read_segments(db, &candidate_ids).await?;
 
     // Phase 2 (backfill): only when a correlated read result has no cache row
     // (historical events from before ingest, or a delta missing its assistant).
@@ -1074,11 +1456,13 @@ async fn apply_lean_read_projection(db: &LocalDb, events: &mut [Event]) -> Resul
 /// only large payload — `raw` already had its content stripped at ingest — so
 /// nulling it removes the read text from the list payload while keeping the
 /// event renderable (the detail/raw surfaces re-fetch the full body on demand).
+/// Marked `bodyWithheld`, the one marker every list-stripped body carries.
 fn strip_read_body(data: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(data) {
         Ok(mut value) => {
             if let Some(obj) = value.as_object_mut() {
                 obj.insert("toolResult".to_string(), serde_json::Value::Null);
+                obj.insert("bodyWithheld".to_string(), serde_json::Value::Bool(true));
             }
             serde_json::to_string(&value).unwrap_or_else(|_| data.to_string())
         }
@@ -1086,47 +1470,41 @@ fn strip_read_body(data: &str) -> String {
     }
 }
 
-async fn load_session_events_delta(
+/// Every event of the session inserted after `cursor`, in insertion (rowid)
+/// order, and the cursor past them. Only the current session is read: a
+/// lineage is written strictly one session after another, so nothing lands in
+/// a predecessor once it has been rotated away from. Insertion order is not
+/// transcript order (a streamed message is inserted at finalize but sits at the
+/// sequence it reserved when it opened), so the caller places each event by
+/// its position. Uses idx_events_session_id.
+async fn load_session_events_after(
     db: &LocalDb,
-    session_id: String,
-    after_rowid: Option<i64>,
+    session_id: &str,
+    cursor: i64,
 ) -> Result<(Vec<Event>, Option<i64>), CairnError> {
-    match after_rowid {
-        // Initial load: reuse the run-ordered sort, and take the session-wide
-        // MAX(rowid) as the cursor (all durable rows are returned here).
-        None => {
-            let lineage = load_session_lineage_ids(db, &session_id).await?;
-            let (events, _run_position) = load_events_for_lineage(db, &lineage).await?;
-            let last_rowid = max_event_rowid_for_lineage(db, &lineage).await?;
-            Ok((events, last_rowid))
-        }
-        // Delta: rows insert monotonically, so rowid order is the append order
-        // and no Rust re-sort is needed. Uses idx_events_session_id.
-        Some(cursor) => {
-            let rows = db
-                .query_all(
-                    format!(
-                        "SELECT {EVENT_COLUMNS}, rowid
-                         FROM events
-                         WHERE session_id = ?1 AND rowid > ?2
-                         ORDER BY rowid ASC"
-                    ),
-                    params![session_id.as_str(), cursor],
-                    |row| {
-                        let event = event_from_row(row)?;
-                        // `rowid` is appended right after EVENT_COLUMNS.
-                        let rowid = row.i64(EVENT_COLUMN_COUNT)?;
-                        Ok((event, rowid))
-                    },
-                )
-                .await
-                .map_err(CairnError::from)?;
-            // Echo the cursor when the delta is empty so the caller holds position.
-            let last_rowid = rows.last().map(|(_, rowid)| *rowid).or(Some(cursor));
-            let events = rows.into_iter().map(|(event, _)| event).collect();
-            Ok((events, last_rowid))
-        }
-    }
+    let rows = db
+        .query_all(
+            format!(
+                "SELECT {}, rowid
+                 FROM events
+                 WHERE session_id = ?1 AND rowid > ?2
+                 ORDER BY rowid ASC",
+                list_event_columns()
+            ),
+            params![session_id, cursor],
+            |row| {
+                let event = event_from_row(row)?;
+                // `rowid` is appended right after EVENT_COLUMNS.
+                let rowid = row.i64(EVENT_COLUMN_COUNT)?;
+                Ok((event, rowid))
+            },
+        )
+        .await
+        .map_err(CairnError::from)?;
+    // Echo the cursor when the delta is empty so the caller holds position.
+    let last_rowid = rows.last().map(|(_, rowid)| *rowid).or(Some(cursor));
+    let events = rows.into_iter().map(|(event, _)| event).collect();
+    Ok((events, last_rowid))
 }
 
 fn message_streams_for_turn(
@@ -1693,6 +2071,44 @@ pub async fn settle_stale_run(
 
     let mut settled = Vec::new();
     for (turn_id, turn_state) in stranded {
+        // On a host restart, a running turn whose `run` call was held open on
+        // its socket owns an active durable row, and that row's reconciler
+        // resumes it exactly as it resumes a park. Settle it as the park it
+        // becomes (yielded for the wait), never as interrupted, or the boot
+        // resume would select it too and the turn would resume twice.
+        if settlement == StaleRunSettlement::HostRestart
+            && turn_state == "running"
+            && owns_held_call(conn, &turn_id).await?
+        {
+            conn.execute(
+                "UPDATE turns
+                 SET state = 'yielded',
+                     yield_reason = 'wait',
+                     ended_at = ?1,
+                     updated_at = ?1
+                 WHERE id = ?2 AND state = 'running'",
+                params![now, turn_id.as_str()],
+            )
+            .await?;
+            settled.push(turn_id);
+            continue;
+        }
+        if settlement == StaleRunSettlement::Reaped && turn_state == "running" {
+            // The turn's process is gone and the host is not restarting, so a
+            // `run` call the turn held open has nobody left to answer. Cancel
+            // its row, as a stop would. Nothing else settles it: the call's
+            // drop guard cannot yield a turn that is no longer running, and
+            // the next boot would resume this crashed turn from the row.
+            conn.execute(
+                "UPDATE agent_waits
+                 SET state = 'cancelled', resolved_at = ?2
+                 WHERE predecessor_turn_id = ?1
+                   AND state = 'pending'
+                   AND hold = 'inline'",
+                params![turn_id.as_str(), now],
+            )
+            .await?;
+        }
         let (target_state, end_reason) = match (settlement, turn_state.as_str()) {
             (StaleRunSettlement::HostRestart, "running") => ("interrupted", Some("host_restart")),
             (StaleRunSettlement::HostRestart, "pending") => ("cancelled", Some("host_restart")),
@@ -1736,6 +2152,22 @@ pub async fn settle_stale_run(
         settled.push(turn_id);
     }
     Ok(Some(settled))
+}
+
+/// Whether `turn_id` owns an active durable row for a `run` call held open on
+/// its socket (`agent_waits.hold = 'inline'`).
+async fn owns_held_call(conn: &Connection, turn_id: &str) -> DbResult<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM agent_waits
+             WHERE predecessor_turn_id = ?1
+               AND state IN ('pending', 'resolving')
+               AND hold = 'inline'
+             LIMIT 1",
+            params![turn_id],
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
 }
 
 /// Map a `runs` row projected by [`RUN_COLUMNS`] into a [`Run`]. Canonical
@@ -1801,6 +2233,39 @@ mod tests {
                 conn.execute(
                     "INSERT INTO runs(id, status, session_id, created_at, updated_at)
                      VALUES ('run-1', 'live', ?1, 1, 1)",
+                    params![session_id.as_str()],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    /// `seed_run`, with the run, its session and the job that owns them wired
+    /// together, the shape the job-keyed transcript window resolves.
+    async fn seed_job_run(db: &LocalDb, session_id: &str) {
+        seed_run(db, session_id).await;
+        db.write(|conn| {
+            let session_id = session_id.to_string();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                     VALUES ('project-1', 'default', 'p', 'p', '/tmp/p', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs(id, project_id, status, created_at, updated_at)
+                     VALUES ('job-1', 'project-1', 'running', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute("UPDATE runs SET job_id = 'job-1' WHERE id = 'run-1'", ())
+                    .await?;
+                conn.execute(
+                    "UPDATE jobs SET current_session_id = ?1 WHERE id = 'job-1'",
                     params![session_id.as_str()],
                 )
                 .await?;
@@ -2053,15 +2518,15 @@ mod tests {
         .unwrap();
     }
 
-    /// Initial load (no cursor): archived assistant events must come back with
-    /// their original `data` reconstructed, not the empty zstd stub. The stub
-    /// parses as valid JSON, so the chat UI silently renders it as an empty
-    /// (invisible) assistant turn — exactly the "assistant events vanished"
-    /// symptom — when reconstruction is skipped.
+    /// A tail page: archived assistant events must come back with their
+    /// original `data` reconstructed, not the empty zstd stub. The stub parses
+    /// as valid JSON, so the chat UI silently renders it as an empty (invisible)
+    /// assistant turn — exactly the "assistant events vanished" symptom — when
+    /// reconstruction is skipped.
     #[tokio::test]
-    async fn session_delta_initial_reconstructs_archived_events() {
+    async fn transcript_tail_reconstructs_archived_events() {
         let db = cairn_db::storage::migrated_test_db("session-delta-archived.db").await;
-        seed_run(&db, "sess-1").await;
+        seed_job_run(&db, "sess-1").await;
         let original =
             serde_json::to_string(&assistant_event(Some("hello world"), None, None)).unwrap();
         insert_event(
@@ -2075,10 +2540,16 @@ mod tests {
         .await;
         archive_event_zstd(&db, "event-1", &original).await;
 
-        let (events, _) = load_session_events_delta(&db, "sess-1".to_string(), None)
-            .await
-            .unwrap();
-        let events = cairn_db::storage::reconstruct_events(&db, events).await;
+        let events = list_job_transcript_window(
+            &db,
+            "job-1",
+            TranscriptWindow::Tail {
+                limit: TRANSCRIPT_PAGE_LIMIT,
+            },
+        )
+        .await
+        .unwrap()
+        .events;
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].data, original,
@@ -2105,10 +2576,10 @@ mod tests {
             assistant_event(Some("first"), None, None),
         )
         .await;
-        let (_initial, cursor) = load_session_events_delta(&db, "sess-1".to_string(), None)
+        let cursor = max_event_rowid_for_lineage(&db, &["sess-1".to_string()])
             .await
-            .unwrap();
-        let cursor = cursor.expect("initial load yields a cursor");
+            .unwrap()
+            .expect("the lineage has a newest event");
 
         insert_event(
             &db,
@@ -2120,7 +2591,7 @@ mod tests {
         )
         .await;
 
-        let (delta, next) = load_session_events_delta(&db, "sess-1".to_string(), Some(cursor))
+        let (delta, next) = load_session_events_after(&db, "sess-1", cursor)
             .await
             .expect("delta query must not error on archival columns");
         assert_eq!(delta.len(), 1, "delta returns only the new event");
@@ -2291,5 +2762,259 @@ mod tests {
         );
         assert!(full.read_segments.is_none());
         assert!(load_event_by_id(db, "missing").unwrap().is_none());
+    }
+
+    async fn insert_turn(db: &LocalDb, turn_id: &str, sequence: i64) {
+        db.execute(
+            "INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+             VALUES (?1, 'sess-1', 'run-1', 'job-1', ?2, 'complete', 1, 1)",
+            params![turn_id, sequence],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn insert_turn_event(db: &LocalDb, id: &str, sequence: i64, turn_id: &str) {
+        db.execute(
+            "INSERT INTO events(
+                id, run_id, session_id, turn_id, sequence, timestamp, event_type, data, created_at
+             ) VALUES (?1, 'run-1', 'sess-1', ?2, ?3, ?3, 'assistant', '{\"eventType\":\"assistant\"}', ?3)",
+            params![id, turn_id, sequence],
+        )
+        .await
+        .unwrap();
+    }
+
+    fn window_ids(window: &JobTranscriptWindow) -> Vec<&str> {
+        window
+            .events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect()
+    }
+
+    async fn page(db: &LocalDb, window: TranscriptWindow) -> JobTranscriptWindow {
+        list_job_transcript_window(db, "job-1", window)
+            .await
+            .unwrap()
+    }
+
+    /// A page boundary snaps back to the start of the turn it would split, but
+    /// never past twice the requested size, and the backward cursor walks on
+    /// from wherever the page actually ended.
+    #[tokio::test]
+    async fn transcript_page_snaps_to_turn_start_within_twice_the_limit() {
+        let db = cairn_db::storage::migrated_test_db("transcript-turn-snap.db").await;
+        seed_job_run(&db, "sess-1").await;
+        insert_turn(&db, "turn-a", 1).await;
+        insert_turn(&db, "turn-b", 2).await;
+        for sequence in 1..=2 {
+            insert_turn_event(&db, &format!("e{sequence}"), sequence, "turn-a").await;
+        }
+        for sequence in 3..=8 {
+            insert_turn_event(&db, &format!("e{sequence}"), sequence, "turn-b").await;
+        }
+
+        // The newest two split turn-b (3..=8); the snap reaches back for its
+        // start but stops at 2 x 2 events.
+        let tail = page(&db, TranscriptWindow::Tail { limit: 2 }).await;
+        assert_eq!(window_ids(&tail), vec!["e5", "e6", "e7", "e8"]);
+        assert_eq!(
+            tail.older,
+            Some(TranscriptPosition {
+                run_seq: 1,
+                sequence: 5
+            })
+        );
+        assert_eq!(tail.run_ordinals.get("run-1"), Some(&1));
+
+        // The next page lands exactly on turn-b's start, so there is nothing
+        // to snap.
+        let older = page(
+            &db,
+            TranscriptWindow::Before {
+                position: tail.older.unwrap(),
+                limit: 2,
+            },
+        )
+        .await;
+        assert_eq!(window_ids(&older), vec!["e3", "e4"]);
+        assert_eq!(
+            older.last_rowid, None,
+            "an older page leaves the forward cursor"
+        );
+
+        let oldest = page(
+            &db,
+            TranscriptWindow::Before {
+                position: older.older.unwrap(),
+                limit: 2,
+            },
+        )
+        .await;
+        assert_eq!(window_ids(&oldest), vec!["e1", "e2"]);
+
+        // A full page cannot know it was the last; the one after it says so.
+        let past_head = page(
+            &db,
+            TranscriptWindow::Before {
+                position: oldest.older.unwrap(),
+                limit: 2,
+            },
+        )
+        .await;
+        assert!(past_head.events.is_empty());
+        assert_eq!(past_head.older, None);
+
+        // A page whose turn starts within reach takes the whole turn.
+        let whole = page(&db, TranscriptWindow::Tail { limit: 5 }).await;
+        assert_eq!(window_ids(&whole), vec!["e3", "e4", "e5", "e6", "e7", "e8"]);
+    }
+
+    /// The bodies the transcript list never renders are withheld from every
+    /// list page — archived or not — and come back whole through the
+    /// single-event fetch.
+    #[tokio::test]
+    async fn transcript_window_withholds_unrendered_bodies() {
+        let db = Arc::new(cairn_db::storage::migrated_test_db("transcript-withhold.db").await);
+        seed_job_run(&db, "sess-1").await;
+        let typed = |event_type: &str, content: &str| {
+            let mut event = assistant_event(Some(content), None, None);
+            event.event_type = event_type.to_string();
+            event
+        };
+        insert_event(
+            &db,
+            "seed",
+            "sess-1",
+            1,
+            None,
+            typed("user:seed", "PRIOR DIGEST"),
+        )
+        .await;
+        insert_event(
+            &db,
+            "init",
+            "sess-1",
+            2,
+            None,
+            typed("system:init", "init body"),
+        )
+        .await;
+        insert_event(
+            &db,
+            "status",
+            "sess-1",
+            3,
+            None,
+            typed("system:status", "status body"),
+        )
+        .await;
+        insert_event(&db, "asst", "sess-1", 4, None, typed("assistant", "hello")).await;
+        insert_event(
+            &db,
+            "res",
+            "sess-1",
+            5,
+            None,
+            typed("result:success", "final"),
+        )
+        .await;
+        let seed_original = serde_json::to_string(&typed("user:seed", "PRIOR DIGEST")).unwrap();
+        archive_event_zstd(&db, "seed", &seed_original).await;
+
+        let tail = page(
+            &db,
+            TranscriptWindow::Tail {
+                limit: TRANSCRIPT_PAGE_LIMIT,
+            },
+        )
+        .await;
+        assert_eq!(
+            window_ids(&tail),
+            vec!["seed", "init", "status", "asst", "res"]
+        );
+        for event in &tail.events {
+            let data: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+            assert_eq!(data["eventType"], event.event_type.as_str());
+            if event.id == "asst" {
+                assert_eq!(data["content"], "hello");
+                assert!(data.get("bodyWithheld").is_none());
+            } else {
+                assert_eq!(data["bodyWithheld"], true, "{} keeps its body", event.id);
+                assert!(data.get("content").is_none(), "{} keeps its body", event.id);
+                assert_eq!(data["sessionId"], "sess-1");
+                assert!(event.storage_mode.is_none() && event.data_blob.is_none());
+            }
+        }
+
+        let seed = load_event_by_id(db.clone(), "seed").unwrap().unwrap();
+        assert_eq!(
+            seed.data, seed_original,
+            "the detail fetch restores the archived body"
+        );
+        let result = load_event_by_id(db, "res").unwrap().unwrap();
+        assert!(result.data.contains("final"));
+    }
+
+    async fn explain(db: &LocalDb, sql: &str, params: Vec<Value>) -> Vec<String> {
+        db.query_all(format!("EXPLAIN QUERY PLAN {sql}"), params, |row| {
+            row.text(3)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Each step of a transcript page is an index seek, so a page costs what it
+    /// returns rather than what precedes it. Turso keeps no statistics, so the
+    /// plan is the only evidence an index is load-bearing.
+    #[tokio::test]
+    async fn transcript_window_statements_stay_on_their_indexes() {
+        let db = cairn_db::storage::migrated_test_db("transcript-window-plans.db").await;
+        let text = |value: &str| Value::Text(value.to_string());
+
+        let page_plan = explain(
+            &db,
+            &run_page_sql(),
+            vec![
+                text("run-1"),
+                Value::Integer(i64::MAX),
+                Value::Integer(i64::MIN),
+                Value::Integer(500),
+            ],
+        )
+        .await;
+        assert!(
+            page_plan
+                .iter()
+                .any(|step| step.contains("USING INDEX idx_events_run_sequence")),
+            "the page step must seek idx_events_run_sequence, got {page_plan:?}"
+        );
+        assert!(
+            !page_plan.iter().any(|step| step.contains("SCAN")
+                || step.contains("SORT")
+                || step.contains("B-TREE")),
+            "the page step must neither scan nor sort, got {page_plan:?}"
+        );
+
+        let runs_plan = explain(&db, JOB_RUN_ORDINALS_SQL, vec![text("job-1")]).await;
+        assert!(
+            runs_plan
+                .iter()
+                .any(|step| step.contains("USING INDEX idx_runs_job_id")),
+            "the run list must seek idx_runs_job_id, got {runs_plan:?}"
+        );
+
+        // Turso may intersect the turn index with the run index
+        // (`MULTI-INDEX AND events (idx_events_turn_id, ...)`); either way the
+        // turn index drives it and nothing is scanned.
+        let turn_plan = explain(&db, TURN_START_SQL, vec![text("turn-1"), text("run-1")]).await;
+        assert!(
+            turn_plan
+                .iter()
+                .any(|step| step.contains("idx_events_turn_id"))
+                && !turn_plan.iter().any(|step| step.contains("SCAN")),
+            "the turn snap must seek idx_events_turn_id, got {turn_plan:?}"
+        );
     }
 }

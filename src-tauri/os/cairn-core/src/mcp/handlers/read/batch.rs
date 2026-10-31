@@ -30,11 +30,25 @@ struct ReadBatchPayload {
     include_bodies: bool,
 }
 
-/// Handle a `read_batch` callback: classify, produce, dedup, and assemble.
+/// Handle a `read_batch` callback: classify, produce, dedup, and assemble. The
+/// MCP tool's result lands in a model's context, so it reads under the context
+/// budget.
 pub(crate) async fn handle_read_batch(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     read_cursors: &ReadCursorState,
+) -> String {
+    read_batch(orch, request, read_cursors, view::ReadBudget::Context).await
+}
+
+/// A `read_batch` composed under `budget`, which the caller chooses for who the
+/// read is for. It is never read from the payload: a read's audience is a fact
+/// about the caller, not a request a caller may make.
+pub(crate) async fn read_batch(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    read_cursors: &ReadCursorState,
+    budget: view::ReadBudget,
 ) -> String {
     let payload: ReadBatchPayload = match crate::mcp::handlers::parse_payload(request) {
         Ok(payload) => payload,
@@ -145,9 +159,9 @@ pub(crate) async fn handle_read_batch(
         .map(|run_id| crate::token_meters::meter_for_process(&orch.process_state, run_id))
         .unwrap_or(&crate::token_meters::CLAUDE_TOKEN_METER);
     let envelope = if payload.include_bodies {
-        view::assemble_with_bodies(segments, meter)
+        view::assemble_with_bodies(segments, budget, meter)
     } else {
-        view::assemble(segments, meter)
+        view::assemble(segments, budget, meter)
     };
     serde_json::to_string(&envelope)
         .unwrap_or_else(|error| format!("Failed to serialize read batch: {error}"))
@@ -357,12 +371,14 @@ async fn produce_web_segment(
     // Peel grep-family params off the URL so they are never forwarded to bmd.
     let clean = strip_query_keys(&clean, GREP_STRIP_KEYS);
     let web_request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: request.cwd.clone(),
         run_id: request.run_id.clone(),
         tool: "read_web".to_string(),
         payload: serde_json::json!({ "target": clean }),
         tool_use_id: request.tool_use_id.clone(),
+        origin: None,
     };
     match crate::mcp::handlers::web::read_web_markdown(orch, &web_request).await {
         Ok(markdown) => {
@@ -481,6 +497,7 @@ async fn produce_resource_segment(
                 .unwrap_or_else(|| rendered.content.lines().count());
             meta.unit_noun = rendered.unit_noun.map(str::to_string);
             meta.record_prelude_lines = rendered.record_prelude_lines;
+            meta.more_records = rendered.more_records;
             meta.offset = rendered.offset.unwrap_or(0).max(0) as usize;
             meta.limit = rendered.limit;
             ReadSegment {
@@ -559,12 +576,14 @@ async fn produce_terminal_segment(
     let clean = strip_query_keys(&clean, GREP_STRIP_KEYS);
 
     let resource_request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: request.cwd.clone(),
         run_id: request.run_id.clone(),
         tool: "read_resource".to_string(),
         payload: serde_json::json!({ "uri": clean }),
         tool_use_id: request.tool_use_id.clone(),
+        origin: None,
     };
     let raw = crate::mcp::handlers::resources::handle_read_resource(
         orch,
@@ -707,6 +726,7 @@ mod tests {
     fn assemble_orders_targets_under_headers() {
         let envelope = view::assemble(
             vec![file_segment("file:a.rs", 2), file_segment("file:b.rs", 2)],
+            view::ReadBudget::Context,
             &crate::token_meters::O200K_TOKEN_METER,
         );
         let a = envelope.text.find("=== file:a.rs").unwrap();
@@ -723,7 +743,11 @@ mod tests {
         for i in 0..5 {
             segments.push(file_segment(&format!("file:small{i}.rs"), 3));
         }
-        let envelope = view::assemble(segments, &crate::token_meters::O200K_TOKEN_METER);
+        let envelope = view::assemble(
+            segments,
+            view::ReadBudget::Context,
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         assert!(
             crate::token_meters::O200K_TOKEN_METER.count(&envelope.text)
                 <= view::READ_BATCH_TOKEN_BUDGET
@@ -748,7 +772,11 @@ mod tests {
         let mut b = file_segment("cairn://p/X/2", 2);
         b.meta.kind = SegmentKind::Resource;
         b.affordance = Some(affordance.clone());
-        let envelope = view::assemble(vec![a, b], &crate::token_meters::O200K_TOKEN_METER);
+        let envelope = view::assemble(
+            vec![a, b],
+            view::ReadBudget::Context,
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         // The identical affordance appears exactly once, at the very end.
         assert_eq!(envelope.text.matches("--- actions ---").count(), 1);
         assert!(envelope.text.trim_end().ends_with("--- actions ---"));
@@ -764,6 +792,7 @@ mod tests {
                 file_segment("file:a.rs", 2),
                 error_segment("file:bad.rs", "Failed to read file: nope"),
             ],
+            view::ReadBudget::Context,
             &crate::token_meters::O200K_TOKEN_METER,
         );
         assert!(envelope.text.contains("=== file:bad.rs [error] ==="));
@@ -818,6 +847,7 @@ mod tests {
         .build();
 
         let request = McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: worktree.path().display().to_string(),
             run_id: None,
@@ -826,6 +856,7 @@ mod tests {
                 "paths": ["file:big.rs?offset=2&limit=3", "file:small.rs"]
             }),
             tool_use_id: None,
+            origin: None,
         };
         let cursors = Mutex::new(HashMap::new());
         let result = handle_read_batch(&orch, &request, &cursors).await;
@@ -865,6 +896,7 @@ mod tests {
         let paths = serde_json::json!(["file:small.rs", "file:huge.rs", "file:missing.rs"]);
 
         let structured_request = McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: worktree.path().display().to_string(),
             run_id: None,
@@ -874,6 +906,7 @@ mod tests {
                 "include_bodies": true
             }),
             tool_use_id: None,
+            origin: None,
         };
         let cursors = Mutex::new(HashMap::new());
         let structured_raw = handle_read_batch(&orch, &structured_request, &cursors).await;
@@ -926,12 +959,14 @@ mod tests {
         let cursors = Mutex::new(HashMap::new());
 
         let request = |path: &str| McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: worktree.path().display().to_string(),
             run_id: Some("run-paging-dedup".to_string()),
             tool: "read_batch".to_string(),
             payload: serde_json::json!({"paths":[path], "include_bodies":true}),
             tool_use_id: None,
+            origin: None,
         };
 
         for _ in 0..2 {
@@ -990,12 +1025,14 @@ mod tests {
 
     async fn read_batch_text(orch: &Orchestrator, paths: serde_json::Value) -> String {
         let request = McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: tempfile::tempdir().unwrap().keep().display().to_string(),
             run_id: None,
             tool: "read_batch".to_string(),
             payload: serde_json::json!({ "paths": paths }),
             tool_use_id: None,
+            origin: None,
         };
         let cursors = Mutex::new(HashMap::new());
         let result = handle_read_batch(orch, &request, &cursors).await;
@@ -1309,6 +1346,94 @@ mod tests {
         assert!(text.contains("offset=2"));
     }
 
+    async fn seed_eras(orch: &Orchestrator, count: i64) {
+        for seq in 1..=count {
+            let sql = format!(
+                "INSERT INTO thread_eras (
+                     job_id, seq, start_block, end_block, started_at, ended_at, summary,
+                     summary_status, summary_model, source_tokens, minted_generation, created_at
+                 ) VALUES ('job-rb', {seq}, {seq}, {seq}, 10, 20, 'Era summary {seq}.', 'fallback', NULL, 500, 1, 30)"
+            );
+            orch.db
+                .local
+                .write(move |conn| {
+                    let sql = sql.clone();
+                    Box::pin(async move {
+                        conn.execute(&sql, ()).await?;
+                        Ok(())
+                    })
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A resource that pages its own records receives its `offset`/`limit`
+    /// rather than having them taken as a line window, and its page continues
+    /// in its own unit. Eras list newest first, so skipping one leaves 4 and 3.
+    #[tokio::test]
+    async fn read_batch_self_paging_resource_pages_and_continues_in_records() {
+        let orch = seeded_orch().await;
+        seed_home_run(&orch).await;
+        seed_eras(&orch, 5).await;
+
+        let envelope = read_batch_envelope(
+            &orch,
+            serde_json::json!(["cairn://p/RB/1/1/builder/eras?limit=2&offset=1"]),
+        )
+        .await;
+
+        let seg = &envelope.segments[0];
+        assert_eq!(seg.natural_unit, NaturalUnit::Record, "{}", envelope.text);
+        assert!(envelope.text.contains("[2 of 5 eras]"), "{}", envelope.text);
+        assert!(
+            envelope.text.contains("Era summary 4."),
+            "{}",
+            envelope.text
+        );
+        assert!(
+            envelope.text.contains("Era summary 3."),
+            "{}",
+            envelope.text
+        );
+        assert!(
+            !envelope.text.contains("Era summary 5."),
+            "{}",
+            envelope.text
+        );
+        assert!(
+            envelope
+                .text
+                .contains("continue: cairn://p/RB/1/1/builder/eras?limit=2&offset=3]"),
+            "{}",
+            envelope.text
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_composes_with_a_self_paging_resources_offset() {
+        let orch = seeded_orch().await;
+        seed_home_run(&orch).await;
+        seed_eras(&orch, 5).await;
+
+        let envelope = read_batch_envelope(
+            &orch,
+            serde_json::json!(["cairn://p/RB/1/1/builder/eras?offset=3&grep=Era summary"]),
+        )
+        .await;
+
+        let seg = &envelope.segments[0];
+        assert_eq!(seg.kind, SegmentKind::Grep, "{}", envelope.text);
+        // Only the eras past the offset are searched.
+        // Eras list newest first: past an offset of 3 only eras 2 and 1 remain.
+        assert_eq!(seg.match_count, Some(2), "{}", envelope.text);
+        assert!(
+            envelope.text.contains("Era summary 1."),
+            "{}",
+            envelope.text
+        );
+    }
+
     #[tokio::test]
     async fn read_batch_chat_limit_is_windowed_not_rejected() {
         // Regression (CAIRN-1581): `.../chat?limit=N` used to bounce as an
@@ -1425,12 +1550,14 @@ mod tests {
         paths: serde_json::Value,
     ) -> ReadBatchEnvelope {
         let request = McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: cwd.display().to_string(),
             run_id: None,
             tool: "read_batch".to_string(),
             payload: serde_json::json!({ "paths": paths }),
             tool_use_id: None,
+            origin: None,
         };
         let cursors = Mutex::new(HashMap::new());
         serde_json::from_str(&handle_read_batch(orch, &request, &cursors).await).unwrap()
@@ -1488,12 +1615,14 @@ mod tests {
             payload["_cairn_origin"] = serde_json::Value::String("cli".to_string());
         }
         let request = McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: tempfile::tempdir().unwrap().keep().display().to_string(),
             run_id: run_id.map(str::to_string),
             tool: "read_batch".to_string(),
             payload,
             tool_use_id: None,
+            origin: None,
         };
         let cursors = Mutex::new(HashMap::new());
         let result = handle_read_batch(orch, &request, &cursors).await;

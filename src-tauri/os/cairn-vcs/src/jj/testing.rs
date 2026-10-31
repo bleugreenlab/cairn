@@ -20,10 +20,16 @@ pub fn provisioned_jj() -> Option<std::path::PathBuf> {
         _ => return None,
     };
     let suffix = if cfg!(windows) { ".exe" } else { "" };
-    let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../binaries")
-        .join(format!("jj-{triple}{suffix}"));
-    bundled.is_file().then_some(bundled)
+    // Found at run time, not baked in with `env!`: integration tests in other
+    // crates link this helper, and a baked path would follow the artifact to
+    // whichever build cell reuses it.
+    let bundled = |src_tauri: &Path| {
+        src_tauri
+            .join("binaries")
+            .join(format!("jj-{triple}{suffix}"))
+    };
+    cairn_common::paths::development_checkout_ancestor(|directory| bundled(directory).is_file())
+        .map(|src_tauri| bundled(&src_tauri))
 }
 
 /// The skip reason a jj-gated test records when jj cannot be resolved.

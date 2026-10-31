@@ -3,8 +3,8 @@
 use cairn_db::turso::params;
 
 use super::common::{
-    connect_for_read, find_query_value, lookup_project_by_key, parse_optional_i64_param,
-    parse_optional_usize_param, storage_error,
+    find_query_value, lookup_project_by_key, parse_optional_i64_param, parse_optional_usize_param,
+    read_resource, storage_error,
 };
 
 use crate::attachments::{AttachmentKind, AttachmentRow};
@@ -527,11 +527,16 @@ pub(super) async fn produce_project_issues(
     project_key: &str,
     params: &[QueryParam],
 ) -> Result<ProjectIssuesPage, String> {
-    let conn = connect_for_read(db).await?;
-    let project_ctx = lookup_project_by_key(&conn, project_key).await?;
     let query = ProjectIssuesQuery::parse(params)?;
-    let (project_issues, total) =
-        load_project_issue_summaries(&conn, &project_ctx.project_id, &query).await?;
+    let project_key = project_key.to_owned();
+    let (project_ctx, (project_issues, total), query) = read_resource(db, move |conn| {
+        Box::pin(async move {
+            let project_ctx = lookup_project_by_key(conn, &project_key).await?;
+            let page = load_project_issue_summaries(conn, &project_ctx.project_id, &query).await?;
+            Ok((project_ctx, page, query))
+        })
+    })
+    .await?;
     let shown = project_issues.len();
     let offset = query.offset.max(0) as usize;
 
@@ -717,83 +722,109 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
     // CAIRN-2129 read-routing so a team project's overview reads from its replica.
     let routed_db = orch.db.for_project(project_key).await;
     let db = &*routed_db;
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
-    let lookup_key = cairn_common::uri::canonical_project(project_key);
-    let mut project_rows = match conn
-        .query(
-            "
-            SELECT id, name, context, key, repo_path
-            FROM projects
-            WHERE key = ?1
-            LIMIT 1
-            ",
-            (lookup_key.as_str(),),
-        )
-        .await
-    {
-        Ok(rows) => rows,
-        Err(error) => return storage_error("Failed to load project", error.into()),
-    };
+    let requested_key = project_key.to_owned();
+    let read = read_resource(db, move |conn| {
+        Box::pin(async move {
+            let lookup_key = cairn_common::uri::canonical_project(&requested_key);
+            let mut project_rows = conn
+                .query(
+                    "
+                    SELECT id, name, context, key, repo_path
+                    FROM projects
+                    WHERE key = ?1
+                    LIMIT 1
+                    ",
+                    (lookup_key.as_str(),),
+                )
+                .await
+                .map_err(|error| storage_error("Failed to load project", error.into()))?;
 
-    let (project_id, project_name, project_context, canonical_key, repo_path): (
-        String,
-        String,
-        Option<String>,
-        String,
-        String,
-    ) = match project_rows.next().await {
-        Ok(Some(row)) => match (
-            row.text(0),
-            row.text(1),
-            row.opt_text(2),
-            row.text(3),
-            row.text(4),
-        ) {
-            (Ok(id), Ok(name), Ok(context), Ok(key), Ok(repo_path)) => {
-                (id, name, context, key, repo_path)
-            }
-            _ => return "Failed to decode project".to_string(),
-        },
-        _ => return format!("Project '{}' not found", project_key),
-    };
+            let (project_id, project_name, project_context, canonical_key, repo_path): (
+                String,
+                String,
+                Option<String>,
+                String,
+                String,
+            ) = match project_rows.next().await {
+                Ok(Some(row)) => match (
+                    row.text(0),
+                    row.text(1),
+                    row.opt_text(2),
+                    row.text(3),
+                    row.text(4),
+                ) {
+                    (Ok(id), Ok(name), Ok(context), Ok(key), Ok(repo_path)) => {
+                        (id, name, context, key, repo_path)
+                    }
+                    _ => return Err("Failed to decode project".to_string()),
+                },
+                _ => return Err(format!("Project '{}' not found", requested_key)),
+            };
+            drop(project_rows);
 
-    let issue_stats = load_project_issue_stats(&conn, &project_id).await;
-    let recent_issues = load_recent_project_issue_summaries(&conn, &project_id, 5).await;
-    let labels =
-        crate::labels::crud::list_labels_conn(&conn, crate::labels::crud::DEFAULT_WORKSPACE_ID)
+            let issue_stats = load_project_issue_stats(conn, &project_id).await;
+            let recent_issues = load_recent_project_issue_summaries(conn, &project_id, 5).await;
+            let labels = crate::labels::crud::list_labels_conn(
+                conn,
+                crate::labels::crud::DEFAULT_WORKSPACE_ID,
+            )
             .await
             .unwrap_or_default();
 
-    let mut terminals: Vec<(String, Option<String>, Option<String>, String)> = Vec::new();
-    if let Ok(mut rows) = conn
-        .query(
-            "
-            SELECT slug, title, description, status
-            FROM job_terminals
-            WHERE project_id = ?1
-              AND job_id IS NULL
-              AND slug IS NOT NULL
-            ORDER BY created_at DESC
-            ",
-            (project_id.as_str(),),
-        )
-        .await
-    {
-        while let Ok(Some(row)) = rows.next().await {
-            let (Ok(Some(slug)), Ok(title), Ok(description), Ok(status)) = (
-                row.opt_text(0),
-                row.opt_text(1),
-                row.opt_text(2),
-                row.text(3),
-            ) else {
-                continue;
-            };
-            terminals.push((slug, title, description, status));
-        }
-    }
+            let mut terminals: Vec<(String, Option<String>, Option<String>, String)> = Vec::new();
+            if let Ok(mut rows) = conn
+                .query(
+                    "
+                    SELECT slug, title, description, status
+                    FROM job_terminals
+                    WHERE project_id = ?1
+                      AND job_id IS NULL
+                      AND slug IS NOT NULL
+                    ORDER BY created_at DESC
+                    ",
+                    (project_id.as_str(),),
+                )
+                .await
+            {
+                while let Ok(Some(row)) = rows.next().await {
+                    let (Ok(Some(slug)), Ok(title), Ok(description), Ok(status)) = (
+                        row.opt_text(0),
+                        row.opt_text(1),
+                        row.opt_text(2),
+                        row.text(3),
+                    ) else {
+                        continue;
+                    };
+                    terminals.push((slug, title, description, status));
+                }
+            }
+
+            let held = crate::execution::gates::census::held_executions_for_project_conn(
+                conn,
+                &project_id,
+            )
+            .await
+            .map_err(|error| error.to_string());
+
+            Ok((
+                (
+                    project_id,
+                    project_name,
+                    project_context,
+                    canonical_key,
+                    repo_path,
+                ),
+                (issue_stats, recent_issues, labels, terminals, held),
+            ))
+        })
+    });
+    let (
+        (project_id, project_name, project_context, canonical_key, repo_path),
+        (issue_stats, recent_issues, labels, terminals, held),
+    ) = match read.await {
+        Ok(rows) => rows,
+        Err(error) => return error,
+    };
 
     // Format as markdown
     let mut output = format!("# {}\n\n", project_name);
@@ -826,7 +857,7 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
         ));
     }
 
-    output.push_str(&render_held_executions(&conn, &canonical_key, &project_id).await);
+    output.push_str(&render_held_executions(held, &canonical_key));
 
     output.push_str(&render_main_attestation(orch, &project_id));
 
@@ -1389,22 +1420,18 @@ fn difference(now: u64, then: u64) -> String {
 /// otherwise silent. This section is how the project overview keeps it visible.
 /// The won't-start list is what keeps a dead execution from posing as a
 /// waiting one. Silent only when there is neither.
-async fn render_held_executions(
-    conn: &cairn_db::turso::Connection,
+fn render_held_executions(
+    held: Result<Vec<crate::execution::gates::census::ProjectHeldExecution>, String>,
     project_key: &str,
-    project_id: &str,
 ) -> String {
-    let held =
-        match crate::execution::gates::census::held_executions_for_project_conn(conn, project_id)
-            .await
-        {
-            Ok(held) => held,
-            // Saying the census could not be read is better than omitting it:
-            // an absent section reads as "nothing is held".
-            Err(error) => {
-                return format!("## Held executions\n\nCould not read held executions: {error}\n\n")
-            }
-        };
+    let held = match held {
+        Ok(held) => held,
+        // Saying the census could not be read is better than omitting it:
+        // an absent section reads as "nothing is held".
+        Err(error) => {
+            return format!("## Held executions\n\nCould not read held executions: {error}\n\n")
+        }
+    };
     let (waiting, wont_start): (Vec<_>, Vec<_>) =
         held.iter().partition(|entry| entry.execution.census.held);
     let entry_line = |entry: &crate::execution::gates::census::ProjectHeldExecution| {
@@ -1453,19 +1480,44 @@ async fn render_held_executions(
 /// difference: while a lane is listed, the absence of its rows for the current
 /// head is a run still working, not a gap.
 ///
-/// Silent when nothing is running, because then the rows and the cadence's
-/// thread messages already say everything there is to say.
+/// Below the running work, every lane's last report since this runner started:
+/// a short lane (a typecheck) runs for a minute or two after each merge, and
+/// would otherwise appear here only in that window. Silent when no lane is
+/// running or has reported.
 fn render_main_attestation(orch: &Orchestrator, project_id: &str) -> String {
-    let Some(in_flight) = crate::execution::checks_main::in_flight(orch, project_id) else {
+    let in_flight = crate::execution::checks_main::in_flight(orch, project_id);
+    let outcomes = crate::execution::checks_main::last_outcomes(orch, project_id);
+    if in_flight.is_none() && outcomes.is_empty() {
         return String::new();
-    };
+    }
     let now = chrono::Utc::now().timestamp_millis();
+    let mut out = String::from("## Main cadence\n\n");
+    if let Some(in_flight) = in_flight {
+        render_main_in_flight(&mut out, &in_flight, now);
+    }
+    if !outcomes.is_empty() {
+        out.push_str("Each lane's last report since this runner started:\n\n");
+        for outcome in &outcomes {
+            out.push_str(&crate::execution::checks_main::render_outcome_line(
+                outcome, now,
+            ));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn render_main_in_flight(
+    out: &mut String,
+    in_flight: &crate::execution::checks_main::InFlight,
+    now: i64,
+) {
     let ago = |armed_at_unix_ms: i64| {
         crate::clock::format_elapsed((now - armed_at_unix_ms).max(0) / 1000)
     };
-    let mut out = String::from(
-        "## Main cadence\n\nEach lane records its row for the current default head when its run \
-         finishes, so a listed lane's rows missing for it now are pending, not absent.\n\n",
+    out.push_str(
+        "Each lane records its row for the current default head when its run finishes, so a \
+         listed lane's rows missing for it now are pending, not absent.\n\n",
     );
     if let Some((branch, armed_at_unix_ms)) = &in_flight.resolving {
         out.push_str(&format!(
@@ -1491,31 +1543,37 @@ fn render_main_attestation(orch: &Orchestrator, project_id: &str) -> String {
         out.push_str(&format!("- Re-arms {}.\n", interruption.describe()));
     }
     out.push('\n');
-    out
 }
 
 pub(super) async fn read_projects(db: &LocalDb) -> String {
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
-    let mut rows = match conn
-        .query(
-            "SELECT key, name, hidden FROM projects ORDER BY name ASC",
-            (),
-        )
-        .await
+    let projects = match read_resource(db, |conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT key, name, hidden FROM projects ORDER BY name ASC",
+                    (),
+                )
+                .await
+                .map_err(|error| storage_error("Failed to list projects", error.into()))?;
+            let mut projects = Vec::new();
+            while let Ok(Some(row)) = rows.next().await {
+                let (Ok(key), Ok(name), Ok(hidden)) = (row.text(0), row.text(1), row.i64(2)) else {
+                    continue;
+                };
+                projects.push((key, name, hidden));
+            }
+            Ok(projects)
+        })
+    })
+    .await
     {
-        Ok(rows) => rows,
-        Err(error) => return storage_error("Failed to list projects", error.into()),
+        Ok(projects) => projects,
+        Err(error) => return error,
     };
 
     let mut out = String::from("# Projects\n\n");
     let mut any = false;
-    while let Ok(Some(row)) = rows.next().await {
-        let (Ok(key), Ok(name), Ok(hidden)) = (row.text(0), row.text(1), row.i64(2)) else {
-            continue;
-        };
+    for (key, name, hidden) in projects {
         any = true;
         let hidden_mark = if hidden != 0 { " (hidden)" } else { "" };
         out.push_str(&format!(
@@ -1599,28 +1657,37 @@ fn render_configured_reference(
     out
 }
 
+/// A project's repo path from its row, read in a short read of its own so the
+/// settings and reference loads that follow touch the filesystem with no
+/// transaction open.
+async fn project_repo_path_row(db: &LocalDb, project_key: &str) -> Result<String, String> {
+    let project_key = project_key.to_owned();
+    read_resource(db, move |conn| {
+        Box::pin(async move {
+            let lookup = cairn_common::uri::canonical_project(&project_key);
+            let mut rows = conn
+                .query(
+                    "SELECT repo_path FROM projects WHERE key = ?1 LIMIT 1",
+                    (lookup.as_str(),),
+                )
+                .await
+                .map_err(|error| storage_error("Failed to load project", error.into()))?;
+            match rows.next().await {
+                Ok(Some(row)) => row
+                    .text(0)
+                    .map_err(|_| "Failed to decode project".to_string()),
+                _ => Err(format!("Project '{}' not found", project_key)),
+            }
+        })
+    })
+    .await
+}
+
 pub(super) async fn read_project_references(orch: &Orchestrator, project_key: &str) -> String {
-    let conn = match connect_for_read(&orch.db.local).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
     let lookup = cairn_common::uri::canonical_project(project_key);
-    let mut rows = match conn
-        .query(
-            "SELECT repo_path FROM projects WHERE key = ?1 LIMIT 1",
-            (lookup.as_str(),),
-        )
-        .await
-    {
-        Ok(rows) => rows,
-        Err(error) => return storage_error("Failed to load project", error.into()),
-    };
-    let repo_path = match rows.next().await {
-        Ok(Some(row)) => match row.text(0) {
-            Ok(repo) => repo,
-            _ => return "Failed to decode project".to_string(),
-        },
-        _ => return format!("Project '{}' not found", project_key),
+    let repo_path = match project_repo_path_row(&orch.db.local, project_key).await {
+        Ok(repo_path) => repo_path,
+        Err(error) => return error,
     };
     let config = crate::config::project_settings::load_project_settings_read_only(
         std::path::Path::new(&repo_path),
@@ -1652,27 +1719,10 @@ pub(super) async fn read_project_reference(
     project_key: &str,
     name: &str,
 ) -> String {
-    let conn = match connect_for_read(&orch.db.local).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
     let lookup = cairn_common::uri::canonical_project(project_key);
-    let mut rows = match conn
-        .query(
-            "SELECT repo_path FROM projects WHERE key = ?1 LIMIT 1",
-            (lookup.as_str(),),
-        )
-        .await
-    {
-        Ok(rows) => rows,
-        Err(error) => return storage_error("Failed to load project", error.into()),
-    };
-    let repo_path = match rows.next().await {
-        Ok(Some(row)) => match row.text(0) {
-            Ok(repo) => repo,
-            _ => return "Failed to decode project".to_string(),
-        },
-        _ => return format!("Project '{}' not found", project_key),
+    let repo_path = match project_repo_path_row(&orch.db.local, project_key).await {
+        Ok(repo_path) => repo_path,
+        Err(error) => return error,
     };
     let config = crate::config::project_settings::load_project_settings_read_only(
         std::path::Path::new(&repo_path),
@@ -1690,28 +1740,32 @@ pub(super) async fn read_project_reference(
 
 pub(super) async fn read_project_settings(orch: &Orchestrator, project_key: &str) -> String {
     let routed_db = orch.db.for_project(project_key).await;
-    let conn = match connect_for_read(&routed_db).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
     let lookup = cairn_common::uri::canonical_project(project_key);
-    let mut rows = match conn
-        .query(
-            "SELECT id, repo_path, default_branch FROM projects WHERE key = ?1 LIMIT 1",
-            (lookup.as_str(),),
-        )
-        .await
-    {
-        Ok(rows) => rows,
-        Err(error) => return storage_error("Failed to load project", error.into()),
-    };
+    let requested_key = project_key.to_owned();
+    let row_key = lookup.clone();
     let (project_id, repo_path, default_branch): (String, String, Option<String>) =
-        match rows.next().await {
-            Ok(Some(row)) => match (row.text(0), row.text(1), row.opt_text(2)) {
-                (Ok(id), Ok(repo), Ok(branch)) => (id, repo, branch),
-                _ => return "Failed to decode project".to_string(),
-            },
-            _ => return format!("Project '{}' not found", project_key),
+        match read_resource(&routed_db, move |conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id, repo_path, default_branch FROM projects WHERE key = ?1 LIMIT 1",
+                        (row_key.as_str(),),
+                    )
+                    .await
+                    .map_err(|error| storage_error("Failed to load project", error.into()))?;
+                match rows.next().await {
+                    Ok(Some(row)) => match (row.text(0), row.text(1), row.opt_text(2)) {
+                        (Ok(id), Ok(repo), Ok(branch)) => Ok((id, repo, branch)),
+                        _ => Err("Failed to decode project".to_string()),
+                    },
+                    _ => Err(format!("Project '{}' not found", requested_key)),
+                }
+            })
+        })
+        .await
+        {
+            Ok(row) => row,
+            Err(error) => return error,
         };
 
     let repo = std::path::Path::new(&repo_path);
@@ -1831,14 +1885,6 @@ pub(super) async fn read_project_search(
     }
 
     let routed_db = orch.db.for_project(project_key).await;
-    let conn = match connect_for_read(&routed_db).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
-    let project_ctx = match lookup_project_by_key(&conn, project_key).await {
-        Ok(ctx) => ctx,
-        Err(error) => return error,
-    };
 
     let limit = match parse_optional_usize_param(params, "limit") {
         Ok(limit) => limit,
@@ -1871,23 +1917,45 @@ pub(super) async fn read_project_search(
 
     // `issue=NUMBER` scopes the search to one issue's accumulated history
     // (executions, transcripts, comments) rather than finding the issue itself.
-    let issue_id = match find_query_value(params, "issue") {
+    let issue_number = match find_query_value(params, "issue") {
         Some(raw) => match raw.trim().parse::<i32>() {
-            Ok(number) => {
-                match super::common::issue_id_for_number(&conn, &project_ctx.project_id, number)
-                    .await
-                {
-                    Some(id) => Some(id),
-                    None => {
-                        return format!("Issue {}/{} not found", project_ctx.project_key, number)
-                    }
-                }
-            }
+            Ok(number) => Some(number),
             Err(_) => {
                 return format!("Invalid 'issue' value '{raw}' for project search projection")
             }
         },
         None => None,
+    };
+
+    // The lookups only: the index drain and the search itself (whose semantic
+    // lane calls the embedder) run after this read has released.
+    let requested_key = project_key.to_owned();
+    let (project_ctx, issue_id) = match read_resource(&routed_db, move |conn| {
+        Box::pin(async move {
+            let project_ctx = lookup_project_by_key(conn, &requested_key).await?;
+            let issue_id = match issue_number {
+                Some(number) => {
+                    match super::common::issue_id_for_number(conn, &project_ctx.project_id, number)
+                        .await
+                    {
+                        Some(id) => Some(id),
+                        None => {
+                            return Err(format!(
+                                "Issue {}/{} not found",
+                                project_ctx.project_key, number
+                            ))
+                        }
+                    }
+                }
+                None => None,
+            };
+            Ok((project_ctx, issue_id))
+        })
+    })
+    .await
+    {
+        Ok(found) => found,
+        Err(error) => return error,
     };
 
     let filters = crate::models::SearchFilters {

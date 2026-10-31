@@ -149,9 +149,10 @@ pub struct Crossing {
     pub descriptor: String,
     /// Human-readable summary for the UI and the deny message.
     summary: String,
-    /// The agent's command exactly as written, for a command-scoped crossing.
-    /// Kept beside the descriptor because normalizing collapses the newlines
-    /// that separate a script's commands.
+    /// The agent's command exactly as written, for every `run` crossing
+    /// whether path- or command-scoped. Consulted only for the instructive
+    /// refusal, never for grant matching. Kept beside the descriptor because
+    /// normalizing collapses the newlines that separate a script's commands.
     command: Option<String>,
 }
 
@@ -181,17 +182,21 @@ impl Crossing {
         }
     }
 
-    /// Shell crossing from a path token outside the admitted executor projection. The descriptor is the
-    /// resolved path, so a session grant generalizes across commands touching it
-    /// (parity with read/write crossings) rather than keying on the exact
-    /// command bytes.
-    pub fn shell_path(resolved: &Path, token: &str) -> Self {
+    /// A kernel denial of `path` inside the item that ran `command`.
+    ///
+    /// The descriptor is the path, so a session grant generalizes across
+    /// commands touching it (parity with read/write crossings) rather than
+    /// keying on the exact command bytes. The command is still carried: a
+    /// recovered path does not change whether the item's blocked step has an
+    /// ordinary in-sandbox route, so the instructive refusal must see it.
+    pub fn shell_path(path: &Path, command: &str) -> Self {
+        let descriptor = path.display().to_string();
         Crossing {
             kind: CrossingKind::ShellPathCrossing,
             verb: "run",
-            descriptor: resolved.display().to_string(),
-            summary: format!("command references an external host path: {token}"),
-            command: None,
+            summary: format!("command references an external host path: {descriptor}"),
+            descriptor,
+            command: Some(command.to_string()),
         }
     }
 
@@ -246,13 +251,14 @@ impl Crossing {
             "verb": self.verb,
             "descriptor": self.descriptor,
             "summary": self.summary,
-            "request": McpCallbackRequest {
+            "request": McpCallbackRequest { answer_bound_ms: None,
                 thread_id: None,
                 cwd: "/wt".to_string(),
                 run_id: Some("run-1".to_string()),
                 tool: self.verb.to_string(),
                 tool_use_id: Some("tool-1".to_string()),
                 payload: serde_json::json!({}),
+                origin: None,
             },
         })
         .to_string()
@@ -475,7 +481,7 @@ mod tests {
 
     #[test]
     fn shell_path_crossing_keys_on_resolved_path() {
-        let c = Crossing::shell_path(Path::new("/etc/hosts"), "/etc/hosts");
+        let c = Crossing::shell_path(Path::new("/etc/hosts"), "cat /etc/hosts");
         assert_eq!(c.kind, CrossingKind::ShellPathCrossing);
         assert_eq!(c.verb, "run");
         assert_eq!(c.descriptor, "/etc/hosts");
@@ -491,7 +497,7 @@ mod tests {
         assert_eq!(c.kind, CrossingKind::ShellCommandEscape);
         assert_ne!(
             c.kind,
-            Crossing::shell_path(Path::new("/etc/hosts"), "/etc/hosts").kind,
+            Crossing::shell_path(Path::new("/etc/hosts"), "cat /etc/hosts").kind,
             "a command escape and a path crossing must not share a kind"
         );
         assert!(c.host_path().is_none(), "it names no path to widen");
@@ -546,12 +552,14 @@ mod tests {
     async fn a_blocked_git_index_write_is_refused_with_its_route_and_raises_no_permission() {
         let orch = super::super::permission::tests::test_orchestrator().await;
         let request = McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: "/wt".to_string(),
             run_id: Some("run-1".to_string()),
             tool: "run".to_string(),
             tool_use_id: Some("tool-1".to_string()),
             payload: serde_json::json!({}),
+            origin: None,
         };
         let crossing = || {
             Crossing::shell_command(
@@ -580,6 +588,117 @@ mod tests {
             raise_fence(&orch, "run-1", Fence::Allow, &request, crossing()).await,
             FenceDecision::Allow
         ));
+    }
+
+    fn run_request() -> McpCallbackRequest {
+        McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: "/wt".to_string(),
+            run_id: Some("run-1".to_string()),
+            tool: "run".to_string(),
+            tool_use_id: Some("tool-1".to_string()),
+            payload: serde_json::json!({}),
+            origin: None,
+        }
+    }
+
+    /// Once the sandbox recovers the denied path (an index or ref lock in the
+    /// cell's shared repository), the crossing is path-scoped, but the item's
+    /// blocked step still has its in-sandbox route. The refusal must answer it
+    /// rather than an "external host path" prompt that names a git internal.
+    #[tokio::test]
+    async fn a_git_writer_denied_on_a_recovered_path_is_refused_with_its_route() {
+        let orch = super::super::permission::tests::test_orchestrator().await;
+        let request = run_request();
+        let command = "git mv a b && git status --short";
+        for path in [
+            "/Users/dev/.cairn-exec/managed-objects/m/repository.git/worktrees/slot-652/index.lock",
+            "/Users/dev/.cairn-exec/managed-objects/m/repository.git/refs/heads/main.lock",
+        ] {
+            let crossing = Crossing::shell_path(Path::new(path), command);
+            // What a grant would be scoped by is unchanged: the path.
+            assert_eq!(crossing.kind, CrossingKind::ShellPathCrossing);
+            assert_eq!(crossing.descriptor, path);
+
+            for fence in [Fence::Ask, Fence::Deny] {
+                match raise_fence(&orch, "run-1", fence, &request, crossing.clone()).await {
+                    FenceDecision::Deny(refusal) => {
+                        assert!(refusal.contains("runs `git mv`"), "{refusal}");
+                        assert!(refusal.contains("plain `mv`"), "{refusal}");
+                    }
+                    other => {
+                        panic!("{fence:?} {path}: expected the instructive refusal, got {other:?}")
+                    }
+                }
+            }
+        }
+        assert_eq!(permission_rows(&orch).await, 0);
+    }
+
+    /// A path denial whose command has no in-sandbox route still raises the
+    /// path-scoped prompt it always did.
+    #[tokio::test]
+    async fn a_path_denial_for_an_unrecognized_command_still_prompts() {
+        let orch = super::super::permission::tests::test_orchestrator().await;
+        // The stored prompt references its run.
+        orch.db
+            .local
+            .execute_script(
+                "
+                INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','Workspace',1,1);
+                INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('project-1','ws','Project','prj','/tmp/project',1,1);
+                INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+                 VALUES ('issue-1','project-1',1,'Issue','active','active','none',1,1);
+                INSERT INTO runs(id, issue_id, project_id, status, created_at, updated_at)
+                 VALUES ('run-1','issue-1','project-1','live',1,1);
+                "
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let task = {
+            let orch = orch.clone();
+            tokio::spawn(async move {
+                raise_fence(
+                    &orch,
+                    "run-1",
+                    Fence::Ask,
+                    &run_request(),
+                    Crossing::shell_path(Path::new("/outside/x"), "touch /outside/x"),
+                )
+                .await
+            })
+        };
+        for _ in 0..400 {
+            if permission_rows(&orch).await > 0 || task.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        if task.is_finished() {
+            match task.await.unwrap() {
+                FenceDecision::Suspended => {}
+                other => panic!("the fence answered without waiting on a prompt: {other:?}"),
+            }
+        } else {
+            task.abort();
+        }
+        assert_eq!(permission_rows(&orch).await, 1);
+
+        use crate::storage::RowExt;
+        let tool_input = orch
+            .db
+            .local
+            .query_one("SELECT tool_input FROM permission_requests", (), |row| {
+                row.text(0)
+            })
+            .await
+            .unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&tool_input).unwrap();
+        assert_eq!(stored["kind"], CrossingKind::ShellPathCrossing.tag());
+        assert_eq!(stored["descriptor"], "/outside/x");
     }
 
     #[test]

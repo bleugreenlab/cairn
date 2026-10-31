@@ -879,6 +879,10 @@ pub enum LaneShortfall {
     /// lease and first output, and background work waits for one to finish.
     #[serde(rename_all = "camelCase")]
     Ramp { warming: u64, window: u32 },
+    /// The host's startup recovery has not finished, so the agent callback
+    /// gateway would refuse every call the launch makes. Every queued launch
+    /// waits, not only the head.
+    StartupRecovery,
 }
 
 /// The boot ramp's warm-up window, passed by a promoter that bounds how many
@@ -2394,7 +2398,7 @@ mod tests {
     async fn a_leased_team_mirror_is_neither_a_launch_claim_nor_a_queued_launch() {
         let db = crate::storage::migrated_test_db("admission-team-mirror-phase.db").await;
         for run in ["run-waiting", "run-launched"] {
-            db.execute_script(&format!(
+            db.execute_script(format!(
                 "INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_generation,created_at,updated_at)
                    VALUES('req-{run}','team:t','lane','ordinary:{run}','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,{seq},'queued',0,1,1);
                  INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at)
@@ -2651,7 +2655,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            db.execute_script(&format!(
+            db.execute_script(format!(
                 "INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,created_at,updated_at)
                    VALUES('req-{run}','private-runtime','lane','ordinary:{run}','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,{seq},'{state}','owner',1,1,1);
                  INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at)
@@ -2732,7 +2736,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            db.execute_script(&format!(
+            db.execute_script(format!(
                 "INSERT INTO runs(id,project_id,job_id,status,created_at,updated_at) VALUES('{run}','p','j','{run_status}',1,1);
                  INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,created_at,updated_at)
                    VALUES('call-admission:{run}','local-runtime','claude-cli','call:{run}','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,{seq},'{state}','local-call-promoter',1,1,1);

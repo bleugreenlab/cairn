@@ -8,18 +8,32 @@
 //! would install: an executor fix merged without a protocol bump. That one is
 //! scheduled here, so it costs the fleet nothing it was doing.
 //!
-//! The schedule has three properties, each against a specific failure:
+//! The schedule has four properties, each against a specific failure:
 //!
 //! - **One machine at a time.** A bad artifact strands the one machine that
 //!   took it, and the failure halts the rollout of that build before it
 //!   reaches the next.
-//! - **Empty before restart.** The machine whose turn it is is refused new
-//!   placement, and the directive goes out only once the runner's queue binds
-//!   nothing to it and two snapshots taken after the hold show nothing in
-//!   flight, so a restart kills no work.
-//! - **No machine holds the fleet hostage.** A machine still busy after the
-//!   drain budget takes work again and its turn passes to the next; one that
-//!   ignores a directive is excluded from that build without halting it.
+//! - **Empty before restart, however long emptying takes.** The machine whose
+//!   turn it is is refused new placement until it is empty, and the directive
+//!   goes out only once the runner's queue binds nothing to it and two
+//!   snapshots taken after the hold show nothing in flight, so a restart kills
+//!   no work. A busy machine is doing its job, not holding the fleet hostage,
+//!   and handing it work back after a fixed budget only guarantees that a
+//!   machine with a steady stream of work never empties. So the turn is bounded
+//!   per piece of work rather than as a whole: a command may hold it for its
+//!   own learned duration plus margin, and work with no expected end for a
+//!   fixed hold.
+//! - **Long-lived services are cycled, not waited on.** A service instance
+//!   never finishes, and any executor restart ends it whether the rollout waits
+//!   or not; its owner already re-places it whenever its executor is lost. So
+//!   service residents are named as what the restart will cycle rather than
+//!   counted as work in flight. A service's one-shot command is work, and is
+//!   waited on like any other.
+//! - **No wedged machine holds the fleet hostage.** Work that outruns its bound
+//!   gives the machine back and passes the turn to the next; a machine that
+//!   ignores a directive is excluded from that build without halting it. A
+//!   served build that moves during a drain retargets the drain rather than
+//!   ending it, so a nearly empty machine is not sent to the back of the line.
 //!
 //! This module is the decision alone, over plain facts the fleet copies out of
 //! its connection table, so every transition is testable without a link.
@@ -27,13 +41,18 @@
 use std::collections::HashMap;
 
 use cairn_common::executor_protocol::{
-    SelfUpdatePhase, SelfUpdateStatus, UpdateReport, UpdateState,
+    DrainHold, SelfUpdatePhase, SelfUpdateStatus, UpdateReport, UpdateState,
 };
 
-/// How long a machine may take to empty before its turn passes to the next.
-pub(crate) const DRAIN_BUDGET_MS: u64 = 15 * 60 * 1000;
-/// How long a machine whose drain overran keeps its work before it is asked
-/// again.
+/// The least slack a command gets past its own expected finish before the
+/// rollout reads it as wedged rather than busy.
+pub(crate) const COMMAND_MARGIN_MS: u64 = 10 * 60 * 1000;
+/// How long work with no expected end may hold a turn: a command never
+/// measured, an environment being acquired, or a terminal or REPL left
+/// running, none of which says when it will finish.
+pub(crate) const UNMEASURED_HOLD_MS: u64 = 60 * 60 * 1000;
+/// How long a machine whose work outran its bound keeps that work before it
+/// is asked again.
 pub(crate) const DEFER_MS: u64 = 30 * 60 * 1000;
 /// How long a directed machine may stay on the link it was directed on. The
 /// executor ends that link as soon as it reads the directive, so a machine
@@ -59,7 +78,65 @@ pub(crate) enum ArtifactBuild {
     /// itself.
     Resolved(String),
     /// Why the runner has nothing to compare against.
-    Unavailable(String),
+    Unavailable(ArtifactUnavailable),
+}
+
+/// Why the runner serves no executor for one target, and the newest protocol
+/// it does hold one for there. The second half is what lets a stranded machine
+/// be told how far behind the runner's cache is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactUnavailable {
+    pub reason: String,
+    pub newest_held_protocol: Option<u32>,
+}
+
+/// One piece of work a restart of the machine would end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeldWork {
+    /// Stable across passes, so a drain knows when it first saw this work.
+    pub key: String,
+    /// The work, named the way an operator reads it.
+    pub label: String,
+    pub started_at_unix_ms: Option<u64>,
+    /// Its own learned upper duration, when it has been measured.
+    pub expected_ms: Option<u64>,
+}
+
+impl HeldWork {
+    /// When this work is expected to finish, and when the turn stops waiting
+    /// for it, given when the drain first saw it.
+    ///
+    /// Measured from no earlier than first sight, so work that started long
+    /// before the turn, or was already past its estimate when the turn began,
+    /// still gets its margin rather than ending the turn on the first pass.
+    fn bound(&self, first_seen_unix_ms: u64) -> DrainHold {
+        let (expected_done_unix_ms, deadline_unix_ms) = match self.expected_ms {
+            Some(expected) => {
+                let margin = (expected / 2).max(COMMAND_MARGIN_MS);
+                match self.started_at_unix_ms {
+                    Some(started) => {
+                        let done = started.saturating_add(expected);
+                        (
+                            Some(done),
+                            done.max(first_seen_unix_ms).saturating_add(margin),
+                        )
+                    }
+                    None => (
+                        None,
+                        first_seen_unix_ms
+                            .saturating_add(expected)
+                            .saturating_add(margin),
+                    ),
+                }
+            }
+            None => (None, first_seen_unix_ms.saturating_add(UNMEASURED_HOLD_MS)),
+        };
+        DrainHold {
+            label: self.label.clone(),
+            expected_done_unix_ms,
+            deadline_unix_ms,
+        }
+    }
 }
 
 /// One attached remote, as the rollout reads it.
@@ -72,8 +149,12 @@ pub(crate) struct Candidate {
     pub target: Option<&'static str>,
     pub running_build: Option<String>,
     pub last_update: Option<UpdateReport>,
-    /// Work bound to or running on this machine that a restart would end.
-    pub in_flight: u32,
+    /// Work bound to or running on this machine that a restart would end and
+    /// that will finish on its own.
+    pub work: Vec<HeldWork>,
+    /// Long-lived service instances on this machine. A restart ends them too,
+    /// but they never finish, so they are cycled rather than waited on.
+    pub services: Vec<String>,
     pub snapshots_received: u64,
     /// Whether the link is open and fresh enough to carry a directive.
     pub reachable: bool,
@@ -89,7 +170,8 @@ pub(crate) struct Directive {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransitionKind {
-    /// Its turn began: new work is refused there.
+    /// Its turn began, or the build it drains for moved: new work is refused
+    /// there.
     Draining,
     /// Empty; the directive was sent.
     Directed,
@@ -97,12 +179,12 @@ pub(crate) enum TransitionKind {
     Updated,
     /// An update to this build failed; no machine is directed to it.
     Halted,
-    /// It did not empty in time and takes work again.
+    /// Work on it outran its bound, so it takes work again.
     Deferred,
     /// It did not act on the directive; other machines still update.
     Excluded,
     /// The turn ended without an outcome: the machine left during its drain,
-    /// came back unexplained, or the runner now serves a different build.
+    /// came back unexplained, or the runner serves nothing it could install.
     Abandoned,
 }
 
@@ -154,12 +236,69 @@ enum TurnPhase {
         since_unix_ms: u64,
         generation: u64,
         snapshots_at_hold: u64,
-        in_flight: u32,
+        /// When this drain first saw each piece of work still in flight.
+        first_seen: HashMap<String, u64>,
+        /// What the last pass found holding the turn, latest bound first.
+        holds: Vec<DrainHold>,
+        /// Service instances the restart will cycle.
+        cycles: Vec<String>,
     },
     Directed {
         at_unix_ms: u64,
         generation: u64,
+        cycled: Vec<String>,
     },
+}
+
+impl TurnPhase {
+    /// A drain's account of the work it found on one pass.
+    fn draining(
+        candidate: &Candidate,
+        since_unix_ms: u64,
+        generation: u64,
+        snapshots_at_hold: u64,
+        first_seen: HashMap<String, u64>,
+        now_unix_ms: u64,
+    ) -> Self {
+        let (first_seen, holds) = account(&candidate.work, first_seen, now_unix_ms);
+        Self::Draining {
+            since_unix_ms,
+            generation,
+            snapshots_at_hold,
+            first_seen,
+            holds,
+            cycles: candidate.services.clone(),
+        }
+    }
+}
+
+/// When each piece of work was first seen (work that finished is forgotten,
+/// work new this pass is first seen now), and what bounds each, latest first.
+fn account(
+    work: &[HeldWork],
+    mut first_seen: HashMap<String, u64>,
+    now_unix_ms: u64,
+) -> (HashMap<String, u64>, Vec<DrainHold>) {
+    first_seen.retain(|key, _| work.iter().any(|item| item.key == *key));
+    let mut holds: Vec<DrainHold> = work
+        .iter()
+        .map(|item| item.bound(*first_seen.entry(item.key.clone()).or_insert(now_unix_ms)))
+        .collect();
+    holds.sort_by(|a, b| {
+        b.deadline_unix_ms
+            .cmp(&a.deadline_unix_ms)
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    (first_seen, holds)
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn listed(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// The runner's rolling-update state. In memory: a runner restart begins a
@@ -170,7 +309,7 @@ pub(crate) struct Rollout {
     turn: Option<Turn>,
     /// Builds no machine is directed to, with why.
     halted: HashMap<String, String>,
-    /// Machines whose drain overran, until when.
+    /// Machines whose work outran its bound, until when.
     deferred: HashMap<String, u64>,
     /// Machines that did not act on a directive, with the build and why.
     excluded: HashMap<String, (String, String)>,
@@ -199,12 +338,16 @@ impl Rollout {
         }
         if self.turn.is_none() {
             if let Some((candidate, target, build_id)) = self.next(candidates, artifacts) {
+                let waiting_on = match candidate.work.len() {
+                    0 => String::new(),
+                    count => format!(" and its {count} in flight have finished"),
+                };
                 step.transitions.push(Transition {
                     executor_id: candidate.executor_id.clone(),
                     kind: TransitionKind::Draining,
                     build_id: build_id.clone(),
                     cause: format!(
-                        "{} runs {} and the runner serves {build_id} for {target}; refusing it new work until it is empty",
+                        "{} runs {} and the runner serves {build_id} for {target}; it takes no new work until it is empty{waiting_on}",
                         candidate.name,
                         candidate.running_build.as_deref().unwrap_or("an unreported build"),
                     ),
@@ -215,12 +358,14 @@ impl Rollout {
                     build_id,
                     target,
                     unexplained_returns: 0,
-                    phase: TurnPhase::Draining {
-                        since_unix_ms: now_unix_ms,
-                        generation: candidate.generation,
-                        snapshots_at_hold: candidate.snapshots_received,
-                        in_flight: candidate.in_flight,
-                    },
+                    phase: TurnPhase::draining(
+                        candidate,
+                        now_unix_ms,
+                        candidate.generation,
+                        candidate.snapshots_received,
+                        HashMap::new(),
+                        now_unix_ms,
+                    ),
                 });
             }
         }
@@ -239,7 +384,9 @@ impl Rollout {
                     since_unix_ms: now_unix_ms,
                     generation: 0,
                     snapshots_at_hold: 0,
-                    in_flight: 0,
+                    first_seen: HashMap::new(),
+                    holds: Vec::new(),
+                    cycles: Vec::new(),
                 };
             }
         }
@@ -254,10 +401,10 @@ impl Rollout {
         let target = candidate.target?;
         let running = candidate.running_build.as_ref()?;
         let (runner_build_id, phase) = match artifacts.get(target)? {
-            ArtifactBuild::Unavailable(reason) => (
+            ArtifactBuild::Unavailable(unavailable) => (
                 None,
                 SelfUpdatePhase::ArtifactUnavailable {
-                    reason: reason.clone(),
+                    reason: unavailable.reason.clone(),
                 },
             ),
             ArtifactBuild::Resolved(build_id) => (
@@ -276,21 +423,31 @@ impl Rollout {
         if running == build_id {
             return SelfUpdatePhase::Current;
         }
+        // Matched by machine alone: a drain retargets when the served build
+        // moves, and a directed machine is awaited on the build it was sent.
         if let Some(turn) = self
             .turn
             .as_ref()
-            .filter(|turn| turn.executor_id == candidate.executor_id && turn.build_id == build_id)
+            .filter(|turn| turn.executor_id == candidate.executor_id)
         {
-            return match turn.phase {
+            return match &turn.phase {
                 TurnPhase::Draining {
                     since_unix_ms,
-                    in_flight,
+                    holds,
+                    cycles,
                     ..
                 } => SelfUpdatePhase::Draining {
-                    in_flight,
-                    since_unix_ms,
+                    in_flight: u32::try_from(holds.len()).unwrap_or(u32::MAX),
+                    since_unix_ms: *since_unix_ms,
+                    holds: holds.clone(),
+                    cycles: cycles.clone(),
                 },
-                TurnPhase::Directed { at_unix_ms, .. } => SelfUpdatePhase::Directed { at_unix_ms },
+                TurnPhase::Directed {
+                    at_unix_ms, cycled, ..
+                } => SelfUpdatePhase::Directed {
+                    at_unix_ms: *at_unix_ms,
+                    cycled: cycled.clone(),
+                },
             };
         }
         if let Some(cause) = self.halted.get(build_id) {
@@ -365,26 +522,47 @@ impl Rollout {
         now_unix_ms: u64,
         step: &mut Step,
     ) -> Option<Turn> {
+        // A drain is for the machine, not for one build: when the served build
+        // moves mid-drain the work already finished still counts, so the drain
+        // is kept and its directive will name the new build. A directed
+        // machine is installing what it was sent and is awaited on that.
+        if matches!(turn.phase, TurnPhase::Draining { .. }) {
+            match artifacts.get(turn.target) {
+                Some(ArtifactBuild::Resolved(served)) if *served != turn.build_id => {
+                    if !self.halted.contains_key(served) {
+                        step.transitions.push(Transition {
+                            executor_id: turn.executor_id.clone(),
+                            kind: TransitionKind::Draining,
+                            build_id: served.clone(),
+                            cause: format!(
+                                "the runner now serves {served} for {} in place of {}; {} keeps draining and will be directed to the new build",
+                                turn.target, turn.build_id, turn.name
+                            ),
+                        });
+                    }
+                    turn.build_id = served.clone();
+                }
+                Some(ArtifactBuild::Resolved(_)) => {}
+                _ => {
+                    step.transitions.push(Transition {
+                        executor_id: turn.executor_id.clone(),
+                        kind: TransitionKind::Abandoned,
+                        build_id: turn.build_id.clone(),
+                        cause: format!(
+                            "the runner no longer serves an executor for {}",
+                            turn.target
+                        ),
+                    });
+                    return None;
+                }
+            }
+        }
         let transition = |kind, cause: String| Transition {
             executor_id: turn.executor_id.clone(),
             kind,
             build_id: turn.build_id.clone(),
             cause,
         };
-        let still_served = matches!(
-            artifacts.get(turn.target),
-            Some(ArtifactBuild::Resolved(build_id)) if *build_id == turn.build_id
-        );
-        if !still_served {
-            step.transitions.push(transition(
-                TransitionKind::Abandoned,
-                format!(
-                    "the runner no longer serves {} for {}",
-                    turn.build_id, turn.target
-                ),
-            ));
-            return None;
-        }
         if let Some(cause) = self.halted.get(&turn.build_id) {
             step.transitions
                 .push(transition(TransitionKind::Abandoned, cause.clone()));
@@ -393,11 +571,19 @@ impl Rollout {
         let candidate = candidates
             .iter()
             .find(|candidate| candidate.executor_id == turn.executor_id);
-        match turn.phase {
+        match std::mem::replace(
+            &mut turn.phase,
+            TurnPhase::Directed {
+                at_unix_ms: 0,
+                generation: 0,
+                cycled: Vec::new(),
+            },
+        ) {
             TurnPhase::Draining {
                 since_unix_ms,
                 generation,
                 snapshots_at_hold,
+                first_seen,
                 ..
             } => {
                 let Some(candidate) = candidate else {
@@ -425,7 +611,7 @@ impl Rollout {
                     (candidate.generation, candidate.snapshots_received)
                 };
                 if candidate.reachable
-                    && candidate.in_flight == 0
+                    && candidate.work.is_empty()
                     && candidate.snapshots_received >= snapshots_at_hold + FRESH_SNAPSHOTS
                 {
                     step.direct = Some(Directive {
@@ -433,45 +619,86 @@ impl Rollout {
                         generation,
                         build_id: turn.build_id.clone(),
                     });
+                    let cycling = match candidate.services.len() {
+                        0 => String::new(),
+                        1 => format!(
+                            "; the restart cycles {}, which its owner places again on the new executor",
+                            listed(&candidate.services)
+                        ),
+                        _ => format!(
+                            "; the restart cycles {}, which their owners place again on the new executor",
+                            listed(&candidate.services)
+                        ),
+                    };
                     step.transitions.push(transition(
                         TransitionKind::Directed,
                         format!(
-                            "{} is empty; directed to install {}",
+                            "{} is empty; directed to install {}{cycling}",
                             turn.name, turn.build_id
                         ),
                     ));
                     turn.phase = TurnPhase::Directed {
                         at_unix_ms: now_unix_ms,
                         generation,
+                        cycled: candidate.services.clone(),
                     };
                     return Some(turn);
                 }
-                if now_unix_ms.saturating_sub(since_unix_ms) >= DRAIN_BUDGET_MS {
+                turn.phase = TurnPhase::draining(
+                    candidate,
+                    since_unix_ms,
+                    generation,
+                    snapshots_at_hold,
+                    first_seen,
+                    now_unix_ms,
+                );
+                let TurnPhase::Draining { first_seen, .. } = &turn.phase else {
+                    unreachable!("just set to draining");
+                };
+                // The most overdue piece of work that outran its bound, if
+                // any: a machine whose work does not end is wedged, and a
+                // wedged machine does not hold the fleet.
+                let overrun = candidate
+                    .work
+                    .iter()
+                    .map(|item| {
+                        let seen = first_seen.get(&item.key).copied().unwrap_or(now_unix_ms);
+                        (item, seen, item.bound(seen))
+                    })
+                    .filter(|(_, _, bound)| now_unix_ms >= bound.deadline_unix_ms)
+                    .min_by_key(|(_, _, bound)| bound.deadline_unix_ms);
+                if let Some((item, seen, bound)) = overrun {
+                    let why = match bound.expected_done_unix_ms {
+                        Some(done) => format!(
+                            "was expected to finish {} minutes ago, from its own learned duration of {} minutes",
+                            now_unix_ms.saturating_sub(done) / 60_000,
+                            item.expected_ms.unwrap_or_default() / 60_000,
+                        ),
+                        None => format!(
+                            "has held the turn {} minutes without finishing",
+                            now_unix_ms.saturating_sub(seen) / 60_000
+                        ),
+                    };
                     self.deferred
                         .insert(turn.executor_id.clone(), now_unix_ms + DEFER_MS);
                     step.transitions.push(transition(
                         TransitionKind::Deferred,
                         format!(
-                            "{} still had {} in flight after {} minutes; it takes work again and is asked after {} minutes",
+                            "{}'s {} {why}, so it is read as wedged; {} takes work again and is asked after {} minutes",
                             turn.name,
-                            candidate.in_flight,
-                            DRAIN_BUDGET_MS / 60_000,
+                            item.label,
+                            turn.name,
                             DEFER_MS / 60_000,
                         ),
                     ));
                     return None;
                 }
-                turn.phase = TurnPhase::Draining {
-                    since_unix_ms,
-                    generation,
-                    snapshots_at_hold,
-                    in_flight: candidate.in_flight,
-                };
                 Some(turn)
             }
             TurnPhase::Directed {
                 at_unix_ms,
                 generation,
+                cycled,
             } => {
                 let elapsed = now_unix_ms.saturating_sub(at_unix_ms);
                 match candidate {
@@ -488,12 +715,14 @@ impl Rollout {
                         // explanation is retried once before it is read as one.
                         if turn.unexplained_returns < UNEXPLAINED_RETURNS {
                             turn.unexplained_returns += 1;
-                            turn.phase = TurnPhase::Draining {
-                                since_unix_ms: now_unix_ms,
-                                generation: candidate.generation,
-                                snapshots_at_hold: candidate.snapshots_received,
-                                in_flight: candidate.in_flight,
-                            };
+                            turn.phase = TurnPhase::draining(
+                                candidate,
+                                now_unix_ms,
+                                candidate.generation,
+                                candidate.snapshots_received,
+                                HashMap::new(),
+                                now_unix_ms,
+                            );
                             return Some(turn);
                         }
                         let cause = format!(
@@ -536,7 +765,14 @@ impl Rollout {
                             .push(transition(TransitionKind::Halted, cause));
                         None
                     }
-                    _ => Some(turn),
+                    _ => {
+                        turn.phase = TurnPhase::Directed {
+                            at_unix_ms,
+                            generation,
+                            cycled,
+                        };
+                        Some(turn)
+                    }
                 }
             }
         }
@@ -568,7 +804,7 @@ impl Rollout {
                     .then(|| (candidate, target, build_id.clone()))
             })
             .min_by(|(left, ..), (right, ..)| {
-                (left.in_flight, &left.name).cmp(&(right.in_flight, &right.name))
+                (left.work.len(), &left.name).cmp(&(right.work.len(), &right.name))
             })
     }
 }
@@ -588,10 +824,29 @@ mod tests {
             target: Some(TARGET),
             running_build: Some(build.into()),
             last_update: None,
-            in_flight: 0,
+            work: Vec::new(),
+            services: Vec::new(),
             snapshots_received: 10,
             reachable: true,
         }
+    }
+
+    const LANE_MS: u64 = 20 * 60_000;
+
+    fn command(key: &str, started_at_unix_ms: u64, expected_ms: Option<u64>) -> HeldWork {
+        HeldWork {
+            key: key.into(),
+            label: format!("`{key}`"),
+            started_at_unix_ms: Some(started_at_unix_ms),
+            expected_ms,
+        }
+    }
+
+    /// `count` measured lanes that started at `NOW`.
+    fn with_work(candidate: &mut Candidate, count: usize) {
+        candidate.work = (0..count)
+            .map(|index| command(&format!("lane-{index}"), NOW, Some(LANE_MS)))
+            .collect();
     }
 
     fn serving(build: &str) -> HashMap<String, ArtifactBuild> {
@@ -623,21 +878,22 @@ mod tests {
         let artifacts = serving("new");
         let mut rollout = Rollout::default();
         let mut machine = remote("bbs", "old");
-        machine.in_flight = 2;
+        with_work(&mut machine, 2);
 
         let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
         assert_eq!(step.hold.as_deref(), Some("id-bbs"));
         assert_eq!(step.direct, None);
-        assert_eq!(
+        assert!(matches!(
             phase(&rollout, &machine, &artifacts),
             SelfUpdatePhase::Draining {
                 in_flight: 2,
-                since_unix_ms: NOW
+                since_unix_ms: NOW,
+                ..
             }
-        );
+        ));
 
         // Its work finishes, but nothing it has said since the hold shows it.
-        machine.in_flight = 0;
+        machine.work.clear();
         let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW + 1_000);
         assert_eq!(step.direct, None);
 
@@ -659,7 +915,8 @@ mod tests {
         assert_eq!(
             phase(&rollout, &machine, &artifacts),
             SelfUpdatePhase::Directed {
-                at_unix_ms: NOW + 2_000
+                at_unix_ms: NOW + 2_000,
+                cycled: Vec::new(),
             }
         );
 
@@ -686,8 +943,8 @@ mod tests {
             remote("bgsrv-ub", "old"),
         ];
         // The least busy goes first; the rest wait behind it.
-        fleet[0].in_flight = 3;
-        fleet[1].in_flight = 1;
+        with_work(&mut fleet[0], 3);
+        with_work(&mut fleet[1], 1);
         let mut order = Vec::new();
         let mut now = NOW;
         for _ in 0..3 {
@@ -707,7 +964,7 @@ mod tests {
                 .position(|machine| machine.executor_id == held)
                 .unwrap();
             order.push(fleet[index].name.clone());
-            fleet[index].in_flight = 0;
+            fleet[index].work.clear();
             settle(&mut fleet[index]);
             now += 1_000;
             let step = rollout.advance(&fleet, &artifacts, now);
@@ -789,21 +1046,94 @@ mod tests {
         assert_eq!(step.hold, None);
     }
 
+    /// The specimen: a machine the cadence keeps busy, whose lanes finish and
+    /// whose pinned work keeps arriving, never once empty at a pass. The old
+    /// whole-drain budget gave it its work back at fifteen minutes; now it
+    /// keeps its turn for as long as every piece of work is within its own
+    /// bound, and updates the moment it empties.
     #[test]
-    fn a_machine_that_does_not_empty_passes_its_turn_and_is_deferred() {
+    fn a_machine_with_a_steady_arrival_of_work_keeps_its_turn_until_it_empties() {
         let artifacts = serving("new");
         let mut rollout = Rollout::default();
         let mut fleet = vec![remote("busy", "old"), remote("idle", "old")];
-        fleet[0].in_flight = 0;
-        fleet[1].in_flight = 1;
-        // The resident batches pinned to `busy` keep arriving after its hold.
+        fleet[1].work = vec![command("other", NOW, Some(LANE_MS))];
+        fleet[1].work.push(command("other-2", NOW, Some(LANE_MS)));
         assert_eq!(
             rollout.advance(&fleet, &artifacts, NOW).hold.as_deref(),
             Some("id-busy")
         );
-        fleet[0].in_flight = 4;
-        let step = rollout.advance(&fleet, &artifacts, NOW + DRAIN_BUDGET_MS);
+
+        // Every five minutes for eighty minutes, a lane finishes and the next
+        // pinned one starts, so something is always in flight.
+        let mut now = NOW;
+        for arrival in 0..16 {
+            now = NOW + arrival * 5 * 60_000;
+            fleet[0].work = vec![command(&format!("pinned-{arrival}"), now, Some(LANE_MS))];
+            let step = rollout.advance(&fleet, &artifacts, now);
+            assert_eq!(step.hold.as_deref(), Some("id-busy"), "at {arrival}");
+            assert!(step.transitions.is_empty(), "{:?}", step.transitions);
+            assert!(matches!(
+                phase(&rollout, &fleet[1], &artifacts),
+                SelfUpdatePhase::Waiting { behind: Some(ref name) } if name == "busy"
+            ));
+        }
+        assert!(
+            now - NOW >= 75 * 60_000,
+            "well past the old fifteen minutes"
+        );
+
+        fleet[0].work.clear();
+        settle(&mut fleet[0]);
+        let step = rollout.advance(&fleet, &artifacts, now + 1_000);
+        assert_eq!(
+            step.direct.map(|direct| direct.executor_id),
+            Some("id-busy".to_string()),
+            "it updates as soon as it is empty"
+        );
+    }
+
+    /// What bounds a turn is each command's own learned duration plus margin:
+    /// a lane past that is wedged, and a wedged machine gives its turn away.
+    #[test]
+    fn work_that_outruns_its_own_learned_duration_passes_the_turn() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut fleet = vec![remote("busy", "old"), remote("idle", "old")];
+        fleet[0].work = vec![
+            command("short", NOW, Some(LANE_MS / 2)),
+            command("rust-tests", NOW, Some(LANE_MS)),
+        ];
+        fleet[1].work = vec![command("a", NOW, None), command("b", NOW, None)];
+        assert_eq!(
+            rollout.advance(&fleet, &artifacts, NOW).hold.as_deref(),
+            Some("id-busy")
+        );
+        let SelfUpdatePhase::Draining { holds, .. } = phase(&rollout, &fleet[0], &artifacts) else {
+            panic!("draining");
+        };
+        assert_eq!(
+            holds[0].label, "`rust-tests`",
+            "the work that bounds the wait leads"
+        );
+        assert_eq!(holds[0].expected_done_unix_ms, Some(NOW + LANE_MS));
+        assert_eq!(holds[0].deadline_unix_ms, NOW + LANE_MS + COMMAND_MARGIN_MS);
+
+        // The short one finished; the long one is past its estimate but
+        // within its margin.
+        fleet[0].work.remove(0);
+        let deadline = NOW + LANE_MS + COMMAND_MARGIN_MS;
+        let step = rollout.advance(&fleet, &artifacts, deadline - 1);
+        assert_eq!(step.hold.as_deref(), Some("id-busy"));
+
+        let step = rollout.advance(&fleet, &artifacts, deadline);
         assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
+        assert!(
+            step.transitions[0]
+                .cause
+                .contains("`rust-tests` was expected to finish 10 minutes ago"),
+            "{}",
+            step.transitions[0].cause
+        );
         assert_eq!(
             step.hold.as_deref(),
             Some("id-idle"),
@@ -812,9 +1142,75 @@ mod tests {
         assert_eq!(
             phase(&rollout, &fleet[0], &artifacts),
             SelfUpdatePhase::Deferred {
-                until_unix_ms: NOW + DRAIN_BUDGET_MS + DEFER_MS
+                until_unix_ms: deadline + DEFER_MS
             }
         );
+    }
+
+    /// Work with no expected end (a command never measured, a terminal left
+    /// running) holds the turn for the fixed hold from when the drain first
+    /// saw it, however long before the drain it started.
+    #[test]
+    fn unmeasured_work_holds_the_turn_for_the_fixed_hold() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut machine = remote("a", "old");
+        machine.work = vec![command("terminal `dev`", NOW - 6 * 3_600_000, None)];
+        rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
+        let step = rollout.advance(
+            std::slice::from_ref(&machine),
+            &artifacts,
+            NOW + UNMEASURED_HOLD_MS - 1,
+        );
+        assert_eq!(step.hold.as_deref(), Some("id-a"));
+        let step = rollout.advance(
+            std::slice::from_ref(&machine),
+            &artifacts,
+            NOW + UNMEASURED_HOLD_MS,
+        );
+        assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
+        assert!(
+            step.transitions[0]
+                .cause
+                .contains("has held the turn 60 minutes without finishing"),
+            "{}",
+            step.transitions[0].cause
+        );
+    }
+
+    /// A service instance never finishes and any restart ends it, so it is
+    /// named as what the restart cycles, never counted as work to wait for.
+    #[test]
+    fn a_service_resident_is_cycled_rather_than_waited_on() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut machine = remote("bgsrv-mac", "old");
+        machine.services = vec![
+            "service `iMessage channel`".into(),
+            "service `desktop automation`".into(),
+        ];
+        rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
+        assert!(matches!(
+            phase(&rollout, &machine, &artifacts),
+            SelfUpdatePhase::Draining { in_flight: 0, ref cycles, .. } if cycles.len() == 2
+        ));
+        settle(&mut machine);
+        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW + 1_000);
+        assert!(
+            step.direct.is_some(),
+            "its services do not keep it from updating"
+        );
+        assert!(
+            step.transitions[0].cause.contains(
+                "the restart cycles service `iMessage channel` and service `desktop automation`, which their owners place again"
+            ),
+            "{}",
+            step.transitions[0].cause
+        );
+        assert!(matches!(
+            phase(&rollout, &machine, &artifacts),
+            SelfUpdatePhase::Directed { ref cycled, .. } if cycled.len() == 2
+        ));
     }
 
     #[test]
@@ -901,17 +1297,60 @@ mod tests {
             .is_some());
     }
 
+    /// The served build moving mid-drain retargets the drain: what already
+    /// finished still counts, the machine stays held, and the directive names
+    /// the new build.
     #[test]
-    fn a_new_artifact_abandons_the_turn_and_starts_over() {
+    fn a_new_artifact_mid_drain_keeps_the_drain_and_retargets_it() {
         let mut rollout = Rollout::default();
-        let machine = remote("a", "old");
+        let mut machine = remote("a", "old");
+        with_work(&mut machine, 1);
         rollout.advance(std::slice::from_ref(&machine), &serving("new"), NOW);
-        let step = rollout.advance(
-            std::slice::from_ref(&machine),
-            &serving("newer"),
-            NOW + 1_000,
+        let newer = serving("newer");
+        let step = rollout.advance(std::slice::from_ref(&machine), &newer, NOW + 60_000);
+        assert_eq!(step.hold.as_deref(), Some("id-a"));
+        assert_eq!(step.transitions.len(), 1, "{:?}", step.transitions);
+        assert_eq!(step.transitions[0].kind, TransitionKind::Draining);
+        assert_eq!(step.transitions[0].build_id, "newer");
+        assert!(matches!(
+            phase(&rollout, &machine, &newer),
+            SelfUpdatePhase::Draining {
+                since_unix_ms: NOW,
+                ..
+            }
+        ));
+
+        machine.work.clear();
+        settle(&mut machine);
+        let step = rollout.advance(std::slice::from_ref(&machine), &newer, NOW + 61_000);
+        assert_eq!(
+            step.direct.map(|direct| direct.build_id),
+            Some("newer".to_string())
         );
-        assert_eq!(step.transitions[0].kind, TransitionKind::Abandoned);
+    }
+
+    /// A directed machine is installing what it was sent. A newer served build
+    /// does not abandon it mid-install; it is awaited on the build it took, and
+    /// the newer one is a turn of its own.
+    #[test]
+    fn a_new_artifact_after_the_directive_awaits_the_directed_build() {
+        let mut rollout = Rollout::default();
+        let mut machine = remote("a", "old");
+        rollout.advance(std::slice::from_ref(&machine), &serving("new"), NOW);
+        settle(&mut machine);
+        assert!(rollout
+            .advance(std::slice::from_ref(&machine), &serving("new"), NOW + 1_000)
+            .direct
+            .is_some());
+        let newer = serving("newer");
+        let step = rollout.advance(&[], &newer, NOW + 30_000);
+        assert_eq!(step.hold.as_deref(), Some("id-a"), "held while it installs");
+        assert!(step.transitions.is_empty(), "{:?}", step.transitions);
+
+        return_on(&mut machine, "new");
+        let step = rollout.advance(std::slice::from_ref(&machine), &newer, NOW + 60_000);
+        assert_eq!(step.transitions[0].kind, TransitionKind::Updated);
+        assert_eq!(step.transitions[0].build_id, "new");
         assert_eq!(step.transitions[1].kind, TransitionKind::Draining);
         assert_eq!(step.transitions[1].build_id, "newer");
     }
@@ -926,7 +1365,10 @@ mod tests {
         );
         let unavailable = HashMap::from([(
             TARGET.to_string(),
-            ArtifactBuild::Unavailable("no x86_64-unknown-linux-gnu executor artifact published for executor protocol v156".into()),
+            ArtifactBuild::Unavailable(ArtifactUnavailable {
+                reason: "no x86_64-unknown-linux-gnu executor artifact published for executor protocol v156".into(),
+                newest_held_protocol: Some(155),
+            }),
         )]);
         let status = rollout.status(&machine, &unavailable).unwrap();
         assert_eq!(status.runner_build_id, None);

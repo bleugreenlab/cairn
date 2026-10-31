@@ -37,6 +37,22 @@ pub struct ProbeWitness {
 }
 
 impl ProbeWitness {
+    /// Whether the in-bounds control crossing succeeded. Reading a witness is
+    /// harmless; only minting one is restricted to this module.
+    pub fn positive_control_passed(&self) -> bool {
+        self.positive_control_passed
+    }
+
+    /// Whether the out-of-bounds crossing succeeded.
+    pub fn crossing_permitted(&self) -> bool {
+        self.crossing_permitted
+    }
+
+    /// What the probe saw, in words.
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
     /// Turn an attempted crossing into the disposition it earns.
     ///
     /// A probe whose positive control failed measured a broken seam rather than
@@ -296,6 +312,431 @@ pub const fn batch_filesystem_edge(mode: PolicyMode) -> EdgeId {
     }
 }
 
+/// The probed class and mode of a host-socket edge, or `None` for an edge this
+/// module has no host-socket probe for.
+fn host_socket_class(
+    edge: EdgeId,
+) -> Option<(cairn_common::executor_protocol::ProcessClass, PolicyMode)> {
+    let key = edge.definition().key;
+    (host_socket_edge(key.process_class, key.policy_mode) == Some(edge))
+        .then_some((key.process_class, key.policy_mode))
+}
+
+/// Which edge a host-socket measurement is about, for the process classes that
+/// have a probe. The other classes stay `Unmeasured`.
+pub const fn host_socket_edge(
+    class: cairn_common::executor_protocol::ProcessClass,
+    mode: PolicyMode,
+) -> Option<EdgeId> {
+    use cairn_common::executor_protocol::ProcessClass;
+    Some(match (class, mode) {
+        (ProcessClass::BatchSpawn, PolicyMode::Confined) => EdgeId::BatchSpawnHostSocketConfined,
+        (ProcessClass::BatchSpawn, PolicyMode::ReadOnlyCheckout) => {
+            EdgeId::BatchSpawnHostSocketReadOnlyCheckout
+        }
+        (ProcessClass::BatchSpawn, PolicyMode::Unconfined) => {
+            EdgeId::BatchSpawnHostSocketUnconfined
+        }
+        (ProcessClass::PipedResident, PolicyMode::Confined) => {
+            EdgeId::PipedResidentHostSocketConfined
+        }
+        (ProcessClass::PipedResident, PolicyMode::ReadOnlyCheckout) => {
+            EdgeId::PipedResidentHostSocketReadOnlyCheckout
+        }
+        (ProcessClass::PipedResident, PolicyMode::Unconfined) => {
+            EdgeId::PipedResidentHostSocketUnconfined
+        }
+        (ProcessClass::PtyResident, PolicyMode::Confined) => EdgeId::PtyResidentHostSocketConfined,
+        (ProcessClass::PtyResident, PolicyMode::ReadOnlyCheckout) => {
+            EdgeId::PtyResidentHostSocketReadOnlyCheckout
+        }
+        (ProcessClass::PtyResident, PolicyMode::Unconfined) => {
+            EdgeId::PtyResidentHostSocketUnconfined
+        }
+        _ => return None,
+    })
+}
+
+/// Attempt, through a process class's real spawn seam, to reach a host
+/// service's unix socket from inside the fence, and report what happened.
+///
+/// The harness -- this unconfined process -- binds a pathname listener in a
+/// fresh directory beneath the temp root and an abstract listener, which is
+/// the shape of the session bus, a tmux server, or an ssh agent. The temp root
+/// is deliberately in the writable set: write rights there must not carry
+/// socket resolution, and this is where that is proven. The child spawns
+/// through `wrap_argv`, then the class's own seam ([`crate::attach_pty_session`]
+/// for a PTY resident), then `install_pre_exec`, and only then a final hook
+/// that makes the attempts with raw syscalls, so no helper binary is needed
+/// and nothing allocates. The positive control binds and connects to the
+/// job's own socket in its scratch: a seam that cannot use a socket at all
+/// measured nothing.
+#[cfg(target_os = "linux")]
+pub fn probe_host_socket(
+    class: cairn_common::executor_protocol::ProcessClass,
+    mode: PolicyMode,
+) -> Result<ProbeWitness, String> {
+    use cairn_common::executor_protocol::ProcessClass;
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::process::CommandExt;
+
+    let edge = host_socket_edge(class, mode)
+        .ok_or_else(|| format!("no host-socket probe for {class:?} under {mode:?}"))?;
+    // Every socket lives under a short root: `$TMPDIR` can be a cell scratch or
+    // check-lane path deep enough to overrun the 108-byte socket address,
+    // which would leave the probe measuring nothing.
+    let worktree =
+        socket_probe::short_tempdir().map_err(|e| format!("create probe worktree: {e}"))?;
+    let scratch =
+        socket_probe::short_tempdir().map_err(|e| format!("create probe scratch: {e}"))?;
+    let outside =
+        socket_probe::short_tempdir().map_err(|e| format!("create probe host dir: {e}"))?;
+
+    let host_path = outside.path().join("host.sock");
+    let _host = std::os::unix::net::UnixListener::bind(&host_path)
+        .map_err(|e| format!("bind the probe's host socket: {e}"))?;
+    let abstract_name = format!("cairn-containment-{}", uuid::Uuid::new_v4().simple());
+    let _host_abstract = std::os::unix::net::SocketAddr::from_abstract_name(&abstract_name)
+        .and_then(|address| std::os::unix::net::UnixListener::bind_addr(&address))
+        .map_err(|e| format!("bind the probe's abstract socket: {e}"))?;
+
+    let attempt = socket_probe::Attempt::new(
+        &scratch.path().join("own.sock"),
+        &host_path,
+        abstract_name.as_bytes(),
+    )?;
+
+    let scratch_grant = [scratch.path().to_string_lossy().into_owned()];
+    let policy = match mode {
+        PolicyMode::Confined => Some(SandboxPolicy::for_run(
+            worktree.path(),
+            &scratch_grant,
+            Vec::new(),
+        )),
+        PolicyMode::ReadOnlyCheckout => Some(SandboxPolicy::for_readonly_checkout(
+            worktree.path(),
+            &scratch_grant,
+            Vec::new(),
+        )),
+        PolicyMode::Unconfined => None,
+        PolicyMode::NotApplicable => {
+            return Err("the host-socket seam always runs under a policy mode".to_string())
+        }
+    }
+    .map(|mut policy| {
+        policy.allow_job_sockets_in(scratch.path());
+        policy
+    });
+
+    let (report_read, report_write) = socket_probe::report_pipe()?;
+    let (program, args) = match &policy {
+        Some(policy) => crate::wrap_argv("/bin/true", &[], policy),
+        None => ("/bin/true".to_string(), Vec::new()),
+    };
+    let mut command = std::process::Command::new(&program);
+    command.args(&args).current_dir(worktree.path());
+    let _pty_master = match class {
+        ProcessClass::PtyResident => {
+            let (master, slave) = socket_probe::open_pty()?;
+            crate::attach_pty_session(&mut command, slave)
+                .map_err(|e| format!("attach the probe to a PTY: {e}"))?;
+            Some(master)
+        }
+        _ => {
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            None
+        }
+    };
+    if let Some(policy) = &policy {
+        crate::install_pre_exec(&mut command, policy);
+    }
+    let report_fd = std::os::fd::AsRawFd::as_raw_fd(&report_write);
+    // SAFETY: the attempt makes only socket, bind, listen, connect, close,
+    // unlink and write calls on stack data captured by value.
+    unsafe {
+        command.pre_exec(move || {
+            attempt.run(report_fd);
+            Ok(())
+        });
+    }
+    let spawned = command.spawn();
+    drop(report_write);
+    let mut child = spawned.map_err(|e| format!("spawn the host-socket probe: {e}"))?;
+    let mut report = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut std::fs::File::from(report_read), &mut report);
+    let _ = child.wait();
+
+    let [control, pathname, abstract_reached] = report[..] else {
+        return Err(format!(
+            "the host-socket probe reported {} bytes rather than three",
+            report.len()
+        ));
+    };
+    let positive_control_passed = control == b'1';
+    let pathname_reached = pathname == b'1';
+    let abstract_reached = abstract_reached == b'1';
+    let detail = socket_probe::describe(
+        positive_control_passed,
+        pathname_reached,
+        abstract_reached,
+        crate::linux::kernel_abi(),
+    );
+    Ok(ProbeWitness {
+        edge,
+        effect: EffectClass::Invoke,
+        positive_control_passed,
+        crossing_permitted: pathname_reached || abstract_reached,
+        detail,
+    })
+}
+
+/// Only Linux has a probe. macOS confines through `sandbox-exec`, which a
+/// pre-exec attempt would run before, so it would measure its own harness;
+/// that platform's socket boundary is cairn/5493.
+#[cfg(not(target_os = "linux"))]
+pub fn probe_host_socket(
+    class: cairn_common::executor_protocol::ProcessClass,
+    mode: PolicyMode,
+) -> Result<ProbeWitness, String> {
+    let _ = (class, mode);
+    Err(format!(
+        "no probe attempts the host-socket seam on {}; it applies no socket boundary yet",
+        std::env::consts::OS
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) mod socket_probe {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    /// The three attempts, as addresses built before the fork so the child
+    /// only makes syscalls.
+    #[derive(Clone, Copy)]
+    pub(super) struct Attempt {
+        control: (libc::sockaddr_un, libc::socklen_t),
+        pathname: (libc::sockaddr_un, libc::socklen_t),
+        abstract_name: (libc::sockaddr_un, libc::socklen_t),
+    }
+
+    // SAFETY: plain address data.
+    unsafe impl Send for Attempt {}
+    unsafe impl Sync for Attempt {}
+
+    pub(crate) fn address(
+        bytes: &[u8],
+        abstract_name: bool,
+    ) -> Result<(libc::sockaddr_un, libc::socklen_t), String> {
+        // SAFETY: an all-zero sockaddr_un is a valid empty address.
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let offset = usize::from(abstract_name);
+        // A pathname needs its terminating NUL inside sun_path.
+        if offset + bytes.len() >= address.sun_path.len() {
+            return Err(format!(
+                "probe socket name is {} bytes, longer than a unix socket address holds",
+                bytes.len()
+            ));
+        }
+        for (slot, byte) in address.sun_path[offset..].iter_mut().zip(bytes) {
+            *slot = *byte as libc::c_char;
+        }
+        let family = std::mem::size_of::<libc::sa_family_t>();
+        let length = if abstract_name {
+            family + 1 + bytes.len()
+        } else {
+            family + bytes.len() + 1
+        };
+        Ok((address, length as libc::socklen_t))
+    }
+
+    impl Attempt {
+        pub(super) fn new(
+            control: &Path,
+            host: &Path,
+            abstract_name: &[u8],
+        ) -> Result<Self, String> {
+            Ok(Self {
+                control: address(control.as_os_str().as_bytes(), false)?,
+                pathname: address(host.as_os_str().as_bytes(), false)?,
+                abstract_name: address(abstract_name, true)?,
+            })
+        }
+
+        /// Runs in the confined child. Writes `1` or `0` for the control, the
+        /// pathname crossing and the abstract crossing, in that order.
+        pub(super) fn run(&self, report: libc::c_int) {
+            // SAFETY: async-signal-safe syscalls on owned stack data.
+            unsafe {
+                let control = self.control_reachable();
+                let result = [
+                    b'0' + u8::from(control),
+                    b'0' + u8::from(connects(&self.pathname)),
+                    b'0' + u8::from(connects(&self.abstract_name)),
+                ];
+                libc::write(report, result.as_ptr().cast(), result.len());
+            }
+        }
+
+        unsafe fn control_reachable(&self) -> bool {
+            let (address, length) = &self.control;
+            let listener = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            if listener < 0 {
+                return false;
+            }
+            let bound = libc::bind(
+                listener,
+                (address as *const libc::sockaddr_un).cast(),
+                *length,
+            ) == 0
+                && libc::listen(listener, 1) == 0;
+            let reached = bound && connects(&self.control);
+            libc::close(listener);
+            libc::unlink(address.sun_path.as_ptr());
+            reached
+        }
+    }
+
+    unsafe fn connects((address, length): &(libc::sockaddr_un, libc::socklen_t)) -> bool {
+        let socket = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if socket < 0 {
+            return false;
+        }
+        let connected = libc::connect(
+            socket,
+            (address as *const libc::sockaddr_un).cast(),
+            *length,
+        ) == 0;
+        libc::close(socket);
+        connected
+    }
+
+    /// A fresh directory directly under `/tmp`, short enough that a socket path
+    /// beneath it always fits a unix socket address. `/tmp` itself is a shared
+    /// root and never socket-resolvable; a directory beneath it can be.
+    pub(crate) fn short_tempdir() -> std::io::Result<tempfile::TempDir> {
+        tempfile::Builder::new().prefix("cairn-").tempdir_in("/tmp")
+    }
+
+    pub(crate) fn report_pipe() -> Result<(OwnedFd, OwnedFd), String> {
+        let mut fds = [0; 2];
+        // SAFETY: fds has room for both ends.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(format!(
+                "open the probe's report pipe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: pipe2 returned two fresh descriptors this function now owns.
+        Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    }
+
+    pub(crate) fn open_pty() -> Result<(OwnedFd, std::fs::File), String> {
+        let (mut master, mut slave) = (0, 0);
+        // SAFETY: openpty writes two descriptors; the optional arguments are null.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "open a PTY for the probe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: openpty returned two fresh descriptors this function now owns.
+        Ok(unsafe {
+            (
+                OwnedFd::from_raw_fd(master),
+                std::fs::File::from_raw_fd(slave),
+            )
+        })
+    }
+
+    pub(super) fn describe(
+        control: bool,
+        pathname: bool,
+        abstract_name: bool,
+        kernel_abi: Option<i32>,
+    ) -> String {
+        let abi = kernel_abi.map_or_else(|| "none".to_string(), |abi| abi.to_string());
+        if !control {
+            return "the job could not bind and reach its own socket in its scratch, so this probe could not exercise the seam".to_string();
+        }
+        let below = |required: i32| kernel_abi.is_none_or(|abi| abi < required);
+        let mut reached = Vec::new();
+        if pathname {
+            reached.push(if below(crate::linux::RESOLVE_UNIX_ABI) {
+                format!("kernel Landlock ABI {abi} < {}: pathname sockets served from outside the fence are reachable", crate::linux::RESOLVE_UNIX_ABI)
+            } else {
+                format!("a pathname socket served from outside the fence was reachable on kernel Landlock ABI {abi}")
+            });
+        }
+        if abstract_name {
+            reached.push(if below(crate::linux::ABSTRACT_SCOPE_ABI) {
+                format!("kernel Landlock ABI {abi} < {}: abstract sockets served from outside the fence are reachable", crate::linux::ABSTRACT_SCOPE_ABI)
+            } else {
+                format!("an abstract socket served from outside the fence was reachable on kernel Landlock ABI {abi}")
+            });
+        }
+        if reached.is_empty() {
+            format!("the job reached its own socket, and both a pathname and an abstract socket served from outside the fence were refused (kernel Landlock ABI {abi})")
+        } else {
+            reached.join("; ")
+        }
+    }
+}
+
+/// A host-socket edge as this machine can currently report it.
+pub fn observe_host_socket(
+    build_id: &str,
+    boot: &str,
+    platform: Option<RemotePlatform>,
+    class: cairn_common::executor_protocol::ProcessClass,
+    mode: PolicyMode,
+) -> EdgeDisposition {
+    let Some(edge) = host_socket_edge(class, mode) else {
+        return EdgeDisposition::Unmeasured {
+            reason: format!("no probe attempts the {class:?} host-socket seam yet"),
+        };
+    };
+    let Some(platform) = platform else {
+        return EdgeDisposition::Unmeasured {
+            reason: "this machine is not one of the published executor platforms, so its measurements have no closed platform identity to bind to".into(),
+        };
+    };
+    let Some(invalidation_fingerprint) = fingerprint(edge, build_id, boot) else {
+        return EdgeDisposition::Unmeasured {
+            reason: "this machine cannot currently read every input that could widen the host-socket seam, so no positive disposition is constructible".into(),
+        };
+    };
+    let witness = match probe_host_socket(class, mode) {
+        Ok(witness) => witness,
+        Err(reason) => return EdgeDisposition::Unmeasured { reason },
+    };
+    let definition = edge.definition();
+    witness.into_disposition(PositiveScope {
+        executor_build_id: build_id.to_string(),
+        boot_generation: boot.to_string(),
+        platform,
+        process_class: definition.key.process_class,
+        carrier: definition.key.carrier,
+        policy_mode: definition.key.policy_mode,
+        probe_version: ProbeVersion::V1,
+        claim_revision: definition.claim_revision,
+        invalidation_fingerprint,
+    })
+}
+
 /// Attempt to read a Cairn home's operator credential the way an unfenced agent
 /// spawn would, and report whether it could.
 ///
@@ -507,6 +948,10 @@ fn probe_evidence(
                     ),
                     EdgeId::OperatorCredentialRead => {
                         observe_operator_credential_read(build_id, boot, platform)
+                    }
+                    socket if host_socket_class(socket).is_some() => {
+                        let (class, mode) = host_socket_class(socket).expect("guarded");
+                        observe_host_socket(build_id, boot, platform, class, mode)
                     }
                     other => EdgeDisposition::Unmeasured {
                         reason: format!(

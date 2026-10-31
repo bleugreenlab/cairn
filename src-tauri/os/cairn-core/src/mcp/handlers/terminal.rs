@@ -3032,6 +3032,36 @@ async fn spawn_terminal_session(
         ],
         _ => Vec::new(),
     };
+    // A job's terminal makes its node's scratch its `$TMPDIR`. While it lives
+    // it holds the scratch's writer on its machine, so a second live process of
+    // the same node on another machine is refused here, by name.
+    let node_scratch = match target.job_id.as_deref() {
+        Some(job_id) => {
+            match crate::node_scratch::grant_for_run(orch, target.run_id.as_deref(), job_id).await {
+                Some((grant, resolved, db)) => {
+                    let here = orch
+                        .fleet
+                        .predicted_job_home(
+                            &cairn_common::executor_protocol::ResidencyHolder::Job {
+                                job_id: job_id.to_owned(),
+                            },
+                        )
+                        .map(|home| home.executor_id);
+                    crate::node_scratch::holders::refuse_second_writer(
+                        orch,
+                        &db,
+                        &resolved.owner_job_id,
+                        here.as_deref(),
+                        "terminal",
+                    )
+                    .await?;
+                    Some(grant)
+                }
+                None => None,
+            }
+        }
+        None => None,
+    };
     let result = orch
         .fleet
         .operate_residency(
@@ -3058,6 +3088,7 @@ async fn spawn_terminal_session(
                     sandbox_policy,
                     runtime_assets: Vec::new(),
                     io: ResidentProcessIoMode::Pty { size },
+                    node_scratch,
                 },
             },
         )
@@ -3819,7 +3850,7 @@ mod terminal_finalize_tests {
         let db = crate::storage::migrated_test_db("term_managed_acquire.db").await;
         let checkout = tempdir().unwrap();
         init_git_checkout(checkout.path());
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','p','{}',1,1);
@@ -4731,6 +4762,7 @@ mod terminal_finalize_tests {
                         spec: None,
                         status: ResidentProcessStatus::Starting,
                         reservation: None,
+                        live_usage: None,
                     },
                 )]),
                 clone_source: None,

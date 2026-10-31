@@ -14,9 +14,7 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::RowExt;
 use crate::symbols::nav::{query as symbol_query, NavProjection, SymbolOp};
 
-use super::common::{
-    connect_and_find_node_job, connect_for_read, find_query_value, parse_optional_usize_param,
-};
+use super::common::{find_query_value, load_node_job, parse_optional_usize_param, read_resource};
 
 /// Query parameters the symbol resources accept (the path segment carries the
 /// symbol name). `op` selects the navigation op; `in` scopes to a glob subtree.
@@ -43,8 +41,8 @@ pub(crate) async fn read_node_symbols(
     params: &[QueryParam],
 ) -> String {
     let db = orch.db.for_project(project).await;
-    let (_, job) = match connect_and_find_node_job(&db, project, number, exec_seq, node_id).await {
-        Ok(pair) => pair,
+    let job = match load_node_job(&db, project, number, exec_seq, node_id).await {
+        Ok(job) => job,
         Err(error) => return error,
     };
     let job = match crate::jobs::queries::get_job(&db, &job.id).await {
@@ -59,12 +57,14 @@ pub(crate) async fn read_node_symbols(
         Err(error) => return error,
     };
     let request = crate::mcp::types::McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: String::new(),
         run_id: Some(run_id),
         tool: "read".into(),
         payload: serde_json::Value::Null,
         tool_use_id: None,
+        origin: None,
     };
     let resolution =
         match crate::mcp::handlers::branch::resolve_for_read(orch, &request, branch).await {
@@ -105,11 +105,12 @@ pub(crate) async fn read_project_symbols(
 ) -> String {
     let repo_path = {
         let routed_db = orch.db.for_project(project).await;
-        let conn = match connect_for_read(&routed_db).await {
-            Ok(conn) => conn,
-            Err(error) => return error,
-        };
-        match project_repo_path(&conn, project).await {
+        let project_key = project.to_owned();
+        match read_resource(&routed_db, move |conn| {
+            Box::pin(async move { project_repo_path(conn, &project_key).await })
+        })
+        .await
+        {
             Ok(path) => path,
             Err(error) => return error,
         }

@@ -556,6 +556,72 @@ async fn set_session_parent(db: &LocalDb, id: &str, parent: &str) {
     .unwrap();
 }
 
+async fn job_run(db: &LocalDb, id: &str, job_id: &str, session_id: &str, created_at: i64) {
+    insert_run(
+        db,
+        id,
+        None,
+        None,
+        Some(job_id),
+        None,
+        "running",
+        Some(session_id),
+        created_at,
+    )
+    .await;
+}
+
+async fn session_event(
+    db: &LocalDb,
+    id: &str,
+    run_id: &str,
+    session_id: &str,
+    sequence: i64,
+    kind: &str,
+) {
+    insert_event(
+        db,
+        id,
+        run_id,
+        Some(session_id),
+        None,
+        sequence,
+        kind,
+        100,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+}
+
+async fn transcript(
+    db: &LocalDb,
+    job_id: &str,
+    window: queries::TranscriptWindow,
+) -> queries::JobTranscriptWindow {
+    queries::list_job_transcript_window(db, job_id, window)
+        .await
+        .unwrap()
+}
+
+fn tail_window() -> queries::TranscriptWindow {
+    queries::TranscriptWindow::Tail {
+        limit: queries::TRANSCRIPT_PAGE_LIMIT,
+    }
+}
+
+macro_rules! ids {
+    ($events:expr) => {
+        $events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>()
+    };
+}
+
 #[tokio::test]
 async fn list_events_for_session_spans_reseed_rotation_lineage() {
     // A cold-resume reseed rotates a job onto a fresh session that carries none
@@ -571,31 +637,8 @@ async fn list_events_for_session_spans_reseed_rotation_lineage() {
     insert_session(&db, "session-old", "job-1", 1).await;
     insert_session(&db, "session-new", "job-1", 2).await;
     link_session_rotation(&db, "session-old", "session-new").await;
-
-    insert_run(
-        &db,
-        "run-old",
-        None,
-        None,
-        None,
-        None,
-        "complete",
-        Some("session-old"),
-        100,
-    )
-    .await;
-    insert_run(
-        &db,
-        "run-new",
-        None,
-        None,
-        None,
-        None,
-        "running",
-        Some("session-new"),
-        200,
-    )
-    .await;
+    job_run(&db, "run-old", "job-1", "session-old", 100).await;
+    job_run(&db, "run-new", "job-1", "session-new", 200).await;
 
     for (id, run, session, seq, kind) in [
         ("old-user", "run-old", "session-old", 1, "user"),
@@ -603,57 +646,32 @@ async fn list_events_for_session_spans_reseed_rotation_lineage() {
         ("new-seed", "run-new", "session-new", 1, "user:seed"),
         ("new-user", "run-new", "session-new", 2, "user"),
     ] {
-        insert_event(
-            &db,
-            id,
-            run,
-            Some(session),
-            None,
-            seq,
-            kind,
-            100,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await;
+        session_event(&db, id, run, session, seq, kind).await;
     }
 
     // Loading the fresh session returns the full lineage, prior events first.
     let events = queries::list_events_for_session(db.clone(), "session-new").unwrap();
     assert_eq!(
-        events
-            .iter()
-            .map(|event| event.id.as_str())
-            .collect::<Vec<_>>(),
+        ids!(events),
         vec!["old-user", "old-assistant", "new-seed", "new-user"]
     );
 
-    // The initial delta load carries the same full lineage, resolved from the
-    // node alone — no caller names a session.
+    // The tail carries the same lineage, resolved from the node alone — no
+    // caller names a session.
     set_current_session(&db, "job-1", "session-new").await;
-    let delta = queries::list_events_for_job_delta(db.clone(), "job-1", None).unwrap();
+    let tail = transcript(&db, "job-1", tail_window()).await;
     assert_eq!(
-        delta
-            .events
-            .iter()
-            .map(|event| event.id.as_str())
-            .collect::<Vec<_>>(),
+        ids!(tail.events),
         vec!["old-user", "old-assistant", "new-seed", "new-user"]
     );
+    assert_eq!(tail.older, None, "the whole lineage fits one page");
+    assert_eq!(tail.run_ordinals.get("run-old"), Some(&1));
+    assert_eq!(tail.run_ordinals.get("run-new"), Some(&2));
 
     // Loading the predecessor directly stays scoped to its own events — the walk
     // only follows genuine in-place rotation predecessors, never successors.
     let old_only = queries::list_events_for_session(db.clone(), "session-old").unwrap();
-    assert_eq!(
-        old_only
-            .iter()
-            .map(|event| event.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["old-user", "old-assistant"]
-    );
+    assert_eq!(ids!(old_only), vec!["old-user", "old-assistant"]);
 }
 
 #[tokio::test]
@@ -669,95 +687,26 @@ async fn list_events_for_session_excludes_cross_job_fork_parent() {
     insert_job(&db, "job-parent", &project_id, None).await;
     insert_job(&db, "job-child", &project_id, None).await;
 
-    // parent-session was NOT replaced by the fork (it keeps serving its own job).
     insert_session(&db, "parent-session", "job-parent", 1).await;
     insert_session(&db, "fork-session", "job-child", 2).await;
     // The fork points back at the parent, but the parent's replaced_by_id stays
     // NULL — the exact shape that must NOT chain.
     set_session_parent(&db, "fork-session", "parent-session").await;
-
-    insert_run(
-        &db,
-        "run-parent",
-        None,
-        None,
-        None,
-        None,
-        "complete",
-        Some("parent-session"),
-        100,
-    )
-    .await;
-    insert_run(
-        &db,
-        "run-fork",
-        None,
-        None,
-        None,
-        None,
-        "running",
-        Some("fork-session"),
-        200,
-    )
-    .await;
-
-    insert_event(
-        &db,
-        "parent-ev",
-        "run-parent",
-        Some("parent-session"),
-        None,
-        1,
-        "user",
-        100,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await;
-    insert_event(
-        &db,
-        "fork-ev",
-        "run-fork",
-        Some("fork-session"),
-        None,
-        1,
-        "user",
-        100,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await;
+    job_run(&db, "run-parent", "job-parent", "parent-session", 100).await;
+    job_run(&db, "run-fork", "job-child", "fork-session", 200).await;
+    session_event(&db, "parent-ev", "run-parent", "parent-session", 1, "user").await;
+    session_event(&db, "fork-ev", "run-fork", "fork-session", 1, "user").await;
 
     set_current_session(&db, "job-parent", "parent-session").await;
     set_current_session(&db, "job-child", "fork-session").await;
 
-    let parent = queries::list_events_for_job_delta(db.clone(), "job-parent", None).unwrap();
-    assert_eq!(
-        parent
-            .events
-            .iter()
-            .map(|event| event.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["parent-ev"]
-    );
+    let parent = transcript(&db, "job-parent", tail_window()).await;
+    assert_eq!(ids!(parent.events), vec!["parent-ev"]);
 
     // The child's forked transcript stays its own: each node resolves its own
     // session, so no request can reach across the fork in either direction.
-    let child = queries::list_events_for_job_delta(db, "job-child", None).unwrap();
-    assert_eq!(
-        child
-            .events
-            .iter()
-            .map(|event| event.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["fork-ev"]
-    );
+    let child = transcript(&db, "job-child", tail_window()).await;
+    assert_eq!(ids!(child.events), vec!["fork-ev"]);
 }
 
 #[tokio::test]
@@ -773,39 +722,21 @@ async fn job_transcript_delta_follows_a_session_reconstruction() {
     insert_job(&db, "job-1", &project_id, None).await;
     insert_session(&db, "session-old", "job-1", 1).await;
     set_current_session(&db, "job-1", "session-old").await;
-    insert_run(
-        &db,
-        "run-old",
-        None,
-        None,
-        Some("job-1"),
-        None,
-        "complete",
-        Some("session-old"),
-        100,
-    )
-    .await;
-    insert_event(
+    job_run(&db, "run-old", "job-1", "session-old", 100).await;
+    session_event(
         &db,
         "old-assistant",
         "run-old",
-        Some("session-old"),
-        None,
+        "session-old",
         1,
         "assistant",
-        100,
-        None,
-        None,
-        None,
-        None,
-        None,
     )
     .await;
 
-    // The open view's position after its initial load.
-    let initial = queries::list_events_for_job_delta(db.clone(), "job-1", None).unwrap();
+    // The open view's position after its first page.
+    let initial = transcript(&db, "job-1", tail_window()).await;
     assert_eq!(initial.events.len(), 1);
-    let cursor = initial.last_rowid.expect("initial load yields a cursor");
+    let cursor = initial.last_rowid.expect("the tail yields a cursor");
 
     // The reseed lands: a fresh session, marked as replacing the old one, and
     // stamped as the node's current session.
@@ -814,60 +745,34 @@ async fn job_transcript_delta_follows_a_session_reconstruction() {
     set_current_session(&db, "job-1", "session-new").await;
 
     // A rotated node with no events yet on its successor still hands back a
-    // usable cursor; a session-scoped MAX(rowid) would return null here and the
-    // caller's append-only merge would duplicate the whole prior transcript.
-    let rotated = queries::list_events_for_job_delta(db.clone(), "job-1", None).unwrap();
-    assert_eq!(
-        rotated
-            .events
-            .iter()
-            .map(|event| event.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["old-assistant"]
-    );
+    // usable cursor; a session-scoped MAX(rowid) would return null here.
+    let rotated = transcript(&db, "job-1", tail_window()).await;
+    assert_eq!(ids!(rotated.events), vec!["old-assistant"]);
     assert_eq!(rotated.last_rowid, Some(cursor));
 
-    insert_run(
-        &db,
-        "run-new",
-        None,
-        None,
-        Some("job-1"),
-        None,
-        "running",
-        Some("session-new"),
-        200,
-    )
-    .await;
-    insert_event(
+    job_run(&db, "run-new", "job-1", "session-new", 200).await;
+    session_event(
         &db,
         "new-assistant",
         "run-new",
-        Some("session-new"),
-        None,
+        "session-new",
         1,
         "assistant",
-        200,
-        None,
-        None,
-        None,
-        None,
-        None,
     )
     .await;
 
     // The pre-rotation cursor keeps working: the successor's event arrives as a
-    // plain delta on the same node key.
-    let delta = queries::list_events_for_job_delta(db.clone(), "job-1", Some(cursor)).unwrap();
-    assert_eq!(
-        delta
-            .events
-            .iter()
-            .map(|event| event.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["new-assistant"]
-    );
+    // plain delta on the same node key, numbered as the job's second run.
+    let delta = transcript(
+        &db,
+        "job-1",
+        queries::TranscriptWindow::After { rowid: cursor },
+    )
+    .await;
+    assert_eq!(ids!(delta.events), vec!["new-assistant"]);
     assert!(delta.last_rowid.unwrap() > cursor);
+    assert_eq!(delta.run_ordinals.get("run-new"), Some(&2));
+    assert_eq!(delta.older, None);
 }
 
 #[tokio::test]
@@ -881,51 +786,115 @@ async fn job_transcript_delta_resolves_the_newest_run_before_a_session_is_stampe
     let project_id = common::create_project(&db, "newchat").await;
     insert_job(&db, "job-1", &project_id, None).await;
     insert_session(&db, "session-1", "job-1", 1).await;
-    insert_run(
-        &db,
-        "run-1",
-        None,
-        None,
-        Some("job-1"),
-        None,
-        "running",
-        Some("session-1"),
-        100,
-    )
-    .await;
-    insert_event(
-        &db,
-        "first",
-        "run-1",
-        Some("session-1"),
-        None,
-        1,
-        "assistant",
-        100,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await;
+    job_run(&db, "run-1", "job-1", "session-1", 100).await;
+    session_event(&db, "first", "run-1", "session-1", 1, "assistant").await;
 
-    let delta = queries::list_events_for_job_delta(db.clone(), "job-1", None).unwrap();
-    assert_eq!(
-        delta
-            .events
-            .iter()
-            .map(|event| event.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["first"]
-    );
+    let tail = transcript(&db, "job-1", tail_window()).await;
+    assert_eq!(ids!(tail.events), vec!["first"]);
 
     // A node that has never opened a session reads as an empty transcript, not
     // an error, and holds the caller's position.
     insert_job(&db, "job-empty", &project_id, None).await;
-    let empty = queries::list_events_for_job_delta(db, "job-empty", Some(7)).unwrap();
+    let empty = transcript(
+        &db,
+        "job-empty",
+        queries::TranscriptWindow::After { rowid: 7 },
+    )
+    .await;
     assert!(empty.events.is_empty());
     assert_eq!(empty.last_rowid, Some(7));
+}
+
+#[tokio::test]
+async fn transcript_pages_stitch_to_the_session_order_and_deltas_continue_it() {
+    // A three-session rotated lineage. In the newest run a message streams
+    // across a system event: it reserved sequence 2 when it opened, but its row
+    // lands after the system event's (sequence 3), the way finalize inserts
+    // it, and both rows carry the same second. Paging backwards from the tail
+    // must reproduce the cold load exactly, and the forward cursor must carry
+    // on from where the tail was taken.
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    let project_id = common::create_project(&db, "stitch").await;
+    insert_job(&db, "job-1", &project_id, None).await;
+    for (session, sequence) in [("s1", 1), ("s2", 2), ("s3", 3), ("s-stray", 9)] {
+        insert_session(&db, session, "job-1", sequence).await;
+    }
+    link_session_rotation(&db, "s1", "s2").await;
+    link_session_rotation(&db, "s2", "s3").await;
+    set_current_session(&db, "job-1", "s3").await;
+
+    // A run on a session outside the lineage still counts toward the run
+    // numbering URIs use, but contributes no events.
+    job_run(&db, "r1", "job-1", "s1", 100).await;
+    job_run(&db, "r-stray", "job-1", "s-stray", 120).await;
+    job_run(&db, "r2", "job-1", "s1", 150).await;
+    job_run(&db, "r3", "job-1", "s2", 200).await;
+    job_run(&db, "r4", "job-1", "s3", 300).await;
+    session_event(&db, "stray", "r-stray", "s-stray", 1, "user").await;
+    for (id, run, session, sequence, kind) in [
+        ("a1", "r1", "s1", 1, "user"),
+        ("a2", "r1", "s1", 2, "assistant"),
+        ("a3", "r1", "s1", 3, "result:success"),
+        ("b1", "r2", "s1", 1, "user"),
+        ("b2", "r2", "s1", 2, "assistant"),
+        ("c1", "r3", "s2", 1, "user:seed"),
+        ("c2", "r3", "s2", 2, "user"),
+        ("c3", "r3", "s2", 3, "assistant"),
+        ("d1", "r4", "s3", 1, "user"),
+        ("d3", "r4", "s3", 3, "system:message"),
+        ("d2", "r4", "s3", 2, "assistant"),
+        ("d4", "r4", "s3", 4, "tool_result"),
+    ] {
+        session_event(&db, id, run, session, sequence, kind).await;
+    }
+
+    let expected = vec![
+        "a1", "a2", "a3", "b1", "b2", "c1", "c2", "c3", "d1", "d2", "d3", "d4",
+    ];
+    let cold = queries::list_events_for_session(db.clone(), "s3").unwrap();
+    assert_eq!(
+        ids!(cold),
+        expected,
+        "the cold load orders a run by sequence"
+    );
+
+    let mut page = transcript(&db, "job-1", queries::TranscriptWindow::Tail { limit: 3 }).await;
+    let cursor = page.last_rowid.expect("the tail yields a cursor");
+    let mut stitched: Vec<String> = page.events.iter().map(|e| e.id.clone()).collect();
+    let mut ordinals = page.run_ordinals.clone();
+    let mut pages = 1;
+    while let Some(position) = page.older {
+        page = transcript(
+            &db,
+            "job-1",
+            queries::TranscriptWindow::Before { position, limit: 3 },
+        )
+        .await;
+        assert!(page.streaming.is_none() && page.last_rowid.is_none());
+        let mut older: Vec<String> = page.events.iter().map(|e| e.id.clone()).collect();
+        older.append(&mut stitched);
+        stitched = older;
+        ordinals.extend(page.run_ordinals.clone());
+        pages += 1;
+        assert!(pages < 10, "paging must reach the head");
+    }
+    assert_eq!(stitched, expected);
+    assert_eq!(ordinals.get("r1"), Some(&1));
+    assert_eq!(ordinals.get("r2"), Some(&3));
+    assert_eq!(ordinals.get("r3"), Some(&4));
+    assert_eq!(ordinals.get("r4"), Some(&5));
+    assert!(!ordinals.contains_key("r-stray"));
+
+    session_event(&db, "d5", "r4", "s3", 5, "assistant").await;
+    let delta = transcript(
+        &db,
+        "job-1",
+        queries::TranscriptWindow::After { rowid: cursor },
+    )
+    .await;
+    assert_eq!(ids!(delta.events), vec!["d5"]);
+    assert_eq!(delta.run_ordinals.get("r4"), Some(&5));
 }
 
 #[tokio::test]
@@ -1008,219 +977,65 @@ async fn list_events_for_turn_preserves_same_second_insertion_order() {
 }
 
 #[tokio::test]
-async fn session_events_delta_initial_load_is_run_ordered_with_cursor() {
+async fn transcript_tail_is_run_ordered_with_cursor() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
+    let project_id = common::create_project(&db, "ordered").await;
+    insert_job(&db, "job-1", &project_id, None).await;
     // Two runs in one session; run-1 created before run-2.
-    insert_run(
-        &db,
-        "run-1",
-        None,
-        None,
-        None,
-        None,
-        "crashed",
-        Some("session-1"),
-        1,
-    )
-    .await;
-    insert_run(
-        &db,
-        "run-2",
-        None,
-        None,
-        None,
-        None,
-        "running",
-        Some("session-1"),
-        2,
-    )
-    .await;
+    job_run(&db, "run-1", "job-1", "session-1", 1).await;
+    job_run(&db, "run-2", "job-1", "session-1", 2).await;
 
     // Insert order (rowids 1,2,3) deliberately interleaves runs and does not
-    // match run order, to prove the initial load sorts by run creation order.
-    insert_event(
-        &db,
-        "e-a",
-        "run-1",
-        Some("session-1"),
-        None,
-        0,
-        "assistant",
-        100,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await;
-    insert_event(
-        &db,
-        "e-c",
-        "run-2",
-        Some("session-1"),
-        None,
-        0,
-        "assistant",
-        200,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await;
-    insert_event(
-        &db,
-        "e-b",
-        "run-1",
-        Some("session-1"),
-        None,
-        1,
-        "assistant",
-        400,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await;
+    // match run order, to prove the tail sorts by run creation order.
+    session_event(&db, "e-a", "run-1", "session-1", 0, "assistant").await;
+    session_event(&db, "e-c", "run-2", "session-1", 0, "assistant").await;
+    session_event(&db, "e-b", "run-1", "session-1", 1, "assistant").await;
 
-    let delta = queries::list_events_for_session_delta(db.clone(), "session-1", None).unwrap();
-    // run-1 events (by created_at) then run-2 events.
-    assert_eq!(
-        delta
-            .events
-            .iter()
-            .map(|event| event.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["e-a", "e-b", "e-c"]
-    );
-    // Cursor is the session-wide MAX(rowid) = last inserted row (e-b).
-    assert_eq!(delta.last_rowid, Some(3));
-    assert!(delta.streaming.is_none());
+    let tail = transcript(&db, "job-1", tail_window()).await;
+    assert_eq!(ids!(tail.events), vec!["e-a", "e-b", "e-c"]);
+    // Cursor is the lineage-wide MAX(rowid) = last inserted row (e-b).
+    assert_eq!(tail.last_rowid, Some(3));
+    assert!(tail.streaming.is_none());
+    assert_eq!(tail.run_ordinals.get("run-1"), Some(&1));
+    assert_eq!(tail.run_ordinals.get("run-2"), Some(&2));
 }
 
 #[tokio::test]
-async fn session_events_delta_returns_only_new_events_and_echoes_cursor() {
+async fn transcript_delta_returns_only_new_events_and_echoes_cursor() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    insert_run(
-        &db,
-        "run-1",
-        None,
-        None,
-        None,
-        None,
-        "crashed",
-        Some("session-1"),
-        1,
-    )
-    .await;
-    insert_event(
-        &db,
-        "e1",
-        "run-1",
-        Some("session-1"),
-        None,
-        0,
-        "assistant",
-        100,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await;
+    let project_id = common::create_project(&db, "delta").await;
+    insert_job(&db, "job-1", &project_id, None).await;
+    job_run(&db, "run-1", "job-1", "session-1", 1).await;
+    session_event(&db, "e1", "run-1", "session-1", 0, "assistant").await;
 
-    let initial = queries::list_events_for_session_delta(db.clone(), "session-1", None).unwrap();
+    let initial = transcript(&db, "job-1", tail_window()).await;
     assert_eq!(initial.last_rowid, Some(1));
 
     // Empty delta echoes the cursor so the caller holds position.
-    let empty = queries::list_events_for_session_delta(db.clone(), "session-1", initial.last_rowid)
-        .unwrap();
+    let empty = transcript(&db, "job-1", queries::TranscriptWindow::After { rowid: 1 }).await;
     assert!(empty.events.is_empty());
     assert_eq!(empty.last_rowid, Some(1));
 
     // A new run inserts after the cursor; the delta picks it up across the run
     // boundary, in append (rowid) order.
-    insert_run(
-        &db,
-        "run-2",
-        None,
-        None,
-        None,
-        None,
-        "running",
-        Some("session-1"),
-        2,
-    )
-    .await;
-    insert_event(
-        &db,
-        "e2",
-        "run-2",
-        Some("session-1"),
-        None,
-        0,
-        "assistant",
-        200,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await;
-    insert_event(
-        &db,
-        "e3",
-        "run-2",
-        Some("session-1"),
-        None,
-        1,
-        "assistant",
-        300,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await;
+    job_run(&db, "run-2", "job-1", "session-1", 2).await;
+    session_event(&db, "e2", "run-2", "session-1", 0, "assistant").await;
+    session_event(&db, "e3", "run-2", "session-1", 1, "assistant").await;
 
-    let delta = queries::list_events_for_session_delta(db.clone(), "session-1", initial.last_rowid)
-        .unwrap();
-    assert_eq!(
-        delta
-            .events
-            .iter()
-            .map(|event| event.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["e2", "e3"]
-    );
+    let delta = transcript(&db, "job-1", queries::TranscriptWindow::After { rowid: 1 }).await;
+    assert_eq!(ids!(delta.events), vec!["e2", "e3"]);
     assert_eq!(delta.last_rowid, Some(3));
 }
 
 #[tokio::test]
-async fn session_events_delta_returns_streaming_placeholder_separately() {
+async fn transcript_window_returns_streaming_placeholder_separately() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    insert_run(
-        &db,
-        "run-1",
-        None,
-        None,
-        None,
-        None,
-        "running",
-        Some("session-1"),
-        1,
-    )
-    .await;
+    let project_id = common::create_project(&db, "streaming").await;
+    insert_job(&db, "job-1", &project_id, None).await;
+    job_run(&db, "run-1", "job-1", "session-1", 1).await;
     insert_turn(&db, "turn-1", "session-1", "run-1", None, 1, "running").await;
     insert_event(
         &db,
@@ -1255,31 +1070,24 @@ async fn session_events_delta_returns_streaming_placeholder_separately() {
     )
     .unwrap();
 
-    let delta = queries::list_events_for_session_delta(db.clone(), "session-1", None).unwrap();
+    let tail = transcript(&db, "job-1", tail_window()).await;
     // The placeholder is NOT spliced into events.
+    assert_eq!(ids!(tail.events), vec!["asst-0"]);
     assert_eq!(
-        delta
-            .events
-            .iter()
-            .map(|event| event.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["asst-0"]
-    );
-    assert_eq!(
-        delta.streaming.as_ref().map(|event| event.id.as_str()),
+        tail.streaming.as_ref().map(|event| event.id.as_str()),
         Some(stream.stream_id())
     );
     assert_eq!(
-        delta
-            .streaming
+        tail.streaming
             .as_ref()
             .map(|event| event.event_type.as_str()),
         Some("assistant:streaming")
     );
+    assert_eq!(tail.run_ordinals.get("run-1"), Some(&1));
 
     // After the stream is aborted the placeholder clears.
     abort_stream(db.clone(), stream.stream_id(), active.version, "test").unwrap();
-    let cleared = queries::list_events_for_session_delta(db.clone(), "session-1", None).unwrap();
+    let cleared = transcript(&db, "job-1", tail_window()).await;
     assert!(cleared.streaming.is_none());
 }
 
@@ -1300,13 +1108,14 @@ async fn active_streams_append_after_existing_events() {
     )
     .await;
     insert_turn(&db, "turn-1", "session-1", "run-1", None, 1, "running").await;
+    // Within a run, `sequence` is transcript order.
     insert_event(
         &db,
         "user-ev",
         "run-1",
         Some("session-1"),
         Some("turn-1"),
-        50,
+        0,
         "user",
         100,
         None,
@@ -1322,7 +1131,7 @@ async fn active_streams_append_after_existing_events() {
         "run-1",
         Some("session-1"),
         Some("turn-1"),
-        0,
+        1,
         "assistant",
         100,
         None,

@@ -729,12 +729,14 @@ async fn preview_write(
     changes: Value,
 ) -> String {
     let request = cairn_core::internal::mcp::types::McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: String::new(),
         run_id: None,
         tool: "write".to_string(),
         payload: json!({ "preview": true, "changes": changes }),
         tool_use_id: None,
+        origin: None,
     };
     cairn_core::internal::mcp::handlers::write::handle_write(orch, &request).await
 }

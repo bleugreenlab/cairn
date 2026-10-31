@@ -6,8 +6,8 @@ const THREAD: &str = "schema-owner";
 const RUN: &str = "thread-db-run";
 const CONDITION_THREAD: &str = "condition-owner";
 const CONDITION_RUN: &str = "thread-db-condition-run";
-const PROCEDURE_THREAD: &str = "procedure-owner";
-const PROCEDURE_RUN: &str = "thread-db-procedure-run";
+const ROWS_THREAD: &str = "rows-owner";
+const ROWS_RUN: &str = "thread-db-rows-run";
 const INTRUDER_THREAD: &str = "intruder";
 const INTRUDER_RUN: &str = "thread-db-intruder-run";
 
@@ -164,10 +164,7 @@ async fn condition_fixture() -> &'static ConditionFixture {
     FIXTURE
         .get_or_init(|| async {
             let (temp, db, orch, _repo) = common::project_resource_fixture(PROJECT).await;
-            for (thread, run) in [
-                (CONDITION_THREAD, CONDITION_RUN),
-                (PROCEDURE_THREAD, PROCEDURE_RUN),
-            ] {
+            for (thread, run) in [(CONDITION_THREAD, CONDITION_RUN), (ROWS_THREAD, ROWS_RUN)] {
                 common::seed_authenticated_thread_run(
                     &db,
                     &format!("project-{PROJECT}"),
@@ -357,47 +354,68 @@ async fn a_write_through_the_resource_fires_an_armed_db_condition() {
     assert_eq!(condition.last_outcome.as_deref(), Some("matched"));
 }
 
-/// The condition contract is "after every committed write to that store", and a
-/// condition can read the app-contract tables the SQL surface never writes. A
-/// procedure is stored through its own resource and its own writer, so this is
-/// the check that the obligation follows committing rather than following
-/// `cairn:~/db`.
+/// A structured row write knows the row it touched, so the condition it trips
+/// names that row in the push it leaves.
 #[tokio::test]
-async fn a_procedures_write_also_fires_an_armed_db_condition() {
+async fn a_fired_condition_names_the_row_a_structured_write_touched() {
     use cairn_core::internal::orchestrator::wakes::conditions;
+    use cairn_db::storage::RowExt;
 
     let ConditionFixture { db, orch, .. } = condition_fixture().await;
-
+    let created = common::change_resource_as_run(
+        orch,
+        patch_thread(
+            ROWS_THREAD,
+            "CREATE TABLE hits(id INTEGER PRIMARY KEY, ready INTEGER)",
+        ),
+        Some(ROWS_RUN),
+    )
+    .await;
+    assert!(created.contains("Applied 1 statements"), "{created}");
     conditions::create_wake_condition(
         db,
-        &format!("thread-{PROCEDURE_RUN}"),
-        "SELECT name FROM _cairn_procedures WHERE name = 'collect'",
-        "collect procedure stored",
+        &format!("thread-{ROWS_RUN}"),
+        "SELECT id FROM hits WHERE ready = 1",
+        "a hit is ready",
         false,
         "agent",
     )
     .await
     .unwrap();
 
-    let created = common::change_resource_as_run(
+    let inserted = common::change_resource_as_run(
         orch,
         json!([{
-            "target": format!("cairn://p/{PROJECT}/{PROCEDURE_THREAD}/procedures"),
-            "mode": "create",
-            "payload": {
-                "name": "collect",
-                "body": { "commands": [{ "command": "echo hi" }] }
-            }
+            "target": format!("cairn://p/{PROJECT}/{ROWS_THREAD}/db/hits"),
+            "mode": "append",
+            "payload": { "ready": 1 }
         }]),
-        Some(PROCEDURE_RUN),
+        Some(ROWS_RUN),
     )
     .await;
-    assert!(created.contains("Created procedure"), "{created}");
+    let row_uri = format!("cairn://p/{PROJECT}/{ROWS_THREAD}/db/hits/1");
+    assert!(
+        inserted.contains(&format!("Inserted {row_uri}")),
+        "{inserted}"
+    );
 
-    await_condition_push(db, PROCEDURE_RUN, "procedures").await;
+    await_condition_push(db, ROWS_RUN, "structured row").await;
+    let content = db
+        .query_one(
+            "SELECT content FROM messages WHERE recipient_run_id = ?1 AND sender_name = 'system'
+             ORDER BY created_at DESC LIMIT 1",
+            cairn_db::turso::params![ROWS_RUN],
+            |row| row.text(0),
+        )
+        .await
+        .unwrap();
+    assert!(
+        content.contains(&format!("after writes to {row_uri}")),
+        "{content}"
+    );
 }
 
-/// `cairn:~/db` is the spelling a stored procedure actually writes, and the one
+/// `cairn:~/db` is the spelling a thread's own code actually writes, and the one
 /// nothing here covered: every other test in this file names the canonical URI.
 /// The ownership gate had no negative coverage at all, so "the gate refuses the
 /// wrong caller" was an assumption rather than a fact.

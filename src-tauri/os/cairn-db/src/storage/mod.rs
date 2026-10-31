@@ -51,8 +51,8 @@ pub use fact_log::{
 pub use feed::{FeedAck, FeedHome, FeedHomeKind, FeedPage, FEED_PAGE_DEFAULT, FEED_PAGE_MAX};
 pub use local_db::{
     db_set_paths, db_set_size, install_crypto_provider, move_db_set, Caller, CheckpointReport,
-    DbCall, DrainBudget, DrainReport, HolderKind, LocalDb, OverdueHolder, RetryConfig,
-    TrackedConnection, READ_STATEMENT_BOUND,
+    DbCall, DrainBudget, DrainReport, HolderActivity, HolderKind, LocalDb, OverdueHolder,
+    RetryConfig, TrackedConnection, TrackedRows, CHECKPOINT_ATTEMPTS_BOUND, READ_STATEMENT_BOUND,
 };
 pub use migration::{
     repair_index_entry_drift, run_integrity_sweep, IntegritySweepOutcome, Migration,
@@ -121,3 +121,4 @@ pub async fn migrated_test_db(name: &str) -> LocalDb {
 }
 
 pub mod outbox;
+pub mod retention;

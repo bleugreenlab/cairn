@@ -449,12 +449,14 @@ async fn live_read_batch_round_trips_through_archival() {
         let clone = clone.clone();
         async move {
             let request = McpCallbackRequest {
+                answer_bound_ms: None,
                 thread_id: None,
                 cwd: clone.display().to_string(),
                 run_id: None,
                 tool: "read_batch".to_string(),
                 payload: json!({ "paths": paths }),
                 tool_use_id: None,
+                origin: None,
             };
             let raw = handle_read_batch(orch, &request, cursors).await;
             serde_json::from_str::<ReadBatchEnvelope>(&raw)

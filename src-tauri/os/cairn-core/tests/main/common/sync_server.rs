@@ -184,7 +184,11 @@ fn sync_tests_optional() -> bool {
 /// this helper was wrong on its first attempt.
 ///
 /// The answer is a property of the migration set rather than of any one server,
-/// so it is resolved once per test binary and shared.
+/// so it is cached for the life of the test process. That shares one answer
+/// only under `cargo test`; nextest runs every test in its own process, so each
+/// gated test pays the full local `TEAM_MIGRATIONS` apply (seconds in a debug
+/// build) before it records its skip. A gated test that runs for minutes is
+/// therefore stuck in this probe or starved by its host, not running its body.
 async fn team_schema_available(url: &str) -> bool {
     static AVAILABLE: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
     *AVAILABLE

@@ -13,7 +13,9 @@
 //!
 //! It also holds the CLI to the tool surface Cairn launches it with: under
 //! `--tools ""` no built-in tool is offered, while the tools of a configured
-//! MCP server and the `--json-schema` StructuredOutput answer both survive.
+//! MCP server and the `--json-schema` StructuredOutput answer both survive,
+//! and every MCP tool call asks for progress with `_meta.progressToken`,
+//! which Cairn's heartbeat on held-open calls relies on.
 //! Those launches use the argument vector of Cairn's own
 //! [`ClaudeCli::spawn_config`], so the test pins Cairn's arguments rather
 //! than a copy of them.
@@ -70,7 +72,31 @@ enum Answer {
     /// the request offers that tool and has no tool result yet; a short text
     /// turn otherwise.
     StructuredOutput,
+    /// A call to Cairn's `read` verb whenever the request offers it and has
+    /// no tool result yet; a short text turn otherwise.
+    McpRead,
 }
+
+const SSE_MCP_READ: &str = concat!(
+    "event: message_start\n",
+    r#"data: {"type":"message_start","message":{"id":"msg_stub_read","type":"message","role":"assistant","model":"claude-stub","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+    "\n\n",
+    "event: content_block_start\n",
+    r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_stub_read","name":"mcp__cairn__read","input":{}}}"#,
+    "\n\n",
+    "event: content_block_delta\n",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+    "\n\n",
+    "event: content_block_stop\n",
+    r#"data: {"type":"content_block_stop","index":0}"#,
+    "\n\n",
+    "event: message_delta\n",
+    r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":5}}"#,
+    "\n\n",
+    "event: message_stop\n",
+    r#"data: {"type":"message_stop"}"#,
+    "\n\n",
+);
 
 /// The schema the StructuredOutput case constrains its answer to, and the
 /// input the stub's tool call fills it with.
@@ -198,11 +224,16 @@ impl Stub {
                     let structured = matches!(answer, Answer::StructuredOutput)
                         && tools.iter().any(|tool| tool == "StructuredOutput")
                         && !has_tool_result(&body);
+                    let mcp_read = matches!(answer, Answer::McpRead)
+                        && tools.iter().any(|tool| tool == "mcp__cairn__read")
+                        && !has_tool_result(&body);
                     let (status, content_type, payload) = if refuse.lock().unwrap().contains(&token)
                     {
                         ("401 Unauthorized", "application/json", UNAUTHORIZED)
                     } else if path.starts_with("/v1/messages") && streaming && structured {
                         ("200 OK", "text/event-stream", SSE_STRUCTURED_OUTPUT)
+                    } else if path.starts_with("/v1/messages") && streaming && mcp_read {
+                        ("200 OK", "text/event-stream", SSE_MCP_READ)
                     } else if path.starts_with("/v1/messages") && streaming {
                         ("200 OK", "text/event-stream", SSE)
                     } else if path.starts_with("/v1/messages") {
@@ -268,6 +299,8 @@ struct McpStub {
     url: String,
     /// The JSON-RPC methods called, in order, and the bearer each carried.
     calls: Arc<Mutex<Vec<(String, String)>>>,
+    /// Every JSON-RPC message posted, whole, in order.
+    bodies: Arc<Mutex<Vec<Value>>>,
 }
 
 impl McpStub {
@@ -275,10 +308,11 @@ impl McpStub {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         let calls: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-        let record = calls.clone();
+        let bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let (record, keep) = (calls.clone(), bodies.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let record = record.clone();
+                let (record, keep) = (record.clone(), keep.clone());
                 std::thread::spawn(move || {
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut request_line = String::new();
@@ -307,6 +341,7 @@ impl McpStub {
                         let request = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
                         let rpc = request["method"].as_str().unwrap_or("").to_string();
                         record.lock().unwrap().push((rpc.clone(), token));
+                        keep.lock().unwrap().push(request.clone());
                         mcp_reply(&rpc, &request)
                     } else {
                         // No server-initiated stream: a GET for one is refused,
@@ -322,11 +357,15 @@ impl McpStub {
                 });
             }
         });
-        Self { url, calls }
+        Self { url, calls, bodies }
     }
 
     fn calls(&self) -> Vec<(String, String)> {
         self.calls.lock().unwrap().clone()
+    }
+
+    fn bodies(&self) -> Vec<Value> {
+        self.bodies.lock().unwrap().clone()
     }
 }
 
@@ -354,6 +393,7 @@ fn mcp_reply(method: &str, request: &Value) -> (&'static str, String) {
             });
             json!({ "tools": tools })
         }
+        "tools/call" => json!({"content": [{"type": "text", "text": "ok"}]}),
         _ => {
             let error = json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "method not found"}});
             return ("200 OK", error.to_string());
@@ -730,6 +770,55 @@ fn the_cli_offers_only_cairn_mcp_tools_under_tools_none() {
             .any(|(method, token)| method == "tools/list" && token == "mcp-SEALED"),
         "the CLI never listed the server's tools with its bearer: {:?}",
         mcp.calls()
+    );
+}
+
+/// The CLI asks for progress on every MCP tool call: it sends
+/// `_meta.progressToken`, and a progress notification on that token resets its
+/// idle bound (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`). Cairn's MCP server
+/// heartbeats a held call on that token, so a CLI that stopped sending one
+/// would abandon long calls at its idle default.
+#[test]
+fn the_cli_sends_a_progress_token_on_tools_call() {
+    let Some((claude, version)) = installed_claude() else {
+        eprintln!("skipping: no `claude` on PATH");
+        return;
+    };
+    eprintln!("pinning the MCP progress token against Claude CLI {version}");
+    let stub = Stub::answering(Answer::McpRead);
+    let mcp = McpStub::start();
+    let servers = McpServers::new(vec![McpServer::cairn_http(&mcp.url)]).unwrap();
+    let verbs: Vec<String> = ["read", "write", "run"]
+        .map(|verb| format!("mcp__cairn__{verb}"))
+        .to_vec();
+    let spec = spec(
+        "/tmp",
+        Some(servers),
+        ClaudeMode::Interactive,
+        ApprovalMode::Allow,
+        None,
+        verbs,
+    );
+    let mut cli = launch_as_cairn(&claude, &stub, &spec, &[(MCP_TOKEN_ENV, "mcp-SEALED")]);
+
+    cli.send("read something");
+    let result = cli.turn_result();
+    assert_eq!(result["subtype"], "success", "{result}");
+
+    let call = mcp
+        .bodies()
+        .into_iter()
+        .find(|body| body["method"] == "tools/call")
+        .unwrap_or_else(|| panic!("the CLI never called a tool: {:?}", mcp.calls()));
+    eprintln!(
+        "tools/call as Claude CLI {version} sends it:\n{}",
+        serde_json::to_string_pretty(&call).unwrap()
+    );
+    assert_eq!(call["params"]["name"], "read", "{call}");
+    let token = &call["params"]["_meta"]["progressToken"];
+    assert!(
+        token.is_string() || token.is_number(),
+        "the CLI sent no progress token: {call}"
     );
 }
 

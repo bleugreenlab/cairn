@@ -1076,7 +1076,8 @@ fn parse_file_projection(
         .find(|param| !allowed_keys.contains(&param.key.as_str()))
     {
         return Err(format!(
-            "Unsupported query parameter '{}' for filesystem read target",
+            "Unsupported query parameter '{}' for filesystem read target (a literal `&` \
+             immediately before a query-key name, as in a grep pattern, must be written `%26`)",
             unsupported.key
         ));
     }
@@ -1250,12 +1251,14 @@ pub async fn handle_read_file(orch: &Orchestrator, request: &McpCallbackRequest)
             None => return format!("Invalid cairn resource URI: {}", split.identity),
         };
         let resource_request = McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: request.cwd.clone(),
             run_id: request.run_id.clone(),
             tool: request.tool.clone(),
             payload: serde_json::json!({ "uri": payload.path }),
             tool_use_id: request.tool_use_id.clone(),
+            origin: None,
         };
         return match &resource {
             CairnResource::NodeTerminal { .. } | CairnResource::ProjectTerminal { .. } => {
@@ -1486,6 +1489,7 @@ pub(crate) async fn produce_file_segment(
                 })
             } else {
                 let glob_request = McpCallbackRequest {
+                    answer_bound_ms: None,
                     thread_id: None,
                     cwd: request.cwd.clone(),
                     run_id: request.run_id.clone(),
@@ -1495,6 +1499,7 @@ pub(crate) async fn produce_file_segment(
                         "path": resolved_target.full_path,
                     }),
                     tool_use_id: request.tool_use_id.clone(),
+                    origin: None,
                 };
                 run_glob_projection(orch, &glob_request, offset, limit, output_mode.as_deref())
                     .await
@@ -1587,12 +1592,14 @@ pub(crate) async fn produce_file_segment(
             } else {
                 grep_payload.path = Some(full_path.display().to_string());
                 let grep_request = McpCallbackRequest {
+                    answer_bound_ms: None,
                     thread_id: None,
                     cwd: request.cwd.clone(),
                     run_id: request.run_id.clone(),
                     tool: "read".to_string(),
                     payload: serde_json::to_value(&grep_payload).unwrap_or_default(),
                     tool_use_id: request.tool_use_id.clone(),
+                    origin: None,
                 };
                 crate::mcp::handlers::search::handle_grep(orch, &grep_request).await
             };
@@ -2615,6 +2622,15 @@ mod tests {
         );
     }
 
+    /// `state` is a contract key, so `&state` in a grep pattern splits; the
+    /// refusal has to name the escape that keeps it literal.
+    #[test]
+    fn a_key_colliding_with_a_grep_ampersand_names_the_escape() {
+        let err = project("grep=a&state").unwrap_err();
+        assert!(err.contains("'state'"), "{err}");
+        assert!(err.contains("%26"), "{err}");
+    }
+
     fn text(bytes: &[u8], offset: Option<i64>, limit: Option<usize>) -> (String, usize, usize) {
         let response = render_text_from_bytes(bytes, offset, limit, None).unwrap();
         assert_eq!(response.kind, "text");
@@ -2739,12 +2755,14 @@ mod tests {
 
     fn grep_request(cwd: &std::path::Path) -> McpCallbackRequest {
         McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: cwd.display().to_string(),
             run_id: None,
             tool: "read_batch".to_string(),
             payload: serde_json::json!({}),
             tool_use_id: None,
+            origin: None,
         }
     }
 

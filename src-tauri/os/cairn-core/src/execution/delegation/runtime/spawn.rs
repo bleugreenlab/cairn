@@ -328,7 +328,7 @@ enum StartProblem {
 /// A packet's state once advancement and dispatch have had their say.
 enum PacketLaunch {
     Created {
-        packet: crate::models::DelegatedWorkPacket,
+        packet: Box<crate::models::DelegatedWorkPacket>,
         job_id: String,
         launch: TaskLaunch,
     },
@@ -513,7 +513,7 @@ pub(crate) async fn spawn_task_packets_within(
                     TaskLaunch::WaitingToStart { .. } => None,
                 };
                 materialized.push(MaterializedTask {
-                    packet,
+                    packet: *packet,
                     job_id,
                     run_id,
                     agent_config,
@@ -737,7 +737,7 @@ async fn classify_packet_launch(
 
     match refresh_packet_state(db, execution_id, packet_id).await {
         Ok(Some(packet)) => PacketLaunch::Created {
-            packet,
+            packet: Box::new(packet),
             job_id,
             launch,
         },
@@ -1663,12 +1663,13 @@ mod unstarted_child_tests {
 
     /// Register the parent's live codex process so it can be parked and
     /// resumed through the real durable-wait path.
-    fn register_parent_process(
-        orch: &Orchestrator,
-    ) -> (
+    /// The parent's scripted provider requests, and its provider turn id.
+    type ParentProcess = (
         Arc<Mutex<Vec<serde_json::Value>>>,
         Arc<Mutex<Option<String>>>,
-    ) {
+    );
+
+    fn register_parent_process(orch: &Orchestrator) -> ParentProcess {
         let (stdin, requests, provider_turn) =
             crate::backends::codex::scripted_delegated_wait_stdin_for_test(
                 "native-thread",
@@ -2076,7 +2077,7 @@ mod unstarted_child_tests {
         assert_eq!(
             count(
                 &orch,
-                "SELECT json_array_length(snapshot, '$.delegatedPackets') FROM executions WHERE id = 'e'"
+                "SELECT COUNT(*) FROM delegated_packets WHERE execution_id = 'e'"
             )
             .await,
             0
@@ -2115,38 +2116,35 @@ mod unstarted_child_tests {
         .await;
         let child = created.spawned[0].job_id.clone();
         let db = orch.db.local.clone();
-        let mut snapshot: serde_json::Value = serde_json::from_str(
-            &db.query_opt_text("SELECT snapshot FROM executions WHERE id = 'e'", ())
+        let packets = cairn_workflow::delegated_packets::list_db(&db, "e")
+            .await
+            .unwrap();
+        let packet_a = packets[0].id.clone();
+        let lost = crate::models::DelegatedWorkPacket {
+            id: "pkt-b".into(),
+            title: "lost".into(),
+            problem_statement: Some("lost".into()),
+            status: crate::models::DelegatedStatus::Pending,
+            result_artifact_job_id: None,
+            materialized_node_ids: vec![],
+            ..packets[0].clone()
+        };
+        let unlinked = crate::models::DelegatedWorkPacket {
+            id: "pkt-c".into(),
+            title: "unlinked".into(),
+            status: crate::models::DelegatedStatus::Materialized,
+            materialized_node_ids: vec![
+                "delegated-pkt-c-trigger".into(),
+                "delegated-pkt-c-context".into(),
+                "delegated-pkt-c-agent".into(),
+            ],
+            ..lost.clone()
+        };
+        for packet in [&lost, &unlinked] {
+            cairn_workflow::delegated_packets::insert_db(&db, "e", packet)
                 .await
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        let packets = snapshot["delegatedPackets"].as_array_mut().unwrap();
-        let packet_a = packets[0]["id"].as_str().unwrap().to_string();
-        let mut lost = packets[0].clone();
-        lost["id"] = "pkt-b".into();
-        lost["title"] = "lost".into();
-        lost["status"] = "pending".into();
-        lost.as_object_mut().unwrap().remove("resultArtifactJobId");
-        lost.as_object_mut().unwrap().remove("materializedNodeIds");
-        let mut unlinked = lost.clone();
-        unlinked["id"] = "pkt-c".into();
-        unlinked["title"] = "unlinked".into();
-        unlinked["status"] = "materialized".into();
-        unlinked["materializedNodeIds"] = serde_json::json!([
-            "delegated-pkt-c-trigger",
-            "delegated-pkt-c-context",
-            "delegated-pkt-c-agent"
-        ]);
-        packets.push(lost);
-        packets.push(unlinked);
-        db.execute(
-            "UPDATE executions SET snapshot = ?1 WHERE id = 'e'",
-            (snapshot.to_string(),),
-        )
-        .await
-        .unwrap();
+                .unwrap();
+        }
         db.execute_script(
             "INSERT INTO jobs(id,execution_id,project_id,issue_id,status,uri_segment,node_name,parent_job_id,recipe_node_id,created_at,updated_at)
                VALUES('j-c','e','p','i','running','j-c','Explore','j-parent','delegated-pkt-c-agent',5,5);
@@ -2207,7 +2205,7 @@ mod unstarted_child_tests {
         assert_eq!(
             text(
                 &orch,
-                "SELECT json_extract(snapshot, '$.delegatedPackets[1].status') FROM executions WHERE id = 'e'"
+                "SELECT status FROM delegated_packets WHERE execution_id = 'e' AND id = 'pkt-b'"
             )
             .await
             .as_deref(),
@@ -2232,7 +2230,7 @@ mod unstarted_child_tests {
         assert_eq!(
             text(
                 &orch,
-                "SELECT json_extract(snapshot, '$.delegatedPackets[2].resultArtifactJobId') FROM executions WHERE id = 'e'"
+                "SELECT result_artifact_job_id FROM delegated_packets WHERE execution_id = 'e' AND id = 'pkt-c'"
             )
             .await
             .as_deref(),
@@ -2258,22 +2256,16 @@ mod unstarted_child_tests {
         )
         .await;
         assert_eq!(created.spawned.len(), 2, "{:?}", created.refused);
-        let packets: serde_json::Value = serde_json::from_str(
-            &text(&orch, "SELECT snapshot FROM executions WHERE id = 'e'")
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let packets = cairn_workflow::delegated_packets::list_db(&orch.db.local, "e")
+            .await
+            .unwrap();
         let packet_of = |job: &str| {
-            packets["delegatedPackets"]
-                .as_array()
-                .unwrap()
+            packets
                 .iter()
-                .find(|packet| packet["resultArtifactJobId"] == job)
-                .unwrap()["id"]
-                .as_str()
+                .find(|packet| packet.result_artifact_job_id.as_deref() == Some(job))
                 .unwrap()
-                .to_string()
+                .id
+                .clone()
         };
         let (stranded, handed) = (
             created.spawned[0].job_id.clone(),
@@ -2457,7 +2449,7 @@ mod unstarted_child_tests {
         assert_eq!(
             text(
                 &orch,
-                "SELECT json_extract(snapshot, '$.delegatedPackets[0].status') FROM executions WHERE id = 'e'"
+                "SELECT status FROM delegated_packets WHERE execution_id = 'e' ORDER BY seq LIMIT 1"
             )
             .await
             .as_deref(),
@@ -2555,7 +2547,7 @@ mod unstarted_child_tests {
         assert_eq!(
             text(
                 &orch,
-                "SELECT json_extract(snapshot, '$.delegatedPackets[0].status') FROM executions WHERE id = 'e'"
+                "SELECT status FROM delegated_packets WHERE execution_id = 'e' ORDER BY seq LIMIT 1"
             )
             .await
             .as_deref(),
@@ -2633,18 +2625,14 @@ mod unstarted_child_tests {
             *executor.actions.lock().unwrap() >= 1,
             "the action ran, so a cascading reduction followed it"
         );
-        let snapshot: serde_json::Value = serde_json::from_str(
-            &text(&orch, "SELECT snapshot FROM executions WHERE id = 'e'")
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        let packets = snapshot["delegatedPackets"].as_array().unwrap();
+        let packets = cairn_workflow::delegated_packets::list_db(&orch.db.local, "e")
+            .await
+            .unwrap();
         assert_eq!(packets.len(), 8, "no persisted packet was dropped");
         assert!(
             packets
                 .iter()
-                .all(|packet| packet["resultArtifactJobId"].is_string()),
+                .all(|packet| packet.result_artifact_job_id.is_some()),
             "every packet is linked to its job: {packets:?}"
         );
         assert_eq!(
@@ -2747,6 +2735,7 @@ mod unstarted_child_tests {
         task: serde_json::Value,
     ) -> serde_json::Value {
         let request = crate::mcp::types::McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: "/tmp".to_string(),
             run_id: Some("run-parent".to_string()),
@@ -2759,6 +2748,7 @@ mod unstarted_child_tests {
                     "payload": task
                 }]
             }),
+            origin: None,
         };
         let result = crate::mcp::handlers::write::handle_write(orch, &request).await;
         serde_json::Deserializer::from_str(&result)
@@ -2865,7 +2855,7 @@ mod unstarted_child_tests {
         assert_eq!(
             count(
                 &orch,
-                "SELECT json_array_length(snapshot, '$.delegatedPackets') FROM executions WHERE id = 'e'"
+                "SELECT COUNT(*) FROM delegated_packets WHERE execution_id = 'e'"
             )
             .await,
             0
@@ -3056,6 +3046,7 @@ mod journal_replay_tests {
             .await
             .unwrap();
             let request = crate::mcp::types::McpCallbackRequest {
+                answer_bound_ms: None,
                 thread_id: None,
                 cwd: "/tmp/p".to_string(),
                 run_id: Some("wf-run".to_string()),
@@ -3068,6 +3059,7 @@ mod journal_replay_tests {
                         "payload": { "prompt": prompt, "background": true, "ordinal": ordinal }
                     }]
                 }),
+                origin: None,
             };
             let result = crate::mcp::handlers::write::handle_write(&orch, &request).await;
             let report: serde_json::Value = serde_json::from_str(&result).unwrap();

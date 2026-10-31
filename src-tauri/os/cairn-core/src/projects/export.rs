@@ -74,6 +74,8 @@ use base64::Engine;
 use cairn_db::turso::{Connection, Row, Value};
 use serde_json::{json, Map, Value as Json};
 
+use futures_util::future::BoxFuture;
+
 use super::migrate::{
     delete_only, direct, owned, owner, OwnerIds, OwnerSet, TableCopySpec, TableLineage,
     CHANNEL_KEY_ADDRESSED, COPY_ORDER,
@@ -141,7 +143,6 @@ const EXPORT_ONLY: &[TableCopySpec] = &[
     owned("runtime_admission_requests", &[owner(OwnerSet::Jobs, "request_id IN (SELECT request_id FROM prepared_ordinary_launches WHERE job_id IN {ids})"), owner(OwnerSet::Runs, "request_id IN (SELECT request_id FROM prepared_runtime_calls WHERE run_id IN {ids})")]),
     owned("session_positions", &[owner(OwnerSet::Sessions, "session_id IN {ids}")]),
     owned("team_ordinary_admission_authority", &[owner(OwnerSet::Jobs, "request_id IN (SELECT request_id FROM prepared_ordinary_launches WHERE job_id IN {ids})")]),
-    owned("thread_automations", &[owner(OwnerSet::Threads, "thread_id IN {ids}")]),
     owned("thread_compaction_entries", &[owner(OwnerSet::Jobs, "job_id IN {ids}")]),
     owned("thread_compaction_marks", &[owner(OwnerSet::Jobs, "job_id IN {ids}")]),
     owned("thread_compactions", &[owner(OwnerSet::Jobs, "job_id IN {ids}")]),
@@ -167,6 +168,30 @@ const EXPORT_EXCLUDED: &[(&str, &str)] = &[
     (
         "ci_logs_cache",
         "its run_id is a GitHub Actions run id, not a Cairn run; a refetchable cache of CI logs",
+    ),
+    (
+        "main_cadence_interruptions",
+        "this runner's own restart-cancelled main-cadence pass: written as the runner stops, read back and deleted by its next boot; it describes the runner, not shared project state, and a deletion sweep has nothing to do because the next boot consumes it",
+    ),
+    (
+        "node_scratches",
+        "a node scratch's authority row describes a Git store on this runner and replicas on this runner's executors; neither travels with an export, and the scratch ends with its node",
+    ),
+    (
+        "operator_notification_dismissals",
+        "one operator's closes in their notification center on this install, keyed by derived entry keys; it describes the operator, not the project, and an entry with no dismissal is simply open again",
+    ),
+    (
+        "page_calls",
+        "an audit trail of what this install's viewers opened and what their open page frames read; it describes the viewers, not the project, and pages themselves export as artifacts",
+    ),
+    (
+        "service_log",
+        "what this runner's service processes did: lifecycle transitions, stderr lines, and call records keyed to this runner's process generations; a destination runner starts its own processes, and the log is pruned to the newest rows per service anyway",
+    ),
+    (
+        "service_schedules",
+        "this runner's cadence for the service processes it supervises: anchors and last outcomes of scheduled methods; a destination runner anchors its own cadence from the declarations, which export with their thread or live in the repository",
     ),
     (
         "search_outbox",
@@ -374,69 +399,64 @@ fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-/// One short read transaction on a connection of its own.
+/// One short pooled read, and how long its transaction ran.
 ///
 /// Every read the export makes goes through one of these and ends it before
 /// the next begins, so the longest transaction the export holds is one
-/// membership statement or one page, never the export.
-struct ShortRead {
-    conn: TrackedConnection,
-    started: Instant,
-}
-
-impl ShortRead {
-    async fn begin(db: &LocalDb) -> Result<Self, String> {
+/// membership statement or one page, never the export, and each is bounded
+/// like any other pooled read. `f` runs statements only and returns owned
+/// data; `#[track_caller]` so the gate names the export step that read.
+#[track_caller]
+fn short_read<'s, T: Send + 'static>(
+    db: &'s LocalDb,
+    f: impl for<'a> FnOnce(&'a TrackedConnection) -> BoxFuture<'a, Result<T, String>> + Send + 's,
+) -> impl Future<Output = Result<(T, Duration), String>> + 's {
+    let read = db.read(move |conn| {
         let started = Instant::now();
-        let conn = db.connect().await.map_err(err)?;
-        conn.execute(db.concurrent_begin(), ()).await.map_err(err)?;
-        Ok(Self { conn, started })
-    }
-
-    /// End the transaction and report how long it was open.
-    async fn finish(self) -> Duration {
-        // A read transaction has nothing to commit; ROLLBACK ends it without
-        // asking the engine to validate a write set.
-        let _ = self.conn.execute("ROLLBACK", ()).await;
-        self.started.elapsed()
-    }
+        let body = f(conn);
+        Box::pin(async move { Ok(body.await.map(|value| (value, started.elapsed()))) })
+    });
+    async move { read.await.map_err(err)? }
 }
 
 /// The start-of-export description of one database: its schema version and
 /// how far its `events` rowids had reached.
 async fn describe(db: &LocalDb, label: &'static str) -> Result<Json, String> {
     let described_at_ms = now_ms();
-    let read = ShortRead::begin(db).await?;
-    let schema = {
-        let mut rows = read
-            .conn
-            .query(
-                "SELECT version, name, (SELECT count(*) FROM cairn_schema_migrations) \
+    let ((schema, events_max_rowid), _) = short_read(db, |conn| {
+        Box::pin(async move {
+            let schema = {
+                let mut rows = conn
+                    .query(
+                        "SELECT version, name, (SELECT count(*) FROM cairn_schema_migrations) \
                  FROM cairn_schema_migrations ORDER BY version DESC LIMIT 1",
-                (),
-            )
-            .await
-            .map_err(err)?;
-        match rows.next().await.map_err(err)? {
-            Some(row) => json!({
-                "latest_migration": row.text(0).map_err(err)?,
-                "latest_migration_name": row.text(1).map_err(err)?,
-                "applied_migrations": row.i64(2).map_err(err)?,
-            }),
-            None => Json::Null,
-        }
-    };
-    let events_max_rowid = {
-        let mut rows = read
-            .conn
-            .query("SELECT max(rowid) FROM events", ())
-            .await
-            .map_err(err)?;
-        match rows.next().await.map_err(err)? {
-            Some(row) => row.opt_i64(0).map_err(err)?,
-            None => None,
-        }
-    };
-    read.finish().await;
+                        (),
+                    )
+                    .await
+                    .map_err(err)?;
+                match rows.next().await.map_err(err)? {
+                    Some(row) => json!({
+                        "latest_migration": row.text(0).map_err(err)?,
+                        "latest_migration_name": row.text(1).map_err(err)?,
+                        "applied_migrations": row.i64(2).map_err(err)?,
+                    }),
+                    None => Json::Null,
+                }
+            };
+            let events_max_rowid = {
+                let mut rows = conn
+                    .query("SELECT max(rowid) FROM events", ())
+                    .await
+                    .map_err(err)?;
+                match rows.next().await.map_err(err)? {
+                    Some(row) => row.opt_i64(0).map_err(err)?,
+                    None => None,
+                }
+            };
+            Ok((schema, events_max_rowid))
+        })
+    })
+    .await?;
     Ok(json!({
         "database": label,
         "described_at_ms": described_at_ms,
@@ -447,10 +467,12 @@ async fn describe(db: &LocalDb, label: &'static str) -> Result<Json, String> {
 
 /// The columns a table writes, read in a short transaction of its own.
 async fn read_columns(db: &LocalDb, table: &str) -> Result<Vec<Column>, String> {
-    let read = ShortRead::begin(db).await?;
-    let columns = table_columns(&read.conn, table).await.map_err(err);
-    read.finish().await;
-    columns
+    let table = table.to_owned();
+    short_read(db, move |conn| {
+        Box::pin(async move { table_columns(conn, &table).await.map_err(err) })
+    })
+    .await
+    .map(|(columns, _)| columns)
 }
 
 /// One table file, written in large chunks off the async worker.
@@ -604,20 +626,18 @@ fn quoted(name: &str) -> String {
 async fn materialize_owner_ids(db: &LocalDb, project_id: &str) -> Result<OwnerIds, String> {
     let mut sets = HashMap::new();
     for set in OwnerSet::ALL {
-        let read = ShortRead::begin(db).await?;
-        let ids = {
-            let mut rows = read
-                .conn
-                .query(&set.select_ids_sql(), (project_id,))
-                .await
-                .map_err(err)?;
-            let mut ids = Vec::new();
-            while let Some(row) = rows.next().await.map_err(err)? {
-                ids.push(row.text(0).map_err(err)?);
-            }
-            ids
-        };
-        read.finish().await;
+        let (sql, owner) = (set.select_ids_sql(), project_id.to_owned());
+        let (ids, _) = short_read(db, move |conn| {
+            Box::pin(async move {
+                let mut rows = conn.query(&sql, (owner.as_str(),)).await.map_err(err)?;
+                let mut ids = Vec::new();
+                while let Some(row) = rows.next().await.map_err(err)? {
+                    ids.push(row.text(0).map_err(err)?);
+                }
+                Ok(ids)
+            })
+        })
+        .await?;
         sets.insert(set, ids);
     }
     Ok(OwnerIds::Materialized(sets))
@@ -632,26 +652,26 @@ struct ProjectRow {
 
 async fn load_project(db: &LocalDb, project_key: &str) -> Result<ProjectRow, String> {
     let key = cairn_common::uri::canonical_project(project_key);
-    let read = ShortRead::begin(db).await?;
-    let project = {
-        let mut rows = read
-            .conn
-            .query(
-                "SELECT id, key, name FROM projects WHERE lower(key) = ?1 LIMIT 1",
-                (key.as_str(),),
-            )
-            .await
-            .map_err(err)?;
-        match rows.next().await.map_err(err)? {
-            Some(row) => Some(ProjectRow {
-                id: row.text(0).map_err(err)?,
-                key: row.text(1).map_err(err)?,
-                name: row.text(2).map_err(err)?,
-            }),
-            None => None,
-        }
-    };
-    read.finish().await;
+    let (project, _) = short_read(db, move |conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id, key, name FROM projects WHERE lower(key) = ?1 LIMIT 1",
+                    (key.as_str(),),
+                )
+                .await
+                .map_err(err)?;
+            Ok(match rows.next().await.map_err(err)? {
+                Some(row) => Some(ProjectRow {
+                    id: row.text(0).map_err(err)?,
+                    key: row.text(1).map_err(err)?,
+                    name: row.text(2).map_err(err)?,
+                }),
+                None => None,
+            })
+        })
+    })
+    .await?;
     project.ok_or_else(|| format!("Project '{project_key}' not found"))
 }
 
@@ -1014,21 +1034,25 @@ async fn select_membership(
     let mut first_term: HashMap<i64, usize> = HashMap::new();
     let mut longest = Duration::ZERO;
     for (index, (term, params)) in queries.iter().enumerate() {
-        let read = ShortRead::begin(db).await?;
-        {
-            let mut rows = read
-                .conn
-                .query(
-                    &format!("SELECT rowid FROM {table} WHERE {term}"),
-                    params.clone(),
-                )
-                .await
-                .map_err(err)?;
-            while let Some(row) = rows.next().await.map_err(err)? {
-                first_term.entry(row.i64(0).map_err(err)?).or_insert(index);
-            }
+        let (sql, params) = (
+            format!("SELECT rowid FROM {table} WHERE {term}"),
+            params.clone(),
+        );
+        let (rowids, open) = short_read(db, move |conn| {
+            Box::pin(async move {
+                let mut rows = conn.query(&sql, params).await.map_err(err)?;
+                let mut rowids = Vec::new();
+                while let Some(row) = rows.next().await.map_err(err)? {
+                    rowids.push(row.i64(0).map_err(err)?);
+                }
+                Ok(rowids)
+            })
+        })
+        .await?;
+        for rowid in rowids {
+            first_term.entry(rowid).or_insert(index);
         }
-        longest = longest.max(read.finish().await);
+        longest = longest.max(open);
     }
     let mut rows: Vec<(i64, usize)> = first_term.into_iter().collect();
     rows.sort_unstable();
@@ -1104,22 +1128,43 @@ async fn export_table(
         written.first_page_at_ms.get_or_insert(page_at_ms);
         written.last_page_at_ms = Some(page_at_ms);
 
-        let mut fetched: BTreeMap<i64, PageRow> = BTreeMap::new();
-        let read = ShortRead::begin(db).await?;
-        for (term_index, rowids) in &by_term {
-            let (term, params) = &table.queries[*term_index];
-            let sql = page_sql(name, &select_list, term, rowids);
-            let mut rows = read.conn.query(&sql, params.clone()).await.map_err(err)?;
-            while let Some(row) = rows.next().await.map_err(err)? {
-                let rowid = row.i64(rowid_index).map_err(err)?;
-                let item = match &writer {
-                    Some(writer) => PageRow::Event(Box::new(writer.read_row(&row, &mut tallies)?)),
-                    None => PageRow::Plain(plain_object(&row, columns, &mut tallies)?),
-                };
-                fetched.insert(rowid, item);
-            }
-        }
-        written.longest = written.longest.max(read.finish().await);
+        let statements: Vec<(String, Vec<Value>)> = by_term
+            .iter()
+            .map(|(term_index, rowids)| {
+                let (term, params) = &table.queries[*term_index];
+                (page_sql(name, &select_list, term, rowids), params.clone())
+            })
+            .collect();
+        // The page's read owns the row reader and the tallies while it runs
+        // and hands them back, so the closure borrows nothing from this loop.
+        let (page_writer, page_tallies, page_columns) =
+            (writer.take(), std::mem::take(&mut tallies), columns.clone());
+        let ((fetched, page_writer, page_tallies), open) = short_read(db, move |conn| {
+            Box::pin(async move {
+                let mut tallies = page_tallies;
+                let mut fetched: BTreeMap<i64, PageRow> = BTreeMap::new();
+                for (sql, params) in statements {
+                    let mut rows = conn.query(&sql, params).await.map_err(err)?;
+                    while let Some(row) = rows.next().await.map_err(err)? {
+                        let rowid = row.i64(rowid_index).map_err(err)?;
+                        let item = match &page_writer {
+                            Some(writer) => {
+                                PageRow::Event(Box::new(writer.read_row(&row, &mut tallies)?))
+                            }
+                            None => {
+                                PageRow::Plain(plain_object(&row, &page_columns, &mut tallies)?)
+                            }
+                        };
+                        fetched.insert(rowid, item);
+                    }
+                }
+                Ok((fetched, page_writer, tallies))
+            })
+        })
+        .await?;
+        writer = page_writer;
+        tallies = page_tallies;
+        written.longest = written.longest.max(open);
         written.pages += 1;
         written.vanished += (page.len() - fetched.len()) as u64;
 

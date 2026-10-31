@@ -334,6 +334,7 @@ async fn execute_shell_action(
         .ok_or_else(|| format!("Implementation job {job_id} has no authenticated run identity"))?;
     let residence = crate::scratch::ensure_job_scratch_dir(&job_id, None);
     let request = crate::mcp::types::McpCallbackRequest {
+        answer_bound_ms: None,
         cwd: residence.to_string_lossy().into_owned(),
         run_id: Some(run_id),
         tool: "run".to_string(),
@@ -344,6 +345,7 @@ async fn execute_shell_action(
         }),
         tool_use_id: Some(format!("action:{}", action_run.id)),
         thread_id: None,
+        origin: None,
     };
     let encoded = crate::mcp::handlers::run::handle_run(orch, &request).await;
     let envelope: cairn_common::read::RunBatchEnvelope = serde_json::from_str(&encoded)
@@ -2336,14 +2338,16 @@ mod tests {
         let checkout = temp.path().join("checkout");
         std::fs::create_dir(&source).unwrap();
 
-        run_git(temp.path(), &["init", "--bare", origin.to_str().unwrap()]);
-        run_git(&source, &["init"]);
+        run_git(
+            temp.path(),
+            &["init", "-b", "main", "--bare", origin.to_str().unwrap()],
+        );
+        run_git(&source, &["init", "-b", "main"]);
         run_git(&source, &["config", "user.email", "agent@example.com"]);
         run_git(&source, &["config", "user.name", "Cairn Agent"]);
         std::fs::write(source.join("README.md"), "base\n").unwrap();
         run_git(&source, &["add", "README.md"]);
         run_git(&source, &["commit", "-m", "base"]);
-        run_git(&source, &["branch", "-M", "main"]);
         run_git(
             &source,
             &["remote", "add", "origin", origin.to_str().unwrap()],

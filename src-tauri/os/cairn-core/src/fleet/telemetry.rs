@@ -259,6 +259,7 @@ mod tests {
             colocated: false,
             health: ExecutorHealthSnapshot {
                 build_volume: None,
+                inference_hold: None,
                 identity: identity.clone(),
                 public_name: name.to_string(),
                 colocated: false,
@@ -288,6 +289,7 @@ mod tests {
                     liveness_observed_at_unix_ms: None,
                     facts_stale_refresh_blocked: None,
                     last_refresh: None,
+                    node_scratches: Vec::new(),
                 },
                 admission: report.admission,
                 queues: Vec::new(),
@@ -312,6 +314,7 @@ mod tests {
             last_update: None,
             self_update: None,
             occupancy: FleetSnapshot::default(),
+            live_usage_gap: None,
             slots: Vec::new(),
             captured_at_unix_ms: 0,
             connection_timeline: Vec::new(),

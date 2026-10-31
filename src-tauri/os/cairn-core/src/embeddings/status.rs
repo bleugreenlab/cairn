@@ -7,13 +7,16 @@
 //! vector of the active space, counted within the consent scope. The turn
 //! count is SQL over an index; the resource count is the resource sweep's
 //! last walk (`super::resources`), because artifact and memory URIs are
-//! derived and cannot be counted in SQL.
+//! derived and cannot be counted in SQL. Whether the active model has vibe
+//! axes yet, and how far learning them is, is the recompute's last report
+//! (`super::vibe_recompute`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::embedder::{Corpus, EmbedHealth, EmbedSpace};
 use super::space::{ResourceProgress, SpaceKeeper};
 use super::turns::TurnProgress;
+use super::vibe_recompute::VibeAxesProgress;
 
 /// Where embedding is.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -28,7 +31,8 @@ pub enum EmbeddingState {
         last_error: Option<String>,
         retry_at: i64,
     },
-    /// Every eligible turn and resource holds a vector of the active space.
+    /// Every eligible turn and resource holds a vector of the active space,
+    /// and the space's vibe axes are not being learned.
     Complete,
     /// The selection cannot be embedded with on this device.
     Unavailable { reason: String },
@@ -61,6 +65,8 @@ pub struct EmbeddingStatus {
     pub turns: Option<TurnProgress>,
     /// `None` until the resource sweep has walked the corpus in this space.
     pub resources: Option<ResourceProgress>,
+    /// Vibe colour axes for this space; `None` until the recompute has looked.
+    pub vibes: Option<VibeAxesProgress>,
 }
 
 fn millis(at: SystemTime) -> i64 {
@@ -74,6 +80,7 @@ fn state_of(
     health: &EmbedHealth,
     turns: Option<&TurnProgress>,
     resources: Option<&ResourceProgress>,
+    vibes: Option<&VibeAxesProgress>,
     now: SystemTime,
     unavailable: impl FnOnce() -> String,
 ) -> EmbeddingState {
@@ -91,7 +98,11 @@ fn state_of(
     }
     let turns_short = turns.is_none_or(|turns| turns.embedded < turns.eligible);
     let resources_short = resources.is_none_or(|resources| resources.embedded < resources.eligible);
-    if turns_short || resources_short {
+    let learning_vibes = matches!(
+        vibes,
+        Some(VibeAxesProgress::Sampling | VibeAxesProgress::Embedding { .. })
+    );
+    if turns_short || resources_short || learning_vibes {
         EmbeddingState::Running
     } else {
         EmbeddingState::Complete
@@ -134,11 +145,13 @@ pub async fn embedding_status(
         None => None,
     };
     let resources = space.as_ref().and(keeper.resource_progress());
+    let vibes = space.as_ref().and(keeper.vibe_progress());
     let state = state_of(
         space.as_ref(),
         &health,
         turns.as_ref(),
         resources.as_ref(),
+        vibes.as_ref(),
         SystemTime::now(),
         || unavailable(&health),
     );
@@ -156,6 +169,7 @@ pub async fn embedding_status(
         state,
         turns,
         resources,
+        vibes,
     }
 }
 
@@ -201,7 +215,7 @@ mod tests {
         let now = SystemTime::now();
         let reason = || "no token".to_string();
         assert_eq!(
-            state_of(None, &configured(), None, None, now, reason),
+            state_of(None, &configured(), None, None, None, now, reason),
             EmbeddingState::Unavailable {
                 reason: "no token".into()
             }
@@ -210,6 +224,7 @@ mod tests {
             state_of(
                 Some(&space()),
                 &EmbedHealth::default(),
+                None,
                 None,
                 None,
                 now,
@@ -231,6 +246,7 @@ mod tests {
                 &paused,
                 Some(&turns),
                 Some(&resources),
+                None,
                 now,
                 reason
             ),
@@ -241,16 +257,20 @@ mod tests {
             }
         );
 
-        let running = |turns: TurnProgress, resources: Option<ResourceProgress>| {
+        let running_with = |turns: TurnProgress,
+                            resources: Option<ResourceProgress>,
+                            vibes: Option<VibeAxesProgress>| {
             state_of(
                 Some(&space()),
                 &configured(),
                 Some(&turns),
                 resources.as_ref(),
+                vibes.as_ref(),
                 now,
                 reason,
             )
         };
+        let running = |turns, resources| running_with(turns, resources, None);
         let (short, done) = (progress(1, 2).0, progress(2, 2));
         assert_eq!(running(short, Some(done.1)), EmbeddingState::Running);
         assert_eq!(
@@ -263,6 +283,22 @@ mod tests {
             EmbeddingState::Running
         );
         assert_eq!(running(done.0, Some(done.1)), EmbeddingState::Complete);
+        assert_eq!(
+            running_with(
+                done.0,
+                Some(done.1),
+                Some(VibeAxesProgress::Embedding {
+                    embedded: 3,
+                    total: 9
+                })
+            ),
+            EmbeddingState::Running,
+            "learning vibe axes is still work under way"
+        );
+        assert_eq!(
+            running_with(done.0, Some(done.1), Some(VibeAxesProgress::Ready)),
+            EmbeddingState::Complete
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

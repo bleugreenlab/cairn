@@ -3,8 +3,8 @@
 use cairn_db::turso::params;
 
 use super::common::{
-    connect_for_read, get_todo_progress, has_artifact_for_job, has_terminal_for_job,
-    job_status_icon, lookup_project_by_key, resource_job_from_row, storage_error,
+    get_todo_progress, has_artifact_for_job, has_terminal_for_job, job_status_icon,
+    lookup_project_by_key, read_resource, resource_job_from_row, storage_error,
     visible_job_node_segment, ResourceJob, JOB_COLUMNS,
 };
 
@@ -168,16 +168,37 @@ pub(super) async fn read_issue(
     project_key: &str,
     number: i32,
 ) -> String {
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
+    let key = project_key.to_owned();
+    let (head, authorship, tail) = match read_resource(db, move |conn| {
+        Box::pin(async move { render_issue_parts(conn, &key, number).await })
+    })
+    .await
+    {
+        Ok(parts) => parts,
         Err(error) => return error,
     };
+    // The author's display name reads the private database's alias
+    // registries, so it is resolved after the issue's read has released.
+    let created_by = crate::identity::display::display_for(
+        local,
+        authorship.as_ref().map(|value| &value.author),
+        authorship.as_ref().map(|value| &value.appearance),
+    )
+    .await
+    .inline();
+    format!("{head}Created by: {created_by}\n{tail}")
+}
 
+/// The issue page around its "Created by" line: everything before it, the
+/// authorship that line names, and everything after it. Statements, and the
+/// formatting of the rows they return, only; it runs inside the read.
+async fn render_issue_parts(
+    conn: &cairn_db::turso::Connection,
+    project_key: &str,
+    number: i32,
+) -> Result<(String, Option<crate::issues::crud::IssueAuthorship>, String), String> {
     // Get project
-    let project_ctx = match lookup_project_by_key(&conn, project_key).await {
-        Ok(ctx) => ctx,
-        Err(e) => return e,
-    };
+    let project_ctx = lookup_project_by_key(conn, project_key).await?;
 
     // Get issue (description is Nullable)
     let mut issue_rows = match conn
@@ -194,7 +215,7 @@ pub(super) async fn read_issue(
         .await
     {
         Ok(rows) => rows,
-        Err(error) => return storage_error("Failed to load issue", error.into()),
+        Err(error) => return Err(storage_error("Failed to load issue", error.into())),
     };
 
     let (
@@ -226,15 +247,15 @@ pub(super) async fn read_issue(
             })();
             match parsed {
                 Ok(issue) => issue,
-                Err(error) => return storage_error("Failed to decode issue", error),
+                Err(error) => return Err(storage_error("Failed to decode issue", error)),
             }
         }
-        Ok(None) => return format!("Issue {}/{} not found", project_key, number),
-        Err(error) => return storage_error("Failed to load issue", error.into()),
+        Ok(None) => return Err(format!("Issue {}/{} not found", project_key, number)),
+        Err(error) => return Err(storage_error("Failed to load issue", error.into())),
     };
 
     let description = description.unwrap_or_default();
-    let labels = crate::labels::attach::list_labels_for_issue(&conn, &issue_id)
+    let labels = crate::labels::attach::list_labels_for_issue(conn, &issue_id)
         .await
         .unwrap_or_default();
 
@@ -242,18 +263,9 @@ pub(super) async fn read_issue(
     let created_date =
         crate::clock::date(created_at as i64).unwrap_or_else(|| "Unknown".to_string());
 
-    let mut output = format!("# {}/{}: {}\n\n", project_key, number, title);
-    output.push_str(&format!("Status: {} | Created: {}\n", status, created_date));
-    output.push_str(&format!(
-        "Created by: {}\n",
-        crate::identity::display::display_for(
-            local,
-            authorship.as_ref().map(|value| &value.author),
-            authorship.as_ref().map(|value| &value.appearance),
-        )
-        .await
-        .inline()
-    ));
+    let mut head = format!("# {}/{}: {}\n\n", project_key, number, title);
+    head.push_str(&format!("Status: {} | Created: {}\n", status, created_date));
+    let mut output = String::new();
     if !labels.is_empty() {
         output.push_str(&format!(
             "Labels: {}\n",
@@ -337,7 +349,7 @@ pub(super) async fn read_issue(
 
     output.push_str(
         &render_family_block(
-            &conn,
+            conn,
             &issue_id,
             parent_issue_id.as_deref(),
             parent_thread_id.as_deref(),
@@ -389,7 +401,7 @@ pub(super) async fn read_issue(
         }
     }
 
-    output.push_str(&render_possibly_related_block(&conn, &issue_id).await);
+    output.push_str(&render_possibly_related_block(conn, &issue_id).await);
 
     // Nodes - grouped by execution
     output.push_str("## Nodes\n\n");
@@ -421,13 +433,13 @@ pub(super) async fn read_issue(
 
     if executions.is_empty() {
         output.push_str("  (no executions yet)\n\n");
-        return output;
+        return Ok((head, authorship, output));
     }
 
     // A held execution has no nodes, so its gate census is the only thing
     // under its line — and the only thing saying why it has none.
     let mut gate_census = match crate::execution::gates::census::census_for_executions_conn(
-        &conn,
+        conn,
         &executions
             .iter()
             .map(|(id, _)| id.clone())
@@ -518,13 +530,13 @@ pub(super) async fn read_issue(
                 "│  │  "
             };
 
-            let node_segment = visible_job_node_segment(&conn, job).await;
+            let node_segment = visible_job_node_segment(conn, job).await;
 
             let status = job_status_icon(&job.status);
 
             // Resource indicators
-            let has_artifact = has_artifact_for_job(&conn, &job.id).await;
-            let has_terminal = has_terminal_for_job(&conn, &job.id).await;
+            let has_artifact = has_artifact_for_job(conn, &job.id).await;
+            let has_terminal = has_terminal_for_job(conn, &job.id).await;
             let mut indicators = String::new();
             if has_artifact {
                 indicators.push_str(" 📄");
@@ -534,7 +546,7 @@ pub(super) async fn read_issue(
             }
 
             // Todo progress
-            let todo = get_todo_progress(&conn, &job.id)
+            let todo = get_todo_progress(conn, &job.id)
                 .await
                 .map(|t| format!(" {}", t))
                 .unwrap_or_default();
@@ -561,7 +573,7 @@ pub(super) async fn read_issue(
                     .clone()
                     .unwrap_or_else(|| "task".to_string());
                 let task_status = job_status_icon(&task.status);
-                let task_has_artifact = has_artifact_for_job(&conn, &task.id).await;
+                let task_has_artifact = has_artifact_for_job(conn, &task.id).await;
                 let task_indicator = if task_has_artifact { " 📄" } else { "" };
 
                 output.push_str(&format!(
@@ -592,20 +604,27 @@ pub(super) async fn read_issue(
 
     output.push('\n');
 
-    output
+    Ok((head, authorship, output))
 }
 
 /// Read an issue's executions collection. Lists each execution's seq, status,
 /// and trigger, and advertises the append-to-start action.
 pub(super) async fn read_issue_executions(db: &LocalDb, project_key: &str, number: i32) -> String {
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
-    let project_ctx = match lookup_project_by_key(&conn, project_key).await {
-        Ok(ctx) => ctx,
-        Err(e) => return e,
-    };
+    let key = project_key.to_owned();
+    read_resource(db, move |conn| {
+        Box::pin(async move { render_issue_executions(conn, &key, number).await })
+    })
+    .await
+    .unwrap_or_else(|error| error)
+}
+
+/// Statements, and the formatting of the rows they return, only.
+async fn render_issue_executions(
+    conn: &cairn_db::turso::Connection,
+    project_key: &str,
+    number: i32,
+) -> Result<String, String> {
+    let project_ctx = lookup_project_by_key(conn, project_key).await?;
     let issue_id = match conn
         .query(
             "SELECT id FROM issues WHERE project_id = ?1 AND number = ?2 LIMIT 1",
@@ -616,12 +635,12 @@ pub(super) async fn read_issue_executions(db: &LocalDb, project_key: &str, numbe
         Ok(mut rows) => match rows.next().await {
             Ok(Some(row)) => match row.text(0) {
                 Ok(id) => id,
-                Err(e) => return storage_error("Failed to decode issue", e),
+                Err(e) => return Err(storage_error("Failed to decode issue", e)),
             },
-            Ok(None) => return format!("Issue {}/{} not found", project_key, number),
-            Err(e) => return storage_error("Failed to load issue", e.into()),
+            Ok(None) => return Err(format!("Issue {}/{} not found", project_key, number)),
+            Err(e) => return Err(storage_error("Failed to load issue", e.into())),
         },
-        Err(e) => return storage_error("Failed to load issue", e.into()),
+        Err(e) => return Err(storage_error("Failed to load issue", e.into())),
     };
 
     let mut output = format!("# Executions for {}/{}\n\n", project_key, number);
@@ -643,7 +662,7 @@ pub(super) async fn read_issue_executions(db: &LocalDb, project_key: &str, numbe
     // Read before the listing query opens its cursor: a second statement on
     // this connection while that cursor is live empties the listing.
     let mut gate_census = match crate::execution::gates::census::census_for_executions_conn(
-        &conn,
+        conn,
         &issue_execution_ids,
     )
     .await
@@ -675,7 +694,7 @@ pub(super) async fn read_issue_executions(db: &LocalDb, project_key: &str, numbe
     // its executions had been deleted.
     let mut rows = match listing {
         Ok(rows) => rows,
-        Err(error) => return storage_error("Failed to load executions", error.into()),
+        Err(error) => return Err(storage_error("Failed to load executions", error.into())),
     };
     {
         while let Ok(Some(row)) = rows.next().await {
@@ -731,7 +750,7 @@ pub(super) async fn read_issue_executions(db: &LocalDb, project_key: &str, numbe
     if !found {
         output.push_str("(no executions yet)\n");
     }
-    output
+    Ok(output)
 }
 
 async fn resolve_issue_id_for_comments(
@@ -827,24 +846,14 @@ pub(super) async fn read_issue_comment(
     }
 }
 
-/// Render a single execution's frozen snapshot: the recipe graph, every agent
-/// snapshot (selection, fence, tools, skills), and the skill set. This is the
-/// read half of the execution-snapshot resource; the agent-edit half lives in
-/// the mutation dispatch.
-pub(super) async fn read_issue_execution(
-    db: &LocalDb,
+/// An execution's id, frozen snapshot, and whether it is live. Statements only.
+async fn execution_snapshot_row(
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
     number: i32,
     exec_seq: i32,
-) -> String {
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
-    let project_ctx = match lookup_project_by_key(&conn, project_key).await {
-        Ok(ctx) => ctx,
-        Err(e) => return e,
-    };
+) -> Result<(String, String, bool), String> {
+    let project_ctx = lookup_project_by_key(conn, project_key).await?;
     let issue_id = match conn
         .query(
             "SELECT id FROM issues WHERE project_id = ?1 AND number = ?2 LIMIT 1",
@@ -855,15 +864,15 @@ pub(super) async fn read_issue_execution(
         Ok(mut rows) => match rows.next().await {
             Ok(Some(row)) => match row.text(0) {
                 Ok(id) => id,
-                Err(e) => return storage_error("Failed to decode issue", e),
+                Err(e) => return Err(storage_error("Failed to decode issue", e)),
             },
-            Ok(None) => return format!("Issue {}/{} not found", project_key, number),
-            Err(e) => return storage_error("Failed to load issue", e.into()),
+            Ok(None) => return Err(format!("Issue {}/{} not found", project_key, number)),
+            Err(e) => return Err(storage_error("Failed to load issue", e.into())),
         },
-        Err(e) => return storage_error("Failed to load issue", e.into()),
+        Err(e) => return Err(storage_error("Failed to load issue", e.into())),
     };
 
-    let (execution_id, snapshot_json, live) = match conn
+    let row = match conn
         .query(
             concat!(
                 "SELECT e.id, e.snapshot, (",
@@ -881,22 +890,43 @@ pub(super) async fn read_issue_execution(
             {
                 Ok((id, Some(json), live)) => (id, json, live),
                 Ok((_, None, _)) => {
-                    return format!(
+                    return Err(format!(
                         "Execution {}/{}/{} has no snapshot",
                         project_key, number, exec_seq
-                    )
+                    ))
                 }
-                Err(e) => return storage_error("Failed to decode snapshot", e),
+                Err(e) => return Err(storage_error("Failed to decode snapshot", e)),
             },
             Ok(None) => {
-                return format!(
+                return Err(format!(
                     "Execution {}/{}/{} not found",
                     project_key, number, exec_seq
-                )
+                ))
             }
-            Err(e) => return storage_error("Failed to load execution", e.into()),
+            Err(e) => return Err(storage_error("Failed to load execution", e.into())),
         },
-        Err(e) => return storage_error("Failed to load execution", e.into()),
+        Err(e) => return Err(storage_error("Failed to load execution", e.into())),
+    };
+    Ok(row)
+}
+
+/// Render a single execution's frozen snapshot: the recipe graph, every agent
+/// snapshot (selection, fence, tools, skills), and the skill set. This is the
+/// read half of the execution-snapshot resource; the agent-edit half lives in
+/// the mutation dispatch.
+pub(super) async fn read_issue_execution(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+) -> String {
+    let key = project_key.to_owned();
+    let read = read_resource(db, move |conn| {
+        Box::pin(async move { execution_snapshot_row(conn, &key, number, exec_seq).await })
+    });
+    let (execution_id, snapshot_json, live) = match read.await {
+        Ok(row) => row,
+        Err(error) => return error,
     };
 
     let snapshot = match crate::config::snapshot_migrate::load(&snapshot_json) {

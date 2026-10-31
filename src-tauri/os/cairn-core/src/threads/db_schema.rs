@@ -25,4 +25,9 @@ pub(super) const THREAD_MIGRATIONS: &[Migration] = &[
         "arc_import_scope",
         include_str!("../../../../thread_migrations/0003_arc_import_scope.sql"),
     ),
+    Migration::new(
+        "0004",
+        "retire_procedures",
+        include_str!("../../../../thread_migrations/0004_retire_procedures.sql"),
+    ),
 ];

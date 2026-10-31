@@ -39,13 +39,15 @@ pub fn runtime_package(name: &str) -> Result<PathBuf, String> {
     ))
 }
 
-/// The package in the checkout this binary was compiled from. The crate sits at
-/// `src-tauri/os/cairn-core`, three levels under the repository root.
+/// The package in the checkout this binary runs from, found at run time rather
+/// than baked in: see [`cairn_common::paths::development_checkout_ancestor`].
 #[cfg(debug_assertions)]
 fn checkout_runtime_package(name: &str) -> Option<PathBuf> {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(3)?;
-    let package = repo.join("packages").join(name);
-    package.join("package.json").is_file().then_some(package)
+    let package = |repo: &Path| repo.join("packages").join(name);
+    cairn_common::paths::development_checkout_ancestor(|repo| {
+        package(repo).join("package.json").is_file()
+    })
+    .map(|repo| package(&repo))
 }
 
 fn installed_runtime_package(home: &Path, name: &str) -> Option<PathBuf> {
@@ -54,6 +56,73 @@ fn installed_runtime_package(home: &Path, name: &str) -> Option<PathBuf> {
         .join("package.json")
         .is_file()
         .then_some(installed)
+}
+
+/// The files a rendered page read hands bun, built by `scripts/build-page-render.ts`.
+pub const PAGE_RENDER_HOST: &str = "host.js";
+pub const PAGE_RENDER_KIT: &str = "page-kit.text.js";
+
+/// The directory holding the page render bundle (the text page kit and the
+/// headless host).
+///
+/// A release build reads the copy the app provisioned into
+/// `<CAIRN_HOME>/runtime/page-render`. A development build reads its own
+/// checkout's `src-tauri/runtime/page-render`, rebuilding it first when its
+/// inputs changed since it was stamped, so a kit edit shows in the next
+/// rendered read and a test renders with the kit it is reviewing.
+pub fn page_render_bundle() -> Result<PathBuf, String> {
+    #[cfg(debug_assertions)]
+    if let Some(repo) = cairn_common::paths::development_checkout_ancestor(|repo| {
+        repo.join("scripts/build-page-render.ts").is_file()
+    }) {
+        return checkout_page_render_bundle(&repo);
+    }
+    let installed = cairn_common::paths::cairn_home().join("runtime/page-render");
+    if page_render_bundle_complete(&installed) {
+        return Ok(installed);
+    }
+    Err(format!(
+        "the page render bundle is not installed at {}; reinstall Cairn, or read the page with ?format=json for its source",
+        installed.display()
+    ))
+}
+
+fn page_render_bundle_complete(dir: &Path) -> bool {
+    [PAGE_RENDER_HOST, PAGE_RENDER_KIT]
+        .iter()
+        .all(|file| dir.join(file).is_file())
+}
+
+/// Build the checkout's bundle if it is stale, one build at a time per process.
+#[cfg(debug_assertions)]
+fn checkout_page_render_bundle(repo: &Path) -> Result<PathBuf, String> {
+    static BUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = BUILD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let out = repo.join("src-tauri/runtime/page-render");
+    let bun = crate::env::resolve_sidecar("bun");
+    let output = std::process::Command::new(&bun)
+        .arg(repo.join("scripts/build-page-render.ts"))
+        .arg("--if-stale")
+        .arg("--out")
+        .arg(&out)
+        .current_dir(repo)
+        .output()
+        .map_err(|error| format!("could not run bun to build the page render bundle: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "building the page render bundle failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if !page_render_bundle_complete(&out) {
+        return Err(format!(
+            "the page render build finished without writing {}",
+            out.display()
+        ));
+    }
+    Ok(out)
 }
 
 /// Read every file of `source` into runtime assets addressed under `destination`.

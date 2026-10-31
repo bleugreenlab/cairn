@@ -1,10 +1,9 @@
-//! The operator-only tenet policy on a project: what a tenet gate releases on,
-//! and which recipes a thread may only file behind a tenet.
+//! The operator-only tenet policy on a project: what a tenet gate releases on.
 //!
-//! Both live on the `projects` row and deliberately NOT in
-//! `.cairn/config.yaml`: a branch can edit its own config, and a gate a branch
-//! could edit is a gate the work it holds could lift. No agent resource
-//! mutation reaches them; the operator's settings path is the only writer.
+//! It lives on the `projects` row and deliberately NOT in
+//! `.cairn/config.yaml`: a branch can edit its own config, and a release rule a
+//! branch could edit is one the work it holds could weaken. No agent resource
+//! mutation reaches it; the operator's settings path is the only writer.
 
 use serde::Serialize;
 
@@ -41,18 +40,13 @@ impl TenetRelease {
 /// Why `ratified` cannot be chosen yet.
 pub const RATIFIED_REFUSAL: &str = "no verified authenticator path exists yet";
 
-/// The refusal for an agent resource mutation naming either policy column.
-pub const OPERATOR_ONLY_POLICY_REFUSAL: &str = "the tenet release policy and the tenet-gated recipe list are operator-only project settings: they cannot be changed through an agent resource mutation, and they are kept out of .cairn/config.yaml so no branch can ungate itself";
+/// The refusal for an agent resource mutation naming the policy column.
+pub const OPERATOR_ONLY_POLICY_REFUSAL: &str = "the tenet release policy is an operator-only project setting: it cannot be changed through an agent resource mutation, and it is kept out of .cairn/config.yaml so no branch can change what releases its own work";
 
-const OPERATOR_ONLY_KEYS: &[&str] = &[
-    "tenetRelease",
-    "tenet_release",
-    "tenetGatedRecipes",
-    "tenet_gated_recipes",
-];
+const OPERATOR_ONLY_KEYS: &[&str] = &["tenetRelease", "tenet_release"];
 
-/// [`OPERATOR_ONLY_POLICY_REFUSAL`] when `payload` names a policy column at its
-/// top level, in either spelling.
+/// [`OPERATOR_ONLY_POLICY_REFUSAL`] when `payload` names the policy column at
+/// its top level, in either spelling.
 pub fn operator_only_policy_refusal(payload: Option<&serde_json::Value>) -> Option<&'static str> {
     let map = payload?.as_object()?;
     OPERATOR_ONLY_KEYS
@@ -73,30 +67,21 @@ pub fn release_label(release: TenetRelease) -> String {
 #[serde(rename_all = "camelCase")]
 pub struct TenetPolicy {
     pub release: TenetRelease,
-    pub gated_recipes: Vec<String>,
 }
 
 impl TenetPolicy {
     pub fn label(&self) -> String {
         release_label(self.release)
     }
-
-    /// Whether a thread filing `recipe` must name or propose a tenet. Recipe
-    /// ids are compared case-insensitively.
-    pub fn gates_recipe(&self, recipe: &str) -> bool {
-        self.gated_recipes
-            .iter()
-            .any(|gated| gated.eq_ignore_ascii_case(recipe))
-    }
 }
 
 /// A project's tenet policy.
 pub async fn load_policy(db: &LocalDb, project_id: &str) -> Result<TenetPolicy, String> {
-    let (release, recipes) = db
+    let release = db
         .query_opt(
-            "SELECT tenet_release, tenet_gated_recipes FROM projects WHERE id = ?1",
+            "SELECT tenet_release FROM projects WHERE id = ?1",
             (project_id.to_string(),),
-            |row| Ok((row.text(0)?, row.text(1)?)),
+            |row| row.text(0),
         )
         .await
         .map_err(|error| format!("Failed to load tenet policy: {error}"))?
@@ -104,8 +89,6 @@ pub async fn load_policy(db: &LocalDb, project_id: &str) -> Result<TenetPolicy, 
     Ok(TenetPolicy {
         release: TenetRelease::parse(&release)
             .ok_or_else(|| format!("unknown tenet release policy: {release}"))?,
-        gated_recipes: serde_json::from_str(&recipes)
-            .map_err(|error| format!("invalid tenet_gated_recipes: {error}"))?,
     })
 }
 
@@ -146,33 +129,4 @@ pub async fn set_release(
     .map_err(|error| format!("Failed to set tenet release policy: {error}"))?;
     emit_project_changed(emitter);
     Ok(release)
-}
-
-/// Set which recipes a thread may only file behind a tenet. Operator settings
-/// only.
-pub async fn set_gated_recipes(
-    db: &LocalDb,
-    emitter: &dyn EventEmitter,
-    project_id: &str,
-    recipes: &[String],
-) -> Result<Vec<String>, String> {
-    let mut cleaned: Vec<String> = Vec::new();
-    for recipe in recipes {
-        let recipe = recipe.trim();
-        if recipe.is_empty() {
-            return Err("a gated recipe id must not be empty".to_string());
-        }
-        if !cleaned.iter().any(|seen| seen.eq_ignore_ascii_case(recipe)) {
-            cleaned.push(recipe.to_string());
-        }
-    }
-    let encoded = serde_json::to_string(&cleaned).map_err(|error| error.to_string())?;
-    db.execute(
-        "UPDATE projects SET tenet_gated_recipes = ?1 WHERE id = ?2",
-        (encoded, project_id.to_string()),
-    )
-    .await
-    .map_err(|error| format!("Failed to set tenet-gated recipes: {error}"))?;
-    emit_project_changed(emitter);
-    Ok(cleaned)
 }

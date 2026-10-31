@@ -41,13 +41,9 @@ async fn github_credentials_use_owner_installation_before_default() {
     db.execute_script(
         "
         INSERT INTO github_app(
-            id, app_id, app_name, app_slug, private_key, webhook_secret,
-            installation_id, relay_channel_id, relay_secret, last_event_sync,
-            relay_public_key, relay_private_key_encrypted
+            id, app_id, app_name, app_slug, private_key, webhook_secret, installation_id
          )
-         VALUES ('default', 42, 'Cairn', 'cairn', 'PRIVATE', 'secret',
-                 100, 'relay-channel', 'relay-secret', 'cursor',
-                 'relay-public', 'relay-private');
+         VALUES ('default', 42, 'Cairn', 'cairn', 'PRIVATE', 'secret', 100);
         INSERT INTO github_installations(
             id, account_login, account_type, installation_id, created_at, updated_at
          )
@@ -60,8 +56,6 @@ async fn github_credentials_use_owner_installation_before_default() {
     let creds = credentials::get_github_credentials(&db).await.unwrap();
     assert_eq!(creds.app_id, Some(42));
     assert_eq!(creds.app_name.as_deref(), Some("Cairn"));
-    assert_eq!(creds.relay_channel_id.as_deref(), Some("relay-channel"));
-    assert_eq!(creds.relay_public_key.as_deref(), Some("relay-public"));
 
     assert_eq!(
         credentials::get_installation_for_owner(&db, "bleugreenlab")
@@ -116,7 +110,6 @@ async fn at_rest_fields_roundtrip_through_store() {
         creds.app_id = Some(42);
         creds.private_key = Some(pem.to_string());
         creds.webhook_secret = Some("whsec_top_secret".to_string());
-        creds.relay_secret = Some("relay-shared-secret".to_string());
     })
     .await
     .unwrap();
@@ -127,29 +120,30 @@ async fn at_rest_fields_roundtrip_through_store() {
     assert!(!stored_pk.contains("BEGIN RSA"));
     let stored_ws = raw_column(&db, "webhook_secret").await.unwrap();
     assert_ne!(stored_ws, "whsec_top_secret");
-    let stored_rs = raw_column(&db, "relay_secret").await.unwrap();
-    assert_ne!(stored_rs, "relay-shared-secret");
 
     // Reading back returns the decrypted plaintext.
     let creds = credentials::get_github_credentials(&db).await.unwrap();
     assert_eq!(creds.private_key.as_deref(), Some(pem));
     assert_eq!(creds.webhook_secret.as_deref(), Some("whsec_top_secret"));
-    assert_eq!(creds.relay_secret.as_deref(), Some("relay-shared-secret"));
 }
 
 #[tokio::test]
 async fn legacy_plaintext_values_are_read_then_reencrypted() {
     let (_temp, db) = common::migrated_db().await;
 
-    // Simulate an existing install: plaintext PEM and relay secret written
-    // directly to the row, the way older builds stored them.
+    // Simulate an existing install: a plaintext PEM and relay secret written
+    // directly to the rows, the way older builds stored them.
     let pem = "-----BEGIN PRIVATE KEY-----\nlegacy\n-----END PRIVATE KEY-----";
     db.write(|conn| {
         Box::pin(async move {
             conn.execute(
-                "INSERT INTO github_app(id, app_id, private_key, relay_secret)
-                 VALUES ('default', 7, ?1, ?2)",
-                params![pem, "legacy-relay-secret"],
+                "INSERT INTO github_app(id, app_id, private_key) VALUES ('default', 7, ?1)",
+                params![pem],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO relay_channel(id, channel_id, secret) VALUES ('default', 'ch', ?1)",
+                params!["legacy-relay-secret"],
             )
             .await?;
             Ok(())
@@ -161,7 +155,10 @@ async fn legacy_plaintext_values_are_read_then_reencrypted() {
     // Plaintext is read transparently.
     let creds = credentials::get_github_credentials(&db).await.unwrap();
     assert_eq!(creds.private_key.as_deref(), Some(pem));
-    assert_eq!(creds.relay_secret.as_deref(), Some("legacy-relay-secret"));
+    let channel = cairn_core::ingress::channel::get_relay_channel(&db)
+        .await
+        .unwrap();
+    assert_eq!(channel.secret.as_deref(), Some("legacy-relay-secret"));
 
     // A write (even an unrelated field) migrates the plaintext to ciphertext.
     credentials::update_github_credentials(&db, |creds| {
@@ -169,15 +166,27 @@ async fn legacy_plaintext_values_are_read_then_reencrypted() {
     })
     .await
     .unwrap();
+    cairn_core::ingress::channel::update_relay_channel(&db, |channel| {
+        channel.health_state = Some("healthy".to_string());
+    })
+    .await
+    .unwrap();
 
     let stored_pk = raw_column(&db, "private_key").await.unwrap();
     assert_ne!(stored_pk, pem);
     assert!(!stored_pk.contains("BEGIN PRIVATE KEY"));
-    let stored_rs = raw_column(&db, "relay_secret").await.unwrap();
+    let stored_rs = db
+        .query_opt_text("SELECT secret FROM relay_channel WHERE id = 'default'", ())
+        .await
+        .unwrap()
+        .unwrap();
     assert_ne!(stored_rs, "legacy-relay-secret");
 
     // And it still decrypts back to the original values.
     let creds = credentials::get_github_credentials(&db).await.unwrap();
     assert_eq!(creds.private_key.as_deref(), Some(pem));
-    assert_eq!(creds.relay_secret.as_deref(), Some("legacy-relay-secret"));
+    let channel = cairn_core::ingress::channel::get_relay_channel(&db)
+        .await
+        .unwrap();
+    assert_eq!(channel.secret.as_deref(), Some("legacy-relay-secret"));
 }

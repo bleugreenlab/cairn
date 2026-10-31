@@ -870,6 +870,34 @@ async fn retain_resolvable_pushes(
     retained
 }
 
+/// The pending attention pushes a resume of `job_id` delivers, and the prompt
+/// block they render to. Pushes are addressed to the job, never to a run, so a
+/// push raised against a run that has since crashed or rotated rides along on
+/// whichever run resumes the job next.
+///
+/// Rendering stays independent of full resource reads: every push carries its
+/// canonical URI and a compact summary, and only bounded, targeted database
+/// details are resolved for direct messages, catch-up, and terminal outcomes.
+async fn drain_resume_pushes(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_id: &str,
+) -> (
+    Vec<crate::orchestrator::attention_push::Push>,
+    Option<String>,
+) {
+    let pushes = match crate::orchestrator::attention_push::list_pending_live(db, job_id).await {
+        Ok(pushes) => retain_resolvable_pushes(db, job_id, pushes).await,
+        Err(error) => {
+            log::warn!("failed to drain attention pushes for {job_id}: {error}");
+            return (Vec::new(), None);
+        }
+    };
+    let prompt =
+        crate::orchestrator::attention_delivery::render_pushes_resolved(orch, &pushes).await;
+    (pushes, prompt)
+}
+
 /// Called when a job finishes. Advances the execution DAG if applicable.
 ///
 /// Only advances for jobs that are part of a recipe DAG (have both `execution_id`
@@ -3325,34 +3353,14 @@ fn continue_job_launch_locked(
     // that is already happening; each is lazy-resolved so a push whose referent
     // already resolved is skipped. They are stamped delivered atomically with
     // their carrying event, persisted below once the prompt is assembled.
-    let drained_pushes = {
+    let (drained_pushes, push_prompt) = {
         let db = owning_db.clone();
-        let recipient = job_id.to_string();
-        run_db(async move {
-            let pushes = crate::orchestrator::attention_push::list_pending_live(&db, &recipient)
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok::<_, String>(retain_resolvable_pushes(&db, &recipient, pushes).await)
+        crate::storage::run_db_blocking(move || async move {
+            Ok::<_, String>(drain_resume_pushes(orch, &db, job_id).await)
         })
         .unwrap_or_default()
     };
     let has_pushes = !drained_pushes.is_empty();
-    // Keep resume assembly independent of full resource reads. Every push carries
-    // its canonical URI and a compact summary; only bounded, targeted database
-    // details are resolved for direct messages, catch-up, and terminal outcomes.
-    let push_prompt = if has_pushes {
-        let pushes = drained_pushes.clone();
-        crate::storage::run_db_blocking(move || async move {
-            Ok::<_, String>(
-                crate::orchestrator::attention_delivery::render_pushes_resolved(orch, &pushes)
-                    .await,
-            )
-        })
-        .ok()
-        .flatten()
-    } else {
-        None
-    };
     let mut event =
         crate::resume_timing::ResumeTimingEvent::new("resume_pushes_ready").elapsed(resume_started);
     event.resume_id = Some(resume_id);
@@ -5482,7 +5490,7 @@ pub fn reconcile_stale_active_turn_for_continue_for_test(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_reseed_seed, assemble_resume_prompt, build_reseed_seed_content,
+        apply_reseed_seed, assemble_resume_prompt, build_reseed_seed_content, drain_resume_pushes,
         ensure_reused_process_account, ensure_reused_process_model, prepend_resume_stamp,
         previous_turn_end_for_resume, push_job_coordinate, resolve_resume_trigger,
         PendingLaunchTurnGuard, PushJobCoordinate, ReseedDecision, ReseedOutcome, ReuseDecision,
@@ -5542,6 +5550,62 @@ mod tests {
             Arc::new(SearchIndex::open_or_create(root.join("search.db")).unwrap()),
         ));
         Orchestrator::builder(state, Arc::new(TestServicesBuilder::new().build()), root).build()
+    }
+
+    /// A thread's session outlives its runs. A passive system direct, raised
+    /// against a run that then crashed and under a coalescing key of its own,
+    /// must ride along with the next resume, on the replacement run, as its own
+    /// words rather than as a pointer to the thread's home.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_passive_push_to_a_crashed_thread_run_rides_the_next_resume_inline() {
+        let orch = test_orchestrator(migrated_test_db("passive-push-crashed-run").await);
+        let db = orch.db.local.clone();
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO threads(id,project_id,name,created_at,updated_at) VALUES('t','p','ux',1,1);
+             INSERT INTO jobs(id,project_id,thread_id,status,uri_segment,created_at,updated_at) VALUES('j','p','t','running','thread',1,1);
+             INSERT INTO runs(id,job_id,project_id,status,created_at,updated_at) VALUES('r1','j','p','live',1,1);",
+        )
+        .await
+        .unwrap();
+        db.write(|conn| {
+            Box::pin(async move {
+                cairn_attention::direct::insert_system_direct_push_with_message_id_conn(
+                    conn,
+                    "j",
+                    "r1",
+                    "tenet #7 approved: keep main green",
+                    crate::messages::queued::DeliveryUrgency::Passive,
+                    Some("tenet-verdict:tenet-7"),
+                    "verdict-message",
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        db.execute_script(
+            "UPDATE runs SET status='crashed', exit_reason='crash' WHERE id='r1';
+             INSERT INTO runs(id,job_id,project_id,status,created_at,updated_at) VALUES('r2','j','p','live',2,2);",
+        )
+        .await
+        .unwrap();
+
+        let (pushes, prompt) = drain_resume_pushes(&orch, &db, "j").await;
+
+        assert_eq!(pushes.len(), 1, "{pushes:?}");
+        let prompt = prompt.expect("the passive push renders into the resume prompt");
+        assert!(
+            prompt.starts_with("Attention update (passive): cairn://p/p/ux"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("[Direct message from system] tenet #7 approved: keep main green"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("for the current content"), "{prompt}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6233,7 +6297,29 @@ mod tests {
         wait_for("launch 2 to serve its turn", || serving(&orch)).await;
 
         // Death 2 has no pending input behind it, so nothing relaunches.
+        let run_2 = orch
+            .process_state
+            .find_process_by_session(&launches.lock().unwrap()[1].0)
+            .expect("launch 2 is registered while it serves");
+        let mut completions = orch.run_completions.subscribe();
         release_death(2);
+        // `finalize_run` broadcasts a run's completion only after it has made
+        // the run terminal and run its idle flush, the one path that could
+        // relaunch it. A slow host can take seconds to get there, so the
+        // assertions below wait for it rather than for a fixed interval.
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match completions.recv().await {
+                    Ok(run) if run == run_2 => break,
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(error) => panic!("run completions closed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("death 2 finalizes");
+        // A relaunch the flush dispatched can still be admitted after the
+        // flush returns; this quiet window is what the no-relaunch claim rests on.
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let launches = launches.lock().unwrap().clone();
         assert_eq!(
@@ -7073,12 +7159,14 @@ mod tests {
         );
 
         let request = crate::mcp::types::McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: "/tmp/p".to_string(),
             run_id: Some("r1".to_string()),
             tool: "ask_user".to_string(),
             payload: serde_json::Value::Null,
             tool_use_id: Some("question-call".to_string()),
+            origin: None,
         };
         let payload = crate::mcp::types::AskUserPayload {
             questions: vec![crate::mcp::types::Question {

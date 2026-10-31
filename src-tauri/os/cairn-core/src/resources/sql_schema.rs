@@ -183,7 +183,9 @@ pub(crate) async fn render_overview(
     .await
 }
 
-fn quote_identifier(identifier: &str) -> String {
+/// Quote an SQL identifier, doubling embedded quotes. The one quoting rule for
+/// every identifier Cairn writes into SQL itself.
+pub(crate) fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 

@@ -21,7 +21,6 @@ pub mod db_store;
 pub mod definition;
 pub mod era_worker;
 pub mod eras;
-pub mod procedures;
 pub(crate) use cairn_db::lineage::{is_dormant_thread_session, thread_status_conn};
 
 pub use definition::{

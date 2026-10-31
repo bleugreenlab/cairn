@@ -66,8 +66,8 @@ const RECIPE_ID_SHAPE: &str = "a recipe id is a plain name of letters, digits, `
 /// Whether `id` is a recipe id: a plain name of letters, digits, `-` and `_`.
 ///
 /// A recipe's identity is the stem of its file, and policy that names a
-/// recipe (the tenet-gated list, contextual-package selection) compares ids,
-/// so an id must not be able to reach a file by another spelling: no path
+/// recipe (contextual-package selection) compares ids, so an id must not be
+/// able to reach a file by another spelling: no path
 /// separators, no `.` (so no `..`, no extension, no hidden name).
 pub fn is_recipe_id(id: &str) -> bool {
     !id.is_empty()

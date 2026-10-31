@@ -366,12 +366,20 @@ async fn seed_top_level_run(
         }).await.unwrap();
 }
 
-fn agent_attention_events(emitter: &SharedCaptureEmitter, attention_type: &str) -> Vec<Value> {
-    emitter
-        .events_named("agent-attention")
-        .into_iter()
-        .filter(|payload| payload.get("type").and_then(Value::as_str) == Some(attention_type))
-        .collect()
+/// The operator's entries for the seeded project, derived from rows the way
+/// the notification center derives them.
+async fn operator_entries(orch: &Orchestrator) -> Vec<crate::notifications::OperatorNotification> {
+    crate::notifications::derive_snapshot(
+        &orch.db.local,
+        &crate::notifications::HoldRegistry::default(),
+        "p-attn",
+        // Past the settle window, when an unrecovered crash becomes an entry.
+        chrono::Utc::now().timestamp() + crate::notifications::AGENT_FAILURE_SETTLE_SECS + 1,
+        &std::collections::HashMap::new(),
+    )
+    .await
+    .unwrap()
+    .entries
 }
 
 #[tokio::test]
@@ -454,11 +462,11 @@ async fn warm_transition_persists_artifact_handoff_reason() {
     assert_eq!(reason.as_deref(), Some("artifact_handoff"));
 }
 
+/// The `agent-attention` channel is retired: a turn end raises nothing on it,
+/// actionable or not. What the operator sees is derived from rows.
 #[tokio::test]
-async fn warm_transition_emits_completion_attention_for_top_level_run() {
+async fn warm_transition_raises_no_legacy_attention_event() {
     let db = test_db().await;
-    // Issue still needs the driver (plan/PR awaiting confirmation looks like
-    // this): the turn-end is a real idle-with-work, so the toast fires.
     seed_top_level_run(&db, "run-attn", "job-attn", "turn-attn", "needs_approval").await;
     let (orch, emitter) = test_orchestrator_with_emitter(db, None);
     register_warm_process(&orch, "run-attn", Some("job-attn"));
@@ -467,38 +475,11 @@ async fn warm_transition_emits_completion_attention_for_top_level_run() {
 
     assert!(transition_to_warm_state(&orch, "run-attn", None));
 
-    let completed = agent_attention_events(&emitter, "completed");
-    assert_eq!(completed.len(), 1);
-    assert_eq!(
-        completed[0].get("projectKey"),
-        Some(&Value::String("prj".into()))
-    );
-    assert_eq!(
-        completed[0].get("homeUri").and_then(Value::as_str),
-        Some(cairn_common::uri::build_node_uri("prj", 42, 1, "builder").as_str())
-    );
+    assert!(emitter.events_named("agent-attention").is_empty());
 }
 
 #[tokio::test]
-async fn warm_transition_without_actionable_work_skips_completed_attention() {
-    let db = test_db().await;
-    // attention=none, status=active, no PR: the turn ended cleanly with
-    // nothing for the driver to act on — a planner that just spawned child
-    // tasks and is now waiting on them looks exactly like this. The desktop
-    // "completed" toast must stay silent (CAIRN-1625).
-    seed_top_level_run(&db, "run-quiet", "job-quiet", "turn-quiet", "none").await;
-    let (orch, emitter) = test_orchestrator_with_emitter(db, None);
-    register_warm_process(&orch, "run-quiet", Some("job-quiet"));
-    orch.process_state
-        .set_current_turn_id("run-quiet", Some("turn-quiet"));
-
-    assert!(transition_to_warm_state(&orch, "run-quiet", None));
-
-    assert!(agent_attention_events(&emitter, "completed").is_empty());
-}
-
-#[tokio::test]
-async fn later_finalize_does_not_duplicate_completed_attention() {
+async fn later_finalize_does_not_duplicate_run_completion() {
     let db = test_db().await;
     seed_top_level_run(
         &db,
@@ -516,7 +497,6 @@ async fn later_finalize_does_not_duplicate_completed_attention() {
     assert!(transition_to_warm_state(&orch, "run-dedupe", None));
     finalize_run(&orch, "run-dedupe", RunStatus::Exited);
 
-    assert_eq!(agent_attention_events(&emitter, "completed").len(), 1);
     assert_eq!(emitter.events_named("run-completed").len(), 1);
 }
 
@@ -556,17 +536,6 @@ async fn recovery_finalization_preserves_an_already_complete_turn() {
         .as_deref(),
         Some("crashed")
     );
-}
-
-#[tokio::test]
-async fn clean_finalize_without_prior_warm_does_not_emit_completed_attention() {
-    let db = test_db().await;
-    seed_top_level_run(&db, "run-finalize", "job-finalize", "turn-finalize", "none").await;
-    let (orch, emitter) = test_orchestrator_with_emitter(db, None);
-
-    finalize_run(&orch, "run-finalize", RunStatus::Exited);
-
-    assert!(agent_attention_events(&emitter, "completed").is_empty());
 }
 
 #[tokio::test]
@@ -677,8 +646,10 @@ async fn terminal_job_completion_completes_only_in_progress_todos() {
     );
 }
 
+/// A crash that terminalizes an in-flight turn leaves exactly one open
+/// "agent failed" entry, however often finalization runs, and no legacy event.
 #[tokio::test]
-async fn crash_finalize_emits_failed_attention_once() {
+async fn crash_finalize_leaves_one_open_agent_failed_entry() {
     let db = test_db().await;
     seed_top_level_run(&db, "run-crash", "job-crash", "turn-crash", "none").await;
     let (orch, emitter) = test_orchestrator_with_emitter(db, None);
@@ -686,7 +657,15 @@ async fn crash_finalize_emits_failed_attention_once() {
     finalize_run(&orch, "run-crash", RunStatus::Crashed);
     finalize_run(&orch, "run-crash", RunStatus::Crashed);
 
-    assert_eq!(agent_attention_events(&emitter, "failed").len(), 1);
+    let failed: Vec<_> = operator_entries(&orch)
+        .await
+        .into_iter()
+        .filter(|entry| entry.kind == crate::notifications::NotificationKind::AgentFailed)
+        .collect();
+    assert_eq!(failed.len(), 1, "{failed:#?}");
+    assert_eq!(failed[0].key, "agent_failed:turn-crash");
+    assert!(failed[0].is_open());
+    assert!(emitter.events_named("agent-attention").is_empty());
 }
 
 #[tokio::test]

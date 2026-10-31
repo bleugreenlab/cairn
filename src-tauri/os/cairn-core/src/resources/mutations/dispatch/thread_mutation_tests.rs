@@ -14,53 +14,53 @@ async fn seeded_orch() -> Orchestrator {
     seeded_orch_with_emitter().await.0
 }
 
+/// The retired surfaces refuse every write with the service shape that
+/// replaced them (tenet 1313).
 #[tokio::test]
-async fn procedure_and_automation_resources_mutate_through_their_landed_contracts() {
+async fn procedure_and_automation_writes_are_refused_with_the_service_shape() {
     let orch = seeded_orch().await;
-    let thread_id = seed_thread(&orch).await;
-    assert!(crate::threads::procedures::list(&thread_id)
-        .await
-        .unwrap()
-        .is_empty());
-
-    let procedure = ChangeItem {
-        target: "cairn://p/prj/roadmap/procedures".into(),
-        mode: ChangeMode::Create,
-        payload: Some(serde_json::json!({
-            "name": "collect",
-            "description": "Collect health",
-            "body": {"commands": [{"command": "echo ok"}]}
-        })),
-    };
-    apply(&orch, &procedure).await.unwrap();
-    let stored = crate::threads::procedures::get(&thread_id, "collect")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(stored.description.as_deref(), Some("Collect health"));
-
-    let automation = ChangeItem {
-        target: "cairn://p/prj/roadmap/automations".into(),
-        mode: ChangeMode::Create,
-        payload: Some(
-            serde_json::json!({"procedure": "collect", "every": "5m", "args": ["health"]}),
+    seed_thread(&orch).await;
+    for (target, mode, payload) in [
+        (
+            "cairn://p/prj/roadmap/procedures",
+            ChangeMode::Create,
+            Some(
+                serde_json::json!({"name": "collect", "body": {"commands": [{"command": "echo ok"}]}}),
+            ),
         ),
-    };
-    apply(&orch, &automation).await.unwrap();
-    let automations =
-        crate::orchestrator::automations::list_thread_automations(&orch.db.local, &thread_id)
-            .await
-            .unwrap();
-    assert_eq!(automations.len(), 1);
-    assert_eq!(automations[0].args, vec!["health"]);
-
-    let refused = ChangeItem {
-        target: "cairn://p/prj/roadmap/procedures/collect".into(),
-        mode: ChangeMode::Delete,
-        payload: None,
-    };
-    let error = apply(&orch, &refused).await.unwrap_err();
-    assert!(error.error.contains("automations reference it"));
+        (
+            "cairn://p/prj/roadmap/procedures/collect",
+            ChangeMode::Delete,
+            None,
+        ),
+        (
+            "cairn://p/prj/roadmap/automations",
+            ChangeMode::Create,
+            Some(serde_json::json!({"procedure": "collect", "every": "5m"})),
+        ),
+        (
+            "cairn://p/prj/roadmap/automations/a-1",
+            ChangeMode::Patch,
+            Some(serde_json::json!({"state": "muted"})),
+        ),
+    ] {
+        let item = ChangeItem {
+            target: target.into(),
+            mode,
+            payload,
+        };
+        let error = apply(&orch, &item).await.unwrap_err();
+        assert!(
+            error.error.contains("tenet 1313"),
+            "{target}: {}",
+            error.error
+        );
+        assert!(
+            error.error.contains("manifest"),
+            "{target}: {}",
+            error.error
+        );
+    }
 }
 
 async fn apply_dry_run(orch: &Orchestrator, item: &ChangeItem) -> ResourceMutationResult<String> {
@@ -155,12 +155,14 @@ async fn seeded_orch_with_emitter() -> (Orchestrator, Arc<CapturingEmitter>) {
 
 fn request() -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: None,
         tool: "change".to_string(),
         payload: serde_json::json!({}),
         tool_use_id: None,
+        origin: None,
     }
 }
 

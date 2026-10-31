@@ -67,6 +67,7 @@ pub enum IngestPhase {
     SnapshotApply = 3,
     Announce = 4,
     Message = 5,
+    MachineSample = 6,
 }
 
 impl IngestPhase {
@@ -77,6 +78,7 @@ impl IngestPhase {
             3 => Self::SnapshotApply,
             4 => Self::Announce,
             5 => Self::Message,
+            6 => Self::MachineSample,
             _ => Self::Idle,
         }
     }
@@ -90,6 +92,7 @@ impl IngestPhase {
             Self::SnapshotApply => "snapshot.apply",
             Self::Announce => "announce",
             Self::Message => "message",
+            Self::MachineSample => "machine.sample",
         }
     }
 }

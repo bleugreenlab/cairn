@@ -98,6 +98,12 @@ pub(crate) async fn run_lanes(
     let runs = lanes.into_iter().map(|(item, globs)| async move {
         let index = item.index;
         let _permit = self::lanes().acquire().await;
+        // No queue entry stands for this lane, so no narrator reports its
+        // claim: its start is the only sign a write wave's inline wait gets
+        // that a verdict is on its way.
+        if let Some(board) = &batch.status_board {
+            board.transition(index, "running", None);
+        }
         (index, run_lane(batch, &item, &globs).await)
     });
     futures_util::future::join_all(runs)

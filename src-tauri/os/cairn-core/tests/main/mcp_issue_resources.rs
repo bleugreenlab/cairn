@@ -1085,6 +1085,15 @@ async fn issue_create_without_execution_creates_issue_only() {
         result.contains("Created issue mcp/1"),
         "unexpected: {result}"
     );
+    // The agent's write result says no work began and names where to start it.
+    assert!(
+        result.contains("no execution started"),
+        "unexpected: {result}"
+    );
+    assert!(
+        result.contains("cairn://p/mcp/1/executions"),
+        "unexpected: {result}"
+    );
     assert_eq!(
         common::query_i64(&fixture.db, "SELECT COUNT(*) FROM issues")
             .await

@@ -1,7 +1,7 @@
 //! File-change resource readers and projections.
 
 use super::common::{
-    connect_for_read, find_query_value, parse_optional_usize_param, resolve_issue_id,
+    find_query_value, parse_optional_usize_param, read_resource, resolve_issue_id,
 };
 
 use crate::storage::{LocalDb, RowExt};
@@ -331,20 +331,24 @@ pub(super) fn push_file_change_table(output: &mut String, rows: &[FileChangeRow]
 
 /// Read all file changes for an issue (aggregated across all jobs)
 pub(super) async fn read_issue_changed(db: &LocalDb, project_key: &str, number: i32) -> String {
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
+    let key = project_key.to_owned();
+    let results = match read_resource(db, move |conn| {
+        Box::pin(async move {
+            let (_, issue_id) = resolve_issue_id(conn, &key, number).await?;
+            if !issue_has_jobs(conn, &issue_id).await {
+                return Ok(None);
+            }
+            Ok(Some(
+                load_issue_file_changes_with_agents(conn, &issue_id).await,
+            ))
+        })
+    })
+    .await
+    {
+        Ok(Some(results)) => results,
+        Ok(None) => return format!("No jobs found for issue {}/{}", project_key, number),
         Err(error) => return error,
     };
-    let (_, issue_id) = match resolve_issue_id(&conn, project_key, number).await {
-        Ok(resolved) => resolved,
-        Err(error) => return error,
-    };
-
-    if !issue_has_jobs(&conn, &issue_id).await {
-        return format!("No jobs found for issue {}/{}", project_key, number);
-    }
-
-    let results = load_issue_file_changes_with_agents(&conn, &issue_id).await;
 
     if results.is_empty() {
         return format!(
@@ -400,18 +404,23 @@ pub(super) async fn read_issue_changed_projection(
     number: i32,
     params: &[QueryParam],
 ) -> String {
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
+    let key = project_key.to_owned();
+    let changes = match read_resource(db, move |conn| {
+        Box::pin(async move {
+            let (_, issue_id) = resolve_issue_id(conn, &key, number).await?;
+            if !issue_has_jobs(conn, &issue_id).await {
+                return Ok(None);
+            }
+            Ok(Some(load_issue_file_changes(conn, &issue_id).await))
+        })
+    })
+    .await
+    {
+        Ok(Some(changes)) => changes,
+        Ok(None) => return format!("No jobs found for issue {}/{}", project_key, number),
         Err(error) => return error,
     };
-    let (_, issue_id) = match resolve_issue_id(&conn, project_key, number).await {
-        Ok(resolved) => resolved,
-        Err(error) => return error,
-    };
-    if !issue_has_jobs(&conn, &issue_id).await {
-        return format!("No jobs found for issue {}/{}", project_key, number);
-    }
-    let entries = file_projection_entries(load_issue_file_changes(&conn, &issue_id).await);
+    let entries = file_projection_entries(changes);
 
     parse_file_projection_lines(params, entries, "issue files").unwrap_or_else(|error| error)
 }

@@ -25,8 +25,8 @@ pub async fn query_for_thread(
                 "SELECT {} FROM messages WHERE channel_type = 'thread' AND channel_id = ?1 AND (?2 IS NULL OR created_at >= ?2) ORDER BY created_at ASC LIMIT 200",
                 MESSAGE_COLUMNS
             );
-            let rows = conn.query(&sql, params![thread_id, since]).await?;
-            collect_messages(rows).await
+            let mut rows = conn.query(&sql, params![thread_id, since]).await?;
+            collect_messages(&mut rows).await
         })
     })
     .await
@@ -100,7 +100,7 @@ async fn cursor_created_at(conn: &cairn_db::turso::Connection, id: &str) -> DbRe
     crate::storage::next_i64(&mut rows, 0).await
 }
 
-async fn collect_messages(mut rows: cairn_db::turso::Rows) -> DbResult<Vec<Message>> {
+async fn collect_messages(rows: &mut cairn_db::turso::Rows) -> DbResult<Vec<Message>> {
     let mut messages = Vec::new();
     while let Some(row) = rows.next().await? {
         messages.push(message_from_row(&row)?);
@@ -455,7 +455,7 @@ async fn query_channel_async(
                      LIMIT ?8",
                 MESSAGE_COLUMNS
             );
-            let rows = conn
+            let mut rows = conn
                 .query(
                     &sql,
                     params![
@@ -471,7 +471,7 @@ async fn query_channel_async(
                 )
                 .await?;
 
-            collect_messages(rows).await
+            collect_messages(&mut rows).await
         })
     })
     .await
@@ -510,9 +510,9 @@ async fn query_for_issue_async(
                      LIMIT 200",
                 MESSAGE_COLUMNS
             );
-            let rows = conn.query(&sql, params![issue_key.as_str(), since]).await?;
+            let mut rows = conn.query(&sql, params![issue_key.as_str(), since]).await?;
 
-            collect_messages(rows).await
+            collect_messages(&mut rows).await
         })
     })
     .await
@@ -524,7 +524,13 @@ async fn query_for_issue_async(
 ///
 /// Direct messages are keyed by `recipient_run_id` (and `sender_run_id`), so a
 /// job's full DM history is the union of directs touching any run owned by the
-/// job. Returned in chronological order, oldest first.
+/// job: a thread session's messages survive every run it crashes or rotates out
+/// of. Returned in chronological order, oldest first.
+///
+/// Without `since` the window is the newest `limit` messages, because a
+/// long-lived recipient's history outgrows any page and an oldest-first window
+/// never reaches what was said recently. With `since` the window opens at that
+/// instant and reads forward, so a reader can page through older history.
 pub(crate) fn query_directs_for_job(
     db: &LocalDb,
     job_id: &str,
@@ -549,22 +555,26 @@ async fn query_directs_for_job_async(
     db.read(|conn| {
         let job_id = job_id.clone();
         Box::pin(async move {
+            let order = if since.is_some() { "ASC" } else { "DESC" };
             let sql = format!(
-                "SELECT {} FROM messages
+                "SELECT {MESSAGE_COLUMNS} FROM messages
                      WHERE channel_type = 'direct'
                        AND (
                             recipient_run_id IN (SELECT id FROM runs WHERE job_id = ?1)
                          OR sender_run_id IN (SELECT id FROM runs WHERE job_id = ?1)
                        )
                        AND (?2 IS NULL OR created_at >= ?2)
-                     ORDER BY created_at ASC, id ASC
-                     LIMIT ?3",
-                MESSAGE_COLUMNS
+                     ORDER BY created_at {order}, id {order}
+                     LIMIT ?3"
             );
-            let rows = conn
+            let mut rows = conn
                 .query(&sql, params![job_id.as_str(), since, limit])
                 .await?;
-            collect_messages(rows).await
+            let mut messages = collect_messages(&mut rows).await?;
+            if since.is_none() {
+                messages.reverse();
+            }
+            Ok(messages)
         })
     })
     .await

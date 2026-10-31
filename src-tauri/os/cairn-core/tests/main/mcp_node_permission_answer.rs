@@ -87,12 +87,14 @@ async fn insert_permission_fixture(db: &LocalDb) {
 
 fn change_request(payload: serde_json::Value) -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: String::new(),
         run_id: Some("run-1".to_string()),
         tool: "write".to_string(),
         payload,
         tool_use_id: None,
+        origin: None,
     }
 }
 
@@ -244,12 +246,14 @@ async fn pending_permission_read_shows_answer_action() {
     let output = handle_read_file(
         &orch,
         &McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: String::new(),
             run_id: None,
             tool: "read".to_string(),
             payload: json!({"path": "cairn://p/tpa/1/1/builder/permissions/perm-1"}),
             tool_use_id: None,
+            origin: None,
         },
     )
     .await;
@@ -269,12 +273,14 @@ async fn raise_fence_honors_policy_and_session_grant() {
     let (_temp, db, orch) = resource_orchestrator_fixture().await;
 
     let request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/wt".to_string(),
         run_id: Some("run-x".to_string()),
         tool: "read".to_string(),
         payload: json!({"path": "file:/outside"}),
         tool_use_id: Some("toolu-x".to_string()),
+        origin: None,
     };
 
     // Allow / Deny short-circuit without touching the DB.
@@ -335,18 +341,20 @@ async fn shell_path_crossing_session_grant_generalizes_across_commands() {
     let (_temp, db, orch) = resource_orchestrator_fixture().await;
 
     let request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/wt".to_string(),
         run_id: Some("run-x".to_string()),
         tool: "run".to_string(),
         payload: json!({"command": "grep needle /etc/hosts"}),
         tool_use_id: Some("toolu-x".to_string()),
+        origin: None,
     };
 
     // Two different commands, same resolved out-of-worktree path -> same
     // descriptor.
-    let first = Crossing::shell_path(Path::new("/etc/hosts"), "/etc/hosts");
-    let second = Crossing::shell_path(Path::new("/etc/hosts"), "/etc/hosts");
+    let first = Crossing::shell_path(Path::new("/etc/hosts"), "cat /etc/hosts");
+    let second = Crossing::shell_path(Path::new("/etc/hosts"), "grep needle /etc/hosts");
     assert_eq!(first.descriptor, "/etc/hosts");
     assert_eq!(first.descriptor, second.descriptor);
 

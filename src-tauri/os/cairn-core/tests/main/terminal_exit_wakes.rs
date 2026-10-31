@@ -43,7 +43,7 @@ async fn prepare_terminal_repository(
 ) {
     std::fs::create_dir_all(repo_path).unwrap();
     for args in [
-        &["init", "-q"][..],
+        &["init", "-b", "main", "-q"][..],
         &["config", "user.email", "test@example.com"][..],
         &["config", "user.name", "Test"][..],
     ] {
@@ -84,12 +84,14 @@ async fn prepare_terminal_repository(
 
 async fn change_resource_as_run(orch: &Orchestrator, changes: Value, run_id: &str) -> String {
     let request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: String::new(),
         run_id: Some(run_id.to_string()),
         tool: "write".to_string(),
         payload: json!({ "changes": changes }),
         tool_use_id: None,
+        origin: None,
     };
     handle_write(orch, &request).await
 }

@@ -72,17 +72,16 @@ fn write_composer(out: &mut String, name: &str, tail: &[&TailMigration]) {
     let _ = writeln!(out, "    ($($item:expr),* $(,)?) => {{");
     let _ = writeln!(out, "        &[");
     let _ = writeln!(out, "            $($item,)*");
+    // Each entry expands through `migrations.rs`'s own `migration!`, whose SQL
+    // include is relative to that file. Spelling the include with
+    // `env!("CARGO_MANIFEST_DIR")` would make cairn-db's library depend on the
+    // absolute path of the checkout that compiled it, which Cargo does not
+    // track, so no build cell could reuse it.
     for migration in tail {
         let stem = &migration.stem;
-        let sql = format!(
-            "include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/{DIRECTORY}/{stem}.sql\"))"
-        );
         match &migration.headers.rebuild_fk_off {
             None => {
-                let _ = writeln!(
-                    out,
-                    "            Migration::new(version_from_stem(\"{stem}\"), name_from_stem(\"{stem}\"), {sql}),"
-                );
+                let _ = writeln!(out, "            migration!(\"{stem}\"),");
             }
             Some(checks) => {
                 let checks = checks
@@ -99,7 +98,7 @@ fn write_composer(out: &mut String, name: &str, tail: &[&TailMigration]) {
                     .join(", ");
                 let _ = writeln!(
                     out,
-                    "            Migration::rebuild_fk_off(version_from_stem(\"{stem}\"), name_from_stem(\"{stem}\"), {sql}, &[{checks}]),"
+                    "            migration!(\"{stem}\", rebuild_fk_off: &[{checks}]),"
                 );
             }
         }

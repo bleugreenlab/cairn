@@ -549,6 +549,7 @@ mod tests {
             mutation_delta: None,
             sandbox_denials: vec![],
             tracked_modifications: None,
+            node_scratch: None,
         };
         assert_eq!(
             DevInstanceLaunchFailure::from_residency_failure(

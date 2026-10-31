@@ -12,6 +12,129 @@ pub struct CallbackOutcome {
     /// parseable as data (e.g. the read-batch envelope, a change report).
     pub reminders: Vec<String>,
     pub transport_ok: bool,
+    /// What went wrong when the callback did not deliver a host answer: the
+    /// class the sink observed and how long it waited. Set by the sink at the
+    /// point of failure, so nothing downstream has to recover the class from
+    /// rendered text.
+    pub failure: Option<CallbackFailure>,
+}
+
+/// The ways a callback can fail to deliver the host's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallbackFailureKind {
+    /// The HTTP client could not be built; nothing was sent.
+    ClientBuild,
+    /// The connection was never established; the host never saw the request.
+    Connect,
+    /// The client's own socket bound expired while waiting for the answer.
+    Timeout,
+    /// The connection was reset or closed by the other side mid-request.
+    Reset,
+    /// Writing the request body failed.
+    RequestBody,
+    /// Any other send failure.
+    Request,
+    /// The host (or a relay) answered with a non-2xx status.
+    HttpStatus(u16),
+    /// The answer's body could not be read.
+    ResponseBody,
+    /// The answer's body was not a callback response.
+    ResponseParse,
+}
+
+impl CallbackFailureKind {
+    /// The class word rendered in failure text and the transport-error header.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::ClientBuild => "client_build",
+            Self::Connect => "connect",
+            Self::Timeout => "timeout",
+            Self::Reset => "reset",
+            Self::RequestBody => "request_body",
+            Self::Request => "request",
+            Self::HttpStatus(_) => "http_status",
+            Self::ResponseBody => "response_body",
+            Self::ResponseParse => "response_parse",
+        }
+    }
+}
+
+/// A failed callback: its class, and how long after sending the sink gave up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallbackFailure {
+    pub kind: CallbackFailureKind,
+    pub elapsed: std::time::Duration,
+}
+
+/// Whether a `waitFor` whose callback failed could have armed its durable wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitArming {
+    /// The host had not reached the point where a wait arms: either the
+    /// request never arrived, or it failed inside the inline phase, and a
+    /// dropped connection aborts the host's handling with it.
+    NotArmed,
+    /// The wait may have armed before the answer was lost.
+    MaybeArmed,
+}
+
+/// Whether a failed `waitFor` callback could have armed its wait. A wait
+/// writes its durable row only after
+/// [`INLINE_DURABLE_WAIT_BUDGET`](cairn_common::callback_contract::INLINE_DURABLE_WAIT_BUDGET)
+/// of inline waiting, so a failure sooner than that means nothing was armed.
+pub fn wait_arming(failure: Option<&CallbackFailure>) -> WaitArming {
+    use cairn_common::callback_contract::INLINE_DURABLE_WAIT_BUDGET;
+    match failure {
+        Some(CallbackFailure {
+            kind: CallbackFailureKind::Connect | CallbackFailureKind::ClientBuild,
+            ..
+        }) => WaitArming::NotArmed,
+        Some(failure) if failure.elapsed < INLINE_DURABLE_WAIT_BUDGET => WaitArming::NotArmed,
+        _ => WaitArming::MaybeArmed,
+    }
+}
+
+/// The opening of a `run` verdict for a callback that failed after grace.
+const RUN_MAY_BE_HELD: &str = "The runner may still be holding this batch durably: if it is, this turn is parked and resumes with its result, and a reissue is refused while the batch is held or parked.";
+
+/// What the batch behind a failed `run` callback may have done, and the safe
+/// next move: the one line an agent needs instead of "the runner is down".
+pub fn run_transport_verdict(
+    failure: Option<&CallbackFailure>,
+    is_wait: bool,
+    commit_msg: Option<&str>,
+) -> String {
+    if is_wait {
+        return match wait_arming(failure) {
+            WaitArming::NotArmed => "The wait was NOT armed: the runner had not reached the point where a wait is recorded. Reissue it.".to_string(),
+            WaitArming::MaybeArmed => "The wait may have been armed before the answer was lost. Reissue it; if the first call armed, the runner refuses the reissue and says so.".to_string(),
+        };
+    }
+    let grace = std::time::Duration::from_millis(cairn_common::run_contract::RUN_GRACE_WINDOW_MS);
+    let subject =
+        commit_msg.map(|subject| truncate_chars(subject.lines().next().unwrap_or(subject), 120));
+    match (failure, subject) {
+        (
+            Some(CallbackFailure {
+                kind: CallbackFailureKind::Connect | CallbackFailureKind::ClientBuild,
+                ..
+            }),
+            _,
+        ) => "The batch never reached the runner; nothing ran. Reissue it.".to_string(),
+        // Past grace the call may have been held or parked, but it may as
+        // well have answered (a held call settles its row before the reply
+        // leaves) or never been bound, so a refused reissue is the only proof
+        // the batch is still running, and an unrefused one may run it twice.
+        (Some(failure), Some(subject)) if failure.elapsed >= grace => format!(
+            "{RUN_MAY_BE_HELD} If a reissue is not refused, the batch may have run and committed: read `cairn:@/vcs/log?limit=5` for `{subject}` before re-running."
+        ),
+        (Some(failure), None) if failure.elapsed >= grace => format!(
+            "{RUN_MAY_BE_HELD} If a reissue is not refused, the batch may have run; it carried no commit_msg, so re-running it is safe if its other side effects are."
+        ),
+        (_, Some(subject)) => format!(
+            "The batch may have run. Uncommitted edits are discarded either way. It carried commit_msg, so read `cairn:@/vcs/log?limit=5` for `{subject}` before re-running."
+        ),
+        (_, None) => "The batch may have run. Uncommitted edits are discarded either way, and it carried no commit_msg, so re-running it is safe if its other side effects are.".to_string(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,18 +277,25 @@ fn sanitize_callback_url(callback_url: &str) -> String {
     }
 }
 
-fn callback_failure_class(result: &str) -> &'static str {
-    if result.starts_with("Error calling Tauri:") {
-        "request"
-    } else if result.starts_with("Error parsing response:") {
-        "response_parse"
-    } else if result.starts_with("Error reading response body:") {
-        "response_body"
-    } else if result.starts_with("Error building HTTP client:") {
-        "client_build"
-    } else {
-        "http_status"
+fn callback_failure_class(outcome: &CallbackOutcome) -> String {
+    match outcome.failure {
+        Some(CallbackFailure {
+            kind: CallbackFailureKind::HttpStatus(status),
+            ..
+        }) => format!("http_status {status}"),
+        Some(failure) => failure.kind.word().to_string(),
+        None => "unknown".to_string(),
     }
+}
+
+fn transport_error_message(outcome: &CallbackOutcome, callback_url: &str, tool: &str) -> String {
+    format!(
+        "MCP callback transport failed\nurl: {}\ntool: {}\nclass: {}\nerror: {}",
+        sanitize_callback_url(callback_url),
+        tool,
+        callback_failure_class(outcome),
+        outcome.result
+    )
 }
 
 fn callback_transport_error_result(
@@ -173,12 +303,23 @@ fn callback_transport_error_result(
     callback_url: &str,
     tool: &str,
 ) -> CallToolResult {
+    let message = transport_error_message(outcome, callback_url, tool);
+    CallToolResult::error(vec![ContentBlock::text(cap_text_result(&message, 0))])
+}
+
+/// A `run` callback that delivered no host answer, as a tool error carrying
+/// the transport detail and the one verdict line for what the batch may have
+/// done ([`run_transport_verdict`]).
+pub fn run_transport_error_result(
+    outcome: &CallbackOutcome,
+    callback_url: &str,
+    is_wait: bool,
+    commit_msg: Option<&str>,
+) -> CallToolResult {
     let message = format!(
-        "MCP callback transport failed\nurl: {}\ntool: {}\nclass: {}\nerror: {}",
-        sanitize_callback_url(callback_url),
-        tool,
-        callback_failure_class(&outcome.result),
-        outcome.result
+        "{}\nverdict: {}",
+        transport_error_message(outcome, callback_url, "run"),
+        run_transport_verdict(outcome.failure.as_ref(), is_wait, commit_msg)
     );
     CallToolResult::error(vec![ContentBlock::text(cap_text_result(&message, 0))])
 }
@@ -429,11 +570,128 @@ mod tests {
         assert!(!result.contains("Call again with offset"));
     }
 
+    fn failure(kind: CallbackFailureKind, secs: u64) -> CallbackFailure {
+        CallbackFailure {
+            kind,
+            elapsed: std::time::Duration::from_secs(secs),
+        }
+    }
+
+    #[test]
+    fn the_class_comes_from_the_typed_failure() {
+        let cases = [
+            (CallbackFailureKind::ClientBuild, "client_build"),
+            (CallbackFailureKind::Connect, "connect"),
+            (CallbackFailureKind::Timeout, "timeout"),
+            (CallbackFailureKind::Reset, "reset"),
+            (CallbackFailureKind::RequestBody, "request_body"),
+            (CallbackFailureKind::Request, "request"),
+            (CallbackFailureKind::HttpStatus(504), "http_status 504"),
+            (CallbackFailureKind::ResponseBody, "response_body"),
+            (CallbackFailureKind::ResponseParse, "response_parse"),
+        ];
+        for (kind, class) in cases {
+            let outcome = CallbackOutcome {
+                // The text no longer decides the class.
+                result: "Error calling Tauri: anything".to_string(),
+                failure: Some(failure(kind, 1)),
+                ..Default::default()
+            };
+            assert_eq!(callback_failure_class(&outcome), class);
+        }
+        assert_eq!(
+            callback_failure_class(&CallbackOutcome::default()),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn a_wait_is_not_armed_unless_it_could_have_passed_the_inline_phase() {
+        use CallbackFailureKind::*;
+        let cases = [
+            (Some(failure(Connect, 300)), WaitArming::NotArmed),
+            (Some(failure(ClientBuild, 0)), WaitArming::NotArmed),
+            (Some(failure(Reset, 1)), WaitArming::NotArmed),
+            (Some(failure(Timeout, 44)), WaitArming::NotArmed),
+            (Some(failure(Reset, 45)), WaitArming::MaybeArmed),
+            (Some(failure(Timeout, 195)), WaitArming::MaybeArmed),
+            (Some(failure(HttpStatus(504), 240)), WaitArming::MaybeArmed),
+            (None, WaitArming::MaybeArmed),
+        ];
+        for (failure, expected) in cases {
+            assert_eq!(wait_arming(failure.as_ref()), expected, "{failure:?}");
+        }
+    }
+
+    #[test]
+    fn the_run_verdict_names_what_the_batch_may_have_done() {
+        use CallbackFailureKind::*;
+        let never = run_transport_verdict(Some(&failure(Connect, 0)), false, Some("x"));
+        assert!(
+            never.contains("never reached the runner; nothing ran"),
+            "{never}"
+        );
+        let early =
+            run_transport_verdict(Some(&failure(Reset, 30)), false, Some("fix parser\n\nbody"));
+        assert!(early.contains("may have run"), "{early}");
+        assert!(
+            early.contains("cairn:@/vcs/log?limit=5") && early.contains("`fix parser`"),
+            "{early}"
+        );
+        let early_no_commit = run_transport_verdict(Some(&failure(Reset, 30)), false, None);
+        assert!(!early_no_commit.contains("vcs/log"), "{early_no_commit}");
+        // Past grace the batch may be held, but it may as well have answered
+        // or never been bound, so a committing batch keeps its vcs/log advice
+        // and a reissue is promised refused only while the batch is held.
+        let late = run_transport_verdict(Some(&failure(Timeout, 195)), false, Some("fix parser"));
+        assert!(
+            late.contains("may still be holding this batch durably"),
+            "{late}"
+        );
+        assert!(
+            late.contains("refused while the batch is held or parked"),
+            "{late}"
+        );
+        assert!(
+            late.contains("If a reissue is not refused")
+                && late.contains("cairn:@/vcs/log?limit=5")
+                && late.contains("`fix parser`"),
+            "{late}"
+        );
+        assert!(!late.contains("Reissuing is safe"), "{late}");
+        let late_no_commit = run_transport_verdict(Some(&failure(Timeout, 195)), false, None);
+        assert!(
+            late_no_commit.contains("may still be holding"),
+            "{late_no_commit}"
+        );
+        assert!(!late_no_commit.contains("vcs/log"), "{late_no_commit}");
+        let not_armed = run_transport_verdict(Some(&failure(Reset, 2)), true, None);
+        assert!(not_armed.contains("NOT armed"), "{not_armed}");
+        let maybe = run_transport_verdict(Some(&failure(Reset, 60)), true, None);
+        assert!(maybe.contains("refuses the reissue"), "{maybe}");
+        // Every verdict is distinct: the next move differs for each.
+        let all = [
+            never,
+            early,
+            early_no_commit,
+            late,
+            late_no_commit,
+            not_armed,
+            maybe,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
     #[test]
     fn test_change_transport_failure_becomes_tool_error() {
         let outcome = CallbackOutcome {
-            result: "Error calling Tauri: connection refused".to_string(),
+            result: "Error calling Tauri: request: connection refused".to_string(),
             transport_ok: false,
+            failure: Some(failure(CallbackFailureKind::Request, 1)),
             ..Default::default()
         };
 

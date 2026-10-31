@@ -134,7 +134,7 @@ fn sha256(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
-fn unix_now_ms() -> u64 {
+pub(crate) fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
@@ -147,9 +147,9 @@ fn unix_now_ms() -> u64 {
 /// The inputs are re-read on every call and the probe re-runs whenever their
 /// fingerprint differs from the last measurement's, so the executor's liveness
 /// pass carries a changed outer profile to the runner on the next heartbeat.
-/// One assembly point serves the advertisement and the per-execution record,
-/// so the two cannot disagree about what this machine is.
-pub fn check_lane_nested_sandbox_evidence() -> SandboxCapabilityEvidence {
+/// [`crate::sandbox_capability_evidence`] is the one assembly point that reads
+/// it.
+pub(crate) fn check_lane_nested_sandbox_evidence() -> SandboxCapabilityEvidence {
     static LAST: Mutex<Option<SandboxCapabilityEvidence>> = Mutex::new(None);
     evidence_for(&LaneContext::current(), &LAST, probe_under, unix_now_ms)
 }
@@ -189,6 +189,7 @@ fn evidence_for(
             fingerprint,
             measured_at_unix_ms: now_ms(),
         }),
+        violation_recovery: None,
     };
     *last = Some(evidence.clone());
     evidence

@@ -39,7 +39,7 @@ fn temp_git_repo() -> TempDir {
             .unwrap();
         assert!(status.success(), "git {:?} failed", args);
     };
-    run(&["init", "-q"]);
+    run(&["init", "-b", "main", "-q"]);
     run(&[
         "remote",
         "add",

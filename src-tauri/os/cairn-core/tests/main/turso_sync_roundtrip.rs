@@ -903,12 +903,14 @@ fn orchestrator_over(dbs: Arc<DbState>, config_dir: &Path) -> Orchestrator {
 /// the job/run-keyed execution side effects that stay private (CAIRN-2181).
 fn external_request(cwd: &Path) -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: cwd.to_string_lossy().to_string(),
         run_id: None,
         tool: "write".to_string(),
         payload: serde_json::Value::Null,
         tool_use_id: None,
+        origin: None,
     }
 }
 
@@ -1569,7 +1571,7 @@ async fn seed_local_run_with_events(db: &LocalDb) {
 /// CAIRN-2225 headline: the desktop run/event/transcript READ surface resolves a
 /// team execution's rows to the OWNING replica, driving the REAL cairn-core read
 /// queries the Tauri commands delegate to (`list_events` /
-/// `list_events_for_session_delta`). This is the symmetric counterpart to
+/// `list_events_for_session`). This is the symmetric counterpart to
 /// `routed_execution_writes_hit_the_team_db_and_sync` (the WRITE side,
 /// CAIRN-2182): a team run's `runs`/`events`/`permission_requests` live wholly in
 /// the replica, so reading them from the private DB returns empty — the live
@@ -1645,16 +1647,15 @@ async fn routed_run_reads_resolve_to_team_replica_and_local_to_private() {
     );
 
     // Session-keyed read: `owning_db_for_session` resolves via `runs.session_id`,
-    // and `list_events_for_session_delta` (the chat-delta hook's query) returns
-    // the session's events from the replica.
+    // and `list_events_for_session` returns the session's events from the
+    // replica.
     let session_owner = routing::owning_db_for_session(&dbs_a, "sess-1")
         .await
         .unwrap();
     assert!(Arc::ptr_eq(&session_owner, &team_a));
-    let delta =
-        queries::list_events_for_session_delta(session_owner.clone(), "sess-1", None).unwrap();
+    let session_events = queries::list_events_for_session(session_owner.clone(), "sess-1").unwrap();
     assert_eq!(
-        delta.events.len(),
+        session_events.len(),
         2,
         "the session delta returns the team session's events from the replica"
     );
@@ -2086,12 +2087,14 @@ async fn routed_question_flow_resolves_to_team_replica_and_local_to_private() {
     //    yielding). Before the fix this returned the live `No run found` error
     //    because lookup_run hit the empty private DB.
     let request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: dir.path().join("repo").to_string_lossy().to_string(),
         run_id: Some(run.to_string()),
         tool: "write".to_string(),
         payload: serde_json::Value::Null,
         tool_use_id: None,
+        origin: None,
     };
     let payload = AskUserPayload {
         questions: vec![Question {
@@ -2195,12 +2198,14 @@ async fn routed_question_flow_resolves_to_team_replica_and_local_to_private() {
     )
     .await;
     let local_request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: dir.path().join("l").to_string_lossy().to_string(),
         run_id: Some("run-local-q".to_string()),
         tool: "write".to_string(),
         payload: serde_json::Value::Null,
         tool_use_id: None,
+        origin: None,
     };
     let local_payload = AskUserPayload {
         questions: vec![Question {

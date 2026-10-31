@@ -525,6 +525,7 @@ pub(crate) async fn preview_artifact_change(
     payload: &serde_json::Value,
     is_patch: bool,
 ) -> Result<(), String> {
+    refuse_generic_page(artifact_name)?;
     let db = orch.db.for_project(project_key).await;
     let thread_session = match (
         cairn_common::uri::NodeAddress::new(number, exec_seq, node_name),
@@ -669,6 +670,7 @@ pub(crate) async fn write_artifact_change(
     // type, so identity is unchanged.
     let (artifact_type, output_name) =
         resolve_artifact_identity(orch, &job_id, artifact_name).await;
+    refuse_generic_page(Some(&artifact_type))?;
 
     let latest = load_latest_artifact(orch, &job_id, &output_name).await;
     let prior_confirmed = latest.as_ref().map(|(_, confirmed)| *confirmed);
@@ -1510,6 +1512,20 @@ async fn load_latest_artifact(
             .ok()
             .map(|value| (value, confirmed != 0))
     })
+}
+
+/// A `page` artifact is the page store's alone: it validates a page's files,
+/// versions it across a thread's sessions, and keeps it out of the terminal
+/// contract. A generic write that would create one is refused toward the
+/// address that does all of that.
+fn refuse_generic_page(artifact_type: Option<&str>) -> Result<(), String> {
+    if artifact_type == Some(crate::pages::PAGE_ARTIFACT_TYPE) {
+        return Err(
+            "A page is written at cairn:~/pages/<name>, which checks its files and versions it across the thread's sessions; a generic artifact named `page` is refused."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Resolve an artifact write's stored identity and schema type.

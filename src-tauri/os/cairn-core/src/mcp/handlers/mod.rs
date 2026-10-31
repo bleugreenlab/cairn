@@ -39,30 +39,6 @@ pub mod web;
 pub mod workflows;
 pub mod write;
 
-/// Payload for `agent-attention` events.
-pub(crate) struct AttentionEvent<'a> {
-    pub(crate) attention_type: &'a str,
-    pub(crate) project_key: &'a str,
-    /// Canonical home URI for the job that needs attention.
-    pub(crate) home_uri: Option<&'a str>,
-    pub(crate) tool_name: Option<&'a str>,
-}
-
-/// Emit an `agent-attention` event to notify the frontend that user attention is needed.
-///
-/// Used for: ask_user prompts, permission requests, job completed/failed.
-pub(crate) fn emit_attention(emitter: &dyn crate::services::EventEmitter, event: &AttentionEvent) {
-    let _ = emitter.emit(
-        "agent-attention",
-        serde_json::json!({
-            "type": event.attention_type,
-            "projectKey": event.project_key,
-            "homeUri": event.home_uri,
-            "toolName": event.tool_name,
-        }),
-    );
-}
-
 /// Authenticated identity and project coordinate for one agent run.
 #[derive(Clone)]
 pub struct RunContext {

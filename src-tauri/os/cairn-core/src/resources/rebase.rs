@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cairn_common::query::QueryParam;
 
-use super::common::{connect_and_find_node_job, find_query_value, node_branch};
+use super::common::{find_node_job, find_query_value, node_branch, read_resource};
 use crate::orchestrator::base_advance::{
     inflight_run_batch_on_branch, mutation_boundary_hold, InflightRunBatch,
 };
@@ -42,9 +42,13 @@ use crate::orchestrator::conflict_session::{
     assess_session_tip, load_active_session, load_latest_session, load_reconcile_pass,
     ConflictSession, MarkerState, ReplayPass, ReplayState, SessionFile, TipAssessment, Unproven,
 };
-use crate::orchestrator::replay_base::{load_base_candidates, resolve_base, BaseSource};
+use crate::orchestrator::replay_base::{
+    load_base_candidates, resolve_base, BaseCandidates, BaseSource,
+};
 use crate::orchestrator::Orchestrator;
 use crate::storage::RowExt;
+
+use super::paging::RecordPage;
 
 /// Hard ceiling on patch lines served in one read, regardless of `limit`. A
 /// merge side can be enormous; a resource that streams all of it into a context
@@ -134,6 +138,49 @@ fn parse_rebase_request<'a>(params: &'a [QueryParam]) -> Result<RebaseRequest<'a
     })
 }
 
+/// The views that page a file or patch themselves (`view=base-ours`,
+/// `view=base-theirs`, and `view=merged` scoped to one `file`) as a page the
+/// read view continues in those lines. The renderer writes its own exact
+/// continuation; a page the budget cuts re-reads from its own start under a
+/// smaller `limit`. `None` for the summary and the unscoped merged overview,
+/// which page nothing, so the universal line window applies to them.
+pub(super) async fn read_node_rebase_page(
+    orch: &Orchestrator,
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    params: &[QueryParam],
+) -> Option<Result<RecordPage, String>> {
+    let (offset, limit) = match parse_rebase_request(params) {
+        Ok(request) => {
+            let paged = match request.view {
+                RebaseView::Summary => false,
+                RebaseView::Merged => request.file.is_some(),
+                RebaseView::BaseOurs | RebaseView::BaseTheirs => true,
+            };
+            if !paged {
+                return None;
+            }
+            (request.offset, request.limit)
+        }
+        Err(error) => return Some(Err(error)),
+    };
+    let body = read_node_rebase(orch, project, number, exec_seq, node_id, params).await;
+    Some(Ok(RecordPage {
+        body,
+        noun: "lines",
+        offset,
+        limit,
+        // The renderer reports the lines it rendered only in its own footer;
+        // the page size asked for is what a smaller re-read is scaled from.
+        shown: limit,
+        total: None,
+        more: false,
+        prelude_lines: None,
+    }))
+}
+
 pub(super) async fn read_node_rebase(
     orch: &Orchestrator,
     project: &str,
@@ -147,32 +194,27 @@ pub(super) async fn read_node_rebase(
         Err(error) => return error,
     };
     let db = orch.db.for_project(project).await;
-    let (conn, job) = match connect_and_find_node_job(&db, project, number, exec_seq, node_id).await
-    {
-        Ok(found) => found,
+    let rows = match NodeRebaseRows::read(&db, project, number, exec_seq, node_id).await {
+        Ok(rows) => rows,
         Err(error) => return error,
     };
-    let branch = match node_branch(&conn, &job.id).await {
-        Ok(Some(branch)) => branch,
-        Ok(None) => {
-            return "This node has no branch, so it cannot have a rebase session.".to_string()
-        }
-        Err(error) => return error,
+    let Some(branch) = rows.branch.clone() else {
+        return "This node has no branch, so it cannot have a rebase session.".to_string();
     };
     // Read before anything else on the page: while the name is conflicted, no
     // replay can run, so everything below it describes a branch that cannot
     // move until this is settled.
     let name_section = format!(
         "{}{}",
-        own_origin_section(orch, &conn, &job.id, &branch).await,
-        conflicted_name_section(orch, &conn, &job.id, &branch).await
+        own_origin_section(orch, &rows, &branch).await,
+        conflicted_name_section(orch, &rows, &branch).await
     );
     let session = match load_active_session(&db, &branch).await {
         Ok(Some(session)) => session,
         Ok(None) => {
             return format!(
                 "{name_section}{}",
-                render_closed_session(orch, &db, &conn, &job.id, &branch).await
+                render_closed_session(orch, &db, &rows, &branch).await
             )
         }
         Err(error) => return error,
@@ -180,8 +222,8 @@ pub(super) async fn read_node_rebase(
 
     let rendered = match request.view {
         RebaseView::Summary => {
-            let standing = load_live_standing(orch, &conn, &job.id, &branch, &session).await;
-            let hold = inflight_run_batch_on_branch(&db, &job.id, &branch).await;
+            let standing = load_live_standing(orch, &rows, &branch, &session).await;
+            let hold = inflight_run_batch_on_branch(&db, &rows.job_id, &branch).await;
             render_summary(
                 orch, project, number, exec_seq, node_id, &session, &standing, &hold,
             )
@@ -217,16 +259,16 @@ pub(super) async fn read_node_rebase(
 async fn render_closed_session(
     orch: &Orchestrator,
     db: &crate::storage::LocalDb,
-    conn: &cairn_db::turso::Connection,
-    job_id: &str,
+    rows: &NodeRebaseRows,
     branch: &str,
 ) -> String {
+    let job_id = rows.job_id.as_str();
     let latest = match load_latest_session(db, branch).await {
         Ok(latest) => latest,
         Err(error) => return error,
     };
     let Some(session) = latest.filter(|session| !session.is_open()) else {
-        return render_no_session(orch, db, conn, job_id, branch).await;
+        return render_no_session(orch, db, rows, branch).await;
     };
 
     let closed_at = crate::clock::stamp(session.updated_at)
@@ -253,7 +295,7 @@ async fn render_closed_session(
     // this page gives a branch that never conflicted at all, so it is answered
     // the same way: from the store, and from what the reconcile record says
     // happened to that advance.
-    let standing = load_base_standing(orch, conn, job_id, branch).await;
+    let standing = load_base_standing(orch, rows, branch).await;
     let now = match &standing {
         Ok(standing) if !standing.carries_base => format!(
             "\n⚠️ **Since then, the base has moved again.** `{}` is now at `{}`, which this \
@@ -366,24 +408,24 @@ impl BaseStanding {
 /// says which it is.
 async fn load_base_standing(
     orch: &Orchestrator,
-    conn: &cairn_db::turso::Connection,
-    job_id: &str,
+    rows: &NodeRebaseRows,
     branch: &str,
 ) -> Result<BaseStanding, String> {
-    let repo_path = load_repo_path(conn, job_id).await?;
-    let candidates = load_base_candidates(conn, job_id)
-        .await
+    let repo_path = rows.repo_path.clone()?;
+    let candidates = rows
+        .candidates
+        .as_ref()
         .map_err(|error| format!("This node's base branch could not be read: {error}"))?;
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(&repo_path));
     let resolved =
-        resolve_base(&jj, &store, branch, &candidates).map_err(|error| error.to_string())?;
+        resolve_base(&jj, &store, branch, candidates).map_err(|error| error.to_string())?;
     let carries_base = crate::jj::branch_carries_commit(&jj, &store, branch, &resolved.commit);
-    let origin_drift = match load_project_id(conn, job_id).await {
+    let origin_drift = match rows.project_id.as_deref() {
         Some(project_id) => {
             crate::orchestrator::base_branch_sync::known_drift(
                 orch,
-                &project_id,
+                project_id,
                 &store,
                 &resolved.branch,
             )
@@ -406,13 +448,54 @@ async fn load_base_standing(
 /// this page resolves it.
 pub(crate) async fn node_base_branch(
     orch: &Orchestrator,
-    conn: &cairn_db::turso::Connection,
-    job_id: &str,
+    rows: &NodeRebaseRows,
     branch: &str,
 ) -> Result<String, String> {
-    load_base_standing(orch, conn, job_id, branch)
+    load_base_standing(orch, rows, branch)
         .await
         .map(|standing| standing.base_branch)
+}
+
+/// Every row the rebase page and the `cairn:~/rebase` actions read about a
+/// node, loaded in one short read before any of the jj, origin, or store-lock
+/// work they then do. Holding a read across that work is what kept a
+/// transaction open for thirteen minutes while a replay waited on the store
+/// lock (cairn/5502).
+pub(crate) struct NodeRebaseRows {
+    pub(crate) job_id: String,
+    /// The node's bookmark, or `None` when it has no branch yet.
+    pub(crate) branch: Option<String>,
+    repo_path: Result<String, String>,
+    candidates: Result<BaseCandidates, String>,
+    project_id: Option<String>,
+}
+
+impl NodeRebaseRows {
+    #[track_caller]
+    pub(crate) fn read<'s>(
+        db: &'s crate::storage::LocalDb,
+        project: &str,
+        number: i32,
+        exec_seq: i32,
+        node_id: &str,
+    ) -> impl std::future::Future<Output = Result<Self, String>> + 's {
+        let (project, node_id) = (project.to_owned(), node_id.to_owned());
+        read_resource(db, move |conn| {
+            Box::pin(async move {
+                let job = find_node_job(conn, &project, number, exec_seq, &node_id).await?;
+                let branch = node_branch(conn, &job.id).await?;
+                Ok(Self {
+                    branch,
+                    repo_path: load_repo_path(conn, &job.id).await,
+                    candidates: load_base_candidates(conn, &job.id)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    project_id: load_project_id(conn, &job.id).await,
+                    job_id: job.id,
+                })
+            })
+        })
+    }
 }
 
 async fn load_project_id(conn: &cairn_db::turso::Connection, job_id: &str) -> Option<String> {
@@ -440,21 +523,14 @@ fn capitalized(sentence: &str) -> String {
 /// The page's section for a node whose OWN branch the store knows to be behind
 /// origin, or nothing. Most often the parent of an issue whose child's pull
 /// request was merged into the parent's branch in GitHub's UI.
-async fn own_origin_section(
-    orch: &Orchestrator,
-    conn: &cairn_db::turso::Connection,
-    job_id: &str,
-    branch: &str,
-) -> String {
-    let (Some(project_id), Ok(repo_path)) = (
-        load_project_id(conn, job_id).await,
-        load_repo_path(conn, job_id).await,
-    ) else {
+async fn own_origin_section(orch: &Orchestrator, rows: &NodeRebaseRows, branch: &str) -> String {
+    let (Some(project_id), Ok(repo_path)) = (rows.project_id.as_deref(), rows.repo_path.as_ref())
+    else {
         return String::new();
     };
-    let store = crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(&repo_path));
+    let store = crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(repo_path));
     let Some(drift) =
-        crate::orchestrator::base_branch_sync::known_drift(orch, &project_id, &store, branch).await
+        crate::orchestrator::base_branch_sync::known_drift(orch, project_id, &store, branch).await
     else {
         return String::new();
     };
@@ -579,24 +655,26 @@ fn advance_state(
 /// with which commands a maintainer can.
 async fn conflicted_name_section(
     orch: &Orchestrator,
-    conn: &cairn_db::turso::Connection,
-    job_id: &str,
+    rows: &NodeRebaseRows,
     branch: &str,
 ) -> String {
-    let Ok(repo_path) = load_repo_path(conn, job_id).await else {
+    let Ok(repo_path) = rows.repo_path.as_ref() else {
         return String::new();
     };
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let store = crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(&repo_path));
+    let store = crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(repo_path));
     if !crate::jj::is_jj_dir(&store) {
         return String::new();
     }
     // The base names the column that says which version sits on the newer
     // base; without it the table still renders, just without that column.
-    let base_branch = match load_base_candidates(conn, job_id).await {
-        Ok(candidates) => match resolve_base(&jj, &store, branch, &candidates) {
+    let base_branch = match rows.candidates.as_ref() {
+        Ok(candidates) => match resolve_base(&jj, &store, branch, candidates) {
             Ok(resolved) => Some(resolved.branch),
-            Err(_) => candidates.recorded.or(candidates.project_default),
+            Err(_) => candidates
+                .recorded
+                .clone()
+                .or_else(|| candidates.project_default.clone()),
         },
         Err(_) => None,
     };
@@ -728,12 +806,11 @@ struct LiveStanding {
 
 async fn load_live_standing(
     orch: &Orchestrator,
-    conn: &cairn_db::turso::Connection,
-    job_id: &str,
+    rows: &NodeRebaseRows,
     branch: &str,
     session: &ConflictSession,
 ) -> Result<LiveStanding, String> {
-    let base = load_base_standing(orch, conn, job_id, branch).await?;
+    let base = load_base_standing(orch, rows, branch).await?;
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let store = std::path::PathBuf::from(&session.store_path);
     let tip = crate::jj::bookmark_commit(&jj, &store, branch);
@@ -834,11 +911,11 @@ fn standing_section(session: &ConflictSession, standing: &Result<LiveStanding, S
 async fn render_no_session(
     orch: &Orchestrator,
     db: &crate::storage::LocalDb,
-    conn: &cairn_db::turso::Connection,
-    job_id: &str,
+    rows: &NodeRebaseRows,
     branch: &str,
 ) -> String {
-    let standing = match load_base_standing(orch, conn, job_id, branch).await {
+    let job_id = rows.job_id.as_str();
+    let standing = match load_base_standing(orch, rows, branch).await {
         Ok(standing) => standing,
         Err(why) => {
             return format!(

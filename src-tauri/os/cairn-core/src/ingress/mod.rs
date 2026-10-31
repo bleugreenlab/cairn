@@ -12,19 +12,29 @@
 //! This module owns the two local tables: `ingress_endpoints`, this install's
 //! mirror of the endpoints it minted, and `ingress_events`.
 
+pub mod channel;
 pub mod consume;
+pub mod custody;
 pub mod endpoints;
+pub mod sync;
+pub mod ws;
 
 use cairn_db::turso::params;
 
 use crate::storage::{LocalDb, RowExt};
+
+/// The api's relay, which every install's channel lives on. Follows
+/// `CAIRN_API_URL`, so a dev instance can be pointed at a local api.
+pub fn relay_url() -> String {
+    crate::api::ApiConfig::default().relay_url()
+}
 
 /// Longest body an `ingress_events` row keeps, the api's largest per-endpoint
 /// body cap. A longer body is cut and the row says so.
 pub const MAX_BODY_CHARS: usize = 1024 * 1024;
 
 /// One endpoint as this install knows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EndpointRecord {
     pub id: String,
     pub channel_id: String,
@@ -38,6 +48,10 @@ pub struct EndpointRecord {
     pub granted_at: Option<String>,
     pub created_at: i64,
     pub revoked_at: Option<i64>,
+    /// Where a sender posts; `None` for first-party endpoints.
+    pub url: Option<String>,
+    /// Deliveries the api refused, as it last reported.
+    pub rejected_count: i64,
 }
 
 impl EndpointRecord {
@@ -46,8 +60,7 @@ impl EndpointRecord {
     }
 }
 
-const ENDPOINT_COLUMNS: &str =
-    "id,channel_id,project_id,name,provider,topic,status,granted_at,created_at,revoked_at";
+const ENDPOINT_COLUMNS: &str = "id,channel_id,project_id,name,provider,topic,status,granted_at,created_at,revoked_at,url,rejected_count";
 
 fn endpoint_from_row(row: &cairn_db::turso::Row) -> crate::storage::DbResult<EndpointRecord> {
     Ok(EndpointRecord {
@@ -61,6 +74,8 @@ fn endpoint_from_row(row: &cairn_db::turso::Row) -> crate::storage::DbResult<End
         granted_at: row.opt_text(7)?,
         created_at: row.i64(8)?,
         revoked_at: row.opt_i64(9)?,
+        url: row.opt_text(10)?,
+        rejected_count: row.opt_i64(11)?.unwrap_or(0),
     })
 }
 
@@ -109,6 +124,32 @@ pub async fn endpoint_named(
     .map_err(|error| error.to_string())
 }
 
+/// Every endpoint this install minted, live ones first.
+pub async fn all_endpoints(db: &LocalDb) -> Result<Vec<EndpointRecord>, String> {
+    db.query_all(
+        format!(
+            "SELECT {ENDPOINT_COLUMNS} FROM ingress_endpoints ORDER BY status = 'active' DESC, project_id, name, created_at"
+        ),
+        (),
+        endpoint_from_row,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Every live endpoint on this install.
+pub async fn active_endpoints(db: &LocalDb) -> Result<Vec<EndpointRecord>, String> {
+    db.query_all(
+        format!(
+            "SELECT {ENDPOINT_COLUMNS} FROM ingress_endpoints WHERE status = 'active' ORDER BY project_id, name, created_at"
+        ),
+        (),
+        endpoint_from_row,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
 /// Every endpoint minted for the project, live ones first.
 pub async fn project_endpoints(
     db: &LocalDb,
@@ -128,12 +169,14 @@ pub async fn project_endpoints(
 pub async fn upsert_endpoint(db: &LocalDb, endpoint: &EndpointRecord) -> Result<(), String> {
     let endpoint = endpoint.clone();
     db.execute(
-        "INSERT INTO ingress_endpoints (id, channel_id, project_id, name, provider, topic, status, granted_at, created_at, revoked_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO ingress_endpoints (id, channel_id, project_id, name, provider, topic, status, granted_at, created_at, revoked_at, url, rejected_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(id) DO UPDATE SET
             status = excluded.status,
             granted_at = excluded.granted_at,
-            revoked_at = excluded.revoked_at",
+            revoked_at = excluded.revoked_at,
+            url = COALESCE(excluded.url, ingress_endpoints.url),
+            rejected_count = excluded.rejected_count",
         params![
             endpoint.id,
             endpoint.channel_id,
@@ -144,7 +187,9 @@ pub async fn upsert_endpoint(db: &LocalDb, endpoint: &EndpointRecord) -> Result<
             endpoint.status,
             endpoint.granted_at,
             endpoint.created_at,
-            endpoint.revoked_at
+            endpoint.revoked_at,
+            endpoint.url,
+            endpoint.rejected_count
         ],
     )
     .await

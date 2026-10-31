@@ -242,6 +242,7 @@ async fn bounded_rearm_resolves_agent_branch_from_managed_store() {
         ran_at: 1,
         check_name: "review".to_string(),
         failure_kind: "infrastructure".to_string(),
+        environment_fingerprint: String::new(),
     };
     assert!(
         super::review_push::bounded_candidate_is_due(&orch, &candidate)
@@ -385,11 +386,15 @@ async fn review_wave_scopes(
 }
 
 /// cairn/4983. An enrolled-but-detached machine is a wait, not a refusal, so
-/// the lane goes to placement, fails as infrastructure, and is bounded in the
+/// the lane goes to placement, fails as infrastructure, and is charged in the
 /// FLEET domain. No timer repairs that: the dormant re-arm used to zero the
 /// fleet counter every cooldown, and nominate the job every tick off the
 /// streak-zero re-stamp a suppressed wave leaves behind, so the lane ran three
 /// more times every five minutes for as long as the machine stayed away.
+///
+/// cairn/5671. A fleet counter counts heads, so every wave of this one head is
+/// one count; what keeps the dormant cadence from re-asking it every tick is
+/// that its newest death was against the very fleet the wave would meet.
 ///
 /// The wave is simulated with the real counter: a cleared claim is one
 /// execution and stores a fleet-domain infrastructure failure, a suppressed
@@ -522,6 +527,7 @@ async fn a_fleet_bounded_lane_is_never_released_on_a_timer_and_runs_once_its_mac
                         verdict_platform: None,
                         verdict_arch: None,
                         verdict_environment_hash: None,
+                        transient_within_grace: false,
                     },
                 )
                 .unwrap();
@@ -584,16 +590,14 @@ async fn a_fleet_bounded_lane_is_never_released_on_a_timer_and_runs_once_its_mac
         .await
         .unwrap();
     assert_eq!(
-        fleet_streak,
-        crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
-        "the release never zeroes a fleet-domain counter, however long it has cooled"
+        fleet_streak, 1,
+        "six waves of one head against one fleet are one arm cycle"
     );
     assert!(!rearm_one_bounded_failed_review(&orch).await);
     assert!(!wave_scheduled(&orch, "j-prod"));
     assert_eq!(
-        executions,
-        crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
-        "three executions for this input hash while the fleet stays as it is"
+        executions, 6,
+        "the agent's own waves ran; twenty dormant ticks added none while the fleet stayed as it is"
     );
 
     // The machine attaches. Its arrival moves the fleet's capability identity,
@@ -628,6 +632,7 @@ async fn a_fleet_bounded_lane_is_never_released_on_a_timer_and_runs_once_its_mac
                 liveness_observed_at_unix_ms: None,
                 facts_stale_refresh_blocked: None,
                 last_refresh: None,
+                node_scratches: Vec::new(),
             },
             sender,
             false,

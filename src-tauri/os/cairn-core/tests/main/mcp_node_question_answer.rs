@@ -173,12 +173,14 @@ async fn a_thread_answering_its_question_records_the_canonical_thread_actor() {
 
 fn change_request(payload: serde_json::Value) -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: String::new(),
         run_id: None,
         tool: "write".to_string(),
         payload,
         tool_use_id: None,
+        origin: None,
     }
 }
 
@@ -241,12 +243,14 @@ async fn pending_question_read_shows_answer_action() {
     let output = handle_read_file(
         &orch,
         &McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: String::new(),
             run_id: None,
             tool: "read".to_string(),
             payload: json!({"path": "cairn://p/tqa/1/1/builder/questions/q-1"}),
             tool_use_id: None,
+            origin: None,
         },
     )
     .await;
@@ -275,12 +279,14 @@ async fn file_read_returns_structured_text_without_implicit_2000_line_cap() {
     let output = handle_read_file(
         &orch,
         &McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: temp.path().display().to_string(),
             run_id: None,
             tool: "read".to_string(),
             payload: json!({"path": "file:large.txt"}),
             tool_use_id: None,
+            origin: None,
         },
     )
     .await;
@@ -304,12 +310,14 @@ async fn file_read_preview_is_bounded_but_reports_true_total() {
     let output = handle_read_file(
         &orch,
         &McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: temp.path().display().to_string(),
             run_id: None,
             tool: "read".to_string(),
             payload: json!({"path": "file:huge.log"}),
             tool_use_id: None,
+            origin: None,
         },
     )
     .await;
@@ -334,12 +342,14 @@ async fn file_read_negative_offset_resolves_to_tail_window() {
     let output = handle_read_file(
         &orch,
         &McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: temp.path().display().to_string(),
             run_id: None,
             tool: "read".to_string(),
             payload: json!({"path": "file:tail.txt", "offset": -2}),
             tool_use_id: None,
+            origin: None,
         },
     )
     .await;

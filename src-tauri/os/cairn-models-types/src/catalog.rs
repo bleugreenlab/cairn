@@ -196,6 +196,26 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
             "self-hosted",
         ],
     },
+    ProviderDescriptor {
+        key: Cow::Borrowed(INFERENCE_BACKEND_KEY),
+        display_name: Cow::Borrowed("Cairn inference"),
+        category: ProviderCategory::Local,
+        // It holds no account: its models are cairn-inference's deployment
+        // records. Custom is the placeholder Cairn's own gateway uses too.
+        api_provider: ApiProvider::Custom,
+        summary: "The models Cairn's own inference deployments serve, loaded on demand: asking for one that is not loaded loads it.",
+        setup_action: "Open inference",
+        setup_requirement: "Cairn holds no inference deployments yet. Link bginf or add a deployment; cairn://inference lists them.",
+        catalog_driven: false,
+        supports_mcp_install: false,
+        keywords: &[
+            "inference",
+            "local",
+            "deployment",
+            "vllm",
+            "self-hosted",
+        ],
+    },
 ];
 
 /// The prefix every custom provider's backend key carries.
@@ -383,6 +403,7 @@ where
 pub const OPENCODE_BACKEND_KEY: &str = "opencode-go";
 pub const TYPESAFE_BACKEND_KEY: &str = "typesafe";
 pub const ACTUAL_BACKEND_KEY: &str = "actual";
+pub const INFERENCE_BACKEND_KEY: &str = "inference";
 pub const CLAUDE_FAMILY_BACKEND: &str = "claude";
 /// The persisted backend key of a Codex session.
 pub const CODEX_BACKEND: &str = "codex";

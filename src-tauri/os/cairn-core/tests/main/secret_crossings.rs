@@ -95,6 +95,7 @@ async fn fixture() -> (
 
 fn write_request(target: &str, content: &str) -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: Some("run-1".to_string()),
@@ -107,17 +108,20 @@ fn write_request(target: &str, content: &str) -> McpCallbackRequest {
             }],
         }),
         tool_use_id: None,
+        origin: None,
     }
 }
 
 fn read_request(path: &str) -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: Some("run-1".to_string()),
         tool: "read".to_string(),
         payload: serde_json::json!({ "path": path }),
         tool_use_id: None,
+        origin: None,
     }
 }
 
@@ -196,6 +200,7 @@ async fn a_secret_nested_deep_in_tool_input_is_still_found() {
     let (_temp, orch, cursors) = fixture().await;
 
     let request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: Some("run-1".to_string()),
@@ -208,6 +213,7 @@ async fn a_secret_nested_deep_in_tool_input_is_still_found() {
             }],
         }),
         tool_use_id: None,
+        origin: None,
     };
 
     let output = dispatch_tool(&orch, &request, &cursors).await.into_inner();

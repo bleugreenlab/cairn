@@ -16,6 +16,7 @@ use cairn_common::uri::{
 };
 use serde_json::Value;
 
+use super::paging::RecordPage;
 use crate::orchestrator::Orchestrator;
 use crate::routes::FactRegistry;
 use crate::storage::{FactFilter, FactRow, FactScope, FactWake, RouteFiringRecord};
@@ -407,15 +408,31 @@ pub(crate) async fn list(
     project: Option<&str>,
     params: &[QueryParam],
 ) -> String {
-    let query = match parse_list_query(params) {
-        Ok(query) => query,
-        Err(error) => return error,
-    };
+    match list_page(orch, project, params).await {
+        Ok(page) => {
+            let mut out = page.body;
+            if page.more {
+                out.push_str(&format!(
+                    "\nMore rows may follow: add `offset={}`.\n",
+                    page.offset + page.limit
+                ));
+            }
+            out
+        }
+        Err(error) => error,
+    }
+}
+
+/// One page of [`list`], counted in rows. The total is not counted: a `match=`
+/// listing would have to scan every row to know it.
+pub(crate) async fn list_page(
+    orch: &Orchestrator,
+    project: Option<&str>,
+    params: &[QueryParam],
+) -> Result<RecordPage, String> {
+    let query = parse_list_query(params)?;
     let scope = match project {
-        Some(project) => match project_id_for_key(orch, project).await {
-            Ok(id) => FactScope::Project(id),
-            Err(error) => return error,
-        },
+        Some(project) => FactScope::Project(project_id_for_key(orch, project).await?),
         None => FactScope::Workspace,
     };
     let filter = |limit, offset| FactFilter {
@@ -429,12 +446,9 @@ pub(crate) async fn list(
     };
     let mut scan_note = None;
     let rows = match &query.matcher {
-        None => match crate::storage::list_facts(&orch.db.local, filter(query.limit, query.offset))
+        None => crate::storage::list_facts(&orch.db.local, filter(query.limit, query.offset))
             .await
-        {
-            Ok(rows) => rows,
-            Err(error) => return error.to_string(),
-        },
+            .map_err(|error| error.to_string())?,
         // The clause is evaluated in Rust by the trigger matcher, so the scan
         // pages through the source's rows; `offset` and `limit` count matches.
         Some(clause) => {
@@ -442,15 +456,10 @@ pub(crate) async fn list(
             let mut skipped = 0;
             let mut scanned = 0;
             'scan: while scanned < MATCH_SCAN_ROWS {
-                let page = match crate::storage::list_facts(
-                    &orch.db.local,
-                    filter(MATCH_SCAN_PAGE, scanned),
-                )
-                .await
-                {
-                    Ok(page) => page,
-                    Err(error) => return error.to_string(),
-                };
+                let page =
+                    crate::storage::list_facts(&orch.db.local, filter(MATCH_SCAN_PAGE, scanned))
+                        .await
+                        .map_err(|error| error.to_string())?;
                 let exhausted = (page.len() as i64) < MATCH_SCAN_PAGE;
                 scanned += page.len() as i64;
                 for row in page {
@@ -489,7 +498,6 @@ pub(crate) async fn list(
     );
     if rows.is_empty() {
         out.push_str("\nNo events match.\n");
-        return out;
     }
     for row in &rows {
         let firings = firings_for(orch, row).await;
@@ -505,16 +513,22 @@ pub(crate) async fn list(
             row.record_ref,
         ));
     }
-    if rows.len() as i64 == query.limit {
-        out.push_str(&format!(
-            "\nMore rows may follow: add `offset={}`.\n",
-            query.offset + query.limit
-        ));
-    }
     if let Some(note) = scan_note {
         out.push_str(&note);
     }
-    out
+    Ok(RecordPage {
+        body: out,
+        noun: "events",
+        offset: query.offset as usize,
+        limit: query.limit as usize,
+        shown: rows.len(),
+        total: None,
+        // A full page is the only signal a further one may exist.
+        more: !rows.is_empty() && rows.len() as i64 == query.limit,
+        // Each row renders as several lines, so a cut page cannot be
+        // recounted and continues from its own start under a smaller limit.
+        prelude_lines: None,
+    })
 }
 
 /// What a source's `record_id` is a key of.
@@ -802,6 +816,8 @@ mod tests {
                     granted_at: None,
                     created_at: 1,
                     revoked_at: None,
+                    url: None,
+                    rejected_count: 0,
                 },
             )
             .await

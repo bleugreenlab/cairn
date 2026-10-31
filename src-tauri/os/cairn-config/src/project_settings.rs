@@ -99,6 +99,41 @@ pub struct ProjectSettingsFile {
     /// the branch being landed, so no branch can change the rules it lands by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landing: Option<LandingSettings>,
+    /// The node scratch: how much of a node's `$TMPDIR` may travel between
+    /// machines. See docs/execution-fabric.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<ScratchSettings>,
+}
+
+/// The `scratch` section of `.cairn/config.yaml`.
+///
+/// Unknown keys are refused: a misspelled `ceilingMB` would otherwise leave the
+/// default ceiling in force while the project believed it had raised it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScratchSettings {
+    /// Synced, uncompressed bytes a node's scratch may hold, in MiB. A
+    /// write-back that would grow the scratch past it is refused by name.
+    #[serde(
+        default,
+        rename = "ceilingMiB",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ceiling_mib: Option<u64>,
+}
+
+/// The node scratch ceiling when a project sets none: 512 MiB, the object
+/// codec's per-pack cap, so any one file that fits a transfer fits the scratch.
+pub const DEFAULT_SCRATCH_CEILING_MIB: u64 = 512;
+
+impl ScratchSettings {
+    /// The ceiling in bytes, falling back to [`DEFAULT_SCRATCH_CEILING_MIB`].
+    pub fn ceiling_bytes(settings: Option<&Self>) -> u64 {
+        settings
+            .and_then(|settings| settings.ceiling_mib)
+            .unwrap_or(DEFAULT_SCRATCH_CEILING_MIB)
+            .saturating_mul(1024 * 1024)
+    }
 }
 
 /// One upstream tool pin a `pinBump` merge may advance.
@@ -290,6 +325,8 @@ struct LegacyProjectSettingsFile {
     landing: Option<LandingSettings>,
     #[serde(default)]
     pin_bumps: Option<BTreeMap<String, PinBumpSpec>>,
+    #[serde(default)]
+    scratch: Option<ScratchSettings>,
 }
 
 /// Legacy terminal command with persistent field
@@ -582,6 +619,7 @@ fn parse_project_settings_under(
         contextual_packages: legacy.contextual_packages,
         landing: legacy.landing,
         pin_bumps: legacy.pin_bumps,
+        scratch: legacy.scratch,
     };
 
     if let Some(policy) = &mut settings.contextual_packages {
@@ -1402,6 +1440,25 @@ mod tests {
     }
 
     #[test]
+    fn scratch_ceiling_parses_strictly_and_defaults_to_512_mib() {
+        let parsed: ProjectSettingsFile =
+            serde_yaml::from_str("scratch:\n  ceilingMiB: 2048\n").unwrap();
+        assert_eq!(
+            ScratchSettings::ceiling_bytes(parsed.scratch.as_ref()),
+            2048 * 1024 * 1024
+        );
+        assert_eq!(
+            ScratchSettings::ceiling_bytes(None),
+            512 * 1024 * 1024,
+            "an unset ceiling is the codec's per-pack cap"
+        );
+        assert!(
+            serde_yaml::from_str::<ProjectSettingsFile>("scratch:\n  ceilingMB: 2048\n").is_err(),
+            "a misspelled ceiling must be refused, not silently ignored"
+        );
+    }
+
+    #[test]
     fn transactional_mutation_refuses_malformed_and_preserves_unknown_content() {
         let temp = TempDir::new().unwrap();
         init_git_repo(temp.path());
@@ -2175,7 +2232,7 @@ copyFiles:
 
     fn git_init(path: &Path) {
         assert!(crate::env::git()
-            .args(["init", "-q"])
+            .args(["init", "-b", "main", "-q"])
             .current_dir(path)
             .status()
             .unwrap()
@@ -2184,7 +2241,7 @@ copyFiles:
 
     fn git_bare(path: &Path) {
         assert!(crate::env::git()
-            .args(["init", "--bare", "-q"])
+            .args(["init", "-b", "main", "--bare", "-q"])
             .current_dir(path)
             .status()
             .unwrap()
@@ -2589,7 +2646,7 @@ activeBackend: codex
 
     fn init_git_repo(path: &Path) {
         assert!(crate::env::git()
-            .args(["init", "-q"])
+            .args(["init", "-b", "main", "-q"])
             .current_dir(path)
             .status()
             .unwrap()

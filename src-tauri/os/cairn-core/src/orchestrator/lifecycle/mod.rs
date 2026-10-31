@@ -37,7 +37,7 @@ pub use finalize::{fail_run, finalize_run, transition_to_warm_state, warm_provid
 pub(crate) use finalize::{
     finalize_run_for_operator_compact, finalize_run_for_recovery,
     interrupt_run_for_provider_depletion, memory_review_turn_ended, record_run_failure_if_active,
-    release_and_stop_process, report_recovery_launch_failure,
+    release_and_stop_process,
 };
 pub use review_push::{
     create_review_push_for_pr_open, evaluate_review_readiness, rearm_one_bounded_failed_review,

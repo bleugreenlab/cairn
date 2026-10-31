@@ -598,6 +598,12 @@ pub struct SandboxCapabilityEvidence {
     /// `sandbox_apply` (cairn/5316).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nested_sandbox_write_context: Option<NestedSandboxProbeContext>,
+    /// Whether a fenced spawn's denial can be recovered by path on this
+    /// machine, which on macOS means reading the kernel's Seatbelt violations
+    /// from the unified log. Absent from an executor that predates it and on
+    /// a platform with no such recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub violation_recovery: Option<ViolationRecoveryEvidence>,
 }
 
 impl SandboxCapabilityEvidence {
@@ -650,6 +656,44 @@ pub enum SandboxLauncherClass {
     ConfinedDescendant,
     /// The executor could not tell, so its measurement is never reused.
     Unknown,
+}
+
+/// Whether this machine recovers a fenced spawn's denial by path, measured by
+/// recovering one.
+///
+/// Seatbelt stops a denied write whether or not anyone is watching; what the
+/// unified-log stream adds is the denied path, which is what attributes the
+/// denial and scopes the crossing an agent may ask for. `log stream` refuses an
+/// account outside `admin`, so a non-admin executor account reaches it only
+/// through the operator's one-command sudo rule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ViolationRecoveryEvidence {
+    /// How this machine starts the stream, decided by the executor account's
+    /// `admin` membership when the stream was last started.
+    pub access: ViolationStreamAccess,
+    pub outcome: ViolationRecoveryOutcome,
+    pub measured_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ViolationStreamAccess {
+    /// The account is in `admin` and runs `log stream` itself.
+    Admin,
+    /// The account is not in `admin` and runs it as `sudo -n`, which only the
+    /// installed rule for exactly that command permits.
+    SudoRule,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ViolationRecoveryOutcome {
+    /// A canary spawn's denial came back through the stream with its path.
+    Measured { detail: String },
+    /// Nothing established that recovery works here; `reason` is the refusal
+    /// or failure that stopped it, verbatim where a tool printed one.
+    Unmeasured { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -847,9 +891,27 @@ pub enum EdgeId {
     RunnerArtifactReleaseFetch,
     ExecutionQueueOffer,
     OperatorCredentialRead,
+    BatchSpawnHostSocketConfined,
+    BatchSpawnHostSocketReadOnlyCheckout,
+    BatchSpawnHostSocketUnconfined,
+    PipedResidentHostSocketConfined,
+    PipedResidentHostSocketReadOnlyCheckout,
+    PipedResidentHostSocketUnconfined,
+    PtyResidentHostSocketConfined,
+    PtyResidentHostSocketReadOnlyCheckout,
+    PtyResidentHostSocketUnconfined,
+    ReplHostSocketConfined,
+    ReplHostSocketReadOnlyCheckout,
+    ReplHostSocketUnconfined,
+    WorkflowHostSocketConfined,
+    WorkflowHostSocketReadOnlyCheckout,
+    WorkflowHostSocketUnconfined,
+    DevInstanceHostSocketConfined,
+    DevInstanceHostSocketReadOnlyCheckout,
+    DevInstanceHostSocketUnconfined,
 }
 impl EdgeId {
-    pub const COUNT: usize = 56;
+    pub const COUNT: usize = 74;
     pub const fn definition(self) -> &'static EdgeDefinition {
         &CONTAINMENT_EDGE_DEFINITIONS[self as usize]
     }
@@ -2398,6 +2460,432 @@ pub const CONTAINMENT_EDGE_DEFINITIONS: [EdgeDefinition; EdgeId::COUNT] = [
         claim_revision: 1,
         supported_probe_versions: PROBE_VERSIONS,
     },
+    // A cell reaching a host service over a unix socket the fence did not
+    // create: the user bus (and through it `systemd-run --user`, which starts
+    // a unit outside every confinement), the systemd, gpg and ssh agents,
+    // X11/Wayland/at-spi, podman, and any same-uid tmux server. One edge per
+    // process class and policy mode, as for the filesystem seams, because the
+    // mode is what decides whether a landlock ruleset is installed at all.
+    // Mediated by the sandbox profile: on Linux, landlock's RESOLVE_UNIX
+    // (ABI 9) for pathname sockets and the abstract-socket scope (ABI 6). Below
+    // ABI 9 the probe measures pathname sockets reachable and the edge is
+    // Ambient. A server the job started inside its own fence -- in its own
+    // domain, or beneath its cell scratch or writable worktree -- stays
+    // reachable and is not this crossing.
+    EdgeDefinition {
+        id: EdgeId::BatchSpawnHostSocketConfined,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::BatchSpawn,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::Confined,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::SandboxProfile,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::BatchSpawnHostSocketReadOnlyCheckout,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::BatchSpawn,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::ReadOnlyCheckout,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::SandboxProfile,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::BatchSpawnHostSocketUnconfined,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::BatchSpawn,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::Unconfined,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::Unmediated,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::PipedResidentHostSocketConfined,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::PipedResident,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::Confined,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::SandboxProfile,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::PipedResidentHostSocketReadOnlyCheckout,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::PipedResident,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::ReadOnlyCheckout,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::SandboxProfile,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::PipedResidentHostSocketUnconfined,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::PipedResident,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::Unconfined,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::Unmediated,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::PtyResidentHostSocketConfined,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::PtyResident,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::Confined,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::SandboxProfile,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::PtyResidentHostSocketReadOnlyCheckout,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::PtyResident,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::ReadOnlyCheckout,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::SandboxProfile,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::PtyResidentHostSocketUnconfined,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::PtyResident,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::Unconfined,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::Unmediated,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::ReplHostSocketConfined,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::Repl,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::Confined,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::SandboxProfile,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::ReplHostSocketReadOnlyCheckout,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::Repl,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::ReadOnlyCheckout,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::SandboxProfile,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::ReplHostSocketUnconfined,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::Repl,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::Unconfined,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::Unmediated,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::WorkflowHostSocketConfined,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::Workflow,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::Confined,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::SandboxProfile,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::WorkflowHostSocketReadOnlyCheckout,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::Workflow,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::ReadOnlyCheckout,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::SandboxProfile,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::WorkflowHostSocketUnconfined,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::Workflow,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::Unconfined,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::Unmediated,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::DevInstanceHostSocketConfined,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::DevInstance,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::Confined,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::SandboxProfile,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::DevInstanceHostSocketReadOnlyCheckout,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::DevInstance,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::ReadOnlyCheckout,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::SandboxProfile,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    EdgeDefinition {
+        id: EdgeId::DevInstanceHostSocketUnconfined,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::DevInstance,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::Unconfined,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::Unmediated,
+        scoping: EdgeScoping::Cell,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: FILESYSTEM_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
 ];
 // CONTAINMENT_INVENTORY_END
 
@@ -2462,6 +2950,24 @@ pub const CONTAINMENT_EDGE_IDS: [EdgeId; EdgeId::COUNT] = [
     EdgeId::RunnerArtifactReleaseFetch,
     EdgeId::ExecutionQueueOffer,
     EdgeId::OperatorCredentialRead,
+    EdgeId::BatchSpawnHostSocketConfined,
+    EdgeId::BatchSpawnHostSocketReadOnlyCheckout,
+    EdgeId::BatchSpawnHostSocketUnconfined,
+    EdgeId::PipedResidentHostSocketConfined,
+    EdgeId::PipedResidentHostSocketReadOnlyCheckout,
+    EdgeId::PipedResidentHostSocketUnconfined,
+    EdgeId::PtyResidentHostSocketConfined,
+    EdgeId::PtyResidentHostSocketReadOnlyCheckout,
+    EdgeId::PtyResidentHostSocketUnconfined,
+    EdgeId::ReplHostSocketConfined,
+    EdgeId::ReplHostSocketReadOnlyCheckout,
+    EdgeId::ReplHostSocketUnconfined,
+    EdgeId::WorkflowHostSocketConfined,
+    EdgeId::WorkflowHostSocketReadOnlyCheckout,
+    EdgeId::WorkflowHostSocketUnconfined,
+    EdgeId::DevInstanceHostSocketConfined,
+    EdgeId::DevInstanceHostSocketReadOnlyCheckout,
+    EdgeId::DevInstanceHostSocketUnconfined,
 ];
 const _: () = assert!(CONTAINMENT_EDGE_IDS.len() == EdgeId::COUNT);
 
@@ -4763,7 +5269,7 @@ pub struct LearnedResourceEstimate {
 /// runtime thread, with a count) are defaulted, so an older executor's
 /// advertisement reads as an unmeasured gap rather than as an idle machine or
 /// a clean runtime. [`PlacementPrediction::memory_pressure`] and
-/// [`MemoryPressurePrice`] are the runner's own decision record, which no
+/// [`HostStallPrice`] (then `MemoryPressurePrice`) are the runner's own decision record, which no
 /// executor decodes. The rest of cairn/5135 is behaviour, not wire: the systemd
 /// unit (`OOMPolicy=continue`, a 5 s restart, a 15 s stop window) and its
 /// self-refresh, a stop bounded by [`EXECUTOR_STOP_DEADLINE_MS`] with a
@@ -4796,6 +5302,35 @@ pub struct LearnedResourceEstimate {
 /// renders as unforecastable. No frame changes shape and an older runner reads
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
+///
+/// cairn/5674 does not move the number. `process_identity` gains
+/// `kernel_thread_states`, a local read of `/proc/<pid>/task` that the runner
+/// appends to its own log lines and failure diagnostics when a colocated
+/// executor goes silent at startup or outlives SIGKILL; it is never
+/// serialized. The executor writes its boot-scoped occupancy lineage record
+/// without fsync, a file only it reads. No frame, variant, field or serialized
+/// form changes, and a runner talking to an older executor gets nothing wrong.
+///
+/// cairn/5661 does not move the number. The runner reads, for the inference
+/// pool controller, how many batches the machines of a pool are executing and
+/// at which submitted priority (from the snapshots they already post), and how
+/// many queued entries those machines declined for a reason an unload would
+/// relieve (from the runner's own queue). Both are reads of state the runner
+/// already holds; nothing is sent, and no variant, field or serialized form
+/// changes. An older executor that reports no priority has its batches counted
+/// as restartable, which is what they are unless it says otherwise. A runner
+/// talking to an older executor gets nothing wrong.
+///
+/// cairn/5650 does not move the number. The runner composes its placement
+/// refusals from each request's recorded declines rather than from its own
+/// reading of a machine at composition time, and names every machine a
+/// refusal passed over with the part of the selector it failed. Both happen in
+/// the runner-only `fleet/mod.rs`. The one edit here is the text
+/// [`PlacementRejectionReason::describe`] renders for `Drained` and
+/// `UpdatePending` (a comma where a semicolon was, so the reason reads as one
+/// item inside a `;`-separated list); `describe` output is display text that
+/// no peer parses, and no variant, field or serialized form changes. A runner
+/// talking to an older executor gets nothing wrong.
 ///
 /// cairn/5194 does not move the number. It journals the runner's own lifecycle
 /// facts (attaches, detaches, link resets, listener restages, runtime stalls)
@@ -4908,6 +5443,14 @@ pub struct LearnedResourceEstimate {
 /// reinterprets a field. What a runner gets wrong talking to an older
 /// executor: nothing, because the older executor is sent only a release it
 /// already handles.
+///
+/// cairn/5523 does not move the number. The runner-only `fleet/mod.rs` now
+/// hands the `command` a `SandboxDenied` callback already carries to the fence
+/// for a `SandboxDenial::Path` as well as for `SandboxDenial::Command`, so a
+/// blocked git writer whose denied path was recovered is answered with its
+/// instructive refusal instead of a prompt. No frame gains, loses, or
+/// reinterprets a field. What a runner gets wrong talking to an older
+/// executor: nothing, because every executor already sends that command.
 ///
 /// cairn/5427 does not move the number. It removes the landing compile gate,
 /// the one runner caller that shortened a review check request's
@@ -5198,7 +5741,279 @@ pub struct LearnedResourceEstimate {
 /// nothing; that executor's lanes report phases whose `origin` is `process`,
 /// timed from the runner script's own start, so their setup omits the
 /// command's prelude and says so.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 157;
+///
+/// cairn/5430 does not move the number. The executor's machine-local Cargo
+/// dependency catalog now carries path-package build products with a record
+/// of its producer's checkout, a consumer cell's checkout takes the producer's
+/// modification times where its content matches, and a cell seeded from the
+/// catalog or by clone loses every unit that bakes in its producer's path.
+/// All of it happens inside one executor's cells and catalog; no frame, field
+/// or value either peer decodes changes. What a runner gets wrong talking to
+/// an older executor: nothing; that executor's cells compile more.
+///
+/// Version 158 (cairn/5253) gives every node a portable scratch. A placed batch
+/// ([`ProcessBatch::node_scratch`]) and a terminal or REPL
+/// ([`ResidentProcessSpec::node_scratch`]) carry a [`NodeScratchGrant`]: the
+/// executor makes a replica of the node's scratch its `$TMPDIR`, brings it
+/// current over the object channel's `scratch/*` routes before work starts,
+/// and writes it back when work ends, reporting a [`ScratchSyncReport`] on
+/// [`CellOutcome::Completed`]. It advertises its replicas
+/// ([`ExecutorAdvertisement::node_scratches`]), accounts them
+/// ([`DiskCategoryAccounting::node_scratch_bytes`]), and removes one on
+/// [`ExecutorMessage::DeleteNodeScratch`], answering
+/// [`ExecutorMessage::NodeScratchDeleted`]. A colocated executor is now issued
+/// an object-channel credential too, because the scratch routes are how every
+/// machine reaches the store. What a runner gets wrong talking to a 157
+/// executor: that executor ignores the grant and runs the batch in a private
+/// `$TMPDIR` that never syncs, and it cannot decode the two new frames. That
+/// reads fail-open, so the number moves (tenet 541).
+///
+/// Version 159 (cairn/5083) adds the host-socket containment edges, one per
+/// process class and policy mode: [`EdgeId::BatchSpawnHostSocketConfined`]
+/// through [`EdgeId::DevInstanceHostSocketUnconfined`]. Each is a new enum
+/// variant an older peer cannot decode, in the observation matrix an executor
+/// advertises and in any envelope a runner sends. It is a version for safety
+/// as well as shape: an older executor installs no socket rules, so a runner
+/// must not read its silence about these edges as their absence. The same
+/// change confines a Linux executor's PTY residents with landlock, as its
+/// batches and piped residents already were, sets `TMUX_TMPDIR` to the
+/// spawn's `$TMPDIR` (the cell scratch, or the node scratch replica), and
+/// grants socket resolution beneath it; none of those is a frame or field. What a runner gets
+/// wrong talking to an older executor: nothing; that executor is updated by
+/// build hash before it takes work.
+///
+/// cairn/5528 does not move the number. A fenced batch whose `$TMPDIR` is a
+/// node scratch replica keeps its `CAIRN_CHECK_RESULT_PATH` handoff under the
+/// cell's own scratch, and the executor now grants its sandbox writes to that
+/// one per-attempt handoff directory. It is a policy the executor builds for
+/// its own spawn; no frame or field changes. What a runner gets wrong talking
+/// to an older executor: nothing it would decode differently. That executor's
+/// fence still refuses the handoff write, surfacing as a fence crossing on the
+/// command, until it runs a build carrying this.
+///
+/// cairn/5510 does not move the number. A resident executor's exit record
+/// ([`ResidentExecutorExit`]) gains two optional fields counting the run of
+/// exits since it last attached, and the wait before a refused executor exits
+/// now doubles across that run; both stay on the executor's own disk and in
+/// `service status --json`, never on the link. The runner keeps, per enrolled
+/// machine, the protocol it was last refused on, and says on
+/// [`EnrolledRemote::stranded`] when it has no artifact to repair that machine
+/// with; that field travels to the desktop, not to an executor. What a runner
+/// gets wrong talking to an older executor: nothing; that executor's refusal
+/// wait stays a fixed minute until it runs a build carrying this.
+///
+/// cairn/4887 does not move the number. The relayed `CallbackRequest` gains an
+/// optional, defaulted `answer_bound_ms` (the longest its sender waits for the
+/// host), and the executor's MCP relay now sizes its own wait from a `run`
+/// batch's declared need and caps the stated bound at the host's. What a
+/// runner gets wrong talking to an older executor: nothing. That executor
+/// deserializes the request into its own struct and re-serializes it without
+/// the field, so the runner sees no stated bound and answers within the
+/// legacy grace-plus-reserve bound, which fits inside the older relay's
+/// grace-sized wait.
+///
+/// cairn/5497 does not move the number. An executor now keeps every `$TMPDIR`
+/// it exports under a short root beside `build-slots/`, a cell's scratch as
+/// `tmp/c<hex>` and a node scratch replica as `tmp/n<hex>/`, so a unix socket
+/// bound beneath one fits `sun_path`. That layout is the executor's own disk:
+/// a grant still names a scratch by id, an advertised replica still carries
+/// that id, and no path the runner reads or writes moves. What a runner gets
+/// wrong talking to an older executor: nothing; that executor's `$TMPDIR`
+/// stays too long for most socket names until it runs a build carrying this.
+///
+/// cairn/5549 does not move the number. [`CommandStop::Silent`] gains two
+/// defaulted fields, `storage_io_bytes_in_window` and `tree` (a bounded list
+/// of [`StoppedProcess`]), and its description names storage I/O beside
+/// output and CPU. The executor's stall stop now counts storage I/O, and a
+/// member waiting on storage when the stop is decided, as progress, and keeps
+/// a leader's own exit when the stop races it; both change only when one
+/// executor ends its own command. [`PlacementPrediction::io_pressure`] prices
+/// the I/O stall executors already advertise (`HostHealth::io_pressure`) the
+/// way memory's is priced, with the price type renamed [`HostStallPrice`] and
+/// its JSON unchanged; it is the runner's own decision record, which no
+/// executor decodes. What a runner gets wrong talking to an older executor:
+/// nothing; that executor's stops arrive without the two fields and render as
+/// before, and it goes on stopping disk-bound trees until it runs a build
+/// carrying this. An older runner ignores the fields.
+///
+/// cairn/5551 does not move the number. [`SandboxCapabilityEvidence`] gains an
+/// optional, defaulted `violation_recovery` saying whether this machine's
+/// fenced denials can be recovered by path, and the executor now starts its
+/// violation stream through `sudo -n` when its account is not in `admin`.
+/// Neither struct refuses unknown keys. What a runner gets wrong talking to an
+/// older executor: nothing; it shows recovery as not reported, which is what it
+/// knew before. Placement reads none of it.
+///
+/// cairn/5614 does not move the number. No field or variant changes:
+/// [`BuildPrerequisiteCheck`] keeps its shape, and the executor now stages the
+/// libraries its prerequisite script sources, asks the script's
+/// prerequisites-only mode (so its `script` string reads `--check-prerequisites`
+/// where it read `--check`; placement takes only the path before the first
+/// space), and reports a script that died on the shell's own error as
+/// `Unchecked`, a status every runner already treats as gating nothing. What a
+/// runner gets wrong talking to an older executor: nothing it decodes
+/// differently. That executor's stale `Missing` from a probe that could not
+/// run is read through [`BuildPrerequisiteCheck::effective_status`] as
+/// `Unchecked`, and it reports such verdicts until it runs a build carrying
+/// this. An older runner shows the new verdicts as it shows any other.
+///
+/// cairn/5600 does not move the number. [`ExecutorMessage::Heartbeat`] gains an
+/// optional, defaulted `machine` ([`MachineSample`]), and the executor's CPU
+/// sampler now sends [`ExecutorMessage::MachineSampled`] in place of the whole
+/// snapshot it used to publish on every tick. The runner takes each reading
+/// either one carries only when it was measured after the one it holds. What a
+/// runner gets wrong talking to an older executor: nothing. That executor sends
+/// neither, its health is read exactly as before, and its readings still
+/// freeze while its pool state is held until it runs a build carrying this. An
+/// older runner logs `MachineSampled` as unrecognised and ignores `machine`, so
+/// it hears a newer executor's CPU brake only from refresh passes thirty
+/// seconds apart and treats it as blind between them. That window opens only
+/// when a runner is older than the executors it directs, and the build-id
+/// rollout (cairn/5311) closes it by moving them onto the runner's build.
+///
+/// cairn/5652 does not move the number. No field or variant changes. A starting
+/// executor now attaches before its build-prerequisite check and its
+/// containment and sandbox probes have run, so its first Hello carries an
+/// `Unchecked` prerequisite verdict and no containment or sandbox evidence,
+/// and it sends the measured values in [`ExecutorMessage::AdvertisementUpdated`]
+/// the moment each lands. `Unchecked` gates nothing, absent containment is the
+/// placeholder every runner already holds before an advertisement arrives, and
+/// every runner already applies `AdvertisementUpdated`. What a runner gets
+/// wrong talking to an older executor: nothing; that executor measures before
+/// attaching, as before. The startup progress lines
+/// ([`EXECUTOR_STARTUP_PROGRESS_MARKER`]) travel on the colocated child's
+/// stderr, which only the supervisor that spawned it from its own build reads.
+///
+/// cairn/5653 does not move the number. [`ScratchSyncReport`] gains an
+/// optional, defaulted `not_synced_bytes` and [`ScratchRefusal`] an optional,
+/// defaulted `largest_directories`, both lists of [`ScratchEntrySize`], and
+/// neither struct refuses unknown keys. The executor also leaves more of a
+/// node scratch behind (test harness temp roots and cache-tagged directories,
+/// see [`node_scratch_unsynced_name`]), which changes what it uploads but no
+/// shape, and gives a batch whose `$TMPDIR` is a node scratch a
+/// `CAIRN_CELL_TMPDIR` under the cell's own scratch. What a runner gets wrong
+/// talking to an older executor: nothing; it names the directories that do
+/// not travel without their sizes, and that executor keeps carrying test
+/// temp roots until it runs a build carrying this. An older runner ignores
+/// both lists, and an older executor decodes a refusal that carries
+/// `largest_directories` as it decodes any other.
+///
+/// cairn/5472 does not move the number. It adds
+/// [`PlacementOutcome::Waiting`] and
+/// [`PlacementRejectionReason::MemoryKillExcluded`], both of which only the
+/// runner constructs and renders: placement decisions are the runner's record,
+/// and the one place they meet an executor's frame, a queued request's
+/// `placement`, is filled in by the runner on its own aggregate after the
+/// snapshot arrives and is never sent back. What a runner gets wrong talking
+/// to an older executor: nothing; that executor is offered less work (never
+/// a command the kernel killed there while it ran alone), in messages it
+/// already decodes.
+///
+/// cairn/5150 does not move the number. A removal now drains the machine in
+/// the runner's memory before it reads occupancy, and clears that drain when it
+/// ends. The machine is told with the [`ExecutorMessage::DrainModeRequest`]
+/// attaching already sends, without waiting for its answer. What a runner gets
+/// wrong talking to an older executor: nothing; that executor has handled the
+/// request since drains existed, and the runner's own refusal to place work is
+/// what holds whether it answers or not.
+///
+/// cairn/5639 does not move the number. It adds `WRITE_CHECK_START_WAIT_MS` to
+/// the `write` verb's time contract, a bound the runner alone reads to decide
+/// how long a committing call waits for its when:write checks to be claimed.
+/// No frame changes shape and no field changes meaning. What a runner gets
+/// wrong talking to an older executor: nothing; the executor never reads the
+/// constant, and the claim the runner watches for is the one every executor
+/// already makes.
+///
+/// cairn/5045 does not move the number. An executor now writes a cell's state
+/// file after releasing pool state rather than while holding it, and
+/// [`FleetSnapshot`] gains an optional, defaulted `cell_transitions` naming
+/// each cell whose next record is still on its way to disk, by
+/// [`CellTransitionKind`]. The record posted for each cell is still the last
+/// one that reached disk, as it was when the write happened under the lock.
+/// What a runner gets wrong talking to an older executor: nothing; the list
+/// arrives empty, which is what it would hold for an executor whose writes
+/// never outlast the lock. An older runner ignores the field, and a kind this
+/// build does not know decodes as `Unknown`.
+///
+/// cairn/5617 does not move the number. [`MachineSample`] gains a defaulted
+/// `live_usage` ([`LiveUsage`] per executing command attempt and per resident
+/// process, from the process-tree sampler's own window), and
+/// [`ExecutingCellRequest`] and [`ResidentProcess`] gain an optional
+/// `live_usage` that only the runner fills, joining the latest sample onto the
+/// rows it serves; an executor never sends it there. What a runner gets wrong
+/// talking to an older executor: nothing; that executor's samples default the
+/// field to `NotSampled`, and its commands show no live usage until it runs a
+/// build carrying this. An older runner ignores the field.
+///
+/// cairn/5361 does not move the number. No message or field changes. An
+/// executor now retires a granted admission that still holds its project's
+/// provisioning ticket once three consecutive `WaitingRequests` reports have
+/// not named it, exactly as if the runner had sent `Cancel`, and a retired
+/// request abandons its managed object fetch at the fetch's next await rather
+/// than finishing it. A `ProjectProvisioning` decline's free-text detail also
+/// says when the holder is already retired. What a runner gets wrong talking
+/// to an older executor: nothing it gets wrong today; such an executor keeps a
+/// cancelled grant's hold until its preparation ends, as before. The report is
+/// the one the runner already sends on every heartbeat, and it already names
+/// every granted request with a live waiter.
+///
+/// cairn/5466 does not move the number. [`SelfUpdatePhase::Draining`] gains
+/// defaulted `holds` ([`DrainHold`]) and `cycles`, and
+/// [`SelfUpdatePhase::Directed`] a defaulted `cycled`; the runner now bounds a
+/// self-update drain per piece of work and stops counting long-lived service
+/// residents as work in flight. [`SelfUpdateStatus`] is the runner's account
+/// to its own surfaces and never crosses to an executor, and the runner reads
+/// the same snapshot fields from every executor it did before. What a runner
+/// gets wrong talking to an older executor: nothing.
+///
+/// cairn/5651 does not move the number. No field or variant changes. A Linux
+/// executor's command teardown now also starts from the descendants it
+/// recorded while their ancestry linked them to the leader, so a descendant in
+/// a session of its own that was orphaned before the command ended is killed
+/// rather than left running. That record is executor memory; the descendants
+/// it adds reach the runner, if at all, as the `Discovered` identities every
+/// executor already reports. What a runner gets wrong talking to an older
+/// executor: nothing it would decode differently. That executor can still
+/// leave such an orphan behind until it runs a build carrying this. A
+/// prior-epoch survivor's quarantine reason also names its notable state and
+/// executable now, inside the free text the reason already was, and
+/// `PersistentCellState::active_quarantine_reason` reads that field only while
+/// the cell is quarantined; neither changes what is serialized.
+///
+/// cairn/5671 does not move the number. The runner's fleet capability
+/// identity, the key its check-suppression counters are charged under, now
+/// folds in whether each eligible machine is measurement-blind, and the runner
+/// reads which eligible machines are blind to name a check death as such. Both
+/// are judgements over telemetry every executor already reports, made with the
+/// same `placement_blindness` placement already applies; nothing is sent, and
+/// no variant, field or serialized form changes. What a runner gets wrong
+/// talking to an older executor: nothing.
+///
+/// cairn/5665 does not move the number. [`ExecutionAllocation`],
+/// [`ProcessBatchItemOutcome`], and [`ExecutingCellRequest`] gain a defaulted
+/// `buildJobs` ([`BuildJobs`]): the jobs a command's cargo and nextest were
+/// told to run, its CPU width, and the memory bound that may have held it
+/// lower. The executor now also caps `CARGO_BUILD_JOBS` and
+/// `NEXTEST_TEST_THREADS` by the jobs its available memory can hold at spawn,
+/// which is executor-local behavior behind an environment variable the
+/// executor already wrote. What a runner gets wrong talking to an older
+/// executor: nothing; it reads no `buildJobs` and renders none, and that
+/// executor keeps sizing builds to cores until it runs a build carrying this.
+/// An older runner ignores the field.
+///
+/// Version 160 (cairn/5660) lets the runner act on inference deployments.
+/// [`ExecutorMessage::DeploymentCommand`] tells a deployment's head machine to
+/// start, stop or probe it ([`DeploymentOperation`]): the executor runs the
+/// recipe's start or stop shell as its own account in its own process group,
+/// bounded by the timeout the command carries, and watches the health URL.
+/// It answers each command with one or more
+/// [`ExecutorMessage::DeploymentReport`]s carrying a [`DeploymentPhaseReport`].
+/// What a runner gets wrong talking to a 159 executor: that executor cannot
+/// decode the command, so a start would wait out its whole bound for a report
+/// that never comes while the gang's machines stay reserved. That reads
+/// fail-open, so the number moves (tenet 541).
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 160;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -5577,23 +6392,176 @@ pub const EXECUTOR_SHUTDOWN_BUDGET_MS: u64 = 3_000;
 /// home (cairn/4569).
 pub const EXECUTOR_ADOPTION_HANDOFF_BUDGET_MS: u64 = 8_000;
 
-/// How long the runner's supervisor waits for a spawned `cairn-executor` to
-/// reach readiness before it declares the startup failed.
+/// How long the runner's supervisor lets a spawned `cairn-executor` go without
+/// reporting startup progress before it declares the startup failed.
 ///
-/// Readiness is announced after adoption, so this has to contain a worst-case
-/// handoff wait with room to spare. Sized below it, the supervisor would kill a
+/// A bound on silence, not on the whole startup. What an executor does before
+/// it can dial grows with the machine, because it adopts every held cell its
+/// home carries, so a ceiling on the total is a constant the host outgrows.
+/// One did: on the runner host, a prerequisite script, the containment probes
+/// and fifteen held cells, all under the CPU a booting runner takes, missed a
+/// 12 s total four generations in a row (cairn/5652). Instead each phase the
+/// executor finishes, and each authority adoption visits, is reported on
+/// stderr as an [`ExecutorStartupProgress`] line, and every report restarts
+/// this budget. A generation that is still making progress is never retired
+/// for being slow; one that stops is retired this long after its last report.
+///
+/// The longest stretch on the way to readiness with nothing to report is the
+/// handoff wait on a contended authority, so this still has to contain that
+/// wait with room to spare. Sized below it, the supervisor would kill a
 /// successor for patiently doing the right thing.
-pub const EXECUTOR_STARTUP_READY_BUDGET_MS: u64 = 12_000;
+pub const EXECUTOR_STARTUP_PROGRESS_BUDGET_MS: u64 = 12_000;
 
 // The three budgets above are one chain, and each link must clear the next: an
 // outgoing executor has to be gone before its successor stops waiting for the
 // locks it holds, and that wait has to finish before the supervisor stops
-// waiting for the successor. Ordered any other way the chain manufactures
-// exactly the crash-loop it exists to prevent, which is why the ordering is
-// asserted here rather than trusted to three files that never mention each
-// other.
+// waiting to hear from the successor. Ordered any other way the chain
+// manufactures exactly the crash-loop it exists to prevent, which is why the
+// ordering is asserted here rather than trusted to three files that never
+// mention each other.
 const _: () = assert!(EXECUTOR_SHUTDOWN_BUDGET_MS < EXECUTOR_ADOPTION_HANDOFF_BUDGET_MS);
-const _: () = assert!(EXECUTOR_ADOPTION_HANDOFF_BUDGET_MS < EXECUTOR_STARTUP_READY_BUDGET_MS);
+const _: () = assert!(EXECUTOR_ADOPTION_HANDOFF_BUDGET_MS < EXECUTOR_STARTUP_PROGRESS_BUDGET_MS);
+
+/// What a starting colocated executor writes to stderr ahead of each
+/// [`ExecutorStartupProgress`] it reports.
+///
+/// Stderr because it is the only channel that exists before the link does: the
+/// supervisor already drains it, and the dial is the last thing startup does.
+/// Only a supervisor reads it, and a supervisor only ever reads the child it
+/// spawned from its own build, so the line is not part of the wire contract.
+pub const EXECUTOR_STARTUP_PROGRESS_MARKER: &str = "cairn-executor-startup-progress ";
+
+/// The steps a starting executor reports on its way to readiness, in the order
+/// bootstrap takes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorStartupPhase {
+    /// Bootstrap has begun: the process is loaded, logging and the toolchain
+    /// PATH are installed, and it holds the executor generation, which may
+    /// have meant waiting out an outgoing one.
+    Launched,
+    /// The credential is loaded and the executor's identity resolved.
+    Identity,
+    /// The machine's capacity is read.
+    MachineCapacity,
+    /// The toolchains on PATH are probed.
+    Toolchains,
+    /// The executable's build identity, a full read of the binary, and the
+    /// self-update record are loaded.
+    BuildIdentity,
+    /// The MCP relay is listening and the runtime's durable state is loaded.
+    Runtime,
+    /// Retained project roots are migrated and node scratch is moved.
+    Migration,
+    /// Held-cell adoption visited one more authority; `done` of `total`.
+    AdoptingCells,
+    /// Held-cell adoption is finished.
+    CellsAdopted,
+    /// The first liveness pass is published, so the first Hello carries real
+    /// facts.
+    FirstLiveness,
+    /// The runner answered the dial; the handshake is under way.
+    Connected,
+}
+
+impl ExecutorStartupPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Launched => "launched",
+            Self::Identity => "identity",
+            Self::MachineCapacity => "machine_capacity",
+            Self::Toolchains => "toolchains",
+            Self::BuildIdentity => "build_identity",
+            Self::Runtime => "runtime",
+            Self::Migration => "migration",
+            Self::AdoptingCells => "adopting_cells",
+            Self::CellsAdopted => "cells_adopted",
+            Self::FirstLiveness => "first_liveness",
+            Self::Connected => "connected",
+        }
+    }
+}
+
+/// One report a starting executor makes to the supervisor waiting for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutorStartupProgress {
+    pub phase: ExecutorStartupPhase,
+    /// Milliseconds since the executor process started.
+    pub elapsed_ms: u64,
+    /// For a phase that walks a known set, how much of it is behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+}
+
+impl ExecutorStartupProgress {
+    /// The stderr line carrying this report, newline included.
+    pub fn to_line(&self) -> String {
+        format!(
+            "{EXECUTOR_STARTUP_PROGRESS_MARKER}{}\n",
+            serde_json::to_string(self).expect("startup progress serializes")
+        )
+    }
+
+    /// The report a stderr line carries, if it carries one. The marker may sit
+    /// anywhere in the line, so a log prefix in front of it changes nothing.
+    pub fn from_line(line: &str) -> Option<Self> {
+        let (_, report) = line.split_once(EXECUTOR_STARTUP_PROGRESS_MARKER)?;
+        serde_json::from_str(report.trim()).ok()
+    }
+}
+
+impl std::fmt::Display for ExecutorStartupProgress {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.phase.label())?;
+        if let (Some(done), Some(total)) = (self.done, self.total) {
+            write!(formatter, " {done}/{total}")?;
+        }
+        write!(formatter, " at {} ms", self.elapsed_ms)
+    }
+}
+
+#[cfg(test)]
+mod startup_progress_tests {
+    use super::*;
+
+    #[test]
+    fn a_progress_line_round_trips_and_survives_a_log_prefix() {
+        let report = ExecutorStartupProgress {
+            phase: ExecutorStartupPhase::AdoptingCells,
+            elapsed_ms: 9_100,
+            done: Some(3),
+            total: Some(15),
+        };
+        let line = report.to_line();
+        assert!(line.ends_with('\n'));
+        assert_eq!(
+            ExecutorStartupProgress::from_line(&line),
+            Some(report.clone())
+        );
+        assert_eq!(
+            ExecutorStartupProgress::from_line(&format!("2026-10-31T02:48:41Z INFO {line}")),
+            Some(report.clone())
+        );
+        assert_eq!(report.to_string(), "adopting_cells 3/15 at 9100 ms");
+    }
+
+    #[test]
+    fn ordinary_stderr_carries_no_progress() {
+        for line in [
+            "",
+            "2026-10-31T02:48:41Z INFO cairn_exec: executor bootstrap: adopting held cells",
+            &format!(
+                "{EXECUTOR_STARTUP_PROGRESS_MARKER}{{\"phase\":\"not_a_phase\",\"elapsedMs\":1}}"
+            ),
+            &format!("{EXECUTOR_STARTUP_PROGRESS_MARKER}{{\"phase\":\"launched\""),
+        ] {
+            assert_eq!(ExecutorStartupProgress::from_line(line), None, "{line}");
+        }
+    }
+}
 
 /// How long a stopping `cairn-executor` spends stopping its resident processes
 /// (terminals, services, dev instances, workflow runtimes) before it gives up on
@@ -6038,6 +7006,62 @@ pub struct BuildPrerequisiteCheck {
     pub detail: String,
 }
 
+/// The name prefix of the directory an executor stages its prerequisite script
+/// in (`<temp>/cairn-prerequisite-<uuid>/`). Shared because that path is how a
+/// probe that never ran its check is told apart from a machine that answered:
+/// see [`ends_on_staged_shell_error`].
+pub const BUILD_PREREQUISITE_STAGING_PREFIX: &str = "cairn-prerequisite-";
+
+impl BuildPrerequisiteCheck {
+    /// The status placement enforces and the executors pages show.
+    ///
+    /// It is the reported status, except that a `Missing` whose text ends on
+    /// the shell's own error about the probe's staged copy reads as
+    /// `Unchecked`. An executor that predates the distinction reported a script
+    /// that died before judging anything (a library it sources absent from the
+    /// staging) as `Missing`, and a verdict stands until the machine
+    /// re-attaches, so the reading has to happen here as well as at the probe.
+    pub fn effective_status(&self) -> BuildPrerequisiteStatus {
+        if self.is_probe_failure_reported_as_missing() {
+            BuildPrerequisiteStatus::Unchecked
+        } else {
+            self.status
+        }
+    }
+
+    /// Whether this is a `Missing` that came from a probe which could not run
+    /// its script, rather than from the script's verdict on the machine.
+    pub fn is_probe_failure_reported_as_missing(&self) -> bool {
+        self.status == BuildPrerequisiteStatus::Missing && ends_on_staged_shell_error(&self.detail)
+    }
+}
+
+/// Whether a prerequisite script's output ends on the shell's own error about
+/// a file in the probe's staging directory, rather than on the script's own
+/// verdict.
+///
+/// Bash reports its own failures (a sourced file that is absent, a syntax
+/// error, an unbound variable, a command it cannot find) as
+/// `<file>: line <n>: <message>`, naming the file as it was invoked, which for
+/// the probe is a path inside a [`BUILD_PREREQUISITE_STAGING_PREFIX`]
+/// directory. The scripts' own diagnostics name the host, the packages and the
+/// repair, and never begin with that path. Output whose last line is the
+/// shell's is a script that stopped before it judged the machine. This reads
+/// only the shell's framing, never the script's prose, so it cannot become a
+/// second declaration of what a platform needs.
+pub fn ends_on_staged_shell_error(output: &str) -> bool {
+    let Some(last) = output.lines().map(str::trim).rfind(|line| !line.is_empty()) else {
+        return false;
+    };
+    let Some((location, report)) = last.split_once(": ") else {
+        return false;
+    };
+    report.starts_with("line ")
+        && location
+            .split(['/', '\\'])
+            .any(|component| component.starts_with(BUILD_PREREQUISITE_STAGING_PREFIX))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutorCapabilities {
@@ -6400,6 +7424,9 @@ pub struct ExecutorAdvertisement {
     pub current_load: usize,
     #[serde(default)]
     pub warm_roots: Vec<VerifiedWarmRoot>,
+    /// The node scratch replicas this machine holds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_scratches: Vec<NodeScratchReplica>,
     /// When this beat was sent. Heartbeat age, and nothing else: the runner's
     /// connection health is derived from it.
     pub observed_at_unix_ms: u64,
@@ -6788,6 +7815,31 @@ pub struct CellRequest {
     pub resource_reservation: ResourceReservation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub learned_estimate: Option<LearnedResourceEstimate>,
+    /// What bringing this batch's node scratch current would cost on each
+    /// machine, priced into placement. Runner-side only: never serialized, so
+    /// no executor reads it and no peer version disagrees about it.
+    #[serde(skip)]
+    pub scratch_sync: Option<ScratchSyncEstimate>,
+}
+
+/// The milliseconds a node scratch sync is predicted to take per machine:
+/// the bytes that machine is missing over its measured sync throughput. An
+/// affinity, never a filter: a cold machine is priced, not excluded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScratchSyncEstimate {
+    pub per_executor_ms: std::collections::BTreeMap<String, u64>,
+    /// The price of a machine the estimate did not cover: the whole head over
+    /// an unmeasured remote link.
+    pub uncovered_ms: u64,
+}
+
+impl ScratchSyncEstimate {
+    pub fn ms_for(&self, executor_id: &str) -> u64 {
+        self.per_executor_ms
+            .get(executor_id)
+            .copied()
+            .unwrap_or(self.uncovered_ms)
+    }
 }
 
 /// What one machine is told about one queue entry, so it can answer from live
@@ -7120,6 +8172,27 @@ pub struct ResidentExecutorExit {
     pub at_unix_ms: u64,
     pub exit_code: u8,
     pub error: String,
+    /// When the run of error exits this one belongs to began: the first since
+    /// the daemon last reached its runner. Absent on a record written before
+    /// runs were kept, which reads as a run that began at `at_unix_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failing_since_unix_ms: Option<u64>,
+    /// How many error exits that run holds, this one included. Absent reads as
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consecutive_exits: Option<u32>,
+}
+
+impl ResidentExecutorExit {
+    /// See [`Self::failing_since_unix_ms`].
+    pub fn failing_since(&self) -> u64 {
+        self.failing_since_unix_ms.unwrap_or(self.at_unix_ms)
+    }
+
+    /// See [`Self::consecutive_exits`].
+    pub fn exits_in_run(&self) -> u32 {
+        self.consecutive_exits.unwrap_or(1).max(1)
+    }
 }
 
 /// A live process holding a Cairn home's executor generation lock.
@@ -7344,6 +8417,146 @@ pub struct ExecutionAllocation {
     /// core. `None` when no CPU was read or the interval was zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_units_millis: Option<u32>,
+    /// How many build jobs the command's cargo and nextest were told to run,
+    /// and what bounded them. `None` from an executor that does not state it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_jobs: Option<BuildJobs>,
+}
+
+/// How many build jobs a command's cargo and nextest were told to run, and
+/// what bounded that number.
+///
+/// Two bounds meet here. The CPU width is the command's share of the
+/// machine's bulk budget. The memory bound is how many jobs the memory the
+/// machine had available as the command started could hold at a reserve per
+/// job, so that one compile cannot fan out past what the host can hold: cargo
+/// defaults to one rustc per logical core, and on an 8-core, 12 GiB machine
+/// eight rustc processes at 1-8 GiB each exhaust it by themselves, whatever
+/// admission decided. Where memory is ample the memory bound exceeds the CPU
+/// width and changes nothing. Neither bound refuses work: the floor is one
+/// job, so a small machine builds slowly rather than dying.
+///
+/// This sizes only what the command left unset. A command, or a project
+/// script it runs, that states its own parallelism keeps it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildJobs {
+    /// What `CARGO_BUILD_JOBS` and `NEXTEST_TEST_THREADS` were set to where
+    /// the command set neither: the smaller bound.
+    pub jobs: u32,
+    /// The command's share of the machine's bulk budget.
+    pub cpu_width: u32,
+    /// `None` when the executor held no fresh memory reading as the command
+    /// started, so the CPU width stood alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryJobBound>,
+}
+
+/// The build jobs a machine's available memory could hold as a command
+/// started.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryJobBound {
+    /// Available memory over the per-job reserve, split evenly across the
+    /// commands sharing it, never below one.
+    pub jobs: u32,
+    pub available_bytes: u64,
+    pub measured_at_unix_ms: u64,
+    /// What one job is assumed to need.
+    pub per_job_reserve_bytes: u64,
+    /// Compile-class commands (and concurrent items of one batch) sharing that
+    /// memory, this one included.
+    pub sharers: u32,
+}
+
+impl MemoryJobBound {
+    /// Splitting among the commands that share the memory counts what they use
+    /// now twice, once in the lower reading and once in the split. That is
+    /// deliberate: a compile that has just started holds little of what it
+    /// will peak at, so the reading alone would let two compiles starting
+    /// together each claim all of the headroom.
+    pub fn new(
+        available_bytes: u64,
+        measured_at_unix_ms: u64,
+        per_job_reserve_bytes: u64,
+        sharers: u32,
+    ) -> Self {
+        let sharers = sharers.max(1);
+        let whole_jobs = available_bytes / per_job_reserve_bytes.max(1);
+        let jobs = u32::try_from(whole_jobs / u64::from(sharers))
+            .unwrap_or(u32::MAX)
+            .max(1);
+        Self {
+            jobs,
+            available_bytes,
+            measured_at_unix_ms,
+            per_job_reserve_bytes,
+            sharers,
+        }
+    }
+}
+
+impl BuildJobs {
+    pub fn new(cpu_width: u32, memory: Option<MemoryJobBound>) -> Self {
+        let cpu_width = cpu_width.max(1);
+        Self {
+            jobs: memory.map_or(cpu_width, |memory| memory.jobs.min(cpu_width)),
+            cpu_width,
+            memory,
+        }
+    }
+
+    /// The same bounds for one of `items` batch items running at once, which
+    /// share the command's width and memory alike.
+    pub fn shared_by(self, items: u32) -> Self {
+        let items = items.max(1);
+        Self::new(
+            self.cpu_width / items,
+            self.memory.map(|memory| {
+                MemoryJobBound::new(
+                    memory.available_bytes,
+                    memory.measured_at_unix_ms,
+                    memory.per_job_reserve_bytes,
+                    memory.sharers.saturating_mul(items),
+                )
+            }),
+        )
+    }
+
+    /// Whether memory, rather than the CPU width, set the number.
+    pub fn memory_bound(&self) -> bool {
+        self.memory
+            .is_some_and(|memory| memory.jobs < self.cpu_width)
+    }
+
+    /// One line an operator can read without a second lookup, so a slow
+    /// compile on a small machine is explained where it is read.
+    pub fn describe(&self) -> String {
+        match self.memory {
+            Some(memory) if self.memory_bound() => {
+                let split = if memory.sharers > 1 {
+                    format!(", split {} ways", memory.sharers)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{} build jobs, held below the CPU width of {} by memory: {} available at start / {} per job{split}",
+                    self.jobs,
+                    self.cpu_width,
+                    human_bytes(memory.available_bytes),
+                    human_bytes(memory.per_job_reserve_bytes),
+                )
+            }
+            Some(memory) => format!(
+                "{} build jobs, the CPU width (memory allowed {})",
+                self.jobs, memory.jobs
+            ),
+            None => format!(
+                "{} build jobs, the CPU width (memory was not measured at start)",
+                self.jobs
+            ),
+        }
+    }
 }
 
 /// How a grant was applied. No variant claims a kernel-enforced cap: without a
@@ -7385,25 +8598,35 @@ impl ExecutionAllocation {
                 None => AllocationEnforcement::Advisory { reason },
             },
             delivered_units_millis: cpu.and_then(|cpu| cpu.delivered_units_millis(wall_ms)),
+            build_jobs: None,
         }
     }
 
+    pub fn with_build_jobs(mut self, build_jobs: BuildJobs) -> Self {
+        self.build_jobs = Some(build_jobs);
+        self
+    }
+
     /// The same application, observed over one part of the command, under that
-    /// part's own grant where it stated one.
+    /// part's own grant and build jobs where it stated them.
     pub fn reobserved(
         &self,
         granted_units: Option<u32>,
+        build_jobs: Option<BuildJobs>,
         cpu: Option<CpuTime>,
         wall_ms: u64,
     ) -> Self {
         let (AllocationEnforcement::Measured { reason }
         | AllocationEnforcement::Advisory { reason }) = self.enforcement;
-        Self::uncapped(
-            granted_units.unwrap_or(self.granted_units),
-            reason,
-            cpu,
-            wall_ms,
-        )
+        Self {
+            build_jobs: build_jobs.or(self.build_jobs),
+            ..Self::uncapped(
+                granted_units.unwrap_or(self.granted_units),
+                reason,
+                cpu,
+                wall_ms,
+            )
+        }
     }
 }
 
@@ -7500,7 +8723,12 @@ impl CellExecutionMeta {
         meta.environment_fingerprint = item.environment_fingerprint.clone();
         meta.cpu = item.cpu;
         meta.allocation = self.allocation.as_ref().map(|allocation| {
-            allocation.reobserved(item.granted_units, item.cpu, item.duration_ms)
+            allocation.reobserved(
+                item.granted_units,
+                item.build_jobs,
+                item.cpu,
+                item.duration_ms,
+            )
         });
         meta.stop = item.stop.clone();
         meta
@@ -8134,6 +9362,9 @@ pub enum CellOutcome {
         sandbox_denials: Vec<SandboxDenialEvidence>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tracked_modifications: Option<TrackedModificationEvidence>,
+        /// What happened to the batch's node scratch, when it had one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node_scratch: Option<Box<ScratchSyncReport>>,
     },
     Unavailable {
         reason: CellUnavailableReason,
@@ -8359,6 +9590,11 @@ pub struct ResidentProcessSpec {
     pub runtime_packages: Vec<ResidentRuntimeAsset>,
     #[serde(default)]
     pub io: ResidentProcessIoMode,
+    /// The node scratch this process's `$TMPDIR` is. Brought current at start
+    /// and written back when the process exits; while it lives, the replica
+    /// advertises `inUse` and the node's batches are placed beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_scratch: Option<NodeScratchGrant>,
 }
 
 pub const MAX_RESIDENT_RUNTIME_ASSET_BYTES: usize = 4 * 1024 * 1024;
@@ -8528,6 +9764,10 @@ pub struct ResidentProcess {
     /// tell them apart. This is the seam that measurement attaches to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reservation: Option<ResourceReservation>,
+    /// What the process is using now. Filled by the runner from the
+    /// executor's latest [`MachineSample`]; an executor never sets it here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_usage: Option<LiveUsageSample>,
 }
 
 impl ResidentProcess {
@@ -9001,6 +10241,15 @@ impl PersistentCellState {
         self.residency.is_none() && self.occupancy.is_empty()
     }
 
+    /// Why this cell is fenced, while it is. A quarantine writes its reason and
+    /// a cell returning to service keeps it, so read outside a quarantine the
+    /// field describes a fence, and processes, that no longer exist.
+    pub fn active_quarantine_reason(&self) -> Option<&str> {
+        (self.lifecycle == PersistentCellLifecycle::Quarantined)
+            .then_some(self.quarantine_reason.as_deref())
+            .flatten()
+    }
+
     pub fn is_held(&self) -> bool {
         !self.is_free()
     }
@@ -9159,6 +10408,14 @@ pub struct ExecutingCellRequest {
     /// new request would wait behind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_resource_identity: Option<CommandResourceIdentity>,
+    /// What the attempt is using now. Filled by the runner from the executor's
+    /// latest [`MachineSample`]; an executor never sets it here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_usage: Option<LiveUsageSample>,
+    /// The build jobs the command was given as it started, so a compile held
+    /// to a few jobs on a small machine says why while it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_jobs: Option<BuildJobs>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -9245,6 +10502,10 @@ pub struct FleetSnapshot {
     /// anything but zero is a defect to report.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub orphaned_provisioning_releases: u64,
+    /// Each cell whose next record is still on its way to disk. The record
+    /// posted in `slots` for such a cell is the last one that reached disk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cell_transitions: Vec<CellTransitionInFlight>,
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -9271,6 +10532,77 @@ pub struct ProvisioningHold {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_id: Option<String>,
     pub since_unix_ms: u64,
+}
+
+/// A cell whose next record is being made durable.
+///
+/// The executor writes a cell's state file after releasing the pool lock, so
+/// the record it posts for the cell is the last one that reached disk, and
+/// this names the one on its way there. A slot that has sat on one state for
+/// seconds with a transition in flight is waiting on its disk; one without is
+/// waiting on something else.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CellTransitionInFlight {
+    pub project_id: String,
+    pub cell_id: String,
+    pub kind: CellTransitionKind,
+    pub since_unix_ms: u64,
+}
+
+/// Which change to a cell is being made durable.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum CellTransitionKind {
+    /// A claim recording the base it prepared the slot at.
+    Claim,
+    /// A command taking the cell.
+    Lease,
+    /// A residency taking the cell.
+    Hold,
+    /// A residency giving the cell back.
+    Release,
+    /// A fenced change to a residency: renewal, reclaim, readmission, or a
+    /// phase of its release.
+    Residency,
+    /// The launch and process record of the command running in the cell.
+    CommandOwnership,
+    /// A command giving the cell back.
+    CommandRelease,
+    /// The work classes the cell is warm for.
+    Warmth,
+    /// The preparation the cell's tree was built from.
+    Fingerprint,
+    /// The cell being fenced out of service.
+    Quarantine,
+    /// Storage accounting, cancellation, or a drain clearing.
+    Maintenance,
+    /// A clone seeding a new cell: the hold on the sibling it clones from, or
+    /// the seed a cell records it was built from.
+    Seed,
+    /// A kind this build does not know, from a newer executor.
+    #[serde(other)]
+    Unknown,
+}
+
+impl CellTransitionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claim => "claim",
+            Self::Lease => "lease",
+            Self::Hold => "hold",
+            Self::Release => "release",
+            Self::Residency => "residency",
+            Self::CommandOwnership => "command ownership",
+            Self::CommandRelease => "command release",
+            Self::Warmth => "warmth",
+            Self::Fingerprint => "fingerprint",
+            Self::Quarantine => "quarantine",
+            Self::Maintenance => "maintenance",
+            Self::Seed => "seed",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// Bumped to 5 for CAIRN-3355: `CompileCacheStats` carries what the daemon did
@@ -10321,6 +11653,175 @@ pub struct HostHealth {
     pub gpus: Measurement<Vec<GpuDevice>>,
 }
 
+/// The machine readings that need nothing but the machine, published apart from
+/// everything that needs pool state.
+///
+/// Every field is a reading the executor takes from the kernel, or from a cache
+/// no pool-state holder can occupy: the CPU and memory sample, the two stall
+/// averages, the volumes' free space, the GPU sampler's last attempt, and the
+/// CPU brake's verdict. Placement decides on exactly these. Before they
+/// travelled on their own they reached the runner only inside a snapshot or a
+/// liveness refresh, both of which take pool state first, and claim and release
+/// persistence hold that mutex across `fsync`. So a stalled disk froze the
+/// readings of the machines that were busiest, and placement refused every one
+/// of them as stale while their links beat on time (cairn/5600).
+///
+/// Each reading keeps the stamp of the attempt that produced it; publishing a
+/// sample never re-stamps one. Queue depths, cells, reservations, and the rest
+/// of [`ExecutorSubstrateReport`] that genuinely lives under pool state stay on
+/// the snapshot, and may be older than this.
+///
+/// Additive, so neither this nor the frames that carry it bump
+/// [`EXECUTOR_PROTOCOL_VERSION`]: an executor that predates it sends none, and
+/// the runner then reads that machine's health exactly as it did before.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineSample {
+    pub cpu: Measurement<CpuPressure>,
+    pub memory: Measurement<MachineMemory>,
+    pub volume: Measurement<MachineVolume>,
+    /// Present exactly when [`MachineTelemetry::build_volume`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_volume: Option<Measurement<MachineVolume>>,
+    #[serde(default)]
+    pub io_pressure: Measurement<IoPressure>,
+    #[serde(default)]
+    pub memory_pressure: Measurement<MemoryPressure>,
+    #[serde(default)]
+    pub gpus: Measurement<Vec<GpuDevice>>,
+    #[serde(default)]
+    pub cpu_admission: CpuAdmissionHealth,
+    /// What each executing command attempt and each resident process is using
+    /// now, from the process-tree sampler's last window. A platform with no
+    /// tree sampler (Windows) reports [`MeasurementGap::UnsupportedPlatform`]
+    /// for the whole list rather than an empty one, because an empty list is
+    /// the claim that nothing is running. Not part of [`ExecutorSubstrateReport`]:
+    /// it is a reading of the work, not of the machine, and placement does not
+    /// decide on it.
+    #[serde(default)]
+    pub live_usage: Measurement<Vec<LiveUsage>>,
+}
+
+impl MachineSample {
+    /// The readings `report` carries that a sample carries too.
+    pub fn of_report(report: &ExecutorSubstrateReport) -> Self {
+        Self {
+            cpu: report.machine.cpu.clone(),
+            memory: report.machine.memory.clone(),
+            volume: report.machine.volume.clone(),
+            build_volume: report.machine.build_volume.clone(),
+            io_pressure: report.host.io_pressure.clone(),
+            memory_pressure: report.host.memory_pressure.clone(),
+            gpus: report.host.gpus.clone(),
+            cpu_admission: report.host.cpu_admission.clone(),
+            live_usage: Measurement::default(),
+        }
+    }
+}
+
+/// What one live usage reading is of.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum LiveUsageSubject {
+    /// One attempt of a command batch: every item of it that is running, summed.
+    Command {
+        request_id: String,
+        attempt_id: String,
+    },
+    /// One resident process, by the key and generation its cell's occupancy
+    /// holds it under ([`CellOccupancy::processes`]).
+    Resident {
+        #[serde(rename = "slotId")]
+        cell_id: String,
+        process_key: String,
+        generation: u64,
+    },
+}
+
+/// A running process tree's CPU and memory over the sampler's last window,
+/// while it runs rather than once it has finished.
+///
+/// Computed from the marks the process-tree sampler already keeps for the stall
+/// stop and the completion record: `window_cpu_ms` is the difference in the
+/// tree's accumulated CPU across the window, so `window_cpu_ms / window_ms` is
+/// the cores it kept busy. No process is walked to produce it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveUsageSample {
+    pub window_cpu_ms: u64,
+    pub window_ms: u64,
+    /// The tree's resident set at the window's last census. `None` when no
+    /// member's resident size could be read, which is a gap and not zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident_bytes: Option<u64>,
+    pub measured_at_unix_ms: u64,
+    /// Always [`MeasurementQuality::Sampled`]: work done between censuses by a
+    /// process born and dead inside one is not seen.
+    pub quality: MeasurementQuality,
+}
+
+impl LiveUsageSample {
+    /// Cores kept busy across the window, or `None` for an empty window.
+    pub fn cores(&self) -> Option<f64> {
+        (self.window_ms > 0).then(|| self.window_cpu_ms as f64 / self.window_ms as f64)
+    }
+}
+
+/// One subject's [`LiveUsageSample`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveUsage {
+    pub subject: LiveUsageSubject,
+    pub sample: LiveUsageSample,
+}
+
+impl ExecutorSubstrateReport {
+    /// Take each reading in `sample` that was measured after the one this
+    /// report carries, and say whether any was.
+    ///
+    /// Reading by reading and by each one's own stamp, because a connection's
+    /// health is written by paths that sample at different moments. A snapshot
+    /// built by a pass that waited a minute for pool state carries readings a
+    /// minute older than the sample published while it waited, and applying
+    /// it whole would move them backwards.
+    pub fn adopt_newer_readings(&mut self, sample: &MachineSample) -> bool {
+        fn newer<T: Clone>(current: &mut Measurement<T>, candidate: &Measurement<T>) -> bool {
+            let take = candidate.measured_at_unix_ms > current.measured_at_unix_ms;
+            if take {
+                *current = candidate.clone();
+            }
+            take
+        }
+        let machine = &mut self.machine;
+        let host = &mut self.host;
+        let mut adopted = newer(&mut machine.cpu, &sample.cpu);
+        adopted |= newer(&mut machine.memory, &sample.memory);
+        adopted |= newer(&mut machine.volume, &sample.volume);
+        adopted |= match (machine.build_volume.as_mut(), sample.build_volume.as_ref()) {
+            (_, None) => false,
+            (None, Some(candidate)) => {
+                machine.build_volume = Some(candidate.clone());
+                true
+            }
+            (Some(current), Some(candidate)) => newer(current, candidate),
+        };
+        adopted |= newer(&mut host.io_pressure, &sample.io_pressure);
+        adopted |= newer(&mut host.memory_pressure, &sample.memory_pressure);
+        adopted |= newer(&mut host.gpus, &sample.gpus);
+        // `None` orders before every stamp, so a brake that has never measured
+        // never displaces one that has.
+        if sample.cpu_admission.measured_at_unix_ms > host.cpu_admission.measured_at_unix_ms {
+            host.cpu_admission = sample.cpu_admission.clone();
+            adopted = true;
+        }
+        adopted
+    }
+}
+
 /// One GPU as its vendor's driver reports it.
 ///
 /// Per-field readings are untimestamped: the enclosing [`Measurement`] carries
@@ -10433,6 +11934,14 @@ pub struct IoPressure {
     pub slowest_device: Option<DeviceWriteLatency>,
 }
 
+impl IoPressure {
+    /// The share placement prices, read the way [`MemoryPressure`]'s is: the
+    /// worse of the two windows.
+    pub fn priced_full_millis(&self) -> u32 {
+        self.full_avg10_millis.max(self.full_avg60_millis)
+    }
+}
+
 /// How much of the time every non-idle task on the host was stalled waiting
 /// for memory at once (Linux PSI `full` in `/proc/pressure/memory`): a machine
 /// reclaiming and swapping instead of working. Measured, rendered and priced
@@ -10485,6 +11994,9 @@ pub struct DiskCategoryAccounting {
     /// What retired executor homes still hold, counted in `usedBytes`.
     #[serde(default)]
     pub retired_homes_bytes: u64,
+    /// Node scratch replicas: each node's `$TMPDIR` copy on this machine.
+    #[serde(default)]
+    pub node_scratch_bytes: u64,
 }
 
 /// Whether a sweep in the executor's current process has actually retried an
@@ -11265,14 +12777,29 @@ pub enum SelfUpdatePhase {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         behind: Option<String>,
     },
-    /// This machine's turn. The runner refuses it new work and directs the
-    /// update once nothing is in flight here.
-    Draining { in_flight: u32, since_unix_ms: u64 },
+    /// This machine's turn. The runner refuses it new work until it is empty,
+    /// however long that takes, and then directs the update.
+    Draining {
+        in_flight: u32,
+        since_unix_ms: u64,
+        /// What it is waiting on, the work that bounds the wait first.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        holds: Vec<DrainHold>,
+        /// Long-lived service instances the restart will cycle. They never
+        /// finish, so they are not waited on.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cycles: Vec<String>,
+    },
     /// Directed to update; the runner is waiting for it to return on the new
     /// build.
-    Directed { at_unix_ms: u64 },
-    /// It did not empty within the drain budget, so it takes work again and
-    /// its turn comes back after `until_unix_ms`.
+    Directed {
+        at_unix_ms: u64,
+        /// Service instances the restart ended, down until it returns.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cycled: Vec<String>,
+    },
+    /// Work on it outran its own bound and was read as wedged, so it takes
+    /// work again and its turn comes back after `until_unix_ms`.
     Deferred { until_unix_ms: u64 },
     /// An update to this build failed in the fleet, so the runner directs no
     /// machine to it. A different artifact resumes the rollout.
@@ -11280,6 +12807,21 @@ pub enum SelfUpdatePhase {
     /// This machine did not act on a directive to this build. Other machines
     /// still update; this one is retried when the artifact changes.
     Excluded { cause: String },
+}
+
+/// One piece of work a draining machine's update waits on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DrainHold {
+    /// The work, named the way an operator reads it.
+    pub label: String,
+    /// When it should finish by its own learned duration. Absent when it has
+    /// never been measured or has not started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_done_unix_ms: Option<u64>,
+    /// When the rollout stops waiting for it, reads the machine as wedged,
+    /// and gives it its work back.
+    pub deadline_unix_ms: u64,
 }
 
 /// Everything a machine continuously posts about itself, so the runner can
@@ -11703,6 +13245,10 @@ pub struct ExecutorHealthSnapshot {
     /// one witness: the runner fills it in, and no executor reports it.
     #[serde(default)]
     pub role: MachineRole,
+    /// The inference deployment the runner holds this machine for, if any.
+    /// Like the role, the runner is its only witness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_hold: Option<InferenceHold>,
     #[serde(default)]
     pub resident_processes: ResidentProcessHealth,
     #[serde(default)]
@@ -11771,6 +13317,11 @@ pub struct ExecutorInspection {
     pub self_update: Option<SelfUpdateStatus>,
     /// This executor's own cells, queued work, and running work.
     pub occupancy: FleetSnapshot,
+    /// Why `occupancy` carries no live usage on its running work, when it
+    /// carries none: a platform with no process-tree sampler, or an executor
+    /// that has sent no sample yet. `None` when the machine reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_usage_gap: Option<MeasurementGap>,
     /// The machine's own projection of its slots, which carries what the last
     /// categorized walk measured for each cell.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -11942,9 +13493,9 @@ impl RemoteLinkState {
 /// How long a bootstrap ceremony waits for the machine it just installed to dial
 /// in for the first time.
 ///
-/// Deliberately NOT [`EXECUTOR_STARTUP_READY_BUDGET_MS`]. That budget bounds a
-/// successor process adopting cells from a predecessor on a machine that is
-/// already warm, and it is the third link of an asserted chain in which each
+/// Deliberately NOT [`EXECUTOR_STARTUP_PROGRESS_BUDGET_MS`]. That budget bounds
+/// the silence of a supervised successor process adopting cells from a
+/// predecessor on a machine that is already warm, and it is the third link of an asserted chain in which each
 /// budget clears the next. This one bounds a different job: a service
 /// registration, a cold process start, a machine capacity probe, toolchain
 /// detection, and a TLS handshake that may cross a relayed tailnet — the same
@@ -12126,6 +13677,59 @@ pub struct EnrolledRemote {
     pub last_seen_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connection_timeline: Vec<RemoteConnectionTransition>,
+    /// Present while this machine is refused on protocol and this runner has no
+    /// executor for its platform to repair it with. Absent from an older
+    /// runner, and absent whenever the refusal is one a self-update can clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stranded: Option<StrandedExecutor>,
+}
+
+/// A machine that dials in, is refused because it speaks an older executor
+/// protocol, and is directed to a self-update this runner cannot serve,
+/// because it holds no executor for the machine's platform at the protocol it
+/// speaks.
+///
+/// Kept apart from the link state because it is a fact about the runner, not
+/// the machine: nothing on the host needs fixing, no retry on the machine's
+/// side clears it, and it ends only when an artifact is published or the
+/// runner is rolled back. Reading it as `absent` or as "directed to
+/// self-update" is what let five Linux machines vanish after a protocol bump
+/// with nothing saying why (cairn/5510).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StrandedExecutor {
+    /// The artifact target the runner would have to serve, e.g.
+    /// `x86_64-unknown-linux-gnu`.
+    pub target: String,
+    /// The protocol this runner speaks, which the machine was refused for not
+    /// speaking.
+    pub expected_protocol: u32,
+    /// The protocol the machine announced.
+    pub received_protocol: u32,
+    /// The newest protocol this runner's artifact cache holds an executor for
+    /// on `target`, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_held_protocol: Option<u32>,
+    /// The runner's own account of why it has no artifact.
+    pub reason: String,
+    /// The first refusal in this run of refusals on the same pair of protocols.
+    pub refused_since_unix_ms: u64,
+    pub last_refused_unix_ms: u64,
+    pub refusals: u32,
+}
+
+impl StrandedExecutor {
+    /// The condition in one line, the same on every surface that names it.
+    pub fn describe(&self) -> String {
+        let held = match self.newest_held_protocol {
+            Some(protocol) => format!("newest held: v{protocol}"),
+            None => "none held".to_string(),
+        };
+        format!(
+            "stranded: this runner has no {} executor for protocol {} ({held}); publish one or roll the app back",
+            self.target, self.expected_protocol
+        )
+    }
 }
 
 /// The complete, immutable account of one placement: what the caller stated,
@@ -12283,6 +13887,12 @@ pub enum PlacementOutcome {
     /// No machine could take this work, and the rejections say why. A refusal is
     /// a decision with the same evidence attached as a success.
     Refused {
+        diagnostic: String,
+    },
+    /// No machine may take this work now, and the request waits rather than
+    /// being placed somewhere the evidence says it will die. The rejections
+    /// say what it waits for; the request's own horizon bounds the wait.
+    Waiting {
         diagnostic: String,
     },
 }
@@ -13089,33 +14699,39 @@ pub struct PlacementPrediction {
     /// it adds nothing. Produced and read only by the runner; `None` on a
     /// record from before memory pressure was priced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_pressure: Option<MemoryPressurePrice>,
+    pub memory_pressure: Option<HostStallPrice>,
+    /// What this machine's storage stall adds beyond its memory stall, or why
+    /// it adds nothing. Produced and read only by the runner; `None` on a
+    /// record from before I/O pressure was priced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_pressure: Option<HostStallPrice>,
 }
 
-/// A machine's memory stall, priced into its time to a verdict.
+/// A machine's stall on one resource (memory, or storage I/O), priced into its
+/// time to a verdict.
 ///
-/// A host fully stalled on memory for a fraction `f` of its time leaves `1-f`
-/// of it to make progress, so a run that would take `t` takes `t/(1-f)`: the
-/// price is the difference, derived from what PSI measures rather than tuned.
-/// A price, never a gate: a thrashing machine still wins when nothing else can
-/// answer sooner.
+/// A host fully stalled for a fraction `f` of its time leaves `1-f` of it to
+/// make progress, so a run that would take `t` takes `t/(1-f)`: the price is
+/// the difference, derived from what PSI measures rather than tuned. A price,
+/// never a gate: a stalled machine still wins when nothing else can answer
+/// sooner (tenet 1139).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(
     tag = "state",
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
-pub enum MemoryPressurePrice {
+pub enum HostStallPrice {
     /// `full_millis` is the stall share priced, after the ceiling.
     Priced { full_millis: u32, penalty_ms: u64 },
-    /// The machine does not measure memory pressure; nothing is added.
+    /// The machine does not measure this pressure; nothing is added.
     Unmeasured { gap: MeasurementGap },
     /// The reading was older than the fleet's telemetry bound; nothing is
     /// added, because a stale stall is not this machine now.
     Stale { age_ms: u64 },
 }
 
-impl MemoryPressurePrice {
+impl HostStallPrice {
     pub fn penalty_ms(&self) -> u64 {
         match self {
             Self::Priced { penalty_ms, .. } => *penalty_ms,
@@ -13123,21 +14739,22 @@ impl MemoryPressurePrice {
         }
     }
 
-    pub fn describe(&self) -> String {
+    /// `resource` names what stalled, as a reader says it: `memory`, `I/O`.
+    pub fn describe(&self, resource: &str) -> String {
         match self {
             Self::Priced {
                 full_millis,
                 penalty_ms,
             } => format!(
-                "memory stalled {:.1}% of the time, +{}",
+                "{resource} stalled {:.1}% of the time, +{}",
                 f64::from(*full_millis) / 10.0,
                 compact_duration(*penalty_ms)
             ),
             Self::Unmeasured { gap } => {
-                format!("memory pressure not priced: {}", gap.describe())
+                format!("{resource} pressure not priced: {}", gap.describe())
             }
             Self::Stale { age_ms } => format!(
-                "memory pressure not priced: its reading is {} old",
+                "{resource} pressure not priced: its reading is {} old",
                 compact_duration(*age_ms)
             ),
         }
@@ -13203,11 +14820,14 @@ impl PlacementPrediction {
             .map_or(0, |reliability| reliability.penalty_ms)
     }
 
-    /// What this machine's memory stall adds to its time to a verdict.
-    pub fn memory_pressure_penalty_ms(&self) -> u64 {
-        self.memory_pressure
-            .as_ref()
-            .map_or(0, MemoryPressurePrice::penalty_ms)
+    /// What this machine's memory and storage stalls add to its time to a
+    /// verdict.
+    pub fn host_stall_penalty_ms(&self) -> u64 {
+        [&self.memory_pressure, &self.io_pressure]
+            .into_iter()
+            .flatten()
+            .map(HostStallPrice::penalty_ms)
+            .fold(0, u64::saturating_add)
     }
 
     /// How much of this prediction is this machine's own history rather than a
@@ -13241,12 +14861,18 @@ impl PlacementPrediction {
                 .as_ref()
                 .map(|reliability| format!("; priced {}", reliability.describe()))
                 .unwrap_or_default()
-                + &self
-                    .memory_pressure
-                    .as_ref()
-                    .filter(|price| price.penalty_ms() > 0)
-                    .map(|price| format!("; {}", price.describe()))
-                    .unwrap_or_default(),
+                + &[
+                    ("memory", &self.memory_pressure),
+                    ("I/O", &self.io_pressure)
+                ]
+                .into_iter()
+                .filter_map(|(resource, price)| {
+                    price
+                        .as_ref()
+                        .filter(|price| price.penalty_ms() > 0)
+                        .map(|price| format!("; {}", price.describe(resource)))
+                })
+                .collect::<String>(),
             self.declined_here
                 .map(|decline| format!("; {}", describe_prior_decline(decline)))
                 .unwrap_or_default()
@@ -13432,6 +15058,18 @@ pub enum PlacementRejectionReason {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         killed_here: Option<MemoryKill>,
     },
+    /// The kernel killed this command for memory on this machine while nothing
+    /// else of Cairn's ran there: the machine's own answer that it cannot run
+    /// the command. Unlike [`Self::ExceedsMemoryCeiling`] this is never placed
+    /// at the clamp, however idle the machine or empty the fleet; the work
+    /// waits for another machine instead. Lifted when this machine's total
+    /// memory grows past `machine_total_bytes`, when a run of the command
+    /// succeeds here, or when the command's identity changes.
+    MemoryKillExcluded {
+        victim_resident_bytes: u64,
+        machine_total_bytes: u64,
+        killed_at_unix_ms: u64,
+    },
     /// Usable, measured, and simply beaten by the machine that won.
     OutrankedBy { executor_name: String },
     /// Capable of running the work, but not a platform whose answer the
@@ -13448,6 +15086,11 @@ pub enum PlacementRejectionReason {
     /// lands, fails, or is deferred. Work already resident here is exempt, as
     /// for a drain.
     UpdatePending,
+    /// The runner holds this machine for an inference deployment that is
+    /// reserving, starting, healthy or stopping (see [`InferenceHold`]). A
+    /// named drain: it clears when the deployment stops or fails, and work
+    /// already resident here is exempt, as for a drain.
+    InferenceReserved { deployment: String, phase: String },
     /// This work needs a cell, and the machine has posted that the volume it
     /// keeps cells on is not mounted. Filtered rather than offered, the way a
     /// drain is: another machine taking the work records no failure here.
@@ -13588,15 +15231,30 @@ impl PlacementRejectionReason {
                 killed_here: *killed_here,
             }
             .describe(),
+            Self::MemoryKillExcluded {
+                victim_resident_bytes,
+                machine_total_bytes,
+                killed_at_unix_ms,
+            } => format!(
+                "excluded: the kernel killed this command here for memory at {} resident while it ran alone on this {} machine ({}); it is not placed here again until this machine's memory grows or a run of it succeeds here",
+                describe_gib(*victim_resident_bytes),
+                describe_gib(*machine_total_bytes),
+                describe_age(*killed_at_unix_ms)
+            ),
             Self::OutrankedBy { executor_name } => format!("outranked by {executor_name}"),
             Self::UntrustedVerdictPlatform { os, trusted } => format!(
                 "runs {os}, and this verdict counts only from {}",
                 trusted.join(", ")
             ),
-            Self::Drained => "drained by an operator; refusing new work".into(),
+            Self::Drained => "drained by an operator, refusing new work".into(),
             Self::UpdatePending => {
-                "being emptied for an executor update; refusing new work".into()
+                "being emptied for an executor update, refusing new work".into()
             }
+            Self::InferenceReserved { deployment, phase } => InferenceHold {
+                deployment: deployment.clone(),
+                phase: phase.clone(),
+            }
+            .describe(),
             Self::BuildVolumeAbsent { path } => format!(
                 "{}: the volume this machine keeps its cells on is not mounted; it takes no work that needs a cell until it returns",
                 build_volume_absent_detail(path)
@@ -13643,7 +15301,7 @@ impl PlacementRejectionReason {
                 script,
                 detail,
             } => format!(
-                "rust work for {project_id} needs the build prerequisites in {script}; this machine reads MISSING as of its last attach: {}",
+                "work that requires the rust toolchain, by its own selector or by {project_id}'s setup, needs the build prerequisites in {script}; this machine reads MISSING as of its last attach: {}",
                 detail.trim()
             ),
         }
@@ -14376,6 +16034,394 @@ pub struct ProcessBatch {
     /// process left in the shared environment before the batch is not published.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_residency: Option<ResidencyFence>,
+    /// The node scratch this batch's `$TMPDIR` is: brought current before the
+    /// first item runs and written back after the last. `None` for every
+    /// check lane, which must never see a node's untracked data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_scratch: Option<NodeScratchGrant>,
+}
+
+// ── Node scratch (cairn/5253) ───────────────────────────────────────────────
+//
+// A node's `$TMPDIR` travels with the node. Its authority is one runner row;
+// its content is a Git tree in an isolated bare store on the runner; each
+// machine that runs the node's work keeps a replica that is brought current
+// before work starts and written back after it ends, over the object channel's
+// `scratch/*` routes. See docs/execution-fabric.md.
+
+/// Bytes of blobs moved in one scratch pack. A single blob larger than this
+/// travels in a pack of its own.
+pub const NODE_SCRATCH_TRANSFER_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The largest file a node scratch can carry, at any ceiling: the object
+/// codec's per-pack cap, which is a hard transport limit.
+pub const NODE_SCRATCH_MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Directory names whose trees never travel. A scratch that contains one is
+/// told so in the run result.
+pub const NODE_SCRATCH_UNSYNCED_DIRECTORIES: [&str; 3] = ["node_modules", ".venv", "target"];
+
+/// Name prefixes of test harness temp roots, which never travel: each is the
+/// leftover of one command on one machine, regenerated by running it again.
+/// `cairn-rust-tests-` is the Rust test runner's per-run root
+/// (`scripts/lib/rust-test-scratch.ts`).
+pub const NODE_SCRATCH_UNSYNCED_PREFIXES: [&str; 1] = ["cairn-rust-tests-"];
+
+/// A file whose presence marks its directory as a regenerable cache that
+/// never travels: the Cache Directory Tagging convention, which Cargo writes
+/// into every `target/` and the Rust test runner into its temp root. Any tool
+/// registers a root of its own by writing one.
+pub const NODE_SCRATCH_UNSYNCED_MARKER: &str = "CACHEDIR.TAG";
+
+/// Whether a directory named `name` never travels by its name alone: a
+/// dependency tree ([`NODE_SCRATCH_UNSYNCED_DIRECTORIES`]), a test harness
+/// temp root ([`NODE_SCRATCH_UNSYNCED_PREFIXES`]), or a directory the
+/// `tempfile` crate made, which a test that keeps its tempdir on failure
+/// leaves behind. A directory holding [`NODE_SCRATCH_UNSYNCED_MARKER`], and
+/// one that is itself a repository, never travels either, whatever its name.
+pub fn node_scratch_unsynced_name(name: &str) -> bool {
+    NODE_SCRATCH_UNSYNCED_DIRECTORIES.contains(&name)
+        || NODE_SCRATCH_UNSYNCED_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        || is_tempfile_name(name)
+}
+
+/// `.tmp` and six ASCII alphanumerics: the name `tempfile` gives every
+/// directory it makes with its default builder.
+fn is_tempfile_name(name: &str) -> bool {
+    name.strip_prefix(".tmp").is_some_and(|suffix| {
+        suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
+}
+
+/// What a batch, terminal, or REPL needs to make a node's scratch its
+/// `$TMPDIR` on this machine.
+///
+/// It carries no credential: the executor reaches the runner through its own
+/// object channel, and the runner authorizes `scratch_id` for this executor's
+/// connection when it hands this grant out.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeScratchGrant {
+    /// Opaque. The only identity that appears on disk or on the wire.
+    pub scratch_id: String,
+    /// The owning node, for refusals that must name it.
+    pub owner_uri: String,
+    /// The authority's head when the grant was issued; `None` while empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_commit: Option<String>,
+    /// How many times the head had advanced when the grant was issued. Heads
+    /// are parentless commits, so this is what orders them: a replica already
+    /// at a later sequence (its own write-back landed after this grant was
+    /// built) is not moved back.
+    #[serde(default)]
+    pub head_seq: u64,
+    pub ceiling_bytes: u64,
+}
+
+/// A path inside a node scratch, as the bytes the filesystem holds.
+///
+/// Serialized as plain text when it is UTF-8, which is nearly always, and as
+/// `{"b64": ...}` otherwise, so a file name no string can carry still travels.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ScratchPath(pub Vec<u8>);
+
+impl ScratchPath {
+    pub fn display(&self) -> String {
+        String::from_utf8_lossy(&self.0).into_owned()
+    }
+}
+
+impl From<&str> for ScratchPath {
+    fn from(path: &str) -> Self {
+        Self(path.as_bytes().to_vec())
+    }
+}
+
+impl Serialize for ScratchPath {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine;
+        use serde::ser::SerializeMap;
+        match std::str::from_utf8(&self.0) {
+            Ok(text) => serializer.serialize_str(text),
+            Err(_) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(
+                    "b64",
+                    &base64::engine::general_purpose::STANDARD.encode(&self.0),
+                )?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ScratchPath {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use base64::Engine;
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Text(String),
+            Bytes { b64: String },
+        }
+        match Wire::deserialize(deserializer)? {
+            Wire::Text(text) => Ok(Self(text.into_bytes())),
+            Wire::Bytes { b64 } => base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map(Self)
+                .map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+/// One file as a scratch tree records it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScratchBlob {
+    pub oid: String,
+    /// The Git file mode: `0o100644`, `0o100755`, or `0o120000` (a symlink).
+    pub mode: u32,
+    pub size: u64,
+}
+
+/// One path a batch changed, relative to the head its machine last synced.
+///
+/// Carrying the base side is what lets the runner merge without holding the
+/// base tree: a path whose head entry still equals `base` was changed only by
+/// this batch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScratchChange {
+    pub path: ScratchPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<ScratchBlob>,
+    /// `None` when the batch deleted the path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new: Option<ScratchBlob>,
+}
+
+/// A file's size, for refusals and warnings that name what is large.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScratchEntrySize {
+    pub path: String,
+    pub bytes: u64,
+}
+
+/// `POST scratch/skeleton`: the commit and trees of `want_commit`, without
+/// blobs. The answer is a pack, or `204` when `have_commit` already covers it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScratchSkeletonRequest {
+    pub scratch_id: String,
+    pub want_commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub have_commit: Option<String>,
+}
+
+/// `POST scratch/blobs`: a pack of a prefix of `oids` whose bytes stay within
+/// [`NODE_SCRATCH_TRANSFER_BATCH_BYTES`] (at least one blob). The
+/// [`SCRATCH_SERVED_HEADER`] says how many were served; the executor asks again
+/// for the rest, which is what makes an interrupted transfer resumable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScratchBlobsRequest {
+    pub scratch_id: String,
+    pub oids: Vec<String>,
+}
+
+pub const SCRATCH_SERVED_HEADER: &str = "x-cairn-scratch-served";
+pub const SCRATCH_UPLOAD_HEADER: &str = "x-cairn-scratch-upload";
+
+/// `POST scratch/upload/begin`: what a batch changed. The runner plans the
+/// merge from this alone and checks the ceiling against the merged size before
+/// any byte moves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScratchUploadBegin {
+    pub scratch_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+    pub changes: Vec<ScratchChange>,
+    /// Names the writer in a conflict copy (`<path>~conflict-<writer>`).
+    pub writer: String,
+}
+
+/// The runner's answer to a begin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ScratchUploadPlan {
+    /// Upload `missing` (in packs of at most
+    /// [`NODE_SCRATCH_TRANSFER_BATCH_BYTES`]) under `upload_id`, then complete.
+    Proceed {
+        upload_id: String,
+        missing: Vec<String>,
+    },
+    Refused(ScratchRefusal),
+}
+
+/// `POST scratch/upload/complete`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScratchUploadComplete {
+    pub upload_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ScratchUploadResult {
+    Applied {
+        head: String,
+        head_bytes: u64,
+        head_seq: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        conflicts: Vec<ScratchConflict>,
+    },
+    /// The head moved or the store reclaimed something since begin: upload
+    /// these too, then complete again.
+    Missing {
+        missing: Vec<String>,
+    },
+    Refused(ScratchRefusal),
+}
+
+/// A path two writers changed differently. The head's version stays at
+/// `path`; this writer's version is beside it at `written_as`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScratchConflict {
+    pub path: ScratchPath,
+    pub written_as: ScratchPath,
+}
+
+/// A write-back the ceiling refused. Nothing moved, and the writer's files
+/// stay where they are on its machine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScratchRefusal {
+    pub owner_uri: String,
+    /// What the scratch would hold after this write-back.
+    pub merged_bytes: u64,
+    pub ceiling_bytes: u64,
+    /// The largest files of the merged scratch, largest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub largest: Vec<ScratchEntrySize>,
+    /// The largest top-level directories of the merged scratch by the bytes
+    /// beneath them, largest first: a tree of many small files that no
+    /// entry in `largest` would name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub largest_directories: Vec<ScratchEntrySize>,
+    /// Files larger than [`NODE_SCRATCH_MAX_FILE_BYTES`], refused at any ceiling.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub oversized: Vec<ScratchEntrySize>,
+}
+
+/// What happened to a node scratch around one batch, on the machine that ran
+/// it. Carried on the batch's outcome and rendered as the run result's
+/// `Scratch:` line.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScratchSyncReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialize: Option<ScratchMaterializeReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_back: Option<ScratchWriteBackReport>,
+    /// The replica's synced commit after the batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced_commit: Option<String>,
+    /// Whether the replica holds writes the head does not.
+    #[serde(default)]
+    pub dirty: bool,
+    /// The scratch's size on this machine after the batch.
+    pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub largest: Vec<ScratchEntrySize>,
+    /// Paths inside the scratch that do not travel: dependency trees, test
+    /// temp roots, cache-tagged directories and nested repositories (see
+    /// [`node_scratch_unsynced_name`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_synced: Vec<String>,
+    /// The directories of `not_synced` the executor sized, with their bytes
+    /// on this machine, largest first. A directory too large to size within
+    /// the executor's budget is absent rather than reported short.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_synced_bytes: Vec<ScratchEntrySize>,
+    /// Set when the scratch could not be used at all and the batch ran with a
+    /// private `$TMPDIR` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScratchMaterializeReport {
+    /// Blob and tree bytes fetched to bring this machine current.
+    pub bytes: u64,
+    pub ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_commit: Option<String>,
+    /// Set when the replica could not be brought current (a path the head
+    /// changed was also changed here and not yet written back), so the batch
+    /// ran against this machine's copy as it stood.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScratchWriteBackReport {
+    /// Blob bytes uploaded.
+    pub bytes: u64,
+    pub ms: u64,
+    pub outcome: ScratchWriteBackOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ScratchWriteBackOutcome {
+    Applied {
+        head: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        conflicts: Vec<ScratchConflict>,
+    },
+    Refused(ScratchRefusal),
+    Failed {
+        stage: String,
+        detail: String,
+    },
+}
+
+/// One replica a machine holds, as its advertisement reports it. Built from
+/// each replica's state file, never by walking a tree, so its cost is the
+/// number of scratches and not the number of files (tenet 314).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeScratchReplica {
+    pub scratch_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced_commit: Option<String>,
+    pub bytes: u64,
+    #[serde(default)]
+    pub dirty: bool,
+    /// A live terminal or REPL holds this replica as its `$TMPDIR`.
+    #[serde(default)]
+    pub in_use: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -14436,9 +16482,10 @@ pub struct ProcessBatchItem {
     rename_all_fields = "camelCase"
 )]
 pub enum CommandStop {
-    /// The command's process tree wrote no output and burned less than the
-    /// executor's progress threshold of CPU for `quiet_ms`, while nothing on the
-    /// executor's side was holding it up.
+    /// The command's process tree wrote no output, burned less than the
+    /// executor's progress threshold of CPU, and moved less than its threshold
+    /// of storage I/O for `quiet_ms`, with no member waiting on storage when
+    /// the stop was decided and nothing on the executor's side holding it up.
     Silent {
         quiet_ms: u64,
         /// When the command last wrote anything. `None` when it wrote nothing
@@ -14448,6 +16495,15 @@ pub enum CommandStop {
         /// CPU the whole tree used across the quiet window, as sampled.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cpu_ms_in_window: Option<u64>,
+        /// Bytes the whole tree read from or wrote to storage across the quiet
+        /// window, as sampled. `None` from an executor that does not measure it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        storage_io_bytes_in_window: Option<u64>,
+        /// The tree as the executor read it just before ending it, waiting
+        /// members first, so a hung tree and a disk-bound one read differently
+        /// after the fact. Bounded; empty when it could not be read.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tree: Vec<StoppedProcess>,
     },
     /// The request the command belonged to was withdrawn while it ran.
     Cancelled,
@@ -14467,6 +16523,93 @@ pub enum CommandStop {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         machine_total_bytes: Option<u64>,
     },
+}
+
+/// One process of a stalled command's tree, read just before the stop ended it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StoppedProcess {
+    pub pid: u32,
+    /// The kernel's state letter for it: `D` is an uninterruptible wait,
+    /// almost always on storage. `None` where the platform does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// The kernel function it was sleeping in (Linux `/proc/<pid>/wchan`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wchan: Option<String>,
+    /// CPU it had used since it started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_ms: Option<u64>,
+    /// Bytes it had read from or written to storage since it started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_io_bytes: Option<u64>,
+    /// Its command line, truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+impl StoppedProcess {
+    pub fn waiting_on_storage(&self) -> bool {
+        self.state.as_deref() == Some("D")
+    }
+
+    /// `pid 412 D in folio_wait_bit_common \`rust-lld ...\` (2100ms CPU, 340 MiB
+    /// storage I/O)`.
+    pub fn describe(&self) -> String {
+        let mut line = format!("pid {}", self.pid);
+        if let Some(state) = &self.state {
+            line.push(' ');
+            line.push_str(state);
+        }
+        if let Some(wchan) = &self.wchan {
+            line.push_str(" in ");
+            line.push_str(wchan);
+        }
+        if let Some(command) = &self.command {
+            line.push_str(&format!(" `{command}`"));
+        }
+        let usage: Vec<String> = [
+            self.cpu_ms.map(|cpu| format!("{cpu}ms CPU")),
+            self.storage_io_bytes
+                .map(|bytes| format!("{} storage I/O", human_bytes(bytes))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !usage.is_empty() {
+            line.push_str(&format!(" ({})", usage.join(", ")));
+        }
+        line
+    }
+}
+
+/// How many of a stopped tree's processes a description names; the record
+/// itself keeps the executor's own bound.
+const STOPPED_TREE_DESCRIBED: usize = 8;
+
+fn describe_stopped_tree(tree: &[StoppedProcess]) -> String {
+    if tree.is_empty() {
+        return String::new();
+    }
+    let waiting = tree
+        .iter()
+        .filter(|process| process.waiting_on_storage())
+        .count();
+    let named: Vec<String> = tree
+        .iter()
+        .take(STOPPED_TREE_DESCRIBED)
+        .map(StoppedProcess::describe)
+        .collect();
+    let more = match tree.len().saturating_sub(STOPPED_TREE_DESCRIBED) {
+        0 => String::new(),
+        more => format!("; and {more} more"),
+    };
+    format!(
+        "; at the stop its tree held {} process{} ({waiting} waiting on storage): {}{more}",
+        tree.len(),
+        if tree.len() == 1 { "" } else { "es" },
+        named.join("; ")
+    )
 }
 
 /// Bytes as a reader wants them: GiB from one GiB up, MiB below.
@@ -14490,10 +16633,22 @@ impl CommandStop {
                 quiet_ms,
                 last_output_unix_ms,
                 cpu_ms_in_window,
+                storage_io_bytes_in_window,
+                tree,
             } => {
-                let cpu = cpu_ms_in_window
-                    .map(|cpu| format!(" (it used {}ms of CPU in that window)", cpu))
-                    .unwrap_or_default();
+                let used: Vec<String> = [
+                    cpu_ms_in_window.map(|cpu| format!("{cpu}ms of CPU")),
+                    storage_io_bytes_in_window
+                        .map(|bytes| format!("{} of storage I/O", human_bytes(bytes))),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                let used = if used.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (it used {} in that window)", used.join(" and "))
+                };
                 let last = match last_output_unix_ms {
                     Some(at) => {
                         let seconds = (at / 1_000) % 86_400;
@@ -14507,8 +16662,9 @@ impl CommandStop {
                     None => "it wrote no output after it started".to_string(),
                 };
                 format!(
-                    "no output and no CPU progress across its process tree for {}s{cpu}; {last}",
-                    quiet_ms / 1_000
+                    "no output, no CPU progress and no storage I/O across its process tree for {}s{used}; {last}{}",
+                    quiet_ms / 1_000,
+                    describe_stopped_tree(tree)
                 )
             }
             Self::Cancelled => "cancelled by its requester while it ran".to_string(),
@@ -14588,6 +16744,10 @@ pub struct ProcessBatchItemOutcome {
     /// batch share the command's width, so an item's grant can be smaller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_units: Option<u32>,
+    /// The build jobs this item was given, split like its width when items
+    /// ran together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_jobs: Option<BuildJobs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_delta_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -14615,6 +16775,86 @@ pub struct ProcessBatchItemOutcome {
 pub enum McpRelayResult {
     Success { response: CallbackResponse },
     Rejected { diagnostic: String },
+}
+
+/// What the runner asks a deployment's head to do. Only the head acts; a
+/// multi-machine recipe's own scripts drive the other machines.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "operation", rename_all = "camelCase")]
+pub enum DeploymentOperation {
+    /// Probe `health_url` first, and report healthy without running anything
+    /// if it already answers. Otherwise run `script`, then poll `health_url`
+    /// until it answers. The script and the wait for health together are
+    /// bounded by `timeout_secs` from receipt. A start that fails runs
+    /// `cleanup`, when there is one, before it reports, so what the start left
+    /// behind does not hold the machines' memory once they are released.
+    Start {
+        script: String,
+        timeout_secs: u64,
+        health_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cleanup: Option<DeploymentScript>,
+    },
+    /// Run `script`, bounded by `timeout_secs`, then wait up to
+    /// `stopped_health_wait_secs` for `health_url` to stop answering. A start
+    /// of the same deployment still running here is killed first.
+    Stop {
+        script: String,
+        health_url: String,
+        timeout_secs: u64,
+        stopped_health_wait_secs: u64,
+    },
+    /// One request to `health_url`, answered healthy or stopped.
+    Probe { health_url: String },
+}
+
+/// A shell script and how long it may run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentScript {
+    pub script: String,
+    pub timeout_secs: u64,
+}
+
+/// A deployment's phase as its head reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "phase", rename_all = "camelCase")]
+pub enum DeploymentPhaseReport {
+    Starting,
+    /// The health URL answers 2xx. `ran_start` is false when it already
+    /// answered, so the start script was not run.
+    Healthy {
+        #[serde(default)]
+        ran_start: bool,
+    },
+    Stopping,
+    /// The health URL does not answer: after a stop, or on a probe.
+    Stopped,
+    Failed {
+        reason: String,
+    },
+}
+
+/// A machine the runner holds for an inference deployment while it is
+/// reserving, starting, healthy or stopping: a drain with a named reason, held
+/// by the runner alone. The machine is never told; the deployment's own
+/// commands go to its head, and placement simply offers this machine no batch
+/// work until the hold is released.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InferenceHold {
+    pub deployment: String,
+    /// The deployment's phase, as the cairn-inference facet labels it.
+    pub phase: String,
+}
+
+impl InferenceHold {
+    pub fn describe(&self) -> String {
+        format!(
+            "reserved for inference deployment {} ({}), refusing new work until it stops",
+            self.deployment, self.phase
+        )
+    }
 }
 
 // The protocol keeps request payloads inline so serde preserves the established
@@ -14675,6 +16915,27 @@ pub enum ExecutorMessage {
         health: ExecutorSubstrateReport,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_update: Option<UpdateReport>,
+        /// The executor's latest [`MachineSample`] as the beat left. `health`
+        /// is the last refresh pass's and stands still while that pass waits
+        /// on pool state; this does not, because the beat reads it from a
+        /// cache nothing holding pool state can occupy. Absent from an
+        /// executor that predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine: Option<MachineSample>,
+    },
+    /// Executor → runner: the machine readings changed, published from the CPU
+    /// sampler without a fleet snapshot.
+    ///
+    /// This is what keeps the runner's view of the CPU brake inside
+    /// [`CPU_ADMISSION_BLIND_AFTER_MS`]: the beat is thirty seconds apart and
+    /// the brake goes blind at fifteen, so the brake's own cadence has to carry
+    /// it. It used to ride a whole snapshot every sample, which took pool state
+    /// first and so could wait as long as the slowest `fsync` beneath it.
+    ///
+    /// A peer that predates it logs the frame as unrecognised and goes on; see
+    /// [`MachineSample`] for why that is not a compatibility boundary.
+    MachineSampled {
+        sample: MachineSample,
     },
     /// Every executor-side queue entry this runner still has a live waiter for.
     ///
@@ -14803,6 +17064,36 @@ pub enum ExecutorMessage {
     },
     CancelJob {
         job_id: String,
+    },
+    /// Runner → executor. This node scratch is closed: remove its replica.
+    ///
+    /// Sent to every connected machine that holds one when the node closes, and
+    /// again to any machine whose advertisement names a closed or unknown
+    /// scratch, which is how a machine that was offline at close is cleaned once
+    /// it reconnects.
+    DeleteNodeScratch {
+        scratch_id: String,
+    },
+    /// Executor → runner. The replica of `scratch_id` is gone from this machine.
+    NodeScratchDeleted {
+        scratch_id: String,
+    },
+    /// Runner → executor. This machine is the head of `deployment`: start,
+    /// stop or probe it. Answered by [`Self::DeploymentReport`]s naming the
+    /// same `command_id`. A newer command for the same deployment supersedes
+    /// one still running.
+    DeploymentCommand {
+        command_id: String,
+        deployment: String,
+        operation: DeploymentOperation,
+    },
+    /// Executor → runner. Where `command_id` has got to. Retained across a
+    /// link bounce like a result, because a start that finished while the
+    /// link was down is still the only record of how the load ended.
+    DeploymentReport {
+        command_id: String,
+        deployment: String,
+        phase: DeploymentPhaseReport,
     },
     ResidencyRequest {
         correlation_id: String,
@@ -15234,7 +17525,7 @@ mod tests {
         // And the successor has to finish that wait before the supervisor gives
         // up on it, or patience during an ordinary handoff reads as a failed
         // startup and is answered with a kill.
-        const { assert!(EXECUTOR_ADOPTION_HANDOFF_BUDGET_MS < EXECUTOR_STARTUP_READY_BUDGET_MS) };
+        const { assert!(EXECUTOR_ADOPTION_HANDOFF_BUDGET_MS < EXECUTOR_STARTUP_PROGRESS_BUDGET_MS) };
     }
 
     #[test]
@@ -15285,13 +17576,53 @@ mod tests {
             AllocationEnforcement::Measured { reason }
         );
         assert_eq!(measured.delivered_units_millis, Some(5_000));
-        let unread = measured.reobserved(None, None, 1_000);
+        let unread = measured.reobserved(None, None, None, 1_000);
         assert_eq!(
             unread.enforcement,
             AllocationEnforcement::Advisory { reason }
         );
         assert_eq!(unread.granted_units, 2);
         assert_eq!(unread.delivered_units_millis, None);
+    }
+
+    #[test]
+    fn build_jobs_name_the_bound_that_set_them() {
+        const GIB: u64 = 1 << 30;
+        let held = BuildJobs::new(8, Some(MemoryJobBound::new(12 * GIB, 1, 5 * GIB / 2, 1)));
+        assert_eq!(held.jobs, 4);
+        assert_eq!(
+            held.describe(),
+            "4 build jobs, held below the CPU width of 8 by memory: 12.0 GiB available at start / 2.5 GiB per job"
+        );
+        let shared = held.shared_by(2);
+        assert_eq!((shared.cpu_width, shared.jobs), (4, 2));
+        assert!(shared.describe().ends_with(", split 2 ways"));
+
+        let ample = BuildJobs::new(32, Some(MemoryJobBound::new(104 * GIB, 1, 5 * GIB / 2, 1)));
+        assert_eq!(
+            ample.describe(),
+            "32 build jobs, the CPU width (memory allowed 41)"
+        );
+        assert_eq!(
+            BuildJobs::new(8, None).describe(),
+            "8 build jobs, the CPU width (memory was not measured at start)"
+        );
+
+        // The record round-trips, and an item's own jobs survive narrowing.
+        let wire: BuildJobs = serde_json::from_value(serde_json::to_value(held).unwrap()).unwrap();
+        assert_eq!(wire, held);
+        let command = ExecutionAllocation::uncapped(8, NoCapReason::CapNotImplemented, None, 1)
+            .with_build_jobs(held);
+        assert_eq!(
+            command.reobserved(None, None, None, 1).build_jobs,
+            Some(held)
+        );
+        assert_eq!(
+            command
+                .reobserved(Some(4), Some(shared), None, 1)
+                .build_jobs,
+            Some(shared)
+        );
     }
 
     #[test]
@@ -15385,6 +17716,40 @@ mod tests {
                 advertisement: advertisement.clone(),
                 health: ExecutorSubstrateReport::default(),
                 last_update: Some(sample_update_report()),
+                machine: Some(MachineSample {
+                    cpu: Measurement::measured(
+                        7,
+                        CpuPressure {
+                            utilization: 0.5,
+                            user: 0.25,
+                            system: 0.25,
+                            logical_cores: 8,
+                        },
+                    ),
+                    ..MachineSample::default()
+                }),
+            },
+            ExecutorMessage::MachineSampled {
+                sample: MachineSample {
+                    memory: Measurement::measured(
+                        8,
+                        MachineMemory {
+                            total_bytes: 16,
+                            available_bytes: 4,
+                        },
+                    ),
+                    build_volume: Some(Measurement::unavailable(
+                        8,
+                        MeasurementGap::BuildVolumeAbsent,
+                    )),
+                    cpu_admission: CpuAdmissionHealth {
+                        state: CpuAdmissionState::Accepting,
+                        utilization: Some(0.5),
+                        state_since_unix_ms: Some(1),
+                        measured_at_unix_ms: Some(8),
+                    },
+                    ..MachineSample::default()
+                },
             },
             ExecutorMessage::AdvertisementUpdated { advertisement },
             ExecutorMessage::ListenerUpdated {
@@ -15510,6 +17875,53 @@ mod tests {
                 attempt_id: "a".into(),
             },
             ExecutorMessage::CancelJob { job_id: "j".into() },
+            ExecutorMessage::DeploymentCommand {
+                command_id: "start-1".into(),
+                deployment: "dsv4f-tp2".into(),
+                operation: DeploymentOperation::Start {
+                    script: "cd /home/dev/dsv4f-recipe && ./start.sh".into(),
+                    timeout_secs: 1_800,
+                    health_url: "http://10.20.20.40:8888/v1/models".into(),
+                    cleanup: Some(DeploymentScript {
+                        script: "./stop.sh".into(),
+                        timeout_secs: 600,
+                    }),
+                },
+            },
+            ExecutorMessage::DeploymentCommand {
+                command_id: "stop-1".into(),
+                deployment: "dsv4f-tp2".into(),
+                operation: DeploymentOperation::Stop {
+                    script: "./stop.sh".into(),
+                    health_url: "http://10.20.20.40:8888/v1/models".into(),
+                    timeout_secs: 600,
+                    stopped_health_wait_secs: 120,
+                },
+            },
+            ExecutorMessage::DeploymentCommand {
+                command_id: "probe-1".into(),
+                deployment: "dsv4f-tp2".into(),
+                operation: DeploymentOperation::Probe {
+                    health_url: "http://10.20.20.40:8888/v1/models".into(),
+                },
+            },
+            ExecutorMessage::DeploymentReport {
+                command_id: "start-1".into(),
+                deployment: "dsv4f-tp2".into(),
+                phase: DeploymentPhaseReport::Healthy { ran_start: true },
+            },
+            ExecutorMessage::DeploymentReport {
+                command_id: "start-1".into(),
+                deployment: "dsv4f-tp2".into(),
+                phase: DeploymentPhaseReport::Failed {
+                    reason: "the start script exited 1".into(),
+                },
+            },
+            ExecutorMessage::DeploymentReport {
+                command_id: "stop-1".into(),
+                deployment: "dsv4f-tp2".into(),
+                phase: DeploymentPhaseReport::Stopped,
+            },
             ExecutorMessage::ResidencyRequest {
                 granted_entry_id: None,
                 correlation_id: "lease-request".into(),
@@ -15670,6 +18082,7 @@ mod tests {
                         ownership: None,
                     },
                     reservation: None,
+                    live_usage: None,
                 },
             )]),
             clone_source: None,
@@ -15824,6 +18237,7 @@ mod tests {
             spec: None,
             status,
             reservation: Some(charged.clone()),
+            live_usage: None,
         };
         let mut occupancy = CellOccupancy {
             command: None,
@@ -16266,6 +18680,7 @@ mod tests {
                 source: ResourceReservationSource::Unmeasured,
             },
             learned_estimate: None,
+            scratch_sync: None,
         }
     }
 
@@ -16341,6 +18756,7 @@ mod tests {
             liveness_observed_at_unix_ms: None,
             facts_stale_refresh_blocked: None,
             last_refresh: None,
+            node_scratches: Vec::new(),
         }
     }
 
@@ -16654,6 +19070,7 @@ mod tests {
                         pixel_height: 0,
                     },
                 },
+                node_scratch: None,
             }),
             status: ResidentProcessStatus::Running {
                 started_at_unix_ms: 1_785_185_750_222,
@@ -16666,6 +19083,7 @@ mod tests {
                 concurrency_units: 0,
                 source: ResourceReservationSource::Declared,
             }),
+            live_usage: None,
         }
     }
 
@@ -17055,6 +19473,7 @@ mod tests {
                         external_managed_caches_bytes: 7,
                         quarantines_bytes: 4,
                         temporary_other_bytes: 5,
+                        node_scratch_bytes: 0,
                     },
                     skipped: vec![SkippedEntry {
                         path: "build-slots/slot-3".into(),
@@ -17365,6 +19784,7 @@ mod tests {
                     connection_timeline: Vec::new(),
                     drained: false,
                     role: Default::default(),
+                    stranded: None,
                 },
                 EnrolledRemote {
                     executor_id: "bglab-ub".into(),
@@ -17387,6 +19807,7 @@ mod tests {
                     // is there to confirm it.
                     drained: true,
                     role: Default::default(),
+                    stranded: None,
                 },
                 EnrolledRemote {
                     executor_id: "bglab-win".into(),
@@ -17402,6 +19823,7 @@ mod tests {
                     connection_timeline: Vec::new(),
                     drained: false,
                     role: Default::default(),
+                    stranded: None,
                 },
             ],
             compile_cache: Some(CompileCacheHealth {
@@ -17454,6 +19876,7 @@ mod tests {
             ],
             executors: vec![ExecutorHealthSnapshot {
                 build_volume: None,
+                inference_hold: None,
                 identity: sample_advertisement().identity,
                 public_name: "local".into(),
                 colocated: true,
@@ -17546,6 +19969,8 @@ mod tests {
                     subscriber_count: 1,
                     resource_reservation: reservation.clone(),
                     learned_estimate: Some(learned_estimate.clone()),
+                    live_usage: None,
+                    build_jobs: None,
                 }],
                 in_flight_residency_operations: HashMap::new(),
                 recent_completions: vec![CellCompletion {
@@ -17620,6 +20045,7 @@ mod tests {
                 // running-panel fixture stays the serializer's exact output.
                 provisioning_holds: Vec::new(),
                 orphaned_provisioning_releases: 0,
+                cell_transitions: Vec::new(),
             },
             store_locks: vec![StoreLockHealth {
                 store: "/tmp/store".into(),
@@ -18087,6 +20513,7 @@ mod tests {
                 connection_timeline: Vec::new(),
                 drained: false,
                 role: Default::default(),
+                stranded: None,
             }],
             status: SubstrateHealthStatus::Degraded,
             warming_up: false,
@@ -18533,6 +20960,34 @@ mod tests {
     }
 
     #[test]
+    fn cell_transitions_round_trip_and_a_newer_kind_decodes_as_unknown() {
+        let fleet = FleetSnapshot {
+            cell_transitions: vec![CellTransitionInFlight {
+                project_id: "p".into(),
+                cell_id: "slot-1".into(),
+                kind: CellTransitionKind::Seed,
+                since_unix_ms: 7,
+            }],
+            ..FleetSnapshot::default()
+        };
+        let value = serde_json::to_value(&fleet).unwrap();
+        assert_eq!(value["cellTransitions"][0]["kind"], "seed");
+        assert_eq!(value["cellTransitions"][0]["cellId"], "slot-1");
+        assert_eq!(
+            serde_json::from_value::<FleetSnapshot>(value).unwrap(),
+            fleet
+        );
+        assert!(serde_json::to_value(FleetSnapshot::default())
+            .unwrap()
+            .get("cellTransitions")
+            .is_none());
+        assert_eq!(
+            serde_json::from_value::<CellTransitionKind>(serde_json::json!("compaction")).unwrap(),
+            CellTransitionKind::Unknown
+        );
+    }
+
+    #[test]
     fn occupancy_evidence_counts_processes_not_holders() {
         let fleet = FleetSnapshot {
             resident_occupancy: Some(ResidentOccupancyEvidence {
@@ -18916,6 +21371,7 @@ mod tests {
             })),
             sandbox_denials: Vec::new(),
             tracked_modifications: None,
+            node_scratch: None,
         }
     }
 
@@ -18936,6 +21392,7 @@ mod tests {
                 data: b"console.log('ok')".to_vec(),
             }],
             io: ResidentProcessIoMode::Pipe,
+            node_scratch: None,
         };
         let value = serde_json::to_value(&process).unwrap();
         assert_eq!(value["cwdRoot"], "residencyScratch");
@@ -19186,6 +21643,62 @@ mod tests {
         assert_eq!(ingress.key.destination, TrustDomain::Cell);
         let desktop = EdgeId::DesktopAutomationControl.definition();
         assert_eq!(desktop.key.destination, TrustDomain::ExecutorHost);
+
+        // A cell reaching a host service's socket (the user bus, an agent, a
+        // tmux server) runs outward, from the guest to the host, and is keyed
+        // by the policy mode that decides whether a ruleset exists at all --
+        // unlike the desktop control surface, which has no guest policy.
+        let socket = EdgeId::BatchSpawnHostSocketConfined.definition();
+        assert_eq!(socket.key.source, TrustDomain::Cell);
+        assert_eq!(socket.key.destination, TrustDomain::ExecutorHost);
+        assert_eq!(socket.key.direction, Direction::GuestToDest);
+        assert_eq!(socket.key.carrier, Carrier::Socket);
+        assert_eq!(socket.key.policy_mode, PolicyMode::Confined);
+        assert_ne!(socket.key.policy_mode, desktop.key.policy_mode);
+    }
+
+    /// Every process class reaches host sockets through its own edge per
+    /// policy mode, as for the filesystem seams: evidence that a confined batch
+    /// is refused the session bus says nothing about an unconfined terminal.
+    #[test]
+    fn every_host_socket_seam_is_represented_once_per_policy_mode() {
+        for class in [
+            ProcessClass::BatchSpawn,
+            ProcessClass::PipedResident,
+            ProcessClass::PtyResident,
+            ProcessClass::Repl,
+            ProcessClass::Workflow,
+            ProcessClass::DevInstance,
+        ] {
+            for mode in [
+                PolicyMode::Confined,
+                PolicyMode::ReadOnlyCheckout,
+                PolicyMode::Unconfined,
+            ] {
+                let found: Vec<_> = CONTAINMENT_EDGE_IDS
+                    .into_iter()
+                    .map(EdgeId::definition)
+                    .filter(|definition| {
+                        definition.key.carrier == Carrier::Socket
+                            && definition.key.source == TrustDomain::Cell
+                            && definition.key.destination == TrustDomain::ExecutorHost
+                            && definition.key.process_class == class
+                            && definition.key.policy_mode == mode
+                    })
+                    .collect();
+                assert_eq!(
+                    found.len(),
+                    1,
+                    "{class:?} under {mode:?} must be exactly one host-socket edge"
+                );
+                let mediated = found[0].mediation == MediationPoint::SandboxProfile;
+                assert_eq!(
+                    mediated,
+                    mode != PolicyMode::Unconfined,
+                    "{class:?} {mode:?}"
+                );
+            }
+        }
     }
 
     /// Every filesystem seam is represented once per runtime policy mode, so a

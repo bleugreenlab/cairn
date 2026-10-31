@@ -21,6 +21,7 @@ mod executions;
 mod executors;
 mod feed;
 mod grants;
+mod inference;
 mod issues;
 mod labels;
 mod mcp;
@@ -30,6 +31,7 @@ mod models;
 mod models_accounts;
 mod nodes;
 mod packs;
+mod pages;
 mod posts;
 mod progress;
 mod projects;
@@ -39,6 +41,7 @@ mod recipes;
 mod repls;
 mod responses;
 mod routes;
+mod services;
 mod settings;
 mod skills;
 mod tenets;
@@ -188,6 +191,13 @@ fn gate_resource_change(
         return Err(build_failure(index, item, refusal));
     }
     let kind = resource.kind();
+    if kind == ResourceKind::IssueExecutions && item.mode == ChangeMode::Append {
+        if let Some(refusal) =
+            crate::tenets::filing_tenet_keys_refusal(item.payload.as_ref(), "payload.")
+        {
+            return Err(build_failure(index, item, refusal));
+        }
+    }
     if matches!(
         kind,
         ResourceKind::Projects | ResourceKind::Project | ResourceKind::ProjectSettings
@@ -322,8 +332,13 @@ pub(crate) async fn dispatch_resource_change(
         off_frame(|| feed::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
-    } else if let Some(summary) =
-        off_frame(|| threads::dispatch(orch, request, index, item, dry_run, &resource)).await?
+    } else if let Some(summary) = {
+        let (resource, applied_data) = (&resource, &mut applied_data);
+        off_frame(move || {
+            threads::dispatch(orch, request, index, item, dry_run, resource, applied_data)
+        })
+    }
+    .await?
     {
         summary
     } else if let Some(summary) = {
@@ -356,6 +371,10 @@ pub(crate) async fn dispatch_resource_change(
     {
         summary
     } else if let Some(summary) =
+        off_frame(|| services::dispatch(orch, request, index, item, dry_run, &resource)).await?
+    {
+        summary
+    } else if let Some(summary) =
         off_frame(|| repls::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
@@ -363,13 +382,8 @@ pub(crate) async fn dispatch_resource_change(
         off_frame(|| browsers::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
-    } else if let Some(summary) = {
-        let (resource, applied_data) = (&resource, &mut applied_data);
-        off_frame(move || {
-            executions::dispatch(orch, request, index, item, dry_run, resource, applied_data)
-        })
-    }
-    .await?
+    } else if let Some(summary) =
+        off_frame(|| executions::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =
@@ -414,6 +428,10 @@ pub(crate) async fn dispatch_resource_change(
     {
         summary
     } else if let Some(summary) =
+        off_frame(|| inference::dispatch(orch, request, index, item, dry_run, &resource)).await?
+    {
+        summary
+    } else if let Some(summary) =
         off_frame(|| models_accounts::dispatch(orch, request, index, item, dry_run, &resource))
             .await?
     {
@@ -434,6 +452,10 @@ pub(crate) async fn dispatch_resource_change(
         })
     }
     .await?
+    {
+        summary
+    } else if let Some(summary) =
+        off_frame(|| pages::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =

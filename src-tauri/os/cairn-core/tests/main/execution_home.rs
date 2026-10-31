@@ -73,9 +73,14 @@ fn git(repo: &Path, args: &[&str]) {
 
 /// A repository with a gitignored directory, which is where state that exists
 /// only in an environment lives: virtualenvs, `node_modules`, build caches.
+///
+/// The initial branch is named explicitly. Left to `init.defaultBranch` it is
+/// `master` on a machine with no git config and `main` on one with it, and a
+/// branch-scoped run against a `main` that does not exist fails to resolve,
+/// which an assertion about what the run did NOT see reads as a pass.
 fn init_repo(repo: &Path) {
     std::fs::create_dir_all(repo).unwrap();
-    git(repo, &["init", "-q"]);
+    git(repo, &["init", "-q", "--initial-branch=main"]);
     git(repo, &["config", "user.email", "test@example.com"]);
     git(repo, &["config", "user.name", "Test User"]);
     std::fs::write(repo.join(".gitignore"), "env/\nnode_modules/\n").unwrap();
@@ -239,12 +244,14 @@ impl Fixture {
         let result = handle_run(
             &self.orch,
             &McpCallbackRequest {
+                answer_bound_ms: None,
                 thread_id: None,
                 cwd: self.cwd.clone(),
                 run_id: Some("r-1".to_string()),
                 tool: "run".to_string(),
                 payload,
                 tool_use_id: Some("toolu-home".to_string()),
+                origin: None,
             },
         )
         .await;
@@ -272,6 +279,7 @@ impl Fixture {
         handle_write(
             &self.orch,
             &McpCallbackRequest {
+                answer_bound_ms: None,
                 thread_id: None,
                 cwd: String::new(),
                 run_id: Some("r-1".to_string()),
@@ -286,6 +294,7 @@ impl Fixture {
                     "payload": { "command": command, "wake": "exit" }
                 }]}),
                 tool_use_id: None,
+                origin: None,
             },
         )
         .await
@@ -297,6 +306,7 @@ impl Fixture {
         handle_write(
             &self.orch,
             &McpCallbackRequest {
+                answer_bound_ms: None,
                 thread_id: None,
                 cwd: self.cwd.clone(),
                 run_id: Some("r-1".to_string()),
@@ -307,6 +317,7 @@ impl Fixture {
                     "payload": { "content": line }
                 }]}),
                 tool_use_id: None,
+                origin: None,
             },
         )
         .await
@@ -347,6 +358,7 @@ impl Fixture {
         handle_write(
             &self.orch,
             &McpCallbackRequest {
+                answer_bound_ms: None,
                 thread_id: None,
                 cwd: self.cwd.clone(),
                 run_id: Some("r-1".to_string()),
@@ -360,6 +372,7 @@ impl Fixture {
                     "commit_msg": format!("rewrite {path}")
                 }),
                 tool_use_id: None,
+                origin: None,
             },
         )
         .await
@@ -371,12 +384,14 @@ impl Fixture {
         handle_read_file(
             &self.orch,
             &McpCallbackRequest {
+                answer_bound_ms: None,
                 thread_id: None,
                 cwd: self.cwd.clone(),
                 run_id: Some("r-1".to_string()),
                 tool: "read".to_string(),
                 payload: json!({ "path": path }),
                 tool_use_id: None,
+                origin: None,
             },
         )
         .await
@@ -914,9 +929,12 @@ async fn losing_the_execution_lease_between_batches_is_survivable_and_invisible(
         after.contains("tracked"),
         "tracked content was not current after reclaim: {after}"
     );
+    // `$TMPDIR` is the node's scratch, which belongs to the node rather than to
+    // any lease (tenet #1258): losing the lease costs warm build state at most,
+    // never the node's data.
     assert!(
-        after.contains("SCRATCH-GONE"),
-        "scratch outlived the lease that owned it: {after}"
+        after.contains("SCRATCH-KEPT"),
+        "the node's scratch must outlive the lease: {after}"
     );
 
     // Whether `env/package` survives is deliberately not asserted: re-acquire
@@ -946,10 +964,46 @@ async fn losing_the_execution_lease_between_batches_is_survivable_and_invisible(
     }
 }
 
+/// Append to `script` a report of where it ran: the checkout root and the
+/// scratch directory, each with symlinks resolved so two spellings of one
+/// directory can never read as two directories.
+fn located(script: &str) -> String {
+    format!("{script}; echo \"root=$(pwd -P)\"; echo \"scratch=$(cd \"$TMPDIR\" && pwd -P)\"")
+}
+
+/// The `(root, scratch)` a [`located`] script reported.
+fn location(output: &str) -> (String, String) {
+    let field = |key: &str| {
+        output
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(key))
+            .filter(|value| value.starts_with('/'))
+            .unwrap_or_else(|| panic!("batch reported no {key}: {output}"))
+            .to_string()
+    };
+    (field("root="), field("scratch="))
+}
+
 /// The scope boundary. Convergence is for a job's own execution; a branch-scoped
 /// run addresses a different coordinate entirely and must never join the job's
 /// environment. Checks and builds take the same path, which is what keeps their
-/// per-batch cells and per-batch scratch hygiene intact.
+/// per-batch cells intact.
+///
+/// A branch-scoped run gets its own checkout but the node's scratch:
+/// verdict-only discards its tracked changes, never the node's data. The scratch
+/// belongs to the node rather than to the job's cell or coordinate (tenet
+/// #1258), so like every batch of the node the branch run reads what the node
+/// left in `$TMPDIR`, and what it writes there flows back. Only check lanes,
+/// whose verdicts are recorded and reused, never see a scratch.
+///
+/// Joining is identity and authority, not content. On a volume that clones, the
+/// branch run's fresh cell may be seeded by a copy-on-write clone of the job's
+/// own cell, and the job's ignored build products then arrive with it by design,
+/// just as they would in a pool cell the job once held. Whether they do depends
+/// on the volume and on timing, so this test asserts neither. What must hold on
+/// every platform is that the branch run has its own checkout and that nothing
+/// it writes there reaches the job.
 #[tokio::test]
 async fn a_branch_scoped_run_never_joins_the_job_environment() {
     if common::skip_if_fenced("a_branch_scoped_run_never_joins_the_job_environment") {
@@ -957,19 +1011,50 @@ async fn a_branch_scoped_run_never_joins_the_job_environment() {
     }
     let fixture = fixture().await;
 
-    let seeded = fixture
-        .shell("mkdir -p env; echo job-only > env/marker; cat env/marker")
+    let home = fixture
+        .shell(&located(
+            "mkdir -p env; echo job-only > env/marker; echo job-only > \"$TMPDIR/marker\"",
+        ))
         .await;
-    assert!(seeded.contains("job-only"), "seeding failed: {seeded}");
+    let (home_root, home_scratch) = location(&home);
 
+    // Each marker is reported through a command substitution, so the expected
+    // text appears only in what the batch printed, never in its echoed header.
     let elsewhere = fixture
         .run(json!({
-            "commands": [{ "command": "cat env/marker" }],
+            "commands": [{ "command": located(
+                "echo \"scratch-read=$(cat \"$TMPDIR/marker\")\"; \
+                 mkdir -p env; echo branch-wrote > env/marker; echo branch-wrote > \"$TMPDIR/marker\""
+            ) }],
             "branch": "main"
         }))
         .await;
+    let (branch_root, _) = location(&elsewhere);
+    assert_ne!(
+        branch_root, home_root,
+        "a branch-scoped run ran in the job's checkout: {elsewhere}"
+    );
     assert!(
-        !elsewhere.contains("job-only"),
-        "a branch-scoped run reached into the job's environment: {elsewhere}"
+        elsewhere.contains("scratch-read=job-only"),
+        "a branch-scoped run was not given the node's scratch: {elsewhere}"
+    );
+
+    let after = fixture
+        .shell(&located(
+            "echo \"checkout=$(cat env/marker)\"; echo \"scratch-now=$(cat \"$TMPDIR/marker\")\"",
+        ))
+        .await;
+    assert_eq!(
+        location(&after),
+        (home_root, home_scratch),
+        "the job did not stay in its own environment: {after}"
+    );
+    assert!(
+        after.contains("checkout=job-only"),
+        "a branch-scoped run's checkout write reached the job's environment: {after}"
+    );
+    assert!(
+        after.contains("scratch-now=branch-wrote"),
+        "a branch-scoped run's scratch write did not flow back to the node: {after}"
     );
 }

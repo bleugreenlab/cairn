@@ -1,0 +1,13 @@
+-- lineage: shared
+-- A thread-owned service's job names the thread that owns it (cairn/5524), so
+-- its runs resolve to the home cairn://p/<project>/<thread>/services/<name>.
+--
+-- Deliberately not `jobs.thread_id`: that column is what makes a job one of
+-- the thread's own (its pages and database are the job's to write, and the
+-- thread pane lists it as a task). A service acts for its thread only inside a
+-- call, under that call's delegation, so its job carries the owner here
+-- instead. NULL for every other job, project services included.
+--
+-- jobs is a ProjectScoped shared table, so this reaches both lineages; a
+-- plain ADD COLUMN keeps it sync-safe.
+ALTER TABLE jobs ADD COLUMN service_thread_id TEXT;

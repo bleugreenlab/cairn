@@ -492,7 +492,8 @@ mod tests {
     /// `cairn://skills/<id>`. Guard that each shipped package parses, and that
     /// the `workflows` skill is present and well-formed. Verifying the shipped
     /// file directly beats dogfooding through the running host, which serves a
-    /// stale binary and a stale synced copy.
+    /// stale binary and a stale synced copy. The `pack-skills` check in
+    /// `.cairn/config.yaml` runs this test by name on every pack SKILL.md change.
     #[test]
     fn bundled_skills_load_and_include_workflows() {
         let src_tauri = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -891,7 +892,7 @@ mod tests {
 
     fn init_git_repo(path: &Path) {
         assert!(crate::env::git()
-            .args(["init", "-q"])
+            .args(["init", "-b", "main", "-q"])
             .current_dir(path)
             .status()
             .unwrap()

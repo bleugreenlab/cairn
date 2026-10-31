@@ -124,6 +124,7 @@ async fn count(db: &LocalDb, sql: &'static str) -> i64 {
 
 fn commenting_write(run_id: &str) -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: Some(run_id.to_string()),
@@ -136,6 +137,7 @@ fn commenting_write(run_id: &str) -> McpCallbackRequest {
             }]
         }),
         tool_use_id: None,
+        origin: None,
     }
 }
 

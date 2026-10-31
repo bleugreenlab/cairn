@@ -10,6 +10,9 @@
 use super::{
     escape_sbpl, Confinement, NestedSandboxWriteProbe, OperatorCredentialFloor, SandboxPolicy,
 };
+use cairn_common::executor_protocol::{
+    ViolationRecoveryEvidence, ViolationRecoveryOutcome, ViolationStreamAccess,
+};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -280,9 +283,18 @@ const KERNEL_SANDBOX_SENDER: &str = "/Sandbox";
 /// would outlive this process until its next matching entry. The wrapper ties
 /// it to this process's lifetime instead: a background reader blocks on the
 /// wrapper's stdin, which the caller must keep open and never write, and kills
-/// the command when that pipe closes. The command's own stdout is the
-/// wrapper's, and its stderr goes to /dev/null, so a command that exits on its
-/// own still closes the caller's end.
+/// the command when that pipe closes. The command's stdout and stderr are the
+/// wrapper's, so a command that exits on its own still closes the caller's end
+/// and a refusal it prints reaches the caller; the killer's own output goes to
+/// /dev/null.
+///
+/// When the command is `sudo`, the kill lands on sudo, because the root `log`
+/// beneath it is not this account's to signal, and sudo relays it. sudo drops
+/// a signal sent from a process group that sudo or its command leads, so a
+/// command cannot kill itself through it (`exec_nopty.c`, sudo 1.9.17). The
+/// killer is in neither: without job control the wrapper starts the command in
+/// the caller's own group, which sudo does not lead. Starting the command with
+/// `set -m` or in a group of its own would make the kill silently inert.
 fn tied_to_this_process(argv: &[&str]) -> Command {
     const WRAPPER: &str = r#"exec 3<&0
 "$@" </dev/null &
@@ -297,6 +309,115 @@ wait "$l""#;
     command
 }
 
+/// How this account reaches `log stream`.
+fn stream_access() -> ViolationStreamAccess {
+    if account_is_admin() {
+        ViolationStreamAccess::Admin
+    } else {
+        ViolationStreamAccess::SudoRule
+    }
+}
+
+/// Whether this process's effective user is in `admin`, as the directory
+/// service answers now.
+///
+/// Not this process's own group list: the kernel fixes that when the process
+/// tree's login began, so an account taken out of `admin` keeps it in every
+/// process a running daemon starts, while `log` asks the directory service and
+/// refuses. Membership that cannot be read counts as not admin, and the sudo
+/// path then either works or says why it did not.
+fn account_is_admin() -> bool {
+    // <membership.h>, in libSystem.
+    extern "C" {
+        fn mbr_uid_to_uuid(uid: libc::uid_t, uu: *mut u8) -> libc::c_int;
+        fn mbr_gid_to_uuid(gid: libc::gid_t, uu: *mut u8) -> libc::c_int;
+        fn mbr_check_membership(
+            user: *const u8,
+            group: *const u8,
+            ismember: *mut libc::c_int,
+        ) -> libc::c_int;
+    }
+    let Some(admin) = group_id(c"admin") else {
+        return false;
+    };
+    let (mut user, mut group, mut member) = ([0u8; 16], [0u8; 16], 0);
+    // SAFETY: each uuid buffer is the 16 bytes a `uuid_t` is, and every
+    // pointer outlives its call.
+    unsafe {
+        mbr_uid_to_uuid(libc::geteuid(), user.as_mut_ptr()) == 0
+            && mbr_gid_to_uuid(admin, group.as_mut_ptr()) == 0
+            && mbr_check_membership(user.as_ptr(), group.as_ptr(), &mut member) == 0
+            && member != 0
+    }
+}
+
+fn group_id(name: &std::ffi::CStr) -> Option<libc::gid_t> {
+    // SAFETY: `group` and `buffer` outlive the call, and `found` is only
+    // dereferenced when the call set it to point at `group`.
+    unsafe {
+        let mut group: libc::group = std::mem::zeroed();
+        let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+        let mut found: *mut libc::group = std::ptr::null_mut();
+        let status = libc::getgrnam_r(
+            name.as_ptr(),
+            &mut group,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        );
+        (status == 0 && !found.is_null()).then(|| (*found).gr_gid)
+    }
+}
+
+/// Why the violation stream did not start, in words an operator can act on.
+///
+/// A non-admin account's stream is refused in two places that need different
+/// remedies. Inside a Seatbelt profile the kernel refuses sudo's setuid exec
+/// before any rule is consulted (`sh` reports `Operation not permitted` and
+/// exits 126), and no rule can fix that; outside one, sudo itself refuses a
+/// command no installed rule names, which the operator's setup script fixes.
+fn refusal_reason(
+    access: ViolationStreamAccess,
+    spawned: &str,
+    exit: Option<i32>,
+    printed: &str,
+) -> String {
+    let printed = printed.trim();
+    let said = if printed.is_empty() {
+        "nothing on stderr".to_string()
+    } else {
+        format!("{printed:?}")
+    };
+    let ended = exit.map_or_else(
+        || "was stopped by a signal".to_string(),
+        |code| format!("exited {code}"),
+    );
+    match access {
+        ViolationStreamAccess::SudoRule
+            if exit == Some(126) || printed.contains("Operation not permitted") =>
+        {
+            format!(
+                "the fence refused sudo: this process runs under a Seatbelt profile, which refuses sudo before any sudoers rule is consulted, so it cannot start the violation stream (`{spawned}` {ended}: {said})"
+            )
+        }
+        ViolationStreamAccess::SudoRule
+            if printed.contains("password is required")
+                || printed.contains("not allowed to execute") =>
+        {
+            format!(
+                "sudo rule absent: this executor account is not in admin and no installed sudoers rule permits it exactly `{}` (`{spawned}` {ended}: {said}); the operator installs the rule with `sudo scripts/setup-self-hosted-runner-macos.sh --executor-user <account>`",
+                crate::violation_stream_sudoers_command()
+            )
+        }
+        ViolationStreamAccess::SudoRule => {
+            format!("sudo did not start the violation stream: `{spawned}` {ended}: {said}")
+        }
+        ViolationStreamAccess::Admin => {
+            format!("the violation stream did not start: `{spawned}` {ended}: {said}")
+        }
+    }
+}
+
 /// One process-wide `log stream` of tagged kernel Seatbelt violations.
 ///
 /// A stream rather than a `log show` query afterwards: the persisted log does
@@ -307,6 +428,9 @@ pub(crate) struct ViolationStream {
     seen: Mutex<Seen>,
     arrived: Condvar,
     alive: AtomicBool,
+    access: ViolationStreamAccess,
+    /// Whether a canary denial came back through this stream, once asked.
+    recovery: Mutex<Option<RecoveryMeasurement>>,
     /// Held, never written: when this process exits the pipe closes, and the
     /// wrapper in [`ViolationStream::start`] stops `log stream` in response.
     _lifeline: Mutex<std::process::ChildStdin>,
@@ -315,67 +439,128 @@ pub(crate) struct ViolationStream {
 #[derive(Default)]
 struct Seen {
     violations: VecDeque<(SystemTime, String, SandboxViolation)>,
+    /// Every tagged kernel denial as `operation target`, path or not (a
+    /// `mach-lookup` names a service). For telling a person what a profile
+    /// refused; never a crossing's scope, which only `violations` supplies.
+    denials: VecDeque<(SystemTime, String, String)>,
     /// Tagged lines that were not kernel violations, kept for a failing live
     /// test to show.
     #[cfg(test)]
     rejected: VecDeque<String>,
 }
 
-/// The running stream, or when it last failed to start, so a process that
+struct RecoveryMeasurement {
+    outcome: ViolationRecoveryOutcome,
+    at: Instant,
+    at_unix_ms: u64,
+}
+
+/// A start that failed: how it was attempted, when, and what refused it.
+#[derive(Clone)]
+struct StreamRefusal {
+    access: ViolationStreamAccess,
+    at: Instant,
+    at_unix_ms: u64,
+    reason: String,
+}
+
+impl StreamRefusal {
+    fn now(access: ViolationStreamAccess, reason: String) -> Self {
+        Self {
+            access,
+            at: Instant::now(),
+            at_unix_ms: crate::nested::unix_now_ms(),
+            reason,
+        }
+    }
+}
+
+enum StreamSlot {
+    Running(Arc<ViolationStream>),
+    Refused(StreamRefusal),
+}
+
+/// What the stream's reader saw first.
+enum StreamStart {
+    Announced,
+    /// The stream ended before printing anything, with its exit code.
+    Ended(Option<i32>),
+}
+
+/// The running stream, or why it last failed to start, so a process that
 /// cannot stream (a sandboxed one: `log` refuses to run there) does not pay a
-/// spawn attempt for every fenced command.
-static VIOLATION_STREAM: Mutex<Option<Result<Arc<ViolationStream>, Instant>>> = Mutex::new(None);
+/// spawn attempt for every fenced command, and can say why it is blind.
+static VIOLATION_STREAM: Mutex<Option<StreamSlot>> = Mutex::new(None);
 
 const STREAM_RETRY_AFTER: Duration = Duration::from_secs(60);
 const STREAM_READY_WAIT: Duration = Duration::from_secs(2);
+/// How long a stream that has exited gets to finish handing over its stderr.
+const COMPLAINT_WAIT: Duration = Duration::from_millis(500);
+const COMPLAINT_LIMIT: usize = 4096;
 const KEPT_VIOLATIONS: usize = 1024;
 const VIOLATION_RETENTION: Duration = Duration::from_secs(600);
 
 impl ViolationStream {
     /// The running stream, starting one when there is none.
     pub(crate) fn watching() -> Option<Arc<Self>> {
-        let mut slot = VIOLATION_STREAM.lock().ok()?;
+        Self::watching_or_refusal().ok()
+    }
+
+    fn watching_or_refusal() -> Result<Arc<Self>, StreamRefusal> {
+        let mut slot = VIOLATION_STREAM.lock().unwrap_or_else(|p| p.into_inner());
         match slot.as_ref() {
-            Some(Ok(stream)) if stream.alive.load(Ordering::Acquire) => {
-                return Some(stream.clone())
+            Some(StreamSlot::Running(stream)) if stream.alive.load(Ordering::Acquire) => {
+                return Ok(stream.clone())
             }
-            Some(Err(failed)) if failed.elapsed() < STREAM_RETRY_AFTER => return None,
+            Some(StreamSlot::Refused(refusal)) if refusal.at.elapsed() < STREAM_RETRY_AFTER => {
+                return Err(refusal.clone())
+            }
             _ => {}
         }
-        let started = Self::start();
-        *slot = Some(started.clone().ok_or_else(Instant::now));
+        // Asked per start rather than per spawn: membership is a directory
+        // service query, and an account moving in or out of `admin` reaches
+        // the next start, which a refused stream makes within a minute.
+        let started = Self::start(stream_access());
+        *slot = Some(match &started {
+            Ok(stream) => StreamSlot::Running(stream.clone()),
+            Err(refusal) => StreamSlot::Refused(refusal.clone()),
+        });
         started
     }
 
     fn current() -> Option<Arc<Self>> {
         match VIOLATION_STREAM.lock().ok()?.as_ref()? {
-            Ok(stream) => Some(stream.clone()),
-            Err(_) => None,
+            StreamSlot::Running(stream) => Some(stream.clone()),
+            StreamSlot::Refused(_) => None,
         }
     }
 
-    fn start() -> Option<Arc<Self>> {
-        let predicate = format!("eventMessage CONTAINS \"{}\"", crate::ViolationTag::PREFIX);
-        let mut child = tied_to_this_process(&[
-            "/usr/bin/log",
-            "stream",
-            "--style",
-            "ndjson",
-            "--predicate",
-            &predicate,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-        let lifeline = child.stdin.take()?;
-        let stdout = child.stdout.take()?;
+    fn start(access: ViolationStreamAccess) -> Result<Arc<Self>, StreamRefusal> {
+        let refused = |reason: String| StreamRefusal::now(access, reason);
+        let argv = crate::violation_stream_spawn_argv(access);
+        let spawned = argv.join(" ");
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let mut child = tied_to_this_process(&argv)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| refused(format!("could not spawn `{spawned}`: {error}")))?;
+        let (Some(lifeline), Some(stdout), Some(stderr)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(refused(format!("`{spawned}` started without its pipes")));
+        };
         let stream = Arc::new(Self {
             seen: Mutex::new(Seen::default()),
             arrived: Condvar::new(),
             alive: AtomicBool::new(true),
+            access,
+            recovery: Mutex::new(None),
             _lifeline: Mutex::new(lifeline),
         });
+        let complaint = complaint_of(stderr);
         let (ready, first_line) = std::sync::mpsc::channel();
         let reader = stream.clone();
         std::thread::Builder::new()
@@ -386,26 +571,55 @@ impl ViolationStream {
                     let Ok(line) = line else { break };
                     // `log stream` announces its filter before any entry.
                     if let Some(ready) = ready.take() {
-                        let _ = ready.send(());
+                        let _ = ready.send(StreamStart::Announced);
                     }
                     reader.record(&line);
                 }
                 reader.alive.store(false, Ordering::Release);
                 reader.arrived.notify_all();
-                let _ = child.wait();
+                let exit = child.wait().ok().and_then(|status| status.code());
+                if let Some(ready) = ready {
+                    let _ = ready.send(StreamStart::Ended(exit));
+                }
             })
-            .ok()?;
+            .map_err(|error| refused(format!("could not start the stream's reader: {error}")))?;
         match first_line.recv_timeout(STREAM_READY_WAIT) {
-            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return None,
+            Ok(StreamStart::Announced) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(StreamStart::Ended(exit)) => {
+                let printed = complaint.recv_timeout(COMPLAINT_WAIT).unwrap_or_default();
+                return Err(refused(refusal_reason(access, &spawned, exit, &printed)));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(refused(format!(
+                    "the reader of `{spawned}` stopped before the stream announced itself"
+                )))
+            }
         }
-        stream.alive.load(Ordering::Acquire).then_some(stream)
+        if stream.alive.load(Ordering::Acquire) {
+            Ok(stream)
+        } else {
+            Err(refused(format!(
+                "`{spawned}` exited just after announcing itself"
+            )))
+        }
     }
 
     fn record(&self, line: &str) {
         let Ok(mut seen) = self.seen.lock() else {
             return;
         };
+        if let Some((tag, summary)) = parse_denial_summary(line) {
+            let now = SystemTime::now();
+            while seen.denials.len() >= KEPT_VIOLATIONS
+                || seen.denials.front().is_some_and(|(at, ..)| {
+                    now.duration_since(*at).unwrap_or_default() > VIOLATION_RETENTION
+                })
+            {
+                seen.denials.pop_front();
+            }
+            seen.denials.push_back((now, tag, summary));
+            self.arrived.notify_all();
+        }
         match parse_violation_entry(line) {
             Some((tag, violation)) => {
                 let now = SystemTime::now();
@@ -456,6 +670,31 @@ impl ViolationStream {
         }
     }
 
+    /// The distinct denials tagged `tag` since `since`, waiting up to `wait`
+    /// for the first to arrive.
+    fn tagged_denials(&self, tag: &str, since: SystemTime, wait: Duration) -> Vec<String> {
+        let deadline = Instant::now() + wait;
+        let Ok(mut seen) = self.seen.lock() else {
+            return Vec::new();
+        };
+        loop {
+            let mut found: Vec<String> = Vec::new();
+            for (at, seen_tag, summary) in &seen.denials {
+                if seen_tag == tag && *at >= since && !found.contains(summary) {
+                    found.push(summary.clone());
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if !found.is_empty() || left.is_zero() || !self.alive.load(Ordering::Acquire) {
+                return found;
+            }
+            match self.arrived.wait_timeout(seen, left) {
+                Ok((next, _)) => seen = next,
+                Err(_) => return found,
+            }
+        }
+    }
+
     #[cfg(test)]
     fn describe(&self, tag: &str) -> String {
         let Ok(seen) = self.seen.lock() else {
@@ -475,6 +714,147 @@ impl ViolationStream {
     }
 }
 
+/// Collect what the stream prints on stderr, bounded, and hand it over once the
+/// stream closes it: a refusal's own words are the most specific reason there is.
+fn complaint_of(stderr: std::process::ChildStderr) -> std::sync::mpsc::Receiver<String> {
+    let (complaint, received) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("cairn-sandbox-violations-stderr".into())
+        .spawn(move || {
+            let mut kept = String::new();
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                if kept.len() < COMPLAINT_LIMIT {
+                    if !kept.is_empty() {
+                        kept.push('\n');
+                    }
+                    kept.push_str(&line);
+                }
+            }
+            let _ = complaint.send(kept);
+        });
+    received
+}
+
+/// Whether a fenced spawn's denial is recovered by path on this machine,
+/// measured by recovering one.
+///
+/// A stream that started is not yet evidence: one whose access or predicate
+/// matched nothing would start just the same. So each stream's first ask denies
+/// a canary write under a fresh tag and waits for it to come back with its
+/// path. A canary that came back holds for the stream's life; one that did not
+/// is retried after [`STREAM_RETRY_AFTER`]. A stream that could not start is
+/// retried on the same cadence, which is what turns this Measured on the next
+/// liveness pass after the operator installs the sudo rule, with no restart.
+pub(crate) fn violation_recovery() -> ViolationRecoveryEvidence {
+    let stream = match ViolationStream::watching_or_refusal() {
+        Ok(stream) => stream,
+        Err(refusal) => {
+            return ViolationRecoveryEvidence {
+                access: refusal.access,
+                outcome: ViolationRecoveryOutcome::Unmeasured {
+                    reason: refusal.reason,
+                },
+                measured_at_unix_ms: refusal.at_unix_ms,
+            }
+        }
+    };
+    let mut held = stream.recovery.lock().unwrap_or_else(|p| p.into_inner());
+    let remeasure = held.as_ref().is_none_or(|measured| {
+        matches!(
+            measured.outcome,
+            ViolationRecoveryOutcome::Unmeasured { .. }
+        ) && measured.at.elapsed() >= STREAM_RETRY_AFTER
+    });
+    if remeasure {
+        *held = Some(RecoveryMeasurement {
+            outcome: recover_a_canary_denial(stream.access),
+            at: Instant::now(),
+            at_unix_ms: crate::nested::unix_now_ms(),
+        });
+    }
+    let measured = held.as_ref().expect("measured above");
+    ViolationRecoveryEvidence {
+        access: stream.access,
+        outcome: measured.outcome.clone(),
+        measured_at_unix_ms: measured.at_unix_ms,
+    }
+}
+
+/// Deny one write the way a fenced spawn's is denied, then recover it from the
+/// stream the way a fenced spawn's caller does.
+///
+/// The target sits in a sibling temp directory with nothing writable granted
+/// beside the worktree, so the profile denies it, and nothing is ever written.
+fn recover_a_canary_denial(access: ViolationStreamAccess) -> ViolationRecoveryOutcome {
+    let unmeasured = |reason: String| ViolationRecoveryOutcome::Unmeasured { reason };
+    let (worktree, outside) = match (tempfile::tempdir(), tempfile::tempdir()) {
+        (Ok(worktree), Ok(outside)) => (worktree, outside),
+        (Err(error), _) | (_, Err(error)) => {
+            return unmeasured(format!(
+                "could not create the recovery canary's directories: {error}"
+            ))
+        }
+    };
+    let target = canonicalize_best_effort(outside.path()).join("cairn-violation-canary");
+    let policy = SandboxPolicy {
+        worktree: worktree.path().to_path_buf(),
+        writable_extra: Vec::new(),
+        deny_read: Vec::new(),
+        writable_regex: Vec::new(),
+        worktree_writable: true,
+        socket_resolvable: Vec::new(),
+        violation_tag: crate::ViolationTag::fresh(),
+    };
+    let since = SystemTime::now();
+    let (program, args) = wrap_argv(
+        "/usr/bin/touch",
+        &[target.to_string_lossy().into_owned()],
+        &policy,
+    );
+    let output = match Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => return unmeasured(format!("could not spawn the recovery canary: {error}")),
+    };
+    if target.exists() {
+        return unmeasured(format!(
+            "the recovery canary's write to {} landed, so there was no denial to recover",
+            target.display()
+        ));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(71) && stderr.contains("sandbox_apply") {
+        return unmeasured(format!(
+            "the recovery canary's profile could not be applied, so it made no denial to recover: {}",
+            stderr.trim()
+        ));
+    }
+    match detect_violation(&policy.violation_tag, since) {
+        Some(violation) if violation.path == target => ViolationRecoveryOutcome::Measured {
+            detail: format!(
+                "a canary {} of {} was denied and recovered by path through `{}`",
+                violation.operation,
+                target.display(),
+                crate::violation_stream_spawn_argv(access).join(" ")
+            ),
+        },
+        Some(violation) => unmeasured(format!(
+            "the recovery canary's denial came back naming {} rather than {}",
+            violation.path.display(),
+            target.display()
+        )),
+        None => unmeasured(format!(
+            "the recovery canary's write to {} was denied, but its violation did not arrive on the stream within {:?}",
+            target.display(),
+            VIOLATION_ARRIVAL_WAIT
+        )),
+    }
+}
+
 /// Parse one `log stream --style ndjson` entry into the spawn tag it carries
 /// and the violation it reports, if it is a tagged kernel Seatbelt violation.
 ///
@@ -491,8 +871,37 @@ impl ViolationStream {
 /// after the path and a path can itself be named to look like a tag.
 fn parse_violation_entry(line: &str) -> Option<(String, SandboxViolation)> {
     static DENY: OnceLock<regex::Regex> = OnceLock::new();
-    static TAG: OnceLock<regex::Regex> = OnceLock::new();
     let deny = DENY.get_or_init(|| regex::Regex::new(r"deny\(\d+\)\s+(\S+)\s+(/.+)$").unwrap());
+    let (tag, violation) = tagged_kernel_violation(line)?;
+    let caps = deny.captures(&violation)?;
+    Some((
+        tag,
+        SandboxViolation {
+            operation: caps.get(1)?.as_str().to_string(),
+            path: PathBuf::from(caps.get(2)?.as_str().trim()),
+        },
+    ))
+}
+
+/// A tagged kernel denial as `operation target`, whatever the target is.
+fn parse_denial_summary(line: &str) -> Option<(String, String)> {
+    static DENY: OnceLock<regex::Regex> = OnceLock::new();
+    let deny = DENY.get_or_init(|| regex::Regex::new(r"deny\(\d+\)\s+(\S+)(?:\s+(.+))?$").unwrap());
+    let (tag, violation) = tagged_kernel_violation(line)?;
+    let caps = deny.captures(&violation)?;
+    let operation = caps.get(1)?.as_str();
+    let summary = match caps.get(2) {
+        Some(target) => format!("{operation} {}", target.as_str().trim()),
+        None => operation.to_string(),
+    };
+    Some((tag, summary))
+}
+
+/// The tag and the violation text of a kernel Seatbelt entry, with the tag
+/// removed; `None` for anything not logged by the kernel's extension as
+/// process 0. Both parsers above stand on this check.
+fn tagged_kernel_violation(line: &str) -> Option<(String, String)> {
+    static TAG: OnceLock<regex::Regex> = OnceLock::new();
     let tag_re = TAG.get_or_init(|| {
         regex::Regex::new(&format!(
             "{}[0-9a-z]+",
@@ -520,14 +929,25 @@ fn parse_violation_entry(line: &str) -> Option<(String, SandboxViolation)> {
     } else {
         first
     };
-    let caps = deny.captures(violation.trim())?;
-    Some((
-        tag.as_str().to_string(),
-        SandboxViolation {
-            operation: caps.get(1)?.as_str().to_string(),
-            path: PathBuf::from(caps.get(2)?.as_str().trim()),
-        },
-    ))
+    Some((tag.as_str().to_string(), violation.trim().to_string()))
+}
+
+/// Start the process-wide violation stream if it is not running, so a spawn
+/// made after this can have its denials read back. Best-effort.
+pub(crate) fn watch_violations() {
+    let _ = ViolationStream::watching();
+}
+
+/// The distinct denials a profile tagged `tag` made since `since`, waiting up
+/// to `wait` for the first; empty when no stream is running.
+pub(crate) fn denials_since(
+    tag: &crate::ViolationTag,
+    since: SystemTime,
+    wait: Duration,
+) -> Vec<String> {
+    ViolationStream::current()
+        .map(|stream| stream.tagged_denials(tag.as_str(), since, wait))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -544,6 +964,7 @@ mod tests {
             deny_read: vec![PathBuf::from("/home/x/.aws")],
             writable_regex: vec![],
             worktree_writable: true,
+            socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
         };
         let profile = sbpl_profile(&policy, &test_floor());
@@ -604,6 +1025,7 @@ mod tests {
             deny_read: vec![],
             writable_regex: vec![],
             worktree_writable: true,
+            socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
         };
         let (program, args) = wrap_argv("bash", &["-c".into(), "echo hi".into()], &policy);
@@ -640,6 +1062,31 @@ mod tests {
             Some((TAG.to_string(), PathBuf::from("/x/cairn-fence-victim")))
         );
         assert_eq!(parse_violation(&ndjson, "cairn-fence-victim"), None);
+    }
+
+    /// A denial without a path (a mach service, a network operation) is kept
+    /// for display, and never becomes a violation a crossing could be scoped to.
+    #[test]
+    fn a_denial_without_a_path_is_shown_but_never_a_crossing() {
+        let ndjson = format!(
+            r#"{{{KERNEL},"eventMessage":"Sandbox: bun(77) deny(1) mach-lookup com.apple.system.logger\n{TAG}"}}"#
+        );
+        assert_eq!(
+            super::parse_denial_summary(ndjson.trim()),
+            Some((
+                TAG.to_string(),
+                "mach-lookup com.apple.system.logger".to_string()
+            ))
+        );
+        assert_eq!(super::parse_violation_entry(ndjson.trim()), None);
+        let forged = format!(
+            r#"{{"processID":42,"senderImagePath":"/usr/bin/bun","eventMessage":"Sandbox: bun(77) deny(1) mach-lookup x\n{TAG}"}}"#
+        );
+        assert_eq!(
+            super::parse_denial_summary(&forged),
+            None,
+            "only the kernel's entries count"
+        );
     }
 
     #[test]
@@ -743,6 +1190,7 @@ mod tests {
                 deny_read: vec![],
                 writable_regex: vec![],
                 worktree_writable: true,
+                socket_resolvable: vec![],
                 violation_tag: crate::ViolationTag::fresh(),
             };
             let probe = dir.path().join("probe");
@@ -788,6 +1236,7 @@ mod tests {
             deny_read: vec![secret.clone()],
             writable_regex: vec![],
             worktree_writable: true,
+            socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
         };
 
@@ -846,6 +1295,7 @@ mod tests {
             deny_read: vec![base.path().to_path_buf()], // a broad denylist entry
             writable_regex: vec![],
             worktree_writable: true,
+            socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
         };
         let run = |cmd: &str| -> std::process::Output {
@@ -892,6 +1342,7 @@ mod tests {
             deny_read: vec![],
             writable_regex: vec![],
             worktree_writable: true,
+            socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
         };
         let run = |cmd: &str| -> std::process::Output {
@@ -1027,7 +1478,7 @@ mod tests {
             true,
         );
         let stream = ViolationStream::current().map_or_else(
-            || "no violation stream is running (`log stream` did not start)".to_string(),
+            || format!("no violation stream is running: {}", last_refusal()),
             |stream| stream.describe(policy.violation_tag.as_str()),
         );
         (
@@ -1045,6 +1496,7 @@ mod tests {
             deny_read: vec![],
             writable_regex: vec![],
             worktree_writable: true,
+            socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
         }
     }
@@ -1143,9 +1595,239 @@ mod tests {
         ) {
             return;
         }
-        let first = ViolationStream::watching().expect("an unconfined process can stream the log");
+        let first = ViolationStream::watching_or_refusal()
+            .unwrap_or_else(|refusal| panic!("the stream did not start: {}", refusal.reason));
         let second = ViolationStream::watching().expect("the stream is still running");
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// Why the last start failed, for a failing live test to show.
+    fn last_refusal() -> String {
+        match VIOLATION_STREAM
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            Some(StreamSlot::Refused(refusal)) => refusal.reason.clone(),
+            Some(StreamSlot::Running(_)) => "a stream is recorded as running".into(),
+            None => "no start was attempted".into(),
+        }
+    }
+
+    /// A refused stream says which of the two refusals it met, because they
+    /// have different remedies, and carries the refusing tool's own words.
+    #[test]
+    fn a_refusal_names_what_refused_the_stream() {
+        let spawned = crate::violation_stream_spawn_argv(ViolationStreamAccess::SudoRule).join(" ");
+        let absent = refusal_reason(
+            ViolationStreamAccess::SudoRule,
+            &spawned,
+            Some(1),
+            "sudo: a password is required\n",
+        );
+        assert!(absent.starts_with("sudo rule absent: "), "{absent}");
+        assert!(absent.contains("sudo: a password is required"), "{absent}");
+        assert!(
+            absent.contains(&crate::violation_stream_sudoers_command()),
+            "the operator is shown the exact rule to install: {absent}"
+        );
+
+        let fenced = refusal_reason(
+            ViolationStreamAccess::SudoRule,
+            &spawned,
+            Some(126),
+            "sh: /usr/bin/sudo: Operation not permitted",
+        );
+        assert!(fenced.starts_with("the fence refused sudo: "), "{fenced}");
+        assert!(fenced.contains("Operation not permitted"), "{fenced}");
+
+        let admin = refusal_reason(
+            ViolationStreamAccess::Admin,
+            &crate::violation_stream_argv().join(" "),
+            Some(64),
+            "log: Must be admin to run 'stream' command",
+        );
+        assert!(
+            admin.contains("Must be admin to run 'stream' command"),
+            "{admin}"
+        );
+
+        let silent = refusal_reason(ViolationStreamAccess::SudoRule, &spawned, None, "");
+        assert!(
+            silent.ends_with("was stopped by a signal: nothing on stderr"),
+            "{silent}"
+        );
+    }
+
+    /// The access decision rests on the directory service's membership, which
+    /// is what `log` consults and what `dsmemberutil` reports, not on this
+    /// process's own group list, which stays stale after an account leaves
+    /// `admin`.
+    #[test]
+    fn admin_membership_is_the_directory_services_answer() {
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() }.to_string();
+        let out = Command::new("/usr/bin/dsmemberutil")
+            .args(["checkmembership", "-u", &uid, "-G", "admin"])
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        let member = said.contains("is a member");
+        assert!(
+            member || said.contains("is not a member"),
+            "unexpected dsmemberutil answer: {said:?}"
+        );
+        assert_eq!(account_is_admin(), member, "dsmemberutil said {said:?}");
+    }
+
+    /// Through sudo, the lifeline's kill reaches sudo, and sudo relays it to
+    /// the root `log` only when the sender is in no process group that sudo or
+    /// its command leads. The killer shares the wrapper's group, so the tied
+    /// command must not lead a group of its own, or the kill is silently
+    /// dropped and a root `log stream` outlives its executor.
+    #[test]
+    fn a_tied_command_leads_no_process_group_so_sudo_relays_the_lifeline_kill() {
+        let mut child = tied_to_this_process(&["/bin/sh", "-c", "echo $$; exec /bin/sleep 600"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let lifeline = child.stdin.take().unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let command: libc::pid_t = line.trim().parse().unwrap();
+        // SAFETY: plain process-group queries.
+        let (command_group, own_group) = unsafe { (libc::getpgid(command), libc::getpgrp()) };
+        assert_ne!(
+            command_group, command,
+            "the tied command leads its own process group, so sudo would drop the lifeline's kill"
+        );
+        assert_eq!(
+            command_group, own_group,
+            "the tied command, and the killer beside it, run in the caller's group"
+        );
+        drop(lifeline);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("the tied command outlived its lifeline");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Recovery is reported measured only when a real denial came back with
+    /// its path, and otherwise names what stopped it: never a stream that
+    /// merely started, never a blank.
+    #[test]
+    fn violation_recovery_is_measured_by_a_recovered_canary_or_names_its_refusal_live() {
+        if skip_without_nested_sandbox_exec(
+            "violation_recovery_is_measured_by_a_recovered_canary_or_names_its_refusal_live",
+        ) {
+            return;
+        }
+        let evidence = violation_recovery();
+        let admin = account_is_admin();
+        assert_eq!(
+            evidence.access,
+            if admin {
+                ViolationStreamAccess::Admin
+            } else {
+                ViolationStreamAccess::SudoRule
+            }
+        );
+        match &evidence.outcome {
+            ViolationRecoveryOutcome::Measured { detail } => {
+                assert!(detail.contains("recovered by path"), "{detail}")
+            }
+            ViolationRecoveryOutcome::Unmeasured { reason } if admin => {
+                panic!("an admin account must recover its canary: {reason}")
+            }
+            ViolationRecoveryOutcome::Unmeasured { reason } => assert!(
+                reason.starts_with("sudo rule absent: ")
+                    || reason.starts_with("the fence refused sudo: "),
+                "a non-admin account without recovery must say why: {reason}"
+            ),
+        }
+    }
+
+    /// The real thing on a host with the rule: a root `log stream` started
+    /// through `sudo -n` stops when the lifeline closes. Run it there with
+    /// `cargo test -p cairn-sandbox --lib -- --ignored the_lifeline_stops_a_root_log_stream_through_sudo_live`
+    /// (from src-tauri).
+    #[test]
+    #[ignore = "needs the operator's sudo rule for the violation stream; run on a Mac executor host with --ignored"]
+    fn the_lifeline_stops_a_root_log_stream_through_sudo_live() {
+        use std::io::Read as _;
+        let argv = crate::violation_stream_spawn_argv(ViolationStreamAccess::SudoRule);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let mut wrapper = tied_to_this_process(&argv)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let lifeline = wrapper.stdin.take().unwrap();
+        let mut stdout = BufReader::new(wrapper.stdout.take().unwrap());
+        let mut announced = String::new();
+        // `log stream` announces its filter first; a refused sudo exits silently here.
+        stdout.read_line(&mut announced).unwrap();
+        if announced.is_empty() {
+            let mut said = String::new();
+            let _ = wrapper.stderr.take().unwrap().read_to_string(&mut said);
+            panic!("sudo -n did not start the stream: {said}");
+        }
+        let log = descendant_named(wrapper.id() as libc::pid_t, "log")
+            .expect("a `log` process runs beneath sudo");
+        drop(lifeline);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while wrapper.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "sudo did not exit after the lifeline's kill, so root `log` pid {log} is still running and must be stopped by hand"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // A live root process answers EPERM to a null signal; a gone one, ESRCH.
+        while unsafe { libc::kill(log, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "root `log` pid {log} outlived the lifeline"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The first process named `name` beneath `root`, whether sudo runs its
+    /// command directly or under a monitor process (its pty mode).
+    fn descendant_named(root: libc::pid_t, name: &str) -> Option<libc::pid_t> {
+        let pgrep = |args: &[&str]| -> Vec<libc::pid_t> {
+            Command::new("/usr/bin/pgrep")
+                .args(args)
+                .output()
+                .map(|out| {
+                    String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .filter_map(|line| line.trim().parse().ok())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let named = pgrep(&["-x", name]);
+        let mut frontier = vec![root];
+        while let Some(parent) = frontier.pop() {
+            for child in pgrep(&["-P", &parent.to_string()]) {
+                if named.contains(&child) {
+                    return Some(child);
+                }
+                frontier.push(child);
+            }
+        }
+        None
     }
 
     #[test]
@@ -1183,6 +1865,7 @@ mod tests {
             deny_read: vec![],
             writable_regex: vec![],
             worktree_writable: true,
+            socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
         };
         let run = |cmd: &str| -> std::process::Output {
@@ -1521,6 +2204,7 @@ mod tests {
             deny_read: vec![],
             writable_regex: vec![],
             worktree_writable: true,
+            socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
         };
         let profile = sbpl_profile(&policy, &fixture.floor);
@@ -1562,6 +2246,7 @@ mod tests {
             deny_read: vec![],
             writable_regex: vec![super::super::glob_to_regex(&glob)],
             worktree_writable: true,
+            socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
         };
         let run = |cmd: &str| -> std::process::Output {

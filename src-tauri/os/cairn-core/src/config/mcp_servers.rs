@@ -963,7 +963,7 @@ args: ["@playwright/mcp@latest"]
 
     fn git_init(path: &Path) {
         assert!(crate::env::git()
-            .args(["init", "-q"])
+            .args(["init", "-b", "main", "-q"])
             .current_dir(path)
             .status()
             .unwrap()
@@ -972,7 +972,7 @@ args: ["@playwright/mcp@latest"]
 
     fn git_bare(path: &Path) {
         assert!(crate::env::git()
-            .args(["init", "--bare", "-q"])
+            .args(["init", "-b", "main", "--bare", "-q"])
             .current_dir(path)
             .status()
             .unwrap()

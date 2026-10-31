@@ -333,18 +333,35 @@ async fn recover_team_launch(
             admission_policy_revision: None,
             admission_capacity: None,
         });
-        if let Err(error) = start_leased(
-            orch,
-            OrdinaryLease::Team {
-                request: remote,
-                workspace_id: recoverable.workspace_id,
-            },
-            recoverable.launch,
-        ) {
-            log::warn!(
-                "team ordinary admission recovery could not continue leased request {}: {error}",
-                request.id
-            );
+        let lease = OrdinaryLease::Team {
+            request: remote,
+            workspace_id: recoverable.workspace_id,
+        };
+        let continue_leased = {
+            let orch = orch.clone();
+            let request_id = request.id.clone();
+            move || {
+                if let Err(error) = start_leased(&orch, lease, recoverable.launch) {
+                    log::warn!(
+                        "team ordinary admission recovery could not continue leased request {request_id}: {error}"
+                    );
+                }
+            }
+        };
+        // This runs inside startup recovery, which must not wait on its own
+        // readiness: the held lease continues in the background once it opens.
+        // Nothing heartbeats the lease while it waits. Team promotion leases
+        // for five minutes, far longer than recovery runs; a lease the API
+        // reclaimed meanwhile fails its transition in `start_leased`, which
+        // terminalizes the start rather than leaving the job `running`.
+        if orch.startup_readiness.is_ready() {
+            continue_leased();
+        } else {
+            let readiness = orch.startup_readiness.clone();
+            orch.spawn_blocking_detached(move || {
+                readiness.wait_ready_blocking();
+                continue_leased();
+            });
         }
         return;
     }
@@ -448,10 +465,11 @@ pub(super) fn enqueue_or_start(
         server_instance_key: None,
     })?;
     if capability.class == crate::backends::RuntimeClass::StatelessHttp {
-        super::start_ordinary_session_now(orch, prepared, identity_override)?;
-        super::start_turn(orch, &prepared.turn_id, &prepared.run_id)?;
-        orch.process_state
-            .set_current_turn_id(&prepared.run_id, Some(&prepared.turn_id));
+        if !orch.startup_readiness.is_ready() {
+            defer_stateless_start(orch, prepared, identity_override);
+            return Ok(false);
+        }
+        start_stateless_now(orch, prepared, identity_override)?;
         return Ok(true);
     }
 
@@ -650,6 +668,81 @@ pub(super) fn enqueue_or_start(
     Ok(false)
 }
 
+fn start_stateless_now(
+    orch: &Orchestrator,
+    prepared: &PreparedJob,
+    identity_override: Option<crate::identity::UserIdentity>,
+) -> Result<(), String> {
+    super::start_ordinary_session_now(orch, prepared, identity_override)?;
+    super::start_turn(orch, &prepared.turn_id, &prepared.run_id)?;
+    orch.process_state
+        .set_current_turn_id(&prepared.run_id, Some(&prepared.turn_id));
+    Ok(())
+}
+
+/// Start a stateless launch once startup recovery is ready.
+///
+/// This class deliberately has no durable admission row, so nothing durable
+/// can hold it. It waits in the background instead, keeping the in-memory
+/// launch claim (which is what keeps the stale-run reaper off this class) until
+/// its start returns. The caller reads `started=false` and hands the launch's
+/// attention delivery over, exactly as for a queued launch, so every exit here
+/// that ends without a process returns that delivery.
+fn defer_stateless_start(
+    orch: &Orchestrator,
+    prepared: &mut PreparedJob,
+    identity_override: Option<crate::identity::UserIdentity>,
+) {
+    let claim = prepared
+        .launch_claim
+        .take()
+        .unwrap_or_else(|| orch.claim_job_launch(&prepared.job_id, &prepared.run_id));
+    let deferred = PreparedJob {
+        job_id: prepared.job_id.clone(),
+        project_id: prepared.project_id.clone(),
+        run_id: prepared.run_id.clone(),
+        session_id: prepared.session_id.clone(),
+        session_start: prepared.session_start.clone(),
+        prompt: prepared.prompt.clone(),
+        job_model: prepared.job_model.clone(),
+        agent_config: prepared.agent_config.clone(),
+        artifact_schema_info: prepared.artifact_schema_info.clone(),
+        execution_id: prepared.execution_id.clone(),
+        turn_id: prepared.turn_id.clone(),
+        launch_event_id: prepared.launch_event_id.clone(),
+        start_reason: prepared.start_reason.clone(),
+        origin: prepared.origin,
+        launch_claim: Some(claim),
+    };
+    let task_orch = orch.clone();
+    orch.spawn_blocking_detached(move || {
+        let orch = task_orch;
+        orch.startup_readiness.wait_ready_blocking();
+        let run_id = deferred.run_id.clone();
+        let turn_id = deferred.turn_id.clone();
+        // An unreadable owning database proves nothing, so only a positive
+        // answer stands the start down.
+        if super::private_lane::run_settled(&orch, &run_id) == Some(true) {
+            return_undelivered_attention(&orch, &run_id, &turn_id, TurnDelivery::Unknown);
+            return;
+        }
+        if let Err(error) = start_stateless_now(&orch, &deferred, identity_override) {
+            log::warn!("deferred stateless launch of run {run_id} failed to start: {error}");
+            terminalize_failed_start(
+                &orch,
+                &run_id,
+                &deferred.session_id,
+                &deferred.job_id,
+                &turn_id,
+                &error,
+            );
+            orch.process_state.stop_and_remove(&run_id);
+        }
+        // Dropping `deferred` releases its launch claim, now that the process
+        // registered or the start failed.
+    });
+}
+
 fn dispatch_team_promotion(
     orch: &Orchestrator,
     request: crate::runtime_admission::EnqueueAdmissionRequest,
@@ -658,6 +751,9 @@ fn dispatch_team_promotion(
     let orch = orch.clone();
     let request_id = request.id.clone();
     scheduler.spawn_blocking_detached(move || {
+        // The local mirror row is durable already; leasing waits for readiness
+        // so the remote grant is never spent on a turn the gateway refuses.
+        orch.startup_readiness.wait_ready_blocking();
         let mut delay = std::time::Duration::from_secs(1);
         loop {
             // The run lives in the team replica and this queue row in the local
@@ -819,6 +915,17 @@ pub(crate) fn promote_private_lane(orch: &Orchestrator, lane: &str) {
 pub(super) fn promote_private_lane_blocking(orch: &Orchestrator, lane: &str) -> Result<(), String> {
     let owner = private_lease_owner(orch);
     loop {
+        // Every caller wrote its admission row before reaching here, so a pass
+        // that reads not-ready leaves the row for the drain that follows
+        // readiness (`Orchestrator::mark_startup_recovery_ready`).
+        if !orch.startup_readiness.is_ready() {
+            orch.private_lanes.record(
+                lane,
+                super::private_lane::private_lane_budget(orch),
+                Some(crate::storage::LaneShortfall::StartupRecovery),
+            );
+            return Ok(());
+        }
         let db = orch.db.local.clone();
         let lane_owned = lane.to_string();
         let owner = owner.clone();
@@ -929,45 +1036,7 @@ fn start_leased(
     let turn_id = snapshot.turn_id.clone();
     let result = start_leased_inner(orch, &lease, snapshot);
     if let Err(error) = &result {
-        return_undelivered_attention(orch, &run_id, &turn_id, TurnDelivery::Unknown);
-        // Enqueue already returned success to the launch source, so nothing
-        // upstream will see this error. Terminalize the run and job exactly as a
-        // direct start failure would, or the job stays `running` forever.
-        crate::orchestrator::session::insert_error_event(orch, &run_id, Some(&session_id), error);
-        let failed = run_db({
-            let dbs = orch.db.clone();
-            let run_id = run_id.clone();
-            async move {
-                crate::execution::routing::owning_db_for_run(&dbs, &run_id)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
-        })
-        .and_then(|owning| {
-            let orch = orch.clone();
-            let job_id = job_id.clone();
-            let error = error.clone();
-            let turn_id = turn_id.clone();
-            let run_id = run_id.clone();
-            run_db(async move {
-                if crate::orchestrator::wakes::restore_provider_hold_after_admission_failure(
-                    &orch, &owning, &turn_id, chrono::Utc::now().timestamp(),
-                ).await? {
-                    // The process launch failed, but its provider-held work did
-                    // not. Record the physical failure without a work verdict.
-                    owning.execute(
-                        "UPDATE runs SET status='crashed', error_message=?1, exit_reason='session_start_failed', updated_at=?2 WHERE id=?3",
-                        cairn_db::turso::params![error, chrono::Utc::now().timestamp(), run_id],
-                    ).await.map_err(|error| error.to_string())?;
-                } else {
-                    super::mark_job_start_failed(&orch, &owning, &job_id, &error, false).await;
-                }
-                Ok::<(), String>(())
-            })
-        });
-        if let Err(mark_error) = failed {
-            log::error!("could not mark promoted job {job_id} start failed: {mark_error}");
-        }
+        terminalize_failed_start(orch, &run_id, &session_id, &job_id, &turn_id, error);
         // Once a generation has been leased, every restoration and start error
         // must close that exact generation, and capacity may only be returned
         // once no process holds it. A claim still pending never reached a
@@ -992,6 +1061,57 @@ fn start_leased(
         }
     }
     result
+}
+
+/// Fail a launch whose start failed after its source was told admission owns
+/// it. Enqueue (or deferral) already returned success to the launch source, so
+/// nothing upstream will see this error: return the turn's attention delivery
+/// and terminalize the run and job exactly as a direct start failure would, or
+/// the job stays `running` forever.
+fn terminalize_failed_start(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: &str,
+    job_id: &str,
+    turn_id: &str,
+    error: &str,
+) {
+    return_undelivered_attention(orch, run_id, turn_id, TurnDelivery::Unknown);
+    crate::orchestrator::session::insert_error_event(orch, run_id, Some(session_id), error);
+    let failed = run_db({
+        let dbs = orch.db.clone();
+        let run_id = run_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+    .and_then(|owning| {
+        let orch = orch.clone();
+        let job_id = job_id.to_string();
+        let error = error.to_string();
+        let turn_id = turn_id.to_string();
+        let run_id = run_id.to_string();
+        run_db(async move {
+            if crate::orchestrator::wakes::restore_provider_hold_after_admission_failure(
+                &orch, &owning, &turn_id, chrono::Utc::now().timestamp(),
+            ).await? {
+                // The process launch failed, but its provider-held work did
+                // not. Record the physical failure without a work verdict.
+                owning.execute(
+                    "UPDATE runs SET status='crashed', error_message=?1, exit_reason='session_start_failed', updated_at=?2 WHERE id=?3",
+                    cairn_db::turso::params![error, chrono::Utc::now().timestamp(), run_id],
+                ).await.map_err(|error| error.to_string())?;
+            } else {
+                super::mark_job_start_failed(&orch, &owning, &job_id, &error, false).await;
+            }
+            Ok::<(), String>(())
+        })
+    });
+    if let Err(mark_error) = failed {
+        log::error!("could not mark promoted job {job_id} start failed: {mark_error}");
+    }
 }
 
 fn start_leased_inner(
@@ -2025,7 +2145,7 @@ mod tests {
         n: u32,
         run_status: &str,
     ) {
-        orch.db.local.execute_script(&format!("\
+        orch.db.local.execute_script(format!("\
             INSERT INTO jobs(id,execution_id,recipe_node_id,issue_id,project_id,node_name,uri_segment,status,current_session_id,created_at,updated_at) VALUES('j{n}','e','builder{n}','i','p','Builder','builder{n}','running','s{n}',1,1);\
             INSERT INTO sessions(id,job_id,backend,status,sequence,created_at,updated_at) VALUES('s{n}','j{n}','claude','open',1,1,1);\
             INSERT INTO runs(id,project_id,issue_id,job_id,session_id,status,start_mode,created_at,updated_at) VALUES('r{n}','p','i','j{n}','s{n}','{run_status}','resume',1,1);\
@@ -2281,7 +2401,7 @@ mod tests {
     /// cold continuation does before it hands its launch to admission.
     async fn brief(orch: &Orchestrator, run: &str, turn: &str, recipient: &str) -> String {
         use crate::orchestrator::attention_push as attention;
-        orch.db.local.execute_script(&format!(
+        orch.db.local.execute_script(format!(
             "INSERT INTO events(id,run_id,turn_id,sequence,event_type,data,timestamp,created_at) VALUES('brief-{turn}','{run}','{turn}',2,'attention:briefing','{{}}',1,1);"
         )).await.unwrap();
         let (id, _) = attention::push(
@@ -2834,7 +2954,7 @@ mod tests {
         let db = Arc::new(crate::storage::migrated_test_db(name).await);
         let root = tempfile::tempdir().unwrap().keep();
         let repo = root.to_string_lossy().replace('\'', "''");
-        db.execute_script(&format!("\
+        db.execute_script(format!("\
             INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);\
             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','P','{repo}',1,1);\
             INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at) VALUES('i','p',1,'I','active','active','none',1,1);\
@@ -3605,6 +3725,174 @@ mod tests {
             .await,
             "4"
         );
+    }
+
+    /// cairn/4758: launches that reach admission while startup recovery runs
+    /// (startup's own promotion pass and event-driven passes alike) stay durably
+    /// queued, say why at every queue position, survive the stale-run reaper,
+    /// and each start exactly once when readiness opens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_recovery_holds_every_queued_launch_until_readiness_then_starts_each_once() {
+        let (mut orch, _, snapshot) = lifecycle_fixture("startup-readiness-hold.db").await;
+        orch.startup_readiness = crate::orchestrator::StartupReadiness::pending();
+        orch.db
+            .local
+            .execute(
+                "DELETE FROM runtime_admission_requests WHERE request_id='req'",
+                (),
+            )
+            .await
+            .unwrap();
+        for n in 1..=2 {
+            queue_launch(&orch, &snapshot, n, "starting").await;
+        }
+        let (starts, _backend) = install_claude_like(&orch);
+
+        super::recover_on_startup(&orch).await;
+        let pass = orch.clone();
+        tokio::task::spawn_blocking(move || super::promote_private_lane_blocking(&pass, "lane"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(started(&starts), 0, "nothing starts before readiness");
+        for n in 1..=2 {
+            assert_eq!(request_state(&orch, &format!("req{n}")).await.0, "queued");
+            assert_eq!(
+                text(&orch, &format!("SELECT state FROM turns WHERE id='t{n}'")).await,
+                "pending"
+            );
+        }
+        let reaper = orch.clone();
+        tokio::task::spawn_blocking(move || crate::runs::reap::reap_stale_runs(&reaper))
+            .await
+            .unwrap();
+        for n in 1..=2 {
+            assert_eq!(
+                text(&orch, &format!("SELECT status FROM runs WHERE id='r{n}'")).await,
+                "starting",
+                "a held launch is a launch in flight, not a run to settle"
+            );
+        }
+        let behind_the_head = crate::execution::jobs::describe_job_launch(&orch, "j2")
+            .await
+            .expect("a queued launch renders its wait");
+        assert!(
+            behind_the_head.contains("position 2 of 2")
+                && behind_the_head.contains("still finishing startup recovery"),
+            "{behind_the_head}"
+        );
+
+        orch.mark_startup_recovery_ready();
+        for _ in 0..500 {
+            if started(&starts) == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(started(&starts), 2, "readiness drains the held queue");
+        let pass = orch.clone();
+        tokio::task::spawn_blocking(move || super::promote_private_lane_blocking(&pass, "lane"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(started(&starts), 2, "each held launch starts once");
+    }
+
+    /// cairn/4758: a stateless launch has no durable admission row, so before
+    /// readiness it waits in the background holding its launch claim, which the
+    /// stale-run reaper reads as a launch in flight. Readiness starts it once. A
+    /// run settled while it waited starts nothing and returns the attention
+    /// delivery its turn carried.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stateless_launch_before_readiness_waits_holding_its_claim_then_starts_once() {
+        for settle_while_held in [false, true] {
+            let (mut orch, _, _) =
+                lifecycle_fixture(&format!("stateless-deferral-{settle_while_held}.db")).await;
+            orch.startup_readiness = crate::orchestrator::StartupReadiness::pending();
+            orch.db
+                .local
+                .execute(
+                    "DELETE FROM runtime_admission_requests WHERE request_id='req'",
+                    (),
+                )
+                .await
+                .unwrap();
+            let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = starts.clone();
+            let _backend = crate::orchestrator::session::install_orchestrator_test_session_backend(
+                &orch,
+                move || Box::new(CountingBackend(counted.clone())),
+            );
+            brief(&orch, "cold", "t", "j").await;
+            let mut prepared = super::PreparedJob {
+                job_id: "j".into(),
+                project_id: "p".into(),
+                run_id: "cold".into(),
+                session_id: "s".into(),
+                session_start: crate::backends::SessionStart::New {
+                    session_id: "s".into(),
+                },
+                prompt: "queued hello".into(),
+                // A slash-qualified model resolves to OpenRouter, a stateless
+                // HTTP backend.
+                job_model: Some(crate::models::Model::from("openrouter/auto")),
+                agent_config: None,
+                artifact_schema_info: None,
+                execution_id: Some("e".into()),
+                turn_id: "t".into(),
+                launch_event_id: "ev".into(),
+                start_reason: crate::models::TurnStartReason::FollowUp,
+                origin: crate::storage::LaunchOrigin::Background,
+                launch_claim: Some(orch.claim_job_launch("j", "cold")),
+            };
+
+            assert!(
+                !super::enqueue_or_start(&orch, &mut prepared, None).unwrap(),
+                "a deferred launch reports that no process holds its prompt yet"
+            );
+            drop(prepared);
+            assert_eq!(
+                orch.claimed_launch_run("j").as_deref(),
+                Some("cold"),
+                "the deferral keeps the launch claim"
+            );
+            let reaper = orch.clone();
+            tokio::task::spawn_blocking(move || crate::runs::reap::reap_stale_runs(&reaper))
+                .await
+                .unwrap();
+            assert_eq!(
+                text(&orch, "SELECT status FROM runs WHERE id='cold'").await,
+                "starting",
+                "the reaper spares a claimed launch"
+            );
+            assert_eq!(started(&starts), 0, "nothing starts before readiness");
+            if settle_while_held {
+                orch.db
+                    .local
+                    .execute("UPDATE runs SET status='crashed' WHERE id='cold'", ())
+                    .await
+                    .unwrap();
+            }
+
+            orch.mark_startup_recovery_ready();
+            for _ in 0..500 {
+                if orch.claimed_launch_run("j").is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                orch.claimed_launch_run("j").is_none(),
+                "the deferral releases its claim once it has acted"
+            );
+            if settle_while_held {
+                assert_eq!(started(&starts), 0, "a settled run is not started");
+                assert!(delivery_returned(&orch, "j", "t").await);
+            } else {
+                assert_eq!(started(&starts), 1, "readiness starts the launch once");
+                assert!(!delivery_returned(&orch, "j", "t").await);
+            }
+        }
     }
 
     /// `launches` background launches queued inside this boot's ramp horizon,

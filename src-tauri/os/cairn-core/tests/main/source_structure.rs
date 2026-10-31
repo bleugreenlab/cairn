@@ -430,8 +430,11 @@ fn brokered_plaintext_is_unwrapped_only_where_it_is_injected() {
             // and is minted rather than resolved from a store.
             "mcp/auth.rs",
             "cairn-common/src/auth.rs",
-            // A run's MCP bearer: injected into its agent's environment, and
-            // compared in constant time where `/mcp` receives it.
+            // A run's MCP bearer: injected into the environment of the agent
+            // or project service that carries it to the runner (and into a
+            // service call's frame on the service's stdin), and compared in
+            // constant time where `/mcp` receives it. The service supervisor
+            // holds bearers as leases and takes their value from here.
             "mcp/run_bearer.rs",
             // A Codex subscription login: the `account/login/start` params,
             // written onto the stdin of the session's app-server, of the
@@ -511,7 +514,8 @@ fn a_lease_is_presented_only_at_a_destination() {
             "security/lease.rs",
             "account/team_token_minter.rs",
             // A run's MCP bearer is presented into the environment of the agent
-            // that carries it to `/mcp`.
+            // that carries it to `/mcp`, and into the environment or call frame
+            // of the project service that carries it to the callback.
             "mcp/run_bearer.rs",
         ],
         "a lease must be presented only where the credential is actually sent",

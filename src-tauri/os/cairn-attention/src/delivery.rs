@@ -786,9 +786,13 @@ async fn resolved_issue_confirmation(
     .flatten()
 }
 
-/// The newest frozen message behind a keyed system direct push. A stable key
-/// (`schedule:`, `automation:`) supersedes in place, so the fingerprint, not the
-/// key, names the message the push currently carries.
+/// The newest frozen message behind a keyed system direct push. Every system
+/// direct push records its message id as the push fingerprint
+/// ([`crate::direct::insert_system_direct_push_with_message_id_conn`]), and a
+/// stable key (`schedule:`, `tenet-verdict:`, `gate:`, ...) supersedes in place,
+/// so the fingerprint, not the key, names the message the push currently
+/// carries. `None` for a push whose fingerprint is not a direct message: review
+/// and resolution pushes use the same column for a source-state fingerprint.
 async fn keyed_direct_message(
     runtime: &AttentionRuntime,
     push: &crate::push::Push,
@@ -799,7 +803,11 @@ async fn keyed_direct_message(
             .ok()
             .flatten()
             .flatten()?;
-    runtime.host.message(&runtime.private_db, &message_id).await
+    runtime
+        .host
+        .message(&runtime.private_db, &message_id)
+        .await
+        .filter(|msg| msg.channel_type == crate::models::ChannelType::Direct)
 }
 
 /// Render a drained attention push as a compact, reference-first update.
@@ -854,17 +862,6 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
             }
         }
         return header;
-    }
-    // An automation push's referent is the owning thread itself, which tells
-    // that thread nothing; the whole fact is the frozen failure notice.
-    if push.key.starts_with("automation:") {
-        return match keyed_direct_message(runtime, push).await {
-            Some(msg) => {
-                let body = crate::message_render::render_direct_message(&msg);
-                format!("{header}\n\n{body}")
-            }
-            None => header,
-        };
     }
     if push.key.starts_with("resolved:") {
         return match resolved_issue_confirmation(runtime, &push.content_ref).await {
@@ -938,6 +935,16 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
     };
     if let Some(digest) = digest {
         return format!("{header}\n\n{digest}");
+    }
+    // A system direct push under its own coalescing key (`automation:`,
+    // `condition:`, `gate:`, `tenet-verdict:`, `tenet-contradiction:`, ...) has
+    // the recipient's own home as its referent, which tells the recipient
+    // nothing; the whole fact is the frozen message. It is recognized by what it
+    // carries, not by a list of prefixes: a list missed every producer added
+    // after it, and each of those reached its recipient as a pointer home.
+    if let Some(msg) = keyed_direct_message(runtime, push).await {
+        let body = crate::message_render::render_direct_message(&msg);
+        return format!("{header}\n\n{body}");
     }
     let prefix = push
         .key

@@ -198,12 +198,9 @@ async fn insert_job_for_node_conn(
         .and_then(|id| snapshot.agents.get(id))
         .and_then(|agent| agent.selection.as_ref())
         .map(|selection| selection.model.to_string());
-    let delegated_packet = snapshot.delegated_packets.iter().find(|packet| {
-        packet
-            .materialized_node_ids
-            .iter()
-            .any(|materialized_node_id| materialized_node_id == &node.id)
-    });
+    let delegated_packet =
+        crate::delegated_packets::find_by_node(conn, execution_id, &node.id).await?;
+    let delegated_packet = delegated_packet.as_ref();
     let requested_forked_session = delegated_packet
         .map(|packet| packet.session.mode == DelegatedSessionMode::Fork)
         .unwrap_or(false);

@@ -78,8 +78,7 @@ async fn create_detects_and_persists_repo_default_branch() {
             .unwrap();
         assert!(status.success(), "git {:?} failed", args);
     };
-    run(&["init"]);
-    run(&["checkout", "-b", "develop"]);
+    run(&["init", "-b", "develop"]);
     run(&["config", "user.email", "test@example.com"]);
     run(&["config", "user.name", "Test"]);
     run(&["commit", "--allow-empty", "-m", "init"]);

@@ -90,6 +90,44 @@ pub fn decrypt_payload(encrypted_b64: &str, secret_key_b64: &str) -> Result<Stri
     String::from_utf8(decrypted).map_err(|e| format!("Invalid UTF-8: {e}"))
 }
 
+/// The version byte a sealed-v2 body starts with.
+const SEALED_V2_VERSION: u8 = 0x02;
+
+/// Open a relay sealed-v2 body: base64 of `0x02 || crypto_box_seal`, the
+/// format the api seals every verified external endpoint's event in.
+///
+/// A body sealed to another key fails as `Decryption failed`, the same error
+/// [`decrypt_payload`] gives, so callers read both as a key mismatch.
+pub fn open_sealed_v2(encrypted_b64: &str, secret_key_b64: &str) -> Result<String, String> {
+    let encrypted = BASE64
+        .decode(encrypted_b64)
+        .map_err(|e| format!("Invalid base64: {e}"))?;
+    let Some((&SEALED_V2_VERSION, sealed)) = encrypted.split_first() else {
+        return Err("Not a sealed-v2 body: the version byte is not 0x02".to_string());
+    };
+    let secret_bytes = BASE64
+        .decode(secret_key_b64)
+        .map_err(|e| format!("Invalid secret key base64: {e}"))?;
+    let secret_key = SecretKey::from_slice(&secret_bytes)
+        .map_err(|_| "Invalid secret key format".to_string())?;
+    let opened = secret_key
+        .unseal(sealed)
+        .map_err(|_| "Decryption failed".to_string())?;
+    String::from_utf8(opened).map_err(|e| format!("Invalid UTF-8: {e}"))
+}
+
+/// Seal `plaintext` to a relay public key in the v2 format the api writes.
+#[cfg(test)]
+pub(crate) fn seal_v2_for_test(plaintext: &str, public_key_b64: &str) -> String {
+    let recipient = PublicKey::from(
+        <[u8; 32]>::try_from(BASE64.decode(public_key_b64).unwrap().as_slice()).unwrap(),
+    );
+    let sealed = recipient.seal(&mut OsRng, plaintext.as_bytes()).unwrap();
+    let mut out = vec![SEALED_V2_VERSION];
+    out.extend_from_slice(&sealed);
+    BASE64.encode(out)
+}
+
 /// Seal `plaintext` to a relay public key in the v1 format the api writes, so
 /// tests can feed the relay consumer real ciphertext.
 #[cfg(test)]
@@ -267,6 +305,53 @@ mod tests {
         .unwrap();
 
         assert_eq!(plaintext, fixture["plaintext"].as_str().unwrap());
+    }
+
+    #[test]
+    fn opens_typescript_sealed_v2_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/relay-sealed-box-v2.json"
+        ))
+        .unwrap();
+        let plaintext = open_sealed_v2(
+            fixture["ciphertext"].as_str().unwrap(),
+            fixture["recipientSecretKey"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            plaintext.as_bytes(),
+            fixture["plaintext"].as_str().unwrap().as_bytes()
+        );
+        // The fixture shares v1's recipient key, so one install key opens both.
+        let v1: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/relay-sealed-box.json"))
+                .unwrap();
+        assert_eq!(fixture["recipientSecretKey"], v1["recipientSecretKey"]);
+    }
+
+    #[test]
+    fn each_opener_refuses_the_other_format() {
+        let v1: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/relay-sealed-box.json"))
+                .unwrap();
+        let v2: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/relay-sealed-box-v2.json"
+        ))
+        .unwrap();
+        let key = v1["recipientSecretKey"].as_str().unwrap();
+        assert!(open_sealed_v2(v1["ciphertext"].as_str().unwrap(), key).is_err());
+        assert!(decrypt_payload(v2["ciphertext"].as_str().unwrap(), key).is_err());
+    }
+
+    #[test]
+    fn a_sealed_v2_body_for_another_key_is_a_decryption_failure() {
+        let (public_key, _) = generate_keypair();
+        let (_, other_secret) = generate_keypair();
+        let sealed = seal_v2_for_test("{}", &public_key);
+        assert_eq!(
+            open_sealed_v2(&sealed, &other_secret).unwrap_err(),
+            "Decryption failed"
+        );
     }
 
     #[test]

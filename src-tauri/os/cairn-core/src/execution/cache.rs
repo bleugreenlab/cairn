@@ -682,6 +682,11 @@ pub(crate) struct InfraScopes {
     /// sorted by platform. Empty when the request counts any platform, and
     /// then a stall is charged to the head scope.
     pub(crate) platform_heads: Vec<(String, String)>,
+    /// The eligible machines that were measurement-blind when `fleet` was
+    /// computed, by name. Their blindness is part of the fleet identity, so a
+    /// fleet suppression read under it lifts the moment their telemetry is
+    /// fresh again, and this is how its message names that repair.
+    pub(crate) fleet_blind: Vec<String>,
 }
 
 impl InfraScopes {
@@ -693,6 +698,7 @@ impl InfraScopes {
             fleet: None,
             environments: Vec::new(),
             platform_heads: Vec::new(),
+            fleet_blind: Vec::new(),
         }
     }
 
@@ -807,6 +813,16 @@ pub(crate) enum InfraStreakOp {
     /// counted by [`claim_check_execution`] at the moment it is RESERVED, so
     /// counting it again on completion would charge one attempt twice.
     OpenStreak,
+    /// A completed infrastructure failure charged to a FLEET scope. A fleet
+    /// counter counts arm cycles that died, not attempts: it opens at `1` and
+    /// advances only when this failure comes from a different head (job and
+    /// tree) than the one that last charged it. Retrying one head against an
+    /// unchanged fleet asks the same question again and is the same failure,
+    /// so three retries inside one blind window are one, and only distinct
+    /// heads dying against the same fleet reach the bound. The reservation
+    /// never charges a fleet scope, because only here is the head known to be
+    /// a new one.
+    ChargeArm,
     /// A genuine verdict — a pass, or a red the agent's own change owns. The
     /// substrate demonstrably works, so the streak and its escalation stamp go.
     Reset,
@@ -820,6 +836,7 @@ impl InfraStreakOp {
     /// decision in one place in Rust rather than reconstructing it in SQL.
     fn as_param(self) -> i64 {
         match self {
+            InfraStreakOp::ChargeArm => 2,
             InfraStreakOp::OpenStreak => 1,
             InfraStreakOp::Reset => 0,
             InfraStreakOp::Hold => -1,
@@ -859,6 +876,18 @@ impl CheckResultCacheWrite {
             return InfraStreakOp::Hold;
         }
         if self.is_infrastructure_failure() {
+            // Recorded so the death is visible and the dormant re-arm can see
+            // this head already met this fleet, but counted toward nothing:
+            // the window clearing on its own is the normal outcome.
+            if self.transient_within_grace {
+                return InfraStreakOp::Hold;
+            }
+            if self
+                .environment_fingerprint
+                .starts_with(INFRA_FLEET_SCOPE_PREFIX)
+            {
+                return InfraStreakOp::ChargeArm;
+            }
             InfraStreakOp::OpenStreak
         } else {
             InfraStreakOp::Reset
@@ -919,6 +948,10 @@ pub(crate) struct SuppressedCheck {
     /// domain carries one entry per eligible machine, so a message can name what
     /// each of them last did.
     pub(crate) scopes: Vec<SuppressedScope>,
+    /// For a fleet-domain suppression, the eligible machines whose blindness
+    /// is part of the identity it is bounded under: their telemetry turning
+    /// fresh is a repair that lifts it. Empty for every other domain.
+    pub(crate) fleet_blind: Vec<String>,
 }
 
 impl SuppressedCheck {
@@ -959,12 +992,16 @@ fn bounding_domain(
             platform: None,
             entry: entry.clone(),
         }],
+        fleet_blind: Vec::new(),
     };
     if let Some((scope, entry)) = at_bound(&scopes.head) {
         return Some(single(InfraRepairDomain::Head, scope, entry));
     }
     if let Some((scope, entry)) = scopes.fleet.as_deref().and_then(at_bound) {
-        return Some(single(InfraRepairDomain::Fleet, scope, entry));
+        return Some(SuppressedCheck {
+            fleet_blind: scopes.fleet_blind.clone(),
+            ..single(InfraRepairDomain::Fleet, scope, entry)
+        });
     }
     // Per platform, the way environments are per machine: a partly bounded
     // set narrows the request's platforms, and only a fully bounded one
@@ -986,6 +1023,7 @@ fn bounding_domain(
             return Some(SuppressedCheck {
                 domain: InfraRepairDomain::HeadOnPlatform,
                 scopes: per_platform,
+                fleet_blind: Vec::new(),
             });
         }
     }
@@ -1007,6 +1045,7 @@ fn bounding_domain(
     (per_machine.len() == scopes.environments.len()).then_some(SuppressedCheck {
         domain: InfraRepairDomain::Environment,
         scopes: per_machine,
+        fleet_blind: Vec::new(),
     })
 }
 
@@ -1176,6 +1215,12 @@ pub(crate) enum CheckExecutionClaim {
 /// The reservation applies only to a scope with an OPEN streak (`>= 1`). A
 /// healthy triple is not rationed: bounding executions at `streak = 0` would let
 /// `BOUND` concurrent evaluations of a perfectly good check suppress it.
+///
+/// The fleet scope is read here but never charged: a fleet counter counts the
+/// heads that died against it, which only the failure itself can say (see
+/// [`InfraStreakOp::ChargeArm`]). Charging it per reservation is what turned
+/// three re-arms of one dormant head inside one telemetry-blind minute into a
+/// fleet-wide suppression (cairn/5671).
 pub(crate) fn claim_check_execution(
     db: Arc<LocalDb>,
     project_id: &str,
@@ -1215,6 +1260,7 @@ pub(crate) fn claim_check_execution(
                 let chargeable: Vec<String> = scopes
                     .all()
                     .into_iter()
+                    .filter(|scope| Some(*scope) != scopes.fleet.as_deref())
                     .filter(|scope| {
                         !scopes.environments.iter().any(|(executor_id, candidate)| {
                             candidate == scope && avoid.contains(executor_id)
@@ -1300,8 +1346,12 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                 // upsert onto a real red verdict and convert it into a
                 // suppression. Invariant: a re-stamp reports an existing row and
                 // never moves it between families.
+                // `?22 = 2` is a fleet charge: it advances only when the row was
+                // last charged by a different head, which the row's own
+                // `job_id` and `tree_hash` record (the upsert compares them
+                // before overwriting them with this head's).
                 conn.execute(
-                    "
+                    &format!("
                     INSERT INTO check_result_cache (
                         project_id, tree_hash, input_hash, check_name, exit_code, passed,
                         output_tail, duration_ms, ran_at, target_results_json, job_id, cached,
@@ -1314,7 +1364,7 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                     )
                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                             ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?23,
-                            CASE WHEN ?22 = 1 THEN 1 ELSE 0 END, ?24, ?25, ?26, ?27, ?28)
+                            CASE WHEN ?22 IN (1, 2) THEN 1 ELSE 0 END, ?24, ?25, ?26, ?27, ?28)
                     ON CONFLICT(project_id, check_name, input_hash, environment_fingerprint,
                                 result_schema_version) DO UPDATE SET
                         tree_hash = excluded.tree_hash,
@@ -1341,7 +1391,12 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                         defined_by_commit_sha = excluded.defined_by_commit_sha,
                         infra_failure_streak = CASE
                             WHEN ?22 = 0 THEN 0
-                            WHEN ?22 = 1 AND check_result_cache.infra_failure_streak < 1 THEN 1
+                            WHEN ?22 IN (1, 2) AND check_result_cache.infra_failure_streak < 1 THEN 1
+                            WHEN ?22 = 2
+                             AND (check_result_cache.job_id IS NOT excluded.job_id
+                                  OR check_result_cache.tree_hash IS NOT excluded.tree_hash)
+                             AND check_result_cache.infra_failure_streak < {OBSERVED_INFRA_FAILURE_BOUND}
+                                THEN check_result_cache.infra_failure_streak + 1
                             ELSE check_result_cache.infra_failure_streak
                         END,
                         infra_escalated_at = CASE
@@ -1357,7 +1412,7 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                         END
                     WHERE (check_result_cache.passed = 0 OR excluded.passed = 1)
                       AND (?22 <> -1 OR excluded.row_family = check_result_cache.row_family)
-                    ",
+                    "),
                     params![
                         result.project_id.as_str(),
                         result.tree_hash.as_str(),
@@ -1849,6 +1904,11 @@ pub struct CheckResultCacheWrite {
     pub verdict_platform: Option<String>,
     pub verdict_arch: Option<String>,
     pub verdict_environment_hash: Option<String>,
+    /// An infrastructure death whose cause clears on its own and has not yet
+    /// outlived [`crate::execution::checks::TRANSIENT_REFUSAL_GRACE_MS`]: the
+    /// row is recorded, so the death is visible and its head is remembered,
+    /// but no counter moves. `false` for every verdict and every other death.
+    pub transient_within_grace: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1967,6 +2027,8 @@ pub(crate) struct FreshCheckObservationWrite {
     pub execution_warmth: Option<String>,
     /// The executor's `CellOrigin` for the cell the command ran in.
     pub cell_origin: Option<ObservedCellOrigin>,
+    /// The build jobs the executor gave the command, and what bounded them.
+    pub build_jobs: Option<cairn_common::executor_protocol::BuildJobs>,
     pub tests: Vec<CheckTestResultRow>,
     /// The suppression scopes this verdict is evidence ABOUT, and the only ones
     /// a genuine verdict clears. A pass on one machine says nothing about a
@@ -2046,6 +2108,7 @@ pub(crate) struct CheckResultObservationProjection {
     pub phases: Option<CheckPhases>,
     pub execution_warmth: Option<String>,
     pub cell_origin: Option<ObservedCellOrigin>,
+    pub build_jobs: Option<cairn_common::executor_protocol::BuildJobs>,
     pub tests: Vec<CheckTestResultRow>,
     pub test_total: usize,
     pub test_offset: usize,
@@ -2089,14 +2152,15 @@ impl ObservedCellOrigin {
 const OBSERVATION_PHASE_COLUMNS: &str = "o.phase_setup_ms,o.phase_compile_ms,o.phase_test_ms,\
      o.phase_doctest_ms,o.phase_publish_ms,o.phase_origin,o.compiled_units,\
      o.phase_passes_json,o.execution_warmth,o.cell_origin_kind,\
-     o.cell_origin_distance_files,o.cell_origin_distance_crates";
+     o.cell_origin_distance_files,o.cell_origin_distance_crates,o.build_jobs_json";
 
 /// What [`observation_phases`] decodes: the phases when the row carries them,
-/// and the executor's warmth and cell origin either way.
+/// and the executor's warmth, cell origin, and build jobs either way.
 type ObservationMeasurements = (
     Option<CheckPhases>,
     Option<String>,
     Option<ObservedCellOrigin>,
+    Option<cairn_common::executor_protocol::BuildJobs>,
 );
 
 /// Decode [`OBSERVATION_PHASE_COLUMNS`] starting at column `at`.
@@ -2143,7 +2207,17 @@ fn observation_phases(row: &cairn_db::turso::Row, at: usize) -> DbResult<Observa
             distance_crates: row.opt_i64(at + 11)?,
         })
     });
-    Ok((phases, row.opt_text(at + 8)?, cell_origin.transpose()?))
+    // A record this build cannot decode reads as unstated, never as a fault
+    // in the verdict it rides beside.
+    let build_jobs = row
+        .opt_text(at + 12)?
+        .and_then(|json| serde_json::from_str(&json).ok());
+    Ok((
+        phases,
+        row.opt_text(at + 8)?,
+        cell_origin.transpose()?,
+        build_jobs,
+    ))
 }
 
 /// Every per-test outcome of one observation, read through the
@@ -2378,6 +2452,9 @@ pub(crate) fn record_fresh_check_observation(
                     "cellOriginKind": observation.cell_origin.as_ref().map(|o| o.kind.as_str()),
                     "cellOriginDistanceFiles": observation.cell_origin.as_ref().and_then(|o| o.distance_files),
                     "cellOriginDistanceCrates": observation.cell_origin.as_ref().and_then(|o| o.distance_crates),
+                    "buildJobs": observation.build_jobs.map(|jobs| jobs.jobs),
+                    "buildJobsJson": observation.build_jobs
+                        .and_then(|jobs| serde_json::to_string(&jobs).ok()),
                 })
                 .to_string();
                 let mut existing = conn
@@ -2412,7 +2489,9 @@ pub(crate) fn record_fresh_check_observation(
                            AND execution_warmth IS json_extract(?31,'$.executionWarmth')
                            AND cell_origin_kind IS json_extract(?31,'$.cellOriginKind')
                            AND cell_origin_distance_files IS json_extract(?31,'$.cellOriginDistanceFiles')
-                           AND cell_origin_distance_crates IS json_extract(?31,'$.cellOriginDistanceCrates')",
+                           AND cell_origin_distance_crates IS json_extract(?31,'$.cellOriginDistanceCrates')
+                           AND build_jobs IS json_extract(?31,'$.buildJobs')
+                           AND build_jobs_json IS json_extract(?31,'$.buildJobsJson')",
                         params![observation.id.as_str(), observation.project_id.as_str(),
                             observation.commit_sha.as_str(), observation.tree_hash.as_str(),
                             observation.check_name.as_str(), observation.input_hash.as_str(),
@@ -2480,7 +2559,7 @@ pub(crate) fn record_fresh_check_observation(
                         phase_setup_ms, phase_compile_ms, phase_test_ms, phase_doctest_ms,
                         phase_publish_ms, phase_origin, compiled_units, phase_passes_json,
                         execution_warmth, cell_origin_kind, cell_origin_distance_files,
-                        cell_origin_distance_crates
+                        cell_origin_distance_crates, build_jobs, build_jobs_json
                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
                               ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,
                               json_extract(?31,'$.definedByCommitSha'),
@@ -2501,7 +2580,9 @@ pub(crate) fn record_fresh_check_observation(
                               json_extract(?31,'$.executionWarmth'),
                               json_extract(?31,'$.cellOriginKind'),
                               json_extract(?31,'$.cellOriginDistanceFiles'),
-                              json_extract(?31,'$.cellOriginDistanceCrates'))
+                              json_extract(?31,'$.cellOriginDistanceCrates'),
+                              json_extract(?31,'$.buildJobs'),
+                              json_extract(?31,'$.buildJobsJson'))
                        ON CONFLICT(id) DO NOTHING",
                     Vec::<cairn_db::turso::Value>::from([
                         observation.id.as_str().into(), observation.project_id.as_str().into(),
@@ -2768,7 +2849,8 @@ pub(crate) fn get_check_result_observation(
                 ).await?;
                 let Some(row) = rows.next().await? else { return Ok(None); };
                 let observation_id = row.text(4)?;
-                let (phases, execution_warmth, cell_origin) = observation_phases(&row, 40)?;
+                let (phases, execution_warmth, cell_origin, build_jobs) =
+                    observation_phases(&row, 40)?;
                 let mut projection = CheckResultObservationProjection {
                     disposition: row.text(0)?,
                     defined_by_commit_sha: row.opt_text(34)?,
@@ -2793,7 +2875,7 @@ pub(crate) fn get_check_result_observation(
                     verdict_platform: row.opt_text(36)?, verdict_arch: row.opt_text(37)?,
                     output_tail: row.text(33)?,
                     selection: row.opt_text(38)?, deferred_count: row.i64(39)?,
-                    phases, execution_warmth, cell_origin, tests: Vec::new(),
+                    phases, execution_warmth, cell_origin, build_jobs, tests: Vec::new(),
                     test_total: 0, test_offset: offset,
                 };
                 let mut totals = conn.query(
@@ -2858,7 +2940,8 @@ pub(crate) fn get_check_result_observation_by_handle(
                     return Ok(None);
                 };
                 let id = row.text(0)?;
-                let (phases, execution_warmth, cell_origin) = observation_phases(&row, 35)?;
+                let (phases, execution_warmth, cell_origin, build_jobs) =
+                    observation_phases(&row, 35)?;
                 let mut projection = CheckResultObservationProjection {
                     disposition: "fresh".into(),
                     defined_by_commit_sha: row.opt_text(30)?,
@@ -2903,6 +2986,7 @@ pub(crate) fn get_check_result_observation_by_handle(
                     phases,
                     execution_warmth,
                     cell_origin,
+                    build_jobs,
                     tests: Vec::new(),
                     test_total: 0,
                     test_offset: 0,
@@ -3417,6 +3501,7 @@ mod tests {
             verdict_platform: None,
             verdict_arch: None,
             verdict_environment_hash: None,
+            transient_within_grace: false,
         }
     }
 
@@ -3436,6 +3521,7 @@ mod tests {
             phases: None,
             execution_warmth: None,
             cell_origin: None,
+            build_jobs: None,
             project_id: "project-a".to_string(),
             commit_sha: commit.to_string(),
             defined_by_commit_sha: commit.to_string(),
@@ -3530,11 +3616,30 @@ mod tests {
                 compile_ms: 408_000,
                 test_ms: 149_735,
                 compiled_units: 37,
+                compiled_crates: vec!["cairn-core".to_string()],
                 summary_ms: Some(144_635),
             }],
         });
+        const GIB: u64 = 1 << 30;
+        write.build_jobs = Some(cairn_common::executor_protocol::BuildJobs::new(
+            8,
+            Some(cairn_common::executor_protocol::MemoryJobBound::new(
+                12 * GIB,
+                90,
+                5 * GIB / 2,
+                1,
+            )),
+        ));
         record_fresh_check_observation(db.clone(), write.clone()).unwrap();
         record_fresh_check_observation(db.clone(), write.clone()).unwrap();
+        let held_lanes = db
+            .query_opt_i64(
+                "SELECT COUNT(*) FROM check_result_observations WHERE build_jobs = 4",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(held_lanes, Some(1));
 
         let mut divergent = write.clone();
         divergent.phases.as_mut().unwrap().test_ms += 1;
@@ -3562,6 +3667,11 @@ mod tests {
             Some("repositoryOnly")
         );
         assert_eq!(by_handle.cell_origin, write.cell_origin);
+        assert_eq!(by_handle.build_jobs, write.build_jobs);
+        let mut wider = write.clone();
+        wider.build_jobs = Some(cairn_common::executor_protocol::BuildJobs::new(8, None));
+        let error = record_fresh_check_observation(db.clone(), wider).unwrap_err();
+        assert!(error.contains("different immutable fields"), "{error}");
         let mut moved_cell = write.clone();
         moved_cell.cell_origin.as_mut().unwrap().distance_files = Some(13);
         let error = record_fresh_check_observation(db.clone(), moved_cell).unwrap_err();
@@ -3581,6 +3691,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(by_commit.phases, write.phases);
+        assert_eq!(by_commit.build_jobs, write.build_jobs);
 
         // A lane whose runner measured nothing stores NULLs and reads `None`.
         let unmeasured = observation("obs-unmeasured", "commit-unmeasured", "env-phases");
@@ -3589,6 +3700,7 @@ mod tests {
             get_check_result_observation_by_handle(db, "project-a", &unmeasured.public_handle)
                 .unwrap()
                 .unwrap();
+        assert_eq!(read.build_jobs, None);
         assert_eq!(
             (read.phases, read.execution_warmth, read.cell_origin),
             (None, None, None)
@@ -4059,6 +4171,7 @@ mod tests {
             fleet: Some(infra_fleet_scope(digest)),
             environments: Vec::new(),
             platform_heads: Vec::new(),
+            fleet_blind: Vec::new(),
         }
     }
 
@@ -4071,7 +4184,62 @@ mod tests {
                 .map(|(id, digest)| ((*id).to_string(), infra_env_scope(digest)))
                 .collect(),
             platform_heads: Vec::new(),
+            fleet_blind: Vec::new(),
         }
+    }
+
+    /// One head (`job-test` at `commit`) evaluated once, its command dying
+    /// against the fleet `digest`, the way the run path writes it: reserve,
+    /// then store under the fleet scope at that head's own tree. Returns
+    /// whether the reservation let it run.
+    fn die_against_fleet(
+        db: &Arc<LocalDb>,
+        check_name: &str,
+        input_hash: &str,
+        commit: &str,
+        digest: &str,
+        transient_within_grace: bool,
+    ) -> bool {
+        let claim = claim_check_execution(
+            db.clone(),
+            "project-a",
+            check_name,
+            input_hash,
+            &fleet_scopes(commit, digest),
+        )
+        .unwrap();
+        if matches!(claim, CheckExecutionClaim::Suppressed(_)) {
+            return false;
+        }
+        let mut failure =
+            failing_result("project-a", input_hash, check_name, Some("infrastructure"));
+        failure.tree_hash = format!("tree-{commit}");
+        failure.job_id = Some("job-test".to_string());
+        failure.environment_fingerprint = infra_fleet_scope(digest);
+        failure.transient_within_grace = transient_within_grace;
+        store_check_result(db.clone(), failure).unwrap();
+        true
+    }
+
+    async fn fleet_streak(db: &Arc<LocalDb>, input_hash: &str, digest: &str) -> i64 {
+        let scope = infra_fleet_scope(digest);
+        let input_hash = input_hash.to_string();
+        db.read(move |conn| {
+            let scope = scope.clone();
+            let input_hash = input_hash.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT infra_failure_streak FROM check_result_cache
+                          WHERE input_hash = ?1 AND environment_fingerprint = ?2",
+                        (input_hash.as_str(), scope.as_str()),
+                    )
+                    .await?;
+                Ok(rows.next().await?.map_or(0, |row| row.i64(0).unwrap_or(0)))
+            })
+        })
+        .await
+        .unwrap()
     }
 
     /// The cairn/4604 specimen: an evidence-classified host defect — a missing
@@ -4220,13 +4388,18 @@ mod tests {
     async fn a_fleet_defect_stays_suppressed_across_commits_and_base_advances() {
         let db = cache_db().await;
         let digest = "no-windows-machine";
-        drive_domain_to_bound(
-            &db,
-            "executor-windows-check",
-            "ih-windows",
-            &fleet_scopes("commit-a", digest),
-            &infra_fleet_scope(digest),
-        );
+        // A fleet counter counts heads that died against it, so the bound is
+        // three separate commits meeting the same fleet.
+        for commit in ["commit-1", "commit-2", "commit-3"] {
+            assert!(die_against_fleet(
+                &db,
+                "executor-windows-check",
+                "ih-windows",
+                commit,
+                digest,
+                false,
+            ));
+        }
 
         for commit in ["commit-a", "commit-b", "base-advance"] {
             let claim = claim_check_execution(
@@ -4304,6 +4477,158 @@ mod tests {
             ),
             "a transient failure leaves the fleet counter at zero, so the next head runs"
         );
+    }
+
+    /// cairn/5671's specimen. One head re-armed again and again against an
+    /// unchanged fleet is asking one question, so it is one failure however
+    /// many times it dies: three dormant re-arms inside one telemetry-blind
+    /// minute must not suppress a lane fleet-wide.
+    #[tokio::test]
+    async fn retries_of_one_commit_count_once_against_the_fleet() {
+        let db = cache_db().await;
+        let digest = "fedora-blind";
+        for attempt in 0..5 {
+            assert!(
+                die_against_fleet(&db, "workspace-compile", "ih-ws", "commit-a", digest, false),
+                "attempt {attempt} of one head is never refused by the fleet counter"
+            );
+        }
+        assert_eq!(
+            fleet_streak(&db, "ih-ws", digest).await,
+            1,
+            "five deaths of one head are one arm cycle"
+        );
+        assert_eq!(
+            store_check_result_streak_op_for_fleet(),
+            InfraStreakOp::ChargeArm,
+            "a fleet death is charged per head, at the death"
+        );
+    }
+
+    fn store_check_result_streak_op_for_fleet() -> InfraStreakOp {
+        let mut failure = failing_result("project-a", "ih", "rust", Some("infrastructure"));
+        failure.environment_fingerprint = infra_fleet_scope("digest");
+        failure.infra_streak_op()
+    }
+
+    /// The other half of the rule: distinct heads dying against one fleet are
+    /// distinct evidence, and three of them still reach the bound — the
+    /// standing structural gap stays bounded.
+    #[tokio::test]
+    async fn three_commits_dying_against_one_fleet_suppress_it() {
+        let db = cache_db().await;
+        let digest = "no-windows-machine";
+        for (index, commit) in ["commit-a", "commit-b", "commit-c"].iter().enumerate() {
+            assert!(die_against_fleet(
+                &db,
+                "executor-windows-check",
+                "ih-windows",
+                commit,
+                digest,
+                false,
+            ));
+            // A retry of the same head before the bound moves nothing.
+            if index + 1 < OBSERVED_INFRA_FAILURE_BOUND as usize {
+                assert!(die_against_fleet(
+                    &db,
+                    "executor-windows-check",
+                    "ih-windows",
+                    commit,
+                    digest,
+                    false,
+                ));
+            }
+            assert_eq!(
+                fleet_streak(&db, "ih-windows", digest).await,
+                (index + 1) as i64
+            );
+        }
+        let claim = claim_check_execution(
+            db,
+            "project-a",
+            "executor-windows-check",
+            "ih-windows",
+            &fleet_scopes("commit-d", digest),
+        )
+        .unwrap();
+        let CheckExecutionClaim::Suppressed(suppressed) = claim else {
+            panic!("three heads dying against one fleet must suppress the lane");
+        };
+        assert_eq!(suppressed.domain, InfraRepairDomain::Fleet);
+        assert_eq!(suppressed.streak(), OBSERVED_INFRA_FAILURE_BOUND);
+    }
+
+    /// A death the runner judged transient and still inside its grace is
+    /// recorded — the row exists, naming its head — and counts toward
+    /// nothing, however many heads die in the window.
+    #[tokio::test]
+    async fn a_transient_death_inside_its_grace_counts_toward_nothing() {
+        let db = cache_db().await;
+        let digest = "fedora-blind";
+        for commit in ["commit-a", "commit-b", "commit-c", "commit-d"] {
+            assert!(die_against_fleet(
+                &db,
+                "workspace-compile",
+                "ih-ws",
+                commit,
+                digest,
+                true,
+            ));
+        }
+        assert_eq!(fleet_streak(&db, "ih-ws", digest).await, 0);
+        assert!(get_suppressed_check_result(
+            db.clone(),
+            "project-a",
+            "workspace-compile",
+            "ih-ws",
+            &fleet_scopes("commit-e", digest),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    /// A suppression charged while a machine was blind is keyed on the blind
+    /// fleet, so it names the repair that lifts it and the recovered fleet —
+    /// a different identity — runs the lane with a fresh budget.
+    #[tokio::test]
+    async fn a_blind_fleet_suppression_lifts_when_the_telemetry_is_fresh() {
+        let db = cache_db().await;
+        for commit in ["commit-a", "commit-b", "commit-c"] {
+            assert!(die_against_fleet(
+                &db,
+                "workspace-compile",
+                "ih-ws",
+                commit,
+                "fedora-blind",
+                false,
+            ));
+        }
+        let blind = InfraScopes {
+            fleet_blind: vec!["fedora".to_string()],
+            ..fleet_scopes("commit-d", "fedora-blind")
+        };
+        let CheckExecutionClaim::Suppressed(suppressed) = claim_check_execution(
+            db.clone(),
+            "project-a",
+            "workspace-compile",
+            "ih-ws",
+            &blind,
+        )
+        .unwrap() else {
+            panic!("three heads past the grace bound the blind fleet");
+        };
+        assert_eq!(suppressed.fleet_blind, vec!["fedora".to_string()]);
+        assert!(matches!(
+            claim_check_execution(
+                db,
+                "project-a",
+                "workspace-compile",
+                "ih-ws",
+                &fleet_scopes("commit-d", "fedora-seeing"),
+            )
+            .unwrap(),
+            CheckExecutionClaim::Clear { .. }
+        ));
     }
 
     /// Both fallbacks in [`InfraScopes::scope_for`]. A domain this scope set

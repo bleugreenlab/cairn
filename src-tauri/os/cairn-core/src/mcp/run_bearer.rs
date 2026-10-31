@@ -23,8 +23,9 @@
 //! # What the book holds
 //!
 //! The SHA-256 digest of each token, never the token. The token's plaintext
-//! lives only inside its lease, from which it is presented once into the child
-//! environment (or a dev export) and compared in constant time on each request.
+//! lives only inside its lease, from which it is presented into the process that
+//! carries it (an agent's or a project service's environment, a service call's
+//! frame, or a dev export) and compared in constant time on each request.
 //! A revoked bearer leaves a non-secret tombstone for a day so a later
 //! presentation can be told *why* it is refused rather than just that it is.
 
@@ -99,6 +100,21 @@ pub fn mcp_credential_env(
             Ok((MCP_TOKEN_ENV, presented.expose().to_string()))
         }
     }
+}
+
+/// The value a project service process presents at `callback_url`: its
+/// standing run's bearer, set in its environment at launch, or a call's
+/// delegated bearer, written into that call's frame on its stdin.
+///
+/// The service counterpart of [`mcp_credential_env`]. The supervisor holds each
+/// bearer as a lease and calls this as it builds what it writes to the
+/// process, so the value is materialised for that write and no earlier, and is
+/// presented to the audience derived from where the service will carry it.
+pub fn service_credential(bearer: &RunBearer, callback_url: &str) -> Result<String, String> {
+    let presented = bearer
+        .present(&audience_for_url(callback_url)?)
+        .map_err(|denied| format!("run bearer not presentable: {denied}"))?;
+    Ok(presented.expose().to_string())
 }
 
 /// The consumer role a bearer is bound to when the endpoint is reached over
@@ -365,9 +381,9 @@ impl RunBearer {
         self.lease.audience()
     }
 
-    /// The token, for the one place it is handed out: the agent process's
-    /// environment, or a dev export, for an agent that will present it to
-    /// `audience`.
+    /// The token, for the places it is handed out: the agent or project service
+    /// process that will present it to `audience` ([`mcp_credential_env`],
+    /// [`service_credential`]), or a dev export.
     pub fn present(&self, audience: &LeaseAudience) -> Result<Presented<'_>, LeaseDenied> {
         self.lease.present(audience)
     }
@@ -462,6 +478,23 @@ impl RunBearerBook {
             now() + BEARER_LIFETIME_SECS,
             token,
         )
+    }
+
+    /// [`Self::mint`] with a shorter life, for a bearer whose run is bounded:
+    /// a project service's per-call credential lives only as long as its call
+    /// may, even if the revocation at the call's end never runs.
+    pub fn mint_expiring(
+        &self,
+        run_id: &str,
+        node_uri: &str,
+        audience: LeaseAudience,
+        lifetime: std::time::Duration,
+    ) -> Result<RunBearer, BearerRefusal> {
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let token = URL_SAFE_NO_PAD.encode(bytes);
+        let lifetime = (lifetime.as_secs() as i64).clamp(1, BEARER_LIFETIME_SECS);
+        self.mint_token(run_id, node_uri, audience, now() + lifetime, token)
     }
 
     fn mint_token(
@@ -631,6 +664,24 @@ mod tests {
 
     fn local() -> LeaseAudience {
         audience_for_host("127.0.0.1:3849")
+    }
+
+    #[test]
+    fn a_service_credential_verifies_at_its_callback_and_is_refused_elsewhere() {
+        let book = RunBearerBook::default();
+        let callback = "http://127.0.0.1:3849/api/mcp";
+        let bearer = book
+            .mint("run-s", NODE, audience_for_url(callback).unwrap())
+            .unwrap();
+        let token = service_credential(&bearer, callback).unwrap();
+        assert_eq!(book.verify(&token, &local()).unwrap().run_id, "run-s");
+        assert!(service_credential(&bearer, "https://elsewhere.example/mcp").is_err());
+
+        book.revoke_run("run-s", "call ended");
+        assert!(
+            service_credential(&bearer, callback).is_err(),
+            "a revoked bearer must not be handed to a service"
+        );
     }
 
     #[test]

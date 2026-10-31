@@ -443,7 +443,22 @@ pub(crate) async fn suspend(
     // after the marker, and pausing only there leaves the marker-to-interrupt
     // window owned by the provider. The status response is validated, so a
     // provider that acknowledges the request without applying it fails closed.
-    let goal_pause = crate::backends::stdin::pause_goal_for_durable_wait(
+    let goal_pause = pause_goal_for_park(orch, record)?;
+    let established = async {
+        supersede_abandoned(orch, db, record).await?;
+        insert(db, record).await
+    }
+    .await;
+    let yielded = settle_goal_pause(orch, record, goal_pause, established)?;
+    Ok(finish_park(orch, db, record, yielded).await)
+}
+
+/// Claim the native goal's continue decision for a park, or fail.
+fn pause_goal_for_park(
+    orch: &Orchestrator,
+    record: &Record,
+) -> Result<Option<crate::backends::codex::DurableGoalPause>, String> {
+    crate::backends::stdin::pause_goal_for_durable_wait(
         &orch.process_state,
         &record.run_id,
         crate::agent_process::process::PauseIntent::Stake(
@@ -453,14 +468,19 @@ pub(crate) async fn suspend(
                 },
             ),
         ),
-    )?;
-    let established = async {
-        supersede_abandoned(orch, db, record).await?;
-        insert(db, record).await
-    }
-    .await;
-    let yielded = match established {
-        Ok(yielded) => yielded,
+    )
+}
+
+/// Pass an establishing write's outcome through, restoring the native goal's
+/// prior status when the write failed.
+fn settle_goal_pause(
+    orch: &Orchestrator,
+    record: &Record,
+    goal_pause: Option<crate::backends::codex::DurableGoalPause>,
+    established: Result<bool, String>,
+) -> Result<bool, String> {
+    match established {
+        Ok(yielded) => Ok(yielded),
         Err(error) => {
             if let Err(rollback_error) =
                 crate::backends::stdin::restore_goal_after_failed_durable_wait(
@@ -478,9 +498,144 @@ pub(crate) async fn suspend(
                     "{error}; native goal rollback also failed: {rollback_error}"
                 ));
             }
-            return Err(error);
+            Err(error)
         }
-    };
+    }
+}
+
+/// Hold a call open on its socket under the durable record a park would take.
+///
+/// A `run` call that outlives the grace window but is still inside its
+/// declared work window stays on its socket, and this row is what gives it a
+/// park's restart behavior while it does: one row, one resolver binding, held
+/// open rather than handed off. Nothing is yielded and nothing is parked. The
+/// call then leaves the hold exactly one way: [`deliver_held_inline`] when it
+/// answers in time, or [`convert_hold_to_park`] when it cannot. A host restart
+/// mid-hold is reconciled like any park ([`reconcile`]).
+pub(crate) async fn hold(orch: &Orchestrator, db: &LocalDb, record: &Record) -> Result<(), String> {
+    if record.tool_use_id.trim().is_empty() {
+        log::warn!(
+            "refusing to hold run {} on no bound tool call",
+            record.run_id
+        );
+        return Err(SUSPENSION_UNAVAILABLE.to_string());
+    }
+    validate_run_batch_ownership(db, record).await?;
+    supersede_abandoned(orch, db, record).await?;
+    insert_as(db, record, Establish::Hold).await.map(|_| ())
+}
+
+/// How a held call's inline delivery went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeldDelivery {
+    /// The row is resolved as delivered on the call's own socket; nothing will
+    /// wake for it.
+    Delivered,
+    /// The row is still held, but its turn is no longer running (a sibling
+    /// call parked it), so the result has to reach the turn durably instead.
+    TurnYielded,
+    /// Something else settled the row first: a stop cancelled it, or an
+    /// item's own permission took the call over.
+    Gone,
+}
+
+/// The resolution a held call's row records when it answered on its socket.
+pub(crate) const DELIVERED_INLINE_OUTCOME: &str = r#"{"outcome":"delivered_inline"}"#;
+
+/// Settle a held call that is answering on its own socket, BEFORE the reply
+/// leaves the host: the row resolves with no stored result and no successor,
+/// and the reconciler (which selects only pending and resolving rows) never
+/// wakes for it.
+pub(crate) async fn deliver_held_inline(
+    db: &LocalDb,
+    record: &Record,
+) -> Result<HeldDelivery, String> {
+    let (id, turn_id) = (record.id.clone(), record.turn_id.clone());
+    db.write(|c| {
+        let (id, turn_id) = (id.clone(), turn_id.clone());
+        Box::pin(async move {
+            let changed = c
+                .execute(
+                    "UPDATE agent_waits SET state='resolved',resolution_json=?3,resolved_at=?4 \
+                     WHERE id=?1 AND state='pending' AND hold='inline' \
+                     AND EXISTS(SELECT 1 FROM turns WHERE id=?2 AND state='running')",
+                    params![
+                        id.as_str(),
+                        turn_id.as_str(),
+                        DELIVERED_INLINE_OUTCOME,
+                        chrono::Utc::now().timestamp_millis()
+                    ],
+                )
+                .await?;
+            if changed > 0 {
+                return Ok(HeldDelivery::Delivered);
+            }
+            let mut rows = c
+                .query(
+                    "SELECT 1 FROM agent_waits WHERE id=?1 AND state='pending' AND hold='inline'",
+                    params![id.as_str()],
+                )
+                .await?;
+            Ok(if rows.next().await?.is_some() {
+                HeldDelivery::TurnYielded
+            } else {
+                HeldDelivery::Gone
+            })
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Turn a held call into an ordinary park, in place: the same row stops
+/// being held, the turn yields, and the park is scheduled exactly as
+/// [`suspend`] schedules it. Fails when the row is no longer held (a stop or
+/// an item's permission settled it first), and then nothing is yielded.
+pub(crate) async fn convert_hold_to_park(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    record: &Record,
+) -> Result<ParkHandoff, String> {
+    let goal_pause = pause_goal_for_park(orch, record)?;
+    let (id, turn_id) = (record.id.clone(), record.turn_id.clone());
+    let converted = db
+        .write(|c| {
+            let (id, turn_id) = (id.clone(), turn_id.clone());
+            Box::pin(async move {
+                let changed = c
+                    .execute(
+                        "UPDATE agent_waits SET hold=NULL WHERE id=?1 AND state='pending' AND hold='inline'",
+                        params![id.as_str()],
+                    )
+                    .await?;
+                if changed == 0 {
+                    return Err(DbError::internal("the held call was already settled"));
+                }
+                yield_turn_for_host(c, &turn_id, TurnYieldReason::Wait)
+                    .await
+                    .map_err(|e| DbError::internal(e.to_string()))
+            })
+        })
+        .await
+        .map_err(|error| {
+            log::warn!(
+                "converting held run batch {} to a park failed: {error}",
+                record.id
+            );
+            SUSPENSION_UNAVAILABLE.to_string()
+        });
+    let yielded = settle_goal_pause(orch, record, goal_pause, converted)?;
+    Ok(finish_park(orch, db, record, yielded).await)
+}
+
+/// The tail every park shares once its row is pending and its turn yielded:
+/// announce the yield, release the turn, and schedule the park.
+async fn finish_park(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    record: &Record,
+    yielded: bool,
+) -> ParkHandoff {
     // Say out loud that the turn parked. The row and the yield land inside one
     // write, which announces nothing on its own, and every reader of turn state
     // caches until something invalidates it -- so without this the node keeps
@@ -509,7 +664,7 @@ pub(crate) async fn suspend(
             }
         },
     );
-    Ok(ParkHandoff(parked_rx))
+    ParkHandoff(parked_rx)
 }
 
 async fn validate_run_batch_ownership(db: &LocalDb, r: &Record) -> Result<(), String> {
@@ -549,10 +704,24 @@ async fn validate_run_batch_ownership(db: &LocalDb, r: &Record) -> Result<(), St
     Ok(())
 }
 
-/// Persist the suspension and yield its turn in one write, reporting whether the
-/// turn was the one that yielded (it is already parked when a sibling call of the
-/// same turn got there first).
+/// Which kind of active row an establishing write lands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Establish {
+    /// An ordinary park: the row and the yielded turn land together.
+    Park,
+    /// A call held open on its socket: the row lands with `hold='inline'` and
+    /// the turn keeps running.
+    Hold,
+}
+
+/// Persist the suspension and, for a park, yield its turn in one write,
+/// reporting whether the turn was the one that yielded (it is already parked
+/// when a sibling call of the same turn got there first; a hold never yields).
 async fn insert(db: &LocalDb, r: &Record) -> Result<bool, String> {
+    insert_as(db, r, Establish::Park).await
+}
+
+async fn insert_as(db: &LocalDb, r: &Record, establish: Establish) -> Result<bool, String> {
     let run_id = r.run_id.clone();
     let r = r.clone();
     db.write(|c|{let r=r.clone();Box::pin(async move{
@@ -566,7 +735,11 @@ async fn insert(db: &LocalDb, r: &Record) -> Result<bool, String> {
             }
         }
         let json=serde_json::to_string(&r.condition).map_err(|e|DbError::internal(e.to_string()))?;
-        c.execute("INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,state,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending',?9)",params![r.id.as_str(),r.job_id.as_str(),r.run_id.as_str(),r.session_id.as_str(),r.turn_id.as_str(),r.tool_use_id.as_str(),json,r.deadline,r.created]).await?;
+        let hold = (establish == Establish::Hold).then_some("inline");
+        c.execute("INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,state,created_at,hold) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending',?9,?10)",params![r.id.as_str(),r.job_id.as_str(),r.run_id.as_str(),r.session_id.as_str(),r.turn_id.as_str(),r.tool_use_id.as_str(),json,r.deadline,r.created,hold]).await?;
+        if establish == Establish::Hold {
+            return Ok(false);
+        }
         let yielded=yield_turn_for_host(c,&r.turn_id,TurnYieldReason::Wait).await.map_err(|e|DbError::internal(e.to_string()))?;
         Ok(yielded)
     })}).await.map_err(|error|{log::warn!("durable suspension insert failed for run {run_id}: {error}");SUSPENSION_UNAVAILABLE.to_string()})
@@ -1587,7 +1760,7 @@ pub(crate) async fn reconcile(orch: &Orchestrator) {
     for db in orch.db.all_dbs().await {
         let records = db.read(|conn| Box::pin(async move {
             let mut rows = conn.query(
-                "SELECT id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,created_at,state,resolution_json FROM agent_waits WHERE state IN ('pending','resolving')",
+                "SELECT id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,created_at,state,resolution_json,hold FROM agent_waits WHERE state IN ('pending','resolving')",
                 (),
             ).await?;
             let mut found = Vec::new();
@@ -1599,7 +1772,7 @@ pub(crate) async fn reconcile(orch: &Orchestrator) {
                     id: row.text(0)?, job_id: row.text(1)?, run_id: row.text(2)?,
                     session_id: row.text(3)?, turn_id: row.text(4)?, tool_use_id: row.text(5)?,
                     condition, deadline: row.opt_i64(7)?, created: row.i64(8)?,
-                }, row.text(9)?, row.opt_text(10)?));
+                }, row.text(9)?, row.opt_text(10)?, row.opt_text(11)?.is_some()));
             }
             Ok(found)
         })).await;
@@ -1607,7 +1780,20 @@ pub(crate) async fn reconcile(orch: &Orchestrator) {
             log::warn!("failed to load pending suspensions during startup");
             continue;
         };
-        for (record, state, stored_result) in records {
+        for (record, state, stored_result, held) in records {
+            // A call held open on its socket when the host died: its socket is
+            // gone with the host, so it becomes the park it would have been,
+            // and this reconciler is its turn's only resumer. Yielding here as
+            // well as in the stale-run sweep makes the two boot sweeps
+            // order-independent.
+            if held {
+                if let Err(error) = release_held_turn(&db, &record).await {
+                    log::warn!(
+                        "startup could not release held call {}'s turn: {error}",
+                        record.id
+                    );
+                }
+            }
             // MCP continuations are owned by the one host-global scheduler. At
             // startup their durable rows are already normalized; do not create a
             // per-wait task or wait for their next poll here.
@@ -1659,6 +1845,28 @@ pub(crate) async fn reconcile(orch: &Orchestrator) {
             });
         }
     }
+}
+
+/// Turn a held row whose host died into an ordinary park: the row stops being
+/// held and its turn, if still running, yields for the wait.
+async fn release_held_turn(db: &LocalDb, record: &Record) -> Result<(), String> {
+    let (id, turn_id) = (record.id.clone(), record.turn_id.clone());
+    db.write(|c| {
+        let (id, turn_id) = (id.clone(), turn_id.clone());
+        Box::pin(async move {
+            c.execute(
+                "UPDATE agent_waits SET hold=NULL WHERE id=?1 AND hold='inline'",
+                params![id.as_str()],
+            )
+            .await?;
+            yield_turn_for_host(c, &turn_id, TurnYieldReason::Wait)
+                .await
+                .map_err(|e| DbError::internal(e.to_string()))?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 async fn resolution_after_restart(

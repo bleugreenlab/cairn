@@ -1,7 +1,8 @@
 //! DAG-native delegated work packets.
 //!
-//! Delegated task requests record durable packets in the execution snapshot. The
-//! DAG effect pipeline materializes pending packets into ordinary nodes/jobs.
+//! Delegated task requests record durable packets in `delegated_packets`, one
+//! row per packet (`cairn_workflow::delegated_packets`). The DAG effect pipeline
+//! materializes pending packets into ordinary nodes/jobs.
 
 pub mod runtime;
 
@@ -16,8 +17,9 @@ use cairn_common::ids;
 
 use crate::models::{
     DelegatedOutputContract, DelegatedSessionMode, DelegatedSessionStrategy, DelegatedStatus,
-    DelegatedWorkPacket, ExecutionSnapshot, OutputSchema,
+    DelegatedWorkPacket, OutputSchema,
 };
+use cairn_workflow::delegated_packets::prompt_digest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegatedTaskSessionMode {
@@ -169,19 +171,24 @@ pub(crate) struct CreateDelegatedPacketInput<'a> {
     background: bool,
 }
 
+/// A task packet for `input`: the one already among `existing` that it
+/// retries (`.1` is `false`), or a new pending one for the caller to store.
 pub(crate) fn create_or_reuse_task_packet(
-    snapshot: &mut ExecutionSnapshot,
+    existing: &[DelegatedWorkPacket],
     input: CreateDelegatedPacketInput<'_>,
-) -> DelegatedWorkPacket {
-    if let Some(existing) = snapshot
-        .delegated_packets
+) -> (DelegatedWorkPacket, bool) {
+    let digest = prompt_digest(input.problem_statement);
+    if let Some(existing) = existing
         .iter()
         .find(|packet| {
             packet.parent_job_id == input.parent_job_id
                 && packet.parent_tool_use_id.as_deref() == input.parent_tool_use_id
                 && packet.agent_config_id == input.agent_config_id
                 && packet.title == input.title
-                && packet.problem_statement == input.problem_statement
+                // A packet past pending keeps only its prompt's digest; one
+                // written before digests existed keeps the prompt itself.
+                && (packet.prompt_digest.as_deref() == Some(digest.as_str())
+                    || packet.problem_statement.as_deref() == Some(input.problem_statement))
                 && packet.task_index == input.task_index
                 && packet.tier_override.as_deref() == input.tier_override
                 && packet.backend_preference.as_deref() == input.backend_preference
@@ -189,7 +196,7 @@ pub(crate) fn create_or_reuse_task_packet(
         })
         .cloned()
     {
-        return existing;
+        return (existing, false);
     }
 
     let packet = DelegatedWorkPacket {
@@ -199,7 +206,8 @@ pub(crate) fn create_or_reuse_task_packet(
         parent_tool_use_id: input.parent_tool_use_id.map(str::to_string),
         origin: crate::models::DelegationOrigin::TaskTool,
         title: input.title.to_string(),
-        problem_statement: input.problem_statement.to_string(),
+        problem_statement: Some(input.problem_statement.to_string()),
+        prompt_digest: Some(digest),
         agent_config_id: input.agent_config_id.to_string(),
         ownership: crate::models::DelegatedOwnershipScope {
             cwd: input.cwd.to_string(),
@@ -219,9 +227,7 @@ pub(crate) fn create_or_reuse_task_packet(
         background: input.background,
         created_at: chrono::Utc::now().timestamp(),
     };
-
-    snapshot.delegated_packets.push(packet.clone());
-    packet
+    (packet, true)
 }
 
 pub(crate) struct CreateCallPacketInput<'a> {
@@ -241,25 +247,26 @@ pub(crate) struct CreateCallPacketInput<'a> {
     pub(crate) background: bool,
 }
 
-/// Persist a pre-materialized call packet (CAIRN-2481).
+/// A pre-materialized call packet (CAIRN-2481).
+///
+/// It keeps its prompt's digest but not the prompt: the call's own launch
+/// carries the prompt, and nothing reads a call packet's.
 ///
 /// Unlike a task packet it is born `Materialized` with its
 /// `result_artifact_job_id` already set, so `expand_delegated_packets` (which
 /// only expands `Pending` packets) skips it — the call never becomes a recipe
 /// node and never advances the DAG — while the completion-resume path finds it by
 /// `result_artifact_job_id` and drives the parent exactly as it does for a task.
-pub(crate) fn create_call_packet(
-    snapshot: &mut ExecutionSnapshot,
-    input: CreateCallPacketInput<'_>,
-) -> DelegatedWorkPacket {
-    let packet = DelegatedWorkPacket {
+pub(crate) fn create_call_packet(input: CreateCallPacketInput<'_>) -> DelegatedWorkPacket {
+    DelegatedWorkPacket {
         id: ids::mint_child(input.parent_job_id),
         parent_job_id: input.parent_job_id.to_string(),
         parent_turn_id: input.parent_turn_id.map(str::to_string),
         parent_tool_use_id: input.parent_tool_use_id.map(str::to_string),
         origin: crate::models::DelegationOrigin::CallTool,
         title: input.title.to_string(),
-        problem_statement: input.problem_statement.to_string(),
+        problem_statement: None,
+        prompt_digest: Some(prompt_digest(input.problem_statement)),
         agent_config_id: input.agent_config_id.to_string(),
         ownership: crate::models::DelegatedOwnershipScope {
             cwd: input.cwd.to_string(),
@@ -278,118 +285,88 @@ pub(crate) fn create_call_packet(
         backend_preference: input.backend_preference.map(str::to_string),
         background: input.background,
         created_at: chrono::Utc::now().timestamp(),
-    };
-
-    snapshot.delegated_packets.push(packet.clone());
-    packet
+    }
 }
 
 #[cfg(test)]
 mod call_packet_tests {
     use super::*;
-    use crate::models::{RecipeSnapshot, RecipeTrigger, TriggerContext, TriggerType};
 
-    fn empty_snapshot() -> ExecutionSnapshot {
-        ExecutionSnapshot {
-            continuity: Default::default(),
-            branch_target: Default::default(),
-            model_routing: None,
-            recipe: RecipeSnapshot {
-                id: "r".to_string(),
-                name: "n".to_string(),
-                description: None,
-                trigger: RecipeTrigger::Manual,
-                nodes: vec![],
-                edges: vec![],
-            },
-            agents: std::collections::HashMap::new(),
-            skills: std::collections::HashMap::new(),
-            trigger_context: TriggerContext {
-                issue_id: None,
-                project_id: "p".to_string(),
-                trigger_type: TriggerType::Manual,
-                event_payload: None,
-                initiated_via: None,
-            },
-            presets: None,
-            delegated_packets: vec![],
-            created_at: 0,
-        }
-    }
-
-    /// A call packet is born Materialized with its result job set, and the DAG
-    /// expander (which only expands Pending packets) never lowers it into a node.
+    /// A call packet is born Materialized with its result job set, so the DAG
+    /// expander (which only expands Pending packets) never lowers it into a
+    /// node, and it holds no prompt.
     #[test]
     fn call_packet_is_materialized_and_never_expands() {
-        let mut snapshot = empty_snapshot();
         let contract = resolve_delegated_output_contract(None).unwrap();
-        let packet = create_call_packet(
-            &mut snapshot,
-            CreateCallPacketInput {
-                parent_job_id: "parent",
-                parent_turn_id: Some("T1"),
-                parent_tool_use_id: Some("tool-1"),
-                title: "call",
-                problem_statement: "do it",
-                agent_config_id: "Explore",
-                cwd: "/tmp",
-                output_contract: contract,
-                result_artifact_job_id: "call-job",
-                task_index: Some(0),
-                tier_override: None,
-                backend_preference: None,
-                background: false,
-            },
-        );
+        let packet = create_call_packet(CreateCallPacketInput {
+            parent_job_id: "parent",
+            parent_turn_id: Some("T1"),
+            parent_tool_use_id: Some("tool-1"),
+            title: "call",
+            problem_statement: "do it",
+            agent_config_id: "Explore",
+            cwd: "/tmp",
+            output_contract: contract,
+            result_artifact_job_id: "call-job",
+            task_index: Some(0),
+            tier_override: None,
+            backend_preference: None,
+            background: false,
+        });
 
         assert_eq!(packet.origin, crate::models::DelegationOrigin::CallTool);
         assert_eq!(packet.status, DelegatedStatus::Materialized);
         assert_eq!(packet.result_artifact_job_id.as_deref(), Some("call-job"));
         assert!(packet.materialized_node_ids.is_empty());
-
-        // The DAG expander only expands Pending packets, so a call is never
-        // lowered into a recipe node and never advances the DAG.
-        assert!(snapshot
-            .delegated_packets
-            .iter()
-            .all(|p| p.status != DelegatedStatus::Pending));
-        assert!(snapshot.recipe.nodes.is_empty());
-        assert!(snapshot.recipe.edges.is_empty());
+        assert_eq!(packet.problem_statement, None);
+        assert_eq!(packet.prompt_digest, Some(prompt_digest("do it")));
     }
 
-    /// A batch of N calls creates N Materialized CallTool packets and zero
-    /// recipe nodes / edges.
-    #[test]
-    fn batch_of_calls_adds_packets_but_no_nodes() {
-        let mut snapshot = empty_snapshot();
-        for i in 0..5 {
-            create_call_packet(
-                &mut snapshot,
-                CreateCallPacketInput {
-                    parent_job_id: "parent",
-                    parent_turn_id: Some("T1"),
-                    parent_tool_use_id: Some("tool-1"),
-                    title: "call",
-                    problem_statement: "do it",
-                    agent_config_id: "Explore",
-                    cwd: "/tmp",
-                    output_contract: resolve_delegated_output_contract(None).unwrap(),
-                    result_artifact_job_id: "call-job",
-                    task_index: Some(i),
-                    tier_override: None,
-                    backend_preference: None,
-                    background: false,
-                },
-            );
+    fn task_input<'a>(prompt: &'a str) -> CreateDelegatedPacketInput<'a> {
+        CreateDelegatedPacketInput {
+            parent_job_id: "parent",
+            parent_turn_id: Some("T1"),
+            parent_tool_use_id: Some("tool-1"),
+            title: "task",
+            problem_statement: prompt,
+            agent_config_id: "Explore",
+            cwd: "/tmp",
+            fence: None,
+            acceptance: vec![],
+            output_contract: resolve_delegated_output_contract(None).unwrap(),
+            session: DelegatedSessionStrategy::default(),
+            task_index: Some(0),
+            tier_override: None,
+            backend_preference: None,
+            background: false,
         }
-        assert_eq!(snapshot.delegated_packets.len(), 5);
-        assert!(snapshot
-            .delegated_packets
-            .iter()
-            .all(|p| p.origin == crate::models::DelegationOrigin::CallTool
-                && p.status == DelegatedStatus::Materialized));
-        assert!(snapshot.recipe.nodes.is_empty());
-        assert!(snapshot.recipe.edges.is_empty());
+    }
+
+    /// A retried spawn reuses its packet whether that packet still holds the
+    /// prompt, holds only its digest (past pending), or predates digests.
+    #[test]
+    fn a_retried_task_matches_its_packet_by_prompt_or_digest() {
+        let (pending, created) = create_or_reuse_task_packet(&[], task_input("do it"));
+        assert!(created);
+        assert_eq!(pending.problem_statement.as_deref(), Some("do it"));
+
+        let past_pending = DelegatedWorkPacket {
+            problem_statement: None,
+            status: DelegatedStatus::Running,
+            ..pending.clone()
+        };
+        let legacy = DelegatedWorkPacket {
+            prompt_digest: None,
+            ..pending.clone()
+        };
+        for existing in [pending.clone(), past_pending, legacy] {
+            let (reused, created) =
+                create_or_reuse_task_packet(std::slice::from_ref(&existing), task_input("do it"));
+            assert!(!created);
+            assert_eq!(reused.id, existing.id);
+        }
+        let (_, created) = create_or_reuse_task_packet(&[pending], task_input("do else"));
+        assert!(created, "a different prompt is a different task");
     }
 }
 

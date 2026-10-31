@@ -11,7 +11,13 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use super::{IngressEventRow, MAX_BODY_CHARS};
+use cairn_common::identity::{
+    Address, AppearanceEvidence, AppearanceSnapshot, AppearanceTransport, CredentialRef,
+    PrincipalRef, VerificationMethod, VerificationRecord, VerificationStatus, VerificationStrength,
+};
+
+use super::{EndpointRecord, IngressEventRow, MAX_BODY_CHARS};
+use crate::issues::crud::IssueAuthorship;
 use crate::orchestrator::Orchestrator;
 use crate::routes::RouteFact;
 
@@ -25,9 +31,35 @@ pub struct EndpointEvent {
     pub verification: Option<String>,
     pub sender: Option<Value>,
     pub received_at: String,
-    /// The opened body, or why there is none (the relay dropped it, or it
-    /// could not be opened).
-    pub body: Result<Value, String>,
+    /// The opened body, or why there is none.
+    pub body: Result<Value, NoBody>,
+}
+
+/// Why an endpoint event arrived without a body this install can read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoBody {
+    /// `ingress_no_body` (dropped, or would not open) or
+    /// `ingress_unknown_encryption` (sealed in a format this install lacks).
+    pub reason: &'static str,
+    pub detail: String,
+}
+
+impl NoBody {
+    pub fn missing(detail: impl Into<String>) -> Self {
+        Self {
+            reason: "ingress_no_body",
+            detail: detail.into(),
+        }
+    }
+
+    pub fn unknown_encryption(encryption: &str) -> Self {
+        Self {
+            reason: "ingress_unknown_encryption",
+            detail: format!(
+                "the relay sealed this body as `{encryption}`, which this install cannot open"
+            ),
+        }
+    }
 }
 
 /// What became of an endpoint event. Either way the relay cursor advances.
@@ -47,6 +79,102 @@ fn undeliverable(reason: &'static str, detail: impl Into<String>) -> Consumed {
         reason,
         detail: detail.into(),
     }
+}
+
+/// A JSON id as text: a non-empty string, or a number.
+fn id_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+/// Who a verified external delivery came from, and how it was authenticated.
+///
+/// Only an external endpoint's delivery has an origin, and only when the
+/// api-stamped `verification` names the endpoint's own scheme: the runner
+/// never takes a scheme on the row's word alone. The principal is read from
+/// the signed body (GitHub's sender and installation, Linear's actor and
+/// organization), falling back to the endpoint itself. What it claims is that
+/// the delivery was authenticated at the endpoint's boundary (and, for a
+/// provider signature or HMAC, that the payload bytes are the ones signed),
+/// not who stands behind the account; a sender the payload declares for
+/// itself stays in the body and the label.
+pub(crate) fn delivery_origin(
+    endpoint: &EndpointRecord,
+    verification: Option<&str>,
+    received_at: &str,
+    body: &Value,
+) -> Option<IssueAuthorship> {
+    let provider = endpoint.provider.as_str();
+    if provider == "first-party" || verification != Some(provider) {
+        return None;
+    }
+    let strength = match provider {
+        "github" | "linear" => "provider_signature",
+        "cairn-hmac" => "hmac_signature",
+        "bearer" => "bearer_token",
+        _ => return None,
+    };
+    let from = |namespace: &[&str], id: &str| {
+        Some((
+            namespace
+                .iter()
+                .find_map(|pointer| body.pointer(pointer).and_then(id_text))?,
+            body.pointer(id).and_then(id_text)?,
+        ))
+    };
+    let signed_actor = match provider {
+        "github" => from(
+            &[
+                "/installation/id",
+                "/organization/id",
+                "/repository/owner/id",
+            ],
+            "/sender/id",
+        ),
+        "linear" => from(&["/organizationId"], "/actor/id"),
+        _ => None,
+    };
+    let author = match signed_actor {
+        Some((namespace, id)) => PrincipalRef::External {
+            provider: provider.to_string(),
+            namespace,
+            id,
+        },
+        None => PrincipalRef::External {
+            provider: "ingress".into(),
+            namespace: "source".into(),
+            id: endpoint.id.clone(),
+        },
+    };
+    let at = chrono::DateTime::parse_from_rfc3339(received_at)
+        .map(|at| at.timestamp())
+        .unwrap_or_else(|_| chrono::Utc::now().timestamp());
+    let verification = VerificationRecord::new(
+        VerificationMethod::SourceCredential,
+        VerificationStatus::Verified,
+        Some(provider.to_string()),
+        Some(endpoint.id.clone()),
+        None,
+        Some(CredentialRef::new(super::custody::credential_ref(&endpoint.id)).ok()?),
+        VerificationStrength::new(strength).ok()?,
+        at,
+    )
+    .ok()?;
+    let evidence = AppearanceEvidence::new(
+        AppearanceTransport::Ingress,
+        Address::Ingress {
+            source_id: endpoint.id.clone(),
+        },
+        verification,
+        at,
+        None,
+    )
+    .ok()?;
+    let appearance = AppearanceSnapshot::new(author.clone(), evidence, vec![], None).ok()?;
+    IssueAuthorship::new(author, appearance).ok()
 }
 
 /// An event type is a short dotted identifier, the same rule the api applies.
@@ -137,7 +265,7 @@ pub async fn consume(orch: &Orchestrator, event: EndpointEvent) -> Consumed {
             "ingress_invalid_type",
             "the event type is not a short lowercase dotted identifier".to_string(),
         )),
-        (_, Err(why)) => Some(("ingress_no_body", why.clone())),
+        (_, Err(why)) => Some((why.reason, why.detail.clone())),
         _ => None,
     };
 
@@ -198,6 +326,14 @@ pub async fn consume(orch: &Orchestrator, event: EndpointEvent) -> Consumed {
     if let Some(sender) = sender_label(event.sender.as_ref()) {
         fields.insert("sender".to_string(), json!(sender));
     }
+    let origin = event.body.as_ref().ok().and_then(|body| {
+        delivery_origin(
+            &endpoint,
+            event.verification.as_deref(),
+            &event.received_at,
+            body,
+        )
+    });
     // A redelivery mints again on purpose: the fact log's Unique dedupe on this
     // identity absorbs it, and a first attempt whose mint failed is repaired.
     let minted = crate::routes::mint(
@@ -209,7 +345,8 @@ pub async fn consume(orch: &Orchestrator, event: EndpointEvent) -> Consumed {
                 fields,
                 // A first-party event's boundary carried no actor, and an
                 // anonymous reporter's claims stay in the body: no origin.
-                origin: None,
+                // An external endpoint's verified delivery has one.
+                origin,
                 // Composed from labels by `mint`: the source is untrusted.
                 summary: None,
                 route_provenance: None,
@@ -259,6 +396,8 @@ mod tests {
                 granted_at: Some("2026-10-18T00:00:00Z".into()),
                 created_at: 1,
                 revoked_at: None,
+                url: None,
+                rejected_count: 0,
             },
         )
         .await
@@ -284,6 +423,151 @@ mod tests {
 
     async fn count(db: &crate::storage::LocalDb, sql: &str) -> i64 {
         db.query_opt_i64(sql, ()).await.unwrap().unwrap_or(0)
+    }
+
+    async fn external_endpoint(db: &crate::storage::LocalDb, id: &str, provider: &str) {
+        crate::ingress::upsert_endpoint(
+            db,
+            &crate::ingress::EndpointRecord {
+                id: id.into(),
+                channel_id: "ch-1".into(),
+                project_id: Some("p".into()),
+                name: id.trim_start_matches("src_").into(),
+                provider: provider.into(),
+                status: "active".into(),
+                created_at: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    fn external_event(endpoint_id: &str, verification: &str, body: Value) -> EndpointEvent {
+        EndpointEvent {
+            relay_event_id: 30,
+            endpoint_id: endpoint_id.into(),
+            delivery_id: Some("d-1".into()),
+            event_type: "push".into(),
+            verification: Some(verification.into()),
+            sender: Some(json!({"id": 99, "login": "mallory"})),
+            received_at: "2026-10-28T20:00:00.000Z".into(),
+            body: Ok(body),
+        }
+    }
+
+    async fn stored_origin(db: &crate::storage::LocalDb) -> (Option<String>, Option<String>) {
+        db.query_opt(
+            "SELECT origin_principal_json, origin_appearance_json FROM fact_log WHERE source = 'ingress' ORDER BY id DESC LIMIT 1",
+            (),
+            |row| {
+                Ok((
+                    crate::storage::RowExt::opt_text(row, 0)?,
+                    crate::storage::RowExt::opt_text(row, 1)?,
+                ))
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    /// A verified GitHub delivery's fact names the signed sender in its
+    /// installation, and the appearance says a provider signature on this
+    /// endpoint vouched for it.
+    #[tokio::test]
+    async fn a_verified_github_delivery_mints_a_fact_with_its_signed_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = orchestrator(temp.path(), &[]).await;
+        external_endpoint(&db, "src_gh", "github").await;
+        let body =
+            json!({"sender": {"id": 583231, "login": "octocat"}, "installation": {"id": 4242}});
+        assert!(matches!(
+            consume(&orch, external_event("src_gh", "github", body)).await,
+            Consumed::Delivered { .. }
+        ));
+        let (principal, appearance) = stored_origin(&db).await;
+        let principal: PrincipalRef = serde_json::from_str(&principal.unwrap()).unwrap();
+        assert_eq!(
+            principal,
+            PrincipalRef::External {
+                provider: "github".into(),
+                namespace: "4242".into(),
+                id: "583231".into()
+            }
+        );
+        let appearance: AppearanceSnapshot = serde_json::from_str(&appearance.unwrap()).unwrap();
+        let evidence = appearance.evidence();
+        assert_eq!(evidence.transport, AppearanceTransport::Ingress);
+        assert_eq!(
+            evidence.address,
+            Address::Ingress {
+                source_id: "src_gh".into()
+            }
+        );
+        assert_eq!(
+            evidence.verification.method(),
+            VerificationMethod::SourceCredential
+        );
+        assert_eq!(
+            evidence.verification.strength().as_str(),
+            "provider_signature"
+        );
+        assert_eq!(
+            evidence.verification.credential_ref().unwrap().as_str(),
+            "ingress-endpoint:src_gh"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cairn_hmac_delivery_is_from_its_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = orchestrator(temp.path(), &[]).await;
+        external_endpoint(&db, "src_ci", "cairn-hmac").await;
+        consume(
+            &orch,
+            external_event("src_ci", "cairn-hmac", json!({"ok": true})),
+        )
+        .await;
+        let (principal, appearance) = stored_origin(&db).await;
+        let principal: PrincipalRef = serde_json::from_str(&principal.unwrap()).unwrap();
+        assert_eq!(
+            principal,
+            PrincipalRef::External {
+                provider: "ingress".into(),
+                namespace: "source".into(),
+                id: "src_ci".into()
+            }
+        );
+        let appearance: AppearanceSnapshot = serde_json::from_str(&appearance.unwrap()).unwrap();
+        assert_eq!(
+            appearance.evidence().verification.strength().as_str(),
+            "hmac_signature"
+        );
+    }
+
+    /// The runner takes no scheme on the row's word: a verification that is not
+    /// the endpoint's own scheme gives the fact no origin.
+    #[tokio::test]
+    async fn a_verification_that_is_not_the_endpoints_scheme_has_no_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = orchestrator(temp.path(), &[]).await;
+        external_endpoint(&db, "src_gh", "github").await;
+        let body = json!({"sender": {"id": 1}, "installation": {"id": 2}});
+        assert!(matches!(
+            consume(&orch, external_event("src_gh", "bearer", body)).await,
+            Consumed::Delivered { .. }
+        ));
+        assert_eq!(stored_origin(&db).await, (None, None));
+    }
+
+    #[tokio::test]
+    async fn a_first_party_event_has_no_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = orchestrator(temp.path(), &[]).await;
+        bugs_endpoint(&db).await;
+        consume(&orch, bug_event(10, 7)).await;
+        assert_eq!(stored_origin(&db).await, (None, None));
     }
 
     #[tokio::test]
@@ -375,10 +659,12 @@ mod tests {
         let mut bad_type = bug_event(21, 2);
         bad_type.event_type = "Bug Reported!".into();
         let mut no_body = bug_event(22, 3);
-        no_body.body = Err("the relay dropped this event's body".into());
+        no_body.body = Err(NoBody::missing("the relay dropped this event's body"));
+        let mut unopenable = bug_event(23, 4);
+        unopenable.body = Err(NoBody::unknown_encryption("sealed-v9"));
 
         let mut reasons = Vec::new();
-        for event in [unknown, bad_type, no_body] {
+        for event in [unknown, bad_type, no_body, unopenable] {
             match consume(&orch, event).await {
                 Consumed::Undeliverable { reason, .. } => reasons.push(reason),
                 other => panic!("expected undeliverable, got {other:?}"),
@@ -389,7 +675,8 @@ mod tests {
             vec![
                 "ingress_unknown_endpoint",
                 "ingress_invalid_type",
-                "ingress_no_body"
+                "ingress_no_body",
+                "ingress_unknown_encryption"
             ]
         );
         assert_eq!(
@@ -398,7 +685,7 @@ mod tests {
                 "SELECT COUNT(*) FROM ingress_events WHERE status = 'undeliverable' AND note IS NOT NULL"
             )
             .await,
-            3
+            4
         );
         assert_eq!(
             count(

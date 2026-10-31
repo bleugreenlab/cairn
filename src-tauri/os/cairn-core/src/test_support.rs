@@ -119,7 +119,7 @@ pub(crate) fn shipping_execution_snapshot_json(issue_id: &str, project_id: &str)
             initiated_via: None,
         },
         presets: None,
-        delegated_packets: vec![],
+        inline_delegated_packets: vec![],
         created_at: 1,
     })
     .unwrap()

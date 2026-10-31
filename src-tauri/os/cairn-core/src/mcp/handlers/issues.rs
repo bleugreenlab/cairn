@@ -31,9 +31,6 @@ pub struct CreateExecutionSpec {
     /// once every gate is satisfied. "Create the issue and a held execution on
     /// it" in one call.
     pub(crate) after: Vec<crate::routes::TriggerClause>,
-    /// `proposal` or `tenet`: the commissioning gate's tenet, which a thread's
-    /// filing of a gated recipe must carry (`crate::tenets::filing`).
-    pub(crate) tenet: Option<crate::tenets::filing::TenetClaim>,
 }
 
 /// Persist a new issue and emit the standard side effects (embed, sync,
@@ -160,9 +157,6 @@ pub struct CreatedIssueOutcome {
     pub(crate) project_key: String,
     pub number: i32,
     pub(crate) uri: String,
-    /// The tenet the commissioning gate proposed for the create's execution,
-    /// when it proposed one.
-    pub(crate) proposed_tenet: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -179,32 +173,14 @@ pub async fn create_issue_in_project(
 ) -> Result<CreatedIssueOutcome, String> {
     let owning_db = orch.db.for_project(project_key).await;
     let ctx = lookup_project_by_key(&owning_db, project_key).await?;
-    let tenet = execution
-        .as_ref()
-        .map(|spec| crate::tenets::filing::TenetFiling {
-            caller_run_id: caller_run_id.clone(),
-            claim: spec.tenet.clone(),
-            key_prefix: "payload.execution",
-        })
-        .unwrap_or_default();
-    // A filing the commissioning gate refuses, or that names its recipe by
-    // anything but a recipe id, is refused before the issue exists, so the
-    // refusal leaves no orphan issue behind it.
+    // A filing that names its recipe by anything but a recipe id is refused
+    // before the issue exists, so the refusal leaves no orphan issue behind it.
     if let Some(spec) = &execution {
-        let recipe = crate::execution::recipe::resolve_filed_recipe_id(
+        crate::execution::recipe::resolve_filed_recipe_id(
             &orch.config_dir,
             &owning_db,
             &ctx.project_id,
             spec.recipe.as_deref(),
-        )
-        .await?;
-        crate::tenets::filing::plan(
-            &orch.db,
-            &owning_db,
-            &ctx.project_key,
-            &ctx.project_id,
-            recipe.as_deref(),
-            &tenet,
         )
         .await?;
     }
@@ -225,9 +201,17 @@ pub async fn create_issue_in_project(
     let uri = cairn_common::uri::build_issue_uri(&ctx.project_key, issue.number);
     let project_key = ctx.project_key.clone();
     let number = issue.number;
+    let executions_uri =
+        cairn_common::uri::build_issue_executions_uri(&ctx.project_key, issue.number);
 
-    let (summary, proposed_tenet) = match execution {
-        None => (summary, None),
+    let summary = match execution {
+        // Filing without work is legitimate, but the result has to say so: a
+        // bare "Created issue" reads the same as a started child to a caller who
+        // believes it sent `execution`, and the child then sits idle unnoticed.
+        None => format!(
+            "{summary} (no execution started; append {{recipe}} to {executions_uri} to start \
+             one)"
+        ),
         // Create+start is "create then start", not one transaction: the issue is
         // already durable here. Reuse the executions-collection start path so the
         // recipe/backend resolution, `initiated_via="external"` stamp, and watcher
@@ -247,19 +231,14 @@ pub async fn create_issue_in_project(
             // attempt yet.
             crate::execution::recipe::LaunchIntent::NewAttempt,
             spec.after,
-            tenet,
         )
         .await
         {
-            Ok(started) => (
-                format!("{summary}\n{}", started.summary),
-                started.proposed_tenet,
-            ),
+            Ok(started) => format!("{summary}\n{started}"),
             Err(error) => {
                 return Err(format!(
                     "{summary}\nIssue created, but starting the execution failed: {error} \
-                     Append {{recipe?, backend?}} to {} to start it.",
-                    cairn_common::uri::build_issue_executions_uri(&ctx.project_key, issue.number)
+                     Append {{recipe?, backend?}} to {executions_uri} to start it."
                 ))
             }
         },
@@ -271,7 +250,6 @@ pub async fn create_issue_in_project(
         project_key,
         number,
         uri,
-        proposed_tenet,
     })
 }
 
@@ -420,26 +398,19 @@ async fn is_delegated_task_node(
     };
     let mut rows = conn
         .query(
-            "SELECT snapshot FROM executions WHERE id = ?1 LIMIT 1",
+            "SELECT 1 FROM executions WHERE id = ?1 LIMIT 1",
             params![execution_id],
         )
         .await?;
-    let snapshot = match rows.next().await? {
-        Some(row) => row.opt_text(0)?,
-        None => None,
-    };
-    let Some(snapshot) = snapshot else {
+    if rows.next().await?.is_none() {
         return Ok(true);
-    };
-    let Ok(snapshot) = serde_json::from_str::<crate::models::ExecutionSnapshot>(&snapshot) else {
-        return Ok(true);
-    };
-    Ok(snapshot.delegated_packets.iter().any(|packet| {
-        packet
-            .materialized_node_ids
-            .iter()
-            .any(|node_id| node_id == recipe_node_id)
-    }))
+    }
+    drop(rows);
+    match cairn_workflow::delegated_packets::find_by_node(conn, execution_id, recipe_node_id).await
+    {
+        Ok(packet) => Ok(packet.is_some()),
+        Err(_) => Ok(true),
+    }
 }
 
 /// The thread a run acts for, when it acts for one.
@@ -480,36 +451,6 @@ async fn owning_thread_for_run(
         .await?;
     match rows.next().await? {
         Some(row) => row.opt_text(0),
-        None => Ok(None),
-    }
-}
-
-/// The thread a run acts for and that thread's project, wherever the thread
-/// lives: [`owning_thread_for_run`] without the project scope.
-///
-/// That scope is right for inferring a parent edge, where a cross-project
-/// answer must be dropped, and wrong for deciding whether a caller IS a
-/// thread, where dropping it would let a thread pass as a person. Read on the
-/// run's own database.
-pub(crate) async fn acting_thread_for_run(
-    conn: &cairn_db::turso::Connection,
-    run_id: &str,
-) -> DbResult<Option<(String, String)>> {
-    let Some(job_id) = owning_node_job_for_run(conn, run_id).await? else {
-        return Ok(None);
-    };
-    let mut rows = conn
-        .query(
-            "SELECT t.id, t.project_id
-             FROM jobs j
-             JOIN threads t ON t.id = j.thread_id
-             WHERE j.id = ?1
-             LIMIT 1",
-            params![job_id.as_str()],
-        )
-        .await?;
-    match rows.next().await? {
-        Some(row) => Ok(Some((row.text(0)?, row.text(1)?))),
         None => Ok(None),
     }
 }
@@ -846,12 +787,14 @@ mod tests {
 
     fn request(run_id: Option<&str>) -> McpCallbackRequest {
         McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: "/tmp/repo".to_string(),
             run_id: run_id.map(ToString::to_string),
             tool: "write".to_string(),
             payload: serde_json::Value::Null,
             tool_use_id: None,
+            origin: None,
         }
     }
 
@@ -1206,6 +1149,107 @@ mod tests {
         assert_eq!(
             spawning_node(&orch.db.local, &unparented.issue_id).await,
             None
+        );
+    }
+
+    /// A create that starts nothing says so and names the way to start it, on
+    /// the canonical executions URI of the issue it just made.
+    #[tokio::test]
+    async fn a_create_without_an_execution_says_none_started() {
+        let db = migrated_db().await;
+        seed_jobs(&db).await;
+        let orch = test_orchestrator(db);
+
+        let outcome = create_issue_in_project(
+            &orch,
+            "proj",
+            "Backlog item".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Some("run-coord".to_string()),
+            crate::issues::crud::installation_machine_authorship("test-installation", 1).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.summary,
+            "Created issue proj/1: \"Backlog item\" (no execution started; append {recipe} to \
+             cairn://p/proj/1/executions to start one)"
+        );
+    }
+
+    /// A create that does start work reports the start, not the no-execution
+    /// clause.
+    #[tokio::test]
+    async fn a_create_with_an_execution_reports_the_start_instead() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let config_dir = root.join("config");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+        std::fs::create_dir_all(repo.join(".cairn/agents")).unwrap();
+        std::fs::write(
+            config_dir.join("recipes/memory-triage.yaml"),
+            include_str!("../../../../../packs/core/recipes/memory-triage.yaml"),
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("agents/integrator.md"),
+            include_str!("../../../../../packs/core/agents/integrator.md"),
+        )
+        .unwrap();
+        let db = crate::storage::migrated_test_db("issues-handler-start.db").await;
+        db.execute_script(&format!(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p', 'default', 'Project', 'proj', '{}', 1, 1);",
+            repo.display()
+        ))
+        .await
+        .unwrap();
+        let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let services = Arc::new(
+            TestServicesBuilder::new()
+                .with_process(crate::services::testing::RecordingProcessSpawner::new())
+                .build(),
+        );
+        let orch = OrchestratorBuilder::new(
+            Arc::new(DbState::new(Arc::new(db), search_index)),
+            services,
+            config_dir,
+        )
+        .build();
+
+        let outcome = create_issue_in_project(
+            &orch,
+            "proj",
+            "Started child".to_string(),
+            None,
+            None,
+            Some(CreateExecutionSpec {
+                recipe: Some("memory-triage".to_string()),
+                ..Default::default()
+            }),
+            None,
+            None,
+            crate::issues::crud::installation_machine_authorship("test-installation", 1).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            outcome
+                .summary
+                .starts_with("Created issue proj/1: \"Started child\"\nStarted execution 1"),
+            "{}",
+            outcome.summary
+        );
+        assert!(
+            !outcome.summary.contains("no execution started"),
+            "{}",
+            outcome.summary
         );
     }
 

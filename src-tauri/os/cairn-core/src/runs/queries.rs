@@ -136,12 +136,21 @@ pub struct RestartResumeSummary {
 /// Only this host's private database is swept. Team replicas belong to their
 /// owner's sweep.
 ///
-/// Call this only once the MCP callback gateway is serving: a resumed agent's
-/// first tool call goes straight back through it.
+/// It acts only once startup recovery is ready, because a resumed agent's first
+/// tool call goes straight back through the MCP callback gateway, which refuses
+/// calls until then (cairn/4758). Before readiness it selects nothing; admission
+/// would hold any launch anyway, but a pass that cannot do its work should not
+/// pretend to.
 pub fn resume_jobs_interrupted_by_restart(
     orch: &crate::orchestrator::Orchestrator,
     boot_at: i64,
 ) -> RestartResumeSummary {
+    if !orch.startup_readiness.is_ready() {
+        log::warn!(
+            "Not resuming restart-interrupted jobs: startup recovery is not ready, so their callbacks would be refused"
+        );
+        return RestartResumeSummary::default();
+    }
     let candidates = match select_restart_resumes(orch, boot_at) {
         Ok(candidates) => candidates,
         Err(error) => {

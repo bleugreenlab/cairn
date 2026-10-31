@@ -9,6 +9,13 @@
 //! the tests that turned red or green since the lane's previous complete row,
 //! and the merges between the two rows.
 //!
+//! What a lane's verdict is made of follows from the command it runs
+//! ([`LaneVerdict`]). A test runner's verdict is its per-test enumeration. Any
+//! other command (a typecheck, a build) has its exit as its verdict, and its
+//! message names the move between the two rows' verdicts and quotes a red
+//! one's output. Such a lane runs in a minute or two after nearly every merge,
+//! so a green that follows a green is recorded but not posted.
+//!
 //! Scheduling is coalesced per lane and never preemptive. A whole-suite run
 //! takes most of an hour while merges land every few minutes, so a newer tip
 //! never cancels the run in flight; it queues at most one more run of that
@@ -23,12 +30,12 @@
 //! it is announced as **cancelled by restart**, recorded, and cited by the pass
 //! the next boot arms, so a restart never leaves main with no pass at all.
 //!
-//! A lane that does not produce a complete per-test verdict is announced louder
-//! than any red, with its cause class: **death** (the lane died: placement,
-//! capacity, infrastructure, a stalled or killed run) or **no-verdict** (the lane
-//! ran to an exit but its result is not a per-test verdict: a test target that
-//! did not compile, zero tests, an incomplete enumeration). Under a post-merge
-//! detection regime, a silent detector is the dangerous case.
+//! A lane that does not produce a complete verdict is announced louder than any
+//! red, with its cause class: **death** (the lane died: placement, capacity,
+//! infrastructure, a stalled or killed run) or **no-verdict** (the lane ran to
+//! an exit but its result is not a verdict: a test target that did not compile,
+//! zero tests, an incomplete enumeration, a run that selected nothing). Under a
+//! post-merge detection regime, a silent detector is the dangerous case.
 //!
 //! Store identity: cadence observations record `cadence = 'main'` and
 //! `job_id = 'main:{project_id}'`. A row is measured against the newest such
@@ -46,6 +53,7 @@ use std::time::Duration;
 use cairn_common::executor_protocol::{CheckSelectorSource, ExecutorSelector};
 
 use crate::config::project_settings::CheckCommand;
+use crate::execution::check_parsers::is_test_runner_command;
 use crate::execution::check_placement::CheckPlacementOverride;
 use crate::execution::checks::{
     execute_check_contract, load_checks_contract_at_commit_detailed,
@@ -230,6 +238,51 @@ pub(crate) struct LaneInFlight {
     pub(crate) queued: bool,
 }
 
+/// What a lane last reported, kept so the project overview names every lane's
+/// standing answer after its run has ended. A short lane (a typecheck) is in
+/// flight for a minute or two after each merge and is otherwise only this.
+/// Held in memory: the boot pass reports every lane again within minutes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LaneOutcome {
+    pub(crate) check: String,
+    pub(crate) platform: String,
+    /// The tip the attempt attested, when the pass resolved one.
+    pub(crate) tip: Option<String>,
+    /// The verdict as a clause: `passed`, `failed (exit 2)`, `78 failed`,
+    /// `did not complete (death)`.
+    pub(crate) summary: String,
+    /// The row that answers, when there is one: its citation and commit, which
+    /// differs from the tip when an earlier row already covers the tip's inputs.
+    pub(crate) row: Option<(String, String)>,
+    pub(crate) at_unix_ms: i64,
+}
+
+/// One line of the project overview's Main cadence section.
+pub(crate) fn render_outcome_line(outcome: &LaneOutcome, now_ms: i64) -> String {
+    let tip = outcome.tip.as_deref().map_or_else(
+        || "an unresolved tip".to_string(),
+        |tip| format!("`{}`", short_commit(tip)),
+    );
+    let mut line = format!(
+        "- {} on {}: {} at {tip}, {} ago",
+        outcome.check,
+        outcome.platform,
+        outcome.summary,
+        age(now_ms, outcome.at_unix_ms)
+    );
+    if let Some((reference, commit)) = &outcome.row {
+        line.push_str(&format!(" — {reference}"));
+        if outcome.tip.as_deref() != Some(commit.as_str()) {
+            line.push_str(&format!(
+                " (the row on `{}`, whose inputs this tip shares)",
+                short_commit(commit)
+            ));
+        }
+    }
+    line.push_str(".\n");
+    line
+}
+
 /// The cadence slots: per project, one arm in flight and at most one queued;
 /// per lane, one run in flight and at most one queued.
 #[derive(Default)]
@@ -245,6 +298,8 @@ pub(crate) struct CadenceSlots {
     /// Per project, the lanes the last restart cancelled that no pass has
     /// reported on since; see [`arm_at_boot`].
     interrupted: HashMap<String, Vec<Interruption>>,
+    /// Each lane's last report, for the project overview.
+    outcomes: HashMap<(String, LaneKey), LaneOutcome>,
     /// Whether the startup default-advance catch-up has observed origin. Until
     /// it has, a pass must not fetch; see [`run_pass`].
     origin_observed: bool,
@@ -315,6 +370,34 @@ impl CadenceSlots {
         if lanes.is_empty() {
             self.interrupted.remove(project_id);
         }
+    }
+
+    /// Record what a lane last reported, replacing its earlier report.
+    fn settled(&mut self, project_id: &str, outcome: LaneOutcome) {
+        let key = (outcome.check.clone(), outcome.platform.clone());
+        self.outcomes.insert((project_id.to_string(), key), outcome);
+    }
+
+    /// Drop the last reports of lanes the tip no longer declares, so the
+    /// overview never lists a lane that will not report again.
+    fn forget_undeclared_outcomes(&mut self, project_id: &str, declared: &[CadenceLane]) {
+        self.outcomes.retain(|(project, (check, platform)), _| {
+            project != project_id
+                || declared
+                    .iter()
+                    .any(|lane| &lane.check == check && &lane.platform == platform)
+        });
+    }
+
+    fn outcomes(&self, project_id: &str) -> Vec<LaneOutcome> {
+        let mut outcomes: Vec<LaneOutcome> = self
+            .outcomes
+            .iter()
+            .filter(|((project, _), _)| project == project_id)
+            .map(|(_, outcome)| outcome.clone())
+            .collect();
+        outcomes.sort_by(|a, b| (&a.check, &a.platform).cmp(&(&b.check, &b.platform)));
+        outcomes
     }
 
     /// Ask for an arm. Returns `true` when the caller must start one;
@@ -456,6 +539,12 @@ impl CadenceSlots {
 /// what tells "pending" from "never ran" (CAIRN-3823).
 pub(crate) fn in_flight(orch: &Orchestrator, project_id: &str) -> Option<InFlight> {
     orch.main_cadence.lock().unwrap().in_flight(project_id)
+}
+
+/// Each lane's last report for `project_id` since this runner started, in lane
+/// order.
+pub(crate) fn last_outcomes(orch: &Orchestrator, project_id: &str) -> Vec<LaneOutcome> {
+    orch.main_cadence.lock().unwrap().outcomes(project_id)
 }
 
 /// Arm every lane for the project's default branch. Calling this on every
@@ -668,12 +757,44 @@ pub(crate) fn spawn_heartbeat(orch: &Orchestrator) {
 // Lanes
 // ---------------------------------------------------------------------------
 
+/// What a lane's verdict is made of, decided by the whole-suite command it
+/// runs: the same test-runner rule the observation store applies when it
+/// records whether a row is complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaneVerdict {
+    /// A test runner. The per-test enumeration is the verdict, and a run that
+    /// reports no test is not one (rulings 695/706).
+    PerTest,
+    /// Any other command: a typecheck, a build, a compile. Its exit is the
+    /// verdict, once its result vouches for having measured something.
+    Exit,
+}
+
+impl LaneVerdict {
+    fn of(check: &CheckCommand) -> Self {
+        let command = check.full_command.as_deref().unwrap_or(&check.command);
+        if is_test_runner_command(command) {
+            LaneVerdict::PerTest
+        } else {
+            LaneVerdict::Exit
+        }
+    }
+
+    fn classify(self, row: CadenceRow) -> CadenceVerdict {
+        match self {
+            LaneVerdict::PerTest => classify_row(row),
+            LaneVerdict::Exit => classify_exit_row(row),
+        }
+    }
+}
+
 /// One check on one platform.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CadenceLane {
     pub(crate) check: String,
     pub(crate) platform: String,
     pub(crate) notify: String,
+    pub(crate) verdict: LaneVerdict,
 }
 
 impl CadenceLane {
@@ -686,12 +807,18 @@ impl CadenceLane {
 fn cadence_lanes(checks: &HashMap<String, CheckCommand>) -> Vec<CadenceLane> {
     let mut lanes: Vec<CadenceLane> = checks
         .iter()
-        .filter_map(|(name, check)| check.main_cadence.as_ref().map(|cadence| (name, cadence)))
-        .flat_map(|(name, cadence)| {
+        .filter_map(|(name, check)| {
+            check
+                .main_cadence
+                .as_ref()
+                .map(|cadence| (name, LaneVerdict::of(check), cadence))
+        })
+        .flat_map(|(name, verdict, cadence)| {
             cadence.platforms.iter().map(move |platform| CadenceLane {
                 check: name.clone(),
                 platform: platform.trim().to_ascii_lowercase(),
                 notify: cadence.notify.clone(),
+                verdict,
             })
         })
         .collect();
@@ -763,10 +890,11 @@ async fn run_pass(
     if declared.is_empty() {
         return Ok(());
     }
-    orch.main_cadence
-        .lock()
-        .unwrap()
-        .forget_undeclared_interruptions(project_id, &declared);
+    {
+        let mut slots = orch.main_cadence.lock().unwrap();
+        slots.forget_undeclared_interruptions(project_id, &declared);
+        slots.forget_undeclared_outcomes(project_id, &declared);
+    }
     let lanes: Vec<CadenceLane> = declared
         .into_iter()
         .filter(|lane| scope.includes(lane))
@@ -918,11 +1046,21 @@ async fn run_lane(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, trigger: T
     let context = &tip.context(trigger);
     match attempt_lane(orch, db.clone(), context, lane).await {
         LaneAttempt::Covered(row) => {
-            let rearmed = orch
-                .main_cadence
-                .lock()
-                .unwrap()
-                .take_interruption(context.project_id, lane);
+            let rearmed = {
+                let mut slots = orch.main_cadence.lock().unwrap();
+                slots.settled(
+                    context.project_id,
+                    LaneOutcome {
+                        check: lane.check.clone(),
+                        platform: lane.platform.clone(),
+                        tip: Some(context.commit.to_string()),
+                        summary: verdict_clause(&row, lane.verdict),
+                        row: Some((row.reference.clone(), row.commit.clone())),
+                        at_unix_ms: now_ms(),
+                    },
+                );
+                slots.take_interruption(context.project_id, lane)
+            };
             if let Some(interruption) = rearmed {
                 log::info!(
                     "main cadence: {} is answered by {}, which already covers `{}`",
@@ -1106,7 +1244,7 @@ async fn attempt_lane(
         });
     };
     match load_row(&db, context.project_key, observation_id, &names).await {
-        Ok(row) => LaneAttempt::Verdict(classify_row(row)),
+        Ok(row) => LaneAttempt::Verdict(lane.verdict.classify(row)),
         Err(error) => LaneAttempt::Verdict(CadenceVerdict::NoVerdict {
             row: None,
             cause: format!("observation {observation_id} could not be read back: {error}"),
@@ -1196,6 +1334,7 @@ async fn report_lane(
     let content = render_report(&CadenceReport {
         check: &lane.check,
         platform: &lane.platform,
+        kind: lane.verdict,
         commit,
         verdict: &verdict,
         comparison: &comparison,
@@ -1203,6 +1342,21 @@ async fn report_lane(
         now_ms: now_ms(),
         rearmed: rearmed.as_ref(),
     });
+    orch.main_cadence.lock().unwrap().settled(
+        project_id,
+        LaneOutcome {
+            check: lane.check.clone(),
+            platform: lane.platform.clone(),
+            tip: commit
+                .or(verdict.row().map(|row| row.commit.as_str()))
+                .map(str::to_string),
+            summary: outcome_summary(lane.verdict, &verdict),
+            row: verdict
+                .row()
+                .map(|row| (row.reference.clone(), row.commit.clone())),
+            at_unix_ms: now_ms(),
+        },
+    );
     match &verdict {
         CadenceVerdict::Complete(_) => log::info!(
             "main cadence {} on {}: row recorded",
@@ -1214,7 +1368,33 @@ async fn report_lane(
             log::error!("{content}")
         }
     }
-    deliver(orch, db, project_id, &lane.notify, &content).await;
+    if posts(lane.verdict, &verdict, &comparison) || rearmed.is_some() {
+        deliver(orch, db, project_id, &lane.notify, &content).await;
+    } else {
+        log::info!(
+            "main cadence {} on {}: still green, so the row is recorded and not posted",
+            lane.check,
+            lane.platform
+        );
+    }
+}
+
+/// Whether an attempt's report is posted to the lane's thread. An exit lane
+/// runs in a minute or two after nearly every merge, so a green that follows a
+/// green would wake the thread once per merge to say what the row already
+/// records; it is logged instead. Every other outcome posts: a per-test row's
+/// diff, any red, any move, a baseline, and every attempt that did not
+/// complete.
+fn posts(kind: LaneVerdict, verdict: &CadenceVerdict, comparison: &Comparison) -> bool {
+    match (kind, verdict) {
+        (LaneVerdict::Exit, CadenceVerdict::Complete(row)) => {
+            !(row.verdict_passed
+                && comparison
+                    .previous()
+                    .is_some_and(|previous| previous.verdict_passed))
+        }
+        _ => true,
+    }
 }
 
 async fn announce_quiet_lane(
@@ -1244,7 +1424,14 @@ async fn announce_quiet_lane(
     if now - latest < HEARTBEAT.as_millis() as i64 {
         return;
     }
-    let content = render_heartbeat(&lane.check, &lane.platform, context.commit, covered, now);
+    let content = render_heartbeat(
+        &lane.check,
+        &lane.platform,
+        lane.verdict,
+        context.commit,
+        covered,
+        now,
+    );
     deliver(orch, db, context.project_id, &lane.notify, &content).await;
 }
 
@@ -1368,7 +1555,7 @@ pub(crate) struct Failure {
     /// See [`failure_signature`].
     pub(crate) signature: String,
     /// The machine condition the excerpt names, if any: see [`host_condition`].
-    pub(crate) host_condition: Option<&'static str>,
+    pub(crate) host_condition: Option<&'static HostCondition>,
 }
 
 impl Failure {
@@ -1400,6 +1587,9 @@ pub(crate) struct CadenceRow {
     pub(crate) verdict_passed: bool,
     pub(crate) exit_code: i64,
     pub(crate) complete: bool,
+    /// The parsed result's selection (`full`, `empty`, `unknown`, ...), when it
+    /// recorded one.
+    pub(crate) selection: Option<String>,
     pub(crate) tests: BTreeMap<String, TestOutcome>,
     pub(crate) output_tail: String,
 }
@@ -1477,6 +1667,34 @@ fn classify_row(row: CadenceRow) -> CadenceVerdict {
             "the suite exited {} with no failing test: the runner failed outside any test (a test target that did not compile, a crash, or a hang), so the {} tests that did report are not the whole suite",
             row.exit_code,
             row.ran()
+        ))
+    } else {
+        None
+    };
+    match cause {
+        Some(cause) => CadenceVerdict::NoVerdict {
+            row: Some(row),
+            cause,
+        },
+        None => CadenceVerdict::Complete(row),
+    }
+}
+
+/// Whether a stored row of an exit lane ([`LaneVerdict::Exit`]) is a verdict.
+/// Its exit is the verdict once the run's own result vouches for having
+/// measured something. A lint that selected nothing, or a run that stopped
+/// before it finished measuring, is stored as incomplete, and a green beside it
+/// is not one.
+fn classify_exit_row(row: CadenceRow) -> CadenceVerdict {
+    let cause = if !row.complete {
+        Some(format!(
+            "the run exited {} but its own result says it did not run to completion, so it measured nothing a verdict can rest on",
+            row.exit_code
+        ))
+    } else if row.selection.as_deref() == Some("empty") {
+        Some(format!(
+            "the run exited {} having selected nothing to check, so it measured nothing",
+            row.exit_code
         ))
     } else {
         None
@@ -1575,7 +1793,8 @@ async fn load_row(
     let head = db
         .query_opt(
             "SELECT id, COALESCE(public_handle, id), commit_sha, COALESCE(verdict_platform, ''),
-                    executor_id, ran_at, verdict, exit_code, complete, output_tail, cadence
+                    executor_id, ran_at, verdict, exit_code, complete, output_tail, cadence,
+                    selection
                FROM check_result_observations WHERE id = ?1",
             (observation_id.to_string(),),
             |row| {
@@ -1591,6 +1810,7 @@ async fn load_row(
                     row.i64(8)?,
                     row.text(9)?,
                     row.text(10)?,
+                    row.opt_text(11)?,
                 ))
             },
         )
@@ -1609,6 +1829,7 @@ async fn load_row(
         complete,
         tail,
         cadence,
+        selection,
     ) = head;
     let tests = db
         .query_all(
@@ -1640,6 +1861,7 @@ async fn load_row(
         verdict_passed: verdict == "passed",
         exit_code,
         complete: complete != 0,
+        selection,
         tests,
         output_tail: tail,
     })
@@ -1736,6 +1958,11 @@ const CANDIDATE_SCAN: i64 = 64;
 /// was armed, not what it observed, so with a chain any cadence's row on main's
 /// first-parent chain qualifies; the cadence's own rows qualify regardless,
 /// having been armed on main's tip.
+///
+/// An exit lane's rows carry no per-test selection to prove the whole command
+/// ran, so its rows qualify by how they were armed instead: the cadence's own
+/// and manual runs, which always execute the whole-suite command, and no
+/// review or write row, which may have run a narrowed one.
 async fn latest_complete_row(
     db: &LocalDb,
     project_id: &str,
@@ -1744,16 +1971,25 @@ async fn latest_complete_row(
     filter: RowFilter<'_>,
     names: ExecutorNames<'_>,
 ) -> Result<Option<CadenceRow>, String> {
+    let whole_suite = match lane.verdict {
+        LaneVerdict::PerTest => "selection = 'full' AND deferred_count = 0",
+        LaneVerdict::Exit => {
+            "COALESCE(selection, '') != 'empty' AND COALESCE(deferred_count, 0) = 0
+                AND cadence IN ('main', 'manual')"
+        }
+    };
     let candidates = db
         .query_all(
-            "SELECT id, commit_sha, cadence FROM check_result_observations
-              WHERE project_id = ?1 AND check_name = ?2 AND verdict_platform = ?3
-                AND complete = 1 AND failure_kind IS NULL
-                AND selection = 'full' AND deferred_count = 0 AND id != ?4
-                AND (?5 = '' OR input_hash = ?5)
-                AND (?6 = '' OR executor_id = ?6)
-                AND (?7 = 1 OR cadence = 'main')
-              ORDER BY ran_at DESC LIMIT ?8",
+            format!(
+                "SELECT id, commit_sha, cadence FROM check_result_observations
+                  WHERE project_id = ?1 AND check_name = ?2 AND verdict_platform = ?3
+                    AND complete = 1 AND failure_kind IS NULL
+                    AND {whole_suite} AND id != ?4
+                    AND (?5 = '' OR input_hash = ?5)
+                    AND (?6 = '' OR executor_id = ?6)
+                    AND (?7 = 1 OR cadence = 'main')
+                  ORDER BY ran_at DESC LIMIT ?8"
+            ),
             (
                 project_id.to_string(),
                 lane.check.clone(),
@@ -1781,8 +2017,9 @@ async fn latest_complete_row(
     // Stable, so rows on one tree keep the query's newest-finish-first order.
     candidates.sort_by_key(|(_, depth)| *depth);
     for (id, _) in candidates {
-        if let CadenceVerdict::Complete(row) =
-            classify_row(load_row(db, project_key, &id, names).await?)
+        if let CadenceVerdict::Complete(row) = lane
+            .verdict
+            .classify(load_row(db, project_key, &id, names).await?)
         {
             return Ok(Some(row));
         }
@@ -1957,37 +2194,85 @@ fn failure_signature(excerpt: &str) -> String {
     truncate(line, 200)
 }
 
-/// OS errors that describe the machine a test ran on rather than the tree it
-/// tested: the face a census names, and the spellings that carry it (Rust's
-/// `Display` and `Debug` of the error, SQLite's message). They are searched
+/// A failure that describes the machine a test ran on rather than the tree it
+/// tested.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HostCondition {
+    /// The name a census gives it.
+    face: &'static str,
+    /// Lowercase spellings that carry it, searched for over the whole excerpt.
+    spellings: &'static [&'static str],
+    /// What the failures sharing it must span to read as the host.
+    spread: Spread,
+}
+
+/// What [`HOST_CONDITION_MIN`] counts for a [`HostCondition`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Spread {
+    /// Tests. An OS error names the machine wherever it lands, so two tests
+    /// in one file hitting a full disk are already the disk.
+    Tests,
+    /// Test files. A time budget expiring is the machine's load only when it
+    /// expires in unrelated places: several timeouts in one file may be that
+    /// file's own hang, which is a red to look at.
+    Files,
+}
+
+/// The host conditions a census recognizes. The OS errors carry Rust's
+/// `Display` and `Debug` of the error and SQLite's message. They are searched
 /// for over the whole excerpt, not the signature: a failure that wraps the
 /// error (`Custom { kind: StorageFull, error: PathError { path:
 /// "/tmp/cairn-change-project-2jgZmE", .. } }`) carries a per-test temp path
 /// on its signature line, so no two of them share a signature.
-const HOST_CONDITIONS: &[(&str, &[&str])] = &[
-    (
-        "No space left on device",
-        &["no space left on device", "storagefull", "(os error 28)"],
-    ),
-    (
-        "Text file busy",
-        &["text file busy", "executablefilebusy", "(os error 26)"],
-    ),
-    ("database is locked", &["database is locked"]),
+///
+/// The timeout is vitest's (`Error: Test timed out in 5000ms.`). On a loaded
+/// host it lands in a rotating set of I/O-bound files, main's included, so the
+/// same files pass on the same host one tip earlier.
+const HOST_CONDITIONS: &[HostCondition] = &[
+    HostCondition {
+        face: "No space left on device",
+        spellings: &["no space left on device", "storagefull", "(os error 28)"],
+        spread: Spread::Tests,
+    },
+    HostCondition {
+        face: "Text file busy",
+        spellings: &["text file busy", "executablefilebusy", "(os error 26)"],
+        spread: Spread::Tests,
+    },
+    HostCondition {
+        face: "database is locked",
+        spellings: &["database is locked"],
+        spread: Spread::Tests,
+    },
+    HostCondition {
+        face: "Test timed out",
+        spellings: &["test timed out in "],
+        spread: Spread::Files,
+    },
 ];
 
-/// How many failures in one row must share a host condition before they are
-/// read as a census of the host rather than as tests. One test that hit a full
-/// disk is still a red to look at; a run of them is the machine.
+/// How many failures (or, for a [`Spread::Files`] condition, test files) in
+/// one row must share a host condition before they are read as a census of
+/// the host rather than as tests. One test that hit a full disk is still a
+/// red to look at; a run of them is the machine.
 const HOST_CONDITION_MIN: usize = 2;
 
 /// The host condition a failure excerpt names: see [`HOST_CONDITIONS`].
-fn host_condition(excerpt: &str) -> Option<&'static str> {
+fn host_condition(excerpt: &str) -> Option<&'static HostCondition> {
     let excerpt = excerpt.to_ascii_lowercase();
-    HOST_CONDITIONS
-        .iter()
-        .find(|(_, spellings)| spellings.iter().any(|spelling| excerpt.contains(spelling)))
-        .map(|(face, _)| *face)
+    HOST_CONDITIONS.iter().find(|condition| {
+        condition
+            .spellings
+            .iter()
+            .any(|spelling| excerpt.contains(spelling))
+    })
+}
+
+/// The test file a per-test id names. A vitest id is `<file> > <full name>`
+/// (and a file that failed to collect is the bare file); an id without the
+/// separator is its own file.
+fn test_file(test: &str) -> &str {
+    test.split(" > ").next().unwrap_or(test)
 }
 
 // ---------------------------------------------------------------------------
@@ -2184,6 +2469,8 @@ async fn merge_bracket(
 pub(crate) struct CadenceReport<'a> {
     pub(crate) check: &'a str,
     pub(crate) platform: &'a str,
+    /// What the lane's verdict is made of, which decides how a row reads.
+    pub(crate) kind: LaneVerdict,
     /// The tip the lane attempted, when it was resolved.
     pub(crate) commit: Option<&'a str>,
     pub(crate) verdict: &'a CadenceVerdict,
@@ -2252,25 +2539,73 @@ fn age(now_ms: i64, then_ms: i64) -> String {
     crate::clock::format_elapsed((now_ms - then_ms).max(0) / 1000)
 }
 
-fn totals(row: &CadenceRow) -> String {
-    format!(
-        "{} ran · {} passed · {} failed · {} skipped",
-        thousands(row.ran()),
-        thousands(row.passed()),
-        thousands(row.failed()),
-        thousands(row.skipped())
-    )
+/// What a row measured: a per-test lane's totals, or an exit lane's verdict and
+/// exit code.
+fn totals(row: &CadenceRow, kind: LaneVerdict) -> String {
+    match kind {
+        LaneVerdict::PerTest => format!(
+            "{} ran · {} passed · {} failed · {} skipped",
+            thousands(row.ran()),
+            thousands(row.passed()),
+            thousands(row.failed()),
+            thousands(row.skipped())
+        ),
+        LaneVerdict::Exit => format!(
+            "{} (exit {})",
+            if row.verdict_passed {
+                "passed"
+            } else {
+                "failed"
+            },
+            row.exit_code
+        ),
+    }
 }
 
-fn row_identity(out: &mut String, row: &CadenceRow) {
+/// A complete row's verdict as a headline clause.
+fn verdict_clause(row: &CadenceRow, kind: LaneVerdict) -> String {
+    match kind {
+        LaneVerdict::PerTest if row.failed() == 0 => format!("all {} passed", thousands(row.ran())),
+        LaneVerdict::PerTest => format!("{} failed", thousands(row.failed())),
+        LaneVerdict::Exit if row.verdict_passed => "passed".to_string(),
+        LaneVerdict::Exit => format!("failed (exit {})", row.exit_code),
+    }
+}
+
+/// An attempt's outcome as the project overview's clause.
+fn outcome_summary(kind: LaneVerdict, verdict: &CadenceVerdict) -> String {
+    match verdict {
+        CadenceVerdict::Complete(row) => verdict_clause(row, kind),
+        CadenceVerdict::NoVerdict { .. } => "did not complete (no-verdict)".to_string(),
+        CadenceVerdict::Death { .. } => "did not complete (death)".to_string(),
+        CadenceVerdict::Cancelled { .. } => "cancelled by restart".to_string(),
+    }
+}
+
+fn row_identity(out: &mut String, row: &CadenceRow, kind: LaneVerdict) {
+    let label = match kind {
+        LaneVerdict::PerTest => "Totals",
+        LaneVerdict::Exit => "Verdict",
+    };
     out.push_str(&format!(
-        "- Tree: commit `{}` · platform `{}` · executor `{}`\n- Observation: {}\n- Totals: {}\n",
+        "- Tree: commit `{}` · platform `{}` · executor `{}`\n- Observation: {}\n- {label}: {}\n",
         row.commit,
         row.platform,
         row.executor.as_deref().unwrap_or("unknown"),
         row.reference,
-        totals(row)
+        totals(row, kind)
     ));
+}
+
+fn render_output_tail(out: &mut String, row: &CadenceRow) {
+    let tail = row.output_tail.trim();
+    if !tail.is_empty() {
+        out.push_str(&format!(
+            "\nOutput tail:\n```\n{}\n```\n",
+            crate::execution::check_parsers::anchored_tail(tail, MAX_CAUSE_CHARS)
+                .replace("```", "'''")
+        ));
+    }
 }
 
 fn render_bracket(out: &mut String, heading: &str, bracket: &Bracket) {
@@ -2333,11 +2668,44 @@ fn group_size(groups: &[(&str, Vec<&str>)]) -> usize {
     groups.iter().map(|(_, tests)| tests.len()).sum()
 }
 
-/// Failures in one row that share one OS error: the host's census, not tests.
+/// Failures in one row that share one host condition: the host's census, not
+/// tests.
 #[derive(Debug)]
 struct HostConditionGroup<'a> {
-    face: &'static str,
+    condition: &'static HostCondition,
     tests: Vec<&'a str>,
+}
+
+impl HostConditionGroup<'_> {
+    fn files(&self) -> usize {
+        self.tests
+            .iter()
+            .map(|test| test_file(test))
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// How many of the condition's [`Spread`] the group holds.
+    fn breadth(&self) -> usize {
+        match self.condition.spread {
+            Spread::Tests => self.tests.len(),
+            Spread::Files => self.files(),
+        }
+    }
+
+    /// Why the group is the machine rather than the tree.
+    fn reading(&self) -> String {
+        let count = self.tests.len();
+        match self.condition.spread {
+            Spread::Tests => format!(
+                "one OS error across {count} tests is a condition of this machine, not of the tree"
+            ),
+            Spread::Files => format!(
+                "one time budget expiring across {count} tests in {} unrelated files is this machine's load, not the tree",
+                self.files()
+            ),
+        }
+    }
 }
 
 /// How a complete row differs from the row it is compared with. A test moved
@@ -2368,24 +2736,35 @@ struct RowDiff<'a> {
 
 fn row_diff<'a>(current: &'a CadenceRow, previous: Option<&'a CadenceRow>) -> RowDiff<'a> {
     let mut diff = RowDiff::default();
-    let mut faces: BTreeMap<&'static str, Vec<&str>> = BTreeMap::new();
+    let mut faces: BTreeMap<&'static str, HostConditionGroup<'_>> = BTreeMap::new();
     for (test, outcome) in &current.tests {
         if let TestOutcome::Failed(Failure {
-            host_condition: Some(face),
+            host_condition: Some(condition),
             ..
         }) = outcome
         {
-            faces.entry(*face).or_default().push(test.as_str());
+            faces
+                .entry(condition.face)
+                .or_insert_with(|| HostConditionGroup {
+                    condition,
+                    tests: Vec::new(),
+                })
+                .tests
+                .push(test.as_str());
         }
     }
-    faces.retain(|_, tests| tests.len() >= HOST_CONDITION_MIN);
-    let on_host: HashSet<&str> = faces.values().flatten().copied().collect();
-    diff.host_conditions = faces
-        .into_iter()
-        .map(|(face, tests)| HostConditionGroup { face, tests })
+    faces.retain(|_, group| group.breadth() >= HOST_CONDITION_MIN);
+    let on_host: HashSet<&str> = faces
+        .values()
+        .flat_map(|group| group.tests.iter().copied())
         .collect();
-    diff.host_conditions
-        .sort_by(|a, b| b.tests.len().cmp(&a.tests.len()).then(a.face.cmp(b.face)));
+    diff.host_conditions = faces.into_values().collect();
+    diff.host_conditions.sort_by(|a, b| {
+        b.tests
+            .len()
+            .cmp(&a.tests.len())
+            .then(a.condition.face.cmp(b.condition.face))
+    });
     let mut newly_red: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut first_red: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (test, outcome) in &current.tests {
@@ -2558,9 +2937,10 @@ fn render_host_conditions(
                 .count()
         };
         out.push_str(&format!(
-            "\n**HOST CONDITION on `{}`: {count} tests failed on `{}`** — one OS error across {count} tests is a condition of this machine, not of the tree, so none of them is counted as newly red or still red.\n",
+            "\n**HOST CONDITION on `{}`: {count} tests failed on `{}`** — {}, so none of them is counted as newly red or still red.\n",
             host(row),
-            group.face
+            group.condition.face,
+            group.reading()
         ));
         let mut discriminator = match previous {
             Some(previous) => format!(
@@ -2593,9 +2973,19 @@ fn render_host_conditions(
 
 /// The "Compared with" line: which row the diff is against, and on which host.
 fn render_basis(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow) {
+    let (baseline, cross_host) = match report.kind {
+        LaneVerdict::PerTest => (
+            "so this row is the baseline and every failure is listed as newly red",
+            "what differs below may be the two hosts (provisioning, load, toolchain) rather than the tree, and none of it is reported as newly red or green",
+        ),
+        LaneVerdict::Exit => (
+            "so this row is the baseline",
+            "a verdict that differs may be the two hosts (provisioning, load, toolchain) rather than the tree",
+        ),
+    };
     let line = match report.comparison {
         Comparison::Baseline => format!(
-            "nothing. No earlier complete whole-suite row on main exists for {} on {}, so this row is the baseline and every failure is listed as newly red.",
+            "nothing. No earlier complete whole-suite row on main exists for {} on {}, {baseline}.",
             report.check, report.platform
         ),
         Comparison::SameExecutor { previous, .. } => format!(
@@ -2606,7 +2996,7 @@ fn render_basis(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow) 
             age(row.ran_at_ms, previous.ran_at_ms)
         ),
         Comparison::OtherExecutor { previous } => format!(
-            "{}, the {} (commit `{}`, ran {} earlier). No earlier complete row exists on `{}`, so this is a **cross-host comparison**: what differs below may be the two hosts (provisioning, load, toolchain) rather than the tree, and none of it is reported as newly red or green.",
+            "{}, the {} (commit `{}`, ran {} earlier). No earlier complete row exists on `{}`, so this is a **cross-host comparison**: {cross_host}.",
             previous.reference,
             armed(previous),
             short_commit(&previous.commit),
@@ -2658,7 +3048,49 @@ fn render_host_census(
     }
 }
 
+/// An exit lane's complete row: its verdict, how it moved from the compared
+/// row's, the output a red one printed, and the merges between the two rows.
+fn render_exit_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow) {
+    let previous = report.comparison.previous();
+    let movement = match previous {
+        None => "baseline".to_string(),
+        Some(previous) => {
+            let moved = match (previous.verdict_passed, row.verdict_passed) {
+                (true, false) => "newly red",
+                (false, false) => "still red",
+                (false, true) => "newly green",
+                (true, true) => "still green",
+            };
+            match report.comparison {
+                Comparison::OtherExecutor { previous } => {
+                    format!("{moved}, cross-host against `{}`", host(previous))
+                }
+                _ => moved.to_string(),
+            }
+        }
+    };
+    out.push_str(&format!(
+        "**Main cadence · {} · {} on `{}` · `{}`: {} — {movement}**\n\n",
+        report.check,
+        report.platform,
+        host(row),
+        short_commit(&row.commit),
+        verdict_clause(row, LaneVerdict::Exit)
+    ));
+    row_identity(out, row, LaneVerdict::Exit);
+    render_basis(out, report, row);
+    if !row.verdict_passed {
+        render_output_tail(out, row);
+    }
+    if previous.is_some() {
+        render_bracket(out, "Merges since the compared row", report.bracket);
+    }
+}
+
 fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow) {
+    if report.kind == LaneVerdict::Exit {
+        return render_exit_complete(out, report, row);
+    }
     let previous = report.comparison.previous();
     let (neighbour, cross_host) = match report.comparison {
         Comparison::SameExecutor { neighbour, .. } => (neighbour.as_deref(), None),
@@ -2668,11 +3100,7 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
     let diff = row_diff(row, previous);
     let newly_red = group_size(&diff.newly_red);
     let first_red = group_size(&diff.first_red);
-    let mut headline = if row.failed() == 0 {
-        format!("all {} passed", thousands(row.ran()))
-    } else {
-        format!("{} failed", thousands(row.failed()))
-    };
+    let mut headline = verdict_clause(row, LaneVerdict::PerTest);
     if !diff.host_conditions.is_empty() {
         let conditions: Vec<String> = diff
             .host_conditions
@@ -2681,7 +3109,7 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
                 format!(
                     "{} tests failed on one host condition: {}",
                     group.tests.len(),
-                    group.face
+                    group.condition.face
                 )
             })
             .collect();
@@ -2713,7 +3141,7 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
         host(row),
         short_commit(&row.commit)
     ));
-    row_identity(out, row);
+    row_identity(out, row, LaneVerdict::PerTest);
     render_basis(out, report, row);
     render_host_conditions(out, row, &diff.host_conditions, previous, neighbour);
     if newly_red > 0 {
@@ -2830,6 +3258,8 @@ fn render_incomplete(
             ));
             if matches!(class, Unobserved::Death) {
                 out.push_str("- Cause class: **death** — the lane died before it produced a result (the execution side of the seam: no machine, capacity, infrastructure, a stalled or killed run).\n");
+            } else if report.kind == LaneVerdict::Exit {
+                out.push_str("- Cause class: **no-verdict** — the lane ran to an exit, but its result does not vouch for having measured anything (the testing side of the seam: it selected nothing, or stopped before it finished). It is not green.\n");
             } else {
                 out.push_str("- Cause class: **no-verdict** — the lane ran to an exit, but its result is not a per-test verdict (the testing side of the seam: a test target that did not compile, zero tests, an incomplete enumeration). It is not green.\n");
             }
@@ -2837,15 +3267,8 @@ fn render_incomplete(
     }
     out.push_str(&format!("- Cause: {cause}\n"));
     if let Some(row) = row {
-        row_identity(out, row);
-        let tail = row.output_tail.trim();
-        if !tail.is_empty() {
-            out.push_str(&format!(
-                "\nOutput tail:\n```\n{}\n```\n",
-                crate::execution::check_parsers::anchored_tail(tail, MAX_CAUSE_CHARS)
-                    .replace("```", "'''")
-            ));
-        }
+        row_identity(out, row, report.kind);
+        render_output_tail(out, row);
     }
     let since = |previous: &CadenceRow| {
         format!(
@@ -2949,6 +3372,7 @@ pub(crate) fn render_report(report: &CadenceReport<'_>) -> String {
 pub(crate) fn render_heartbeat(
     check: &str,
     platform: &str,
+    kind: LaneVerdict,
     tip: &str,
     covered: &CadenceRow,
     now_ms: i64,
@@ -2959,7 +3383,7 @@ pub(crate) fn render_heartbeat(
         covered.reference,
         short_commit(&covered.commit),
         age(now_ms, covered.ran_at_ms),
-        totals(covered)
+        totals(covered, kind)
     )
 }
 
@@ -2989,6 +3413,7 @@ mod tests {
                 0
             },
             complete: true,
+            selection: Some("full".to_string()),
             tests: tests
                 .iter()
                 .map(|(test, outcome)| (test.to_string(), outcome.clone()))
@@ -3021,6 +3446,7 @@ mod tests {
         render_report(&CadenceReport {
             check: "rust-tests",
             platform: "linux",
+            kind: LaneVerdict::PerTest,
             commit: Some("bbbbbbbbbbbbbbbbbbbb"),
             verdict,
             comparison,
@@ -3318,11 +3744,7 @@ mod tests {
         let db = LocalDb::open_migrated_for_test(temp.path().join("cadence.db"))
             .await
             .unwrap();
-        let lane = CadenceLane {
-            check: "rust-tests".into(),
-            platform: "linux".into(),
-            notify: "testing".into(),
-        };
+        let lane = linux_lane();
 
         // Before the restart: a pass on the old tip, a merge queued behind it,
         // and the stop ending its lane.
@@ -3395,6 +3817,7 @@ mod tests {
         let message = render_report(&CadenceReport {
             check: "rust-tests",
             platform: "linux",
+            kind: LaneVerdict::PerTest,
             commit: Some("7e1b2a9a1d6bc3d4"),
             verdict: &CadenceVerdict::Complete(moved),
             comparison: &Comparison::Baseline,
@@ -3492,15 +3915,54 @@ mod tests {
                 CadenceLane {
                     check: "rust-tests".into(),
                     platform: "linux".into(),
-                    notify: "testing".into()
+                    notify: "testing".into(),
+                    verdict: LaneVerdict::PerTest,
                 },
                 CadenceLane {
                     check: "rust-tests".into(),
                     platform: "macos".into(),
-                    notify: "testing".into()
+                    notify: "testing".into(),
+                    verdict: LaneVerdict::PerTest,
                 },
             ]
         );
+    }
+
+    /// The repository's own lanes are judged as their whole-suite commands
+    /// warrant. `bun run test:frontend` names no runner, so frontend-tests is a
+    /// per-test lane only because the parser knows the script; read as an exit
+    /// lane it would compare no tests. And its whole-suite command must be the
+    /// whole suite: the scoped form finds no changed files on main's tip and
+    /// records an empty selection, which never qualifies as main's row.
+    #[test]
+    fn the_repository_lanes_are_judged_by_their_whole_suite_commands() {
+        let config = include_str!("../../../../../.cairn/config.yaml");
+        let (settings, _) = crate::config::project_settings::parse_project_settings(config)
+            .expect("repository project config must parse");
+        let contract = crate::config::project_settings::checks_contract_from(settings)
+            .expect("repository must declare checks");
+        let lanes = cadence_lanes(&contract.checks);
+        let verdict = |check: &str| {
+            lanes
+                .iter()
+                .find(|lane| lane.check == check && lane.platform == "linux")
+                .map(|lane| lane.verdict)
+        };
+        for check in ["rust-tests", "frontend-tests"] {
+            assert_eq!(verdict(check), Some(LaneVerdict::PerTest), "{check}");
+        }
+        for check in [
+            "typecheck",
+            "typecheck-ui",
+            "frontend-build",
+            "workspace-compile",
+        ] {
+            assert_eq!(verdict(check), Some(LaneVerdict::Exit), "{check}");
+        }
+        let frontend =
+            crate::execution::selection::whole_suite_command(&contract.checks["frontend-tests"])
+                .unwrap();
+        assert_eq!(frontend, "bun run test:frontend");
     }
 
     #[test]
@@ -3784,6 +4246,80 @@ mod tests {
         let mut lone = passing.clone();
         lone[0].1 = failed("called `Result::unwrap()` on an `Err` value: database is locked");
         let current = on("fedora", row("cur", "bbbbbbbbbbbbbbbb", 5 * HOUR, &lone));
+        let text = report(
+            &CadenceVerdict::Complete(current),
+            &same(&previous),
+            &Bracket::default(),
+        );
+        assert!(text.contains("1 failed — 1 newly red"), "{text}");
+        assert!(!text.contains("HOST CONDITION"), "{text}");
+    }
+
+    /// Specimen cairn/5574: frontend-tests on a host at load 53-56 dropped
+    /// cases in five unrelated `scripts/**` files, every one `Test timed out
+    /// in 5000ms`, and main failed the same way on the same host.
+    #[test]
+    fn vitest_timeouts_across_files_are_one_host_condition_but_one_file_stays_red() {
+        let timeout = || {
+            failed(
+                "Error: Test timed out in 5000ms.\nIf this is a long-running test, pass a timeout value as the last argument or configure it globally with \"testTimeout\".\n    at scripts/lib/pinned-sources.test.ts:41:3",
+            )
+        };
+        let names = [
+            "scripts/check-executor-protocol.test.ts > protocol > matches the schema",
+            "scripts/check-executor-protocol.test.ts > protocol > rejects drift",
+            "scripts/release-workflows.test.ts > release > pins every action",
+            "scripts/lib/skip-ledger.test.ts > ledger > reads the history",
+            "src/components/Button.test.tsx > renders",
+        ];
+        let passing: Vec<(&str, TestOutcome)> = names
+            .iter()
+            .map(|name| (*name, TestOutcome::Passed))
+            .collect();
+        let previous = on("local", row("prev", "aaaaaaaaaaaaaaaa", HOUR, &passing));
+
+        let mut loaded = passing.clone();
+        for outcome in loaded.iter_mut().take(4) {
+            outcome.1 = timeout();
+        }
+        let current = on("local", row("cur", "bbbbbbbbbbbbbbbb", 5 * HOUR, &loaded));
+        let text = report(
+            &CadenceVerdict::Complete(current),
+            &same(&previous),
+            &Bracket::default(),
+        );
+        assert!(
+            text.contains("4 failed — 4 tests failed on one host condition: Test timed out — 0 newly red, 0 newly green"),
+            "{text}"
+        );
+        assert_eq!(text.matches("**HOST CONDITION").count(), 1, "{text}");
+        assert!(
+            text.contains("**HOST CONDITION on `local`: 4 tests failed on `Test timed out`** — one time budget expiring across 4 tests in 3 unrelated files is this machine's load"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Discriminator: 4 of 4 passed on `local` at the compared row"),
+            "{text}"
+        );
+        assert!(!text.contains("NEWLY RED"), "{text}");
+
+        // Timeouts confined to one file may be that file's own hang: two
+        // cases there are still reds to look at, not the host.
+        let mut one_file = passing.clone();
+        one_file[0].1 = timeout();
+        one_file[1].1 = timeout();
+        let current = on("local", row("cur", "bbbbbbbbbbbbbbbb", 5 * HOUR, &one_file));
+        let text = report(
+            &CadenceVerdict::Complete(current),
+            &same(&previous),
+            &Bracket::default(),
+        );
+        assert!(text.contains("2 failed — 2 newly red"), "{text}");
+        assert!(!text.contains("HOST CONDITION"), "{text}");
+
+        let mut lone = passing.clone();
+        lone[2].1 = timeout();
+        let current = on("local", row("cur", "bbbbbbbbbbbbbbbb", 5 * HOUR, &lone));
         let text = report(
             &CadenceVerdict::Complete(current),
             &same(&previous),
@@ -4313,6 +4849,16 @@ mod tests {
             check: "rust-tests".into(),
             platform: "linux".into(),
             notify: "testing".into(),
+            verdict: LaneVerdict::PerTest,
+        }
+    }
+
+    fn typecheck_lane() -> CadenceLane {
+        CadenceLane {
+            check: "typecheck".into(),
+            platform: "linux".into(),
+            notify: "testing".into(),
+            verdict: LaneVerdict::Exit,
         }
     }
 
@@ -4606,6 +5152,7 @@ mod tests {
         let text = render_heartbeat(
             "rust-tests",
             "linux",
+            LaneVerdict::PerTest,
             "cccccccccccccccc",
             &covered,
             8 * HOUR,
@@ -4624,5 +5171,294 @@ mod tests {
         assert!(
             format!("{MAIN_CADENCE_STREAM_PREFIX}p1:rust-tests:linux").starts_with("main-cadence:")
         );
+    }
+
+    /// A typecheck's row, as the store records one: no per-test rows, the
+    /// result complete, the tsc parser's `unknown` selection.
+    fn tsc_row(id: &str, commit: &str, ran_at_ms: i64, exit_code: i64) -> CadenceRow {
+        let mut row = row(id, commit, ran_at_ms, &[]);
+        row.exit_code = exit_code;
+        row.verdict_passed = exit_code == 0;
+        row.selection = Some("unknown".to_string());
+        row
+    }
+
+    fn exit_report(verdict: &CadenceVerdict, comparison: &Comparison, bracket: &Bracket) -> String {
+        render_report(&CadenceReport {
+            check: "typecheck",
+            platform: "linux",
+            kind: LaneVerdict::Exit,
+            commit: Some("bbbbbbbbbbbbbbbbbbbb"),
+            verdict,
+            comparison,
+            bracket,
+            now_ms: 10 * HOUR,
+            rearmed: None,
+        })
+    }
+
+    #[test]
+    fn a_lane_takes_its_verdict_kind_from_the_command_it_runs() {
+        let checks: HashMap<String, CheckCommand> = serde_yaml::from_str(
+            "rust-tests:\n  command: bun run test:rust:tiered {changedFiles}\n  fullCommand: bun run test:rust:full\n  mainCadence:\n    platforms: [linux]\n    notify: testing\n\
+             typecheck:\n  command: bunx --bun tsc --noEmit\n  mainCadence:\n    platforms: [linux]\n    notify: testing\n\
+             frontend-build:\n  command: bunx --bun vite build\n  mainCadence:\n    platforms: [linux]\n    notify: testing\n",
+        )
+        .unwrap();
+        let kinds: Vec<(String, LaneVerdict)> = cadence_lanes(&checks)
+            .into_iter()
+            .map(|lane| (lane.check, lane.verdict))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("frontend-build".to_string(), LaneVerdict::Exit),
+                ("rust-tests".to_string(), LaneVerdict::PerTest),
+                ("typecheck".to_string(), LaneVerdict::Exit),
+            ]
+        );
+    }
+
+    /// cairn/5555: a typecheck reports no test, so judged as a test runner its
+    /// every row was no verdict. Its exit is its verdict; a test runner's
+    /// zero-test row is still not one.
+    #[test]
+    fn an_exit_lanes_row_is_judged_by_its_exit_and_a_test_runners_is_not() {
+        assert!(matches!(
+            LaneVerdict::Exit.classify(tsc_row("g", "c", 0, 0)),
+            CadenceVerdict::Complete(row) if row.verdict_passed
+        ));
+        assert!(matches!(
+            LaneVerdict::Exit.classify(tsc_row("r", "c", 0, 2)),
+            CadenceVerdict::Complete(row) if !row.verdict_passed
+        ));
+
+        let mut unmeasured = tsc_row("u", "c", 0, 0);
+        unmeasured.complete = false;
+        assert!(matches!(
+            LaneVerdict::Exit.classify(unmeasured),
+            CadenceVerdict::NoVerdict { .. }
+        ));
+        let mut nothing_selected = tsc_row("e", "c", 0, 0);
+        nothing_selected.selection = Some("empty".to_string());
+        assert!(matches!(
+            LaneVerdict::Exit.classify(nothing_selected),
+            CadenceVerdict::NoVerdict { .. }
+        ));
+
+        assert!(matches!(
+            LaneVerdict::PerTest.classify(tsc_row("g", "c", 0, 0)),
+            CadenceVerdict::NoVerdict { .. }
+        ));
+    }
+
+    /// The specimen: a merge that breaks `tsc --noEmit` after a green row
+    /// posts the red, the error it printed, and the merge that broke it.
+    #[test]
+    fn a_newly_red_typecheck_names_its_error_and_the_merges_since_the_green() {
+        let previous = tsc_row("green", "aaaaaaaaaaaaaaaaaaaa", 2 * HOUR, 0);
+        let mut red = tsc_row("red", "bbbbbbbbbbbbbbbbbbbb", 3 * HOUR, 2);
+        red.output_tail = "src/hooks/useBuildFabric.ts(749,7): error TS2322: Type '\"STRANDED\"' is not assignable to type 'BuildFabricDeviation'.\nFound 1 error.".to_string();
+        let bracket = Bracket {
+            merges: vec![BracketMerge {
+                commit: "bbbbbbbbbbbbbbbbbbbb".into(),
+                subject: "build fabric: strand detection (#4413)".into(),
+                pr: Some(4413),
+                issue: Some("cairn/5510".into()),
+            }],
+            ..Bracket::default()
+        };
+        let comparison = same(&previous);
+        let verdict = LaneVerdict::Exit.classify(red);
+        assert!(posts(LaneVerdict::Exit, &verdict, &comparison));
+        let text = exit_report(&verdict, &comparison, &bracket);
+        assert!(
+            text.starts_with(
+                "**Main cadence · typecheck · linux on `bbs` · `bbbbbbbbbbbb`: failed (exit 2) — newly red**"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("- Verdict: failed (exit 2)"), "{text}");
+        assert!(!text.contains("Totals"), "{text}");
+        assert!(text.contains("error TS2322"), "{text}");
+        assert!(
+            text.contains("cairn://p/cairn/check-observations/green, the previous cadence row"),
+            "{text}"
+        );
+        assert!(text.contains("#4413 · cairn/5510"), "{text}");
+        assert!(!text.contains("MAIN CADENCE DID NOT COMPLETE"), "{text}");
+    }
+
+    #[test]
+    fn an_exit_lane_posts_everything_but_a_green_after_a_green() {
+        let green = || tsc_row("g", "c", HOUR, 0);
+        let red = || tsc_row("r", "c", HOUR, 2);
+        let complete = |row| CadenceVerdict::Complete(row);
+        let exit = |verdict: &CadenceVerdict, comparison: &Comparison| {
+            posts(LaneVerdict::Exit, verdict, comparison)
+        };
+        assert!(!exit(&complete(green()), &same(&green())), "still green");
+        assert!(
+            !exit(
+                &complete(green()),
+                &Comparison::OtherExecutor { previous: green() }
+            ),
+            "still green across hosts"
+        );
+        assert!(exit(&complete(green()), &same(&red())), "newly green");
+        assert!(exit(&complete(red()), &same(&red())), "still red");
+        assert!(exit(&complete(green()), &Comparison::Baseline), "baseline");
+        assert!(exit(
+            &CadenceVerdict::Death {
+                cause: "no machine".into()
+            },
+            &same(&green())
+        ));
+
+        let still_green = exit_report(&complete(green()), &same(&green()), &Bracket::default());
+        assert!(
+            still_green.contains(": passed — still green**"),
+            "{still_green}"
+        );
+        assert!(!still_green.contains("Output tail"), "{still_green}");
+
+        // A per-test lane's row posts whatever it says.
+        let tests = row("t", "c", HOUR, &[("a", TestOutcome::Passed)]);
+        assert!(posts(
+            LaneVerdict::PerTest,
+            &complete(tests.clone()),
+            &same(&tests)
+        ));
+    }
+
+    /// An exit lane's comparison rows are its own check's whole-command rows:
+    /// the cadence's and manual runs. A review row may have run a narrowed
+    /// command, a row that selected nothing measured nothing, and another
+    /// check's rows are another question.
+    #[tokio::test]
+    async fn an_exit_lane_compares_with_whole_command_rows_of_its_own_check() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = cadence_db(&temp).await;
+        let names = |executor: &str| executor.to_string();
+        let insert = |id: &str, check: &str, ran_at: i64, cadence: &str, selection: &str| {
+            format!(
+                "INSERT INTO check_result_observations
+                   (id, project_id, commit_sha, tree_hash, check_name, input_hash,
+                    environment_fingerprint, exit_code, verdict, complete, reusable,
+                    parser_version, result_schema_version, ran_at, duration_ms, job_id,
+                    cadence, output_tail, executor_id, verdict_platform, public_handle,
+                    selection, deferred_count)
+                 VALUES('{id}','p','c-{id}','t','{check}','i-{id}','env',0,'passed',1,0,
+                        1,1,{ran_at},5,'main:p','{cadence}','','bbs','linux','h-{id}',
+                        '{selection}',0);"
+            )
+        };
+        let script = [
+            insert("main-green", "typecheck", 1, "main", "unknown"),
+            insert("manual-green", "typecheck", 2, "manual", "unknown"),
+            insert("review-green", "typecheck", 3, "review", "unknown"),
+            insert("empty", "typecheck", 4, "main", "empty"),
+            insert("other-check", "typecheck-ui", 5, "main", "unknown"),
+        ]
+        .concat();
+        db.execute_script(script).await.unwrap();
+
+        // Main's first-parent chain, tip first: the review and empty rows sit
+        // nearest the tip, and neither may stand in.
+        let chain = MainChain::from_log(
+            "c-other-check\nc-empty\nc-review-green\nc-manual-green\nc-main-green\n",
+        );
+        let newest = latest_complete_row(
+            &db,
+            "p",
+            "cairn",
+            &typecheck_lane(),
+            RowFilter {
+                main_chain: Some(&chain),
+                ..RowFilter::default()
+            },
+            &names,
+        )
+        .await
+        .unwrap()
+        .expect("a whole-command row on main qualifies");
+        assert_eq!(newest.id, "manual-green");
+
+        // Without the chain only the cadence's own rows can be placed on main.
+        let unchained = latest_complete_row(
+            &db,
+            "p",
+            "cairn",
+            &typecheck_lane(),
+            RowFilter::default(),
+            &names,
+        )
+        .await
+        .unwrap()
+        .expect("the cadence's own row qualifies");
+        assert_eq!(unchained.id, "main-green");
+
+        // The per-test lane over the same rows finds nothing: none is a
+        // full per-test selection.
+        let mut as_tests = typecheck_lane();
+        as_tests.verdict = LaneVerdict::PerTest;
+        assert!(latest_complete_row(
+            &db,
+            "p",
+            "cairn",
+            &as_tests,
+            RowFilter {
+                main_chain: Some(&chain),
+                ..RowFilter::default()
+            },
+            &names
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+
+    /// A typecheck lane is in flight for a minute or two, so the overview
+    /// would list it beside rust-tests only by remembering what it reported.
+    #[test]
+    fn the_overview_keeps_each_declared_lanes_last_report() {
+        let mut slots = CadenceSlots::default();
+        let outcome = |check: &str, summary: &str, tip: &str, row_commit: &str| LaneOutcome {
+            check: check.into(),
+            platform: "linux".into(),
+            tip: Some(tip.into()),
+            summary: summary.into(),
+            row: Some((
+                format!("cairn://p/cairn/check-observations/{check}"),
+                row_commit.into(),
+            )),
+            at_unix_ms: HOUR,
+        };
+        slots.settled("p", outcome("typecheck", "failed (exit 2)", "t1", "t1"));
+        slots.settled("p", outcome("rust-tests", "78 failed", "t1", "t1"));
+        slots.settled("p", outcome("typecheck", "passed", "t2", "t1"));
+        slots.settled("q", outcome("typecheck", "passed", "t9", "t9"));
+
+        let listed = slots.outcomes("p");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|outcome| (outcome.check.as_str(), outcome.summary.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("rust-tests", "78 failed"), ("typecheck", "passed")],
+            "one line per lane, its latest report, in lane order"
+        );
+        assert_eq!(
+            render_outcome_line(&listed[1], 3 * HOUR),
+            "- typecheck on linux: passed at `t2`, 2h ago — cairn://p/cairn/check-observations/typecheck (the row on `t1`, whose inputs this tip shares).\n"
+        );
+
+        slots.forget_undeclared_outcomes("p", &[linux_lane()]);
+        assert_eq!(
+            slots.outcomes("p").len(),
+            1,
+            "typecheck is no longer declared"
+        );
+        assert_eq!(slots.outcomes("q").len(), 1, "projects are independent");
     }
 }

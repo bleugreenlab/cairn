@@ -310,6 +310,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("tenet_evidence_events", "project_id = ?1"),
     spec("tenet_evidence", "project_id = ?1"),
     owned("thread_read_positions", &[owner(OwnerSet::Threads, "thread_id IN {ids}")]),
+    owned("thread_services", &[owner(OwnerSet::Threads, "thread_id IN {ids}")]),
     owned("wake_schedules", &[owner(OwnerSet::Threads, "home_kind = 'thread' AND home_id IN {ids}")]),
     owned("wake_conditions", &[owner(OwnerSet::Threads, "home_kind = 'thread' AND home_id IN {ids}")]),
     spec("issues", "project_id = ?1"),
@@ -324,6 +325,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("issue_labels", "issue_id IN (SELECT id FROM issues WHERE project_id = ?1)"),
     spec("issue_workspaces", "issue_id IN (SELECT id FROM issues WHERE project_id = ?1)"),
     spec("executions", "project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)"),
+    spec("delegated_packets", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     spec("condition_evaluations", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     spec("execution_history", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     spec("jobs", "project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
@@ -414,6 +416,8 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     delete_only("posts", "project_id = ?1"),
     delete_only("post_comments", "post_id IN (SELECT id FROM posts WHERE project_id = ?1)"),
     delete_only("landing_allocations", "project_id = ?1"),
+    delete_only("service_log", "project_id = ?1"),
+    delete_only("service_schedules", "project_id = ?1"),
 ];
 
 pub(super) const fn spec(table: &'static str, where_sql: &'static str) -> TableCopySpec {
@@ -1544,6 +1548,14 @@ pub(super) mod tests {
             INSERT INTO feed_cursors(home_kind, home_id) VALUES ('thread', 'thread-delete');
             INSERT INTO landing_allocations(id, project_id, kind, value, name, provisional, branch, allocated_at)
               VALUES ('allocation-delete', 'project-delete', 'migration', 2, '0002_x', 'NEXT_x', 'agent/delete', 1);
+            INSERT INTO service_log(project_id, service, kind, text, created_at)
+              VALUES ('project-delete', 'echo', 'lifecycle', 'started', 1);
+            INSERT INTO thread_services(id, project_id, thread_id, name, version, data, source_hash, created_at)
+              VALUES ('service-delete', 'project-delete', 'thread-delete', 'tutor', 1, '{}', 'h', 1);
+            INSERT INTO service_log(project_id, owner_thread, service, kind, text, created_at)
+              VALUES ('project-delete', 'thread-delete', 'tutor', 'lifecycle', 'started', 1);
+            INSERT INTO service_schedules(project_id, owner_thread, service, entry_key, method, every_ms, anchor_at, created_at, updated_at)
+              VALUES ('project-delete', 'thread-delete', 'tutor', 'entry', 'tick', 1000, 1, 1, 1);
             "#,
         )
         .await

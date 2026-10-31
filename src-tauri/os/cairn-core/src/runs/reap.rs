@@ -303,8 +303,10 @@ async fn load_non_terminal_runs(db: &LocalDb, job_id: &str) -> Result<Vec<RunCan
                      FROM runs
                      WHERE job_id = ?1
                        AND status IN ('starting', 'live')
-                       -- Scheduler tasks, rather than agent processes, stand behind automation runs.
-                       AND start_mode <> 'automation'",
+                       -- Scheduler tasks stand behind automation runs, and the
+                       -- service supervisor behind service runs; neither has an
+                       -- agent process handle.
+                       AND start_mode NOT IN ('automation', 'service')",
                     params![job_id.as_str()],
                 )
                 .await?;
@@ -330,7 +332,7 @@ async fn load_jobs_with_non_terminal_runs(db: &LocalDb) -> Result<Vec<String>, S
                     "SELECT DISTINCT job_id
                      FROM runs
                      WHERE status IN ('starting', 'live')
-                       AND start_mode <> 'automation'
+                       AND start_mode NOT IN ('automation', 'service')
                        AND job_id IS NOT NULL",
                     (),
                 )

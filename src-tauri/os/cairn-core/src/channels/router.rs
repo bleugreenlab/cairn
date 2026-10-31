@@ -4997,6 +4997,16 @@ mod tests {
         .unwrap()
     }
 
+    /// Whether `plan` seeks table alias `alias` through an index whose name
+    /// starts with `index`. A covering seek is the same access path with the
+    /// table lookup elided, so `USING COVERING INDEX` counts; which spelling a
+    /// planner prints is its choice, not the property these tests pin.
+    fn seeks_by(plan: &str, alias: &str, index: &str) -> bool {
+        ["USING INDEX", "USING COVERING INDEX"]
+            .iter()
+            .any(|using| plan.contains(&format!("SEARCH {alias} {using} {index}")))
+    }
+
     /// Every channel provider re-reads the review backlog on a five-second
     /// sweep, so what that read costs has to follow the BACKLOG. It used to
     /// follow the workspace: the loader asked SQL to recover each push's issue by
@@ -5078,8 +5088,7 @@ mod tests {
         )
         .await;
         assert!(
-            thread_jobs.contains("SEARCH t USING INDEX")
-                && thread_jobs.contains("idx_jobs_thread_id"),
+            seeks_by(&thread_jobs, "t", "") && thread_jobs.contains("idx_jobs_thread_id"),
             "a followed thread is found by its (project, name) key and reaches \
              its session job through threads(id):\n{thread_jobs}"
         );
@@ -5105,11 +5114,11 @@ mod tests {
         let edge = query_plan(&db, &follow_live_edge_sql(JOBS), job_ids).await;
         for plan in [&events, &edge] {
             assert!(
-                plan.contains("SEARCH r USING INDEX idx_runs_job_id"),
+                seeks_by(plan, "r", "idx_runs_job_id"),
                 "the resolved jobs drive the read:\n{plan}"
             );
             assert!(
-                plan.contains("SEARCH e USING INDEX idx_events"),
+                seeks_by(plan, "e", "idx_events"),
                 "and each run seeks its own events:\n{plan}"
             );
             assert!(

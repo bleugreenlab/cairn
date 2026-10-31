@@ -2,7 +2,7 @@ use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_db::turso::params;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashMap},
     sync::{Mutex, OnceLock},
 };
 use tokio::sync::mpsc;
@@ -29,11 +29,18 @@ pub struct WakeCondition {
     pub updated_at: i64,
 }
 
-static NOTIFY: OnceLock<Mutex<Option<mpsc::UnboundedSender<String>>>> = OnceLock::new();
+/// A committed write: the thread whose store it touched, and the row URIs it
+/// knows it touched (empty when the writer cannot name rows).
+type WriteNotice = (String, Vec<String>);
 
-fn notifier() -> &'static Mutex<Option<mpsc::UnboundedSender<String>>> {
+static NOTIFY: OnceLock<Mutex<Option<mpsc::UnboundedSender<WriteNotice>>>> = OnceLock::new();
+
+fn notifier() -> &'static Mutex<Option<mpsc::UnboundedSender<WriteNotice>>> {
     NOTIFY.get_or_init(|| Mutex::new(None))
 }
+
+/// How many triggering row URIs a fired condition's push names.
+const NAMED_ROW_URIS: usize = 5;
 
 /// Announce that a write to `thread_id`'s store has committed.
 ///
@@ -43,28 +50,39 @@ fn notifier() -> &'static Mutex<Option<mpsc::UnboundedSender<String>>> {
 /// obligation belongs to the act of committing rather than to any one write
 /// path. A commit that skips the call is indistinguishable from one that never
 /// happened to an armed condition, and nothing at the call site shows it.
-pub fn notify_thread_db_written(thread_id: &str) {
+///
+/// `row_uris` names the rows the write touched when the writer knows them (a
+/// structured row write always does); a fired condition's push names them as
+/// the write that tripped it. Writers that cannot name rows pass none.
+pub fn notify_thread_db_written(thread_id: &str, row_uris: &[String]) {
     if let Ok(sender) = notifier().lock() {
         if let Some(sender) = sender.as_ref() {
-            let _ = sender.send(thread_id.to_string());
+            let _ = sender.send((thread_id.to_string(), row_uris.to_vec()));
         }
     }
 }
 
 pub fn install_evaluator(runtime: AttentionRuntime) {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::unbounded_channel::<WriteNotice>();
     if let Ok(mut sender) = notifier().lock() {
         *sender = Some(tx);
     }
     tokio::spawn(async move {
         while let Some(first) = rx.recv().await {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            let mut threads = HashSet::from([first]);
-            while let Ok(thread_id) = rx.try_recv() {
-                threads.insert(thread_id);
+            // Row URIs accumulate per thread across the debounce window, so a
+            // condition tripped by a burst of writes can name all of them.
+            let mut threads: HashMap<String, BTreeSet<String>> = HashMap::new();
+            for (thread_id, row_uris) in
+                std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok()))
+            {
+                threads.entry(thread_id).or_default().extend(row_uris);
             }
-            for thread_id in threads {
-                if let Err(error) = evaluate_thread_conditions(&runtime, &thread_id).await {
+            for (thread_id, row_uris) in threads {
+                let row_uris: Vec<String> = row_uris.into_iter().collect();
+                if let Err(error) =
+                    evaluate_thread_conditions_after(&runtime, &thread_id, &row_uris).await
+                {
                     tracing::error!(%thread_id, %error, "failed to evaluate thread wake conditions");
                 }
             }
@@ -76,12 +94,21 @@ pub async fn evaluate_thread_conditions(
     runtime: &AttentionRuntime,
     thread_id: &str,
 ) -> Result<Vec<(String, ConditionOutcome, bool)>, String> {
+    evaluate_thread_conditions_after(runtime, thread_id, &[]).await
+}
+
+/// Evaluate a thread's armed conditions after a write that touched `row_uris`.
+async fn evaluate_thread_conditions_after(
+    runtime: &AttentionRuntime,
+    thread_id: &str,
+    row_uris: &[String],
+) -> Result<Vec<(String, ConditionOutcome, bool)>, String> {
     let conditions = load_active_wake_conditions(&runtime.private_db, thread_id).await?;
     let mut results = Vec::with_capacity(conditions.len());
     for condition in conditions {
         let outcome = runtime.host.evaluate_condition(&condition).await;
         let fired = if should_fire(&condition, &outcome) {
-            fire_condition(runtime, &condition, &outcome).await?
+            fire_condition(runtime, &condition, &outcome, row_uris).await?
         } else {
             record_quiet_outcome(&runtime.private_db, &condition, &outcome).await?;
             false
@@ -134,14 +161,17 @@ async fn fire_condition(
     runtime: &AttentionRuntime,
     condition: &WakeCondition,
     outcome: &ConditionOutcome,
+    row_uris: &[String],
 ) -> Result<bool, String> {
     let condition = condition.clone();
     let outcome = outcome.clone();
     let host = runtime.host.clone();
+    let trigger = written_rows_line(row_uris);
     let result = runtime.private_db.write(move |conn| {
         let host = host.clone();
         let condition = condition.clone();
         let outcome = outcome.clone();
+        let trigger = trigger.clone();
         Box::pin(async move {
         let mut rows = conn.query(
             "SELECT state, last_outcome, last_error FROM wake_conditions WHERE id = ?1 AND home_kind = 'thread' AND home_id = ?2",
@@ -175,9 +205,10 @@ async fn fire_condition(
         };
         let content = match &outcome {
             ConditionOutcome::Matched { rows, shown, total } => format!(
-                "{}\n\nCondition `{}` matched — {} rows matched, {} shown:\n{}",
+                "{}\n\nCondition `{}` matched{} — {} rows matched, {} shown:\n{}",
                 condition.reason,
                 condition.id,
+                trigger,
                 total.map_or_else(|| "more than the display limit".into(), |n| n.to_string()),
                 shown,
                 rows
@@ -203,6 +234,25 @@ async fn fire_condition(
         Ok(true)
     } else {
         Ok(false)
+    }
+}
+
+/// ` after writes to A, B (and 3 more)`, or nothing when no rows were named.
+fn written_rows_line(row_uris: &[String]) -> String {
+    if row_uris.is_empty() {
+        return String::new();
+    }
+    let named = row_uris
+        .iter()
+        .take(NAMED_ROW_URIS)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = row_uris.len().saturating_sub(NAMED_ROW_URIS);
+    if more == 0 {
+        format!(" after writes to {named}")
+    } else {
+        format!(" after writes to {named} (and {more} more)")
     }
 }
 
@@ -421,6 +471,20 @@ pub async fn delete_thread_wake_conditions(db: &LocalDb, thread_id: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fired_push_names_at_most_five_triggering_rows() {
+        assert_eq!(written_rows_line(&[]), "");
+        let one = vec!["cairn://p/p/t/db/attempts/7".to_string()];
+        assert_eq!(
+            written_rows_line(&one),
+            " after writes to cairn://p/p/t/db/attempts/7"
+        );
+        let seven: Vec<String> = (1..=7).map(|n| format!("cairn://p/p/t/db/a/{n}")).collect();
+        let line = written_rows_line(&seven);
+        assert!(line.contains("cairn://p/p/t/db/a/5 (and 2 more)"), "{line}");
+        assert!(!line.contains("/a/6"), "{line}");
+    }
 
     async fn fixture() -> (LocalDb, WakeCondition) {
         let db = crate::storage::migrated_test_db("wake-conditions.db").await;

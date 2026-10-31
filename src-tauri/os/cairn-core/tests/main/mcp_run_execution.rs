@@ -333,12 +333,14 @@ async fn setup_with_executor(
 /// green while no batch on the machine ever suspended (CAIRN-3229).
 fn request(cwd: &str, run_id: Option<&str>, payload: Value) -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: cwd.to_string(),
         run_id: run_id.map(ToOwned::to_owned),
         tool: "run".to_string(),
         payload,
         tool_use_id: None,
+        origin: None,
     }
 }
 
@@ -742,6 +744,7 @@ fn occupying_request(
             ..Default::default()
         },
         learned_estimate: None,
+        scratch_sync: None,
     }
 }
 
@@ -1510,7 +1513,7 @@ async fn convert_run_to_thread_session(db: &LocalDb, run_id: &str, thread_name: 
     // A real thread mints its own database beside the main one the moment it is
     // created (`db_store::initialize_for_creation`). This fixture fabricates the
     // thread row directly, so it has to place the store the same way; without it
-    // the thread's procedures reach for the developer's live data directory.
+    // the thread's batches reach for the developer's live data directory.
     point_thread_store_at_fixture(db, &issue_id);
 }
 
@@ -1630,248 +1633,51 @@ async fn spawned_run_items_receive_their_canonical_home_uri_from_the_team_databa
     );
 }
 
-/// A stored procedure must be RECOGNIZED as a procedure by the run path, and
-/// the only reading of a thread sub-path that can be trusted to do it is the
-/// one that stored it. Both names here carry a hyphen — the thread's and the
-/// procedure's — because that is what a real collector is called, and a laxer
-/// second reading of the canonical URI is precisely the failure under guard.
+/// Procedures are retired (tenet 1313), and a `run` target that names one is
+/// refused with the service shape that replaced it, at the session and through
+/// a canonical URI alike. It must never be diagnosed as a skill script: that
+/// is a true sentence about a resource the caller never addressed.
 #[tokio::test]
-async fn thread_procedure_invocation_expands_batch_args_and_refuses_cross_thread_execution() {
+async fn a_retired_procedure_target_is_refused_with_the_service_shape() {
     let (_temp, db, orch, cwd) = setup("run-procedure-thread").await;
     convert_run_to_thread_session(&db, "run-procedure-thread", "news-collector").await;
 
-    let authored = handle_write(
-        &orch,
-        &request(
-            &cwd,
-            Some("run-procedure-thread"),
-            json!({
-                "changes": [{
-                    "target": "cairn://p/rhg/news-collector/procedures",
-                    "mode": "create",
-                    "payload": {
-                        "name": "echo-args",
-                        "body": {
-                            "commands": [{"command": "printf '%s|%s' \"$1\" \"$2\""}],
-                            "sequential": true
-                        }
-                    }
-                }]
-            }),
-        ),
-    )
-    .await;
-    assert!(
-        authored.contains("Created procedure cairn://p/rhg/news-collector/procedures/echo-args"),
-        "procedure authoring failed: {authored}"
-    );
-
-    let invoked = run_text(
-        &handle_run(
-            &orch,
-            &request(
-                &cwd,
-                Some("run-procedure-thread"),
-                json!({"commands": [{
-                    "target": "cairn:~/procedures/echo-args",
-                    "payload": {"args": ["alpha", "two words"]}
-                }]}),
-            ),
-        )
-        .await,
-    );
-    assert!(
-        invoked.contains("alpha|two words"),
-        "procedure args did not reach the stored command: {invoked}"
-    );
-
-    // The collection addresses no single procedure, so it is refused with that
-    // reason. Before one resolver owned this, every procedure target — the
-    // collection and the valid invocation above alike — reached the
-    // skill-script branch and came back "expected cairn://skills/<id>/scripts/<name>",
-    // a true sentence about a resource the caller never addressed.
-    let collection = run_text(
-        &handle_run(
-            &orch,
-            &request(
-                &cwd,
-                Some("run-procedure-thread"),
-                json!({"commands": [{"target": "cairn:~/procedures"}]}),
-            ),
-        )
-        .await,
-    );
-    assert!(
-        collection.contains("procedure collection"),
-        "the collection must be refused as a collection: {collection}"
-    );
-    assert!(
-        !collection.contains("skill script"),
-        "a procedure-surface target must never be diagnosed as a skill script: {collection}"
-    );
-
-    db.execute(
-        "INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) SELECT 'other-thread',project_id,'other-desk','active','none',1,1 FROM threads WHERE name='news-collector'",
-        (),
-    )
-    .await
-    .unwrap();
-    point_thread_store_at_fixture(&db, "other-thread");
-    let authored_other = handle_write(
-        &orch,
-        &request(
-            &cwd,
-            None,
-            json!({"changes": [{
-                "target": "cairn://p/rhg/other-desk/procedures",
-                "mode": "create",
-                "payload": {
-                    "name": "foreign",
-                    "body": {"commands": [{"command": "printf forbidden"}]}
-                }
-            }]}),
-        ),
-    )
-    .await;
-    assert!(
-        authored_other.contains("Created procedure cairn://p/rhg/other-desk/procedures/foreign"),
-        "foreign procedure authoring failed: {authored_other}"
-    );
-
-    let refusal = run_text(
-        &handle_run(
-            &orch,
-            &request(
-                &cwd,
-                Some("run-procedure-thread"),
-                json!({"commands": [{"target": "cairn://p/rhg/other-desk/procedures/foreign"}]}),
-            ),
-        )
-        .await,
-    );
-    assert!(
-        refusal.contains("belongs to another thread"),
-        "cross-thread invocation was not refused: {refusal}"
-    );
-    assert!(
-        refusal.contains("read and copy"),
-        "refusal must name the supported path: {refusal}"
-    );
-}
-
-/// A scheduled automation is the thread running its own procedure while nobody
-/// is at the keyboard, so it must execute under the thread's fence exactly as
-/// the interactive invocation above does. It is reached through the scheduler's
-/// fire, not `handle_run` with the session's run: the scheduler mints a run on
-/// the thread's `automations` job, and that job used to name an agent no
-/// snapshot held, with no execution at all. Every fire was then refused by
-/// placement with "authenticated run has no resolvable fence policy", while the
-/// same procedure invoked by hand from the thread ran fine.
-#[tokio::test]
-async fn a_scheduled_automation_runs_its_procedure_under_the_thread_fence() {
-    use cairn_core::internal::orchestrator::automations;
-
-    let (_temp, db, orch, cwd) = setup("run-automation-thread").await;
-    convert_run_to_thread_session(&db, "run-automation-thread", "bug-desk").await;
-    let thread_id = "issue-run-automation-thread";
-
-    let authored = handle_write(
-        &orch,
-        &request(
-            &cwd,
-            Some("run-automation-thread"),
-            json!({"changes": [{
-                "target": "cairn://p/rhg/bug-desk/procedures",
-                "mode": "create",
-                "payload": {
-                    "name": "check-bugs",
-                    "body": {"commands": [{"command": "printf 'checked %s' \"$1\""}]}
-                }
-            }]}),
-        ),
-    )
-    .await;
-    assert!(
-        authored.contains("Created procedure cairn://p/rhg/bug-desk/procedures/check-bugs"),
-        "procedure authoring failed: {authored}"
-    );
-    let automation = automations::create_thread_automation(
-        &db,
-        thread_id,
-        "check-bugs",
-        vec!["backlog".into()],
-        5 * 60 * 1_000,
-        "agent",
-    )
-    .await
-    .unwrap();
-
-    assert!(
-        automations::fire_thread_automation(&orch, &automation, automation.anchor_at)
-            .await
-            .unwrap(),
-        "the due occurrence must be claimed and fired"
-    );
-
-    let settled = automations::get_thread_automation(&db, thread_id, &automation.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        settled.last_status.as_deref(),
-        Some("ok"),
-        "the scheduled procedure must execute: {:?}",
-        settled.last_error
-    );
-    assert_eq!(settled.consecutive_failures, 0);
-
-    // Under the thread's fence, specifically: the fence walk is run -> job ->
-    // execution -> snapshot -> agents[agent_config_id], and the automation's
-    // run must arrive at the session's own snapshot entry, not a lookalike.
-    let run_id = settled.last_run_id.expect("the fire minted a run");
-    let walked = |sql: &'static str, id: String| {
-        let db = db.clone();
-        async move { common::scalar_text_by_id(&db, sql, &id).await }
-    };
-    let automation_job = walked("SELECT job_id FROM runs WHERE id = ?1", run_id.clone())
-        .await
-        .unwrap();
-    let session_job = "job-run-automation-thread".to_string();
-    assert_eq!(
-        walked(
-            "SELECT parent_job_id FROM jobs WHERE id = ?1",
-            automation_job.clone()
-        )
-        .await,
-        Some(session_job.clone()),
-        "the automation runs on the thread's own automations job"
-    );
-    for column in [
-        "SELECT execution_id FROM jobs WHERE id = ?1",
-        "SELECT agent_config_id FROM jobs WHERE id = ?1",
+    for target in [
+        "cairn:~/procedures/echo-args",
+        "cairn:~/procedures",
+        "cairn://p/rhg/news-collector/procedures/echo-args",
+        "cairn:~/automations",
     ] {
-        assert_eq!(
-            walked(column, automation_job.clone()).await,
-            walked(column, session_job.clone()).await,
-            "{column}: the automation must resolve through the session's snapshot"
+        let refusal = run_text(
+            &handle_run(
+                &orch,
+                &request(
+                    &cwd,
+                    Some("run-procedure-thread"),
+                    json!({"commands": [{"target": target}]}),
+                ),
+            )
+            .await,
         );
+        assert!(refusal.contains("tenet 1313"), "{target}: {refusal}");
+        assert!(refusal.contains("serve({methods"), "{target}: {refusal}");
+        assert!(
+            refusal.contains("cairn://p/rhg/news-collector/services"),
+            "{target}: {refusal}"
+        );
+        assert!(!refusal.contains("skill script"), "{target}: {refusal}");
     }
-    assert_eq!(
-        walked("SELECT status FROM runs WHERE id = ?1", run_id)
-            .await
-            .as_deref(),
-        Some("completed")
-    );
 }
 
-/// A stored procedure's body is the agent's own code acting on the host from a
-/// child process, so the whole composition is under test here: procedure
-/// expansion, the SDK the runner ships with the batch, the executor's callback
-/// relay and its per-batch capability, run identity on the relayed call, and
-/// `cairn:~/db` resolving to the invoking thread's store. Each half has its own
-/// tests; this is the one place they meet.
+/// A thread's inline code is the agent's own code acting on the host from a
+/// child process, so the whole composition is under test here: the SDK the
+/// runner ships with the batch, the executor's callback relay and its
+/// per-batch capability, run identity on the relayed call, and `cairn:~/db`
+/// resolving to the invoking thread's store. Each half has its own tests; this
+/// is the one place they meet. A service method's `ctx.cairn.run` batch takes
+/// the same path.
 ///
-/// The refused write is the other half of the contract: a procedure whose write
+/// The refused write is the other half of the contract: a batch whose write
 /// the host rejects must fail where its author can see it and persist nothing.
 /// Before cairn/4759 such a write returned an ignorable string, and two
 /// collectors reported success for two weeks while writing nothing.
@@ -1879,10 +1685,10 @@ async fn a_scheduled_automation_runs_its_procedure_under_the_thread_fence() {
 /// `bun` is required, not probed: the test runner itself runs under bun, so a
 /// lane without it is broken rather than one where this may quietly pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_thread_procedure_persists_its_sdk_writes_to_the_thread_database() {
+async fn a_thread_batch_persists_its_sdk_writes_to_the_thread_database() {
     assert!(
         binary_available("bun"),
-        "bun must be on PATH: it runs the test suite and every TypeScript procedure body"
+        "bun must be on PATH: it runs the test suite and every TypeScript batch"
     );
     let run_id = "run-sdk-procedure";
     let (_temp, db, orch, cwd) = setup(run_id).await;
@@ -1902,48 +1708,19 @@ async fn a_thread_procedure_persists_its_sdk_writes_to_the_thread_database() {
     .await;
     assert!(created.contains("Applied 1 statements"), "{created}");
 
-    let procedure = |name: &str, sql: &str| {
-        json!({"changes": [{
-            "target": "cairn://p/rhg/fast-pass/procedures",
-            "mode": "create",
-            "payload": {
-                "name": name,
-                "body": {"commands": [{
-                    "interpreter": "typescript",
-                    "code": format!(
-                        "import {{ write }} from \"@cairn/sdk\";\n\
-                         const report = await write([{{ target: \"cairn:~/db\", mode: \"patch\", payload: {{ sql: {sql:?} }} }}]);\n\
-                         console.log(`applied=${{report.applied.length}}`);"
-                    )
-                }]}
-            }
-        }]})
-    };
-    for (name, sql) in [
-        (
-            "collect",
-            "INSERT INTO fast_pass_runs(id, items) VALUES ('run-1', 38)",
-        ),
-        (
-            "collect-misspelled",
-            "INSERT INTO fast_pass_runz(id, items) VALUES ('run-2', 4)",
-        ),
-    ] {
-        let authored =
-            handle_write(&orch, &request(&cwd, Some(run_id), procedure(name, sql))).await;
-        assert!(
-            authored.contains(&format!(
-                "Created procedure cairn://p/rhg/fast-pass/procedures/{name}"
-            )),
-            "procedure authoring failed: {authored}"
-        );
-    }
-    let invoke = |name: &str| {
+    let invoke = |sql: &str| {
         let orch = orch.clone();
         let request = request(
             &cwd,
             Some(run_id),
-            json!({"commands": [{"target": format!("cairn:~/procedures/{name}")}]}),
+            json!({"commands": [{
+                "interpreter": "typescript",
+                "code": format!(
+                    "import {{ write }} from \"@cairn/sdk\";\n\
+                     const report = await write([{{ target: \"cairn:~/db\", mode: \"patch\", payload: {{ sql: {sql:?} }} }}]);\n\
+                     console.log(`applied=${{report.applied.length}}`);"
+                )
+            }]}),
         );
         async move { run_text(&handle_run(&orch, &request).await) }
     };
@@ -1954,21 +1731,21 @@ async fn a_thread_procedure_persists_its_sdk_writes_to_the_thread_database() {
         )
     };
 
-    let collected = invoke("collect").await;
+    let collected = invoke("INSERT INTO fast_pass_runs(id, items) VALUES ('run-1', 38)").await;
     assert!(
         collected.contains("applied=1"),
-        "the procedure's SDK write must be applied by the host: {collected}"
+        "the batch's SDK write must be applied by the host: {collected}"
     );
     let persisted = rows().await;
     assert!(
         persisted.contains("run-1") && persisted.contains("38"),
-        "the row the procedure wrote must be in the thread's database: {persisted}"
+        "the row the batch wrote must be in the thread's database: {persisted}"
     );
 
-    let refused = invoke("collect-misspelled").await;
+    let refused = invoke("INSERT INTO fast_pass_runz(id, items) VALUES ('run-2', 4)").await;
     assert!(
         refused.contains("Exit code:") && refused.contains("no such table"),
-        "a write the host refuses must fail the procedure with the host's reason: {refused}"
+        "a write the host refuses must fail the batch with the host's reason: {refused}"
     );
     assert!(
         !refused.contains("applied="),
@@ -1984,12 +1761,14 @@ async fn read_text(orch: &Orchestrator, cwd: &str, run_id: Option<&str>, path: &
     cairn_core::internal::mcp::handlers::read::handle_read_file(
         orch,
         &McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: cwd.to_string(),
             run_id: run_id.map(ToOwned::to_owned),
             tool: "read".to_string(),
             payload: json!({ "path": path }),
             tool_use_id: None,
+            origin: None,
         },
     )
     .await
@@ -2813,7 +2592,7 @@ async fn tree_bound_item_without_resolvable_context_fails_before_execution() {
     // Depends on the same real subprocess timeout-kill lifecycle as the sub-task
     // timeout case. Under the agent worktree fence, an inherited sandbox denial
     // can win before the timeout path this test is meant to exercise.
-    if common::skip_if_fenced("timed_out_item_without_run_context_kills_and_returns") {
+    if common::skip_if_fenced("tree_bound_item_without_resolvable_context_fails_before_execution") {
         return;
     }
     let (_temp, db, orch, _cwd) = setup("run-nokill").await;

@@ -47,6 +47,10 @@ pub mod account {
     pub use crate::account::*;
 }
 
+pub mod node_scratch {
+    pub use crate::node_scratch::*;
+}
+
 pub mod repeat_report {
     pub use crate::repeat_report::*;
 }

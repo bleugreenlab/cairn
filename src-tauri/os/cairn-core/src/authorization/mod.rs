@@ -35,10 +35,13 @@ pub mod protected;
 use std::sync::Arc;
 
 use cairn_common::authorization::{
-    AuthorityAudience, AuthorityConstraintSet, AuthorityContext, AuthorityDecision, AuthorityGrant,
-    AuthorityLifetime, AuthorityLifetimeKind, AuthorityPolicy, AuthorityPrincipal,
-    AuthorityProvenance, AuthorityReason, AuthorityRequest,
+    AuthorityAction, AuthorityAudience, AuthorityConstraintSet, AuthorityContext,
+    AuthorityDecision, AuthorityGrant, AuthorityInstrument, AuthorityLifetime,
+    AuthorityLifetimeKind, AuthorityMutation, AuthorityPlace, AuthorityPolicy, AuthorityPrincipal,
+    AuthorityProvenance, AuthorityReason, AuthorityRequest, AuthorityScope,
 };
+use cairn_common::identity::AppearanceSnapshot;
+use cairn_common::protocol::PageWriteOrigin;
 use cairn_db::storage::authority as store;
 use cairn_db::storage::authority::NewAuthorizationEvent;
 
@@ -78,10 +81,16 @@ fn now() -> i64 {
 /// Returns `None` when the request carries no resolvable run identity. A caller
 /// must treat that as "no authority to adjudicate this" and refuse, rather than
 /// proceeding unauthenticated.
+///
+/// A request with a page-write origin resolves to the verified actor acting
+/// through that page, never to a run: see [`page_write_actor`].
 pub async fn resolve_actor(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
 ) -> Option<AuthorityActor> {
+    if let Some(origin) = request.page_write_origin() {
+        return Some(page_write_actor(orch, origin));
+    }
     // The run's own rows may live in a team replica, so identity is resolved
     // through the router; the grants are not, so they are read from the private
     // database.
@@ -100,6 +109,7 @@ pub async fn resolve_actor(
             node_uri,
             run_id: Some(run_id.clone()),
             agent_id: ctx.agent_config_id.clone(),
+            ..Default::default()
         },
         audience: AuthorityAudience::workspace(WORKSPACE_ID),
         context: AuthorityContext {
@@ -111,6 +121,94 @@ pub async fn resolve_actor(
         },
         db: orch.db.local.clone(),
     })
+}
+
+/// The actor behind a page write: the verified principal, acting through the
+/// page version, with no run and no lifetime anchors.
+///
+/// It has no anchors on purpose. A page carries no turn or session to bind a
+/// grant to, and [`adjudicate`] refuses every approval boundary to an
+/// instrument outright, so no grant of any lifetime ever answers for one.
+pub fn page_write_actor(orch: &Orchestrator, origin: &PageWriteOrigin) -> AuthorityActor {
+    AuthorityActor {
+        principal: AuthorityPrincipal {
+            node_uri: None,
+            run_id: None,
+            agent_id: None,
+            actor: Some(origin.actor.clone()),
+            instrument: Some(AuthorityInstrument::Page {
+                page: origin.page.clone(),
+                version: origin.version,
+                owner: origin.owner.clone(),
+            }),
+        },
+        audience: AuthorityAudience::workspace(WORKSPACE_ID),
+        context: AuthorityContext {
+            audience: Some(AuthorityAudience::workspace(WORKSPACE_ID)),
+            run_id: None,
+            turn_id: None,
+            session_id: None,
+            request_id: None,
+        },
+        db: orch.db.local.clone(),
+    }
+}
+
+/// One row an instrument-carried act wrote: what happened, to which table, and
+/// the row it names.
+#[derive(Debug, Clone)]
+pub struct InstrumentedWrite {
+    pub mutation: AuthorityMutation,
+    /// The canonical collection the row belongs to (`.../db/<table>`).
+    pub collection: String,
+    /// The row URI, or a description when the row has none.
+    pub summary: String,
+}
+
+/// Journal what an actor wrote through an instrument.
+///
+/// A row write is direct work by policy, and direct work is otherwise never
+/// journaled. An act carried by an instrument is the exception: its principal
+/// is not a run, so no run's transcript records who made it, and the journal
+/// is the one durable place that attributes it (actor, appearance, and the
+/// instrument in the principal). One event per row, so each carries its own
+/// mutation. Journaling failures are logged, never propagated, as for every
+/// other journal entry.
+pub async fn journal_instrumented_write(
+    actor: &AuthorityActor,
+    appearance: &AppearanceSnapshot,
+    writes: &[InstrumentedWrite],
+) {
+    for write in writes {
+        let event = NewAuthorizationEvent {
+            scope: AuthorityScope::new(
+                AuthorityPlace::Resource {
+                    canonical_uri: write.collection.clone(),
+                },
+                AuthorityAction::Write,
+            ),
+            mutation: write.mutation.as_str().to_string(),
+            summary: write.summary.clone(),
+            outcome: AuthorityDecision::Direct.as_str().to_string(),
+            reason: AuthorityReason::WithinExistingAuthority
+                .as_str()
+                .to_string(),
+            principal: actor.principal.clone(),
+            audience: actor.audience.clone(),
+            run_id: None,
+            request_uri: None,
+            grant_id: None,
+            decision_actor: actor.principal.actor.clone(),
+            appearance_snapshot: Some(appearance.clone()),
+            decided_at: now(),
+        };
+        if let Err(error) = store::append_event(&actor.db, event).await {
+            log::warn!(
+                "failed to journal an instrumented write of {}: {error}",
+                write.summary
+            );
+        }
+    }
 }
 
 /// The turn a `Turn` grant is compared against.
@@ -236,6 +334,12 @@ async fn adjudicate(
         // free of authorization bookkeeping is what stops the model from
         // taxing every project edit.
         AuthorityPolicy::Direct => Ok(AuthorityDecision::Direct),
+        // An instrument holds no authority of its own, and the actor behind it
+        // did not ask for this boundary: the page's code did. No grant answers
+        // for it and no prompt is raised; the boundary is simply closed to it.
+        AuthorityPolicy::RequiresApproval(reason) if actor.principal.instrument.is_some() => {
+            Ok(AuthorityDecision::Forbidden(reason))
+        }
         AuthorityPolicy::RequiresApproval(reason) => {
             let at = now();
             let candidates = store::candidate_grants(
@@ -476,6 +580,7 @@ mod tests {
                 node_uri: Some("cairn://p/cairn/1/1/builder".to_string()),
                 run_id: Some("run-1".to_string()),
                 agent_id: Some("build".to_string()),
+                ..Default::default()
             },
             audience: AuthorityAudience::workspace(WORKSPACE_ID),
             context: AuthorityContext {
@@ -521,6 +626,7 @@ mod tests {
                 node_uri: Some("cairn://p/cairn/1/1/builder".to_string()),
                 run_id: Some("run-1".to_string()),
                 agent_id: Some("build".to_string()),
+                ..Default::default()
             },
             audience: AuthorityAudience::workspace(WORKSPACE_ID),
             lifetime,
@@ -705,6 +811,73 @@ mod tests {
         assert!(cited
             .iter()
             .all(|event| event.appearance_snapshot.as_ref() == Some(&appearance_snapshot)));
+    }
+
+    /// An instrument holds no authority: even a standing grant for the exact
+    /// scope does not answer for a page write, and no prompt is raised.
+    #[tokio::test]
+    async fn an_instrument_never_crosses_a_boundary_even_with_a_standing_grant() {
+        let mut actor = actor("authz-instrument.db").await;
+        let request = mcp_request("linear", AuthorityMutation::Update);
+        issue_grant(&actor.db, issue(&request, AuthorityLifetimeKind::Standing))
+            .await
+            .unwrap();
+        actor.principal = AuthorityPrincipal {
+            actor: Some(cairn_common::identity::PrincipalRef::Machine {
+                device_id: "device-1".to_string(),
+            }),
+            instrument: Some(AuthorityInstrument::Page {
+                page: "cairn://p/cairn/t/pages/board".to_string(),
+                version: 1,
+                owner: "cairn://p/cairn/t".to_string(),
+            }),
+            ..Default::default()
+        };
+        for decision in [
+            gate(&actor, &request).await.unwrap(),
+            authorize(&actor, &request).await.unwrap(),
+        ] {
+            assert_eq!(
+                decision,
+                AuthorityDecision::Forbidden(AuthorityReason::WorkspaceToolCapability)
+            );
+        }
+    }
+
+    /// Stored principals predate `actor` and `instrument`, and keep decoding;
+    /// a principal without them serializes exactly as before.
+    #[test]
+    fn principal_json_round_trips_with_and_without_the_typed_actor() {
+        let legacy =
+            r#"{"node_uri":"cairn://p/cairn/1/1/builder","run_id":"run-1","agent_id":"build"}"#;
+        let decoded: AuthorityPrincipal = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded.actor, None);
+        assert_eq!(decoded.instrument, None);
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), legacy);
+
+        let page = AuthorityPrincipal {
+            actor: Some(cairn_common::identity::PrincipalRef::Human {
+                issuer: "https://auth.example".to_string(),
+                subject: "user-1".to_string(),
+                organization: None,
+            }),
+            instrument: Some(AuthorityInstrument::Page {
+                page: "cairn://p/cairn/t/pages/board".to_string(),
+                version: 3,
+                owner: "cairn://p/cairn/t".to_string(),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&page).unwrap();
+        assert_eq!(json["actor"]["kind"], "human");
+        assert_eq!(
+            json["instrument"],
+            serde_json::json!({"kind": "page", "page": "cairn://p/cairn/t/pages/board", "version": 3, "owner": "cairn://p/cairn/t"})
+        );
+        assert_eq!(
+            serde_json::from_value::<AuthorityPrincipal>(json).unwrap(),
+            page
+        );
     }
 
     #[tokio::test]

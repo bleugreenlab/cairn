@@ -89,10 +89,12 @@ pub enum ResourceKind {
     ThreadBranch,
     ThreadDb,
     ThreadDbSchema,
-    ThreadProcedures,
-    ThreadProcedure,
-    ThreadAutomations,
-    ThreadAutomation,
+    ThreadDbTable,
+    ThreadDbRow,
+    ThreadServices,
+    ThreadService,
+    ThreadServiceStatus,
+    ThreadServiceLog,
     Changed,
     IssueExecutions,
     IssueExecution,
@@ -137,6 +139,8 @@ pub enum ResourceKind {
     TaskPermissions,
     TaskPermission,
     Db,
+    DbTable,
+    DbRow,
     Dev,
     DevDb,
     DevPid,
@@ -159,7 +163,9 @@ pub enum ResourceKind {
     Inference,
     InferenceRecipes,
     InferenceDeployments,
+    InferenceDeployment,
     InferencePools,
+    InferenceRequests,
     Bug,
     Skills,
     Skill,
@@ -175,6 +181,10 @@ pub enum ResourceKind {
     NodeMemory,
     NodeEras,
     NodeEra,
+    ProjectPages,
+    NodePages,
+    NodePage,
+    NodePageLog,
     Recipes,
     Recipe,
     ProjectRecipes,
@@ -183,6 +193,10 @@ pub enum ResourceKind {
     Workflow,
     ProjectWorkflows,
     ProjectWorkflow,
+    ProjectServices,
+    ProjectService,
+    ProjectServiceStatus,
+    ProjectServiceLog,
     Routes,
     Route,
     RouteHistory,
@@ -259,10 +273,12 @@ impl ResourceKind {
         ResourceKind::ThreadBranch,
         ResourceKind::ThreadDb,
         ResourceKind::ThreadDbSchema,
-        ResourceKind::ThreadProcedures,
-        ResourceKind::ThreadProcedure,
-        ResourceKind::ThreadAutomations,
-        ResourceKind::ThreadAutomation,
+        ResourceKind::ThreadDbTable,
+        ResourceKind::ThreadDbRow,
+        ResourceKind::ThreadServices,
+        ResourceKind::ThreadService,
+        ResourceKind::ThreadServiceStatus,
+        ResourceKind::ThreadServiceLog,
         ResourceKind::Changed,
         ResourceKind::IssueExecutions,
         ResourceKind::IssueExecution,
@@ -307,6 +323,8 @@ impl ResourceKind {
         ResourceKind::TaskPermissions,
         ResourceKind::TaskPermission,
         ResourceKind::Db,
+        ResourceKind::DbTable,
+        ResourceKind::DbRow,
         ResourceKind::Dev,
         ResourceKind::DevDb,
         ResourceKind::DevPid,
@@ -329,7 +347,9 @@ impl ResourceKind {
         ResourceKind::Inference,
         ResourceKind::InferenceRecipes,
         ResourceKind::InferenceDeployments,
+        ResourceKind::InferenceDeployment,
         ResourceKind::InferencePools,
+        ResourceKind::InferenceRequests,
         ResourceKind::Bug,
         ResourceKind::Skills,
         ResourceKind::Skill,
@@ -345,6 +365,10 @@ impl ResourceKind {
         ResourceKind::NodeMemory,
         ResourceKind::NodeEras,
         ResourceKind::NodeEra,
+        ResourceKind::ProjectPages,
+        ResourceKind::NodePages,
+        ResourceKind::NodePage,
+        ResourceKind::NodePageLog,
         ResourceKind::Recipes,
         ResourceKind::Recipe,
         ResourceKind::ProjectRecipes,
@@ -353,6 +377,10 @@ impl ResourceKind {
         ResourceKind::Workflow,
         ResourceKind::ProjectWorkflows,
         ResourceKind::ProjectWorkflow,
+        ResourceKind::ProjectServices,
+        ResourceKind::ProjectService,
+        ResourceKind::ProjectServiceStatus,
+        ResourceKind::ProjectServiceLog,
         ResourceKind::Routes,
         ResourceKind::Route,
         ResourceKind::RouteHistory,
@@ -428,10 +456,18 @@ impl ResourceKind {
     /// enumerates nothing and is open, artifact `patch` enumerates eight keys
     /// and is *still* open, and `delete` mutations across the table enumerate
     /// nothing while being genuinely closed. It has to be declared by kind.
+    ///
+    /// Thread database rows are the same seam over a different schema: an
+    /// append or patch payload is a column map, closed against the live table
+    /// by the row engine (`resources::db_rows`), which names the table's
+    /// columns when it refuses one.
     pub fn payload_keys_are_schema_resolved(self) -> bool {
         matches!(
             self,
-            ResourceKind::NodeArtifact | ResourceKind::TaskArtifact
+            ResourceKind::NodeArtifact
+                | ResourceKind::TaskArtifact
+                | ResourceKind::ThreadDbTable
+                | ResourceKind::ThreadDbRow
         )
     }
 

@@ -1,0 +1,11 @@
+-- lineage: shared
+-- cairn/4887: a `run` call held open on its socket past the grace window carries
+-- the same durable record a park does, so a host restart mid-hold resumes the
+-- turn exactly once. `hold` distinguishes the two kinds of active row:
+--
+--   NULL      an ordinary park: the turn is yielded and the process parked.
+--   'inline'  the call is held open on its socket; the turn is not yielded and
+--             the process is not parked. Converting to a park clears it.
+--
+-- The existing per-call unique index over active rows already covers both.
+ALTER TABLE agent_waits ADD COLUMN hold TEXT;

@@ -23,15 +23,16 @@ use rmcp::{
     tool, tool_router, RoleServer, ServerHandler,
 };
 use serde::Deserialize;
-use std::{borrow::Cow, future::Future, sync::Arc};
+use std::{borrow::Cow, future::Future, sync::Arc, time::Duration};
 
 use cairn_common::protocol::CallbackRequest;
 use cairn_common::read::{ReadBatchEnvelope, RunBatchEnvelope};
 use cairn_common::uri::{parse_uri as parse_cairn_uri, CairnResource};
 
+use crate::heartbeat::{with_heartbeat, HEARTBEAT_INTERVAL};
 use crate::output::{
     assemble_reminders, cap_run_result, cap_text_result, change_callback_result, redact_command,
-    CallbackOutcome,
+    run_transport_error_result, CallbackOutcome,
 };
 use crate::schemas::{validate_run_input, ChangeInput, ReadFileInput, RunInput};
 use crate::sink::{CallbackSink, RunPrincipal};
@@ -62,6 +63,8 @@ pub struct CairnMcpServer {
     /// Authenticated run identity for project-scoped agent operations.
     run_id: Option<Arc<String>>,
     tool_router: Arc<ToolRouter<Self>>,
+    /// How often a held call that carried a progress token reports progress.
+    heartbeat_every: Duration,
 }
 
 #[tool_router]
@@ -79,8 +82,16 @@ impl CairnMcpServer {
             cwd: Arc::new(cwd),
             run_id: run_id.map(Arc::new),
             tool_router: Arc::new(Self::tool_router()),
+            heartbeat_every: HEARTBEAT_INTERVAL,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_heartbeat_interval(mut self, every: Duration) -> Self {
+        self.heartbeat_every = every;
+        self
+    }
+
     /// Apply ordered file and resource mutations through the canonical change carrier.
     #[tool(
         description = r#"Apply ordered file and resource mutations through one carrier. Items in `changes` apply in input order.
@@ -153,12 +164,14 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
             payload["_cairn_origin"] = serde_json::Value::String("cli".into());
         }
         let request = CallbackRequest {
+            answer_bound_ms: None,
             cwd: self.cwd.to_string(),
             run_id: self.run_id.as_ref().map(|r| r.to_string()),
             tool: "write".to_string(),
             payload,
             tool_use_id: None,
             thread_id,
+            origin: None,
         };
 
         let outcome = self.callback(&request).await;
@@ -175,13 +188,13 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
 
 Targets (mix freely within one call):
 - File: `file:` (worktree root), `file:src/lib.rs` (worktree-relative), `file:/abs/path` (absolute / global)
-- Resource: canonical `cairn://p/PROJECT[/NUMBER[/EXEC/NODE[/sub]]]` and the other `cairn://` families (posts, feed, executors, channels, models, inference, help); `cairn:~/...` resolves against the run home. Source-control questions need no checkout: `cairn:@/vcs/diff`, `/vcs/ancestry` (fork point, ahead/behind, is X in main), `/vcs/log` and `/vcs/blame` answer from the store and take the same refs `branch=` does. Every resource read returns an affordance block listing its filters, links, and actions.
+- Resource: canonical `cairn://p/PROJECT[/NUMBER[/EXEC/NODE[/sub]]]` and the other `cairn://` families (posts, feed, executors, channels, models, inference, help); `cairn:~/...` resolves against the run home. Source-control questions need no checkout: `cairn:@/vcs/diff`, `/vcs/ancestry` (fork point, ahead/behind, is X in main), `/vcs/log` and `/vcs/blame` answer from the store and take the same refs `branch=` does. Services are project-declared supervised processes at `cairn://p/PROJECT/services/<name>` (with `/status` and `/log`): a `write` patch `{action:"start"|"stop"|"restart"}` controls one, and an append `{method, params}` calls it. Every resource read returns an affordance block listing its filters, links, and actions.
 - Web: `http(s)://...` URLs and local `.pdf` paths return markdown; `cairn://websearch?q=QUERY` runs a web search (everything after `q=` is the literal query, so spaces are fine).
 - Images: reading an image (an image file, `cairn:~/browser?screenshot`, a stored image URI) shows it to BOTH you and the user, and a durable `![label](cairn://p/PROJECT/ISSUE/images/N)` reference renders in the transcript to carry the image forward.
 
 Per-target scoping rides in each URI's query string — append `?key=value&...`:
 - Files: `offset=N` skips N leading lines; `limit=N` returns N lines; `offset=-N` tails. `branch=REF` reads content as of another revision (a branch name, commit, or node URI) without switching branches. `glob=PATTERN` selects matched files. `issue_history=true|verbose` appends issues that touched the file.
-- Grep is universal: `grep=REGEX` matches over ANY target's rendered text. Results group by file the way `rg --heading` does: the path on its own line, then its matches beneath it as `N:text` (context lines as `N-text`), a blank line before the next file. Modifiers: `-i`, `-A=N`/`-B=N`/`-C=N`, `output_mode=files_with_matches|content|count`, `head_limit=N` to cap matches (matches, not rendered lines — context does not count against it). A capped grep reports the FULL result's counts and marks itself partial (`[23 matches in 6 files; 8 of 23 matches shown]`) with a `continue:` footer that widens the cap, so a windowed enumeration is never mistaken for a complete one. `offset` is not allowed with grep — page with `head_limit`. `&` and `+` are literal inside a value; use `%26` for a literal `&` that immediately precedes a recognized key token.
+- Grep is universal: `grep=REGEX` matches over ANY target's rendered text. Results group by file the way `rg --heading` does: the path on its own line, then its matches beneath it as `N:text` (context lines as `N-text`), a blank line before the next file. Modifiers: `-i`, `-A=N`/`-B=N`/`-C=N`, `output_mode=files_with_matches|content|count`, `head_limit=N` to cap matches (matches, not rendered lines — context does not count against it). A capped grep reports the FULL result's counts and marks itself partial (`[23 matches in 6 files; 8 of 23 matches shown]`) with a `continue:` footer that widens the cap, so a windowed enumeration is never mistaken for a complete one. `offset` is not allowed with grep — page with `head_limit` — except on a resource whose own `offset` pages its records (vcs/log, /issues, db rows), where `offset`/`limit` choose the page grep searches. `&` and `+` are literal inside a value; use `%26` for a literal `&` that immediately precedes a recognized key token.
 - Structural code: `ast=PATTERN` runs an ast-grep pattern (real code with `$VAR`/`$$$` metavariables, e.g. `ast=console.log($$$)`) over any file/dir target; `outline` (bare flag) renders a signature skeleton. Symbol navigation lives on `cairn:~/symbols/{name}?op=definition|references|callers|implementations` (`in=GLOB` scopes it).
 - Resources: `offset`/`limit` page rendered lines, and each collection takes its own keys (e.g. `/issues?status=active&limit=20`, `/messages?since=EPOCH`, project search `cairn://p/PROJECT?search=QUERY`); the affordance block lists them. Raw transcripts (`/chat/raw?format=json`) return JSONL, one event per line.
 
@@ -271,12 +284,14 @@ Partial failures never abort: a failed target stays in place under an `[error]` 
             payload["_cairn_origin"] = serde_json::Value::String("cli".to_string());
         }
         let request = CallbackRequest {
+            answer_bound_ms: None,
             cwd: self.cwd.to_string(),
             run_id: self.run_id.as_ref().map(|r| r.to_string()),
             tool: "read_batch".to_string(),
             payload,
             tool_use_id: None,
             thread_id,
+            origin: None,
         };
         self.callback(&request).await
     }
@@ -305,9 +320,9 @@ Partial failures never abort: a failed target stays in place under an `[error]` 
     #[tool(
         description = r#"Execute an ordered batch of synchronous invocations, or suspend this turn on a sole `waitFor` item. Each item in `commands` is exactly one of: a shell `command`; a `target` skill-script URI (cairn://skills/<id>/scripts/<name>) with optional `payload.args`; a `target` external MCP tool (cairn://mcp/<server>/<tool>) with named arguments in `payload.args_json` (read cairn://mcp/<server> for each tool's arg shape); or inline `code` with a required `interpreter` (`typescript`/`javascript` via bun, `python` via uv, `matlab`). Inline code is the default way to run code that isn't a CLI invocation — the interpreter execs the source directly, so there is no shell and no quoting; keep it synchronous and run-to-completion, and put long-running or background processes in a terminal resource via `write`. Add `repl:<slug>` to an inline item to evaluate it in a stateful REPL session created at `cairn:~/repl/<slug>`. A batch may not mix tree-bound items (shell, inline code, skill scripts) with MCP or REPL items.
 
-Items run in PARALLEL by default; `sequential:true` runs in order (fail-fast unless `stop_on_error:false`). Output composes under `=== <header> ===` headers in input order. One call in, one final result out: a batch that outlives the 120-second synchronous window suspends and resumes with the finished result. An item's `timeout` (ms) kills that item at the bound and reports whatever output it produced rather than terminating the call. For a tree-bound batch in which every item declares a timeout, those bounds also limit how long the batch waits for a busy machine (the parallel maximum or sequential sum, capped at the 6-hour batch ceiling) and tell a remote executor how long to hold its queue place; if any item omits one, the batch may wait up to that ceiling. An omitted timeout also lets a tree-bound item run to completion under the ceiling. A response item (`cairn://responses/...`) runs to its `timeout`, or without one to its definition's declared timeout, under the same ceiling, and its batch suspends past the window like a long shell batch. An MCP-tool item runs to its declared `timeout` under the same ceiling and suspends the same way; without one it keeps the MCP gateway's 30-second default, so declare `timeout` on a tool call you know runs long. Stopping the run cancels an in-flight MCP request. A `cairn.run` of a response or MCP-tool item from @cairn/sdk inside a shell item has no call of its own to suspend on and ends at 120 seconds. REPL and decide (`cairn://models/decide`) items execute on the host inside the 120-second window, and a longer `timeout` is cut to 120 seconds.
+Items run in PARALLEL by default; `sequential:true` runs in order (fail-fast unless `stop_on_error:false`). Output composes under `=== <header> ===` headers in input order. One call in, one final result out, in the same turn whenever it can be. A batch in which every item declares a `timeout` stays open for their parallel maximum or sequential sum (at least the 120-second synchronous window, at most the 6-hour batch ceiling). Only a batch that outlives its window suspends: one with an item that omits `timeout` after 120 seconds, or a declared one past its sum; it resumes with the finished result. An item's `timeout` (ms) kills that item at the bound and reports whatever output it produced rather than terminating the call. For a tree-bound batch in which every item declares a timeout, those bounds also limit how long the batch waits for a busy machine (the parallel maximum or sequential sum, capped at the 6-hour batch ceiling) and tell a remote executor how long to hold its queue place; if any item omits one, the batch may wait up to that ceiling. An omitted timeout also lets a tree-bound item run to completion under the ceiling. A response item (`cairn://responses/...`) runs to its `timeout`, or without one to its definition's declared timeout, under the same ceiling, and its batch suspends past the window like a long shell batch. An MCP-tool item runs to its declared `timeout` under the same ceiling and suspends the same way; without one it keeps the MCP gateway's 30-second default, so declare `timeout` on a tool call you know runs long. Stopping the run cancels an in-flight MCP request. A `cairn.run` of a response or MCP-tool item from @cairn/sdk inside a shell item has no call of its own to suspend on and ends at 120 seconds. REPL and decide (`cairn://models/decide`) items execute on the host inside the 120-second window, and a longer `timeout` is cut to 120 seconds.
 
-If a successful batch dirties the tree, `commit_msg` is required and commits all worktree changes once after success (`^` amends); without it the worktree is restored to HEAD. `branch` runs the batch against another revision — a branch name, a commit, or a node URI — to tell a regression from a failure already on the base (read `cairn:@/check-results/<base>?suite=S&environment=current` first: the ledger may already hold that verdict, and diffs and ancestry are `cairn:@/vcs/...` reads, not branch runs); it is verdict-only: tracked writes are discarded, and commit_msg, MCP, and REPL items are rejected. `executor` places the batch on a specific machine (`{name:"..."}`) or platform (`{os:"linux"}`), optionally refined by `requiredToolchains`: the batch runs on a machine that satisfies it or is refused naming what prevents it, never quietly elsewhere. It is a call-level option beside `commands` (one batch runs on one machine), and one inside a command item is refused like any key outside this grammar; read cairn://executors for what is available, and omit it otherwise. Every result's first line names the machine the batch ran on.
+If a successful batch dirties the tree, `commit_msg` is required and commits all worktree changes once after success (`^` amends); without it the worktree is restored to HEAD. `branch` runs the batch against another revision — a branch name, a commit, or a node URI — to tell a regression from a failure already on the base (read `cairn:@/check-results/<base>?suite=S&environment=current` first: the ledger may already hold that verdict, and diffs and ancestry are `cairn:@/vcs/...` reads, not branch runs); it is verdict-only: tracked writes are discarded (its `$TMPDIR` is still the node's scratch, so writes there persist), and commit_msg, MCP, and REPL items are rejected. `executor` places the batch on a specific machine (`{name:"..."}`) or platform (`{os:"linux"}`), optionally refined by `requiredToolchains`: the batch runs on a machine that satisfies it or is refused naming what prevents it, never quietly elsewhere. It is a call-level option beside `commands` (one batch runs on one machine), and one inside a command item is refused like any key outside this grammar; read cairn://executors for what is available, and omit it otherwise. Every result's first line names the machine the batch ran on.
 
 A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`), a terminal exits or prints a phrase (`{kind:"terminal",ref:"cairn:~/terminal/dev",on:"output",phrase:"ready"}`), or ANOTHER node's project check lanes settle (`{kind:"checks",ref:"cairn://p/CAIRN/123/1/builder/checks",on:"settled"}`, or `on:"verdict",suite:"..."` for one suite), resuming with the lanes' verdicts. You cannot wait on your own lanes; for those, end the turn on `write cairn:~/wakes {subscribe:{kind:"checks"}}` instead."#
     )]
@@ -336,28 +351,40 @@ A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`
         );
 
         let request = CallbackRequest {
+            answer_bound_ms: None,
             cwd: self.cwd.to_string(),
             run_id: self.run_id.as_ref().map(|r| r.to_string()),
             tool: "run".to_string(),
             payload: serde_json::to_value(&input).unwrap_or_default(),
             tool_use_id: None,
             thread_id,
+            origin: None,
         };
 
         let outcome = self.callback(&request).await;
         // The run handler returns a RunBatchEnvelope (composed text + image
         // content blocks) like read_batch; parse it and lift each image into its
         // own content block after the text so an image-bearing MCP tool result
-        // (e.g. an Axon look screenshot) reaches the agent. A transport/parse
-        // failure falls back to the raw text.
-        let envelope =
-            serde_json::from_str::<RunBatchEnvelope>(&outcome.result).unwrap_or_else(|_| {
-                RunBatchEnvelope {
-                    text: outcome.result.clone(),
-                    images: Vec::new(),
-                    invalid_input: false,
-                }
-            });
+        // (e.g. an Axon look screenshot) reaches the agent.
+        let envelope = match serde_json::from_str::<RunBatchEnvelope>(&outcome.result) {
+            Ok(envelope) => envelope,
+            // No host answer arrived: an error, with the one line that says
+            // what the batch may have done and what to do next.
+            Err(_) if !outcome.transport_ok => {
+                let is_wait = input.commands.iter().any(|item| item.wait_for.is_some());
+                return Ok(run_transport_error_result(
+                    &outcome,
+                    self.sink.describe(),
+                    is_wait,
+                    input.commit_msg.as_deref(),
+                ));
+            }
+            Err(_) => RunBatchEnvelope {
+                text: outcome.result.clone(),
+                images: Vec::new(),
+                invalid_input: false,
+            },
+        };
         let text = assemble_reminders(cap_run_result(&envelope.text), &outcome.reminders);
         let mut blocks: Vec<ContentBlock> = Vec::with_capacity(1 + envelope.images.len());
         blocks.push(ContentBlock::text(text));
@@ -474,8 +501,24 @@ impl ServerHandler for CairnMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
         let server = self.for_request(&context.extensions)?;
+        // Every verb can be held open; a client that asked for progress hears
+        // a heartbeat while it waits (see `heartbeat`).
+        let beat = context.meta.get_progress_token().map(|token| {
+            (
+                context.peer.clone(),
+                token,
+                context.ct.clone().cancelled_owned(),
+            )
+        });
+        let tool = request.name.clone();
         let tcc = ToolCallContext::new(server.as_ref(), request, context);
-        server.tool_router.call(tcc).await
+        with_heartbeat(
+            server.tool_router.call(tcc),
+            beat,
+            server.heartbeat_every,
+            &tool,
+        )
+        .await
     }
 
     async fn read_resource(
@@ -517,12 +560,14 @@ impl ServerHandler for CairnMcpServer {
 
         // Call Tauri callback
         let callback_request = CallbackRequest {
+            answer_bound_ms: None,
             cwd: server.cwd.to_string(),
             run_id: server.run_id.as_ref().map(|r| r.to_string()),
             tool: tool_name.to_string(),
             payload: serde_json::json!({ "uri": uri }),
             tool_use_id: None,
             thread_id,
+            origin: None,
         };
 
         let response = server.callback(&callback_request).await;
@@ -656,6 +701,13 @@ mod tests {
         assert!(
             normalize(&description).contains(&grace),
             "the run description must name the grace window ({grace}): {description}"
+        );
+        // Tenet 1297: a fully declared batch stays open for its declared need,
+        // and only a batch past its window suspends.
+        assert!(
+            description.contains("every item declares a `timeout` stays open")
+                && description.contains("Only a batch that outlives its window suspends"),
+            "the run description must state the declared-need hold: {description}"
         );
 
         let schema = serde_json::Value::Object((*run.input_schema).clone());
@@ -795,6 +847,7 @@ mod tests {
             result: envelope,
             reminders: Vec::new(),
             transport_ok: true,
+            failure: None,
         });
         let mcp = CairnMcpServer::new(
             sink.clone(),
@@ -818,6 +871,80 @@ mod tests {
         assert_eq!(
             sink.requests()[0].payload["paths"][0],
             "cairn:~/arc?format=json"
+        );
+    }
+
+    async fn run_through_failure(
+        kind: crate::output::CallbackFailureKind,
+        elapsed_secs: u64,
+        input: serde_json::Value,
+    ) -> CallToolResult {
+        let sink = RecordingSink::answering(CallbackOutcome {
+            result: format!(
+                "Error calling Tauri: {}: cause [after 1.0s; x]",
+                kind.word()
+            ),
+            failure: Some(crate::output::CallbackFailure {
+                kind,
+                elapsed: std::time::Duration::from_secs(elapsed_secs),
+            }),
+            ..Default::default()
+        });
+        let mcp = CairnMcpServer::new(
+            sink,
+            Caller::Fixed {
+                run_id: None,
+                cwd: "/test/path".to_string(),
+            },
+        );
+        mcp.run(
+            Parameters(crate::test_support::run_input(input)),
+            rmcp::model::RequestMetaObject::default(),
+        )
+        .await
+        .expect("run result")
+    }
+
+    /// A lost `run` answer used to come back as a SUCCESSFUL tool result whose
+    /// text was the transport string. It is an error now, carrying the verdict
+    /// line that tells the agent what its batch may have done.
+    #[tokio::test]
+    async fn a_run_transport_failure_is_an_error_with_its_verdict() {
+        use crate::output::CallbackFailureKind::*;
+        let wait = run_through_failure(
+            Reset,
+            2,
+            serde_json::json!({"commands": [{"waitFor": {"duration": "3m"}}]}),
+        )
+        .await;
+        assert!(wait.is_error.unwrap_or(false));
+        assert!(get_text(&wait).contains("NOT armed"), "{}", get_text(&wait));
+        assert!(get_text(&wait).contains("class: reset"));
+
+        let commit = run_through_failure(
+            Reset,
+            30,
+            serde_json::json!({"commands": [{"command": "x"}], "commit_msg": "tighten parser"}),
+        )
+        .await;
+        assert!(commit.is_error.unwrap_or(false));
+        let text = get_text(&commit);
+        assert!(
+            text.contains("cairn:@/vcs/log?limit=5") && text.contains("tighten parser"),
+            "{text}"
+        );
+
+        let late = run_through_failure(
+            Timeout,
+            195,
+            serde_json::json!({"commands": [{"command": "x"}]}),
+        )
+        .await;
+        assert!(late.is_error.unwrap_or(false));
+        let text = get_text(&late);
+        assert!(
+            text.contains("may still be holding this batch durably"),
+            "{text}"
         );
     }
 }

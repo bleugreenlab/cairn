@@ -181,6 +181,8 @@ mod tests {
                 upper_peak_rss_bytes: None,
                 upper_disk_growth_bytes: None,
             }),
+            live_usage: None,
+            build_jobs: None,
         }
     }
 

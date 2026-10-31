@@ -317,7 +317,7 @@ mod tests {
                 .status
                 .success());
         };
-        git(&["init", "-q"]);
+        git(&["init", "-b", "main", "-q"]);
 
         let result = populate_real(
             &source_root,

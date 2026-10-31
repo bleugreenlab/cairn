@@ -341,7 +341,7 @@ async fn create_host_execution(
             initiated_via: None,
         },
         presets: None,
-        delegated_packets: vec![],
+        inline_delegated_packets: vec![],
         branch_target: Default::default(),
         // A host execution runs no agent node of its own, so there is nothing for
         // a routing table to have decided.
@@ -1196,7 +1196,7 @@ mod host_snapshot_tests {
             "the delegated agent must survive the repair"
         );
         assert_eq!(
-            repaired.delegated_packets.len(),
+            repaired.inline_delegated_packets.len(),
             1,
             "the packets booked in this snapshot must survive the repair"
         );

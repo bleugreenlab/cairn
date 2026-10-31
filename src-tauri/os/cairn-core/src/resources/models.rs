@@ -1226,6 +1226,9 @@ pub(crate) fn render_embeddings(
             ),
         }
     }
+    if let Some(vibes) = &status.vibes {
+        let _ = writeln!(out, "- Vibe colours: {}", vibe_progress(vibes));
+    }
     let history = if status.consented {
         "all of it"
     } else {
@@ -1236,6 +1239,33 @@ pub(crate) fn render_embeddings(
         "\nChange the model with write cairn://settings {embeddingModel: \"provider/model\"}; null returns to the Cairn gateway. A change deletes the old model's vectors and re-embeds history.\n",
     );
     out
+}
+
+/// Where learning the active model's vibe axes stands, as one line.
+fn vibe_progress(progress: &crate::embeddings::VibeAxesProgress) -> String {
+    use crate::embeddings::VibeAxesProgress;
+    match progress {
+        VibeAxesProgress::Ready => "ready (this model has axes)".to_string(),
+        VibeAxesProgress::Sampling => "learning axes: sampling history".to_string(),
+        VibeAxesProgress::Embedding { embedded, total } => format!(
+            "learning axes: {} / {} sampled events embedded",
+            grouped(*embedded),
+            grouped(*total)
+        ),
+        VibeAxesProgress::NotEnoughHistory {
+            counts,
+            needed,
+            retry_at,
+        } => format!(
+            "neutral, not enough labelled history: phase {}/{}, friction {}/{}, distribution {} (each needs {needed}); sampled again {}",
+            counts.phase_positive,
+            counts.phase_negative,
+            counts.friction_positive,
+            counts.friction_negative,
+            counts.distribution,
+            instant(*retry_at)
+        ),
+    }
 }
 
 pub(crate) fn render_usage(facet: &dyn Models, params: &[QueryParam]) -> String {
@@ -1382,12 +1412,14 @@ mod tests {
 
     fn request() -> McpCallbackRequest {
         McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: "/tmp".to_string(),
             run_id: None,
             tool: "read".to_string(),
             payload: serde_json::json!({}),
             tool_use_id: None,
+            origin: None,
         }
     }
 

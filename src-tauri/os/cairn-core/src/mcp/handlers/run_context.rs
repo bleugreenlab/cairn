@@ -362,12 +362,14 @@ mod tests {
             .await
             .unwrap();
         let request = CallbackRequest {
+            answer_bound_ms: None,
             cwd: String::new(),
             run_id: Some("r-thread".to_string()),
             tool: "write".to_string(),
             payload: serde_json::json!({}),
             tool_use_id: None,
             thread_id: None,
+            origin: None,
         };
         let target =
             crate::resources::resolve_home_relative_resource_uri(&dbs, &request, "cairn:~/tasks")

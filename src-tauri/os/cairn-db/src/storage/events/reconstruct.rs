@@ -49,6 +49,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use cairn_common::read::ReadSegment;
 use cairn_common::token_meter::{Cut, TokenMeter};
@@ -104,11 +105,45 @@ pub const RECONSTRUCT_BATCH_BYTES: usize = 32 * 1024 * 1024;
 /// Identity (a single scan, no allocation) when every row is `full`. See the
 /// module docs for per-mode behavior.
 pub async fn reconstruct_events(db: &LocalDb, events: Vec<Event>) -> Vec<Event> {
+    reconstruct_with(
+        db,
+        events,
+        team_store(db),
+        db.private_route_db().map(Arc::as_ref),
+    )
+    .await
+}
+
+/// [`reconstruct_events`] with the content store and private route database
+/// named explicitly rather than taken from `db`, for tests that drive a team
+/// replica's rows without a team context.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn reconstruct_events_with_routes(
+    db: &LocalDb,
+    events: Vec<Event>,
+    store: Option<&dyn ContentStore>,
+    private_route_db: Option<&LocalDb>,
+) -> Vec<Event> {
+    reconstruct_with(db, events, store, private_route_db).await
+}
+
+async fn reconstruct_with(
+    db: &LocalDb,
+    events: Vec<Event>,
+    store: Option<&dyn ContentStore>,
+    private_route_db: Option<&LocalDb>,
+) -> Vec<Event> {
     if !events.iter().any(is_archived) {
         return withheld(events);
     }
-    let coords = load_coords(db, &events).await;
+    let coords = load_coords(db, &events, store, private_route_db).await;
     withheld(finish(coords, events))
+}
+
+/// The store a team replica's offloaded packs and blobs are fetched from. The
+/// private database returns `None`: its packs and blobs are inline.
+fn team_store(db: &LocalDb) -> Option<&dyn ContentStore> {
+    db.team_id().map(|_| db.content_store().as_ref())
 }
 
 /// What reconstruction made of one event: whether the `data` it now carries is
@@ -155,7 +190,13 @@ pub async fn reconstruct_events_reporting(
     events: Vec<Event>,
 ) -> Vec<(Event, Reconstruction)> {
     let reported = if events.iter().any(is_archived) {
-        let coords = load_coords(db, &events).await;
+        let coords = load_coords(
+            db,
+            &events,
+            team_store(db),
+            db.private_route_db().map(Arc::as_ref),
+        )
+        .await;
         finish_reporting(coords, events)
     } else {
         events
@@ -181,54 +222,34 @@ pub async fn reconstruct_events_reporting(
 
 /// Gather every coordinate, pack, and blob a batch's archived events need.
 ///
-/// Two phases so the `ObjectStore` (which holds a non-Send `Rc`) is never
-/// alive across an await: gather all coordinates and pack bytes via async DB
-/// reads under one read connection first, then build the layered stores and
-/// reconstruct synchronously.
-async fn load_coords(db: &LocalDb, events: &[Event]) -> Coords {
-    let run_ids = gitcoord_run_ids(events);
-    let hashes = blobbed_hashes(events);
-    // A team replica carries a content store; the private DB returns `None`. When
-    // present, an offloaded pack/blob whose bytes are absent locally is fetched
-    // from the shared per-team store (the store read-through caches into the
-    // private `cas_cache`, so repeat reconstructs are offline). The fetch happens
-    // in this async phase, before the non-Send `ObjectStore` is built.
-    let store = db.team_id().map(|_| db.content_store().clone());
-    let private_route_db = db.private_route_db().cloned();
-    db.read(move |conn| {
-        let private_route_db = private_route_db.clone();
-        Box::pin(async move {
-            DbResult::Ok(
-                Coords::load(
-                    conn,
-                    &run_ids,
-                    &hashes,
-                    store.as_deref(),
-                    private_route_db.as_deref(),
-                )
-                .await,
-            )
-        })
-    })
-    .await
-    .unwrap_or_default()
-}
-
-/// Connection-scoped reconstruction for callers that already hold a read
-/// connection (e.g. the transcript resource), avoiding a nested pool checkout.
-pub async fn reconstruct_events_with_conn_and_routes(
-    conn: &turso::Connection,
-    events: Vec<Event>,
+/// The database rows come first, in one short pooled read that runs
+/// statements and nothing else. Then, with no transaction open, whatever those
+/// rows point at outside this database: a team project's machine-local repo
+/// path in the private database, and pack and blob objects fetched from a
+/// team's content store, which for a cold object is a network fetch (the store
+/// read-through caches into the private `cas_cache`, so repeat reconstructs
+/// are offline). The caller then builds the layered stores and reconstructs
+/// synchronously, so the `ObjectStore` (which holds a non-Send `Rc`) is never
+/// alive across an await.
+async fn load_coords(
+    db: &LocalDb,
+    events: &[Event],
     store: Option<&dyn ContentStore>,
     private_route_db: Option<&LocalDb>,
-) -> Vec<Event> {
-    if !events.iter().any(is_archived) {
-        return withheld(events);
-    }
-    let run_ids = gitcoord_run_ids(&events);
-    let hashes = blobbed_hashes(&events);
-    let coords = Coords::load(conn, &run_ids, &hashes, store, private_route_db).await;
-    withheld(finish(coords, events))
+) -> Coords {
+    let run_ids = gitcoord_run_ids(events);
+    let hashes = blobbed_hashes(events);
+    // A team replica has no `archival_blobs` table: its blobs are in the store.
+    let local_blobs = store.is_none();
+    let rows = db
+        .read(move |conn| {
+            Box::pin(async move {
+                DbResult::Ok(CoordRows::load(conn, &run_ids, &hashes, local_blobs).await)
+            })
+        })
+        .await
+        .unwrap_or_default();
+    rows.resolve(store, private_route_db).await
 }
 
 /// Apply the disclosure quarantine (CAIRN-3828) to fully reconstructed events.
@@ -368,20 +389,106 @@ struct ReconstructCtx {
     blobs: HashMap<String, String>,
 }
 
-impl Coords {
+/// What [`load_coords`] reads from the database, before anything those rows
+/// point at outside it is resolved.
+#[derive(Default)]
+struct CoordRows {
+    runs: Vec<RunRow>,
+    /// execution_id -> its `execution_history` pack columns, when it has any.
+    packs: HashMap<String, PackRow>,
+    /// Each requested blob hash, with its compressed `archival_blobs` bytes
+    /// when this is the private database and the row exists.
+    blobs: Vec<(String, Option<Vec<u8>>)>,
+}
+
+struct RunRow {
+    run_id: String,
+    execution_id: String,
+    project_id: String,
+    project_key: String,
+    /// The project row's repo path, which for a team project is the creator's.
+    repo_path: String,
+}
+
+enum PackRow {
+    /// Local run: the pack and its index are inline.
+    Inline(Vec<u8>, Vec<u8>),
+    /// Team run: the framed pack is a content-store object with this hash.
+    Stored(String),
+}
+
+impl CoordRows {
+    /// Statements only: this runs inside a pooled read.
     async fn load(
         conn: &turso::Connection,
         run_ids: &[String],
         hashes: &[String],
+        local_blobs: bool,
+    ) -> CoordRows {
+        let mut runs = Vec::new();
+        for run_id in run_ids {
+            if let Some(run) = load_run_row(conn, run_id).await {
+                runs.push(run);
+            }
+        }
+
+        let exec_ids: HashSet<&str> = runs.iter().map(|run| run.execution_id.as_str()).collect();
+        let mut packs = HashMap::new();
+        for exec_id in exec_ids {
+            if let Some(pack) = load_pack_row(conn, exec_id).await {
+                packs.insert(exec_id.to_owned(), pack);
+            }
+        }
+
+        let mut blobs = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            let local = if local_blobs {
+                load_blob_local(conn, hash).await
+            } else {
+                None
+            };
+            blobs.push((hash.clone(), local));
+        }
+
+        CoordRows { runs, packs, blobs }
+    }
+
+    /// Everything outside this database the rows point at, with no
+    /// transaction open: team repo paths from the private database, and pack
+    /// and blob objects from the content store.
+    async fn resolve(
+        self,
         store: Option<&dyn ContentStore>,
         private_route_db: Option<&LocalDb>,
     ) -> Coords {
-        let mut run_meta: HashMap<String, RunMeta> = HashMap::new();
+        let CoordRows {
+            runs,
+            packs: mut pack_rows,
+            blobs: blob_rows,
+        } = self;
 
-        for run_id in run_ids {
-            if let Some(meta) = load_run_meta(conn, run_id, private_route_db).await {
-                run_meta.insert(run_id.clone(), meta);
-            }
+        let mut run_meta: HashMap<String, RunMeta> = HashMap::new();
+        for run in runs {
+            let repo_path = match cairn_common::ids::parse_route_scope(&run.project_id) {
+                // A team project's checkout is machine-local: its path is in
+                // this machine's private routes, not the synced project row.
+                Ok(cairn_common::ids::RouteScope::Team(_)) => {
+                    let Some(private_db) = private_route_db else {
+                        continue;
+                    };
+                    load_private_local_repo_path(private_db, &run.project_key)
+                        .await
+                        .unwrap_or_default()
+                }
+                _ => run.repo_path,
+            };
+            run_meta.insert(
+                run.run_id,
+                RunMeta {
+                    execution_id: run.execution_id,
+                    repo_path: PathBuf::from(repo_path),
+                },
+            );
         }
 
         let exec_ids: HashSet<String> = run_meta
@@ -397,14 +504,18 @@ impl Coords {
             else {
                 continue;
             };
-            let pack = load_pack_bytes(conn, &exec_id, store).await;
+            let pack = match pack_rows.remove(&exec_id) {
+                Some(PackRow::Inline(pack, idx)) => Some((pack, idx)),
+                Some(PackRow::Stored(pack_hash)) => fetch_pack(store, &pack_hash).await,
+                None => None,
+            };
             packs.insert(exec_id, ExecPack { repo_path, pack });
         }
 
         let mut blobs: HashMap<String, String> = HashMap::new();
-        for hash in hashes {
-            if let Some(text) = load_blob(conn, hash, store).await {
-                blobs.insert(hash.clone(), text);
+        for (hash, local) in blob_rows {
+            if let Some(text) = resolve_blob(&hash, local, store).await {
+                blobs.insert(hash, text);
             }
         }
 
@@ -414,7 +525,9 @@ impl Coords {
             blobs,
         }
     }
+}
 
+impl Coords {
     /// Build the layered stores synchronously (no awaits, so no non-Send value
     /// crosses a suspend point).
     fn into_ctx(self) -> ReconstructCtx {
@@ -438,11 +551,7 @@ impl ReconstructCtx {
     }
 }
 
-async fn load_run_meta(
-    conn: &turso::Connection,
-    run_id: &str,
-    private_route_db: Option<&LocalDb>,
-) -> Option<RunMeta> {
+async fn load_run_row(conn: &turso::Connection, run_id: &str) -> Option<RunRow> {
     let mut rows = conn
         .query(
             "SELECT j.execution_id, p.id, p.key, p.repo_path
@@ -457,20 +566,12 @@ async fn load_run_meta(
         .ok()?;
     let row = rows.next().await.ok()??;
     let execution_id: Option<String> = row.opt_text(0).ok()?;
-    let project_id: String = row.text(1).ok()?;
-    let project_key: String = row.text(2).ok()?;
-    let synced_repo_path: String = row.text(3).ok()?;
-    let repo_path = match cairn_common::ids::parse_route_scope(&project_id) {
-        Ok(cairn_common::ids::RouteScope::Team(_)) => {
-            load_private_local_repo_path(private_route_db?, &project_key)
-                .await
-                .unwrap_or_default()
-        }
-        _ => synced_repo_path,
-    };
-    Some(RunMeta {
+    Some(RunRow {
+        run_id: run_id.to_owned(),
+        project_id: row.text(1).ok()?,
+        project_key: row.text(2).ok()?,
+        repo_path: row.text(3).ok()?,
         execution_id: execution_id?,
-        repo_path: PathBuf::from(repo_path),
     })
 }
 
@@ -486,18 +587,13 @@ async fn load_private_local_repo_path(private_db: &LocalDb, project_key: &str) -
         .flatten()
 }
 
-/// Load an execution's range pack bytes, returning `None` for an empty range
-/// (NULL pack columns and no `pack_hash`) or a missing `execution_history` row.
+/// An execution's range pack columns, `None` for an empty range (NULL pack
+/// columns and no `pack_hash`) or a missing `execution_history` row.
 ///
-/// Local run: `pack`/`pack_idx` are inline. Team run: those columns are NULL and
-/// `pack_hash` points at the framed pack object in the content store, fetched
-/// here by hash and split back into `(pack, idx)`. A missing pointer, absent
-/// store, fetch error, or malformed object yields `None` (degrade to stub).
-async fn load_pack_bytes(
-    conn: &turso::Connection,
-    execution_id: &str,
-    store: Option<&dyn ContentStore>,
-) -> Option<(Vec<u8>, Vec<u8>)> {
+/// Local run: `pack`/`pack_idx` are inline. Team run: those columns are NULL
+/// and `pack_hash` points at the framed pack object in the content store,
+/// which [`fetch_pack`] fetches once the read has released.
+async fn load_pack_row(conn: &turso::Connection, execution_id: &str) -> Option<PackRow> {
     let mut rows = conn
         .query(
             "SELECT pack, pack_idx, pack_hash FROM execution_history WHERE execution_id = ?1 LIMIT 1",
@@ -507,10 +603,19 @@ async fn load_pack_bytes(
         .ok()?;
     let row = rows.next().await.ok()??;
     if let (Some(pack), Some(idx)) = (row.opt_blob(0).ok()?, row.opt_blob(1).ok()?) {
-        return Some((pack, idx));
+        return Some(PackRow::Inline(pack, idx));
     }
-    let pack_hash = row.opt_text(2).ok()??;
-    let bytes = store?.get(&pack_hash).await.ok()??;
+    row.opt_text(2).ok()?.map(PackRow::Stored)
+}
+
+/// Fetch a team run's framed pack object by hash and split it back into
+/// `(pack, idx)`. An absent store, fetch error, or malformed object yields
+/// `None` (degrade to stub).
+async fn fetch_pack(
+    store: Option<&dyn ContentStore>,
+    pack_hash: &str,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let bytes = store?.get(pack_hash).await.ok()??;
     // Content-addressed integrity: the fetched object MUST hash to the pointer
     // that named it. A mismatch (corrupt/stale object, broker or backend bug,
     // tampering) is treated as absent so reconstruction degrades to a stub rather
@@ -534,10 +639,11 @@ async fn load_pack_bytes(
 /// UNCOMPRESSED (their sha256 IS the key, so a fetch can verify integrity), hence
 /// used directly after the hash check, no decompress. Private conn (`store` is
 /// `None`): the bytes come from `archival_blobs`, which holds the
-/// zstd-COMPRESSED form, so the local path decompresses.
-async fn load_blob(
-    conn: &turso::Connection,
+/// zstd-COMPRESSED form, read by [`CoordRows::load`] and passed here as
+/// `local`, so the local path decompresses.
+async fn resolve_blob(
     hash: &str,
+    local: Option<Vec<u8>>,
     store: Option<&dyn ContentStore>,
 ) -> Option<String> {
     // A segment blob is addressed by its own hash and read only here, so this is
@@ -568,8 +674,7 @@ async fn load_blob(
         }
         // Private conn: `archival_blobs` holds the zstd-compressed bytes.
         None => {
-            let content = load_blob_local(conn, hash).await?;
-            let bytes = decompress(CODEC_ZSTD_V1, &content).ok()?;
+            let bytes = decompress(CODEC_ZSTD_V1, &local?).ok()?;
             String::from_utf8(bytes).ok()
         }
     }

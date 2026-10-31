@@ -206,6 +206,28 @@ struct AnonDeviceRow {
     jwt_expires_at: Option<i64>,
 }
 
+/// The unexpired anonymous token stored in `db`, decrypted. Only a database
+/// this machine wrote (or a copy of one) decrypts, because the key is the
+/// machine's: this is how offline tools working on a copy of this install's
+/// database reach the gateway without the token being handed around.
+#[cfg(feature = "internal-api")]
+pub async fn stored_anon_jwt(db: &crate::storage::LocalDb) -> Result<Option<String>, String> {
+    let row = db
+        .query_opt(
+            "SELECT jwt_encrypted, jwt_expires_at FROM anon_device LIMIT 1",
+            (),
+            |row| Ok((row.opt_text(0)?, row.opt_i64(1)?)),
+        )
+        .await
+        .map_err(|e| format!("Failed to get anon device: {e}"))?;
+    match row {
+        Some((Some(encrypted), Some(exp))) if exp > chrono::Utc::now().timestamp() => {
+            decrypt_jwt_from_storage(&encrypted).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
 async fn get_anon_device(db: &DbState) -> Result<Option<AnonDeviceRow>, String> {
     db.local
         .read(|conn| {

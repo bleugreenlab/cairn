@@ -279,12 +279,14 @@ mod tests {
     /// shape production ever produces for an MCP-hosted agent.
     fn mcp_request(payload: Value) -> McpCallbackRequest {
         McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: "/tmp/wt".to_string(),
             run_id: Some(RUN_ID.to_string()),
             tool: "run".to_string(),
             payload,
             tool_use_id: None,
+            origin: None,
         }
     }
 

@@ -345,10 +345,10 @@ async fn index_row(
         return Ok(());
     };
     let path = project_path(orch, row.project_id.as_deref()).await;
-    let routes = orch
-        .fact_log
-        .index
-        .routes(&orch.config_dir, path.as_deref())?;
+    let routes =
+        orch.fact_log
+            .index
+            .routes(&orch.config_dir, path.as_deref(), orch.services.clock.now())?;
     let consumers = orch.fact_log.index.threads(&orch.db.local).await?;
     let presence = super::log::presence_from_str(&row.presence);
     let stored = stored_fact(&row)?;
@@ -836,11 +836,11 @@ async fn run_route_row(
         Err(error) => return (route_state::FAILED, Some(format!("hydrate: {error}"))),
     };
     let path = project_path(orch, row.project_id.as_deref()).await;
-    let routes = match orch
-        .fact_log
-        .index
-        .routes(&orch.config_dir, path.as_deref())
-    {
+    let routes = match orch.fact_log.index.routes(
+        &orch.config_dir,
+        path.as_deref(),
+        orch.services.clock.now(),
+    ) {
         Ok(routes) => routes,
         Err(error) => return (route_state::FAILED, Some(format!("routes: {error}"))),
     };
@@ -1485,6 +1485,9 @@ mod tests {
     #[tokio::test]
     async fn route_yaml_is_read_when_it_changes_not_per_fact() {
         let temp = tempfile::tempdir().unwrap();
+        // The fixture's clock stands still, so the route index's TTL never
+        // lapses here however slow the run: every read below is one the index
+        // chose, not one the host's speed forced.
         let (orch, _db) = orchestrator(temp.path(), &[("to-issue", MESSAGE_ROUTE)]).await;
         let reads = || crate::config::routes::ROUTE_DIR_READS.with(std::cell::Cell::get);
         let before = reads();
@@ -1747,12 +1750,14 @@ mod tests {
             let orch = orch.clone();
             async move {
                 let request = crate::mcp::types::McpCallbackRequest {
+                    answer_bound_ms: None,
                     thread_id: None,
                     cwd: "/tmp".to_string(),
                     run_id: None,
                     tool: "read".to_string(),
                     payload: serde_json::json!({}),
                     tool_use_id: None,
+                    origin: None,
                 };
                 crate::resources::read_cairn_resource(&orch, &request, &uri).await
             }

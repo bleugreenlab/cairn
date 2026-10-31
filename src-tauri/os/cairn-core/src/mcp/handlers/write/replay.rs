@@ -207,7 +207,7 @@ pub(super) async fn record_pending_file_report(
     let owner = ReplayOwner {
         token: uuid::Uuid::new_v4().to_string(),
     };
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = wall_clock_ms();
     match db.execute(
         "INSERT OR IGNORE INTO write_replay_ledger(run_id, tool_use_id, report, created_at, owner_token, finalized, claimed_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?4)",
         cairn_db::turso::params![call.run_id.clone(), call.id.clone(), report.to_string(), now, owner.token.clone()],
@@ -220,17 +220,29 @@ pub(super) async fn record_pending_file_report(
 
 const FILE_REPLAY_LEASE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The lease clock: wall-clock milliseconds, the unit `claimed_at` is stored in so
+/// that deliveries in different processes can judge one another's leases.
+fn wall_clock_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
 pub(super) async fn await_file_replay_or_takeover(
     db: &LocalDb,
     call: &WriteCall,
 ) -> FileReplayClaim {
-    await_file_replay_or_takeover_with_lease(db, call, FILE_REPLAY_LEASE).await
+    await_file_replay_or_takeover_with_lease(db, call, FILE_REPLAY_LEASE, wall_clock_ms).await
 }
 
+/// `now_ms` reads the lease clock. It is an argument so that how much lease time
+/// has passed is something a caller states rather than waits for: real time cannot
+/// express "the owner renewed in time" on a host where one ledger write outlasts a
+/// short lease. Polling still sleeps in real time; only the lease judgment reads
+/// this clock.
 async fn await_file_replay_or_takeover_with_lease(
     db: &LocalDb,
     call: &WriteCall,
     lease: std::time::Duration,
+    now_ms: impl Fn() -> i64,
 ) -> FileReplayClaim {
     let poll_interval = std::cmp::max(
         std::time::Duration::from_millis(10),
@@ -253,7 +265,7 @@ async fn await_file_replay_or_takeover_with_lease(
         let (Some(old_owner), Some(claimed_at)) = (old_owner, claimed_at) else {
             return FileReplayClaim::Stalled;
         };
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = now_ms();
         let lease_millis = i64::try_from(lease.as_millis()).unwrap_or(i64::MAX);
         if now.saturating_sub(claimed_at) < lease_millis {
             tokio::time::sleep(poll_interval).await;
@@ -271,12 +283,16 @@ async fn await_file_replay_or_takeover_with_lease(
     }
 }
 
-async fn renew_owned_report(db: &LocalDb, call: &WriteCall, owner: &ReplayOwner) -> bool {
-    let now = chrono::Utc::now().timestamp_millis();
+async fn renew_owned_report(
+    db: &LocalDb,
+    call: &WriteCall,
+    owner: &ReplayOwner,
+    now_ms: i64,
+) -> bool {
     matches!(
         db.execute(
             "UPDATE write_replay_ledger SET claimed_at=?4 WHERE run_id=?1 AND tool_use_id=?2 AND finalized=0 AND owner_token=?3",
-            cairn_db::turso::params![call.run_id.clone(), call.id.clone(), owner.token.clone(), now],
+            cairn_db::turso::params![call.run_id.clone(), call.id.clone(), owner.token.clone(), now_ms],
         )
         .await,
         Ok(1)
@@ -300,7 +316,7 @@ pub(super) async fn with_owned_report_heartbeat<F: std::future::Future>(
         tokio::select! {
             output = &mut future => return output,
             _ = heartbeat.tick() => {
-                if !renew_owned_report(db, call, owner).await {
+                if !renew_owned_report(db, call, owner, wall_clock_ms()).await {
                     log::warn!("write replay owner lost its lease while post-seal work was still running");
                 }
             }
@@ -915,6 +931,26 @@ mod tests {
             .to_string()
     }
 
+    /// A lease clock the test moves by hand, so lease time passes only when the
+    /// test says it does.
+    #[derive(Clone)]
+    struct LeaseClock(std::sync::Arc<std::sync::atomic::AtomicI64>);
+
+    impl LeaseClock {
+        fn at(ms: i64) -> Self {
+            Self(std::sync::Arc::new(std::sync::atomic::AtomicI64::new(ms)))
+        }
+
+        fn now(&self) -> i64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Move the clock forward and return the new time.
+        fn advance(&self, ms: i64) -> i64 {
+            self.0.fetch_add(ms, std::sync::atomic::Ordering::SeqCst) + ms
+        }
+    }
+
     /// The publication ladder settles AFTER the ledger row is claimed under the
     /// store lock, so the in-lock report can say `committed` about a commit whose
     /// export or required origin push then failed. A redelivery of the same call
@@ -1109,31 +1145,43 @@ mod tests {
         );
     }
 
+    /// A waiter that has waited longer than one lease in total must still not take
+    /// over an owner that renewed inside every lease window.
     #[tokio::test]
     async fn an_active_file_owner_is_not_taken_over_after_a_waiter_exceeds_one_lease() {
         let (db, call) = ledger_db("write-replay-owned-active.db").await;
         let owner = record_pending_file_report(&db, &call, &report("accumulating"))
             .await
             .unwrap();
+        let lease = std::time::Duration::from_millis(80);
+        let claimed = 1_000_000;
+        let clock = LeaseClock::at(claimed);
+        assert!(renew_owned_report(&db, &call, &owner, clock.now()).await);
         let db = std::sync::Arc::new(db);
         let waiter_db = db.clone();
         let waiter_call = WriteCall {
             run_id: call.run_id.clone(),
             id: call.id.clone(),
         };
+        let waiter_clock = clock.clone();
         let waiter = tokio::spawn(async move {
-            await_file_replay_or_takeover_with_lease(
-                &waiter_db,
-                &waiter_call,
-                std::time::Duration::from_millis(80),
-            )
+            await_file_replay_or_takeover_with_lease(&waiter_db, &waiter_call, lease, move || {
+                waiter_clock.now()
+            })
             .await
         });
 
+        // Each renewal lands 35 ms of lease time after the last, inside the 80 ms
+        // lease, while the waiter's total wait passes it. The real sleeps only give
+        // the waiter turns to poll; they cannot age the claim.
         for _ in 0..4 {
-            tokio::time::sleep(std::time::Duration::from_millis(35)).await;
-            assert!(renew_owned_report(&db, &call, &owner).await);
+            assert!(renew_owned_report(&db, &call, &owner, clock.advance(35)).await);
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         }
+        assert!(
+            clock.now() - claimed > 80,
+            "the waiter has outwaited one lease"
+        );
         assert!(
             !waiter.is_finished(),
             "fresh heartbeats must prevent takeover"
@@ -1162,6 +1210,7 @@ mod tests {
             &db,
             &call,
             std::time::Duration::from_millis(20),
+            wall_clock_ms,
         )
         .await
         {
@@ -1198,6 +1247,7 @@ mod tests {
             &db,
             &call,
             std::time::Duration::from_millis(20),
+            wall_clock_ms,
         )
         .await
         {
@@ -1238,6 +1288,7 @@ mod tests {
             &db,
             &call,
             std::time::Duration::from_millis(20),
+            wall_clock_ms,
         )
         .await
         {
@@ -1260,6 +1311,10 @@ mod tests {
         let owner = record_pending_file_report(&db, &call, &report("accumulating"))
             .await
             .unwrap();
+        // The lease clock stands still, so only the owner's final report can end
+        // the wait.
+        let clock = LeaseClock::at(1_000_000);
+        assert!(renew_owned_report(&db, &call, &owner, clock.now()).await);
         let db = std::sync::Arc::new(db);
         let waiter_db = db.clone();
         let waiter_call = WriteCall {
@@ -1271,6 +1326,7 @@ mod tests {
                 &waiter_db,
                 &waiter_call,
                 std::time::Duration::from_secs(1),
+                move || clock.now(),
             )
             .await
         });

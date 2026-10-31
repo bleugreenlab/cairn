@@ -24,6 +24,9 @@
 //! Each seam states its [`Confinement`] so that choice is made explicitly.
 
 pub mod containment;
+#[cfg(all(test, target_os = "linux"))]
+mod host_socket_tests;
+mod isolated;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -33,7 +36,7 @@ pub mod operator_credential;
 mod setuid_refusal;
 mod write_refusal;
 
-pub use nested::check_lane_nested_sandbox_evidence;
+pub use isolated::{IsolatedChild, IsolatedLimits};
 pub use operator_credential::{
     credential_denial, detect_credential_floor_denial, Confinement, MacosProfile,
     OperatorCredentialFloor, OPERATOR_CREDENTIAL_REFUSAL,
@@ -75,7 +78,7 @@ pub struct NestedSandboxWriteProbe {
 ///
 /// An executor deciding whether its check lanes can do so asks a different
 /// question, because it spawns those lanes inside a profile of its own; see
-/// [`check_lane_nested_sandbox_evidence`].
+/// [`sandbox_capability_evidence`].
 ///
 /// This deliberately does not consult `CAIRN_SANDBOXED`: that marker records a
 /// Cairn policy decision, while an inherited Seatbelt profile is kernel state.
@@ -133,6 +136,15 @@ pub struct SandboxPolicy {
     /// worktree is always in [`readable_paths`](Self::readable_paths) regardless;
     /// this flag only gates the write-allow.
     pub worktree_writable: bool,
+    /// Directories beneath which a fenced spawn may reach a pathname unix
+    /// socket served from outside its own sandbox: the cell's own scratch, so
+    /// a later batch of a job can reconnect to a server an earlier batch
+    /// started there. A writable worktree joins this set implicitly (see
+    /// [`socket_resolvable_paths`](Self::socket_resolvable_paths)), and a
+    /// shared root never does (see
+    /// [`allow_job_sockets_in`](Self::allow_job_sockets_in)). Enforced by
+    /// Linux landlock from ABI 9; macOS does not yet scope sockets.
+    pub socket_resolvable: Vec<PathBuf>,
     /// The marker this spawn's denials carry into the macOS violation log.
     pub violation_tag: ViolationTag,
 }
@@ -162,12 +174,128 @@ impl ViolationTag {
     /// A tag that never changes, for a profile whose text is a fingerprint
     /// rather than one that confines a spawn.
     fn canonical() -> Self {
-        Self("cairn-fence-canonical".into())
+        Self(format!("{}canonical", Self::PREFIX))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// The argv of the process-wide `log stream` that reads tagged Seatbelt
+/// violations on macOS, program first.
+///
+/// The single source of that command. The macOS fence spawns exactly this,
+/// and [`violation_stream_sudoers_command`] renders the one sudoers rule that
+/// lets a non-admin executor account run it (`log stream` refuses anyone not
+/// in `admin`). The render is committed as
+/// `scripts/lib/fence-violation-stream.sudoers-command`, which the Mac setup
+/// script installs and the runner-isolation gate allows; a test pins that file
+/// to this function, so neither can drift from what is spawned.
+pub fn violation_stream_argv() -> Vec<String> {
+    vec![
+        "/usr/bin/log".into(),
+        "stream".into(),
+        "--style".into(),
+        "ndjson".into(),
+        "--predicate".into(),
+        format!("eventMessage CONTAINS \"{}\"", ViolationTag::PREFIX),
+    ]
+}
+
+/// What an account outside `admin` runs [`violation_stream_argv`] under: sudo,
+/// told to refuse rather than prompt when no rule permits the command.
+pub const VIOLATION_STREAM_SUDO: [&str; 2] = ["/usr/bin/sudo", "-n"];
+
+/// The argv the macOS fence spawns for its violation stream, given how this
+/// account reaches `log stream`: [`violation_stream_argv`] itself, behind
+/// [`VIOLATION_STREAM_SUDO`] for an account outside `admin`. Nothing else is
+/// ever added, so what sudo is asked to run is what the sudoers rule names.
+pub fn violation_stream_spawn_argv(
+    access: cairn_common::executor_protocol::ViolationStreamAccess,
+) -> Vec<String> {
+    use cairn_common::executor_protocol::ViolationStreamAccess;
+    let argv = violation_stream_argv();
+    match access {
+        ViolationStreamAccess::Admin => argv,
+        ViolationStreamAccess::SudoRule => VIOLATION_STREAM_SUDO
+            .iter()
+            .map(|arg| arg.to_string())
+            .chain(argv)
+            .collect(),
+    }
+}
+
+/// This machine's sandbox capability evidence: whether a check lane can apply
+/// a nested Seatbelt profile, and whether a fenced denial is recovered by path.
+///
+/// One assembly point serves the advertisement, every liveness pass, and the
+/// per-execution record, so none of them can disagree about the machine. Both
+/// halves re-measure when what they depend on may have moved, so a pass after
+/// a host change carries the new answer without a daemon restart.
+pub fn sandbox_capability_evidence() -> cairn_common::executor_protocol::SandboxCapabilityEvidence {
+    let mut evidence = nested::check_lane_nested_sandbox_evidence();
+    evidence.violation_recovery = violation_recovery();
+    evidence
+}
+
+#[cfg(target_os = "macos")]
+fn violation_recovery() -> Option<cairn_common::executor_protocol::ViolationRecoveryEvidence> {
+    Some(macos::violation_recovery())
+}
+
+/// Only macOS recovers a denied path out of band; elsewhere a denial stays
+/// command-scoped, so there is nothing to report.
+#[cfg(not(target_os = "macos"))]
+fn violation_recovery() -> Option<cairn_common::executor_protocol::ViolationRecoveryEvidence> {
+    None
+}
+
+/// The sudoers command spec, everything after `NOPASSWD: `, that permits
+/// exactly [`violation_stream_argv`] and nothing else.
+pub fn violation_stream_sudoers_command() -> String {
+    sudoers_command(&violation_stream_argv())
+}
+
+/// Render argv as a sudoers command spec that matches it byte for byte.
+///
+/// sudo compares a rule's argument text, as an fnmatch pattern, against the
+/// invoked arguments joined by single spaces, and in that text `"` is an
+/// ordinary character (sudo 1.9.17 rejects `\"` there, measured on macOS). So
+/// the render escapes only what sudoers requires inside arguments
+/// (`\ , : =`), and refuses an argument whose text a single-space join would
+/// not reproduce, or that would turn into a pattern or a comment.
+fn sudoers_command(argv: &[String]) -> String {
+    assert!(
+        argv.first().is_some_and(|program| program.starts_with('/')),
+        "a sudoers command must name its program by absolute path: {argv:?}"
+    );
+    argv.iter()
+        .map(|arg| {
+            assert!(
+                !arg.is_empty()
+                    && !arg.starts_with(' ')
+                    && !arg.ends_with(' ')
+                    && !arg.contains("  "),
+                "sudo joins arguments with single spaces, so {arg:?} cannot be matched exactly"
+            );
+            assert!(
+                !arg.chars().any(|c| matches!(c, '*' | '?' | '[' | ']' | '#')
+                    || c.is_control()
+                    || (c.is_whitespace() && c != ' ')),
+                "{arg:?} would be a pattern, a comment or a line break in sudoers, not literal text"
+            );
+            let mut rendered = String::with_capacity(arg.len());
+            for c in arg.chars() {
+                if matches!(c, '\\' | ',' | ':' | '=') {
+                    rendered.push('\\');
+                }
+                rendered.push(c);
+            }
+            rendered
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn paths_overlap(a: &Path, b: &Path) -> bool {
@@ -202,6 +330,7 @@ impl SandboxPolicy {
             deny_read,
             writable_regex: Vec::new(),
             worktree_writable: true,
+            socket_resolvable: Vec::new(),
             violation_tag: ViolationTag::fresh(),
         }
     }
@@ -244,6 +373,7 @@ impl SandboxPolicy {
             deny_read,
             writable_regex: Vec::new(),
             worktree_writable: false,
+            socket_resolvable: Vec::new(),
             violation_tag: ViolationTag::fresh(),
         }
     }
@@ -276,7 +406,10 @@ impl SandboxPolicy {
             writable_extra,
             deny_read,
             writable_regex: writable_globs.iter().map(|g| glob_to_regex(g)).collect(),
+            // The state dir stands in as the worktree, so it is resolvable:
+            // a daemon's own control socket lives there.
             worktree_writable: true,
+            socket_resolvable: Vec::new(),
             violation_tag: ViolationTag::fresh(),
         }
     }
@@ -341,6 +474,40 @@ impl SandboxPolicy {
             paths.push(self.worktree.clone());
         }
         paths.extend(self.writable_extra.iter().cloned());
+        paths
+    }
+
+    /// Let later spawns of the same job reach socket servers bound beneath
+    /// `dir`, which is the cell's own scratch (its `$TMPDIR`).
+    ///
+    /// Each spawn installs its own landlock domain, so two batches of one job
+    /// are sibling domains and the kernel treats a server one of them started
+    /// as foreign to the other. Naming the job's scratch here is what keeps
+    /// `tmux -S $TMPDIR/t.sock` started in one batch usable from the next.
+    ///
+    /// A shared root is refused rather than trusted to callers: granting
+    /// `/tmp`, `$HOME`, `/run` or Cairn's scratch root would re-open every
+    /// other job's sockets and the predictable host ones (`/tmp/tmux-<uid>`,
+    /// `/tmp/ssh-*`, `/run/user/<uid>/bus`) the boundary exists to close.
+    pub fn allow_job_sockets_in(&mut self, dir: &Path) {
+        if is_shared_socket_root(dir) || self.socket_resolvable.iter().any(|path| path == dir) {
+            return;
+        }
+        self.socket_resolvable.push(dir.to_path_buf());
+    }
+
+    /// Subpaths beneath which a fenced spawn may reach a socket served from
+    /// outside its own sandbox: the worktree (only when
+    /// [`worktree_writable`](Self::worktree_writable)) plus the job's scratch.
+    /// Filtered again here, so a worktree that happens to be a shared root
+    /// never widens the set either.
+    pub fn socket_resolvable_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        if self.worktree_writable {
+            paths.push(self.worktree.clone());
+        }
+        paths.extend(self.socket_resolvable.iter().cloned());
+        paths.retain(|path| !is_shared_socket_root(path));
         paths
     }
 
@@ -439,6 +606,84 @@ pub fn install_pre_exec(cmd: &mut std::process::Command, policy: &SandboxPolicy)
     }
 }
 
+/// Attach `command` to a pseudoterminal as a session leader, the way a resident
+/// PTY spawns: `slave` becomes its stdio and controlling terminal, inherited
+/// signal dispositions reset to default, and every inherited descriptor above
+/// stdio is marked close-on-exec.
+///
+/// It lives beside [`install_pre_exec`] because it is half of the PTY spawn
+/// seam: the executor's terminal spawn and the containment probe for that seam
+/// both call it, then install the confinement, so the probe measures the very
+/// hook order a terminal gets. Call it before [`install_pre_exec`]; hooks run
+/// in registration order, and the confinement must cover the program and
+/// nothing the session setup needs.
+///
+/// Descriptors are marked rather than closed: std's own exec-error pipe is
+/// among them, and closing it would turn a failed exec or a failed
+/// confinement into a spawn that appears to succeed.
+#[cfg(unix)]
+pub fn attach_pty_session(
+    command: &mut std::process::Command,
+    slave: std::fs::File,
+) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    command
+        .stdin(std::process::Stdio::from(slave.try_clone()?))
+        .stdout(std::process::Stdio::from(slave.try_clone()?))
+        .stderr(std::process::Stdio::from(slave));
+    // SAFETY: runs in the forked child before exec and makes only
+    // async-signal-safe calls, apart from the descriptor listing, which reads a
+    // directory exactly as portable-pty's own hook did.
+    unsafe {
+        command.pre_exec(|| {
+            for signal in [
+                libc::SIGCHLD,
+                libc::SIGHUP,
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTERM,
+                libc::SIGALRM,
+            ] {
+                libc::signal(signal, libc::SIG_DFL);
+            }
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Without a controlling terminal the shell gets no SIGWINCH on
+            // resize and no job control.
+            #[allow(clippy::cast_lossless)]
+            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            mark_inherited_descriptors_cloexec();
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn mark_inherited_descriptors_cloexec() {
+    let Ok(entries) = std::fs::read_dir("/dev/fd") else {
+        return;
+    };
+    for fd in entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<libc::c_int>().ok())
+        .filter(|fd| *fd > 2)
+    {
+        // SAFETY: fcntl on a descriptor that has since closed only returns
+        // EBADF.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags != -1 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
 /// What this platform would actually apply to a confined batch spawn, as text
 /// that changes whenever the enforcement does.
 ///
@@ -453,6 +698,7 @@ pub fn enforcement_description() -> Option<String> {
     // shape of rule does this build install", and pinning the paths keeps the
     // digest stable across cells while still moving when the generator does.
     let mut policy = SandboxPolicy::for_run(Path::new("/cairn/containment/probe"), &[], Vec::new());
+    policy.allow_job_sockets_in(Path::new("/cairn/containment/scratch"));
     policy.violation_tag = ViolationTag::canonical();
     #[cfg(target_os = "macos")]
     {
@@ -823,6 +1069,26 @@ fn shell_basename(shell_path: &str) -> String {
         .to_string()
 }
 
+/// Whether granting socket resolution beneath `dir` would reach sockets that
+/// are not the job's own: `dir` is, or contains, a temp root, the home
+/// directory, Cairn's scratch root, or a runtime/device root.
+fn is_shared_socket_root(dir: &Path) -> bool {
+    let mut roots = temp_dirs();
+    roots.extend(home_dir());
+    roots.push(cairn_common::scratch::scratch_root());
+    roots.extend(["/run", "/var/run", "/dev"].map(PathBuf::from));
+    is_shared_socket_root_in(dir, &roots)
+}
+
+fn is_shared_socket_root_in(dir: &Path, roots: &[PathBuf]) -> bool {
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let dir = canonical(dir);
+    !dir.is_absolute()
+        || roots
+            .iter()
+            .any(|root| canonical(root).starts_with(&dir) || root.starts_with(&dir))
+}
+
 fn temp_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![std::env::temp_dir()];
     for p in [
@@ -894,6 +1160,100 @@ pub fn glob_to_regex(glob: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sudoers rule the Mac setup script installs and the runner-isolation
+    /// gate allows, as committed. Read at compile time, so the public mirror
+    /// carries it (`MIRROR_ASSETS` in `scripts/mirror-os.ts`).
+    const COMMITTED_SUDOERS_COMMAND: &str =
+        include_str!("../../../../scripts/lib/fence-violation-stream.sudoers-command");
+
+    #[test]
+    fn committed_violation_stream_sudoers_command_is_the_render() {
+        let rendered = format!("{}\n", violation_stream_sudoers_command());
+        if std::env::var_os("CAIRN_WRITE_SUDOERS_COMMAND").is_some() {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../scripts/lib/fence-violation-stream.sudoers-command");
+            std::fs::write(&path, &rendered).unwrap();
+            return;
+        }
+        assert_eq!(
+            COMMITTED_SUDOERS_COMMAND, rendered,
+            "scripts/lib/fence-violation-stream.sudoers-command is not the render of \
+             cairn_sandbox::violation_stream_argv. Regenerate it with \
+             `CAIRN_WRITE_SUDOERS_COMMAND=1 cargo test -p cairn-sandbox --lib \
+             committed_violation_stream_sudoers_command_is_the_render` (from src-tauri), \
+             commit it, and reinstall the rule on every Mac executor host \
+             (docs/releases.md)"
+        );
+    }
+
+    #[test]
+    fn violation_stream_sudoers_command_matches_the_spawned_argv() {
+        // sudo compares the rule's arguments, unescaped, with argv joined by
+        // single spaces; the program is compared separately, as a path.
+        let argv = violation_stream_argv();
+        assert_eq!(
+            violation_stream_sudoers_command().replace('\\', ""),
+            argv.join(" ")
+        );
+        assert_eq!(argv[0], "/usr/bin/log");
+        assert!(argv[5].contains(ViolationTag::PREFIX));
+    }
+
+    /// An account outside `admin` reaches `log stream` only through the
+    /// operator's rule, which sudo matches byte for byte. So what the fence
+    /// spawns behind `sudo -n` must be exactly the command the committed rule
+    /// names: program by path, arguments joined by single spaces.
+    #[test]
+    fn the_sudo_spawn_runs_exactly_the_command_the_installed_rule_names() {
+        use cairn_common::executor_protocol::ViolationStreamAccess;
+        let spawned = violation_stream_spawn_argv(ViolationStreamAccess::SudoRule);
+        assert_eq!(spawned[..2], VIOLATION_STREAM_SUDO);
+        let command = &spawned[2..];
+        assert_eq!(command, violation_stream_argv());
+        assert_eq!(
+            COMMITTED_SUDOERS_COMMAND.trim_end().replace('\\', ""),
+            command.join(" "),
+            "the sudo spawn and scripts/lib/fence-violation-stream.sudoers-command disagree, so sudo -n would refuse it"
+        );
+        assert_eq!(
+            violation_stream_spawn_argv(ViolationStreamAccess::Admin),
+            violation_stream_argv(),
+            "an admin account runs the pinned command itself"
+        );
+    }
+
+    #[test]
+    fn sudoers_command_escapes_what_sudoers_requires_and_nothing_else() {
+        let argv: Vec<String> = ["/bin/x", "a,b:c=d\\e", "\"quoted\" text"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            sudoers_command(&argv),
+            "/bin/x a\\,b\\:c\\=d\\\\e \"quoted\" text"
+        );
+    }
+
+    #[test]
+    fn sudoers_command_refuses_what_it_cannot_render_literally() {
+        for arg in [
+            "glob*",
+            "one?",
+            "[set]",
+            "#comment",
+            "two  spaces",
+            " lead",
+            "",
+            "tab\there",
+        ] {
+            let argv = vec!["/bin/x".to_string(), arg.to_string()];
+            assert!(
+                std::panic::catch_unwind(|| sudoers_command(&argv)).is_err(),
+                "{arg:?} was rendered"
+            );
+        }
+        assert!(std::panic::catch_unwind(|| sudoers_command(&["log".to_string()])).is_err());
+    }
 
     #[test]
     fn default_denylist_is_external_secrets_only() {
@@ -994,6 +1354,76 @@ mod tests {
                 .count(),
             1,
             "repeated grants must not accumulate duplicates"
+        );
+    }
+
+    #[test]
+    fn the_socket_resolvable_set_is_the_job_scratch_and_a_writable_worktree() {
+        let wt = PathBuf::from("/work/wt");
+        let scratch = PathBuf::from("/cairn/cells/a/scratch");
+        let mut policy = SandboxPolicy::for_run(&wt, &[], vec![]);
+        assert_eq!(policy.socket_resolvable_paths(), vec![wt.clone()]);
+
+        policy.allow_job_sockets_in(&scratch);
+        policy.allow_job_sockets_in(&scratch);
+        assert_eq!(policy.socket_resolvable_paths(), vec![wt, scratch.clone()]);
+
+        // None of the writable carve-outs leaks in: they are shared roots
+        // whose sockets belong to the host and to other jobs.
+        let resolvable = policy.socket_resolvable_paths();
+        for extra in &policy.writable_extra {
+            assert!(!resolvable.contains(extra), "{}", extra.display());
+        }
+
+        // A read-only checkout is not a place the job can bind a server.
+        let mut readonly = SandboxPolicy::for_readonly_checkout(Path::new("/live"), &[], vec![]);
+        readonly.allow_job_sockets_in(&scratch);
+        assert_eq!(readonly.socket_resolvable_paths(), vec![scratch]);
+    }
+
+    #[test]
+    fn a_shared_root_never_becomes_socket_resolvable() {
+        let roots = [
+            PathBuf::from("/tmp"),
+            PathBuf::from("/home/tester"),
+            PathBuf::from("/home/tester/.cairn/scratch"),
+            PathBuf::from("/run"),
+        ];
+        for shared in [
+            "/tmp",
+            "/",
+            "/home",
+            "/home/tester",
+            "/home/tester/.cairn",
+            "/home/tester/.cairn/scratch",
+            "/run",
+            "relative/dir",
+        ] {
+            assert!(
+                is_shared_socket_root_in(Path::new(shared), &roots),
+                "{shared} must be refused"
+            );
+        }
+        // A directory beneath a shared root is the job's own: a cell scratch
+        // under the scratch root, or a test's tempdir under /tmp.
+        for own in [
+            "/home/tester/.cairn/scratch/job-1",
+            "/tmp/cell-abc",
+            "/home/tester/.cairn-exec/build-slots/x/.authority/slot-1/scratch",
+        ] {
+            assert!(
+                !is_shared_socket_root_in(Path::new(own), &roots),
+                "{own} is a job directory"
+            );
+        }
+
+        // And the live entry point refuses the real temp root.
+        let mut policy = SandboxPolicy::for_run(Path::new("/work/wt"), &[], vec![]);
+        policy.allow_job_sockets_in(&std::env::temp_dir());
+        policy.allow_job_sockets_in(&cairn_common::scratch::scratch_root());
+        assert_eq!(
+            policy.socket_resolvable_paths(),
+            vec![PathBuf::from("/work/wt")]
         );
     }
 

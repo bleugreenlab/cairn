@@ -168,6 +168,7 @@ fn profile_records(
         served_name,
         upstream_id: profile.catalog_id.clone(),
         verbs: None,
+        modalities: None,
         engine: Engine::Command {
             start: start.to_string(),
             stop: profile.stop.clone(),

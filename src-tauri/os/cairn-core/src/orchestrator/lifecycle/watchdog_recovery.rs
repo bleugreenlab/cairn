@@ -13,9 +13,7 @@ use crate::runs::watchdog_ledger::{
 };
 use crate::storage::{run_db_blocking, LocalDb, RowExt};
 
-use super::{
-    kill_session_with_reason, report_recovery_launch_failure, PROVIDER_SILENCE_RECOVERY_EXIT_REASON,
-};
+use super::{kill_session_with_reason, PROVIDER_SILENCE_RECOVERY_EXIT_REASON};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderWatchdogRecovery {
@@ -531,7 +529,6 @@ pub fn recover_provider_watchdog(
         match reserve_recovery_successor(db.clone(), identity, &target.job_id, now) {
             SuccessorReservation::Reserved => {}
             SuccessorReservation::BudgetExhausted => {
-                report_recovery_launch_failure(orch, &identity.run_id);
                 finish_recovery(
                     db,
                     identity,
@@ -726,7 +723,6 @@ pub fn recover_provider_watchdog(
     let successor_launch = match successor_launch {
         Ok(launch) => launch,
         Err(error) => {
-            report_recovery_launch_failure(orch, &identity.run_id);
             record_lifecycle(
                 db.clone(),
                 identity,
@@ -1037,7 +1033,6 @@ pub(crate) fn sweep_stranded_watchdog_jobs(orch: &Orchestrator) -> usize {
         }
         let reservation = reserve_recovery_successor(db.clone(), &identity, &job_id, now);
         if reservation != SuccessorReservation::Reserved {
-            report_recovery_launch_failure(orch, &identity.run_id);
             let (reason, details) = match reservation {
                 SuccessorReservation::BudgetExhausted => (
                     "stranded_recovery_budget_exhausted",
@@ -1097,7 +1092,6 @@ pub(crate) fn sweep_stranded_watchdog_jobs(orch: &Orchestrator) -> usize {
                 }
             }
             Err(error) => {
-                report_recovery_launch_failure(orch, &identity.run_id);
                 record_lifecycle(
                     db.clone(),
                     &identity,

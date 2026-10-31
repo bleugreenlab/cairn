@@ -1518,7 +1518,7 @@ mod tests {
 
     fn git_init(path: &std::path::Path) {
         assert!(crate::env::git()
-            .args(["init", "-q"])
+            .args(["init", "-b", "main", "-q"])
             .current_dir(path)
             .status()
             .unwrap()
@@ -1527,7 +1527,7 @@ mod tests {
 
     fn git_bare(path: &std::path::Path) {
         assert!(crate::env::git()
-            .args(["init", "--bare", "-q"])
+            .args(["init", "-b", "main", "--bare", "-q"])
             .current_dir(path)
             .status()
             .unwrap()
@@ -2318,6 +2318,14 @@ buildServices:
                 url: "http://ctl.example:4100".into(),
                 machines: [("halo".to_string(), "fedora".to_string())].into(),
             }),
+            recipes: [(
+                "dsv4f-tp2".to_string(),
+                crate::inference::RecipeDeclaration {
+                    verbs: Some([cairn_models_types::catalog::VerbKind::Session].into()),
+                    ..Default::default()
+                },
+            )]
+            .into(),
         };
         set_inference(dir.path(), &link).unwrap();
         save_settings(dir.path(), &test_settings()).unwrap();
@@ -2325,7 +2333,12 @@ buildServices:
 
         set_inference(dir.path(), &crate::inference::InferenceSettings::default()).unwrap();
         let text = std::fs::read_to_string(get_settings_path(dir.path())).unwrap();
-        assert!(!text.contains("inference"), "{text}");
+        // The section is gone; `inference` the provider key may still be
+        // listed among the installed providers.
+        assert!(
+            !text.lines().any(|line| line.starts_with("inference:")),
+            "{text}"
+        );
         assert!(set_inference(
             dir.path(),
             &crate::inference::InferenceSettings {
@@ -2333,6 +2346,7 @@ buildServices:
                     url: "ctl.example".into(),
                     machines: Default::default(),
                 }),
+                recipes: Default::default(),
             }
         )
         .is_err());

@@ -20,13 +20,30 @@
 /// guard against a race is not a reason to keep the race.
 pub const WRITE_STORE_LOCK_WAIT_MS: u64 = 600_000;
 
-/// How long a committing `write` or `run` waits inline for the when:write
+/// The longest a committing `write` or `run` waits inline for the when:write
 /// checks of the commit it just sealed before answering with the checks marked
-/// pending.
+/// pending. It is the ceiling for a wave that is running: one whose lane an
+/// executor has claimed. A wave nothing has claimed answers pending sooner, at
+/// [`WRITE_CHECK_START_WAIT_MS`].
 ///
 /// The commit is the call's result; the checks are commentary on it. A wave
 /// that runs past this keeps running in the background and lands its verdicts
 /// at `cairn:~/checks`. Without this bound a hung or slow wave held the result
 /// open until the callback socket gave up, and the agent saw a transport
-/// failure for a write that had already committed.
+/// failure for a write that had already committed. The callback socket is
+/// sized from this ceiling, so it must not shrink below any wait the host can
+/// actually make.
 pub const WRITE_CHECK_INLINE_WAIT_MS: u64 = 120_000;
+
+/// How long a committing call waits for any lane of its write-check wave to be
+/// admitted (claimed by an executor) before it answers with the checks pending.
+///
+/// A lane no machine has claimed is not about to produce a verdict: on a host
+/// whose admission brake holds non-interactive work, nothing claims it at all,
+/// and waiting the full [`WRITE_CHECK_INLINE_WAIT_MS`] for it bought nothing.
+/// The unloaded path from the call to a claim (planning, slot resolution, ref
+/// publication, queueing) takes a few seconds, so this leaves generous
+/// headroom. Never longer than the inline wait, which stays the ceiling.
+pub const WRITE_CHECK_START_WAIT_MS: u64 = 15_000;
+
+const _: () = assert!(WRITE_CHECK_START_WAIT_MS <= WRITE_CHECK_INLINE_WAIT_MS);

@@ -74,7 +74,6 @@ mod tests {
         RunItem {
             command: Some(command.to_string()),
             description: None,
-            procedure_args: Vec::new(),
             timeout: None,
             target: None,
             payload: None,
@@ -90,7 +89,6 @@ mod tests {
         RunItem {
             command: None,
             description: None,
-            procedure_args: Vec::new(),
             timeout: None,
             target: None,
             payload: None,
@@ -106,7 +104,6 @@ mod tests {
         RunItem {
             command: None,
             description: None,
-            procedure_args: Vec::new(),
             timeout: None,
             target: Some(target.to_string()),
             payload: None,

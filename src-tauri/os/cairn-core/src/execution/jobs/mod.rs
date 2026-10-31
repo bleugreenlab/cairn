@@ -334,9 +334,11 @@ pub struct CreateChildTaskInput {
 /// through this seam before they reach the backend. Admission promotion can
 /// therefore fence and recheck one operation instead of wrapping individual
 /// backend call sites. Keeping the prepared launch claim borrowed here also
-/// guarantees it spans process registration on the direct path.
+/// guarantees it spans process registration on the direct path. It is private
+/// to `jobs` because its callers are the readiness-gated funnel: a new caller
+/// outside this module would spawn inside startup recovery's window.
 #[allow(clippy::too_many_arguments)]
-pub fn start_ordinary_session(
+fn start_ordinary_session(
     orch: &Orchestrator,
     run_id: &str,
     prompt: &str,

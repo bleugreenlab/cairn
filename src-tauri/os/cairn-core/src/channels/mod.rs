@@ -1083,7 +1083,7 @@ async fn spawn_imessage(
                 id: "channel-imessage",
                 label: "iMessage channel",
             },
-            name,
+            crate::fleet::service_placement::named_executor(name),
             ResidencyFootprint {
                 memory_bytes: 64 * 1024 * 1024,
                 disk_growth_bytes: 64 * 1024 * 1024,

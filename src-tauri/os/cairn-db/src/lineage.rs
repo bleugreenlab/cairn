@@ -122,11 +122,13 @@ pub async fn home_uri_for_job_conn(
                 "SELECT p.key, i.number, COALESCE(e.seq, 1), j.uri_segment,
                         parent.uri_segment, j.agent_config_id, t.name,
                         (j.thread_id IS NOT NULL AND {session}) AS is_thread_session,
-                        tb.number AS thread_branch_number
+                        tb.number AS thread_branch_number,
+                        j.service_thread_id, st.name AS service_thread_name
                  FROM jobs j
                  LEFT JOIN issues i ON i.id = j.issue_id
                  LEFT JOIN jobs parent ON j.parent_job_id = parent.id
                  LEFT JOIN threads t ON t.id = COALESCE(j.thread_id, parent.thread_id)
+                 LEFT JOIN threads st ON st.id = j.service_thread_id
                  LEFT JOIN thread_branches tb ON tb.job_id = j.id
                  JOIN projects p ON p.id = COALESCE(i.project_id, j.project_id)
                  LEFT JOIN executions e ON e.id = j.execution_id
@@ -141,6 +143,22 @@ pub async fn home_uri_for_job_conn(
     };
     let key = row.text(0)?;
     let segment = row.opt_text(3)?;
+    // A service's job: no issue, thread, or parent; its segment is the service
+    // id. A thread's service names its owner in `service_thread_id`, and a
+    // thread that is gone leaves it with no home rather than a project one.
+    if row.opt_text(5)?.as_deref() == Some("service") {
+        return Ok(match row.opt_text(9)? {
+            None => {
+                segment.map(|service| cairn_common::uri::build_project_service_uri(&key, &service))
+            }
+            Some(_) => match (row.opt_text(10)?, segment) {
+                (Some(thread), Some(service)) => Some(cairn_common::uri::build_thread_service_uri(
+                    &key, &thread, &service,
+                )),
+                _ => None,
+            },
+        });
+    }
     // Only a thread's session job is the thread address itself; everything else
     // under it hangs beneath. A task reaches its thread through its parent, and
     // the pre-cutover jobs migration 0157 re-pointed carry the thread's id

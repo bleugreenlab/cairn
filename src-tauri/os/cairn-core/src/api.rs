@@ -22,6 +22,11 @@ impl Default for ApiConfig {
 }
 
 impl ApiConfig {
+    /// The relay every install's channel lives on.
+    pub fn relay_url(&self) -> String {
+        format!("{}/relay", self.base_url.trim_end_matches('/'))
+    }
+
     /// Runner registration endpoint (member-authenticated).
     pub fn runner_registration_url(&self) -> String {
         format!("{}/runners/register", self.base_url.trim_end_matches('/'))
@@ -164,6 +169,7 @@ mod tests {
             config.push_notify_url(),
             "https://api.cairn.computer/push/notify"
         );
+        assert_eq!(config.relay_url(), "https://api.cairn.computer/relay");
     }
 
     #[test]

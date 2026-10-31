@@ -223,7 +223,7 @@ async fn checks_alias_mute_and_unmute_use_the_canonical_condition_source() {
     let (issue_id, number) = seed_issue(&orch).await;
     orch.db
         .local
-        .execute_script(&format!(
+        .execute_script(format!(
             "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
                SELECT 'exec-checks','recipe',id,project_id,'running',1,1 FROM issues WHERE id='{issue_id}';
              INSERT INTO jobs(id, execution_id, project_id, issue_id, status, uri_segment, node_name, branch, created_at, updated_at)
@@ -332,12 +332,14 @@ async fn seed_issue(orch: &Orchestrator) -> (String, i32) {
 
 fn request() -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: None,
         tool: "change".to_string(),
         payload: serde_json::json!({}),
         tool_use_id: None,
+        origin: None,
     }
 }
 
@@ -578,12 +580,14 @@ async fn apply_as_run(
     run_id: &str,
 ) -> ResourceMutationResult<String> {
     let req = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: Some(run_id.to_string()),
         tool: "change".to_string(),
         payload: serde_json::json!({}),
         tool_use_id: None,
+        origin: None,
     };
     dispatch_resource_change(orch, &req, 0, item, false)
         .await
@@ -2602,6 +2606,7 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::NodeProgress => "cairn://p/cairn/1/1/builder/progress",
         K::NodeRebase => "cairn://p/cairn/1/1/builder/rebase",
         K::NodeArtifact => "cairn://p/cairn/1/1/builder/plan",
+        K::NodePage => "cairn://p/cairn/1/1/builder/pages/board",
         K::NodeTerminal => "cairn://p/cairn/1/1/builder/terminal/dev",
         K::NodeRepl => "cairn://p/cairn/1/1/builder/repl/analysis",
         K::TaskTerminal => "cairn://p/cairn/1/1/builder/task/sub/terminal/dev",
@@ -2654,11 +2659,15 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::ProjectResponse => "cairn://p/cairn/responses/summarize",
         K::Grant => "cairn://grants/grant-1",
         K::ModelsSession => "cairn://models/sessions/session-1",
+        K::InferenceDeployment => "cairn://inference/deployments/dsv4f-tp2",
         K::ModelsAccounts => "cairn://models/accounts",
         K::ModelsAccount => "cairn://models/accounts/acc_1",
+        K::InferencePools => "cairn://inference/pools",
+        K::InferenceRequests => "cairn://inference/requests",
         K::ProjectAttachment => "cairn://p/cairn/4647/attachments/1",
         K::ProjectEventEndpoints => "cairn://p/cairn/events/endpoints",
         K::ProjectEventEndpoint => "cairn://p/cairn/events/endpoints/bugs",
+        K::ProjectService => "cairn://p/cairn/services/echo",
         // Pre-existing gaps, filled here because they sit between this test and
         // the arm above: the parity check panics on the first unsampled kind and
         // never reaches any later one, so the whole tail of the table —
@@ -2667,10 +2676,9 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::ThreadBranch => "cairn://p/cairn/harness/branches/1",
         K::ThreadDb => "cairn://p/cairn/harness/db",
         K::ThreadDbSchema => "cairn://p/cairn/harness/db/schema",
-        K::ThreadProcedures => "cairn://p/cairn/harness/procedures",
-        K::ThreadProcedure => "cairn://p/cairn/harness/procedures/triage",
-        K::ThreadAutomations => "cairn://p/cairn/harness/automations",
-        K::ThreadAutomation => "cairn://p/cairn/harness/automations/nightly",
+        K::ThreadDbTable => "cairn://p/cairn/harness/db/attempts",
+        K::ThreadDbRow => "cairn://p/cairn/harness/db/attempts/1",
+        K::ThreadService => "cairn://p/cairn/harness/services/tutor",
         other => {
             panic!("sample_resource: {other:?} carries a mutation but has no sample URI; add one")
         }
@@ -3427,12 +3435,14 @@ async fn seed_post(
 /// carries none at all, which is what an operator's own read looks like.
 async fn read_as(orch: &Orchestrator, run_id: Option<&str>, uri: &str) -> String {
     let request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: run_id.map(str::to_string),
         tool: "read".to_string(),
         payload: serde_json::json!({}),
         tool_use_id: None,
+        origin: None,
     };
     crate::resources::read_cairn_resource(orch, &request, uri).await
 }
@@ -3747,7 +3757,7 @@ async fn a_thread_proposes_and_withdraws_tenets_but_never_answers_or_edits_them(
     ] {
         for payload in [
             serde_json::json!({"tenetRelease": "answered"}),
-            serde_json::json!({"tenet_gated_recipes": []}),
+            serde_json::json!({"tenet_release": "answered"}),
         ] {
             let refusal = apply(&orch, &tenet_item(target, mode, payload))
                 .await

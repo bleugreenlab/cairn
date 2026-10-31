@@ -545,6 +545,79 @@ mod tests {
             .collect()
     }
 
+    /// cairn-inference's served `/v1/models` is the listing shape this decoder
+    /// reads, so a provider pointed at it describes every model, aliases
+    /// included, exactly as the served list does.
+    #[test]
+    fn a_cairn_inference_listing_decodes_as_its_served_list_describes_it() {
+        use cairn_inference::served::{listing, served_models};
+        use cairn_inference::{EngineMeasure, Inventory};
+        let inventory = Inventory::from_yaml(
+            r#"
+ recipes:
+   - id: dsv4f-tp2
+     source: bginf
+     model: {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
+     servedName: deepseek-v4-flash-vision-exp
+     modalities: {input: [text, image], output: [text]}
+     engine: {kind: command, start: ./start.sh}
+     requirements: {machines: 1}
+     aliases: [dsv4-flash]
+   - id: qwen3-embed-4b
+     source: bginf
+     model: {name: qwen/qwen3-embedding-4b}
+     servedName: qwen3-embedding-4b
+     verbs: [embed]
+     engine: {kind: command, start: ./start.sh}
+     requirements: {machines: 1}
+     aliases: [embed]
+ deployments:
+   - {id: dsv4f-tp2, source: bginf, recipe: dsv4f-tp2, machines: [sp1], head: sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
+   - {id: qwen3-embed-4b, source: bginf, recipe: qwen3-embed-4b, machines: [halo], head: halo, apiPort: 8090, apiPath: /v1, healthPath: /health}
+ pools: []
+ "#,
+        )
+        .unwrap();
+        let measures = std::collections::BTreeMap::from([(
+            "dsv4f-tp2".into(),
+            EngineMeasure {
+                max_model_len: Some(1_048_576),
+                kv_cache_tokens: Some(681_280),
+            },
+        )]);
+        let served = served_models(&inventory, &measures);
+        assert_eq!(served.len(), 4);
+        let config = undeclared();
+        let decoded = discovered_from(&config, &listing(&served).to_string());
+        for model in &served {
+            let entry = find(&decoded, &model.id);
+            assert_eq!(
+                entry.modalities.as_ref(),
+                Some(&model.modalities),
+                "{}",
+                model.id
+            );
+            assert_eq!(
+                entry.context_window,
+                model.context_length.map(|tokens| tokens as i64),
+                "{}",
+                model.id
+            );
+        }
+        // The clamp reaches the reader: the cache, not the engine's limit.
+        assert_eq!(find(&decoded, "dsv4-flash").context_window, Some(681_280));
+        for chat in ["deepseek-v4-flash-vision-exp", "dsv4-flash"] {
+            assert_eq!(find(&decoded, chat).serves, None, "{chat}");
+        }
+        for embedder in ["qwen3-embedding-4b", "embed"] {
+            assert_eq!(
+                offered(&config, find(&decoded, embedder)),
+                [VerbKind::Embed],
+                "{embedder}"
+            );
+        }
+    }
+
     #[test]
     fn an_entry_that_outputs_embeddings_serves_only_embed() {
         let config = undeclared();

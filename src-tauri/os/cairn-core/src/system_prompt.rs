@@ -163,6 +163,10 @@ spans resources rather than belonging to any single one:
   preview-shaped the same way. Apply is same-run only and rejects stale targets.
 - Terminals are long-lived resources: `create` starts one, `append` sends input,
   `delete` stops it (see the terminal entries in the mutation matrix).
+- Services are project-declared supervised processes at
+  `cairn://p/PROJECT/services/<name>`, with `/status` and `/log` beneath each:
+  `patch {action}` starts, stops, or restarts one, and `append {method, params}`
+  calls it and returns the result in the change report.
 - Appending to your node's `cairn:~/tasks` spawns sub-agents; appending to
   `cairn:~/questions` asks the user. Both block until results return and then
   resume your turn, and multiple task appends in one call run in parallel.

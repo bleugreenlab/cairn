@@ -1293,12 +1293,14 @@ mod tests {
 
     async fn read_terminal(orch: &Orchestrator, uri: &str) -> TerminalReadResult {
         let request = McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: "/tmp".to_string(),
             run_id: None,
             tool: "read_resource".to_string(),
             payload: serde_json::json!({ "uri": uri }),
             tool_use_id: None,
+            origin: None,
         };
         let cursors = StdMutex::new(HashMap::new());
         let raw = handle_read_resource(orch, &request, &cursors).await;

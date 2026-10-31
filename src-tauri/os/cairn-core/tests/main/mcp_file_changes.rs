@@ -545,12 +545,14 @@ fn make_request_as_run(
     run_id: Option<&str>,
 ) -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: cwd.to_string(),
         run_id: run_id.map(str::to_string),
         tool: "write".to_string(),
         payload,
         tool_use_id: None,
+        origin: None,
     }
 }
 
@@ -774,12 +776,14 @@ async fn a_live_run_whose_own_branch_is_removed_gets_a_typed_refusal_on_read_and
 
 fn make_read_request(cwd: &str, path: &str) -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: cwd.to_string(),
         run_id: Some("run-change".to_string()),
         tool: "read".to_string(),
         payload: json!({ "path": path }),
         tool_use_id: None,
+        origin: None,
     }
 }
 
@@ -841,7 +845,7 @@ async fn count_rows(db: &LocalDb, sql: &'static str) -> i64 {
 
 fn init_git_repo(path: &std::path::Path) {
     for args in [
-        vec!["init"],
+        vec!["init", "-b", "main"],
         vec!["config", "user.email", "test@example.com"],
         vec!["config", "user.name", "Test User"],
         vec!["commit", "--allow-empty", "-m", "initial"],
@@ -929,12 +933,14 @@ async fn seed_change_run(
 
 fn make_preview_request(cwd: &str, payload: serde_json::Value) -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: cwd.to_string(),
         run_id: Some("run-preview".to_string()),
         tool: "write".to_string(),
         payload,
         tool_use_id: Some("toolu-preview".to_string()),
+        origin: None,
     }
 }
 
@@ -980,7 +986,7 @@ impl ChangeTestRepo {
         init_git_repo(project.path());
         let origin = tempfile::tempdir().unwrap();
         let output = std::process::Command::new("git")
-            .args(["init", "--bare"])
+            .args(["init", "-b", "main", "--bare"])
             .current_dir(origin.path())
             .output()
             .unwrap();
@@ -1261,6 +1267,98 @@ async fn a_thread_cannot_commit_a_tracked_file_and_an_ordinary_issue_still_can()
         "after\n",
         "the refusal must be taken before the mutation applies: {refusal}"
     );
+}
+
+/// A batch with file edits holds the store lock for its logical transaction and
+/// dispatches its resource items inside that hold. Both `cairn:~/rebase` actions
+/// take the same lock inline, so dispatched there they waited on their own
+/// batch until the callback socket gave up (cairn/5509). The batch is refused
+/// before any lock is taken. The test holds the lock itself, so a batch that
+/// reached any acquisition would wait instead of answering.
+#[tokio::test]
+async fn a_file_batch_with_a_rebase_item_is_refused_before_taking_the_store_lock() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("rebase-batch.txt", "before\n");
+    repo.seal_base("seed rebase batch specimen");
+    let store = jj::project_store_dir(repo.config.path(), repo.project.path());
+    let held = repo.orch.hold_jj_store_lock_for_test(&store).await;
+
+    for (target, action) in [
+        ("cairn:~/rebase", "replay"),
+        (
+            "cairn://p/chg/1/1/builder/rebase",
+            "fast-forward-from-origin",
+        ),
+    ] {
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            repo.change_report(json!({
+                "changes": [
+                    {
+                        "target": "file:rebase-batch.txt",
+                        "mode": "patch",
+                        "payload": { "old_string": "before", "new_string": "after" }
+                    },
+                    { "target": target, "mode": "patch", "payload": { "action": action } }
+                ],
+                "commit_msg": "edit and rebase in one batch"
+            })),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{action}: the batch waited on the store lock"));
+
+        assert_eq!(
+            report["applied"].as_array().map(Vec::len),
+            Some(0),
+            "{action}: {report:?}"
+        );
+        assert_eq!(failure_count(&report), 1, "{action}: {report:?}");
+        assert_eq!(report["failures"][0]["index"], 1, "{action}: {report:?}");
+        let error = report["failures"][0]["error"].as_str().unwrap();
+        assert!(
+            error.contains("Refusing cairn:~/rebase in a batch with file edits")
+                && error.contains("as its own write"),
+            "{action}: the refusal must name the rule and the remedy: {error}"
+        );
+    }
+    assert!(
+        repo.orch.jj_store_lock_waiters_for_test(&store).is_empty(),
+        "a refused batch must leave nothing queued on the store lock"
+    );
+    drop(held);
+    assert_eq!(repo.read("rebase-batch.txt"), "before\n");
+}
+
+/// The store lock is not reentrant. A task that asks for it while holding it
+/// would otherwise queue behind itself forever; it must fail at once instead,
+/// and its unwind must release the lock for everyone else.
+#[tokio::test]
+async fn a_task_re_acquiring_the_store_lock_it_holds_fails_fast_and_releases_it() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let store = jj::project_store_dir(repo.config.path(), repo.project.path());
+    let orch = repo.orch.clone();
+    let task_store = store.clone();
+    let reentrant = tokio::spawn(async move {
+        let _outer = orch.hold_jj_store_lock_for_test(&task_store).await;
+        let _inner = orch.hold_jj_store_lock_for_test(&task_store).await;
+    });
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), reentrant)
+        .await
+        .expect("a same-task re-acquire must not wait on its own guard");
+    assert!(outcome.unwrap_err().is_panic());
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        repo.orch.hold_jj_store_lock_for_test(&store),
+    )
+    .await
+    .expect("the panicking task's guard must have been released");
 }
 
 /// The refusal is keyed on the `commit_msg`, which is the whole surface a

@@ -86,6 +86,7 @@ async fn seed_run(db: &LocalDb, started_at: Option<i64>, created_at: i64, status
 /// issue. Dispatched, it leaves a row; fenced, it must leave nothing.
 fn commenting_write(run_id: &str) -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: Some(run_id.to_string()),
@@ -98,6 +99,7 @@ fn commenting_write(run_id: &str) -> McpCallbackRequest {
             }]
         }),
         tool_use_id: None,
+        origin: None,
     }
 }
 
@@ -271,12 +273,14 @@ async fn a_request_without_a_run_id_is_not_fenced() {
 async fn reads_are_fenced_too() {
     let (_temp, _db, orch) = fixture(Some(BOOT_AT - 45), BOOT_AT - 60, "live").await;
     let request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: Some(RUN_ID.to_string()),
         tool: "read".to_string(),
         payload: serde_json::json!({ "path": "file:/etc/hostname" }),
         tool_use_id: None,
+        origin: None,
     };
 
     assert_refused(&dispatch(&orch, &request).await);

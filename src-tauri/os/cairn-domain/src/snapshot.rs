@@ -29,7 +29,13 @@ pub struct DelegatedSessionStrategy {
     pub mode: DelegatedSessionMode,
 }
 
-/// Durable record of a delegated task lowered into the execution snapshot.
+/// Durable record of one delegated task or call.
+///
+/// Stored as a row of the `delegated_packets` table, keyed by execution and
+/// packet id, so a status change rewrites one small row rather than the
+/// execution snapshot (cairn/5597). Packets written by earlier builds still sit
+/// in the snapshot's [`ExecutionSnapshot::inline_delegated_packets`] until the
+/// backfill moves them.
 // No `Eq`: `output_contract` can carry an inline custom JSON Schema
 // (`serde_json::Value`), which is `PartialEq` but not `Eq`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -43,7 +49,17 @@ pub struct DelegatedWorkPacket {
     pub parent_tool_use_id: Option<String>,
     pub origin: DelegationOrigin,
     pub title: String,
-    pub problem_statement: String,
+    /// The task's prompt, held only while the packet is `Pending`. Expansion
+    /// copies it into the context node it creates, and a call's prompt goes
+    /// straight to the call's own launch, so no later state needs it here.
+    /// Packets written before the table existed carry it in every state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem_statement: Option<String>,
+    /// SHA-256 of the prompt, hex: what a retried spawn is matched against once
+    /// the prompt itself is gone. Absent on packets written before it existed,
+    /// which still carry the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_digest: Option<String>,
     pub agent_config_id: String,
     pub ownership: DelegatedOwnershipScope,
     #[serde(default)]
@@ -353,9 +369,18 @@ pub struct ExecutionSnapshot {
     /// Never serialized; no runtime path reads it.
     #[serde(default, skip_serializing)]
     pub presets: Option<SnapshotPresets>,
-    /// Durable task delegations awaiting or resulting from materialization into the DAG
-    #[serde(default)]
-    pub delegated_packets: Vec<DelegatedWorkPacket>,
+    /// Delegated packets as builds before the `delegated_packets` table wrote
+    /// them: inline, where every status change rewrote the whole snapshot
+    /// (cairn/5597). Read-only. Nothing appends here; the packet store reads
+    /// these through until the backfill moves them into the table and strips
+    /// the key. The field stays typed so a whole-snapshot rewrite keeps them and
+    /// a move into a team re-keys them.
+    #[serde(
+        rename = "delegatedPackets",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub inline_delegated_packets: Vec<DelegatedWorkPacket>,
     /// Which branch target this execution actually ran under. The graph above is
     /// already transformed to match; this records the choice for display and
     /// debugging. Pre-existing snapshots deserialize as `New`.
@@ -469,7 +494,7 @@ impl ExecutionSnapshot {
             skills,
             trigger_context,
             presets: None,
-            delegated_packets: Vec::new(),
+            inline_delegated_packets: Vec::new(),
             branch_target: BranchTarget::default(),
             continuity: Continuity::default(),
             model_routing: None,
@@ -493,7 +518,7 @@ impl ExecutionSnapshot {
             *issue_id = cairn_common::ids::rekey_to_team(issue_id, team_id)
                 .map_err(|e| format!("re-keying snapshot issue_id: {e}"))?;
         }
-        for packet in &mut self.delegated_packets {
+        for packet in &mut self.inline_delegated_packets {
             packet.id = cairn_common::ids::rekey_to_team(&packet.id, team_id)
                 .map_err(|e| format!("re-keying delegated packet id: {e}"))?;
             packet.parent_job_id = cairn_common::ids::rekey_to_team(&packet.parent_job_id, team_id)
@@ -574,14 +599,15 @@ mod tests {
                 initiated_via: None,
             },
             presets: None,
-            delegated_packets: vec![DelegatedWorkPacket {
+            inline_delegated_packets: vec![DelegatedWorkPacket {
                 id: "pkt-1".to_string(),
                 parent_job_id: "job-1".to_string(),
                 parent_turn_id: Some("turn-1".to_string()),
                 parent_tool_use_id: Some("tool-1".to_string()),
                 origin: DelegationOrigin::TaskTool,
                 title: "Explore".to_string(),
-                problem_statement: "Investigate the bug".to_string(),
+                problem_statement: Some("Investigate the bug".to_string()),
+                prompt_digest: None,
                 agent_config_id: "explore".to_string(),
                 ownership: DelegatedOwnershipScope {
                     cwd: "/tmp/test".to_string(),
@@ -615,9 +641,9 @@ mod tests {
         assert_eq!(restored.agents.len(), 1);
         assert_eq!(restored.skills.len(), 1);
         assert_eq!(restored.trigger_context.project_id, "project-1");
-        assert_eq!(restored.delegated_packets.len(), 1);
+        assert_eq!(restored.inline_delegated_packets.len(), 1);
         assert_eq!(
-            restored.delegated_packets[0]
+            restored.inline_delegated_packets[0]
                 .output_contract
                 .artifact_name(),
             "return"
@@ -880,7 +906,11 @@ mod tests {
         }"#;
 
         let restored: ExecutionSnapshot = serde_json::from_str(json).unwrap();
-        assert!(restored.delegated_packets.is_empty());
+        assert!(restored.inline_delegated_packets.is_empty());
+        // A snapshot with no inline packets writes no key for them at all.
+        assert!(!serde_json::to_string(&restored)
+            .unwrap()
+            .contains("delegatedPackets"));
         // Every snapshot written before the branch target existed ran under the
         // only behaviour there was: mint a branch and ship a PR.
         assert_eq!(restored.branch_target, BranchTarget::New);

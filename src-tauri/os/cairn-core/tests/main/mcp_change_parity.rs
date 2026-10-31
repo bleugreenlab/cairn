@@ -85,12 +85,14 @@ async fn table_and_dispatch_match_for_every_kind_and_mode() {
                 item["payload"] = payload_for(spec);
             }
             let request = McpCallbackRequest {
+                answer_bound_ms: None,
                 thread_id: None,
                 cwd: cwd.clone(),
                 run_id: None,
                 tool: "write".to_string(),
                 payload: json!({ "preview": true, "changes": [item] }),
                 tool_use_id: None,
+                origin: None,
             };
             let result = handle_write(&orch, &request).await;
             let context = format!("{uri} mode={}", mode.as_str());

@@ -15,7 +15,8 @@
 //!   [`RELAY_HOP_MARGIN`].
 //! - **The executor's in-cell MCP relay** (`McpRelay` in cairn-exec) uses
 //!   [`relay_timeout`]: the host's answer bound for that verb
-//!   ([`host_answer_bound`]) plus [`CALLBACK_TIMEOUT_MARGIN`].
+//!   ([`host_answer_bound`]), or a longer bound a `run` sender stated, plus
+//!   [`CALLBACK_TIMEOUT_MARGIN`].
 //! - **The fence round trip** (`RunnerCallback::SandboxDenied`, sent by
 //!   cairn-exec and awaited by the runner's permission wait) uses
 //!   [`runner_callback_timeout`]: [`RELAYED_FENCE_WAIT_BUDGET`] plus
@@ -31,13 +32,38 @@
 //! suspends and answers with a marker, so the wait it exposes to its callers
 //! never exceeds the budget.
 //!
+//! ## A `run` call answers in its turn
+//!
+//! A `run` call stays open for its declared item timeouts and answers in the
+//! same turn. Its work window is the grace window, or the batch's
+//! [`declared_need`](crate::run_contract::declared_need) when every item
+//! declared a timeout and that is longer, capped at the batch ceiling. Parking
+//! (durably suspending the turn and answering with a marker) is the fallback,
+//! used only when the work outlives that window: an undeclared batch past
+//! grace, a declared one past its need, or a host that cannot hold the call.
+//! Whatever window applies, the host answers before the socket closes: it
+//! keeps [`ANSWER_RESERVE`] after the work window to park the call and send
+//! the reply, so its answer bound is the work window plus that reserve.
+//!
+//! The sender states how long it listens in
+//! [`CallbackRequest::answer_bound_ms`], and the host answers within
+//! [`effective_answer_bound`]. `cairn-cmd` states the host's own bound, which
+//! its socket was sized from. The SDK states its own timeout, or that it
+//! listens as long as the host takes; it has no tool call to park on, so a
+//! long batch it runs is waited for rather than parked. A request without the
+//! field (an older client, or one relayed by an older executor that dropped
+//! it) gets [`LEGACY_RUN_ANSWER_BOUND`], which fits inside every bound such a
+//! sender ever applied.
+//!
 //! The ordering is enforced at compile time by the `const` assertions below
 //! and again, per request shape, by this module's tests.
 use std::time::Duration;
 
 use crate::executor_protocol::RunnerCallback;
 use crate::protocol::CallbackRequest;
-use crate::run_contract::RUN_GRACE_WINDOW_MS;
+use crate::run_contract::{
+    declared_need_of_payload, is_control_flow_batch, RUN_BATCH_CEILING_MS, RUN_GRACE_WINDOW_MS,
+};
 use crate::uri::{parse_uri, CairnResource};
 use crate::write_contract::{WRITE_CHECK_INLINE_WAIT_MS, WRITE_STORE_LOCK_WAIT_MS};
 
@@ -96,9 +122,34 @@ const LEGACY_HANDOFF_MARGIN: Duration = Duration::from_secs(5);
 pub const FENCE_CALLBACK_TIMEOUT: Duration =
     add(RELAYED_FENCE_WAIT_BUDGET, CALLBACK_TIMEOUT_MARGIN);
 
-/// The host's grace window for a `run` batch. It answers within it either way:
-/// synchronously if the batch settled, with a suspend marker if not.
-const RUN_HOST_BOUND: Duration = Duration::from_millis(RUN_GRACE_WINDOW_MS);
+/// The `run` grace window: the shortest work window any `run` call gets.
+const RUN_GRACE: Duration = Duration::from_millis(RUN_GRACE_WINDOW_MS);
+
+/// The longest work window any `run` call gets: the batch ceiling.
+const RUN_CEILING: Duration = Duration::from_millis(RUN_BATCH_CEILING_MS as u64);
+
+/// The room the host keeps after a `run` call's work window: past the work
+/// deadline it still has to park the call durably (a store-lock bracket and
+/// one row) and send the reply, and both must land before the sender gives up.
+pub const ANSWER_RESERVE: Duration = Duration::from_secs(20);
+
+/// The host's answer bound for a `run` request that did not state its own: the
+/// grace window plus the reserve, ignoring any declared need. Every sender
+/// built before senders stated a bound waited at least the grace window plus
+/// [`CALLBACK_TIMEOUT_MARGIN`], so this always answers while it still listens.
+pub const LEGACY_RUN_ANSWER_BOUND: Duration = add(RUN_GRACE, ANSWER_RESERVE);
+
+/// The longest a `run` call is ever answered within: a batch that runs to the
+/// ceiling, plus the reserve. A stated bound above it is held to it.
+pub const LONGEST_RUN_ANSWER_BOUND: Duration = add(RUN_CEILING, ANSWER_RESERVE);
+
+/// The bound Cairn hands every agent CLI for one MCP tool call, hard and idle
+/// alike: Claude's `MCP_TOOL_TIMEOUT` and `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`,
+/// and Codex's per-server `tool_timeout_sec`. Seven days is an effective
+/// "never" that still ends a wedged socket, so Cairn's own bounds, not the
+/// client's, decide when a call ends. Every socket must stay below it so the
+/// agent never abandons cairn-cmd mid-await.
+pub const AGENT_MCP_TOOL_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// The longest bounded host wait for every other verb: a file-target `write`
 /// queued on the project store lock, then waiting inline for the when:write
@@ -129,10 +180,25 @@ const _: () = {
     // Bookkeeping callbacks never carry an inline wait, but keep their bound
     // honest: it must not be mistaken for one that can.
     assert!(above(FENCE_CALLBACK_TIMEOUT, BOOKKEEPING_CALLBACK_TIMEOUT));
+    // The longest `run` socket (a batch that declared the whole ceiling) stays
+    // below the agent's own tool timeout.
+    assert!(above(
+        AGENT_MCP_TOOL_TIMEOUT,
+        add(
+            add(add(RUN_CEILING, ANSWER_RESERVE), CALLBACK_TIMEOUT_MARGIN),
+            RELAY_HOP_MARGIN
+        )
+    ));
+    // The legacy bound answers while an older relay (grace + margin) and an
+    // older socket (that + the hop margin) still listen.
+    assert!(above(
+        add(RUN_GRACE, CALLBACK_TIMEOUT_MARGIN),
+        LEGACY_RUN_ANSWER_BOUND
+    ));
     // Every relay bound outlives its host bound, and every socket its relay.
     assert!(above(
-        add(RUN_HOST_BOUND, CALLBACK_TIMEOUT_MARGIN),
-        RUN_HOST_BOUND
+        add(LEGACY_RUN_ANSWER_BOUND, CALLBACK_TIMEOUT_MARGIN),
+        LEGACY_RUN_ANSWER_BOUND
     ));
     assert!(above(
         add(DEFAULT_HOST_BOUND, CALLBACK_TIMEOUT_MARGIN),
@@ -144,10 +210,17 @@ const _: () = {
     ));
     assert!(above(
         UNBOUNDED_CALLBACK_TIMEOUT,
-        add(RUN_HOST_BOUND, CALLBACK_TIMEOUT_MARGIN)
+        add(add(RUN_CEILING, ANSWER_RESERVE), CALLBACK_TIMEOUT_MARGIN)
+    ));
+    assert!(above(
+        AGENT_MCP_TOOL_TIMEOUT,
+        add(
+            add(UNBOUNDED_CALLBACK_TIMEOUT, CALLBACK_TIMEOUT_MARGIN),
+            RELAY_HOP_MARGIN
+        )
     ));
     // The host's inline waits fit inside the shortest request it can arrive on.
-    assert!(above(RUN_HOST_BOUND, INLINE_DURABLE_WAIT_BUDGET));
+    assert!(above(RUN_GRACE, INLINE_DURABLE_WAIT_BUDGET));
 };
 
 /// How long the host may take to answer a request before it must have replied.
@@ -182,28 +255,85 @@ pub fn change_has_blocking_append(payload: &serde_json::Value) -> bool {
     })
 }
 
-/// The host's answer bound for a request. `run` always answers within its
-/// grace window; a blocking tasks/questions append awaits an unbounded external
-/// event; everything else answers within the store-lock wait plus the inline
-/// write-check wait.
+/// How long the host may spend on a `run` call's work before it must park it:
+/// the grace window, or the batch's declared need when every item declared a
+/// timeout and that is longer, capped at the batch ceiling. A `waitFor` or a
+/// workflow target is control flow that answers or suspends at once, so it
+/// gets grace whatever it declares.
+pub fn run_work_window(payload: &serde_json::Value) -> Duration {
+    if is_control_flow_batch(payload) {
+        return RUN_GRACE;
+    }
+    declared_need_of_payload(payload)
+        .map_or(RUN_GRACE, |need| need.max(RUN_GRACE))
+        .min(RUN_CEILING)
+}
+
+/// The host's answer bound for a request. `run` answers within its work window
+/// plus [`ANSWER_RESERVE`] (see the module doc); a blocking tasks/questions
+/// append awaits an unbounded external event; everything else answers within
+/// the store-lock wait plus the inline write-check wait.
 ///
-/// A `run` item's own `timeout` is deliberately absent: it decides when that
-/// item is killed, never when the host answers. Deriving the bound per item is
-/// what once let a no-timeout command fail the agent at a 180-second socket
-/// while the host ran on for ten minutes.
+/// Only a batch whose items ALL declared a timeout moves the `run` bound. An
+/// item with no timeout runs to completion, which no socket should be sized
+/// for, so such a batch parks past grace and resumes durably instead.
 pub fn host_answer_bound(request: &CallbackRequest) -> HostAnswerBound {
     match request.tool.as_str() {
-        "run" => HostAnswerBound::Bounded(RUN_HOST_BOUND),
+        "run" => HostAnswerBound::Bounded(add(run_work_window(&request.payload), ANSWER_RESERVE)),
         "write" if change_has_blocking_append(&request.payload) => HostAnswerBound::Unbounded,
         _ => HostAnswerBound::Bounded(DEFAULT_HOST_BOUND),
     }
 }
 
-/// The executor relay's bound for a request forwarded from inside a cell.
-pub fn relay_timeout(request: &CallbackRequest) -> Duration {
+/// The bound the host actually answers a request within.
+///
+/// A `run` sender's stated [`CallbackRequest::answer_bound_ms`] is believed up
+/// to [`LONGEST_RUN_ANSWER_BOUND`]: it is how long that sender listens, and
+/// every relay it passed waits at least as long ([`relay_timeout`]). The host
+/// still parks a call it can park once its work window ends; the extra time
+/// only lets a call it cannot park (an SDK call, which has no tool call of its
+/// own) wait for its batch instead of being cancelled. A `run` request that
+/// stated nothing gets [`LEGACY_RUN_ANSWER_BOUND`], since its sender may wait
+/// no longer than that. Any other verb is never answered later than
+/// [`host_answer_bound`].
+pub fn effective_answer_bound(request: &CallbackRequest) -> HostAnswerBound {
+    let own = host_answer_bound(request);
+    match (request.answer_bound_ms.map(Duration::from_millis), own) {
+        (Some(stated), _) if request.tool == "run" => {
+            HostAnswerBound::Bounded(stated.min(LONGEST_RUN_ANSWER_BOUND))
+        }
+        (Some(stated), HostAnswerBound::Bounded(bound)) => {
+            HostAnswerBound::Bounded(bound.min(stated))
+        }
+        (Some(stated), HostAnswerBound::Unbounded) => {
+            HostAnswerBound::Bounded(stated.min(UNBOUNDED_CALLBACK_TIMEOUT))
+        }
+        (None, _) if request.tool == "run" => HostAnswerBound::Bounded(LEGACY_RUN_ANSWER_BOUND),
+        (None, own) => own,
+    }
+}
+
+/// The bound `cairn-cmd` states in [`CallbackRequest::answer_bound_ms`]: the
+/// host's own bound for the request, which its socket was sized from, or
+/// `None` for an unbounded one (whose socket is the unbounded callback
+/// timeout, and which states nothing).
+pub fn stated_answer_bound_ms(request: &CallbackRequest) -> Option<u64> {
     match host_answer_bound(request) {
-        HostAnswerBound::Bounded(bound) => add(bound, CALLBACK_TIMEOUT_MARGIN),
-        HostAnswerBound::Unbounded => UNBOUNDED_CALLBACK_TIMEOUT,
+        HostAnswerBound::Bounded(bound) => Some(bound.as_millis() as u64),
+        HostAnswerBound::Unbounded => None,
+    }
+}
+
+/// The executor relay's bound for a request forwarded from inside a cell: the
+/// host's own bound, or the longer bound a `run` sender stated (so an SDK
+/// call inside a cell is waited for as long as it listens), plus the margin.
+/// The relay never answers a request before the host must have.
+pub fn relay_timeout(request: &CallbackRequest) -> Duration {
+    match (host_answer_bound(request), effective_answer_bound(request)) {
+        (HostAnswerBound::Bounded(own), HostAnswerBound::Bounded(effective)) => {
+            add(own.max(effective), CALLBACK_TIMEOUT_MARGIN)
+        }
+        _ => UNBOUNDED_CALLBACK_TIMEOUT,
     }
 }
 
@@ -230,18 +360,12 @@ mod tests {
     use super::*;
     use crate::executor_protocol::SandboxDenial;
 
-    /// The spawned agent's MCP tool timeout: `MCP_TOOL_TIMEOUT=604800000` in
-    /// the Claude backends and `tool_timeout_sec=604800` for Codex.
-    const AGENT_MCP_TOOL_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-
     fn callback_request(tool: &str, payload: serde_json::Value) -> CallbackRequest {
         CallbackRequest {
-            thread_id: None,
             cwd: "/tmp".to_string(),
-            run_id: None,
             tool: tool.to_string(),
             payload,
-            tool_use_id: None,
+            ..Default::default()
         }
     }
 
@@ -267,6 +391,18 @@ mod tests {
             callback_request(
                 "write",
                 serde_json::json!({ "changes": [{ "target": "file:a", "mode": "create" }] }),
+            ),
+            callback_request(
+                "run",
+                serde_json::json!({ "commands": [{ "command": "x", "timeout": 600_000 }] }),
+            ),
+            callback_request(
+                "run",
+                serde_json::json!({ "commands": [{ "command": "x", "timeout": 99_000_000u64 }] }),
+            ),
+            callback_request(
+                "run",
+                serde_json::json!({ "commands": [{ "waitFor": { "duration": "3m" } }] }),
             ),
             callback_request("read_batch", serde_json::json!({ "paths": ["file:x"] })),
             callback_request("watch", serde_json::json!({})),
@@ -381,33 +517,170 @@ mod tests {
         }
     }
 
-    /// The socket bound is a property of the host's grace window, not of the
-    /// batch: an item's `timeout` must not move it.
+    /// Tenet 1297: a `run` call stays open for its declared item timeouts. A
+    /// batch whose items ALL declared one moves the bound to its need plus the
+    /// reserve; a batch with any undeclared item stays at grace plus the
+    /// reserve and parks past grace.
     #[test]
-    fn the_run_bound_is_constant_across_item_timeouts() {
-        let batches = [
-            serde_json::json!({ "commands": [{ "command": "echo hi" }] }),
-            serde_json::json!({
-                "commands": [{ "command": "sleep 1", "timeout": 5_000_000u32 }]
-            }),
-            serde_json::json!({
+    fn a_fully_declared_run_holds_the_socket_for_its_need() {
+        let ten_minutes = Duration::from_secs(600);
+        let bound =
+            |payload: serde_json::Value| host_answer_bound(&callback_request("run", payload));
+        assert_eq!(
+            bound(serde_json::json!({
+                "commands": [{ "command": "cargo test", "timeout": 600_000 }]
+            })),
+            HostAnswerBound::Bounded(ten_minutes + ANSWER_RESERVE)
+        );
+        assert_eq!(
+            bound(serde_json::json!({
                 "commands": [
-                    { "command": "sleep 150", "timeout": 300_000u32 },
-                    { "command": "sleep 150", "timeout": 300_000u32 }
+                    { "command": "a", "timeout": 300_000 },
+                    { "command": "b", "timeout": 300_000 }
                 ],
                 "sequential": true
-            }),
-        ];
-        for payload in batches {
-            assert_eq!(
-                host_answer_bound(&callback_request("run", payload.clone())),
-                HostAnswerBound::Bounded(RUN_HOST_BOUND),
-                "item timeouts must not move the bound: {payload}"
-            );
-        }
+            })),
+            HostAnswerBound::Bounded(ten_minutes + ANSWER_RESERVE)
+        );
+        // Partly declared: the undeclared item runs to completion, so the
+        // batch keeps the grace window.
+        assert_eq!(
+            bound(serde_json::json!({
+                "commands": [
+                    { "command": "a", "timeout": 600_000 },
+                    { "command": "b" }
+                ]
+            })),
+            HostAnswerBound::Bounded(LEGACY_RUN_ANSWER_BOUND)
+        );
+        // A short declaration never shrinks the window below grace.
+        assert_eq!(
+            bound(serde_json::json!({ "commands": [{ "command": "a", "timeout": 1_000 }] })),
+            HostAnswerBound::Bounded(LEGACY_RUN_ANSWER_BOUND)
+        );
+        // Control flow answers or suspends at once, whatever it declares.
+        assert_eq!(
+            bound(serde_json::json!({
+                "commands": [{ "target": "cairn://workflows/review", "timeout": 600_000 }]
+            })),
+            HostAnswerBound::Bounded(LEGACY_RUN_ANSWER_BOUND)
+        );
         assert_eq!(
             relay_timeout(&callback_request("run", serde_json::json!({}))),
-            Duration::from_millis(RUN_GRACE_WINDOW_MS) + CALLBACK_TIMEOUT_MARGIN
+            LEGACY_RUN_ANSWER_BOUND + CALLBACK_TIMEOUT_MARGIN
+        );
+    }
+
+    #[test]
+    fn the_ceiling_run_socket_stays_below_the_agent_mcp_tool_timeout() {
+        let request = callback_request(
+            "run",
+            serde_json::json!({ "commands": [{ "command": "x", "timeout": 99_000_000u64 }] }),
+        );
+        assert_eq!(
+            host_answer_bound(&request),
+            HostAnswerBound::Bounded(RUN_CEILING + ANSWER_RESERVE)
+        );
+        assert!(socket_timeout(&request) < AGENT_MCP_TOOL_TIMEOUT);
+    }
+
+    /// A request that states no bound came from a sender that may wait only
+    /// the old grace-sized relay (180 s) or socket (195 s), so the host answers
+    /// within grace plus the reserve, ignoring the declared need.
+    #[test]
+    fn an_unstated_run_bound_falls_back_to_the_legacy_bound() {
+        let mut request = callback_request(
+            "run",
+            serde_json::json!({ "commands": [{ "command": "x", "timeout": 600_000 }] }),
+        );
+        assert_eq!(
+            effective_answer_bound(&request),
+            HostAnswerBound::Bounded(Duration::from_secs(140))
+        );
+        assert!(LEGACY_RUN_ANSWER_BOUND < RUN_GRACE + CALLBACK_TIMEOUT_MARGIN);
+
+        request.answer_bound_ms = stated_answer_bound_ms(&request);
+        assert_eq!(
+            effective_answer_bound(&request),
+            HostAnswerBound::Bounded(Duration::from_secs(600) + ANSWER_RESERVE)
+        );
+        // A sender that states less than the host would allow is believed.
+        request.answer_bound_ms = Some(150_000);
+        assert_eq!(
+            effective_answer_bound(&request),
+            HostAnswerBound::Bounded(Duration::from_secs(150))
+        );
+        // Other verbs are never answered later than the host's own bound.
+        let mut read = callback_request("read_batch", serde_json::json!({ "paths": ["file:x"] }));
+        assert_eq!(effective_answer_bound(&read), host_answer_bound(&read));
+        read.answer_bound_ms = Some(u64::MAX);
+        assert_eq!(effective_answer_bound(&read), host_answer_bound(&read));
+    }
+
+    /// The SDK has no tool call to park on, so the host waits for a batch it
+    /// runs for as long as the SDK listens, which the SDK states. A stated
+    /// bound longer than the host's own is believed up to the ceiling, even
+    /// for an undeclared batch, and every relay it crosses waits that long.
+    #[test]
+    fn a_run_sender_that_listens_longer_is_waited_for_up_to_the_ceiling() {
+        let mut request = callback_request(
+            "run",
+            serde_json::json!({ "commands": [{ "command": "x" }] }),
+        );
+        request.answer_bound_ms = Some(3_600_000);
+        assert_eq!(
+            effective_answer_bound(&request),
+            HostAnswerBound::Bounded(Duration::from_secs(3_600))
+        );
+        assert_eq!(
+            relay_timeout(&request),
+            Duration::from_secs(3_600) + CALLBACK_TIMEOUT_MARGIN
+        );
+        request.answer_bound_ms = Some(u64::MAX);
+        assert_eq!(
+            effective_answer_bound(&request),
+            HostAnswerBound::Bounded(LONGEST_RUN_ANSWER_BOUND)
+        );
+        assert!(socket_timeout(&request) < AGENT_MCP_TOOL_TIMEOUT);
+        // cairn-cmd states the host's own bound, so its relay is unchanged.
+        request.answer_bound_ms = stated_answer_bound_ms(&request);
+        assert_eq!(
+            relay_timeout(&request),
+            LEGACY_RUN_ANSWER_BOUND + CALLBACK_TIMEOUT_MARGIN
+        );
+    }
+
+    /// An executor built before the field existed deserializes the request
+    /// into its own `CallbackRequest` and re-serializes it to forward, which
+    /// drops the field, so the host falls back to the legacy bound.
+    #[test]
+    fn an_older_relay_drops_the_stated_bound_on_the_way_through() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct OlderCallbackRequest {
+            cwd: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            run_id: Option<String>,
+            tool: String,
+            payload: serde_json::Value,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            tool_use_id: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            thread_id: Option<String>,
+        }
+        let mut request = callback_request(
+            "run",
+            serde_json::json!({ "commands": [{ "command": "x", "timeout": 600_000 }] }),
+        );
+        request.answer_bound_ms = stated_answer_bound_ms(&request);
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(wire.contains("answer_bound_ms"));
+        let older: OlderCallbackRequest = serde_json::from_str(&wire).unwrap();
+        let forwarded = serde_json::to_string(&older).unwrap();
+        let arrived: CallbackRequest = serde_json::from_str(&forwarded).unwrap();
+        assert_eq!(arrived.answer_bound_ms, None);
+        assert_eq!(
+            effective_answer_bound(&arrived),
+            HostAnswerBound::Bounded(LEGACY_RUN_ANSWER_BOUND)
         );
     }
 

@@ -2099,7 +2099,9 @@ mod tests {
         let config_dir = root.join("config");
         std::fs::create_dir_all(config_dir.join("agents")).unwrap();
         // The workspace config dir is a git repo, as CAIRN-1468 makes ~/.cairn.
-        assert!(git(&["init", "-q"], &config_dir).status.success());
+        assert!(git(&["init", "-b", "main", "-q"], &config_dir)
+            .status
+            .success());
         // Unrelated dirty state in the same repo must survive every commit.
         std::fs::write(config_dir.join("settings.yaml"), "tiers: [sm]\n").unwrap();
 
@@ -2214,11 +2216,13 @@ mod tests {
                 .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
         }
         fn init_repo(dir: &Path) {
-            assert!(git(&["init", "-q"], dir).status.success());
+            assert!(git(&["init", "-b", "main", "-q"], dir).status.success());
         }
         fn init_bare(dir: &Path) {
             std::fs::create_dir_all(dir).unwrap();
-            assert!(git(&["init", "--bare", "-q"], dir).status.success());
+            assert!(git(&["init", "-b", "main", "--bare", "-q"], dir)
+                .status
+                .success());
         }
         fn set_origin(repo: &Path, origin: &Path) {
             assert!(

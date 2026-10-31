@@ -137,6 +137,7 @@ pub(super) fn execute_tool_call(
         PreparedCall::Reject(output) => return Ok(output),
     };
     let request = crate::mcp::types::McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: config.working_dir.clone(),
         run_id: Some(config.run_id.clone()),
@@ -147,6 +148,7 @@ pub(super) fn execute_tool_call(
         },
         payload,
         tool_use_id: Some(tool_call.id.clone()),
+        origin: None,
     };
     // read_batch and run return a JSON batch envelope (composed text + image
     // content blocks). The OpenAI tool-message format is text-only, so collapse

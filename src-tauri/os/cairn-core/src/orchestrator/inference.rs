@@ -3,7 +3,8 @@
 //!
 //! The poller sends bginf exactly two GET requests per tick (`/profiles` and
 //! `/state`) through the facet's GET-only client, and starts, stops or powers
-//! nothing. Each tick re-imports bginf's configuration and reconciles it into
+//! nothing; acting on deployments is `inference_control`'s, through Cairn's
+//! own executors. Each tick re-imports bginf's configuration and reconciles it into
 //! the records whose source is bginf; the raw responses are kept beside them so
 //! the comparison is always computed from one snapshot.
 
@@ -437,6 +438,10 @@ pub struct InferenceView {
     pub inventory: Inventory,
     /// Enrolled executors by name: `true` when attached now.
     pub executors: BTreeMap<String, bool>,
+    /// What Cairn has done to the deployments it acts on.
+    pub deployment_control: super::inference_control::ControlView,
+    /// The pool controller's records and plans.
+    pub control: super::pool_control::ControlView,
     pub now_ms: i64,
 }
 
@@ -451,11 +456,15 @@ pub async fn load_view(orch: &Orchestrator) -> Result<InferenceView, String> {
     for executor in orch.fleet.inspect_executors(captured_at) {
         executors.insert(executor.name, true);
     }
+    let inventory = load_inventory(&orch.db.local).await?;
+    let control = super::pool_control::load_control_view(orch, &inventory).await?;
     Ok(InferenceView {
         config: link_config(orch),
         link: load_link(&orch.db.local).await?,
-        inventory: load_inventory(&orch.db.local).await?,
+        inventory,
         executors,
+        deployment_control: super::inference_control::load_control_view(orch).await?,
+        control,
         now_ms: now_ms(),
     })
 }

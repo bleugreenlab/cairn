@@ -417,13 +417,6 @@ async fn run_scheduler_loop(orch: Orchestrator) {
                 log::error!("Failed to load wake schedules: {error}");
                 Vec::new()
             });
-        let automations =
-            crate::orchestrator::automations::load_active_thread_automations(&orch.db.local)
-                .await
-                .unwrap_or_else(|error| {
-                    log::error!("Failed to load thread automations: {error}");
-                    Vec::new()
-                });
         let mut provider_holds = Vec::new();
         for db in orch.db.all_dbs().await {
             if let Err(error) = crate::orchestrator::wakes::supersede_orphaned_provider_limit_holds(
@@ -476,17 +469,6 @@ async fn run_scheduler_loop(orch: Orchestrator) {
                     .and_then(|at| DateTime::<Utc>::from_timestamp(at, 0))
             }))
             .chain(next_gate_due)
-            .chain(
-                automations
-                    .iter()
-                    .filter_map(|automation| {
-                        automation
-                            .due_at(now.timestamp())
-                            .or_else(|| automation.next_due_at(now.timestamp()))
-                            .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0))
-                    })
-                    .min(),
-            )
             .min();
         let sleep_dur = match soonest {
             Some(fire) => (fire - now)
@@ -537,25 +519,6 @@ async fn run_scheduler_loop(orch: Orchestrator) {
             .await
             {
                 log::error!("Failed to resolve provider hold '{}': {error}", hold.id);
-                fire_error = true;
-            }
-        }
-        for automation in automations {
-            if automation.due_at(wake.timestamp()).is_none() {
-                continue;
-            }
-            if let Err(error) = crate::orchestrator::automations::fire_thread_automation(
-                &orch,
-                &automation,
-                wake.timestamp(),
-            )
-            .await
-            {
-                log::error!(
-                    "Failed to fire thread automation '{}': {}",
-                    automation.id,
-                    error
-                );
                 fire_error = true;
             }
         }

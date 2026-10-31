@@ -13,7 +13,8 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
 use crate::threads::eras::{self, EraChild, ThreadEra};
 
-use super::common::connect_for_read;
+use super::common::read_resource;
+use super::paging::RecordPage;
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 200;
@@ -109,8 +110,12 @@ fn render_child_line(child: &EraChild) -> String {
 }
 
 async fn resolve_chat_uri(db: &LocalDb, node_id: &str, job_id: &str) -> Result<String, String> {
-    let conn = connect_for_read(db).await?;
-    match crate::jobs::queries::home_uri_for_job_conn(&conn, job_id).await {
+    let job = job_id.to_owned();
+    let home = read_resource(db, move |conn| {
+        Box::pin(async move { Ok(crate::jobs::queries::home_uri_for_job_conn(conn, &job).await) })
+    })
+    .await?;
+    match home {
         Ok(Some(base_uri)) => Ok(format!("{base_uri}/chat")),
         Ok(None) => Err(format!(
             "Cannot resolve eras: '{node_id}' has no addressable coordinates."
@@ -131,35 +136,63 @@ pub(crate) async fn render_node_eras(
     limit: i64,
     offset: i64,
 ) -> String {
-    let total = match eras::count_eras(db, job_id).await {
-        Ok(total) => total,
-        Err(error) => return format!("Error listing eras: {error}"),
-    };
-    let list = match eras::list_eras(db, job_id, limit, offset).await {
-        Ok(list) => list,
-        Err(error) => return format!("Error listing eras: {error}"),
-    };
+    match render_node_eras_page(db, node_id, collection_uri, chat_uri, job_id, limit, offset).await
+    {
+        Ok(page) => {
+            let mut out = page.body;
+            let next_offset = page.offset + page.shown;
+            if page.shown > 0 && page.total.is_some_and(|total| next_offset < total) {
+                out.push_str(&format!(
+                    "\n_Continue: {collection_uri}?offset={next_offset}&limit={limit}_\n"
+                ));
+            }
+            out
+        }
+        Err(error) => error,
+    }
+}
+
+/// One page of [`render_node_eras`], counted in eras: a fixed header, then one
+/// line per era.
+async fn render_node_eras_page(
+    db: &LocalDb,
+    node_id: &str,
+    collection_uri: &str,
+    chat_uri: &str,
+    job_id: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<RecordPage, String> {
+    let total = eras::count_eras(db, job_id)
+        .await
+        .map_err(|error| format!("Error listing eras: {error}"))?;
+    let list = eras::list_eras(db, job_id, limit, offset)
+        .await
+        .map_err(|error| format!("Error listing eras: {error}"))?;
 
     let mut out = format!("# Eras \u{2014} {node_id}\n\n{total} era(s)\n\n");
+    let prelude_lines = out.lines().count();
     if list.is_empty() {
         out.push_str(
             "_No eras have been minted for this thread yet. An era is written at \
              thread-compaction fold time, when the seed's oldest span exceeds its token \
              budget \u{2014} nothing is computed or authored by this read._\n\n",
         );
-        return out;
     }
     for era in &list {
         let member_uri = format!("{collection_uri}/{}", era.seq);
         out.push_str(&render_era_line(era, &member_uri, chat_uri));
     }
-    let next_offset = offset + list.len() as i64;
-    if next_offset < total {
-        out.push_str(&format!(
-            "\n_Continue: {collection_uri}?offset={next_offset}&limit={limit}_\n"
-        ));
-    }
-    out
+    Ok(RecordPage {
+        body: out,
+        noun: "eras",
+        offset: offset as usize,
+        limit: limit as usize,
+        shown: list.len(),
+        total: Some(total as usize),
+        more: false,
+        prelude_lines: Some(prelude_lines),
+    })
 }
 
 /// Render one era from already-resolved coordinates. See
@@ -217,16 +250,9 @@ pub(crate) async fn read_node_eras_collection(
         Err(error) => return error,
     };
     let db = orch.db.for_project(project).await;
-    let job_id = match crate::resources::node::resolve_node_or_task_job_id_for_read(
-        &db, project, number, exec_seq, node_id, None,
-    )
-    .await
+    let (job_id, chat_uri) = match resolve_eras_owner(&db, project, number, exec_seq, node_id).await
     {
-        Ok(job_id) => job_id,
-        Err(error) => return error,
-    };
-    let chat_uri = match resolve_chat_uri(&db, node_id, &job_id).await {
-        Ok(chat_uri) => chat_uri,
+        Ok(owner) => owner,
         Err(error) => return error,
     };
     let collection_uri = build_node_eras_uri(project, number, exec_seq, node_id);
@@ -240,6 +266,47 @@ pub(crate) async fn read_node_eras_collection(
         offset,
     )
     .await
+}
+
+/// [`read_node_eras_collection`] as a page the read view continues in eras.
+pub(crate) async fn read_node_eras_page(
+    orch: &Orchestrator,
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    params: &[QueryParam],
+) -> Result<RecordPage, String> {
+    let (limit, offset) = parse_query(params)?;
+    let db = orch.db.for_project(project).await;
+    let (job_id, chat_uri) = resolve_eras_owner(&db, project, number, exec_seq, node_id).await?;
+    let collection_uri = build_node_eras_uri(project, number, exec_seq, node_id);
+    render_node_eras_page(
+        &db,
+        node_id,
+        &collection_uri,
+        &chat_uri,
+        &job_id,
+        limit,
+        offset,
+    )
+    .await
+}
+
+/// The job whose eras a node address names, and that job's chat URI.
+async fn resolve_eras_owner(
+    db: &LocalDb,
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+) -> Result<(String, String), String> {
+    let job_id = crate::resources::node::resolve_node_or_task_job_id_for_read(
+        db, project, number, exec_seq, node_id, None,
+    )
+    .await?;
+    let chat_uri = resolve_chat_uri(db, node_id, &job_id).await?;
+    Ok((job_id, chat_uri))
 }
 
 pub(crate) async fn read_node_era(

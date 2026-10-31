@@ -3,7 +3,7 @@
 use cairn_common::uri::build_label_uri;
 use cairn_db::turso::params;
 
-use super::common::{connect_for_read, storage_error};
+use super::common::{read_resource, storage_error};
 use crate::labels::crud::{get_label_conn, list_labels_conn, DEFAULT_WORKSPACE_ID};
 use crate::storage::{LocalDb, RowExt};
 
@@ -27,21 +27,30 @@ async fn usage_count(conn: &cairn_db::turso::Connection, label_id: &str) -> i64 
 }
 
 pub(super) async fn read_labels(db: &LocalDb) -> String {
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
-    let labels = match list_labels_conn(&conn, DEFAULT_WORKSPACE_ID).await {
+    let labels = match read_resource(db, |conn| {
+        Box::pin(async move {
+            let labels = list_labels_conn(conn, DEFAULT_WORKSPACE_ID)
+                .await
+                .map_err(|error| storage_error("Failed to load labels", error))?;
+            let mut counted = Vec::with_capacity(labels.len());
+            for label in labels {
+                let count = usage_count(conn, &label.id).await;
+                counted.push((label, count));
+            }
+            Ok(counted)
+        })
+    })
+    .await
+    {
         Ok(labels) => labels,
-        Err(error) => return storage_error("Failed to load labels", error),
+        Err(error) => return error,
     };
 
     let mut out = "# Labels — workspace\n\n".to_string();
     if labels.is_empty() {
         out.push_str("No labels defined.\n\n");
     } else {
-        for label in labels {
-            let count = usage_count(&conn, &label.id).await;
+        for (label, count) in labels {
             out.push_str(&format!(
                 "- [{}]({}) — {} issue(s) — `{}`\n",
                 label.name,
@@ -56,15 +65,21 @@ pub(super) async fn read_labels(db: &LocalDb) -> String {
 }
 
 pub(super) async fn read_label(db: &LocalDb, label_id: &str) -> String {
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
+    let requested = label_id.to_owned();
+    let (label, count) = match read_resource(db, move |conn| {
+        Box::pin(async move {
+            let label = get_label_conn(conn, &requested)
+                .await
+                .map_err(|_| format!("Label not found: {requested}"))?;
+            let count = usage_count(conn, &label.id).await;
+            Ok((label, count))
+        })
+    })
+    .await
+    {
+        Ok(found) => found,
         Err(error) => return error,
     };
-    let label = match get_label_conn(&conn, label_id).await {
-        Ok(label) => label,
-        Err(_) => return format!("Label not found: {label_id}"),
-    };
-    let count = usage_count(&conn, &label.id).await;
     let mut out = format!("# Label `{}`\n\n", label.id);
     out.push_str(&format!("Name: {}\n", label.name));
     out.push_str(&format!("Color: `{}`\n", label.color));

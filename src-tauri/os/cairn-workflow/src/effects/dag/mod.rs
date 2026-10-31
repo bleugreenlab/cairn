@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::advancement::{
     advance_execution_impl, create_jobs_for_new_nodes, find_ready_condition_nodes,
     load_execution_snapshot, load_job, load_nodes_from_execution, load_project_repo_path,
-    run_advancement_db, update_execution_snapshot,
+    run_advancement_db,
 };
 use crate::checkpoint_cache::normalize_command;
 use crate::db_records::{DbJob, DbRecipeNode};

@@ -4,7 +4,17 @@
 //! run, where it is placed, and which machines share one desired state; the
 //! [`inventory`] holds them together and validates them as a whole.
 //! [`resolve`] is the pin-over-default resolver that turns a pool and its
-//! powered machines into the deployments it should be running.
+//! powered machines into the deployments it should be running. A pool under
+//! Cairn's own control is decided instead by the [`pool_control`] module's pool
+//! controller, which loads on request, unloads for waiting builds and loads
+//! the default when the pool is idle, and writes the result as desired state.
+//! [`served`] is what Cairn offers from its deployments: every deployed
+//! recipe under its served name and aliases, loaded or not, with what each
+//! model takes and gives and the context its engine can actually hold.
+//!
+//! [`control`] is the act side: a deployment's phase as the orch holds it, the
+//! transitions start and stop requests and the head's reports move it through,
+//! the machines a phase reserves, and whether a gang fits.
 //!
 //! The [`bginf`] module mirrors the operator's existing bginf control service
 //! into these records and compares Cairn's resolution against bginf's own. It
@@ -13,12 +23,15 @@
 //! The crate owns no storage: the host persists the inventory. It depends only
 //! on the models facet's vocabulary, so it is hostable outside Cairn.
 pub mod bginf;
+pub mod control;
 pub mod deployment;
 pub mod inventory;
 pub mod machine;
 pub mod pool;
+pub mod pool_control;
 pub mod recipe;
 pub mod resolve;
+pub mod served;
 
 #[cfg(test)]
 pub(crate) mod fixture;
@@ -36,6 +49,7 @@ pub use recipe::{
 pub use resolve::{
     converged, loaded, resolve, Blocked, MachineObservation, Reason, Resolution, Slot, SLOTS,
 };
+pub use served::{served_models, EngineMeasure, ServedModel};
 
 /// A string identifier newtype: transparent in serde, ordered, displayable.
 macro_rules! string_id {

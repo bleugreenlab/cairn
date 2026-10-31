@@ -538,10 +538,9 @@ mod tests {
     fn local_pr_files_excludes_target_only_changes_after_fork() {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
-        git(repo, &["init"]);
+        git(repo, &["init", "-b", "main"]);
         git(repo, &["config", "user.email", "test@test.com"]);
         git(repo, &["config", "user.name", "Test User"]);
-        git(repo, &["checkout", "-B", "main"]);
 
         std::fs::write(repo.join("file.txt"), "base\n").unwrap();
         git(repo, &["add", "-A"]);

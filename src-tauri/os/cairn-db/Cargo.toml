@@ -29,20 +29,11 @@ tantivy = "0.26.1"
 # this line, so tursodb and the sync-supervisor image build the same source
 # (CAIRN-2147 ABI invariant); keep it on one line.
 #
-# FORK: https://github.com/bleugreen/turso, rev 31b95024 (branch
-# cairn/964faddd-connection-interrupt) is ONE commit on upstream 964faddd that
-# adds `Connection::set_query_timeout` and `Connection::interrupt` to the Rust
-# binding (no engine change), which LocalDb's pooled-read bound needs. The same
-# change is upstream PR https://github.com/tursodatabase/turso/pull/10992 (branch
-# cairn/connection-interrupt, head 963a6899, on turso main). The next person to
-# move cairn-db's turso revision removes the fork once upstream PR
-# https://github.com/tursodatabase/turso/pull/10992 is in that revision. Until
-# then, do not delete the fork or that branch: rev 31b95024 lives only there, and
-# every cold fetch and the sync-supervisor image build resolve it from there.
-#
-# 964faddd includes upstream's MVCC checkpoint rollback repair: stage root-map
-# mutations until pager commit and clear pending reads on teardown (CAIRN-3838).
-turso = { git = "https://github.com/bleugreen/turso", rev = "31b950246e8f93fa47ff0d1b78955ff3d1c69139", default-features = false, features = ["sync"] }
+# The revision must contain upstream's MVCC checkpoint rollback repair (stage
+# root-map mutations until pager commit, clear pending reads on teardown;
+# CAIRN-3838) and the Rust binding's `Connection::set_query_timeout` and
+# `Connection::interrupt`, which LocalDb's pooled-read bound needs.
+turso = { git = "https://github.com/tursodatabase/turso", rev = "7b7f159537bec57ce461cb814d8c1ab07f5d5a7f", default-features = false, features = ["sync"] }
 # Direct rustls handle so `LocalDb::ensure_crypto_provider` can install a
 # process-wide default `CryptoProvider` before turso's sync TLS client is built.
 # See the doc comment on `ensure_crypto_provider` in storage/local_db.rs.

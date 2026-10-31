@@ -15,8 +15,18 @@ use crate::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
 use std::{sync::Arc, time::Duration};
 
-const INLINE_BUDGET: Duration = Duration::from_secs(45);
+/// How long a wait stays inline before it arms its durable row.
+///
+/// The `run` client's verdict for a lost `waitFor` answer depends on this: a
+/// callback that failed sooner than this budget cannot have armed anything
+/// (`cairn_mcp_server::output::wait_arming`), because a dropped connection
+/// aborts this handler with it. Arming earlier would make that verdict wrong.
+const INLINE_BUDGET: Duration = cairn_common::callback_contract::INLINE_DURABLE_WAIT_BUDGET;
 const MAX_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// What a reissued wait is told when its identical predecessor is still armed
+/// for the same turn: the reissue arms nothing, and the turn resumes once.
+pub(crate) const WAIT_ALREADY_ARMED: &str = "This wait is already armed for this turn: an identical waitFor recorded earlier is still pending, and its result resumes this turn when it fires. Nothing new was armed.";
 
 /// What the agent reads for a `waitFor` that outlived the inline budget.
 ///
@@ -93,10 +103,6 @@ pub(crate) async fn handle_owned_wait(
         Ok(value) => value,
         Err(error) => return error,
     };
-    let turn_id = match orch.process_state.get_current_turn_id(&ctx.run_id) {
-        Some(value) => value,
-        None => return "waitFor requires an active turn".into(),
-    };
     // The transport's own id when there is one. Otherwise the record stays
     // unbound until the durable path below actually needs a call to answer —
     // see [`bind_call`].
@@ -105,6 +111,23 @@ pub(crate) async fn handle_owned_wait(
     let (condition, deadline) = match normalize(orch, request, &ctx.job_id, wait, created).await {
         Ok(value) => value,
         Err(error) => return error,
+    };
+    // A reissue of a wait whose answer was lost after it armed. Its turn is
+    // already yielded (so the process reports no live turn), which is why the
+    // turn is the one its active suspension belongs to.
+    if let Some(turn_id) = durable_suspend::suspending_turn_id(orch, &db, &ctx.run_id).await {
+        let requested_ms = deadline.map(|deadline| deadline - created);
+        if already_armed(&db, &ctx.run_id, &turn_id, &condition, requested_ms).await {
+            log::info!(
+                "refusing a reissued waitFor for run {}: its identical predecessor is still armed",
+                ctx.run_id
+            );
+            return WAIT_ALREADY_ARMED.into();
+        }
+    }
+    let turn_id = match orch.process_state.get_current_turn_id(&ctx.run_id) {
+        Some(value) => value,
+        None => return "waitFor requires an active turn".into(),
     };
     let session_id = match durable_suspend::run_session(&db, &ctx.run_id).await {
         Ok(Some(value)) => value,
@@ -175,6 +198,48 @@ pub(crate) async fn handle_owned_wait(
             WAIT_SUSPENDED_MARKER.into()
         }
     }
+}
+
+/// Whether this run's turn already holds an active wait identical to the one
+/// arriving: the same condition, and for a duration wait the same requested
+/// length. A legitimate sequential re-run never matches, because the first
+/// wait's row is resolved once it answers.
+async fn already_armed(
+    db: &LocalDb,
+    run_id: &str,
+    turn_id: &str,
+    condition: &Condition,
+    duration_ms: Option<i64>,
+) -> bool {
+    let Ok(condition_json) = serde_json::to_string(condition) else {
+        return false;
+    };
+    let is_duration = matches!(condition, Condition::Duration);
+    let (run_id, turn_id) = (run_id.to_string(), turn_id.to_string());
+    db.read(|c| {
+        let (run_id, turn_id, condition_json) =
+            (run_id.clone(), turn_id.clone(), condition_json.clone());
+        Box::pin(async move {
+            let mut rows = c
+                .query(
+                    "SELECT deadline_ms, created_at FROM agent_waits WHERE run_id=?1 AND predecessor_turn_id=?2 AND condition_json=?3 AND state IN ('pending','resolving')",
+                    params![run_id, turn_id, condition_json],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                if !is_duration {
+                    return Ok(true);
+                }
+                let armed_ms = row.opt_i64(0)?.map(|deadline| deadline - row.i64(1).unwrap_or(0));
+                if armed_ms == duration_ms {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Bind a wait to the provider call it must answer, on the way to suspending it.
@@ -825,6 +890,130 @@ mod tests {
             claim_wait_tool_use_id(&orch.db.local, "run-1", "current-turn", &wait).await,
             Claim::One("current-provider-id".into())
         );
+    }
+
+    async fn arm_row(
+        db: &LocalDb,
+        id: &str,
+        turn: &str,
+        condition: &Condition,
+        deadline: Option<i64>,
+    ) {
+        let json = serde_json::to_string(condition).unwrap();
+        let (id, turn) = (id.to_string(), turn.to_string());
+        db.write(|c| {
+            let (id, turn, json) = (id.clone(), turn.clone(), json.clone());
+            Box::pin(async move {
+                c.execute(
+                    "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,state,created_at) VALUES(?1,'job-1','run-1','session-1',?2,?1,?3,?4,'pending',1000)",
+                    params![id, turn, json, deadline],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A waitFor whose answer was lost after it armed is reissued in the same
+    /// (now parked) turn. The reissue must arm nothing, or the turn would
+    /// resume twice; a different wait, or one from an earlier turn, arms.
+    #[tokio::test]
+    async fn an_identical_wait_reissued_in_its_turn_is_already_armed() {
+        let orch = test_orchestrator().await;
+        let db = &orch.db.local;
+        db.execute(
+            "INSERT INTO sessions (id,job_id,status,backend_id,created_at,updated_at) VALUES ('session-1','job-1','open','handle-1',1,1)",
+            (),
+        )
+        .await
+        .unwrap();
+        let checks = Condition::Checks {
+            uri: "cairn://p/prj/2/1/builder/checks".into(),
+            job_id: "job-2".into(),
+            suite: None,
+        };
+        arm_row(db, "wait-checks", "current-turn", &checks, None).await;
+        arm_row(
+            db,
+            "wait-3m",
+            "current-turn",
+            &Condition::Duration,
+            Some(1000 + 180_000),
+        )
+        .await;
+        arm_row(
+            db,
+            "wait-old",
+            "old-turn",
+            &Condition::Terminal {
+                uri: "cairn://p/prj/1/1/builder/terminal/t".into(),
+                slug: "t".into(),
+                on: TerminalWaitEvent::Exit,
+                phrase: None,
+            },
+            None,
+        )
+        .await;
+
+        assert!(already_armed(db, "run-1", "current-turn", &checks, None).await);
+        assert!(
+            already_armed(
+                db,
+                "run-1",
+                "current-turn",
+                &Condition::Duration,
+                Some(180_000)
+            )
+            .await
+        );
+        // A different duration is a different wait.
+        assert!(
+            !already_armed(
+                db,
+                "run-1",
+                "current-turn",
+                &Condition::Duration,
+                Some(240_000)
+            )
+            .await
+        );
+        // A different target is a different wait.
+        let other = Condition::Checks {
+            uri: "cairn://p/prj/3/1/builder/checks".into(),
+            job_id: "job-3".into(),
+            suite: None,
+        };
+        assert!(!already_armed(db, "run-1", "current-turn", &other, None).await);
+        // A row from an earlier turn does not refuse this turn's wait.
+        let old = Condition::Terminal {
+            uri: "cairn://p/prj/1/1/builder/terminal/t".into(),
+            slug: "t".into(),
+            on: TerminalWaitEvent::Exit,
+            phrase: None,
+        };
+        assert!(!already_armed(db, "run-1", "current-turn", &old, None).await);
+        // Once the wait answers, an identical re-run arms normally.
+        db.execute(
+            "UPDATE agent_waits SET state='resolved' WHERE id='wait-checks'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(!already_armed(db, "run-1", "current-turn", &checks, None).await);
+        let active: i64 = db
+            .read(|c| {
+                Box::pin(async move {
+                    let mut rows = c
+                        .query("SELECT COUNT(*) FROM agent_waits WHERE predecessor_turn_id='current-turn' AND state='pending'", ())
+                        .await?;
+                    rows.next().await?.unwrap().i64(0)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(active, 1);
     }
 
     fn record(condition: Condition, deadline: Option<i64>) -> Record {

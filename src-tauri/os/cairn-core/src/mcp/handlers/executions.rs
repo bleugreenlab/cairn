@@ -48,17 +48,8 @@ async fn resolve_project_and_issue(
     resolved.ok_or_else(|| format!("Issue {}/{} not found", key, number))
 }
 
-/// What a launch from an executions-collection append reports.
-pub(crate) struct StartedExecution {
-    /// The caller-facing account of what the launch did.
-    pub(crate) summary: String,
-    /// The canonical URI of the tenet the commissioning gate proposed for this
-    /// filing, when it proposed one. A filing that names an existing tenet
-    /// leaves this empty: its tenet was proposed, and answered, elsewhere.
-    pub(crate) proposed_tenet: Option<String>,
-}
-
-/// Start a new execution for an issue from an append to its executions collection.
+/// Start a new execution for an issue from an append to its executions
+/// collection, returning the caller-facing account of what the launch did.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_execution_from_collection(
     orch: &Orchestrator,
@@ -71,8 +62,7 @@ pub(crate) async fn start_execution_from_collection(
     overrides: Option<crate::models::LaunchDeltas>,
     intent: crate::execution::recipe::LaunchIntent,
     after: Vec<crate::routes::TriggerClause>,
-    tenet: crate::tenets::filing::TenetFiling,
-) -> Result<StartedExecution, String> {
+) -> Result<String, String> {
     // Route the issue lookup to the database that OWNS the project: a team
     // project's issue rows live wholly in its synced replica (CAIRN-2181), so
     // resolving against the private DB would never find a team issue and the
@@ -82,9 +72,8 @@ pub(crate) async fn start_execution_from_collection(
     let (project_id, issue_id) = resolve_project_and_issue(&owning_db, project_key, number).await?;
     let key = cairn_common::uri::canonical_project(project_key);
 
-    // Resolve the recipe once: the gate below checks this id and the launch is
-    // handed this same id, so no spelling of a gated recipe can pass the check
-    // as one recipe and launch as another.
+    // Resolve the recipe once, refusing a path or file name, so the launch is
+    // handed the canonical id of the file it loads.
     let recipe = crate::execution::recipe::resolve_filed_recipe_id(
         &orch.config_dir,
         &owning_db,
@@ -93,20 +82,6 @@ pub(crate) async fn start_execution_from_collection(
     )
     .await?;
     let recipe = recipe.as_deref();
-
-    // The commissioning gate: a thread's filing of a gated recipe holds on the
-    // operator's verdict, proposed here or named by number.
-    let tenet_gate =
-        match crate::tenets::filing::plan(&orch.db, &owning_db, &key, &project_id, recipe, &tenet)
-            .await?
-        {
-            Some(plan) => Some(plan.apply(orch, &owning_db).await?),
-            None => None,
-        };
-    let mut after = after;
-    if let Some(gate) = &tenet_gate {
-        after.push(gate.clause.clone());
-    }
 
     // Read BEFORE the launch: after it, the prior canonical execution is
     // superseded and this would resolve to the new one. Only a launch that will
@@ -119,7 +94,7 @@ pub(crate) async fn start_execution_from_collection(
         None
     };
 
-    let launched = crate::execution::recipe::start_recipe_execution_and_advance(
+    let execution = crate::execution::recipe::start_recipe_execution_and_advance(
         orch,
         &issue_id,
         recipe,
@@ -132,16 +107,7 @@ pub(crate) async fn start_execution_from_collection(
         crate::models::TriggerType::Manual,
         intent,
         &after,
-    );
-    let execution = match launched {
-        Ok(execution) => execution,
-        Err(error) => {
-            if let Some(gate) = &tenet_gate {
-                gate.compensate(orch, &owning_db).await;
-            }
-            return Err(error);
-        }
-    };
+    )?;
 
     // Creation-time evaluation: a gate filed after something that has already
     // happened releases now, not on an event long past. The execution row is
@@ -168,30 +134,18 @@ pub(crate) async fn start_execution_from_collection(
 
     let issue_uri = cairn_common::uri::build_issue_uri(&key, number);
     let seq = execution.seq.unwrap_or(0);
-    let proposed_tenet = tenet_gate
-        .as_ref()
-        .and_then(crate::tenets::filing::FilingGate::proposed_uri)
-        .map(str::to_string);
     if let Some(evaluation) = evaluation.filter(|evaluation| !evaluation.released) {
-        return Ok(StartedExecution {
-            summary: held_filing_summary(
-                &key,
-                number,
-                seq,
-                &execution.recipe_id,
-                &issue_uri,
-                &evaluation,
-                matches!(intent, crate::execution::recipe::LaunchIntent::NewAttempt)
-                    .then_some(superseded),
-                tenet_gate.as_ref(),
-            ),
-            proposed_tenet,
-        });
+        return Ok(held_filing_summary(
+            &key,
+            number,
+            seq,
+            &execution.recipe_id,
+            &issue_uri,
+            &evaluation,
+            matches!(intent, crate::execution::recipe::LaunchIntent::NewAttempt)
+                .then_some(superseded),
+        ));
     }
-    let tenet_phrase = tenet_gate
-        .as_ref()
-        .map(crate::tenets::filing::FilingGate::started_phrase)
-        .unwrap_or_default();
     // Say what starting this did to the issue's lineage. Starting an ordinary
     // execution IS the supersede decision, so the result has to report it — the
     // caller does not get a second chance to notice (CAIRN-4665).
@@ -212,13 +166,10 @@ pub(crate) async fn start_execution_from_collection(
         }
         None => String::new(),
     };
-    Ok(StartedExecution {
-        summary: format!(
-            "Started execution {} for {}-{} (recipe '{}').{}{} Watch {} for attention.",
-            seq, key, number, execution.recipe_id, tenet_phrase, standing, issue_uri
-        ),
-        proposed_tenet,
-    })
+    Ok(format!(
+        "Started execution {} for {}-{} (recipe '{}').{} Watch {} for attention.",
+        seq, key, number, execution.recipe_id, standing, issue_uri
+    ))
 }
 
 /// What filing a held execution reports: that it is held, what it waits on and
@@ -227,8 +178,7 @@ pub(crate) async fn start_execution_from_collection(
 ///
 /// `next_attempt` is `Some(owner_now)` for a held next attempt: it fenced
 /// nothing at filing, and takes the attempt from whichever execution owns it
-/// at release. `tenet` is the commissioning gate's tenet, when it has one.
-#[allow(clippy::too_many_arguments)]
+/// at release.
 fn held_filing_summary(
     key: &str,
     number: i32,
@@ -237,19 +187,9 @@ fn held_filing_summary(
     issue_uri: &str,
     evaluation: &crate::execution::gates::sweep::Evaluation,
     next_attempt: Option<Option<i64>>,
-    tenet: Option<&crate::tenets::filing::FilingGate>,
 ) -> String {
-    // A thread may not release its own tenet-gated filing, so the summary
-    // offers the early release only where it is the reader's to take.
-    let exit = match tenet {
-        Some(_) => String::new(),
-        None => format!(
-            " Release it early with patch {{release:true}} on {issue_uri}/executions/{seq}."
-        ),
-    };
-    let tenet = tenet
-        .map(crate::tenets::filing::FilingGate::held_phrase)
-        .unwrap_or_default();
+    let exit =
+        format!(" Release it early with patch {{release:true}} on {issue_uri}/executions/{seq}.");
     let attempt = match next_attempt {
         Some(Some(owner)) => format!(
             " Filing it fenced nothing: execution {owner} keeps running, and this one takes the \
@@ -276,7 +216,7 @@ fn held_filing_summary(
     };
     format!(
         "Filed execution {seq} for {key}-{number} (recipe '{recipe_id}') HELD: no jobs and no \
-         slot until {waiting}. It starts on its own when the last gate is satisfied.{tenet}\
+         slot until {waiting}. It starts on its own when the last gate is satisfied.\
          {attempt}{foreclosed}{exit}"
     )
 }
@@ -316,20 +256,6 @@ pub(crate) async fn patch_execution_gates(
     );
     let state = crate::execution::gates::authoring::hold_state(&owning_db, &execution_id).await?;
     crate::execution::gates::authoring::require_held(&state, &label)?;
-    let project_id = super::run_context::project_id_by_key(&owning_db, project_key).await?;
-    crate::tenets::filing::guard_gate_change(
-        &orch.db,
-        &owning_db,
-        project_key,
-        &project_id,
-        &execution_id,
-        request.run_id.as_deref(),
-        match &patch {
-            GatePatch::Release => None,
-            GatePatch::Replace(clauses) => Some(clauses.as_slice()),
-        },
-    )
-    .await?;
 
     match patch {
         GatePatch::Release => {
@@ -897,12 +823,14 @@ mod snapshot_edit_guard_tests {
 
     fn request(run_id: Option<&str>) -> CallbackRequest {
         CallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: "/tmp/no-such-worktree".to_string(),
             run_id: run_id.map(str::to_string),
             tool: "change".to_string(),
             payload: serde_json::json!({}),
             tool_use_id: None,
+            origin: None,
         }
     }
 

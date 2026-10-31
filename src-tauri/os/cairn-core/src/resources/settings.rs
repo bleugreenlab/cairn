@@ -299,16 +299,19 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
             if let Some(installation) = creds.installation_id {
                 out.push_str(&format!("- installation: {installation}\n"));
             }
-            out.push_str(&format!(
-                "- relay: {}\n",
-                if creds.relay_channel_id.is_some() {
-                    "configured"
-                } else {
-                    "not configured"
-                }
-            ));
         }
         Err(error) => out.push_str(&format!("- status unavailable: {error}\n")),
+    }
+    match crate::ingress::channel::get_relay_channel(&orch.db.local).await {
+        Ok(channel) => out.push_str(&format!(
+            "- relay channel: {}\n",
+            if channel.channel_id.is_some() {
+                "configured"
+            } else {
+                "not configured"
+            }
+        )),
+        Err(error) => out.push_str(&format!("- relay channel unavailable: {error}\n")),
     }
     out.push('\n');
 

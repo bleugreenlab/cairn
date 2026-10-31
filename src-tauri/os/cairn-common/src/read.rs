@@ -192,6 +192,12 @@ pub struct SegmentMeta {
     /// retained lines back into truthful record counts and continuation offsets.
     #[serde(default)]
     pub record_prelude_lines: Option<usize>,
+    /// `Record` unit with no countable total (`total_units` is `None`): the
+    /// producer saw records past this page. A store log or an event scan knows
+    /// whether another page exists without knowing how many records remain,
+    /// and this is what earns such a page its continuation.
+    #[serde(default)]
+    pub more_records: bool,
     /// For a read served from a named revision (`?branch=`), the preformatted
     /// label naming what was read: the coordinate, its short commit, the
     /// commit's age, and for the default branch how fresh the store's copy of
@@ -220,6 +226,7 @@ impl SegmentMeta {
             unit_noun: None,
             grep_shown: None,
             record_prelude_lines: None,
+            more_records: false,
             revision: None,
             truncated: false,
             char_continuation: false,

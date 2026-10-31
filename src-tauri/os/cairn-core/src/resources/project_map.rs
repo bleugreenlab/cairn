@@ -9,7 +9,7 @@ use crate::orchestrator::Orchestrator;
 use crate::projects::codemap::{self, CodeMap, CodeMapFile};
 use crate::storage::{LocalDb, RowExt};
 
-use super::common::{connect_for_read, lookup_project_by_key};
+use super::common::{lookup_project_by_key, read_resource};
 
 const WAKE_SECONDS: i64 = 60 * 60;
 const DEFAULT_LINES: usize = 25;
@@ -56,17 +56,20 @@ pub(crate) async fn read_project_map(
         Ok(path) => path,
         Err(error) => return error,
     };
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
-    let project = match lookup_project_by_key(&conn, project_key).await {
-        Ok(project) => project,
-        Err(error) => return error,
-    };
     let now = chrono::Utc::now().timestamp();
-    let activity = load_activity(&conn, &project.project_id, now).await;
-    drop(conn);
+    let key = project_key.to_owned();
+    let (project, activity) = match read_resource(db, move |conn| {
+        Box::pin(async move {
+            let project = lookup_project_by_key(conn, &key).await?;
+            let activity = load_activity(conn, &project.project_id, now).await;
+            Ok((project, activity))
+        })
+    })
+    .await
+    {
+        Ok(found) => found,
+        Err(error) => return error,
+    };
 
     let view = match codemap::current(orch, db, &project.project_id).await {
         Ok(view) => view,

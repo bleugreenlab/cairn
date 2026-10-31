@@ -356,7 +356,9 @@ pub struct NewAuthorizationEvent {
     pub scope: AuthorityScope,
     pub mutation: String,
     pub summary: String,
-    /// `allowed_by_grant` | `approval_required` | `forbidden`.
+    /// `allowed_by_grant` | `approval_required` | `forbidden` | `direct`.
+    /// `direct` is journaled only for an act carried by an instrument (a page
+    /// write), whose principal is not a run and so is recorded nowhere else.
     pub outcome: String,
     /// Stable policy reason code.
     pub reason: String,
@@ -612,6 +614,7 @@ mod tests {
                 node_uri: Some("cairn://p/CAIRN/1/1/builder".to_string()),
                 run_id: Some("run-1".to_string()),
                 agent_id: Some("build".to_string()),
+                ..Default::default()
             },
             audience: AuthorityAudience::workspace("default"),
             lifetime,

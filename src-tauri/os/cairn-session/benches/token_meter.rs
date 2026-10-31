@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use cairn_common::read::{NaturalUnit, ReadSegment, SegmentKind, SegmentMeta};
 use cairn_common::token_meter::{Cut, TokenMeter};
-use cairn_db::storage::render::{assemble, render_segment_bounded};
+use cairn_db::storage::render::{assemble, render_segment_bounded, ReadBudget};
 use cairn_session::token_meters::{CLAUDE_TOKEN_METER, O200K_TOKEN_METER};
 
 struct Toks(cairn_toks::Tokenizer);
@@ -218,7 +218,7 @@ fn main() {
                         .enumerate()
                         .map(|(i, text)| segment(&format!("file:part{i}.txt"), text))
                         .collect();
-                    black_box(assemble(segments, meter));
+                    black_box(assemble(segments, ReadBudget::Context, meter));
                 })
             }),
         ];

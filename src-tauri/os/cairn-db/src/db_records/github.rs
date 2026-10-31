@@ -13,13 +13,8 @@ pub struct DbGitHubApp {
     pub private_key: Option<String>,
     pub webhook_secret: Option<String>,
     pub installation_id: Option<i32>,
-    pub relay_channel_id: Option<String>,
-    pub relay_secret: Option<String>,
-    pub last_event_sync: Option<String>,
     pub created_at: i32,
     pub updated_at: i32,
-    pub relay_public_key: Option<String>,
-    pub relay_private_key_encrypted: Option<String>,
 }
 
 #[derive(Debug)]
@@ -31,13 +26,8 @@ pub struct NewGitHubApp<'a> {
     pub private_key: Option<&'a str>,
     pub webhook_secret: Option<&'a str>,
     pub installation_id: Option<i32>,
-    pub relay_channel_id: Option<&'a str>,
-    pub relay_secret: Option<&'a str>,
-    pub last_event_sync: Option<&'a str>,
     pub created_at: i32,
     pub updated_at: i32,
-    pub relay_public_key: Option<&'a str>,
-    pub relay_private_key_encrypted: Option<&'a str>,
 }
 
 #[derive(Debug, Default)]
@@ -48,12 +38,7 @@ pub struct UpdateGitHubAppChangeset<'a> {
     pub private_key: Option<Option<&'a str>>,
     pub webhook_secret: Option<Option<&'a str>>,
     pub installation_id: Option<Option<i32>>,
-    pub relay_channel_id: Option<Option<&'a str>>,
-    pub relay_secret: Option<Option<&'a str>>,
-    pub last_event_sync: Option<Option<&'a str>>,
     pub updated_at: Option<i32>,
-    pub relay_public_key: Option<Option<&'a str>>,
-    pub relay_private_key_encrypted: Option<Option<&'a str>>,
 }
 
 // ============================================================================

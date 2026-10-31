@@ -1157,6 +1157,18 @@ pub(crate) fn body_grep_payload(
     params: &[QueryParam],
     allow_glob: bool,
 ) -> Result<Option<GrepPayload>, String> {
+    body_grep_payload_with(params, allow_glob, false)
+}
+
+/// [`body_grep_payload`] for a body whose renderer may own `offset`/`limit`.
+/// When `renderer_pages`, both keys belong to the resource (they choose the
+/// page grep runs over), so `offset` composes with grep and `limit` is not
+/// read as `head_limit`.
+pub(crate) fn body_grep_payload_with(
+    params: &[QueryParam],
+    allow_glob: bool,
+    renderer_pages: bool,
+) -> Result<Option<GrepPayload>, String> {
     let Some(pattern) = grep_query_value(params, "grep") else {
         return Ok(None);
     };
@@ -1166,7 +1178,7 @@ pub(crate) fn body_grep_payload(
                 .to_string(),
         );
     }
-    if grep_query_value(params, "offset").is_some() {
+    if !renderer_pages && grep_query_value(params, "offset").is_some() {
         return Err("'offset' is a line-window and does not combine with 'grep'; use 'head_limit' or 'limit' to cap the number of matches (the cap counts matches, and a capped read says how many it elided)".to_string());
     }
     if !allow_glob && grep_query_value(params, "glob").is_some() {
@@ -1195,7 +1207,11 @@ pub(crate) fn body_grep_payload(
             }
         }
     }
-    let head_limit_fallback = grep_opt_u32(grep_query_value(params, "limit"), "limit")?;
+    let head_limit_fallback = if renderer_pages {
+        None
+    } else {
+        grep_opt_u32(grep_query_value(params, "limit"), "limit")?
+    };
     let payload = build_grep_payload(
         params,
         pattern.to_string(),
@@ -1860,6 +1876,29 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn body_grep_payload_leaves_a_self_paging_resources_keys_to_it() {
+        // `offset` composes with grep, and `limit` sizes the page rather than
+        // capping matches.
+        let payload = body_grep_payload_with(
+            &[qp("grep", "x"), qp("offset", "2"), qp("limit", "7")],
+            false,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(payload.head_limit, None);
+        assert_eq!(payload.offset, None);
+        let payload = body_grep_payload_with(
+            &[qp("grep", "x"), qp("limit", "7"), qp("head_limit", "3")],
+            false,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(payload.head_limit, Some(3));
     }
 
     #[test]

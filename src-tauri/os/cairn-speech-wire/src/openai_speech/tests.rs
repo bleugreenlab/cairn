@@ -285,19 +285,58 @@ fn an_error_status_is_classified_as_the_streams_first_item() {
     assert!(clip.next().is_none());
 }
 
+/// The stall bound the silent-server tests run with: short, so the bound a
+/// silent connection is held to can be observed.
+const BOUND: Duration = Duration::from_millis(500);
+/// Scheduling slack on top of [`BOUND`], counted from the moment the request
+/// reached the server, before the server must see the close.
+const SLACK: Duration = Duration::from_millis(1500);
+/// How long a test waits for its request to reach the server at all. It only
+/// stops a broken test hanging: the time before the request leaves (building
+/// the first client loads the platform's root certificates) is not the
+/// server's silence and is no part of any bound.
+const HANG_GUARD: Duration = Duration::from_secs(20);
+
+/// What a silent server reports: when the request reached it, and that it saw
+/// the client close the connection.
+struct Silent {
+    arrived: mpsc::Receiver<Instant>,
+    saw_closed: mpsc::Receiver<()>,
+}
+
+impl Silent {
+    /// When the request (or the TLS ClientHello) reached the server, the
+    /// moment the stall bound is measured from. Blocks until it has.
+    fn arrival(&self) -> Instant {
+        self.arrived
+            .recv_timeout(HANG_GUARD)
+            .expect("the request reached the server")
+    }
+
+    fn closes_within_the_bound(&self, arrived: Instant) {
+        let left = (arrived + BOUND + SLACK).saturating_duration_since(Instant::now());
+        self.saw_closed
+            .recv_timeout(left)
+            .expect("the server saw the connection close within the stall bound");
+    }
+}
+
 /// A server that answers with `head` (nothing at all when empty), then sends
-/// nothing more and reports when it sees the client close the connection.
-fn silent_server(head: &'static [u8]) -> (std::net::SocketAddr, mpsc::Receiver<()>) {
+/// nothing more.
+fn silent_server(head: &'static [u8]) -> (std::net::SocketAddr, Silent) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    let (arrive, arrived) = mpsc::channel();
     let (closed, saw_closed) = mpsc::channel();
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let _ = read_request(&mut stream);
+        let at = Instant::now();
         if !head.is_empty() {
             stream.write_all(head).unwrap();
             stream.flush().unwrap();
         }
+        let _ = arrive.send(at);
         // Block until the client goes away: a read returns 0 or fails then.
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
@@ -307,27 +346,32 @@ fn silent_server(head: &'static [u8]) -> (std::net::SocketAddr, mpsc::Receiver<(
             let _ = closed.send(());
         }
     });
-    (address, saw_closed)
+    (
+        address,
+        Silent {
+            arrived,
+            saw_closed,
+        },
+    )
 }
 
-/// The stall bound the silent-server tests run with: short, so the bound a
-/// silent connection is held to can be observed.
-const BOUND: Duration = Duration::from_millis(500);
-/// Scheduling slack on top of [`BOUND`] before the server must see the close.
-const SLACK: Duration = Duration::from_millis(1500);
-
 /// The cancellation contract against a silent server: the caller is released
-/// at once, and the connection is closed within the stall bound.
+/// at once, and the connection is closed within the stall bound. The cancel
+/// comes once the request is on the wire, so the close is measured against
+/// the server's silence.
 fn released_at_once_closed_within_the_bound(
     mut clip: ClipStream,
     cancel: Arc<AtomicBool>,
-    saw_closed: mpsc::Receiver<()>,
+    server: Silent,
 ) {
+    let (entering, entered) = mpsc::channel();
     let waiting = thread::spawn(move || {
+        entering.send(()).unwrap();
         let ended = clip.next().is_none();
         (ended, Instant::now())
     });
-    thread::sleep(Duration::from_millis(150));
+    entered.recv().unwrap();
+    let arrived = server.arrival();
     let cancelled = Instant::now();
     cancel.store(true, Ordering::SeqCst);
     let (ended, returned) = waiting.join().unwrap();
@@ -337,14 +381,12 @@ fn released_at_once_closed_within_the_bound(
         "the caller waited {:?} on the network",
         returned.duration_since(cancelled)
     );
-    saw_closed
-        .recv_timeout(BOUND + SLACK)
-        .expect("the server saw the connection close within the stall bound");
+    server.closes_within_the_bound(arrived);
 }
 
 #[test]
 fn a_cancel_before_the_headers_releases_the_caller_and_closes_within_the_bound() {
-    let (address, saw_closed) = silent_server(b"");
+    let (address, server) = silent_server(b"");
     let cancel = Arc::new(AtomicBool::new(false));
     let clip = post_clip(
         &endpoint(address),
@@ -354,12 +396,12 @@ fn a_cancel_before_the_headers_releases_the_caller_and_closes_within_the_bound()
         BOUND,
     )
     .unwrap();
-    released_at_once_closed_within_the_bound(clip, cancel, saw_closed);
+    released_at_once_closed_within_the_bound(clip, cancel, server);
 }
 
 #[test]
 fn a_cancel_while_the_body_is_silent_releases_the_caller_and_closes_within_the_bound() {
-    let (address, saw_closed) = silent_server(
+    let (address, server) = silent_server(
         b"HTTP/1.1 200 OK\r\ncontent-type: audio/pcm\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n",
     );
     let cancel = Arc::new(AtomicBool::new(false));
@@ -372,12 +414,12 @@ fn a_cancel_while_the_body_is_silent_releases_the_caller_and_closes_within_the_b
     )
     .unwrap();
     assert_eq!(clip.next().unwrap().unwrap(), b"abc");
-    released_at_once_closed_within_the_bound(clip, cancel, saw_closed);
+    released_at_once_closed_within_the_bound(clip, cancel, server);
 }
 
 #[test]
 fn dropping_a_silent_clip_closes_within_the_bound() {
-    let (address, saw_closed) = silent_server(b"");
+    let (address, server) = silent_server(b"");
     let clip = post_clip(
         &endpoint(address),
         &json!({}),
@@ -386,23 +428,21 @@ fn dropping_a_silent_clip_closes_within_the_bound() {
         BOUND,
     )
     .unwrap();
-    thread::sleep(Duration::from_millis(100));
+    let arrived = server.arrival();
     let dropped = Instant::now();
     drop(clip);
     assert!(
         dropped.elapsed() < Duration::from_millis(50),
         "drop never waits"
     );
-    saw_closed
-        .recv_timeout(BOUND + SLACK)
-        .expect("the server saw the connection close within the stall bound");
+    server.closes_within_the_bound(arrived);
 }
 
-/// A server that takes a TLS ClientHello and never answers it, reporting when
-/// the client closes the connection.
-fn silent_tls_server() -> (OpenAiSpeechEndpoint, mpsc::Receiver<()>) {
+/// A server that takes a TLS ClientHello and never answers it.
+fn silent_tls_server() -> (OpenAiSpeechEndpoint, Silent) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    let (arrive, arrived) = mpsc::channel();
     let (closed, saw_closed) = mpsc::channel();
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -412,6 +452,7 @@ fn silent_tls_server() -> (OpenAiSpeechEndpoint, mpsc::Receiver<()>) {
         let mut hello = [0u8; 4096];
         // The ClientHello arrives; nothing is ever sent back.
         assert!(stream.read(&mut hello).unwrap() > 0, "a ClientHello");
+        let _ = arrive.send(Instant::now());
         loop {
             match stream.read(&mut hello) {
                 Ok(0) | Err(_) => {
@@ -427,12 +468,18 @@ fn silent_tls_server() -> (OpenAiSpeechEndpoint, mpsc::Receiver<()>) {
         url: format!("https://{address}/v1/audio/speech"),
         headers: vec![],
     };
-    (endpoint, saw_closed)
+    (
+        endpoint,
+        Silent {
+            arrived,
+            saw_closed,
+        },
+    )
 }
 
 #[test]
 fn a_cancel_during_the_tls_handshake_releases_the_caller_and_closes_within_the_bound() {
-    let (endpoint, saw_closed) = silent_tls_server();
+    let (endpoint, server) = silent_tls_server();
     let cancel = Arc::new(AtomicBool::new(false));
     let started = Instant::now();
     let clip = post_clip(
@@ -447,12 +494,12 @@ fn a_cancel_during_the_tls_handshake_releases_the_caller_and_closes_within_the_b
         started.elapsed() < Duration::from_millis(100),
         "post_clip does not wait on the server"
     );
-    released_at_once_closed_within_the_bound(clip, cancel, saw_closed);
+    released_at_once_closed_within_the_bound(clip, cancel, server);
 }
 
 #[test]
 fn dropping_a_clip_during_the_tls_handshake_closes_within_the_bound() {
-    let (endpoint, saw_closed) = silent_tls_server();
+    let (endpoint, server) = silent_tls_server();
     let clip = post_clip(
         &endpoint,
         &json!({}),
@@ -461,11 +508,9 @@ fn dropping_a_clip_during_the_tls_handshake_closes_within_the_bound() {
         BOUND,
     )
     .unwrap();
-    thread::sleep(Duration::from_millis(150));
+    let arrived = server.arrival();
     drop(clip);
-    saw_closed
-        .recv_timeout(BOUND + SLACK)
-        .expect("the server saw the connection close within the stall bound");
+    server.closes_within_the_bound(arrived);
 }
 
 /// A stalled clip fails with a transport error: the stream's own stall
@@ -479,8 +524,7 @@ fn assert_stalled(error: &SpeechWireError) {
 
 #[test]
 fn the_stall_bound_covers_the_tls_handshake() {
-    let (endpoint, saw_closed) = silent_tls_server();
-    let started = Instant::now();
+    let (endpoint, server) = silent_tls_server();
     let mut clip = post_clip(
         &endpoint,
         &json!({}),
@@ -490,15 +534,14 @@ fn the_stall_bound_covers_the_tls_handshake() {
     )
     .unwrap();
     assert_stalled(&clip.next().unwrap().unwrap_err());
-    assert!(started.elapsed() < BOUND + SLACK);
-    saw_closed
-        .recv_timeout(BOUND + SLACK)
-        .expect("the server saw the connection close within the stall bound");
+    let arrived = server.arrival();
+    assert!(arrived.elapsed() < BOUND + SLACK, "{:?}", arrived.elapsed());
+    server.closes_within_the_bound(arrived);
 }
 
 #[test]
 fn a_stalled_clip_reports_it_and_closes_within_the_bound() {
-    let (address, saw_closed) = silent_server(b"");
+    let (address, server) = silent_server(b"");
     let mut clip = post_clip(
         &endpoint(address),
         &json!({}),
@@ -508,9 +551,71 @@ fn a_stalled_clip_reports_it_and_closes_within_the_bound() {
     )
     .unwrap();
     assert_stalled(&clip.next().unwrap().unwrap_err());
-    saw_closed
-        .recv_timeout(BOUND + SLACK)
-        .expect("the server saw the connection close within the stall bound");
+    let arrived = server.arrival();
+    assert!(arrived.elapsed() < BOUND + SLACK, "{:?}", arrived.elapsed());
+    server.closes_within_the_bound(arrived);
+}
+
+/// The stall bound is the server's silence. However long the worker takes to
+/// get the request out (the first client in a process loads the platform's
+/// root certificates, 600-700 ms on a macOS host), that wait is not charged;
+/// silence once the request has left is.
+#[test]
+fn preparing_the_request_is_not_charged_to_the_stall_bound() {
+    use super::http::Piece;
+    let (sender, pieces) = mpsc::sync_channel(8);
+    let (finish, finished) = mpsc::channel::<()>();
+    let worker = thread::spawn(move || {
+        thread::sleep(BOUND * 3);
+        sender.send(Piece::Sent).unwrap();
+        sender.send(Piece::Audio(b"abc".to_vec())).unwrap();
+        // Then silence, holding the channel open so it reads as a stall.
+        let _ = finished.recv_timeout(HANG_GUARD);
+    });
+    let mut clip = ClipStream::new(
+        pieces,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        BOUND,
+        HANG_GUARD,
+        "Kokoro".into(),
+    );
+    assert_eq!(clip.next().unwrap().unwrap(), b"abc");
+    let waited = Instant::now();
+    let error = clip.next().unwrap().unwrap_err();
+    assert!(waited.elapsed() >= BOUND, "{:?}", waited.elapsed());
+    assert!(
+        matches!(&error, SpeechWireError::Transport(m) if m == "Kokoro speech stalled: no audio for 500ms"),
+        "{error:?}"
+    );
+    finish.send(()).unwrap();
+    worker.join().unwrap();
+}
+
+/// A request that never leaves (a wedged client build) fails at the setup
+/// bound, counted from the stream's creation, and reads as our side failing,
+/// not as the server stalling.
+#[test]
+fn a_request_never_sent_fails_at_the_setup_bound_not_as_a_stall() {
+    use super::http::Piece;
+    let setup = Duration::from_millis(300);
+    let (_worker, pieces) = mpsc::sync_channel::<Piece>(8);
+    let created = Instant::now();
+    let mut clip = ClipStream::new(
+        pieces,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        BOUND,
+        setup,
+        "Kokoro".into(),
+    );
+    let error = clip.next().unwrap().unwrap_err();
+    assert!(created.elapsed() >= setup, "{:?}", created.elapsed());
+    assert!(
+        matches!(&error, SpeechWireError::Transport(m) if m == "Kokoro speech request was not sent within 300ms"),
+        "{error:?}"
+    );
+    assert!(clip.next().is_none());
 }
 
 #[test]

@@ -20,11 +20,13 @@ mod issues;
 mod jobs;
 mod models;
 mod nodes;
+mod pages;
 mod posts;
 mod projects;
 mod registry;
 mod responses;
 mod routes;
+mod services;
 mod specs;
 mod tasks;
 mod tenets;
@@ -66,6 +68,8 @@ pub fn run_target_for(kind: ResourceKind) -> Option<&'static RunTargetSpec> {
 
 pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     globals::DB_CONTRACT,
+    globals::DB_TABLE_CONTRACT,
+    globals::DB_ROW_CONTRACT,
     globals::DEV_CONTRACT,
     globals::DEV_DB_CONTRACT,
     globals::DEV_PID_CONTRACT,
@@ -87,7 +91,9 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     inference::INFERENCE_CONTRACT,
     inference::INFERENCE_RECIPES_CONTRACT,
     inference::INFERENCE_DEPLOYMENTS_CONTRACT,
+    inference::INFERENCE_DEPLOYMENT_CONTRACT,
     inference::INFERENCE_POOLS_CONTRACT,
+    inference::INFERENCE_REQUESTS_CONTRACT,
     globals::EXECUTOR_ACTION_CONTRACT,
     globals::MCP_CONTRACT,
     globals::HELP_CONTRACT,
@@ -107,6 +113,10 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     posts::PROJECT_POSTS_CONTRACT,
     tenets::PROJECT_TENETS_CONTRACT,
     tenets::PROJECT_TENET_CONTRACT,
+    pages::PROJECT_PAGES_CONTRACT,
+    pages::NODE_PAGES_CONTRACT,
+    pages::NODE_PAGE_CONTRACT,
+    pages::NODE_PAGE_LOG_CONTRACT,
     posts::HOME_FEED_CONTRACT,
     projects::PROJECT_CODEMAP_CONTRACT,
     projects::PROJECT_MAP_CONTRACT,
@@ -128,10 +138,8 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     issues::THREAD_BRANCH_CONTRACT,
     issues::THREAD_DB_CONTRACT,
     issues::THREAD_DB_SCHEMA_CONTRACT,
-    issues::THREAD_PROCEDURES_CONTRACT,
-    issues::THREAD_PROCEDURE_CONTRACT,
-    issues::THREAD_AUTOMATIONS_CONTRACT,
-    issues::THREAD_AUTOMATION_CONTRACT,
+    issues::THREAD_DB_TABLE_CONTRACT,
+    issues::THREAD_DB_ROW_CONTRACT,
     issues::CHANGED_CONTRACT,
     issues::ISSUE_EXECUTIONS_CONTRACT,
     issues::ISSUE_EXECUTION_CONTRACT,
@@ -199,6 +207,14 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     registry::WORKFLOW_CONTRACT,
     registry::PROJECT_WORKFLOWS_CONTRACT,
     registry::PROJECT_WORKFLOW_CONTRACT,
+    services::PROJECT_SERVICES_CONTRACT,
+    services::PROJECT_SERVICE_CONTRACT,
+    services::PROJECT_SERVICE_STATUS_CONTRACT,
+    services::PROJECT_SERVICE_LOG_CONTRACT,
+    services::THREAD_SERVICES_CONTRACT,
+    services::THREAD_SERVICE_CONTRACT,
+    services::THREAD_SERVICE_STATUS_CONTRACT,
+    services::THREAD_SERVICE_LOG_CONTRACT,
     routes::ROUTES_CONTRACT,
     routes::ROUTE_CONTRACT,
     routes::ROUTE_HISTORY_CONTRACT,

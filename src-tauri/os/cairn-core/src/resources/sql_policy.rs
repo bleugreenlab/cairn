@@ -28,6 +28,106 @@ pub(crate) fn refuse_retired_rulings(sql: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The table one write statement targets and what it does there, for
+/// attributing a SQL write's `db-change` events: `insert`, `update`, or
+/// `delete`, with DDL on a table counted as `update`. Recognized forms are
+/// `INSERT [OR x] INTO`, `REPLACE INTO`, `UPDATE [OR x]`, `DELETE FROM`, and
+/// `CREATE [TEMP] TABLE` / `DROP TABLE` / `ALTER TABLE` with `IF [NOT] EXISTS`.
+///
+/// `None` for anything else, including WITH-prefixed DML, other DDL (indexes,
+/// views, triggers), and a schema-qualified name: a caller treats those as
+/// touching any table. A trigger's writes to other tables are never seen here.
+pub(crate) fn statement_target(sql: &str) -> Option<(String, &'static str)> {
+    let words = sql_identifiers(sql);
+    let keyword = |index: usize| words.get(index).map(|word| word.to_ascii_uppercase());
+    let is = |index: usize, expected: &str| keyword(index).as_deref() == Some(expected);
+    let (index, action) = match keyword(0)?.as_str() {
+        "INSERT" | "REPLACE" => {
+            let into = if is(1, "OR") { 3 } else { 1 };
+            if !is(into, "INTO") {
+                return None;
+            }
+            (into + 1, "insert")
+        }
+        "UPDATE" => (if is(1, "OR") { 3 } else { 1 }, "update"),
+        "DELETE" if is(1, "FROM") => (2, "delete"),
+        "CREATE" | "DROP" | "ALTER" => {
+            let mut index = 1;
+            if is(0, "CREATE") && (is(index, "TEMP") || is(index, "TEMPORARY")) {
+                index += 1;
+            }
+            if !is(index, "TABLE") {
+                return None;
+            }
+            index += 1;
+            if is(index, "IF") {
+                index += if is(index + 1, "NOT") { 3 } else { 2 };
+            }
+            (index, "update")
+        }
+        _ => return None,
+    };
+    let table = words.get(index)?;
+    // `main.t` scans as two words; naming `main` would misattribute the write.
+    if ["main", "temp"]
+        .iter()
+        .any(|schema| table.eq_ignore_ascii_case(schema))
+    {
+        return None;
+    }
+    Some((table.clone(), action))
+}
+
+/// One table or view of a database's catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogEntry {
+    pub name: String,
+    /// A view's defining `CREATE VIEW` statement; `None` for a table.
+    pub view_sql: Option<String>,
+}
+
+/// The tables a read statement reads, spelled as the catalog spells them and
+/// sorted: every identifier the SQL names that is a table, and, for each view
+/// it names, the tables that view reads, recursively.
+///
+/// An over-approximation by design. A column or alias that shares a table's
+/// name adds that table, which costs a subscriber an extra re-read and never
+/// staleness; a table the SQL actually reads is always named by an identifier
+/// or reached through a view, so it is never missed. String literals and
+/// comments name nothing.
+pub(crate) fn referenced_tables(sql: &str, catalog: &[CatalogEntry]) -> Vec<String> {
+    let mut tables: Vec<String> = Vec::new();
+    let mut expanded_views = std::collections::HashSet::new();
+    let mut pending = vec![sql.to_string()];
+    while let Some(text) = pending.pop() {
+        for identifier in sql_identifiers(&text) {
+            let Some(entry) = catalog
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(&identifier))
+            else {
+                continue;
+            };
+            match &entry.view_sql {
+                None => {
+                    if !tables
+                        .iter()
+                        .any(|table| table.eq_ignore_ascii_case(&entry.name))
+                    {
+                        tables.push(entry.name.clone());
+                    }
+                }
+                Some(view) => {
+                    if expanded_views.insert(entry.name.to_ascii_lowercase()) {
+                        pending.push(view.clone());
+                    }
+                }
+            }
+        }
+    }
+    tables.sort();
+    tables
+}
+
 /// Validate the single, read-only statement accepted by SQL read projections.
 pub(crate) fn validate_read_only_sql(sql: &str) -> Result<(), String> {
     let statements = split_statements(sql);
@@ -298,6 +398,109 @@ mod tests {
         }
         assert!(refuse_retired_rulings("SELECT '_cairn_rulings' -- _cairn_rulings").is_ok());
         assert!(refuse_retired_rulings("SELECT * FROM _cairn_open_questions").is_ok());
+    }
+
+    #[test]
+    fn statement_target_attributes_every_write_form() {
+        let cases = [
+            (
+                "INSERT INTO attempts(problem) VALUES (?)",
+                Some(("attempts", "insert")),
+            ),
+            (
+                "insert or replace into \"we ird\" values (1)",
+                Some(("we ird", "insert")),
+            ),
+            (
+                "REPLACE INTO attempts VALUES (1)",
+                Some(("attempts", "insert")),
+            ),
+            ("UPDATE attempts SET x = 1", Some(("attempts", "update"))),
+            (
+                "UPDATE OR IGNORE [attempts] SET x = 1",
+                Some(("attempts", "update")),
+            ),
+            (
+                "DELETE FROM `attempts` WHERE id = 1",
+                Some(("attempts", "delete")),
+            ),
+            (
+                "CREATE TABLE attempts(id INTEGER)",
+                Some(("attempts", "update")),
+            ),
+            (
+                "CREATE TEMP TABLE IF NOT EXISTS scratch(id)",
+                Some(("scratch", "update")),
+            ),
+            (
+                "DROP TABLE IF EXISTS attempts",
+                Some(("attempts", "update")),
+            ),
+            (
+                "ALTER TABLE attempts ADD COLUMN lang TEXT",
+                Some(("attempts", "update")),
+            ),
+            (
+                "WITH x AS (SELECT 1) INSERT INTO attempts SELECT * FROM x",
+                None,
+            ),
+            ("CREATE INDEX idx ON attempts(problem)", None),
+            ("INSERT INTO main.attempts VALUES (1)", None),
+            ("SELECT * FROM attempts", None),
+        ];
+        for (sql, expected) in cases {
+            let got = statement_target(sql);
+            assert_eq!(
+                got.as_ref()
+                    .map(|(table, action)| (table.as_str(), *action)),
+                expected,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn referenced_tables_are_the_named_tables_and_what_named_views_read() {
+        let table = |name: &str| CatalogEntry {
+            name: name.to_string(),
+            view_sql: None,
+        };
+        let catalog = [
+            table("issues"),
+            table("comments"),
+            table("jobs"),
+            table("Labels"),
+            CatalogEntry {
+                name: "issue_list".to_string(),
+                view_sql: Some(
+                    "CREATE VIEW issue_list AS SELECT i.*, l.name FROM issues i JOIN labels l"
+                        .to_string(),
+                ),
+            },
+            CatalogEntry {
+                name: "looped".to_string(),
+                view_sql: Some("CREATE VIEW looped AS SELECT * FROM looped, jobs".to_string()),
+            },
+        ];
+        assert_eq!(
+            referenced_tables(
+                "SELECT c.body FROM \"comments\" c JOIN [ISSUES] i ON i.id = c.issue_id",
+                &catalog
+            ),
+            ["comments", "issues"]
+        );
+        assert_eq!(
+            referenced_tables("SELECT * FROM issue_list", &catalog),
+            ["Labels", "issues"]
+        );
+        assert_eq!(
+            referenced_tables("SELECT * FROM looped", &catalog),
+            ["jobs"]
+        );
+        assert_eq!(
+            referenced_tables("SELECT 'jobs' -- comments\n, 1", &catalog),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

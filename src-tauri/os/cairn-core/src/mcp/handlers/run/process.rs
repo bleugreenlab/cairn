@@ -482,13 +482,14 @@ pub(crate) async fn run_one(
         // only one of them would get it.
         match fence::resolve_run_fence(orch, request).await {
             fence::RunFenceResolution::Resolved(run_id, fence_mode) => {
+                let command = shell_command.as_deref().unwrap_or(&program);
                 let crossing = match &denial {
                     sandbox::SandboxDenial::Path { path, .. } => {
-                        fence::Crossing::shell_path(path.as_path(), &path.display().to_string())
+                        fence::Crossing::shell_path(path.as_path(), command)
                     }
                     sandbox::SandboxDenial::Command => fence::Crossing::unattributed_denial(
                         &header,
-                        shell_command.as_deref().unwrap_or(&program),
+                        command,
                         sandbox::reported_denial_line(&format!("{}\n{}", exec.stdout, exec.stderr))
                             .as_deref(),
                     ),

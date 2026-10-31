@@ -730,7 +730,14 @@ mod pass {
         let origin = fx._temp.path().join("origin.git");
         git(
             fx._temp.path(),
-            &["init", "-q", "--bare", &origin.to_string_lossy()],
+            &[
+                "init",
+                "-b",
+                "main",
+                "-q",
+                "--bare",
+                &origin.to_string_lossy(),
+            ],
         );
         git(
             &fx.repo,

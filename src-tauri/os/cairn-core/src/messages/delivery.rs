@@ -383,9 +383,15 @@ async fn insert_system_direct_push_once_conn(
         .execute(
             "INSERT OR IGNORE INTO messages (
             id, channel_type, channel_id, sender_run_id, sender_name,
-            recipient_run_id, content, created_at
-         ) VALUES (?1, 'direct', NULL, NULL, 'system', ?2, ?3, ?4)",
-            params![message_id.as_str(), recipient_run_id, content, now],
+            recipient_run_id, content, created_at, urgency
+         ) VALUES (?1, 'direct', NULL, NULL, 'system', ?2, ?3, ?4, ?5)",
+            params![
+                message_id.as_str(),
+                recipient_run_id,
+                content,
+                now,
+                urgency.as_str()
+            ],
         )
         .await?;
     let wake = direct_wake_for_urgency(urgency);

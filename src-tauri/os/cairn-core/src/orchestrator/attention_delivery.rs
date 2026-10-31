@@ -446,6 +446,60 @@ mod tests {
         assert!(!rendered.contains("for the current content"), "{rendered}");
     }
 
+    /// A system direct push names its message by fingerprint whatever key it
+    /// coalesces under. Recognizing these by a prefix list let every producer
+    /// added after the list reach its recipient as a bare pointer home.
+    #[tokio::test]
+    async fn every_keyed_system_direct_carries_its_message_inline() {
+        let db = migrated_db().await;
+        seed(&db, "active", None, None).await;
+        db.execute_script(
+            "INSERT INTO runs(id, project_id, job_id, issue_id, created_at, updated_at)
+             VALUES('run-watcher','p','watcher','parent',1,1);",
+        )
+        .await
+        .unwrap();
+        let keys = [
+            "automation:a",
+            "condition:c",
+            "gate:g",
+            "tenet-verdict:v",
+            "tenet-contradiction:x",
+        ];
+        db.write(move |conn| {
+            Box::pin(async move {
+                for key in keys {
+                    crate::messages::delivery::insert_system_direct_push_with_key_conn(
+                        conn,
+                        "watcher",
+                        "run-watcher",
+                        &format!("body of {key}"),
+                        crate::messages::queued::DeliveryUrgency::Passive,
+                        Some(key),
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let pushes = crate::orchestrator::attention_push::list_pending(&db, "watcher")
+            .await
+            .unwrap();
+        assert_eq!(pushes.len(), keys.len());
+        let orch = test_orchestrator(db);
+        for push in &pushes {
+            let rendered = render_push_resolved(&orch, push).await;
+            assert!(
+                rendered.contains(&format!("body of {}", push.key)),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("for the current content"), "{rendered}");
+        }
+    }
+
     #[tokio::test]
     async fn render_resolved_push_uses_concise_confirmation_not_issue_body() {
         let db = migrated_db().await;

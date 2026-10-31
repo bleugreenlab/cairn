@@ -401,7 +401,7 @@ pub(crate) const PROJECT_TERMINAL_CONTRACT: ResourceContract =
         uri_template: "cairn://p/{project}/terminal/{slug}",
         name: "Project terminal",
         description: "Project-scoped terminal output",
-        read_projections: NO_PROJECTIONS,
+        read_projections: TERMINAL_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
         mutations: &[

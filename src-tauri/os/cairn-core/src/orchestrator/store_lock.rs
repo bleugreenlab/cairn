@@ -691,18 +691,23 @@ impl Orchestrator {
     ) -> Result<JjStoreGuard, ()> {
         let operation = operation.into();
         let store = store_dir.to_string_lossy().into_owned();
+        // Checked in release builds too. The lock is not reentrant, so a task
+        // that queues behind its own guard is never served: the hold lasts until
+        // something outside drops the whole future, and every other writer on the
+        // store waits behind it. Panicking unwinds that task and releases its
+        // guard now, and names the operation that re-entered.
         let current_task = tokio::task::try_id();
-        debug_assert!(
-            current_task.is_none()
-                || self
-                    .jj_store_lock_metrics
-                    .lock()
-                    .unwrap()
-                    .get(&store)
-                    .and_then(|metrics| metrics.current_task)
-                    != current_task,
-            "task attempted to re-acquire jj store lock for {store} while already holding it"
-        );
+        let held_by_this_task = current_task.is_some() && {
+            let metrics = self.jj_store_lock_metrics.lock().unwrap();
+            metrics.get(&store).and_then(|metrics| metrics.current_task) == current_task
+        };
+        if held_by_this_task {
+            panic!(
+                "`{operation}` attempted to re-acquire the jj store lock for {store} from the \
+                 task that already holds it; the lock is not reentrant, so this would wait on \
+                 itself forever"
+            );
+        }
         let lock = self.jj_store_lock(store_dir);
         let waiter = JjStoreWaiterRegistration::register(
             &self.jj_store_lock_metrics,

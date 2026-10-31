@@ -545,12 +545,14 @@ fn now_ms() -> i64 {
 
 fn user_request() -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         cwd: String::new(),
         run_id: None,
         tool: "remote_intent".into(),
         payload: Value::Null,
         tool_use_id: None,
         thread_id: None,
+        origin: None,
     }
 }
 

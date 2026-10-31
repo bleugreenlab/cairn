@@ -539,6 +539,33 @@ pub struct AuthorityPrincipal {
     pub node_uri: Option<String>,
     pub run_id: Option<String>,
     pub agent_id: Option<String>,
+    /// The verified principal acting, typed. Set for an act that no run makes,
+    /// such as a write through a page, where the run fields above are all
+    /// `None`. It carries whatever principal the verified appearance names (a
+    /// `Human` for a JWT caller, a `Machine` for this install's desktop) and is
+    /// never relabeled to fit a role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<crate::identity::PrincipalRef>,
+    /// What the actor acted through, when that is not the actor itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instrument: Option<AuthorityInstrument>,
+}
+
+/// The artifact an actor acted through. An instrument is context, not a
+/// principal: it holds no authority of its own and is never a delegation hop.
+/// "Actor X, through page P@v owned by thread T."
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthorityInstrument {
+    Page {
+        /// The canonical page URI.
+        page: String,
+        version: u32,
+        /// The canonical URI of the thread that owns the page and supplies its
+        /// authority context. Owning a page is not evidence of authoring a
+        /// particular version of it.
+        owner: String,
+    },
 }
 
 /// The context a grant is bound to. Contextual binding is separate from the
@@ -1035,6 +1062,7 @@ mod tests {
                 node_uri: Some("cairn://p/CAIRN/1/1/builder".to_string()),
                 run_id: Some("run-1".to_string()),
                 agent_id: Some("build".to_string()),
+                ..Default::default()
             },
             audience: AuthorityAudience::workspace("default"),
             lifetime,

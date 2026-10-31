@@ -1006,16 +1006,14 @@ mod tests {
             None,
             LaunchIntent::NewAttempt,
             clauses,
-            crate::tenets::filing::TenetFiling::unattributed(),
         )
         .await
-        .map(|started| started.summary)
     }
 
     async fn resolve_issue(env: &Env, number: i32, status: &str) {
         env.db
             .execute(
-                &format!("UPDATE issues SET status = ?1, {status}_at = 5 WHERE number = ?2"),
+                format!("UPDATE issues SET status = ?1, {status}_at = 5 WHERE number = ?2"),
                 (status.to_string(), number),
             )
             .await
@@ -1537,12 +1535,14 @@ mod tests {
 
         let clauses = super::super::authoring::parse_after(Some(&gates(2)), "after").unwrap();
         let request = CallbackRequest {
+            answer_bound_ms: None,
             cwd: "/".to_string(),
             run_id: None,
             tool: "write".to_string(),
             payload: Value::Null,
             tool_use_id: None,
             thread_id: None,
+            origin: None,
         };
         patch_execution_gates(
             &env.orch,
@@ -1891,12 +1891,14 @@ mod tests {
 
     async fn patch(env: &Env, number: i32, patch: GatePatch) -> Result<String, String> {
         let request = CallbackRequest {
+            answer_bound_ms: None,
             cwd: "/".to_string(),
             run_id: None,
             tool: "write".to_string(),
             payload: Value::Null,
             tool_use_id: None,
             thread_id: None,
+            origin: None,
         };
         patch_execution_gates(&env.orch, &request, "prj", number, 1, patch, false).await
     }

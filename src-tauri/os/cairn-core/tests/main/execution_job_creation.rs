@@ -134,7 +134,8 @@ fn delegated_packet(parent_job_id: &str, agent_node_id: &str) -> DelegatedWorkPa
         parent_tool_use_id: Some("tool-1".to_string()),
         origin: DelegationOrigin::TaskTool,
         title: "Survey".to_string(),
-        problem_statement: "Look into it".to_string(),
+        problem_statement: Some("Look into it".to_string()),
+        prompt_digest: None,
         agent_config_id: "Explore".to_string(),
         ownership: DelegatedOwnershipScope {
             cwd: "/scratch".to_string(),
@@ -210,7 +211,7 @@ async fn a_task_delegated_by_a_thread_session_is_listed_under_that_thread() {
             agent_node_id,
         )],
     );
-    snapshot.delegated_packets = vec![delegated_packet("j-session", agent_node_id)];
+    snapshot.inline_delegated_packets = vec![delegated_packet("j-session", agent_node_id)];
     insert_execution(&db, execution_id, &snapshot).await;
 
     let jobs = create_jobs_for_execution(db.clone(), execution_id).unwrap();

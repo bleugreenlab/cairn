@@ -681,6 +681,10 @@ struct CheckPhaseStatus {
     /// When the current phase began: when the batch started waiting, was
     /// claimed, or started being prepared.
     since_unix_ms: Option<u64>,
+    /// What holds a queued batch, in a few words (`declined by local (host
+    /// pressure: cpu 97%)`), for a line too short for the full diagnostic.
+    /// `None` when no machine has declined it.
+    held_by: Option<String>,
 }
 
 type CheckStatusNotify = Arc<dyn Fn(Vec<CheckStatusEntry>, CheckPhaseStatus) + Send + Sync>;
@@ -747,11 +751,17 @@ impl CheckStatusBoard {
             }
         }
         if state == "running" {
-            *self.phase.lock().unwrap() = CheckPhaseStatus {
-                phase: Some("running".into()),
-                label: Some("running checks".into()),
-                ..CheckPhaseStatus::default()
-            };
+            // A phase already running carries the machine and start time its
+            // claim named; a lane's own start (and every output chunk after
+            // it) must not wipe them back to a bare `running checks`.
+            let mut phase = self.phase.lock().unwrap();
+            if phase.phase.as_deref() != Some("running") {
+                *phase = CheckPhaseStatus {
+                    phase: Some("running".into()),
+                    label: Some("running checks".into()),
+                    ..CheckPhaseStatus::default()
+                };
+            }
         } else if self
             .entries
             .lock()
@@ -774,6 +784,113 @@ impl CheckStatusBoard {
         *self.phase.lock().unwrap() = status;
         self.emit();
     }
+}
+
+/// How far a write-check wave has got toward a verdict, as the committing
+/// call's inline wait reads it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WaveStage {
+    /// Planned, with nothing dispatched yet.
+    #[default]
+    Planning,
+    /// Dispatching: resolving the build slot, preparing the check's inputs.
+    Preparing,
+    /// In the queue, claimed by no machine.
+    Queued,
+    /// A machine claimed a lane, or a lane started.
+    Running,
+}
+
+impl WaveStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Preparing => "preparing",
+            Self::Queued => "queued",
+            Self::Running => "running",
+        }
+    }
+}
+
+/// Where a write-check wave stands, published from its status board to the
+/// committing call's inline wait.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WaveProgress {
+    stage: WaveStage,
+    /// The machine running it, once one has claimed it.
+    executor: Option<String>,
+    /// When the current stage began, when the board knows.
+    since_unix_ms: Option<u64>,
+    /// What holds it, while it is not running.
+    reason: Option<String>,
+    /// Whether any lane has ever been claimed. Latched: a wave that ran and
+    /// then steps back (to prepare the batch that re-verifies its fix) stays
+    /// admitted, however its snapshots coalesce on the way to the waiter.
+    admitted: bool,
+}
+
+/// The progress a board snapshot shows, given what was published before it.
+///
+/// A settled or idle board says nothing new and keeps the last stage: the
+/// wave's outcome is what reports its end. A lane's own start resets the
+/// board's phase to a bare `running`, so the machine the claim named is
+/// carried forward while the wave stays running.
+fn wave_progress(
+    previous: &WaveProgress,
+    entries: &[CheckStatusEntry],
+    phase: &CheckPhaseStatus,
+) -> WaveProgress {
+    let running_phase = phase.phase.as_deref() == Some("running");
+    if running_phase || entries.iter().any(|entry| entry.state == "running") {
+        let carried = (previous.stage == WaveStage::Running).then_some(previous);
+        let claimed = running_phase.then_some(phase);
+        return WaveProgress {
+            stage: WaveStage::Running,
+            executor: claimed
+                .and_then(|phase| phase.executor.clone())
+                .or_else(|| carried.and_then(|previous| previous.executor.clone())),
+            since_unix_ms: claimed
+                .and_then(|phase| phase.since_unix_ms)
+                .or_else(|| carried.and_then(|previous| previous.since_unix_ms)),
+            reason: None,
+            admitted: true,
+        };
+    }
+    match phase.phase.as_deref() {
+        Some("queued") => WaveProgress {
+            stage: WaveStage::Queued,
+            executor: None,
+            since_unix_ms: phase.since_unix_ms,
+            reason: phase.held_by.clone().or_else(|| phase.diagnostic.clone()),
+            admitted: previous.admitted,
+        },
+        Some("dispatching" | "provisioning") => WaveProgress {
+            stage: WaveStage::Preparing,
+            executor: None,
+            since_unix_ms: phase.since_unix_ms,
+            reason: phase.diagnostic.clone(),
+            admitted: previous.admitted,
+        },
+        _ => previous.clone(),
+    }
+}
+
+/// A write wave's status sink: every board snapshot goes to `emit` (the UI's
+/// `check-status` event) and, as [`WaveProgress`], to the committing call's
+/// inline wait. Publishing never blocks on that waiter, which may be gone.
+fn wave_status_notify(
+    emit: impl Fn(Vec<CheckStatusEntry>, CheckPhaseStatus) + Send + Sync + 'static,
+    progress: tokio::sync::watch::Sender<WaveProgress>,
+) -> CheckStatusNotify {
+    Arc::new(move |checks, phase_status| {
+        progress.send_if_modified(|current| {
+            let next = wave_progress(current, &checks, &phase_status);
+            let changed = *current != next;
+            *current = next;
+            changed
+        });
+        emit(checks, phase_status);
+    })
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2939,6 +3056,7 @@ pub(crate) async fn plan_infra_scopes(
                     inputs.commit_sha,
                     &placement.verdict_platforms,
                 ),
+                fleet_blind: Vec::new(),
             })
             .collect();
     };
@@ -2974,6 +3092,21 @@ pub(crate) async fn plan_infra_scopes(
                 project_requirements: &project_requirements,
                 work_class: inputs.work_class,
             };
+            let environments: Vec<(String, String)> = orch
+                .fleet
+                .eligible_environments(scope, &repair_epochs)
+                .into_iter()
+                .map(|(executor_id, identity)| {
+                    (
+                        executor_id,
+                        crate::execution::cache::infra_env_scope(&identity),
+                    )
+                })
+                .collect();
+            let eligible: Vec<String> = environments
+                .iter()
+                .map(|(executor_id, _)| executor_id.clone())
+                .collect();
             InfraScopes {
                 head: head.clone(),
                 platform_heads: InfraScopes::platform_heads_for(
@@ -2984,17 +3117,13 @@ pub(crate) async fn plan_infra_scopes(
                 fleet: Some(crate::execution::cache::infra_fleet_scope(
                     &orch.fleet.capability_identity(scope),
                 )),
-                environments: orch
+                fleet_blind: orch
                     .fleet
-                    .eligible_environments(scope, &repair_epochs)
+                    .measurement_blindness(&eligible)
                     .into_iter()
-                    .map(|(executor_id, identity)| {
-                        (
-                            executor_id,
-                            crate::execution::cache::infra_env_scope(&identity),
-                        )
-                    })
+                    .map(|machine| machine.name)
                     .collect(),
+                environments,
             }
         })
         .collect()
@@ -3474,12 +3603,14 @@ impl DispatchNarrator {
                     ),
                     (false, _) => format!("{}; parked since {since}", self.wait.description),
                 };
-                if let Some(declined) = describe_declines(declines) {
+                let held_by = describe_declines(declines);
+                if let Some(declined) = &held_by {
                     diagnostic.push_str("; ");
-                    diagnostic.push_str(&declined);
+                    diagnostic.push_str(declined);
                 }
                 CheckPhaseStatus {
                     since_unix_ms: Some(*since_unix_ms),
+                    held_by,
                     ..check_phase_status(
                         Some("queued"),
                         Some("queued"),
@@ -4026,16 +4157,52 @@ async fn submit_single_planned_check_batch(
         // The queued row says what it is queued BEHIND. "Waiting for build
         // slot" told an operator watching their own fleet only that Cairn was
         // waiting on Cairn, which is the one thing they could already see.
-        let executed = orch
-            .fleet
-            .submit_write_check_batch(
-                orch,
-                request.clone(),
-                processes,
-                batch.run_context,
-                batch.status_board.clone(),
-            )
-            .await;
+        // A write-check batch is one queue entry under its own identity, never
+        // coalesced, so where it stands is read by that identity; the claim
+        // and every decline then reach the board, and through it the
+        // committing call's inline wait.
+        let identity = (request.request_id.clone(), request.attempt_id.clone());
+        let wait_batch = PlannedCheckBatchRequest {
+            items: Vec::new(),
+            status_board: None,
+            ..batch.clone()
+        };
+        let board = batch.status_board.clone();
+        let submission = orch.fleet.submit_write_check_batch(
+            orch,
+            request.clone(),
+            processes,
+            batch.run_context,
+            batch.status_board.clone(),
+        );
+        let executed = match board {
+            None => submission.await,
+            Some(board) => {
+                narrate_dispatch(
+                    submission,
+                    wait,
+                    || {
+                        orch.fleet.request_dispatch_phase(&identity).map(|phase| {
+                            crate::fleet::CheckDispatch {
+                                phase,
+                                joined: None,
+                            }
+                        })
+                    },
+                    || {
+                        patience.for_group(
+                            orch,
+                            &wait_batch,
+                            wait_scope.0.as_ref(),
+                            &wait_scope.1,
+                            &wait_scope.2,
+                        )
+                    },
+                    |status| board.show_phase(status),
+                )
+                .await
+            }
+        };
         let (item_outcomes, delta) =
             split_write_check_batch_outcome(executed.outcome, &executed.account, indexed.len());
         let mut results = indexed.iter().copied().zip(item_outcomes).collect();
@@ -4372,6 +4539,13 @@ pub(crate) enum SubstrateFailureShape {
     /// it is not a verdict; the machine is the one to avoid until the volume
     /// is back.
     BuildVolumeLost,
+    /// Placement found machines that match the check but could not read their
+    /// current load: a reading it decides on was stale or missing, so it
+    /// refused them. Kept apart from `NoMachine` because the two call for
+    /// opposite responses: a fleet with nothing that matches stays that way
+    /// until the fleet changes, while a blind machine is usually back within
+    /// minutes on its own.
+    MeasurementBlind,
 }
 
 impl SubstrateFailureShape {
@@ -4414,6 +4588,9 @@ impl SubstrateFailureShape {
             }
             Self::BuildVolumeLost => {
                 "The volume holding this check's working tree went away while it ran, so whatever it reported is not a verdict on the code."
+            }
+            Self::MeasurementBlind => {
+                "The machines that can run this check were refusing new work because Cairn could not read their current load, so this check did not start. That clears on its own when they report again."
             }
         }
     }
@@ -4632,6 +4809,12 @@ fn infra_repair_domain(
             SubstrateFailureShape::NoMachine
             | SubstrateFailureShape::Draining
             | SubstrateFailureShape::BuildVolumeAbsent => InfraRepairDomain::Fleet,
+            // Fleet too, but under an identity that names the blind machines
+            // (`Fleet::capability_identity`), so the counter it is charged to
+            // exists only while they stay blind and their recovery is the
+            // fleet change that lifts it. Inside its grace it is charged to
+            // nothing at all (see `name_measurement_blind_refusal`).
+            SubstrateFailureShape::MeasurementBlind => InfraRepairDomain::Fleet,
             // Cell races, lost links, capacity, storage, cancellation:
             // conditions local to one attempt at one head, which must stay
             // narrow and remain retryable elsewhere. `Preparation` stays here
@@ -4669,6 +4852,69 @@ fn infra_repair_domain(
         return InfraRepairDomain::Environment;
     }
     InfraRepairDomain::Head
+}
+
+/// How long a measurement-blind refusal is taken for the window it usually is
+/// before the deaths it causes count toward a fleet suppression.
+///
+/// A machine whose telemetry goes stale is nearly always reporting again
+/// within minutes: fedora's six wedges on 10-30/31 all cleared unaided, and
+/// the longest observed stall (cairn/5600) lasted under twenty. A death inside
+/// this bound is recorded and named, and moves no counter; past it, the
+/// condition has stopped looking like a window, and its deaths count — under
+/// an identity that still lifts the moment the telemetry is fresh again.
+pub(crate) const TRANSIENT_REFUSAL_GRACE_MS: u64 = 10 * 60 * 1_000;
+
+/// A no-machine refusal re-read against the eligible machines that were
+/// measurement-blind when it came back, returning the failure as it should be
+/// named and whether it is still inside [`TRANSIENT_REFUSAL_GRACE_MS`].
+///
+/// One refusal reason (`NoMatchingExecutor`) covers two populations: a fleet
+/// with nothing that matches, and matching machines placement could not
+/// measure. Only the second has an eligible machine that is blind, so that is
+/// the test. The youngest blindness decides the grace: while any blind machine
+/// could plausibly report again, the refusal is a window. A reading missing
+/// outright carries no instant to measure from and is taken as past it, so a
+/// machine that never reports is still bounded.
+fn name_measurement_blind_refusal(
+    failure: SubstrateFailure,
+    blind: &[crate::fleet::MeasurementBlindness],
+) -> (SubstrateFailure, bool) {
+    if failure.shape() != SubstrateFailureShape::NoMachine || blind.is_empty() {
+        return (failure, false);
+    }
+    let within_grace = blind.iter().any(|machine| {
+        machine
+            .blind_for_ms
+            .is_some_and(|blind_for_ms| blind_for_ms < TRANSIENT_REFUSAL_GRACE_MS)
+    });
+    let machines = blind
+        .iter()
+        .map(|machine| format!("{} ({})", machine.name, machine.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let grace_minutes = TRANSIENT_REFUSAL_GRACE_MS / 60_000;
+    let counted = if within_grace {
+        format!(
+            "inside the {grace_minutes}-minute grace for a blind window, so this death counts toward no suppression"
+        )
+    } else {
+        format!(
+            "blind past the {grace_minutes}-minute grace, so this death counts toward a fleet suppression that lifts when the telemetry is fresh again"
+        )
+    };
+    let diagnostic = format!(
+        "measurement-blind: {machines}; {counted}.\n{}",
+        failure.diagnostic
+    );
+    (
+        SubstrateFailure {
+            shape: SubstrateFailureShape::MeasurementBlind,
+            diagnostic,
+            ..failure
+        },
+        within_grace,
+    )
 }
 
 /// What an elapsed acquisition deadline actually says happened.
@@ -5317,6 +5563,16 @@ fn classify_check_failure(
                 .position(|line| line.contains("CAIRN_INFRASTRUCTURE_EXIT"))
         })
         .flatten();
+    // The run computed a pass and the executor's result destination refused
+    // it (`HANDOFF_FAILED_EXIT_CODE` in scripts/lib/rust-process-outcome.ts).
+    // The code and the marker are both required, as for exit 75.
+    let handoff_refused = (exit_code == Some(74))
+        .then(|| {
+            lines
+                .iter()
+                .position(|line| line.contains("CAIRN_HANDOFF_FAILED_EXIT"))
+        })
+        .flatten();
     let producer_failure = producer_failure_marker(&lines);
     let cache_or_sandbox_denial = lines.iter().position(|line| {
         let line = line.replace('\\', "/").to_ascii_lowercase();
@@ -5382,6 +5638,16 @@ fn classify_check_failure(
             reason: "Cairn: sccache cache-read corruption matched reviewed evidence".to_string(),
             evidence_line: Some(evidence_line),
             cache_corruption: true,
+        });
+    }
+    if let Some(evidence_line) = handoff_refused {
+        return Some(FailureClassification {
+            kind: CheckFailureKind::Infrastructure,
+            reason: "Cairn: the run computed its verdict, but the executor refused its structured \
+                     result, so no verdict was recorded"
+                .to_string(),
+            evidence_line: Some(evidence_line),
+            cache_corruption: false,
         });
     }
     if let Some((evidence_line, kind)) = producer_failure {
@@ -5714,9 +5980,9 @@ pub(crate) async fn jobs_sharing_branch(db: &LocalDb, job_id: &str) -> Vec<Strin
 /// doc-only / non-source commit). A cache hit returns the stored verdict without
 /// re-running.
 ///
-/// The wave runs as its own task and the caller waits for it at most
-/// [`WRITE_CHECK_INLINE_WAIT`]. The commit is already sealed when this is
-/// called, so the caller's result must not depend on the checks settling:
+/// The wave runs as its own task and the caller waits for it only while a
+/// verdict is plausibly imminent (see [`await_write_check_wave`]). The commit
+/// is already sealed when this is called, so the caller's result must not depend on the checks settling:
 /// a wave that outlives the bound keeps running, keeps `/checks` reporting
 /// it as in flight, and records its verdicts (and publishes any fix commit)
 /// on its own, while the caller returns a pending line in its place.
@@ -5737,9 +6003,11 @@ pub(crate) async fn run_write_checks_after_seal(
     let cwd = cwd.to_string();
     let tool_use_id = tool_use_id.to_string();
     let sealed_resolution = target.sealed_resolution();
+    let (progress, progress_seen) = tokio::sync::watch::channel(WaveProgress::default());
     await_write_check_wave(
         guard,
-        WRITE_CHECK_INLINE_WAIT,
+        WRITE_CHECK_INLINE_WAIT_BOUNDS,
+        progress_seen,
         async move {
             run_write_checks_after_seal_inner(
                 &wave_orch,
@@ -5747,6 +6015,7 @@ pub(crate) async fn run_write_checks_after_seal(
                 &cwd,
                 &tool_use_id,
                 sealed_resolution.as_ref(),
+                progress,
             )
             .await
         },
@@ -5786,17 +6055,85 @@ impl WriteCheckTarget<'_> {
     }
 }
 
-/// How long a committing `write` or `run` waits inline for its when:write
+/// The longest a committing `write` or `run` waits inline for its when:write
 /// checks. Stated in the write time contract so the callback layers wrapping
 /// the host can size themselves above it.
 const WRITE_CHECK_INLINE_WAIT: std::time::Duration =
     std::time::Duration::from_millis(cairn_common::write_contract::WRITE_CHECK_INLINE_WAIT_MS);
 
-/// Detach `wave` and wait for it at most `bound`. The in-flight guard moves
-/// into the detached task, so the job stays "write checks in flight" for
-/// exactly as long as the wave really runs, whether or not anyone is still
-/// waiting on it. Dropping the caller (a transport timeout, an interrupt)
-/// therefore no longer cancels checks for a commit that has already landed.
+/// The two bounds a committing call's inline wait for its write checks keeps,
+/// both counted from the call.
+#[derive(Clone, Copy, Debug)]
+struct InlineWaitBounds {
+    /// How long to wait while no lane of the wave has been admitted.
+    start: std::time::Duration,
+    /// How long to wait in all once one has.
+    total: std::time::Duration,
+}
+
+const WRITE_CHECK_INLINE_WAIT_BOUNDS: InlineWaitBounds = InlineWaitBounds {
+    start: std::time::Duration::from_millis(
+        cairn_common::write_contract::WRITE_CHECK_START_WAIT_MS,
+    ),
+    total: WRITE_CHECK_INLINE_WAIT,
+};
+
+/// How a committing call's inline wait for its write checks ended, by the
+/// names the `write_check_inline_wait` profiler span records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlineWaitOutcome {
+    /// The wave's summary came back inside the wait.
+    Served,
+    /// No lane was admitted within the start bound.
+    PendingNotStarted,
+    /// A lane was running when the total bound expired.
+    PendingRunning,
+    /// A lane had been admitted, but none was running when the total bound
+    /// expired: the wave was back in the queue, or preparing the batch that
+    /// re-verifies its fix.
+    PendingAtBound,
+}
+
+impl InlineWaitOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Served => "served",
+            Self::PendingNotStarted => "pending_not_started",
+            Self::PendingRunning => "pending_running",
+            Self::PendingAtBound => "pending_at_bound",
+        }
+    }
+}
+
+/// How a wait that expired ended, from whether any lane was ever admitted and
+/// where the wave stood at expiry. Admission is latched: a wave that ran and
+/// then went back to provisioning had already earned the full wait.
+fn classify_expired_wait(admitted: bool, stage: WaveStage) -> InlineWaitOutcome {
+    match (admitted, stage) {
+        (false, _) => InlineWaitOutcome::PendingNotStarted,
+        (true, WaveStage::Running) => InlineWaitOutcome::PendingRunning,
+        (true, _) => InlineWaitOutcome::PendingAtBound,
+    }
+}
+
+/// A wait that expired before its wave settled.
+struct PendingWave {
+    outcome: InlineWaitOutcome,
+    waited: std::time::Duration,
+    progress: WaveProgress,
+}
+
+/// Detach `wave` and wait for it only while its verdict is plausibly
+/// imminent. Until `progress` reports a lane admitted (claimed by an
+/// executor), the wait lasts at most `bounds.start`; once one has been, it
+/// lasts up to `bounds.total`, counted from the call. A wave answered from the
+/// cache settles at once and is returned at once.
+///
+/// The in-flight guard moves into the detached task, so the job stays "write
+/// checks in flight" for exactly as long as the wave really runs, whether or
+/// not anyone is still waiting on it. Dropping the caller (a transport
+/// timeout, an interrupt) therefore no longer cancels checks for a commit that
+/// has already landed.
 ///
 /// Some outcomes live only in the wave's return value (a fold conflict and its
 /// recovery patch, a non-convergent fix), so ownership of that value never
@@ -5806,7 +6143,8 @@ const WRITE_CHECK_INLINE_WAIT: std::time::Duration =
 /// result to `deliver_late` instead. Exactly one of the two receives it.
 async fn await_write_check_wave<F, D, DF>(
     guard: WriteChecksInFlightGuard,
-    bound: std::time::Duration,
+    bounds: InlineWaitBounds,
+    mut progress: tokio::sync::watch::Receiver<WaveProgress>,
     wave: F,
     deliver_late: D,
 ) -> Option<String>
@@ -5815,6 +6153,18 @@ where
     D: FnOnce(String) -> DF + Send + 'static,
     DF: std::future::Future<Output = ()> + Send + 'static,
 {
+    // Its duration is the wait's. A caller dropped mid-wait closes it still
+    // reading `caller_dropped`.
+    let span = tracing::info_span!(
+        target: "profiler",
+        "write_check_inline_wait",
+        outcome = "caller_dropped",
+        stage = tracing::field::Empty,
+        executor = tracing::field::Empty,
+        admitted = tracing::field::Empty,
+        start_bound_ms = whole_ms(bounds.start),
+        total_bound_ms = whole_ms(bounds.total),
+    );
     let (offer, mut inline) = tokio::sync::oneshot::channel::<OfferedOutcome>();
     tokio::spawn(async move {
         let outcome = tokio::spawn(async move {
@@ -5824,25 +6174,80 @@ where
         .await;
         hand_off_wave_outcome(offer, settled_wave_summary(outcome), deliver_late).await;
     });
-    match tokio::time::timeout(bound, &mut inline).await {
-        Ok(Ok(offered)) => claim_offered_outcome(offered),
+    let started = tokio::time::Instant::now();
+    let mut admitted = progress.borrow_and_update().admitted;
+    let mut watching = true;
+    let settled = loop {
+        let bound = if admitted { bounds.total } else { bounds.start };
+        tokio::select! {
+            biased;
+            offered = &mut inline => break Some(offered),
+            changed = progress.changed(), if watching => {
+                // The wave drops its sender as it finishes; its outcome still
+                // arrives on `inline`.
+                watching = changed.is_ok();
+                admitted = progress.borrow_and_update().admitted;
+            }
+            () = tokio::time::sleep_until(started + bound) => break None,
+        }
+    };
+    let last = progress.borrow().clone();
+    match settled {
+        Some(Ok(offered)) => {
+            record_inline_wait(&span, InlineWaitOutcome::Served.as_str(), &last, admitted);
+            log::debug!(
+                "when:write checks answered inline after {}ms",
+                started.elapsed().as_millis()
+            );
+            claim_offered_outcome(offered)
+        }
         // The supervisor always sends unless the runtime is shutting down.
-        Ok(Err(_)) => None,
-        Err(_) => {
+        Some(Err(_)) => {
+            record_inline_wait(&span, "wave_lost", &last, admitted);
+            None
+        }
+        None => {
             // Close before deciding: a result offered in the instant the bound
             // elapsed is still ours to return, and anything after the close is
             // refused and goes to late delivery instead.
             inline.close();
             if let Ok(offered) = inline.try_recv() {
+                record_inline_wait(&span, InlineWaitOutcome::Served.as_str(), &last, admitted);
                 return claim_offered_outcome(offered);
             }
+            let pending = PendingWave {
+                outcome: classify_expired_wait(admitted, last.stage),
+                waited: started.elapsed(),
+                progress: last,
+            };
+            record_inline_wait(&span, pending.outcome.as_str(), &pending.progress, admitted);
+            let why = pending_wave_reason(&pending, unix_time_ms_for_checks());
             log::info!(
-                "when:write checks still running after {}s; returning the commit with checks pending",
-                bound.as_secs()
+                "when:write checks pending after {}s ({}): {why}",
+                pending.waited.as_secs(),
+                pending.outcome.as_str()
             );
-            Some(pending_write_checks_summary(bound))
+            Some(pending_write_checks_summary(&why))
         }
     }
+}
+
+fn record_inline_wait(
+    span: &tracing::Span,
+    outcome: &str,
+    progress: &WaveProgress,
+    admitted: bool,
+) {
+    span.record("outcome", outcome);
+    span.record("stage", progress.stage.as_str());
+    if let Some(executor) = progress.executor.as_deref() {
+        span.record("executor", executor);
+    }
+    span.record("admitted", admitted);
+}
+
+fn whole_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// A wave's final summary as offered to its caller, with the receipt the caller
@@ -5947,14 +6352,60 @@ fn late_write_check_message(summary: &str) -> String {
 }
 
 /// The line a committing call carries when its write checks outlive the inline
-/// wait. It leads with the fact the agent most needs: the commit landed.
-fn pending_write_checks_summary(bound: std::time::Duration) -> String {
+/// wait. It says why they are pending (`why`, from [`pending_wave_reason`]) so
+/// a held lane reads differently from a slow suite, then leads with the fact
+/// the agent most needs: the commit landed.
+fn pending_write_checks_summary(why: &str) -> String {
     format!(
-        "Checks: \u{22EF} pending \u{2014} the commit above landed; its when:write checks were still running \
-         after {}s and continue in the background. Their verdicts (and any formatter fix, which lands \
-         as its own commit) appear at cairn:~/checks.",
-        bound.as_secs()
+        "Checks: \u{22EF} pending ({why}) \u{2014} the commit above landed; its when:write checks continue \
+         in the background. Their verdicts (and any formatter fix, which lands as its own commit) appear \
+         at cairn:~/checks, and a [Write checks] message follows when they finish."
     )
+}
+
+/// Why a wave is still pending when its wait expired: what holds it, or where
+/// it is running and for how long.
+fn pending_wave_reason(wave: &PendingWave, now_unix_ms: u64) -> String {
+    let waited = describe_ms(whole_ms(wave.waited));
+    let progress = &wave.progress;
+    let held = || {
+        progress
+            .reason
+            .clone()
+            .unwrap_or_else(|| stage_words(progress.stage).to_string())
+    };
+    match wave.outcome {
+        InlineWaitOutcome::PendingRunning => {
+            let on = progress
+                .executor
+                .as_deref()
+                .map(|executor| format!(" on {executor}"))
+                .unwrap_or_default();
+            match progress.since_unix_ms {
+                Some(since) => format!(
+                    "running{on} since {}, {} in",
+                    clock_utc(since),
+                    describe_ms(now_unix_ms.saturating_sub(since))
+                ),
+                None => format!("running{on}, still running after {waited}"),
+            }
+        }
+        InlineWaitOutcome::PendingAtBound => {
+            format!("admitted but not running after {waited}: {}", held())
+        }
+        InlineWaitOutcome::PendingNotStarted | InlineWaitOutcome::Served => {
+            format!("not admitted after {waited}: {}", held())
+        }
+    }
+}
+
+fn stage_words(stage: WaveStage) -> &'static str {
+    match stage {
+        WaveStage::Planning => "still planning",
+        WaveStage::Preparing => "still preparing the check's inputs",
+        WaveStage::Queued => "queued, and no machine has claimed it",
+        WaveStage::Running => "running",
+    }
 }
 
 struct WriteChecksInFlightGuard {
@@ -5992,6 +6443,7 @@ async fn run_write_checks_after_seal_inner(
     cwd: &str,
     tool_use_id: &str,
     sealed_resolution: Option<&crate::mcp::handlers::branch::BranchResolution>,
+    progress: tokio::sync::watch::Sender<WaveProgress>,
 ) -> Option<String> {
     // No run context ⇒ no run id to stream against and no job to anchor the diff.
     let run_context = run_context?;
@@ -6142,20 +6594,23 @@ async fn run_write_checks_after_seal_inner(
             .then_some(index)
         })
         .collect();
-    let status_notify: CheckStatusNotify = Arc::new(move |checks, phase_status| {
-        let _ = emitter.emit(
-            "check-status",
-            serde_json::to_value(CheckStatusPayload {
-                run_id: notify_run_id.clone(),
-                tool_use_id: notify_tool_use_id.clone(),
-                checks,
-                phase: phase_status.phase,
-                phase_label: phase_status.label,
-                phase_diagnostic: phase_status.diagnostic,
-            })
-            .unwrap_or(serde_json::Value::Null),
-        );
-    });
+    let status_notify = wave_status_notify(
+        move |checks, phase_status| {
+            let _ = emitter.emit(
+                "check-status",
+                serde_json::to_value(CheckStatusPayload {
+                    run_id: notify_run_id.clone(),
+                    tool_use_id: notify_tool_use_id.clone(),
+                    checks,
+                    phase: phase_status.phase,
+                    phase_label: phase_status.label,
+                    phase_diagnostic: phase_status.diagnostic,
+                })
+                .unwrap_or(serde_json::Value::Null),
+            );
+        },
+        progress,
+    );
     let status_board = CheckStatusBoard::new(&keyed, status_notify);
     status_board.set_phase(
         (!miss_indices.is_empty()).then_some("dispatching"),
@@ -7068,21 +7523,6 @@ pub(crate) async fn load_checks_contract_at_commit_detailed(
     .map_err(|error| CommitChecksContractError::BlockingTask(error.to_string()))?
 }
 
-/// Whether `commit` declares any check this build can run, or why that could
-/// not be read. A commit with no config, or a config with no `checks`, declares
-/// none. An unreadable or unparseable config is an error, never "none": a gate
-/// that read it as none would pass a head nobody checked.
-pub(crate) async fn checks_declared_at_commit(
-    object_repository: &Path,
-    commit: &str,
-) -> Result<bool, String> {
-    match load_checks_contract_at_commit_detailed(object_repository, commit).await {
-        Ok(contract) => Ok(!contract.contract.checks.is_empty()),
-        Err(CommitChecksContractError::Missing | CommitChecksContractError::NoChecks) => Ok(false),
-        Err(error) => Err(error.manual_diagnostic(commit)),
-    }
-}
-
 /// [`checks_contract_at_commit`] off the async caller's runtime thread. The read
 /// touches the object database, which is filesystem work.
 pub(crate) async fn load_checks_contract_at_commit(
@@ -7516,9 +7956,20 @@ pub(crate) fn suppressed_check_message(suppressed: &SuppressedCheck) -> String {
             message
         }
         InfraRepairDomain::Fleet => {
+            // Two populations, two sentences: a fleet suppression keyed on
+            // blind machines lifts when they can be measured again, and one
+            // keyed on the capability set alone lifts only when it changes.
+            let lifts = if suppressed.fleet_blind.is_empty() {
+                "It runs again when the set of machines matching its requirements changes."
+                    .to_string()
+            } else {
+                format!(
+                    "Cairn could not read the current load of {}, so it runs again as soon as their telemetry is fresh, or when the set of machines matching its requirements changes.",
+                    suppressed.fleet_blind.join(", ")
+                )
+            };
             let head = format!(
-                "Stopped after {streak} infrastructure failures against the fleet this check can reach; a new commit will not re-run it. \
-                 It runs again when the set of machines matching its requirements changes."
+                "Stopped after this check died on {streak} separate commits against the fleet it can reach (retries of one commit count once); a new commit will not re-run it. {lifts}"
             );
             let last = suppressed.evidence().output_tail.trim();
             if last.is_empty() {
@@ -7853,6 +8304,9 @@ fn fresh_observation_write(
         cell_origin: provenance
             .and_then(|meta| meta.cell_origin.as_ref())
             .map(crate::execution::cache::ObservedCellOrigin::from_executor),
+        build_jobs: provenance
+            .and_then(|meta| meta.allocation.as_ref())
+            .and_then(|allocation| allocation.build_jobs),
         tests,
         infra_reset_scopes,
     }
@@ -8528,6 +8982,30 @@ where
                     other => other,
                 };
 
+                // A no-machine refusal is named by what the matching machines
+                // said, read now, while the refusal is still the fleet's
+                // current answer.
+                let mut transient_within_grace = false;
+                let exec_outcome = match exec_outcome {
+                    Err(CheckExecutionFailure::Substrate(failure))
+                        if failure.shape() == SubstrateFailureShape::NoMachine =>
+                    {
+                        let eligible: Vec<String> = infra_scopes
+                            .environments
+                            .iter()
+                            .map(|(executor_id, _)| executor_id.clone())
+                            .collect();
+                        let blind = diagnostic_orch
+                            .map(|orch| orch.fleet.measurement_blindness(&eligible))
+                            .unwrap_or_default();
+                        let (failure, within_grace) =
+                            name_measurement_blind_refusal(failure, &blind);
+                        transient_within_grace = within_grace;
+                        Err(CheckExecutionFailure::Substrate(failure))
+                    }
+                    other => other,
+                };
+
                 let (
                     exit_code,
                     output,
@@ -8837,6 +9315,7 @@ where
                             verdict_environment_hash: provenance
                                 .as_ref()
                                 .and_then(|meta| meta.verdict_environment_hash.clone()),
+                            transient_within_grace,
                         };
                         let reuse =
                             check_reuse_decision(&plan.command, failure_kind, parsed.as_ref());
@@ -9082,6 +9561,7 @@ pub(crate) fn record_suppressed_check(
             verdict_platform: None,
             verdict_arch: None,
             verdict_environment_hash: None,
+            transient_within_grace: false,
         },
     );
     log::info!(
@@ -9222,6 +9702,7 @@ fn record_unattempted_check(
             verdict_platform: None,
             verdict_arch: None,
             verdict_environment_hash: None,
+            transient_within_grace: false,
         },
     ) {
         log::warn!(
@@ -10337,10 +10818,11 @@ mod tests {
             (Shape::CommandOomKilled, Domain::Environment),
             (Shape::BuildVolumeAbsent, Domain::Fleet),
             (Shape::BuildVolumeLost, Domain::Environment),
+            (Shape::MeasurementBlind, Domain::Fleet),
         ];
         assert_eq!(
             table.len(),
-            16,
+            17,
             "a new substrate shape must be classified in this table, not defaulted"
         );
         for (shape, expected) in table {
@@ -10366,6 +10848,136 @@ mod tests {
             Domain::Head
         );
         assert_eq!(super::infra_repair_domain(None, None), Domain::Head);
+    }
+
+    /// cairn/5671. "Nothing in the fleet matches" and "the matching machine
+    /// could not be measured" arrive as one refusal reason and were told as one
+    /// sentence. The second is a window that clears on its own, so it is named
+    /// as itself and, while young, charged to nothing.
+    #[test]
+    fn a_brake_blind_refusal_is_named_transient_and_given_its_grace() {
+        use super::{
+            name_measurement_blind_refusal, SubstrateFailure, SubstrateFailureShape as Shape,
+            TRANSIENT_REFUSAL_GRACE_MS,
+        };
+        use crate::fleet::MeasurementBlindness;
+        let refusal = || {
+            SubstrateFailure::new(
+                Shape::NoMachine,
+                "NoMatchingExecutor: no executor could take this spillEligible request: \
+                 bgsrv-ub (drained by an operator; refusing new work); \
+                 fedora (cpu was measured 108276ms ago, past the 90000ms bound).",
+            )
+        };
+        let fedora = |blind_for_ms| MeasurementBlindness {
+            executor_id: "fedora".into(),
+            name: "fedora".into(),
+            reason: "cpu was measured 108276ms ago, past the 90000ms bound".into(),
+            blind_for_ms,
+        };
+
+        let (named, within_grace) =
+            name_measurement_blind_refusal(refusal(), &[fedora(Some(18_276))]);
+        assert_eq!(named.shape(), Shape::MeasurementBlind);
+        assert!(within_grace, "eighteen seconds blind is a window");
+        let message = named.agent_message();
+        assert!(
+            message.starts_with(Shape::MeasurementBlind.lead()),
+            "{message}"
+        );
+        assert!(
+            !message.contains(Shape::NoMachine.lead()),
+            "a blind machine is not a fleet with nothing that matches: {message}"
+        );
+        assert!(
+            named.diagnostic().starts_with(
+                "measurement-blind: fedora (cpu was measured 108276ms ago, past the 90000ms bound)"
+            ),
+            "{}",
+            named.diagnostic()
+        );
+        assert!(named.diagnostic().contains("counts toward no suppression"));
+        assert!(
+            named
+                .diagnostic()
+                .contains("bgsrv-ub (drained by an operator"),
+            "the fleet's own account of every machine survives"
+        );
+
+        let (outlived, within_grace) =
+            name_measurement_blind_refusal(refusal(), &[fedora(Some(TRANSIENT_REFUSAL_GRACE_MS))]);
+        assert_eq!(outlived.shape(), Shape::MeasurementBlind);
+        assert!(!within_grace, "past the grace, its deaths count");
+        assert!(outlived
+            .diagnostic()
+            .contains("lifts when the telemetry is fresh"));
+
+        let (_, within_grace) = name_measurement_blind_refusal(refusal(), &[fedora(None)]);
+        assert!(
+            !within_grace,
+            "a reading missing outright has no instant to measure from, so it stays bounded"
+        );
+
+        let (structural, within_grace) = name_measurement_blind_refusal(refusal(), &[]);
+        assert_eq!(
+            structural.shape(),
+            Shape::NoMachine,
+            "with no blind eligible machine, nothing matches: that is the structural gap"
+        );
+        assert!(!within_grace);
+
+        let (capacity, within_grace) = name_measurement_blind_refusal(
+            SubstrateFailure::new(Shape::Capacity, "busy"),
+            &[fedora(Some(1))],
+        );
+        assert_eq!(
+            capacity.shape(),
+            Shape::Capacity,
+            "only a no-machine refusal is re-read"
+        );
+        assert!(!within_grace);
+    }
+
+    /// A fleet suppression says what lifts it, and the two populations get
+    /// two sentences: one keyed on blind machines lifts on their telemetry,
+    /// one keyed on the capability set alone only on a fleet change. Both say
+    /// they counted commits, not attempts.
+    #[test]
+    fn a_fleet_suppression_names_what_lifts_it() {
+        use crate::execution::cache::{
+            infra_fleet_scope, InfraRepairDomain, SuppressedCheck, SuppressedScope,
+        };
+        let mut entry = cache_entry("workspace-compile", "tree-a", false);
+        entry.infra_failure_streak = 3;
+        let suppressed = |fleet_blind: Vec<String>| SuppressedCheck {
+            domain: InfraRepairDomain::Fleet,
+            scopes: vec![SuppressedScope {
+                scope: infra_fleet_scope("digest"),
+                executor_id: None,
+                platform: None,
+                entry: entry.clone(),
+            }],
+            fleet_blind,
+        };
+
+        let blind = super::suppressed_check_message(&suppressed(vec!["fedora".to_string()]));
+        assert!(blind.contains("died on 3 separate commits"), "{blind}");
+        assert!(
+            blind.contains("retries of one commit count once"),
+            "{blind}"
+        );
+        assert!(
+            blind.contains("could not read the current load of fedora")
+                && blind.contains("as soon as their telemetry is fresh"),
+            "{blind}"
+        );
+
+        let structural = super::suppressed_check_message(&suppressed(Vec::new()));
+        assert!(
+            structural.contains("when the set of machines matching its requirements changes")
+                && !structural.contains("telemetry"),
+            "{structural}"
+        );
     }
 
     /// The refusal a thread session gets instead of an internal row error
@@ -10421,6 +11033,7 @@ mod tests {
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
+            scratch_sync: None,
         };
         let emitted = crate::execution::wire::durable_check_request(|wait_horizon_unix_ms| {
             let mut request = request();
@@ -10740,6 +11353,709 @@ mod tests {
         std::future::ready(())
     }
 
+    fn wait_bounds(start_ms: u64, total_ms: u64) -> InlineWaitBounds {
+        InlineWaitBounds {
+            start: std::time::Duration::from_millis(start_ms),
+            total: std::time::Duration::from_millis(total_ms),
+        }
+    }
+
+    /// A progress channel nothing ever publishes to. Hold the sender: a
+    /// dropped one is the wave finishing.
+    fn quiet_progress() -> (
+        tokio::sync::watch::Sender<WaveProgress>,
+        tokio::sync::watch::Receiver<WaveProgress>,
+    ) {
+        tokio::sync::watch::channel(WaveProgress::default())
+    }
+
+    fn queued_progress(reason: &str) -> WaveProgress {
+        WaveProgress {
+            stage: WaveStage::Queued,
+            reason: Some(reason.into()),
+            ..WaveProgress::default()
+        }
+    }
+
+    fn running_progress(executor: &str) -> WaveProgress {
+        WaveProgress {
+            stage: WaveStage::Running,
+            executor: Some(executor.into()),
+            since_unix_ms: Some(unix_time_ms_for_checks()),
+            reason: None,
+            admitted: true,
+        }
+    }
+
+    const HELD_BY_THE_BRAKE: &str = "declined by local (host pressure: cpu 97%)";
+
+    /// The case the start bound exists for: a lane no machine claims (the
+    /// local brake holding non-interactive work). The call answers at the
+    /// start bound, not the total, says what holds the lane, and the verdict
+    /// still reaches the agent late, exactly once.
+    #[tokio::test]
+    async fn a_wave_never_admitted_returns_pending_at_the_start_bound() {
+        let temp = TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
+        let (progress, seen) = tokio::sync::watch::channel(queued_progress(HELD_BY_THE_BRAKE));
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (delivered_tx, mut delivered) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let verdict = "Checks: \u{2713} rust-fmt (0.4s)";
+
+        let started = std::time::Instant::now();
+        let summary = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            await_write_check_wave(
+                guard,
+                wait_bounds(50, 3_000),
+                seen,
+                async move {
+                    let _ = released.await;
+                    Some(verdict.to_string())
+                },
+                move |late: String| async move {
+                    let _ = delivered_tx.send(late);
+                },
+            ),
+        )
+        .await
+        .expect("the committing call must answer, not wait for the checks")
+        .expect("a pending wave still reports a checks line");
+        let waited = started.elapsed();
+
+        assert!(waited >= std::time::Duration::from_millis(50), "{waited:?}");
+        assert!(
+            waited < std::time::Duration::from_millis(3_000),
+            "an unadmitted wave must not wait the total bound: {waited:?}"
+        );
+        assert!(
+            summary.starts_with("Checks: \u{22EF} pending (not admitted after "),
+            "{summary}"
+        );
+        assert!(summary.contains(HELD_BY_THE_BRAKE), "{summary}");
+        assert!(summary.contains("the commit above landed"), "{summary}");
+        assert!(summary.contains("cairn:~/checks"), "{summary}");
+        assert!(summary.contains("[Write checks]"), "{summary}");
+        assert!(
+            orch.write_checks_in_flight("job-a"),
+            "the detached wave still runs, so /checks must keep reporting it in flight",
+        );
+
+        drop(progress);
+        release.send(()).unwrap();
+        let late = tokio::time::timeout(std::time::Duration::from_secs(5), delivered.recv())
+            .await
+            .expect("the verdict of a wave answered pending must be delivered late")
+            .expect("one delivery");
+        assert_eq!(late, verdict);
+        assert!(delivered.recv().await.is_none(), "delivered exactly once");
+    }
+
+    /// A lane a machine claimed is a verdict on its way, so the wait runs to
+    /// the total bound and names the machine.
+    #[tokio::test]
+    async fn an_admitted_wave_waits_to_the_total_bound() {
+        let temp = TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
+        let (progress, seen) = quiet_progress();
+        // Paused after the orchestrator is built, so the claim and both bounds
+        // share one clock however loaded the host running the test is.
+        tokio::time::pause();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            progress.send_replace(running_progress("bgsrv-mac"));
+            std::future::pending::<()>().await;
+        });
+
+        let started = tokio::time::Instant::now();
+        let summary = await_write_check_wave(
+            guard,
+            wait_bounds(80, 400),
+            seen,
+            std::future::pending::<Option<String>>(),
+            ignore_late,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(400),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            summary.starts_with("Checks: \u{22EF} pending (running on bgsrv-mac since "),
+            "{summary}"
+        );
+        assert!(summary.contains("the commit above landed"), "{summary}");
+    }
+
+    /// Admission past the start bound's reach still extends the wait: a lane
+    /// claimed early whose verdict lands after the start bound is returned
+    /// inline, with nothing delivered late.
+    #[tokio::test]
+    async fn admission_extends_the_wait_and_the_verdict_returns_inline() {
+        let temp = TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
+        let (progress, seen) = quiet_progress();
+        let (delivered_tx, mut delivered) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::time::pause();
+
+        let summary = await_write_check_wave(
+            guard,
+            wait_bounds(80, 3_000),
+            seen,
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                progress.send_replace(running_progress("bgsrv-mac"));
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                Some("Checks: \u{2713} rust-fmt (0.3s)".to_string())
+            },
+            move |late: String| async move {
+                let _ = delivered_tx.send(late);
+            },
+        )
+        .await;
+
+        assert_eq!(summary.as_deref(), Some("Checks: \u{2713} rust-fmt (0.3s)"));
+        assert!(
+            delivered.recv().await.is_none(),
+            "an outcome returned inline is not also delivered late"
+        );
+    }
+
+    /// Admission is latched. A wave that ran and went back to preparing (the
+    /// batch that re-verifies its fix) keeps the full wait, and expiring then
+    /// reads as neither "not admitted" nor "running".
+    #[tokio::test]
+    async fn admission_is_latched() {
+        let temp = TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
+        let (progress, seen) = quiet_progress();
+        tokio::time::pause();
+        tokio::spawn(async move {
+            progress.send_replace(running_progress("bgsrv-mac"));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            // The board's next snapshot: preparing the fix re-verification.
+            progress.send_modify(|current| {
+                *current = wave_progress(
+                    current,
+                    &[status_entry("pending")],
+                    &check_phase_status(
+                        Some("provisioning"),
+                        None,
+                        Some("resolving build slot".into()),
+                    ),
+                );
+            });
+            std::future::pending::<()>().await;
+        });
+
+        let started = tokio::time::Instant::now();
+        let summary = await_write_check_wave(
+            guard,
+            wait_bounds(60, 300),
+            seen,
+            std::future::pending::<Option<String>>(),
+            ignore_late,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(300),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            summary.starts_with(
+                "Checks: \u{22EF} pending (admitted but not running after 0s: resolving build slot)"
+            ),
+            "{summary}"
+        );
+        assert_eq!(
+            classify_expired_wait(true, WaveStage::Preparing),
+            InlineWaitOutcome::PendingAtBound
+        );
+        assert_eq!(
+            classify_expired_wait(true, WaveStage::Running),
+            InlineWaitOutcome::PendingRunning
+        );
+        assert_eq!(
+            classify_expired_wait(false, WaveStage::Queued),
+            InlineWaitOutcome::PendingNotStarted
+        );
+    }
+
+    /// A wave answered entirely from the cache never reports progress and
+    /// settles at once; the call returns at once with its verdict.
+    #[tokio::test]
+    async fn a_cache_served_wave_answers_immediately() {
+        let temp = TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
+        let (_progress, seen) = quiet_progress();
+
+        let started = std::time::Instant::now();
+        let summary = await_write_check_wave(
+            guard,
+            wait_bounds(5_000, 10_000),
+            seen,
+            async { Some("Checks: \u{2713} rust-fmt (cached)".to_string()) },
+            ignore_late,
+        )
+        .await;
+
+        assert_eq!(
+            summary.as_deref(),
+            Some("Checks: \u{2713} rust-fmt (cached)")
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The wave drops its progress sender as it finishes, a moment before its
+    /// outcome is offered. That must not end the wait: the outcome still comes
+    /// back inline.
+    #[tokio::test]
+    async fn progress_sender_dropping_does_not_end_the_wait_early() {
+        let temp = TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
+        let (progress, seen) = quiet_progress();
+        drop(progress);
+
+        let summary = await_write_check_wave(
+            guard,
+            wait_bounds(1_000, 2_000),
+            seen,
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Some("Checks: \u{2713} rust-fmt (0.1s)".to_string())
+            },
+            ignore_late,
+        )
+        .await;
+
+        assert_eq!(summary.as_deref(), Some("Checks: \u{2713} rust-fmt (0.1s)"));
+    }
+
+    /// The receipt handshake at the new, short bound: a verdict offered in the
+    /// very instant the start bound expires is either returned inline or
+    /// delivered late, never both and never neither.
+    #[tokio::test]
+    async fn a_verdict_offered_as_the_start_bound_expires_reaches_the_agent_once() {
+        let temp = TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
+        let (_progress, seen) = tokio::sync::watch::channel(queued_progress(HELD_BY_THE_BRAKE));
+        let (delivered_tx, mut delivered) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let verdict = "Checks: \u{2713} rust-fmt (0.1s)";
+        // Paused after the orchestrator is built, so its own I/O ran on real
+        // time; from here the wave's timer and the start bound share one
+        // instant.
+        tokio::time::pause();
+        let start = std::time::Duration::from_millis(50);
+
+        let summary = await_write_check_wave(
+            guard,
+            wait_bounds(50, 5_000),
+            seen,
+            async move {
+                tokio::time::sleep(start).await;
+                Some(verdict.to_string())
+            },
+            move |late: String| async move {
+                let _ = delivered_tx.send(late);
+            },
+        )
+        .await
+        .unwrap();
+
+        let late: Vec<String> = {
+            let mut late = Vec::new();
+            while let Some(summary) = delivered.recv().await {
+                late.push(summary);
+            }
+            late
+        };
+        if summary == verdict {
+            assert!(
+                late.is_empty(),
+                "returned inline and delivered late: {late:?}"
+            );
+        } else {
+            assert!(summary.contains("not admitted"), "{summary}");
+            assert_eq!(late, vec![verdict.to_string()]);
+        }
+    }
+
+    fn status_entry(state: &str) -> CheckStatusEntry {
+        CheckStatusEntry {
+            index: 0,
+            name: "rust-fmt".into(),
+            state: state.into(),
+            annotation: None,
+            cached: false,
+        }
+    }
+
+    #[test]
+    fn wave_progress_reads_the_stage_from_the_board() {
+        let start = WaveProgress::default();
+        let queued = wave_progress(
+            &start,
+            &[status_entry("pending")],
+            &CheckPhaseStatus {
+                since_unix_ms: Some(PARKED_AT),
+                held_by: Some(HELD_BY_THE_BRAKE.into()),
+                ..check_phase_status(
+                    Some("queued"),
+                    Some("queued"),
+                    Some(format!(
+                        "a long forecast; parked since 09:48:00Z; {HELD_BY_THE_BRAKE}"
+                    )),
+                )
+            },
+        );
+        assert_eq!(
+            queued,
+            WaveProgress {
+                stage: WaveStage::Queued,
+                executor: None,
+                since_unix_ms: Some(PARKED_AT),
+                reason: Some(HELD_BY_THE_BRAKE.into()),
+                admitted: false,
+            },
+            "a queued wave names what holds it, not the whole diagnostic"
+        );
+        let undeclined = wave_progress(
+            &start,
+            &[status_entry("pending")],
+            &check_phase_status(Some("queued"), Some("queued"), Some("the forecast".into())),
+        );
+        assert_eq!(undeclined.reason.as_deref(), Some("the forecast"));
+
+        for phase in ["provisioning", "dispatching"] {
+            let preparing = wave_progress(
+                &start,
+                &[status_entry("pending")],
+                &check_phase_status(Some(phase), None, Some("resolving build slot".into())),
+            );
+            assert_eq!(preparing.stage, WaveStage::Preparing, "{phase}");
+            assert_eq!(preparing.reason.as_deref(), Some("resolving build slot"));
+        }
+
+        let claimed = wave_progress(
+            &queued,
+            &[status_entry("pending")],
+            &CheckPhaseStatus {
+                executor: Some("bgsrv-mac".into()),
+                since_unix_ms: Some(PARKED_AT + 9_000),
+                ..check_phase_status(Some("running"), Some("running checks"), None)
+            },
+        );
+        assert_eq!(claimed, running_at("bgsrv-mac", PARKED_AT + 9_000));
+
+        let started = wave_progress(
+            &claimed,
+            &[status_entry("running")],
+            &check_phase_status(Some("running"), Some("running checks"), None),
+        );
+        assert_eq!(
+            started, claimed,
+            "a lane's own start keeps the machine the claim named"
+        );
+        let started_unclaimed = wave_progress(
+            &queued,
+            &[status_entry("running")],
+            &CheckPhaseStatus::default(),
+        );
+        assert_eq!(started_unclaimed.stage, WaveStage::Running);
+        assert_eq!(started_unclaimed.executor, None);
+        assert!(started_unclaimed.admitted);
+
+        let reverifying = wave_progress(
+            &claimed,
+            &[status_entry("pending")],
+            &check_phase_status(
+                Some("provisioning"),
+                None,
+                Some("resolving build slot".into()),
+            ),
+        );
+        assert_eq!(reverifying.stage, WaveStage::Preparing);
+        assert!(
+            reverifying.admitted,
+            "admission is latched: a wave that ran stays admitted while it prepares its fix re-verification"
+        );
+        let requeued = wave_progress(
+            &reverifying,
+            &[status_entry("pending")],
+            &check_phase_status(Some("queued"), Some("queued"), None),
+        );
+        assert!(requeued.admitted);
+
+        let settled = wave_progress(
+            &claimed,
+            &[status_entry("passed")],
+            &CheckPhaseStatus::default(),
+        );
+        assert_eq!(settled, claimed, "a settled board keeps the last stage");
+    }
+
+    fn running_at(executor: &str, since_unix_ms: u64) -> WaveProgress {
+        WaveProgress {
+            stage: WaveStage::Running,
+            executor: Some(executor.into()),
+            since_unix_ms: Some(since_unix_ms),
+            reason: None,
+            admitted: true,
+        }
+    }
+
+    /// The real path from the fleet's dispatch facts to the inline wait: the
+    /// narrator renders them, the write wave's board shows them (`set_phase`
+    /// and `show_phase` both publish), and the board's sink, built as
+    /// `run_write_checks_after_seal_inner` builds it, feeds the progress the
+    /// wait reads. Were any link missing, a lane really running would be cut
+    /// at the start bound as "not admitted".
+    #[tokio::test(start_paused = true)]
+    async fn the_write_wave_board_feeds_its_dispatch_to_the_inline_wait() {
+        let (progress, mut seen) = tokio::sync::watch::channel(WaveProgress::default());
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emitted_by_sink = emitted.clone();
+        let plans = vec![(plan("rust-fmt", "true"), "input".to_string())];
+        let board = CheckStatusBoard::new(
+            &plans,
+            wave_status_notify(
+                move |_, phase: CheckPhaseStatus| {
+                    emitted_by_sink.lock().unwrap().push(phase);
+                },
+                progress,
+            ),
+        );
+
+        board.set_phase(
+            Some("provisioning"),
+            Some("preparing build slot"),
+            Some("resolving build slot".into()),
+        );
+        assert!(seen.has_changed().unwrap());
+        assert_eq!(seen.borrow_and_update().stage, WaveStage::Preparing);
+
+        let held = crate::fleet::CheckDispatch {
+            phase: crate::fleet::CheckDispatchPhase::Placing {
+                since_unix_ms: PARKED_AT,
+                declines: vec![crate::fleet::CheckDispatchDecline {
+                    executor_name: "local".into(),
+                    reason: cairn_common::executor_protocol::DeclineReason::Pressure,
+                    detail: Some("cpu 97%".into()),
+                    at_unix_ms: PARKED_AT + 1_000,
+                }],
+            },
+            joined: None,
+        };
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let queued_seen = std::sync::Mutex::new(None);
+        narrate_dispatch(
+            tokio::time::sleep(std::time::Duration::from_secs(5)),
+            &GroupWait::from_occupancy(predicted(292_000, 1)),
+            || {
+                Some(
+                    match reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                        0 => held.clone(),
+                        _ => running_on("bgsrv-mac", PARKED_AT + 9_000, None),
+                    },
+                )
+            },
+            || -> GroupWait { unreachable!("the forecast stays fresh for 30s") },
+            |status| {
+                board.show_phase(status);
+                queued_seen
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(|| seen.borrow().clone());
+            },
+        )
+        .await;
+
+        assert_eq!(
+            queued_seen.into_inner().unwrap(),
+            Some(WaveProgress {
+                stage: WaveStage::Queued,
+                executor: None,
+                since_unix_ms: Some(PARKED_AT),
+                reason: Some(HELD_BY_THE_BRAKE.into()),
+                admitted: false,
+            }),
+            "a held lane's decline reaches the wait as its reason"
+        );
+        assert_eq!(
+            *seen.borrow_and_update(),
+            running_at("bgsrv-mac", PARKED_AT + 9_000),
+            "a claim reaches the wait as running, with the machine"
+        );
+
+        board.transition(0, "running", None);
+        assert_eq!(*seen.borrow(), running_at("bgsrv-mac", PARKED_AT + 9_000));
+        let shown = emitted.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            (shown.executor.as_deref(), shown.since_unix_ms),
+            (Some("bgsrv-mac"), Some(PARKED_AT + 9_000)),
+            "a lane's start (and each output chunk) keeps the machine on the status row"
+        );
+        board.transition(0, "passed", Some("0.4s".into()));
+        assert_eq!(seen.borrow().stage, WaveStage::Running);
+        assert!(
+            emitted
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|phase| phase.phase.as_deref() == Some("queued")),
+            "the UI sink still receives every snapshot"
+        );
+    }
+
+    /// A `tree: impact` lane runs on the runner and never meets the fleet's
+    /// queue, so the narrator never reports it claimed. It reports its own
+    /// start instead; without that its wave would read as never admitted and
+    /// be cut at the start bound while the lane ran.
+    #[tokio::test]
+    async fn a_runner_lane_marks_its_wave_admitted_as_it_starts() {
+        let (progress, seen) = tokio::sync::watch::channel(WaveProgress::default());
+        let plans = vec![(plan("migrations", "true"), "input".to_string())];
+        let board = CheckStatusBoard::new(&plans, wave_status_notify(|_, _| {}, progress));
+        let temp = TempDir::new().unwrap();
+        let request = PlannedCheckBatchRequest {
+            project_id: "project".into(),
+            // No repository: the lane fails to materialize, after its start.
+            repository: temp.path().join("absent").to_string_lossy().into_owned(),
+            store_dir: temp.path().join("store"),
+            sealed_commit: "commit".into(),
+            requesting_job_id: "job".into(),
+            owner: cairn_common::executor_protocol::CellOwnerRef {
+                project_id: "project".into(),
+                project_key: None,
+                issue_number: None,
+                job_id: Some("job".into()),
+                execution_seq: None,
+                node_kind: None,
+            },
+            affinity_key: None,
+            priority: CellPriority::WriteCheck,
+            env: Vec::new(),
+            items: Vec::new(),
+            run_context: None,
+            mutation_policy: MutationPolicy::PureVerdict,
+            status_board: Some(board),
+            purpose: None,
+        };
+
+        let results = crate::execution::impact_slice::run_lanes(
+            &request,
+            vec![(
+                batch_item("true", CheckResourceClass::Shared),
+                vec!["migrations/**".into()],
+            )],
+        )
+        .await;
+
+        assert!(results.contains_key(&0));
+        let progress = seen.borrow().clone();
+        assert!(progress.admitted, "{progress:?}");
+        assert_eq!(progress.stage, WaveStage::Running);
+    }
+
+    #[test]
+    fn the_pending_line_says_why_the_checks_are_pending() {
+        let pending = |outcome, waited_ms, progress| PendingWave {
+            outcome,
+            waited: std::time::Duration::from_millis(waited_ms),
+            progress,
+        };
+        let not_admitted = pending_wave_reason(
+            &pending(
+                InlineWaitOutcome::PendingNotStarted,
+                15_004,
+                queued_progress(HELD_BY_THE_BRAKE),
+            ),
+            PARKED_AT,
+        );
+        assert_eq!(
+            not_admitted,
+            format!("not admitted after 15s: {HELD_BY_THE_BRAKE}")
+        );
+        assert_eq!(
+            pending_wave_reason(
+                &pending(
+                    InlineWaitOutcome::PendingNotStarted,
+                    15_000,
+                    WaveProgress {
+                        stage: WaveStage::Preparing,
+                        ..WaveProgress::default()
+                    },
+                ),
+                PARKED_AT,
+            ),
+            "not admitted after 15s: still preparing the check's inputs"
+        );
+        assert_eq!(
+            pending_wave_reason(
+                &pending(
+                    InlineWaitOutcome::PendingNotStarted,
+                    15_000,
+                    WaveProgress::default(),
+                ),
+                PARKED_AT,
+            ),
+            "not admitted after 15s: still planning"
+        );
+        assert_eq!(
+            pending_wave_reason(
+                &pending(
+                    InlineWaitOutcome::PendingRunning,
+                    120_000,
+                    running_at("bgsrv-mac", PARKED_AT),
+                ),
+                PARKED_AT + 100_000,
+            ),
+            "running on bgsrv-mac since 09:48:00Z, 1m40s in"
+        );
+        assert_eq!(
+            pending_wave_reason(
+                &pending(
+                    InlineWaitOutcome::PendingAtBound,
+                    120_000,
+                    WaveProgress {
+                        stage: WaveStage::Queued,
+                        ..WaveProgress::default()
+                    },
+                ),
+                PARKED_AT,
+            ),
+            "admitted but not running after 2m: queued, and no machine has claimed it"
+        );
+
+        let line = pending_write_checks_summary(&not_admitted);
+        assert!(
+            line.starts_with(&format!(
+                "Checks: \u{22EF} pending (not admitted after 15s: {HELD_BY_THE_BRAKE}) \u{2014} \
+                 the commit above landed;"
+            )),
+            "{line}"
+        );
+        assert!(line.contains("cairn:~/checks"), "{line}");
+        assert!(line.contains("[Write checks]"), "{line}");
+    }
+
     /// After the call answered pending, the wave's final word may exist nowhere
     /// else: a fold conflict, say, with the patch the agent needs to replay. It
     /// must reach the late-delivery path rather than be dropped with the handle.
@@ -10753,9 +12069,11 @@ mod tests {
         let fold_failure =
             "Checks: \u{2717} write-check fold (conflict in src/a.rs)\n```diff\n-x\n+y\n```";
 
+        let (_progress, seen) = quiet_progress();
         let summary = await_write_check_wave(
             guard,
-            std::time::Duration::from_millis(20),
+            wait_bounds(20, 20),
+            seen,
             async move {
                 let _ = released.await;
                 Some(fold_failure.to_string())
@@ -10832,9 +12150,11 @@ mod tests {
         let orch = test_orchestrator(temp.path()).await;
         let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
         let (delivered_tx, mut delivered) = tokio::sync::oneshot::channel::<String>();
+        let (_progress, seen) = quiet_progress();
         await_write_check_wave(
             guard,
-            std::time::Duration::from_secs(5),
+            wait_bounds(5_000, 5_000),
+            seen,
             async { Some("Checks: \u{2713} fmt".to_string()) },
             move |late: String| async move {
                 let _ = delivered_tx.send(late);
@@ -10845,39 +12165,6 @@ mod tests {
         assert!(delivered.try_recv().is_err());
     }
 
-    /// A wave that never settles (no lane placed, a hung command) must not hold
-    /// the committing call open: it answers at the bound with the checks pending,
-    /// and the still-running wave keeps the job's checks reported as moving.
-    #[tokio::test]
-    async fn a_write_check_wave_that_never_settles_returns_pending_at_the_bound() {
-        let temp = TempDir::new().unwrap();
-        let orch = test_orchestrator(temp.path()).await;
-        let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
-        let bound = std::time::Duration::from_millis(50);
-
-        let summary = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            await_write_check_wave(
-                guard,
-                bound,
-                std::future::pending::<Option<String>>(),
-                ignore_late,
-            ),
-        )
-        .await
-        .expect("the committing call must answer within the bound, not when checks settle")
-        .expect("a pending wave still reports a checks line");
-
-        assert!(summary.starts_with("Checks: "), "{summary}");
-        assert!(summary.contains("pending"), "{summary}");
-        assert!(summary.contains("the commit above landed"), "{summary}");
-        assert!(summary.contains("cairn:~/checks"), "{summary}");
-        assert!(
-            orch.write_checks_in_flight("job-a"),
-            "the detached wave still runs, so /checks must keep reporting it in flight",
-        );
-    }
-
     /// A wave that settles inside the bound returns its verdict line unchanged,
     /// and its in-flight state clears with it.
     #[tokio::test]
@@ -10886,9 +12173,11 @@ mod tests {
         let orch = test_orchestrator(temp.path()).await;
         let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
 
+        let (_progress, seen) = quiet_progress();
         let summary = await_write_check_wave(
             guard,
-            std::time::Duration::from_secs(5),
+            wait_bounds(5_000, 5_000),
+            seen,
             async { Some("Checks: \u{2713} rust-fmt (0.4s)".to_string()) },
             ignore_late,
         )
@@ -10912,9 +12201,11 @@ mod tests {
         let fold_failure =
             "Checks: \u{2717} write-check fold (non-convergent: verification mutated again)";
 
+        let (_progress, seen) = quiet_progress();
         let caller = tokio::spawn(await_write_check_wave(
             guard,
-            std::time::Duration::from_secs(60),
+            wait_bounds(60_000, 60_000),
+            seen,
             async move {
                 let _ = released.await;
                 Some(fold_failure.to_string())
@@ -10950,12 +12241,14 @@ mod tests {
     #[test]
     fn the_inline_write_check_wait_sits_inside_the_write_callback_contract() {
         let write = cairn_common::protocol::CallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: "/tmp".into(),
             run_id: None,
             tool: "write".into(),
             payload: serde_json::json!({ "changes": [{ "target": "file:a", "mode": "create" }] }),
             tool_use_id: None,
+            origin: None,
         };
         let cairn_common::callback_contract::HostAnswerBound::Bounded(host) =
             cairn_common::callback_contract::host_answer_bound(&write)
@@ -11006,7 +12299,7 @@ mod tests {
     fn committed_git_repo(temp: &TempDir) -> (std::path::PathBuf, String) {
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-q"]);
+        git(&repo, &["init", "-b", "main", "-q"]);
         std::fs::write(repo.join("checked.txt"), "sealed").unwrap();
         git(&repo, &["add", "checked.txt"]);
         git(
@@ -12438,7 +13731,7 @@ cairn-common = { path = "../cairn-common" }
                 "infra-stacks" => &["bun", "node", "npm"],
                 "rust-fmt" | "lockfile" | "licenses" | "rust-lint" | "rust-tests"
                 | "external-host" | "codex-pin" | "codex-contract" | "invoke-admission"
-                | "check-inputs" => &["bun", "rust"],
+                | "check-inputs" | "pack-skills" | "workspace-compile" => &["bun", "rust"],
                 "executor-windows-check" | "executor-linux-check" | "executor-macos-check" => {
                     &["rust"]
                 }
@@ -12574,10 +13867,60 @@ cairn-common = { path = "../cairn-common" }
     }
 
     #[test]
+    fn repository_skip_census_lane_follows_what_it_audits() {
+        // The census reads every `.rs` under src-tauri and the skip manifest. A
+        // lane keyed on anything narrower reuses its verdict across the change
+        // that breaks or fixes it, which is how frontend-tests carried it.
+        let config = include_str!("../../../../../.cairn/config.yaml");
+        let (settings, _) = crate::config::project_settings::parse_project_settings(config)
+            .expect("repository check config must parse");
+        let contract = crate::config::project_settings::checks_contract_from(settings)
+            .expect("repository must declare checks");
+        let census = contract
+            .checks
+            .get("skip-census")
+            .expect("skip-census exists")
+            .clone();
+        assert_eq!(
+            census.when,
+            CheckWhen::Write,
+            "the breaking commit sees its red"
+        );
+        assert!(matches!(census.policy, CheckPolicy::Advisory));
+        assert!(
+            census.main_cadence.is_some(),
+            "main's tip carries a census row"
+        );
+        assert!(
+            crate::execution::check_parsers::is_test_runner_command(&census.command),
+            "a per-test lane, so its row names the census test"
+        );
+
+        let checks = HashMap::from([("skip-census".to_string(), census)]);
+        let resolved = inputs(&checks);
+        let applies = |path: &str| {
+            plan_checks(&checks, &resolved, &[change(path)], Path::new("/repo"))
+                .iter()
+                .any(|plan| plan.applies)
+        };
+        for path in [
+            "src-tauri/skip-manifest.toml",
+            "src-tauri/os/cairn-core/src/pages/tests.rs",
+            "src-tauri/os/cairn-common/src/skip_ledger.rs",
+            "scripts/lib/skip-ledger.test.ts",
+            "scripts/lib/skip-ledger.ts",
+        ] {
+            assert!(applies(path), "skip-census must run when {path} changes");
+        }
+        assert!(!applies("src/App.tsx"));
+        assert!(!applies("docs/checks.md"));
+    }
+
+    #[test]
     fn result_key_uses_tree_content_not_commit_history() {
         let temp = TempDir::new().unwrap();
         let repo = temp.path();
-        git(repo, &["init", "--quiet"]);
+        git(repo, &["init", "-b", "main", "--quiet"]);
         git(repo, &["config", "user.name", "Cairn Test"]);
         git(repo, &["config", "user.email", "cairn@example.test"]);
         std::fs::create_dir_all(repo.join("src")).unwrap();
@@ -14444,6 +15787,7 @@ cairn-common = { path = "../cairn-common" }
             })),
             sandbox_denials: Vec::new(),
             tracked_modifications: None,
+            node_scratch: None,
         });
 
         for (index, outcome) in failures.into_iter().enumerate() {
@@ -14487,6 +15831,8 @@ cairn-common = { path = "../cairn-common" }
             quiet_ms: 900_000,
             last_output_unix_ms: Some(1_792_000_000_000),
             cpu_ms_in_window: Some(12),
+            storage_io_bytes_in_window: Some(0),
+            tree: Vec::new(),
         };
         let metadata: cairn_common::executor_protocol::CellExecutionMeta =
             serde_json::from_value(serde_json::json!({
@@ -14530,6 +15876,7 @@ cairn-common = { path = "../cairn-common" }
                 mutation_delta: None,
                 sandbox_denials: Vec::new(),
                 tracked_modifications: None,
+                node_scratch: None,
             },
             &crate::fleet::CellAccount::default(),
             None,
@@ -14554,6 +15901,7 @@ cairn-common = { path = "../cairn-common" }
                 mutation_delta: None,
                 sandbox_denials: Vec::new(),
                 tracked_modifications: None,
+                node_scratch: None,
             },
             &crate::fleet::CellAccount::default(),
             1,
@@ -14601,6 +15949,8 @@ cairn-common = { path = "../cairn-common" }
             quiet_ms: 1_800_000,
             last_output_unix_ms: None,
             cpu_ms_in_window: Some(3),
+            storage_io_bytes_in_window: None,
+            tree: Vec::new(),
         };
         let metadata: cairn_common::executor_protocol::CellExecutionMeta =
             serde_json::from_value(serde_json::json!({
@@ -14621,6 +15971,7 @@ cairn-common = { path = "../cairn-common" }
                 mutation_delta: None,
                 sandbox_denials: Vec::new(),
                 tracked_modifications: None,
+                node_scratch: None,
             },
             &crate::fleet::CellAccount::default(),
             None,
@@ -15639,7 +16990,7 @@ cairn-common = { path = "../cairn-common" }
     /// against whichever one a specimen happens to use. The match below makes
     /// the list exhaustive by construction: a new shape stops compiling here
     /// until it is added.
-    const ALL_SUBSTRATE_SHAPES: [SubstrateFailureShape; 16] = [
+    const ALL_SUBSTRATE_SHAPES: [SubstrateFailureShape; 17] = [
         SubstrateFailureShape::Dispatch,
         SubstrateFailureShape::Capacity,
         SubstrateFailureShape::MachineUnreachable,
@@ -15656,6 +17007,7 @@ cairn-common = { path = "../cairn-common" }
         SubstrateFailureShape::CommandOomKilled,
         SubstrateFailureShape::BuildVolumeAbsent,
         SubstrateFailureShape::BuildVolumeLost,
+        SubstrateFailureShape::MeasurementBlind,
     ];
 
     /// The bound is on the COMPOSED message, so it has to hold for every lead
@@ -15684,7 +17036,8 @@ cairn-common = { path = "../cairn-common" }
                 | SubstrateFailureShape::CommandStalled
                 | SubstrateFailureShape::CommandOomKilled
                 | SubstrateFailureShape::BuildVolumeAbsent
-                | SubstrateFailureShape::BuildVolumeLost => {}
+                | SubstrateFailureShape::BuildVolumeLost
+                | SubstrateFailureShape::MeasurementBlind => {}
             }
 
             let message = SubstrateFailure::new(shape, &log).agent_message();
@@ -16584,6 +17937,7 @@ cairn-common = { path = "../cairn-common" }
             phases: None,
             execution_warmth: None,
             cell_origin: None,
+            build_jobs: None,
             project_id: "project-a".to_string(),
             commit_sha: "commit-source".to_string(),
             defined_by_commit_sha: "commit-source".to_string(),
@@ -18164,18 +19518,19 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             platform_heads: Vec::new(),
             fleet: Some(infra_fleet_scope("empty-eligible-set")),
             environments: Vec::new(),
+            fleet_blind: Vec::new(),
         };
-        let run = |failure: CheckExecutionFailure| {
+        let run = |tree: &'static str, failure: CheckExecutionFailure| {
             let db = db.clone();
             let plans = plans.clone();
             let scopes = scopes.clone();
             async move {
-                let coordinates = sealed_coordinates(commit, "tree-target", &plans);
+                let coordinates = sealed_coordinates(commit, tree, &plans);
                 run_planned_checks_with_board(
                     db,
                     "project-a",
                     commit,
-                    "tree-target",
+                    tree,
                     "job-a",
                     &plans,
                     &coordinates,
@@ -18198,15 +19553,19 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         };
 
         // An enrolled-but-detached history: placement found no live match,
-        // which the fleet domain bounds, and two reserved retries spend it.
-        run(CheckExecutionFailure::substrate(
-            SubstrateFailureShape::NoMachine,
-            "no live enrolled executor satisfies toolchains rust on windows",
-        ))
-        .await;
-        for _ in 0..2 {
+        // which the fleet domain bounds, and three heads dying against it
+        // spend it. A reservation alone never charges a fleet counter.
+        for tree in ["tree-earlier", "tree-earliest", "tree-target"] {
             claim_check_execution(db.clone(), "project-a", &lane.name, "ih-windows", &scopes)
                 .unwrap();
+            run(
+                tree,
+                CheckExecutionFailure::substrate(
+                    SubstrateFailureShape::NoMachine,
+                    "no live enrolled executor satisfies toolchains rust on windows",
+                ),
+            )
+            .await;
         }
         let bounded =
             get_suppressed_check_result(db.clone(), "project-a", &lane.name, "ih-windows", &scopes)
@@ -18241,7 +19600,9 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         assert!(suppressed.is_empty(), "no known machine: the bound yields");
         assert_eq!(to_run.len(), 1);
 
-        let outcome = run(CheckExecutionFailure::NotPlaceable(
+        let outcome = run(
+            "tree-target",
+            CheckExecutionFailure::NotPlaceable(
             "No machine enrolled in this fleet, attached or not, satisfies toolchains rust on windows."
                 .to_string(),
         ))
@@ -18706,6 +20067,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                     verdict_platform: None,
                     verdict_arch: None,
                     verdict_environment_hash: None,
+                    transient_within_grace: false,
                 },
             )
             .unwrap();
@@ -18741,6 +20103,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                 verdict_platform: None,
                 verdict_arch: None,
                 verdict_environment_hash: None,
+                transient_within_grace: false,
             },
         )
         .unwrap();
@@ -19994,6 +21357,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                     ("machine-a".into(), "env-a".into()),
                     ("machine-b".into(), "env-b".into()),
                 ],
+                fleet_blind: Vec::new(),
             },
             avoid_executor_ids: vec![avoid.to_string()],
         };
@@ -20043,6 +21407,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                     ("machine-a".into(), "env-a".into()),
                     ("machine-b".into(), "env-b".into()),
                 ],
+                fleet_blind: Vec::new(),
             },
             avoid_executor_ids: vec![avoid.to_string()],
         };
@@ -20525,6 +21890,30 @@ mod executor_base_content_tests {
         assert_eq!(classification.kind, CheckFailureKind::Infrastructure);
         assert!(classification.kind.is_infrastructure());
         assert!(!check_reuse_decision(command, Some(classification.kind), None).reusable);
+    }
+
+    /// A passing run whose result handoff was refused is a non-verdict: never
+    /// the suite's red, never its green, and never reusable evidence.
+    #[test]
+    fn a_refused_result_handoff_classifies_as_unreusable_infrastructure() {
+        let output = "        Summary [   2.104s] 17 tests run: 17 passed, 0 skipped\n\
+             CAIRN_HANDOFF_FAILED_EXIT: tests: 17 passed, 0 failed (verdict as computed, exit 0); \
+             result handoff refused: EACCES: permission denied at \
+             /cells/slot-1/scratch/cairn-check-result-1/result.json\n\
+             error: script \"test:rust\" exited with code 74";
+        let command = "bun run test:rust:tiered";
+        let classification =
+            classify_check_failure(command, Some(74), false, false, None, output).unwrap();
+        assert_eq!(classification.kind, CheckFailureKind::Infrastructure);
+        assert!(!classification.kind.is_verdict_about_the_code());
+        assert_eq!(classification.evidence_line, Some(1));
+        assert!(!check_reuse_decision(command, Some(classification.kind), None).reusable);
+
+        // The marker under another exit is not the handoff protocol.
+        assert_eq!(
+            classify_check_failure(command, Some(1), false, false, None, output),
+            None
+        );
     }
 
     #[test]

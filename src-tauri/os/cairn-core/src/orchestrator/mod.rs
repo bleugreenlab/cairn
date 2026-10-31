@@ -11,7 +11,6 @@ pub mod attention;
 pub mod attention_delivery;
 pub mod attention_push;
 pub mod attention_retirement;
-pub mod automations;
 pub mod base_advance;
 pub mod build_change;
 pub mod build_services;
@@ -33,18 +32,23 @@ pub mod executor_registry; // Synced visibility; live placement remains in fleet
 pub(crate) mod generation_cache;
 pub mod identity;
 pub mod inference;
+pub mod inference_control;
+pub mod inference_route;
 pub(crate) mod landing;
 pub mod lifecycle;
 pub mod model_defaults;
 pub mod models;
 pub mod object_plane;
 pub mod parent_wake;
+pub mod pool_control;
 pub mod provider_pool;
 pub mod recipes;
 pub mod replay_base;
 pub mod session;
 mod settings;
 pub mod skills;
+pub mod startup_readiness;
+pub use startup_readiness::StartupReadiness;
 mod store_lock;
 use store_lock::summarize_bounded;
 #[cfg(test)]
@@ -124,6 +128,8 @@ pub struct OrchestratorBuilder {
     thread_status_cache: Arc<generation_cache::ThreadStatusCache>,
     issue_status_cache: Arc<generation_cache::IssueStatusCache>,
     issue_list_cache: Arc<generation_cache::IssueListCache>,
+    operator_notifications_cache: Arc<generation_cache::OperatorNotificationsCache>,
+    hold_sources: Arc<crate::notifications::HoldRegistry>,
     api_config: ApiConfig,
     effect_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEffect>>,
     browser_command_tx: Option<crate::browsers::BrowserCommandTx>,
@@ -137,6 +143,7 @@ pub struct OrchestratorBuilder {
     recent_turn_end_check_requests: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
     artifact_revision_quiet: std::time::Duration,
     boot_at: i64,
+    startup_readiness: startup_readiness::StartupReadiness,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +285,50 @@ impl OrchestratorBuilder {
             }),
             announce("issue_status"),
         );
+        let hold_sources = Arc::new(crate::notifications::HoldRegistry::default());
+        // The rebuild schedules its own time-dependent re-check on the cache it
+        // belongs to, which exists only once construction returns.
+        let notifications_cache_slot: Arc<
+            std::sync::OnceLock<std::sync::Weak<generation_cache::OperatorNotificationsCache>>,
+        > = Arc::default();
+        let operator_notifications_cache = generation_cache::OperatorNotificationsCache::new(
+            "operator notifications projection",
+            generation_cache::STATUS_ROLLUP_FLOOR,
+            generation_cache::rebuild_with({
+                let dbs = dbs.clone();
+                let holds = Arc::downgrade(&hold_sources);
+                let slot = notifications_cache_slot.clone();
+                move |project_id: String| {
+                    let dbs = dbs.clone();
+                    let holds = holds.clone();
+                    let slot = slot.clone();
+                    async move {
+                        let dbs = dbs.upgrade().ok_or_else(runner_gone)?;
+                        let holds = holds.upgrade().ok_or_else(runner_gone)?;
+                        let snapshot = crate::notifications::rebuild_operator_notifications(
+                            &dbs,
+                            &holds,
+                            &project_id,
+                        )
+                        .await?;
+                        if let (Some(at), Some(cache)) = (
+                            snapshot.next_change_at,
+                            slot.get().and_then(std::sync::Weak::upgrade),
+                        ) {
+                            let wait = (at - chrono::Utc::now().timestamp()).max(0) as u64 + 1;
+                            cache.invalidate_after(
+                                &project_id,
+                                std::time::Duration::from_secs(wait),
+                                "time-dependent-entry-due",
+                            );
+                        }
+                        Ok(Arc::new(snapshot))
+                    }
+                }
+            }),
+            announce(crate::notifications::PROJECTION),
+        );
+        let _ = notifications_cache_slot.set(Arc::downgrade(&operator_notifications_cache));
         let issue_list_cache = generation_cache::IssueListCache::new(
             "issue list projection",
             generation_cache::ISSUE_LIST_FLOOR,
@@ -299,6 +350,7 @@ impl OrchestratorBuilder {
                 thread_status_cache.clone(),
                 issue_status_cache.clone(),
                 issue_list_cache.clone(),
+                operator_notifications_cache.clone(),
             )),
             clock: services.clock.clone(),
             fs: services.fs.clone(),
@@ -339,6 +391,8 @@ impl OrchestratorBuilder {
             thread_status_cache,
             issue_status_cache,
             issue_list_cache,
+            operator_notifications_cache,
+            hold_sources,
             api_config: ApiConfig::default(),
             effect_tx: None,
             browser_command_tx: None,
@@ -354,7 +408,18 @@ impl OrchestratorBuilder {
             recent_turn_end_check_requests,
             artifact_revision_quiet: crate::execution::artifact_revisions::DEFAULT_QUIET_PERIOD,
             boot_at: chrono::Utc::now().timestamp(),
+            startup_readiness: startup_readiness::StartupReadiness::ready(),
         }
+    }
+
+    /// Build for a host that runs startup recovery: agent launches hold in
+    /// durable admission, and the callback gateway refuses calls, until
+    /// [`Orchestrator::mark_startup_recovery_ready`]. Without this the latch is
+    /// ready from construction, which is what every host that never recovers
+    /// (and every test fixture) wants.
+    pub fn startup_recovery_pending(mut self) -> Self {
+        self.startup_readiness = startup_readiness::StartupReadiness::pending();
+        self
     }
 
     /// Override how long an artifact must go unwritten before its revision is
@@ -597,6 +662,7 @@ impl OrchestratorBuilder {
             process_state: self.process_state,
             mcp_auth: self.mcp_auth,
             run_bearers: Arc::new(crate::mcp::run_bearer::RunBearerBook::default()),
+            project_services: Arc::new(crate::project_services::ProjectServices::default()),
             warm_gc: self.warm_gc,
             pty_state: self.pty_state,
             repl_state: self.repl_state,
@@ -605,6 +671,7 @@ impl OrchestratorBuilder {
             ),
             park_slots: Arc::new(crate::orchestrator::lifecycle::ParkSlots::default()),
             private_lanes: Arc::new(crate::execution::jobs::PrivateLaneLedger::default()),
+            startup_readiness: self.startup_readiness,
             fleet,
             object_plane: Arc::new(crate::orchestrator::object_plane::ObjectPlaneState::default()),
             permission_responses: self.permission_responses,
@@ -672,7 +739,6 @@ impl OrchestratorBuilder {
             build_service_reconcile: Arc::new(Mutex::new(())),
             build_service_runtime: Arc::new(Mutex::new(HashMap::new())),
             compile_cache_service: Arc::new(RwLock::new(None)),
-            agent_completion_attention_dedupe: Arc::new(Mutex::new(HashSet::new())),
             codemap_refresh_in_flight: Arc::new(Mutex::new(HashSet::new())),
             session_reseed_fallback_attempted: Arc::new(Mutex::new(HashSet::new())),
             turn_end_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
@@ -695,6 +761,8 @@ impl OrchestratorBuilder {
             thread_status_cache: self.thread_status_cache,
             issue_status_cache: self.issue_status_cache,
             issue_list_cache: self.issue_list_cache,
+            operator_notifications_cache: self.operator_notifications_cache,
+            hold_sources: self.hold_sources,
             codex_pool: Arc::new(crate::backends::codex::pool::CodexAppServerPool::default()),
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -706,6 +774,9 @@ impl OrchestratorBuilder {
                 .bind_runtime(handle.clone());
             orchestrator.issue_status_cache.bind_runtime(handle.clone());
             orchestrator.issue_list_cache.bind_runtime(handle.clone());
+            orchestrator
+                .operator_notifications_cache
+                .bind_runtime(handle.clone());
             let mut pulls = crate::storage::subscribe_team_pull_applied();
             let snapshot = Arc::downgrade(&orchestrator.sidebar_active_issues);
             let generation = Arc::downgrade(&orchestrator.sidebar_active_issues_generation);
@@ -1026,6 +1097,8 @@ pub struct Orchestrator {
     /// Per-run bearers for the streamable-HTTP MCP endpoint. Process-local, so
     /// a restart drops them all (see `mcp::run_bearer`).
     pub run_bearers: Arc<crate::mcp::run_bearer::RunBearerBook>,
+    /// Project services: the supervisor's registry and its live runs.
+    pub(crate) project_services: Arc<crate::project_services::ProjectServices>,
     /// Warm process GC (optional — hosts may not enable warm processes)
     pub warm_gc: Option<Arc<crate::agent_process::gc::WarmProcessGC>>,
     /// Active PTY sessions (terminals)
@@ -1042,6 +1115,10 @@ pub struct Orchestrator {
     /// The last admission decision each private ordinary-session lane made:
     /// the budget it measured and why its queue head waits, if it does.
     pub(crate) private_lanes: Arc<crate::execution::jobs::PrivateLaneLedger>,
+    /// Whether startup recovery has finished: the one authority both the
+    /// callback gateway's 503 hold and the admission promoters read. See
+    /// [`startup_readiness`].
+    pub startup_readiness: startup_readiness::StartupReadiness,
 
     // === Broadcast channels for cross-component communication ===
     /// Permission response broadcast: (request_id, response_json)
@@ -1175,6 +1252,10 @@ pub struct Orchestrator {
     pub(crate) issue_status_cache: Arc<generation_cache::IssueStatusCache>,
     /// Per-project issue list, encoded once per publish, on the same terms.
     pub(crate) issue_list_cache: Arc<generation_cache::IssueListCache>,
+    /// Per-project operator notification center list, on the same terms.
+    pub(crate) operator_notifications_cache: Arc<generation_cache::OperatorNotificationsCache>,
+    /// The producers of hold entries in the notification center.
+    pub(crate) hold_sources: Arc<crate::notifications::HoldRegistry>,
     /// Runner-owned persistent commit-addressed execution workspaces.
     pub fleet: Arc<crate::fleet::Fleet>,
     /// Runtime-only object-channel credentials and staged managed-executor uploads.
@@ -1413,13 +1494,6 @@ pub struct Orchestrator {
     compile_cache_service:
         Arc<RwLock<Option<crate::orchestrator::build_services::ObservedCompileCacheService>>>,
 
-    /// Per-run dedupe for legacy `agent-attention` terminal toasts.
-    ///
-    /// The completion toast now fires at the turn idle boundary while the same
-    /// run may later EOF/finalize. Keying by run id suppresses cleanup-path
-    /// duplicates and repeated crash finalization attempts.
-    agent_completion_attention_dedupe: Arc<Mutex<HashSet<String>>>,
-
     /// Projects whose code map is being recomputed right now. A code map is a
     /// whole-tree walk, so a second request while one is in flight is dropped
     /// rather than queued: the running pass re-reads the base after each round
@@ -1471,6 +1545,25 @@ impl Orchestrator {
     /// Reclaim and promote durable ordinary session requests after host restart.
     pub async fn recover_ordinary_admissions_on_startup(&self) {
         crate::execution::jobs::recover_ordinary_admissions_on_startup(self).await;
+    }
+
+    /// Open the startup-readiness latch, then drain every admission queue once.
+    ///
+    /// Launches that arrived during recovery wrote their durable admission row
+    /// before their promoter read the latch, so each was either promoted by its
+    /// own pass or is still queued for this drain. Team promotion loops and
+    /// deferred unqueued starts wake from the latch themselves, and the process
+    /// sweep re-promotes private lanes on every tick, so a drain that misses
+    /// heals on its own.
+    pub fn mark_startup_recovery_ready(&self) {
+        if !self.startup_readiness.mark_ready() {
+            return;
+        }
+        let orch = self.clone();
+        self.spawn_blocking_detached(move || {
+            crate::execution::jobs::promote_private_lanes_blocking(&orch);
+            crate::execution::jobs::promote_call_lanes(&orch);
+        });
     }
 
     /// Each private ordinary-session lane's occupancy and the budget its
@@ -1913,17 +2006,13 @@ impl Orchestrator {
             .collect()
     }
 
-    /// Emit a typed attention event to any in-flight `watch` long-poll.
+    /// Emit a typed attention event to any in-flight `watch` long-poll, the
+    /// durable attention ledger, and the team push.
     ///
-    /// Consults the short-window dedupe cache: if an emit for the same
-    /// `(issue_id, fact-key)` landed within the dedupe window, the new one is
-    /// dropped (the prior emit's content is already in-flight to subscribers).
-    /// Fire-and-forget: a send error (no subscribers) is ignored.
-    ///
-    /// Also opportunistically prunes the dedupe cache on each emit: when the
-    /// cache exceeds `DEDUPE_CACHE_SWEEP_THRESHOLD` entries, drop everything
-    /// older than the dedupe window (those entries can no longer suppress
-    /// anything). Bounded growth, no background task required.
+    /// Every emit is delivered; nothing here deduplicates. Repeats are absorbed
+    /// downstream: the ledger's keyed items are idempotent, and the team push
+    /// keeps its own per-issue fingerprint. Fire-and-forget: a send error (no
+    /// subscribers) is ignored.
     pub fn emit_attention_event(&self, mut event: AttentionEvent) {
         if event.route_provenance.is_none() {
             event.route_provenance = crate::routes::current_provenance();
@@ -2080,6 +2169,11 @@ impl Orchestrator {
         crate::tenets::evidence::spawn(self.clone());
         crate::orchestrator::wakes::conditions::install_evaluator(self.clone());
         crate::orchestrator::inference::spawn_bginf_poller(self.clone());
+        crate::orchestrator::inference_control::spawn_deployment_control(self.clone());
+        crate::orchestrator::pool_control::spawn_pool_controller(self.clone());
+        // A machine that reconnects holding replicas of closed scratches is
+        // told to delete them, whether or not any work has asked for one yet.
+        crate::node_scratch::lifecycle::ensure_subscribed(self);
     }
 
     pub fn start_embed_worker(&self) {
@@ -2114,10 +2208,23 @@ impl Orchestrator {
             };
             crate::embeddings::turns::spawn_turn_embedding_sweep(keeper.clone(), consented.clone());
             crate::embeddings::resources::spawn_resource_sweep(
-                keeper,
-                consented,
+                keeper.clone(),
+                consented.clone(),
                 Arc::new(orch.clone()),
             );
+            // Colours need axes in the selected model's space: the bundled
+            // Cohere set, those learned before, or a set learned now.
+            if let Some(vibes) = orch.vibe_state.clone() {
+                use crate::embeddings::vibe_recompute;
+                match vibe_recompute::load_stored_axes(&orch.db.local).await {
+                    Ok(sets) => sets.into_iter().for_each(|set| vibes.insert(set)),
+                    Err(error) => log::warn!(
+                        target: vibe_recompute::VIBES_TARGET,
+                        "vibe axes: loading stored axes failed: {error}"
+                    ),
+                }
+                vibe_recompute::spawn_vibe_axes_recompute(keeper, vibes, consented);
+            }
         });
     }
 
@@ -2300,6 +2407,18 @@ impl Orchestrator {
     /// the floor; every write goes through the emitter instead.
     pub fn acknowledge_thread_status(&self, project_id: &str, reason: &'static str) {
         self.thread_status_cache.invalidate_now(project_id, reason);
+        // The thread's unread burst is an entry in the notification center too,
+        // and the operator who just read it expects it gone there as well.
+        self.operator_notifications_cache
+            .invalidate_now(project_id, reason);
+    }
+
+    /// Add a producer of hold entries to the notification center. A source
+    /// registered under a name already present replaces it.
+    pub fn register_hold_source(&self, source: Arc<dyn crate::notifications::HoldSource>) {
+        self.hold_sources.register(source);
+        self.operator_notifications_cache
+            .invalidate_matching("hold-source-registered", |_| true);
     }
 
     /// Spawn a background task that registers an anonymous device JWT for the
@@ -2338,6 +2457,32 @@ impl Orchestrator {
                 summary.archive,
             ),
             Err(e) => log::warn!("archival sweep failed: {e}"),
+        }
+    }
+
+    /// Run one retention evictor pass over the private database: delete what
+    /// the `Evict` rules in `cairn_db::storage::retention` name, a page at a
+    /// time, folding the logical log when the pass has grown it. Team replicas
+    /// are never evicted here, since their deletes would replicate to every
+    /// member.
+    pub async fn run_retention_maintenance(
+        &self,
+        state: &mut cairn_db::storage::retention::EvictorState,
+    ) {
+        use cairn_db::storage::retention::{run_pass, EvictorBudget, PassEnd};
+        let report = run_pass(
+            &self.db.local,
+            chrono::Utc::now().timestamp(),
+            EvictorBudget::PRODUCTION,
+            state,
+        )
+        .await;
+        let failed = report.end == PassEnd::FoldFailed
+            || report.rules.iter().any(|rule| rule.error.is_some());
+        if failed {
+            log::warn!("retention pass: {report}");
+        } else {
+            log::info!("retention pass: {report}");
         }
     }
 
@@ -2397,6 +2542,34 @@ impl Orchestrator {
                 orch.run_archival_maintenance().await;
             }
         });
+        // The retention evictor beside it, on its own shorter interval: its
+        // passes are bounded, so a backlog clears over many short passes rather
+        // than one long one. The first pass waits a full interval so it never
+        // competes with startup. The operator can stop it without a rebuild,
+        // and the boot log says which way it went.
+        use cairn_db::storage::retention::{evictor_enabled, EVICTOR_ENV};
+        let setting = std::env::var(EVICTOR_ENV).ok();
+        if !evictor_enabled(setting.as_deref()) {
+            log::warn!("retention evictor: off ({EVICTOR_ENV}={setting:?}); nothing is evicted");
+            return;
+        }
+        log::info!(
+            "retention evictor: on ({EVICTOR_ENV}={setting:?}), every {:?}, at most {} fold(s) a pass",
+            cairn_db::storage::retention::PASS_INTERVAL,
+            cairn_db::storage::retention::EvictorBudget::PRODUCTION.folds_per_pass,
+        );
+        let orch = self.clone();
+        tokio::spawn(async move {
+            let period = cairn_db::storage::retention::PASS_INTERVAL;
+            let mut interval =
+                tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut state = cairn_db::storage::retention::EvictorState::default();
+            loop {
+                interval.tick().await;
+                orch.run_retention_maintenance(&mut state).await;
+            }
+        });
     }
 
     /// Spawn the one-time historical analytics-rollup backfill on a background
@@ -2421,6 +2594,29 @@ impl Orchestrator {
                 log::warn!("analytics rollup backfill failed: {e}");
             }
         });
+    }
+
+    /// Move delegated packets still inline in execution snapshots into the
+    /// `delegated_packets` table (cairn/5597), resuming wherever the last start
+    /// stopped. Gated by `delegated_packet_backfill_state`, so once the walk has
+    /// finished every later start pays one read. Nothing waits on it: the
+    /// packet store reads inline packets through until they move.
+    pub async fn run_delegated_packet_backfill(&self) {
+        match cairn_workflow::delegated_packets::run_backfill(&self.db.local).await {
+            Ok(report) if report.packets > 0 || !report.completed => {
+                log::info!("delegated packet backfill: {report:?}");
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("delegated packet backfill failed: {e}"),
+        }
+    }
+
+    /// [`Self::run_delegated_packet_backfill`] on its own task: on an install
+    /// with many executions it is a long walk no other startup work should wait
+    /// behind.
+    pub fn spawn_delegated_packet_backfill(&self) {
+        let orch = self.clone();
+        tokio::spawn(async move { orch.run_delegated_packet_backfill().await });
     }
 
     /// Spawn the live recipe scheduler: a detached loop that fires
@@ -2644,6 +2840,7 @@ impl Orchestrator {
         crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(self).await;
         crate::execution::checks_main::origin_observed(self).await;
         crate::orchestrator::base_advance::sweep_reconcile_intents(self).await;
+        crate::project_services::supervisor::start_launch_services(self).await;
     }
 
     pub fn spawn_default_advance_reconcile(&self) {
@@ -2660,6 +2857,9 @@ impl Orchestrator {
             crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(&orch)
                 .await;
             crate::execution::checks_main::origin_observed(&orch).await;
+            // After the catch-up, so `launch` services start from the base tip
+            // the runner has just brought current.
+            crate::project_services::supervisor::start_launch_services(&orch).await;
             orch.spawn_reconcile_intent_sweep();
             crate::orchestrator::base_branch_sync::spawn_base_branch_poll(&orch);
         });
@@ -3392,6 +3592,10 @@ impl Orchestrator {
             // Inventory is per target, so discovery needs the configured
             // accounts rather than a vendor-wide list.
             crate::backends::actual::models::discover_catalog_blocking(self)
+        } else if backend_name == crate::backends::inference::INFERENCE_BACKEND_KEY {
+            // Its models are cairn-inference's deployments, read from the
+            // orch's own records rather than from any endpoint.
+            crate::backends::inference::discover_catalog_blocking(self)
         } else if backend_name == crate::backends::openrouter::OPENROUTER_BACKEND_KEY {
             // Chat, image and embeddings listings, read side by side; one
             // failing must neither hide the others nor go unsaid, and a failed
@@ -3631,6 +3835,7 @@ mod tests {
         };
         ExecutorHealthSnapshot {
             build_volume: None,
+            inference_hold: None,
             identity: identity.clone(),
             public_name: "bglab-win".into(),
             colocated: false,
@@ -3660,6 +3865,7 @@ mod tests {
                 liveness_observed_at_unix_ms: Some(0),
                 facts_stale_refresh_blocked: None,
                 last_refresh: None,
+                node_scratches: Vec::new(),
             },
             admission: AdmissionHealth::default(),
             queues: Vec::new(),
@@ -4408,7 +4614,7 @@ mod tests {
             })
             .unwrap_or_default();
         db.local
-            .execute_script(&format!(
+            .execute_script(format!(
                 "
                 INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
                  VALUES ('{prefix}-project', 'default', 'Model-less', '{prefix}', '/tmp/{prefix}', 1, 1);
@@ -4480,7 +4686,7 @@ mod tests {
             })
             .unwrap_or_default();
         db.local
-            .execute_script(&format!(
+            .execute_script(format!(
                 "
                 INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
                  VALUES ('{prefix}-project', 'default', 'Claude', '{prefix}', '/tmp/{prefix}', 1, 1);

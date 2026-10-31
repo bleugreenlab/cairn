@@ -635,12 +635,23 @@ pub(super) async fn resolve_reservation(
     // both "no learned number", and they call for different responses: one is a
     // cold start, the other is a fault worth seeing on the decision record.
     let local = load_profile(db.clone(), identity, context).await;
-    // The fleet is consulted only where this machine is still cold or thinly
-    // evidenced, which is the only place a borrowed number could change an
-    // answer. A machine that has measured this command past the confidence floor
-    // speaks for itself and pays for no extra query.
-    let cold_here =
-        !matches!(&local, Ok(Some(profile)) if profile.sample_count >= MIN_CONFIDENT_SAMPLES);
+    // The fleet is consulted only where this machine cannot speak for its own
+    // memory, which is the only place a borrowed number could change an
+    // answer: it is cold, thinly evidenced, or its peak was quarantined as
+    // saturation. The last is the machine too small for the command: its tree
+    // grew until it filled the machine, so the quarantine rightly discards the
+    // peak as demand, and without the fleet's measurement the work fell back to
+    // its class prior and an unknown fit, which is how a whole-suite pass
+    // measured at 20+ GiB elsewhere kept landing on a 12 GiB host. A machine
+    // that has measured this command past the confidence floor, under its own
+    // budget, speaks for itself and pays for no extra query.
+    let cold_here = !matches!(
+        &local,
+        Ok(Some(profile)) if profile.sample_count >= MIN_CONFIDENT_SAMPLES
+            && !profile
+                .upper_peak_rss_bytes
+                .is_some_and(|peak| memory_peak_quarantined(peak, memory_budget_bytes))
+    );
     let fleet_evidence = match cold_here {
         false => None,
         true => load_fleet_evidence(db, identity, context).await.ok(),
@@ -2358,6 +2369,70 @@ mod tests {
             resolved.memory_fit,
             MemoryFit::Exceeds(MemoryCeiling {
                 estimate_bytes: with_headroom(8 * GIB),
+                ceiling_bytes: SPECIMEN_CAP,
+                killed_here: None,
+            })
+        );
+    }
+
+    /// cairn/5472's first specimen: bgsrv-ub had run the whole suite past the
+    /// confidence floor with every peak filling the machine, so its own profile
+    /// was confident and quarantined at once, and the 20+ GiB the rest of the
+    /// fleet measured for the same command was never read: the work was charged
+    /// its class prior and its fit was unknown. A quarantined peak does not
+    /// speak for this machine's memory, so the fleet's measurement decides fit.
+    #[tokio::test]
+    async fn a_machine_whose_own_peaks_were_quarantined_is_judged_by_the_fleets_measurement() {
+        let db = Arc::new(
+            crate::storage::migrated_test_db("resource-profile-quarantined-borrows.db").await,
+        );
+        let identity = CommandResourceIdentity {
+            version: 1,
+            key: "test:rust".into(),
+        };
+        let context = |executor_class: &str| ProfileContext {
+            executor_class: executor_class.into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            toolchain_fingerprint: "rust".into(),
+        };
+        for (executor_class, peak) in [
+            ("bbs:bbs", 22 * GIB),
+            ("fedora:fedora", 22 * GIB),
+            ("bgsrv-ub:bgsrv-ub", SPECIMEN_BUDGET),
+        ] {
+            for finished in 1..=MIN_CONFIDENT_SAMPLES {
+                update_profile(
+                    db.clone(),
+                    &identity,
+                    &context(executor_class),
+                    finished,
+                    Some(peak),
+                    Some(GIB),
+                    Some(1_000),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let resolved = resolve_reservation(
+            db,
+            Some(&identity),
+            &context("bgsrv-ub:bgsrv-ub"),
+            cold_start_prior(CellCommandClass::CargoTest, &capabilities()),
+            Some(SPECIMEN_BUDGET),
+            test_duration_context(),
+        )
+        .await;
+        assert_eq!(
+            resolved.rationale.fallback,
+            Some(ReservationFallback::MemoryObservationQuarantined),
+            "its own peak is still not a demand"
+        );
+        assert_eq!(
+            resolved.memory_fit,
+            MemoryFit::Exceeds(MemoryCeiling {
+                estimate_bytes: with_headroom(22 * GIB),
                 ceiling_bytes: SPECIMEN_CAP,
                 killed_here: None,
             })

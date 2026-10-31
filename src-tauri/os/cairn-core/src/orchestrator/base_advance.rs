@@ -1499,6 +1499,9 @@ async fn reconcile_jj_downstream(
         );
         // The code map projects the base tree, so this merge is exactly what
         // makes the stored one describe a tree that is no longer the base.
+        // A service runs its package as it stands at the base tip, so this
+        // merge may have changed what one of them should be running.
+        crate::project_services::supervisor::note_base_advance(orch, &merged_job.project_id);
         crate::projects::codemap::note_base_advance(
             orch,
             db,
@@ -1696,6 +1699,7 @@ pub(crate) async fn reconcile_default_advance(
     // moves the base the code map projects, whether or not Cairn drove it.
     crate::projects::codemap::note_base_advance(orch, &db, project_id, &repo_path, default_branch)
         .await;
+    crate::project_services::supervisor::note_base_advance(orch, project_id);
     // Bring the advanced tip into the shared store and reconcile the default
     // bookmark onto it — BEFORE looking at siblings, because this is owed whether
     // or not anything downstream needs rebasing.
@@ -4614,6 +4618,31 @@ fn marker_guidance(state: MarkerState, condition: crate::jj::ConflictCondition) 
     }
 }
 
+/// The step that moves a conflicted branch onto its base. Committing merged
+/// content does not: the branch's ancestry stays on the old base until a replay
+/// is requested on the session. Every note that asks for content work first ends
+/// on this one phrase, so no note can stop at "commit it" while another names
+/// the replay.
+const REQUEST_THE_REPLAY: &str = "then request the replay on `cairn:~/rebase`";
+
+/// The guidance for a genuine content conflict, as its four steps in order:
+/// open the session, write the merge, commit it, request the replay.
+fn content_conflict_guidance() -> String {
+    format!(
+        "\nThis is a CONTENT CONFLICT: the two sides genuinely disagree, and your branch has NOT \
+         moved onto the new base. Open the session at `cairn:~/rebase`: it lists each conflicting \
+         file with both sides' commits, and `cairn:~/rebase?view=merged` shows the two sides \
+         merged. Write the merged result of each conflicting file with ordinary edits and commit \
+         it on your branch with a normal `commit_msg`, {REQUEST_THE_REPLAY} and follow the \
+         resolution that page states; the commit alone does not move your branch. Request \
+         `resolution:\"take-committed-tip\"` only when your committed version of every \
+         conflicting file already contains the base's side; the page checks that by content and \
+         names any file that falls short. Pull the clean-on-retry files across too if your \
+         resolution depends on them — they are part of the same coordinated change and your \
+         branch will not compile without them. Never rebase or force-push by hand."
+    )
+}
+
 /// The guidance for a replay refused at export because the rebased tree carried
 /// jj conflict scaffolding, though jj recorded no conflict.
 ///
@@ -4630,7 +4659,7 @@ fn scaffolding_guidance(refusal: &crate::jj::ScaffoldingRefusal, ours: Option<&s
          git ref stay on your last clean tip{tip}, and a `/rebase` session is open for this \
          conflict at `cairn:~/rebase`. The files changed on both sides are where jj merged the \
          two versions silently; read both versions of each through that session, commit any \
-         merged result your work needs with ordinary edits, then request the replay there. Never \
+         merged result your work needs with ordinary edits, {REQUEST_THE_REPLAY}. Never \
          rebase or force-push by hand. If a replay meets the same refusal, the branch needs an \
          operator to repair it in the store.",
         refusal.commit,
@@ -4664,14 +4693,7 @@ fn append_conflict_diagnostic(
 
     let guidance = match (&diagnostic.scaffolding, diagnostic.condition) {
         (Some(refusal), _) => scaffolding_guidance(refusal, diagnostic.ours.as_deref()),
-        (None, crate::jj::ConflictCondition::ContentConflict) => {
-            "\nThis is a CONTENT CONFLICT: the two sides genuinely disagree. Read both versions of \
-             each conflicting file, write the merged result with ordinary edits, and commit it on \
-             your branch. Pull the clean-on-retry files across too if your resolution depends on \
-             them — they are part of the same coordinated change and your branch will not compile \
-             without them. Never rebase or force-push by hand."
-                .to_string()
-        }
+        (None, crate::jj::ConflictCondition::ContentConflict) => content_conflict_guidance(),
         (None, crate::jj::ConflictCondition::BaseDrift) => {
             "\nThis is BASE DRIFT, not a content conflict: every conflicting file is already \
              byte-identical between your branch and the new base, so there is nothing to merge and \
@@ -4716,8 +4738,9 @@ fn unparseable_guidance(refusal: Option<&crate::jj::ValidationRefusal>) -> Strin
          parsed on its own and the line merge of the two did not, so the replay was rolled back \
          and your branch is still on its old base. The parser's first error in each file:{failures}\n\
          Read both versions of each file, write the merged result with ordinary edits (usually a \
-         list closed twice or an entry left outside its brackets), and commit it on your branch; \
-         the next replay is checked the same way. Never rebase or force-push by hand."
+         list closed twice or an entry left outside its brackets), commit it on your branch, \
+         {REQUEST_THE_REPLAY}; that replay is checked the same way. Never rebase or force-push by \
+         hand."
     )
 }
 
@@ -8020,6 +8043,51 @@ mod tests {
         assert!(
             content.contains("force-push"),
             "the content branch still forbids hand-rebasing: {content}"
+        );
+    }
+
+    /// Committing a resolution does not move a conflicted branch; the replay
+    /// does. cairn/5253's builder followed a content-conflict note that ended at
+    /// "commit it", and its branch never moved until it found the replay itself.
+    /// So the content-conflict note must carry the replay step, in the same words
+    /// the scaffolding note uses, and the replay must come after the commit.
+    #[test]
+    fn the_content_conflict_note_requests_the_replay_the_scaffolding_note_does() {
+        let content = content_conflict_guidance();
+        let scaffolding = scaffolding_guidance(
+            &crate::jj::ScaffoldingRefusal {
+                commit: "r".repeat(40),
+                entries: vec!["JJ-CONFLICT-README".to_string()],
+            },
+            None,
+        );
+        let unparseable = unparseable_guidance(None);
+
+        for note in [&content, &scaffolding, &unparseable] {
+            assert!(
+                note.contains(REQUEST_THE_REPLAY),
+                "every note that asks for a merge names the replay that lands it: {note}"
+            );
+        }
+        assert!(content.contains("cairn:~/rebase?view=merged"), "{content}");
+
+        let step = |needle: &str| {
+            content
+                .find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` missing: {content}"))
+        };
+        let open = step("Open the session at `cairn:~/rebase`");
+        let write = step("Write the merged result");
+        let commit = step("`commit_msg`");
+        let replay = step(REQUEST_THE_REPLAY);
+        assert!(
+            open < write && write < commit && commit < replay,
+            "the steps run open, write, commit, replay: {content}"
+        );
+        assert!(
+            content.contains("take-committed-tip")
+                && content.contains("already contains the base's side"),
+            "take-committed-tip is offered only with its precondition: {content}"
         );
     }
 

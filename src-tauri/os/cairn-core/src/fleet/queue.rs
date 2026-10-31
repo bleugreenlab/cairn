@@ -40,7 +40,7 @@
 //! the only place that holds both, and it holds them in that order because the
 //! sweep must happen in the same critical section that removes the connection.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use cairn_common::executor_protocol::{
@@ -1292,6 +1292,27 @@ fn journal_row(
 
 /// A typed disk refusal in one clause: the floor it hit and whether
 /// reclamation can still relieve it.
+/// Whether unloading an inference deployment from the machine that declined
+/// would relieve the decline. Counting one it would not (the disk floor, the
+/// CPU brake, a toolchain, project eligibility) would unload a model for
+/// nothing and reload it on the next request, a multi-minute load each way.
+///
+/// No reason recorded today qualifies: a reserved machine's refusal (the
+/// inference drain reason) and a memory-fit refusal whose shortfall is the
+/// resident footprint do, and neither exists yet. Exhaustive on purpose, so a
+/// new reason is classified where it is introduced.
+fn relieved_by_unload(reason: DeclineReason) -> bool {
+    match reason {
+        DeclineReason::Capacity
+        | DeclineReason::Pressure
+        | DeclineReason::Disk
+        | DeclineReason::Constraint
+        | DeclineReason::Unknown
+        | DeclineReason::ProjectProvisioning
+        | DeclineReason::BuildVolumeAbsent => false,
+    }
+}
+
 pub(crate) fn disk_decline_summary(disk: &DiskDecline) -> String {
     let outlook = match disk.outlook {
         DiskReliefOutlook::InFlight => "a storage sweep is running and may relieve it".to_string(),
@@ -1455,6 +1476,27 @@ impl ExecutionQueue {
             .collect()
     }
 
+    /// How many unclaimed entries any of `executor_ids` declined for a reason
+    /// unloading a model from that machine would relieve: the build pressure
+    /// that lets the inference pool controller unload an idle model.
+    pub(crate) fn waiting_relieved_by_unload(&self, executor_ids: &HashSet<String>) -> u32 {
+        if executor_ids.is_empty() {
+            return 0;
+        }
+        let state = self.entries.lock().unwrap();
+        let count = state
+            .entries
+            .values()
+            .filter(|entry| !matches!(entry.state, EntryState::Claimed { .. }))
+            .filter(|entry| {
+                entry.declined.iter().any(|(id, decline)| {
+                    executor_ids.contains(id) && relieved_by_unload(decline.reason)
+                })
+            })
+            .count();
+        u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
     /// The live attempt of a request id, and where it is bound.
     ///
     /// A request id addresses at most one live attempt, which is what lets a
@@ -1504,8 +1546,16 @@ pub(crate) fn spawn_queue_journal(
     crate::orchestrator::spawn_onto(
         tokio::runtime::Handle::try_current().ok().as_ref(),
         async move {
-            if let Err(error) = expire_previous_incarnations(&db, &runner_incarnation).await {
-                log::warn!("{error}");
+            let started = std::time::Instant::now();
+            match expire_previous_incarnations(&db, &runner_incarnation).await {
+                Ok(sweep) => log::info!(
+                    "execution queue: closed {} previous runner incarnation(s), \
+                     {} entr(ies) expired, in {} ms",
+                    sweep.incarnations_closed,
+                    sweep.entries_expired,
+                    started.elapsed().as_millis()
+                ),
+                Err(error) => log::warn!("{error}"),
             }
             while let Some(batch) = receiver.recv().await {
                 let incarnation = runner_incarnation.clone();
@@ -1566,55 +1616,151 @@ pub(crate) fn spawn_queue_journal(
     );
 }
 
-/// Close entries a previous runner incarnation left open.
+/// The journal's next runner incarnation after `?1` in index order: one seek
+/// into `idx_execution_queue_live`, so listing every incarnation costs one
+/// seek per incarnation rather than a pass over the journal.
+const NEXT_INCARNATION: &str = "SELECT runner_incarnation FROM execution_queue
+     WHERE runner_incarnation > ?1
+     ORDER BY runner_incarnation
+     LIMIT 1";
+
+/// The entries of ONE incarnation whose latest row is still non-terminal.
+///
+/// Bounding the question to one incarnation is the whole point. Asked of the
+/// whole journal, "is this the entry's latest row" visits every row: most rows
+/// are in an open state (each finished entry leaves its queued, offered and
+/// claimed rows behind), so filtering on state selects nearly everything.
+/// Asked of one incarnation it is a range of `idx_execution_queue_live` plus one
+/// probe of the `(entry_id, sequence)` index per row in it.
+const OPEN_ENTRIES_OF_INCARNATION: &str = "SELECT live.entry_id, live.sequence
+     FROM execution_queue live
+     WHERE live.runner_incarnation = ?1
+       AND live.state IN ('queued', 'offered', 'claimed')
+       AND NOT EXISTS (
+           SELECT 1 FROM execution_queue newer
+           WHERE newer.entry_id = live.entry_id AND newer.sequence > live.sequence)";
+
+/// One entry's expiry row, rechecked against the journal as it is written: a
+/// point lookup and one index probe, so a row that stopped being the latest
+/// between the read that found it and this write is skipped, not expired.
+const EXPIRE_ENTRY: &str = "INSERT OR IGNORE INTO execution_queue(
+         event_id, entry_id, sequence, runner_incarnation,
+         request_id, attempt_id, project_id, state,
+         constraints_json, scoring_json, horizon_unix_ms, created_at, detail)
+     SELECT
+         live.entry_id || ':expired:restart',
+         live.entry_id,
+         live.sequence + 1,
+         ?1,
+         live.request_id,
+         live.attempt_id,
+         live.project_id,
+         'expired',
+         live.constraints_json,
+         live.scoring_json,
+         live.horizon_unix_ms,
+         unixepoch() * 1000,
+         'runner restarted'
+     FROM execution_queue live
+     WHERE live.entry_id = ?2
+       AND live.sequence = ?3
+       AND live.runner_incarnation != ?1
+       AND live.state IN ('queued', 'offered', 'claimed')
+       AND NOT EXISTS (
+           SELECT 1 FROM execution_queue newer
+           WHERE newer.entry_id = live.entry_id AND newer.sequence > live.sequence)";
+
+/// What one start's sweep closed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IncarnationSweep {
+    pub(crate) incarnations_closed: usize,
+    pub(crate) entries_expired: u64,
+}
+
+/// Close entries previous runner incarnations left open.
 ///
 /// Nothing is resurrected. The waiters those entries answered were in-process
 /// futures of a process that has ended, so the only honest thing to record is
 /// that they expired with it.
+///
+/// Incarnation by incarnation, skipping every one an earlier start already
+/// closed (`execution_queue_closed_incarnations`), so a start pays for the
+/// processes since the last sweep and not for the journal's whole history. For
+/// each, finding its open entries is a pooled read, so the engine's read bound
+/// interrupts a runaway one and nothing it held needs rolling back; the write
+/// that follows is one point insert per open entry, which a dead process's
+/// in-memory queue bounds, plus the incarnation's closed marker in the same
+/// transaction. A sweep that fails part-way keeps what it closed, and the next
+/// start resumes at the first incarnation it did not.
 pub(crate) async fn expire_previous_incarnations(
     db: &crate::storage::LocalDb,
     runner_incarnation: &str,
-) -> Result<(), String> {
-    let incarnation = runner_incarnation.to_string();
-    db.write(move |conn| {
-        let incarnation = incarnation.clone();
-        Box::pin(async move {
-            conn.execute(
-                "INSERT OR IGNORE INTO execution_queue(
-                     event_id, entry_id, sequence, runner_incarnation,
-                     request_id, attempt_id, project_id, state,
-                     constraints_json, scoring_json, horizon_unix_ms, created_at, detail)
-                 SELECT
-                     live.entry_id || ':expired:restart',
-                     live.entry_id,
-                     live.sequence + 1,
-                     ?1,
-                     live.request_id,
-                     live.attempt_id,
-                     live.project_id,
-                     'expired',
-                     live.constraints_json,
-                     live.scoring_json,
-                     live.horizon_unix_ms,
-                     unixepoch() * 1000,
-                     'runner restarted'
-                 FROM execution_queue live
-                 JOIN (
-                     SELECT entry_id, MAX(sequence) AS sequence
-                     FROM execution_queue
-                     GROUP BY entry_id
-                 ) latest
-                   ON latest.entry_id = live.entry_id AND latest.sequence = live.sequence
-                 WHERE live.runner_incarnation != ?1
-                   AND live.state IN ('queued', 'offered', 'claimed')",
-                (incarnation.as_str(),),
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|error| format!("closing a previous runner's queue entries failed: {error}"))
+) -> Result<IncarnationSweep, String> {
+    use crate::storage::RowExt;
+
+    fn failed(error: impl std::fmt::Display) -> String {
+        format!("closing a previous runner's queue entries failed: {error}")
+    }
+
+    let closed: std::collections::HashSet<String> = db
+        .query_all(
+            "SELECT runner_incarnation FROM execution_queue_closed_incarnations",
+            (),
+            |row| row.text(0),
+        )
+        .await
+        .map_err(failed)?
+        .into_iter()
+        .collect();
+    let mut sweep = IncarnationSweep::default();
+    let mut after = String::new();
+    while let Some(incarnation) = db
+        .query_opt(NEXT_INCARNATION, (after.clone(),), |row| row.text(0))
+        .await
+        .map_err(failed)?
+    {
+        after.clone_from(&incarnation);
+        if incarnation == runner_incarnation || closed.contains(&incarnation) {
+            continue;
+        }
+        let open: Vec<(String, i64)> = db
+            .query_all(OPEN_ENTRIES_OF_INCARNATION, (incarnation.clone(),), |row| {
+                Ok((row.text(0)?, row.i64(1)?))
+            })
+            .await
+            .map_err(failed)?;
+        let closer = runner_incarnation.to_string();
+        let expired = db
+            .write(move |conn| {
+                let open = open.clone();
+                let incarnation = incarnation.clone();
+                let closer = closer.clone();
+                Box::pin(async move {
+                    let mut expired = 0;
+                    for (entry_id, sequence) in &open {
+                        expired += conn
+                            .execute(
+                                EXPIRE_ENTRY,
+                                (closer.as_str(), entry_id.as_str(), *sequence),
+                            )
+                            .await?;
+                    }
+                    conn.execute(
+                        "INSERT OR IGNORE INTO execution_queue_closed_incarnations(
+                             runner_incarnation, closed_by, expired_entries, closed_at)
+                         VALUES (?1, ?2, ?3, unixepoch() * 1000)",
+                        (incarnation.as_str(), closer.as_str(), expired as i64),
+                    )
+                    .await?;
+                    Ok(expired)
+                })
+            })
+            .await
+            .map_err(failed)?;
+        sweep.incarnations_closed += 1;
+        sweep.entries_expired += expired;
+    }
+    Ok(sweep)
 }
 
 /// Test seams on the fleet that drive this queue's own transitions. Kept here,
@@ -1664,6 +1810,7 @@ impl super::Fleet {
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
+            scratch_sync: None,
         };
         let (entry_id, receiver) = self
             .queue
@@ -1833,6 +1980,255 @@ pub(super) mod tests {
         });
     }
 
+    /// Journal rows for `entries` entries of `incarnation`, each queued then
+    /// offered, then completed, except every `open_every`th entry (counting
+    /// from the first), which stops at claimed and so is left open.
+    async fn seed_incarnation(
+        db: &crate::storage::LocalDb,
+        incarnation: &str,
+        entries: usize,
+        open_every: usize,
+    ) {
+        let mut rows = Vec::with_capacity(entries * 3);
+        for entry in 0..entries {
+            let entry_id = format!("{incarnation}-entry-{entry}");
+            let last = if entry % open_every == 0 {
+                "claimed"
+            } else {
+                "completed"
+            };
+            for (sequence, state) in ["queued", "offered", last].into_iter().enumerate() {
+                rows.push(format!(
+                    "('{entry_id}:{state}:{sequence}', '{entry_id}', {sequence}, \
+                     '{incarnation}', 'request-{entry}', 'attempt', 'p', '{state}', \
+                     '{{}}', '{{}}', 0, {sequence})"
+                ));
+            }
+        }
+        for chunk in rows.chunks(500) {
+            db.execute(
+                format!(
+                    "INSERT INTO execution_queue(
+                         event_id, entry_id, sequence, runner_incarnation, request_id,
+                         attempt_id, project_id, state, constraints_json, scoring_json,
+                         horizon_unix_ms, created_at)
+                     VALUES {}",
+                    chunk.join(", ")
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn timed_sweep(
+        db: &crate::storage::LocalDb,
+        runner_incarnation: &str,
+    ) -> (IncarnationSweep, std::time::Duration) {
+        let started = std::time::Instant::now();
+        let sweep = expire_previous_incarnations(db, runner_incarnation)
+            .await
+            .unwrap();
+        (sweep, started.elapsed())
+    }
+
+    /// A start writes one expiry row for each entry an earlier incarnation left
+    /// open and for nothing else: not a finished entry, not one an earlier
+    /// sweep already closed, not its own. Each incarnation it sweeps is marked
+    /// closed, so the next start sweeps only what came after.
+    #[tokio::test]
+    async fn a_start_closes_exactly_the_entries_earlier_incarnations_left_open() {
+        let db = crate::storage::migrated_test_db("queue_expiry_semantics.db").await;
+        seed_incarnation(&db, "runner-1", 4, 2).await; // entries 0 and 2 open
+        seed_incarnation(&db, "runner-2", 3, 3).await; // entry 0 open
+        seed_incarnation(&db, "runner-3", 2, 1).await; // this start's own
+
+        // A journal from before closed incarnations were recorded: the sweep
+        // then already expired runner-1's entry 2 under runner-2.
+        db.execute(
+            "INSERT INTO execution_queue(
+                 event_id, entry_id, sequence, runner_incarnation, request_id, attempt_id,
+                 project_id, state, constraints_json, scoring_json, horizon_unix_ms,
+                 created_at, detail)
+             VALUES ('runner-1-entry-2:expired:restart', 'runner-1-entry-2', 3, 'runner-2',
+                     'request-2', 'attempt', 'p', 'expired', '{}', '{}', 0, 3,
+                     'runner restarted')",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let sweep = expire_previous_incarnations(&db, "runner-3").await.unwrap();
+        assert_eq!(
+            sweep,
+            IncarnationSweep {
+                incarnations_closed: 2,
+                entries_expired: 2,
+            }
+        );
+        let expired_by_this_start = db
+            .query_all(
+                "SELECT event_id, entry_id, sequence, request_id, detail
+                 FROM execution_queue
+                 WHERE state = 'expired' AND runner_incarnation = 'runner-3'
+                 ORDER BY entry_id",
+                (),
+                |row| {
+                    Ok((
+                        row.text(0)?,
+                        row.text(1)?,
+                        row.i64(2)?,
+                        row.text(3)?,
+                        row.text(4)?,
+                    ))
+                },
+            )
+            .await
+            .unwrap();
+        let expiry = |entry: &str, request: &str| {
+            (
+                format!("{entry}:expired:restart"),
+                entry.to_string(),
+                3,
+                request.to_string(),
+                "runner restarted".to_string(),
+            )
+        };
+        assert_eq!(
+            expired_by_this_start,
+            vec![
+                expiry("runner-1-entry-0", "request-0"),
+                expiry("runner-2-entry-0", "request-0"),
+            ]
+        );
+        let closed = || async {
+            db.query_all(
+                "SELECT runner_incarnation, closed_by, expired_entries
+                 FROM execution_queue_closed_incarnations ORDER BY runner_incarnation",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?, row.i64(2)?)),
+            )
+            .await
+            .unwrap()
+        };
+        let marker = |of: &str, by: &str, expired: i64| (of.to_string(), by.to_string(), expired);
+        assert_eq!(
+            closed().await,
+            vec![
+                marker("runner-1", "runner-3", 1),
+                marker("runner-2", "runner-3", 1),
+            ]
+        );
+
+        // The same start again finds nothing to do.
+        assert_eq!(
+            expire_previous_incarnations(&db, "runner-3").await.unwrap(),
+            IncarnationSweep::default()
+        );
+        // The next start closes runner-3's own two open entries and skips the
+        // incarnations runner-3 closed; the expiry rows runner-3 wrote are
+        // terminal and are not mistaken for open entries of its own.
+        assert_eq!(
+            expire_previous_incarnations(&db, "runner-4").await.unwrap(),
+            IncarnationSweep {
+                incarnations_closed: 1,
+                entries_expired: 2,
+            }
+        );
+        assert_eq!(
+            closed().await.last(),
+            Some(&marker("runner-3", "runner-4", 2))
+        );
+    }
+
+    /// What a start costs follows the incarnations since the last sweep, never
+    /// the journal's whole history: the self-join it replaced visited every row
+    /// per row and ran for hours over a 577k-row journal. Two incarnation sizes
+    /// bound the growth as linear (4x the rows may cost at most 8x, where
+    /// quadratic would cost 16x). Over a closed backlog, the guarantee is
+    /// structural: the sweep reads only the one unclosed incarnation
+    /// (`incarnations_closed == 1`). The timing beside it is a coarse backstop
+    /// that would catch a backlog reread, not a benchmark: both timings are tens
+    /// of milliseconds, so it carries the same slack as the ratio, sized for
+    /// scheduler jitter on a loaded lane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_start_pays_for_the_incarnations_since_the_last_sweep_not_for_the_journal() {
+        let db = crate::storage::migrated_test_db("queue_expiry_scaling.db").await;
+
+        seed_incarnation(&db, "runner-1", 1_000, 50).await;
+        let (sweep, small) = timed_sweep(&db, "runner-2").await;
+        assert_eq!(
+            sweep,
+            IncarnationSweep {
+                incarnations_closed: 1,
+                entries_expired: 20,
+            }
+        );
+
+        seed_incarnation(&db, "runner-2", 4_000, 50).await;
+        let (sweep, large) = timed_sweep(&db, "runner-3").await;
+        assert_eq!(
+            sweep,
+            IncarnationSweep {
+                incarnations_closed: 1,
+                entries_expired: 80,
+            }
+        );
+        assert!(
+            large < small * 8 + std::time::Duration::from_millis(250),
+            "4x the rows cost {large:?} against {small:?}: worse than linear"
+        );
+
+        seed_incarnation(&db, "runner-3", 100, 50).await;
+        let (sweep, steady) = timed_sweep(&db, "runner-4").await;
+        assert_eq!(
+            sweep,
+            IncarnationSweep {
+                incarnations_closed: 1,
+                entries_expired: 2,
+            }
+        );
+        assert!(
+            steady < small + std::time::Duration::from_millis(250),
+            "a 100-entry incarnation over a 5,000-entry closed backlog cost {steady:?}, \
+             well past sweeping 1,000 entries ({small:?}): the backlog is being reread"
+        );
+    }
+
+    /// The sweep's expensive half, finding open entries, never runs inside a
+    /// write transaction: it is pooled reads, which the read bound covers and
+    /// the engine can interrupt with nothing to roll back. What it writes is one
+    /// short transaction per incarnation it closes, and nothing at all when
+    /// there is nothing left to close. (A write held for hours by the
+    /// whole-journal statement this replaced is what blocked every checkpoint.)
+    #[tokio::test]
+    async fn a_sweep_finds_outside_any_write_and_writes_once_per_incarnation() {
+        let db = crate::storage::migrated_test_db("queue_expiry_writes.db").await;
+        seed_incarnation(&db, "runner-1", 20, 5).await;
+        seed_incarnation(&db, "runner-2", 10, 5).await;
+        seed_incarnation(&db, "runner-3", 10, 100).await;
+
+        let before = db.write_transaction_count();
+        let sweep = expire_previous_incarnations(&db, "runner-4").await.unwrap();
+        assert_eq!(
+            sweep,
+            IncarnationSweep {
+                incarnations_closed: 3,
+                entries_expired: 7,
+            }
+        );
+        assert_eq!(db.write_transaction_count() - before, 3);
+        assert_eq!(db.live_connections(), 0);
+
+        let before = db.write_transaction_count();
+        assert_eq!(
+            expire_previous_incarnations(&db, "runner-4").await.unwrap(),
+            IncarnationSweep::default()
+        );
+        assert_eq!(db.write_transaction_count(), before);
+    }
+
     pub(crate) fn request(request_id: &str, mobility: PlacementMobility) -> CellRequest {
         CellRequest {
             request_id: request_id.into(),
@@ -1866,6 +2262,7 @@ pub(super) mod tests {
             command_resource_identity: None,
             resource_reservation: Default::default(),
             learned_estimate: None,
+            scratch_sync: None,
         }
     }
 

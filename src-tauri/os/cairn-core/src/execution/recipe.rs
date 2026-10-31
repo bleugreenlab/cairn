@@ -1452,9 +1452,9 @@ fn insert_execution(db: Arc<LocalDb>, execution: NewExecution) -> Result<(), Str
 /// back as the file's own `memory-triage`. A path, a file name, or anything
 /// else that is not a recipe id is refused here, naming the canonical id when
 /// one resolves. A plain id no file answers to comes back as named, and the
-/// launch then refuses it as not found. A filing's policy checks (the tenet
-/// gate) read this id and its launch is handed this same id, so the two can
-/// never disagree about which recipe is filed.
+/// launch then refuses it as not found. The launch is handed this id, so a
+/// filing's result names the recipe the file declares, not the caller's
+/// spelling.
 pub(crate) async fn resolve_filed_recipe_id(
     config_dir: &Path,
     db: &LocalDb,

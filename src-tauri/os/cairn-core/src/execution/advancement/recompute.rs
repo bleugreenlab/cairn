@@ -188,7 +188,7 @@ mod artifact_present_tests {
                 initiated_via: None,
             },
             presets: None,
-            delegated_packets: vec![],
+            inline_delegated_packets: vec![],
             created_at: 1,
         })
         .unwrap()
@@ -240,7 +240,7 @@ mod artifact_present_tests {
                 initiated_via: None,
             },
             presets: None,
-            delegated_packets: vec![],
+            inline_delegated_packets: vec![],
             created_at: 1,
         })
         .unwrap()
@@ -275,7 +275,7 @@ mod artifact_present_tests {
                 initiated_via: None,
             },
             presets: None,
-            delegated_packets: vec![],
+            inline_delegated_packets: vec![],
             created_at: 1,
         }
     }
@@ -971,7 +971,7 @@ mod port_gate_tests {
                 initiated_via: None,
             },
             presets: None,
-            delegated_packets: vec![],
+            inline_delegated_packets: vec![],
             created_at: 1,
         };
         snap.to_json().unwrap()
@@ -1102,7 +1102,7 @@ mod port_gate_tests {
         let contract =
             crate::execution::delegation::resolve_delegated_output_contract(None).unwrap();
         let artifact_name = contract.artifact_name();
-        let mut snap = ExecutionSnapshot {
+        let snap = ExecutionSnapshot {
             continuity: Default::default(),
             branch_target: Default::default(),
             model_routing: None,
@@ -1124,11 +1124,10 @@ mod port_gate_tests {
                 initiated_via: None,
             },
             presets: None,
-            delegated_packets: vec![],
+            inline_delegated_packets: vec![],
             created_at: 1,
         };
-        crate::execution::delegation::create_call_packet(
-            &mut snap,
+        let packet = crate::execution::delegation::create_call_packet(
             crate::execution::delegation::CreateCallPacketInput {
                 parent_job_id: "j-wf",
                 parent_turn_id: None,
@@ -1165,6 +1164,9 @@ mod port_gate_tests {
                 Ok::<_, DbError>(())
             })
         }).await.unwrap();
+        cairn_workflow::delegated_packets::insert_db(db, "e-1", &packet)
+            .await
+            .unwrap();
     }
 
     async fn reduce_call(db: &LocalDb) -> Option<JobStatus> {
@@ -1311,7 +1313,7 @@ mod warm_provider_run_tests {
                     initiated_via: None,
                 },
                 presets: None,
-                delegated_packets: vec![],
+                inline_delegated_packets: vec![],
                 created_at: 1,
             },
         }

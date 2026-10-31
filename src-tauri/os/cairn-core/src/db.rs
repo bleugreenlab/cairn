@@ -1151,7 +1151,7 @@ mod tests {
         let team_db = migrated_team_db("db-bridge-route-backfill-team.db").await;
         let repo = tempfile::tempdir().unwrap();
         std::process::Command::new("git")
-            .args(["init", "-q"])
+            .args(["init", "-b", "main", "-q"])
             .current_dir(repo.path())
             .status()
             .unwrap();

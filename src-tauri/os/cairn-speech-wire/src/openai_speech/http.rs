@@ -22,6 +22,11 @@ use super::wire::{classify_error, decode_sse_data, SpeechUsage, SseEvent, Stream
 use crate::SpeechWireError;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the worker may take, from `post_clip`'s return, to get the request
+/// out: fetching or building the shared client, local work that takes under a
+/// second. Never derived from the stall bound, which is the server's silence;
+/// overrunning it is our side failing and is reported apart from a stall.
+const SETUP: Duration = Duration::from_secs(10);
 /// How often a waiting stream rechecks the cancel flag.
 const POLL: Duration = Duration::from_millis(20);
 /// Raw audio is read in chunks of at most this many bytes.
@@ -79,7 +84,12 @@ impl OpenAiSpeechEndpoint {
     }
 }
 
-enum Piece {
+pub(super) enum Piece {
+    /// The client is ready and the request is leaving. The stall bound is the
+    /// server's silence, so it starts here: preparing the shared client (the
+    /// first one in a process loads the platform's root certificates, most of
+    /// a second on macOS) is never charged to it.
+    Sent,
     Audio(Vec<u8>),
     Usage(Option<SpeechUsage>),
     End,
@@ -90,21 +100,53 @@ enum Piece {
 ///
 /// A worker thread makes the request and reads the response, handing pieces
 /// over a bounded channel; iteration waits on the channel, rechecking `cancel`
-/// every few milliseconds, so the caller is never held by the network. Once
-/// the stream ends (cancelled, stalled, finished or dropped) the worker is
-/// detached: it sees that at its next read and drops the response, closing
-/// the connection, and a read that never returns ends at the stall bound.
+/// every few milliseconds, so the caller is never held by the network. The
+/// stall bound applies once the request has left ([`Piece::Sent`]); before
+/// that the request must leave within the setup bound. Once the stream ends
+/// (cancelled, stalled, not sent, finished or dropped) the worker is detached:
+/// it sees that at its next read and drops the response, closing the
+/// connection, and a read that never returns ends at the stall bound.
 pub struct ClipStream {
     pieces: Receiver<Piece>,
     gone: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     stall: Duration,
+    /// The setup bound, for its message.
+    setup: Duration,
+    /// When the request must have left by.
+    send_by: Instant,
+    /// Whether [`Piece::Sent`] has arrived, so every wait is stall-bounded.
+    sent: bool,
     usage: Option<SpeechUsage>,
     finished: bool,
     provider: String,
 }
 
 impl ClipStream {
+    /// A stream over `pieces` whose request must leave within `setup` from
+    /// now, then whose every wait is bounded by `stall`.
+    pub(super) fn new(
+        pieces: Receiver<Piece>,
+        gone: Arc<AtomicBool>,
+        cancel: Arc<AtomicBool>,
+        stall: Duration,
+        setup: Duration,
+        provider: String,
+    ) -> Self {
+        Self {
+            pieces,
+            gone,
+            cancel,
+            stall,
+            setup,
+            send_by: Instant::now() + setup,
+            sent: false,
+            usage: None,
+            finished: false,
+            provider,
+        }
+    }
+
     /// Token usage, once `speech.audio.done` has been read (SSE only).
     pub fn usage(&self) -> Option<SpeechUsage> {
         self.usage
@@ -123,13 +165,21 @@ impl Iterator for ClipStream {
         if self.finished {
             return None;
         }
-        let deadline = Instant::now() + self.stall;
+        let mut deadline = if self.sent {
+            Instant::now() + self.stall
+        } else {
+            self.send_by
+        };
         loop {
             if self.cancel.load(Ordering::SeqCst) {
                 self.end();
                 return None;
             }
             match self.pieces.recv_timeout(POLL) {
+                Ok(Piece::Sent) => {
+                    self.sent = true;
+                    deadline = Instant::now() + self.stall;
+                }
                 Ok(Piece::Audio(audio)) => return Some(Ok(audio)),
                 Ok(Piece::Usage(usage)) => self.usage = usage,
                 Ok(Piece::End) => {
@@ -143,11 +193,18 @@ impl Iterator for ClipStream {
                 Err(RecvTimeoutError::Timeout) => {
                     if Instant::now() >= deadline {
                         self.end();
-                        return Some(Err(SpeechWireError::Transport(format!(
-                            "{} speech stalled: no audio for {}s",
-                            self.provider,
-                            self.stall.as_secs()
-                        ))));
+                        let message = if self.sent {
+                            format!(
+                                "{} speech stalled: no audio for {:?}",
+                                self.provider, self.stall
+                            )
+                        } else {
+                            format!(
+                                "{} speech request was not sent within {:?}",
+                                self.provider, self.setup
+                            )
+                        };
+                        return Some(Err(SpeechWireError::Transport(message)));
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
@@ -192,8 +249,9 @@ fn client(stall: Duration) -> Result<reqwest::blocking::Client, SpeechWireError>
 
 /// Start one clip request and stream its audio. Returns at once: the request,
 /// its headers (a refusal status included) and its audio all arrive through
-/// the stream. `stall` bounds every wait for the next piece, and each network
-/// operation the worker makes.
+/// the stream. The request must leave within the setup bound (10 s) of this
+/// return; `stall` then bounds each network operation the worker makes, and
+/// every wait for the next piece.
 ///
 /// The caller's thread only parses the URL, headers and body. Even fetching
 /// the shared client stays on the worker, because building one the first time
@@ -231,15 +289,9 @@ pub fn post_clip(
         .name("speech-clip".into())
         .spawn(move || worker.run(request, stream_format))
         .map_err(|error| SpeechWireError::Transport(error.to_string()))?;
-    Ok(ClipStream {
-        pieces,
-        gone,
-        cancel,
-        stall,
-        usage: None,
-        finished: false,
-        provider,
-    })
+    Ok(ClipStream::new(
+        pieces, gone, cancel, stall, SETUP, provider,
+    ))
 }
 
 /// `error` with every cause it wraps, since reqwest's own message hides them.
@@ -296,6 +348,10 @@ impl Worker {
                 return;
             }
         };
+        // A clip that ended while the client was being prepared sends nothing.
+        if !self.deliver(Piece::Sent) {
+            return;
+        }
         let response = match client.execute(request) {
             Ok(response) => response,
             Err(error) if error.is_timeout() => {

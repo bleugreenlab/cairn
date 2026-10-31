@@ -70,12 +70,14 @@ async fn issue_fixture() -> (TempDir, Arc<LocalDb>, Orchestrator) {
 
 async fn dispatch(orch: &Orchestrator, tool: &str, payload: Value) -> String {
     let request = McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: None,
         tool: tool.to_string(),
         payload,
         tool_use_id: None,
+        origin: None,
     };
     let cursors = Mutex::new(HashMap::new());
     dispatch_tool(orch, &request, &cursors)

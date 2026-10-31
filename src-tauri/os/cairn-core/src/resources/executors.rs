@@ -380,6 +380,7 @@ pub(crate) fn render_executors(
             plural(executors.len(), "executor", "executors")
         ));
     }
+    out.push_str(&stranded_summary(enrolled));
     for executor in executors {
         out.push_str(&format!("## {}\n", executor.name));
         let capabilities = &executor.health.advertisement.capabilities;
@@ -411,6 +412,9 @@ pub(crate) fn render_executors(
                 "- Draining: yes ({})\n",
                 crate::fleet::DrainResidents::of(&executor.occupancy).headline()
             ));
+        }
+        if let Some(hold) = &executor.health.inference_hold {
+            out.push_str(&inference_hold_line(hold));
         }
         out.push_str(&format!(
             "- Running now: {} (queued {})\n",
@@ -475,6 +479,33 @@ pub(crate) fn render_executors(
     out
 }
 
+/// The fleet-wide line for machines refused on protocol that this runner
+/// cannot repair, or nothing when there are none.
+///
+/// It sits beside the attached count because it is the same kind of fact: how
+/// much of the fleet can take work. Leaving it to each machine's own line is how
+/// five machines read as merely absent after a protocol bump.
+fn stranded_summary(enrolled: &[EnrolledRemote]) -> String {
+    let stranded: Vec<_> = enrolled
+        .iter()
+        .filter_map(|remote| remote.stranded.as_ref())
+        .collect();
+    let Some(first) = stranded.first() else {
+        return String::new();
+    };
+    let mut targets: Vec<&str> = stranded.iter().map(|s| s.target.as_str()).collect();
+    targets.sort_unstable();
+    targets.dedup();
+    format!(
+        "{} stranded: refused at every dial for speaking an older executor protocol, and this runner holds no executor for protocol {} on {}. Nothing on those machines needs fixing; publish executor-protocol-v{} for {} (publish-executor-protocol.yml), or roll the app back.\n\n",
+        plural(stranded.len(), "enrolled machine is", "enrolled machines are"),
+        first.expected_protocol,
+        targets.join(", "),
+        first.expected_protocol,
+        if targets.len() == 1 { "that target" } else { "those targets" },
+    )
+}
+
 /// Render an enrollment that is still running, or the one that most recently
 /// failed, for a name that has no machine behind it yet.
 ///
@@ -511,6 +542,15 @@ pub(crate) fn render_enrollment(
         "This machine is being enrolled. No load, admission, or occupancy is reported: those are measured on the machine, and it is not reporting yet.\n"
     });
     out
+}
+
+/// The line naming the inference deployment that holds a machine.
+fn inference_hold_line(hold: &cairn_common::executor_protocol::InferenceHold) -> String {
+    format!(
+        "- Inference: {}; see cairn://inference/deployments/{}\n",
+        hold.describe(),
+        hold.deployment
+    )
 }
 
 /// The `Draining:` value on one attached machine's page.
@@ -570,6 +610,20 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
         "- Last attempt: {}\n",
         last_attempt_age(remote, captured_at_unix_ms)
     ));
+    if let Some(stranded) = &remote.stranded {
+        out.push_str(&format!(
+            "- Refused on protocol: {} over {} (received v{}, expected v{}; last {})\n",
+            plural(stranded.refusals as usize, "refusal", "refusals"),
+            held(captured_at_unix_ms.saturating_sub(stranded.refused_since_unix_ms)),
+            stranded.received_protocol,
+            stranded.expected_protocol,
+            age(captured_at_unix_ms.saturating_sub(stranded.last_refused_unix_ms)),
+        ));
+        out.push_str(&format!(
+            "- Why no artifact: {}\n",
+            one_line(&stranded.reason)
+        ));
+    }
     out.push_str(&render_connection_timeline(
         &remote.connection_timeline,
         captured_at_unix_ms,
@@ -586,6 +640,16 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
     }
     out.push('\n');
 
+    if let Some(stranded) = &remote.stranded {
+        out.push_str(&format!(
+            "This machine dials in and is refused: it runs executor protocol v{received}, this runner speaks v{expected}, and the self-update the refusal directs it to cannot succeed, because this runner holds no {target} executor for v{expected}. It restarts and is refused again, backing off up to ten minutes between tries. Nothing on the host needs fixing and nothing here retries its way out: publish executor-protocol-v{expected} for {target} (publish-executor-protocol.yml), and the machine updates itself at its next dial; or roll the app back to a build that speaks v{received}.\n",
+            received = stranded.received_protocol,
+            expected = stranded.expected_protocol,
+            target = stranded.target,
+        ));
+        out.push_str("\nNo load, admission, or occupancy is reported: those are measured on the machine, and this one is not reporting.\n");
+        return out;
+    }
     out.push_str(match &remote.link {
         RemoteLinkState::Bootstrapping { .. } => {
             "This machine is being bootstrapped: the runner is installing the executor and registering it as a service over SSH. That is a one-time ceremony; once it finishes the machine connects on its own and the runner stops reaching into it.\n"
@@ -626,6 +690,11 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
 
 /// One machine's link condition in a single line.
 fn enrolled_link_summary(remote: &EnrolledRemote) -> String {
+    // Ahead of the link state, which still reads absent: the machine does dial
+    // in, and what keeps it out is the runner, which is the fact to lead with.
+    if let Some(stranded) = &remote.stranded {
+        return stranded.describe();
+    }
     let attempt = remote.last_attempt.as_ref();
     let summary = attempt.map(|attempt| attempt.summary.as_str());
     match &remote.link {
@@ -806,23 +875,44 @@ fn render_self_update(
         SelfUpdatePhase::Draining {
             in_flight: 0,
             since_unix_ms,
+            cycles,
+            ..
         } => format!(
-            "update pending: empty, confirming nothing new arrived before the restart (new work refused since {})",
-            age(captured_at_unix_ms.saturating_sub(*since_unix_ms))
+            "draining for update: empty, confirming nothing new arrived before the restart (new work refused since {}){}",
+            age(captured_at_unix_ms.saturating_sub(*since_unix_ms)),
+            restart_cycles(cycles)
         ),
         SelfUpdatePhase::Draining {
             in_flight,
             since_unix_ms,
-        } => format!(
-            "update pending: finishing {in_flight} in flight; new work goes elsewhere (since {})",
-            age(captured_at_unix_ms.saturating_sub(*since_unix_ms))
-        ),
-        SelfUpdatePhase::Directed { at_unix_ms } => format!(
-            "updating: directed to install {served} {}; waiting for it to return on that build",
-            age(captured_at_unix_ms.saturating_sub(*at_unix_ms))
+            holds,
+            cycles,
+        } => {
+            let waiting_on = match holds.first() {
+                Some(hold) => format!(
+                    ", {}{}, {}",
+                    if *in_flight > 1 { "the longest " } else { "" },
+                    hold.label,
+                    hold_remaining(hold, captured_at_unix_ms)
+                ),
+                None => String::new(),
+            };
+            format!(
+                "draining for update: {in_flight} in flight{waiting_on}; new work goes elsewhere (since {}){}",
+                age(captured_at_unix_ms.saturating_sub(*since_unix_ms)),
+                restart_cycles(cycles)
+            )
+        }
+        SelfUpdatePhase::Directed { at_unix_ms, cycled } => format!(
+            "updating: directed to install {served} {}; waiting for it to return on that build{}",
+            age(captured_at_unix_ms.saturating_sub(*at_unix_ms)),
+            match cycled.as_slice() {
+                [] => String::new(),
+                cycled => format!("; {} down until it does", cycled.join(", ")),
+            }
         ),
         SelfUpdatePhase::Deferred { until_unix_ms } => format!(
-            "update deferred: it did not empty in time, so it takes work again and is asked again in {}",
+            "update deferred: work there outran its own expected duration and was read as wedged, so it takes work again and is asked again in {}",
             duration_ms(until_unix_ms.saturating_sub(captured_at_unix_ms))
         ),
         SelfUpdatePhase::Halted { cause } => {
@@ -831,6 +921,30 @@ fn render_self_update(
         SelfUpdatePhase::Excluded { cause } => {
             format!("update skipped on this machine for {served}: {cause}")
         }
+    }
+}
+
+/// How much longer a draining machine's update waits on one piece of work.
+fn hold_remaining(
+    hold: &cairn_common::executor_protocol::DrainHold,
+    captured_at_unix_ms: u64,
+) -> String {
+    let bound = duration_ms(hold.deadline_unix_ms.saturating_sub(captured_at_unix_ms));
+    match hold.expected_done_unix_ms {
+        Some(done) if done > captured_at_unix_ms => {
+            format!("~{} left", duration_ms(done - captured_at_unix_ms))
+        }
+        Some(_) => format!("past its expected finish, waited on up to {bound} more"),
+        None => format!("no expected finish, waited on up to {bound} more"),
+    }
+}
+
+/// The service instances a self-update restart ends, which their owners place
+/// again once the machine returns.
+fn restart_cycles(cycles: &[String]) -> String {
+    match cycles {
+        [] => String::new(),
+        cycles => format!("; the restart cycles {}", cycles.join(", ")),
     }
 }
 
@@ -867,6 +981,11 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     out.push_str(&render_build_prerequisites(capabilities));
     out.push_str(&render_project_eligibility(&executor.project_eligibility));
     out.push_str(&render_containment(capabilities, executor.colocated));
+    out.push_str(&render_macos_fence(
+        capabilities,
+        health.advertisement.observed_at_unix_ms,
+        health.heartbeat_age_ms,
+    ));
     out.push_str(&render_nested_sandbox(
         capabilities,
         health.advertisement.observed_at_unix_ms,
@@ -961,6 +1080,9 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         executor.captured_at_unix_ms,
     ));
     out.push_str(&format!("- Draining: {}\n", drain_line(executor)));
+    if let Some(hold) = &executor.health.inference_hold {
+        out.push_str(&inference_hold_line(hold));
+    }
     out.push_str(&format!("- Build: {}\n", render_build(executor)));
     if let Some(status) = &executor.self_update {
         out.push_str(&format!(
@@ -1338,6 +1460,11 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             .map(|value| value.process_count)
             .unwrap_or(0)
     ));
+    out.push_str(&render_running_now(
+        occupancy,
+        executor.live_usage_gap,
+        executor.captured_at_unix_ms,
+    ));
     out.push('\n');
 
     out.push_str("## Pool slots\n");
@@ -1379,11 +1506,22 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
                 .saturating_sub(cell.last_used_unix_ms)),
             render_cache_distance(cell.last_distance.as_ref(), executor.captured_at_unix_ms)
         ));
-        if let Some(reason) = &cell.quarantine_reason {
+        if let Some(reason) = cell.active_quarantine_reason() {
             out.push_str(&format!("  - Quarantine: {}\n", reason.replace('\n', " ")));
         }
         if let Some(seed) = &cell.seeded_from {
             out.push_str(&format!("  - Seeded: {}\n", seed.describe()));
+        }
+        if let Some(transition) = occupancy.cell_transitions.iter().find(|transition| {
+            transition.project_id == cell.project_id && transition.cell_id == cell.cell_id
+        }) {
+            out.push_str(&format!(
+                "  - Record being written: {}, started {}\n",
+                transition.kind.label(),
+                age(executor
+                    .captured_at_unix_ms
+                    .saturating_sub(transition.since_unix_ms))
+            ));
         }
     }
     out.push('\n');
@@ -1455,6 +1593,7 @@ pub(crate) fn render_placements(executor: &ExecutorInspection) -> String {
                 selection.reason.as_str()
             ),
             (PlacementOutcome::Refused { diagnostic }, None) => format!("refused: {diagnostic}"),
+            (PlacementOutcome::Waiting { diagnostic }, None) => format!("waiting: {diagnostic}"),
         };
         out.push_str(&format!(
             "- Request `{}` ({}, asked for {asked}): {outcome}\n  - Detail: cairn://executors/{}?view=placement&request={}\n",
@@ -2286,6 +2425,9 @@ fn render_placement_detail(out: &mut String, decision: &PlacementDecision) {
         PlacementOutcome::Refused { diagnostic } => {
             out.push_str(&format!("  - Refused: {diagnostic}\n"));
         }
+        PlacementOutcome::Waiting { diagnostic } => {
+            out.push_str(&format!("  - Waiting: {diagnostic}\n"));
+        }
     }
     if let Some(winner) = &decision.unpinned_winner {
         out.push_str(&format!(
@@ -2415,7 +2557,10 @@ fn render_prediction(out: &mut String, label: &str, prediction: &PlacementPredic
         out.push_str(&format!("    - Priced: {}\n", reliability.describe()));
     }
     if let Some(memory) = &prediction.memory_pressure {
-        out.push_str(&format!("    - Memory: {}\n", memory.describe()));
+        out.push_str(&format!("    - Memory: {}\n", memory.describe("memory")));
+    }
+    if let Some(io) = &prediction.io_pressure {
+        out.push_str(&format!("    - I/O: {}\n", io.describe("I/O")));
     }
     // History, not a reading: the reason this machine ranked behind ones that
     // never refused this entry, whatever its numbers say.
@@ -3625,6 +3770,85 @@ fn render_quarantine_census(
     out
 }
 
+/// Each running command and live resident process, with what it is using now,
+/// cited with the age of the window it was measured over. The same live usage
+/// the fleet pane reads, from the same join, so the two cannot disagree.
+fn render_running_now(
+    occupancy: &cairn_common::executor_protocol::FleetSnapshot,
+    gap: Option<cairn_common::executor_protocol::MeasurementGap>,
+    now: u64,
+) -> String {
+    let residents: Vec<_> = occupancy
+        .cells
+        .iter()
+        .flat_map(|cell| {
+            cell.occupancy
+                .processes
+                .iter()
+                .filter(|(_, process)| process.is_live())
+                .map(move |(key, process)| (cell, key, process))
+        })
+        .collect();
+    if occupancy.executing_requests.is_empty() && residents.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n## Running now\n");
+    if let Some(gap) = gap {
+        out.push_str(&format!(
+            "Live usage: not reported ({}); CPU and memory below are a gap, not zero.\n",
+            gap.describe()
+        ));
+    }
+    let usage = |sample: Option<cairn_common::executor_protocol::LiveUsageSample>| match sample {
+        Some(sample) => format!(
+            "{} CPU, {} resident, over {} measured {}",
+            sample.cores().map_or_else(
+                || "unmeasured".to_string(),
+                |cores| format!("{cores:.1} cores")
+            ),
+            sample
+                .resident_bytes
+                .map_or_else(|| "unread".to_string(), bytes),
+            duration_ms(sample.window_ms),
+            age(now.saturating_sub(sample.measured_at_unix_ms))
+        ),
+        None if gap.is_some() => "usage not reported".to_string(),
+        None => "usage not measured yet".to_string(),
+    };
+    for request in &occupancy.executing_requests {
+        let command: String = request
+            .command
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(80)
+            .collect();
+        let build_jobs = request
+            .build_jobs
+            .map(|jobs| format!("; {}", jobs.describe()))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "- {}: `{}` (request {}, started {}): {}{build_jobs}\n",
+            request.cell_id,
+            command,
+            request.request_id,
+            age(now.saturating_sub(request.started_at_unix_ms)),
+            usage(request.live_usage)
+        ));
+    }
+    for (cell, key, process) in residents {
+        out.push_str(&format!(
+            "- {}: resident `{}` (generation {}): {}\n",
+            cell.cell_id,
+            key,
+            process.generation,
+            usage(process.live_usage)
+        ));
+    }
+    out
+}
+
 fn age(ms: u64) -> String {
     if ms < 1_000 {
         return format!("{ms}ms ago");
@@ -3702,9 +3926,15 @@ fn build_prerequisite_summary(capabilities: &ExecutorCapabilities) -> Option<Str
     let Some(check) = &capabilities.build_prerequisites else {
         return Some("not reported (this machine's executor predates the check)".to_string());
     };
-    match check.status {
+    match check.effective_status() {
         BuildPrerequisiteStatus::Satisfied => None,
         BuildPrerequisiteStatus::Missing => Some(format!("MISSING — {}", one_line(&check.detail))),
+        BuildPrerequisiteStatus::Unchecked if check.is_probe_failure_reported_as_missing() => {
+            Some(format!(
+                "not checked — reported as MISSING by a probe that could not run its script: {}",
+                one_line(&check.detail)
+            ))
+        }
         BuildPrerequisiteStatus::Unchecked => {
             Some(format!("not checked — {}", one_line(&check.detail)))
         }
@@ -3726,7 +3956,7 @@ fn render_build_prerequisites(capabilities: &ExecutorCapabilities) -> String {
     let Some(check) = &capabilities.build_prerequisites else {
         return "- Build prerequisites: not reported by this executor\n".to_string();
     };
-    let status = match check.status {
+    let status = match check.effective_status() {
         BuildPrerequisiteStatus::Satisfied => "satisfied",
         BuildPrerequisiteStatus::Missing => "MISSING",
         BuildPrerequisiteStatus::Unchecked => "could not be checked",
@@ -3738,6 +3968,13 @@ fn render_build_prerequisites(capabilities: &ExecutorCapabilities) -> String {
     };
     let mut out =
         format!("- Build prerequisites: {status} — {source}, as of this machine's last attach\n");
+    // A verdict stands until re-attach, so an executor that reported its own
+    // staging failure as MISSING keeps showing it until it is replaced. Say
+    // what it is, or an operator goes looking for packages the check never
+    // looked for.
+    if check.is_probe_failure_reported_as_missing() {
+        out.push_str("  - This executor reported MISSING, but its probe could not run the script: it ended on the shell's own error about the copy it staged, below, so it says nothing about this machine and placement does not enforce it. An executor carrying the staging fix asks again when it next attaches.\n");
+    }
     for line in check
         .detail
         .lines()
@@ -3793,7 +4030,7 @@ fn ineligibility_summary(refusals: &[PlacementRejectionReason]) -> Option<String
                 format!("setup needs `{program}`, which is not on its PATH")
             }
             PlacementRejectionReason::BuildPrerequisitesMissing { .. } => {
-                "rust work (build prerequisites MISSING)".to_string()
+                "work requiring the rust toolchain (build prerequisites MISSING)".to_string()
             }
             other => other.describe(),
         })
@@ -3849,6 +4086,9 @@ fn render_containment(capabilities: &ExecutorCapabilities, colocated: bool) -> S
         containment.boot_generation,
         platform
     );
+    if capabilities.os.eq_ignore_ascii_case("linux") {
+        out.push_str(&linux_fence_summary(containment));
+    }
     if containment.observations.is_empty() {
         out.push_str("  - this executor measured no edge\n");
         return out;
@@ -3944,6 +4184,111 @@ fn render_nested_sandbox(
         None => "  - No fingerprint: an input could not be read, so the probe re-runs on every refresh rather than reuse this\n".to_string(),
     });
     out
+}
+
+/// What the fence on a macOS machine does, in one line: whether a fenced
+/// batch's out-of-bounds write is denied, read off the confined batch's
+/// filesystem edge, and whether the denied path is recovered, read off the
+/// violation-recovery measurement.
+///
+/// The two are separate facts. Seatbelt denies the write whether or not
+/// anything is watching; recovery is what names the path, attributes the
+/// denial and scopes the crossing an agent may ask for, and it depends on the
+/// executor account reaching `log stream`. A page that said "fenced" while
+/// recovery was blind would overclaim exactly the way an account dropped from
+/// `admin` made it do.
+fn render_macos_fence(
+    capabilities: &ExecutorCapabilities,
+    beat_observed_at_unix_ms: u64,
+    heartbeat_age_ms: u64,
+) -> String {
+    use cairn_common::executor_protocol::{
+        EdgeDisposition, EdgeId, ViolationRecoveryOutcome, ViolationStreamAccess,
+    };
+    if !capabilities.os.eq_ignore_ascii_case("macos") {
+        return String::new();
+    }
+    let denials = capabilities
+        .containment
+        .as_ref()
+        .and_then(|containment| {
+            containment
+                .observations
+                .iter()
+                .find(|observation| observation.edge == EdgeId::BatchSpawnFilesystemConfined)
+        })
+        .map(|observation| &observation.disposition);
+    let denials = match denials {
+        Some(EdgeDisposition::Refused { .. } | EdgeDisposition::Constrained { .. }) => {
+            "denials fire".to_string()
+        }
+        Some(EdgeDisposition::Ambient { observed, .. }) => {
+            format!("writes are not confined ({})", observed.detail)
+        }
+        Some(EdgeDisposition::Unmeasured { reason }) => format!("denials unmeasured ({reason})"),
+        None => "denials not reported".to_string(),
+    };
+    let recovery = capabilities
+        .sandbox
+        .as_ref()
+        .and_then(|evidence| evidence.violation_recovery.as_ref());
+    let recovery = match recovery {
+        None => "recovery not reported by this executor".to_string(),
+        Some(evidence) => {
+            let measured = age(beat_observed_at_unix_ms
+                .saturating_sub(evidence.measured_at_unix_ms)
+                .saturating_add(heartbeat_age_ms));
+            match &evidence.outcome {
+                ViolationRecoveryOutcome::Measured { detail } => format!(
+                    "recovery measured {measured} {}: {detail}",
+                    match evidence.access {
+                        ViolationStreamAccess::Admin => "as an admin account",
+                        ViolationStreamAccess::SudoRule => "through the operator's sudo rule",
+                    }
+                ),
+                ViolationRecoveryOutcome::Unmeasured { reason } => {
+                    format!("recovery unmeasured: {reason} (measured {measured})")
+                }
+            }
+        }
+    };
+    format!("- Fence: {denials}; {recovery}\n")
+}
+
+/// What a fenced Linux batch on this machine is actually kept from, in one
+/// line, read off the confined batch's host-socket edge.
+///
+/// The landlock fence always confines writes; whether it also keeps a batch
+/// off the session bus, the ssh and gpg agents, X11 and other users' tmux
+/// servers depends on the kernel (Landlock ABI 9), and a page that said
+/// "fenced" without saying which would be the overclaim cairn/5083 was filed
+/// on. Reads are never confined on Linux, so the line never implies they are.
+fn linux_fence_summary(
+    containment: &cairn_common::executor_protocol::ContainmentObservations,
+) -> String {
+    use cairn_common::executor_protocol::{EdgeDisposition, EdgeId};
+    let socket = containment
+        .observations
+        .iter()
+        .find(|observation| observation.edge == EdgeId::BatchSpawnHostSocketConfined)
+        .map(|observation| &observation.disposition);
+    match socket {
+        Some(EdgeDisposition::Refused { .. }) => {
+            "- Fence: writes and host sockets (reads are not confined on Linux)\n".to_string()
+        }
+        Some(EdgeDisposition::Ambient { observed, .. }) => format!(
+            "- Fence: writes only; host sockets reachable ({}) (reads are not confined on Linux)\n",
+            observed.detail
+        ),
+        Some(EdgeDisposition::Constrained { observed, .. }) => format!(
+            "- Fence: writes; host sockets constrained ({}) (reads are not confined on Linux)\n",
+            observed.detail
+        ),
+        Some(EdgeDisposition::Unmeasured { reason }) => format!(
+            "- Fence: writes; host sockets unmeasured ({reason}) (reads are not confined on Linux)\n"
+        ),
+        None => "- Fence: writes; host sockets not reported by this executor (reads are not confined on Linux)\n".to_string(),
+    }
 }
 
 fn describe_disposition(disposition: &cairn_common::executor_protocol::EdgeDisposition) -> String {
@@ -4076,6 +4421,7 @@ mod storage_section_tests {
                     external_managed_caches_bytes: 93 * GIB,
                     quarantines_bytes: 104 * GIB,
                     temporary_other_bytes: 125 * GIB,
+                    node_scratch_bytes: 0,
                 },
                 other_top: vec![DiskPathUsage {
                     path: "cairn.db".into(),
@@ -5127,6 +5473,35 @@ mod tests {
         );
     }
 
+    /// A cell that left quarantine keeps the reason it was fenced for; the page
+    /// names it only while the fence stands, so processes long gone are not
+    /// reported as holding a cell that is back in service.
+    #[test]
+    fn a_quarantine_line_is_shown_only_while_the_cell_is_quarantined() {
+        use cairn_common::executor_protocol::PersistentCellLifecycle;
+        let reason = "cell slot-1 still has 1 process(es) alive from a prior epoch: [302625]";
+        let mut quarantined = cached_slot();
+        quarantined.lifecycle = PersistentCellLifecycle::Quarantined;
+        quarantined.quarantine_reason = Some(reason.into());
+        let mut returned = cached_slot();
+        returned.cell_id = "slot-2".into();
+        returned.lifecycle = PersistentCellLifecycle::Active;
+        returned.quarantine_reason = Some(reason.replace("slot-1", "slot-2"));
+
+        let mut executor = inspection("local", true);
+        executor.occupancy.cells = vec![quarantined, returned];
+        let rendered = render_executor(&executor);
+
+        assert!(
+            rendered.contains(&format!("  - Quarantine: {reason}")),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("cell slot-2 still has"),
+            "a cell back in service still shows its old quarantine: {rendered}"
+        );
+    }
+
     #[test]
     fn pool_slot_head_is_what_the_checkout_resolves_not_what_the_cell_recorded() {
         use cairn_common::executor_protocol::ObservedCellHead;
@@ -5171,6 +5546,22 @@ mod tests {
     #[test]
     fn pool_slot_rendering_shows_project_head_lifecycle_size_age_and_distance_without_private_identity(
     ) {
+        let mut executor = inspection("local", true);
+        let slot = cached_slot();
+        executor.occupancy.cell_transitions =
+            vec![cairn_common::executor_protocol::CellTransitionInFlight {
+                project_id: slot.project_id.clone(),
+                cell_id: slot.cell_id.clone(),
+                kind: cairn_common::executor_protocol::CellTransitionKind::Lease,
+                since_unix_ms: executor.captured_at_unix_ms.saturating_sub(4_000),
+            }];
+        executor.occupancy.cells = vec![slot];
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("  - Record being written: lease, started 4s ago"),
+            "a slot with a write in flight names it: {rendered}"
+        );
+
         let mut executor = inspection("local", true);
         executor.occupancy.cells = vec![cached_slot()];
         let rendered = render_executor(&executor);
@@ -5296,6 +5687,57 @@ mod tests {
         );
     }
 
+    /// A Linux machine's page says which boundaries its fence holds, read off
+    /// the measured socket edge, and never implies read protection.
+    #[test]
+    fn the_linux_fence_summary_names_what_the_kernel_enforces() {
+        use cairn_common::executor_protocol::{
+            ContainmentObservations, EdgeDisposition, EdgeId, EdgeObservation, ObservedEffect,
+        };
+        let observations = |disposition| ContainmentObservations {
+            executor_build_id: "build".into(),
+            boot_generation: "boot".into(),
+            platform: None,
+            current_fingerprints: Vec::new(),
+            observations: vec![EdgeObservation {
+                edge: EdgeId::BatchSpawnHostSocketConfined,
+                disposition,
+                observed_at_unix_ms: 0,
+            }],
+        };
+        let ambient = linux_fence_summary(&observations(EdgeDisposition::Ambient {
+            observed: ObservedEffect {
+                effect: cairn_common::executor_protocol::EffectClass::Invoke,
+                positive_control_passed: true,
+                detail: "kernel Landlock ABI 7 < 9: pathname sockets served from outside the fence are reachable".into(),
+            },
+            scope: None,
+        }));
+        assert!(
+            ambient.starts_with(
+                "- Fence: writes only; host sockets reachable (kernel Landlock ABI 7 < 9"
+            ),
+            "{ambient}"
+        );
+        let unmeasured = linux_fence_summary(&observations(EdgeDisposition::Unmeasured {
+            reason: "no probe".into(),
+        }));
+        assert!(
+            unmeasured.contains("host sockets unmeasured (no probe)"),
+            "{unmeasured}"
+        );
+        let absent = linux_fence_summary(&ContainmentObservations {
+            observations: Vec::new(),
+            ..observations(EdgeDisposition::Unmeasured {
+                reason: String::new(),
+            })
+        });
+        assert!(absent.contains("not reported"), "{absent}");
+        for line in [ambient, unmeasured, absent] {
+            assert!(line.contains("reads are not confined on Linux"), "{line}");
+        }
+    }
+
     /// A machine that reports nothing must not render as a machine that
     /// measured something and found it safe.
     #[test]
@@ -5332,6 +5774,7 @@ mod tests {
             nested_sandbox_write_detail:
                 "an in-bounds temp write succeeded under a nested Seatbelt profile".into(),
             nested_sandbox_write_context: None,
+            violation_recovery: None,
         };
         executor.health.advertisement.capabilities.sandbox = Some(evidence.clone());
         let rendered = render_executor(&executor);
@@ -5372,6 +5815,112 @@ mod tests {
         );
     }
 
+    /// A Mac whose fence denies writes but whose executor account cannot reach
+    /// the violation stream says both, with the refusal that blinded it, and
+    /// turns to measured once the stream works.
+    #[test]
+    fn the_macos_fence_line_separates_denials_from_recovery() {
+        use cairn_common::executor_protocol::{
+            ContainmentObservations, EdgeDisposition, EdgeId, EdgeObservation, EffectClass,
+            Fingerprint, FingerprintAlgorithm, ObservedEffect, PositiveScope, ProbeVersion,
+            RemotePlatform, SandboxCapabilityEvidence, ViolationRecoveryEvidence,
+            ViolationRecoveryOutcome, ViolationStreamAccess,
+        };
+        // Ages below are reckoned on the executor's clock plus the 4s-old
+        // heartbeat `inspection` carries.
+        let mut executor = inspection("bgsrv-mac", false);
+        let capabilities = &mut executor.health.advertisement.capabilities;
+        capabilities.os = "macos".into();
+        executor.health.advertisement.observed_at_unix_ms = 1_000_000;
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "- Fence: denials not reported; recovery not reported by this executor\n"
+            ),
+            "{rendered}"
+        );
+
+        let definition = EdgeId::BatchSpawnFilesystemConfined.definition();
+        let disposition = EdgeDisposition::Refused {
+            scope: PositiveScope {
+                executor_build_id: "b".into(),
+                boot_generation: "g".into(),
+                platform: RemotePlatform::DarwinArm64,
+                process_class: definition.key.process_class,
+                carrier: definition.key.carrier,
+                policy_mode: definition.key.policy_mode,
+                probe_version: ProbeVersion::V1,
+                claim_revision: definition.claim_revision,
+                invalidation_fingerprint: Fingerprint {
+                    algorithm: FingerprintAlgorithm::Sha256,
+                    digest: "digest".into(),
+                    inputs: definition.invalidation_inputs.to_vec(),
+                },
+            },
+            observed: ObservedEffect {
+                effect: EffectClass::Write,
+                positive_control_passed: true,
+                detail: "a write into the home directory was refused".into(),
+            },
+        };
+        let denials = "denials fire";
+        let capabilities = &mut executor.health.advertisement.capabilities;
+        capabilities.containment = Some(ContainmentObservations {
+            executor_build_id: "b".into(),
+            boot_generation: "g".into(),
+            platform: None,
+            current_fingerprints: Vec::new(),
+            observations: vec![EdgeObservation {
+                edge: EdgeId::BatchSpawnFilesystemConfined,
+                disposition,
+                observed_at_unix_ms: 0,
+            }],
+        });
+        let mut evidence = SandboxCapabilityEvidence {
+            cairn_sandboxed_marker: false,
+            nested_sandbox_write_available: true,
+            nested_sandbox_write_detail: "ok".into(),
+            nested_sandbox_write_context: None,
+            violation_recovery: Some(ViolationRecoveryEvidence {
+                access: ViolationStreamAccess::SudoRule,
+                outcome: ViolationRecoveryOutcome::Unmeasured {
+                    reason: "sudo rule absent: this executor account is not in admin".into(),
+                },
+                measured_at_unix_ms: 1_000_000 - 30_000,
+            }),
+        };
+        capabilities.sandbox = Some(evidence.clone());
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(&format!(
+                "- Fence: {denials}; recovery unmeasured: sudo rule absent: this executor account is not in admin (measured 34s ago)\n"
+            )),
+            "{rendered}"
+        );
+
+        evidence.violation_recovery = Some(ViolationRecoveryEvidence {
+            access: ViolationStreamAccess::SudoRule,
+            outcome: ViolationRecoveryOutcome::Measured {
+                detail: "a canary file-write-create was denied and recovered by path".into(),
+            },
+            measured_at_unix_ms: 1_000_000 - 5_000,
+        });
+        executor.health.advertisement.capabilities.sandbox = Some(evidence);
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(&format!(
+                "- Fence: {denials}; recovery measured 9s ago through the operator's sudo rule: a canary file-write-create was denied and recovered by path\n"
+            )),
+            "{rendered}"
+        );
+
+        executor.health.advertisement.capabilities.os = "linux".into();
+        assert!(
+            !render_executor(&executor).contains("recovery"),
+            "only macOS recovers a denied path out of band"
+        );
+    }
+
     pub(super) fn inspection(name: &str, colocated: bool) -> ExecutorInspection {
         let identity = ExecutorIdentity {
             device_id: "device-9f3c1a".into(),
@@ -5385,6 +5934,7 @@ mod tests {
             colocated,
             health: ExecutorHealthSnapshot {
                 build_volume: None,
+                inference_hold: None,
                 identity: identity.clone(),
                 public_name: name.into(),
                 colocated,
@@ -5414,6 +5964,7 @@ mod tests {
                     liveness_observed_at_unix_ms: Some(CAPTURED_AT - 5_000),
                     facts_stale_refresh_blocked: None,
                     last_refresh: None,
+                    node_scratches: Vec::new(),
                 },
                 admission: ExecutorSubstrateReport::default().admission,
                 queues: Vec::new(),
@@ -5438,6 +5989,7 @@ mod tests {
             last_update: None,
             self_update: None,
             occupancy: FleetSnapshot::default(),
+            live_usage_gap: None,
             slots: Vec::new(),
             captured_at_unix_ms: CAPTURED_AT,
             connection_timeline: Vec::new(),
@@ -5761,7 +6313,7 @@ mod tests {
         );
         assert!(
             listed.contains(
-                "- Not eligible for cairn: setup needs bun; rust work (build prerequisites MISSING)\n"
+                "- Not eligible for cairn: setup needs bun; work requiring the rust toolchain (build prerequisites MISSING)\n"
             ),
             "{listed}"
         );
@@ -5884,6 +6436,47 @@ mod tests {
         assert!(
             detailed.contains("- Build prerequisites: could not be checked — `scripts/setup-self-hosted-runner-windows.ps1 -Check`, as of this machine's last attach\n"),
             "{detailed}"
+        );
+    }
+
+    /// An executor that predates the staging fix reported a script that died on
+    /// the shell's own error, a library it sources absent from the staged
+    /// copy, as MISSING, and that verdict stands until the machine re-attaches.
+    /// Both pages must read it as a check that never ran, and say why.
+    #[test]
+    fn a_missing_verdict_from_a_probe_that_could_not_run_reads_as_unchecked() {
+        let stale = BuildPrerequisiteCheck {
+            script: "scripts/setup-self-hosted-runner-macos.sh --check".into(),
+            status: BuildPrerequisiteStatus::Missing,
+            detail: "/var/folders/k1/T/cairn-prerequisite-b440083b/setup-self-hosted-runner-macos.sh: line 31: /var/folders/k1/T/cairn-prerequisite-b440083b/lib/runner-isolation.sh: No such file or directory".into(),
+        };
+        let listed = render_executors(
+            &[with_prerequisites("bgsrv-mac", Some(stale.clone()))],
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+        );
+        assert!(
+            listed.contains("- Build prerequisites: not checked — reported as MISSING by a probe that could not run its script: /var/folders/k1/T/cairn-prerequisite-b440083b/setup-self-hosted-runner-macos.sh: line 31:"),
+            "{listed}"
+        );
+
+        let page = render_executor(&with_prerequisites("bgsrv-mac", Some(stale)));
+        assert!(
+            page.contains("- Build prerequisites: could not be checked — `scripts/setup-self-hosted-runner-macos.sh --check`, as of this machine's last attach\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains(
+                "  - This executor reported MISSING, but its probe could not run the script"
+            ),
+            "{page}"
+        );
+        assert!(
+            page.contains("lib/runner-isolation.sh: No such file or directory\n"),
+            "{page}"
         );
     }
 
@@ -6292,6 +6885,7 @@ mod tests {
             connection_timeline: Vec::new(),
             drained: false,
             role: Default::default(),
+            stranded: None,
         }
     }
 
@@ -6713,6 +7307,94 @@ mod tests {
             !rendered.contains("The runner supervises a colocated executor"),
             "an outage must not render as the empty-runner explanation: {rendered}"
         );
+    }
+
+    /// The cairn/5510 fleet: Linux machines refused on protocol 157 by a runner
+    /// that speaks 159 and holds no Linux executor past 157. Each must read as
+    /// stranded, with the count beside the attached count, rather than as
+    /// absent and directed to a self-update that cannot happen.
+    #[test]
+    fn a_stranded_machine_is_named_and_counted_rather_than_read_as_absent() {
+        let stranded = |name: &str, target: &str| {
+            let mut remote = enrolled(
+                name,
+                RemoteLinkState::Absent {
+                    last_beat_unix_ms: None,
+                    last_reason: "this runner has not seen it since starting".into(),
+                },
+            );
+            remote.last_attempt = None;
+            remote.last_seen_unix_ms = None;
+            remote.stranded = Some(cairn_common::executor_protocol::StrandedExecutor {
+                target: target.into(),
+                expected_protocol: 159,
+                received_protocol: 157,
+                newest_held_protocol: Some(157),
+                reason: "no x86_64-unknown-linux-gnu executor artifact published for executor protocol v159".into(),
+                refused_since_unix_ms: REMOTE_CAPTURED_AT - 3_600_000,
+                last_refused_unix_ms: REMOTE_CAPTURED_AT - 30_000,
+                refusals: 12,
+            });
+            remote
+        };
+        let fleet = [
+            stranded("bbs", "x86_64-unknown-linux-gnu"),
+            stranded("bginf-sp1", "aarch64-unknown-linux-gnu"),
+            stranded("fedora", "x86_64-unknown-linux-gnu"),
+            enrolled(
+                "bglab-win",
+                RemoteLinkState::Absent {
+                    last_beat_unix_ms: None,
+                    last_reason: String::new(),
+                },
+            ),
+        ];
+        let rendered = render_executors(&[], &fleet, &[], None, REMOTE_CAPTURED_AT, false);
+        assert!(
+            rendered.contains("3 enrolled machines are stranded"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "no executor for protocol 159 on aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu"
+            ),
+            "each target is named once: {rendered}"
+        );
+        assert!(
+            rendered.contains("publish executor-protocol-v159"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- Link: stranded: this runner has no x86_64-unknown-linux-gnu executor for protocol 159 (newest held: v157); publish one or roll the app back"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("directed to self-update"), "{rendered}");
+
+        let page = render_enrolled_remote(&fleet[2], REMOTE_CAPTURED_AT);
+        assert!(
+            page.contains(
+                "- Status: stranded: this runner has no x86_64-unknown-linux-gnu executor"
+            ),
+            "{page}"
+        );
+        assert!(
+            page.contains("- Refused on protocol: 12 refusals over 1h (received v157, expected v159; last 30s ago)"),
+            "{page}"
+        );
+        assert!(
+            page.contains(
+                "- Why no artifact: no x86_64-unknown-linux-gnu executor artifact published"
+            ),
+            "{page}"
+        );
+        assert!(page.contains("Nothing on the host needs fixing"), "{page}");
+        assert!(
+            !page.contains("has not been seen since this runner started. That is ordinary"),
+            "a stranded machine is not described as an ordinary absence: {page}"
+        );
+
+        let healthy = render_executors(&[], &fleet[3..], &[], None, REMOTE_CAPTURED_AT, false);
+        assert!(!healthy.contains("stranded"), "{healthy}");
     }
 
     /// The two down states mean opposite things about whether a person needs to
@@ -7687,6 +8369,15 @@ mod tests {
                     quiet_ms: 900_000,
                     last_output_unix_ms: None,
                     cpu_ms_in_window: Some(40),
+                    storage_io_bytes_in_window: Some(3 << 20),
+                    tree: vec![cairn_common::executor_protocol::StoppedProcess {
+                        pid: 4133,
+                        state: Some("D".into()),
+                        wchan: Some("folio_wait_bit_common".into()),
+                        cpu_ms: Some(2_100),
+                        storage_io_bytes: Some(340 << 20),
+                        command: Some("rust-lld -flavor gnu".into()),
+                    }],
                 },
                 stopped_at_unix_ms: CAPTURED_AT - 120_000,
                 signalled_groups: vec![4120, 4133],
@@ -7694,7 +8385,12 @@ mod tests {
             }];
         let rendered = render_executor(&executor);
         assert!(rendered.contains("## Stopped commands"), "{rendered}");
-        assert!(rendered.contains("- rust-tests (2m ago, request req-1): no output and no CPU progress across its process tree for 900s"), "{rendered}");
+        assert!(rendered.contains("- rust-tests (2m ago, request req-1): no output, no CPU progress and no storage I/O across its process tree for 900s (it used 40ms of CPU and 3 MiB of storage I/O in that window)"), "{rendered}");
+        // Hung and disk-bound read differently after the fact.
+        assert!(
+            rendered.contains("(1 waiting on storage): pid 4133 D in folio_wait_bit_common `rust-lld -flavor gnu` (2100ms CPU, 340 MiB storage I/O)"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("signalled groups 4120, 4133"),
             "{rendered}"
@@ -8015,6 +8711,12 @@ mod tests {
         let mut pending = self_updating(SelfUpdatePhase::Draining {
             in_flight: 3,
             since_unix_ms: CAPTURED_AT - 90_000,
+            holds: vec![cairn_common::executor_protocol::DrainHold {
+                label: "`bun run test:rust:tiered` for cairn/5456".into(),
+                expected_done_unix_ms: Some(CAPTURED_AT + 9 * 60_000),
+                deadline_unix_ms: CAPTURED_AT + 19 * 60_000,
+            }],
+            cycles: vec!["service `iMessage channel`".into()],
         });
         pending.health.build_skew = Some(cairn_common::executor_protocol::BuildSkew {
             runner_build_id: "build-1329".into(),
@@ -8026,7 +8728,9 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("- Self-update: update pending: finishing 3 in flight"),
+            rendered.contains(
+                "- Self-update: draining for update: 3 in flight, the longest `bun run test:rust:tiered` for cairn/5456, ~9.0m left; new work goes elsewhere (since 1m ago); the restart cycles service `iMessage channel`\n"
+            ),
             "{rendered}"
         );
 
@@ -8265,5 +8969,56 @@ mod supervision_tests {
             render_colocated_supervision(None, &ColocatedSupervision::default(), true, NOW),
             ""
         );
+    }
+}
+
+#[cfg(test)]
+mod running_now_tests {
+    use super::render_running_now;
+    use cairn_common::executor_protocol::{
+        BuildJobs, CellCommandClass, ExecutingCellRequest, FleetSnapshot, MemoryJobBound,
+    };
+
+    const GIB: u64 = 1 << 30;
+
+    fn running(build_jobs: Option<BuildJobs>) -> FleetSnapshot {
+        FleetSnapshot {
+            executing_requests: vec![ExecutingCellRequest {
+                executor_id: String::new(),
+                cell_id: "slot-103".into(),
+                request_id: "request".into(),
+                attempt_id: "attempt".into(),
+                owner: None,
+                command_class: CellCommandClass::CargoTest,
+                command: "bun run test:rust:tiered".into(),
+                started_at_unix_ms: 0,
+                process_ids: vec![1],
+                priority: None,
+                subscriber_count: 1,
+                resource_reservation: Default::default(),
+                learned_estimate: None,
+                command_resource_identity: None,
+                live_usage: None,
+                build_jobs,
+            }],
+            ..FleetSnapshot::default()
+        }
+    }
+
+    /// A compile held to four jobs on an eight-core machine says so where the
+    /// operator reads it, with the reading that held it.
+    #[test]
+    fn a_running_row_names_its_build_jobs_and_the_memory_that_held_them() {
+        let held = BuildJobs::new(8, Some(MemoryJobBound::new(12 * GIB, 0, 5 * GIB / 2, 1)));
+        let rendered = render_running_now(&running(Some(held)), None, 60_000);
+        assert!(
+            rendered.contains(
+                "usage not measured yet; 4 build jobs, held below the CPU width of 8 by memory: 12.0 GiB available at start / 2.5 GiB per job\n"
+            ),
+            "{rendered}"
+        );
+        // An executor that does not report build jobs leaves the row as it was.
+        let silent = render_running_now(&running(None), None, 60_000);
+        assert!(silent.contains("usage not measured yet\n"), "{silent}");
     }
 }

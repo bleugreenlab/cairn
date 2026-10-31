@@ -10,7 +10,10 @@ use std::{
 use tokio::sync::RwLock;
 
 use crate::{
-    resources::{sql_policy, sql_schema::USER_TABLE_PREDICATE},
+    resources::{
+        sql_policy,
+        sql_schema::{quote_identifier, USER_TABLE_PREDICATE},
+    },
     storage::{LocalDb, MigrationRunner},
 };
 
@@ -49,22 +52,112 @@ fn cache() -> &'static RwLock<HashMap<PathBuf, Arc<LocalDb>>> {
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-pub async fn apply_write(
-    thread_id: &str,
-    statements: Vec<String>,
-    params: Vec<Vec<cairn_db::turso::Value>>,
-) -> Result<u64, String> {
-    if statements.len() != params.len() {
-        return Err(format!(
-            "received {} parameter arrays for {} statements",
-            params.len(),
-            statements.len()
-        ));
+/// What a structured statement does to one row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowAction {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl RowAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Insert => "insert",
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
     }
-    let db = open(thread_id).await?;
+}
+
+/// How a structured statement's row is addressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowKey {
+    /// The caller names the key (an update or delete by URI).
+    Known(String),
+    /// An insert whose statement ends in `RETURNING <pk>`; the first value of
+    /// its first returned row is the key, generated or not.
+    Returned,
+    /// The table has no single-column primary key, so the row has no URI.
+    Unaddressed,
+}
+
+/// The one row a structured statement touches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowTarget {
+    pub table: String,
+    pub action: RowAction,
+    pub key: RowKey,
+}
+
+/// One statement of a thread-database write, with its bound values. A
+/// statement with a `row` is a structured row write; one without is SQL the
+/// caller supplied.
+#[derive(Debug, Clone)]
+pub struct WriteStatement {
+    pub sql: String,
+    pub params: Vec<cairn_db::turso::Value>,
+    pub row: Option<RowTarget>,
+}
+
+/// Whose store a write lands in, named both ways: by id for the store and by
+/// project and name for the URIs and events it reports.
+#[derive(Debug, Clone)]
+pub struct WriteScope {
+    pub thread_id: String,
+    pub project_id: String,
+    /// The canonical project slug, as it appears in `cairn://p/<project>`.
+    pub project: String,
+    pub thread_name: String,
+}
+
+impl WriteScope {
+    /// `cairn://p/<project>/<thread>/db`.
+    pub fn db_root(&self) -> String {
+        format!(
+            "{}/db",
+            cairn_common::uri::build_thread_uri(&self.project, &self.thread_name)
+        )
+    }
+}
+
+/// One table-level effect of a committed write, as its `db-change` reports it.
+/// `table` is `None` when a SQL statement could not be attributed, which a
+/// consumer reads as "any table in this thread".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowChange {
+    pub table: Option<String>,
+    pub action: &'static str,
+    pub uri: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteOutcome {
+    pub changed: u64,
+    /// Structured writes: one entry naming the row. SQL writes: one entry per
+    /// distinct (table, action), without a row.
+    pub changes: Vec<RowChange>,
+}
+
+/// The `table` every thread-database `db-change` carries. It is a pseudo-table
+/// on purpose: the app's invalidators key on real table names, and a thread
+/// table called `issues` must never trip the issue list's.
+pub const THREAD_DB_CHANGE_TABLE: &str = "thread_db";
+
+/// The single write path into a thread's database. Structured row writes and
+/// SQL writes alike are policed here, statement by statement, run as one
+/// transaction, and announced after commit: one `db-change` per effect and a
+/// wake notice naming the rows the write could name.
+pub async fn apply_write(
+    scope: &WriteScope,
+    statements: Vec<WriteStatement>,
+    emitter: &dyn crate::services::EventEmitter,
+) -> Result<WriteOutcome, String> {
+    police(&statements)?;
+    let db = open(&scope.thread_id).await?;
     let changes_schema = statements.iter().any(|statement| {
         matches!(
-            sql_policy::sql_tokens(statement)
+            sql_policy::sql_tokens(&statement.sql)
                 .first()
                 .map(String::as_str),
             Some("CREATE" | "DROP" | "ALTER")
@@ -73,18 +166,112 @@ pub async fn apply_write(
     // Turso requires schema changes to run outside its concurrent transaction
     // mode. The resource still owns transaction control: callers cannot submit
     // BEGIN/COMMIT, and a mixed DDL/DML batch remains one atomic transaction.
-    let changed = if changes_schema {
-        db.exclusive(move |conn| {
-            Box::pin(execute_statements(conn, statements.clone(), params.clone()))
-        })
-        .await
+    let executed = if changes_schema {
+        let statements = statements.clone();
+        db.exclusive(move |conn| Box::pin(execute_statements(conn, statements.clone())))
+            .await
     } else {
-        db.write(move |conn| Box::pin(execute_statements(conn, statements.clone(), params.clone())))
+        let statements = statements.clone();
+        db.write(move |conn| Box::pin(execute_statements(conn, statements.clone())))
             .await
     }
     .map_err(sanitize_error)?;
-    crate::orchestrator::wakes::conditions::notify_thread_db_written(thread_id);
-    Ok(changed)
+
+    let root = scope.db_root();
+    let mut changes: Vec<RowChange> = Vec::new();
+    for (statement, result) in statements.iter().zip(&executed.per_statement) {
+        let change = match &statement.row {
+            Some(target) => {
+                let key = match (&target.key, &result.returned_key) {
+                    (RowKey::Known(key), _) => Some(key.clone()),
+                    (RowKey::Returned, Some(key)) => Some(key.clone()),
+                    _ => None,
+                };
+                let uri =
+                    key.map(|key| cairn_common::uri::build_db_row_uri(&root, &target.table, &key));
+                // A structured update or delete that matched nothing changed
+                // nothing; it is refused rather than reported or announced.
+                if result.changed == 0 && target.action != RowAction::Insert {
+                    return Err(format!(
+                        "No row at {}",
+                        uri.unwrap_or_else(|| cairn_common::uri::build_db_table_uri(
+                            &root,
+                            &target.table
+                        ))
+                    ));
+                }
+                RowChange {
+                    table: Some(target.table.clone()),
+                    action: target.action.as_str(),
+                    uri,
+                }
+            }
+            None => match sql_policy::statement_target(&statement.sql) {
+                Some((table, action)) => RowChange {
+                    table: Some(table),
+                    action,
+                    uri: None,
+                },
+                None if is_read_statement(&statement.sql) => continue,
+                None => RowChange {
+                    table: None,
+                    action: "update",
+                    uri: None,
+                },
+            },
+        };
+        if !changes.iter().any(|seen| {
+            seen.table == change.table && seen.action == change.action && seen.uri == change.uri
+        }) {
+            changes.push(change);
+        }
+    }
+
+    for change in &changes {
+        let _ = emitter.emit(
+            "db-change",
+            serde_json::json!({
+                "table": THREAD_DB_CHANGE_TABLE,
+                "action": change.action,
+                "projectId": scope.project_id,
+                "threadId": scope.thread_id,
+                "name": scope.thread_name,
+                "dbTable": change.table,
+                "rowUri": change.uri,
+            }),
+        );
+    }
+    let row_uris: Vec<String> = changes
+        .iter()
+        .filter_map(|change| change.uri.clone())
+        .collect();
+    crate::orchestrator::wakes::conditions::notify_thread_db_written(&scope.thread_id, &row_uris);
+    Ok(WriteOutcome {
+        changed: executed.changed,
+        changes,
+    })
+}
+
+/// A statement that writes nothing a consumer could observe, so it earns no
+/// `db-change`: a SELECT or EXPLAIN carried in a write batch, or a schema
+/// PRAGMA (the policy admits only read-only ones).
+fn is_read_statement(sql: &str) -> bool {
+    matches!(
+        sql_policy::sql_tokens(sql).first().map(String::as_str),
+        Some("SELECT" | "EXPLAIN" | "PRAGMA")
+    )
+}
+
+/// Run the write policy over every statement of a write: the check
+/// [`apply_write`] makes before it opens a transaction, exposed so a dry run
+/// refuses exactly what the real write would.
+pub fn police(statements: &[WriteStatement]) -> Result<(), String> {
+    if statements.is_empty() {
+        return Err("SQL write is empty".to_string());
+    }
+    statements
+        .iter()
+        .try_for_each(|statement| validate_write_statement(&statement.sql))
 }
 
 /// Mint the database that belongs to a newly-created thread and install every
@@ -113,18 +300,64 @@ pub(crate) async fn initialize_for_creation(
     Ok(path)
 }
 
+struct StatementResult {
+    changed: u64,
+    /// The key a `RETURNING` insert reported, as URI segment text.
+    returned_key: Option<String>,
+}
+
+struct Executed {
+    changed: u64,
+    per_statement: Vec<StatementResult>,
+}
+
 async fn execute_statements(
     conn: &cairn_db::turso::Connection,
-    statements: Vec<String>,
-    params: Vec<Vec<cairn_db::turso::Value>>,
-) -> crate::storage::DbResult<u64> {
-    let mut changed = 0;
-    for (index, (statement, values)) in statements.iter().zip(params).enumerate() {
-        changed += conn.execute(statement, values).await.map_err(|error| {
+    statements: Vec<WriteStatement>,
+) -> crate::storage::DbResult<Executed> {
+    let mut executed = Executed {
+        changed: 0,
+        per_statement: Vec::with_capacity(statements.len()),
+    };
+    for (index, statement) in statements.into_iter().enumerate() {
+        let failed = |error: cairn_db::turso::Error| {
             crate::storage::DbError::Row(format!("statement {} failed: {error}", index + 1))
-        })?;
+        };
+        let returning = statement
+            .row
+            .as_ref()
+            .is_some_and(|target| target.key == RowKey::Returned);
+        let result = if returning {
+            let mut rows = conn
+                .query(&statement.sql, statement.params)
+                .await
+                .map_err(failed)?;
+            let mut changed = 0;
+            let mut returned_key = None;
+            while let Some(row) = rows.next().await.map_err(failed)? {
+                if returned_key.is_none() {
+                    returned_key =
+                        crate::resources::db_rows::pk_segment(&row.get_value(0).map_err(failed)?);
+                }
+                changed += 1;
+            }
+            StatementResult {
+                changed,
+                returned_key,
+            }
+        } else {
+            StatementResult {
+                changed: conn
+                    .execute(&statement.sql, statement.params)
+                    .await
+                    .map_err(failed)?,
+                returned_key: None,
+            }
+        };
+        executed.changed += result.changed;
+        executed.per_statement.push(result);
     }
-    Ok(changed)
+    Ok(executed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,48 +682,58 @@ fn sidecar_paths(path: &Path) -> [PathBuf; 4] {
     ]
 }
 
-pub fn validate_write_sql(sql: &str) -> Result<Vec<String>, String> {
+/// Split SQL a caller supplied into statements, refusing an empty write. The
+/// per-statement policy runs inside [`apply_write`] (and [`police`]).
+pub fn split_write_sql(sql: &str) -> Result<Vec<String>, String> {
     let statements = sql_policy::split_statements(sql);
     if statements.is_empty() {
         return Err("SQL write is empty".to_string());
     }
+    Ok(statements)
+}
+
+/// The write policy for one statement, whoever composed it. Identifiers are
+/// matched in every SQLite quoting form, so a generated statement (which
+/// always quotes) is held to the same rule as hand-written SQL.
+fn validate_write_statement(statement: &str) -> Result<(), String> {
     // Before the app-contract DDL check, so `DROP TABLE _cairn_rulings` is told
     // where rulings went rather than that the table's shape is Cairn's.
-    sql_policy::refuse_retired_rulings(sql)?;
-    for statement in &statements {
-        let tokens = sql_policy::sql_tokens(statement);
-        if tokens
-            .iter()
-            .any(|token| token.eq_ignore_ascii_case("_cairn_procedures"))
+    sql_policy::refuse_retired_rulings(statement)?;
+    let identifiers = sql_policy::sql_identifiers(statement);
+    let tokens = sql_policy::sql_tokens(statement);
+    let first = tokens
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| "SQL write is empty".to_string())?;
+    match first {
+        "ATTACH" | "DETACH" => return Err("A thread's store is confined to its own file; ATTACH and DETACH would reach another database".to_string()),
+        "VACUUM" => return Err("VACUUM is not permitted because VACUUM INTO can write an arbitrary path".to_string()),
+        "PRAGMA" => sql_policy::validate_schema_pragma(&tokens)?,
+        "SELECT" | "WITH" | "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "CREATE"
+        | "DROP" | "ALTER" | "ANALYZE" | "REINDEX" | "EXPLAIN" => {}
+        other => return Err(format!("Unsupported SQL statement '{other}' for a thread database write")),
+    }
+    if matches!(first, "CREATE" | "DROP" | "ALTER") {
+        if let Some(identifier) = identifiers
+            .into_iter()
+            .find(|identifier| identifier.to_ascii_lowercase().starts_with("_cairn_"))
         {
-            return Err(
-                "`_cairn_procedures` is resource-only; use cairn:~/procedures instead of raw SQL"
-                    .to_string(),
-            );
-        }
-        let first = tokens
-            .first()
-            .map(String::as_str)
-            .ok_or_else(|| "SQL write is empty".to_string())?;
-        match first {
-            "ATTACH" | "DETACH" => return Err("A thread's store is confined to its own file; ATTACH and DETACH would reach another database".to_string()),
-            "VACUUM" => return Err("VACUUM is not permitted because VACUUM INTO can write an arbitrary path".to_string()),
-            "PRAGMA" => sql_policy::validate_schema_pragma(&tokens)?,
-            "SELECT" | "WITH" | "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "CREATE"
-            | "DROP" | "ALTER" | "ANALYZE" | "REINDEX" | "EXPLAIN" => {}
-            other => return Err(format!("Unsupported SQL statement '{other}' for a thread database write")),
-        }
-        if matches!(first, "CREATE" | "DROP" | "ALTER") {
-            if let Some(identifier) = sql_policy::sql_identifiers(statement)
-                .into_iter()
-                .find(|identifier| identifier.to_ascii_lowercase().starts_with("_cairn_"))
-            {
-                return Err(format!(
-                    "`{identifier}` is app-contract schema — INSERT, UPDATE, and DELETE its rows, but its shape is Cairn's"
-                ));
-            }
+            return Err(format!(
+                "`{identifier}` is app-contract schema — INSERT, UPDATE, and DELETE its rows, but its shape is Cairn's"
+            ));
         }
     }
+    Ok(())
+}
+
+/// [`split_write_sql`] then the per-statement policy: the whole check on SQL
+/// text, for tests and callers that hold no statements yet.
+#[cfg(test)]
+fn validate_write_sql(sql: &str) -> Result<Vec<String>, String> {
+    let statements = split_write_sql(sql)?;
+    statements
+        .iter()
+        .try_for_each(|statement| validate_write_statement(statement))?;
     Ok(statements)
 }
 
@@ -526,25 +769,9 @@ fn validate_thread_id(thread_id: &str) -> Result<(), String> {
     }
 }
 
-fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn write_policy_reserves_procedure_rows_for_the_resource() {
-        for sql in [
-            "INSERT INTO _cairn_procedures(name, body) VALUES ('x', '{}')",
-            "DROP TABLE _CAIRN_PROCEDURES",
-        ] {
-            assert!(validate_write_sql(sql)
-                .unwrap_err()
-                .contains("cairn:~/procedures"));
-        }
-    }
 
     #[test]
     fn write_policy_confines_the_database_file() {
@@ -627,6 +854,18 @@ mod tests {
         .unwrap()
     }
 
+    /// Every registered thread migration's version, in order, less `held`. The
+    /// guard tests compare against this rather than a literal list so a new
+    /// thread migration does not read as a guard regression.
+    fn every_version_but(held: &[&str]) -> Vec<String> {
+        crate::threads::db_schema::THREAD_MIGRATIONS
+            .iter()
+            .map(|migration| migration.version())
+            .filter(|version| !held.contains(version))
+            .map(str::to_owned)
+            .collect()
+    }
+
     #[tokio::test]
     async fn guard_holds_0002_on_a_store_with_unimported_rulings() {
         let dir = tempfile::tempdir().unwrap();
@@ -637,7 +876,10 @@ mod tests {
 
         let db = open_path(path.clone()).await.unwrap();
         // Only 0002 is held; the migrations after it still apply.
-        assert_eq!(applied_versions(&db).await, ["0001", "0003"]);
+        assert_eq!(
+            applied_versions(&db).await,
+            every_version_but(&[crate::threads::db_schema::RULINGS_TO_TENETS])
+        );
         let state = inspect_legacy(&path).await.unwrap().unwrap();
         assert!(state.rulings_table && !state.rulings_dropped);
         assert_eq!(state.rulings.len(), 1);
@@ -654,7 +896,7 @@ mod tests {
 
         mark_rulings_imported(&path);
         let db = open_path(path.clone()).await.unwrap();
-        assert_eq!(applied_versions(&db).await, ["0001", "0002", "0003"]);
+        assert_eq!(applied_versions(&db).await, every_version_but(&[]));
         let state = inspect_legacy(&path).await.unwrap().unwrap();
         assert!(!state.rulings_table && state.rulings_dropped);
     }
@@ -666,7 +908,7 @@ mod tests {
         drop(stage_store_for_test(&path, "0001").await);
 
         let db = open_path(path).await.unwrap();
-        assert_eq!(applied_versions(&db).await, ["0001", "0002", "0003"]);
+        assert_eq!(applied_versions(&db).await, every_version_but(&[]));
     }
 
     #[tokio::test]

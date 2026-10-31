@@ -10,6 +10,7 @@ pub(crate) mod channels;
 mod check_results;
 mod codemap;
 mod common;
+pub(crate) mod db_rows;
 mod dev_instances;
 mod diff;
 mod eras;
@@ -29,15 +30,19 @@ mod models;
 pub mod mutations;
 mod node;
 pub mod packs;
+pub(crate) mod paging;
 pub(crate) mod posts;
 mod progress;
 mod project;
 mod project_map;
 mod read;
+#[cfg(test)]
+mod read_contract_tests;
 mod rebase;
 mod recipes;
 mod responses;
 mod routes;
+mod services;
 mod settings;
 pub(crate) mod sql_policy;
 pub(crate) mod sql_schema;
@@ -49,8 +54,8 @@ mod transcript;
 mod vcs;
 mod workflows;
 
+pub(crate) use common::node_job_not_found_message;
 pub(crate) use common::resolve_node_owner_id;
-pub(crate) use common::{connect_and_find_node_job, node_branch, node_job_not_found_message};
 pub(crate) use common::{
     pointer_affordance_block, resolve_home_relative_against, resolve_home_relative_resource_uri,
 };
@@ -58,13 +63,14 @@ pub(crate) use node::{
     reseed_verbatim_baseline_bytes, resolve_node_or_task_job_id,
     resolve_node_or_task_job_id_for_read,
 };
+pub(crate) use read::open_thread_store;
 pub(crate) use read::run_condition_sql;
 pub(crate) use read::{produce_cairn_resource, read_cairn_resource};
-pub(crate) use rebase::node_base_branch;
+pub(crate) use rebase::{node_base_branch, NodeRebaseRows};
 pub(crate) use thread_seed::{
     compose_node_seed, compose_thread_seed_with_policy, seed_tokens, SeedPolicy, ThreadSeed,
 };
 /// The one interpretation of a thread sub-path, shared by the read dispatcher,
 /// the write dispatcher, and anything that resolves a thread-addressed resource.
-pub(crate) use threads::delegate_thread_descendant;
+pub(crate) use threads::{delegate_thread_descendant, retired_surface};
 pub(crate) use transcript::era_source_digest;

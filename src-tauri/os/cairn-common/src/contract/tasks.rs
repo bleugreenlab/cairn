@@ -12,7 +12,7 @@ pub(crate) const TASK_TERMINAL_CONTRACT: ResourceContract =
         uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{task}/terminal/{slug}",
         name: "Task terminal",
         description: "Sub-agent task terminal output scoped to the task job",
-        read_projections: NO_PROJECTIONS,
+        read_projections: TERMINAL_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
         mutations: &[

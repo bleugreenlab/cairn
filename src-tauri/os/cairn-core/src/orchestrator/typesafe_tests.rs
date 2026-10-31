@@ -123,12 +123,14 @@ fn request(model: &str) -> DecideRequest {
 
 async fn read(orch: &Orchestrator, uri: &str) -> String {
     let request = crate::mcp::types::McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: None,
         tool: "read".to_string(),
         payload: json!({}),
         tool_use_id: None,
+        origin: None,
     };
     crate::resources::read_cairn_resource(orch, &request, uri).await
 }

@@ -150,11 +150,18 @@ pub(crate) const THREAD_DB_CONTRACT: ResourceContract = ResourceContract {
         ProjectionSpec { key: "limit", values: "N rows (default 100, max 1000); N tables in the overview (default 40, max 200)" },
         ProjectionSpec { key: "format", values: "json for JSONL rows; omit for tab-separated text" },
     ],
-    related: &[RelatedSpec {
-        label: "generated SQL schema",
-        kind: ResourceKind::ThreadDbSchema,
-        actions: false,
-    }],
+    related: &[
+        RelatedSpec {
+            label: "generated SQL schema",
+            kind: ResourceKind::ThreadDbSchema,
+            actions: false,
+        },
+        RelatedSpec {
+            label: "one table's rows, each addressed by primary key",
+            kind: ResourceKind::ThreadDbTable,
+            actions: false,
+        },
+    ],
     cross_actions: NO_CROSS_ACTIONS,
     mutations: &[MutationSpec {
         mode: ChangeMode::Patch,
@@ -165,101 +172,83 @@ pub(crate) const THREAD_DB_CONTRACT: ResourceContract = ResourceContract {
     }],
 };
 
-pub(crate) const THREAD_PROCEDURES_CONTRACT: ResourceContract = ResourceContract {
-    kind: ResourceKind::ThreadProcedures,
-    uri_template: "cairn://p/{project}/{name}/procedures",
-    name: "Thread procedures",
-    description: "Named, replayable run batches stored in this thread's durable database. Procedures execute with the invoking thread's identity; read another thread's procedures by canonical URI, but copy one into your own thread before invoking it.",
-    read_projections: NO_PROJECTIONS,
-    related: &[RelatedSpec { label: "automations", kind: ResourceKind::ThreadAutomations, actions: true }],
+/// Row-collection read keys, shared by a thread table and an application table
+/// so the two stores keep one read grammar.
+pub(crate) const DB_TABLE_PROJECTIONS: &[ProjectionSpec] = &[
+    ProjectionSpec {
+        key: "where",
+        values: "COL=VALUE — equality filter, repeatable (AND); LIKE and ranges stay in ?sql=",
+    },
+    ProjectionSpec {
+        key: "order",
+        values: "COL ascending or -COL descending (default: primary key ascending)",
+    },
+    ProjectionSpec {
+        key: "offset",
+        values: "N rows to skip (default 0)",
+    },
+    ProjectionSpec {
+        key: "limit",
+        values: "N rows (default 100, max 1000)",
+    },
+    ProjectionSpec {
+        key: "format",
+        values: "json for one document with rows as column-name objects; omit for a markdown table",
+    },
+];
+
+pub(crate) const DB_ROW_PROJECTIONS: &[ProjectionSpec] = &[ProjectionSpec {
+    key: "format",
+    values: "json for the row as a column-name object; omit for a markdown table",
+}];
+
+pub(crate) const THREAD_DB_TABLE_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ThreadDbTable,
+    uri_template: "cairn://p/{project}/{name}/db/{table}",
+    name: "Thread database table",
+    description: "The rows of one table in this thread's database, each addressed by its own row URI when the table has a single-column primary key. Read with equality filters, ordering, and paging; append a column map to insert a row, and the reply carries the new row's URI (a generated key included). The affordance block lists the live columns, types, nullability, and primary key. The segment `schema` is reserved: read a table named `schema` with ?sql= or the database's ?table=schema.",
+    read_projections: DB_TABLE_PROJECTIONS,
+    related: &[RelatedSpec {
+        label: "database overview and queries",
+        kind: ResourceKind::ThreadDb,
+        actions: true,
+    }],
     cross_actions: NO_CROSS_ACTIONS,
     mutations: &[MutationSpec {
-        mode: ChangeMode::Create,
-        required: &[
-            KeySpec::new("name", KeyType::Str, "[a-z0-9][a-z0-9-]{0,63}"),
-            KeySpec::new("body", KeyType::Object, "stored run batch envelope"),
-        ],
-        optional: &[KeySpec::new("description", KeyType::Str, "")],
-        label: "create procedure",
-        example: r#"write({changes:[{target:"cairn:~/procedures",mode:"create",payload:{name:"collect",body:{commands:[{code:"console.log('ok')",interpreter:"javascript"}]}}}]})"#,
+        mode: ChangeMode::Append,
+        required: &[],
+        optional: &[],
+        label: "insert one row (payload is a column map)",
+        example: r#"write({changes:[{target:"cairn:~/db/TABLE",mode:"append",payload:{COLUMN:"value"}}]})"#,
     }],
 };
 
-pub(crate) const THREAD_PROCEDURE_CONTRACT: ResourceContract = ResourceContract {
-    kind: ResourceKind::ThreadProcedure,
-    uri_template: "cairn://p/{project}/{name}/procedures/{procedure}",
-    name: "Thread procedure",
-    description: "One named, replayable run batch. Invoke the owning thread's procedure with run({commands:[{target:\"cairn:~/procedures/{procedure}\",payload:{args:[...]}}]}).",
-    read_projections: NO_PROJECTIONS,
-    related: &[RelatedSpec { label: "automations", kind: ResourceKind::ThreadAutomations, actions: true }],
+pub(crate) const THREAD_DB_ROW_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ThreadDbRow,
+    uri_template: "cairn://p/{project}/{name}/db/{table}/{pk}",
+    name: "Thread database row",
+    description: "One row of a thread database table, addressed by its single-column primary key. Patch a column map to update it; delete to remove it. The primary key is the row's address and is not patchable. A table with a composite or absent primary key has no row URIs; read its rows with ?sql= or the collection's where= filter.",
+    read_projections: DB_ROW_PROJECTIONS,
+    related: &[RelatedSpec {
+        label: "database overview and queries",
+        kind: ResourceKind::ThreadDb,
+        actions: true,
+    }],
     cross_actions: NO_CROSS_ACTIONS,
     mutations: &[
         MutationSpec {
             mode: ChangeMode::Patch,
             required: &[],
-            optional: &[
-                KeySpec::new("body", KeyType::Object, "replacement run batch envelope"),
-                KeySpec::new("description", KeyType::Str, "null clears it"),
-            ],
-            label: "edit procedure",
-            example: r#"write({changes:[{target:"cairn:~/procedures/collect",mode:"patch",payload:{description:"Collect observations"}}]})"#,
+            optional: &[],
+            label: "update columns of this row (payload is a column map)",
+            example: r#"write({changes:[{target:"cairn:~/db/TABLE/PK",mode:"patch",payload:{COLUMN:"value"}}]})"#,
         },
         MutationSpec {
             mode: ChangeMode::Delete,
             required: &[],
             optional: &[],
-            label: "delete procedure",
-            example: r#"write({changes:[{target:"cairn:~/procedures/collect",mode:"delete"}]})"#,
-        },
-    ],
-};
-
-pub(crate) const THREAD_AUTOMATIONS_CONTRACT: ResourceContract = ResourceContract {
-    kind: ResourceKind::ThreadAutomations,
-    uri_template: "cairn://p/{project}/{name}/automations",
-    name: "Thread automations",
-    description: "Cron-like collectors that execute a stored procedure without a model call. Unlike wakes, an automation runs work and normally wakes nobody; the first failure of each failure streak is delivered to the owning thread.",
-    read_projections: NO_PROJECTIONS,
-    related: &[RelatedSpec { label: "procedures", kind: ResourceKind::ThreadProcedures, actions: true }],
-    cross_actions: NO_CROSS_ACTIONS,
-    mutations: &[MutationSpec {
-        mode: ChangeMode::Create,
-        required: &[
-            KeySpec::new("procedure", KeyType::Str, "procedure name"),
-            KeySpec::new("every", KeyType::Str, "5m to 30d"),
-        ],
-        optional: &[KeySpec::new("args", KeyType::Array, "positional arguments")],
-        label: "create automation",
-        example: r#"write({changes:[{target:"cairn:~/automations",mode:"create",payload:{procedure:"collect",every:"6h"}}]})"#,
-    }],
-};
-
-pub(crate) const THREAD_AUTOMATION_CONTRACT: ResourceContract = ResourceContract {
-    kind: ResourceKind::ThreadAutomation,
-    uri_template: "cairn://p/{project}/{name}/automations/{id}",
-    name: "Thread automation",
-    description: "One scheduled procedure invocation, including its cadence, next due occurrence, and last outcome.",
-    read_projections: NO_PROJECTIONS,
-    related: &[RelatedSpec { label: "procedures", kind: ResourceKind::ThreadProcedures, actions: true }],
-    cross_actions: NO_CROSS_ACTIONS,
-    mutations: &[
-        MutationSpec {
-            mode: ChangeMode::Patch,
-            required: &[],
-            optional: &[
-                KeySpec::new("every", KeyType::Str, "5m to 30d"),
-                KeySpec::new("args", KeyType::Array, "positional arguments"),
-                KeySpec::new("state", KeyType::Str, "active | muted"),
-            ],
-            label: "edit automation",
-            example: r#"write({changes:[{target:"cairn:~/automations/ID",mode:"patch",payload:{state:"muted"}}]})"#,
-        },
-        MutationSpec {
-            mode: ChangeMode::Delete,
-            required: &[],
-            optional: &[],
-            label: "delete automation",
-            example: r#"write({changes:[{target:"cairn:~/automations/ID",mode:"delete"}]})"#,
+            label: "delete this row",
+            example: r#"write({changes:[{target:"cairn:~/db/TABLE/PK",mode:"delete"}]})"#,
         },
     ],
 };
@@ -273,7 +262,7 @@ pub(crate) const THREAD_CONTRACT: ResourceContract = ResourceContract {
     // resolves to a node-family kind whose template spells an issue coordinate a
     // thread does not have. Reading any of these addresses returns that family's
     // own affordance block, so this line only has to say the addresses exist.
-    description: "A first-class thread overview. Its session owns the same job-scoped resources an execution node does, addressed beneath the thread name: /chat, /arc, /branches, /todos, /tasks, /task/{task}, /memories, /messages, /wakes, /questions, /permissions, /terminal/{slug}, /browser, /repl/{slug}, /calls, /progress, /symbols, /db, /procedures, /automations. The session has no default branch; numbered branches are explicit resources beneath /branches. Branch-shaped resources (diff, changed, checks, rebase) do not apply to the thread session itself.",
+    description: "A first-class thread overview. Its session owns the same job-scoped resources an execution node does, addressed beneath the thread name: /chat, /arc, /branches, /todos, /tasks, /task/{task}, /memories, /messages, /wakes, /questions, /permissions, /terminal/{slug}, /browser, /repl/{slug}, /calls, /progress, /symbols, /db, /pages, /services. The session has no default branch; numbered branches are explicit resources beneath /branches. Branch-shaped resources (diff, changed, checks, rebase) do not apply to the thread session itself.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
@@ -339,6 +328,10 @@ pub(crate) const CHANGED_CONTRACT: ResourceContract = ResourceContract {
             key: "output_mode",
             values: "files_with_matches|content|count",
         },
+        ProjectionSpec {
+            key: "limit",
+            values: "files listed (default all)",
+        },
     ],
     related: &[RelatedSpec {
         label: "node diff",
@@ -354,7 +347,7 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
         kind: ResourceKind::IssueExecutions,
         uri_template: "cairn://p/{project}/{number}/executions",
         name: "Issue executions",
-        description: "Executions for an issue. Append {recipe, backend?, branch?, continuity?, lifecycle?, overrides?, after?, proposal?, tenet?} to start a new execution programmatically. Starting an ordinary execution IS the decision to supersede whichever execution owns this issue's attempt now: that one is fenced (its nodes take no further turns and its effects are refused) and its agents are stopped. With `after` the execution is filed HELD and starts only when every gate clause is satisfied. A thread filing a tenet-gated recipe must send exactly one of `proposal` or `tenet`, and the execution is held on the operator's verdict.",
+        description: "Executions for an issue. Append {recipe, backend?, branch?, continuity?, lifecycle?, overrides?, after?} to start a new execution programmatically. Starting an ordinary execution IS the decision to supersede whichever execution owns this issue's attempt now: that one is fenced (its nodes take no further turns and its effects are refused) and its agents are stopped. With `after` the execution is filed HELD and starts only when every gate clause is satisfied; a `tenet_verdict` clause holds it on the operator's verdict on a tenet.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
@@ -388,8 +381,6 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
                 ),
                 LAUNCH_OVERRIDES,
                 AFTER_GATES,
-                TENET_PROPOSAL,
-                TENET_NUMBER,
             ],
             label: "start execution",
             example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions\",mode:\"append\",payload:{recipe:\"planbuild\",overrides:{without:[\"review\"]}}}]})",

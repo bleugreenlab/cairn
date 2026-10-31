@@ -31,6 +31,7 @@ use tracing::Instrument;
 
 use super::diff::{diff_data_between, escape_table, filter_patch, short, RangeDiff};
 use super::files::{dedupe_file_changes_by_path, push_file_change_table, FileChangeRow};
+use super::paging::RecordPage;
 use crate::mcp::handlers::branch::{
     resolve_current_for_read, resolve_for_project_read, BranchResolution,
 };
@@ -959,6 +960,20 @@ async fn log_page(
     .await
 }
 
+/// `vcs/log` as a page the read view continues in commits. The store answers
+/// whether more commits match but not how many, so the page carries no total.
+pub(super) async fn read_log_page(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project: &str,
+    params: &[QueryParam],
+) -> Result<RecordPage, String> {
+    let query = parse_query(VcsOp::Log, params)?;
+    let db = orch.db.for_project(project).await;
+    let project_id = project_id_by_key(&db, project).await?;
+    log_record_page(orch, request, project, &project_id, &query).await
+}
+
 async fn read_log(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -966,45 +981,9 @@ async fn read_log(
     project_id: &str,
     query: &VcsQuery,
 ) -> Result<String, String> {
-    let to = resolve_or_default(orch, request, project_id, "to", query.to.as_deref()).await?;
-    let from = match query.from.as_deref() {
-        Some(from) => Some(resolve_named(orch, project_id, "from", from).await?),
-        None => None,
-    };
-    let page = log_page(
-        project_id,
-        &to.resolution,
-        from.as_ref().map(Endpoint::commit),
-        to.commit(),
-        query.path.as_deref(),
-        query.limit,
-        query.offset,
-    )
-    .await?;
-    if query.json {
-        return Ok(serde_json::to_string_pretty(&serde_json::json!({
-            "to": to.json(),
-            "from": from.as_ref().map(Endpoint::json),
-            "path": query.path,
-            "offset": page.offset,
-            "more": page.more,
-            "commits": commits_json(&page),
-        }))
-        .unwrap_or_default());
-    }
-    let mut out = format!("# Store log - {project}\n\n- To: `{}`\n", to.label);
-    if let Some(from) = &from {
-        out.push_str(&format!(
-            "- Excluding: `{}` and its ancestors\n",
-            from.label
-        ));
-    }
-    if let Some(path) = &query.path {
-        out.push_str(&format!("- Path: `{path}`\n"));
-    }
-    out.push('\n');
-    push_commit_table(&mut out, &page);
-    if page.more {
+    let page = log_record_page(orch, request, project, project_id, query).await?;
+    let mut out = page.body;
+    if page.more && !query.json {
         let mut next = format!("cairn://p/{project}/vcs/log?");
         let mut keys = Vec::new();
         if let Some(to) = &query.to {
@@ -1023,6 +1002,75 @@ async fn read_log(
     }
     Ok(out)
 }
+
+/// One page of the log: a header, then one table row per commit in Markdown,
+/// or one JSON document.
+async fn log_record_page(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project: &str,
+    project_id: &str,
+    query: &VcsQuery,
+) -> Result<RecordPage, String> {
+    let to = resolve_or_default(orch, request, project_id, "to", query.to.as_deref()).await?;
+    let from = match query.from.as_deref() {
+        Some(from) => Some(resolve_named(orch, project_id, "from", from).await?),
+        None => None,
+    };
+    let page = log_page(
+        project_id,
+        &to.resolution,
+        from.as_ref().map(Endpoint::commit),
+        to.commit(),
+        query.path.as_deref(),
+        query.limit,
+        query.offset,
+    )
+    .await?;
+    let record_page = |body: String, prelude_lines: Option<usize>| RecordPage {
+        body,
+        noun: "commits",
+        offset: query.offset,
+        limit: query.limit,
+        shown: page.entries.len(),
+        total: None,
+        more: page.more,
+        prelude_lines,
+    };
+    if query.json {
+        let body = serde_json::to_string_pretty(&serde_json::json!({
+            "to": to.json(),
+            "from": from.as_ref().map(Endpoint::json),
+            "path": query.path,
+            "offset": page.offset,
+            "more": page.more,
+            "commits": commits_json(&page),
+        }))
+        .unwrap_or_default();
+        // One document has no per-commit lines, so a page the budget cuts is
+        // re-read from its own start under a smaller `limit` until it fits
+        // whole, rather than continued as a prefix of unparseable JSON.
+        return Ok(record_page(body, None));
+    }
+    let mut out = format!("# Store log - {project}\n\n- To: `{}`\n", to.label);
+    if let Some(from) = &from {
+        out.push_str(&format!(
+            "- Excluding: `{}` and its ancestors\n",
+            from.label
+        ));
+    }
+    if let Some(path) = &query.path {
+        out.push_str(&format!("- Path: `{path}`\n"));
+    }
+    out.push('\n');
+    // The table's header and separator rows precede the first commit row.
+    let prelude_lines = out.lines().count() + COMMIT_TABLE_HEADER_LINES;
+    push_commit_table(&mut out, &page);
+    Ok(record_page(out, Some(prelude_lines)))
+}
+
+/// Lines [`push_commit_table`] writes before its first commit row.
+const COMMIT_TABLE_HEADER_LINES: usize = 2;
 
 fn commits_json(page: &LogAnswer) -> serde_json::Value {
     page.entries

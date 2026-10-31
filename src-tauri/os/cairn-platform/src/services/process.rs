@@ -569,6 +569,7 @@ mod tests {
             deny_read: vec![],
             writable_regex: vec![],
             worktree_writable: true,
+            socket_resolvable: vec![],
             violation_tag: cairn_sandbox::ViolationTag::fresh(),
         };
         let cfg = SpawnConfig::new("/bin/bash")
@@ -597,6 +598,7 @@ mod tests {
             deny_read: vec![],
             writable_regex: vec![],
             worktree_writable: true,
+            socket_resolvable: vec![],
             violation_tag: cairn_sandbox::ViolationTag::fresh(),
         };
         let cfg = SpawnConfig::new("echo")

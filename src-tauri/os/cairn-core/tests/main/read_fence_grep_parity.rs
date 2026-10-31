@@ -12,12 +12,14 @@ async fn read(orch: &Orchestrator, cwd: &std::path::Path, path: String) -> Strin
     handle_read_file(
         orch,
         &McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: cwd.display().to_string(),
             run_id: None,
             tool: "read".to_string(),
             payload: json!({ "path": path }),
             tool_use_id: None,
+            origin: None,
         },
     )
     .await

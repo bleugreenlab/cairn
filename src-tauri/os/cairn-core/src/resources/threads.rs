@@ -1,7 +1,7 @@
 //! First-class thread resource rendering, descendant normalization, and
 //! migration-address resolution.
 
-use super::common::{connect_for_read, lookup_project_by_key};
+use super::common::{lookup_project_by_key, read_resource};
 use cairn_common::uri::{is_reserved_node_segment, CairnResource, DEFAULT_BROWSER_SLUG};
 use cairn_db::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
@@ -32,6 +32,59 @@ pub(super) async fn resolve_thread_id(
 /// merely unimplemented there — they name something that does not exist. Saying
 /// so is a better answer than the silent coercion into an artifact of that name
 /// this replaced.
+/// Why an address under `procedures` or `automations` resolves to nothing, and
+/// what replaced it: a thread runs code without a turn only through a service
+/// (tenet 1313). Read, write, and `run` all reach this through
+/// [`delegate_thread_descendant`], so each says the same thing.
+fn retired_surface_refusal(project: &str, thread: &str, surface: &str) -> String {
+    let services = format!(
+        "{}/services",
+        cairn_common::uri::build_thread_uri(project, thread)
+    );
+    let shape = "write({changes:[{target:\"cairn:~/services/<name>\",mode:\"create\",\
+         payload:{files:{\"main.ts\":\"import { serve } from '@cairn/sdk/service'; \
+         serve({methods:{refresh: async (params, ctx) => { /* ctx.cairn.run([...]), \
+         ctx.cairn.write([...]) */ }}});\"}, manifest:{schedule:[{every:\"15m\",\
+         method:\"refresh\"}]}}}]})";
+    let lead = if surface == "automations" {
+        "Thread automations are retired (tenet 1313): scheduled thread code is a `schedule` \
+         entry in a service's manifest. The runner calls the method every interval as this \
+         thread, with no turn, and wakes the thread only when a failure streak begins."
+    } else {
+        "Thread procedures are retired (tenet 1313): thread code that runs without a turn is a \
+         method of a service, in its `main.ts` under `serve({methods})`. A former procedure's \
+         batch runs inside the method as `ctx.cairn.run([...])`; call the method with \
+         write({changes:[{target:\"cairn:~/services/<name>\",mode:\"append\",payload:{method:\
+         \"refresh\"}}]}), or schedule it with `manifest.schedule`."
+    };
+    format!(
+        "{lead} Write a service at {services}/<name>: {shape}. Its next due time and last \
+         outcome are on {services}/<name>/status. See cairn://skills/pages (Services) and \
+         docs/services.md."
+    )
+}
+
+/// The refusal for `resource` when it addresses a retired thread surface
+/// (`procedures` or `automations`, at session or task level).
+pub(crate) fn retired_surface(resource: &CairnResource) -> Option<String> {
+    let CairnResource::Thread {
+        project,
+        name,
+        path,
+    } = resource
+    else {
+        return None;
+    };
+    let segments: Vec<&str> = path.iter().map(String::as_str).collect();
+    match segments.as_slice() {
+        [surface @ ("procedures" | "automations"), ..]
+        | ["task", _, surface @ ("procedures" | "automations"), ..] => {
+            Some(retired_surface_refusal(project, name, surface))
+        }
+        _ => None,
+    }
+}
+
 fn branchless_refusal(name: &str, segment: &str) -> String {
     format!(
         "A thread session has no branch, so '{segment}' does not apply to thread '{name}'. \
@@ -41,58 +94,64 @@ fn branchless_refusal(name: &str, segment: &str) -> String {
 }
 
 pub(super) async fn read_thread_branches(db: &LocalDb, project_key: &str, thread: &str) -> String {
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
-    let project = match lookup_project_by_key(&conn, project_key).await {
-        Ok(project) => project,
-        Err(error) => return error,
-    };
-    let mut rows = match conn.query(
-        "SELECT b.number, b.title, b.stage, b.moved_at, mr.status, mr.github_pr_number, mr.github_pr_url
-         FROM thread_branches b JOIN threads t ON t.id = b.thread_id
-         LEFT JOIN merge_requests mr ON mr.job_id = b.job_id
-         WHERE t.project_id = ?1 AND t.name = ?2 ORDER BY b.number",
-        params![project.project_id.as_str(), thread],
-    ).await { Ok(rows) => rows, Err(error) => return format!("Failed to load thread branches: {error}") };
-    let mut out = format!("# Branches — {thread}\n\n");
-    let mut count = 0;
-    while let Ok(Some(row)) = rows.next().await {
-        let (
-            Ok(number),
-            Ok(title),
-            Ok(stage),
-            Ok(moved_at),
-            Ok(pr_status),
-            Ok(pr_number),
-            Ok(pr_url),
-        ) = (
-            row.i64(0),
-            row.opt_text(1),
-            row.text(2),
-            row.i64(3),
-            row.opt_text(4),
-            row.opt_i64(5),
-            row.opt_text(6),
-        )
-        else {
-            continue;
-        };
-        count += 1;
-        let label = title.unwrap_or_else(|| "Untitled".to_string());
-        let pr = match (pr_number, pr_status, pr_url) {
-            (Some(number), Some(status), Some(url)) => format!("PR [#{number}]({url}) {status}"),
-            (Some(number), Some(status), None) => format!("PR #{number} {status}"),
-            (_, Some(status), _) => format!("PR {status}"),
-            _ => "no PR".to_string(),
-        };
-        out.push_str(&format!("- [#{number} — {label}](cairn://p/{project_key}/{thread}/branches/{number}) · {stage} · moved {} · {pr}\n", crate::clock::age(moved_at)));
-    }
-    if count == 0 {
-        out.push_str("No branches.\n");
-    }
-    out
+    let project_key = project_key.to_owned();
+    let thread = thread.to_owned();
+    read_resource(db, move |conn| {
+        Box::pin(async move {
+            let project_key = project_key.as_str();
+            let thread = thread.as_str();
+            let project = match lookup_project_by_key(conn, project_key).await {
+                Ok(project) => project,
+                Err(error) => return Ok(error),
+            };
+            let mut rows = match conn.query(
+                "SELECT b.number, b.title, b.stage, b.moved_at, mr.status, mr.github_pr_number, mr.github_pr_url
+                 FROM thread_branches b JOIN threads t ON t.id = b.thread_id
+                 LEFT JOIN merge_requests mr ON mr.job_id = b.job_id
+                 WHERE t.project_id = ?1 AND t.name = ?2 ORDER BY b.number",
+                params![project.project_id.as_str(), thread],
+            ).await { Ok(rows) => rows, Err(error) => return Ok(format!("Failed to load thread branches: {error}")) };
+            let mut out = format!("# Branches — {thread}\n\n");
+            let mut count = 0;
+            while let Ok(Some(row)) = rows.next().await {
+                let (
+                    Ok(number),
+                    Ok(title),
+                    Ok(stage),
+                    Ok(moved_at),
+                    Ok(pr_status),
+                    Ok(pr_number),
+                    Ok(pr_url),
+                ) = (
+                    row.i64(0),
+                    row.opt_text(1),
+                    row.text(2),
+                    row.i64(3),
+                    row.opt_text(4),
+                    row.opt_i64(5),
+                    row.opt_text(6),
+                )
+                else {
+                    continue;
+                };
+                count += 1;
+                let label = title.unwrap_or_else(|| "Untitled".to_string());
+                let pr = match (pr_number, pr_status, pr_url) {
+                    (Some(number), Some(status), Some(url)) => format!("PR [#{number}]({url}) {status}"),
+                    (Some(number), Some(status), None) => format!("PR #{number} {status}"),
+                    (_, Some(status), _) => format!("PR {status}"),
+                    _ => "no PR".to_string(),
+                };
+                out.push_str(&format!("- [#{number} — {label}](cairn://p/{project_key}/{thread}/branches/{number}) · {stage} · moved {} · {pr}\n", crate::clock::age(moved_at)));
+            }
+            if count == 0 {
+                out.push_str("No branches.\n");
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .unwrap_or_else(|error| error)
 }
 
 pub(super) async fn read_thread_branch(
@@ -101,60 +160,66 @@ pub(super) async fn read_thread_branch(
     thread: &str,
     number: i32,
 ) -> String {
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
-    let project = match lookup_project_by_key(&conn, project_key).await {
-        Ok(project) => project,
-        Err(error) => return error,
-    };
-    let mut rows = match conn.query(
-        "SELECT b.title, b.stage, b.git_ref, b.created_at, b.moved_at, mr.status, mr.github_pr_number, mr.github_pr_url
-         FROM thread_branches b JOIN threads t ON t.id = b.thread_id
-         LEFT JOIN merge_requests mr ON mr.job_id = b.job_id
-         WHERE t.project_id = ?1 AND t.name = ?2 AND b.number = ?3 LIMIT 1",
-        params![project.project_id.as_str(), thread, number],
-    ).await { Ok(rows) => rows, Err(error) => return format!("Failed to load thread branch: {error}") };
-    let Some(row) = rows.next().await.ok().flatten() else {
-        return format!("Thread branch {thread}/{number} not found");
-    };
-    let (
-        Ok(title),
-        Ok(stage),
-        Ok(git_ref),
-        Ok(created_at),
-        Ok(moved_at),
-        Ok(pr_status),
-        Ok(pr_number),
-        Ok(pr_url),
-    ) = (
-        row.opt_text(0),
-        row.text(1),
-        row.text(2),
-        row.i64(3),
-        row.i64(4),
-        row.opt_text(5),
-        row.opt_i64(6),
-        row.opt_text(7),
-    )
-    else {
-        return "Failed to decode thread branch".into();
-    };
-    let mut out = format!("# Branch #{number} — {}\n\nStage: {stage}\n\nRef: `{git_ref}`\n\nCreated: {} · Last movement: {}\n", title.unwrap_or_else(|| "Untitled".into()), crate::clock::age(created_at), crate::clock::age(moved_at));
-    if let Some(status) = pr_status {
-        let label = pr_number
-            .map(|n| format!("PR #{n}"))
-            .unwrap_or_else(|| "PR".into());
-        if let Some(url) = pr_url {
-            out.push_str(&format!("\n{label}: [{status}]({url})\n"));
-        } else {
-            out.push_str(&format!("\n{label}: {status}\n"));
-        }
-    } else {
-        out.push_str("\nPR: none\n");
-    }
-    out
+    let project_key = project_key.to_owned();
+    let thread = thread.to_owned();
+    read_resource(db, move |conn| {
+        Box::pin(async move {
+            let project_key = project_key.as_str();
+            let thread = thread.as_str();
+            let project = match lookup_project_by_key(conn, project_key).await {
+                Ok(project) => project,
+                Err(error) => return Ok(error),
+            };
+            let mut rows = match conn.query(
+                "SELECT b.title, b.stage, b.git_ref, b.created_at, b.moved_at, mr.status, mr.github_pr_number, mr.github_pr_url
+                 FROM thread_branches b JOIN threads t ON t.id = b.thread_id
+                 LEFT JOIN merge_requests mr ON mr.job_id = b.job_id
+                 WHERE t.project_id = ?1 AND t.name = ?2 AND b.number = ?3 LIMIT 1",
+                params![project.project_id.as_str(), thread, number],
+            ).await { Ok(rows) => rows, Err(error) => return Ok(format!("Failed to load thread branch: {error}")) };
+            let Some(row) = rows.next().await.ok().flatten() else {
+                return Ok(format!("Thread branch {thread}/{number} not found"));
+            };
+            let (
+                Ok(title),
+                Ok(stage),
+                Ok(git_ref),
+                Ok(created_at),
+                Ok(moved_at),
+                Ok(pr_status),
+                Ok(pr_number),
+                Ok(pr_url),
+            ) = (
+                row.opt_text(0),
+                row.text(1),
+                row.text(2),
+                row.i64(3),
+                row.i64(4),
+                row.opt_text(5),
+                row.opt_i64(6),
+                row.opt_text(7),
+            )
+            else {
+                return Ok("Failed to decode thread branch".into());
+            };
+            let mut out = format!("# Branch #{number} — {}\n\nStage: {stage}\n\nRef: `{git_ref}`\n\nCreated: {} · Last movement: {}\n", title.unwrap_or_else(|| "Untitled".into()), crate::clock::age(created_at), crate::clock::age(moved_at));
+            if let Some(status) = pr_status {
+                let label = pr_number
+                    .map(|n| format!("PR #{n}"))
+                    .unwrap_or_else(|| "PR".into());
+                if let Some(url) = pr_url {
+                    out.push_str(&format!("\n{label}: [{status}]({url})\n"));
+                } else {
+                    out.push_str(&format!("\n{label}: {status}\n"));
+                }
+            } else {
+                out.push_str("\nPR: none\n");
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .unwrap_or_else(|error| error)
 }
 
 fn parse_seq(kind: &str, value: &str) -> Result<i32, String> {
@@ -173,6 +238,13 @@ fn parse_ordinal(kind: &str, value: &str) -> Result<i32, String> {
         Ok(number) if number > 0 => Ok(number),
         _ => Err(format!("Invalid thread {kind}: {value}")),
     }
+}
+
+/// A thread database table or primary-key segment, percent-decoded as
+/// `build_db_table_uri`/`build_db_row_uri` encoded it.
+fn decode_db_segment(kind: &str, value: &str) -> Result<String, String> {
+    cairn_common::uri::decode_path_segment(value)
+        .map_err(|error| format!("Invalid thread database {kind} segment '{value}': {error}"))
 }
 
 /// Normalize a thread-session descendant onto the job-owned resource family that
@@ -197,6 +269,9 @@ fn parse_ordinal(kind: &str, value: &str) -> Result<i32, String> {
 ///
 /// `Err` is a purposeful refusal carrying its reason, not a failure to map.
 pub(crate) fn delegate_thread_descendant(resource: CairnResource) -> Result<CairnResource, String> {
+    if let Some(refusal) = retired_surface(&resource) {
+        return Err(refusal);
+    }
     let CairnResource::Thread {
         project,
         name,
@@ -244,27 +319,56 @@ pub(crate) fn delegate_thread_descendant(resource: CairnResource) -> Result<Cair
         ["db"] | ["task", _, "db"] => {
             return Ok(CairnResource::ThreadDb { project, name });
         }
+        // The schema projection keeps its arm ahead of the row grammar: `schema`
+        // is reserved under `/db/`, so it never reaches the table arms below.
         ["db", "schema"] | ["task", _, "db", "schema"] => {
             return Ok(CairnResource::ThreadDbSchema { project, name });
         }
-        ["procedures"] | ["task", _, "procedures"] => {
-            return Ok(CairnResource::ThreadProcedures { project, name });
+        ["db", "schema", _] | ["task", _, "db", "schema", _] => {
+            return Err(super::db_rows::reserved_table_segment_refusal(&format!(
+                "{}/db",
+                cairn_common::uri::build_thread_uri(&project, &name)
+            )));
         }
-        ["procedures", procedure] | ["task", _, "procedures", procedure] => {
-            return Ok(CairnResource::ThreadProcedure {
+        ["db", table] | ["task", _, "db", table] => {
+            return Ok(CairnResource::ThreadDbTable {
                 project,
                 name,
-                procedure: (*procedure).to_string(),
+                table: decode_db_segment("table", table)?,
             });
         }
-        ["automations"] | ["task", _, "automations"] => {
-            return Ok(CairnResource::ThreadAutomations { project, name });
-        }
-        ["automations", id] => {
-            return Ok(CairnResource::ThreadAutomation {
+        ["db", table, pk] | ["task", _, "db", table, pk] => {
+            return Ok(CairnResource::ThreadDbRow {
                 project,
                 name,
-                id: (*id).to_string(),
+                table: decode_db_segment("table", table)?,
+                pk: decode_db_segment("primary key", pk)?,
+            });
+        }
+        // A thread's services are the thread's, from its session and its tasks
+        // alike, as its database is.
+        ["services"] | ["task", _, "services"] => {
+            return Ok(CairnResource::ThreadServices { project, name });
+        }
+        ["services", service] | ["task", _, "services", service] => {
+            return Ok(CairnResource::ThreadService {
+                project,
+                name,
+                service: (*service).to_string(),
+            });
+        }
+        ["services", service, "status"] | ["task", _, "services", service, "status"] => {
+            return Ok(CairnResource::ThreadServiceStatus {
+                project,
+                name,
+                service: (*service).to_string(),
+            });
+        }
+        ["services", service, "log"] | ["task", _, "services", service, "log"] => {
+            return Ok(CairnResource::ThreadServiceLog {
+                project,
+                name,
+                service: (*service).to_string(),
             });
         }
 
@@ -308,6 +412,9 @@ pub(crate) fn delegate_thread_descendant(resource: CairnResource) -> Result<Cair
         ["memories", seq] => at_thread!(NodeMemory, memory_seq: parse_seq("memory sequence", seq)?),
         ["eras"] => at_thread!(NodeEras),
         ["eras", seq] => at_thread!(NodeEra, era_seq: parse_seq("era sequence", seq)?),
+        ["pages"] => at_thread!(NodePages),
+        ["pages", page] => at_thread!(NodePage, name: (*page).to_string()),
+        ["pages", page, "log"] => at_thread!(NodePageLog, name: (*page).to_string()),
         ["terminal", slug] => at_thread!(NodeTerminal, slug: (*slug).to_string()),
         ["repl", slug] => at_thread!(NodeRepl, slug: (*slug).to_string()),
         ["browser"] => at_thread!(NodeBrowser, slug: DEFAULT_BROWSER_SLUG.to_string()),
@@ -427,17 +534,22 @@ pub(super) async fn resolve_migrated_thread_uri(
     let Ok(_number) = parts[1].parse::<i64>() else {
         return Ok(None);
     };
-    let conn = connect_for_read(db).await?;
     // The alias is a best-effort fallback: a project (or thread) that does not
     // resolve means "no alias here", never a new failure path. Erroring out
     // would preempt the canonical handling downstream — e.g. the contract
     // gate's "Unsupported resource mutation" rejection, which must win even
     // when the database knows nothing about the project in the URI.
     let alias = format!("cairn://p/{}/{}", parts[0], parts[1]);
-    let Some((_, _, name)) = crate::threads::resolve_parent_thread_uri_conn(&conn, &alias)
-        .await
-        .map_err(|e| e.to_string())?
-    else {
+    let lookup = alias.clone();
+    let resolved = read_resource(db, move |conn| {
+        Box::pin(async move {
+            crate::threads::resolve_parent_thread_uri_conn(conn, &lookup)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    })
+    .await?;
+    let Some((_, _, name)) = resolved else {
         return Ok(None);
     };
     let canonical = format!("cairn://p/{}/{}", parts[0], name);
@@ -451,41 +563,45 @@ pub(super) async fn resolve_migrated_thread_uri(
 }
 
 pub(super) async fn read_project_threads(db: &LocalDb, project_key: &str) -> String {
-    let conn = match connect_for_read(db).await {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let project = match lookup_project_by_key(&conn, project_key).await {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    // Active only. This collection is what an agent reads to find the threads it
-    // can address, so a closed thread must not appear in it — while its own
-    // canonical URI keeps resolving, transcript and children intact, so it can be
-    // read and reopened.
-    let mut rows = match conn.query("SELECT name, jurisdiction, status, attention, updated_at FROM threads WHERE project_id = ?1 AND status = 'active' ORDER BY name", params![project.project_id.as_str()]).await {
-        Ok(v) => v, Err(e) => return format!("Failed to load project threads: {e}")
-    };
-    let mut out = format!("# Threads — {}\n\n", project.project_key);
-    let mut count = 0;
-    while let Ok(Some(row)) = rows.next().await {
-        let (Ok(name), Ok(jurisdiction), Ok(status), Ok(attention), Ok(updated_at)) = (
-            row.text(0),
-            row.opt_text(1),
-            row.text(2),
-            row.text(3),
-            row.i64(4),
-        ) else {
-            continue;
-        };
-        count += 1;
-        let last_activity = crate::clock::age(updated_at);
-        out.push_str(&format!("- [{name}](cairn://p/{}/{name})\n  {}Status: {status}. Attention: {attention}. Last activity: {last_activity}.\n", project.project_key, jurisdiction.map(|v| format!("Jurisdiction: {v}. ")).unwrap_or_default()));
-    }
-    if count == 0 {
-        out.push_str("No threads.\n");
-    }
-    out
+    let project_key = project_key.to_owned();
+    read_resource(db, move |conn| {
+        Box::pin(async move {
+            let project_key = project_key.as_str();
+            let project = match lookup_project_by_key(conn, project_key).await {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            // Active only. This collection is what an agent reads to find the threads it
+            // can address, so a closed thread must not appear in it — while its own
+            // canonical URI keeps resolving, transcript and children intact, so it can be
+            // read and reopened.
+            let mut rows = match conn.query("SELECT name, jurisdiction, status, attention, updated_at FROM threads WHERE project_id = ?1 AND status = 'active' ORDER BY name", params![project.project_id.as_str()]).await {
+                Ok(v) => v, Err(e) => return Ok(format!("Failed to load project threads: {e}"))
+            };
+            let mut out = format!("# Threads — {}\n\n", project.project_key);
+            let mut count = 0;
+            while let Ok(Some(row)) = rows.next().await {
+                let (Ok(name), Ok(jurisdiction), Ok(status), Ok(attention), Ok(updated_at)) = (
+                    row.text(0),
+                    row.opt_text(1),
+                    row.text(2),
+                    row.text(3),
+                    row.i64(4),
+                ) else {
+                    continue;
+                };
+                count += 1;
+                let last_activity = crate::clock::age(updated_at);
+                out.push_str(&format!("- [{name}](cairn://p/{}/{name})\n  {}Status: {status}. Attention: {attention}. Last activity: {last_activity}.\n", project.project_key, jurisdiction.map(|v| format!("Jurisdiction: {v}. ")).unwrap_or_default()));
+            }
+            if count == 0 {
+                out.push_str("No threads.\n");
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .unwrap_or_else(|error| error)
 }
 
 /// Render a thread's overview.
@@ -499,105 +615,113 @@ pub(super) async fn read_thread(
     name: &str,
     path: &[String],
 ) -> String {
-    let conn = match connect_for_read(db).await {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let project = match lookup_project_by_key(&conn, project_key).await {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let mut rows = match conn.query("SELECT id, jurisdiction, status, attention, definition FROM threads WHERE project_id = ?1 AND name = ?2 LIMIT 1", params![project.project_id.as_str(), name]).await {
-        Ok(v) => v, Err(e) => return format!("Failed to load thread: {e}")
-    };
-    let Some(row) = rows.next().await.ok().flatten() else {
-        return format!("Thread '{}' not found in {}", name, project.project_key);
-    };
-    let (Ok(id), Ok(jurisdiction), Ok(status), Ok(attention), Ok(definition)) = (
-        row.text(0),
-        row.opt_text(1),
-        row.text(2),
-        row.text(3),
-        row.opt_text(4),
-    ) else {
-        return "Failed to decode thread".into();
-    };
-    let mut jobs = match conn
-        .query(
-            &format!(
-                "SELECT j.id, j.uri_segment, j.status FROM jobs j
-                 WHERE j.thread_id = ?1 AND {}
-                 ORDER BY j.created_at DESC, j.rowid DESC LIMIT 1",
-                crate::threads::SESSION_JOB_SHAPE
-            ),
-            params![id.as_str()],
-        )
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => return format!("Failed to load thread session: {e}"),
-    };
-    let session = jobs
-        .next()
-        .await
-        .ok()
-        .flatten()
-        .and_then(|row| Some((row.text(0).ok()?, row.opt_text(1).ok()?, row.text(2).ok()?)));
-    // Every addressable descendant was normalized onto its node-family resource
-    // by `delegate_thread_descendant` before dispatch reached here, so anything
-    // still arriving with a path is a shape nothing answers for.
-    if !path.is_empty() {
-        return format!(
-            "Unknown thread session resource '{}'. Read {} for the thread overview.",
-            path.join("/"),
-            cairn_common::uri::build_thread_uri(&project.project_key, name)
-        );
-    }
-    let canonical = format!("cairn://p/{}/{}", project.project_key, name);
-    let mut out = format!("# {name}\n\n");
-    if let Some(jurisdiction) = jurisdiction {
-        out.push_str(&format!("Jurisdiction: {jurisdiction}\n\n"));
-    }
-    out.push_str(&format!("Status: {status} · Attention: {attention}\n\n"));
-    if let Some(definition) = definition {
-        out.push_str(&format!("Definition: {definition}\n\n"));
-    }
-    out.push_str(&format!("- [arc]({canonical}/arc)\n"));
-    match session {
-        Some((job_id, segment, session_status)) => out.push_str(&format!(
-            "- Live session: {}{} ({})\n",
-            job_id,
-            segment.map(|v| format!(" / {v}")).unwrap_or_default(),
-            session_status
-        )),
-        None => out.push_str("- Live session: not started\n"),
-    }
-    let mut children = match conn
-        .query(
-            "SELECT number, title FROM issues WHERE parent_thread_id = ?1 ORDER BY number",
-            params![id.as_str()],
-        )
-        .await
-    {
-        Ok(v) => v,
-        Err(_) => return out,
-    };
-    out.push_str("\n## Children\n\n");
-    let mut any = false;
-    while let Ok(Some(row)) = children.next().await {
-        let (Ok(number), Ok(title)) = (row.i64(0), row.text(1)) else {
-            continue;
-        };
-        any = true;
-        out.push_str(&format!(
-            "- [{number} — {title}](cairn://p/{}/{number})\n",
-            project.project_key
-        ));
-    }
-    if !any {
-        out.push_str("None.\n");
-    }
-    out
+    let project_key = project_key.to_owned();
+    let name = name.to_owned();
+    let path = path.to_vec();
+    read_resource(db, move |conn| {
+        Box::pin(async move {
+            let project_key = project_key.as_str();
+            let name = name.as_str();
+            let path = path.as_slice();
+            let project = match lookup_project_by_key(conn, project_key).await {
+                Ok(v) => v,
+                Err(e) => return Ok(e),
+            };
+            let mut rows = match conn.query("SELECT id, jurisdiction, status, attention, definition FROM threads WHERE project_id = ?1 AND name = ?2 LIMIT 1", params![project.project_id.as_str(), name]).await {
+                Ok(v) => v, Err(e) => return Ok(format!("Failed to load thread: {e}"))
+            };
+            let Some(row) = rows.next().await.ok().flatten() else {
+                return Ok(format!("Thread '{}' not found in {}", name, project.project_key));
+            };
+            let (Ok(id), Ok(jurisdiction), Ok(status), Ok(attention), Ok(definition)) = (
+                row.text(0),
+                row.opt_text(1),
+                row.text(2),
+                row.text(3),
+                row.opt_text(4),
+            ) else {
+                return Ok("Failed to decode thread".into());
+            };
+            let mut jobs = match conn
+                .query(
+                    &format!(
+                        "SELECT j.id, j.uri_segment, j.status FROM jobs j
+                         WHERE j.thread_id = ?1 AND {}
+                         ORDER BY j.created_at DESC, j.rowid DESC LIMIT 1",
+                        crate::threads::SESSION_JOB_SHAPE
+                    ),
+                    params![id.as_str()],
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return Ok(format!("Failed to load thread session: {e}")),
+            };
+            let session = jobs
+                .next()
+                .await
+                .ok()
+                .flatten()
+                .and_then(|row| Some((row.text(0).ok()?, row.opt_text(1).ok()?, row.text(2).ok()?)));
+            // Every addressable descendant was normalized onto its node-family resource
+            // by `delegate_thread_descendant` before dispatch reached here, so anything
+            // still arriving with a path is a shape nothing answers for.
+            if !path.is_empty() {
+                return Ok(format!(
+                    "Unknown thread session resource '{}'. Read {} for the thread overview.",
+                    path.join("/"),
+                    cairn_common::uri::build_thread_uri(&project.project_key, name)
+                ));
+            }
+            let canonical = format!("cairn://p/{}/{}", project.project_key, name);
+            let mut out = format!("# {name}\n\n");
+            if let Some(jurisdiction) = jurisdiction {
+                out.push_str(&format!("Jurisdiction: {jurisdiction}\n\n"));
+            }
+            out.push_str(&format!("Status: {status} · Attention: {attention}\n\n"));
+            if let Some(definition) = definition {
+                out.push_str(&format!("Definition: {definition}\n\n"));
+            }
+            out.push_str(&format!("- [arc]({canonical}/arc)\n"));
+            match session {
+                Some((job_id, segment, session_status)) => out.push_str(&format!(
+                    "- Live session: {}{} ({})\n",
+                    job_id,
+                    segment.map(|v| format!(" / {v}")).unwrap_or_default(),
+                    session_status
+                )),
+                None => out.push_str("- Live session: not started\n"),
+            }
+            let mut children = match conn
+                .query(
+                    "SELECT number, title FROM issues WHERE parent_thread_id = ?1 ORDER BY number",
+                    params![id.as_str()],
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(_) => return Ok(out),
+            };
+            out.push_str("\n## Children\n\n");
+            let mut any = false;
+            while let Ok(Some(row)) = children.next().await {
+                let (Ok(number), Ok(title)) = (row.i64(0), row.text(1)) else {
+                    continue;
+                };
+                any = true;
+                out.push_str(&format!(
+                    "- [{number} — {title}](cairn://p/{}/{number})\n",
+                    project.project_key
+                ));
+            }
+            if !any {
+                out.push_str("None.\n");
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .unwrap_or_else(|error| error)
 }
 
 #[cfg(test)]
@@ -667,51 +791,34 @@ mod delegation_tests {
         assert_eq!(resource.to_uri(), "cairn://p/cairn/design-review/db");
     }
 
+    /// Every address under the retired surfaces, at session and task level,
+    /// is refused with the service shape that replaced it.
     #[test]
-    fn procedures_and_automations_delegate_at_session_and_task_level() {
-        for (path, kind, uri) in [
-            (
-                "procedures",
-                ResourceKind::ThreadProcedures,
-                "cairn://p/cairn/design-review/procedures",
-            ),
-            (
-                "procedures/collect",
-                ResourceKind::ThreadProcedure,
-                "cairn://p/cairn/design-review/procedures/collect",
-            ),
-            (
-                "task/probe/procedures",
-                ResourceKind::ThreadProcedures,
-                "cairn://p/cairn/design-review/procedures",
-            ),
-            (
-                "task/probe/procedures/collect",
-                ResourceKind::ThreadProcedure,
-                "cairn://p/cairn/design-review/procedures/collect",
-            ),
-            (
-                "automations",
-                ResourceKind::ThreadAutomations,
-                "cairn://p/cairn/design-review/automations",
-            ),
-            (
-                "automations/auto-1",
-                ResourceKind::ThreadAutomation,
-                "cairn://p/cairn/design-review/automations/auto-1",
-            ),
-            (
-                "task/probe/automations",
-                ResourceKind::ThreadAutomations,
-                "cairn://p/cairn/design-review/automations",
-            ),
+    fn procedures_and_automations_are_refused_with_the_service_shape() {
+        for path in [
+            "procedures",
+            "procedures/collect",
+            "task/probe/procedures",
+            "task/probe/procedures/collect",
+            "automations",
+            "automations/auto-1",
+            "task/probe/automations",
         ] {
-            let resource = delegate(path).expect("thread-owned resource delegates");
-            assert_eq!(resource.kind(), kind, "{path}");
-            assert_eq!(resource.to_uri(), uri, "{path}");
-            assert_eq!(resource.project(), Some("cairn"), "{path}");
-            assert_eq!(resource.issue_number(), None, "{path}");
+            let refusal = delegate(path).expect_err(path);
+            assert!(refusal.contains("tenet 1313"), "{path}: {refusal}");
+            assert!(refusal.contains("serve({methods"), "{path}: {refusal}");
+            assert!(refusal.contains("schedule"), "{path}: {refusal}");
+            assert!(
+                refusal.contains("cairn://p/cairn/design-review/services"),
+                "{path}: {refusal}"
+            );
         }
+        assert!(delegate("automations")
+            .unwrap_err()
+            .starts_with("Thread automations are retired"));
+        assert!(delegate("procedures/collect")
+            .unwrap_err()
+            .starts_with("Thread procedures are retired"));
     }
 
     /// The reserved coordinate carries the thread in the node slot and, for a

@@ -13,7 +13,6 @@ pub(super) async fn dispatch(
     item: &ChangeItem,
     dry_run: bool,
     resource: &CairnResource,
-    applied_data: &mut Option<serde_json::Value>,
 ) -> ResourceMutationResult<Option<String>> {
     let summary = match (resource, item.mode) {
         (CairnResource::IssueExecutions { project, number }, ChangeMode::Append) => {
@@ -69,12 +68,6 @@ pub(super) async fn dispatch(
                 item.payload.as_ref().and_then(|p| p.get("after")),
                 "payload.after",
             )?;
-            let tenet = crate::tenets::filing::TenetFiling::from_payload(
-                request.run_id.clone(),
-                item.payload.as_ref().and_then(|p| p.as_object()),
-                "payload",
-            )
-            .map_err(|error| build_failure(index, item, error))?;
             // CAIRN-4665: the default is the issue's next ATTEMPT, which
             // supersedes whichever execution owns the issue now. A caller that
             // wants a second opinion running beside the canonical one must
@@ -108,7 +101,7 @@ pub(super) async fn dispatch(
                         .unwrap_or_default()
                 )
             } else {
-                let started = executions::start_execution_from_collection(
+                executions::start_execution_from_collection(
                     orch,
                     project,
                     *number,
@@ -119,14 +112,9 @@ pub(super) async fn dispatch(
                     overrides,
                     intent,
                     after,
-                    tenet,
                 )
                 .await
-                .map_err(|error| build_failure(index, item, error))?;
-                if let Some(tenet) = started.proposed_tenet {
-                    *applied_data = Some(serde_json::json!({ "tenet": tenet }));
-                }
-                started.summary
+                .map_err(|error| build_failure(index, item, error))?
             }
         }
         (

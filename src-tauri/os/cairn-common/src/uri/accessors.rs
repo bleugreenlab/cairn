@@ -22,6 +22,7 @@ impl CairnResource {
             | ProjectPosts { project, .. }
             | ProjectTenets { project, .. }
             | ProjectTenet { project, .. }
+            | ProjectPages { project, .. }
             | ProjectCodemap { project, .. }
             | ProjectMap { project, .. }
             | ProjectHome { project, .. }
@@ -85,8 +86,15 @@ impl CairnResource {
             | NodeMemory { project, .. }
             | NodeEras { project, .. }
             | NodeEra { project, .. }
+            | NodePages { project, .. }
+            | NodePage { project, .. }
+            | NodePageLog { project, .. }
             | ProjectRecipes { project, .. }
             | ProjectRecipe { project, .. }
+            | ProjectServices { project, .. }
+            | ProjectService { project, .. }
+            | ProjectServiceStatus { project, .. }
+            | ProjectServiceLog { project, .. }
             | ProjectRoutes { project, .. }
             | ProjectRoute { project, .. }
             | ProjectRouteHistory { project, .. }
@@ -132,10 +140,12 @@ impl CairnResource {
             | Self::ThreadBranch { .. }
             | Self::ThreadDb { .. }
             | Self::ThreadDbSchema { .. }
-            | Self::ThreadProcedures { .. }
-            | Self::ThreadProcedure { .. }
-            | Self::ThreadAutomations { .. }
-            | Self::ThreadAutomation { .. } => None,
+            | Self::ThreadDbTable { .. }
+            | Self::ThreadDbRow { .. }
+            | Self::ThreadServices { .. }
+            | Self::ThreadService { .. }
+            | Self::ThreadServiceStatus { .. }
+            | Self::ThreadServiceLog { .. } => None,
             Self::Node {
                 number,
                 exec_seq,
@@ -263,6 +273,30 @@ impl CairnResource {
             Self::ProjectTenets { .. } | Self::ProjectTenet { .. } => {
                 Some(format!("/p/{}/tenets", project))
             }
+            Self::ProjectPages { .. } => Some(format!("/p/{}/pages", project)),
+            // A page renders as a facet of the thread that owns it. A draft on an
+            // issue node has no route of its own; it opens as that node's artifact.
+            Self::NodePage {
+                number,
+                exec_seq,
+                node_id,
+                name,
+                ..
+            }
+            | Self::NodePageLog {
+                number,
+                exec_seq,
+                node_id,
+                name,
+                ..
+            } => match super::NodeAddress::new(*number, *exec_seq, node_id) {
+                super::NodeAddress::Thread { name: thread } => Some(format!(
+                    "/p/{}/threads/{}/pages/{}",
+                    project, thread, name
+                )),
+                super::NodeAddress::Node { .. } => None,
+            },
+            Self::NodePages { .. } => None,
             Self::ProjectBrowser { slug, .. } | Self::ProjectBrowserNetworkRequest { slug, .. } => {
                 Some(format!("/p/{}/browser?browserId={}", project, slug))
             }
@@ -352,6 +386,8 @@ impl CairnResource {
             | Self::NodeEras { .. }
             | Self::NodeEra { .. }
             | Self::Db
+            | Self::DbTable { .. }
+            | Self::DbRow { .. }
             | Self::Dev
             | Self::DevDb
             | Self::DevPid
@@ -374,7 +410,9 @@ impl CairnResource {
             | Self::Inference
             | Self::InferenceRecipes
             | Self::InferenceDeployments
+            | Self::InferenceDeployment { .. }
             | Self::InferencePools
+            | Self::InferenceRequests
             | Self::Bug
             | Self::Help
             | Self::WebSearch
@@ -382,6 +420,10 @@ impl CairnResource {
             | Self::Workflow { .. }
             | Self::ProjectWorkflows { .. }
             | Self::ProjectWorkflow { .. }
+            | Self::ProjectServices { .. }
+            | Self::ProjectService { .. }
+            | Self::ProjectServiceStatus { .. }
+            | Self::ProjectServiceLog { .. }
             | Self::Mcp { .. }
             | Self::ProjectImage { .. }
             // The issue segment scopes the collection's NAME, not an issue
@@ -417,6 +459,7 @@ impl CairnResource {
             | Self::ProjectPosts { project }
             | Self::ProjectTenets { project }
             | Self::ProjectTenet { project, .. }
+            | Self::ProjectPages { project }
             | Self::ProjectCodemap { project }
             | Self::ProjectMap { project }
             | Self::ProjectHome { project }
@@ -433,10 +476,12 @@ impl CairnResource {
             | Self::ThreadBranch { project, .. }
             | Self::ThreadDb { project, .. }
             | Self::ThreadDbSchema { project, .. }
-            | Self::ThreadProcedures { project, .. }
-            | Self::ThreadProcedure { project, .. }
-            | Self::ThreadAutomations { project, .. }
-            | Self::ThreadAutomation { project, .. }
+            | Self::ThreadDbTable { project, .. }
+            | Self::ThreadDbRow { project, .. }
+            | Self::ThreadServices { project, .. }
+            | Self::ThreadService { project, .. }
+            | Self::ThreadServiceStatus { project, .. }
+            | Self::ThreadServiceLog { project, .. }
             | Self::Node { project, .. }
             | Self::NodeChat { project, .. }
             | Self::NodeChatRaw { project, .. }
@@ -492,10 +537,17 @@ impl CairnResource {
             | Self::NodeMemory { project, .. }
             | Self::NodeEras { project, .. }
             | Self::NodeEra { project, .. }
+            | Self::NodePages { project, .. }
+            | Self::NodePage { project, .. }
+            | Self::NodePageLog { project, .. }
             | Self::ProjectRecipes { project }
             | Self::ProjectRecipe { project, .. }
             | Self::ProjectWorkflows { project }
             | Self::ProjectWorkflow { project, .. }
+            | Self::ProjectServices { project }
+            | Self::ProjectService { project, .. }
+            | Self::ProjectServiceStatus { project, .. }
+            | Self::ProjectServiceLog { project, .. }
             | Self::ProjectRoutes { project }
             | Self::ProjectRoute { project, .. }
             | Self::ProjectRouteHistory { project, .. }
@@ -543,6 +595,8 @@ impl CairnResource {
             | Self::Actions
             | Self::Action { .. }
             | Self::Db
+            | Self::DbTable { .. }
+            | Self::DbRow { .. }
             | Self::Dev
             | Self::DevDb
             | Self::DevPid
@@ -565,7 +619,9 @@ impl CairnResource {
             | Self::Inference
             | Self::InferenceRecipes
             | Self::InferenceDeployments
+            | Self::InferenceDeployment { .. }
             | Self::InferencePools
+            | Self::InferenceRequests
             | Self::Bug
             | Self::Help
             | Self::WebSearch
@@ -624,6 +680,9 @@ impl CairnResource {
             | Self::NodeMemory { number, .. }
             | Self::NodeEras { number, .. }
             | Self::NodeEra { number, .. }
+            | Self::NodePages { number, .. }
+            | Self::NodePage { number, .. }
+            | Self::NodePageLog { number, .. }
             | Self::NodeSymbols { number, .. } => Some(*number),
             Self::ProjectThreads { .. }
             | Self::Thread { .. }
@@ -631,10 +690,12 @@ impl CairnResource {
             | Self::ThreadBranch { .. }
             | Self::ThreadDb { .. }
             | Self::ThreadDbSchema { .. }
-            | Self::ThreadProcedures { .. }
-            | Self::ThreadProcedure { .. }
-            | Self::ThreadAutomations { .. }
-            | Self::ThreadAutomation { .. }
+            | Self::ThreadDbTable { .. }
+            | Self::ThreadDbRow { .. }
+            | Self::ThreadServices { .. }
+            | Self::ThreadService { .. }
+            | Self::ThreadServiceStatus { .. }
+            | Self::ThreadServiceLog { .. }
             | Self::Project { .. }
             | Self::ProjectIssues { .. }
             | Self::Posts
@@ -643,6 +704,7 @@ impl CairnResource {
             | Self::ProjectPosts { .. }
             | Self::ProjectTenets { .. }
             | Self::ProjectTenet { .. }
+            | Self::ProjectPages { .. }
             | Self::ProjectCodemap { .. }
             | Self::ProjectMap { .. }
             | Self::ProjectHome { .. }
@@ -704,8 +766,14 @@ impl CairnResource {
             | Self::Workflow { .. }
             | Self::ProjectWorkflows { .. }
             | Self::ProjectWorkflow { .. }
+            | Self::ProjectServices { .. }
+            | Self::ProjectService { .. }
+            | Self::ProjectServiceStatus { .. }
+            | Self::ProjectServiceLog { .. }
             | Self::ProjectSymbols { .. }
             | Self::Db
+            | Self::DbTable { .. }
+            | Self::DbRow { .. }
             | Self::Dev
             | Self::DevDb
             | Self::DevPid
@@ -728,7 +796,9 @@ impl CairnResource {
             | Self::Inference
             | Self::InferenceRecipes
             | Self::InferenceDeployments
+            | Self::InferenceDeployment { .. }
             | Self::InferencePools
+            | Self::InferenceRequests
             | Self::Bug
             | Self::Help
             | Self::WebSearch
@@ -781,6 +851,9 @@ impl CairnResource {
             | Self::NodeMemory { node_id, .. }
             | Self::NodeEras { node_id, .. }
             | Self::NodeEra { node_id, .. }
+            | Self::NodePages { node_id, .. }
+            | Self::NodePage { node_id, .. }
+            | Self::NodePageLog { node_id, .. }
             | Self::NodeSymbols { node_id, .. } => Some(node_id),
             _ => None,
         }

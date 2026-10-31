@@ -49,12 +49,14 @@ async fn fixture_on(orch: Orchestrator) -> Fixture {
 
 fn as_run(run_id: &str) -> McpCallbackRequest {
     McpCallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: Some(run_id.to_string()),
         tool: "change".to_string(),
         payload: json!({}),
         tool_use_id: None,
+        origin: None,
     }
 }
 

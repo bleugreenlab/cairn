@@ -113,6 +113,19 @@ pub async fn dispatch_tool(
         return ObservedSafe::observe(refusal, Crossing::FinalResponse);
     }
 
+    // A project service's runs carry a fixed scope: its own home outside a
+    // call, the service-and-caller intersection inside one. Asked here, before
+    // any handler, for the same reason as the fences above.
+    if let Some(refusal) = crate::project_services::authority::refuse(orch, request).await {
+        return ObservedSafe::observe(
+            DispatchOutput {
+                content: refusal,
+                reminders: Vec::new(),
+            },
+            Crossing::FinalResponse,
+        );
+    }
+
     // Inbound crossing (CAIRN-3822). Placed after ownership fencing, which costs
     // no side effects either, and before everything that does: dedup bookkeeping,
     // continuation restoration, and every handler. Every authenticated dispatch
@@ -1422,12 +1435,14 @@ mod tests {
 
     fn terminal_read_request(run_id: &str, paths: serde_json::Value) -> McpCallbackRequest {
         McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: "/tmp".to_string(),
             run_id: Some(run_id.to_string()),
             tool: "read_batch".to_string(),
             payload: serde_json::json!({ "paths": paths }),
             tool_use_id: None,
+            origin: None,
         }
     }
 

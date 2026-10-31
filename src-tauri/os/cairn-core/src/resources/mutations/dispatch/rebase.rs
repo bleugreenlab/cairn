@@ -85,25 +85,24 @@ pub(super) async fn dispatch(
             }
 
             let db = orch.db.for_project(project).await;
-            let (conn, job) = crate::resources::connect_and_find_node_job(
-                &db, project, *number, *exec_seq, node_id,
-            )
-            .await
-            .map_err(|error| build_failure(index, item, error))?;
-            let branch = crate::resources::node_branch(&conn, &job.id)
-                .await
-                .map_err(|error| build_failure(index, item, error))?
-                .ok_or_else(|| {
-                    build_failure(
-                        index,
-                        item,
-                        "This node has no branch to replay.".to_string(),
-                    )
-                })?;
+            // Read, then release: the origin fetch and the replay below both
+            // wait on the store lock, which this same write batch may hold, so
+            // nothing here may keep a read open across them (cairn/5502).
+            let rows =
+                crate::resources::NodeRebaseRows::read(&db, project, *number, *exec_seq, node_id)
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+            let branch = rows.branch.clone().ok_or_else(|| {
+                build_failure(
+                    index,
+                    item,
+                    "This node has no branch to replay.".to_string(),
+                )
+            })?;
 
             if action == "fast-forward-from-origin" {
                 let target = if fast_forward_branch.is_some() {
-                    crate::resources::node_base_branch(orch, &conn, &job.id, &branch)
+                    crate::resources::node_base_branch(orch, &rows, &branch)
                         .await
                         .map_err(|error| build_failure(index, item, error))?
                 } else {
@@ -132,7 +131,7 @@ pub(super) async fn dispatch(
                 crate::orchestrator::base_advance::request_branch_replay(
                     orch,
                     &db,
-                    &job.id,
+                    &rows.job_id,
                     &branch,
                     fingerprint,
                     resolution.is_some(),
@@ -145,4 +144,100 @@ pub(super) async fn dispatch(
         _ => return Ok(None),
     };
     Ok(Some(summary))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::SearchIndex;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// The 10-29 holder (cairn/5502): a replay request whose store lock is
+    /// already held, as it is when the same write batch carries file items.
+    /// The request waits on the lock; while it does, it must hold no database
+    /// connection, because a transaction parked there for the whole wait blocks
+    /// every checkpoint and nothing can cut it.
+    #[tokio::test]
+    async fn a_replay_waiting_on_the_store_lock_holds_no_connection() {
+        let db = Arc::new(crate::storage::migrated_test_db("replay-holds-nothing.db").await);
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+               VALUES ('proj-1', 'default', 'Project', 'proj', '/repo', 'main', 1, 1);
+             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+               VALUES ('issue-1', 'proj-1', 1, 'Issue', 'active', 1, 1);
+             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('exec-1', 'recipe-default', 'issue-1', 'proj-1', 'running', 1, 1);
+             INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, uri_segment, created_at, updated_at)
+               VALUES ('job-1', 'exec-1', 'node', 'issue-1', 'proj-1', 'running', 'agent/one', 'main', 'builder', 1, 1);",
+        )
+        .await
+        .unwrap();
+        let root = tempfile::tempdir().unwrap().keep();
+        let orch = crate::orchestrator::Orchestrator::builder(
+            Arc::new(DbState::new(
+                db.clone(),
+                Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap()),
+            )),
+            Arc::new(TestServicesBuilder::new().build()),
+            root,
+        )
+        .build();
+
+        let store = crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new("/repo"));
+        let held = orch
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Background,
+                "the write batch's file items",
+            )
+            .await;
+
+        let item = ChangeItem {
+            target: "cairn:~/rebase".into(),
+            mode: ChangeMode::Patch,
+            payload: Some(serde_json::json!({ "action": "replay" })),
+        };
+        let request = McpCallbackRequest {
+            thread_id: None,
+            cwd: String::new(),
+            run_id: None,
+            tool: "write".into(),
+            payload: serde_json::Value::Null,
+            tool_use_id: None,
+            answer_bound_ms: None,
+            origin: None,
+        };
+        let resource = CairnResource::NodeRebase {
+            project: "proj".into(),
+            number: 1,
+            exec_seq: 1,
+            node_id: "builder".into(),
+        };
+        let replay = dispatch(&orch, &request, 0, &item, false, &resource);
+        let mut replay = std::pin::pin!(replay);
+
+        // Give the request every chance to reach the lock and park there.
+        let parked = tokio::time::timeout(Duration::from_millis(500), replay.as_mut()).await;
+        assert!(
+            parked.is_err(),
+            "the replay must still be waiting on the held store lock"
+        );
+        assert_eq!(
+            db.live_connections(),
+            0,
+            "a replay waiting on the store lock is holding a database connection: {:?}",
+            db.overdue_holders(Duration::ZERO, Duration::ZERO)
+        );
+
+        drop(held);
+        // Whatever the replay concludes against a store that does not exist,
+        // it concludes, and leaves nothing open.
+        let _ = tokio::time::timeout(Duration::from_secs(30), replay.as_mut())
+            .await
+            .expect("the replay finishes once the lock is released");
+        assert_eq!(db.live_connections(), 0);
+    }
 }

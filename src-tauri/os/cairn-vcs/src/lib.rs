@@ -964,7 +964,7 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, String, String, String) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
-        command("git", &["-C", path, "init", "-q"]);
+        command("git", &["-C", path, "init", "-b", "main", "-q"]);
         command(
             "git",
             &["-C", path, "config", "user.email", "test@cairn.local"],

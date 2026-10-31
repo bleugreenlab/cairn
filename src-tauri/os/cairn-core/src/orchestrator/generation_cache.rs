@@ -41,6 +41,8 @@ use std::time::{Duration, Instant};
 pub(crate) type ThreadStatusCache = CadencedCache<Arc<ThreadStatusSnapshot>>;
 pub(crate) type IssueStatusCache = CadencedCache<Arc<IssueStatusSnapshot>>;
 pub(crate) type IssueListCache = CadencedCache<EncodedIssueList>;
+pub(crate) type OperatorNotificationsCache =
+    CadencedCache<Arc<crate::notifications::OperatorNotificationsSnapshot>>;
 
 /// The shortest interval between two rebuilds of one project's thread or issue
 /// status rollup.
@@ -152,6 +154,34 @@ pub(crate) const ISSUE_LIST_INPUT_TABLES: &[&str] = &[
     "executor_enrollments",
 ];
 
+/// The tables the operator notification center derives its entries from.
+///
+/// Each kind's source of truth (`crate::notifications::derive`), plus the
+/// rows that place a job (`executions`, `threads`, `action_runs`), the
+/// operator's dismissals, and the frame hold sources announce on. No entry
+/// reads a transcript, so `events` is absent.
+///
+/// Scoping by job set is deliberately not attempted here. The center reads
+/// every job in the project (any of them can ask a question or fail), so a
+/// project-scoped frame is already as narrow as the answer allows, and the
+/// cadence floor bounds what a burst of them costs.
+const OPERATOR_NOTIFICATION_INPUT_TABLES: &[&str] = &[
+    "prompts",
+    "permission_requests",
+    "tenets",
+    "merge_requests",
+    "runs",
+    "turns",
+    "jobs",
+    "issues",
+    "executions",
+    "artifacts",
+    "action_runs",
+    "threads",
+    crate::notifications::DISMISSALS_TABLE,
+    crate::notifications::HOLDS_TABLE,
+];
+
 /// Inputs whose rows are not owned by any one project, so a `db-change` for
 /// them legitimately carries no `projectId` and invalidates every key.
 #[cfg(test)]
@@ -188,6 +218,7 @@ pub(crate) struct ProjectionInvalidatingEmitter {
     thread_status: Arc<ThreadStatusCache>,
     issue_status: Arc<IssueStatusCache>,
     issue_list: Arc<IssueListCache>,
+    operator_notifications: Arc<OperatorNotificationsCache>,
 }
 
 impl ProjectionInvalidatingEmitter {
@@ -196,12 +227,14 @@ impl ProjectionInvalidatingEmitter {
         thread_status: Arc<ThreadStatusCache>,
         issue_status: Arc<IssueStatusCache>,
         issue_list: Arc<IssueListCache>,
+        operator_notifications: Arc<OperatorNotificationsCache>,
     ) -> Self {
         Self {
             inner,
             thread_status,
             issue_status,
             issue_list,
+            operator_notifications,
         }
     }
 
@@ -216,7 +249,8 @@ impl ProjectionInvalidatingEmitter {
         let thread_input = THREAD_STATUS_INPUT_TABLES.contains(&table);
         let issue_input = ISSUE_STATUS_INPUT_TABLES.contains(&table);
         let list_input = ISSUE_LIST_INPUT_TABLES.contains(&table);
-        if !thread_input && !issue_input && !list_input {
+        let notification_input = OPERATOR_NOTIFICATION_INPUT_TABLES.contains(&table);
+        if !thread_input && !issue_input && !list_input && !notification_input {
             return;
         }
         let Some(project_id) = payload
@@ -240,10 +274,18 @@ impl ProjectionInvalidatingEmitter {
                 self.issue_list
                     .invalidate_matching("issue-list-input-unscoped", |_| true);
             }
+            if notification_input {
+                self.operator_notifications
+                    .invalidate_matching("notification-input-unscoped", |_| true);
+            }
             return;
         };
         if thread_input && self.touches_a_thread(project_id, table, payload) {
             self.thread_status.invalidate(project_id, "thread-input");
+        }
+        if notification_input {
+            self.operator_notifications
+                .invalidate(project_id, "notification-input");
         }
         if issue_input && self.touches_an_issue(project_id, table, payload) {
             self.issue_status.invalidate(project_id, "issue-input");
@@ -267,6 +309,8 @@ impl ProjectionInvalidatingEmitter {
                     self.thread_status.invalidate(project_id, "team-sync");
                     self.issue_status.invalidate(project_id, "team-sync");
                     self.issue_list.invalidate(project_id, "team-sync");
+                    self.operator_notifications
+                        .invalidate(project_id, "team-sync");
                 }
             }
             None => {
@@ -274,6 +318,8 @@ impl ProjectionInvalidatingEmitter {
                     .invalidate_matching("team-sync", |_| true);
                 self.issue_status.invalidate_matching("team-sync", |_| true);
                 self.issue_list.invalidate_matching("team-sync", |_| true);
+                self.operator_notifications
+                    .invalidate_matching("team-sync", |_| true);
             }
         }
     }
@@ -995,6 +1041,27 @@ where
         for key in keys {
             self.invalidate(&key, reason);
         }
+    }
+
+    /// Invalidate one key once `delay` has passed, on the bound runtime.
+    ///
+    /// For a projection whose answer changes with time alone: a row that only
+    /// becomes an entry once it has stood unchanged for a while produces no
+    /// write when that moment comes, so the rebuild that held it back asks for
+    /// this. Lost on restart, which is harmless: the first rebuild after boot
+    /// asks again.
+    pub(crate) fn invalidate_after(&self, key: &str, delay: Duration, reason: &'static str) {
+        let Some(runtime) = self.runtime() else {
+            return;
+        };
+        let cache = self.this.clone();
+        let key = key.to_string();
+        runtime.spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Some(cache) = cache.upgrade() {
+                cache.invalidate(&key, reason);
+            }
+        });
     }
 
     /// Announce every key whose published value satisfies `predicate`, without
@@ -2128,6 +2195,7 @@ mod tests {
         threads: Arc<ThreadStatusCache>,
         issues: Arc<IssueStatusCache>,
         list: Arc<IssueListCache>,
+        notifications: Arc<OperatorNotificationsCache>,
         thread_jobs: Arc<Mutex<HashSet<String>>>,
         issue_jobs: Arc<Mutex<HashSet<String>>>,
         announced: Arc<Mutex<Vec<String>>>,
@@ -2181,17 +2249,25 @@ mod tests {
             rebuild_with(|_key| async { Ok(EncodedIssueList::from_json("[]")) }),
             recording(&announced, "issue_list"),
         );
+        let notifications = OperatorNotificationsCache::new(
+            "test-notifications",
+            floor,
+            rebuild_with(|_key| async { Ok(Arc::default()) }),
+            recording(&announced, "operator_notifications"),
+        );
         let emitter = ProjectionInvalidatingEmitter::new(
             Arc::new(CapturingEmitter::new()),
             threads.clone(),
             issues.clone(),
             list.clone(),
+            notifications.clone(),
         );
         Sidebar {
             emitter,
             threads,
             issues,
             list,
+            notifications,
             thread_jobs,
             issue_jobs,
             announced,
@@ -2207,7 +2283,66 @@ mod tests {
             self.threads.settle(key).await;
             self.issues.settle(key).await;
             self.list.settle(key).await;
+            self.notifications.settle(key).await;
         }
+    }
+
+    /// A key asked to change with time is rebuilt then, with no write.
+    #[tokio::test(start_paused = true)]
+    async fn a_delayed_invalidation_dirties_its_key_when_it_comes_due() {
+        let s = sidebar(STATUS_ROLLUP_FLOOR);
+        s.notifications.get("proj").await.unwrap();
+        let before = s.notifications.generation("proj");
+        s.notifications
+            .invalidate_after("proj", Duration::from_secs(31), "settle");
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(s.notifications.generation("proj"), before, "not yet due");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(s.notifications.generation("proj"), before + 1);
+        assert_eq!(
+            s.notifications.generation("other"),
+            0,
+            "only the asking key"
+        );
+    }
+
+    /// Every table an entry is derived from moves the center; a transcript
+    /// write, even one that moves a thread's unread count, does not.
+    #[tokio::test(start_paused = true)]
+    async fn every_notification_input_dirties_the_notification_center() {
+        let s = sidebar(STATUS_ROLLUP_FLOOR);
+        for table in OPERATOR_NOTIFICATION_INPUT_TABLES {
+            let before = s.notifications.generation("proj");
+            s.emit(serde_json::json!({"table": table, "projectId": "proj"}));
+            assert_eq!(s.notifications.generation("proj"), before + 1, "{table}");
+        }
+
+        *s.thread_jobs.lock().unwrap() = job_set(&["thread-job"]);
+        s.threads.get("proj").await.unwrap();
+        let (threads, before) = (
+            s.threads.generation("proj"),
+            s.notifications.generation("proj"),
+        );
+        s.emit(events_frame("proj", "thread-job"));
+        assert_eq!(
+            s.threads.generation("proj"),
+            threads + 1,
+            "the write moved a thread"
+        );
+        assert_eq!(
+            s.notifications.generation("proj"),
+            before,
+            "a thread's unread replies are not the center's"
+        );
+
+        let before = s.notifications.generation("proj");
+        s.emit(serde_json::json!({"table": "session_positions", "projectId": "proj"}));
+        assert_eq!(
+            s.notifications.generation("proj"),
+            before,
+            "a table no entry reads"
+        );
     }
 
     fn events_frame(project: &str, job: &str) -> Value {

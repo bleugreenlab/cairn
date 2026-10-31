@@ -56,12 +56,14 @@ fn parse_check_run_observation(raw: &str) -> Result<serde_json::Value, String> {
 
 fn check_run_status_request(client: &CairnMcpServer, observation_handle: &str) -> CallbackRequest {
     CallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: client.cwd().to_string(),
         run_id: client.run_id().map(ToString::to_string),
         tool: "check_run".to_string(),
         payload: serde_json::json!({ "observationHandle": observation_handle }),
         tool_use_id: None,
+        origin: None,
     }
 }
 
@@ -305,12 +307,14 @@ pub(crate) async fn run_cli_watch(issue_uri: String, since: Option<i64>) -> bool
             None => serde_json::json!({ "issue_uri": issue_uri }),
         };
         let request = CallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: client.cwd().to_string(),
             run_id: client.run_id().map(ToString::to_string),
             tool: "watch".to_string(),
             payload,
             tool_use_id: None,
+            origin: None,
         };
         let outcome = client.callback(&request).await;
         if !outcome.transport_ok {
@@ -417,12 +421,14 @@ fn check_run_request(
             serde_json::to_value(placement.source).expect("a selector source serializes");
     }
     CallbackRequest {
+        answer_bound_ms: None,
         thread_id: None,
         cwd: client.cwd().to_string(),
         run_id: client.run_id().map(ToString::to_string),
         tool: "check_run".to_string(),
         payload,
         tool_use_id: None,
+        origin: None,
     }
 }
 

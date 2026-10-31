@@ -19,7 +19,8 @@ export type ActionContext =
   | "jobSelected"
   | "projectTerminal"
   | "chat"
-  | "dialog";
+  | "dialog"
+  | "notificationCenter";
 
 export interface ActionDefinition {
   id: string;

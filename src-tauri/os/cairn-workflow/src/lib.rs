@@ -12,6 +12,7 @@ pub mod checkpoints;
 pub mod condition;
 pub mod conditions;
 pub mod dag;
+pub mod delegated_packets;
 pub mod effects;
 pub mod gates;
 pub mod inputs;

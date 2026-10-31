@@ -1,6 +1,6 @@
 use crate::agent_process::process::{GoalPause, GoalPauseOwner, PauseIntent};
 use crate::execution::jobs::GoalReactivation;
-use crate::models::{DelegatedStatus, ExecutionSnapshot};
+use crate::models::DelegatedStatus;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::ids;
@@ -658,22 +658,11 @@ pub fn is_call_child(orch: &Orchestrator, job_id: &str) -> bool {
         else {
             return Ok(false);
         };
-        let Some(snapshot_json) = select_optional_text(
-            &db,
-            "SELECT snapshot FROM executions WHERE id = ?1",
-            &execution_id,
-        )
-        .await
-        .map_err(|e| e.to_string())?
-        else {
-            return Ok(false);
-        };
-        let snapshot: ExecutionSnapshot =
-            serde_json::from_str(&snapshot_json).map_err(|e| e.to_string())?;
-        Ok(snapshot.delegated_packets.iter().any(|packet| {
-            packet.result_artifact_job_id.as_deref() == Some(job_id.as_str())
-                && packet.origin == crate::models::DelegationOrigin::CallTool
-        }))
+        let packet =
+            cairn_workflow::delegated_packets::find_by_result_job_db(&db, &execution_id, &job_id)
+                .await
+                .map_err(|e| e.to_string())?;
+        Ok(packet.is_some_and(|packet| packet.origin == crate::models::DelegationOrigin::CallTool))
     })
     .unwrap_or(false)
 }
@@ -732,25 +721,13 @@ fn resume_parent_after_task_settled(
                 return Ok(None);
             };
 
-            let snapshot_json = select_optional_text(
+            let Some(packet) = cairn_workflow::delegated_packets::find_by_result_job_db(
                 &db,
-                "SELECT snapshot FROM executions WHERE id = ?1",
                 &execution_id,
+                &child_job_id,
             )
             .await
-            .map_err(|e| format!("Failed to load execution snapshot: {}", e))?;
-            let Some(snapshot_json) = snapshot_json else {
-                return Ok(None);
-            };
-            let snapshot: ExecutionSnapshot = serde_json::from_str(&snapshot_json)
-                .map_err(|e| format!("Failed to parse execution snapshot: {}", e))?;
-            let Some(packet) = snapshot
-                .delegated_packets
-                .iter()
-                .find(|packet| {
-                    packet.result_artifact_job_id.as_deref() == Some(child_job_id.as_str())
-                })
-                .cloned()
+            .map_err(|e| format!("Failed to load delegated packet: {}", e))?
             else {
                 return Ok(None);
             };
@@ -765,7 +742,12 @@ fn resume_parent_after_task_settled(
                 return Ok(None);
             }
 
-            let sibling_ids = delegated_sibling_ids(&snapshot.delegated_packets, &refreshed_packet);
+            // Every packet of the execution, wherever it is stored: a sibling
+            // missing here would read as settled and wake the parent early.
+            let packets = cairn_workflow::delegated_packets::list_db(&db, &execution_id)
+                .await
+                .map_err(|e| format!("Failed to load delegated packets: {}", e))?;
+            let sibling_ids = delegated_sibling_ids(&packets, &refreshed_packet);
 
             // Background spawns never prepared a successor turn, so the blocking
             // successor/resume path below does not apply: notify the spawner via

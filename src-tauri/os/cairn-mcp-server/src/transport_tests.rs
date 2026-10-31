@@ -7,18 +7,21 @@
 //! the structural half (no second tool router anywhere) lives in cairn-core's
 //! source-structure suite.
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientInfo, ProtocolVersion, RequestMetaObject,
+    CallToolRequestParams, CallToolResult, ClientInfo, ProgressNotificationParam, ProtocolVersion,
+    RequestMetaObject,
 };
-use rmcp::service::{RoleClient, RunningService};
+use rmcp::service::{MaybeSendFuture, NotificationContext, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{ClientHandler, ClientLifecycleMode, ClientServiceExt, ServiceExt};
 
+use crate::heartbeat::HEARTBEAT_INTERVAL;
 use crate::output::CallbackOutcome;
 use crate::server::{CairnMcpServer, Caller};
 use crate::sink::RunPrincipal;
@@ -42,11 +45,23 @@ type Client = RunningService<RoleClient, VersionedClient>;
 /// Serve a per-request server at `/mcp`, attaching `principal` to every request
 /// the way the orchestrator's bearer middleware does.
 async fn serve_http(sink: Arc<RecordingSink>, principal: Option<RunPrincipal>) -> String {
-    let service = StreamableHttpService::new(
-        move || Ok(CairnMcpServer::new(sink.clone(), Caller::PerRequest)),
-        LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default(),
-    );
+    serve_http_beating(sink, principal, HEARTBEAT_INTERVAL).await
+}
+
+async fn serve_http_beating(
+    sink: Arc<RecordingSink>,
+    principal: Option<RunPrincipal>,
+    every: Duration,
+) -> String {
+    let service =
+        StreamableHttpService::new(
+            move || {
+                Ok(CairnMcpServer::new(sink.clone(), Caller::PerRequest)
+                    .with_heartbeat_interval(every))
+            },
+            LocalSessionManager::default().into(),
+            StreamableHttpServerConfig::default(),
+        );
     let mut router = Router::new().route_service("/mcp", service);
     if let Some(principal) = principal {
         router = router.layer(axum::Extension(principal));
@@ -121,6 +136,7 @@ fn host_answer() -> CallbackOutcome {
             "The worktree has uncommitted changes.".to_string(),
         ],
         transport_ok: true,
+        failure: None,
     }
 }
 
@@ -404,4 +420,249 @@ async fn stdio_wire_lifecycle(discover: bool, version: &str) {
     drop(writer);
     drop(lines);
     task.await.unwrap();
+}
+
+type WireLines =
+    tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>;
+type WireWriter = tokio::io::WriteHalf<tokio::io::DuplexStream>;
+
+/// A raw stdio connection to a fixed server over `sink`, initialized.
+async fn initialized_stdio_wire(sink: Arc<RecordingSink>) -> (WireLines, WireWriter) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let server = CairnMcpServer::new(
+        sink,
+        Caller::Fixed {
+            run_id: Some(RUN.into()),
+            cwd: String::new(),
+        },
+    );
+    let (server_side, client_side) = tokio::io::duplex(1 << 20);
+    tokio::spawn(async move {
+        let _ = server
+            .serve(crate::classic_stdio_transport(server_side))
+            .await
+            .unwrap()
+            .waiting()
+            .await;
+    });
+    let (reader, mut writer) = tokio::io::split(client_side);
+    let mut lines = BufReader::new(reader).lines();
+    let initialize = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"wire-probe","version":"1"}
+    }});
+    writer
+        .write_all(format!("{initialize}\n").as_bytes())
+        .await
+        .unwrap();
+    let response: serde_json::Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(response["id"], 1, "{response}");
+    writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .unwrap();
+    (lines, writer)
+}
+
+/// Send one `read` call with `meta` as its `_meta`, held by the sink, and
+/// collect every notification that precedes its response, each stamped with
+/// the virtual time since the call was sent. The connection is handed back
+/// still open, so the caller can keep listening.
+async fn held_stdio_call(
+    meta: Option<serde_json::Value>,
+) -> (
+    Vec<(Duration, serde_json::Value)>,
+    Duration,
+    (WireLines, WireWriter),
+) {
+    use tokio::io::AsyncWriteExt;
+    let hold = HEARTBEAT_INTERVAL * 5 + HEARTBEAT_INTERVAL / 2;
+    let sink = RecordingSink::answering_after(host_answer(), hold);
+    let (mut lines, mut writer) = initialized_stdio_wire(sink).await;
+    let mut params = serde_json::json!({"name":"read","arguments":{"paths":["cairn:~/"]}});
+    if let Some(meta) = meta {
+        params["_meta"] = meta;
+    }
+    let call = serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":params});
+    let sent = tokio::time::Instant::now();
+    writer
+        .write_all(format!("{call}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut notifications = Vec::new();
+    let answered = loop {
+        let line = tokio::time::timeout(hold + HEARTBEAT_INTERVAL, lines.next_line())
+            .await
+            .expect("the held call answers")
+            .unwrap()
+            .unwrap();
+        let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if message["id"] == 5 {
+            assert!(message.get("error").is_none(), "{message}");
+            break sent.elapsed();
+        }
+        notifications.push((sent.elapsed(), message));
+    };
+    (notifications, answered, (lines, writer))
+}
+
+/// Virtual time: the duplex pipe has no I/O driver, so a paused clock advances
+/// straight to the next beat and the timings below are exact.
+#[tokio::test(start_paused = true)]
+async fn a_held_stdio_call_reports_progress_on_its_token_until_it_answers() {
+    let (notifications, answered, (mut lines, _writer)) =
+        held_stdio_call(Some(serde_json::json!({"progressToken": 7}))).await;
+
+    assert_eq!(answered, HEARTBEAT_INTERVAL * 5 + HEARTBEAT_INTERVAL / 2);
+    assert_eq!(notifications.len(), 5, "{notifications:?}");
+    for (beat, (at, message)) in (1u32..).zip(&notifications) {
+        assert_eq!(message["method"], "notifications/progress", "{message}");
+        assert_eq!(message["params"]["progressToken"], 7, "{message}");
+        assert_eq!(
+            message["params"]["progress"].as_f64(),
+            Some(f64::from(beat)),
+            "{message}"
+        );
+        assert!(message["params"].get("total").is_none(), "{message}");
+        assert_eq!(*at, HEARTBEAT_INTERVAL * beat, "beat {beat}");
+    }
+    assert_eq!(
+        notifications[0].1["params"]["message"],
+        "read still running (60s elapsed)"
+    );
+
+    // Nothing follows the answer.
+    let after = tokio::time::timeout(HEARTBEAT_INTERVAL * 3, lines.next_line()).await;
+    assert!(after.is_err(), "a message followed the answer: {after:?}");
+}
+
+/// Once the client cancels a held call, nothing more is sent for it: no beat
+/// on a token the client has forgotten, and (rmcp drops a cancelled request's
+/// response) no answer when the held work finally finishes.
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_stdio_call_stops_its_heartbeat() {
+    use tokio::io::AsyncWriteExt;
+    let hold = HEARTBEAT_INTERVAL * 10;
+    let sink = RecordingSink::answering_after(host_answer(), hold);
+    let (mut lines, mut writer) = initialized_stdio_wire(sink).await;
+    let call = serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
+        "name":"read","arguments":{"paths":["cairn:~/"]},"_meta":{"progressToken":7}
+    }});
+    writer
+        .write_all(format!("{call}\n").as_bytes())
+        .await
+        .unwrap();
+    for beat in 1u32..=2 {
+        let line = tokio::time::timeout(HEARTBEAT_INTERVAL * 2, lines.next_line())
+            .await
+            .expect("a beat arrives")
+            .unwrap()
+            .unwrap();
+        let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(message["method"], "notifications/progress", "{message}");
+        assert_eq!(
+            message["params"]["progress"].as_f64(),
+            Some(f64::from(beat)),
+            "{message}"
+        );
+    }
+
+    let cancel = serde_json::json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}});
+    writer
+        .write_all(format!("{cancel}\n").as_bytes())
+        .await
+        .unwrap();
+    // Listen past the moment the held work finishes.
+    let after = tokio::time::timeout(hold, lines.next_line()).await;
+    assert!(
+        after.is_err(),
+        "a message followed the cancellation: {after:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_stdio_call_without_a_progress_token_hears_no_heartbeat() {
+    let (notifications, answered, _connection) = held_stdio_call(None).await;
+    assert_eq!(answered, HEARTBEAT_INTERVAL * 5 + HEARTBEAT_INTERVAL / 2);
+    assert!(notifications.is_empty(), "{notifications:?}");
+}
+
+/// A client that records every progress notification it hears.
+#[derive(Clone)]
+struct ProgressClient(tokio::sync::mpsc::UnboundedSender<ProgressNotificationParam>);
+
+impl ClientHandler for ProgressClient {
+    fn get_info(&self) -> ClientInfo {
+        let mut info = ClientInfo::default();
+        info.protocol_version = ProtocolVersion::V_2025_11_25;
+        info
+    }
+
+    fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + MaybeSendFuture + '_ {
+        let _ = self.0.send(params);
+        std::future::ready(())
+    }
+}
+
+/// Over streamable HTTP, rmcp routes a call's progress onto that request's own
+/// response stream, so the client hears it before the result.
+#[tokio::test]
+async fn a_held_http_call_reports_progress_on_its_own_stream() {
+    let every = Duration::from_millis(25);
+    let sink = RecordingSink::answering_after(host_answer(), every * 10);
+    let url = serve_http_beating(
+        sink,
+        Some(RunPrincipal {
+            run_id: RUN.to_string(),
+        }),
+        every,
+    )
+    .await;
+    let (tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    let client = ProgressClient(tx)
+        .serve(StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(url),
+        ))
+        .await
+        .expect("HTTP client initializes");
+
+    // rmcp's client stamps every request with a progress token of its own, as
+    // the Claude CLI does.
+    let result = client
+        .call_tool(call("read", serde_json::json!({"paths": ["cairn:~/"]})))
+        .await
+        .unwrap();
+    assert_ne!(result.is_error, Some(true));
+
+    // A notification that preceded the result may reach the handler just
+    // after it; let those settle before counting.
+    tokio::time::sleep(every * 2).await;
+    let mut beats = Vec::new();
+    while let Ok(progress) = heard.try_recv() {
+        beats.push(progress);
+    }
+    assert!(beats.len() >= 3, "{beats:?}");
+    assert!(
+        beats
+            .iter()
+            .all(|beat| beat.progress_token == beats[0].progress_token),
+        "{beats:?}"
+    );
+    assert!(
+        beats
+            .windows(2)
+            .all(|pair| pair[0].progress < pair[1].progress),
+        "{beats:?}"
+    );
+
+    tokio::time::sleep(every * 5).await;
+    assert!(
+        heard.try_recv().is_err(),
+        "progress continued after the result"
+    );
+    client.cancel().await.unwrap();
 }

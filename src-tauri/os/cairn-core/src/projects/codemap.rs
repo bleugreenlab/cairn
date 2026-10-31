@@ -374,10 +374,8 @@ async fn compute_tree(
 /// What a reader gets for one project right now: the best map available, and
 /// whether the base has moved past it.
 ///
-/// This is the one "serve the cache, arm a refresh" path. Both readers go
-/// through it -- the `cairn://p/{project}/codemap` resource and the frontend's
-/// `get_project_codemap` command -- so neither can drift into a different
-/// answer about the same project.
+/// This is the one "serve the cache, arm a refresh" path, which the
+/// `cairn://p/{project}/codemap` resource reads through.
 pub struct CodeMapView {
     /// `None` while the first map for this project is still being computed.
     pub map: Option<CodeMap>,

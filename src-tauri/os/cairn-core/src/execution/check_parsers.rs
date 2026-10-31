@@ -30,7 +30,8 @@
 //! across its four consumers (`config/project_settings.rs`, the TS
 //! `CheckCommand`, the editor, and docs). The repo's Rust entry points
 //! (`test:rust`, `nextest`, and `cargo test`) route to the rust parser,
-//! `vitest` to the vitest parser, `bun test` to the bun parser, and `tsc` to the
+//! `vitest` and the repo's frontend entry point (`test:frontend`, which shards
+//! vitest) to the vitest parser, `bun test` to the bun parser, and `tsc` to the
 //! tsc parser. A command that names none of them (`bun run test:api`) is still
 //! read when its output carries a runner's own closing summary: bun's
 //! `Ran N tests across M files.` or vitest's `Tests  … (N)`.
@@ -183,6 +184,10 @@ pub(crate) struct CheckPhasePass {
     pub(crate) test_ms: u64,
     #[serde(default)]
     pub(crate) compiled_units: u64,
+    /// The workspace (local-path) crates among `compiled_units`, by name; the
+    /// registry crates a cold build also compiles are counted, not named.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) compiled_crates: Vec<String>,
     /// nextest's own `Summary [ Xs ]` for the pass, when it printed one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) summary_ms: Option<u64>,
@@ -190,6 +195,18 @@ pub(crate) struct CheckPhasePass {
 
 /// More passes than any lane runs; a result claiming more is not a lane's.
 const MAX_PHASE_PASSES: usize = 16;
+
+/// Far more crates than the workspace holds, so a pass naming more is not one.
+const MAX_PASS_COMPILED_CRATES: usize = 256;
+
+/// A cargo package name: what `Compiling <name>` can carry, and nothing longer.
+fn plausible_crate_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
 
 impl CheckPhases {
     /// The `phases` a result file carries, when it is one this core can store.
@@ -215,9 +232,17 @@ impl CheckPhases {
             ]
         }))
         .all(|value| i64::try_from(value).is_ok());
+        let crates_plausible = phases.passes.iter().all(|pass| {
+            pass.compiled_crates.len() <= MAX_PASS_COMPILED_CRATES
+                && pass
+                    .compiled_crates
+                    .iter()
+                    .all(|name| plausible_crate_name(name))
+        });
         (matches!(phases.origin.as_str(), "executor" | "process")
             && phases.passes.len() <= MAX_PHASE_PASSES
-            && representable)
+            && representable
+            && crates_plausible)
             .then_some(phases)
     }
 }
@@ -428,7 +453,7 @@ enum ParserKind {
     Tsc,
 }
 
-/// Whether `command` names Vitest itself.
+/// Whether `command` runs Vitest: names it, or is the repo's frontend runner.
 pub(crate) fn is_vitest_command(command: &str) -> bool {
     detect_parser(command) == Some(ParserKind::Vitest)
 }
@@ -453,7 +478,7 @@ fn detect_parser(command: &str) -> Option<ParserKind> {
     {
         return Some(ParserKind::Rust);
     }
-    if command.contains("vitest") {
+    if command.contains("vitest") || command.contains("test:frontend") {
         return Some(ParserKind::Vitest);
     }
     if command.contains("bun test") {
@@ -1678,7 +1703,13 @@ test result: FAILED. 2 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; 
             detect_parser("cd api && bun test --isolate"),
             Some(ParserKind::BunTest)
         );
-        assert_eq!(detect_parser("bun run test:frontend:scoped"), None);
+        for command in ["bun run test:frontend", "bun run test:frontend:scoped"] {
+            assert_eq!(
+                detect_parser(command),
+                Some(ParserKind::Vitest),
+                "{command}"
+            );
+        }
         assert_eq!(detect_parser("bun run test:api"), None);
         assert_eq!(detect_parser("bun run check:web"), None);
     }
@@ -2382,7 +2413,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
                 r#"{RESULT_ARTIFACT_JSON_MARKER}{{"schemaVersion":1,"parser":"nextest","complete":true,"selection":"full","undeclaredSkips":0,"tests":[],"phases":{phases}}}"#
             )
         };
-        let phases = r#"{"origin":"executor","setupMs":12000,"compileMs":408000,"testMs":149735,"doctestMs":0,"publishMs":1479,"compiledUnits":1,"passes":[{"name":"full","wallMs":557735,"compileMs":408000,"testMs":149735,"compiledUnits":1,"summaryMs":144635}]}"#;
+        let phases = r#"{"origin":"executor","setupMs":12000,"compileMs":408000,"testMs":149735,"doctestMs":0,"publishMs":1479,"compiledUnits":1,"passes":[{"name":"full","wallMs":557735,"compileMs":408000,"testMs":149735,"compiledUnits":1,"compiledCrates":["cairn-core"],"summaryMs":144635}]}"#;
         let parsed = parse_check_output("bun run test:rust:full", &with(phases)).unwrap();
         let measured = parsed
             .phases
@@ -2398,6 +2429,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             (12_000, 408_000, 149_735, 1_479)
         );
         assert_eq!(measured.passes[0].summary_ms, Some(144_635));
+        assert_eq!(measured.passes[0].compiled_crates, vec!["cairn-core"]);
         // They ride into the stored result and back.
         let stored = serde_json::to_string(&parsed).unwrap();
         let back: ParsedCheckResult = serde_json::from_str(&stored).unwrap();
@@ -2408,6 +2440,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             r#"{"origin":"process","setupMs":-1,"compileMs":1,"testMs":1,"publishMs":1}"#,
             r#"{"origin":"process","setupMs":18446744073709551615,"compileMs":1,"testMs":1,"publishMs":1}"#,
             r#""twelve minutes""#,
+            r#"{"origin":"process","setupMs":1,"compileMs":1,"testMs":1,"publishMs":1,"passes":[{"name":"local","wallMs":1,"compileMs":1,"testMs":0,"compiledCrates":["cairn-core (/cell)"]}]}"#,
         ] {
             let parsed = parse_check_output("bun run test:rust", &with(bad)).unwrap();
             assert_eq!(parsed.phases, None, "{bad}");
@@ -2705,7 +2738,11 @@ Exit code: 1";
         }
         assert!(is_test_runner_command("cd api && bun test"));
         assert!(is_test_runner_command("bun run test:rust"));
+        assert!(is_test_runner_command("bun run test:frontend"));
         assert!(!is_test_runner_command("bunx tsc --noEmit"));
+        assert!(!is_test_runner_command(
+            "cargo check --manifest-path src-tauri/Cargo.toml --workspace --all-targets"
+        ));
     }
 
     #[test]

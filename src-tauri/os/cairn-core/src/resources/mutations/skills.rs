@@ -304,12 +304,14 @@ mod tests {
 
     fn request(run_id: Option<&str>) -> McpCallbackRequest {
         McpCallbackRequest {
+            answer_bound_ms: None,
             cwd: "/empty/scratch".to_string(),
             run_id: run_id.map(str::to_string),
             tool: "write".to_string(),
             payload: serde_json::Value::Null,
             tool_use_id: None,
             thread_id: None,
+            origin: None,
         }
     }
 

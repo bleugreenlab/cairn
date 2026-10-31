@@ -32,7 +32,7 @@ pub(crate) const NODE_MESSAGES_CONTRACT: ResourceContract =
         kind: ResourceKind::NodeMessages,
         uri_template: "cairn://p/{project}/{number}/{exec}/{node}/messages",
         name: "Node messages",
-        description: "Direct messages to and from a node agent. Canonical messaging target for a node, symmetric with project/issue /messages: append delivers a direct message (queued and steered if the recipient is mid-turn), read returns the node's direct-message stream.",
+        description: "Direct messages to and from a node agent. Canonical messaging target for a node, symmetric with project/issue /messages: append delivers a direct message (queued and steered if the recipient is mid-turn), read returns the node's direct-message stream across all of its runs, each line marked with its delivery urgency: the newest `limit` messages by default, or reading forward from `since`.",
         read_projections: &[
             ProjectionSpec {
                 key: "since",
@@ -270,7 +270,7 @@ pub(crate) const NODE_TERMINAL_CONTRACT: ResourceContract =
         uri_template: "cairn://p/{project}/{number}/{exec}/{node}/terminal/{slug}",
         name: "Node terminal",
         description: "Execution node terminal output",
-        read_projections: NO_PROJECTIONS,
+        read_projections: TERMINAL_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
         mutations: &[

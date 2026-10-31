@@ -291,8 +291,30 @@ pub(crate) fn start_call_run(
         || (capability.class == crate::backends::RuntimeClass::MultiplexedServer
             && capability.claim.server_instance_key.is_none())
     {
-        let _launch = orch.claim_job_launch(&prepared.job_id, &prepared.run_id);
-        return start_call_run_now(orch, prepared);
+        let launch = orch.claim_job_launch(&prepared.job_id, &prepared.run_id);
+        if orch.startup_readiness.is_ready() {
+            return start_call_run_now(orch, prepared);
+        }
+        // No durable row can hold this class, so it waits on the readiness
+        // latch in the background, keeping its launch claim until it starts.
+        let task_orch = orch.clone();
+        let prepared = prepared.clone();
+        orch.spawn_blocking_detached(move || {
+            let orch = task_orch;
+            orch.startup_readiness.wait_ready_blocking();
+            if super::private_lane::run_settled(&orch, &prepared.run_id) != Some(true) {
+                if let Err(e) = start_call_run_now(&orch, &prepared) {
+                    log::error!("deferred call {} failed to start: {e}", prepared.run_id);
+                    crate::orchestrator::lifecycle::fail_run(
+                        &orch,
+                        &prepared.run_id,
+                        &format!("call start failed: {e}"),
+                    );
+                }
+            }
+            drop(launch);
+        });
+        return Ok(());
     }
 
     let ceiling = backend
@@ -740,6 +762,11 @@ fn prepared_call_for(orch: &Orchestrator, request_id: &str) -> Option<PreparedCa
 /// lease and failed its run); `false` when the lane is empty, at its ceiling,
 /// or unreadable.
 fn promote_next_call(orch: &Orchestrator, lane: &str, ceiling: usize) -> bool {
+    // The row is durable before any pass reaches here, so a call held for
+    // startup recovery waits queued for the drain that follows readiness.
+    if !orch.startup_readiness.is_ready() {
+        return false;
+    }
     loop {
         let Ok(Some(next_lease)) = lease_next_call(orch, lane, ceiling) else {
             return false;
@@ -1981,7 +2008,7 @@ mod restart_call_tests {
         seq: i64,
     ) {
         let owner = owner.map_or("NULL".to_string(), |owner| format!("'{owner}'"));
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO jobs (id, project_id, issue_id, parent_job_id, status, agent_config_id, output_contract, uri_segment, node_name, created_at, updated_at) VALUES ('j-{run}','p','i','j-wf','running','Explore','{{\"schemaType\":\"return\"}}','{run}','Explore',1,1);
              INSERT INTO sessions (id, job_id, created_at, updated_at) VALUES ('s-{run}','j-{run}',1,1);
              INSERT INTO runs (id, job_id, issue_id, project_id, session_id, status, start_mode, created_at, updated_at) VALUES ('{run}','j-{run}','i','p','s-{run}','{run_status}','fresh',1,1);

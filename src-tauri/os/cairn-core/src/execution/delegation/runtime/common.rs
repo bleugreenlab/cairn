@@ -2,6 +2,7 @@ use crate::effects::types::WorkflowEffect;
 use crate::models::{AgentConfig, DelegatedStatus};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
+use cairn_workflow::delegated_packets as packets;
 
 use crate::execution::delegation::{
     create_call_packet, create_or_reuse_task_packet, CreateCallPacketInput,
@@ -251,21 +252,16 @@ pub(super) async fn persist_task_packet(
     background: bool,
 ) -> Result<crate::models::DelegatedWorkPacket, String> {
     let db = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id).await?;
-    // Serialize snapshot read-modify-write per execution to prevent concurrent
-    // batch_tasks calls from overwriting each other's packets.
+    // Serialize packet creation per execution, so two spawns of the same retried
+    // task cannot both miss each other's packet and create two, and so
+    // advancement's DAG reduction (which holds this lock) never expands a packet
+    // whose spawn is still in flight.
     let lock = orch.execution_lock(execution_id);
     let _guard = lock.lock().await;
 
-    let snapshot_json = select_optional_text(
-        &db,
-        "SELECT snapshot FROM executions WHERE id = ?1",
-        execution_id,
-    )
-    .await
-    .map_err(|e| format!("Failed to load execution: {}", e))?;
-    let snapshot_json = snapshot_json.ok_or("Execution has no snapshot")?;
-    let mut snapshot = crate::config::snapshot_migrate::load(&snapshot_json)
-        .map_err(|e| format!("Failed to parse execution snapshot: {}", e))?;
+    let existing = packets::list_db(&db, execution_id)
+        .await
+        .map_err(|e| format!("Failed to load delegated packets: {}", e))?;
 
     let parent_turn_id = match select_optional_text(
         &db,
@@ -297,8 +293,8 @@ pub(super) async fn persist_task_packet(
         payload.output_schema.as_ref(),
     )?;
 
-    let packet = create_or_reuse_task_packet(
-        &mut snapshot,
+    let (packet, created) = create_or_reuse_task_packet(
+        &existing,
         CreateDelegatedPacketInput {
             parent_job_id: &parent_ctx.job_id,
             parent_turn_id: parent_turn_id.as_deref(),
@@ -318,17 +314,16 @@ pub(super) async fn persist_task_packet(
         },
     );
 
-    let snapshot_json = serde_json::to_string(&snapshot)
-        .map_err(|e| format!("Failed to serialize execution snapshot: {}", e))?;
-    update_execution_snapshot(&db, execution_id, snapshot_json)
-        .await
-        .map_err(|e| format!("Failed to persist delegated packet: {}", e))?;
+    if created {
+        packets::insert_db(&db, execution_id, &packet)
+            .await
+            .map_err(|e| format!("Failed to persist delegated packet: {}", e))?;
+    }
 
     Ok(packet)
 }
 
-/// Persist a pre-materialized call packet into the execution snapshot
-/// (CAIRN-2481). The call sibling of [`persist_task_packet`]: it takes the same
+/// Persist a pre-materialized call packet (CAIRN-2481). The call sibling of [`persist_task_packet`]: it takes the same
 /// per-execution snapshot lock and anchor resolution, but writes a `Materialized`
 /// `CallTool` packet whose `result_artifact_job_id` is the already-created call
 /// job, so the DAG never expands it into a node.
@@ -349,21 +344,9 @@ pub(super) async fn persist_call_packet(
     background: bool,
 ) -> Result<crate::models::DelegatedWorkPacket, String> {
     let db = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id).await?;
-    // Serialize the snapshot read-modify-write per execution so a batch of calls
-    // never overwrites each other's packets.
+    // Serialize packet creation per execution, as `persist_task_packet` does.
     let lock = orch.execution_lock(execution_id);
     let _guard = lock.lock().await;
-
-    let snapshot_json = select_optional_text(
-        &db,
-        "SELECT snapshot FROM executions WHERE id = ?1",
-        execution_id,
-    )
-    .await
-    .map_err(|e| format!("Failed to load execution: {}", e))?;
-    let snapshot_json = snapshot_json.ok_or("Execution has no snapshot")?;
-    let mut snapshot = crate::config::snapshot_migrate::load(&snapshot_json)
-        .map_err(|e| format!("Failed to parse execution snapshot: {}", e))?;
 
     let parent_turn_id = match select_optional_text(
         &db,
@@ -388,53 +371,27 @@ pub(super) async fn persist_call_packet(
     .as_deref()
     .and_then(crate::backends::backend_for_model);
 
-    let packet = create_call_packet(
-        &mut snapshot,
-        CreateCallPacketInput {
-            parent_job_id: &parent_ctx.job_id,
-            parent_turn_id: parent_turn_id.as_deref(),
-            parent_tool_use_id,
-            title,
-            problem_statement,
-            agent_config_id,
-            cwd,
-            output_contract,
-            result_artifact_job_id,
-            task_index,
-            tier_override,
-            backend_preference: parent_backend,
-            background,
-        },
-    );
+    let packet = create_call_packet(CreateCallPacketInput {
+        parent_job_id: &parent_ctx.job_id,
+        parent_turn_id: parent_turn_id.as_deref(),
+        parent_tool_use_id,
+        title,
+        problem_statement,
+        agent_config_id,
+        cwd,
+        output_contract,
+        result_artifact_job_id,
+        task_index,
+        tier_override,
+        backend_preference: parent_backend,
+        background,
+    });
 
-    let snapshot_json = serde_json::to_string(&snapshot)
-        .map_err(|e| format!("Failed to serialize execution snapshot: {}", e))?;
-    update_execution_snapshot(&db, execution_id, snapshot_json)
+    packets::insert_db(&db, execution_id, &packet)
         .await
         .map_err(|e| format!("Failed to persist call packet: {}", e))?;
 
     Ok(packet)
-}
-
-async fn update_execution_snapshot(
-    db: &LocalDb,
-    execution_id: &str,
-    snapshot_json: String,
-) -> DbResult<()> {
-    let execution_id = execution_id.to_string();
-    db.write(|conn| {
-        let execution_id = execution_id.clone();
-        let snapshot_json = snapshot_json.clone();
-        Box::pin(async move {
-            conn.execute(
-                "UPDATE executions SET snapshot = ?1 WHERE id = ?2",
-                (snapshot_json.as_str(), execution_id.as_str()),
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
 }
 
 pub(super) async fn latest_run_for_job(
@@ -467,26 +424,13 @@ pub(super) async fn refresh_packet_state(
     execution_id: &str,
     packet_id: &str,
 ) -> Result<Option<crate::models::DelegatedWorkPacket>, String> {
-    let snapshot_json = select_optional_text(
-        db,
-        "SELECT snapshot FROM executions WHERE id = ?1",
-        execution_id,
-    )
-    .await
-    .map_err(|e| format!("Failed to load execution: {}", e))?;
-    let snapshot_json = snapshot_json.ok_or("Execution has no snapshot")?;
-    let mut snapshot = crate::config::snapshot_migrate::load(&snapshot_json)
-        .map_err(|e| format!("Failed to parse snapshot: {}", e))?;
-
-    let mut changed = false;
-    let Some(index) = snapshot
-        .delegated_packets
-        .iter()
-        .position(|packet| packet.id == packet_id)
+    let Some(mut packet) = packets::get_db(db, execution_id, packet_id)
+        .await
+        .map_err(|e| format!("Failed to load delegated packet: {}", e))?
     else {
         return Ok(None);
     };
-    let packet = &mut snapshot.delegated_packets[index];
+    let mut changed = false;
 
     if let Some(job_id) = &packet.result_artifact_job_id {
         let job_status = select_optional_text(db, "SELECT status FROM jobs WHERE id = ?1", job_id)
@@ -523,67 +467,22 @@ pub(super) async fn refresh_packet_state(
         }
     }
 
-    let result = packet.clone();
     if changed {
-        let status = serde_json::to_value(&result.status)
-            .map_err(|e| format!("Failed to serialize packet status: {}", e))?;
-        write_packet_field(db, execution_id, &snapshot, index, "status", status)
+        // Status alone, field by field: packet state is written by callers
+        // that hold no common lock (the spawn, the resume gate a child's
+        // completion fires, a start-failure wake), and a whole-packet write
+        // from this earlier read would undo another caller's change, bringing
+        // a retired packet back `Pending` or unlinking its job.
+        let change = packets::PacketChange {
+            status: Some(packet.status.clone()),
+            ..Default::default()
+        };
+        packets::update_db(db, execution_id, packet_id, &change)
             .await
             .map_err(|e| format!("Failed to update delegated packet status: {}", e))?;
     }
 
-    Ok(Some(result))
-}
-
-/// Write one field of one delegated packet without rewriting the rest of the
-/// execution snapshot.
-///
-/// Packet state is written by callers that hold no common lock — the spawn, the
-/// resume gate a child's completion fires, a start-failure wake on its own
-/// thread — and each read the snapshot before writing it. Rewriting the whole
-/// snapshot from that earlier read would erase whatever another caller wrote in
-/// between: a retired packet would come back `Pending` and be expanded into an
-/// orphan child, a linked job would be unlinked. Patching just this field, and
-/// only while the packet is still at the index it was read from, cannot. A
-/// stored snapshot whose shape the in-place patch cannot address (one the loader
-/// migrates on read) falls back to writing the snapshot as loaded.
-async fn write_packet_field(
-    db: &LocalDb,
-    execution_id: &str,
-    loaded: &crate::models::ExecutionSnapshot,
-    index: usize,
-    field: &str,
-    value: serde_json::Value,
-) -> DbResult<()> {
-    let packet_id = loaded.delegated_packets[index].id.clone();
-    let patched = db
-        .execute(
-            "UPDATE executions
-             SET snapshot = json_set(snapshot, ?3, json(?4))
-             WHERE id = ?1 AND json_extract(snapshot, ?5) = ?2",
-            cairn_db::turso::params![
-                execution_id.to_string(),
-                packet_id,
-                format!("$.delegatedPackets[{index}].{field}"),
-                value.to_string(),
-                format!("$.delegatedPackets[{index}].id"),
-            ],
-        )
-        .await?;
-    if patched == 1 {
-        return Ok(());
-    }
-    let mut snapshot = loaded.clone();
-    let packet = serde_json::to_value(&snapshot.delegated_packets[index])
-        .and_then(|mut packet| {
-            packet[field] = value;
-            serde_json::from_value(packet)
-        })
-        .map_err(|e| crate::storage::DbError::internal(e.to_string()))?;
-    snapshot.delegated_packets[index] = packet;
-    let snapshot_json = serde_json::to_string(&snapshot)
-        .map_err(|e| crate::storage::DbError::internal(e.to_string()))?;
-    update_execution_snapshot(db, execution_id, snapshot_json).await
+    Ok(Some(packet))
 }
 
 /// Settle a packet that advancement did not link to a child job: link it to the
@@ -615,24 +514,12 @@ pub(super) async fn link_or_retire_unmaterialized_packet(
     let lock = orch.execution_lock(execution_id);
     let _guard = lock.lock().await;
 
-    let snapshot_json = select_optional_text(
-        db,
-        "SELECT snapshot FROM executions WHERE id = ?1",
-        execution_id,
-    )
-    .await
-    .map_err(|e| format!("Failed to load execution: {}", e))?
-    .ok_or("Execution has no snapshot")?;
-    let snapshot = crate::config::snapshot_migrate::load(&snapshot_json)
-        .map_err(|e| format!("Failed to parse execution snapshot: {}", e))?;
-    let Some(index) = snapshot
-        .delegated_packets
-        .iter()
-        .position(|packet| packet.id == packet_id)
+    let Some(packet) = packets::get_db(db, execution_id, packet_id)
+        .await
+        .map_err(|e| format!("Failed to load delegated packet: {}", e))?
     else {
         return Ok(None);
     };
-    let packet = &snapshot.delegated_packets[index];
     if let Some(job_id) = packet.result_artifact_job_id.clone() {
         return Ok(Some(job_id));
     }
@@ -654,22 +541,24 @@ pub(super) async fn link_or_retire_unmaterialized_packet(
         .await
         .map_err(|e| format!("Failed to look up delegated job: {}", e))?;
 
-    let (field, value) = match &node_job {
-        Some(job_id) => ("resultArtifactJobId", serde_json::json!(job_id)),
+    let change = match &node_job {
+        Some(job_id) => packets::PacketChange {
+            result_artifact_job_id: Some(job_id.clone()),
+            ..Default::default()
+        },
         None if matches!(
             packet.status,
             DelegatedStatus::Pending | DelegatedStatus::Materialized
         ) =>
         {
-            (
-                "status",
-                serde_json::to_value(DelegatedStatus::Failed)
-                    .map_err(|e| format!("Failed to serialize packet status: {}", e))?,
-            )
+            packets::PacketChange {
+                status: Some(DelegatedStatus::Failed),
+                ..Default::default()
+            }
         }
         None => return Ok(None),
     };
-    write_packet_field(db, execution_id, &snapshot, index, field, value)
+    packets::update_db(db, execution_id, packet_id, &change)
         .await
         .map_err(|e| format!("Failed to settle delegated packet: {}", e))?;
     Ok(node_job)

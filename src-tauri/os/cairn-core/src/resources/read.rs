@@ -27,6 +27,7 @@ use super::node::{
     read_task_chat_event, read_task_chat_raw, read_task_chat_turn, read_task_checks,
     read_task_permission, read_task_permissions,
 };
+use super::paging::{paging, RecordPage};
 use super::progress::read_node_progress;
 use super::rebase::read_node_rebase;
 use super::symbols::{read_node_symbols, read_project_symbols};
@@ -80,6 +81,8 @@ pub(crate) struct RenderedResource {
     /// of `total_units`. `None` when the body is the whole result.
     pub grep_shown: Option<usize>,
     pub record_prelude_lines: Option<usize>,
+    /// `Record` with no countable total: the producer saw another page.
+    pub more_records: bool,
     pub affordance: Option<Affordance>,
     /// Image blocks (e.g. a browser screenshot) lifted into the read envelope
     /// alongside the text body. Empty for ordinary text resources.
@@ -101,127 +104,6 @@ pub(crate) async fn run_condition_sql(
     )
     .await
     .map(|page| (page.body, page.shown, page.total))
-}
-
-async fn resolve_thread_for_resource(
-    orch: &Orchestrator,
-    project: &str,
-    name: &str,
-) -> Result<(std::sync::Arc<LocalDb>, String), String> {
-    let db = orch.db.for_project(project).await;
-    let thread_id = super::threads::resolve_thread_id(&db, project, name)
-        .await?
-        .ok_or_else(|| format!("Thread '{name}' not found in {project}"))?;
-    Ok((db, thread_id))
-}
-
-fn render_procedure(procedure: &crate::threads::procedures::Procedure) -> String {
-    let mut out = format!("# Procedure `{}`\n", procedure.name);
-    if let Some(description) = &procedure.description {
-        out.push_str(&format!("\n{description}\n"));
-    }
-
-    out.push_str(&format!(
-        "\nCreated: {}\nUpdated: {}\n\n```json\n{}\n```",
-        procedure.created_at,
-        procedure.updated_at,
-        serde_json::to_string_pretty(&procedure.body).unwrap_or_else(|_| "{}".to_string())
-    ));
-    out
-}
-
-async fn render_thread_procedures(
-    orch: &Orchestrator,
-    project: &str,
-    name: &str,
-    selected: Option<&str>,
-) -> String {
-    let (_, thread_id) = match resolve_thread_for_resource(orch, project, name).await {
-        Ok(value) => value,
-        Err(error) => return error,
-    };
-    if let Some(procedure_name) = selected {
-        return match crate::threads::procedures::get(&thread_id, procedure_name).await {
-            Ok(Some(procedure)) => render_procedure(&procedure),
-            Ok(None) => format!("Procedure `{procedure_name}` not found"),
-            Err(error) => error,
-        };
-    }
-    match crate::threads::procedures::list(&thread_id).await {
-        Ok(procedures) if procedures.is_empty() => {
-            "# Procedures\n\nNo procedures stored.".to_string()
-        }
-        Ok(procedures) => {
-            let mut out = "# Procedures\n".to_string();
-            for procedure in procedures {
-                out.push_str(&format!(
-                    "\n- [`{}`](cairn://p/{project}/{name}/procedures/{})",
-                    procedure.name, procedure.name
-                ));
-                if let Some(description) = procedure.description {
-                    out.push_str(&format!(" — {description}"));
-                }
-            }
-            out
-        }
-        Err(error) => error,
-    }
-}
-
-fn render_automation(automation: &crate::orchestrator::automations::ThreadAutomation) -> String {
-    let next_due = automation.next_due_at(chrono::Utc::now().timestamp());
-    let args = serde_json::to_string(&automation.args).unwrap_or_else(|_| "[]".to_string());
-    format!(
-        "# Automation `{}`\n\nProcedure: `{}`\nState: {}\nEvery: {} ms\nArgs: `{}`\nNext due: {}\nLast fired: {}\nLast run: {}\nLast status: {}\nLast error: {}\nConsecutive failures: {}",
-        automation.id, automation.procedure_name, automation.state, automation.every_ms, args,
-        next_due.map_or_else(|| "none".into(), |v| v.to_string()),
-        automation.last_fired_occurrence_at.map_or_else(|| "never".into(), |v| v.to_string()),
-        automation.last_run_id.as_deref().unwrap_or("none"),
-        automation.last_status.as_deref().unwrap_or("none"),
-        automation.last_error.as_deref().unwrap_or("none"),
-        automation.consecutive_failures
-    )
-}
-
-async fn render_thread_automations(
-    orch: &Orchestrator,
-    project: &str,
-    name: &str,
-    selected: Option<&str>,
-) -> String {
-    let (db, thread_id) = match resolve_thread_for_resource(orch, project, name).await {
-        Ok(value) => value,
-        Err(error) => return error,
-    };
-    if let Some(id) = selected {
-        return match crate::orchestrator::automations::get_thread_automation(&db, &thread_id, id)
-            .await
-        {
-            Ok(Some(automation)) => render_automation(&automation),
-            Ok(None) => format!("Automation `{id}` not found"),
-            Err(error) => error,
-        };
-    }
-    match crate::orchestrator::automations::list_thread_automations(&db, &thread_id).await {
-        Ok(automations) if automations.is_empty() => {
-            "# Automations\n\nNo automations configured.".to_string()
-        }
-        Ok(automations) => {
-            let mut out = "# Automations\n".to_string();
-            for automation in automations {
-                out.push_str(&format!(
-                    "\n- [`{}`](cairn://p/{project}/{name}/automations/{}) — `{}` every {} ms ({})",
-                    automation.id,
-                    automation.id,
-                    automation.procedure_name,
-                    automation.every_ms,
-                    automation.state
-                ));
-            }
-            out
-        }
-        Err(error) => error,
-    }
 }
 
 fn desktop_health_ready(health: &serde_json::Value) -> bool {
@@ -295,6 +177,7 @@ impl RenderedResource {
             match_count: None,
             grep_shown: None,
             record_prelude_lines: None,
+            more_records: false,
             affordance,
             images: Vec::new(),
         }
@@ -319,6 +202,27 @@ impl RenderedResource {
             match_count: window.match_count,
             grep_shown: window.shown,
             record_prelude_lines: None,
+            more_records: false,
+            affordance,
+            images: Vec::new(),
+        }
+    }
+
+    /// A page of records the renderer paged itself with its own
+    /// `offset`/`limit`. The view continues it in records, never in lines.
+    fn record(page: RecordPage, affordance: Option<Affordance>) -> Self {
+        Self {
+            content: page.body,
+            natural_unit: NaturalUnit::Record,
+            unit_noun: Some(page.noun),
+            total_units: page.total,
+            shown_units: Some(page.shown),
+            offset: Some(page.offset as i64),
+            limit: Some(page.limit),
+            match_count: None,
+            grep_shown: None,
+            record_prelude_lines: page.prelude_lines,
+            more_records: page.total.is_none() && page.more,
             affordance,
             images: Vec::new(),
         }
@@ -344,6 +248,7 @@ impl RenderedResource {
             match_count: None,
             grep_shown: None,
             record_prelude_lines: None,
+            more_records: false,
             affordance,
             images: Vec::new(),
         }
@@ -368,8 +273,16 @@ fn rendered_chat_total_turns(content: &str) -> Option<usize> {
         .and_then(|value| value.parse::<usize>().ok())
 }
 
-const DB_SQL_DEFAULT_LIMIT: usize = 100;
-const DB_SQL_MAX_LIMIT: usize = 1_000;
+pub(super) const DB_SQL_DEFAULT_LIMIT: usize = 100;
+pub(super) const DB_SQL_MAX_LIMIT: usize = 1_000;
+
+/// Best-effort connection guard for every database read projection. The SQL
+/// validator (for `?sql=`), the row engine's generated SELECTs, and the read
+/// transaction are the durable safety layers; `query_only` prevents accidental
+/// writes if Turso supports the SQLite pragma in this build.
+pub(super) async fn enter_query_only(conn: &cairn_db::turso::Connection) {
+    let _ = conn.execute("PRAGMA query_only = ON", ()).await;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DbSqlFormat {
@@ -512,6 +425,7 @@ async fn produce_schema_overview(
         match_count: None,
         grep_shown: None,
         record_prelude_lines: None,
+        more_records: false,
         affordance,
         images: Vec::new(),
     }
@@ -542,6 +456,7 @@ async fn produce_sql_resource(
             match_count: None,
             grep_shown: None,
             record_prelude_lines: Some(page.prelude_lines),
+            more_records: false,
             affordance,
             images: Vec::new(),
         },
@@ -559,6 +474,23 @@ async fn produce_db_sql_resource(
     produce_sql_resource(&orch.db.local, params, affordance, "cairn://db").await
 }
 
+/// Resolve a thread by name and open its existing database. `Ok(None)` when the
+/// thread has never written its database; `Err` carries a reader-facing reason
+/// (the thread is unknown, or the store failed to open).
+pub(crate) async fn open_thread_store(
+    orch: &Orchestrator,
+    project: &str,
+    name: &str,
+) -> Result<Option<std::sync::Arc<LocalDb>>, String> {
+    let routed = orch.db.for_project(project).await;
+    let thread_id = super::threads::resolve_thread_id(&routed, project, name)
+        .await?
+        .ok_or_else(|| format!("Thread '{name}' not found in {project}"))?;
+    crate::threads::db_store::open_existing(&thread_id)
+        .await
+        .map_err(|error| format!("Failed to open thread database: {error}"))
+}
+
 async fn produce_thread_db_resource(
     orch: &Orchestrator,
     project: &str,
@@ -566,25 +498,12 @@ async fn produce_thread_db_resource(
     params: &[QueryParam],
     affordance: Option<Affordance>,
 ) -> RenderedResource {
-    let routed = orch.db.for_project(project).await;
-    let thread_id = match super::threads::resolve_thread_id(&routed, project, name).await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            return RenderedResource::line(
-                format!("Thread '{name}' not found in {project}"),
-                affordance,
-                None,
-                None,
-            )
-        }
-        Err(error) => return RenderedResource::line(error, affordance, None, None),
-    };
     if let Some(sql) = find_query_value(params, "sql") {
         if let Err(refusal) = super::sql_policy::refuse_retired_rulings(sql) {
             return RenderedResource::line(refusal, affordance, None, None);
         }
     }
-    let db = match crate::threads::db_store::open_existing(&thread_id).await {
+    let db = match open_thread_store(orch, project, name).await {
         Ok(Some(db)) => db,
         Ok(None) => {
             let message = if find_query_value(params, "sql").is_some() {
@@ -594,14 +513,7 @@ async fn produce_thread_db_resource(
             };
             return RenderedResource::line(message.to_string(), affordance, None, None);
         }
-        Err(error) => {
-            return RenderedResource::line(
-                format!("Failed to open thread database: {error}"),
-                affordance,
-                None,
-                None,
-            )
-        }
+        Err(error) => return RenderedResource::line(error, affordance, None, None),
     };
     produce_sql_resource(
         &db,
@@ -619,20 +531,7 @@ async fn produce_thread_db_schema_resource(
     name: &str,
     affordance: Option<Affordance>,
 ) -> RenderedResource {
-    let routed = orch.db.for_project(project).await;
-    let thread_id = match super::threads::resolve_thread_id(&routed, project, name).await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            return RenderedResource::line(
-                format!("Thread '{name}' not found in {project}"),
-                affordance,
-                None,
-                None,
-            )
-        }
-        Err(error) => return RenderedResource::line(error, affordance, None, None),
-    };
-    let db = match crate::threads::db_store::open_existing(&thread_id).await {
+    let db = match open_thread_store(orch, project, name).await {
         Ok(Some(db)) => db,
         Ok(None) => {
             return RenderedResource::line(
@@ -642,14 +541,7 @@ async fn produce_thread_db_schema_resource(
                 None,
             )
         }
-        Err(error) => {
-            return RenderedResource::line(
-                format!("Failed to open thread database: {error}"),
-                affordance,
-                None,
-                None,
-            )
-        }
+        Err(error) => return RenderedResource::line(error, affordance, None, None),
     };
     match super::sql_schema::render_source(&db).await {
         Ok(source) => RenderedResource::line(source, affordance, None, None),
@@ -659,6 +551,53 @@ async fn produce_thread_db_schema_resource(
             None,
             None,
         ),
+    }
+}
+
+/// A table or row under either database root, through the shared row engine.
+/// The application database is read-only; a thread's database is writable by
+/// its owner, which the write path enforces, so its affordance advertises the
+/// structured writes to every reader.
+async fn produce_db_rows_resource(
+    orch: &Orchestrator,
+    resource: &CairnResource,
+    table: &str,
+    pk: Option<&str>,
+    params: &[QueryParam],
+    affordance: Option<Affordance>,
+) -> RenderedResource {
+    use super::db_rows::{produce, Store};
+    match resource {
+        CairnResource::ThreadDbTable { project, name, .. }
+        | CairnResource::ThreadDbRow { project, name, .. } => {
+            let root = format!("{}/db", cairn_common::uri::build_thread_uri(project, name));
+            let db = match open_thread_store(orch, project, name).await {
+                Ok(Some(db)) => db,
+                Ok(None) => {
+                    return RenderedResource::line(
+                        format!("(thread database not created; write CREATE TABLE SQL to {root} to create it)"),
+                        affordance,
+                        None,
+                        None,
+                    )
+                }
+                Err(error) => return RenderedResource::line(error, affordance, None, None),
+            };
+            let store = Store {
+                db: &db,
+                root,
+                writable: true,
+            };
+            produce(&store, table, pk, params, resource, affordance).await
+        }
+        _ => {
+            let store = Store {
+                db: &orch.db.local,
+                root: "cairn://db".to_string(),
+                writable: false,
+            };
+            produce(&store, table, pk, params, resource, affordance).await
+        }
     }
 }
 
@@ -763,10 +702,7 @@ async fn run_sql_projection(
     let format = projection.format;
     db.read(move |conn| {
         Box::pin(async move {
-            // Best-effort connection guard. The SQL validator and read transaction
-            // are the durable safety layers; query_only prevents accidental writes
-            // if Turso supports the SQLite pragma in this build.
-            let _ = conn.execute("PRAGMA query_only = ON", ()).await;
+            enter_query_only(conn).await;
             let mut rows = conn.query(&sql, ()).await?;
             let columns = rows.column_names();
             let prelude_lines = match format {
@@ -880,7 +816,7 @@ fn render_sql_json_lines(
     lines.join("\n")
 }
 
-fn sql_value_to_json(value: Value) -> serde_json::Value {
+pub(super) fn sql_value_to_json(value: Value) -> serde_json::Value {
     match value {
         Value::Null => serde_json::Value::Null,
         Value::Integer(value) => serde_json::json!(value),
@@ -904,7 +840,7 @@ fn sql_value_to_json(value: Value) -> serde_json::Value {
     }
 }
 
-fn render_sql_value(value: Value) -> String {
+pub(super) fn render_sql_value(value: Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
         Value::Integer(value) => value.to_string(),
@@ -1296,7 +1232,10 @@ pub(crate) async fn produce_cairn_resource(
 
     let raw_artifact = matches!(
         resource,
-        CairnResource::NodeArtifact { .. } | CairnResource::TaskArtifact { .. }
+        CairnResource::NodeArtifact { .. }
+            | CairnResource::TaskArtifact { .. }
+            | CairnResource::NodePage { .. }
+            | CairnResource::ThreadService { .. }
     ) && find_query_value(&split.params, "format") == Some("json");
     // A raw artifact read returns the stored JSON and nothing else, so a caller
     // can parse the read result directly. That holds for the arc too, whose JSON
@@ -1446,12 +1385,20 @@ pub(crate) async fn produce_cairn_resource(
             | CairnResource::NodeDiff { .. }
             | CairnResource::ProjectVcsDiff { .. }
     );
-    match crate::mcp::handlers::search::body_grep_payload(&split.params, allow_glob) {
+    // A renderer that pages its own records keeps `offset`/`limit` under grep:
+    // they choose the page grep searches, and only `head_limit` caps matches.
+    let renderer_pages = paging(resource.kind()).renderer_owns_offset();
+    match crate::mcp::handlers::search::body_grep_payload_with(
+        &split.params,
+        allow_glob,
+        renderer_pages,
+    ) {
         Err(error) => return RenderedResource::line(error, affordance, None, None),
         Ok(Some(payload)) => {
             // Record collections page by SQL/cursor; under grep the entire
             // filtered set must be rendered before grep, so force an unbounded
-            // limit in place of the default page.
+            // limit in place of the default page, unless the caller paged the
+            // collection itself.
             let record_collection = matches!(
                 resource,
                 CairnResource::ProjectIssues { .. }
@@ -1460,8 +1407,16 @@ pub(crate) async fn produce_cairn_resource(
                     | CairnResource::NodeMessages { .. }
                     | CairnResource::TaskMessages { .. }
             );
-            let mut body_params = strip_params(&split.params, GREP_FAMILY_KEYS);
-            if record_collection {
+            let caller_pages = renderer_pages
+                && (find_query_value(&split.params, "offset").is_some()
+                    || find_query_value(&split.params, "limit").is_some());
+            let grep_keys: Vec<&str> = GREP_FAMILY_KEYS
+                .iter()
+                .copied()
+                .filter(|key| !renderer_pages || !matches!(*key, "offset" | "limit"))
+                .collect();
+            let mut body_params = strip_params(&split.params, &grep_keys);
+            if record_collection && !caller_pages {
                 body_params.push(QueryParam {
                     key: "limit".to_string(),
                     value: GREP_RECORD_RENDER_LIMIT.to_string(),
@@ -1501,6 +1456,32 @@ pub(crate) async fn produce_cairn_resource(
 
     if let CairnResource::ThreadDbSchema { project, name } = &resource {
         return produce_thread_db_schema_resource(orch, project, name, affordance).await;
+    }
+
+    match &resource {
+        CairnResource::ThreadDbTable { table, .. } | CairnResource::DbTable { table } => {
+            return produce_db_rows_resource(
+                orch,
+                &resource,
+                table,
+                None,
+                &split.params,
+                affordance,
+            )
+            .await;
+        }
+        CairnResource::ThreadDbRow { table, pk, .. } | CairnResource::DbRow { table, pk } => {
+            return produce_db_rows_resource(
+                orch,
+                &resource,
+                table,
+                Some(pk),
+                &split.params,
+                affordance,
+            )
+            .await;
+        }
+        _ => {}
     }
 
     if matches!(resource, CairnResource::DevDb) {
@@ -1558,6 +1539,7 @@ pub(crate) async fn produce_cairn_resource(
                 match_count: None,
                 grep_shown: None,
                 record_prelude_lines: None,
+                more_records: false,
                 affordance,
                 images: Vec::new(),
             },
@@ -1590,6 +1572,7 @@ pub(crate) async fn produce_cairn_resource(
             match_count: None,
             grep_shown: None,
             record_prelude_lines: None,
+            more_records: false,
             affordance,
             images: Vec::new(),
         };
@@ -1644,12 +1627,29 @@ pub(crate) async fn produce_cairn_resource(
     ) && find_query_value(&split.params, "format")
         == Some("json");
     let is_raw_line_resource = is_structured_raw_transcript || raw_artifact;
-    // Record pagers: `offset`/`limit` page records (commits), not rendered
-    // lines, so both reach the renderer and the view does not re-window.
-    let renderer_pages_records = matches!(resource, CairnResource::ProjectVcsLog { .. });
-    let body_params = if renderer_pages_records {
-        strip_params(&split.params, &["char_offset"])
-    } else if renderer_owns_params || is_browser_resource {
+
+    // A renderer that pages its own records receives both keys and returns a
+    // page the view continues in records, so a budget cut can never resume a
+    // line count's worth of records further on.
+    if renderer_pages {
+        let body_params = strip_params(&split.params, &["char_offset"]);
+        if let Some(page) = produce_record_page(orch, request, &resource, &body_params).await {
+            return match page {
+                Ok(mut page) => {
+                    if let Some(canonical) = migrated_annotation {
+                        page.body = with_migrated_annotation(&canonical, &page.body);
+                        page.prelude_lines = page
+                            .prelude_lines
+                            .map(|lines| lines + MIGRATED_ANNOTATION_LINES);
+                    }
+                    RenderedResource::record(page, affordance)
+                }
+                Err(error) => RenderedResource::line(error, affordance, None, None),
+            };
+        }
+    }
+
+    let body_params = if renderer_owns_params || is_browser_resource {
         strip_params(&split.params, &["offset"])
     } else if is_raw_line_resource {
         strip_params(&split.params, &["offset", "limit", "char_offset"])
@@ -1658,9 +1658,7 @@ pub(crate) async fn produce_cairn_resource(
     };
     let mut content = render_resource_body(orch, request, &resource, body_params).await;
     if let Some(canonical) = migrated_annotation {
-        content = format!("> This numeric address is retained for migrated history; this thread is now at {canonical}.
-
-{content}");
+        content = with_migrated_annotation(&canonical, &content);
     }
     if is_raw_line_resource {
         if let Some(char_offset) = view_char_offset {
@@ -1671,17 +1669,70 @@ pub(crate) async fn produce_cairn_resource(
     RenderedResource::line(
         content,
         affordance,
-        if renderer_pages_records {
-            None
-        } else {
-            view_offset
-        },
-        if renderer_owns_params || renderer_pages_records {
+        view_offset,
+        if renderer_owns_params {
             None
         } else {
             view_limit
         },
     )
+}
+
+/// Lines [`with_migrated_annotation`] puts ahead of a body.
+const MIGRATED_ANNOTATION_LINES: usize = 2;
+
+fn with_migrated_annotation(canonical: &str, content: &str) -> String {
+    format!(
+        "> This numeric address is retained for migrated history; this thread is now at {canonical}.\n\n{content}"
+    )
+}
+
+/// The page of a resource whose renderer pages its own records, for the
+/// [`super::paging::Paging::Records`] kinds not produced earlier in [`produce_cairn_resource`]
+/// (the database collections and `/issues` have their own producers). `None`
+/// for every other resource.
+async fn produce_record_page(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    resource: &CairnResource,
+    params: &[QueryParam],
+) -> Option<Result<RecordPage, String>> {
+    Some(match resource {
+        CairnResource::ProjectVcsLog { project } => {
+            super::vcs::read_log_page(orch, request, project, params).await
+        }
+        CairnResource::ProjectEvents { project } => {
+            super::events::list_page(orch, Some(project), params).await
+        }
+        CairnResource::WorkspaceEvents => super::events::list_page(orch, None, params).await,
+        CairnResource::NodeEras {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        } => {
+            super::eras::read_node_eras_page(orch, project, *number, *exec_seq, node_id, params)
+                .await
+        }
+        CairnResource::ProjectCheckResults { project, revision } => {
+            super::check_results::read_project_check_results_page(
+                orch, request, project, revision, params,
+            )
+            .await
+        }
+        CairnResource::NodeRebase {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        } => {
+            return super::rebase::read_node_rebase_page(
+                orch, project, *number, *exec_seq, node_id, params,
+            )
+            .await
+        }
+        _ => return None,
+    })
 }
 
 /// The database an attachment address reads through, plus its project id.
@@ -1840,19 +1891,18 @@ async fn render_resource_body(
                 .await
                 .content
         }
-        CairnResource::ThreadProcedures { project, name } => {
-            render_thread_procedures(orch, &project, &name, None).await
+        CairnResource::ThreadDbTable { ref table, .. } | CairnResource::DbTable { ref table } => {
+            produce_db_rows_resource(orch, resource, table, None, &params, None)
+                .await
+                .content
         }
-        CairnResource::ThreadProcedure {
-            project,
-            name,
-            procedure,
-        } => render_thread_procedures(orch, &project, &name, Some(&procedure)).await,
-        CairnResource::ThreadAutomations { project, name } => {
-            render_thread_automations(orch, &project, &name, None).await
+        CairnResource::ThreadDbRow {
+            ref table, ref pk, ..
         }
-        CairnResource::ThreadAutomation { project, name, id } => {
-            render_thread_automations(orch, &project, &name, Some(&id)).await
+        | CairnResource::DbRow { ref table, ref pk } => {
+            produce_db_rows_resource(orch, resource, table, Some(pk), &params, None)
+                .await
+                .content
         }
         CairnResource::Dev => produce_dev_collection_resource(None).await.content,
         CairnResource::DevDb => produce_dev_db_sql_resource(&params, None).await.content,
@@ -1893,11 +1943,14 @@ async fn render_resource_body(
             crate::resources::grants::read_grant(&orch.db.local, &id).await
         }
         // The cairn-inference facet: the stored inventory and the bginf link's
-        // last read, compared live on the pools page.
+        // last read, compared live on the pools page, and the pool controller's
+        // state and request queue.
         CairnResource::Inference
         | CairnResource::InferenceRecipes
         | CairnResource::InferenceDeployments
-        | CairnResource::InferencePools => {
+        | CairnResource::InferenceDeployment { .. }
+        | CairnResource::InferencePools
+        | CairnResource::InferenceRequests => {
             match crate::orchestrator::inference::load_view(orch).await {
                 Err(error) => format!("cairn://inference is unavailable: {error}"),
                 Ok(view) => match resource {
@@ -1909,6 +1962,12 @@ async fn render_resource_body(
                     }
                     CairnResource::InferenceDeployments => {
                         crate::resources::inference::render_deployments(&view, &params)
+                    }
+                    CairnResource::InferenceDeployment { id } => {
+                        crate::resources::inference::render_deployment(&view, id.as_str(), &params)
+                    }
+                    CairnResource::InferenceRequests => {
+                        crate::resources::inference::render_requests(&view, &params)
                     }
                     _ => crate::resources::inference::render_pools(&view, &params),
                 },
@@ -2942,6 +3001,31 @@ async fn render_resource_body(
                 read_node_era(orch, &project, number, exec_seq, &node_id, era_seq).await
             }
         }
+        CairnResource::ProjectPages { project } => {
+            crate::pages::read_project_pages(db, &project, &params).await
+        }
+        CairnResource::NodePages {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        } => {
+            if let Some(error) = reject_query_params("pages", &params) {
+                error
+            } else {
+                crate::pages::read_pages(db, &project, number, exec_seq, &node_id).await
+            }
+        }
+        page @ CairnResource::NodePage { .. } => {
+            let address =
+                crate::pages::PageAddress::from_resource(&page).expect("a NodePage names a page");
+            crate::pages::read_page(orch, request, db, &address, &params).await
+        }
+        log @ CairnResource::NodePageLog { .. } => {
+            let address =
+                crate::pages::PageAddress::from_resource(&log).expect("a NodePageLog names a page");
+            crate::pages::read_page_log(&orch.db.local, db, &address, &params).await
+        }
         CairnResource::Recipes => {
             if let Some(error) = reject_query_params("recipes", &params) {
                 error
@@ -3001,6 +3085,58 @@ async fn render_resource_body(
                 read_workflow(orch, request, &workflow_id, Some(&project)).await
             }
         }
+        CairnResource::ProjectServices { project } => {
+            if let Some(error) = reject_query_params("project services", &params) {
+                error
+            } else {
+                super::services::read_index(orch, &project).await
+            }
+        }
+        CairnResource::ProjectService { project, service } => {
+            if let Some(error) = reject_query_params("project service", &params) {
+                error
+            } else {
+                super::services::read_service(orch, &project, &service).await
+            }
+        }
+        CairnResource::ProjectServiceStatus { project, service } => {
+            if let Some(error) = reject_query_params("service status", &params) {
+                error
+            } else {
+                super::services::read_status(orch, &project, None, &service).await
+            }
+        }
+        CairnResource::ProjectServiceLog { project, service } => {
+            super::services::read_log(orch, &project, None, &service, &params).await
+        }
+        CairnResource::ThreadServices { project, name } => {
+            if let Some(error) = reject_query_params("thread services", &params) {
+                error
+            } else {
+                super::services::read_thread_index(orch, &project, &name).await
+            }
+        }
+        CairnResource::ThreadService {
+            project,
+            name,
+            service,
+        } => super::services::read_thread_service(orch, &project, &name, &service, &params).await,
+        CairnResource::ThreadServiceStatus {
+            project,
+            name,
+            service,
+        } => {
+            if let Some(error) = reject_query_params("service status", &params) {
+                error
+            } else {
+                super::services::read_status(orch, &project, Some(&name), &service).await
+            }
+        }
+        CairnResource::ThreadServiceLog {
+            project,
+            name,
+            service,
+        } => super::services::read_log(orch, &project, Some(&name), &service, &params).await,
         CairnResource::Routes => super::routes::collection(orch, request, None, &params).await,
         CairnResource::Route { route_id } => {
             super::routes::member(orch, request, &route_id, None).await
@@ -3846,12 +3982,14 @@ line2', X'0001020AFF', 2.5),
 
     async fn render_db_test_uri_at(orch: &Orchestrator, uri: &str, budget: u32) -> String {
         let request = McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: String::new(),
             run_id: None,
             tool: "read".to_string(),
             payload: serde_json::json!({}),
             tool_use_id: None,
+            origin: None,
         };
         let rendered = produce_cairn_resource(orch, &request, uri).await;
         let mut meta =
@@ -4216,12 +4354,14 @@ line2', X'0001020AFF', 2.5),
         assert!(imported.errors.is_empty(), "{:?}", imported.errors);
         assert_eq!(imported.inserted(), 1);
         let request = McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: String::new(),
             run_id: None,
             tool: "read".to_string(),
             payload: serde_json::json!({}),
             tool_use_id: None,
+            origin: None,
         };
 
         // (b) the tasks collection reads as a collection, not as "no artifact
@@ -4359,12 +4499,14 @@ line2', X'0001020AFF', 2.5),
         });
 
         let request = McpCallbackRequest {
+            answer_bound_ms: None,
             thread_id: None,
             cwd: String::new(),
             run_id: None,
             tool: "read".to_string(),
             payload: serde_json::json!({}),
             tool_use_id: None,
+            origin: None,
         };
         let rendered =
             produce_cairn_resource(&orch, &request, "cairn://p/brw/browser?interactive&limit=3")

@@ -116,25 +116,19 @@ impl std::fmt::Display for BoundedRearmLookupError {
 ///   attention projection deliberately leaves silent)
 /// - Otherwise: no emit (the turn ended cleanly with no work left).
 ///
-/// Returns `true` when an actionable fact was emitted, `false` when the turn
-/// ended with nothing for the driver to act on. The warm-transition caller uses
-/// this to gate the desktop "completed" toast so it fires only on a real
-/// idle-with-work, not on every intermediate turn-end (CAIRN-1625).
-///
 /// Fact construction is shared with the boundary wake (`wake_for_issue`) via
 /// [`attention::idle_fact_for_issue`] so the two paths cannot diverge. The
 /// terminalized `job_id` biases the open-PR lookup toward this builder's `/pr`.
-pub(super) fn emit_for_turn_end(orch: &Orchestrator, job_id: &str) -> bool {
+pub(super) fn emit_for_turn_end(orch: &Orchestrator, job_id: &str) {
     let Some((issue_id, ctx)) = issue_for_attention_by_job(orch, job_id) else {
-        return false;
+        return;
     };
     let issue_uri = ctx.issue_uri();
     // CAIRN-2483: this edge no longer creates the review push. Review firing is
     // gated on the whole issue being quiescent, with readiness re-evaluated from
     // turn-end checks completion, the job-terminal recompute hook, and the PR-open
     // edge. This function keeps only its idle-fact / `AttentionEvent`
-    // half, which still drives the desktop "completed" toast and `cairn watch`;
-    // `needs_attention` semantics are untouched.
+    // half, which drives `cairn watch`.
     //
     // Resolve the fact (and any detail URI) synchronously via the shared helper.
     let dbs = orch.db.clone();
@@ -158,7 +152,7 @@ pub(super) fn emit_for_turn_end(orch: &Orchestrator, job_id: &str) -> bool {
     .ok()
     .flatten();
     let Some(idle) = idle else {
-        return false;
+        return;
     };
     orch.emit_attention_event(crate::orchestrator::AttentionEvent {
         issue_id,
@@ -169,7 +163,6 @@ pub(super) fn emit_for_turn_end(orch: &Orchestrator, job_id: &str) -> bool {
         updated_at: idle.updated_at,
         route_provenance: None,
     });
-    true
 }
 
 /// Synchronously answer whether this job's work ships a pull request, from the
@@ -742,6 +735,10 @@ pub(super) struct BoundedRearmCandidate {
     pub(super) ran_at: i64,
     pub(super) check_name: String,
     pub(super) failure_kind: String,
+    /// The scope the newest row was written under. For a death charged to a
+    /// fleet counter this is that counter's scope, which is how the cadence
+    /// tells that this head already met the fleet it would meet again.
+    pub(super) environment_fingerprint: String,
 }
 
 pub(super) async fn bounded_rearm_candidate_job(
@@ -848,6 +845,7 @@ pub(super) const BOUNDED_REARM_CANDIDATES_SQL: &str = "WITH live_job AS (
                                c.input_hash AS input_hash, c.check_name AS check_name,
                                c.ran_at AS ran_at, c.failure_kind AS failure_kind,
                                c.infra_failure_streak AS infra_failure_streak,
+                               COALESCE(c.environment_fingerprint, '') AS environment_fingerprint,
                                ROW_NUMBER() OVER (
                                  PARTITION BY c.job_id, c.check_name
                                  ORDER BY c.ran_at DESC, c.rowid DESC
@@ -855,7 +853,8 @@ pub(super) const BOUNDED_REARM_CANDIDATES_SQL: &str = "WITH live_job AS (
                           FROM live_job lj
                          CROSS JOIN check_result_cache c ON c.job_id = lj.job_id
                       )
-                      SELECT job_id, tree_hash, input_hash, ran_at, check_name, failure_kind
+                      SELECT job_id, tree_hash, input_hash, ran_at, check_name, failure_kind,
+                             environment_fingerprint
                         FROM latest
                        WHERE recency = 1
                          AND failure_kind IN ('capacity', 'infrastructure', 'not_placeable',
@@ -914,6 +913,7 @@ async fn bounded_rearm_candidates_in_db(
                     ran_at: row.i64(3)?,
                     check_name: row.text(4)?,
                     failure_kind: row.text(5)?,
+                    environment_fingerprint: row.text(6)?,
                 });
             }
             Ok::<_, DbError>(candidates)
@@ -1022,6 +1022,15 @@ pub(super) async fn bounded_candidate_is_due(
     .await
     .pop()
     .expect("one scope set per placement question");
+    // This head's newest attempt died against the very fleet the wave would
+    // meet now. A fleet counter counts heads rather than attempts, so asking
+    // again would cost a placement and a death record and could never move
+    // it: nothing about the answer has changed. The fleet's identity moving
+    // — a machine attaching, or a blind one reporting again — is what makes
+    // the head worth asking again, and that is when this stops holding.
+    if scopes.fleet.as_deref() == Some(candidate.environment_fingerprint.as_str()) {
+        return Ok(false);
+    }
     let bounded = {
         let project_id = coords.project_id.clone();
         let check_name = candidate.check_name.clone();

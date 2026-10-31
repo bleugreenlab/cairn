@@ -26,6 +26,7 @@ mod claude_transcript;
 pub mod codex;
 pub mod custom;
 mod http_loop;
+pub mod inference;
 pub(crate) mod launch;
 pub use launch::Admitted;
 pub mod ollama;
@@ -260,6 +261,13 @@ pub trait AgentBackend: Send + Sync {
         Err(format!("{} cannot answer a decision", offer.provider))
     }
 
+    /// The id this backend sends on the wire for `model`: the model itself,
+    /// except on a provider that serves one model under several names, which
+    /// sends the one its engine answers to.
+    fn sent_model(&self, _orch: &Orchestrator, model: &str) -> String {
+        model.to_string()
+    }
+
     /// Models Cairn itself declares this backend serves, whatever discovery
     /// finds or whether it has run: an offer the facet owns rather than one
     /// the provider lists (Codex's image tool). The provider's catalog record
@@ -387,6 +395,7 @@ pub(crate) fn backend_for_name(name: Option<&str>) -> Box<dyn AgentBackend> {
         Some(typesafe::TYPESAFE_BACKEND_KEY) => Box::new(typesafe::TypeSafeBackend),
         Some("ollama") => Box::new(ollama::OllamaBackend),
         Some(actual::ACTUAL_BACKEND_KEY) => Box::new(actual::ActualBackend),
+        Some(inference::INFERENCE_BACKEND_KEY) => Box::new(inference::InferenceBackend),
         // A custom provider's key names the account that defines it. Resolving
         // the account itself needs a workspace, which this has none of, so the
         // backend carries the id and looks the rest up when it is handed an

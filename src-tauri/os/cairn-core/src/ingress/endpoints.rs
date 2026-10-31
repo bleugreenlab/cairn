@@ -34,17 +34,34 @@ struct Channel {
     secret: String,
 }
 
-/// Endpoints ride the install's relay channel, which today is registered by
-/// connecting the GitHub App.
-pub const NO_CHANNEL: &str = "This install has no relay channel yet, and ingress endpoints are delivered over it. Connect the GitHub App in Settings → GitHub to register one, then mint the endpoint again.";
-
-async fn channel(orch: &Orchestrator) -> Result<Channel, String> {
-    let creds = crate::github::credentials::get_github_credentials(&orch.db.local).await?;
-    match (creds.relay_channel_id, creds.relay_secret) {
-        (Some(id), Some(secret)) => Ok(Channel { id, secret }),
-        _ => Err(NO_CHANNEL.to_string()),
+impl Channel {
+    fn of(channel: &super::channel::RelayChannel) -> Option<Self> {
+        let (id, secret) = channel.credentials()?;
+        Some(Self {
+            id: id.to_string(),
+            secret: secret.to_string(),
+        })
     }
 }
+
+/// The install's channel, registered if it has none: minting is what first
+/// needs one.
+async fn ensured_channel(orch: &Orchestrator, relay_url: &str) -> Result<Channel, String> {
+    let channel = super::channel::ensure(&orch.db.local, relay_url).await?;
+    Channel::of(&channel)
+        .ok_or_else(|| "the relay channel has no secret after registration".to_string())
+}
+
+/// The install's channel as it stands, never registering one: an install
+/// with no channel has no endpoints to refresh or revoke.
+async fn existing_channel(orch: &Orchestrator) -> Result<Option<Channel>, String> {
+    Ok(Channel::of(
+        &super::channel::get_relay_channel(&orch.db.local).await?,
+    ))
+}
+
+/// Every provider the api mints, matching its `PROVIDERS`.
+pub const PROVIDERS: &[&str] = &["first-party", "cairn-hmac", "github", "linear", "bearer"];
 
 #[derive(Debug, Deserialize)]
 struct WireEndpoint {
@@ -55,11 +72,28 @@ struct WireEndpoint {
     project_ref: Option<String>,
     granted_at: Option<String>,
     status: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    rejected_count: i64,
 }
 
-#[derive(Debug, Deserialize)]
+/// A mint or rotation's reply. `secret` is present only when the api
+/// generated it, and it is never seen again after this response.
+#[derive(Deserialize)]
 struct OneEndpoint {
     endpoint: WireEndpoint,
+    #[serde(default)]
+    secret: Option<String>,
+}
+
+impl std::fmt::Debug for OneEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneEndpoint")
+            .field("endpoint", &self.endpoint)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +114,8 @@ fn record(channel_id: &str, wire: WireEndpoint, created_at: i64) -> EndpointReco
         granted_at: wire.granted_at,
         created_at,
         revoked_at: revoked.then_some(created_at),
+        url: wire.url,
+        rejected_count: wire.rejected_count,
     }
 }
 
@@ -101,42 +137,139 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|error| error.to_string())
 }
 
-/// Mint a first-party endpoint for a project and mirror it. The endpoint
-/// receives nothing until an operator grants it on the api.
-pub async fn mint(
-    orch: &Orchestrator,
-    relay_url: &str,
-    project_id: &str,
-    project_key: &str,
-    name: &str,
-    provider: &str,
-    topic: &str,
-) -> Result<EndpointRecord, String> {
+/// What to mint.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MintSpec<'a> {
+    /// The project (id, key) the endpoint belongs to; `None` for an
+    /// install-scoped endpoint such as the GitHub App's.
+    pub project: Option<(&'a str, &'a str)>,
+    pub name: &'a str,
+    pub provider: &'a str,
+    /// First-party only.
+    pub topic: Option<&'a str>,
+    /// External only: where the event type comes from (the api's `type_from`).
+    pub type_from: Option<&'a serde_json::Value>,
+    pub max_body_bytes: Option<i64>,
+    pub rate_per_min: Option<i64>,
+    /// A provider's own signing secret, for internal callers only: the
+    /// GitHub App's webhook secret, or Linear's. Never from an agent.
+    pub provider_secret: Option<&'a str>,
+}
+
+fn validate(spec: &MintSpec<'_>) -> Result<(), String> {
+    let name = spec.name;
     if !valid_endpoint_name(name) {
         return Err(format!(
             "Endpoint name '{name}' must be 1-63 lowercase letters, digits, or hyphens, not starting with a hyphen"
         ));
     }
-    if provider != "first-party" {
+    let provider = spec.provider;
+    if !PROVIDERS.contains(&provider) {
         return Err(format!(
-            "Provider '{provider}' cannot be minted yet: only first-party endpoints are available"
+            "Unknown provider '{provider}'. Available: {}",
+            PROVIDERS.join(", ")
         ));
     }
-    if !FIRST_PARTY_TOPICS.contains(&topic) {
+    if provider == "first-party" {
+        let topic = spec.topic.unwrap_or_default();
+        if !FIRST_PARTY_TOPICS.contains(&topic) {
+            return Err(format!(
+                "A first-party endpoint needs a topic. Available: {}",
+                FIRST_PARTY_TOPICS.join(", ")
+            ));
+        }
+        if spec.type_from.is_some()
+            || spec.max_body_bytes.is_some()
+            || spec.rate_per_min.is_some()
+            || spec.provider_secret.is_some()
+        {
+            return Err(
+                "A first-party endpoint takes no type_from, max_body_bytes, rate_per_min, or secret"
+                    .to_string(),
+            );
+        }
+    } else if spec.topic.is_some() {
+        return Err("topic applies only to first-party endpoints".to_string());
+    }
+    if matches!(provider, "cairn-hmac" | "bearer") && spec.provider_secret.is_some() {
         return Err(format!(
-            "Unknown first-party topic '{topic}'. Available: {}",
-            FIRST_PARTY_TOPICS.join(", ")
+            "A {provider} secret is generated by the server and kept in this machine's keychain"
         ));
     }
-    if super::active_endpoint_named(&orch.db.local, project_id, name)
-        .await?
-        .is_some()
-    {
+    if provider == "linear" && spec.provider_secret.is_none() {
+        return Err(
+            "A linear endpoint needs the signing secret Linear shows for its webhook".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Keep a secret the api generated, or undo what it cost. A live endpoint
+/// whose secret nobody holds is worse than none, so a keychain failure
+/// revokes the endpoint the api just minted.
+async fn keep_generated_secret(
+    orch: &Orchestrator,
+    relay_url: &str,
+    endpoint: &EndpointRecord,
+    secret: Option<String>,
+) -> Result<(), String> {
+    let Some(secret) = secret else {
+        return Ok(());
+    };
+    if let Err(error) = super::custody::store(&endpoint.id, &secret) {
+        if let Err(revoke_error) = revoke(orch, relay_url, endpoint).await {
+            log::warn!(
+                "endpoint {} is live on the api with no stored secret, and revoking it failed: {revoke_error}",
+                endpoint.id
+            );
+        }
         return Err(format!(
-            "This project already has a live endpoint named '{name}'; revoke it first to reuse the name"
+            "The endpoint's secret could not be stored in this machine's keychain ({error}), so the endpoint was revoked"
         ));
     }
-    let channel = channel(orch).await?;
+    Ok(())
+}
+
+/// Mint an endpoint and mirror it. A generated secret goes straight to the
+/// keychain; the returned record never carries it.
+pub async fn mint(
+    orch: &Orchestrator,
+    relay_url: &str,
+    spec: MintSpec<'_>,
+) -> Result<EndpointRecord, String> {
+    validate(&spec)?;
+    if let Some((project_id, _)) = spec.project {
+        if super::active_endpoint_named(&orch.db.local, project_id, spec.name)
+            .await?
+            .is_some()
+        {
+            return Err(format!(
+                "This project already has a live endpoint named '{}'; revoke it first to reuse the name",
+                spec.name
+            ));
+        }
+    }
+    let channel = ensured_channel(orch, relay_url).await?;
+    let mut body = json!({"name": spec.name, "provider": spec.provider});
+    if let Some((project_id, project_key)) = spec.project {
+        body["project_ref"] = json!(project_id);
+        body["project_key"] = json!(project_key);
+    }
+    if let Some(topic) = spec.topic {
+        body["topic"] = json!(topic);
+    }
+    if let Some(type_from) = spec.type_from {
+        body["type_from"] = type_from.clone();
+    }
+    if let Some(max_body_bytes) = spec.max_body_bytes {
+        body["max_body_bytes"] = json!(max_body_bytes);
+    }
+    if let Some(rate_per_min) = spec.rate_per_min {
+        body["rate_per_min"] = json!(rate_per_min);
+    }
+    if let Some(secret) = spec.provider_secret {
+        body["secret"] = json!(secret);
+    }
     let response = client()?
         .post(format!(
             "{}/channels/{}/endpoints",
@@ -144,35 +277,89 @@ pub async fn mint(
             channel.id
         ))
         .bearer_auth(&channel.secret)
-        .json(&json!({
-            "name": name,
-            "provider": provider,
-            "topic": topic,
-            "project_ref": project_id,
-            "project_key": project_key,
-        }))
+        .json(&body)
         .send()
         .await
         .map_err(|error| format!("could not reach the relay to mint the endpoint: {error}"))?;
     if !response.status().is_success() {
         return Err(refusal(response).await);
     }
-    let OneEndpoint { endpoint } = response
+    let OneEndpoint { endpoint, secret } = response
         .json()
         .await
-        .map_err(|error| format!("invalid relay response: {error}"))?;
+        .map_err(|_| "invalid relay response to the mint".to_string())?;
     let endpoint = record(&channel.id, endpoint, chrono::Utc::now().timestamp_millis());
     super::upsert_endpoint(&orch.db.local, &endpoint).await?;
+    keep_generated_secret(orch, relay_url, &endpoint, secret).await?;
     Ok(endpoint)
 }
 
-/// Revoke an endpoint on the api and in the mirror.
+/// Replace an external endpoint's secret. A generated one replaces the
+/// keychain entry; `provider_secret` is for internal callers holding a
+/// provider's own.
+pub async fn rotate(
+    orch: &Orchestrator,
+    relay_url: &str,
+    endpoint: &EndpointRecord,
+    provider_secret: Option<&str>,
+) -> Result<EndpointRecord, String> {
+    if endpoint.provider == "first-party" {
+        return Err("A first-party endpoint has no secret to rotate".to_string());
+    }
+    if !endpoint.is_active() {
+        return Err(format!("Endpoint {} is revoked", endpoint.name));
+    }
+    let channel = ensured_channel(orch, relay_url).await?;
+    let body = match provider_secret {
+        Some(secret) => json!({ "secret": secret }),
+        None => json!({}),
+    };
+    let response = client()?
+        .post(format!(
+            "{}/channels/{}/endpoints/{}/rotate",
+            relay_url.trim_end_matches('/'),
+            channel.id,
+            endpoint.id
+        ))
+        .bearer_auth(&channel.secret)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("could not reach the relay to rotate the endpoint: {error}"))?;
+    if !response.status().is_success() {
+        return Err(refusal(response).await);
+    }
+    let OneEndpoint {
+        endpoint: wire,
+        secret,
+    } = response
+        .json()
+        .await
+        .map_err(|_| "invalid relay response to the rotation".to_string())?;
+    let rotated = EndpointRecord {
+        created_at: endpoint.created_at,
+        ..record(&channel.id, wire, endpoint.created_at)
+    };
+    super::upsert_endpoint(&orch.db.local, &rotated).await?;
+    if let Some(secret) = secret {
+        super::custody::store(&rotated.id, &secret).map_err(|error| {
+            format!(
+                "The endpoint was rotated, but its new secret could not be stored in this machine's keychain ({error}). Rotate it again."
+            )
+        })?;
+    }
+    Ok(rotated)
+}
+
+/// Revoke an endpoint on the api and in the mirror, and forget its secret.
 pub async fn revoke(
     orch: &Orchestrator,
     relay_url: &str,
     endpoint: &EndpointRecord,
 ) -> Result<EndpointRecord, String> {
-    let channel = channel(orch).await?;
+    let channel = existing_channel(orch).await?.ok_or_else(|| {
+        "This install has no relay channel, so it has no endpoint to revoke".to_string()
+    })?;
     let response = client()?
         .delete(format!(
             "{}/channels/{}/endpoints/{}",
@@ -194,6 +381,14 @@ pub async fn revoke(
         ..endpoint.clone()
     };
     super::upsert_endpoint(&orch.db.local, &revoked).await?;
+    if endpoint.provider != "first-party" {
+        if let Err(error) = super::custody::forget(&endpoint.id) {
+            log::warn!(
+                "revoked endpoint {} but could not delete its keychain entry: {error}",
+                endpoint.id
+            );
+        }
+    }
     Ok(revoked)
 }
 
@@ -204,7 +399,9 @@ pub async fn refresh(
     relay_url: &str,
     timeout: Duration,
 ) -> Result<(), String> {
-    let channel = channel(orch).await?;
+    let Some(channel) = existing_channel(orch).await? else {
+        return Ok(());
+    };
     let response = client()?
         .get(format!(
             "{}/channels/{}/endpoints",
@@ -239,7 +436,7 @@ pub async fn refresh(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::routes::fixture::orchestrator;
     use std::sync::{Arc, Mutex};
@@ -256,9 +453,15 @@ mod tests {
 
     type Seen = Arc<Mutex<Vec<(String, String, String, serde_json::Value)>>>;
 
+    /// The secret the stand-in api generates for an external mint.
+    pub(crate) const MINTED_SECRET: &str = "Generated-by-the-api-7Qw2Lp9Xz4Rk";
+    /// The secret it generates for a rotation.
+    pub(crate) const ROTATED_SECRET: &str = "Rotated-by-the-api-3Vn8Hd5Jc1Ty";
+
     /// A stand-in relay recording each request's method, path, Authorization,
-    /// and body, answering like the api does.
-    async fn relay() -> (String, Seen) {
+    /// and body, answering like the api does: an external mint or rotation
+    /// reveals a generated secret once.
+    pub(crate) async fn relay() -> (String, Seen) {
         use axum::{body::Bytes, http::HeaderMap, http::Method, http::Uri, Router};
         let seen: Seen = Arc::default();
         let record = seen.clone();
@@ -268,6 +471,15 @@ mod tests {
                 async move {
                     let body: serde_json::Value =
                         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                    if uri.path() == "/relay/channels" {
+                        record.lock().unwrap().push((
+                            method.to_string(),
+                            uri.path().to_string(),
+                            String::new(),
+                            body.clone(),
+                        ));
+                        return axum::Json(json!({ "channel_id": "ch-new", "secret": "new-secret" }));
+                    }
                     record.lock().unwrap().push((
                         method.to_string(),
                         uri.path().to_string(),
@@ -278,17 +490,29 @@ mod tests {
                             .to_string(),
                         body.clone(),
                     ));
+                    let rotating = uri.path().ends_with("/rotate");
+                    let provider = body["provider"]
+                        .as_str()
+                        .unwrap_or(if rotating { "cairn-hmac" } else { "first-party" })
+                        .to_string();
+                    let external = provider != "first-party";
                     let endpoint = json!({
                         "id": "src_0123456789abcdefghijkl",
                         "name": body["name"].as_str().unwrap_or("bugs"),
-                        "provider": "first-party",
-                        "topic": "cairn.bugs",
+                        "provider": provider,
+                        "topic": if external { json!(null) } else { json!("cairn.bugs") },
                         "project_ref": "p",
-                        "granted_at": if method == Method::GET { json!("2026-10-18T01:00:00.000Z") } else { json!(null) },
+                        "url": if external { json!("https://api.cairn.test/e/src_0123456789abcdefghijkl") } else { json!(null) },
+                        "rejected_count": if method == Method::GET { 3 } else { 0 },
+                        "granted_at": if method == Method::GET || external { json!("2026-10-18T01:00:00.000Z") } else { json!(null) },
                         "status": if method == Method::DELETE { "revoked" } else { "active" },
                     });
                     let reply = if method == Method::GET {
                         json!({ "endpoints": [endpoint] })
+                    } else if rotating {
+                        json!({ "endpoint": endpoint, "secret": ROTATED_SECRET })
+                    } else if method == Method::POST && external && body["secret"].is_null() {
+                        json!({ "endpoint": endpoint, "secret": MINTED_SECRET })
                     } else {
                         json!({ "endpoint": endpoint })
                     };
@@ -302,31 +526,76 @@ mod tests {
         (url, seen)
     }
 
-    async fn connect_channel(orch: &Orchestrator) {
-        crate::github::credentials::update_github_credentials(&orch.db.local, |creds| {
-            creds.relay_channel_id = Some("ch-1".into());
-            creds.relay_secret = Some("channel-secret".into());
+    pub(crate) async fn connect_channel(orch: &Orchestrator) {
+        let (public_key, private_key) = crate::github::crypto::generate_keypair();
+        let private_key_encrypted = crate::github::crypto::encrypt_private_key(
+            &private_key,
+            &crate::github::crypto::get_machine_id(),
+        )
+        .unwrap();
+        crate::ingress::channel::update_relay_channel(&orch.db.local, |channel| {
+            channel.channel_id = Some("ch-1".into());
+            channel.secret = Some("channel-secret".into());
+            channel.public_key = Some(public_key);
+            channel.private_key_encrypted = Some(private_key_encrypted);
         })
         .await
         .unwrap();
     }
 
+    fn bugs(name: &str) -> MintSpec<'_> {
+        MintSpec {
+            project: Some(("p", "cairn")),
+            name,
+            provider: "first-party",
+            topic: Some("cairn.bugs"),
+            ..MintSpec::default()
+        }
+    }
+
     #[tokio::test]
-    async fn minting_without_a_relay_channel_is_refused_with_the_way_forward() {
+    async fn minting_without_a_channel_registers_one() {
         let temp = tempfile::tempdir().unwrap();
-        let (orch, _) = orchestrator(temp.path(), &[]).await;
-        let error = mint(
-            &orch,
-            "http://127.0.0.1:9/relay",
-            "p",
-            "cairn",
-            "bugs",
-            "first-party",
-            "cairn.bugs",
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error, NO_CHANNEL);
+        let (orch, db) = orchestrator(temp.path(), &[]).await;
+        let (url, seen) = relay().await;
+        let minted = mint(&orch, &url, bugs("bugs")).await.unwrap();
+        assert_eq!(minted.channel_id, "ch-new");
+        let channel = crate::ingress::channel::get_relay_channel(&db)
+            .await
+            .unwrap();
+        assert_eq!(channel.credentials(), Some(("ch-new", "new-secret")));
+        assert!(channel.intact_private_key().is_some());
+        let seen = seen.lock().unwrap().clone();
+        let calls: Vec<_> = seen
+            .iter()
+            .map(|(method, path, auth, _)| (method.as_str(), path.as_str(), auth.as_str()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ("POST", "/relay/channels", ""),
+                (
+                    "POST",
+                    "/relay/channels/ch-new/endpoints",
+                    "Bearer new-secret"
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshing_without_a_channel_registers_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = orchestrator(temp.path(), &[]).await;
+        let (url, seen) = relay().await;
+        refresh(&orch, &url, Duration::from_secs(3)).await.unwrap();
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(
+            crate::ingress::channel::get_relay_channel(&db)
+                .await
+                .unwrap(),
+            crate::ingress::channel::RelayChannel::default()
+        );
     }
 
     #[tokio::test]
@@ -336,30 +605,12 @@ mod tests {
         connect_channel(&orch).await;
         let (url, seen) = relay().await;
 
-        let minted = mint(
-            &orch,
-            &url,
-            "p",
-            "cairn",
-            "bugs",
-            "first-party",
-            "cairn.bugs",
-        )
-        .await
-        .unwrap();
+        let minted = mint(&orch, &url, bugs("bugs")).await.unwrap();
         assert_eq!(minted.granted_at, None);
-        assert!(mint(
-            &orch,
-            &url,
-            "p",
-            "cairn",
-            "bugs",
-            "first-party",
-            "cairn.bugs"
-        )
-        .await
-        .unwrap_err()
-        .contains("already has a live endpoint"));
+        assert!(mint(&orch, &url, bugs("bugs"))
+            .await
+            .unwrap_err()
+            .contains("already has a live endpoint"));
 
         refresh(&orch, &url, Duration::from_secs(3)).await.unwrap();
         let refreshed = crate::ingress::get_endpoint(&db, &minted.id)
@@ -370,6 +621,7 @@ mod tests {
             refreshed.granted_at.as_deref(),
             Some("2026-10-18T01:00:00.000Z")
         );
+        assert_eq!(refreshed.rejected_count, 3);
 
         let revoked = revoke(&orch, &url, &refreshed).await.unwrap();
         assert_eq!(revoked.status, "revoked");
@@ -409,41 +661,108 @@ mod tests {
         );
     }
 
+    /// An external mint passes its limits through, keeps the generated
+    /// secret in the keychain (never on the record), and rotate and revoke
+    /// replace and delete it.
     #[tokio::test]
-    async fn only_first_party_endpoints_on_a_known_topic_are_minted() {
+    async fn an_external_mint_keeps_its_secret_in_the_keychain_through_rotate_and_revoke() {
+        crate::config::secrets::mock_keychain::install();
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = orchestrator(temp.path(), &[]).await;
+        connect_channel(&orch).await;
+        let (url, seen) = relay().await;
+        let type_from = json!({"header": "X-Event"});
+        let minted = mint(
+            &orch,
+            &url,
+            MintSpec {
+                project: Some(("p", "cairn")),
+                name: "ci",
+                provider: "cairn-hmac",
+                type_from: Some(&type_from),
+                max_body_bytes: Some(65536),
+                rate_per_min: Some(30),
+                ..MintSpec::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            minted.url.as_deref(),
+            Some("https://api.cairn.test/e/src_0123456789abcdefghijkl")
+        );
+        assert!(!format!("{minted:?}").contains(MINTED_SECRET));
+        assert_eq!(
+            super::super::custody::reveal_for_copy(&minted.id).as_deref(),
+            Some(MINTED_SECRET)
+        );
+        assert_eq!(
+            seen.lock().unwrap()[0].3,
+            json!({"name": "ci", "provider": "cairn-hmac", "project_ref": "p", "project_key": "cairn", "type_from": {"header": "X-Event"}, "max_body_bytes": 65536, "rate_per_min": 30})
+        );
+
+        let rotated = rotate(&orch, &url, &minted, None).await.unwrap();
+        assert!(!format!("{rotated:?}").contains(ROTATED_SECRET));
+        assert_eq!(
+            super::super::custody::reveal_for_copy(&minted.id).as_deref(),
+            Some(ROTATED_SECRET)
+        );
+        let mirrored = crate::ingress::get_endpoint(&db, &minted.id)
+            .await
+            .unwrap()
+            .unwrap();
+        revoke(&orch, &url, &mirrored).await.unwrap();
+        assert!(!super::super::custody::held(&minted.id));
+    }
+
+    #[tokio::test]
+    async fn minting_refuses_what_the_api_would() {
         let temp = tempfile::tempdir().unwrap();
         let (orch, _) = orchestrator(temp.path(), &[]).await;
         connect_channel(&orch).await;
         let url = "http://127.0.0.1:9/relay";
-        assert!(
-            mint(&orch, url, "p", "cairn", "bugs", "cairn-hmac", "cairn.bugs")
-                .await
-                .unwrap_err()
-                .contains("only first-party")
-        );
-        assert!(mint(
-            &orch,
-            url,
-            "p",
-            "cairn",
-            "bugs",
-            "first-party",
-            "cairn.secrets"
-        )
+        let refused = |spec: MintSpec<'static>| {
+            let orch = orch.clone();
+            async move { mint(&orch, url, spec).await.unwrap_err() }
+        };
+        assert!(refused(MintSpec {
+            provider: "zapier",
+            ..bugs("bugs")
+        })
         .await
-        .unwrap_err()
-        .contains("Unknown first-party topic"));
-        assert!(mint(
-            &orch,
-            url,
-            "p",
-            "cairn",
-            "Bugs",
-            "first-party",
-            "cairn.bugs"
-        )
+        .contains("Unknown provider"));
+        assert!(refused(MintSpec {
+            topic: Some("cairn.secrets"),
+            ..bugs("bugs")
+        })
         .await
-        .unwrap_err()
+        .contains("needs a topic"));
+        assert!(refused(MintSpec {
+            name: "Bugs",
+            ..bugs("bugs")
+        })
+        .await
         .contains("lowercase"));
+        assert!(refused(MintSpec {
+            provider: "cairn-hmac",
+            ..bugs("bugs")
+        })
+        .await
+        .contains("only to first-party"));
+        assert!(refused(MintSpec {
+            provider: "bearer",
+            topic: None,
+            provider_secret: Some("chosen-by-the-caller-123"),
+            ..bugs("bugs")
+        })
+        .await
+        .contains("generated by the server"));
+        assert!(refused(MintSpec {
+            provider: "linear",
+            topic: None,
+            ..bugs("bugs")
+        })
+        .await
+        .contains("signing secret Linear"));
     }
 }

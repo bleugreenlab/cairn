@@ -722,6 +722,37 @@ pub async fn process_spec(
         format!("http://127.0.0.1:{}/api/mcp", orch.mcp_callback_port),
         orch.mcp_auth.get_secret_for_mcp().ok(),
     );
+    // A REPL makes its node's scratch its `$TMPDIR` and, while it lives, holds
+    // the scratch's writer on its machine: a second live process of the same
+    // node on another machine is refused, by name.
+    let node_scratch = match crate::node_scratch::grant_for_run(
+        orch,
+        run_context.map(|ctx| ctx.run_id.as_str()),
+        job_id,
+    )
+    .await
+    {
+        Some((grant, resolved, db)) => {
+            let here = orch
+                .fleet
+                .predicted_job_home(&cairn_common::executor_protocol::ResidencyHolder::Job {
+                    job_id: job_id.to_owned(),
+                })
+                .map(|home| home.executor_id);
+            {
+                crate::node_scratch::holders::refuse_second_writer(
+                    orch,
+                    &db,
+                    &resolved.owner_job_id,
+                    here.as_deref(),
+                    "REPL",
+                )
+                .await?;
+            }
+            Some(grant)
+        }
+        None => None,
+    };
     Ok(ResidentProcessSpec {
         runtime_packages,
         program,
@@ -737,6 +768,7 @@ pub async fn process_spec(
             data: body.as_bytes().to_vec(),
         }],
         io: ResidentProcessIoMode::Pipe,
+        node_scratch,
     })
 }
 

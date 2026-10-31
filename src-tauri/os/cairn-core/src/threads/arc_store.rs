@@ -58,7 +58,7 @@ pub async fn project(db: &LocalDb, job_id: &str, prose: &Value) -> Result<ArcPro
     let owner = arc_owner(db, job_id).await?;
     let store = super::db_store::open(&owner.thread_id).await?;
     if import_legacy_collections_into(&store, prose).await? {
-        crate::orchestrator::wakes::conditions::notify_thread_db_written(&owner.thread_id);
+        crate::orchestrator::wakes::conditions::notify_thread_db_written(&owner.thread_id, &[]);
     }
     let open_questions = store
         .read(|conn| {
@@ -136,7 +136,7 @@ pub(crate) async fn import_legacy_collections(
     let owner = arc_owner(db, job_id).await?;
     let store = super::db_store::open(&owner.thread_id).await?;
     if import_legacy_collections_into(&store, prose).await? {
-        crate::orchestrator::wakes::conditions::notify_thread_db_written(&owner.thread_id);
+        crate::orchestrator::wakes::conditions::notify_thread_db_written(&owner.thread_id, &[]);
     }
     Ok(())
 }

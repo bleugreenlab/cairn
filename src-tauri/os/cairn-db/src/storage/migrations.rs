@@ -2241,6 +2241,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "execution_queue",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // Which of this install's runner incarnations have had their queue entries
+    // closed: an index over the runner-local journal above.
+    (
+        "execution_queue_closed_incarnations",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     // A project's ref store is a file on this machine: its measured size, what
     // each maintenance prune removed, and the operator's prune choice here.
     (
@@ -2255,6 +2261,36 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // machine's executor links, meaningless on any other installation.
     (
         "runner_events",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // What a page's open frames read and reported on this install, and which
+    // viewer had it open: an audit trail of this install's own viewers, pruned
+    // to the newest rows per page.
+    (
+        "page_calls",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // What this runner's service processes did (lifecycle, stderr, calls),
+    // sanitized on write and pruned to the newest rows per service.
+    (
+        "service_log",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // The cadence of this runner's scheduled service methods: anchors and
+    // last outcomes for the processes it supervises, rebuilt from the
+    // declarations on any runner that serves them.
+    (
+        "service_schedules",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // A node scratch's store is a directory on this runner and its replicas
+    // are this runner's executors.
+    (
+        "node_scratches",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "node_scratch_replicas",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     // ── ProjectScoped: the durable shared collaboration surface ──────────────
@@ -2340,6 +2376,9 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // `held` from their presence -- so they share its scope.
     ("execution_gates", TableScope::ProjectScoped),
     ("executions", TableScope::ProjectScoped),
+    // cairn/5597: an execution's delegated packets, moved out of its snapshot.
+    // Read and written wherever the execution is, so they share its scope.
+    ("delegated_packets", TableScope::ProjectScoped),
     ("attachments", TableScope::ProjectScoped),
     ("file_changes", TableScope::ProjectScoped),
     // Superseded by `attachments` and no longer read or written. It stays in the
@@ -2405,6 +2444,14 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // which is the opposite of what the marker means.
     (
         "thread_read_positions",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    // What THIS operator closed in their notification center. The facts behind
+    // the entries are shared; the decision to stop looking at one is not.
+    // Replicating it would let a teammate's dismissal hide an entry from someone
+    // who never saw it.
+    (
+        "operator_notification_dismissals",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
     ("tenet_evidence", TableScope::ProjectScoped),
@@ -2482,6 +2529,26 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "inference_bginf_link",
         TableScope::Private(PrivateReason::RebuildableCache),
     ),
+    // What this runner has commanded its inference machines to do (cairn/5660):
+    // the phase of each deployment it acted on, and the loads it measured.
+    (
+        "inference_deployment_state",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "inference_deployment_loads",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // The pool controller's record per pool and its queue of model requests:
+    // what this orch decided for, and was asked of, its own inference machines.
+    (
+        "inference_pool_control",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "inference_requests",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     // The desktop-automation capabilities this runner last probed off each
     // enrolled executor (0158). A cached answer about machines THIS runner can
     // reach, refreshed by probing again; a teammate's replica would describe a
@@ -2541,6 +2608,11 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "github_installations",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
+    // The install's relay channel (cairn/5129): its secret, keypair and cursor.
+    (
+        "relay_channel",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
     // Ingress endpoint events and this install's endpoint mirror (0267). The
     // endpoints belong to this install's relay channel, and the events were
     // sealed to its key, like the GitHub App credentials beside them.
@@ -2578,6 +2650,10 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ),
     (
         "archival_backfill_state",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "delegated_packet_backfill_state",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     (
@@ -2655,12 +2731,14 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
             target: ScopeTarget::ProjectScoped,
         }),
     ),
-    // Procedure schedules share the wake scheduler's local-only claim path.
-    // Team projection must move that owner and its occurrence ledger together.
+    // A thread's service packages are thread content, so they lean shared; but
+    // a service runs only on this runner's machine until resident processes
+    // reach the callback relay (cairn/5562), so a team copy would be source no
+    // teammate's runner can serve.
     (
-        "thread_automations",
+        "thread_services",
         TableScope::Private(PrivateReason::DeferredShared {
-            issue: "CAIRN-4107",
+            issue: "CAIRN-5524",
             target: ScopeTarget::ProjectScoped,
         }),
     ),
@@ -2826,6 +2904,17 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
             target: ScopeTarget::ProjectScoped,
         }),
     ),
+    // vibe_axes: colour axes learned from this install's own history in one
+    // model's space; a workspace without them relearns them from its own.
+    (
+        "vibe_axes",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    // vibe_axis_samples: the resumable work of a recompute in progress.
+    (
+        "vibe_axis_samples",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     // config_disables: a host-side resolution override; team-config propagation is
     // a separate cross-scope feature, deferred with a named owner.
     (
@@ -2989,6 +3078,16 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "executions",
         id_columns: &["id", "issue_id", "project_id"],
+    },
+    RekeyTableManifest {
+        table: "delegated_packets",
+        id_columns: &[
+            "execution_id",
+            "id",
+            "parent_job_id",
+            "parent_turn_id",
+            "result_artifact_job_id",
+        ],
     },
     RekeyTableManifest {
         table: "file_changes",
@@ -4319,7 +4418,7 @@ mod tests {
             .collect::<Vec<_>>();
         MigrationRunner::new(before).run(&db).await.unwrap();
         const DEFAULT_KINDS: &str = r#"["message","permission","question","resolved","review"]"#;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
              VALUES ('project', 'default', 'Project', 'PRJ', '/repo', 1, 1);
              INSERT INTO jobs (id, project_id, status, created_at, updated_at)
@@ -5049,6 +5148,128 @@ mod tests {
         );
     }
 
+    /// Deleting an event runs the `message_streams.final_event_id` foreign-key
+    /// action, `UPDATE message_streams SET final_event_id = NULL WHERE
+    /// final_event_id = ?`. Turso hides that action from `EXPLAIN`, so this pins
+    /// the plan of the equivalent statement: it must seek
+    /// `idx_message_streams_final_event`, not scan every stream (cairn/5584).
+    #[tokio::test]
+    async fn final_event_set_null_seeks_its_index() {
+        let db = migrated_db().await.unwrap();
+        let plan = explain_plan(
+            &db,
+            "UPDATE message_streams SET final_event_id = NULL WHERE final_event_id = 'e'",
+        )
+        .await;
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_message_streams_final_event")),
+            "the final_event_id SET NULL action must seek its index, got {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|step| step.contains("SCAN message_streams")),
+            "the final_event_id SET NULL action must not scan message_streams, got {plan:?}"
+        );
+    }
+
+    /// The plan pin above covers the statement; this covers the hidden action
+    /// itself. Deleting events whose streams name them as `final_event_id` must
+    /// cost the same however many other streams exist. In a debug build, 500
+    /// deletes take about 80 ms with the index. Without it each delete scans all
+    /// 40,500 streams, and the 500 deletes take about 2.6 s.
+    #[tokio::test]
+    async fn deleting_events_with_final_streams_does_not_scan_streams() {
+        const BACKGROUND: usize = 40_000;
+        const DELETED: usize = 500;
+        const BATCH: usize = 500;
+
+        let db = migrated_db().await.unwrap();
+        db.write(move |conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO runs(id, status, created_at, updated_at) VALUES ('r', 'running', 1, 1)",
+                    (),
+                )
+                .await?;
+                let total = BACKGROUND + DELETED;
+                for start in (0..total).step_by(BATCH) {
+                    let rows = start..(start + BATCH).min(total);
+                    let events = rows
+                        .clone()
+                        .map(|i| format!("('e{i}', 'r', 's', {i}, 1, 'assistant', '{{}}', 1)"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let streams = rows
+                        .map(|i| format!("('m{i}', 'r', 'b', {i}, 'finalized', 'e{i}', 1, 1)"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    conn.execute(
+                        &format!(
+                            "INSERT INTO events(id, run_id, session_id, sequence, timestamp, \
+                             event_type, data, created_at) VALUES {events}"
+                        ),
+                        (),
+                    )
+                    .await?;
+                    conn.execute(
+                        &format!(
+                            "INSERT INTO message_streams(id, run_id, backend, sequence, status, \
+                             final_event_id, created_at, updated_at) VALUES {streams}"
+                        ),
+                        (),
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        db.write(move |conn| {
+            Box::pin(async move {
+                for i in BACKGROUND..BACKGROUND + DELETED {
+                    conn.execute("DELETE FROM events WHERE id = ?1", (format!("e{i}"),))
+                        .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "deleting {DELETED} events beside {BACKGROUND} streams took {elapsed:?}; \
+             the final_event_id foreign-key action is scanning message_streams"
+        );
+
+        let nulled = db
+            .query_one(
+                "SELECT COUNT(*) FROM message_streams WHERE final_event_id IS NULL",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        let kept = db
+            .query_one(
+                "SELECT COUNT(*) FROM message_streams WHERE final_event_id IS NOT NULL",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (nulled, kept),
+            (DELETED as i64, BACKGROUND as i64),
+            "deleted events' streams survive with final_event_id cleared; the rest are untouched"
+        );
+    }
+
     /// Seed `n` vibes and return how long 200 "newest revision" reads take.
     async fn time_revision_edge_reads(n: i64) -> std::time::Duration {
         let db = migrated_db().await.unwrap();
@@ -5475,6 +5696,152 @@ mod tests {
         );
     }
 
+    /// cairn/5129: an install whose relay channel lived on `github_app` keeps
+    /// it, field for field, on `relay_channel`, and `github_app` loses exactly
+    /// the moved columns while keeping the App and its unmapped-mention
+    /// counters. Seeded in the pre-migration schema with raw SQL.
+    #[tokio::test]
+    async fn the_relay_channel_moves_verbatim_off_github_app() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("relay-channel.turso.db"))
+            .await
+            .unwrap();
+        let head = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.name() != "relay_channel")
+            .cloned()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(head).run(&db).await.unwrap();
+        db.execute_batch(
+            "INSERT INTO github_app(
+                id, app_id, app_name, app_slug, private_key, webhook_secret, installation_id,
+                relay_channel_id, relay_secret, last_event_sync, created_at, updated_at,
+                relay_public_key, relay_private_key_encrypted, relay_health_state,
+                relay_health_reason, relay_first_failure_at, relay_last_failure_at,
+                relay_consecutive_failures, relay_failing_event_id, relay_failing_event_at,
+                relay_last_successful_delivery_at, relay_pending_public_key,
+                relay_pending_private_key_encrypted, relay_key_rotated_at,
+                relay_unmapped_mention_count, relay_last_unmapped_event_id,
+                relay_last_unmapped_repository, relay_last_unmapped_at,
+                relay_undeliverable_since_healthy)
+             VALUES ('default', 42, 'Cairn', 'cairn', 'AQpem-ciphertext', 'AQwebhook-ciphertext', 7,
+                'ch-1', 'AQsecret-ciphertext', '2026-10-01T00:00:00.000Z|41', 11, 12,
+                'public-key', 'AQprivate-ciphertext', 'skipping',
+                'ingress_unknown_endpoint', 'first-fail', 'last-fail',
+                3, '42', 'event-at',
+                'success-at', 'pending-public',
+                'AQpending-private-ciphertext', '2026-09-01T00:00:00Z',
+                5, '99', 'acme/repo', 'unmapped-at',
+                2);",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT id || '|' || channel_id || '|' || secret || '|' || public_key || '|'
+                        || private_key_encrypted || '|' || key_rotated_at || '|'
+                        || pending_public_key || '|' || pending_private_key_encrypted || '|'
+                        || last_event_sync || '|' || health_state || '|' || health_reason || '|'
+                        || first_failure_at || '|' || last_failure_at || '|'
+                        || consecutive_failures || '|' || failing_event_id || '|'
+                        || failing_event_at || '|' || last_successful_delivery_at || '|'
+                        || undeliverable_since_healthy || '|' || created_at || '|' || updated_at
+                   FROM relay_channel",
+            )
+            .await
+            .unwrap(),
+            "default|ch-1|AQsecret-ciphertext|public-key|AQprivate-ciphertext|2026-09-01T00:00:00Z|\
+             pending-public|AQpending-private-ciphertext|2026-10-01T00:00:00.000Z|41|skipping|\
+             ingress_unknown_endpoint|first-fail|last-fail|3|42|event-at|success-at|2|11|12"
+        );
+        let columns = db
+            .query_all("PRAGMA table_info(github_app)", (), |row| row.text(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            columns,
+            vec![
+                "id",
+                "app_id",
+                "app_name",
+                "app_slug",
+                "private_key",
+                "webhook_secret",
+                "installation_id",
+                "created_at",
+                "updated_at",
+                "relay_unmapped_mention_count",
+                "relay_last_unmapped_event_id",
+                "relay_last_unmapped_repository",
+                "relay_last_unmapped_at",
+            ]
+        );
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT app_id || '|' || private_key || '|' || webhook_secret || '|'
+                        || relay_unmapped_mention_count || '|' || relay_last_unmapped_event_id
+                        || '|' || relay_last_unmapped_repository || '|' || relay_last_unmapped_at
+                   FROM github_app WHERE id = 'default'",
+            )
+            .await
+            .unwrap(),
+            "42|AQpem-ciphertext|AQwebhook-ciphertext|5|99|acme/repo|unmapped-at"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM ingress_endpoints WHERE rejected_count <> 0"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    /// An App without a relay channel moves nothing: there is no channel row.
+    #[tokio::test]
+    async fn an_app_without_a_relay_channel_moves_no_row() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("relay-channel-none.turso.db"))
+            .await
+            .unwrap();
+        let head = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.name() != "relay_channel")
+            .cloned()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(head).run(&db).await.unwrap();
+        db.execute_batch(
+            "INSERT INTO github_app(id, app_id, relay_channel_id) VALUES ('default', 42, 'ch-orphan');",
+        )
+        .await
+        .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM relay_channel")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            query_i64(&db, "SELECT app_id FROM github_app WHERE id = 'default'")
+                .await
+                .unwrap(),
+            42
+        );
+    }
+
     /// A fresh install has no vectors, so it records no space: its first
     /// reconcile records whatever it embeds with.
     #[tokio::test]
@@ -5613,7 +5980,7 @@ mod tests {
             let db = &db;
             async move {
                 db.query_opt_text(
-                    &format!(
+                    format!(
                         "SELECT verdict_platform || '/' || verdict_arch || ' '
                                 || COALESCE(toolchain_fingerprint, '-') || ' '
                                 || COALESCE(verdict_environment_hash, '-')
@@ -7370,15 +7737,20 @@ mod tests {
     }
 
     /// Canonicalizes DDL for cross-lineage comparison. Turso's `sqlite_master`
-    /// re-rendering is not idempotent for the trailing `FOREIGN KEY (...)
-    /// REFERENCES x(id)` form (it inserts a space before `(id)`) and collapses
-    /// trigger-body newlines, so byte-equality requires normalizing whitespace
-    /// and the space-before-paren. Both differences are purely cosmetic.
+    /// text depends on how an object reached its shape, and the two lineages
+    /// build some tables by different routes (one `CREATE`, or a `CREATE` plus
+    /// `ALTER TABLE ADD COLUMN`). Re-rendering inserts a space before `(id)` in
+    /// `REFERENCES x(id)` and collapses trigger-body newlines; whether `ADD
+    /// COLUMN` re-renders the statement (spacing every list comma) or splices the
+    /// column into the authored text varies by Turso revision. Byte-equality
+    /// therefore normalizes whitespace, the space before a paren and the space
+    /// after a comma. All of these differences are purely cosmetic.
     fn norm(sql: &str) -> String {
         sql.split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
             .replace(" (", "(")
+            .replace(", ", ",")
     }
 
     async fn migrated_team_db() -> (tempfile::TempDir, LocalDb) {
@@ -7726,14 +8098,14 @@ mod tests {
                 // its team projection fully drops the workspace arm.
                 "skill_configs" => p
                     .replace(
-                        "workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE, ",
+                        "workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,",
                         "",
                     )
                     .replace(
                         "project_id TEXT REFERENCES projects(id)",
                         "project_id TEXT NOT NULL REFERENCES projects(id)",
                     )
-                    .replace(", CHECK((workspace_id IS NULL) !=(project_id IS NULL))", ""),
+                    .replace(",CHECK((workspace_id IS NULL) !=(project_id IS NULL))", ""),
                 "issue_labels" => p.replace(
                     "label_id TEXT NOT NULL REFERENCES labels(id) ON DELETE CASCADE",
                     "label_id TEXT NOT NULL",

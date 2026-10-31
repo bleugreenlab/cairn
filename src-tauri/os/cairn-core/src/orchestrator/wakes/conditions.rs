@@ -100,9 +100,18 @@ mod integration_tests {
         install_evaluator(orch);
 
         crate::threads::db_store::apply_write(
-            &thread_id,
-            vec!["INSERT INTO findings(id, ready) VALUES(1, 1)".into()],
-            vec![Vec::new()],
+            &crate::threads::db_store::WriteScope {
+                thread_id: thread_id.clone(),
+                project_id: "p".into(),
+                project: "p".into(),
+                thread_name: "general".into(),
+            },
+            vec![crate::threads::db_store::WriteStatement {
+                sql: "INSERT INTO findings(id, ready) VALUES(1, 1)".into(),
+                params: Vec::new(),
+                row: None,
+            }],
+            &crate::services::testing::CapturingEmitter::new(),
         )
         .await
         .unwrap();

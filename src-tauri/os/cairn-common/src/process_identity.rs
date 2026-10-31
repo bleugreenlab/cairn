@@ -177,6 +177,123 @@ pub fn process_group_is_alive(process_group_id: u32) -> bool {
     probed == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+/// What the kernel says a process's threads are doing: what a pid's presence
+/// cannot say about a process that has gone silent, or that will not finish
+/// exiting.
+///
+/// A signalled process is gone only once every one of its threads has left the
+/// kernel. A thread in uninterruptible sleep (`D`, almost always waiting on
+/// storage) leaves when that wait returns and not before, SIGKILL included.
+/// Until then the leader can read as a zombie that `waitpid` does not report,
+/// and the group's open files, its locks among them, stay open. Telling that
+/// apart from a zombie nobody reaped is what this is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelThreadStates {
+    /// The thread-group leader's state letter (`R`, `S`, `D`, `Z`, ...).
+    pub leader: Option<char>,
+    /// Every thread the kernel still lists, the leader included.
+    pub threads: usize,
+    /// The threads in uninterruptible sleep, each with the kernel function it
+    /// is waiting in where the kernel will say.
+    pub uninterruptible: Vec<(u32, Option<String>)>,
+}
+
+impl std::fmt::Display for KernelThreadStates {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let leader_exited = self.leader == Some('Z');
+        if self.uninterruptible.is_empty() {
+            return match (leader_exited, self.threads) {
+                (true, 0 | 1) => formatter
+                    .write_str("a zombie: it has exited, and only its parent's reap is outstanding"),
+                (true, threads) => write!(
+                    formatter,
+                    "its main thread has exited and {} other thread(s) have not, none in uninterruptible sleep",
+                    threads - 1
+                ),
+                (false, threads) => write!(
+                    formatter,
+                    "{threads} thread(s), none in uninterruptible sleep; main thread state {}",
+                    self.leader.unwrap_or('?')
+                ),
+            };
+        }
+        if leader_exited {
+            formatter.write_str("its main thread has exited; ")?;
+        }
+        write!(
+            formatter,
+            "{} of {} thread(s) in uninterruptible sleep, which no signal interrupts (",
+            self.uninterruptible.len(),
+            self.threads
+        )?;
+        for (index, (tid, wchan)) in self.uninterruptible.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            match wchan {
+                Some(wchan) => write!(formatter, "{tid} in {wchan}")?,
+                None => write!(formatter, "{tid}")?,
+            }
+        }
+        formatter.write_str(")")
+    }
+}
+
+/// The state of every thread of `pid`, or `None` when the kernel no longer
+/// lists it or this platform cannot say.
+#[cfg(target_os = "linux")]
+pub fn kernel_thread_states(pid: u32) -> Option<KernelThreadStates> {
+    let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    let mut states = KernelThreadStates {
+        leader: None,
+        threads: 0,
+        uninterruptible: Vec::new(),
+    };
+    for tid in tasks
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+    {
+        let Some(state) = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat"))
+            .ok()
+            .as_deref()
+            .and_then(thread_state)
+        else {
+            continue;
+        };
+        states.threads += 1;
+        if tid == pid {
+            states.leader = Some(state);
+        }
+        if state == 'D' {
+            // `0` is the kernel declining to name the function.
+            let wchan = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/wchan"))
+                .ok()
+                .map(|wchan| wchan.trim().to_owned())
+                .filter(|wchan| !wchan.is_empty() && wchan != "0");
+            states.uninterruptible.push((tid, wchan));
+        }
+    }
+    states.uninterruptible.sort();
+    (states.threads > 0).then_some(states)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn kernel_thread_states(_pid: u32) -> Option<KernelThreadStates> {
+    None
+}
+
+/// The state letter of a `/proc/.../stat` line: the first field after the
+/// comm's final `)`.
+#[cfg(target_os = "linux")]
+fn thread_state(stat: &str) -> Option<char> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
+}
+
 /// An identifier the kernel mints once per boot, or `None` where this platform
 /// cannot say. Two different values prove a restart in between, and so that
 /// no process running before it still runs.
@@ -411,5 +528,53 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn a_thread_stuck_in_the_kernel_is_named_with_where_it_waits() {
+        let states = KernelThreadStates {
+            leader: Some('Z'),
+            threads: 2,
+            uninterruptible: vec![(4242, Some("btrfs_sync_file".into()))],
+        };
+        assert_eq!(
+            states.to_string(),
+            "its main thread has exited; 1 of 2 thread(s) in uninterruptible sleep, which no signal interrupts (4242 in btrfs_sync_file)"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_running_process_lists_its_threads_under_a_live_leader() {
+        let states = kernel_thread_states(std::process::id()).expect("own threads");
+        assert!(states.threads >= 1, "{states:?}");
+        assert!(!matches!(states.leader, None | Some('Z')), "{states:?}");
+    }
+
+    /// The case a SIGKILLed executor that will not finish exiting has to be
+    /// told apart from: a child that has exited completely and that only a
+    /// missed `waitpid` keeps listed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exited_child_nobody_has_reaped_reads_as_a_zombie_with_nothing_left_waiting() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let states = loop {
+            let states = kernel_thread_states(pid).expect("an unreaped child is still listed");
+            if states.leader == Some('Z') {
+                break states;
+            }
+            assert!(std::time::Instant::now() < deadline, "{states:?}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(states.threads, 1, "{states:?}");
+        assert!(states.uninterruptible.is_empty(), "{states:?}");
+        assert!(states.to_string().contains("zombie"), "{states}");
+        child.wait().unwrap();
+        assert_eq!(kernel_thread_states(pid), None);
     }
 }

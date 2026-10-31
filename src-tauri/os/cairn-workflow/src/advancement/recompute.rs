@@ -624,16 +624,13 @@ async fn node_less_required_artifact_conn(
         return Ok(Some(contract.artifact_name()));
     }
     let packet_artifact = match execution_id {
-        Some(execution_id) => load_execution_snapshot_conn(conn, &execution_id)
-            .await
-            .ok()
-            .and_then(|snapshot| {
-                snapshot
-                    .delegated_packets
-                    .iter()
-                    .find(|packet| packet.result_artifact_job_id.as_deref() == Some(job_id))
-                    .map(|packet| packet.output_contract.artifact_name())
-            }),
+        Some(execution_id) => {
+            crate::delegated_packets::find_by_result_job(conn, &execution_id, job_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|packet| packet.output_contract.artifact_name())
+        }
         None => None,
     };
     Ok(Some(
@@ -1658,11 +1655,8 @@ pub async fn reduce_delegated_child_job_conn(
             serde_json::from_str(&json).map_err(|e| DbError::internal(e.to_string()))?;
         contract.artifact_name()
     } else {
-        let snapshot = load_execution_snapshot_conn(conn, &execution_id).await?;
-        let Some(packet) = snapshot
-            .delegated_packets
-            .iter()
-            .find(|packet| packet.result_artifact_job_id.as_deref() == Some(job_id))
+        let Some(packet) =
+            crate::delegated_packets::find_by_result_job(conn, &execution_id, job_id).await?
         else {
             return Ok(None);
         };

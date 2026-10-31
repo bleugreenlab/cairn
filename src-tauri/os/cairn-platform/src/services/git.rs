@@ -236,6 +236,8 @@ impl GitClient for RealGitClient {
     }
 
     fn init_repo(&self, path: &Path, initial_branch: &str) -> Result<(), String> {
+        // host-default-branch: HEAD is pointed at `initial_branch` by the
+        // symbolic-ref below before anything is committed.
         let output = self.run_git_strs(path, &["init"])?;
         if !output.success {
             return Err(format!("git init failed: {}", output.stderr));

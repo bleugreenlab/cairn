@@ -32,6 +32,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use cairn_common::callback_contract::AGENT_MCP_TOOL_TIMEOUT;
+
 /// The environment variable Cairn's HTTP attachment reads its bearer from.
 pub const MCP_TOKEN_ENV: &str = "CAIRN_MCP_TOKEN";
 
@@ -45,15 +47,6 @@ pub const CAIRN_TOOLS: [&str; 3] = ["read", "run", "write"];
 /// its server entry: the run identity, and the machine secret, which must never
 /// appear in process arguments or on disk.
 const CAIRN_STDIO_INHERITED_ENV: [&str; 2] = ["CAIRN_RUN_ID", "CAIRN_MCP_SECRET"];
-
-/// Codex's per-server MCP tool-call timeout. The host owns execution: a
-/// Cairn `run` answers within its grace window, but a blocking `write` append
-/// to a node's tasks or questions awaits a sub-agent or a user answer with no
-/// host-side deadline. Codex's default would abandon that call while the host
-/// keeps working. Seven days is an effective "never" that still bounds a wedged
-/// socket, and sits above `cairn-cmd`'s own callback ceiling. (Claude's
-/// equivalent is the `MCP_TOOL_TIMEOUT` process environment variable.)
-const CODEX_TOOL_TIMEOUT_SECS: u64 = 604_800;
 
 /// The set of MCP servers a session or a Codex app-server is given.
 ///
@@ -181,9 +174,15 @@ impl McpServer {
                 None => format!("url={}", toml_string(url)),
             },
         };
+        // Codex's per-server tool-call timeout, an active-time bound that
+        // progress never resets. Its default (300 s) would abandon a blocking
+        // `write` append that awaits a sub-agent or a user while the host
+        // keeps working. (Claude's equivalents are process environment
+        // variables; see `claude::claude_session_env`.)
         format!(
-            "mcp_servers.{}={{{entry}, tool_timeout_sec={CODEX_TOOL_TIMEOUT_SECS}}}",
-            self.name
+            "mcp_servers.{}={{{entry}, tool_timeout_sec={}}}",
+            self.name,
+            AGENT_MCP_TOOL_TIMEOUT.as_secs()
         )
     }
 }

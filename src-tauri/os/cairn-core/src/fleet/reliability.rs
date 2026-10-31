@@ -340,6 +340,8 @@ mod tests {
             quiet_ms: 30 * MINUTE,
             last_output_unix_ms: None,
             cpu_ms_in_window: None,
+            storage_io_bytes_in_window: None,
+            tree: Vec::new(),
         }
     }
 

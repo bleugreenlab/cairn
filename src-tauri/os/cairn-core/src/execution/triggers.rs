@@ -548,7 +548,7 @@ mod tests {
                 initiated_via: None,
             },
             presets: None,
-            delegated_packets: vec![],
+            inline_delegated_packets: vec![],
             created_at: 0,
         };
 

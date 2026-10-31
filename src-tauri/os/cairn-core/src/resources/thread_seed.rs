@@ -37,7 +37,7 @@ use crate::tenets::{TenetOrigin, TenetStatus, TenetView};
 use crate::threads::arc_store::ArcProjection;
 use crate::threads::compaction::{self, ChildMark, EntrySource, TocEntry};
 
-use super::common::{connect_for_read, job_status_icon};
+use super::common::{job_status_icon, read_resource};
 use super::transcript::DigestCoordinate;
 use super::transcript::{
     format_transcript_digest_with, group_turn_blocks, load_job_events_ordered, DigestMeta,
@@ -175,23 +175,39 @@ pub(crate) async fn compose_thread_seed_with_policy(
         );
     }
 
-    let (coordinates, source_session_id, children, branches, store) = {
-        let conn = connect_for_read(db).await?;
-        let coordinates = node_coordinates(&conn, job_id).await.ok_or_else(|| {
-            "Cannot compose a thread seed: the node has no addressable coordinates.".to_string()
-        })?;
-        let source_session_id = current_session_id(&conn, job_id).await.ok_or_else(|| {
-            "Cannot compose a thread seed: the job has no current session.".to_string()
-        })?;
-        let children = load_children(&conn, job_id)
-            .await
-            .map_err(|error| format!("Failed to resolve this thread's children: {error}"))?;
-        let branches = load_branches(&conn, job_id)
-            .await
-            .map_err(|error| format!("Failed to resolve this thread's branches: {error}"))?;
-        let store = thread_store_census(&conn, job_id, now).await;
-        (coordinates, source_session_id, children, branches, store)
-    };
+    let job = job_id.to_owned();
+    let (coordinates, source_session_id, children, branches, store) =
+        read_resource(db, move |conn| {
+            Box::pin(async move {
+                let job_id = job.as_str();
+                let coordinates = node_coordinates(conn, job_id).await.ok_or_else(|| {
+                    "Cannot compose a thread seed: the node has no addressable coordinates."
+                        .to_string()
+                })?;
+                let source_session_id =
+                    current_session_id(conn, job_id).await.ok_or_else(|| {
+                        "Cannot compose a thread seed: the job has no current session.".to_string()
+                    })?;
+                let children = load_children(conn, job_id).await.map_err(|error| {
+                    format!("Failed to resolve this thread's children: {error}")
+                })?;
+                let branches = load_branches(conn, job_id).await.map_err(|error| {
+                    format!("Failed to resolve this thread's branches: {error}")
+                })?;
+                let thread_id = job_thread_id(conn, job_id).await;
+                Ok((
+                    coordinates,
+                    source_session_id,
+                    children,
+                    branches,
+                    thread_id,
+                ))
+            })
+        })
+        .await?;
+    // The thread's own store is a second database, opened and counted after
+    // the main read has released.
+    let store = thread_store_census(store, now).await;
     let chat_uri = format!("{}/chat", coordinates.base_uri);
 
     let marks = compaction::unconsumed_marks(db, job_id, &source_session_id)
@@ -794,23 +810,23 @@ fn degrade_to_budget(
 
 /// The eras as a single address. An era summary is a sentence and three of them
 /// render inline; under pressure the collection URI carries all of it.
-async fn thread_store_census(conn: &cairn_db::turso::Connection, job_id: &str, now: i64) -> String {
-    let Ok(mut rows) = conn
-        .query("SELECT thread_id FROM jobs WHERE id = ?1", params![job_id])
-        .await
-    else {
-        return String::new();
-    };
-    let Ok(Some(row)) = rows.next().await else {
-        return String::new();
-    };
-    let Ok(thread_id) = row.get::<String>(0) else {
+async fn thread_store_census(thread_id: Option<String>, now: i64) -> String {
+    let Some(thread_id) = thread_id else {
         return String::new();
     };
     let Some(census) = crate::threads::db_store::census(&thread_id).await else {
         return String::new();
     };
     render_thread_store_census(&census, now)
+}
+
+/// The thread a session job belongs to. Statements only.
+async fn job_thread_id(conn: &cairn_db::turso::Connection, job_id: &str) -> Option<String> {
+    let mut rows = conn
+        .query("SELECT thread_id FROM jobs WHERE id = ?1", params![job_id])
+        .await
+        .ok()?;
+    rows.next().await.ok()??.get::<String>(0).ok()
 }
 
 fn render_thread_store_census(
@@ -2265,14 +2281,17 @@ pub(crate) async fn compose_node_seed(
         return Ok(None);
     }
 
-    let (coordinates, artifacts) = {
-        let conn = connect_for_read(db).await?;
-        let coordinates = node_coordinates(&conn, &job.id).await;
-        let artifacts = artifact_names(&conn, &job.id)
-            .await
-            .map_err(|error| format!("Failed to list this node's artifacts: {error}"))?;
-        (coordinates, artifacts)
-    };
+    let job_id = job.id.clone();
+    let (coordinates, artifacts) = read_resource(db, move |conn| {
+        Box::pin(async move {
+            let coordinates = node_coordinates(conn, &job_id).await;
+            let artifacts = artifact_names(conn, &job_id)
+                .await
+                .map_err(|error| format!("Failed to list this node's artifacts: {error}"))?;
+            Ok((coordinates, artifacts))
+        })
+    })
+    .await?;
     let fallback_label = job
         .node_name
         .as_deref()
