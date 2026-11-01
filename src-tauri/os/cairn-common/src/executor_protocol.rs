@@ -6337,6 +6337,15 @@ pub struct LearnedResourceEstimate {
 /// a link that is not there. An older runner ignores the field. The runner
 /// derives model pools from it (`fleet::pools`) and only displays them; no
 /// admission, placement, or load-context input reads it.
+///
+/// cairn/5768 does not move the number. No frame, variant, field or
+/// serialized form changes. The executor now also sets `RUST_TEST_THREADS` in
+/// the environment of the child it spawns, to the build jobs where the command
+/// left it unset and clamped to the CPU grant where it did not, as it already
+/// did for `NEXTEST_TEST_THREADS`. That is the executor's own policy over its
+/// own child. What a runner gets wrong talking to an older executor: nothing
+/// it decodes differently; that executor still runs a plain `cargo test`
+/// binary at one test thread per logical core whatever the grant.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above
